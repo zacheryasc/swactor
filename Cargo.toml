@@ -1,0 +1,11 @@
+[package]
+name = "swactor"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tokio = { version = "1.48.0", features = ["rt", "macros"] }
+tokio-util = "0.7.17"
