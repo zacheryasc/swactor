@@ -30,7 +30,7 @@ fn main() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("failed to build runtime");
-    let greeter = Greeter::spawn(Greeter, &rt);
+    let greeter = Greeter.spawn(&rt);
 
     let response = rt
         .block_on(async move {
