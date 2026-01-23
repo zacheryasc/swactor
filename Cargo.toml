@@ -6,6 +6,10 @@ edition = "2024"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["getrandom"]
+getrandom = ["dep:getrandom"]
+
 [dependencies]
-tokio = { version = "1.48.0", features = ["rt", "macros"] }
-tokio-util = "0.7.17"
+getrandom = { version = "0.2", optional = true }
+crossbeam-queue = "0.3.12"
