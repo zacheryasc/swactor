@@ -1,7 +1,8 @@
-pub use crossbeam_queue::ArrayQueue;
+//! Shallow wrapper around the `crossbeam_queue::ArrayQueue` implementation of a mpmc ring buffer.
 use std::sync::Arc;
+pub use crossbeam_queue::ArrayQueue;
 
-/// The receiving end of a `crossbeam_queue::ArrayQueue`, a lock-free mpsc queue.
+/// The receiving end of a `crossbeam_queue::ArrayQueue`, a lock-free mpmc queue.
 /// The queue is constructed by the `Receiver::new()` method.
 /// Responsible for creating the `Sender` ends of itself.
 ///

@@ -1,6 +1,19 @@
+/// Simple, ergonomic, local `Error` type.
+/// # Usage
+/// ```
+/// use swactor::Error;
+/// 
+/// fn foo_if_even(num: u64) -> Result<String, Error> {
+///     if num % 2 == 0 {
+///         return Ok("foo".into());
+///     }
+///     else {
+///         return Err(Error::from("baz"));
+///     }
+/// }
+/// ```
 #[derive(Debug)]
 pub struct Error(Box<dyn std::error::Error + Send + Sync + 'static>);
-pub type Result<T> = std::result::Result<T, Error>;
 pub(crate) fn convert_err<E: std::fmt::Debug>(e: E) -> Error {
     Error(format!("{e:?}").into())
 }
