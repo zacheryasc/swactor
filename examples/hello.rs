@@ -1,4 +1,7 @@
-use swactor::{ActorAddress, ActorInterface, Message, Runtime, RuntimeFlavor};
+use swactor::{
+    actor::{ActorAddress, ActorInterface},
+    runtime::{Runtime, RuntimeConfig},
+};
 
 #[derive(Debug, Default)]
 struct Greeter {
@@ -13,7 +16,9 @@ struct GreetMessage {
     /// who do we send out greeting back to?
     return_addr: ActorAddress,
 }
-impl Message for GreetMessage {}
+
+#[derive(Debug, Default, Clone)]
+struct GreetResponse(String);
 
 impl ActorInterface for Greeter {
     type Incoming = GreetMessage;
@@ -29,17 +34,18 @@ impl ActorInterface for Greeter {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-struct GreetResponse(String);
-impl Message for GreetResponse {}
-
 fn main() {
-    let mut rt = Runtime::new(100, Some(RuntimeFlavor::SingleThreaded));
+    let rt = Runtime::new(RuntimeConfig::default());
+
+    // spawn a `Greeter` in the runtime, returning an address to contact it with
     let addr = rt
         .spawn(Greeter::default())
         .expect("failed to spawn greeter");
-    let inbox = rt.new_inbox::<GreetResponse>();
 
+    // create an `Inbox` that allows us to receive messages from the runtime
+    let inbox = rt.new_inbox::<GreetResponse>().unwrap();
+
+    // send a message to the `Greeter` we spawned
     rt.send_to(
         addr,
         GreetMessage {
@@ -48,10 +54,11 @@ fn main() {
         },
     )
     .unwrap();
+
+    // default runtime is single threaded, and requires the parent process to drive
     for _ in 0..3 {
         rt.tick();
     }
-
     let resp = inbox.try_recv().expect("greeter should have said hello");
 
     println!("{}", resp.0);
