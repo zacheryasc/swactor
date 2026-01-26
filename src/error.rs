@@ -2,7 +2,7 @@
 /// # Usage
 /// ```
 /// use swactor::Error;
-/// 
+///
 /// fn foo_if_even(num: u64) -> Result<String, Error> {
 ///     if num % 2 == 0 {
 ///         return Ok("foo".into());

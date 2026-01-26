@@ -2,12 +2,13 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     actor::{ActorAddress, ActorInterface, Message},
-    ring_buffer::Sender, runtime::Runtime,
+    channel::Sender,
+    runtime::Runtime,
 };
 
 /// FIXME: Go over with a fine-toothed comb and reassure yourself this typing
 /// makes sense, that we are not doing loads of indirection on a hot path.
-/// 
+///
 /// A type erased `Message` to be routed between actor processes.
 pub(crate) type Envelope = Arc<dyn std::any::Any + Send + Sync>;
 
@@ -60,13 +61,15 @@ impl ActorInterface for Router {
         match msg {
             RouterMessage::AddAddr(addr, sender) => {
                 self.directory.insert(addr, sender);
-            },
-            RouterMessage::RemoveAddr(addr) => { self.directory.remove(&addr); },
+            }
+            RouterMessage::RemoveAddr(addr) => {
+                self.directory.remove(&addr);
+            }
             RouterMessage::SendToAddr { addr, msg } => {
                 if let Some(sender) = self.directory.get(&addr) {
                     sender.try_send(msg);
                 }
-            },
+            }
         }
     }
 }

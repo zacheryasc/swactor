@@ -2,6 +2,7 @@
 name = "swactor"
 version = "0.1.0"
 edition = "2024"
+autobenches = false
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -9,7 +10,13 @@ crate-type = ["cdylib", "rlib"]
 [features]
 default = ["getrandom"]
 getrandom = ["dep:getrandom"]
+no_random = [] # compile without access to a source of randomness
+stress = []  # Enable stress tests
 
 [dependencies]
 getrandom = { version = "0.2", optional = true }
 crossbeam-queue = "0.3.12"
+
+[[bin]]
+name = "bench"
+path = "benches/main.rs"
