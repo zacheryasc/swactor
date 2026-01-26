@@ -1,14 +1,13 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use crossbeam_queue::ArrayQueue;
-
+use crate::channel::HybridChannel;
 use crate::{
-    Error,
     actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message},
-    ring_buffer::{Receiver, Sender},
+    channel::{Receiver, Sender},
     router::{Router, RouterMessage},
+    Error,
 };
 
 /// Generic message inbox for receiving messages outside of the runtime.
@@ -60,7 +59,7 @@ impl Default for RuntimeConfig {
 /// The `Runtime` struct is the primary gateway for interacting with the framework.
 pub struct Runtime {
     config: RuntimeConfig,
-    actor_queue: ArrayQueue<Box<dyn AnyActor>>,
+    actor_queue: HybridChannel<Box<dyn AnyActor>>,
     router_interface: Sender<RouterMessage>,
     router: Option<Actor<Router>>, // `None` if single-threaded
 
@@ -91,7 +90,7 @@ impl Runtime {
     /// Builds a new `Runtime` struct, but does not yet run anything. If multithreaded, call
     /// `run()`, if single threaded, needs to be driven by calls to the `tick()` method.
     pub fn new(config: RuntimeConfig) -> Self {
-        let actor_queue = ArrayQueue::new(config.max_actors);
+        let actor_queue = HybridChannel::new(config.max_actors);
 
         // router is a unique actor in that the runtime needs access to it's `Sender` handle
         let router_inner = Router::new();
@@ -176,7 +175,7 @@ impl Runtime {
     /// Spawn worker threads and start processing, returning a set of handles and
     /// a Runtime object to interface with.
     ///
-    /// ### WARN: 
+    /// ### WARN:
     /// ##### This function panics if the configuration is set as single threaded
     /// `config.num_threads == 1`
     pub fn run(mut self) -> Result<RuntimeHandle, Error> {
@@ -217,10 +216,19 @@ impl Runtime {
                 while ctx.is_running.load(Ordering::Acquire) {
                     if let Some(mut actor) = ctx.actor_queue.pop() {
                         actor.tick(&ctx);
-                        if let Err(_) = ctx.actor_queue.push(actor) {
-                            panic!(
-                                "Runtime panic: attempted to return an actor to the queue, but queue was full."
-                            )
+                        // FIXME: Justify this loop. It is here to prevent panics when the
+                        // actor queue is full, but results in a spinlock.
+                        loop {
+                            match ctx.actor_queue.push(actor) {
+                                Ok(()) => break,
+                                Err(a) => {
+                                    actor = a;
+                                    if !ctx.is_running.load(Ordering::Acquire) {
+                                        break;
+                                    }
+                                    thread::yield_now();
+                                }
+                            }
                         }
                     } else {
                         thread::yield_now();

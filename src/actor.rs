@@ -1,34 +1,34 @@
-use crate::{runtime::Runtime, WATERLEVEL, get_random, ring_buffer::Receiver};
+use crate::{WATERLEVEL, channel::Receiver, get_random, runtime::Runtime};
 
 /// The primary trait defining data that can be passed to and from actor processes
 pub trait Message: 'static + Sized + Clone + Send + Sync {}
 impl<T: 'static + Sized + Clone + Send + Sync> Message for T {}
 
 /// The trait that needs to be implemented in order to run a process as an `Actor`
-/// 
+///
 /// The `Incoming` type represents `Messages` that can be delivered to the `Actor`.
-/// 
+///
 /// The `Response` type represents possible `Messages` the actor may attempt to reply with.
-/// 
+///
 /// The `fn handle(..)` is where you implement the logic for handling `Incoming` messages
-/// 
+///
 /// # Example
 /// ```
 /// use swactor::{actor::{ActorAddress, ActorInterface}, runtime::Runtime};
-/// 
+///
 /// struct Greeter {
 ///     num_greeted: usize,
 /// }
-/// 
+///
 /// #[derive(Clone)] // required to auto implement `Message`
 /// struct GreetMessage {
 ///     who: String,
 ///     return_addr: ActorAddress,
 /// }
-/// 
+///
 /// #[derive(Clone)]
 /// struct GreetResponse(String);
-/// 
+///
 /// impl ActorInterface for Greeter {
 ///     type Incoming = GreetMessage;
 ///     type Response = GreetResponse;
@@ -71,10 +71,7 @@ where
 
 impl<A: ActorInterface> Actor<A> {
     pub(crate) fn new(inbox: Receiver<A::Incoming>, inner: A) -> Self {
-        Self {
-            inbox,
-            inner,
-        }
+        Self { inbox, inner }
     }
 }
 
