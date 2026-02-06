@@ -176,7 +176,7 @@ impl ActorInterface for PyActor {
                 for effect in effects {
                     match effect {
                         Effect::Send { addr, msg } => {
-                            let _ = ctx.raw_inner().send_via_queue(
+                            let _ = ctx.raw_inner().send_any(
                                 addr,
                                 Box::new(PyMsg(msg)) as Box<dyn Any + Send>,
                             );
@@ -364,6 +364,14 @@ impl PyRuntime {
         })
     }
 
+    fn stats(&self) -> PyResult<PyRuntimeStats> {
+        let rt = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        Ok(build_stats(rt))
+    }
+
     fn shutdown(&self) -> PyResult<()> {
         let rt = self
             .inner
@@ -419,6 +427,16 @@ impl PyRuntimeHandle {
         Ok(PyInbox { inner: inbox })
     }
 
+    fn stats(&self) -> PyResult<PyRuntimeStats> {
+        let handle = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
+            })?;
+        Ok(build_stats(&handle.runtime))
+    }
+
     fn shutdown(&self) -> PyResult<()> {
         let handle = self
             .inner
@@ -442,6 +460,86 @@ impl PyRuntimeHandle {
     }
 }
 
+// ─── ActorInfo / RuntimeStats ────────────────────────────────────────────────
+
+#[pyclass(name = "ActorInfo")]
+#[derive(Clone)]
+pub struct PyActorInfo {
+    #[pyo3(get)]
+    address: PyActorAddress,
+    #[pyo3(get)]
+    worker_id: usize,
+}
+
+#[pymethods]
+impl PyActorInfo {
+    fn __repr__(&self) -> String {
+        let hex = self.address.hex();
+        format!("ActorInfo(address={hex}, worker={})", self.worker_id)
+    }
+}
+
+#[pyclass(name = "RuntimeStats")]
+#[derive(Clone)]
+pub struct PyRuntimeStats {
+    #[pyo3(get)]
+    num_actors: usize,
+    #[pyo3(get)]
+    num_workers: usize,
+    #[pyo3(get)]
+    actors: Vec<PyActorInfo>,
+}
+
+#[pymethods]
+impl PyRuntimeStats {
+    fn __repr__(&self) -> String {
+        let mut out = format!(
+            "RuntimeStats(actors={}, workers={})",
+            self.num_actors, self.num_workers
+        );
+
+        // Group actors by worker
+        let mut by_worker: std::collections::BTreeMap<usize, Vec<&PyActorInfo>> =
+            std::collections::BTreeMap::new();
+        for info in &self.actors {
+            by_worker.entry(info.worker_id).or_default().push(info);
+        }
+
+        for wid in 0..self.num_workers {
+            let actors = by_worker.get(&wid);
+            let count = actors.map_or(0, |v| v.len());
+            out.push_str(&format!("\n  Worker {wid}: {count} actors"));
+            if let Some(actors) = actors {
+                for info in actors {
+                    out.push_str(&format!("\n    - {}", info.address.hex()));
+                }
+            }
+        }
+
+        out
+    }
+
+    fn __str__(&self) -> String {
+        self.__repr__()
+    }
+}
+
+fn build_stats(runtime: &Runtime) -> PyRuntimeStats {
+    let (num_workers, snapshot) = runtime.stats();
+    let actors: Vec<PyActorInfo> = snapshot
+        .into_iter()
+        .map(|(addr, wid)| PyActorInfo {
+            address: PyActorAddress::from(addr),
+            worker_id: wid.as_usize(),
+        })
+        .collect();
+    PyRuntimeStats {
+        num_actors: actors.len(),
+        num_workers,
+        actors,
+    }
+}
+
 // ─── Module registration ─────────────────────────────────────────────────────
 
 pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -451,5 +549,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntimeConfig>()?;
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyRuntimeHandle>()?;
+    m.add_class::<PyActorInfo>()?;
+    m.add_class::<PyRuntimeStats>()?;
     Ok(())
 }

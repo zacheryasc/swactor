@@ -49,6 +49,16 @@ impl AddressMap {
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().len()
     }
+
+    /// Returns a snapshot of all (address, worker) pairs.
+    pub fn snapshot(&self) -> Vec<(ActorAddress, WorkerId)> {
+        self.inner
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(addr, wid)| (*addr, *wid))
+            .collect()
+    }
 }
 
 /// Round-robin actor placement strategy.

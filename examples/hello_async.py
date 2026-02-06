@@ -30,6 +30,8 @@ async def main():
         reply = await recv(inbox)
         print(reply)
 
+     # show us our actors!
+    print(handle.stats())
     handle.shutdown()
     handle.join()
 
