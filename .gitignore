@@ -1,4 +1,4 @@
-/target
+**/target
 tools/depgraph/target/
 node_modules/
 .vscode/
