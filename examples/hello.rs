@@ -1,6 +1,6 @@
 use swactor::{
     actor::{ActorAddress, ActorInterface},
-    runtime::{Runtime, RuntimeConfig},
+    runtime::{Ctx, Runtime, RuntimeConfig},
 };
 
 #[derive(Debug, Default)]
@@ -24,10 +24,10 @@ impl ActorInterface for Greeter {
     type Incoming = GreetMessage;
     type Response = GreetResponse;
 
-    fn handle(&mut self, ctx: &Runtime, msg: GreetMessage) {
+    fn handle(&mut self, ctx: &Ctx, msg: GreetMessage) {
         let res = GreetResponse(format!("Hello, {}!", msg.who));
         self.num_greeted += 1;
-        if let Err(_) = ctx.send_to(msg.return_addr, res) {
+        if let Err(_) = ctx.send(msg.return_addr, res) {
             // no error handling
             self.num_greeted -= 1;
         }

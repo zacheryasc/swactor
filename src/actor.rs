@@ -1,50 +1,15 @@
-use crate::{WATERLEVEL, channel::Receiver, get_random, runtime::Runtime};
+use std::any::Any;
+
+use crate::{get_random, runtime::{ContextInner, Ctx}, worker::Mailbox};
 
 /// The primary trait defining data that can be passed to and from actor processes
 pub trait Message: 'static + Sized + Clone + Send + Sync {}
 impl<T: 'static + Sized + Clone + Send + Sync> Message for T {}
 
-/// The trait that needs to be implemented in order to run a process as an `Actor`
-///
-/// The `Incoming` type represents `Messages` that can be delivered to the `Actor`.
-///
-/// The `Response` type represents possible `Messages` the actor may attempt to reply with.
-///
-/// The `fn handle(..)` is where you implement the logic for handling `Incoming` messages
-///
-/// # Example
-/// ```
-/// use swactor::{actor::{ActorAddress, ActorInterface}, runtime::Runtime};
-///
-/// struct Greeter {
-///     num_greeted: usize,
-/// }
-///
-/// #[derive(Clone)] // required to auto implement `Message`
-/// struct GreetMessage {
-///     who: String,
-///     return_addr: ActorAddress,
-/// }
-///
-/// #[derive(Clone)]
-/// struct GreetResponse(String);
-///
-/// impl ActorInterface for Greeter {
-///     type Incoming = GreetMessage;
-///     type Response = GreetResponse;
-///     
-///     fn handle(&mut self, ctx: &Runtime, msg: Self::Incoming) {
-///         let response = GreetResponse(format!("Hello, {}!", msg.who).to_string());
-///         if let Ok(_) = ctx.send_to(msg.return_addr, response) {
-///             self.num_greeted += 1;
-///         }
-///     }
-/// }
-/// ```
 pub trait ActorInterface: 'static + Send {
     type Incoming: Message;
     type Response: Message;
-    fn handle(&mut self, ctx: &Runtime, msg: Self::Incoming);
+    fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming);
 }
 
 /// A unique address for this actor. 32 bytes is overkill for a small application,
@@ -60,47 +25,58 @@ impl ActorAddress {
     }
 }
 
-/// The actor process as represented in the Runtime, with the actor state stored with it's inbox.
+/// The actor process as represented in the Runtime, with the actor state stored with its mailbox.
 pub(crate) struct Actor<A>
 where
     A: ActorInterface,
 {
-    inbox: Receiver<A::Incoming>,
+    addr: ActorAddress,
+    mailbox: Mailbox<A::Incoming>,
     inner: A,
 }
 
 impl<A: ActorInterface> Actor<A> {
-    pub(crate) fn new(inbox: Receiver<A::Incoming>, inner: A) -> Self {
-        Self { inbox, inner }
+    pub(crate) fn new(addr: ActorAddress, mailbox: Mailbox<A::Incoming>, inner: A) -> Self {
+        Self {
+            addr,
+            mailbox,
+            inner,
+        }
     }
 }
 
 /// Trait for type-erased actors
 pub(crate) trait AnyActor: Send {
-    fn tick(&mut self, ctx: &Runtime);
+    /// Tick the actor, processing pending messages. Returns `true` if any work was done.
+    fn tick(&mut self, inner: &dyn ContextInner) -> bool;
+    /// Deliver a type-erased message into this actor's mailbox.
+    /// Returns `true` if the downcast succeeded.
+    fn deliver(&mut self, msg: Box<dyn Any + Send>) -> bool;
 }
 
 impl<A> AnyActor for Actor<A>
 where
     A: ActorInterface,
 {
-    fn tick(&mut self, ctx: &Runtime) {
-        // TODO: WATERLEVEL is hard coded, and so is this message handling scheme. We should
-        // make it so both are more flexible, with sane defaults.
-        let total_messages = self.inbox.len();
-        let messages_to_process = if total_messages < WATERLEVEL {
-            total_messages
-        } else {
-            total_messages >> 1
-        };
-
-        for _ in 0..messages_to_process {
-            match self.inbox.try_recv() {
-                Some(msg) => self.inner.handle(ctx, msg),
-                None => unreachable!(
-                    "We checked number of unprocessed messages in the queue ahead of processing"
-                ),
+    fn tick(&mut self, inner: &dyn ContextInner) -> bool {
+        let n = self.mailbox.drain_count();
+        if n > 0 {
+            let ctx = Ctx::new(inner, self.addr);
+            for _ in 0..n {
+                if let Some(msg) = self.mailbox.pop() {
+                    self.inner.handle(&ctx, msg);
+                }
             }
+        }
+        n > 0
+    }
+
+    fn deliver(&mut self, msg: Box<dyn Any + Send>) -> bool {
+        if let Ok(typed) = msg.downcast::<A::Incoming>() {
+            self.mailbox.push(*typed);
+            true
+        } else {
+            false
         }
     }
 }

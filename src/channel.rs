@@ -1,17 +1,18 @@
-use std::{collections::VecDeque, sync::{Arc, Mutex}};
 
-use crossbeam_queue::ArrayQueue;
+use std::sync::Arc;
+
+use crossbeam_queue::{ArrayQueue, SegQueue};
 
 pub struct HybridChannel<T> {
     ring: ArrayQueue<T>,
-    overflow: Mutex<VecDeque<T>>,
+    overflow: SegQueue<T>,
 }
 
 impl<T> HybridChannel<T> {
     pub fn new(capacity: usize) -> Self {
         Self {
             ring: ArrayQueue::new(capacity),
-            overflow: Mutex::new(VecDeque::new()),
+            overflow: SegQueue::new(),
         }
     }
 
@@ -19,7 +20,7 @@ impl<T> HybridChannel<T> {
         match self.ring.push(value) {
             Ok(()) => Ok(()),
             Err(v) => {
-                self.overflow.lock().unwrap().push_back(v);
+                self.overflow.push(v);
                 Ok(())
             }
         }
@@ -30,12 +31,14 @@ impl<T> HybridChannel<T> {
             return Some(value);
         }
 
-        self.overflow.lock().unwrap().pop_front()
+        match self.overflow.pop() {
+            Some(value) => {
+                Some(value)
+            }
+            None => None,
+        }
     }
 
-    pub fn len(&self) -> usize {
-        self.ring.len() + self.overflow.lock().unwrap().len()
-    }
 }
 
 pub(crate) struct Receiver<T> {
@@ -48,11 +51,6 @@ impl<T> Receiver<T> {
 
         Self { queue }
     }
-
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
-
     pub fn try_recv(&self) -> Option<T> {
         return self.queue.pop();
     }
