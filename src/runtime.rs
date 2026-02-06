@@ -64,6 +64,11 @@ impl<'a> Ctx<'a> {
         Self { inner, self_addr }
     }
 
+    #[cfg(feature = "python")]
+    pub(crate) fn raw_inner(&self) -> &dyn ContextInner {
+        self.inner
+    }
+
     /// Returns the address of the actor currently being ticked.
     pub fn self_addr(&self) -> ActorAddress {
         self.self_addr
@@ -233,25 +238,22 @@ impl Runtime {
         }
     }
 
-    /// Spawn worker threads and start processing, returning a set of handles and
-    /// a Runtime object to interface with.
+    /// Spawn worker threads and start processing, returning a handle
+    /// to interact with the runtime and join the threads later.
     ///
-    /// ### WARN:
-    /// ##### Returns an error if the configuration is set as single threaded
-    /// `config.num_threads == 1`
+    /// Works in both single-threaded and multi-threaded configurations.
+    /// In single-threaded mode, one background thread is spawned.
     pub fn run(mut self) -> Result<RuntimeHandle, Error> {
-        if self.config.num_threads < 2 {
-            return Err(Error::from(
-                "Runtime error: cannot call `Runtime::run()` from a single-threaded context.",
-            ));
-        }
-
         self.is_running.store(true, Ordering::Release);
 
-        let workers = self
-            .pending_workers
-            .take()
-            .expect("Workers must be present for multi-threaded runtime");
+        let mut workers: Vec<Worker> = Vec::new();
+
+        if let Some(w) = self.single_worker.take() {
+            workers.push(w.into_inner());
+        }
+        if let Some(ws) = self.pending_workers.take() {
+            workers.extend(ws);
+        }
 
         let rt = Arc::new(self);
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(workers.len());
