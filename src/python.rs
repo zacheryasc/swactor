@@ -7,7 +7,6 @@ use pyo3::types::PyModule;
 use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor};
 use crate::config::{BackoffPolicy, RuntimeConfig};
 use crate::runtime::{Ctx, Inbox, Runtime, RuntimeHandle};
-use crate::worker::Mailbox;
 use crate::Error;
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
@@ -182,10 +181,8 @@ impl ActorInterface for PyActor {
                             );
                         }
                         Effect::Spawn { addr, handler } => {
-                            let waterlevel = ctx.raw_inner().mailbox_waterlevel();
                             let actor = PyActor::new(handler);
-                            let actor = Actor::new(addr, Mailbox::new(waterlevel), actor);
-                            let boxed: Box<dyn AnyActor> = Box::new(actor);
+                            let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
                             let _ = ctx.raw_inner().spawn_any(addr, boxed);
                         }
                     }
@@ -479,6 +476,29 @@ impl PyActorInfo {
     }
 }
 
+#[pyclass(name = "WorkerInfo")]
+#[derive(Clone)]
+pub struct PyWorkerInfo {
+    #[pyo3(get)]
+    id: usize,
+    #[pyo3(get)]
+    num_actors: usize,
+    #[pyo3(get)]
+    mailbox_depth: usize,
+    #[pyo3(get)]
+    messages_processed: u64,
+}
+
+#[pymethods]
+impl PyWorkerInfo {
+    fn __repr__(&self) -> String {
+        format!(
+            "WorkerInfo(id={}, actors={}, queued={}, processed={})",
+            self.id, self.num_actors, self.mailbox_depth, self.messages_processed
+        )
+    }
+}
+
 #[pyclass(name = "RuntimeStats")]
 #[derive(Clone)]
 pub struct PyRuntimeStats {
@@ -488,6 +508,8 @@ pub struct PyRuntimeStats {
     num_workers: usize,
     #[pyo3(get)]
     actors: Vec<PyActorInfo>,
+    #[pyo3(get)]
+    workers: Vec<PyWorkerInfo>,
 }
 
 #[pymethods]
@@ -498,19 +520,13 @@ impl PyRuntimeStats {
             self.num_actors, self.num_workers
         );
 
-        // Group actors by worker
-        let mut by_worker: std::collections::BTreeMap<usize, Vec<&PyActorInfo>> =
-            std::collections::BTreeMap::new();
-        for info in &self.actors {
-            by_worker.entry(info.worker_id).or_default().push(info);
-        }
-
-        for wid in 0..self.num_workers {
-            let actors = by_worker.get(&wid);
-            let count = actors.map_or(0, |v| v.len());
-            out.push_str(&format!("\n  Worker {wid}: {count} actors"));
-            if let Some(actors) = actors {
-                for info in actors {
+        for w in &self.workers {
+            out.push_str(&format!(
+                "\n  Worker {}: {} actors, {} queued, {} processed",
+                w.id, w.num_actors, w.mailbox_depth, w.messages_processed
+            ));
+            for info in &self.actors {
+                if info.worker_id == w.id {
                     out.push_str(&format!("\n    - {}", info.address.hex()));
                 }
             }
@@ -525,18 +541,30 @@ impl PyRuntimeStats {
 }
 
 fn build_stats(runtime: &Runtime) -> PyRuntimeStats {
-    let (num_workers, snapshot) = runtime.stats();
-    let actors: Vec<PyActorInfo> = snapshot
+    let stats = runtime.stats();
+    let actors: Vec<PyActorInfo> = stats
+        .actors
         .into_iter()
         .map(|(addr, wid)| PyActorInfo {
             address: PyActorAddress::from(addr),
-            worker_id: wid.as_usize(),
+            worker_id: wid,
+        })
+        .collect();
+    let workers: Vec<PyWorkerInfo> = stats
+        .workers
+        .into_iter()
+        .map(|w| PyWorkerInfo {
+            id: w.id,
+            num_actors: w.num_actors,
+            mailbox_depth: w.mailbox_depth,
+            messages_processed: w.messages_processed,
         })
         .collect();
     PyRuntimeStats {
         num_actors: actors.len(),
-        num_workers,
+        num_workers: stats.num_workers,
         actors,
+        workers,
     }
 }
 
@@ -550,6 +578,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRuntime>()?;
     m.add_class::<PyRuntimeHandle>()?;
     m.add_class::<PyActorInfo>()?;
+    m.add_class::<PyWorkerInfo>()?;
     m.add_class::<PyRuntimeStats>()?;
     Ok(())
 }

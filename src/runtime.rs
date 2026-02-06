@@ -10,10 +10,25 @@ use crate::address_map::{AddressMap, Placement, WorkerId};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, RuntimeConfig};
-use crate::worker::Mailbox;
-use crate::worker::{TickContext, Worker};
+use crate::worker::{TickContext, Worker, WorkerStats};
 use crate::Error;
 
+
+/// Snapshot of per-worker state.
+pub struct WorkerInfo {
+    pub id: usize,
+    pub num_actors: usize,
+    pub mailbox_depth: usize,
+    pub messages_processed: u64,
+}
+
+/// Snapshot of overall runtime state.
+pub struct RuntimeStats {
+    pub num_workers: usize,
+    /// Each entry is (address, worker_id).
+    pub actors: Vec<(ActorAddress, usize)>,
+    pub workers: Vec<WorkerInfo>,
+}
 
 /// Generic message inbox for receiving messages outside of the runtime.
 pub struct Inbox<M: Message> {
@@ -82,9 +97,7 @@ impl<'a> Ctx<'a> {
     /// Spawn a new actor, returning its address.
     pub fn spawn<A: ActorInterface>(&self, actor: A) -> Result<ActorAddress, Error> {
         let addr = ActorAddress::new_random();
-        let waterlevel = self.inner.mailbox_waterlevel();
-        let actor = Actor::new(addr, Mailbox::new(waterlevel), actor);
-        let boxed: Box<dyn AnyActor> = Box::new(actor);
+        let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
         self.inner.spawn_any(addr, boxed)?;
         Ok(addr)
     }
@@ -115,6 +128,7 @@ pub struct Runtime {
     spawn_txs: Vec<Sender<(ActorAddress, Box<dyn AnyActor>)>>,
     placement: Placement,
     is_running: AtomicBool,
+    worker_stats: Vec<Arc<WorkerStats>>,
     /// Single-threaded mode: worker stored inline
     single_worker: Option<RefCell<Worker>>,
     /// Multi-threaded mode: workers waiting to be assigned to threads by run()
@@ -142,6 +156,7 @@ impl Runtime {
 
         let mut transfer_txs = Vec::with_capacity(num_workers);
         let mut spawn_txs = Vec::with_capacity(num_workers);
+        let mut worker_stats = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
@@ -154,7 +169,9 @@ impl Runtime {
             let spawn_tx = spawn_rx.new_sender();
             spawn_txs.push(spawn_tx);
 
-            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx));
+            let stats = Arc::new(WorkerStats::new());
+            worker_stats.push(stats.clone());
+            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats));
         }
 
         if config.num_threads < 2 {
@@ -168,6 +185,7 @@ impl Runtime {
                 spawn_txs,
                 placement,
                 is_running: AtomicBool::new(false),
+                worker_stats,
                 single_worker: Some(RefCell::new(worker)),
                 pending_workers: None,
             }
@@ -181,6 +199,7 @@ impl Runtime {
                 spawn_txs,
                 placement,
                 is_running: AtomicBool::new(false),
+                worker_stats,
                 single_worker: None,
                 pending_workers: Some(workers),
             }
@@ -192,8 +211,7 @@ impl Runtime {
         let addr = ActorAddress::new_random();
         let worker_id = self.placement.next_worker();
         self.address_map.insert(addr, worker_id);
-        let actor = Actor::new(addr, Mailbox::new(self.config.mailbox_waterlevel), actor);
-        let boxed: Box<dyn AnyActor> = Box::new(actor);
+        let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
         self.spawn_txs[worker_id.as_usize()]
             .try_send((addr, boxed))
             .map_err(|_| Error::from("Runtime error: spawn queue full"))?;
@@ -280,15 +298,35 @@ impl Runtime {
         })
     }
 
-    /// Returns a snapshot of runtime stats: all actor addresses with their worker assignments,
-    /// plus the number of workers.
-    pub(crate) fn stats(&self) -> (usize, Vec<(ActorAddress, WorkerId)>) {
+    /// Returns a snapshot of runtime stats: actor placements and per-worker info.
+    pub fn stats(&self) -> RuntimeStats {
         let num_workers = if self.config.num_threads < 2 {
             1
         } else {
             self.config.num_threads
         };
-        (num_workers, self.address_map.snapshot())
+        let workers = self
+            .worker_stats
+            .iter()
+            .enumerate()
+            .map(|(i, ws)| WorkerInfo {
+                id: i,
+                num_actors: ws.num_actors.load(Ordering::Relaxed),
+                mailbox_depth: ws.total_mailbox_depth.load(Ordering::Relaxed),
+                messages_processed: ws.messages_processed.load(Ordering::Relaxed),
+            })
+            .collect();
+        let actors = self
+            .address_map
+            .snapshot()
+            .into_iter()
+            .map(|(addr, wid)| (addr, wid.as_usize()))
+            .collect();
+        RuntimeStats {
+            num_workers,
+            actors,
+            workers,
+        }
     }
 
     /// Signal all workers to stop

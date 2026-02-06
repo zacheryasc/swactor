@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use crate::{get_random, runtime::{ContextInner, Ctx}, worker::Mailbox};
+use crate::runtime::Ctx;
 
 /// The primary trait defining data that can be passed to and from actor processes
 pub trait Message: 'static + Sized + Clone + Send + Sync {}
@@ -20,63 +20,32 @@ pub struct ActorAddress(pub [u8; 32]);
 impl ActorAddress {
     pub fn new_random() -> Self {
         let mut bytes = [0u8; 32];
-        get_random(&mut bytes);
+        crate::get_random(&mut bytes);
         Self(bytes)
     }
 }
 
-/// The actor process as represented in the Runtime, with the actor state stored with its mailbox.
-pub(crate) struct Actor<A>
-where
-    A: ActorInterface,
-{
-    addr: ActorAddress,
-    mailbox: Mailbox<A::Incoming>,
-    inner: A,
-}
+/// The actor process as represented in the Runtime — thin wrapper around user state.
+pub(crate) struct Actor<A: ActorInterface>(A);
 
 impl<A: ActorInterface> Actor<A> {
-    pub(crate) fn new(addr: ActorAddress, mailbox: Mailbox<A::Incoming>, inner: A) -> Self {
-        Self {
-            addr,
-            mailbox,
-            inner,
-        }
+    pub(crate) fn new(inner: A) -> Self {
+        Self(inner)
     }
 }
 
-/// Trait for type-erased actors
+/// Trait for type-erased actors — single-message handler.
 pub(crate) trait AnyActor: Send {
-    /// Tick the actor, processing pending messages. Returns `true` if any work was done.
-    fn tick(&mut self, inner: &dyn ContextInner) -> bool;
-    /// Deliver a type-erased message into this actor's mailbox.
-    /// Returns `true` if the downcast succeeded.
-    fn deliver(&mut self, msg: Box<dyn Any + Send>) -> bool;
+    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>);
 }
 
 impl<A> AnyActor for Actor<A>
 where
     A: ActorInterface,
 {
-    fn tick(&mut self, inner: &dyn ContextInner) -> bool {
-        let n = self.mailbox.drain_count();
-        if n > 0 {
-            let ctx = Ctx::new(inner, self.addr);
-            for _ in 0..n {
-                if let Some(msg) = self.mailbox.pop() {
-                    self.inner.handle(&ctx, msg);
-                }
-            }
-        }
-        n > 0
-    }
-
-    fn deliver(&mut self, msg: Box<dyn Any + Send>) -> bool {
+    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) {
         if let Ok(typed) = msg.downcast::<A::Incoming>() {
-            self.mailbox.push(*typed);
-            true
-        } else {
-            false
+            self.0.handle(ctx, *typed);
         }
     }
 }

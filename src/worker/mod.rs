@@ -1,24 +1,42 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 
 use crate::actor::{ActorAddress, AnyActor, Message};
 use crate::address_map::{AddressMap, Placement, WorkerId};
 use crate::channel::{Receiver, Sender};
 use crate::config::{BackoffPolicy, RuntimeConfig};
-use crate::runtime::{ContextInner, Envelope, InboxRegistry};
+use crate::runtime::{ContextInner, Ctx, Envelope, InboxRegistry};
 use crate::Error;
+
+/// Per-worker stats published via atomics. Readable from any thread.
+pub(crate) struct WorkerStats {
+    pub num_actors: AtomicUsize,
+    pub total_mailbox_depth: AtomicUsize,
+    pub messages_processed: AtomicU64,
+}
+
+impl WorkerStats {
+    pub fn new() -> Self {
+        Self {
+            num_actors: AtomicUsize::new(0),
+            total_mailbox_depth: AtomicUsize::new(0),
+            messages_processed: AtomicU64::new(0),
+        }
+    }
+}
 
 /// Shared state passed to tick_once — single thin pointer avoids register spill.
 pub(crate) struct TickContext<'a> {
-    pub address_map: &'a AddressMap,
-    pub transfer_txs: &'a [Sender<Envelope>],
-    pub spawn_txs: &'a [Sender<(ActorAddress, Box<dyn AnyActor>)>],
-    pub placement: &'a Placement,
-    pub inbox_registry: &'a InboxRegistry,
-    pub config: &'a RuntimeConfig,
+    pub(crate) address_map: &'a AddressMap,
+    pub(crate) transfer_txs: &'a [Sender<Envelope>],
+    pub(crate) spawn_txs: &'a [Sender<(ActorAddress, Box<dyn AnyActor>)>],
+    pub(crate) placement: &'a Placement,
+    pub(crate) inbox_registry: &'a InboxRegistry,
+    pub(crate) config: &'a RuntimeConfig,
 }
 
 /// A worker owns a set of actors and runs them in a loop.
@@ -27,24 +45,27 @@ pub(crate) struct Worker {
     pool: ActorPool,
     transfer_rx: Receiver<Envelope>,
     spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
+    stats: Arc<WorkerStats>,
 }
 
 impl Worker {
-    pub fn new(
+    pub(crate) fn new(
         id: WorkerId,
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
+        stats: Arc<WorkerStats>,
     ) -> Self {
         Self {
             id,
             pool: ActorPool::new(),
             transfer_rx,
             spawn_rx,
+            stats,
         }
     }
 
     /// Run one iteration of the worker loop. Returns `true` if any work was done.
-    pub fn tick_once(&mut self, tc: &TickContext) -> bool {
+    pub(crate) fn tick_once(&mut self, tc: &TickContext) -> bool {
         let mut did_work = false;
 
         // 1. Drain spawn queue → add actors to pool
@@ -65,6 +86,7 @@ impl Worker {
         let pending_local: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
             RefCell::new(Vec::new());
 
+        let processed;
         {
             let worker_ctx = WorkerContext {
                 worker_id: self.id,
@@ -76,7 +98,8 @@ impl Worker {
                 config: tc.config,
                 pending_local: &pending_local,
             };
-            if self.pool.tick_all(&worker_ctx) {
+            processed = self.pool.tick_all(&worker_ctx);
+            if processed > 0 {
                 did_work = true;
             }
         }
@@ -89,6 +112,11 @@ impl Worker {
         for (addr, msg) in pending {
             self.pool.deliver(&addr, msg);
         }
+
+        // 5. Publish stats
+        self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
+        self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
+        self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
 
         did_work
     }
@@ -166,9 +194,25 @@ impl ContextInner for WorkerContext<'_> {
     }
 }
 
-/// Per-worker actor storage.
+/// How many messages to process this tick:
+/// - `len < waterlevel` → process all (`len`)
+/// - `len >= waterlevel` → process half (`len >> 1`)
+pub(crate) fn drain_count(len: usize, waterlevel: usize) -> usize {
+    if len < waterlevel {
+        len
+    } else {
+        len >> 1
+    }
+}
+
+struct ActorSlot {
+    mailbox: VecDeque<Box<dyn Any + Send>>,
+    actor: Box<dyn AnyActor>,
+}
+
+/// Per-worker actor storage. Owns per-actor mailboxes.
 pub(crate) struct ActorPool {
-    actors: HashMap<ActorAddress, Box<dyn AnyActor>>,
+    actors: HashMap<ActorAddress, ActorSlot>,
 }
 
 impl ActorPool {
@@ -179,42 +223,58 @@ impl ActorPool {
     }
 
     pub fn insert(&mut self, addr: ActorAddress, actor: Box<dyn AnyActor>) {
-        self.actors.insert(addr, actor);
+        self.actors.insert(addr, ActorSlot {
+            mailbox: VecDeque::new(),
+            actor,
+        });
     }
 
     pub fn remove(&mut self, addr: &ActorAddress) -> Option<Box<dyn AnyActor>> {
-        self.actors.remove(addr)
+        self.actors.remove(addr).map(|slot| slot.actor)
     }
 
     /// Deliver a type-erased message to the actor at `addr`.
-    /// Returns `true` if the actor was found and the message type matched.
+    /// Returns `true` if the actor exists (message is queued; type check deferred to tick).
     pub fn deliver(&mut self, addr: &ActorAddress, msg: Box<dyn Any + Send>) -> bool {
-        if let Some(actor) = self.actors.get_mut(addr) {
-            actor.deliver(msg)
+        if let Some(slot) = self.actors.get_mut(addr) {
+            slot.mailbox.push_back(msg);
+            true
         } else {
             false
         }
     }
 
-    /// Tick all actors in the pool. Returns `true` if any actor processed messages.
-    pub fn tick_all(&mut self, inner: &dyn ContextInner) -> bool {
-        let mut did_work = false;
-        for actor in self.actors.values_mut() {
-            if actor.tick(inner) {
-                did_work = true;
+    /// Tick all actors in the pool. Returns the number of messages processed.
+    pub fn tick_all(&mut self, inner: &dyn ContextInner) -> usize {
+        let mut count = 0;
+        for (&addr, slot) in self.actors.iter_mut() {
+            let len = slot.mailbox.len();
+            let n = drain_count(len, inner.mailbox_waterlevel());
+            if n > 0 {
+                let ctx = Ctx::new(inner, addr);
+                for _ in 0..n {
+                    if let Some(msg) = slot.mailbox.pop_front() {
+                        slot.actor.handle_any(&ctx, msg);
+                        count += 1;
+                    }
+                }
             }
         }
-        did_work
+        count
     }
 
     pub fn len(&self) -> usize {
         self.actors.len()
     }
+
+    pub fn total_mailbox_depth(&self) -> usize {
+        self.actors.values().map(|slot| slot.mailbox.len()).sum()
+    }
 }
 
 
 
-pub struct Mailbox<M: Message> {
+pub(crate) struct Mailbox<M: Message> {
     queue: VecDeque<M>,
     waterlevel: usize,
 }
@@ -247,12 +307,9 @@ impl<M: Message> Mailbox<M> {
     /// - `len < waterlevel` → process all (`len`)
     /// - `len >= waterlevel` → process half (`len >> 1`)
     pub fn drain_count(&self) -> usize {
-        let len = self.queue.len();
-        if len < self.waterlevel {
-            len
-        } else {
-            len >> 1
-        }
+        drain_count(self.queue.len(), self.waterlevel)
     }
 }
 
+#[cfg(test)]
+mod tests;
