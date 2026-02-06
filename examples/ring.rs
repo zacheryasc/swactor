@@ -1,6 +1,6 @@
 use swactor::{
     actor::{ActorAddress, ActorInterface},
-    runtime::{Inbox, Runtime, RuntimeConfig},
+    runtime::{Ctx, Inbox, Runtime, RuntimeConfig},
 };
 
 #[derive(Debug, Default, Clone)]
@@ -30,8 +30,8 @@ impl RingActor {
 impl ActorInterface for RingActor {
     type Incoming = RingMessage;
     type Response = ();
-    fn handle(&mut self, ctx: &Runtime, msg: Self::Incoming) {
-        if let Err(_) = ctx.send_to(self.next, msg.next()) {
+    fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
+        if let Err(_) = ctx.send(self.next, msg.next()) {
             // do nothing
         }
     }

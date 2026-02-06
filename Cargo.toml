@@ -16,7 +16,11 @@ stress = []  # Enable stress tests
 [dependencies]
 getrandom = { version = "0.2", optional = true }
 crossbeam-queue = "0.3.12"
+crossbeam-utils = "0.8.21"
 
-[[bin]]
-name = "bench"
-path = "benches/main.rs"
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "runtime_benchmarks"
+harness = false
