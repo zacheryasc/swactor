@@ -1,6 +1,14 @@
 # swactor
 (S)mall (W)ASM-compatible (actor) library
 
+## Useful
+
+View code dependency DAG
+
+```bash
+cargo run --manifest-path tools/depgraph/Cargo.toml -- --src-dir src/ --output deps
+```
+
 ## Quick example
 
 ```rust
