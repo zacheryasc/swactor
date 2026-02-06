@@ -11,12 +11,13 @@ crate-type = ["cdylib", "rlib"]
 default = ["getrandom"]
 getrandom = ["dep:getrandom"]
 no_random = [] # compile without access to a source of randomness
-stress = []  # Enable stress tests
+python = ["dep:pyo3"]
 
 [dependencies]
 getrandom = { version = "0.2", optional = true }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
