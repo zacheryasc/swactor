@@ -1,0 +1,215 @@
+digraph swactor {
+    rankdir=LR;
+    fontname="Helvetica";
+    fontsize=14;
+    node [fontname="Helvetica", fontsize=11, style=filled, shape=record];
+    edge [fontname="Helvetica", fontsize=9];
+    label="swactor — internal dependency DAG";
+    labelloc=t;
+    compound=true;
+    newrank=true;
+    splines=ortho;
+
+    subgraph cluster_error {
+        label="error";
+        style="rounded,filled"; fillcolor="#f0f0f0"; color="#888";
+        Error [label="{Error|0: Box\<dyn std :: error :: Error + Send + Sync + 'static\>}", fillcolor="#e8f5e9"];
+    }
+    subgraph cluster_config {
+        label="config";
+        style="rounded,filled"; fillcolor="#f0f0f0"; color="#888";
+        BackoffPolicy [label="{BackoffPolicy|spin_threshold: u32\nyield_threshold: u32\nsleep_increment_us: u64\nsleep_max_us: u64}", fillcolor="#e8f5e9"];
+        RuntimeConfig [label="{RuntimeConfig|max_actors: usize\nactor_max_messages: usize\nnum_threads: usize\nmailbox_waterlevel: usize\nbackoff_policy: BackoffPolicy}", fillcolor="#e8f5e9"];
+    }
+    subgraph cluster_channel {
+        label="channel";
+        style="rounded,filled"; fillcolor="#f0f0f0"; color="#888";
+        HybridChannel [label="{HybridChannel|ring: ArrayQueue\<T\>\noverflow: SegQueue\<T\>}", fillcolor="#fff9c4"];
+        Receiver [label="{Receiver|queue: Arc\<HybridChannel\<T\>\>}", fillcolor="#fff9c4"];
+        Sender [label="{Sender|queue: Arc\<HybridChannel\<T\>\>}", fillcolor="#fff9c4"];
+    }
+    subgraph cluster_actor {
+        label="actor";
+        style="rounded,filled"; fillcolor="#e3f2fd"; color="#1565c0";
+        Message [label="{«trait» Message}", fillcolor="#bbdefb"];
+        ActorInterface [label="{«trait» ActorInterface|Incoming(Message)\nResponse(Message)\nhandle((&self, &Ctx, Self::Incoming))}", fillcolor="#bbdefb"];
+        ActorAddress [label="{ActorAddress|0: [u8; ..]}", fillcolor="#bbdefb"];
+        Actor [label="{Actor|addr: ActorAddress\nmailbox: Mailbox\<A::Incoming\>\ninner: A}", fillcolor="#bbdefb"];
+        AnyActor [label="{«trait» AnyActor|tick((&self, &dyn ContextInner) → bool)\ndeliver((&self, Box\<dyn Any + Send\>) → bool)}", fillcolor="#bbdefb"];
+    }
+    subgraph cluster_address_map {
+        label="address_map";
+        style="rounded,filled"; fillcolor="#f3e5f5"; color="#7b1fa2";
+        WorkerId [label="{WorkerId|0: usize}", fillcolor="#e1bee7"];
+        AddressMap [label="{AddressMap|inner: RwLock\<HashMap\<ActorAddress, WorkerId\>\>}", fillcolor="#e1bee7"];
+        Placement [label="{Placement|next: AtomicUsize\nnum_workers: usize}", fillcolor="#e1bee7"];
+    }
+    subgraph cluster_runtime {
+        label="runtime";
+        style="rounded,filled"; fillcolor="#fce4ec"; color="#c62828";
+        Inbox [label="{Inbox|addr: ActorAddress\ninner: Receiver\<M\>}", fillcolor="#ffcdd2"];
+        RuntimeHandle [label="{RuntimeHandle|runtime: Arc\<Runtime\>\nthreads: Vec\<JoinHandle\<()\>\>}", fillcolor="#ffcdd2"];
+        Ctx [label="{Ctx|inner: &'a dyn ContextInner\nself_addr: ActorAddress}", fillcolor="#ffcdd2"];
+        SenderT [label="{«trait» SenderT|try_send_any((&self, Box\<dyn Any + Send\>))}", fillcolor="#ffcdd2"];
+        Runtime [label="{Runtime|config: RuntimeConfig\naddress_map: Arc\<AddressMap\>\ninbox_registry: Arc\<InboxRegistry\>\ntransfer_txs: Vec\<Sender\<Envelope\>\>\nspawn_txs: Vec\<Sender\<(ActorAddress, Box\<dyn AnyActor\>)\>\>\nplacement: Placement\nis_running: AtomicBool\nsingle_worker: Option\<RefCell\<Worker\>\>\npending_workers: Option\<Vec\<Worker\>\>}", fillcolor="#ffcdd2"];
+        Envelope [label="{Envelope|dest: ActorAddress\npayload: Box\<dyn Any + Send\>}", fillcolor="#ffcdd2"];
+        InboxRegistry [label="{InboxRegistry|senders: RwLock\<HashMap\<ActorAddress, Arc\<dyn SenderT\>\>\>}", fillcolor="#ffcdd2"];
+        ContextInner [label="{«trait» ContextInner|send_any((&self, ActorAddress, Box\<dyn Any + Send\>) → Result\<(), Error\>)\nspawn_any((&self, ActorAddress, Box\<dyn AnyActor\>) → Result\<(), Error\>)\nmailbox_waterlevel((&self) → usize)}", fillcolor="#ffcdd2"];
+    }
+    subgraph cluster_worker {
+        label="worker";
+        style="rounded,filled"; fillcolor="#fff3e0"; color="#e65100";
+        TickContext [label="{TickContext|address_map: &'a AddressMap\ntransfer_txs: &'a [Sender\<Envelope\>]\nspawn_txs: &'a [Sender\<(ActorAddress, Box\<dyn AnyActor\>)\>]\nplacement: &'a Placement\ninbox_registry: &'a InboxRegistry\nconfig: &'a RuntimeConfig}", fillcolor="#ffe0b2"];
+        Worker [label="{Worker|id: WorkerId\npool: ActorPool\ntransfer_rx: Receiver\<Envelope\>\nspawn_rx: Receiver\<(ActorAddress, Box\<dyn AnyActor\>)\>}", fillcolor="#ffe0b2"];
+        WorkerContext [label="{WorkerContext|worker_id: WorkerId\naddress_map: &'a AddressMap\ntransfer_txs: &'a [Sender\<Envelope\>]\nspawn_txs: &'a [Sender\<(ActorAddress, Box\<dyn AnyActor\>)\>]\nplacement: &'a Placement\ninbox_registry: &'a InboxRegistry\nconfig: &'a RuntimeConfig\npending_local: &'a RefCell\<Vec\<(ActorAddress, Box\<dyn Any + Send\>)\>\>}", fillcolor="#ffe0b2"];
+        ActorPool [label="{ActorPool|actors: HashMap\<ActorAddress, Box\<dyn AnyActor\>\>}", fillcolor="#ffe0b2"];
+        Mailbox [label="{Mailbox|queue: VecDeque\<M\>\nwaterlevel: usize}", fillcolor="#ffe0b2"];
+    }
+    subgraph cluster_python {
+        label="python  (feature-gated)";
+        style="rounded,dashed,filled"; fillcolor="#f5f5f5"; color="#999";
+        PyMsg [label="{PyMsg|0: PyObject}", fillcolor="#d7ccc8"];
+        PyActorAddress [label="{PyActorAddress|inner: ActorAddress}", fillcolor="#d7ccc8"];
+        Effect [label="{«enum» Effect|Send \{ addr: ActorAddress, msg: PyObject \}\nSpawn \{ addr: ActorAddress, handler: PyObject \}}", fillcolor="#d7ccc8"];
+        PyCtx [label="{PyCtx|self_addr: ActorAddress\neffects: RefCell\<Vec\<Effect\>\>}", fillcolor="#d7ccc8"];
+        PyActor [label="{PyActor|handler: PyObject}", fillcolor="#d7ccc8"];
+        PyInbox [label="{PyInbox|inner: Inbox\<PyMsg\>}", fillcolor="#d7ccc8"];
+        PyRuntimeConfig [label="{PyRuntimeConfig|num_threads: usize\nmax_actors: usize\nactor_max_messages: usize\nmailbox_waterlevel: usize\nspin_threshold: u32\nyield_threshold: u32\nsleep_increment_us: u64\nsleep_max_us: u64}", fillcolor="#d7ccc8"];
+        PyRuntime [label="{PyRuntime|inner: Option\<Runtime\>}", fillcolor="#d7ccc8"];
+        PyRuntimeHandle [label="{PyRuntimeHandle|inner: Option\<RuntimeHandle\>}", fillcolor="#d7ccc8"];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  INTRA-MODULE EDGES (within same cluster)
+    // ═══════════════════════════════════════════════════════════════════
+
+    ActorInterface -> Message [label="Incoming", style=dashed, color="#666", penwidth=1];
+    Actor -> ActorAddress [label="addr", style=dashed, color="#666", penwidth=1];
+    Actor -> AnyActor [label="impl", style=dotted, color="#666", penwidth=1];
+    Worker -> ActorPool [label="pool", style=dashed, color="#666", penwidth=1];
+    Worker -> TickContext [label="tick_once() param", style=dashed, color="#666", penwidth=1];
+    Receiver -> HybridChannel [label="queue", style=dashed, color="#666", penwidth=1];
+    Sender -> HybridChannel [label="queue", style=dashed, color="#666", penwidth=1];
+    Receiver -> Sender [label="new_sender() param", style=dashed, color="#666", penwidth=1];
+    AddressMap -> WorkerId [label="inner", style=dashed, color="#666", penwidth=1];
+    Placement -> WorkerId [label="next_worker() param", style=dashed, color="#666", penwidth=1];
+    RuntimeConfig -> BackoffPolicy [label="backoff_policy", style=dashed, color="#666", penwidth=1];
+    RuntimeHandle -> Runtime [label="runtime", style=dashed, color="#666", penwidth=1];
+    Ctx -> ContextInner [label="inner", style=dashed, color="#666", penwidth=1];
+    Runtime -> InboxRegistry [label="inbox_registry", style=dashed, color="#666", penwidth=1];
+    Runtime -> Envelope [label="transfer_txs", style=dashed, color="#666", penwidth=1];
+    InboxRegistry -> SenderT [label="senders", style=dashed, color="#666", penwidth=1];
+    Runtime -> Inbox [label="new_inbox() param", style=dashed, color="#666", penwidth=1];
+    Runtime -> RuntimeHandle [label="run() param", style=dashed, color="#666", penwidth=1];
+    Runtime -> ContextInner [label="impl", style=dotted, color="#666", penwidth=1];
+    PyCtx -> Effect [label="effects", style=dashed, color="#666", penwidth=1];
+    PyInbox -> PyMsg [label="inner", style=dashed, color="#666", penwidth=1];
+    PyCtx -> PyActorAddress [label="self_addr() param", style=dashed, color="#666", penwidth=1];
+    PyInbox -> PyActorAddress [label="addr() param", style=dashed, color="#666", penwidth=1];
+    PyRuntime -> PyRuntimeConfig [label="new() param", style=dashed, color="#666", penwidth=1];
+    PyRuntime -> PyActorAddress [label="spawn() param", style=dashed, color="#666", penwidth=1];
+    PyRuntime -> PyInbox [label="inbox() param", style=dashed, color="#666", penwidth=1];
+    PyRuntime -> PyRuntimeHandle [label="run() param", style=dashed, color="#666", penwidth=1];
+    PyRuntimeHandle -> PyActorAddress [label="spawn() param", style=dashed, color="#666", penwidth=1];
+    PyRuntimeHandle -> PyInbox [label="inbox() param", style=dashed, color="#666", penwidth=1];
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  CROSS-MODULE EDGES  (the real dependency DAG)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- channel depends on runtime ---
+    Sender -> SenderT [label="impl", style=dotted, color="#666", penwidth=1.5];
+
+    // --- actor depends on runtime ---
+    ActorInterface -> Ctx [label="handle", style=solid, color="#1565c0", penwidth=1.5];
+    AnyActor -> ContextInner [label="tick", style=solid, color="#1565c0", penwidth=1.5];
+    Actor -> ContextInner [label="tick() param", style=solid, color="#1565c0", penwidth=1.5];
+
+    // --- actor depends on worker ---
+    Actor -> Mailbox [label="mailbox", style=solid, color="#1565c0", penwidth=1.5];
+
+    // --- address_map depends on actor ---
+    AddressMap -> ActorAddress [label="inner", style=solid, color="#7b1fa2", penwidth=1.5];
+
+    // --- runtime depends on error ---
+    ContextInner -> Error [label="send_any", style=solid, color="#c62828", penwidth=1.5];
+    Ctx -> Error [label="send() param", style=solid, color="#c62828", penwidth=1.5];
+    Runtime -> Error [label="spawn() param", style=solid, color="#c62828", penwidth=1.5];
+    InboxRegistry -> Error [label="try_deliver() param", style=solid, color="#c62828", penwidth=1.5];
+
+    // --- runtime depends on config ---
+    Runtime -> RuntimeConfig [label="config", style=solid, color="#c62828", penwidth=1.5];
+
+    // --- runtime depends on channel ---
+    Inbox -> Receiver [label="inner", style=solid, color="#c62828", penwidth=1.5];
+    Runtime -> Sender [label="transfer_txs", style=solid, color="#c62828", penwidth=1.5];
+
+    // --- runtime depends on actor ---
+    Inbox -> ActorAddress [label="addr", style=solid, color="#c62828", penwidth=1.5];
+    Ctx -> ActorAddress [label="self_addr", style=solid, color="#c62828", penwidth=1.5];
+    Runtime -> ActorAddress [label="spawn_txs", style=solid, color="#c62828", penwidth=1.5];
+    Runtime -> AnyActor [label="spawn_txs", style=solid, color="#c62828", penwidth=1.5];
+    Envelope -> ActorAddress [label="dest", style=solid, color="#c62828", penwidth=1.5];
+    InboxRegistry -> ActorAddress [label="senders", style=solid, color="#c62828", penwidth=1.5];
+    ContextInner -> ActorAddress [label="send_any", style=solid, color="#c62828", penwidth=1.5];
+    ContextInner -> AnyActor [label="spawn_any", style=solid, color="#c62828", penwidth=1.5];
+
+    // --- runtime depends on address_map ---
+    Runtime -> AddressMap [label="address_map", style=solid, color="#c62828", penwidth=1.5];
+    Runtime -> Placement [label="placement", style=solid, color="#c62828", penwidth=1.5];
+
+    // --- runtime depends on worker ---
+    Runtime -> Worker [label="single_worker", style=solid, color="#c62828", penwidth=1.5];
+
+    // --- worker depends on error ---
+    WorkerContext -> Error [label="send_any() param", style=solid, color="#e65100", penwidth=1.5];
+
+    // --- worker depends on config ---
+    TickContext -> RuntimeConfig [label="config", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> RuntimeConfig [label="config", style=solid, color="#e65100", penwidth=1.5];
+    Worker -> BackoffPolicy [label="run() param", style=solid, color="#e65100", penwidth=1.5];
+
+    // --- worker depends on channel ---
+    TickContext -> Sender [label="transfer_txs", style=solid, color="#e65100", penwidth=1.5];
+    Worker -> Receiver [label="transfer_rx", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> Sender [label="transfer_txs", style=solid, color="#e65100", penwidth=1.5];
+
+    // --- worker depends on actor ---
+    TickContext -> ActorAddress [label="spawn_txs", style=solid, color="#e65100", penwidth=1.5];
+    TickContext -> AnyActor [label="spawn_txs", style=solid, color="#e65100", penwidth=1.5];
+    Worker -> ActorAddress [label="spawn_rx", style=solid, color="#e65100", penwidth=1.5];
+    Worker -> AnyActor [label="spawn_rx", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> ActorAddress [label="spawn_txs", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> AnyActor [label="spawn_txs", style=solid, color="#e65100", penwidth=1.5];
+    ActorPool -> ActorAddress [label="actors", style=solid, color="#e65100", penwidth=1.5];
+    ActorPool -> AnyActor [label="actors", style=solid, color="#e65100", penwidth=1.5];
+
+    // --- worker depends on address_map ---
+    TickContext -> AddressMap [label="address_map", style=solid, color="#e65100", penwidth=1.5];
+    TickContext -> Placement [label="placement", style=solid, color="#e65100", penwidth=1.5];
+    Worker -> WorkerId [label="id", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> WorkerId [label="worker_id", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> AddressMap [label="address_map", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> Placement [label="placement", style=solid, color="#e65100", penwidth=1.5];
+
+    // --- worker depends on runtime ---
+    TickContext -> Envelope [label="transfer_txs", style=solid, color="#e65100", penwidth=1.5];
+    TickContext -> InboxRegistry [label="inbox_registry", style=solid, color="#e65100", penwidth=1.5];
+    Worker -> Envelope [label="transfer_rx", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> Envelope [label="transfer_txs", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> InboxRegistry [label="inbox_registry", style=solid, color="#e65100", penwidth=1.5];
+    WorkerContext -> ContextInner [label="impl", style=dotted, color="#e65100", penwidth=1.5];
+    ActorPool -> ContextInner [label="tick_all() param", style=solid, color="#e65100", penwidth=1.5];
+
+    // --- python depends on actor ---
+    PyActorAddress -> ActorAddress [label="inner", style=solid, color="#999", penwidth=1.5];
+    Effect -> ActorAddress [label="Send", style=solid, color="#999", penwidth=1.5];
+    PyCtx -> ActorAddress [label="self_addr", style=solid, color="#999", penwidth=1.5];
+    PyActor -> ActorInterface [label="impl", style=dotted, color="#999", penwidth=1.5];
+
+    // --- python depends on runtime ---
+    PyInbox -> Inbox [label="inner", style=solid, color="#999", penwidth=1.5];
+    PyRuntime -> Runtime [label="inner", style=solid, color="#999", penwidth=1.5];
+    PyRuntimeHandle -> RuntimeHandle [label="inner", style=solid, color="#999", penwidth=1.5];
+    PyActor -> Ctx [label="handle() param", style=solid, color="#999", penwidth=1.5];
+}
