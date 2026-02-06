@@ -280,6 +280,17 @@ impl Runtime {
         })
     }
 
+    /// Returns a snapshot of runtime stats: all actor addresses with their worker assignments,
+    /// plus the number of workers.
+    pub(crate) fn stats(&self) -> (usize, Vec<(ActorAddress, WorkerId)>) {
+        let num_workers = if self.config.num_threads < 2 {
+            1
+        } else {
+            self.config.num_threads
+        };
+        (num_workers, self.address_map.snapshot())
+    }
+
     /// Signal all workers to stop
     pub fn shutdown(&self) {
         self.is_running.store(false, Ordering::Release);
