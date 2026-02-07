@@ -4,9 +4,9 @@ use std::cell::RefCell;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor};
+use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Ctx};
 use crate::config::{BackoffPolicy, RuntimeConfig};
-use crate::runtime::{Ctx, Inbox, Runtime, RuntimeHandle};
+use crate::runtime::{Inbox, Runtime, RuntimeHandle};
 use crate::Error;
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────

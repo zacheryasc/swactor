@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use crate::actor::{ActorAddress, AnyActor, Message};
+use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx, Message};
 use crate::address_map::{AddressMap, Placement, WorkerId};
 use crate::channel::{Receiver, Sender};
-use crate::config::{BackoffPolicy, RuntimeConfig};
-use crate::runtime::{ContextInner, Ctx, Envelope, InboxRegistry};
+use crate::config::RuntimeConfig;
+use crate::runtime::{Envelope, InboxRegistry};
 use crate::Error;
 
 /// Per-worker stats published via atomics. Readable from any thread.
@@ -90,12 +90,7 @@ impl Worker {
         {
             let worker_ctx = WorkerContext {
                 worker_id: self.id,
-                address_map: tc.address_map,
-                transfer_txs: tc.transfer_txs,
-                spawn_txs: tc.spawn_txs,
-                placement: tc.placement,
-                inbox_registry: tc.inbox_registry,
-                config: tc.config,
+                tc,
                 pending_local: &pending_local,
             };
             processed = self.pool.tick_all(&worker_ctx);
@@ -121,7 +116,8 @@ impl Worker {
         did_work
     }
 
-    pub(crate) fn run(&mut self, tc: &TickContext, is_running: &AtomicBool, backoff: &BackoffPolicy) {
+    pub(crate) fn run(&mut self, tc: &TickContext, is_running: &AtomicBool) {
+        let backoff = &tc.config.backoff_policy;
         let mut idle_count: u32 = 0;
         while is_running.load(Ordering::Acquire) {
             let did_work = self.tick_once(tc);
@@ -151,18 +147,13 @@ impl Worker {
 /// Cross-worker sends go through the transfer queue.
 struct WorkerContext<'a> {
     worker_id: WorkerId,
-    address_map: &'a AddressMap,
-    transfer_txs: &'a [Sender<Envelope>],
-    spawn_txs: &'a [Sender<(ActorAddress, Box<dyn AnyActor>)>],
-    placement: &'a Placement,
-    inbox_registry: &'a InboxRegistry,
-    config: &'a RuntimeConfig,
+    tc: &'a TickContext<'a>,
     pending_local: &'a RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>>,
 }
 
 impl ContextInner for WorkerContext<'_> {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
-        match self.address_map.lookup(&addr) {
+        match self.tc.address_map.lookup(&addr) {
             Some(wid) if wid == self.worker_id => {
                 // Same worker: buffer for local delivery (after current tick round)
                 self.pending_local.borrow_mut().push((addr, msg));
@@ -171,26 +162,26 @@ impl ContextInner for WorkerContext<'_> {
             Some(wid) => {
                 // Cross worker: envelope through transfer queue
                 let envelope = Envelope::new(addr, msg);
-                let _ = self.transfer_txs[wid.as_usize()].try_send(envelope);
+                let _ = self.tc.transfer_txs[wid.as_usize()].try_send(envelope);
                 Ok(())
             }
             None => {
                 // Try inbox registry (external inboxes)
-                self.inbox_registry.try_deliver(addr, msg)
+                self.tc.inbox_registry.try_deliver(addr, msg)
             }
         }
     }
 
     fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) -> Result<(), Error> {
-        let worker_id = self.placement.next_worker();
-        self.address_map.insert(addr, worker_id);
-        self.spawn_txs[worker_id.as_usize()]
+        let worker_id = self.tc.placement.next_worker();
+        self.tc.address_map.insert(addr, worker_id);
+        self.tc.spawn_txs[worker_id.as_usize()]
             .try_send((addr, actor))
             .map_err(|_| Error::from("Spawn queue full"))
     }
 
     fn mailbox_waterlevel(&self) -> usize {
-        self.config.mailbox_waterlevel
+        self.tc.config.mailbox_waterlevel
     }
 }
 

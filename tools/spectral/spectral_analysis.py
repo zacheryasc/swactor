@@ -1412,8 +1412,8 @@ def main() -> None:
         description="Spectral analysis of dependency DAGs"
     )
     parser.add_argument("dot_file", help="Path to DOT file (from depgraph)")
-    parser.add_argument("-o", "--output-dir", default=".",
-                        help="Output directory (default: current directory)")
+    parser.add_argument("-o", "--output-dir", default="docs/connectome",
+                        help="Output directory (default: docs/connectome)")
     parser.add_argument("--no-plots", action="store_true",
                         help="Text report only (no matplotlib dependency)")
     parser.add_argument("--json", action="store_true",
@@ -1435,25 +1435,25 @@ def main() -> None:
     # Generate report
     report = generate_report(result)
     print(report)
-    report_path = os.path.join(args.output_dir, "spectral_report.txt")
+    report_path = os.path.join(args.output_dir, "connectome_report.txt")
     with open(report_path, "w") as f:
         f.write(report)
     print(f"\nReport saved to {report_path}")
 
     # Generate interactive HTML dashboard
-    html_path = os.path.join(args.output_dir, "spectral_dashboard.html")
+    html_path = os.path.join(args.output_dir, "connectome_dashboard.html")
     generate_dashboard_html(result, html_path, dot_source=dot_text)
     print(f"Interactive dashboard saved to {html_path}")
 
     # Generate static PNG dashboard
     if not args.no_plots:
-        dashboard_path = os.path.join(args.output_dir, "spectral_dashboard.png")
+        dashboard_path = os.path.join(args.output_dir, "connectome_dashboard.png")
         generate_dashboard(result, dashboard_path)
         print(f"Static dashboard saved to {dashboard_path}")
 
     # Generate JSON
     if args.json:
-        json_path = os.path.join(args.output_dir, "spectral_metrics.json")
+        json_path = os.path.join(args.output_dir, "connectome_metrics.json")
         with open(json_path, "w") as f:
             json.dump(metrics_to_dict(result), f, indent=2)
         print(f"JSON saved to {json_path}")

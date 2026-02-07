@@ -4,11 +4,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use crate::actor::{ActorAddress, AnyActor};
+use crate::actor::{ActorAddress, AnyActor, Ctx};
 use crate::address_map::{AddressMap, Placement, WorkerId};
 use crate::channel::Receiver;
-use crate::config::{BackoffPolicy, RuntimeConfig};
-use crate::runtime::{Ctx, Envelope, InboxRegistry};
+use crate::config::RuntimeConfig;
+use crate::runtime::{Envelope, InboxRegistry};
 
 use super::{TickContext, Worker, WorkerStats};
 
@@ -399,7 +399,6 @@ fn run_loop_stops_on_shutdown() {
     let mut worker = Worker::new(WorkerId(0), transfer_rx, spawn_rx, stats);
 
     let is_running = AtomicBool::new(false);
-    let backoff = BackoffPolicy::default();
     let address_map = AddressMap::new();
     let placement = Placement::new(1);
     let inbox_registry = InboxRegistry::new();
@@ -415,6 +414,6 @@ fn run_loop_stops_on_shutdown() {
     };
 
     thread::scope(|s| {
-        s.spawn(|| worker.run(&tc, &is_running, &backoff));
+        s.spawn(|| worker.run(&tc, &is_running));
     });
 }
