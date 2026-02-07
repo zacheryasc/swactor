@@ -4,10 +4,9 @@ use std::cell::RefCell;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Ctx};
-use crate::config::{BackoffPolicy, RuntimeConfig};
-use crate::runtime::{Inbox, Runtime, RuntimeHandle};
-use crate::Error;
+use ::swactor::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Ctx};
+use ::swactor::config::{BackoffPolicy, RuntimeConfig};
+use ::swactor::runtime::{Inbox, Runtime, RuntimeHandle};
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
 
@@ -38,7 +37,7 @@ impl PyMsg {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-fn to_py_err(e: Error) -> PyErr {
+fn to_py_err(e: ::swactor::Error) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
 }
 
@@ -570,7 +569,7 @@ fn build_stats(runtime: &Runtime) -> PyRuntimeStats {
 
 // ─── Module registration ─────────────────────────────────────────────────────
 
-pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyActorAddress>()?;
     m.add_class::<PyCtx>()?;
     m.add_class::<PyInbox>()?;
@@ -581,4 +580,9 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyWorkerInfo>()?;
     m.add_class::<PyRuntimeStats>()?;
     Ok(())
+}
+
+#[pymodule]
+fn swactor(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    register(m)
 }

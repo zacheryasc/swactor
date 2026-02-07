@@ -532,7 +532,22 @@ dependencies = [
  "crossbeam-queue",
  "crossbeam-utils",
  "getrandom",
+]
+
+[[package]]
+name = "swactor-python"
+version = "0.1.0"
+dependencies = [
  "pyo3",
+ "swactor",
+]
+
+[[package]]
+name = "swactor-wasm"
+version = "0.1.0"
+dependencies = [
+ "swactor",
+ "wasm-bindgen",
 ]
 
 [[package]]

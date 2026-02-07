@@ -26,16 +26,16 @@ impl ActorAddress {
 }
 
 /// The actor process as represented in the Runtime — thin wrapper around user state.
-pub(crate) struct Actor<A: ActorInterface>(A);
+pub struct Actor<A: ActorInterface>(A);
 
 impl<A: ActorInterface> Actor<A> {
-    pub(crate) fn new(inner: A) -> Self {
+    pub fn new(inner: A) -> Self {
         Self(inner)
     }
 }
 
 /// Trait for type-erased actors — single-message handler.
-pub(crate) trait AnyActor: Send {
+pub trait AnyActor: Send {
     fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>);
 }
 
@@ -51,7 +51,7 @@ where
 }
 
 /// Object-safe inner trait for sending type-erased messages.
-pub(crate) trait ContextInner {
+pub trait ContextInner {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
     fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) -> Result<(), Error>;
     fn mailbox_waterlevel(&self) -> usize;
@@ -71,8 +71,7 @@ impl<'a> Ctx<'a> {
         Self { inner, self_addr }
     }
 
-    #[cfg(feature = "python")]
-    pub(crate) fn raw_inner(&self) -> &dyn ContextInner {
+    pub fn raw_inner(&self) -> &dyn ContextInner {
         self.inner
     }
 

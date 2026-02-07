@@ -12,7 +12,7 @@ use crate::config::RuntimeConfig;
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
 use crate::stats::WorkerStats;
 
-use super::Worker;
+use crate::worker::Worker;
 
 // ── Actors ─────────────────────────────────────────────────────────
 

@@ -10,12 +10,11 @@ requires-python = ">=3.9"
 [dependency-groups]
 dev = ["jupyter", "ipykernel"]
 
-[tool.maturin]
-features = ["python"]
-
 [tool.uv]
 cache-keys = [
     { file = "pyproject.toml" },
     { file = "Cargo.toml" },
     { file = "src/**/*.rs" },
+    { file = "../../Cargo.toml" },
+    { file = "../../src/**/*.rs" },
 ]

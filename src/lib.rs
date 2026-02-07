@@ -12,21 +12,12 @@ pub mod stats;
 
 pub mod runtime;
 
-#[cfg(feature = "python")]
-mod python;
-
-#[cfg(feature = "python")]
-#[pyo3::pymodule]
-fn swactor(m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
-    python::register(m)
-}
-
 #[cfg(feature = "getrandom")]
 pub(crate) fn get_random(buf: &mut [u8]) {
     getrandom::getrandom(buf).unwrap()
 }
 
-#[cfg(feature = "no_random")]
+#[cfg(all(feature = "no_random", not(feature = "getrandom")))]
 pub(crate) fn get_random(buf: &mut [u8]) {
     use core::sync::atomic::{AtomicUsize, Ordering};
 
