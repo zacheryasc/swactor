@@ -1,43 +1,15 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
-use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx, Message};
-use crate::address_map::{AddressMap, Placement, WorkerId};
-use crate::channel::{Receiver, Sender};
-use crate::config::RuntimeConfig;
-use crate::runtime::{Envelope, InboxRegistry};
+use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx};
+use crate::channel::Receiver;
+use crate::delivery::{Envelope, TickContext, WorkerId};
+use crate::stats::WorkerStats;
 use crate::Error;
-
-/// Per-worker stats published via atomics. Readable from any thread.
-pub(crate) struct WorkerStats {
-    pub num_actors: AtomicUsize,
-    pub total_mailbox_depth: AtomicUsize,
-    pub messages_processed: AtomicU64,
-}
-
-impl WorkerStats {
-    pub fn new() -> Self {
-        Self {
-            num_actors: AtomicUsize::new(0),
-            total_mailbox_depth: AtomicUsize::new(0),
-            messages_processed: AtomicU64::new(0),
-        }
-    }
-}
-
-/// Shared state passed to tick_once — single thin pointer avoids register spill.
-pub(crate) struct TickContext<'a> {
-    pub(crate) address_map: &'a AddressMap,
-    pub(crate) transfer_txs: &'a [Sender<Envelope>],
-    pub(crate) spawn_txs: &'a [Sender<(ActorAddress, Box<dyn AnyActor>)>],
-    pub(crate) placement: &'a Placement,
-    pub(crate) inbox_registry: &'a InboxRegistry,
-    pub(crate) config: &'a RuntimeConfig,
-}
 
 /// A worker owns a set of actors and runs them in a loop.
 pub(crate) struct Worker {
@@ -188,7 +160,7 @@ impl ContextInner for WorkerContext<'_> {
 /// How many messages to process this tick:
 /// - `len < waterlevel` → process all (`len`)
 /// - `len >= waterlevel` → process half (`len >> 1`)
-pub(crate) fn drain_count(len: usize, waterlevel: usize) -> usize {
+pub fn drain_count(len: usize, waterlevel: usize) -> usize {
     if len < waterlevel {
         len
     } else {
@@ -264,43 +236,6 @@ impl ActorPool {
 }
 
 
-
-pub(crate) struct Mailbox<M: Message> {
-    queue: VecDeque<M>,
-    waterlevel: usize,
-}
-
-impl<M: Message> Mailbox<M> {
-    pub fn new(waterlevel: usize) -> Self {
-        Self {
-            queue: VecDeque::new(),
-            waterlevel,
-        }
-    }
-
-    pub fn push(&mut self, msg: M) {
-        self.queue.push_back(msg);
-    }
-
-    pub fn pop(&mut self) -> Option<M> {
-        self.queue.pop_front()
-    }
-
-    pub fn len(&self) -> usize {
-        self.queue.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
-    }
-
-    /// How many messages to process this tick:
-    /// - `len < waterlevel` → process all (`len`)
-    /// - `len >= waterlevel` → process half (`len >> 1`)
-    pub fn drain_count(&self) -> usize {
-        drain_count(self.queue.len(), self.waterlevel)
-    }
-}
 
 #[cfg(test)]
 mod tests;

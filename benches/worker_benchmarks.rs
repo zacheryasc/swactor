@@ -1,21 +1,48 @@
+use std::collections::VecDeque;
+
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, Throughput,
 };
-use swactor::worker::Mailbox;
+use swactor::worker::drain_count;
 
 // ---------------------------------------------------------------------------
-// Push throughput
+// drain_count O(1) verification
 // ---------------------------------------------------------------------------
 
-fn mailbox_push(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mailbox_push");
+fn bench_drain_count(c: &mut Criterion) {
+    let mut group = c.benchmark_group("drain_count");
+
+    // Below waterlevel
+    group.bench_function("below", |b| {
+        b.iter(|| std::hint::black_box(drain_count(50, 100)));
+    });
+
+    // At waterlevel
+    group.bench_function("at", |b| {
+        b.iter(|| std::hint::black_box(drain_count(100, 100)));
+    });
+
+    // Above waterlevel
+    group.bench_function("above", |b| {
+        b.iter(|| std::hint::black_box(drain_count(500, 100)));
+    });
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
+// VecDeque push throughput (mirrors old mailbox_push)
+// ---------------------------------------------------------------------------
+
+fn vecdeque_push(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vecdeque_push");
     for n in [100, 1_000, 10_000] {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter(|| {
-                let mut mb: Mailbox<u64> = Mailbox::new(n);
+                let mut q: VecDeque<u64> = VecDeque::new();
                 for i in 0..n {
-                    mb.push(i as u64);
+                    q.push_back(i as u64);
                 }
             });
         });
@@ -24,25 +51,25 @@ fn mailbox_push(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Pop throughput
+// VecDeque pop throughput (mirrors old mailbox_pop)
 // ---------------------------------------------------------------------------
 
-fn mailbox_pop(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mailbox_pop");
+fn vecdeque_pop(c: &mut Criterion) {
+    let mut group = c.benchmark_group("vecdeque_pop");
     for n in [100, 1_000, 10_000] {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
             b.iter_batched(
                 || {
-                    let mut mb: Mailbox<u64> = Mailbox::new(n);
+                    let mut q: VecDeque<u64> = VecDeque::new();
                     for i in 0..n {
-                        mb.push(i as u64);
+                        q.push_back(i as u64);
                     }
-                    mb
+                    q
                 },
-                |mut mb| {
+                |mut q| {
                     for _ in 0..n {
-                        std::hint::black_box(mb.pop());
+                        std::hint::black_box(q.pop_front());
                     }
                 },
                 criterion::BatchSize::SmallInput,
@@ -53,85 +80,27 @@ fn mailbox_pop(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
-// Interleaved push+pop
+// Simulated actor tick: drain_count + pop N from VecDeque
 // ---------------------------------------------------------------------------
 
-fn mailbox_interleaved(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mailbox_interleaved");
-    for n in [100, 1_000, 10_000] {
-        group.throughput(Throughput::Elements(n as u64 * 2));
-        group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, &n| {
-            b.iter(|| {
-                let mut mb: Mailbox<u64> = Mailbox::new(n);
-                for i in 0..n {
-                    mb.push(i as u64);
-                    std::hint::black_box(mb.pop());
-                }
-            });
-        });
-    }
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// drain_count O(1) verification
-// ---------------------------------------------------------------------------
-
-fn mailbox_drain_count(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mailbox_drain_count");
-
-    // Below waterlevel
-    group.bench_function("below", |b| {
-        let mut mb: Mailbox<u64> = Mailbox::new(100);
-        for i in 0..50 {
-            mb.push(i);
-        }
-        b.iter(|| std::hint::black_box(mb.drain_count()));
-    });
-
-    // At waterlevel
-    group.bench_function("at", |b| {
-        let mut mb: Mailbox<u64> = Mailbox::new(100);
-        for i in 0..100 {
-            mb.push(i);
-        }
-        b.iter(|| std::hint::black_box(mb.drain_count()));
-    });
-
-    // Above waterlevel
-    group.bench_function("above", |b| {
-        let mut mb: Mailbox<u64> = Mailbox::new(100);
-        for i in 0..500 {
-            mb.push(i);
-        }
-        b.iter(|| std::hint::black_box(mb.drain_count()));
-    });
-
-    group.finish();
-}
-
-// ---------------------------------------------------------------------------
-// Simulated actor tick: drain_count + pop N
-// ---------------------------------------------------------------------------
-
-fn mailbox_actor_tick(c: &mut Criterion) {
-    let mut group = c.benchmark_group("mailbox_actor_tick");
+fn simulated_actor_tick(c: &mut Criterion) {
+    let mut group = c.benchmark_group("simulated_actor_tick");
 
     for (wl, fill) in [(10, 5), (10, 10), (10, 50), (100, 200)] {
         let param = format!("wl={wl},fill={fill}");
         group.bench_function(BenchmarkId::from_parameter(&param), |b| {
             b.iter_batched(
                 || {
-                    let mut mb: Mailbox<u64> = Mailbox::new(wl);
+                    let mut q: VecDeque<u64> = VecDeque::new();
                     for i in 0..fill {
-                        mb.push(i as u64);
+                        q.push_back(i as u64);
                     }
-                    mb
+                    q
                 },
-                |mut mb| {
-                    let n = mb.drain_count();
+                |mut q| {
+                    let n = drain_count(q.len(), wl);
                     for _ in 0..n {
-                        std::hint::black_box(mb.pop());
+                        std::hint::black_box(q.pop_front());
                     }
                 },
                 criterion::BatchSize::SmallInput,
@@ -144,10 +113,9 @@ fn mailbox_actor_tick(c: &mut Criterion) {
 
 criterion_group!(
     benches,
-    mailbox_push,
-    mailbox_pop,
-    mailbox_interleaved,
-    mailbox_drain_count,
-    mailbox_actor_tick,
+    bench_drain_count,
+    vecdeque_push,
+    vecdeque_pop,
+    simulated_actor_tick,
 );
 criterion_main!(benches);
