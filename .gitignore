@@ -1,6 +1,5 @@
 **/target
-tools/depgraph/target/
-node_modules/
+**/node_modules/
 .vscode/
-.venv
+**/.venv
 __pycache__
