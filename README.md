@@ -263,3 +263,17 @@ node test.mjs                           # run WASM tests
 | `getrandom` | yes | System RNG for actor addresses |
 | `no_random` | no | Deterministic counter (for WASM / reproducible tests) |
 | `python` | no | PyO3 bindings, builds cdylib wheel |
+## Connectome analysis
+
+Spectral analysis of the internal dependency graph, producing a Connectome Complexity Index (CCI) and visual dashboards.
+
+```sh
+# Generate the dependency DAG
+cargo run --manifest-path tools/depgraph/Cargo.toml -- --src-dir src/ --output deps
+
+# Run spectral analysis (outputs to docs/connectome/)
+source .venv/bin/activate
+python tools/spectral/spectral_analysis.py deps.dot
+```
+
+This produces a text report, an interactive HTML dashboard, and a static PNG dashboard in `docs/connectome/`. See [docs/connectome.md](docs/connectome.md) for details on the metrics and interpretation.

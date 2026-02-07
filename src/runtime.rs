@@ -65,43 +65,8 @@ impl RuntimeHandle {
     }
 }
 
-/// Actor syscall interface — passed to `ActorInterface::handle()`.
-///
-/// Wraps a `&dyn ContextInner` to solve the object-safety problem while
-/// providing a typed public API.
-pub struct Ctx<'a> {
-    inner: &'a dyn ContextInner,
-    self_addr: ActorAddress,
-}
-
-impl<'a> Ctx<'a> {
-    pub(crate) fn new(inner: &'a dyn ContextInner, self_addr: ActorAddress) -> Self {
-        Self { inner, self_addr }
-    }
-
-    #[cfg(feature = "python")]
-    pub(crate) fn raw_inner(&self) -> &dyn ContextInner {
-        self.inner
-    }
-
-    /// Returns the address of the actor currently being ticked.
-    pub fn self_addr(&self) -> ActorAddress {
-        self.self_addr
-    }
-
-    /// Send a typed message to an actor address.
-    pub fn send<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
-        self.inner.send_any(addr, Box::new(msg))
-    }
-
-    /// Spawn a new actor, returning its address.
-    pub fn spawn<A: ActorInterface>(&self, actor: A) -> Result<ActorAddress, Error> {
-        let addr = ActorAddress::new_random();
-        let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.inner.spawn_any(addr, boxed)?;
-        Ok(addr)
-    }
-}
+// Re-export Ctx and ContextInner for backwards compatibility
+pub use crate::actor::{ContextInner, Ctx};
 
 /// Type-erased sender for external inboxes.
 pub(crate) trait SenderT: Send + Sync {
@@ -287,7 +252,7 @@ impl Runtime {
                     inbox_registry: &rt_clone.inbox_registry,
                     config: &rt_clone.config,
                 };
-                worker.run(&tc, &rt_clone.is_running, &rt_clone.config.backoff_policy);
+                worker.run(&tc, &rt_clone.is_running);
             });
             handles.push(handle);
         }
@@ -398,14 +363,6 @@ impl InboxRegistry {
 }
 
 
-
-
-/// Object-safe inner trait for sending type-erased messages.
-pub(crate) trait ContextInner {
-    fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
-    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) -> Result<(), Error>;
-    fn mailbox_waterlevel(&self) -> usize;
-}
 
 
 impl ContextInner for Runtime {
