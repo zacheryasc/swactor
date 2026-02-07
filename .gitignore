@@ -3,3 +3,4 @@ tools/depgraph/target/
 node_modules/
 .vscode/
 .venv
+__pycache__

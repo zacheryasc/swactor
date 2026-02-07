@@ -5,40 +5,31 @@ from swactor import Runtime, RuntimeConfig, ActorAddress
 
 
 class TestActorAddress(unittest.TestCase):
-    def test_repr(self):
-        rt = Runtime()
-        addr = rt.spawn(lambda ctx, msg: None)
-        r = repr(addr)
-        self.assertTrue(r.startswith("ActorAddress("))
-        self.assertTrue(r.endswith(")"))
-        # hex string should be 64 chars (32 bytes)
-        hex_part = r[len("ActorAddress("):-1]
-        self.assertEqual(len(hex_part), 64)
-
-    def test_hex(self):
-        rt = Runtime()
-        addr = rt.spawn(lambda ctx, msg: None)
-        self.assertEqual(len(addr.hex()), 64)
-
-    def test_to_bytes(self):
-        rt = Runtime()
-        addr = rt.spawn(lambda ctx, msg: None)
-        self.assertEqual(len(addr.to_bytes()), 32)
-
-    def test_equality(self):
-        rt = Runtime()
-        addr = rt.spawn(lambda ctx, msg: None)
-        # Same address object should be equal to itself
-        self.assertEqual(addr, addr)
-
-    def test_hashable(self):
+    def test_address_identity_and_collections(self):
+        """Addresses for distinct actors are unique, hashable, and survive repr/bytes round-trips."""
         rt = Runtime()
         addr1 = rt.spawn(lambda ctx, msg: None)
         addr2 = rt.spawn(lambda ctx, msg: None)
+
+        # Distinct actors have distinct addresses
+        self.assertNotEqual(addr1, addr2)
+        # Same address equals itself
+        self.assertEqual(addr1, addr1)
+
+        # Usable as dict keys / set members
         s = {addr1, addr2}
         self.assertEqual(len(s), 2)
-        s.add(addr1)
+        s.add(addr1)  # duplicate is a no-op
         self.assertEqual(len(s), 2)
+
+        # Bytes and hex representations are well-formed
+        self.assertEqual(len(addr1.to_bytes()), 32)
+        self.assertEqual(len(addr1.hex()), 64)
+
+        # repr round-trip is readable
+        r = repr(addr1)
+        self.assertTrue(r.startswith("ActorAddress("))
+        self.assertTrue(r.endswith(")"))
 
 
 class TestRuntimeConfig(unittest.TestCase):
