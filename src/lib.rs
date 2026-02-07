@@ -6,8 +6,9 @@ pub(crate) mod error;
 pub use error::Error;
 
 
-pub(crate) mod address_map;
 pub mod config;
+pub(crate) mod delivery;
+pub mod stats;
 
 pub mod runtime;
 

@@ -5,12 +5,12 @@ use std::sync::Arc;
 use std::thread;
 
 use crate::actor::{ActorAddress, AnyActor, Ctx};
-use crate::address_map::{AddressMap, Placement, WorkerId};
 use crate::channel::Receiver;
 use crate::config::RuntimeConfig;
-use crate::runtime::{Envelope, InboxRegistry};
+use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
+use crate::stats::WorkerStats;
 
-use super::{TickContext, Worker, WorkerStats};
+use super::Worker;
 
 // ── Actors ─────────────────────────────────────────────────────────
 

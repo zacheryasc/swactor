@@ -1,34 +1,19 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message};
-use crate::address_map::{AddressMap, Placement, WorkerId};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, RuntimeConfig};
-use crate::worker::{TickContext, Worker, WorkerStats};
+use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
+use crate::stats::WorkerStats;
+// Re-export stats types so existing code using `runtime::*` still works
+pub use crate::stats::{RuntimeStats, WorkerInfo};
+use crate::worker::Worker;
 use crate::Error;
-
-
-/// Snapshot of per-worker state.
-pub struct WorkerInfo {
-    pub id: usize,
-    pub num_actors: usize,
-    pub mailbox_depth: usize,
-    pub messages_processed: u64,
-}
-
-/// Snapshot of overall runtime state.
-pub struct RuntimeStats {
-    pub num_workers: usize,
-    /// Each entry is (address, worker_id).
-    pub actors: Vec<(ActorAddress, usize)>,
-    pub workers: Vec<WorkerInfo>,
-}
 
 /// Generic message inbox for receiving messages outside of the runtime.
 pub struct Inbox<M: Message> {
@@ -65,22 +50,9 @@ impl RuntimeHandle {
     }
 }
 
-// Re-export Ctx and ContextInner for backwards compatibility
-pub use crate::actor::{ContextInner, Ctx};
-
-/// Type-erased sender for external inboxes.
-pub(crate) trait SenderT: Send + Sync {
-    fn try_send_any(&self, msg: Box<dyn Any + Send>);
-}
-
-impl<M: Message> SenderT for Sender<M> {
-    fn try_send_any(&self, msg: Box<dyn Any + Send>) {
-        if let Ok(typed) = msg.downcast::<M>() {
-            let _ = Sender::try_send(self, *typed);
-        }
-    }
-}
-
+// Re-export Ctx for backwards compatibility
+pub use crate::actor::Ctx;
+use crate::actor::ContextInner;
 
 // ─── Runtime ─────────────────────────────────────────────────────────────────
 
@@ -299,71 +271,6 @@ impl Runtime {
         self.is_running.store(false, Ordering::Release);
     }
 }
-
-
-
-/// A type-erased message envelope for cross-worker delivery.
-///
-/// Uses `Box` (no atomic refcount) and move semantics (no clone).
-pub(crate) struct Envelope {
-    dest: ActorAddress,
-    payload: Box<dyn Any + Send>,
-}
-
-impl Envelope {
-    pub fn new(dest: ActorAddress, payload: Box<dyn Any + Send>) -> Self {
-        Self { dest, payload }
-    }
-
-    pub fn dest(&self) -> ActorAddress {
-        self.dest
-    }
-
-    pub fn downcast<M: 'static>(self) -> Option<M> {
-        self.payload.downcast::<M>().ok().map(|b| *b)
-    }
-
-    pub fn into_payload(self) -> Box<dyn Any + Send> {
-        self.payload
-    }
-}
-
-
-// ─── InboxRegistry ───────────────────────────────────────────────────────────
-
-/// Registry of external inboxes — replaces the Router's role for non-actor receivers.
-pub(crate) struct InboxRegistry {
-    senders: RwLock<HashMap<ActorAddress, Arc<dyn SenderT>>>,
-}
-
-impl InboxRegistry {
-    pub fn new() -> Self {
-        Self {
-            senders: RwLock::new(HashMap::new()),
-        }
-    }
-
-    pub fn register(&self, addr: ActorAddress, sender: Arc<dyn SenderT>) {
-        self.senders.write().unwrap().insert(addr, sender);
-    }
-
-    pub fn try_deliver(
-        &self,
-        addr: ActorAddress,
-        msg: Box<dyn Any + Send>,
-    ) -> Result<(), Error> {
-        let senders = self.senders.read().unwrap();
-        if let Some(sender) = senders.get(&addr) {
-            sender.try_send_any(msg);
-            Ok(())
-        } else {
-            Err(Error::from("Address not found"))
-        }
-    }
-}
-
-
-
 
 impl ContextInner for Runtime {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {

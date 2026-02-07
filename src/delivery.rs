@@ -1,8 +1,14 @@
+use std::any::Any;
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
-use crate::actor::ActorAddress;
+use crate::actor::{ActorAddress, AnyActor, Message};
+use crate::channel::Sender;
+use crate::config::RuntimeConfig;
+use crate::Error;
+
+// ─── Address Map Types ───────────────────────────────────────────────────────
 
 /// Identifies a worker thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -81,8 +87,90 @@ impl Placement {
     }
 }
 
+// ─── Delivery Types ──────────────────────────────────────────────────────────
+
+/// A type-erased message envelope for cross-worker delivery.
+///
+/// Uses `Box` (no atomic refcount) and move semantics (no clone).
+pub(crate) struct Envelope {
+    dest: ActorAddress,
+    payload: Box<dyn Any + Send>,
+}
+
+impl Envelope {
+    pub fn new(dest: ActorAddress, payload: Box<dyn Any + Send>) -> Self {
+        Self { dest, payload }
+    }
+
+    pub fn dest(&self) -> ActorAddress {
+        self.dest
+    }
+
+    pub fn downcast<M: 'static>(self) -> Option<M> {
+        self.payload.downcast::<M>().ok().map(|b| *b)
+    }
+
+    pub fn into_payload(self) -> Box<dyn Any + Send> {
+        self.payload
+    }
+}
+
+/// Type-erased sender for external inboxes.
+pub(crate) trait SenderT: Send + Sync {
+    fn try_send_any(&self, msg: Box<dyn Any + Send>);
+}
+
+impl<M: Message> SenderT for Sender<M> {
+    fn try_send_any(&self, msg: Box<dyn Any + Send>) {
+        if let Ok(typed) = msg.downcast::<M>() {
+            let _ = Sender::try_send(self, *typed);
+        }
+    }
+}
+
+/// Registry of external inboxes — replaces the Router's role for non-actor receivers.
+pub(crate) struct InboxRegistry {
+    senders: RwLock<HashMap<ActorAddress, Arc<dyn SenderT>>>,
+}
+
+impl InboxRegistry {
+    pub fn new() -> Self {
+        Self {
+            senders: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn register(&self, addr: ActorAddress, sender: Arc<dyn SenderT>) {
+        self.senders.write().unwrap().insert(addr, sender);
+    }
+
+    pub fn try_deliver(
+        &self,
+        addr: ActorAddress,
+        msg: Box<dyn Any + Send>,
+    ) -> Result<(), Error> {
+        let senders = self.senders.read().unwrap();
+        if let Some(sender) = senders.get(&addr) {
+            sender.try_send_any(msg);
+            Ok(())
+        } else {
+            Err(Error::from("Address not found"))
+        }
+    }
+}
+
+/// Shared state passed to tick_once — single thin pointer avoids register spill.
+pub(crate) struct TickContext<'a> {
+    pub(crate) address_map: &'a AddressMap,
+    pub(crate) transfer_txs: &'a [Sender<Envelope>],
+    pub(crate) spawn_txs: &'a [Sender<(ActorAddress, Box<dyn AnyActor>)>],
+    pub(crate) placement: &'a Placement,
+    pub(crate) inbox_registry: &'a InboxRegistry,
+    pub(crate) config: &'a RuntimeConfig,
+}
+
 #[cfg(test)]
-mod tests {
+mod address_map_tests {
     use super::*;
 
     #[test]
