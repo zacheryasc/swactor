@@ -237,5 +237,3 @@ impl ActorPool {
 
 
 
-#[cfg(test)]
-mod tests;

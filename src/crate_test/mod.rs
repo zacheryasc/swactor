@@ -1,3 +1,5 @@
+//! Tests meant to be run against the crate-level API
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
