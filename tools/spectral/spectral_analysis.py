@@ -87,6 +87,20 @@ class ComplexityMetrics:
     connected_components: int
 
 
+@dataclass
+class StructuralProperties:
+    avg_degree: float
+    max_fan_in: int
+    max_fan_in_node: str
+    max_fan_out: int
+    max_fan_out_node: str
+    dag_depth: int
+    clustering_coeff: float
+    module_cohesion: dict[str, float]
+    avg_module_cohesion: float
+    avg_module_size: float
+
+
 # ─── DOT Parser ───────────────────────────────────────────────────────────────
 
 def parse_dot(text: str) -> DependencyGraph:
@@ -403,6 +417,117 @@ def compute_complexity_metrics(
     )
 
 
+# ─── Structural Properties ───────────────────────────────────────────────────
+
+def _compute_dag_depth(A: np.ndarray) -> int:
+    """Longest directed path in the graph."""
+    n = A.shape[0]
+    if n == 0:
+        return 0
+    UNVISITED, VISITING, DONE = 0, 1, 2
+    state = [UNVISITED] * n
+    depth = [0] * n
+
+    def dfs(node: int) -> int:
+        if state[node] == DONE:
+            return depth[node]
+        if state[node] == VISITING:
+            return 0  # cycle — treat as leaf
+        state[node] = VISITING
+        best = 0
+        for j in range(n):
+            if A[node, j] > 0:
+                best = max(best, 1 + dfs(j))
+        state[node] = DONE
+        depth[node] = best
+        return best
+
+    return max(dfs(i) for i in range(n))
+
+
+def _compute_clustering_coefficient(A_sym: np.ndarray) -> float:
+    """Global clustering coefficient (transitivity) on the undirected graph.
+
+    Uses the matrix identity: C = trace(A³) / (||A²||₁ - trace(A²))
+    where ||·||₁ is the sum of all elements.
+    """
+    n = A_sym.shape[0]
+    if n < 3:
+        return 0.0
+    A2 = A_sym @ A_sym
+    A3 = A2 @ A_sym
+    numerator = np.trace(A3)
+    denominator = A2.sum() - np.trace(A2)
+    if denominator == 0:
+        return 0.0
+    return float(numerator / denominator)
+
+
+def compute_structural_properties(
+    graph: DependencyGraph,
+    spectral: SpectralResults,
+) -> StructuralProperties:
+    """Compute graph-theoretic structural properties."""
+    n = len(graph.nodes)
+    n_edges = len(graph.edges)
+    node_names = spectral.node_names
+    A = spectral.adjacency
+
+    avg_degree = n_edges / n if n > 0 else 0.0
+
+    in_degrees = A.sum(axis=0)
+    out_degrees = A.sum(axis=1)
+
+    if n > 0:
+        fi_idx = int(np.argmax(in_degrees))
+        fo_idx = int(np.argmax(out_degrees))
+        max_fan_in = int(in_degrees[fi_idx])
+        max_fan_out = int(out_degrees[fo_idx])
+        max_fan_in_node = node_names[fi_idx]
+        max_fan_out_node = node_names[fo_idx]
+    else:
+        max_fan_in = max_fan_out = 0
+        max_fan_in_node = max_fan_out_node = ""
+
+    dag_depth = _compute_dag_depth(A)
+    clustering_coeff = _compute_clustering_coefficient(spectral.adjacency_sym)
+
+    # Per-module cohesion: intra-edges / max-possible-intra-edges
+    module_cohesion: dict[str, float] = {}
+    module_sizes: dict[str, int] = {}
+    for mod in graph.modules:
+        mod_nodes = [i for i, name in enumerate(node_names)
+                     if graph.node_to_module.get(name) == mod]
+        k = len(mod_nodes)
+        module_sizes[mod] = k
+        if k <= 1:
+            module_cohesion[mod] = float("nan")
+            continue
+        max_possible = k * (k - 1)
+        actual = sum(1 for i in mod_nodes for j in mod_nodes
+                     if i != j and A[i, j] > 0)
+        module_cohesion[mod] = actual / max_possible
+
+    valid = [v for v in module_cohesion.values() if not math.isnan(v)]
+    avg_cohesion = sum(valid) / len(valid) if valid else 0.0
+
+    sizes = list(module_sizes.values())
+    avg_size = sum(sizes) / len(sizes) if sizes else 0.0
+
+    return StructuralProperties(
+        avg_degree=avg_degree,
+        max_fan_in=max_fan_in,
+        max_fan_in_node=max_fan_in_node,
+        max_fan_out=max_fan_out,
+        max_fan_out_node=max_fan_out_node,
+        dag_depth=dag_depth,
+        clustering_coeff=clustering_coeff,
+        module_cohesion=module_cohesion,
+        avg_module_cohesion=avg_cohesion,
+        avg_module_size=avg_size,
+    )
+
+
 # ─── Full Pipeline ────────────────────────────────────────────────────────────
 
 @dataclass
@@ -411,6 +536,7 @@ class AnalysisResult:
     spectral: SpectralResults
     coupling: ModuleCouplingResult
     metrics: ComplexityMetrics
+    structural: StructuralProperties
 
 
 def run_analysis(graph: DependencyGraph) -> AnalysisResult:
@@ -418,11 +544,13 @@ def run_analysis(graph: DependencyGraph) -> AnalysisResult:
     spectral = compute_spectral(graph)
     coupling = compute_module_coupling(graph)
     metrics = compute_complexity_metrics(spectral, coupling)
+    structural = compute_structural_properties(graph, spectral)
     return AnalysisResult(
         graph=graph,
         spectral=spectral,
         coupling=coupling,
         metrics=metrics,
+        structural=structural,
     )
 
 
@@ -433,6 +561,7 @@ def generate_report(result: AnalysisResult) -> str:
     s = result.spectral
     m = result.metrics
     c = result.coupling
+    p = result.structural
     lines: list[str] = []
 
     def w(text: str = "") -> None:
@@ -453,37 +582,29 @@ def generate_report(result: AnalysisResult) -> str:
     w(f"  Modules:              {', '.join(c.module_names)}")
     w()
 
-    # Eigenvalue spectrum
-    w("LAPLACIAN EIGENVALUE SPECTRUM")
+    # Structural properties
+    w("STRUCTURAL PROPERTIES")
     w("-" * 40)
-    for i, ev in enumerate(s.eigenvalues):
-        marker = " <-- Fiedler value (lambda_2)" if i == 1 else ""
-        w(f"  lambda_{i:2d} = {ev:8.4f}{marker}")
-    w()
-    if len(s.eigenvalues) > 1:
-        spectral_gap = float(s.eigenvalues[-1] - s.eigenvalues[1])
-        w(f"  Spectral gap (lambda_max - lambda_2): {spectral_gap:.4f}")
-    w(f"  Fiedler value (algebraic connectivity): {s.fiedler_value:.4f}")
+    w(f"  Edges/node (avg degree):   {p.avg_degree:.2f}")
+    w(f"  Max fan-in:                {p.max_fan_in:<4d} ({p.max_fan_in_node})")
+    w(f"  Max fan-out:               {p.max_fan_out:<4d} ({p.max_fan_out_node})")
+    w(f"  DAG depth:                 {p.dag_depth}")
+    w(f"  Clustering coefficient:    {p.clustering_coeff:.4f}")
     w()
 
-    # Fiedler vector analysis
-    if len(s.fiedler_vector) > 0:
-        w("FIEDLER VECTOR — SPECTRAL BISECTION")
-        w("-" * 40)
-        # Sort by fiedler value
-        indices = np.argsort(s.fiedler_vector)
-        w("  Partition A (Fiedler < 0):")
-        for idx in indices:
-            if s.fiedler_vector[idx] < 0:
-                w(f"    {s.node_names[idx]:25s} [{s.node_modules[idx]:12s}]  "
-                  f"f = {s.fiedler_vector[idx]:+.4f}")
-        w("  ────────────────────────────────────")
-        w("  Partition B (Fiedler >= 0):")
-        for idx in indices:
-            if s.fiedler_vector[idx] >= 0:
-                w(f"    {s.node_names[idx]:25s} [{s.node_modules[idx]:12s}]  "
-                  f"f = {s.fiedler_vector[idx]:+.4f}")
-        w()
+    # Module cohesion
+    w("MODULE COHESION")
+    w("-" * 40)
+    w(f"  {'Module':<16s} {'Size':>5s}  {'Cohesion':>8s}")
+    for mod in c.module_names:
+        coh = p.module_cohesion.get(mod, float("nan"))
+        size = sum(1 for n in result.graph.nodes if n.module == mod)
+        coh_str = f"{coh:.3f}" if not math.isnan(coh) else "    —"
+        w(f"  {mod:<16s} {size:>5d}  {coh_str:>8s}")
+    w(f"  {'─' * 32}")
+    w(f"  {'Average cohesion:':<22s}  {p.avg_module_cohesion:8.3f}")
+    w(f"  {'Avg module size:':<22s}  {p.avg_module_size:8.1f}")
+    w()
 
     # Module coupling
     w("MODULE COUPLING MATRIX (directed edge counts)")
@@ -545,23 +666,28 @@ def generate_report(result: AnalysisResult) -> str:
 
 # ─── Dashboard Visualization ─────────────────────────────────────────────────
 
-# Module colors matching the depgraph tool
-MODULE_COLORS = {
-    "error": "#4caf50",
-    "config": "#8bc34a",
-    "channel": "#ffeb3b",
-    "actor": "#2196f3",
-    "address_map": "#9c27b0",
-    "runtime": "#f44336",
-    "worker": "#ff9800",
-    "python": "#795548",
-}
+# Module border colors from the depgraph palette (used as the accent color).
+# These rotate by discovery-order index; the palette has 8 entries.
+_PALETTE_BORDER = [
+    "#1565c0",  # 0 — blue
+    "#c62828",  # 1 — red
+    "#e65100",  # 2 — orange
+    "#7b1fa2",  # 3 — purple
+    "#2e7d32",  # 4 — green
+    "#f9a825",  # 5 — yellow
+    "#00838f",  # 6 — teal
+    "#d84315",  # 7 — deep orange
+]
 
-DEFAULT_COLOR = "#9e9e9e"
+# Module index assigned at analysis time (populated by generate_dashboard_html)
+_module_index: dict[str, int] = {}
 
 
 def get_module_color(module: str) -> str:
-    return MODULE_COLORS.get(module, DEFAULT_COLOR)
+    idx = _module_index.get(module)
+    if idx is not None:
+        return _PALETTE_BORDER[idx % len(_PALETTE_BORDER)]
+    return "#9e9e9e"
 
 
 def generate_dashboard(result: AnalysisResult, output_path: str) -> None:
@@ -570,6 +696,11 @@ def generate_dashboard(result: AnalysisResult, output_path: str) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.gridspec import GridSpec
+
+    # Ensure module palette indices are populated
+    _module_index.clear()
+    for i, mod in enumerate(result.graph.modules):
+        _module_index[mod] = i
 
     s = result.spectral
     m = result.metrics
@@ -595,63 +726,52 @@ def generate_dashboard(result: AnalysisResult, output_path: str) -> None:
     fig.suptitle("Spectral Analysis Dashboard — Dependency DAG",
                  fontsize=16, fontweight="bold", color="#e0e0e0")
 
-    # ── Top-left: Eigenvalue spectrum ──
+    p = result.structural
+
+    # ── Top-left: Structural properties ──
     ax1 = fig.add_subplot(gs[0, 0])
-    n = len(s.eigenvalues)
-    colors_eig = ["#ff4444" if i == 1 else "#4fc3f7" for i in range(n)]
-    markerline, stemlines, baseline = ax1.stem(
-        range(n), s.eigenvalues, linefmt="-", markerfmt="o", basefmt=" "
-    )
-    markerline.set_color("#4fc3f7")
-    markerline.set_markersize(5)
-    stemlines.set_color("#4fc3f7")
-    stemlines.set_alpha(0.6)
-    # Highlight lambda_2
-    if n > 1:
-        ax1.plot(1, s.eigenvalues[1], "o", color="#ff4444", markersize=10,
-                 zorder=5, label=f"$\\lambda_2$ = {s.fiedler_value:.4f}")
-        ax1.legend(fontsize=10, loc="upper left",
-                   facecolor="#16213e", edgecolor="#444")
-    ax1.set_xlabel("Index")
-    ax1.set_ylabel("Eigenvalue")
-    ax1.set_title("Laplacian Eigenvalue Spectrum", fontsize=12, fontweight="bold")
-    ax1.grid(True, alpha=0.3)
+    ax1.axis("off")
+    ax1.set_title("Structural Properties", fontsize=12, fontweight="bold")
+    props = [
+        ("Edges/node (avg degree)", f"{p.avg_degree:.2f}"),
+        ("Max fan-in", f"{p.max_fan_in}  ({p.max_fan_in_node})"),
+        ("Max fan-out", f"{p.max_fan_out}  ({p.max_fan_out_node})"),
+        ("DAG depth", f"{p.dag_depth}"),
+        ("Clustering coefficient", f"{p.clustering_coeff:.4f}"),
+        ("Avg module size", f"{p.avg_module_size:.1f}"),
+        ("Avg module cohesion", f"{p.avg_module_cohesion:.3f}"),
+    ]
+    y = 0.88
+    for label, value in props:
+        ax1.text(0.05, y, label, transform=ax1.transAxes, fontsize=10,
+                 color="#aaa", fontfamily="monospace", va="top")
+        ax1.text(0.95, y, value, transform=ax1.transAxes, fontsize=10,
+                 fontweight="bold", color="#e0e0e0", fontfamily="monospace",
+                 va="top", ha="right")
+        y -= 0.12
 
-    # ── Top-right: Fiedler vector ──
+    # ── Top-right: Module cohesion ──
     ax2 = fig.add_subplot(gs[0, 1])
-    if len(s.fiedler_vector) > 0:
-        sorted_indices = np.argsort(s.fiedler_vector)
-        sorted_values = s.fiedler_vector[sorted_indices]
-        sorted_names = [s.node_names[i] for i in sorted_indices]
-        sorted_modules = [s.node_modules[i] for i in sorted_indices]
-        bar_colors = [get_module_color(mod) for mod in sorted_modules]
-
-        bars = ax2.barh(range(len(sorted_values)), sorted_values,
-                        color=bar_colors, edgecolor="none", height=0.8)
-        ax2.axvline(x=0, color="#ff4444", linewidth=1.5, linestyle="--",
-                    alpha=0.8, label="Bisection boundary")
-        ax2.set_yticks(range(len(sorted_names)))
-        ax2.set_yticklabels(sorted_names, fontsize=6)
-        ax2.set_xlabel("Fiedler value")
-        ax2.set_title("Fiedler Vector (spectral bisection)", fontsize=12,
-                       fontweight="bold")
-
-        # Legend for modules
-        unique_modules = []
-        seen = set()
-        for mod in sorted_modules:
-            if mod not in seen:
-                seen.add(mod)
-                unique_modules.append(mod)
-        from matplotlib.patches import Patch
-        legend_patches = [Patch(facecolor=get_module_color(mod), label=mod)
-                          for mod in unique_modules]
-        ax2.legend(handles=legend_patches, fontsize=7, loc="lower right",
-                   facecolor="#16213e", edgecolor="#444", ncol=2)
+    cohesion_mods = [mod for mod in c.module_names
+                     if not math.isnan(p.module_cohesion.get(mod, float("nan")))]
+    if cohesion_mods:
+        cohesion_vals = [p.module_cohesion[mod] for mod in cohesion_mods]
+        bar_colors = [get_module_color(mod) for mod in cohesion_mods]
+        bars = ax2.barh(range(len(cohesion_mods)), cohesion_vals,
+                        color=bar_colors, edgecolor="none", height=0.6)
+        ax2.set_yticks(range(len(cohesion_mods)))
+        ax2.set_yticklabels(cohesion_mods, fontsize=9)
+        ax2.set_xlim(0, 1.05)
+        ax2.set_xlabel("Cohesion (intra-edges / max possible)")
+        ax2.axvline(x=p.avg_module_cohesion, color="#ff4444", linewidth=1.5,
+                    linestyle="--", alpha=0.7, label=f"avg = {p.avg_module_cohesion:.3f}")
+        ax2.legend(fontsize=9, loc="lower right",
+                   facecolor="#16213e", edgecolor="#444")
+        ax2.grid(True, axis="x", alpha=0.3)
     else:
-        ax2.text(0.5, 0.5, "No Fiedler vector\n(single node graph)",
+        ax2.text(0.5, 0.5, "No modules with 2+ types",
                  ha="center", va="center", fontsize=14, transform=ax2.transAxes)
-        ax2.set_title("Fiedler Vector", fontsize=12, fontweight="bold")
+    ax2.set_title("Module Cohesion", fontsize=12, fontweight="bold")
 
     # ── Bottom-left: Module coupling heatmap ──
     ax3 = fig.add_subplot(gs[1, 0])
@@ -746,25 +866,40 @@ def generate_dashboard_html(
     m = result.metrics
     c = result.coupling
 
-    # Prepare data as JSON for embedding
-    sorted_indices = list(np.argsort(s.fiedler_vector)) if len(s.fiedler_vector) > 0 else []
-    fiedler_data = []
-    for idx in sorted_indices:
-        fiedler_data.append({
-            "name": s.node_names[idx],
-            "module": s.node_modules[idx],
-            "value": float(s.fiedler_vector[idx]),
-        })
+    p = result.structural
 
-    eigenvalue_data = [{"index": i, "value": float(v)}
-                       for i, v in enumerate(s.eigenvalues)]
+    # Prepare data as JSON for embedding
+    structural_data = {
+        "avg_degree": round(p.avg_degree, 2),
+        "max_fan_in": p.max_fan_in,
+        "max_fan_in_node": p.max_fan_in_node,
+        "max_fan_out": p.max_fan_out,
+        "max_fan_out_node": p.max_fan_out_node,
+        "dag_depth": p.dag_depth,
+        "clustering_coeff": round(p.clustering_coeff, 4),
+        "avg_module_cohesion": round(p.avg_module_cohesion, 3),
+        "avg_module_size": round(p.avg_module_size, 1),
+    }
+
+    cohesion_data = []
+    for mod in c.module_names:
+        coh = p.module_cohesion.get(mod, float("nan"))
+        if not math.isnan(coh):
+            cohesion_data.append({
+                "module": mod,
+                "cohesion": round(coh, 3),
+                "size": sum(1 for n in result.graph.nodes if n.module == mod),
+            })
 
     coupling_data = {
         "modules": c.module_names,
         "matrix": c.coupling_matrix.tolist(),
     }
 
-    # Module colors
+    # Module colors — populate index from discovery order so palette rotates
+    _module_index.clear()
+    for i, mod in enumerate(result.graph.modules):
+        _module_index[mod] = i
     all_modules = list(dict.fromkeys(n.module for n in result.graph.nodes))
     module_colors_json = {mod: get_module_color(mod) for mod in all_modules}
 
@@ -799,12 +934,11 @@ def generate_dashboard_html(
         "cci_label": cci_label,
         "cci_color": cci_color,
         "cci_desc": cci_desc,
-        "fiedler_value": round(s.fiedler_value, 4),
     }
 
     data_blob = json.dumps({
-        "eigenvalues": eigenvalue_data,
-        "fiedler": fiedler_data,
+        "structural": structural_data,
+        "cohesion": cohesion_data,
         "coupling": coupling_data,
         "metrics": metrics_json,
         "module_colors": module_colors_json,
@@ -901,11 +1035,7 @@ svg text { user-select:none; }
 .hm-cell { cursor:pointer; transition:opacity 0.15s; }
 .hm-cell:hover { opacity:0.8; stroke:#4fc3f7; stroke-width:2; }
 
-/* Eigenvalue bars */
-.ev-bar { cursor:pointer; transition:opacity 0.15s; }
-.ev-bar:hover { opacity:0.8; }
-
-/* Fiedler bars */
+/* Cohesion / heatmap bars */
 .fi-bar { cursor:pointer; transition:opacity 0.15s; }
 .fi-bar:hover { opacity:0.85; }
 </style>
@@ -914,11 +1044,11 @@ svg text { user-select:none; }
 
 <div class="tab-bar">
   <div class="title">swactor &mdash; dependency analysis</div>
-  <button class="tab active" data-tab="dag">Dependency DAG</button>
-  <button class="tab" data-tab="spectral">Spectral Analysis</button>
+  <button class="tab active" data-tab="spectral">Spectral Analysis</button>
+  <button class="tab" data-tab="dag">Dependency DAG</button>
 </div>
 
-<div class="tab-content active" id="tab-dag">
+<div class="tab-content" id="tab-dag">
   <div id="dag-controls">
     <button onclick="zoomIn()">+</button>
     <button onclick="zoomOut()">&minus;</button>
@@ -929,16 +1059,16 @@ svg text { user-select:none; }
   <div id="dag-loading">Loading Graphviz&hellip;</div>
 </div>
 
-<div class="tab-content" id="tab-spectral">
+<div class="tab-content active" id="tab-spectral">
   <div class="grid">
-    <div class="panel" id="panel-eigenvalues">
-      <h2><span class="icon">&#x03BB;</span> Laplacian Eigenvalue Spectrum</h2>
-      <svg id="svg-eigenvalues"></svg>
+    <div class="panel" id="panel-structural">
+      <h2><span class="icon">&#x25C9;</span> Structural Properties</h2>
+      <div id="structural-content"></div>
     </div>
 
-    <div class="panel" id="panel-fiedler">
-      <h2><span class="icon">&#x2702;</span> Fiedler Vector &mdash; Spectral Bisection</h2>
-      <svg id="svg-fiedler"></svg>
+    <div class="panel" id="panel-cohesion">
+      <h2><span class="icon">&#x25A8;</span> Module Cohesion</h2>
+      <svg id="svg-cohesion"></svg>
     </div>
 
     <div class="panel" id="panel-heatmap">
@@ -959,7 +1089,7 @@ svg text { user-select:none; }
 <script>
 // ─── Data ──────────────────────────────────────────────────────────────────
 const DATA = __DATA_BLOB__;
-const { eigenvalues, fiedler, coupling, metrics, module_colors } = DATA;
+const { structural, cohesion, coupling, metrics, module_colors } = DATA;
 
 // ─── Tab switching ─────────────────────────────────────────────────────────
 document.querySelectorAll('.tab').forEach(btn => {
@@ -968,6 +1098,9 @@ document.querySelectorAll('.tab').forEach(btn => {
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'dag') {
+      window.dispatchEvent(new Event('dag-visible'));
+    }
   });
 });
 
@@ -984,138 +1117,99 @@ function hideTip() { TT.style.display = 'none'; }
 
 function modColor(mod) { return module_colors[mod] || '#9e9e9e'; }
 
-// ─── Eigenvalue Spectrum ───────────────────────────────────────────────────
+// ─── Structural Properties ────────────────────────────────────────────────
 (function() {
-  const svg = document.getElementById('svg-eigenvalues');
-  const W = 560, H = 300, M = {t:20,r:20,b:40,l:50};
+  const c = document.getElementById('structural-content');
+  const s = structural;
+  c.innerHTML = `
+    <div class="metrics-grid">
+      <div class="sub-header">Density &amp; Depth</div>
+      <div class="metric-item"><span class="metric-label">Edges/node (avg degree)</span><span class="metric-value">${s.avg_degree}</span></div>
+      <div class="metric-item"><span class="metric-label">DAG depth</span><span class="metric-value">${s.dag_depth}</span></div>
+      <div class="metric-item"><span class="metric-label">Clustering coefficient</span><span class="metric-value">${s.clustering_coeff}</span></div>
+      <div class="metric-item"><span class="metric-label">Avg module size</span><span class="metric-value">${s.avg_module_size}</span></div>
+
+      <div class="sub-header">Dependency Hotspots</div>
+      <div class="metric-item"><span class="metric-label">Max fan-in</span><span class="metric-value">${s.max_fan_in} &larr; ${s.max_fan_in_node}</span></div>
+      <div class="metric-item"><span class="metric-label">Max fan-out</span><span class="metric-value">${s.max_fan_out} &rarr; ${s.max_fan_out_node}</span></div>
+
+      <div class="sub-header">Cohesion</div>
+      <div class="metric-item"><span class="metric-label">Avg module cohesion</span><span class="metric-value">${s.avg_module_cohesion}</span></div>
+      <div class="metric-item"><span class="metric-label">Cross-module ratio</span><span class="metric-value">${(metrics.cross_module_ratio*100).toFixed(1)}%</span></div>
+    </div>
+  `;
+})();
+
+// ─── Module Cohesion ──────────────────────────────────────────────────────
+(function() {
+  const svg = document.getElementById('svg-cohesion');
+  const n = cohesion.length;
+  if (n === 0) return;
+  const barH = Math.max(20, Math.min(36, 300/n));
+  const W = 560, H = Math.max(200, n*barH + 60), M = {t:10,r:30,b:30,l:120};
   const w = W-M.l-M.r, h = H-M.t-M.b;
   svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
 
-  const maxVal = Math.max(...eigenvalues.map(d=>d.value), 1);
-  const xScale = i => M.l + (i / (eigenvalues.length-1||1)) * w;
-  const yScale = v => M.t + h - (v / maxVal) * h;
+  const xScale = v => M.l + v * w;
+  const yScale = i => M.t + (i/n) * h + barH/2;
 
-  // Grid lines
-  for (let tick = 0; tick <= maxVal; tick += Math.ceil(maxVal/5)) {
-    const y = yScale(tick);
+  // Background grid
+  for (const tick of [0.25, 0.5, 0.75, 1.0]) {
+    const x = xScale(tick);
     const line = document.createElementNS('http://www.w3.org/2000/svg','line');
-    Object.entries({x1:M.l,x2:W-M.r,y1:y,y2:y,stroke:'#2a2a5a','stroke-width':0.5}).forEach(([k,v])=>line.setAttribute(k,v));
+    Object.entries({x1:x,x2:x,y1:M.t,y2:M.t+h,stroke:'#2a2a5a','stroke-width':0.5}).forEach(([k,v])=>line.setAttribute(k,v));
     svg.appendChild(line);
     const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
-    txt.setAttribute('x', M.l-6); txt.setAttribute('y', y+4);
-    txt.setAttribute('text-anchor','end'); txt.setAttribute('fill','#888'); txt.setAttribute('font-size','10');
-    txt.textContent = tick.toFixed(0);
+    txt.setAttribute('x', x); txt.setAttribute('y', H-8);
+    txt.setAttribute('text-anchor','middle'); txt.setAttribute('fill','#666'); txt.setAttribute('font-size','10');
+    txt.textContent = (tick*100).toFixed(0) + '%';
     svg.appendChild(txt);
   }
 
-  // Axis labels
-  const xLabel = document.createElementNS('http://www.w3.org/2000/svg','text');
-  xLabel.setAttribute('x', M.l+w/2); xLabel.setAttribute('y', H-4);
-  xLabel.setAttribute('text-anchor','middle'); xLabel.setAttribute('fill','#888'); xLabel.setAttribute('font-size','11');
-  xLabel.textContent = 'Index';
-  svg.appendChild(xLabel);
+  // Average line
+  const avgX = xScale(structural.avg_module_cohesion);
+  const avgLine = document.createElementNS('http://www.w3.org/2000/svg','line');
+  Object.entries({x1:avgX,x2:avgX,y1:M.t,y2:M.t+h,stroke:'#ff4444','stroke-width':1.5,'stroke-dasharray':'5,3','stroke-opacity':0.7}).forEach(([k,v])=>avgLine.setAttribute(k,v));
+  svg.appendChild(avgLine);
+  const avgLbl = document.createElementNS('http://www.w3.org/2000/svg','text');
+  avgLbl.setAttribute('x', avgX+4); avgLbl.setAttribute('y', M.t+10);
+  avgLbl.setAttribute('fill','#ff4444'); avgLbl.setAttribute('font-size','9'); avgLbl.setAttribute('opacity','0.8');
+  avgLbl.textContent = 'avg';
+  svg.appendChild(avgLbl);
 
-  const yLabel = document.createElementNS('http://www.w3.org/2000/svg','text');
-  yLabel.setAttribute('x', 14); yLabel.setAttribute('y', M.t+h/2);
-  yLabel.setAttribute('text-anchor','middle'); yLabel.setAttribute('fill','#888');
-  yLabel.setAttribute('font-size','11'); yLabel.setAttribute('transform', `rotate(-90,14,${M.t+h/2})`);
-  yLabel.textContent = 'Eigenvalue';
-  svg.appendChild(yLabel);
-
-  eigenvalues.forEach((d, i) => {
-    const x = xScale(i), y = yScale(d.value), y0 = yScale(0);
-    // Stem line
-    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
-    Object.entries({x1:x,x2:x,y1:y0,y2:y,stroke:i===1?'#ff4444':'#4fc3f7','stroke-width':i===1?2.5:1.5,'stroke-opacity':i===1?1:0.6}).forEach(([k,v])=>line.setAttribute(k,v));
-    svg.appendChild(line);
-    // Dot
-    const circ = document.createElementNS('http://www.w3.org/2000/svg','circle');
-    circ.setAttribute('cx',x); circ.setAttribute('cy',y);
-    circ.setAttribute('r', i===1?6:3.5);
-    circ.setAttribute('fill', i===1?'#ff4444':'#4fc3f7');
-    circ.classList.add('ev-bar');
-    circ.addEventListener('mousemove', e => showTip(e,
-      `<span class="tt-label">&lambda;<sub>${i}</sub></span> = <span class="tt-val">${d.value.toFixed(4)}</span>`
-      + (i===1 ? '<br><span style="color:#ff4444">Fiedler value (algebraic connectivity)</span>' : '')
-    ));
-    circ.addEventListener('mouseleave', hideTip);
-    svg.appendChild(circ);
-  });
-
-  // Fiedler label
-  if (eigenvalues.length > 1) {
-    const lbl = document.createElementNS('http://www.w3.org/2000/svg','text');
-    lbl.setAttribute('x', xScale(1)+10); lbl.setAttribute('y', yScale(eigenvalues[1].value)-6);
-    lbl.setAttribute('fill','#ff4444'); lbl.setAttribute('font-size','11'); lbl.setAttribute('font-weight','600');
-    lbl.textContent = `\u03BB\u2082 = ${metrics.fiedler_value}`;
-    svg.appendChild(lbl);
-  }
-})();
-
-// ─── Fiedler Vector ────────────────────────────────────────────────────────
-(function() {
-  const svg = document.getElementById('svg-fiedler');
-  const n = fiedler.length;
-  const barH = Math.max(12, Math.min(22, 500/n));
-  const W = 560, H = Math.max(300, n*barH + 60), M = {t:10,r:20,b:30,l:140};
-  const w = W-M.l-M.r, h = H-M.t-M.b;
-  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
-
-  const maxAbs = Math.max(...fiedler.map(d=>Math.abs(d.value)), 0.01);
-  const xScale = v => M.l + w/2 + (v/maxAbs) * (w/2);
-  const yScale = i => M.t + (i/n) * h + barH/2;
-
-  // Zero line
-  const zl = document.createElementNS('http://www.w3.org/2000/svg','line');
-  Object.entries({x1:xScale(0),x2:xScale(0),y1:M.t,y2:M.t+h,stroke:'#ff4444','stroke-width':1.5,'stroke-dasharray':'5,3','stroke-opacity':0.7}).forEach(([k,v])=>zl.setAttribute(k,v));
-  svg.appendChild(zl);
-
-  // Partition labels
-  const negCount = fiedler.filter(d=>d.value<0).length;
-  if (negCount > 0 && negCount < n) {
-    const lblA = document.createElementNS('http://www.w3.org/2000/svg','text');
-    lblA.setAttribute('x', M.l+4); lblA.setAttribute('y', M.t + (negCount/n)*h/2 + barH/2);
-    lblA.setAttribute('fill','#ff4444'); lblA.setAttribute('font-size','10'); lblA.setAttribute('opacity','0.5');
-    lblA.textContent = 'Partition A';
-    svg.appendChild(lblA);
-  }
-
-  fiedler.forEach((d, i) => {
-    const x0 = xScale(0), x1 = xScale(d.value);
-    const y = yScale(i) - barH*0.4;
-    const bw = Math.abs(x1-x0);
-
+  cohesion.forEach((d, i) => {
+    const barW = Math.max(d.cohesion * w, 2);
+    const y = yScale(i) - barH*0.35;
     const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
-    rect.setAttribute('x', Math.min(x0,x1)); rect.setAttribute('y', y);
-    rect.setAttribute('width', Math.max(bw, 1)); rect.setAttribute('height', barH*0.8);
-    rect.setAttribute('rx', 2);
+    rect.setAttribute('x', M.l); rect.setAttribute('y', y);
+    rect.setAttribute('width', barW); rect.setAttribute('height', barH*0.7);
+    rect.setAttribute('rx', 3);
     rect.setAttribute('fill', modColor(d.module));
     rect.setAttribute('opacity', 0.85);
     rect.classList.add('fi-bar');
     rect.addEventListener('mousemove', e => showTip(e,
-      `<span class="tt-label">${d.name}</span><br>` +
-      `Module: <span class="tt-val">${d.module}</span><br>` +
-      `Fiedler: <span class="tt-val">${d.value.toFixed(4)}</span><br>` +
-      `Partition: <span class="tt-val">${d.value < 0 ? 'A' : 'B'}</span>`
+      `<span class="tt-label">${d.module}</span><br>` +
+      `Types: <span class="tt-val">${d.size}</span><br>` +
+      `Cohesion: <span class="tt-val">${(d.cohesion*100).toFixed(1)}%</span>`
     ));
     rect.addEventListener('mouseleave', hideTip);
     svg.appendChild(rect);
 
-    // Label
+    // Value label on bar
+    const valTxt = document.createElementNS('http://www.w3.org/2000/svg','text');
+    valTxt.setAttribute('x', M.l + barW + 6); valTxt.setAttribute('y', yScale(i)+4);
+    valTxt.setAttribute('fill','#ccc'); valTxt.setAttribute('font-size','10'); valTxt.setAttribute('font-weight','600');
+    valTxt.textContent = (d.cohesion*100).toFixed(0) + '%';
+    svg.appendChild(valTxt);
+
+    // Module label
     const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
-    txt.setAttribute('x', M.l-4); txt.setAttribute('y', yScale(i)+3);
-    txt.setAttribute('text-anchor','end'); txt.setAttribute('fill','#ccc');
-    txt.setAttribute('font-size', Math.min(11, barH*0.75));
-    txt.textContent = d.name;
+    txt.setAttribute('x', M.l-8); txt.setAttribute('y', yScale(i)+4);
+    txt.setAttribute('text-anchor','end'); txt.setAttribute('fill', modColor(d.module));
+    txt.setAttribute('font-size','11'); txt.setAttribute('font-weight','600');
+    txt.textContent = `${d.module} (${d.size})`;
     svg.appendChild(txt);
   });
-
-  // X axis label
-  const xLabel = document.createElementNS('http://www.w3.org/2000/svg','text');
-  xLabel.setAttribute('x', M.l+w/2); xLabel.setAttribute('y', H-6);
-  xLabel.setAttribute('text-anchor','middle'); xLabel.setAttribute('fill','#888'); xLabel.setAttribute('font-size','11');
-  xLabel.textContent = 'Fiedler value';
-  svg.appendChild(xLabel);
 })();
 
 // ─── Module Coupling Heatmap ───────────────────────────────────────────────
@@ -1250,7 +1344,9 @@ vp.appendChild(svg);
 
 // ─── Dark-mode SVG recoloring ──────────────────────────────────────────────
 svg.querySelectorAll('polygon[fill="white"]').forEach(el => el.setAttribute('fill','#1a1a2e'));
-svg.querySelectorAll('.graph > text, .cluster > text, .edge text').forEach(el => el.setAttribute('fill','#e0e0e0'));
+svg.querySelectorAll('.graph > text').forEach(el => el.setAttribute('fill','#e0e0e0'));
+svg.querySelectorAll('.cluster > text').forEach(el => el.setAttribute('fill','#1a1a1a'));
+svg.querySelectorAll('.edge text').forEach(el => el.setAttribute('fill','#ffb74d'));
 svg.querySelectorAll('.node text').forEach(el => el.setAttribute('fill','#1a1a1a'));
 
 // ─── Click-to-focus ────────────────────────────────────────────────────────
@@ -1347,7 +1443,10 @@ window.resetView = function() {
   ty = (vh - bb.height * scale) / 2;
   applyTransform();
 };
-resetView();
+let dagFitted = false;
+window.addEventListener('dag-visible', () => {
+  if (!dagFitted) { dagFitted = true; requestAnimationFrame(resetView); }
+});
 
 window.zoomIn = function() { scale *= 1.3; applyTransform(); };
 window.zoomOut = function() { scale *= 0.7; applyTransform(); };
@@ -1367,8 +1466,8 @@ vp.addEventListener('click', e => { if (!didDrag && !e.target.closest('.node')) 
 def metrics_to_dict(result: AnalysisResult) -> dict[str, Any]:
     """Convert analysis results to a JSON-serializable dict."""
     m = result.metrics
-    s = result.spectral
     c = result.coupling
+    p = result.structural
 
     return {
         "graph": {
@@ -1378,12 +1477,13 @@ def metrics_to_dict(result: AnalysisResult) -> dict[str, Any]:
             "connected_components": m.connected_components,
             "modules": c.module_names,
         },
-        "spectral": {
-            "eigenvalues": s.eigenvalues.tolist(),
-            "fiedler_value": s.fiedler_value,
-            "fiedler_vector": s.fiedler_vector.tolist(),
-            "node_names": s.node_names,
-            "node_modules": s.node_modules,
+        "structural": {
+            "avg_degree": p.avg_degree,
+            "max_fan_in": {"count": p.max_fan_in, "node": p.max_fan_in_node},
+            "max_fan_out": {"count": p.max_fan_out, "node": p.max_fan_out_node},
+            "dag_depth": p.dag_depth,
+            "clustering_coefficient": p.clustering_coeff,
+            "avg_module_size": p.avg_module_size,
         },
         "module_coupling": {
             "module_names": c.module_names,
@@ -1391,15 +1491,17 @@ def metrics_to_dict(result: AnalysisResult) -> dict[str, Any]:
             "cross_module_edges": c.cross_module_edges,
             "total_edges": c.total_edges,
         },
+        "module_cohesion": {
+            mod: None if math.isnan(v) else v
+            for mod, v in p.module_cohesion.items()
+        },
         "metrics": {
             "algebraic_connectivity": m.algebraic_connectivity,
-            "normalized_algebraic_connectivity": m.normalized_algebraic_connectivity,
             "spectral_entropy": m.spectral_entropy,
-            "normalized_spectral_entropy": m.normalized_spectral_entropy,
             "edge_density": m.edge_density,
             "cross_module_ratio": m.cross_module_ratio,
             "spectral_radius": m.spectral_radius,
-            "normalized_spectral_radius": m.normalized_spectral_radius,
+            "avg_module_cohesion": p.avg_module_cohesion,
             "cci": m.cci,
         },
     }

@@ -686,11 +686,12 @@ class TestIntegration(unittest.TestCase):
         d = metrics_to_dict(result)
 
         self.assertIn("graph", d)
-        self.assertIn("spectral", d)
+        self.assertIn("structural", d)
         self.assertIn("module_coupling", d)
+        self.assertIn("module_cohesion", d)
         self.assertIn("metrics", d)
         self.assertEqual(d["graph"]["n_nodes"], 3)
-        self.assertIsInstance(d["spectral"]["eigenvalues"], list)
+        self.assertIsInstance(d["structural"]["dag_depth"], int)
         self.assertIsInstance(d["metrics"]["cci"], float)
 
         # Should be JSON-serializable

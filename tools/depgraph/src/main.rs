@@ -54,31 +54,25 @@ struct Edge {
 
 // ─── Module colors ───────────────────────────────────────────────────────────
 
-fn module_colors(module: &str) -> (&'static str, &'static str, &'static str) {
-    // Returns (cluster_fill, cluster_border, node_fill)
-    match module {
-        "error" => ("#f0f0f0", "#888", "#e8f5e9"),
-        "config" => ("#f0f0f0", "#888", "#e8f5e9"),
-        "channel" => ("#f0f0f0", "#888", "#fff9c4"),
-        "actor" => ("#e3f2fd", "#1565c0", "#bbdefb"),
-        "address_map" => ("#f3e5f5", "#7b1fa2", "#e1bee7"),
-        "runtime" => ("#fce4ec", "#c62828", "#ffcdd2"),
-        "worker" => ("#fff3e0", "#e65100", "#ffe0b2"),
-        "python" => ("#f5f5f5", "#999", "#d7ccc8"),
-        _ => ("#f0f0f0", "#888", "#e0e0e0"),
-    }
+/// 8-color pastel palette for module clusters.
+/// Each entry: (cluster_fill, cluster_border, node_fill)
+const PALETTE: &[(&str, &str, &str)] = &[
+    ("#e3f2fd", "#1565c0", "#bbdefb"),
+    ("#fce4ec", "#c62828", "#ffcdd2"),
+    ("#fff3e0", "#e65100", "#ffe0b2"),
+    ("#f3e5f5", "#7b1fa2", "#e1bee7"),
+    ("#e8f5e9", "#2e7d32", "#c8e6c9"),
+    ("#fff9c4", "#f9a825", "#fff59d"),
+    ("#e0f7fa", "#00838f", "#b2ebf2"),
+    ("#fbe9e7", "#d84315", "#ffccbc"),
+];
+
+fn module_colors_by_index(index: usize) -> (&'static str, &'static str, &'static str) {
+    PALETTE[index % PALETTE.len()]
 }
 
-fn module_edge_color(module: &str) -> &'static str {
-    match module {
-        "error" | "config" | "channel" => "#666",
-        "actor" => "#1565c0",
-        "address_map" => "#7b1fa2",
-        "runtime" => "#c62828",
-        "worker" => "#e65100",
-        "python" => "#999",
-        _ => "#666",
-    }
+fn module_edge_color_by_index(index: usize) -> &'static str {
+    PALETTE[index % PALETTE.len()].1
 }
 
 // ─── Phase 1: Module discovery ───────────────────────────────────────────────
@@ -827,22 +821,21 @@ fn generate_dot(modules: &[ModuleInfo], edges: &[Edge]) -> String {
     writeln!(out, "    splines=ortho;").unwrap();
     writeln!(out).unwrap();
 
-    // Define module ordering for consistent output
-    let module_order = [
-        "error",
-        "config",
-        "channel",
-        "actor",
-        "address_map",
-        "runtime",
-        "worker",
-        "python",
-    ];
+    // Use actual module names in discovery order for consistent output
+    let module_order: Vec<&str> = modules.iter().map(|m| m.name.as_str()).collect();
+
+    // Build module_name → index lookup for palette rotation
+    let module_index: HashMap<&str, usize> = module_order
+        .iter()
+        .enumerate()
+        .map(|(i, &name)| (name, i))
+        .collect();
 
     // Emit subgraph clusters
-    for mod_name in &module_order {
+    for (i, mod_name) in module_order.iter().enumerate() {
         if let Some(module) = modules.iter().find(|m| m.name == *mod_name) {
-            emit_cluster(&mut out, module);
+            let (cluster_fill, cluster_border, node_fill) = module_colors_by_index(i);
+            emit_cluster(&mut out, module, cluster_fill, cluster_border, node_fill);
         }
     }
 
@@ -866,7 +859,8 @@ fn generate_dot(modules: &[ModuleInfo], edges: &[Edge]) -> String {
     writeln!(out).unwrap();
 
     for edge in edges.iter().filter(|e| e.from_module == e.to_module) {
-        emit_edge(&mut out, edge, true);
+        let idx = module_index.get(edge.from_module.as_str()).copied().unwrap_or(0);
+        emit_edge(&mut out, edge, true, module_edge_color_by_index(idx));
     }
 
     // Emit cross-module edges
@@ -928,7 +922,8 @@ fn generate_dot(modules: &[ModuleInfo], edges: &[Edge]) -> String {
         )
         .unwrap();
         for edge in edges_group {
-            emit_edge(&mut out, edge, false);
+            let idx = module_index.get(edge.from_module.as_str()).copied().unwrap_or(0);
+            emit_edge(&mut out, edge, false, module_edge_color_by_index(idx));
         }
     }
 
@@ -936,8 +931,7 @@ fn generate_dot(modules: &[ModuleInfo], edges: &[Edge]) -> String {
     out
 }
 
-fn emit_cluster(out: &mut String, module: &ModuleInfo) {
-    let (cluster_fill, cluster_border, node_fill) = module_colors(&module.name);
+fn emit_cluster(out: &mut String, module: &ModuleInfo, cluster_fill: &str, cluster_border: &str, node_fill: &str) {
 
     let style = if module.feature_gate.is_some() {
         "rounded,dashed,filled"
@@ -1010,12 +1004,7 @@ fn emit_cluster(out: &mut String, module: &ModuleInfo) {
     writeln!(out, "    }}").unwrap();
 }
 
-fn emit_edge(out: &mut String, edge: &Edge, intra: bool) {
-    let color = if intra {
-        "#666"
-    } else {
-        module_edge_color(&edge.from_module)
-    };
+fn emit_edge(out: &mut String, edge: &Edge, intra: bool, color: &str) {
 
     let (style, penwidth) = match edge.kind {
         EdgeKind::TraitImpl => {
@@ -1247,6 +1236,7 @@ fn main() {
 
     let mut src_dir = PathBuf::from("src");
     let mut output_prefix = String::from("deps");
+    let mut output_dir: Option<PathBuf> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -1259,11 +1249,16 @@ fn main() {
                 i += 1;
                 output_prefix = args[i].clone();
             }
+            "--output-dir" => {
+                i += 1;
+                output_dir = Some(PathBuf::from(&args[i]));
+            }
             "--help" | "-h" => {
-                eprintln!("Usage: depgraph [--src-dir src/] [--output deps]");
-                eprintln!("  --src-dir DIR   Source directory (default: src/)");
-                eprintln!("  --output PREFIX  Output prefix (default: deps)");
-                eprintln!("                   Produces PREFIX.dot and PREFIX.html");
+                eprintln!("Usage: depgraph [--src-dir src/] [--output deps] [--output-dir DIR]");
+                eprintln!("  --src-dir DIR     Source directory (default: src/)");
+                eprintln!("  --output PREFIX   Output prefix (default: deps)");
+                eprintln!("  --output-dir DIR  Directory for output files (default: cwd)");
+                eprintln!("                    Produces PREFIX.dot and PREFIX.html");
                 std::process::exit(0);
             }
             other => {
@@ -1272,6 +1267,11 @@ fn main() {
             }
         }
         i += 1;
+    }
+
+    // Ensure output directory exists.
+    if let Some(ref dir) = output_dir {
+        fs::create_dir_all(dir).expect("Failed to create output directory");
     }
 
     eprintln!("Scanning source directory: {}", src_dir.display());
@@ -1330,15 +1330,23 @@ fn main() {
 
     // Phase 5: DOT output
     let dot = generate_dot(&modules, &edges);
-    let dot_path = format!("{}.dot", output_prefix);
+    let dot_file = format!("{}.dot", output_prefix);
+    let dot_path = match &output_dir {
+        Some(dir) => dir.join(&dot_file),
+        None => PathBuf::from(&dot_file),
+    };
     fs::write(&dot_path, &dot).expect("Failed to write .dot file");
-    eprintln!("Wrote {}", dot_path);
+    eprintln!("Wrote {}", dot_path.display());
 
     // Phase 6: HTML output
     let html = generate_html(&dot);
-    let html_path = format!("{}.html", output_prefix);
+    let html_file = format!("{}.html", output_prefix);
+    let html_path = match &output_dir {
+        Some(dir) => dir.join(&html_file),
+        None => PathBuf::from(&html_file),
+    };
     fs::write(&html_path, &html).expect("Failed to write .html file");
-    eprintln!("Wrote {}", html_path);
+    eprintln!("Wrote {}", html_path.display());
 
     eprintln!("Done!");
 }
