@@ -16,7 +16,17 @@ pub trait ActorInterface: 'static + Send {
 /// but most systems are powerful, and this allows us to create a global map of
 /// actor processes in the future, without worrying about collision.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActorAddress(pub [u8; 32]);
+
+impl std::fmt::Display for ActorAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in &self.0[..8] {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\u{2026}")
+    }
+}
 impl ActorAddress {
     pub fn new_random() -> Self {
         let mut bytes = [0u8; 32];

@@ -1,0 +1,568 @@
+<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<title>swactor — dependency analysis</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#1a1a2e; color:#e0e0e0; font-family:system-ui,-apple-system,sans-serif; overflow:hidden; }
+
+/* ─── Tab bar ───────────────────────────────────────────────────────────── */
+.tab-bar { display:flex; align-items:center; height:42px; background:#12122a;
+           border-bottom:1px solid #2a2a5a; padding:0 16px; gap:8px; }
+.tab-bar .title { font-size:14px; font-weight:700; letter-spacing:0.5px; margin-right:18px;
+                  color:#8ab4f8; white-space:nowrap; }
+.tab { background:none; border:none; color:#888; font-size:13px; padding:8px 16px;
+       cursor:pointer; border-bottom:2px solid transparent; transition:color 0.15s; }
+.tab:hover { color:#ccc; }
+.tab.active { color:#e0e0e0; border-bottom-color:#4fc3f7; }
+
+/* ─── Tab content ───────────────────────────────────────────────────────── */
+.tab-content { display:none; }
+.tab-content.active { display:block; }
+
+/* ─── DAG tab ───────────────────────────────────────────────────────────── */
+#tab-dag { height:calc(100vh - 42px); overflow:hidden; position:relative; }
+#dag-viewport { width:100%; height:100%; cursor:grab; }
+#dag-viewport:active { cursor:grabbing; }
+#dag-viewport svg { display:block; }
+#dag-controls { position:absolute; top:12px; left:12px; z-index:10;
+                background:rgba(30,30,60,0.9); border-radius:8px; padding:10px 14px;
+                color:#ccc; font-size:13px; backdrop-filter:blur(8px); }
+#dag-controls button { background:#333; color:#fff; border:1px solid #555;
+                       border-radius:4px; padding:4px 10px; cursor:pointer; margin:0 3px; }
+#dag-controls button:hover { background:#555; }
+#dag-loading { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
+               color:#ccc; font-size:18px; }
+
+/* ─── Spectral tab ──────────────────────────────────────────────────────── */
+#tab-spectral { overflow-y:auto; max-height:calc(100vh - 42px); }
+
+.grid { display:grid; grid-template-columns:1fr 1fr; grid-template-rows:auto auto;
+        gap:16px; padding:16px 20px 20px; max-width:1600px; margin:0 auto; }
+
+.panel { background:#16213e; border-radius:10px; border:1px solid #2a2a5a;
+         padding:16px; position:relative; min-height:100px; }
+.panel h2 { font-size:14px; font-weight:600; margin-bottom:10px; color:#8ab4f8;
+            display:flex; align-items:center; gap:8px; }
+.panel h2 .icon { font-size:16px; }
+.panel svg { width:100%; display:block; }
+
+.tooltip { position:fixed; background:rgba(22,33,62,0.96); border:1px solid #4fc3f7;
+           border-radius:6px; padding:8px 12px; font-size:12px; pointer-events:none;
+           z-index:100; backdrop-filter:blur(8px); max-width:300px;
+           box-shadow:0 4px 20px rgba(0,0,0,0.4); display:none; }
+.tooltip .tt-label { font-weight:600; color:#4fc3f7; }
+.tooltip .tt-val { color:#e0e0e0; }
+
+svg text { user-select:none; }
+
+/* Metrics panel */
+.metrics-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px 20px; }
+.metric-item { display:flex; justify-content:space-between; font-size:12px;
+               padding:4px 8px; border-radius:4px; }
+.metric-item:hover { background:rgba(79,195,247,0.08); }
+.metric-label { opacity:0.7; }
+.metric-value { font-weight:600; font-family:'SF Mono',monospace; }
+.cci-box { grid-column:1/-1; text-align:center; margin-top:10px; padding:14px;
+           border-radius:8px; background:rgba(0,0,0,0.25); border:1px solid #333; }
+.cci-score { font-size:32px; font-weight:700; }
+.cci-label { font-size:14px; margin-top:2px; }
+.cci-desc { font-size:11px; opacity:0.6; margin-top:4px; }
+
+.sub-header { font-size:11px; font-weight:600; text-transform:uppercase;
+              letter-spacing:1px; opacity:0.4; margin:8px 0 4px; grid-column:1/-1; }
+
+/* Heatmap */
+.hm-cell { cursor:pointer; transition:opacity 0.15s; }
+.hm-cell:hover { opacity:0.8; stroke:#4fc3f7; stroke-width:2; }
+
+/* Cohesion / heatmap bars */
+.fi-bar { cursor:pointer; transition:opacity 0.15s; }
+.fi-bar:hover { opacity:0.85; }
+</style>
+</head>
+<body>
+
+<div class="tab-bar">
+  <div class="title">swactor &mdash; dependency analysis</div>
+  <button class="tab active" data-tab="spectral">Spectral Analysis</button>
+  <button class="tab" data-tab="dag">Dependency DAG</button>
+</div>
+
+<div class="tab-content" id="tab-dag">
+  <div id="dag-controls">
+    <button onclick="zoomIn()">+</button>
+    <button onclick="zoomOut()">&minus;</button>
+    <button onclick="resetView()">fit</button>
+    <span style="margin-left:8px;opacity:0.6">scroll to zoom &middot; drag to pan &middot; click node to focus</span>
+  </div>
+  <div id="dag-viewport"></div>
+  <div id="dag-loading">Loading Graphviz&hellip;</div>
+</div>
+
+<div class="tab-content active" id="tab-spectral">
+  <div class="grid">
+    <div class="panel" id="panel-structural">
+      <h2><span class="icon">&#x25C9;</span> Structural Properties</h2>
+      <div id="structural-content"></div>
+    </div>
+
+    <div class="panel" id="panel-cohesion">
+      <h2><span class="icon">&#x25A8;</span> Module Cohesion</h2>
+      <svg id="svg-cohesion"></svg>
+    </div>
+
+    <div class="panel" id="panel-heatmap">
+      <h2><span class="icon">&#x25A6;</span> Module Coupling (directed edge counts)</h2>
+      <svg id="svg-heatmap"></svg>
+    </div>
+
+    <div class="panel" id="panel-metrics">
+      <h2><span class="icon">&#x2211;</span> Complexity Metrics</h2>
+      <div id="metrics-content"></div>
+    </div>
+  </div>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<!-- ─── Script 1: synchronous — data + tab switching + spectral panels ─── -->
+<script>
+// ─── Data ──────────────────────────────────────────────────────────────────
+const DATA = {"structural": {"avg_degree": 1.08, "max_fan_in": 2, "max_fan_in_node": "GossipState", "max_fan_out": 4, "max_fan_out_node": "GossipActor", "dag_depth": 5, "clustering_coeff": 0.1364, "avg_module_cohesion": 0.317, "avg_module_size": 3.0}, "cohesion": [{"module": "protocol", "cohesion": 0.2, "size": 5}, {"module": "trace", "cohesion": 0.25, "size": 5}, {"module": "sim", "cohesion": 0.5, "size": 2}], "coupling": {"modules": ["protocol", "trace", "report", "sim"], "matrix": [[4.0, 2.0, 0.0, 0.0], [1.0, 5.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0]]}, "metrics": {"n_nodes": 12, "n_edges": 13, "n_modules": 4, "connected_components": 3, "algebraic_connectivity": 0.0, "normalized_algebraic_connectivity": 0.0, "spectral_entropy": 2.9643, "normalized_spectral_entropy": 0.9351, "edge_density": 0.0985, "cross_module_ratio": 0.2308, "spectral_radius": 2.8046, "normalized_spectral_radius": 0.255, "cci": 0.333, "cci_label": "MODERATE", "cci_color": "#ff9800", "cci_desc": "typical well-structured codebase"}, "module_colors": {"protocol": "#1565c0", "trace": "#c62828", "sim": "#7b1fa2"}};
+const { structural, cohesion, coupling, metrics, module_colors } = DATA;
+
+// ─── Tab switching ─────────────────────────────────────────────────────────
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'dag') {
+      window.dispatchEvent(new Event('dag-visible'));
+    }
+  });
+});
+
+// ─── Tooltip ───────────────────────────────────────────────────────────────
+const TT = document.getElementById('tooltip');
+function showTip(evt, html) {
+  TT.innerHTML = html;
+  TT.style.display = 'block';
+  const x = evt.clientX + 14, y = evt.clientY - 10;
+  TT.style.left = Math.min(x, window.innerWidth - TT.offsetWidth - 20) + 'px';
+  TT.style.top = Math.min(y, window.innerHeight - TT.offsetHeight - 20) + 'px';
+}
+function hideTip() { TT.style.display = 'none'; }
+
+function modColor(mod) { return module_colors[mod] || '#9e9e9e'; }
+
+// ─── Structural Properties ────────────────────────────────────────────────
+(function() {
+  const c = document.getElementById('structural-content');
+  const s = structural;
+  c.innerHTML = `
+    <div class="metrics-grid">
+      <div class="sub-header">Density &amp; Depth</div>
+      <div class="metric-item"><span class="metric-label">Edges/node (avg degree)</span><span class="metric-value">${s.avg_degree}</span></div>
+      <div class="metric-item"><span class="metric-label">DAG depth</span><span class="metric-value">${s.dag_depth}</span></div>
+      <div class="metric-item"><span class="metric-label">Clustering coefficient</span><span class="metric-value">${s.clustering_coeff}</span></div>
+      <div class="metric-item"><span class="metric-label">Avg module size</span><span class="metric-value">${s.avg_module_size}</span></div>
+
+      <div class="sub-header">Dependency Hotspots</div>
+      <div class="metric-item"><span class="metric-label">Max fan-in</span><span class="metric-value">${s.max_fan_in} &larr; ${s.max_fan_in_node}</span></div>
+      <div class="metric-item"><span class="metric-label">Max fan-out</span><span class="metric-value">${s.max_fan_out} &rarr; ${s.max_fan_out_node}</span></div>
+
+      <div class="sub-header">Cohesion</div>
+      <div class="metric-item"><span class="metric-label">Avg module cohesion</span><span class="metric-value">${s.avg_module_cohesion}</span></div>
+      <div class="metric-item"><span class="metric-label">Cross-module ratio</span><span class="metric-value">${(metrics.cross_module_ratio*100).toFixed(1)}%</span></div>
+    </div>
+  `;
+})();
+
+// ─── Module Cohesion ──────────────────────────────────────────────────────
+(function() {
+  const svg = document.getElementById('svg-cohesion');
+  const n = cohesion.length;
+  if (n === 0) return;
+  const barH = Math.max(20, Math.min(36, 300/n));
+  const W = 560, H = Math.max(200, n*barH + 60), M = {t:10,r:30,b:30,l:120};
+  const w = W-M.l-M.r, h = H-M.t-M.b;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  const xScale = v => M.l + v * w;
+  const yScale = i => M.t + (i/n) * h + barH/2;
+
+  // Background grid
+  for (const tick of [0.25, 0.5, 0.75, 1.0]) {
+    const x = xScale(tick);
+    const line = document.createElementNS('http://www.w3.org/2000/svg','line');
+    Object.entries({x1:x,x2:x,y1:M.t,y2:M.t+h,stroke:'#2a2a5a','stroke-width':0.5}).forEach(([k,v])=>line.setAttribute(k,v));
+    svg.appendChild(line);
+    const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+    txt.setAttribute('x', x); txt.setAttribute('y', H-8);
+    txt.setAttribute('text-anchor','middle'); txt.setAttribute('fill','#666'); txt.setAttribute('font-size','10');
+    txt.textContent = (tick*100).toFixed(0) + '%';
+    svg.appendChild(txt);
+  }
+
+  // Average line
+  const avgX = xScale(structural.avg_module_cohesion);
+  const avgLine = document.createElementNS('http://www.w3.org/2000/svg','line');
+  Object.entries({x1:avgX,x2:avgX,y1:M.t,y2:M.t+h,stroke:'#ff4444','stroke-width':1.5,'stroke-dasharray':'5,3','stroke-opacity':0.7}).forEach(([k,v])=>avgLine.setAttribute(k,v));
+  svg.appendChild(avgLine);
+  const avgLbl = document.createElementNS('http://www.w3.org/2000/svg','text');
+  avgLbl.setAttribute('x', avgX+4); avgLbl.setAttribute('y', M.t+10);
+  avgLbl.setAttribute('fill','#ff4444'); avgLbl.setAttribute('font-size','9'); avgLbl.setAttribute('opacity','0.8');
+  avgLbl.textContent = 'avg';
+  svg.appendChild(avgLbl);
+
+  cohesion.forEach((d, i) => {
+    const barW = Math.max(d.cohesion * w, 2);
+    const y = yScale(i) - barH*0.35;
+    const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
+    rect.setAttribute('x', M.l); rect.setAttribute('y', y);
+    rect.setAttribute('width', barW); rect.setAttribute('height', barH*0.7);
+    rect.setAttribute('rx', 3);
+    rect.setAttribute('fill', modColor(d.module));
+    rect.setAttribute('opacity', 0.85);
+    rect.classList.add('fi-bar');
+    rect.addEventListener('mousemove', e => showTip(e,
+      `<span class="tt-label">${d.module}</span><br>` +
+      `Types: <span class="tt-val">${d.size}</span><br>` +
+      `Cohesion: <span class="tt-val">${(d.cohesion*100).toFixed(1)}%</span>`
+    ));
+    rect.addEventListener('mouseleave', hideTip);
+    svg.appendChild(rect);
+
+    // Value label on bar
+    const valTxt = document.createElementNS('http://www.w3.org/2000/svg','text');
+    valTxt.setAttribute('x', M.l + barW + 6); valTxt.setAttribute('y', yScale(i)+4);
+    valTxt.setAttribute('fill','#ccc'); valTxt.setAttribute('font-size','10'); valTxt.setAttribute('font-weight','600');
+    valTxt.textContent = (d.cohesion*100).toFixed(0) + '%';
+    svg.appendChild(valTxt);
+
+    // Module label
+    const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+    txt.setAttribute('x', M.l-8); txt.setAttribute('y', yScale(i)+4);
+    txt.setAttribute('text-anchor','end'); txt.setAttribute('fill', modColor(d.module));
+    txt.setAttribute('font-size','11'); txt.setAttribute('font-weight','600');
+    txt.textContent = `${d.module} (${d.size})`;
+    svg.appendChild(txt);
+  });
+})();
+
+// ─── Module Coupling Heatmap ───────────────────────────────────────────────
+(function() {
+  const mods = coupling.modules;
+  const mat = coupling.matrix;
+  const n = mods.length;
+  const svg = document.getElementById('svg-heatmap');
+  const cellSz = Math.min(55, 400/n);
+  const M = {t:10,r:60,b:80,l:100};
+  const W = M.l + n*cellSz + M.r, H = M.t + n*cellSz + M.b;
+  svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+
+  const maxVal = Math.max(...mat.flat(), 1);
+
+  // Color scale: 0=transparent dark, max=deep red
+  function heatColor(v) {
+    if (v === 0) return '#1a1a2e';
+    const t = v / maxVal;
+    const r = Math.round(40 + 215*t);
+    const g = Math.round(30 + 40*(1-t));
+    const b = Math.round(50*(1-t));
+    return `rgb(${r},${g},${b})`;
+  }
+
+  for (let i = 0; i < n; i++) {
+    // Row labels
+    const rl = document.createElementNS('http://www.w3.org/2000/svg','text');
+    rl.setAttribute('x', M.l-8); rl.setAttribute('y', M.t + i*cellSz + cellSz/2 + 4);
+    rl.setAttribute('text-anchor','end'); rl.setAttribute('fill', modColor(mods[i]));
+    rl.setAttribute('font-size','11'); rl.setAttribute('font-weight','600');
+    rl.textContent = mods[i];
+    svg.appendChild(rl);
+
+    // Column labels
+    const cl = document.createElementNS('http://www.w3.org/2000/svg','text');
+    cl.setAttribute('x', M.l + i*cellSz + cellSz/2);
+    cl.setAttribute('y', M.t + n*cellSz + 16);
+    cl.setAttribute('text-anchor','end'); cl.setAttribute('fill', modColor(mods[i]));
+    cl.setAttribute('font-size','11'); cl.setAttribute('font-weight','600');
+    cl.setAttribute('transform', `rotate(-45, ${M.l + i*cellSz + cellSz/2}, ${M.t + n*cellSz + 16})`);
+    cl.textContent = mods[i];
+    svg.appendChild(cl);
+
+    for (let j = 0; j < n; j++) {
+      const v = mat[i][j];
+      const rect = document.createElementNS('http://www.w3.org/2000/svg','rect');
+      rect.setAttribute('x', M.l + j*cellSz + 1);
+      rect.setAttribute('y', M.t + i*cellSz + 1);
+      rect.setAttribute('width', cellSz-2); rect.setAttribute('height', cellSz-2);
+      rect.setAttribute('rx', 3);
+      rect.setAttribute('fill', heatColor(v));
+      rect.classList.add('hm-cell');
+      rect.addEventListener('mousemove', e => showTip(e,
+        `<span class="tt-label">${mods[i]} &rarr; ${mods[j]}</span><br>` +
+        `Edges: <span class="tt-val">${v}</span>` +
+        (i !== j ? '<br><span style="opacity:0.6">cross-module</span>' : '<br><span style="opacity:0.6">intra-module</span>')
+      ));
+      rect.addEventListener('mouseleave', hideTip);
+      svg.appendChild(rect);
+
+      // Cell text
+      if (v > 0) {
+        const txt = document.createElementNS('http://www.w3.org/2000/svg','text');
+        txt.setAttribute('x', M.l + j*cellSz + cellSz/2);
+        txt.setAttribute('y', M.t + i*cellSz + cellSz/2 + 4);
+        txt.setAttribute('text-anchor','middle'); txt.setAttribute('font-size','11');
+        txt.setAttribute('font-weight','700'); txt.setAttribute('pointer-events','none');
+        txt.setAttribute('fill', v > maxVal*0.5 ? '#fff' : '#ccc');
+        txt.textContent = v;
+        svg.appendChild(txt);
+      }
+    }
+  }
+
+  // Axis labels
+  const srcL = document.createElementNS('http://www.w3.org/2000/svg','text');
+  srcL.setAttribute('x', 10); srcL.setAttribute('y', M.t + n*cellSz/2);
+  srcL.setAttribute('text-anchor','middle'); srcL.setAttribute('fill','#666');
+  srcL.setAttribute('font-size','10');
+  srcL.setAttribute('transform', `rotate(-90,10,${M.t + n*cellSz/2})`);
+  srcL.textContent = 'source module';
+  svg.appendChild(srcL);
+})();
+
+// ─── Metrics Panel ─────────────────────────────────────────────────────────
+(function() {
+  const c = document.getElementById('metrics-content');
+  const mm = metrics;
+  c.innerHTML = `
+    <div class="metrics-grid">
+      <div class="sub-header">Graph</div>
+      <div class="metric-item"><span class="metric-label">Nodes</span><span class="metric-value">${mm.n_nodes}</span></div>
+      <div class="metric-item"><span class="metric-label">Directed edges</span><span class="metric-value">${mm.n_edges}</span></div>
+      <div class="metric-item"><span class="metric-label">Modules</span><span class="metric-value">${mm.n_modules}</span></div>
+      <div class="metric-item"><span class="metric-label">Components</span><span class="metric-value">${mm.connected_components}</span></div>
+
+      <div class="sub-header">Spectral</div>
+      <div class="metric-item"><span class="metric-label">&lambda;<sub>2</sub> (alg. connectivity)</span><span class="metric-value">${mm.algebraic_connectivity}</span></div>
+      <div class="metric-item"><span class="metric-label">&lambda;<sub>2</sub>/n (normalized)</span><span class="metric-value">${mm.normalized_algebraic_connectivity}</span></div>
+      <div class="metric-item"><span class="metric-label">Spectral entropy</span><span class="metric-value">${mm.spectral_entropy}</span></div>
+      <div class="metric-item"><span class="metric-label">Norm. entropy</span><span class="metric-value">${mm.normalized_spectral_entropy}</span></div>
+      <div class="metric-item"><span class="metric-label">Spectral radius</span><span class="metric-value">${mm.spectral_radius}</span></div>
+      <div class="metric-item"><span class="metric-label">Norm. radius</span><span class="metric-value">${mm.normalized_spectral_radius}</span></div>
+
+      <div class="sub-header">Coupling</div>
+      <div class="metric-item"><span class="metric-label">Edge density</span><span class="metric-value">${mm.edge_density}</span></div>
+      <div class="metric-item"><span class="metric-label">Cross-module ratio</span><span class="metric-value">${(mm.cross_module_ratio*100).toFixed(1)}%</span></div>
+
+      <div class="cci-box">
+        <div class="cci-score" style="color:${mm.cci_color}">CCI = ${mm.cci}</div>
+        <div class="cci-label" style="color:${mm.cci_color}">${mm.cci_label}</div>
+        <div class="cci-desc">${mm.cci_desc}</div>
+      </div>
+    </div>
+  `;
+})();
+</script>
+
+<!-- ─── Script 2: module — viz-js DAG rendering (async) ─────────────────── -->
+<script type="module">
+import { instance } from 'https://cdn.jsdelivr.net/npm/@viz-js/viz@3.11.0/lib/viz-standalone.mjs';
+
+const DOT_SOURCE = `digraph swactor {
+    rankdir=LR;
+    fontname="Helvetica";
+    fontsize=14;
+    node [fontname="Helvetica", fontsize=11, style=filled, shape=record];
+    edge [fontname="Helvetica", fontsize=9];
+    label="swactor — internal dependency DAG";
+    labelloc=t;
+    compound=true;
+    newrank=true;
+    splines=ortho;
+
+    subgraph cluster_protocol {
+        label="protocol";
+        style="rounded,filled"; fillcolor="#e3f2fd"; color="#1565c0";
+        VersionedValue [label="{VersionedValue|value: Vec\\<u8\\>\\nversion: u64}", fillcolor="#bbdefb"];
+        GossipState [label="{GossipState|entries: HashMap\\<String, VersionedValue\\>}", fillcolor="#bbdefb"];
+        GossipQueryResponse [label="{GossipQueryResponse|key: String\\nvalue: Option\\<Vec\\<u8\\>\\>\\nversion: Option\\<u64\\>}", fillcolor="#bbdefb"];
+        GossipMessage [label="{«enum» GossipMessage|AddPeer (ActorAddress)\\nRemovePeer (ActorAddress)\\nSet \\{ key: String, value: Vec\\<u8\\> \\}\\nDoGossipRound\\nPush \\{ from: ActorAddress, state: GossipState \\}\\nQuery \\{ key: String, reply_to: ActorAddress \\}\\nTakeSnapshot}", fillcolor="#bbdefb"];
+        GossipActor [label="{GossipActor|state: GossipState\\npeers: Vec\\<ActorAddress\\>\\ntrace: Option\\<TraceContext\\>}", fillcolor="#bbdefb"];
+    }
+    subgraph cluster_trace {
+        label="trace";
+        style="rounded,filled"; fillcolor="#fce4ec"; color="#c62828";
+        TraceContext [label="{TraceContext|event_log: EventLog\\ntick_counter: TickCounter\\nname_registry: NameRegistry}", fillcolor="#ffcdd2"];
+        GossipEvent [label="{GossipEvent|tick: u64\\nnode_name: String\\nnode_addr: ActorAddress\\nkind: GossipEventKind}", fillcolor="#ffcdd2"];
+        GossipEventKind [label="{«enum» GossipEventKind|LocalSet \\{ key: String \\}\\nGossipRoundStarted \\{ target_name: String \\}\\nGossipRoundNoPeers\\nPushReceived \\{ from_name: String, keys_updated: usize \\}\\nQueryReceived \\{ key: String \\}\\nPeerAdded \\{ peer_name: String \\}\\nPeerRemoved \\{ peer_name: String \\}\\nStateSnapshot \\{ snapshot: NodeSnapshot \\}}", fillcolor="#ffcdd2"];
+        NodeSnapshot [label="{NodeSnapshot|entries: HashMap\\<String, VersionedValue\\>\\npeer_count: usize}", fillcolor="#ffcdd2"];
+        SimulationTrace [label="{SimulationTrace|name: String\\nnode_names: Vec\\<String\\>\\nnode_addrs: Vec\\<ActorAddress\\>\\ntopology_edges: Vec\\<(String, String)\\>\\nevents: Vec\\<GossipEvent\\>\\nsnapshots_per_round: Vec\\<Vec\\<(String, NodeSnapshot)\\>\\>\\nnum_rounds: usize\\ntotal_keys: usize}", fillcolor="#ffcdd2"];
+    }
+    subgraph cluster_report {
+        label="report";
+        style="rounded,filled"; fillcolor="#fff3e0"; color="#e65100";
+    }
+    subgraph cluster_sim {
+        label="sim";
+        style="rounded,filled"; fillcolor="#f3e5f5"; color="#7b1fa2";
+        Topology [label="{«enum» Topology|Ring\\nStar\\nFullMesh\\nChain\\nPartitioned}", fillcolor="#e1bee7"];
+        SimConfig [label="{SimConfig|name: String\\ntopology: Topology\\nnum_nodes: usize\\ninitial_data: Vec\\<(String, Vec\\<u8\\>)\\>\\nnum_rounds: usize\\nticks_per_round: usize\\nheal_after_round: Option\\<usize\\>}", fillcolor="#e1bee7"];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  INTRA-MODULE EDGES (within same cluster)
+    // ═══════════════════════════════════════════════════════════════════
+
+    GossipState -> VersionedValue [label="entries", style=dashed, color="#1565c0", penwidth=1];
+    GossipMessage -> GossipState [label="Push", style=dashed, color="#1565c0", penwidth=1];
+    GossipActor -> GossipState [label="state", style=dashed, color="#1565c0", penwidth=1];
+    GossipActor -> GossipMessage [label="handle() param", style=dashed, color="#1565c0", penwidth=1];
+    GossipEvent -> GossipEventKind [label="kind", style=dashed, color="#c62828", penwidth=1];
+    GossipEventKind -> NodeSnapshot [label="StateSnapshot", style=dashed, color="#c62828", penwidth=1];
+    SimulationTrace -> GossipEvent [label="events", style=dashed, color="#c62828", penwidth=1];
+    SimulationTrace -> NodeSnapshot [label="snapshots_per_round", style=dashed, color="#c62828", penwidth=1];
+    TraceContext -> GossipEvent [label="record_event() param", style=dashed, color="#c62828", penwidth=1];
+    SimConfig -> Topology [label="topology", style=dashed, color="#7b1fa2", penwidth=1];
+
+    // ═══════════════════════════════════════════════════════════════════
+    //  CROSS-MODULE EDGES  (the real dependency DAG)
+    // ═══════════════════════════════════════════════════════════════════
+
+    // --- protocol depends on trace ---
+    GossipActor -> TraceContext [label="trace", style=solid, color="#1565c0", penwidth=1.5];
+    GossipActor -> GossipEventKind [label="record() param", style=solid, color="#1565c0", penwidth=1.5];
+
+    // --- trace depends on protocol ---
+    NodeSnapshot -> VersionedValue [label="entries", style=solid, color="#c62828", penwidth=1.5];
+}
+`;
+
+const viz = await instance();
+const svg = viz.renderSVGElement(DOT_SOURCE);
+document.getElementById('dag-loading').remove();
+
+const vp = document.getElementById('dag-viewport');
+vp.appendChild(svg);
+
+// ─── Dark-mode SVG recoloring ──────────────────────────────────────────────
+svg.querySelectorAll('polygon[fill="white"]').forEach(el => el.setAttribute('fill','#1a1a2e'));
+svg.querySelectorAll('.graph > text').forEach(el => el.setAttribute('fill','#e0e0e0'));
+svg.querySelectorAll('.cluster > text').forEach(el => el.setAttribute('fill','#1a1a1a'));
+svg.querySelectorAll('.edge text').forEach(el => el.setAttribute('fill','#ffb74d'));
+svg.querySelectorAll('.node text').forEach(el => el.setAttribute('fill','#1a1a1a'));
+
+// ─── Click-to-focus ────────────────────────────────────────────────────────
+const edges = svg.querySelectorAll('.edge');
+const nodes = svg.querySelectorAll('.node');
+const clusterChrome = [];
+svg.querySelectorAll('.cluster').forEach(c => {
+  c.querySelectorAll(':scope > path, :scope > polygon, :scope > text').forEach(el => clusterChrome.push(el));
+});
+
+const nodeByTitle = new Map();
+nodes.forEach(n => {
+  const t = n.querySelector('title');
+  if (t) nodeByTitle.set(t.textContent.trim(), n);
+});
+
+const nodeToClusterEls = new Map();
+svg.querySelectorAll('.cluster').forEach(cluster => {
+  const chrome = [...cluster.querySelectorAll(':scope > path, :scope > polygon, :scope > text')];
+  cluster.querySelectorAll('.node title').forEach(t => {
+    nodeToClusterEls.set(t.textContent.trim(), chrome);
+  });
+});
+
+const adj = new Map();
+edges.forEach(edge => {
+  const t = edge.querySelector('title');
+  if (!t) return;
+  const parts = t.textContent.trim().split('->').map(s => s.trim());
+  if (parts.length !== 2) return;
+  const [src, dst] = parts;
+  if (!adj.has(src)) adj.set(src, { edges: [], neighbors: new Set() });
+  if (!adj.has(dst)) adj.set(dst, { edges: [], neighbors: new Set() });
+  adj.get(src).edges.push(edge);
+  adj.get(src).neighbors.add(dst);
+  adj.get(dst).edges.push(edge);
+  adj.get(dst).neighbors.add(src);
+});
+
+const DIM = 0.08;
+let focused = null;
+
+function clearFocus() {
+  focused = null;
+  nodes.forEach(n => n.style.opacity = '');
+  edges.forEach(e => e.style.opacity = '');
+  clusterChrome.forEach(el => el.style.opacity = '');
+}
+
+function focusNode(title) {
+  if (focused === title) { clearFocus(); return; }
+  focused = title;
+  const info = adj.get(title) || { edges: [], neighbors: new Set() };
+  const connected = new Set([title, ...info.neighbors]);
+
+  nodes.forEach(n => n.style.opacity = DIM);
+  edges.forEach(e => e.style.opacity = DIM);
+  clusterChrome.forEach(el => el.style.opacity = DIM);
+
+  connected.forEach(name => {
+    const el = nodeByTitle.get(name);
+    if (el) el.style.opacity = 1;
+  });
+
+  info.edges.forEach(e => e.style.opacity = 1);
+
+  const seen = new Set();
+  connected.forEach(name => {
+    const chrome = nodeToClusterEls.get(name);
+    if (chrome) chrome.forEach(el => {
+      if (!seen.has(el)) { seen.add(el); el.style.opacity = 1; }
+    });
+  });
+}
+
+nodes.forEach(node => {
+  node.style.cursor = 'pointer';
+  node.addEventListener('click', e => {
+    e.stopPropagation();
+    const t = node.querySelector('title');
+    if (t) focusNode(t.textContent.trim());
+  });
+});
+
+// ─── Pan & zoom ────────────────────────────────────────────────────────────
+let scale = 1, tx = 0, ty = 0, dragging = false, didDrag = false, sx = 0, sy = 0;
+function applyTransform() { svg.style.transform = `translate(${tx}px,${ty}px) scale(${scale})`; svg.style.transformOrigin = '0 0'; }
+
+window.resetView = function() {
+  const vw = vp.clientWidth, vh = vp.clientHeight;
+  const bb = svg.getBBox();
+  scale = Math.min(vw / bb.width, vh / bb.height) * 0.92;
+  tx = (vw - bb.width * scale) / 2;
+  ty = (vh - bb.height * scale) / 2;
+  applyTransform();
+};
+let dagFitted = false;
+window.addEventListener('dag-visible', () => {
+  if (!dagFitted) { dagFitted = true; requestAnimationFrame(resetView); }
+});
+
+window.zoomIn = function() { scale *= 1.3; applyTransform(); };
+window.zoomOut = function() { scale *= 0.7; applyTransform(); };
+
+vp.addEventListener('wheel', e => { e.preventDefault(); const f = e.deltaY < 0 ? 1.12 : 0.89; const rect = vp.getBoundingClientRect(); const mx = e.clientX - rect.left; const my = e.clientY - rect.top; tx = mx - f * (mx - tx); ty = my - f * (my - ty); scale *= f; applyTransform(); }, { passive:false });
+vp.addEventListener('pointerdown', e => { dragging=true; didDrag=false; sx=e.clientX-tx; sy=e.clientY-ty; vp.setPointerCapture(e.pointerId); });
+vp.addEventListener('pointermove', e => { if(!dragging) return; didDrag=true; tx=e.clientX-sx; ty=e.clientY-sy; applyTransform(); });
+vp.addEventListener('pointerup', () => dragging=false);
+vp.addEventListener('click', e => { if (!didDrag && !e.target.closest('.node')) clearFocus(); });
+</script>
+</body></html>

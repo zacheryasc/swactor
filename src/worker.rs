@@ -13,7 +13,7 @@ use crate::Error;
 
 /// A worker owns a set of actors and runs them in a loop.
 pub(crate) struct Worker {
-    id: WorkerId,
+    pub(crate) id: WorkerId,
     pub(crate) pool: ActorPool,
     transfer_rx: Receiver<Envelope>,
     spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,

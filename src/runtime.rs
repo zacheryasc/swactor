@@ -215,17 +215,21 @@ impl Runtime {
 
         for mut worker in workers {
             let rt_clone = rt.clone();
-            let handle = thread::spawn(move || {
-                let tc = TickContext {
-                    address_map: &rt_clone.address_map,
-                    transfer_txs: &rt_clone.transfer_txs,
-                    spawn_txs: &rt_clone.spawn_txs,
-                    placement: &rt_clone.placement,
-                    inbox_registry: &rt_clone.inbox_registry,
-                    config: &rt_clone.config,
-                };
-                worker.run(&tc, &rt_clone.is_running);
-            });
+            let name = format!("swactor-worker-{}", worker.id.0);
+            let handle = thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    let tc = TickContext {
+                        address_map: &rt_clone.address_map,
+                        transfer_txs: &rt_clone.transfer_txs,
+                        spawn_txs: &rt_clone.spawn_txs,
+                        placement: &rt_clone.placement,
+                        inbox_registry: &rt_clone.inbox_registry,
+                        config: &rt_clone.config,
+                    };
+                    worker.run(&tc, &rt_clone.is_running);
+                })
+                .expect("failed to spawn worker thread");
             handles.push(handle);
         }
 
