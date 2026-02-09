@@ -10,7 +10,7 @@ use crate::actor::{ActorAddress, AnyActor, Ctx};
 use crate::channel::Receiver;
 use crate::config::RuntimeConfig;
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
-use crate::stats::WorkerStats;
+use crate::stats::{MailboxSnapshot, WorkerStats};
 
 use crate::worker::Worker;
 
@@ -68,7 +68,8 @@ impl Env {
         let tc_spawn = spawn_rx.new_sender();
 
         let stats = Arc::new(WorkerStats::new());
-        let worker = Worker::new(WorkerId(0), transfer_rx, spawn_rx, stats.clone());
+        let mbox_snap = Arc::new(std::sync::Mutex::new(MailboxSnapshot::new()));
+        let worker = Worker::new(WorkerId(0), transfer_rx, spawn_rx, stats.clone(), mbox_snap);
 
         Self {
             worker,
@@ -385,7 +386,8 @@ fn run_loop_stops_on_shutdown() {
     let spawn_tx = spawn_rx.new_sender();
 
     let stats = Arc::new(WorkerStats::new());
-    let mut worker = Worker::new(WorkerId(0), transfer_rx, spawn_rx, stats);
+    let mbox_snap = Arc::new(std::sync::Mutex::new(MailboxSnapshot::new()));
+    let mut worker = Worker::new(WorkerId(0), transfer_rx, spawn_rx, stats, mbox_snap);
 
     let is_running = AtomicBool::new(false);
     let address_map = AddressMap::new();

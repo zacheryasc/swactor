@@ -1,0 +1,229 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 900" font-family="system-ui, sans-serif">
+  <defs>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-gray" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#5f6368">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#34a853">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#ea4335">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#4285f4">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="900" rx="8" fill="#f8f9fb" stroke="#e0e3e8" stroke-width="1.5"/>
+
+  <!-- Title -->
+  <text x="600" y="40" text-anchor="middle" font-size="20" font-weight="bold" fill="#202124">Runtime Lifecycle</text>
+  <text x="600" y="60" text-anchor="middle" font-size="12" fill="#5f6368">src/runtime.rs · src/worker.rs · src/config.rs</text>
+
+  <!-- ============================================ -->
+  <!-- SECTION 1: CONSTRUCTION -->
+  <!-- ============================================ -->
+  <rect x="30" y="80" width="1140" height="145" rx="6" fill="#e8f0fe" fill-opacity="0.18" stroke="#4285f4" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="50" y="102" font-size="13" font-weight="700" fill="#4285f4" letter-spacing="1">CONSTRUCTION</text>
+  <text x="1140" y="102" text-anchor="end" font-size="10" fill="#9aa0a6">runtime.rs:80-122</text>
+
+  <!-- Step 1: Runtime::new -->
+  <rect x="55" y="118" width="175" height="50" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="142" y="140" text-anchor="middle" font-size="12" font-weight="600" fill="#1a73e8">Runtime::new(config)</text>
+  <text x="142" y="156" text-anchor="middle" font-size="10" fill="#5f6368">parse RuntimeConfig</text>
+
+  <line x1="230" y1="143" x2="285" y2="143" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step 2: Create Workers -->
+  <rect x="290" y="118" width="175" height="50" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="377" y="140" text-anchor="middle" font-size="12" font-weight="600" fill="#137333">Create Workers</text>
+  <text x="377" y="156" text-anchor="middle" font-size="10" fill="#5f6368">N per config.workers</text>
+
+  <line x1="465" y1="143" x2="520" y2="143" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step 3: Allocate Channels -->
+  <rect x="525" y="118" width="195" height="50" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="622" y="138" text-anchor="middle" font-size="12" font-weight="600" fill="#e37400">Allocate Channels</text>
+  <text x="622" y="154" text-anchor="middle" font-size="10" fill="#5f6368">transfer_tx/rx + spawn_tx/rx</text>
+  <text x="622" y="165" text-anchor="middle" font-size="9" fill="#9aa0a6">per worker</text>
+
+  <line x1="720" y1="143" x2="775" y2="143" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step 4: Init Shared State -->
+  <rect x="780" y="118" width="195" height="50" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="877" y="138" text-anchor="middle" font-size="12" font-weight="600" fill="#1a73e8">Init Shared State</text>
+  <text x="877" y="155" text-anchor="middle" font-size="10" fill="#5f6368">AddressMap, InboxRegistry,</text>
+  <text x="877" y="165" text-anchor="middle" font-size="9" fill="#5f6368">Placement</text>
+
+  <!-- Arrow from construction down to tick cycle -->
+  <line x1="600" y1="195" x2="600" y2="245" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="612" y="222" font-size="10" fill="#5f6368">ready</text>
+
+  <!-- ============================================ -->
+  <!-- SECTION 2: TICK CYCLE -->
+  <!-- ============================================ -->
+  <rect x="30" y="250" width="1140" height="280" rx="6" fill="#e6f4ea" fill-opacity="0.15" stroke="#34a853" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="50" y="272" font-size="13" font-weight="700" fill="#34a853" letter-spacing="1">TICK CYCLE</text>
+  <text x="1140" y="272" text-anchor="end" font-size="10" fill="#9aa0a6">worker.rs:40-96</text>
+
+  <!-- Phase boxes - row of 6 -->
+  <!-- Phase 1 -->
+  <rect x="55" y="295" width="155" height="80" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <circle cx="75" cy="311" r="12" fill="#4285f4"/>
+  <text x="75" y="316" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">1</text>
+  <text x="132" y="316" text-anchor="middle" font-size="12" font-weight="600" fill="#1a73e8">Drain Spawns</text>
+  <text x="132" y="335" text-anchor="middle" font-size="10" fill="#5f6368">spawn_rx →</text>
+  <text x="132" y="349" text-anchor="middle" font-size="10" fill="#5f6368">pool.insert()</text>
+  <text x="132" y="366" text-anchor="middle" font-size="9" fill="#9aa0a6">new actors join</text>
+
+  <line x1="210" y1="335" x2="240" y2="335" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Phase 2 -->
+  <rect x="245" y="295" width="155" height="80" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <circle cx="265" cy="311" r="12" fill="#f9ab00"/>
+  <text x="265" y="316" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">2</text>
+  <text x="322" y="316" text-anchor="middle" font-size="12" font-weight="600" fill="#e37400">Drain Transfers</text>
+  <text x="322" y="335" text-anchor="middle" font-size="10" fill="#5f6368">transfer_rx →</text>
+  <text x="322" y="349" text-anchor="middle" font-size="10" fill="#5f6368">pool.deliver()</text>
+  <text x="322" y="366" text-anchor="middle" font-size="9" fill="#9aa0a6">cross-worker msgs</text>
+
+  <line x1="400" y1="335" x2="430" y2="335" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Phase 3 -->
+  <rect x="435" y="295" width="155" height="80" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <circle cx="455" cy="311" r="12" fill="#34a853"/>
+  <text x="455" y="316" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">3</text>
+  <text x="512" y="316" text-anchor="middle" font-size="12" font-weight="600" fill="#137333">tick_all()</text>
+  <text x="512" y="335" text-anchor="middle" font-size="10" fill="#5f6368">pop_front → handle</text>
+  <text x="512" y="349" text-anchor="middle" font-size="10" fill="#5f6368">+ catch_unwind</text>
+  <text x="512" y="366" text-anchor="middle" font-size="9" fill="#9aa0a6">process messages</text>
+
+  <line x1="590" y1="335" x2="620" y2="335" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Phase 4 -->
+  <rect x="625" y="295" width="155" height="80" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <circle cx="645" cy="311" r="12" fill="#4285f4"/>
+  <text x="645" y="316" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">4</text>
+  <text x="712" y="316" text-anchor="middle" font-size="12" font-weight="600" fill="#1a73e8">Drain Spawns</text>
+  <text x="712" y="335" text-anchor="middle" font-size="10" fill="#5f6368">again: actors</text>
+  <text x="712" y="349" text-anchor="middle" font-size="10" fill="#5f6368">spawned in Phase 3</text>
+  <text x="712" y="366" text-anchor="middle" font-size="9" fill="#9aa0a6">handler-created</text>
+
+  <line x1="780" y1="335" x2="810" y2="335" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Phase 5 -->
+  <rect x="815" y="295" width="155" height="80" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <circle cx="835" cy="311" r="12" fill="#f9ab00"/>
+  <text x="835" y="316" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">5</text>
+  <text x="892" y="316" text-anchor="middle" font-size="12" font-weight="600" fill="#e37400">pending_local</text>
+  <text x="892" y="335" text-anchor="middle" font-size="10" fill="#5f6368">drain buffer →</text>
+  <text x="892" y="349" text-anchor="middle" font-size="10" fill="#5f6368">pool.deliver()</text>
+  <text x="892" y="366" text-anchor="middle" font-size="9" fill="#9aa0a6">same-worker msgs</text>
+
+  <line x1="970" y1="335" x2="1000" y2="335" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <!-- Phase 6 -->
+  <rect x="1005" y="295" width="145" height="80" rx="12" fill="#f1f3f4" stroke="#9aa0a6" stroke-width="1.8" filter="url(#shadow)"/>
+  <circle cx="1025" cy="311" r="12" fill="#9aa0a6"/>
+  <text x="1025" y="316" text-anchor="middle" font-size="11" fill="#fff" font-weight="bold">6</text>
+  <text x="1077" y="316" text-anchor="middle" font-size="12" font-weight="600" fill="#5f6368">Publish Stats</text>
+  <text x="1077" y="335" text-anchor="middle" font-size="10" fill="#5f6368">update atomics</text>
+  <text x="1077" y="349" text-anchor="middle" font-size="10" fill="#5f6368">WorkerStats</text>
+
+  <!-- Large curved loop-back arrow from Phase 6 back to Phase 1 -->
+  <path d="M 1077 375 Q 1077 430 900 445 Q 600 465 300 445 Q 132 430 132 395"
+        fill="none" stroke="#34a853" stroke-width="2.5" marker-end="url(#arrow-green)" stroke-dasharray="8,4"/>
+  <text x="600" y="470" text-anchor="middle" font-size="12" fill="#34a853" font-weight="600">next tick iteration</text>
+
+  <!-- tick_once label -->
+  <text x="600" y="510" text-anchor="middle" font-size="11" fill="#5f6368" font-style="italic">one call to tick_once() executes phases 1–6</text>
+
+  <!-- ============================================ -->
+  <!-- SECTION 3: EXECUTION MODES -->
+  <!-- ============================================ -->
+  <rect x="30" y="540" width="1140" height="330" rx="6" fill="#fef7e0" fill-opacity="0.12" stroke="#f9ab00" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="50" y="562" font-size="13" font-weight="700" fill="#e37400" letter-spacing="1">EXECUTION MODES</text>
+  <text x="1140" y="562" text-anchor="end" font-size="10" fill="#9aa0a6">runtime.rs:185-217</text>
+
+  <!-- Mode A: tick() -->
+  <rect x="55" y="580" width="520" height="200" rx="10" fill="#fff" stroke="#4285f4" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="55" y="580" width="520" height="32" rx="10" fill="#4285f4"/>
+  <rect x="55" y="600" width="520" height="12" fill="#4285f4"/>
+  <text x="315" y="601" text-anchor="middle" font-size="14" font-weight="bold" fill="#fff">tick() mode — single-threaded</text>
+
+  <!-- tick() flow -->
+  <rect x="80" y="630" width="170" height="42" rx="8" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.2"/>
+  <text x="165" y="648" text-anchor="middle" font-size="11" font-weight="600" fill="#1a73e8">user calls</text>
+  <text x="165" y="663" text-anchor="middle" font-size="11" font-weight="600" fill="#1a73e8">runtime.tick()</text>
+
+  <line x1="250" y1="651" x2="290" y2="651" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="295" y="630" width="170" height="42" rx="8" fill="#e6f4ea" stroke="#34a853" stroke-width="1.2"/>
+  <text x="380" y="648" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">iterate</text>
+  <text x="380" y="663" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">tick_workers</text>
+
+  <line x1="380" y1="672" x2="380" y2="700" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="295" y="705" width="170" height="42" rx="8" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.2"/>
+  <text x="380" y="723" text-anchor="middle" font-size="11" font-weight="600" fill="#e37400">w.tick_once()</text>
+  <text x="380" y="738" text-anchor="middle" font-size="10" fill="#5f6368">for each worker</text>
+
+  <!-- Loop arrow for tick_workers -->
+  <path d="M 465 726 Q 495 726 495 665 Q 495 651 465 651"
+        fill="none" stroke="#34a853" stroke-width="1.2" marker-end="url(#arrow-green)"/>
+  <text x="512" y="692" font-size="9" fill="#34a853">next</text>
+
+  <text x="165" y="756" font-size="10" fill="#5f6368">RefCell&lt;Vec&lt;Worker&gt;&gt; — stays on caller's thread</text>
+
+  <!-- Mode B: run() -->
+  <rect x="620" y="580" width="530" height="200" rx="10" fill="#fff" stroke="#34a853" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="620" y="580" width="530" height="32" rx="10" fill="#34a853"/>
+  <rect x="620" y="600" width="530" height="12" fill="#34a853"/>
+  <text x="885" y="601" text-anchor="middle" font-size="14" font-weight="bold" fill="#fff">run() mode — multi-threaded</text>
+
+  <!-- run() flow -->
+  <rect x="645" y="630" width="155" height="42" rx="8" fill="#e6f4ea" stroke="#34a853" stroke-width="1.2"/>
+  <text x="722" y="648" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">workers → threads</text>
+  <text x="722" y="663" text-anchor="middle" font-size="10" fill="#5f6368">std::thread::spawn</text>
+
+  <line x1="800" y1="651" x2="835" y2="651" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="840" y="630" width="155" height="42" rx="8" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.2"/>
+  <text x="917" y="648" text-anchor="middle" font-size="11" font-weight="600" fill="#1a73e8">while is_running</text>
+  <text x="917" y="663" text-anchor="middle" font-size="10" fill="#5f6368">{ tick_once(); backoff() }</text>
+
+  <line x1="1000" y1="651" x2="1035" y2="651" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="1040" y="636" width="90" height="30" rx="8" fill="#e6f4ea" stroke="#34a853" stroke-width="1.2"/>
+  <text x="1085" y="656" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">Handle</text>
+
+  <!-- Loop arrow -->
+  <path d="M 995 651 Q 1010 690 917 690 Q 850 690 840 672"
+        fill="none" stroke="#34a853" stroke-width="1.2" marker-end="url(#arrow-green)"/>
+  <text x="930" y="705" text-anchor="middle" font-size="9" fill="#34a853">loop</text>
+
+  <!-- Returns RuntimeHandle -->
+  <text x="722" y="700" font-size="10" fill="#5f6368">returns RuntimeHandle to caller</text>
+
+  <!-- Shutdown flow -->
+  <rect x="645" y="720" width="480" height="42" rx="8" fill="#fce8e6" stroke="#ea4335" stroke-width="1.2"/>
+  <text x="885" y="738" text-anchor="middle" font-size="12" font-weight="600" fill="#c5221f">Shutdown</text>
+  <text x="885" y="752" text-anchor="middle" font-size="10" fill="#ea4335">is_running.store(false) → worker loops exit → thread.join()</text>
+
+  <!-- Arrow from run loop to shutdown -->
+  <path d="M 917 672 Q 917 706 885 718"
+        fill="none" stroke="#ea4335" stroke-width="1.2" marker-end="url(#arrow-red)"/>
+
+  <!-- ============================================ -->
+  <!-- Bottom source refs and legend -->
+  <!-- ============================================ -->
+  <text x="600" y="885" text-anchor="middle" font-size="10" fill="#9aa0a6">runtime.rs:80-122 (new) · worker.rs:40-96 (tick_once) · worker.rs:98-120 (run loop) · runtime.rs:185-217 (run) · config.rs (BackoffPolicy)</text>
+</svg>

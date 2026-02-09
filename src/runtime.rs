@@ -9,7 +9,7 @@ use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, RuntimeConfig};
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
-use crate::stats::WorkerStats;
+use crate::stats::{ActorInfo, MailboxSnapshot, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
 pub use crate::stats::{RuntimeStats, WorkerInfo};
 use crate::worker::Worker;
@@ -66,6 +66,8 @@ pub struct Runtime {
     placement: Placement,
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
+    /// Per-worker mailbox snapshots, updated each tick by workers.
+    mailbox_snapshots: Vec<Arc<std::sync::Mutex<MailboxSnapshot>>>,
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
 }
@@ -91,6 +93,7 @@ impl Runtime {
         let mut transfer_txs = Vec::with_capacity(num_workers);
         let mut spawn_txs = Vec::with_capacity(num_workers);
         let mut worker_stats = Vec::with_capacity(num_workers);
+        let mut mailbox_snapshots = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
@@ -104,11 +107,13 @@ impl Runtime {
             spawn_txs.push(spawn_tx);
 
             let stats = Arc::new(WorkerStats::new());
+            let mbox_snap = Arc::new(std::sync::Mutex::new(MailboxSnapshot::new()));
             worker_stats.push(stats.clone());
-            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats));
+            mailbox_snapshots.push(mbox_snap.clone());
+            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats, mbox_snap));
         }
 
-        Self {
+        let rt = Self {
             config,
             address_map,
             inbox_registry,
@@ -117,8 +122,18 @@ impl Runtime {
             placement,
             is_running: AtomicBool::new(false),
             worker_stats,
+            mailbox_snapshots,
             tick_workers: RefCell::new(workers),
-        }
+        };
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            num_workers,
+            max_actors = rt.config.max_actors,
+            "runtime.created"
+        );
+
+        rt
     }
 
     /// Spawn an actor, returns its address
@@ -130,12 +145,24 @@ impl Runtime {
         self.spawn_txs[worker_id.as_usize()]
             .try_send((addr, boxed))
             .map_err(|_| Error::from("Runtime error: spawn queue full"))?;
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            actor_addr = %addr,
+            worker_id = worker_id.as_usize(),
+            "actor.spawned"
+        );
+
         Ok(addr)
     }
 
     /// Send a message to an actor address
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
         let msg_box: Box<dyn Any + Send> = Box::new(msg);
+
+        #[cfg(feature = "tracing")]
+        tracing::trace!(dest = %addr, "message.sent");
+
         match self.address_map.lookup(&addr) {
             Some(wid) => self.transfer_txs[wid.as_usize()]
                 .try_send(Envelope::new(addr, msg_box))
@@ -185,6 +212,9 @@ impl Runtime {
     pub fn run(self) -> Result<RuntimeHandle, Error> {
         self.is_running.store(true, Ordering::Release);
 
+        #[cfg(feature = "tracing")]
+        tracing::info!(num_workers = self.config.num_threads.max(1), "runtime.started");
+
         let workers: Vec<Worker> = self.tick_workers.replace(Vec::new());
 
         let rt = Arc::new(self);
@@ -232,6 +262,11 @@ impl Runtime {
                 num_actors: ws.num_actors.load(Ordering::Relaxed),
                 mailbox_depth: ws.total_mailbox_depth.load(Ordering::Relaxed),
                 messages_processed: ws.messages_processed.load(Ordering::Relaxed),
+                local_sends: ws.local_sends.load(Ordering::Relaxed),
+                cross_sends: ws.cross_sends.load(Ordering::Relaxed),
+                inbox_sends: ws.inbox_sends.load(Ordering::Relaxed),
+                type_mismatches: ws.type_mismatches.load(Ordering::Relaxed),
+                panics: ws.panics.load(Ordering::Relaxed),
             })
             .collect();
         let actors = self
@@ -240,15 +275,41 @@ impl Runtime {
             .into_iter()
             .map(|(addr, wid)| (addr, wid.as_usize()))
             .collect();
+
+        // Collect per-actor mailbox depth details
+        let mut actor_details = Vec::new();
+        for (wid, snap_lock) in self.mailbox_snapshots.iter().enumerate() {
+            let snap = snap_lock.lock().unwrap();
+            for &(addr, depth) in &snap.depths {
+                actor_details.push(ActorInfo {
+                    address: addr,
+                    worker_id: wid,
+                    mailbox_depth: depth,
+                });
+            }
+        }
+
+        // Drain tick timings from each worker
+        let tick_timings = self
+            .worker_stats
+            .iter()
+            .map(|ws| ws.drain_tick_timings())
+            .collect();
+
         RuntimeStats {
             num_workers,
             actors,
             workers,
+            actor_details,
+            tick_timings,
         }
     }
 
     /// Signal all workers to stop
     pub fn shutdown(&self) {
+        #[cfg(feature = "tracing")]
+        tracing::info!("runtime.shutdown");
+
         self.is_running.store(false, Ordering::Release);
     }
 }

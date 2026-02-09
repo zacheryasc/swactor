@@ -4,11 +4,12 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx};
 use crate::channel::Receiver;
 use crate::delivery::{Envelope, TickContext, WorkerId};
-use crate::stats::WorkerStats;
+use crate::stats::{MailboxSnapshot, TickTiming, WorkerStats};
 use crate::Error;
 
 /// A worker owns a set of actors and runs them in a loop.
@@ -18,6 +19,8 @@ pub(crate) struct Worker {
     transfer_rx: Receiver<Envelope>,
     spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
     stats: Arc<WorkerStats>,
+    /// Shared snapshot of per-actor mailbox depths, readable by Runtime::stats().
+    mailbox_snapshot: Arc<std::sync::Mutex<MailboxSnapshot>>,
 }
 
 impl Worker {
@@ -26,6 +29,7 @@ impl Worker {
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
         stats: Arc<WorkerStats>,
+        mailbox_snapshot: Arc<std::sync::Mutex<MailboxSnapshot>>,
     ) -> Self {
         Self {
             id,
@@ -33,18 +37,32 @@ impl Worker {
             transfer_rx,
             spawn_rx,
             stats,
+            mailbox_snapshot,
         }
     }
 
     /// Run one iteration of the worker loop. Returns `true` if any work was done.
     pub(crate) fn tick_once(&mut self, tc: &TickContext) -> bool {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::trace_span!("worker.tick", worker_id = self.id.0).entered();
+
         let mut did_work = false;
+        let t0 = Instant::now();
 
         // 1. Drain spawn queue → add actors to pool
+        #[cfg(feature = "tracing")]
+        let mut spawn_count: usize = 0;
         while let Some((addr, actor)) = self.spawn_rx.try_recv() {
             self.pool.insert(addr, actor);
+            #[cfg(feature = "tracing")]
+            { spawn_count += 1; }
             did_work = true;
         }
+        #[cfg(feature = "tracing")]
+        if spawn_count > 0 {
+            tracing::debug!(worker_id = self.id.0, count = spawn_count, "worker.spawns_drained");
+        }
+        let t1 = Instant::now();
 
         // 2. Drain transfer queue → deliver envelopes to actors
         while let Some(envelope) = self.transfer_rx.try_recv() {
@@ -53,6 +71,7 @@ impl Worker {
             self.pool.deliver(&dest, payload);
             did_work = true;
         }
+        let t2 = Instant::now();
 
         // 3. Tick all actors with WorkerContext
         let pending_local: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
@@ -64,11 +83,22 @@ impl Worker {
                 worker_id: self.id,
                 tc,
                 pending_local: &pending_local,
+                stats: &self.stats,
             };
-            processed = self.pool.tick_all(&worker_ctx);
+            processed = self.pool.tick_all(&worker_ctx, &self.stats);
             if processed > 0 {
                 did_work = true;
             }
+        }
+        let t3 = Instant::now();
+
+        #[cfg(feature = "tracing")]
+        if processed > 0 {
+            tracing::debug!(
+                worker_id = self.id.0,
+                messages_processed = processed,
+                "worker.tick_all"
+            );
         }
 
         // 4. Drain spawn queue again — actors spawned during step 3
@@ -77,6 +107,7 @@ impl Worker {
             self.pool.insert(addr, actor);
             did_work = true;
         }
+        let t4 = Instant::now();
 
         // 5. Drain pending_local buffer → deliver to local actors
         let pending = pending_local.into_inner();
@@ -86,16 +117,55 @@ impl Worker {
         for (addr, msg) in pending {
             self.pool.deliver(&addr, msg);
         }
+        let t5 = Instant::now();
 
         // 6. Publish stats
         self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
         self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
         self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
 
+        // Publish per-actor mailbox depths
+        {
+            let depths: Vec<(ActorAddress, usize)> = self.pool.mailbox_depths();
+            let mut snap = self.mailbox_snapshot.lock().unwrap();
+            snap.depths = depths;
+        }
+
+        let t6 = Instant::now();
+
+        // Record tick timing
+        let timing = TickTiming {
+            phase_us: [
+                t1.duration_since(t0).as_micros() as u64,
+                t2.duration_since(t1).as_micros() as u64,
+                t3.duration_since(t2).as_micros() as u64,
+                t4.duration_since(t3).as_micros() as u64,
+                t5.duration_since(t4).as_micros() as u64,
+                t6.duration_since(t5).as_micros() as u64,
+            ],
+            messages_processed: processed,
+            did_work,
+        };
+        self.stats.push_tick_timing(timing);
+
+        #[cfg(feature = "tracing")]
+        if did_work {
+            tracing::debug!(
+                worker_id = self.id.0,
+                num_actors = self.pool.len(),
+                mailbox_depth = self.pool.total_mailbox_depth(),
+                messages_processed = processed,
+                "worker.stats"
+            );
+        }
+
         did_work
     }
 
     pub(crate) fn run(&mut self, tc: &TickContext, is_running: &AtomicBool) {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::info_span!("worker.run", worker_id = self.id.0).entered();
+
         let backoff = &tc.config.backoff_policy;
         let mut idle_count: u32 = 0;
         while is_running.load(Ordering::Acquire) {
@@ -128,6 +198,7 @@ struct WorkerContext<'a> {
     worker_id: WorkerId,
     tc: &'a TickContext<'a>,
     pending_local: &'a RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>>,
+    stats: &'a WorkerStats,
 }
 
 impl ContextInner for WorkerContext<'_> {
@@ -135,17 +206,20 @@ impl ContextInner for WorkerContext<'_> {
         match self.tc.address_map.lookup(&addr) {
             Some(wid) if wid == self.worker_id => {
                 // Same worker: buffer for local delivery (after current tick round)
+                self.stats.local_sends.fetch_add(1, Ordering::Relaxed);
                 self.pending_local.borrow_mut().push((addr, msg));
                 Ok(())
             }
             Some(wid) => {
                 // Cross worker: envelope through transfer queue
+                self.stats.cross_sends.fetch_add(1, Ordering::Relaxed);
                 let envelope = Envelope::new(addr, msg);
                 let _ = self.tc.transfer_txs[wid.as_usize()].try_send(envelope);
                 Ok(())
             }
             None => {
                 // Try inbox registry (external inboxes)
+                self.stats.inbox_sends.fetch_add(1, Ordering::Relaxed);
                 self.tc.inbox_registry.try_deliver(addr, msg)
             }
         }
@@ -201,7 +275,7 @@ impl ActorPool {
     }
 
     /// Tick all actors in the pool. Returns the number of messages processed.
-    pub fn tick_all(&mut self, inner: &dyn ContextInner) -> usize {
+    pub fn tick_all(&mut self, inner: &dyn ContextInner, stats: &WorkerStats) -> usize {
         let mut count = 0;
         for (&addr, slot) in self.actors.iter_mut() {
             let ctx = Ctx::new(inner, addr);
@@ -210,7 +284,10 @@ impl ActorPool {
                     slot.actor.handle_any(&ctx, msg);
                 }));
                 if result.is_err() {
+                    stats.panics.fetch_add(1, Ordering::Relaxed);
                     eprintln!("swactor: actor {addr} panicked in handler");
+                    #[cfg(feature = "tracing")]
+                    tracing::error!(actor_addr = %addr, "actor.panicked");
                 }
                 count += 1;
             }
@@ -225,7 +302,9 @@ impl ActorPool {
     pub fn total_mailbox_depth(&self) -> usize {
         self.actors.values().map(|slot| slot.mailbox.len()).sum()
     }
+
+    /// Returns per-actor mailbox depths for dashboard reporting.
+    pub fn mailbox_depths(&self) -> Vec<(ActorAddress, usize)> {
+        self.actors.iter().map(|(&addr, slot)| (addr, slot.mailbox.len())).collect()
+    }
 }
-
-
-
