@@ -210,7 +210,6 @@ enum RawAction {
 #[derive(Debug, Arbitrary)]
 struct FuzzInput {
     max_actors: u8,
-    mailbox_waterlevel: u8,
     scenarios: Vec<Scenario>,
 }
 
@@ -773,7 +772,6 @@ impl fmt::Debug for FuzzState {
 
 fuzz_target!(|input: FuzzInput| {
     let max_actors = (input.max_actors as usize).max(1).min(200);
-    let mailbox_waterlevel = (input.mailbox_waterlevel as usize).max(1).min(50);
 
     let interval = log_interval();
     let run = if interval > 0 {
@@ -783,7 +781,6 @@ fuzz_target!(|input: FuzzInput| {
 
     let config = RuntimeConfig {
         max_actors,
-        mailbox_waterlevel,
         num_threads: 1,
         ..Default::default()
     };
@@ -806,7 +803,7 @@ fuzz_target!(|input: FuzzInput| {
         let depth: usize = stats.workers.iter().map(|w| w.mailbox_depth).sum();
         let processed: u64 = stats.workers.iter().map(|w| w.messages_processed).sum();
         eprintln!("\
-\n=== Run #{run} | cap={max_actors} waterlevel={mailbox_waterlevel} ===
+\n=== Run #{run} | cap={max_actors} ===
 {trace}\
 --- {spawned} spawned, {sent} sent, {recv} received, \
 {alive} alive, {depth} queued, {processed} processed ---\n",

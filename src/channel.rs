@@ -17,6 +17,10 @@ impl<T> HybridChannel<T> {
     }
 
     pub fn push(&self, value: T) -> Result<(), T> {
+        if !self.overflow.is_empty() {
+            self.overflow.push(value);
+            return Ok(());
+        }
         match self.ring.push(value) {
             Ok(()) => Ok(()),
             Err(v) => {

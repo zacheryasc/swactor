@@ -28,7 +28,6 @@ pub struct RuntimeConfig {
     pub max_actors: usize,
     pub actor_max_messages: usize,
     pub num_threads: usize,
-    pub mailbox_waterlevel: usize,
     pub backoff_policy: BackoffPolicy,
 }
 
@@ -40,15 +39,12 @@ const DEFAULT_MAX_ACTORS: usize = 1_000;
 /// 1_000 * 16kB = 16MB
 const DEFAULT_ACTOR_MAX_MESSAGES: usize = 1_000;
 
-const DEFAULT_MAILBOX_WATERLEVEL: usize = 10;
-
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             max_actors: DEFAULT_MAX_ACTORS,
             actor_max_messages: DEFAULT_ACTOR_MAX_MESSAGES,
             num_threads: 1,
-            mailbox_waterlevel: DEFAULT_MAILBOX_WATERLEVEL,
             backoff_policy: BackoffPolicy::default(),
         }
     }

@@ -227,8 +227,6 @@ pub struct PyRuntimeConfig {
     #[pyo3(get, set)]
     actor_max_messages: usize,
     #[pyo3(get, set)]
-    mailbox_waterlevel: usize,
-    #[pyo3(get, set)]
     spin_threshold: u32,
     #[pyo3(get, set)]
     yield_threshold: u32,
@@ -246,7 +244,6 @@ impl PyRuntimeConfig {
         num_threads = 1,
         max_actors = 1_000,
         actor_max_messages = 1_000,
-        mailbox_waterlevel = 10,
         spin_threshold = 64,
         yield_threshold = 256,
         sleep_increment_us = 50,
@@ -256,7 +253,6 @@ impl PyRuntimeConfig {
         num_threads: usize,
         max_actors: usize,
         actor_max_messages: usize,
-        mailbox_waterlevel: usize,
         spin_threshold: u32,
         yield_threshold: u32,
         sleep_increment_us: u64,
@@ -266,7 +262,6 @@ impl PyRuntimeConfig {
             num_threads,
             max_actors,
             actor_max_messages,
-            mailbox_waterlevel,
             spin_threshold,
             yield_threshold,
             sleep_increment_us,
@@ -281,7 +276,6 @@ impl From<PyRuntimeConfig> for RuntimeConfig {
             num_threads: py.num_threads,
             max_actors: py.max_actors,
             actor_max_messages: py.actor_max_messages,
-            mailbox_waterlevel: py.mailbox_waterlevel,
             backoff_policy: BackoffPolicy {
                 spin_threshold: py.spin_threshold,
                 yield_threshold: py.yield_threshold,

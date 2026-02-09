@@ -66,15 +66,12 @@ pub struct Runtime {
     placement: Placement,
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
-    /// Single-threaded mode: worker stored inline
-    single_worker: Option<RefCell<Worker>>,
-    /// Multi-threaded mode: workers waiting to be assigned to threads by run()
-    pending_workers: Option<Vec<Worker>>,
+    /// Workers available for tick(). run() drains this and moves workers to threads.
+    tick_workers: RefCell<Vec<Worker>>,
 }
 
-// Safety: RefCell<Worker> is only accessed from the thread that owns the Runtime
-// in single-threaded mode. In multi-threaded mode, single_worker is None and
-// pending_workers is consumed by run() before Arc sharing.
+// Safety: RefCell<Vec<Worker>> is only accessed from the owning thread via tick().
+// After run() the RefCell is empty and not accessed by worker threads.
 unsafe impl Sync for Runtime {}
 
 impl Runtime {
@@ -111,35 +108,16 @@ impl Runtime {
             workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats));
         }
 
-        if config.num_threads < 2 {
-            // Single-threaded: store one worker inline
-            let worker = workers.remove(0);
-            Self {
-                config,
-                address_map,
-                inbox_registry,
-                transfer_txs,
-                spawn_txs,
-                placement,
-                is_running: AtomicBool::new(false),
-                worker_stats,
-                single_worker: Some(RefCell::new(worker)),
-                pending_workers: None,
-            }
-        } else {
-            // Multi-threaded: stash workers for run()
-            Self {
-                config,
-                address_map,
-                inbox_registry,
-                transfer_txs,
-                spawn_txs,
-                placement,
-                is_running: AtomicBool::new(false),
-                worker_stats,
-                single_worker: None,
-                pending_workers: Some(workers),
-            }
+        Self {
+            config,
+            address_map,
+            inbox_registry,
+            transfer_txs,
+            spawn_txs,
+            placement,
+            is_running: AtomicBool::new(false),
+            worker_stats,
+            tick_workers: RefCell::new(workers),
         }
     }
 
@@ -179,17 +157,23 @@ impl Runtime {
     }
 
     /// Drive one tick of the single-threaded worker.
+    ///
+    /// Panics if called on a multi-threaded runtime — use `run()` instead.
     pub fn tick(&self) {
-        if let Some(ref worker) = self.single_worker {
-            let tc = TickContext {
-                address_map: &self.address_map,
-                transfer_txs: &self.transfer_txs,
-                spawn_txs: &self.spawn_txs,
-                placement: &self.placement,
-                inbox_registry: &self.inbox_registry,
-                config: &self.config,
-            };
-            worker.borrow_mut().tick_once(&tc);
+        assert!(
+            self.config.num_threads < 2,
+            "tick() is only valid for single-threaded runtimes; use run() for multi-threaded"
+        );
+        let tc = TickContext {
+            address_map: &self.address_map,
+            transfer_txs: &self.transfer_txs,
+            spawn_txs: &self.spawn_txs,
+            placement: &self.placement,
+            inbox_registry: &self.inbox_registry,
+            config: &self.config,
+        };
+        for worker in self.tick_workers.borrow_mut().iter_mut() {
+            worker.tick_once(&tc);
         }
     }
 
@@ -198,17 +182,10 @@ impl Runtime {
     ///
     /// Works in both single-threaded and multi-threaded configurations.
     /// In single-threaded mode, one background thread is spawned.
-    pub fn run(mut self) -> Result<RuntimeHandle, Error> {
+    pub fn run(self) -> Result<RuntimeHandle, Error> {
         self.is_running.store(true, Ordering::Release);
 
-        let mut workers: Vec<Worker> = Vec::new();
-
-        if let Some(w) = self.single_worker.take() {
-            workers.push(w.into_inner());
-        }
-        if let Some(ws) = self.pending_workers.take() {
-            workers.extend(ws);
-        }
+        let workers: Vec<Worker> = self.tick_workers.replace(Vec::new());
 
         let rt = Arc::new(self);
         let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(workers.len());
@@ -293,9 +270,5 @@ impl ContextInner for Runtime {
         self.spawn_txs[worker_id.as_usize()]
             .try_send((addr, actor))
             .map_err(|_| Error::from("Spawn queue full"))
-    }
-
-    fn mailbox_waterlevel(&self) -> usize {
-        self.config.mailbox_waterlevel
     }
 }
