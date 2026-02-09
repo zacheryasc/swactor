@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 920" font-family="system-ui, sans-serif">
+  <defs>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-gray" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#5f6368">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#34a853">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-purple" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#9334e6">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#4285f4">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="920" rx="8" fill="#f8f9fb" stroke="#e0e3e8" stroke-width="1.5"/>
+
+  <!-- Title -->
+  <text x="550" y="40" text-anchor="middle" font-size="20" font-weight="bold" fill="#202124">Transport Encode / Decode Flow</text>
+  <text x="550" y="60" text-anchor="middle" font-size="12" fill="#5f6368">src/transport.rs · CodecRegistry · TransportBridge</text>
+
+  <!-- ============================================ -->
+  <!-- ENCODE SIDE (Runtime A) -->
+  <!-- ============================================ -->
+  <rect x="30" y="80" width="500" height="760" rx="6" fill="#e8f0fe" fill-opacity="0.15" stroke="#4285f4" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="280" y="102" text-anchor="middle" font-size="15" font-weight="700" fill="#4285f4">SENDING RUNTIME</text>
+  <text x="280" y="118" text-anchor="middle" font-size="11" fill="#5f6368">Encode Path</text>
+
+  <!-- Step: ctx.send -->
+  <rect x="140" y="138" width="280" height="46" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="280" y="158" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">ctx.send(addr, msg)</text>
+  <text x="280" y="174" text-anchor="middle" font-size="10" fill="#5f6368">typed message enters send path</text>
+
+  <line x1="280" y1="184" x2="280" y2="218" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step: type erasure -->
+  <rect x="130" y="222" width="300" height="44" rx="12" fill="#f1f3f4" stroke="#9aa0a6" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="280" y="241" text-anchor="middle" font-size="12" font-weight="600" fill="#5f6368">Box::new(msg) as Box&lt;dyn Any + Send&gt;</text>
+  <text x="280" y="257" text-anchor="middle" font-size="10" fill="#9aa0a6">type erased — concrete type lost</text>
+
+  <line x1="280" y1="266" x2="280" y2="300" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step: routing reaches transport -->
+  <rect x="100" y="304" width="360" height="40" rx="10" fill="none" stroke="#5f6368" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="280" y="320" text-anchor="middle" font-size="11" fill="#5f6368">routing: AddressMap miss → Inbox miss → Transport</text>
+  <text x="280" y="336" text-anchor="middle" font-size="10" fill="#9aa0a6">see transport_routing.svg</text>
+
+  <line x1="280" y1="344" x2="280" y2="380" stroke="#9334e6" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+
+  <!-- Step: TypeId lookup -->
+  <rect x="115" y="384" width="330" height="50" rx="12" fill="#f3e8fd" stroke="#9334e6" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="280" y="405" text-anchor="middle" font-size="12" font-weight="600" fill="#7627bb">(*msg).type_id() → TypeId</text>
+  <text x="280" y="423" text-anchor="middle" font-size="10" fill="#5f6368">encoders.get(&amp;type_id) → Arc&lt;ErasedCodec&gt;</text>
+
+  <line x1="280" y1="434" x2="280" y2="468" stroke="#9334e6" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+
+  <!-- Step: downcast + encode -->
+  <rect x="95" y="472" width="370" height="68" rx="12" fill="#f3e8fd" stroke="#9334e6" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="280" y="492" text-anchor="middle" font-size="13" font-weight="700" fill="#7627bb">TypedCodec&lt;M, C&gt;</text>
+  <text x="280" y="510" text-anchor="middle" font-size="11" fill="#5f6368">msg.downcast::&lt;M&gt;() — recover concrete type</text>
+  <text x="280" y="526" text-anchor="middle" font-size="11" fill="#5f6368">codec.encode(&amp;typed_msg) → Vec&lt;u8&gt;</text>
+
+  <line x1="280" y1="540" x2="280" y2="578" stroke="#9334e6" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+
+  <!-- Step: WireEnvelope -->
+  <rect x="110" y="582" width="340" height="58" rx="12" fill="#f3e8fd" stroke="#9334e6" stroke-width="2" filter="url(#shadow)"/>
+  <text x="280" y="604" text-anchor="middle" font-size="14" font-weight="700" fill="#7627bb">WireEnvelope</text>
+  <text x="280" y="622" text-anchor="middle" font-size="10" fill="#5f6368">{ dest: addr, type_tag: "app::Ping", payload }</text>
+  <text x="280" y="636" text-anchor="middle" font-size="10" fill="#9aa0a6">type_tag from M::type_tag() — stable string</text>
+
+  <line x1="280" y1="640" x2="280" y2="680" stroke="#9334e6" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+
+  <!-- Step: transport.send -->
+  <rect x="140" y="684" width="280" height="44" rx="12" fill="#f3e8fd" stroke="#9334e6" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="280" y="703" text-anchor="middle" font-size="12" font-weight="600" fill="#7627bb">transport.send(wire_envelope)</text>
+  <text x="280" y="719" text-anchor="middle" font-size="10" fill="#5f6368">TCP, gRPC, InMemory, etc.</text>
+
+  <!-- Key annotations -->
+  <rect x="60" y="760" width="410" height="60" rx="8" fill="none" stroke="#9aa0a6" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="265" y="778" text-anchor="middle" font-size="11" font-weight="600" fill="#5f6368">Encode key: TypeId (Rust compiler-assigned)</text>
+  <text x="265" y="795" text-anchor="middle" font-size="10" fill="#9aa0a6">Fast lookup. NOT stable across compilations.</text>
+  <text x="265" y="810" text-anchor="middle" font-size="10" fill="#9aa0a6">Works because encoder runs in the same process as the sender.</text>
+
+  <!-- ============================================ -->
+  <!-- WIRE BOUNDARY -->
+  <!-- ============================================ -->
+  <line x1="540" y1="130" x2="540" y2="790" stroke="#9334e6" stroke-width="2.5" stroke-dasharray="8,6"/>
+  <rect x="519" y="420" width="42" height="80" rx="6" fill="#f3e8fd" stroke="#9334e6" stroke-width="1.5"/>
+  <text x="540" y="450" text-anchor="middle" font-size="11" font-weight="700" fill="#9334e6" transform="rotate(90, 540, 460)">WIRE</text>
+
+  <!-- Arrow across wire -->
+  <path d="M 450 706 Q 540 706 575 706" fill="none" stroke="#9334e6" stroke-width="2.5" marker-end="url(#arrow-purple)"/>
+
+  <!-- ============================================ -->
+  <!-- DECODE SIDE (Runtime B) -->
+  <!-- ============================================ -->
+  <rect x="570" y="80" width="500" height="760" rx="6" fill="#e6f4ea" fill-opacity="0.15" stroke="#34a853" stroke-width="1.5" stroke-opacity="0.5"/>
+  <text x="820" y="102" text-anchor="middle" font-size="15" font-weight="700" fill="#34a853">RECEIVING RUNTIME</text>
+  <text x="820" y="118" text-anchor="middle" font-size="11" fill="#5f6368">Decode Path</text>
+
+  <!-- Step: receive wire envelope -->
+  <rect x="680" y="138" width="280" height="46" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="820" y="158" text-anchor="middle" font-size="13" font-weight="600" fill="#137333">receive WireEnvelope</text>
+  <text x="820" y="174" text-anchor="middle" font-size="10" fill="#5f6368">from TCP, gRPC, InMemory, etc.</text>
+
+  <line x1="820" y1="184" x2="820" y2="218" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Step: TransportBridge -->
+  <rect x="660" y="222" width="320" height="48" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="820" y="243" text-anchor="middle" font-size="13" font-weight="600" fill="#137333">TransportBridge::receive(envelope)</text>
+  <text x="820" y="259" text-anchor="middle" font-size="10" fill="#5f6368">deserializes wire bytes back to Box&lt;dyn Any&gt;</text>
+
+  <line x1="820" y1="270" x2="820" y2="308" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+
+  <!-- Step: type_tag lookup -->
+  <rect x="655" y="312" width="330" height="50" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="820" y="333" text-anchor="middle" font-size="12" font-weight="600" fill="#137333">decoders.get(type_tag) → DecodeFn</text>
+  <text x="820" y="350" text-anchor="middle" font-size="10" fill="#5f6368">lookup by "app::Ping" → closure</text>
+
+  <line x1="820" y1="362" x2="820" y2="400" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+
+  <!-- Step: codec.decode -->
+  <rect x="635" y="404" width="370" height="68" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="820" y="424" text-anchor="middle" font-size="13" font-weight="700" fill="#137333">DecodeFn (closure)</text>
+  <text x="820" y="442" text-anchor="middle" font-size="11" fill="#5f6368">codec.decode(bytes) → Ping { value: 42, ... }</text>
+  <text x="820" y="458" text-anchor="middle" font-size="11" fill="#5f6368">Box::new(msg) as Box&lt;dyn Any + Send&gt;</text>
+
+  <line x1="820" y1="472" x2="820" y2="510" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+
+  <!-- Step: deliver_raw -->
+  <rect x="680" y="514" width="280" height="46" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="820" y="534" text-anchor="middle" font-size="12" font-weight="600" fill="#137333">runtime.deliver_raw(addr, msg)</text>
+  <text x="820" y="550" text-anchor="middle" font-size="10" fill="#5f6368">→ transfer queue → worker</text>
+
+  <line x1="820" y1="560" x2="820" y2="598" stroke="#4285f4" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+
+  <!-- Step: normal tick processing -->
+  <rect x="660" y="602" width="320" height="48" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="820" y="622" text-anchor="middle" font-size="12" font-weight="600" fill="#1a73e8">tick → mailbox → handle_any()</text>
+  <text x="820" y="638" text-anchor="middle" font-size="10" fill="#5f6368">downcast Box&lt;dyn Any&gt; → Ping</text>
+
+  <line x1="820" y1="650" x2="820" y2="688" stroke="#4285f4" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+
+  <!-- Step: user handler -->
+  <rect x="700" y="692" width="240" height="44" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="820" y="711" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">PongActor::handle(Ping)</text>
+  <text x="820" y="727" text-anchor="middle" font-size="10" fill="#5f6368">user code runs</text>
+
+  <!-- Key annotations -->
+  <rect x="610" y="760" width="430" height="60" rx="8" fill="none" stroke="#9aa0a6" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="825" y="778" text-anchor="middle" font-size="11" font-weight="600" fill="#5f6368">Decode key: type_tag string (user-defined)</text>
+  <text x="825" y="795" text-anchor="middle" font-size="10" fill="#9aa0a6">Stable across compilations, processes, and machines.</text>
+  <text x="825" y="810" text-anchor="middle" font-size="10" fill="#9aa0a6">Carried on the wire inside WireEnvelope.</text>
+
+  <!-- ============================================ -->
+  <!-- Legend -->
+  <!-- ============================================ -->
+  <rect x="50" y="858" width="1000" height="48" rx="8" fill="none" stroke="#e0e3e8" stroke-width="1"/>
+  <text x="70" y="882" font-size="12" font-weight="600" fill="#202124">Legend</text>
+
+  <line x1="140" y1="880" x2="175" y2="880" stroke="#9334e6" stroke-width="1.8" marker-end="url(#arrow-purple)"/>
+  <text x="185" y="884" font-size="11" fill="#9334e6">Encode path</text>
+
+  <line x1="300" y1="880" x2="335" y2="880" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="345" y="884" font-size="11" fill="#34a853">Decode path</text>
+
+  <line x1="460" y1="880" x2="495" y2="880" stroke="#4285f4" stroke-width="1.8" marker-end="url(#arrow-blue)"/>
+  <text x="505" y="884" font-size="11" fill="#4285f4">Local delivery</text>
+
+  <line x1="630" y1="880" x2="665" y2="880" stroke="#9334e6" stroke-width="2.5" stroke-dasharray="8,6"/>
+  <text x="675" y="884" font-size="11" fill="#9334e6">Wire boundary</text>
+
+  <text x="850" y="884" font-size="10" fill="#9aa0a6">transport.rs · runtime.rs · worker.rs</text>
+</svg>

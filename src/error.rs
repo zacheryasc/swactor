@@ -14,18 +14,15 @@
 /// ```
 #[derive(Debug)]
 pub struct Error(Box<dyn std::error::Error + Send + Sync + 'static>);
-pub(crate) fn convert_err<E: std::fmt::Debug>(e: E) -> Error {
-    Error(format!("{e:?}").into())
-}
 
 impl<T: AsRef<str>> From<T> for Error {
     fn from(value: T) -> Self {
-        convert_err(value.as_ref())
+        Error(format!("{:?}", value.as_ref()).into())
     }
 }
 
-impl ToString for Error {
-    fn to_string(&self) -> String {
-        format!("{:?}", self.0)
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.0)
     }
 }

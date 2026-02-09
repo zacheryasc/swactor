@@ -21,6 +21,7 @@ getrandom = ["dep:getrandom"]
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 no_random = [] # compile without access to a source of randomness
+transport = []  # transport-agnostic messaging (no mandatory deps; codec is user-provided)
 
 [dependencies]
 getrandom = { version = "0.2", optional = true }

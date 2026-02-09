@@ -31,18 +31,8 @@ impl<T> HybridChannel<T> {
     }
 
     pub fn pop(&self) -> Option<T> {
-        if let Some(value) = self.ring.pop() {
-            return Some(value);
-        }
-
-        match self.overflow.pop() {
-            Some(value) => {
-                Some(value)
-            }
-            None => None,
-        }
+        self.ring.pop().or_else(|| self.overflow.pop())
     }
-
 }
 
 pub(crate) struct Receiver<T> {
@@ -56,7 +46,7 @@ impl<T> Receiver<T> {
         Self { queue }
     }
     pub fn try_recv(&self) -> Option<T> {
-        return self.queue.pop();
+        self.queue.pop()
     }
 
     pub fn new_sender(&self) -> Sender<T> {
@@ -72,7 +62,7 @@ pub(crate) struct Sender<T> {
 
 impl<T> Sender<T> {
     pub fn try_send(&self, value: T) -> Result<(), T> {
-        return self.queue.push(value);
+        self.queue.push(value)
     }
 }
 

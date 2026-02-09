@@ -1,6 +1,9 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 
 use crate::actor::ActorAddress;
+
+const TICK_BUFFER_CAP: usize = 1024;
 
 /// Timing data for one tick_once invocation.
 #[derive(Debug, Clone, Default)]
@@ -26,8 +29,8 @@ pub struct WorkerStats {
     // Error counters
     pub type_mismatches: AtomicU64,
     pub panics: AtomicU64,
-    // Tick timing ring buffer (last N ticks)
-    tick_timings: std::sync::Mutex<RingBuffer<TickTiming>>,
+    // Tick timing buffer (last N ticks)
+    tick_timings: std::sync::Mutex<VecDeque<TickTiming>>,
 }
 
 impl WorkerStats {
@@ -41,17 +44,37 @@ impl WorkerStats {
             inbox_sends: AtomicU64::new(0),
             type_mismatches: AtomicU64::new(0),
             panics: AtomicU64::new(0),
-            tick_timings: std::sync::Mutex::new(RingBuffer::new(1024)),
+            tick_timings: std::sync::Mutex::new(VecDeque::with_capacity(TICK_BUFFER_CAP)),
         }
     }
 
     pub fn push_tick_timing(&self, timing: TickTiming) {
-        self.tick_timings.lock().unwrap().push(timing);
+        let mut buf = self.tick_timings.lock().unwrap();
+        if buf.len() >= TICK_BUFFER_CAP {
+            buf.pop_front();
+        }
+        buf.push_back(timing);
     }
 
     /// Returns a snapshot of recent tick timings (drains the buffer).
     pub fn drain_tick_timings(&self) -> Vec<TickTiming> {
-        self.tick_timings.lock().unwrap().drain()
+        self.tick_timings.lock().unwrap().drain(..).collect()
+    }
+
+    /// Create a point-in-time snapshot as a [`WorkerInfo`].
+    pub fn snapshot(&self, id: usize) -> WorkerInfo {
+        use std::sync::atomic::Ordering::Relaxed;
+        WorkerInfo {
+            id,
+            num_actors: self.num_actors.load(Relaxed),
+            mailbox_depth: self.total_mailbox_depth.load(Relaxed),
+            messages_processed: self.messages_processed.load(Relaxed),
+            local_sends: self.local_sends.load(Relaxed),
+            cross_sends: self.cross_sends.load(Relaxed),
+            inbox_sends: self.inbox_sends.load(Relaxed),
+            type_mismatches: self.type_mismatches.load(Relaxed),
+            panics: self.panics.load(Relaxed),
+        }
     }
 }
 
@@ -91,42 +114,4 @@ pub struct RuntimeStats {
     pub actor_details: Vec<ActorInfo>,
     /// Recent tick timings per worker (index = worker id).
     pub tick_timings: Vec<Vec<TickTiming>>,
-}
-
-/// Simple ring buffer for storing recent values.
-pub(crate) struct RingBuffer<T> {
-    buf: Vec<T>,
-    capacity: usize,
-}
-
-impl<T> RingBuffer<T> {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            buf: Vec::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    pub fn push(&mut self, value: T) {
-        if self.buf.len() >= self.capacity {
-            self.buf.remove(0);
-        }
-        self.buf.push(value);
-    }
-
-    /// Drain all items, returning them and leaving the buffer empty.
-    pub fn drain(&mut self) -> Vec<T> {
-        std::mem::take(&mut self.buf)
-    }
-}
-
-/// Per-actor mailbox depth snapshot, collected by workers.
-pub(crate) struct MailboxSnapshot {
-    pub depths: Vec<(ActorAddress, usize)>,
-}
-
-impl MailboxSnapshot {
-    pub fn new() -> Self {
-        Self { depths: Vec::new() }
-    }
 }

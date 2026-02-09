@@ -2,26 +2,29 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DOCS_DIR="$SCRIPT_DIR"
-OUT_DIR="$DOCS_DIR"
-TOOLS_DIR="$(cd "$SCRIPT_DIR/../../../tools" && pwd)"
+TOOLS_DIR="$ROOT_DIR/tools"
 
+# --- Phase 1: Generate architecture.dot from source AST ---
 
-mkdir -p "$OUT_DIR"
+echo "==> Generating architecture.dot from source..."
+cargo run --manifest-path "$TOOLS_DIR/depgraph/Cargo.toml" \
+  -- --src-dir "$ROOT_DIR/src/" --output architecture --output-dir "$DOCS_DIR/"
 
-# Collect .dot sources
+# --- Phase 2: Render all .dot files to .svg ---
+
 dots=("$DOCS_DIR"/*.dot)
 if [ ${#dots[@]} -eq 0 ]; then
   echo "No .dot files found in $DOCS_DIR"
   exit 0
 fi
 
-# Pick a renderer: prefer graphviz `dot`, fall back to @viz-js/viz via Node
 render_with_dot() {
   for src in "${dots[@]}"; do
     name="$(basename "$src" .dot)"
-    echo "  dot: $name.dot -> generated/$name.svg"
-    dot -Tsvg "$src" -o "$OUT_DIR/$name.svg"
+    echo "  dot: $name.dot -> $name.svg"
+    dot -Tsvg "$src" -o "$DOCS_DIR/$name.svg"
   done
 }
 
@@ -39,7 +42,6 @@ const require = createRequire("$TOOLS_DIR/package.json");
 const { instance } = require("@viz-js/viz");
 
 const docsDir = "$DOCS_DIR";
-const outDir  = "$OUT_DIR";
 
 const viz = await instance();
 const dots = readdirSync(docsDir).filter(f => f.endsWith(".dot"));
@@ -48,20 +50,19 @@ for (const file of dots) {
   const src  = readFileSync(join(docsDir, file), "utf-8");
   const name = basename(file, ".dot");
   const svg  = viz.renderString(src, { format: "svg" });
-  writeFileSync(join(outDir, \`\${name}.svg\`), svg);
-  console.log(\`  viz-js: \${file} -> generated/\${name}.svg\`);
+  writeFileSync(join(docsDir, \`\${name}.svg\`), svg);
+  console.log(\`  viz-js: \${file} -> \${name}.svg\`);
 }
 NODEJS
 
   node "$tmpfile"
 }
 
-echo "Rendering DOT diagrams..."
+echo "==> Rendering DOT -> SVG..."
 
 if command -v dot &>/dev/null; then
   render_with_dot
 elif command -v node &>/dev/null; then
-  # Ensure @viz-js/viz is available
   if [ -f "$TOOLS_DIR/package.json" ]; then
     if ! [ -d "$TOOLS_DIR/node_modules/@viz-js/viz" ]; then
       echo "Installing @viz-js/viz..."
@@ -78,4 +79,4 @@ else
   exit 1
 fi
 
-echo "Done. Output in ${OUT_DIR}"
+echo "==> Done. SVGs in $DOCS_DIR/"

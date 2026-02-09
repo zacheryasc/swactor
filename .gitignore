@@ -9,3 +9,5 @@ corpus
 # Analysis artifacts (depgraph + spectral)
 **/deps.dot
 **/deps.html
+docs/architecture.dot
+docs/architecture.html
