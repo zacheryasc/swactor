@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/swactor-python", "crates/swactor-wasm", "crates/swactor-gossip", "crates/gossip-dashboard"]
+members = [".", "crates/swactor-python", "crates/swactor-wasm", "crates/swactor-gossip", "crates/gossip-dashboard", "crates/runtime-dashboard"]
 exclude = ["tools/depgraph"]
 
 [package]
@@ -15,11 +15,13 @@ crate-type = ["rlib"]
 default = ["getrandom"]
 getrandom = ["dep:getrandom"]
 serde = ["dep:serde"]
+tracing = ["dep:tracing"]
 no_random = [] # compile without access to a source of randomness
 
 [dependencies]
 getrandom = { version = "0.2", optional = true }
 serde = { version = "1", features = ["derive"], optional = true }
+tracing = { version = "0.1", optional = true }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 

@@ -1,0 +1,155 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 800" font-family="system-ui, sans-serif">
+  <defs>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-gray" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#5f6368">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#34a853">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#ea4335">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-blue" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#4285f4">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="800" rx="8" fill="#f8f9fb" stroke="#e0e3e8" stroke-width="1.5"/>
+
+  <!-- Title -->
+  <text x="550" y="40" text-anchor="middle" font-size="20" font-weight="bold" fill="#202124">Message Lifecycle</text>
+  <text x="550" y="60" text-anchor="middle" font-size="12" fill="#5f6368">src/worker.rs · src/delivery.rs · src/channel.rs · src/actor.rs</text>
+
+  <!-- ============================================ -->
+  <!-- SWIM LANE: ORIGIN -->
+  <!-- ============================================ -->
+  <rect x="30" y="80" width="1040" height="120" rx="6" fill="#e8f0fe" fill-opacity="0.25" stroke="#4285f4" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="50" y="100" font-size="13" font-weight="700" fill="#4285f4" letter-spacing="1">ORIGIN</text>
+
+  <!-- Entry 1: runtime.send_to -->
+  <rect x="150" y="110" width="200" height="52" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="250" y="133" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">runtime.send_to(</text>
+  <text x="250" y="150" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">addr, msg)</text>
+
+  <!-- Entry 2: ctx.send -->
+  <rect x="700" y="110" width="200" height="52" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="800" y="133" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">ctx.send(</text>
+  <text x="800" y="150" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">addr, msg)</text>
+
+  <text x="160" y="187" font-size="10" fill="#5f6368">external caller</text>
+  <text x="710" y="187" font-size="10" fill="#5f6368">from actor handler</text>
+
+  <!-- Arrows from both entries down into routing -->
+  <line x1="250" y1="162" x2="250" y2="220" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <line x1="800" y1="162" x2="800" y2="220" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Converge arrows to decision diamond -->
+  <path d="M 250 220 Q 250 240 460 255" fill="none" stroke="#5f6368" stroke-width="1.8"/>
+  <path d="M 800 220 Q 800 240 590 255" fill="none" stroke="#5f6368" stroke-width="1.8"/>
+
+  <!-- ============================================ -->
+  <!-- SWIM LANE: ROUTING -->
+  <!-- ============================================ -->
+  <rect x="30" y="210" width="1040" height="260" rx="6" fill="#fef7e0" fill-opacity="0.2" stroke="#f9ab00" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="50" y="232" font-size="13" font-weight="700" fill="#e37400" letter-spacing="1">ROUTING</text>
+
+  <!-- Decision diamond: AddressMap::lookup -->
+  <polygon points="525,250 620,290 525,330 430,290" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="525" y="286" text-anchor="middle" font-size="11" font-weight="600" fill="#e37400">AddressMap</text>
+  <text x="525" y="300" text-anchor="middle" font-size="11" font-weight="600" fill="#e37400">::lookup()</text>
+
+  <!-- Branch LEFT: Not found → InboxRegistry -->
+  <line x1="430" y1="290" x2="265" y2="290" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="350" y="282" text-anchor="middle" font-size="11" fill="#5f6368" font-weight="600">not found</text>
+
+  <rect x="100" y="265" width="165" height="50" rx="12" fill="#f1f3f4" stroke="#9aa0a6" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="182" y="286" text-anchor="middle" font-size="12" font-weight="600" fill="#5f6368">InboxRegistry</text>
+  <text x="182" y="302" text-anchor="middle" font-size="10" fill="#9aa0a6">::try_deliver()</text>
+
+  <!-- InboxRegistry → External Receiver -->
+  <line x1="182" y1="315" x2="182" y2="365" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+  <rect x="100" y="370" width="165" height="44" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="182" y="390" text-anchor="middle" font-size="12" font-weight="600" fill="#137333">Receiver&lt;M&gt;</text>
+  <text x="182" y="405" text-anchor="middle" font-size="10" fill="#5f6368">external consumer</text>
+
+  <!-- Branch DOWN: Same worker → pending_local -->
+  <line x1="525" y1="330" x2="525" y2="385" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="536" y="355" font-size="11" fill="#5f6368" font-weight="600">same</text>
+  <text x="536" y="368" font-size="10" fill="#5f6368">worker</text>
+
+  <rect x="435" y="390" width="180" height="50" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="525" y="412" text-anchor="middle" font-size="12" font-weight="600" fill="#e37400">pending_local</text>
+  <text x="525" y="428" text-anchor="middle" font-size="10" fill="#5f6368">RefCell&lt;Vec&gt; buffer</text>
+
+  <text x="525" y="458" text-anchor="middle" font-size="10" fill="#f9ab00" font-weight="600">delivered in Phase 5</text>
+
+  <!-- Branch RIGHT: Different worker → HybridChannel -->
+  <line x1="620" y1="290" x2="750" y2="290" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="685" y="282" text-anchor="middle" font-size="11" fill="#5f6368" font-weight="600">different</text>
+  <text x="685" y="296" text-anchor="middle" font-size="10" fill="#5f6368">worker</text>
+
+  <rect x="752" y="260" width="185" height="60" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="844" y="281" text-anchor="middle" font-size="12" font-weight="600" fill="#1a73e8">Envelope::new()</text>
+  <text x="844" y="298" text-anchor="middle" font-size="10" fill="#5f6368">→ HybridChannel</text>
+  <text x="844" y="312" text-anchor="middle" font-size="9" fill="#9aa0a6">ArrayQueue + SegQueue</text>
+
+  <text x="844" y="340" text-anchor="middle" font-size="10" fill="#4285f4" font-weight="600">drained in Phase 2</text>
+
+  <!-- Arrows from pending_local and HybridChannel converge down -->
+  <path d="M 525 440 L 525 500" fill="none" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <path d="M 844 320 Q 844 460 660 500" fill="none" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- ============================================ -->
+  <!-- SWIM LANE: DELIVERY -->
+  <!-- ============================================ -->
+  <rect x="30" y="480" width="1040" height="290" rx="6" fill="#e6f4ea" fill-opacity="0.2" stroke="#34a853" stroke-width="1" stroke-opacity="0.4"/>
+  <text x="50" y="500" font-size="13" font-weight="700" fill="#34a853" letter-spacing="1">DELIVERY</text>
+
+  <!-- pool.deliver -->
+  <rect x="430" y="510" width="200" height="50" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="530" y="532" text-anchor="middle" font-size="12" font-weight="600" fill="#137333">pool.deliver(addr, payload)</text>
+  <text x="530" y="548" text-anchor="middle" font-size="10" fill="#5f6368">push to VecDeque mailbox</text>
+
+  <!-- Arrow down to Phase 3 -->
+  <line x1="530" y1="560" x2="530" y2="600" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="542" y="584" font-size="10" fill="#5f6368">Phase 3</text>
+
+  <!-- mailbox.pop_front -->
+  <rect x="420" y="605" width="220" height="48" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="530" y="625" text-anchor="middle" font-size="12" font-weight="600" fill="#1a73e8">mailbox.pop_front()</text>
+  <text x="530" y="641" text-anchor="middle" font-size="10" fill="#5f6368">→ AnyActor::handle_any()</text>
+
+  <!-- Arrow down to downcast diamond -->
+  <line x1="530" y1="653" x2="530" y2="685" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- Downcast diamond -->
+  <polygon points="530,688 590,715 530,742 470,715" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="530" y="718" text-anchor="middle" font-size="10" font-weight="600" fill="#e37400">downcast</text>
+
+  <!-- Success branch (left) -->
+  <line x1="470" y1="715" x2="350" y2="715" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <rect x="200" y="695" width="150" height="40" rx="10" fill="#e6f4ea" stroke="#34a853" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="275" y="712" text-anchor="middle" font-size="12" font-weight="600" fill="#137333">User Handler</text>
+  <text x="275" y="726" text-anchor="middle" font-size="10" fill="#34a853">called</text>
+
+  <!-- Failure branch (right) -->
+  <line x1="590" y1="715" x2="710" y2="715" stroke="#ea4335" stroke-width="1.8" marker-end="url(#arrow-red)"/>
+  <rect x="710" y="695" width="150" height="40" rx="10" fill="#fce8e6" stroke="#ea4335" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="785" y="712" text-anchor="middle" font-size="12" font-weight="600" fill="#c5221f">Dropped</text>
+  <text x="785" y="726" text-anchor="middle" font-size="10" fill="#ea4335">type mismatch</text>
+
+  <!-- Labels on branches -->
+  <text x="410" y="708" text-anchor="middle" font-size="10" fill="#34a853" font-weight="600">OK</text>
+  <text x="650" y="708" text-anchor="middle" font-size="10" fill="#ea4335" font-weight="600">fail</text>
+
+  <!-- Source refs bottom -->
+  <text x="550" y="780" text-anchor="middle" font-size="10" fill="#9aa0a6">worker.rs:134-151 · delivery.rs:92-116 · channel.rs · actor.rs:53-59</text>
+</svg>
