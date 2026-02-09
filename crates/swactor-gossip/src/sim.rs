@@ -289,13 +289,14 @@ pub fn heal_partition_via_handle(
     handle: &swactor::runtime::RuntimeHandle,
     topology: &Topology,
     addrs: &[ActorAddress],
-    _names: &[String],
-) {
+    names: &[String],
+) -> Vec<(String, String)> {
     if !matches!(topology, Topology::Partitioned) {
-        return;
+        return Vec::new();
     }
     let n = addrs.len();
     let half = n / 2;
+    let mut new_edges = Vec::new();
     if half > 0 && half < n {
         handle
             .runtime
@@ -305,7 +306,10 @@ pub fn heal_partition_via_handle(
             .runtime
             .send_to(addrs[half], GossipMessage::AddPeer(addrs[half - 1]))
             .unwrap();
+        new_edges.push((names[half - 1].clone(), names[half].clone()));
+        new_edges.push((names[half].clone(), names[half - 1].clone()));
     }
+    new_edges
 }
 
 // ── Topology wiring ──────────────────────────────────────────────────────
@@ -377,18 +381,22 @@ pub fn heal_partition(
     rt: &Runtime,
     topology: &Topology,
     addrs: &[ActorAddress],
-    _names: &[String],
-) {
+    names: &[String],
+) -> Vec<(String, String)> {
     if !matches!(topology, Topology::Partitioned) {
-        return;
+        return Vec::new();
     }
     let n = addrs.len();
     let half = n / 2;
+    let mut new_edges = Vec::new();
     // Add bidirectional links between the two halves (bridge nodes).
     if half > 0 && half < n {
         rt.send_to(addrs[half - 1], GossipMessage::AddPeer(addrs[half]))
             .unwrap();
         rt.send_to(addrs[half], GossipMessage::AddPeer(addrs[half - 1]))
             .unwrap();
+        new_edges.push((names[half - 1].clone(), names[half].clone()));
+        new_edges.push((names[half].clone(), names[half - 1].clone()));
     }
+    new_edges
 }

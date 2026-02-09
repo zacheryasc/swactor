@@ -1,11 +1,10 @@
-name = "Partitioned-8 Heal"
+name = "Partition & Heal (8 nodes)"
 topology = "partitioned"
 num_nodes = 8
 num_rounds = 20
 ticks_per_round = 5
-num_threads = 2
+num_threads = 1
 heal_after_round = 10
-port = 8080
 
 [initial_data]
 color = "blue"

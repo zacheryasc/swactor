@@ -2,7 +2,7 @@ pub mod config;
 mod dashboard_html;
 mod server;
 
-pub use server::{DashboardConfig, run_with_dashboard, serve_replay};
+pub use server::serve_dashboard;
 
 use std::fs;
 use std::io;

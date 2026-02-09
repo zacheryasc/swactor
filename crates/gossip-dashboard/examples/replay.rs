@@ -1,19 +1,15 @@
-use gossip_dashboard::{load_trace, serve_replay};
+use gossip_dashboard::serve_dashboard;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let path = args
+    let trace_dir = args
         .get(1)
-        .expect("Usage: replay <trace.json>");
+        .expect("Usage: replay <trace-dir> [port]");
 
-    let trace = load_trace(path).expect("failed to load trace");
+    let port: u16 = args
+        .get(2)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
 
-    eprintln!(
-        "Loaded trace '{}': {} nodes, {} events",
-        trace.name,
-        trace.node_names.len(),
-        trace.events.len()
-    );
-
-    serve_replay(&trace, 8081);
+    serve_dashboard(trace_dir, port);
 }

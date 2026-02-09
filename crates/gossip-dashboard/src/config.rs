@@ -5,8 +5,6 @@ use std::io;
 use serde::Deserialize;
 use swactor_gossip::sim::{SimConfig, Topology};
 
-use crate::server::DashboardConfig;
-
 #[derive(Deserialize)]
 pub struct SimFileConfig {
     pub name: String,
@@ -16,7 +14,6 @@ pub struct SimFileConfig {
     pub ticks_per_round: usize,
     pub num_threads: usize,
     pub heal_after_round: Option<usize>,
-    pub port: Option<u16>,
     pub initial_data: Option<BTreeMap<String, String>>,
 }
 
@@ -26,7 +23,7 @@ impl SimFileConfig {
         toml::from_str(&contents).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
-    pub fn into_sim_config(self) -> (SimConfig, DashboardConfig) {
+    pub fn into_sim_config(self) -> SimConfig {
         let topology = match self.topology.to_lowercase().as_str() {
             "ring" => Topology::Ring,
             "star" => Topology::Star,
@@ -43,7 +40,7 @@ impl SimFileConfig {
             .map(|(k, v)| (k, v.into_bytes()))
             .collect();
 
-        let sim = SimConfig {
+        SimConfig {
             name: self.name,
             topology,
             num_nodes: self.num_nodes,
@@ -52,12 +49,6 @@ impl SimFileConfig {
             ticks_per_round: self.ticks_per_round,
             heal_after_round: self.heal_after_round,
             num_threads: self.num_threads,
-        };
-
-        let dash = DashboardConfig {
-            port: self.port.unwrap_or(8080),
-        };
-
-        (sim, dash)
+        }
     }
 }
