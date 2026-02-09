@@ -8,6 +8,10 @@ version = "0.1.0"
 edition = "2024"
 autobenches = false
 
+[profile.bench]
+debug = true       
+strip = false      
+
 [lib]
 crate-type = ["rlib"]
 
