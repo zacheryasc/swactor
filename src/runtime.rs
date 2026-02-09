@@ -9,7 +9,7 @@ use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, RuntimeConfig};
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
-use crate::stats::{ActorInfo, MailboxSnapshot, WorkerStats};
+use crate::stats::{ActorInfo, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
 pub use crate::stats::{RuntimeStats, WorkerInfo};
 use crate::worker::Worker;
@@ -67,9 +67,13 @@ pub struct Runtime {
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
     /// Per-worker mailbox snapshots, updated each tick by workers.
-    mailbox_snapshots: Vec<Arc<std::sync::Mutex<MailboxSnapshot>>>,
+    mailbox_snapshots: Vec<Arc<std::sync::Mutex<Vec<(ActorAddress, usize)>>>>,
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
+    #[cfg(feature = "transport")]
+    codec_registry: Option<Arc<crate::transport::CodecRegistry>>,
+    #[cfg(feature = "transport")]
+    transport_router: Option<Arc<crate::transport::TransportRouter>>,
 }
 
 // Safety: RefCell<Vec<Worker>> is only accessed from the owning thread via tick().
@@ -107,7 +111,7 @@ impl Runtime {
             spawn_txs.push(spawn_tx);
 
             let stats = Arc::new(WorkerStats::new());
-            let mbox_snap = Arc::new(std::sync::Mutex::new(MailboxSnapshot::new()));
+            let mbox_snap = Arc::new(std::sync::Mutex::new(Vec::new()));
             worker_stats.push(stats.clone());
             mailbox_snapshots.push(mbox_snap.clone());
             workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats, mbox_snap));
@@ -124,6 +128,10 @@ impl Runtime {
             worker_stats,
             mailbox_snapshots,
             tick_workers: RefCell::new(workers),
+            #[cfg(feature = "transport")]
+            codec_registry: None,
+            #[cfg(feature = "transport")]
+            transport_router: None,
         };
 
         #[cfg(feature = "tracing")]
@@ -158,17 +166,12 @@ impl Runtime {
 
     /// Send a message to an actor address
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
-        let msg_box: Box<dyn Any + Send> = Box::new(msg);
+        let result = self.send_any(addr, Box::new(msg));
 
         #[cfg(feature = "tracing")]
         tracing::trace!(dest = %addr, "message.sent");
 
-        match self.address_map.lookup(&addr) {
-            Some(wid) => self.transfer_txs[wid.as_usize()]
-                .try_send(Envelope::new(addr, msg_box))
-                .map_err(|_| Error::from("Transfer queue full")),
-            None => self.inbox_registry.try_deliver(addr, msg_box),
-        }
+        result
     }
 
     /// Create an external inbox for receiving messages in the outer process containing the runtime
@@ -183,6 +186,21 @@ impl Runtime {
         })
     }
 
+    fn make_tick_context(&self) -> TickContext<'_> {
+        TickContext {
+            address_map: &self.address_map,
+            transfer_txs: &self.transfer_txs,
+            spawn_txs: &self.spawn_txs,
+            placement: &self.placement,
+            inbox_registry: &self.inbox_registry,
+            config: &self.config,
+            #[cfg(feature = "transport")]
+            codec_registry: self.codec_registry.as_deref(),
+            #[cfg(feature = "transport")]
+            transport_router: self.transport_router.as_deref(),
+        }
+    }
+
     /// Drive one tick of the single-threaded worker.
     ///
     /// Panics if called on a multi-threaded runtime — use `run()` instead.
@@ -191,14 +209,7 @@ impl Runtime {
             self.config.num_threads < 2,
             "tick() is only valid for single-threaded runtimes; use run() for multi-threaded"
         );
-        let tc = TickContext {
-            address_map: &self.address_map,
-            transfer_txs: &self.transfer_txs,
-            spawn_txs: &self.spawn_txs,
-            placement: &self.placement,
-            inbox_registry: &self.inbox_registry,
-            config: &self.config,
-        };
+        let tc = self.make_tick_context();
         for worker in self.tick_workers.borrow_mut().iter_mut() {
             worker.tick_once(&tc);
         }
@@ -226,14 +237,7 @@ impl Runtime {
             let handle = thread::Builder::new()
                 .name(name)
                 .spawn(move || {
-                    let tc = TickContext {
-                        address_map: &rt_clone.address_map,
-                        transfer_txs: &rt_clone.transfer_txs,
-                        spawn_txs: &rt_clone.spawn_txs,
-                        placement: &rt_clone.placement,
-                        inbox_registry: &rt_clone.inbox_registry,
-                        config: &rt_clone.config,
-                    };
+                    let tc = rt_clone.make_tick_context();
                     worker.run(&tc, &rt_clone.is_running);
                 })
                 .expect("failed to spawn worker thread");
@@ -248,61 +252,28 @@ impl Runtime {
 
     /// Returns a snapshot of runtime stats: actor placements and per-worker info.
     pub fn stats(&self) -> RuntimeStats {
-        let num_workers = if self.config.num_threads < 2 {
-            1
-        } else {
-            self.config.num_threads
-        };
-        let workers = self
-            .worker_stats
-            .iter()
-            .enumerate()
-            .map(|(i, ws)| WorkerInfo {
-                id: i,
-                num_actors: ws.num_actors.load(Ordering::Relaxed),
-                mailbox_depth: ws.total_mailbox_depth.load(Ordering::Relaxed),
-                messages_processed: ws.messages_processed.load(Ordering::Relaxed),
-                local_sends: ws.local_sends.load(Ordering::Relaxed),
-                cross_sends: ws.cross_sends.load(Ordering::Relaxed),
-                inbox_sends: ws.inbox_sends.load(Ordering::Relaxed),
-                type_mismatches: ws.type_mismatches.load(Ordering::Relaxed),
-                panics: ws.panics.load(Ordering::Relaxed),
-            })
+        let num_workers = if self.config.num_threads < 2 { 1 } else { self.config.num_threads };
+
+        let workers = self.worker_stats.iter().enumerate()
+            .map(|(i, ws)| ws.snapshot(i))
             .collect();
-        let actors = self
-            .address_map
-            .snapshot()
-            .into_iter()
+
+        let actors = self.address_map.snapshot().into_iter()
             .map(|(addr, wid)| (addr, wid.as_usize()))
             .collect();
 
-        // Collect per-actor mailbox depth details
         let mut actor_details = Vec::new();
         for (wid, snap_lock) in self.mailbox_snapshots.iter().enumerate() {
-            let snap = snap_lock.lock().unwrap();
-            for &(addr, depth) in &snap.depths {
-                actor_details.push(ActorInfo {
-                    address: addr,
-                    worker_id: wid,
-                    mailbox_depth: depth,
-                });
+            for &(addr, depth) in snap_lock.lock().unwrap().iter() {
+                actor_details.push(ActorInfo { address: addr, worker_id: wid, mailbox_depth: depth });
             }
         }
 
-        // Drain tick timings from each worker
-        let tick_timings = self
-            .worker_stats
-            .iter()
+        let tick_timings = self.worker_stats.iter()
             .map(|ws| ws.drain_tick_timings())
             .collect();
 
-        RuntimeStats {
-            num_workers,
-            actors,
-            workers,
-            actor_details,
-            tick_timings,
-        }
+        RuntimeStats { num_workers, actors, workers, actor_details, tick_timings }
     }
 
     /// Signal all workers to stop
@@ -312,16 +283,63 @@ impl Runtime {
 
         self.is_running.store(false, Ordering::Release);
     }
+
+    /// Set the codec registry for remote transport.
+    #[cfg(feature = "transport")]
+    pub fn set_codec_registry(&mut self, registry: Arc<crate::transport::CodecRegistry>) {
+        self.codec_registry = Some(registry);
+    }
+
+    /// Set the transport router for remote message delivery.
+    #[cfg(feature = "transport")]
+    pub fn set_transport_router(&mut self, router: Arc<crate::transport::TransportRouter>) {
+        self.transport_router = Some(router);
+    }
+
+    /// Route a message whose destination is not in the local address map.
+    fn route_nonlocal(
+        &self,
+        addr: ActorAddress,
+        msg: Box<dyn Any + Send>,
+    ) -> Result<(), Error> {
+        #[cfg(feature = "transport")]
+        {
+            if self.inbox_registry.contains(&addr) {
+                return self.inbox_registry.try_deliver(addr, msg);
+            }
+            if let (Some(cr), Some(tr)) = (&self.codec_registry, &self.transport_router) {
+                return crate::transport::send_via_transport(addr, msg, cr, tr);
+            }
+        }
+        self.inbox_registry.try_deliver(addr, msg)
+    }
+
+    /// Deliver a raw deserialized message into the runtime.
+    ///
+    /// Used by [`CodecRegistry::receive`](crate::transport::CodecRegistry::receive)
+    /// to inject incoming messages from remote runtimes.
+    #[cfg(feature = "transport")]
+    pub fn deliver_raw(
+        &self,
+        addr: ActorAddress,
+        msg: Box<dyn Any + Send>,
+    ) -> Result<(), Error> {
+        match self.address_map.lookup(&addr) {
+            Some(wid) => self.transfer_txs[wid.as_usize()]
+                .try_send(Envelope::new(addr, msg))
+                .map_err(|_| Error::from("Transfer queue full")),
+            None => self.inbox_registry.try_deliver(addr, msg),
+        }
+    }
 }
 
 impl ContextInner for Runtime {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
-            Some(wid) => {
-                let _ = self.transfer_txs[wid.as_usize()].try_send(Envelope::new(addr, msg));
-                Ok(())
-            }
-            None => self.inbox_registry.try_deliver(addr, msg),
+            Some(wid) => self.transfer_txs[wid.as_usize()]
+                .try_send(Envelope::new(addr, msg))
+                .map_err(|_| Error::from("Transfer queue full")),
+            None => self.route_nonlocal(addr, msg),
         }
     }
 

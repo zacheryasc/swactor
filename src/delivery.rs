@@ -28,12 +28,6 @@ pub(crate) struct AddressMap {
 }
 
 impl AddressMap {
-    pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(HashMap::new()),
-        }
-    }
-
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             inner: RwLock::new(HashMap::with_capacity(cap)),
@@ -44,16 +38,8 @@ impl AddressMap {
         self.inner.write().unwrap().insert(addr, worker);
     }
 
-    pub fn remove(&self, addr: &ActorAddress) {
-        self.inner.write().unwrap().remove(addr);
-    }
-
     pub fn lookup(&self, addr: &ActorAddress) -> Option<WorkerId> {
         self.inner.read().unwrap().get(addr).copied()
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
     }
 
     /// Returns a snapshot of all (address, worker) pairs.
@@ -106,10 +92,6 @@ impl Envelope {
         self.dest
     }
 
-    pub fn downcast<M: 'static>(self) -> Option<M> {
-        self.payload.downcast::<M>().ok().map(|b| *b)
-    }
-
     pub fn into_payload(self) -> Box<dyn Any + Send> {
         self.payload
     }
@@ -144,6 +126,11 @@ impl InboxRegistry {
         self.senders.write().unwrap().insert(addr, sender);
     }
 
+    /// Check if an address is registered without consuming a message.
+    pub fn contains(&self, addr: &ActorAddress) -> bool {
+        self.senders.read().unwrap().contains_key(addr)
+    }
+
     pub fn try_deliver(
         &self,
         addr: ActorAddress,
@@ -167,4 +154,29 @@ pub(crate) struct TickContext<'a> {
     pub(crate) placement: &'a Placement,
     pub(crate) inbox_registry: &'a InboxRegistry,
     pub(crate) config: &'a RuntimeConfig,
+    #[cfg(feature = "transport")]
+    pub(crate) codec_registry: Option<&'a crate::transport::CodecRegistry>,
+    #[cfg(feature = "transport")]
+    pub(crate) transport_router: Option<&'a crate::transport::TransportRouter>,
+}
+
+impl<'a> TickContext<'a> {
+    /// Route a message whose destination is not in the local address map.
+    /// Tries inbox registry, then remote transport, then falls back to inbox error.
+    pub(crate) fn route_nonlocal(
+        &self,
+        addr: ActorAddress,
+        msg: Box<dyn Any + Send>,
+    ) -> Result<(), Error> {
+        #[cfg(feature = "transport")]
+        {
+            if self.inbox_registry.contains(&addr) {
+                return self.inbox_registry.try_deliver(addr, msg);
+            }
+            if let (Some(cr), Some(tr)) = (self.codec_registry, self.transport_router) {
+                return crate::transport::send_via_transport(addr, msg, cr, tr);
+            }
+        }
+        self.inbox_registry.try_deliver(addr, msg)
+    }
 }

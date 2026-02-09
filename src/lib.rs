@@ -12,6 +12,9 @@ pub mod stats;
 
 pub mod runtime;
 
+#[cfg(feature = "transport")]
+pub mod transport;
+
 #[cfg(feature = "getrandom")]
 pub(crate) fn get_random(buf: &mut [u8]) {
     getrandom::getrandom(buf).unwrap()
@@ -30,7 +33,3 @@ pub(crate) fn get_random(buf: &mut [u8]) {
         *byte = bytes[i % core::mem::size_of::<usize>()];
     }
 }
-
-
-#[cfg(test)]
-mod crate_test;

@@ -1,9 +1,9 @@
 # swactor
 
-Small, WASM-compatible actor runtime for Rust, with Python and WebAssembly
-bindings.
+Minimal actor runtime for Rust. Single-threaded or multi-threaded, with
+Python and WebAssembly bindings.
 
-## Quick Start (Rust)
+## Quick Start
 
 ```rust
 use swactor::actor::{ActorAddress, ActorInterface};
@@ -39,221 +39,92 @@ fn main() {
 }
 ```
 
-## Quick Start (Python)
+## Features
+
+### Actor Model
+
+Actors implement one trait (`ActorInterface`), receive one message type, and
+hold mutable state. No lifecycle hooks, no supervision trees, no async.
+
+Every actor gets a 32-byte globally unique `ActorAddress`. The same
+`ctx.send(addr, msg)` call works whether the target is on the same worker,
+a different worker thread, an external inbox, or a remote process.
+
+Single-threaded mode (`rt.tick()`) gives deterministic frame-level control.
+Multi-threaded mode (`rt.run()`) spawns OS threads with adaptive backoff.
+
+See [docs/actor-model.md](docs/actor-model.md) and
+[docs/runtime.md](docs/runtime.md) for the full model.
+
+### Transport
+
+Pluggable cross-process messaging. User-provided codecs handle serialization
+(gRPC/protobuf, bincode, hand-rolled — no serde bounds imposed) and
+user-provided transports handle delivery (TCP, in-memory, gRPC channel).
 
 ```bash
-uv pip install .    # builds the Rust extension automatically
+cargo build --features transport
+cargo run --example tcp_ping_pong --features transport -- receiver  # terminal 1
+cargo run --example tcp_ping_pong --features transport -- sender    # terminal 2
 ```
 
-Single-threaded — caller drives each tick:
+See [docs/transport.md](docs/transport.md) for the routing chain, codec
+registry, and address resolution.
 
-```python
-from swactor import Runtime
+### Runtime Dashboard
 
-def echo(ctx, msg):
-    ctx.send(msg["reply_to"], f"hello, {msg['name']}!")
+Live web dashboard for monitoring actors, message throughput, and mailbox
+depths. Supports trace recording and replay at configurable speed.
 
-rt = Runtime()
-addr = rt.spawn(echo)
-inbox = rt.inbox()
-rt.send(addr, {"name": "world", "reply_to": inbox.addr})
-rt.tick()
-print(inbox.try_recv())  # "hello, world!"
-```
+Includes hand-authored SVG diagrams (actor lifecycle, message lifecycle,
+tick cycle, transport routing) and generated diagrams from DOT sources
+(architecture, dataflow, type erasure).
 
-Multi-threaded — workers run on background threads:
+See [crates/runtime-dashboard/](crates/runtime-dashboard/README.md).
 
-```python
-import asyncio
-from swactor import Runtime, RuntimeConfig
+### Language Bindings
 
-async def main():
-    rt = Runtime(RuntimeConfig(num_threads=2))
-
-    def echo(ctx, msg):
-        ctx.send(msg["reply_to"], f"hello, {msg['name']}!")
-
-    addr = rt.spawn(echo)
-    inbox = rt.inbox()
-    handle = rt.run()  # spawns worker threads, consumes rt
-
-    for name in ["alice", "bob", "charlie"]:
-        handle.send(addr, {"name": name, "reply_to": inbox.addr})
-        while (reply := inbox.try_recv()) is None:
-            await asyncio.sleep(0.01)
-        print(reply)
-
-    handle.shutdown()
-    handle.join()
-
-asyncio.run(main())
-```
-
-## Quick Start (WASM)
-
-The `wasm/` crate wraps swactor for use from JavaScript via `wasm-bindgen`.
-It runs single-threaded with the caller driving `tick()` — a natural fit
-for game loops, simulations, or any frame-based update cycle.
+**Python** — PyO3 via Maturin. Spawn actors from Python callables, pass
+dicts as messages, single-threaded or multi-threaded.
 
 ```bash
-cd wasm && wasm-pack build --target nodejs    # or --target web
+cd crates/swactor-python && maturin develop
 ```
 
-```javascript
-import { SwactorRuntime } from "./wasm/pkg/swactor_wasm.js";
+Examples in `examples/python/` (single-thread, async, Jupyter notebook).
 
-const rt = new SwactorRuntime();
-
-// spawn a counter actor — accumulates values sent to it
-const counter = rt.spawn_counter();
-
-// spawn a relay that forwards messages to the counter
-const relay = rt.spawn_relay(counter);
-
-// send through the relay
-rt.send(relay, 5);
-rt.send(relay, 7);
-
-rt.tick();  // relay receives and forwards
-rt.tick();  // counter receives forwarded messages
-
-// drain results from the inbox
-let v;
-while ((v = rt.try_recv()) !== undefined) {
-    console.log(v);  // 5, then 12
-}
-
-rt.free();
-```
-
-The WASM crate uses the `no_random` feature (deterministic address
-generation) so there's no dependency on system RNG.
-
-## Running the Examples
+**WASM** — wasm-bindgen. Runs single-threaded with deterministic addressing
+(`no_random` feature).
 
 ```bash
-cargo run --example hello    # single actor, request/response
-cargo run --example ring     # 500 actors in a ring topology
+cd crates/swactor-wasm && wasm-pack build --target nodejs
 ```
 
-## Multi-threaded Mode
+### Connectome Analysis
 
-Pass `num_threads` in the config. The runtime spawns OS threads and runs
-workers autonomously — no `tick()` calls needed.
+Structural analysis of the internal dependency graph.
 
-```rust
-let mut config = RuntimeConfig::default();
-config.num_threads = 4;
-let rt = Runtime::new(config);
+- **depgraph** (`tools/depgraph/`) — AST-based extraction of module
+  dependencies, outputs GraphViz DOT
+- **spectral** (`tools/spectral/`) — Laplacian eigenvalue analysis,
+  Connectome Complexity Index (CCI), coupling heatmaps, interactive HTML
+  dashboard
 
-let addr = rt.spawn(MyActor::default()).unwrap();
-let handle = rt.run().unwrap();  // consumes rt, spawns 4 threads
-
-// use handle.runtime to spawn/send while workers run
-handle.runtime.send_to(addr, MyMsg).unwrap();
-
-handle.shutdown();
-handle.join();
+```bash
+cargo run --manifest-path tools/depgraph/Cargo.toml -- --src-dir src/ --output deps
+python tools/spectral/spectral_analysis.py deps.dot
 ```
 
-## Architecture
-
-The runtime is layered: **Runtime** → **Workers** → **ActorPool** → **Actors**.
-
-```
-┌─ Runtime (Arc, shared) ──────────────────────────────────────┐
-│                                                               │
-│  AddressMap    Placement    InboxRegistry    is_running        │
-│  (addr→worker) (round-robin) (external inboxes) (AtomicBool)  │
-│                                                               │
-│  transfer_txs[]              spawn_txs[]                      │
-│  (one Sender per worker)     (one Sender per worker)          │
-│                                                               │
-└───────┬───────────────┬───────────────┬───────────────────────┘
-        │               │               │
-        v               v               v
-   ┌─ Worker 0 ──┐ ┌─ Worker 1 ──┐ ┌─ Worker 2 ──┐
-   │  ActorPool   │ │  ActorPool   │ │  ActorPool   │
-   │  ┌────────┐  │ │  ┌────────┐  │ │  ┌────────┐  │
-   │  │mailbox │  │ │  │mailbox │  │ │  │mailbox │  │
-   │  │ actor  │  │ │  │ actor  │  │ │  │ actor  │  │
-   │  └────────┘  │ │  └────────┘  │ │  └────────┘  │
-   │  ┌────────┐  │ │  ┌────────┐  │ │              │
-   │  │mailbox │  │ │  │mailbox │  │ └──────────────┘
-   │  │ actor  │  │ │  │ actor  │  │
-   │  └────────┘  │ │  └────────┘  │
-   └──────────────┘ └──────────────┘
-```
-
-Each worker runs a **four-phase tick loop**:
-
-1. **Drain spawn queue** — add newly spawned actors to the pool
-2. **Drain transfer queue** — deliver cross-worker messages to mailboxes
-3. **Tick all actors** — pop messages, call handlers, buffer outgoing sends
-4. **Drain pending local** — deliver same-worker messages for the next tick
-
-Messages are type-erased (`Box<dyn Any + Send>`) in transit and downcast
-back to the concrete type at delivery. Mismatched types are silently dropped.
-
-Detailed architecture docs live in `docs/`:
-
-| Document | Covers |
-|----------|--------|
-| [Worker Thread](docs/worker-thread.md) | Tick phases, backoff, message routing, full system topology |
-| [Runtime](docs/runtime.md) | Runtime, Ctx, Inbox, RuntimeHandle, stats |
-| [Actor Model](docs/actor-model.md) | Traits, type erasure, addresses |
-| [Channels & Shared State](docs/channels.md) | HybridChannel, AddressMap, Placement |
-
-## Source Layout
-
-```
-src/
-├── lib.rs           module root, feature gates, get_random()
-├── actor.rs         Message, ActorInterface, ActorAddress, type erasure
-├── runtime.rs       Runtime, Ctx, Inbox, RuntimeHandle, InboxRegistry
-├── worker/
-│   ├── mod.rs       Worker, WorkerContext, ActorPool, tick loop
-│   └── tests.rs     worker unit tests with step-based DSL
-├── channel.rs       HybridChannel (ArrayQueue + SegQueue), Sender/Receiver
-├── config.rs        RuntimeConfig, BackoffPolicy
-├── address_map.rs   AddressMap (RwLock<HashMap>), Placement (round-robin)
-├── error.rs         Error type
-└── python.rs        PyO3 bindings (feature = "python")
-
-wasm/
-├── Cargo.toml       separate crate, depends on swactor with no_random
-├── src/lib.rs       wasm-bindgen wrapper (SwactorRuntime)
-└── test.mjs         Node.js test suite
-
-examples/
-├── hello.rs                    echo actor
-├── ring.rs                     ring topology
-└── python/
-    ├── hello_single_thread.py  minimal Python example
-    ├── hello_async.py          multi-threaded + asyncio
-    └── getting_started.ipynb   Jupyter notebook
-
-tests/
-├── runtime_api.rs   single + multi-thread integration tests
-├── stats_demo.rs    stats snapshot tests
-└── test_python.py   Python binding tests
-```
+See [docs/connectome.md](docs/connectome.md) for metric interpretation.
 
 ## Building & Testing
 
 ```bash
-# Rust
-cargo test                              # run all tests
-cargo run --example hello               # run an example
+cargo test                              # all tests
+cargo test --features transport         # include transport tests
+cargo run --example hello               # single actor example
+cargo run --example ring                # 500-actor ring topology
 cargo bench                             # benchmarks (criterion)
-
-# Python bindings (requires Rust toolchain on PATH)
-uv pip install .                        # build + install
-uv run python3 tests/test_python.py     # run Python tests
-
-# WASM bindings
-cd wasm && wasm-pack build --target nodejs
-node test.mjs                           # run WASM tests
 ```
 
 ## Feature Flags
@@ -261,19 +132,20 @@ node test.mjs                           # run WASM tests
 | Flag | Default | What it does |
 |------|---------|--------------|
 | `getrandom` | yes | System RNG for actor addresses |
-| `no_random` | no | Deterministic counter (for WASM / reproducible tests) |
-| `python` | no | PyO3 bindings, builds cdylib wheel |
-## Connectome analysis
+| `no_random` | no | Deterministic counter (WASM / reproducible tests) |
+| `transport` | no | Pluggable remote messaging (codec + transport) |
+| `tracing` | no | `tracing` instrumentation for runtime internals |
+| `serde` | no | Serde derives for stats types |
+| `python` | no | PyO3 bindings (cdylib wheel) |
 
-Spectral analysis of the internal dependency graph, producing a Connectome Complexity Index (CCI) and visual dashboards.
+## Documentation
 
-```sh
-# Generate the dependency DAG
-cargo run --manifest-path tools/depgraph/Cargo.toml -- --src-dir src/ --output deps
-
-# Run spectral analysis (outputs to docs/connectome/)
-source .venv/bin/activate
-python tools/spectral/spectral_analysis.py deps.dot
-```
-
-This produces a text report, an interactive HTML dashboard, and a static PNG dashboard in `docs/connectome/`. See [docs/connectome.md](docs/connectome.md) for details on the metrics and interpretation.
+| Document | Covers |
+|----------|--------|
+| [Actor Model](docs/actor-model.md) | Traits, type erasure, addresses |
+| [Runtime](docs/runtime.md) | Runtime, Ctx, Inbox, RuntimeHandle, stats |
+| [Worker Thread](docs/worker-thread.md) | Tick phases, backoff, routing, full system topology |
+| [Channels](docs/channels.md) | HybridChannel, AddressMap, Placement |
+| [Transport](docs/transport.md) | Codec, Transport, remote messaging, address resolution |
+| [Connectome](docs/connectome.md) | CCI metrics, spectral analysis interpretation |
+| [Dashboard](crates/runtime-dashboard/README.md) | Live web UI, trace recording, diagram index |

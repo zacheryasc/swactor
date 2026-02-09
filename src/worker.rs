@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx};
 use crate::channel::Receiver;
 use crate::delivery::{Envelope, TickContext, WorkerId};
-use crate::stats::{MailboxSnapshot, TickTiming, WorkerStats};
+use crate::stats::{TickTiming, WorkerStats};
 use crate::Error;
 
 /// A worker owns a set of actors and runs them in a loop.
@@ -20,7 +20,7 @@ pub(crate) struct Worker {
     spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
     stats: Arc<WorkerStats>,
     /// Shared snapshot of per-actor mailbox depths, readable by Runtime::stats().
-    mailbox_snapshot: Arc<std::sync::Mutex<MailboxSnapshot>>,
+    mailbox_snapshot: Arc<std::sync::Mutex<Vec<(ActorAddress, usize)>>>,
 }
 
 impl Worker {
@@ -29,7 +29,7 @@ impl Worker {
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
         stats: Arc<WorkerStats>,
-        mailbox_snapshot: Arc<std::sync::Mutex<MailboxSnapshot>>,
+        mailbox_snapshot: Arc<std::sync::Mutex<Vec<(ActorAddress, usize)>>>,
     ) -> Self {
         Self {
             id,
@@ -127,8 +127,7 @@ impl Worker {
         // Publish per-actor mailbox depths
         {
             let depths: Vec<(ActorAddress, usize)> = self.pool.mailbox_depths();
-            let mut snap = self.mailbox_snapshot.lock().unwrap();
-            snap.depths = depths;
+            *self.mailbox_snapshot.lock().unwrap() = depths;
         }
 
         let t6 = Instant::now();
@@ -205,22 +204,18 @@ impl ContextInner for WorkerContext<'_> {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
         match self.tc.address_map.lookup(&addr) {
             Some(wid) if wid == self.worker_id => {
-                // Same worker: buffer for local delivery (after current tick round)
                 self.stats.local_sends.fetch_add(1, Ordering::Relaxed);
                 self.pending_local.borrow_mut().push((addr, msg));
                 Ok(())
             }
             Some(wid) => {
-                // Cross worker: envelope through transfer queue
                 self.stats.cross_sends.fetch_add(1, Ordering::Relaxed);
-                let envelope = Envelope::new(addr, msg);
-                let _ = self.tc.transfer_txs[wid.as_usize()].try_send(envelope);
+                let _ = self.tc.transfer_txs[wid.as_usize()].try_send(Envelope::new(addr, msg));
                 Ok(())
             }
             None => {
-                // Try inbox registry (external inboxes)
                 self.stats.inbox_sends.fetch_add(1, Ordering::Relaxed);
-                self.tc.inbox_registry.try_deliver(addr, msg)
+                self.tc.route_nonlocal(addr, msg)
             }
         }
     }
@@ -232,7 +227,6 @@ impl ContextInner for WorkerContext<'_> {
             .try_send((addr, actor))
             .map_err(|_| Error::from("Spawn queue full"))
     }
-
 }
 
 struct ActorSlot {
@@ -257,10 +251,6 @@ impl ActorPool {
             mailbox: VecDeque::new(),
             actor,
         });
-    }
-
-    pub fn remove(&mut self, addr: &ActorAddress) -> Option<Box<dyn AnyActor>> {
-        self.actors.remove(addr).map(|slot| slot.actor)
     }
 
     /// Deliver a type-erased message to the actor at `addr`.

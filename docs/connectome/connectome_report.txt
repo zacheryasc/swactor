@@ -4,121 +4,62 @@
 
 GRAPH SUMMARY
 ----------------------------------------
-  Nodes:                36
-  Directed edges:       78
-  Modules:              8
+  Nodes:                39
+  Directed edges:       97
+  Modules:              9
   Connected components: 2
-  Modules:              error, config, channel, actor, address_map, runtime, worker, python
+  Modules:              actor, worker, channel, error, config, delivery, stats, runtime, transport
 
-LAPLACIAN EIGENVALUE SPECTRUM
+STRUCTURAL PROPERTIES
 ----------------------------------------
-  lambda_ 0 =   0.0000
-  lambda_ 1 =   0.0000 <-- Fiedler value (lambda_2)
-  lambda_ 2 =   0.1864
-  lambda_ 3 =   0.4814
-  lambda_ 4 =   0.6124
-  lambda_ 5 =   0.7986
-  lambda_ 6 =   0.8319
-  lambda_ 7 =   1.0046
-  lambda_ 8 =   1.2394
-  lambda_ 9 =   1.3690
-  lambda_10 =   1.4527
-  lambda_11 =   1.6261
-  lambda_12 =   2.3213
-  lambda_13 =   2.3936
-  lambda_14 =   2.9092
-  lambda_15 =   3.1570
-  lambda_16 =   3.2200
-  lambda_17 =   3.3902
-  lambda_18 =   3.4799
-  lambda_19 =   3.6052
-  lambda_20 =   3.8848
-  lambda_21 =   4.1863
-  lambda_22 =   4.7070
-  lambda_23 =   5.1732
-  lambda_24 =   5.5865
-  lambda_25 =   5.7959
-  lambda_26 =   5.8550
-  lambda_27 =   6.1829
-  lambda_28 =   6.4619
-  lambda_29 =   6.8986
-  lambda_30 =   7.3807
-  lambda_31 =   7.8965
-  lambda_32 =   9.1602
-  lambda_33 =  11.1710
-  lambda_34 =  14.0475
-  lambda_35 =  15.5333
+  Edges/node (avg degree):   2.49
+  Max fan-in:                16   (ActorAddress)
+  Max fan-out:               18   (Runtime)
+  DAG depth:                 7
+  Clustering coefficient:    0.2668
 
-  Spectral gap (lambda_max - lambda_2): 15.5333
-  Fiedler value (algebraic connectivity): 0.0000
-
-FIEDLER VECTOR — SPECTRAL BISECTION
+MODULE COHESION
 ----------------------------------------
-  Partition A (Fiedler < 0):
-    HybridChannel             [channel     ]  f = -0.0000
-    RuntimeConfig             [config      ]  f = -0.0000
-    SenderT                   [runtime     ]  f = -0.0000
-    PyRuntimeHandle           [python      ]  f = -0.0000
-    PyRuntimeConfig           [python      ]  f = -0.0000
-    Placement                 [address_map ]  f = -0.0000
-    Message                   [actor       ]  f = -0.0000
-    PyActorAddress            [python      ]  f = -0.0000
-    PyRuntime                 [python      ]  f = -0.0000
-    Envelope                  [runtime     ]  f = -0.0000
-    PyActor                   [python      ]  f = -0.0000
-    TickContext               [worker      ]  f = -0.0000
-    Sender                    [channel     ]  f = -0.0000
-    InboxRegistry             [runtime     ]  f = -0.0000
-    Runtime                   [runtime     ]  f = -0.0000
-    Receiver                  [channel     ]  f = -0.0000
-  ────────────────────────────────────
-  Partition B (Fiedler >= 0):
-    Error                     [error       ]  f = +0.0000
-    Ctx                       [actor       ]  f = +0.0000
-    Effect                    [python      ]  f = +0.0000
-    BackoffPolicy             [config      ]  f = +0.0000
-    ActorAddress              [actor       ]  f = +0.0000
-    AddressMap                [address_map ]  f = +0.0000
-    ContextInner              [actor       ]  f = +0.0000
-    Worker                    [worker      ]  f = +0.0000
-    ActorPool                 [worker      ]  f = +0.0000
-    WorkerContext             [worker      ]  f = +0.0000
-    RuntimeHandle             [runtime     ]  f = +0.0000
-    PyInbox                   [python      ]  f = +0.0000
-    ActorInterface            [actor       ]  f = +0.0000
-    AnyActor                  [actor       ]  f = +0.0000
-    WorkerId                  [address_map ]  f = +0.0000
-    Inbox                     [runtime     ]  f = +0.0000
-    PyCtx                     [python      ]  f = +0.0000
-    PyMsg                     [python      ]  f = +0.0000
-    Actor                     [actor       ]  f = +0.0000
-    Mailbox                   [worker      ]  f = +1.0000
+  Module            Size  Cohesion
+  actor                7     0.214
+  worker               4     0.167
+  channel              3     0.500
+  error                1         —
+  config               2     0.500
+  delivery             7     0.167
+  stats                5     0.250
+  runtime              3     0.500
+  transport            7     0.119
+  ────────────────────────────────
+  Average cohesion:          0.302
+  Avg module size:             4.3
 
 MODULE COUPLING MATRIX (directed edge counts)
 ----------------------------------------
-                     error    config   channel     actoraddress_map   runtime    worker    python
-  error                  0         0         0         0         0         0         0         0
-  config                 0         1         0         0         0         0         0         0
-  channel                0         0         3         0         0         1         0         0
-  actor                  2         0         0         7         0         0         0         0
-  address_map            0         0         0         1         2         0         0         0
-  runtime                2         1         2         6         2         6         1         0
-  worker                 1         1         2         9         4         3         3         0
-  python                 0         0         0         5         0         3         0        10
+                     actor    worker   channel     error    config  delivery     stats   runtime transport
+  actor                  9         0         0         2         0         0         0         0         0
+  worker                 9         2         1         1         0         5         3         0         0
+  channel                0         0         3         0         0         1         0         0         0
+  error                  0         0         0         0         0         0         0         0         0
+  config                 0         0         0         0         1         0         0         0         0
+  delivery               5         0         1         2         1         7         0         0         2
+  stats                  2         0         0         0         0         0         5         0         0
+  runtime                4         1         2         1         1         5         2         3         2
+  transport              3         0         2         4         0         0         0         0         5
 
-  Cross-module edges: 46 / 78 (59.0%)
+  Cross-module edges: 62 / 97 (63.9%)
 
 CONNECTOME COMPLEXITY INDEX (CCI)
 ----------------------------------------
   Sub-metric                                      Raw Normalized   Weight  Contrib
   ──────────────────────────────────────── ────────── ────────── ──────── ────────
   Algebraic connectivity (lambda_2/n)          0.0000     0.0000     0.25   0.0000
-  Spectral entropy (H/log2(k))                 4.6411     0.9123     0.25   0.2281
-  Edge density (|E|/n(n-1))                    0.0619     0.0619     0.15   0.0093
-  Cross-module coupling ratio                  0.5897     0.5897     0.20   0.1179
-  Spectral radius (rho/(n-1))                  6.6762     0.1907     0.15   0.0286
+  Spectral entropy (H/log2(k))                 4.7287     0.9077     0.25   0.2269
+  Edge density (|E|/n(n-1))                    0.0655     0.0655     0.15   0.0098
+  Cross-module coupling ratio                  0.6392     0.6392     0.20   0.1278
+  Spectral radius (rho/(n-1))                  7.9636     0.2096     0.15   0.0314
   ──────────────────────────────────────── ────────── ────────── ──────── ────────
-  CCI (weighted sum)                                                 1.00   0.3839
+  CCI (weighted sum)                                                 1.00   0.3960
 
   Interpretation: MODERATE complexity — typical well-structured codebase
 
