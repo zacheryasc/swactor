@@ -1,0 +1,11 @@
+name = "Partition & Heal (100 nodes)"
+topology = "partitioned"
+num_nodes = 100
+num_rounds = 10
+ticks_per_round = 5
+num_threads = 4
+heal_after_round = 5
+
+[initial_data]
+color = "blue"
+version = "1"

@@ -1,0 +1,11 @@
+name = "Ring (10 nodes)"
+topology = "ring"
+num_nodes = 10
+num_rounds = 15
+ticks_per_round = 5
+num_threads = 1
+
+[initial_data]
+color = "blue"
+version = "1"
+status = "active"
