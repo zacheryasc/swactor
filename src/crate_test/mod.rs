@@ -253,13 +253,8 @@ fn wrong_type_silently_dropped() {
 }
 
 #[test]
-fn backpressure_drains_half() {
-    let config = RuntimeConfig {
-        mailbox_waterlevel: 4,
-        ..Default::default()
-    };
-
-    run_with(config, &[
+fn all_messages_drain_in_one_tick() {
+    run(&[
         Step::Spawn(1),
         Step::Tick,
 
@@ -268,15 +263,7 @@ fn backpressure_drains_half() {
         Step::Send(1, 4), Step::Send(1, 5), Step::Send(1, 6), Step::Send(1, 7),
         Step::Send(1, 8), Step::Send(1, 9),
 
-        // Tick 1: 10 in mailbox, drain_count(10, 4) = 5
-        Step::Tick,
-        Step::Expect { pool_len: 1, depth: 5, processed: 5 },
-
-        // Tick 2: 5 remaining, drain_count(5, 4) = 2
-        Step::Tick,
-        Step::Expect { pool_len: 1, depth: 3, processed: 7 },
-
-        // Tick 3: 3 remaining, drain_count(3, 4) = 3 (below waterlevel → all)
+        // All 10 processed in a single tick
         Step::Tick,
         Step::Expect { pool_len: 1, depth: 0, processed: 10 },
         Step::ExpectHandled(1, 10),

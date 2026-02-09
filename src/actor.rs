@@ -64,7 +64,6 @@ where
 pub trait ContextInner {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
     fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) -> Result<(), Error>;
-    fn mailbox_waterlevel(&self) -> usize;
 }
 
 /// Actor syscall interface — passed to `ActorInterface::handle()`.

@@ -71,7 +71,14 @@ impl Worker {
             }
         }
 
-        // 4. Drain pending_local buffer → deliver to local actors
+        // 4. Drain spawn queue again — actors spawned during step 3
+        //    must be in the pool before pending_local delivery.
+        while let Some((addr, actor)) = self.spawn_rx.try_recv() {
+            self.pool.insert(addr, actor);
+            did_work = true;
+        }
+
+        // 5. Drain pending_local buffer → deliver to local actors
         let pending = pending_local.into_inner();
         if !pending.is_empty() {
             did_work = true;
@@ -80,7 +87,7 @@ impl Worker {
             self.pool.deliver(&addr, msg);
         }
 
-        // 5. Publish stats
+        // 6. Publish stats
         self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
         self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
         self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
@@ -152,20 +159,6 @@ impl ContextInner for WorkerContext<'_> {
             .map_err(|_| Error::from("Spawn queue full"))
     }
 
-    fn mailbox_waterlevel(&self) -> usize {
-        self.tc.config.mailbox_waterlevel
-    }
-}
-
-/// How many messages to process this tick:
-/// - `len < waterlevel` → process all (`len`)
-/// - `len >= waterlevel` → process half (`len >> 1`)
-pub fn drain_count(len: usize, waterlevel: usize) -> usize {
-    if len < waterlevel {
-        len
-    } else {
-        len >> 1
-    }
 }
 
 struct ActorSlot {
@@ -211,16 +204,15 @@ impl ActorPool {
     pub fn tick_all(&mut self, inner: &dyn ContextInner) -> usize {
         let mut count = 0;
         for (&addr, slot) in self.actors.iter_mut() {
-            let len = slot.mailbox.len();
-            let n = drain_count(len, inner.mailbox_waterlevel());
-            if n > 0 {
-                let ctx = Ctx::new(inner, addr);
-                for _ in 0..n {
-                    if let Some(msg) = slot.mailbox.pop_front() {
-                        slot.actor.handle_any(&ctx, msg);
-                        count += 1;
-                    }
+            let ctx = Ctx::new(inner, addr);
+            while let Some(msg) = slot.mailbox.pop_front() {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    slot.actor.handle_any(&ctx, msg);
+                }));
+                if result.is_err() {
+                    eprintln!("swactor: actor {addr} panicked in handler");
                 }
+                count += 1;
             }
         }
         count

@@ -38,7 +38,6 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.num_threads, 1)
         self.assertEqual(cfg.max_actors, 1000)
         self.assertEqual(cfg.actor_max_messages, 1000)
-        self.assertEqual(cfg.mailbox_waterlevel, 10)
         self.assertEqual(cfg.spin_threshold, 64)
         self.assertEqual(cfg.yield_threshold, 256)
         self.assertEqual(cfg.sleep_increment_us, 50)
