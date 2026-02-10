@@ -15,7 +15,7 @@ fn mt_config(threads: usize, max_actors: usize, max_messages: usize) -> RuntimeC
     RuntimeConfig {
         num_threads: threads,
         max_actors,
-        actor_max_messages: max_messages,
+        channel_buffer_size: max_messages,
         backoff_policy: BackoffPolicy {
             spin_threshold: 32,
             yield_threshold: 64,

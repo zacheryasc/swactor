@@ -225,7 +225,7 @@ pub struct PyRuntimeConfig {
     #[pyo3(get, set)]
     max_actors: usize,
     #[pyo3(get, set)]
-    actor_max_messages: usize,
+    channel_buffer_size: usize,
     #[pyo3(get, set)]
     spin_threshold: u32,
     #[pyo3(get, set)]
@@ -243,7 +243,7 @@ impl PyRuntimeConfig {
         *,
         num_threads = 1,
         max_actors = 1_000,
-        actor_max_messages = 1_000,
+        channel_buffer_size = 1_000,
         spin_threshold = 64,
         yield_threshold = 256,
         sleep_increment_us = 50,
@@ -252,7 +252,7 @@ impl PyRuntimeConfig {
     fn new(
         num_threads: usize,
         max_actors: usize,
-        actor_max_messages: usize,
+        channel_buffer_size: usize,
         spin_threshold: u32,
         yield_threshold: u32,
         sleep_increment_us: u64,
@@ -261,7 +261,7 @@ impl PyRuntimeConfig {
         Self {
             num_threads,
             max_actors,
-            actor_max_messages,
+            channel_buffer_size,
             spin_threshold,
             yield_threshold,
             sleep_increment_us,
@@ -275,7 +275,7 @@ impl From<PyRuntimeConfig> for RuntimeConfig {
         RuntimeConfig {
             num_threads: py.num_threads,
             max_actors: py.max_actors,
-            actor_max_messages: py.actor_max_messages,
+            channel_buffer_size: py.channel_buffer_size,
             backoff_policy: BackoffPolicy {
                 spin_threshold: py.spin_threshold,
                 yield_threshold: py.yield_threshold,

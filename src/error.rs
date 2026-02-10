@@ -17,12 +17,12 @@ pub struct Error(Box<dyn std::error::Error + Send + Sync + 'static>);
 
 impl<T: AsRef<str>> From<T> for Error {
     fn from(value: T) -> Self {
-        Error(format!("{:?}", value.as_ref()).into())
+        Error(value.as_ref().to_string().into())
     }
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
+        write!(f, "{}", self.0)
     }
 }

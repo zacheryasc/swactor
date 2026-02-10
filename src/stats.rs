@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+use crossbeam_queue::ArrayQueue;
 
 use crate::actor::ActorAddress;
 
@@ -29,8 +30,8 @@ pub struct WorkerStats {
     // Error counters
     pub type_mismatches: AtomicU64,
     pub panics: AtomicU64,
-    // Tick timing buffer (last N ticks)
-    tick_timings: std::sync::Mutex<VecDeque<TickTiming>>,
+    // Tick timing ring buffer (last N ticks, lock-free)
+    tick_timings: ArrayQueue<TickTiming>,
 }
 
 impl WorkerStats {
@@ -44,21 +45,25 @@ impl WorkerStats {
             inbox_sends: AtomicU64::new(0),
             type_mismatches: AtomicU64::new(0),
             panics: AtomicU64::new(0),
-            tick_timings: std::sync::Mutex::new(VecDeque::with_capacity(TICK_BUFFER_CAP)),
+            tick_timings: ArrayQueue::new(TICK_BUFFER_CAP),
         }
     }
 
     pub fn push_tick_timing(&self, timing: TickTiming) {
-        let mut buf = self.tick_timings.lock().unwrap();
-        if buf.len() >= TICK_BUFFER_CAP {
-            buf.pop_front();
+        if let Err(rejected) = self.tick_timings.push(timing) {
+            // Ring full — drop oldest, then retry (best-effort for stats)
+            let _ = self.tick_timings.pop();
+            let _ = self.tick_timings.push(rejected);
         }
-        buf.push_back(timing);
     }
 
     /// Returns a snapshot of recent tick timings (drains the buffer).
     pub fn drain_tick_timings(&self) -> Vec<TickTiming> {
-        self.tick_timings.lock().unwrap().drain(..).collect()
+        let mut out = Vec::new();
+        while let Some(t) = self.tick_timings.pop() {
+            out.push(t);
+        }
+        out
     }
 
     /// Create a point-in-time snapshot as a [`WorkerInfo`].

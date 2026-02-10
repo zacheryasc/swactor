@@ -16,17 +16,13 @@ impl<T> HybridChannel<T> {
         }
     }
 
-    pub fn push(&self, value: T) -> Result<(), T> {
+    pub fn push(&self, value: T) {
         if !self.overflow.is_empty() {
             self.overflow.push(value);
-            return Ok(());
+            return;
         }
-        match self.ring.push(value) {
-            Ok(()) => Ok(()),
-            Err(v) => {
-                self.overflow.push(v);
-                Ok(())
-            }
+        if let Err(v) = self.ring.push(value) {
+            self.overflow.push(v);
         }
     }
 
@@ -61,7 +57,7 @@ pub(crate) struct Sender<T> {
 }
 
 impl<T> Sender<T> {
-    pub fn try_send(&self, value: T) -> Result<(), T> {
+    pub fn send(&self, value: T) {
         self.queue.push(value)
     }
 }

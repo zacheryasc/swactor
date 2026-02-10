@@ -14,7 +14,7 @@ use swactor::{
 fn make_config(max_actors: usize, max_messages: usize) -> RuntimeConfig {
     RuntimeConfig {
         max_actors,
-        actor_max_messages: max_messages,
+        channel_buffer_size: max_messages,
         num_threads: 1,
         ..Default::default()
     }

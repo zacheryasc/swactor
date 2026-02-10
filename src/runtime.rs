@@ -101,7 +101,7 @@ impl Runtime {
         let mut workers = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
-            let transfer_rx = Receiver::<Envelope>::new(config.actor_max_messages);
+            let transfer_rx = Receiver::<Envelope>::new(config.channel_buffer_size);
             let transfer_tx = transfer_rx.new_sender();
             transfer_txs.push(transfer_tx);
 
@@ -151,8 +151,7 @@ impl Runtime {
         self.address_map.insert(addr, worker_id);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
         self.spawn_txs[worker_id.as_usize()]
-            .try_send((addr, boxed))
-            .map_err(|_| Error::from("Runtime error: spawn queue full"))?;
+            .send((addr, boxed));
 
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -177,7 +176,7 @@ impl Runtime {
     /// Create an external inbox for receiving messages in the outer process containing the runtime
     pub fn new_inbox<M: Message>(&self) -> Result<Inbox<M>, Error> {
         let addr = ActorAddress::new_random();
-        let receiver = Receiver::<M>::new(self.config.actor_max_messages);
+        let receiver = Receiver::<M>::new(self.config.channel_buffer_size);
         let sender = receiver.new_sender();
         self.inbox_registry.register(addr, Arc::new(sender));
         Ok(Inbox {
@@ -296,24 +295,6 @@ impl Runtime {
         self.transport_router = Some(router);
     }
 
-    /// Route a message whose destination is not in the local address map.
-    fn route_nonlocal(
-        &self,
-        addr: ActorAddress,
-        msg: Box<dyn Any + Send>,
-    ) -> Result<(), Error> {
-        #[cfg(feature = "transport")]
-        {
-            if self.inbox_registry.contains(&addr) {
-                return self.inbox_registry.try_deliver(addr, msg);
-            }
-            if let (Some(cr), Some(tr)) = (&self.codec_registry, &self.transport_router) {
-                return crate::transport::send_via_transport(addr, msg, cr, tr);
-            }
-        }
-        self.inbox_registry.try_deliver(addr, msg)
-    }
-
     /// Deliver a raw deserialized message into the runtime.
     ///
     /// Used by [`CodecRegistry::receive`](crate::transport::CodecRegistry::receive)
@@ -325,9 +306,11 @@ impl Runtime {
         msg: Box<dyn Any + Send>,
     ) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
-            Some(wid) => self.transfer_txs[wid.as_usize()]
-                .try_send(Envelope::new(addr, msg))
-                .map_err(|_| Error::from("Transfer queue full")),
+            Some(wid) => {
+                self.transfer_txs[wid.as_usize()]
+                    .send(Envelope::new(addr, msg));
+                Ok(())
+            }
             None => self.inbox_registry.try_deliver(addr, msg),
         }
     }
@@ -336,18 +319,19 @@ impl Runtime {
 impl ContextInner for Runtime {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
-            Some(wid) => self.transfer_txs[wid.as_usize()]
-                .try_send(Envelope::new(addr, msg))
-                .map_err(|_| Error::from("Transfer queue full")),
-            None => self.route_nonlocal(addr, msg),
+            Some(wid) => {
+                self.transfer_txs[wid.as_usize()]
+                    .send(Envelope::new(addr, msg));
+                Ok(())
+            }
+            None => self.make_tick_context().route_nonlocal(addr, msg),
         }
     }
 
-    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) -> Result<(), Error> {
+    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) {
         let worker_id = self.placement.next_worker();
         self.address_map.insert(addr, worker_id);
         self.spawn_txs[worker_id.as_usize()]
-            .try_send((addr, actor))
-            .map_err(|_| Error::from("Spawn queue full"))
+            .send((addr, actor));
     }
 }
