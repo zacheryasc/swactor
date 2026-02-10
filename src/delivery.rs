@@ -105,7 +105,7 @@ pub(crate) trait SenderT: Send + Sync {
 impl<M: Message> SenderT for Sender<M> {
     fn try_send_any(&self, msg: Box<dyn Any + Send>) {
         if let Ok(typed) = msg.downcast::<M>() {
-            let _ = Sender::try_send(self, *typed);
+            Sender::send(self, *typed);
         }
     }
 }

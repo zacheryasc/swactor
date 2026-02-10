@@ -59,7 +59,7 @@ fn main() {
     let rt = Runtime::new(RuntimeConfig {
         num_threads: 4,
         max_actors: 512,
-        actor_max_messages: 1000,
+        channel_buffer_size: 1000,
         ..Default::default()
     });
 

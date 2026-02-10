@@ -64,7 +64,7 @@ fn run_simulation_single_threaded(config: SimConfig) -> SimulationTrace {
     let rt = Runtime::new(RuntimeConfig {
         num_threads: 1,
         max_actors: (config.num_nodes + 64).next_power_of_two(),
-        actor_max_messages: (config.num_nodes * 4).max(1_000),
+        channel_buffer_size: (config.num_nodes * 4).max(1_000),
         ..Default::default()
     });
 
@@ -177,7 +177,7 @@ fn run_simulation_multi_threaded(config: SimConfig) -> SimulationTrace {
     let rt = Runtime::new(RuntimeConfig {
         num_threads: config.num_threads,
         max_actors: (config.num_nodes + 64).next_power_of_two(),
-        actor_max_messages: (config.num_nodes * 4).max(1_000),
+        channel_buffer_size: (config.num_nodes * 4).max(1_000),
         ..Default::default()
     });
 

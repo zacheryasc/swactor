@@ -590,6 +590,41 @@ fn panic_does_not_corrupt_subsequent_messages() {
     assert_eq!(replies, vec![Count(1), Count(2)], "counter should be unaffected by peer panics");
 }
 
+#[test]
+fn panicked_actor_is_poisoned_and_discards_future_messages() {
+    // Given a CounterActor that receives 3 messages: Increment, PanicMsg, Increment
+    // We need an actor that can handle both — so we use PanicActor for the panic
+    // and a separate CounterActor that continues working.
+    //
+    // Specifically: a PanicActor receives one PanicMsg, panics, then future
+    // PanicMsgs should be silently discarded (actor is poisoned).
+    let rt = Runtime::new(RuntimeConfig::default());
+    let panic_addr = rt.spawn(PanicActor).unwrap();
+    let good_addr = rt.spawn(CounterActor { count: 0 }).unwrap();
+    let inbox = rt.new_inbox::<Count>().unwrap();
+
+    // Send a panic message, then more panic messages — they should be discarded
+    rt.send_to(panic_addr, PanicMsg).unwrap();
+    rt.send_to(panic_addr, PanicMsg).unwrap();
+    rt.send_to(panic_addr, PanicMsg).unwrap();
+
+    // Also send to a healthy actor to prove the system still works
+    rt.send_to(good_addr, Increment { reply_to: *inbox.addr() }).unwrap();
+
+    // When messages are processed
+    for _ in 0..20 {
+        rt.tick();
+    }
+
+    // Then: healthy actor still works, and only 1 panic recorded (not 3)
+    let reply = inbox.try_recv();
+    assert!(reply.is_some(), "healthy actor should still reply after peer is poisoned");
+
+    let s = rt.stats();
+    let total_panics: u64 = s.workers.iter().map(|w| w.panics).sum();
+    assert_eq!(total_panics, 1, "only the first panic should be recorded; rest are discarded");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Observability
 // ═══════════════════════════════════════════════════════════════════════════
@@ -662,14 +697,465 @@ fn stats_record_panics() {
         rt.tick();
     }
 
-    // Then stats record the panics
+    // Then stats record the panic (second message is discarded — actor is poisoned)
     let s = rt.stats();
     let total_panics: u64 = s.workers.iter().map(|w| w.panics).sum();
     assert!(
-        total_panics >= 2,
-        "stats should record at least 2 panics, got {}",
+        total_panics >= 1,
+        "stats should record at least 1 panic, got {}",
         total_panics
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Edge Cases & Adversarial Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Additional actors for edge-case tests ────────────────────────────────
+
+/// Sends a countdown message to itself, then replies Done(0) when remaining hits zero.
+/// Tests pending_local self-delivery path.
+struct SelfSendActor;
+
+#[derive(Clone)]
+struct Countdown {
+    remaining: usize,
+    reply_to: ActorAddress,
+}
+
+impl ActorInterface for SelfSendActor {
+    type Incoming = Countdown;
+    type Response = Done;
+    fn handle(&mut self, ctx: &Ctx, msg: Countdown) {
+        if msg.remaining == 0 {
+            let _ = ctx.send(msg.reply_to, Done(0));
+        } else {
+            let _ = ctx.send(
+                ctx.self_addr(),
+                Countdown { remaining: msg.remaining - 1, reply_to: msg.reply_to },
+            );
+        }
+    }
+}
+
+/// Spawns a DoubleActor child, sends it work, then panics.
+/// The child should still process the forwarded message.
+struct SpawnThenPanicActor;
+
+impl ActorInterface for SpawnThenPanicActor {
+    type Incoming = Forward;
+    type Response = ();
+    fn handle(&mut self, ctx: &Ctx, msg: Forward) {
+        let child = ctx.spawn(DoubleActor).unwrap();
+        let _ = ctx.send(child, Forward { value: msg.value, reply_to: msg.reply_to });
+        panic!("intentional panic after spawn+send");
+    }
+}
+
+/// Processes `remaining_good` messages, then panics on the next one.
+/// Uses a shared counter so the test can observe how many were processed.
+struct PanicAfterNActor {
+    remaining_good: usize,
+    counter: Arc<AtomicUsize>,
+}
+
+impl ActorInterface for PanicAfterNActor {
+    type Incoming = Ping;
+    type Response = ();
+    fn handle(&mut self, _ctx: &Ctx, _msg: Ping) {
+        if self.remaining_good == 0 {
+            panic!("intentional delayed panic");
+        }
+        self.remaining_good -= 1;
+        self.counter.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Sends a reply, then panics. Tests that messages sent before the panic
+/// are still delivered (they're already in the queue).
+struct SendThenPanicActor;
+
+impl ActorInterface for SendThenPanicActor {
+    type Incoming = Ping;
+    type Response = Pong;
+    fn handle(&mut self, ctx: &Ctx, msg: Ping) {
+        let _ = ctx.send(msg.reply_to, Pong);
+        panic!("intentional panic after send");
+    }
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────
+
+
+#[test]
+fn wrong_type_to_actor_increments_type_mismatch_counter() {
+    // Given a PingPongActor that expects Ping
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(PingPongActor).unwrap();
+
+    // When I send it a Count message (wrong type)
+    rt.send_to(addr, Count(42)).unwrap();
+    for _ in 0..10 {
+        rt.tick();
+    }
+
+    // Then stats record the type mismatch
+    let s = rt.stats();
+    let mismatches: u64 = s.workers.iter().map(|w| w.type_mismatches).sum();
+    assert_eq!(mismatches, 1, "sending wrong type should increment type_mismatches");
+}
+
+// FIXME dont count dropped messages
+#[test]
+fn type_mismatch_still_counted_as_processed() {
+    // Given a PingPongActor
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(PingPongActor).unwrap();
+
+    // When I send it 3 wrong-type messages
+    for _ in 0..3 {
+        rt.send_to(addr, Count(0)).unwrap();
+    }
+    for _ in 0..10 {
+        rt.tick();
+    }
+
+    // Then all 3 are counted in both type_mismatches AND messages_processed
+    // (the message was dequeued and attempted — it "went through" the system)
+    let s = rt.stats();
+    let mismatches: u64 = s.workers.iter().map(|w| w.type_mismatches).sum();
+    let processed: u64 = s.workers.iter().map(|w| w.messages_processed).sum();
+    assert_eq!(mismatches, 3);
+    assert!(
+        processed >= 3,
+        "type-mismatched messages count as processed (dequeued+attempted), got {}",
+        processed
+    );
+}
+
+#[test]
+fn self_send_chain_completes() {
+    // Given a SelfSendActor that will bounce a message to itself 10 times
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(SelfSendActor).unwrap();
+    let inbox = rt.new_inbox::<Done>().unwrap();
+
+    // When triggered with remaining=10
+    rt.send_to(addr, Countdown { remaining: 10, reply_to: *inbox.addr() }).unwrap();
+
+    // Then after enough ticks the chain completes.
+    // Each self-send goes through pending_local → next tick's mailbox,
+    // so it needs at least 11 ticks (1 initial + 10 bounces).
+    let reply = tick_until_recv(&rt, &inbox, 50);
+    assert_eq!(reply, Some(Done(0)), "self-send chain should complete");
+}
+
+#[test]
+fn panic_mid_batch_discards_remaining_messages() {
+    // Given an actor that processes 2 messages then panics on the 3rd
+    let counter = Arc::new(AtomicUsize::new(0));
+    let rt = Runtime::new(RuntimeConfig::default());
+    let dummy = rt.new_inbox::<Pong>().unwrap();
+    let addr = rt.spawn(PanicAfterNActor {
+        remaining_good: 2,
+        counter: counter.clone(),
+    }).unwrap();
+
+    // When I queue 5 messages and tick (all arrive before first tick_all)
+    for _ in 0..5 {
+        rt.send_to(addr, Ping { reply_to: *dummy.addr() }).unwrap();
+    }
+    for _ in 0..20 {
+        rt.tick();
+    }
+
+    // Then only 2 messages were processed — the 3rd panicked, 4th+5th discarded
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "only messages before the panic should be processed"
+    );
+    let s = rt.stats();
+    let panics: u64 = s.workers.iter().map(|w| w.panics).sum();
+    assert_eq!(panics, 1, "exactly one panic should be recorded");
+}
+
+#[test]
+fn spawn_then_panic_child_survives() {
+    // Given a SpawnThenPanicActor
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(SpawnThenPanicActor).unwrap();
+    let inbox = rt.new_inbox::<Done>().unwrap();
+
+    // When the parent spawns a child, sends it work, then panics
+    rt.send_to(addr, Forward { value: 5, reply_to: *inbox.addr() }).unwrap();
+
+    // Then the child still processes the forwarded message and replies Done(10)
+    let reply = tick_until_recv(&rt, &inbox, 30);
+    assert_eq!(
+        reply,
+        Some(Done(10)),
+        "child spawned before parent panic should still work"
+    );
+}
+
+#[test]
+fn panic_after_send_still_delivers_sent_messages() {
+    // Given a SendThenPanicActor (sends Pong, then panics)
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(SendThenPanicActor).unwrap();
+    let inbox = rt.new_inbox::<Pong>().unwrap();
+
+    // When it processes a Ping (sends reply, then panics)
+    rt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+
+    // Then the Pong reply still arrives — sends happen before the panic unwinds
+    let reply = tick_until_recv(&rt, &inbox, 20);
+    assert!(
+        reply.is_some(),
+        "message sent before panic should still be delivered"
+    );
+}
+
+// FIXME: document somewhere this behavior. No test is needed. It is not obvious what to do
+// about failed messages. Because this is going to be distributed, we cannot rely on delivery always
+// succeeeding.
+#[test]
+fn send_to_poisoned_actor_is_a_silent_black_hole() {
+    // Given a poisoned actor (panicked on first message)
+    let rt = Runtime::new(RuntimeConfig::default());
+    let panic_addr = rt.spawn(PanicActor).unwrap();
+    rt.send_to(panic_addr, PanicMsg).unwrap();
+    for _ in 0..5 {
+        rt.tick();
+    }
+
+    // When I send more messages to it
+    let result = rt.send_to(panic_addr, PanicMsg);
+
+    // Then send_to succeeds (address is still in address_map)
+    assert!(
+        result.is_ok(),
+        "send_to poisoned actor should succeed from sender's POV"
+    );
+
+    // And ticking doesn't produce new panics — messages are discarded in tick_all
+    for _ in 0..10 {
+        rt.tick();
+    }
+    let s = rt.stats();
+    let panics: u64 = s.workers.iter().map(|w| w.panics).sum();
+    assert_eq!(panics, 1, "poisoned actor should not produce new panics");
+}
+
+#[test]
+fn tiny_buffer_delivers_all_messages_in_order() {
+    // Given a runtime with channel_buffer_size=1 (overflow on every 2nd message)
+    let rt = Runtime::new(RuntimeConfig {
+        channel_buffer_size: 1,
+        ..Default::default()
+    });
+    let addr = rt.spawn(CounterActor { count: 0 }).unwrap();
+    let inbox = rt.new_inbox::<Count>().unwrap();
+
+    // When I send 50 messages (almost all hit the overflow queue)
+    for _ in 0..50 {
+        rt.send_to(addr, Increment { reply_to: *inbox.addr() }).unwrap();
+    }
+
+    // Then all 50 arrive and in FIFO order
+    let replies = tick_and_drain(&rt, &inbox, 100);
+    assert_eq!(replies.len(), 50, "all messages should arrive despite tiny buffer");
+    assert_eq!(
+        replies.last(),
+        Some(&Count(50)),
+        "messages should maintain FIFO order through overflow queue"
+    );
+}
+
+#[test]
+fn empty_runtime_tick_and_stats_are_safe() {
+    // Given a runtime with no actors at all
+    let rt = Runtime::new(RuntimeConfig::default());
+
+    // When I tick and check stats
+    for _ in 0..10 {
+        rt.tick();
+    }
+    let s = rt.stats();
+
+    // Then everything reports zeros without panicking
+    assert_eq!(s.actors.len(), 0);
+    assert_eq!(s.num_workers, 1);
+    let total: u64 = s.workers.iter().map(|w| w.messages_processed).sum();
+    assert_eq!(total, 0);
+}
+
+#[test]
+fn stats_stable_after_idle_ticks() {
+    // Given an actor that processes a message
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(CounterActor { count: 0 }).unwrap();
+    let inbox = rt.new_inbox::<Count>().unwrap();
+    rt.send_to(addr, Increment { reply_to: *inbox.addr() }).unwrap();
+    for _ in 0..5 {
+        rt.tick();
+    }
+    let _ = inbox.try_recv();
+    let s1 = rt.stats();
+
+    // When I tick 100 more times with no messages
+    for _ in 0..100 {
+        rt.tick();
+    }
+    let s2 = rt.stats();
+
+    // Then messages_processed doesn't grow during idle ticks
+    let total1: u64 = s1.workers.iter().map(|w| w.messages_processed).sum();
+    let total2: u64 = s2.workers.iter().map(|w| w.messages_processed).sum();
+    assert_eq!(
+        total1, total2,
+        "idle ticks must not inflate messages_processed"
+    );
+}
+
+#[test]
+fn deep_spawn_chain_completes() {
+    // Given a 100-level chain (tests no stack overflow from recursive tick_all)
+    let rt = Runtime::new(RuntimeConfig {
+        max_actors: 2000,
+        ..Default::default()
+    });
+    let addr = rt.spawn(ChainActor).unwrap();
+    let inbox = rt.new_inbox::<Done>().unwrap();
+
+    // When chain of depth 100 is triggered
+    rt.send_to(
+        addr,
+        ChainMsg { remaining: 100, depth: 0, reply_to: *inbox.addr() },
+    ).unwrap();
+
+    // Then the leaf at depth 100 replies
+    let reply = tick_until_recv(&rt, &inbox, 500);
+    assert_eq!(
+        reply,
+        Some(Done(100)),
+        "100-level chain should complete"
+    );
+}
+
+#[test]
+fn all_spawned_addresses_are_unique() {
+    let rt = Runtime::new(RuntimeConfig {
+        max_actors: 10_000,
+        ..Default::default()
+    });
+    let mut addrs: Vec<ActorAddress> = (0..1000)
+        .map(|_| rt.spawn(PingPongActor).unwrap())
+        .collect();
+
+    addrs.sort_by_key(|a| a.0);
+    let before = addrs.len();
+    addrs.dedup_by_key(|a| a.0);
+    assert_eq!(addrs.len(), before, "all 1000 addresses should be unique");
+}
+
+#[test]
+fn inbox_empty_before_any_tick() {
+    // Given a sent message that hasn't been ticked
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(PingPongActor).unwrap();
+    let inbox = rt.new_inbox::<Pong>().unwrap();
+    rt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+
+    // Then inbox is empty — no processing without tick
+    assert!(inbox.try_recv().is_none());
+}
+
+#[test]
+fn interleaved_spawn_and_send_in_handler_all_complete() {
+    // Given a FanOutActor that spawns 20 children with interleaved spawn+send
+    let rt = Runtime::new(RuntimeConfig::default());
+    let addr = rt.spawn(FanOutActor).unwrap();
+    let inbox = rt.new_inbox::<Done>().unwrap();
+
+    rt.send_to(addr, FanOut { count: 20, reply_to: *inbox.addr() }).unwrap();
+
+    let replies = tick_and_drain(&rt, &inbox, 50);
+    assert_eq!(
+        replies.len(),
+        20,
+        "all 20 children spawned+messaged in same handler should reply"
+    );
+}
+
+#[test]
+fn multiple_inbox_types_coexist() {
+    // Given two inboxes of different types on the same runtime
+    let rt = Runtime::new(RuntimeConfig::default());
+    let counter = rt.spawn(CounterActor { count: 0 }).unwrap();
+    let pinger = rt.spawn(PingPongActor).unwrap();
+    let count_inbox = rt.new_inbox::<Count>().unwrap();
+    let pong_inbox = rt.new_inbox::<Pong>().unwrap();
+
+    // When both actors reply to their respective inboxes
+    rt.send_to(counter, Increment { reply_to: *count_inbox.addr() }).unwrap();
+    rt.send_to(pinger, Ping { reply_to: *pong_inbox.addr() }).unwrap();
+    for _ in 0..10 {
+        rt.tick();
+    }
+
+    // Then each inbox gets its correct type — no cross-contamination
+    assert_eq!(count_inbox.try_recv(), Some(Count(1)));
+    assert_eq!(pong_inbox.try_recv(), Some(Pong));
+}
+
+#[test]
+fn poisoned_actor_messages_not_counted_as_processed() {
+    // Given a poisoned actor that then receives 10 more messages
+    let rt = Runtime::new(RuntimeConfig::default());
+    let panic_addr = rt.spawn(PanicActor).unwrap();
+    rt.send_to(panic_addr, PanicMsg).unwrap();
+    for _ in 0..5 {
+        rt.tick();
+    }
+    let s1 = rt.stats();
+    let processed_before: u64 = s1.workers.iter().map(|w| w.messages_processed).sum();
+
+    // When I send 10 messages to the poisoned actor and tick
+    for _ in 0..10 {
+        rt.send_to(panic_addr, PanicMsg).unwrap();
+    }
+    for _ in 0..20 {
+        rt.tick();
+    }
+    let s2 = rt.stats();
+    let processed_after: u64 = s2.workers.iter().map(|w| w.messages_processed).sum();
+
+    // Then the 10 discarded messages should NOT increase the processed count
+    assert_eq!(
+        processed_before, processed_after,
+        "messages discarded by poisoned actors should not be counted as processed"
+    );
+}
+
+#[test]
+fn rapid_spawn_and_immediate_send() {
+    // Given a runtime, spawn an actor and immediately send before any tick
+    let rt = Runtime::new(RuntimeConfig::default());
+    let inbox = rt.new_inbox::<Pong>().unwrap();
+
+    // When I spawn + send in rapid succession, 50 times
+    let mut addrs = Vec::new();
+    for _ in 0..50 {
+        let addr = rt.spawn(PingPongActor).unwrap();
+        rt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+        addrs.push(addr);
+    }
+
+    // Then all 50 replies eventually arrive (spawn queue drained before transfer)
+    let replies = tick_and_drain(&rt, &inbox, 50);
+    assert_eq!(replies.len(), 50, "all spawn+send pairs should complete");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

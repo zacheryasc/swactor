@@ -119,15 +119,14 @@ impl Worker {
         }
         let t5 = Instant::now();
 
-        // 6. Publish stats
-        self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
-        self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
-        self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
+        // 6. Publish stats (skip entirely when idle to avoid allocation + mutex)
+        if did_work {
+            self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
+            self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
+            self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
 
-        // Publish per-actor mailbox depths
-        {
-            let depths: Vec<(ActorAddress, usize)> = self.pool.mailbox_depths();
-            *self.mailbox_snapshot.lock().unwrap() = depths;
+            let mut snap = self.mailbox_snapshot.lock().unwrap();
+            self.pool.mailbox_depths_into(&mut snap);
         }
 
         let t6 = Instant::now();
@@ -210,7 +209,7 @@ impl ContextInner for WorkerContext<'_> {
             }
             Some(wid) => {
                 self.stats.cross_sends.fetch_add(1, Ordering::Relaxed);
-                let _ = self.tc.transfer_txs[wid.as_usize()].try_send(Envelope::new(addr, msg));
+                self.tc.transfer_txs[wid.as_usize()].send(Envelope::new(addr, msg));
                 Ok(())
             }
             None => {
@@ -220,18 +219,18 @@ impl ContextInner for WorkerContext<'_> {
         }
     }
 
-    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) -> Result<(), Error> {
+    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) {
         let worker_id = self.tc.placement.next_worker();
         self.tc.address_map.insert(addr, worker_id);
         self.tc.spawn_txs[worker_id.as_usize()]
-            .try_send((addr, actor))
-            .map_err(|_| Error::from("Spawn queue full"))
+            .send((addr, actor))
     }
 }
 
 struct ActorSlot {
     mailbox: VecDeque<Box<dyn Any + Send>>,
     actor: Box<dyn AnyActor>,
+    poisoned: bool,
 }
 
 /// Per-worker actor storage. Owns per-actor mailboxes.
@@ -248,8 +247,9 @@ impl ActorPool {
 
     pub fn insert(&mut self, addr: ActorAddress, actor: Box<dyn AnyActor>) {
         self.actors.insert(addr, ActorSlot {
-            mailbox: VecDeque::new(),
+            mailbox: VecDeque::with_capacity(16),
             actor,
+            poisoned: false,
         });
     }
 
@@ -268,16 +268,30 @@ impl ActorPool {
     pub fn tick_all(&mut self, inner: &dyn ContextInner, stats: &WorkerStats) -> usize {
         let mut count = 0;
         for (&addr, slot) in self.actors.iter_mut() {
+            if slot.poisoned {
+                // Discard all messages for poisoned actors
+                slot.mailbox.clear();
+                continue;
+            }
             let ctx = Ctx::new(inner, addr);
             while let Some(msg) = slot.mailbox.pop_front() {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    slot.actor.handle_any(&ctx, msg);
+                    slot.actor.handle_any(&ctx, msg)
                 }));
-                if result.is_err() {
-                    stats.panics.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("swactor: actor {addr} panicked in handler");
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(actor_addr = %addr, "actor.panicked");
+                match result {
+                    Ok(false) => {
+                        stats.type_mismatches.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        stats.panics.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("swactor: actor {addr} panicked — poisoned, future messages will be discarded");
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(actor_addr = %addr, "actor.panicked");
+                        slot.poisoned = true;
+                        slot.mailbox.clear();
+                        break;
+                    }
+                    Ok(true) => {}
                 }
                 count += 1;
             }
@@ -293,8 +307,9 @@ impl ActorPool {
         self.actors.values().map(|slot| slot.mailbox.len()).sum()
     }
 
-    /// Returns per-actor mailbox depths for dashboard reporting.
-    pub fn mailbox_depths(&self) -> Vec<(ActorAddress, usize)> {
-        self.actors.iter().map(|(&addr, slot)| (addr, slot.mailbox.len())).collect()
+    /// Fill `out` with per-actor mailbox depths, reusing the existing allocation.
+    pub fn mailbox_depths_into(&self, out: &mut Vec<(ActorAddress, usize)>) {
+        out.clear();
+        out.extend(self.actors.iter().map(|(&addr, slot)| (addr, slot.mailbox.len())));
     }
 }

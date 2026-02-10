@@ -45,17 +45,22 @@ impl<A: ActorInterface> Actor<A> {
 }
 
 /// Trait for type-erased actors — single-message handler.
+///
+/// Returns `true` if the message was handled, `false` on type mismatch.
 pub trait AnyActor: Send {
-    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>);
+    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) -> bool;
 }
 
 impl<A> AnyActor for Actor<A>
 where
     A: ActorInterface,
 {
-    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) {
+    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) -> bool {
         if let Ok(typed) = msg.downcast::<A::Incoming>() {
             self.0.handle(ctx, *typed);
+            true
+        } else {
+            false
         }
     }
 }
@@ -63,7 +68,7 @@ where
 /// Object-safe inner trait for sending type-erased messages.
 pub trait ContextInner {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
-    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) -> Result<(), Error>;
+    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>);
 }
 
 /// Actor syscall interface — passed to `ActorInterface::handle()`.
@@ -98,7 +103,7 @@ impl<'a> Ctx<'a> {
     pub fn spawn<A: ActorInterface>(&self, actor: A) -> Result<ActorAddress, Error> {
         let addr = ActorAddress::new_random();
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.inner.spawn_any(addr, boxed)?;
+        self.inner.spawn_any(addr, boxed);
         Ok(addr)
     }
 }
