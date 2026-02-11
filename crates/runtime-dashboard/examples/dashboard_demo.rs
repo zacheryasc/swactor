@@ -7,6 +7,7 @@ use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::Runtime;
 
+use runtime_dashboard::collector::StatsCollector;
 use runtime_dashboard::{start_dashboard, DashboardConfig};
 
 // ── Demo actors ─────────────────────────────────────────────────────────
@@ -31,7 +32,7 @@ impl ActorInterface for PingActor {
     fn handle(&mut self, ctx: &Ctx, msg: Ping) {
         self.count += 1;
         // Forward to the target — creates cross-worker traffic
-        if self.count < 200 {
+        if self.count < 10_000 {
             let _ = ctx.send(msg.0, Ping(ctx.self_addr()));
         }
     }
@@ -67,12 +68,10 @@ fn main() {
     // Handle Ctrl+C gracefully
     {
         let stop = Arc::clone(&stop);
-        let _ = std::panic::catch_unwind(|| {
-            // Try to register a signal handler; fall back to running until killed
-            unsafe {
-                libc_signal(2, move || stop.store(true, Ordering::Relaxed));
-            }
-        });
+        ctrlc::set_handler(move || {
+            stop.store(true, Ordering::Relaxed);
+        })
+        .expect("failed to set Ctrl+C handler");
     }
 
     let dash = start_dashboard(DashboardConfig {
@@ -81,12 +80,16 @@ fn main() {
     });
     dash.install_tracing();
 
-    let rt = Runtime::new(RuntimeConfig {
-        num_threads: 4,
+    let num_threads = 4;
+    let collector = StatsCollector::new(num_threads);
+
+    let mut rt = Runtime::new(RuntimeConfig {
+        num_threads,
         max_actors: 1024,
         channel_buffer_size: 2000,
         ..Default::default()
     });
+    rt.set_stats_hook(collector.clone());
 
     // Spawn ping actors for cross-worker traffic
     let mut ping_addrs = Vec::new();
@@ -103,7 +106,7 @@ fn main() {
     }
 
     let handle = rt.run().expect("failed to start runtime");
-    dash.set_runtime(handle.runtime.clone());
+    dash.set_runtime(handle.runtime.clone(), collector);
 
     eprintln!("Dashboard at http://localhost:9090 — press Ctrl+C to stop");
 
@@ -121,7 +124,7 @@ fn main() {
         }
 
         // Periodically spawn more actors
-        if round % 150 == 75 && counter_addrs.len() < 200 {
+        if round % 150 == 75 && counter_addrs.len() < 500 {
             for _ in 0..8 {
                 match handle.runtime.spawn(CounterActor::new()) {
                     Ok(addr) => counter_addrs.push(addr),
@@ -146,10 +149,4 @@ fn main() {
     handle.shutdown();
     dash.shutdown();
     handle.join();
-}
-
-// Minimal signal handling without external deps
-unsafe fn libc_signal(_sig: i32, _handler: impl FnOnce()) {
-    // This is a no-op fallback; the loop checks the AtomicBool
-    // In practice, Ctrl+C will terminate the process
 }

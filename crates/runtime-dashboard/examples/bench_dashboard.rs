@@ -5,6 +5,7 @@ use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::config::{BackoffPolicy, RuntimeConfig};
 use swactor::runtime::Runtime;
 
+use runtime_dashboard::collector::StatsCollector;
 use runtime_dashboard::{start_dashboard, DashboardConfig};
 
 // ---------------------------------------------------------------------------
@@ -102,10 +103,12 @@ fn run_for(duration: Duration, mut tick: impl FnMut()) {
 
 fn scenario_single_actor(dash: &runtime_dashboard::DashboardHandle) {
     eprintln!("  [1/4] Single-actor bombardment (5s)");
-    let rt = Runtime::new(bench_config(4, 64, 100_000));
+    let collector = StatsCollector::new(4);
+    let mut rt = Runtime::new(bench_config(4, 64, 100_000));
+    rt.set_stats_hook(collector.clone());
     let addr = rt.spawn(SinkActor::new()).unwrap();
     let handle = rt.run().unwrap();
-    dash.set_runtime(handle.runtime.clone());
+    dash.set_runtime(handle.runtime.clone(), collector);
 
     run_for(Duration::from_secs(5), || {
         for _ in 0..100 {
@@ -120,12 +123,14 @@ fn scenario_single_actor(dash: &runtime_dashboard::DashboardHandle) {
 
 fn scenario_multi_actor(dash: &runtime_dashboard::DashboardHandle) {
     eprintln!("  [2/4] Multi-actor fan-out (5s)");
-    let rt = Runtime::new(bench_config(4, 128, 10_000));
+    let collector = StatsCollector::new(4);
+    let mut rt = Runtime::new(bench_config(4, 128, 10_000));
+    rt.set_stats_hook(collector.clone());
     let addrs: Vec<_> = (0..50)
         .map(|_| rt.spawn(SinkActor::new()).unwrap())
         .collect();
     let handle = rt.run().unwrap();
-    dash.set_runtime(handle.runtime.clone());
+    dash.set_runtime(handle.runtime.clone(), collector);
 
     run_for(Duration::from_secs(5), || {
         for &addr in &addrs {
@@ -143,7 +148,9 @@ fn scenario_multi_actor(dash: &runtime_dashboard::DashboardHandle) {
 fn scenario_ring(dash: &runtime_dashboard::DashboardHandle) {
     eprintln!("  [3/4] Ring topology (5s)");
     let ring_size = 100;
-    let rt = Runtime::new(bench_config(4, ring_size + 64, 1_024));
+    let collector = StatsCollector::new(4);
+    let mut rt = Runtime::new(bench_config(4, ring_size + 64, 1_024));
+    rt.set_stats_hook(collector.clone());
 
     // Build ring backwards: last spawned actor is the entry point
     let mut addrs = Vec::with_capacity(ring_size);
@@ -163,7 +170,7 @@ fn scenario_ring(dash: &runtime_dashboard::DashboardHandle) {
     let entry = *addrs.last().unwrap();
 
     let handle = rt.run().unwrap();
-    dash.set_runtime(handle.runtime.clone());
+    dash.set_runtime(handle.runtime.clone(), collector);
 
     run_for(Duration::from_secs(5), || {
         let _ = handle.runtime.send_to(entry, RingMsg);
@@ -176,10 +183,12 @@ fn scenario_ring(dash: &runtime_dashboard::DashboardHandle) {
 
 fn scenario_spawn_storm(dash: &runtime_dashboard::DashboardHandle) {
     eprintln!("  [4/4] Spawn storm (5s)");
-    let rt = Runtime::new(bench_config(4, 50_000, 1_024));
+    let collector = StatsCollector::new(4);
+    let mut rt = Runtime::new(bench_config(4, 50_000, 1_024));
+    rt.set_stats_hook(collector.clone());
     let spawner = rt.spawn(SpawnerActor::new()).unwrap();
     let handle = rt.run().unwrap();
-    dash.set_runtime(handle.runtime.clone());
+    dash.set_runtime(handle.runtime.clone(), collector);
 
     run_for(Duration::from_secs(5), || {
         let _ = handle.runtime.send_to(spawner, SpawnCmd);

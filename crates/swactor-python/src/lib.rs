@@ -500,6 +500,8 @@ pub struct PyRuntimeStats {
     #[pyo3(get)]
     num_workers: usize,
     #[pyo3(get)]
+    uptime_ms: u64,
+    #[pyo3(get)]
     actors: Vec<PyActorInfo>,
     #[pyo3(get)]
     workers: Vec<PyWorkerInfo>,
@@ -556,6 +558,7 @@ fn build_stats(runtime: &Runtime) -> PyRuntimeStats {
     PyRuntimeStats {
         num_actors: actors.len(),
         num_workers: stats.num_workers,
+        uptime_ms: stats.uptime_ms,
         actors,
         workers,
     }

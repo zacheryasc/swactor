@@ -5,6 +5,7 @@ use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::Runtime;
 
+use runtime_dashboard::collector::StatsCollector;
 use runtime_dashboard::{start_dashboard, DashboardConfig};
 
 // ── Demo actors ─────────────────────────────────────────────────────────
@@ -56,12 +57,16 @@ fn main() {
     });
     dash.install_tracing();
 
-    let rt = Runtime::new(RuntimeConfig {
-        num_threads: 4,
+    let num_threads = 4;
+    let collector = StatsCollector::new(num_threads);
+
+    let mut rt = Runtime::new(RuntimeConfig {
+        num_threads,
         max_actors: 512,
         channel_buffer_size: 1000,
         ..Default::default()
     });
+    rt.set_stats_hook(collector.clone());
 
     let mut ping_addrs = Vec::new();
     for _ in 0..12 {
@@ -76,7 +81,7 @@ fn main() {
     }
 
     let handle = rt.run().expect("failed to start runtime");
-    dash.set_runtime(handle.runtime.clone());
+    dash.set_runtime(handle.runtime.clone(), collector);
 
     eprintln!("Recording trace for 10 seconds...");
     eprintln!("Dashboard at http://localhost:9090");

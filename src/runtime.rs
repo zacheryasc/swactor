@@ -3,13 +3,14 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, RuntimeConfig};
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
-use crate::stats::{ActorInfo, WorkerStats};
+use crate::stats::{StatsHook, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
 pub use crate::stats::{RuntimeStats, WorkerInfo};
 use crate::worker::Worker;
@@ -66,10 +67,10 @@ pub struct Runtime {
     placement: Placement,
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
-    /// Per-worker mailbox snapshots, updated each tick by workers.
-    mailbox_snapshots: Vec<Arc<std::sync::Mutex<Vec<(ActorAddress, usize)>>>>,
+    stats_hook: Option<Arc<dyn StatsHook>>,
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
+    created_at: Instant,
     #[cfg(feature = "transport")]
     codec_registry: Option<Arc<crate::transport::CodecRegistry>>,
     #[cfg(feature = "transport")]
@@ -79,6 +80,30 @@ pub struct Runtime {
 // Safety: RefCell<Vec<Worker>> is only accessed from the owning thread via tick().
 // After run() the RefCell is empty and not accessed by worker threads.
 unsafe impl Sync for Runtime {}
+
+/// Globally unique identity of a swactor runtime instance.
+/// Pure identity — no networking info. A runtime can exist on any device,
+/// any protocol, or no network at all.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct RuntimeAddress(pub [u8; 32]);
+
+impl std::fmt::Display for RuntimeAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for b in &self.0[..8] {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\u{2026}")
+    }
+}
+
+impl RuntimeAddress {
+    pub fn new_random() -> Self {
+        let mut bytes = [0u8; 32];
+        crate::get_random(&mut bytes);
+        Self(bytes)
+    }
+}
 
 impl Runtime {
     /// Builds a new `Runtime` struct, but does not yet run anything. If multithreaded, call
@@ -97,7 +122,6 @@ impl Runtime {
         let mut transfer_txs = Vec::with_capacity(num_workers);
         let mut spawn_txs = Vec::with_capacity(num_workers);
         let mut worker_stats = Vec::with_capacity(num_workers);
-        let mut mailbox_snapshots = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
         for i in 0..num_workers {
@@ -111,10 +135,8 @@ impl Runtime {
             spawn_txs.push(spawn_tx);
 
             let stats = Arc::new(WorkerStats::new());
-            let mbox_snap = Arc::new(std::sync::Mutex::new(Vec::new()));
             worker_stats.push(stats.clone());
-            mailbox_snapshots.push(mbox_snap.clone());
-            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats, mbox_snap));
+            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats));
         }
 
         let rt = Self {
@@ -126,8 +148,9 @@ impl Runtime {
             placement,
             is_running: AtomicBool::new(false),
             worker_stats,
-            mailbox_snapshots,
+            stats_hook: None,
             tick_workers: RefCell::new(workers),
+            created_at: Instant::now(),
             #[cfg(feature = "transport")]
             codec_registry: None,
             #[cfg(feature = "transport")]
@@ -193,6 +216,7 @@ impl Runtime {
             placement: &self.placement,
             inbox_registry: &self.inbox_registry,
             config: &self.config,
+            stats_hook: self.stats_hook.as_deref(),
             #[cfg(feature = "transport")]
             codec_registry: self.codec_registry.as_deref(),
             #[cfg(feature = "transport")]
@@ -261,18 +285,13 @@ impl Runtime {
             .map(|(addr, wid)| (addr, wid.as_usize()))
             .collect();
 
-        let mut actor_details = Vec::new();
-        for (wid, snap_lock) in self.mailbox_snapshots.iter().enumerate() {
-            for &(addr, depth) in snap_lock.lock().unwrap().iter() {
-                actor_details.push(ActorInfo { address: addr, worker_id: wid, mailbox_depth: depth });
-            }
-        }
-
         let tick_timings = self.worker_stats.iter()
             .map(|ws| ws.drain_tick_timings())
             .collect();
 
-        RuntimeStats { num_workers, actors, workers, actor_details, tick_timings }
+        let uptime_ms = self.created_at.elapsed().as_millis() as u64;
+
+        RuntimeStats { num_workers, uptime_ms, actors, workers, actor_details: Vec::new(), tick_timings }
     }
 
     /// Signal all workers to stop
@@ -281,6 +300,13 @@ impl Runtime {
         tracing::info!("runtime.shutdown");
 
         self.is_running.store(false, Ordering::Release);
+    }
+
+    /// Set a stats hook to receive per-actor snapshots from workers.
+    ///
+    /// Must be called before [`run()`](Self::run) or [`tick()`](Self::tick).
+    pub fn set_stats_hook(&mut self, hook: Arc<dyn StatsHook>) {
+        self.stats_hook = Some(hook);
     }
 
     /// Set the codec registry for remote transport.

@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use swactor::runtime::Runtime;
 
+use crate::actors_html::ACTORS_HTML;
+use crate::collector::StatsCollector;
 use crate::dashboard_html::DASHBOARD_HTML;
 use crate::layer::EventStore;
 use crate::trace::RuntimeTrace;
@@ -87,8 +89,8 @@ fn make_sse_response(
     )
 }
 
-fn respond_html(request: tiny_http::Request, mode: &str) {
-    let html = DASHBOARD_HTML.replace("__DASHBOARD_MODE__", mode);
+fn respond_html(request: tiny_http::Request, html_template: &str, mode: &str) {
+    let html = html_template.replace("__DASHBOARD_MODE__", mode);
     let response = tiny_http::Response::from_string(html).with_header(
         "Content-Type: text/html; charset=utf-8"
             .parse::<tiny_http::Header>()
@@ -108,6 +110,7 @@ fn respond_404(request: tiny_http::Request) {
 pub(crate) fn spawn_http_server(
     store: Arc<EventStore>,
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
+    collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
     shutdown: Arc<AtomicBool>,
     port: u16,
 ) {
@@ -119,6 +122,7 @@ pub(crate) fn spawn_http_server(
         let server = Arc::clone(&server);
         let store = Arc::clone(&store);
         let runtime = Arc::clone(&runtime);
+        let collector = Arc::clone(&collector);
         let shutdown = Arc::clone(&shutdown);
         thread::spawn(move || {
             loop {
@@ -129,17 +133,23 @@ pub(crate) fn spawn_http_server(
 
                 let url = request.url().to_string();
                 match url.as_str() {
-                    "/" => respond_html(request, "live"),
+                    "/" => respond_html(request, DASHBOARD_HTML, "live"),
+                    "/actors" => respond_html(request, ACTORS_HTML, "live"),
                     "/events" => {
                         handle_live_sse(
                             request,
                             Arc::clone(&store),
                             Arc::clone(&runtime),
+                            Arc::clone(&collector),
                             Arc::clone(&shutdown),
                         );
                     }
                     "/api/stats" => {
-                        handle_stats_api(request, Arc::clone(&runtime));
+                        handle_stats_api(
+                            request,
+                            Arc::clone(&runtime),
+                            Arc::clone(&collector),
+                        );
                     }
                     _ => respond_404(request),
                 }
@@ -152,6 +162,7 @@ fn handle_live_sse(
     request: tiny_http::Request,
     store: Arc<EventStore>,
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
+    collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
     shutdown: Arc<AtomicBool>,
 ) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -166,7 +177,10 @@ fn handle_live_sse(
             {
                 let maybe_rt = runtime.lock().unwrap().clone();
                 if let Some(rt) = maybe_rt {
-                    let stats = rt.stats();
+                    let mut stats = rt.stats();
+                    if let Some(col) = collector.lock().unwrap().as_ref() {
+                        col.enrich(&mut stats);
+                    }
                     let json = serde_json::to_string(&stats).unwrap();
                     if tx.send(format_sse("stats", &json)).is_err() {
                         return;
@@ -198,10 +212,20 @@ fn handle_live_sse(
     let _ = request.respond(response);
 }
 
-fn handle_stats_api(request: tiny_http::Request, runtime: Arc<Mutex<Option<Arc<Runtime>>>>) {
+fn handle_stats_api(
+    request: tiny_http::Request,
+    runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
+    collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
+) {
     let maybe_rt = runtime.lock().unwrap().clone();
     let json = match maybe_rt {
-        Some(rt) => serde_json::to_string(&rt.stats()).unwrap(),
+        Some(rt) => {
+            let mut stats = rt.stats();
+            if let Some(col) = collector.lock().unwrap().as_ref() {
+                col.enrich(&mut stats);
+            }
+            serde_json::to_string(&stats).unwrap()
+        }
         None => "{}".to_string(),
     };
     let response = tiny_http::Response::from_string(json).with_header(
@@ -232,7 +256,8 @@ pub(crate) fn spawn_replay_server(trace: Arc<RuntimeTrace>, port: u16, speed: f6
 
                 let url = request.url().to_string();
                 match url.as_str() {
-                    "/" => respond_html(request, "replay"),
+                    "/" => respond_html(request, DASHBOARD_HTML, "replay"),
+                    "/actors" => respond_html(request, ACTORS_HTML, "replay"),
                     "/events" => {
                         handle_replay_sse(request, Arc::clone(&trace), speed);
                     }
