@@ -98,6 +98,27 @@ pub struct WorkerInfo {
     pub panics: u64,
 }
 
+/// Per-actor snapshot transferred from worker to runtime (not serialized).
+pub struct ActorSnapshot {
+    pub address: ActorAddress,
+    pub mailbox_depth: usize,
+    pub last_msg_type: Option<&'static str>,
+    pub messages_processed: u64,
+    pub poisoned: bool,
+}
+
+/// Observer hook called by workers after productive ticks.
+///
+/// Implement this to collect per-actor snapshot data outside the runtime.
+/// The runtime itself stores nothing — snapshots are ephemeral and passed by reference.
+pub trait StatsHook: Send + Sync {
+    /// Called once per worker after a productive tick.
+    ///
+    /// `worker_id` is the index of the worker (0..num_workers).
+    /// `snapshots` borrows the worker's scratch buffer — copy what you need.
+    fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]);
+}
+
 /// Per-actor info for the dashboard.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -105,6 +126,15 @@ pub struct ActorInfo {
     pub address: ActorAddress,
     pub worker_id: usize,
     pub mailbox_depth: usize,
+    /// Rust type name of the last message this actor successfully handled.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub last_msg_type: Option<String>,
+    /// Total messages successfully processed by this actor.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub messages_processed: u64,
+    /// Whether the actor has panicked and is no longer processing messages.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub poisoned: bool,
 }
 
 /// Snapshot of overall runtime state.
@@ -112,6 +142,9 @@ pub struct ActorInfo {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct RuntimeStats {
     pub num_workers: usize,
+    /// Milliseconds since the runtime was created.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub uptime_ms: u64,
     /// Each entry is (address, worker_id).
     pub actors: Vec<(ActorAddress, usize)>,
     pub workers: Vec<WorkerInfo>,

@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
 use tracing::field::{Field, Visit};
 use tracing::span;
@@ -27,18 +28,18 @@ pub struct EventStore {
     events: Mutex<VecDeque<DashboardEvent>>,
     capacity: usize,
     next_seq: AtomicU64,
-    /// When recording is enabled, all events are also appended here (unbounded).
-    full_log: Option<Mutex<Vec<DashboardEvent>>>,
+    /// When recording is enabled, events are kept in a lock-free bounded ring buffer.
+    full_log: Option<ArrayQueue<DashboardEvent>>,
 }
 
 impl EventStore {
-    pub fn new(capacity: usize, record: bool) -> Self {
+    pub fn new(capacity: usize, record: bool, record_event_capacity: usize) -> Self {
         Self {
             events: Mutex::new(VecDeque::with_capacity(capacity)),
             capacity,
             next_seq: AtomicU64::new(0),
             full_log: if record {
-                Some(Mutex::new(Vec::new()))
+                Some(ArrayQueue::new(record_event_capacity.max(1)))
             } else {
                 None
             },
@@ -48,7 +49,7 @@ impl EventStore {
     pub fn push(&self, mut event: DashboardEvent) {
         event.seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
         if let Some(ref log) = self.full_log {
-            log.lock().unwrap().push(event.clone());
+            let _ = log.force_push(event.clone());
         }
         let mut events = self.events.lock().unwrap();
         if events.len() >= self.capacity {
@@ -82,11 +83,16 @@ impl EventStore {
         (batch, new_cursor)
     }
 
-    /// Returns a clone of the full event log. Only available when recording is enabled.
+    /// Drains the full recording log. Only available when recording is enabled.
+    /// This is destructive — events are consumed. Intended for `save_trace()`.
     pub fn all_events(&self) -> Option<Vec<DashboardEvent>> {
-        self.full_log
-            .as_ref()
-            .map(|log| log.lock().unwrap().clone())
+        self.full_log.as_ref().map(|log| {
+            let mut out = Vec::new();
+            while let Some(ev) = log.pop() {
+                out.push(ev);
+            }
+            out
+        })
     }
 }
 

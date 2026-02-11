@@ -9,7 +9,7 @@ use std::time::Instant;
 use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx};
 use crate::channel::Receiver;
 use crate::delivery::{Envelope, TickContext, WorkerId};
-use crate::stats::{TickTiming, WorkerStats};
+use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
 use crate::Error;
 
 /// A worker owns a set of actors and runs them in a loop.
@@ -19,8 +19,8 @@ pub(crate) struct Worker {
     transfer_rx: Receiver<Envelope>,
     spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
     stats: Arc<WorkerStats>,
-    /// Shared snapshot of per-actor mailbox depths, readable by Runtime::stats().
-    mailbox_snapshot: Arc<std::sync::Mutex<Vec<(ActorAddress, usize)>>>,
+    /// Reusable scratch buffer for building per-actor snapshots.
+    snapshot_buf: Vec<ActorSnapshot>,
 }
 
 impl Worker {
@@ -29,7 +29,6 @@ impl Worker {
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
         stats: Arc<WorkerStats>,
-        mailbox_snapshot: Arc<std::sync::Mutex<Vec<(ActorAddress, usize)>>>,
     ) -> Self {
         Self {
             id,
@@ -37,7 +36,7 @@ impl Worker {
             transfer_rx,
             spawn_rx,
             stats,
-            mailbox_snapshot,
+            snapshot_buf: Vec::new(),
         }
     }
 
@@ -125,8 +124,10 @@ impl Worker {
             self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
             self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
 
-            let mut snap = self.mailbox_snapshot.lock().unwrap();
-            self.pool.mailbox_depths_into(&mut snap);
+            if let Some(hook) = tc.stats_hook {
+                self.pool.mailbox_depths_into(&mut self.snapshot_buf);
+                hook.on_tick(self.id.0, &self.snapshot_buf);
+            }
         }
 
         let t6 = Instant::now();
@@ -231,6 +232,8 @@ struct ActorSlot {
     mailbox: VecDeque<Box<dyn Any + Send>>,
     actor: Box<dyn AnyActor>,
     poisoned: bool,
+    last_msg_type: Option<&'static str>,
+    messages_processed: u64,
 }
 
 /// Per-worker actor storage. Owns per-actor mailboxes.
@@ -250,6 +253,8 @@ impl ActorPool {
             mailbox: VecDeque::with_capacity(16),
             actor,
             poisoned: false,
+            last_msg_type: None,
+            messages_processed: 0,
         });
     }
 
@@ -279,7 +284,7 @@ impl ActorPool {
                     slot.actor.handle_any(&ctx, msg)
                 }));
                 match result {
-                    Ok(false) => {
+                    Ok(None) => {
                         stats.type_mismatches.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(_) => {
@@ -291,7 +296,10 @@ impl ActorPool {
                         slot.mailbox.clear();
                         break;
                     }
-                    Ok(true) => {}
+                    Ok(Some(type_name)) => {
+                        slot.last_msg_type = Some(type_name);
+                        slot.messages_processed += 1;
+                    }
                 }
                 count += 1;
             }
@@ -307,9 +315,17 @@ impl ActorPool {
         self.actors.values().map(|slot| slot.mailbox.len()).sum()
     }
 
-    /// Fill `out` with per-actor mailbox depths, reusing the existing allocation.
-    pub fn mailbox_depths_into(&self, out: &mut Vec<(ActorAddress, usize)>) {
+    /// Fill `out` with per-actor snapshots, reusing the existing allocation.
+    pub fn mailbox_depths_into(&self, out: &mut Vec<ActorSnapshot>) {
         out.clear();
-        out.extend(self.actors.iter().map(|(&addr, slot)| (addr, slot.mailbox.len())));
+        out.extend(self.actors.iter().map(|(&addr, slot)| {
+            ActorSnapshot {
+                address: addr,
+                mailbox_depth: slot.mailbox.len(),
+                last_msg_type: slot.last_msg_type,
+                messages_processed: slot.messages_processed,
+                poisoned: slot.poisoned,
+            }
+        }));
     }
 }

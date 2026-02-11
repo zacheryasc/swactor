@@ -154,6 +154,7 @@ pub(crate) struct TickContext<'a> {
     pub(crate) placement: &'a Placement,
     pub(crate) inbox_registry: &'a InboxRegistry,
     pub(crate) config: &'a RuntimeConfig,
+    pub(crate) stats_hook: Option<&'a dyn crate::stats::StatsHook>,
     #[cfg(feature = "transport")]
     pub(crate) codec_registry: Option<&'a crate::transport::CodecRegistry>,
     #[cfg(feature = "transport")]

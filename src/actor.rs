@@ -46,21 +46,21 @@ impl<A: ActorInterface> Actor<A> {
 
 /// Trait for type-erased actors — single-message handler.
 ///
-/// Returns `true` if the message was handled, `false` on type mismatch.
+/// Returns `Some(type_name)` if handled, `None` on type mismatch.
 pub trait AnyActor: Send {
-    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) -> bool;
+    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) -> Option<&'static str>;
 }
 
 impl<A> AnyActor for Actor<A>
 where
     A: ActorInterface,
 {
-    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) -> bool {
+    fn handle_any(&mut self, ctx: &Ctx, msg: Box<dyn Any + Send>) -> Option<&'static str> {
         if let Ok(typed) = msg.downcast::<A::Incoming>() {
             self.0.handle(ctx, *typed);
-            true
+            Some(std::any::type_name::<A::Incoming>())
         } else {
-            false
+            None
         }
     }
 }

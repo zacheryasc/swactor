@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "mt_benchmarks"
 harness = false
+
+[[example]]
+name = "tcp_ping_pong"
+required-features = ["transport"]
