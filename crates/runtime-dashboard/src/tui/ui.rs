@@ -11,6 +11,8 @@ pub fn draw(f: &mut Frame, app: &App, table_state: &mut TableState) {
     match app.view_mode {
         ViewMode::Overview => draw_overview(f, app, table_state),
         ViewMode::WorkerDetail => draw_worker_detail(f, app, table_state),
+        #[cfg(feature = "distribution")]
+        ViewMode::Distribution => draw_distribution(f, app, table_state),
     }
 }
 
@@ -439,6 +441,248 @@ fn draw_focused_actor_table(f: &mut Frame, app: &App, table_state: &mut TableSta
     );
 
     f.render_stateful_widget(table, area, table_state);
+}
+
+// ─── Distribution View ──────────────────────────────────────────────────────
+
+#[cfg(feature = "distribution")]
+fn draw_distribution(f: &mut Frame, app: &App, table_state: &mut TableState) {
+    let chunks = Layout::vertical([
+        Constraint::Length(3),  // Summary bar
+        Constraint::Fill(1),   // Members table
+        Constraint::Length(10), // Bottom panels: cache + routing
+        Constraint::Length(1),  // Help bar
+    ])
+    .split(f.area());
+
+    draw_dist_summary(f, app, chunks[0]);
+    draw_dist_members(f, app, table_state, chunks[1]);
+
+    let bottom = Layout::horizontal([
+        Constraint::Percentage(40),
+        Constraint::Percentage(60),
+    ])
+    .split(chunks[2]);
+
+    draw_dist_cache(f, app, bottom[0]);
+    draw_dist_routing(f, app, bottom[1]);
+    draw_dist_help(f, chunks[3]);
+}
+
+#[cfg(feature = "distribution")]
+fn draw_dist_summary(f: &mut Frame, app: &App, area: Rect) {
+    let (node_id, listen_addr, alive, suspect, dead, cache, dir, rt_size, rt_buckets, repair) =
+        match &app.distribution {
+            Some(d) => (
+                &d.node_id[..d.node_id.len().min(16)],
+                d.listen_addr.as_str(),
+                d.alive_count,
+                d.suspect_count,
+                d.dead_count,
+                d.cache_size,
+                d.directory_entry_count,
+                d.routing_table_size,
+                d.routing_buckets.len(),
+                d.repair_queue_size,
+            ),
+            None => ("—", "—", 0, 0, 0, 0, 0, 0, 0, 0),
+        };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("  Node: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                node_id.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Addr: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(listen_addr.to_string(), Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Members: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{alive}"), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" alive, ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{suspect}"),
+                if suspect > 0 { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) },
+            ),
+            Span::styled(" suspect, ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{dead}"),
+                if dead > 0 { Style::default().fg(Color::Red).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::DarkGray) },
+            ),
+            Span::styled(" dead", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("   Cache: {cache}"), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("  Directory: {dir}"), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("  Routing: {rt_size} nodes, {rt_buckets} buckets"), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("   Repair queue: {repair}"), Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let block = Block::default().borders(Borders::ALL).title(" Distribution ");
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
+}
+
+#[cfg(feature = "distribution")]
+fn draw_dist_members(f: &mut Frame, app: &App, table_state: &mut TableState, area: Rect) {
+    let header_cells = ["STATE", "NODE ID", "ADDRESS", "INCARNATION"].iter().map(|&h| {
+        Cell::from(h).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    });
+    let header = Row::new(header_cells).height(1);
+
+    let rows: Vec<Row> = match &app.distribution {
+        Some(d) => d
+            .members
+            .iter()
+            .map(|m| {
+                let state_style = match m.state.as_str() {
+                    "alive" => Style::default().fg(Color::Green),
+                    "suspect" => Style::default().fg(Color::Yellow),
+                    "dead" => Style::default().fg(Color::Red),
+                    _ => Style::default(),
+                };
+                let id_short = if m.node_id.len() > 16 {
+                    format!("{}...", &m.node_id[..14])
+                } else {
+                    m.node_id.clone()
+                };
+                Row::new(vec![
+                    Cell::from(m.state.clone()).style(state_style),
+                    Cell::from(id_short),
+                    Cell::from(m.addr.clone()),
+                    Cell::from(format!("{}", m.incarnation)),
+                ])
+            })
+            .collect(),
+        None => vec![],
+    };
+
+    table_state.select(Some(app.dist_member_selected));
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Min(18),
+            Constraint::Length(22),
+            Constraint::Length(12),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Members "),
+    )
+    .row_highlight_style(
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    )
+    .highlight_symbol("> ");
+
+    f.render_stateful_widget(table, area, table_state);
+}
+
+#[cfg(feature = "distribution")]
+fn draw_dist_cache(f: &mut Frame, app: &App, area: Rect) {
+    let rows: Vec<Row> = match &app.distribution {
+        Some(d) => d
+            .cache_entries
+            .iter()
+            .take(area.height.saturating_sub(2) as usize)
+            .map(|e| {
+                let actor_short = if e.actor_addr.len() > 16 {
+                    format!("{}...", &e.actor_addr[..14])
+                } else {
+                    e.actor_addr.clone()
+                };
+                let node_short = if e.node_id.len() > 12 {
+                    format!("{}...", &e.node_id[..10])
+                } else {
+                    e.node_id.clone()
+                };
+                Row::new(vec![
+                    Cell::from(actor_short),
+                    Cell::from(node_short),
+                ])
+            })
+            .collect(),
+        None => vec![],
+    };
+
+    let header = Row::new(vec![
+        Cell::from("ACTOR").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Cell::from("NODE").style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+    ])
+    .height(1);
+
+    let table = Table::new(
+        rows,
+        [Constraint::Percentage(55), Constraint::Percentage(45)],
+    )
+    .header(header)
+    .block(Block::default().borders(Borders::ALL).title(" Cache "));
+
+    f.render_widget(table, area);
+}
+
+#[cfg(feature = "distribution")]
+fn draw_dist_routing(f: &mut Frame, app: &App, area: Rect) {
+    let buckets: Vec<(usize, usize)> = match &app.distribution {
+        Some(d) => d.routing_buckets.clone(),
+        None => vec![],
+    };
+
+    let max_count = buckets.iter().map(|(_, c)| *c).max().unwrap_or(1).max(1);
+    let bar_max_width = area.width.saturating_sub(16) as usize; // space for "[NNN] " + " N"
+
+    let lines: Vec<Line> = buckets
+        .iter()
+        .take(area.height.saturating_sub(2) as usize)
+        .map(|(idx, count)| {
+            let bar_len = (*count as f64 / max_count as f64 * bar_max_width as f64).round() as usize;
+            let bar_len = bar_len.max(1);
+            Line::from(vec![
+                Span::styled(
+                    format!(" [{:>3}] ", idx),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    "\u{2588}".repeat(bar_len),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!(" {}", count),
+                    Style::default().fg(Color::White),
+                ),
+            ])
+        })
+        .collect();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Routing Buckets ");
+    let paragraph = Paragraph::new(lines).block(block);
+    f.render_widget(paragraph, area);
+}
+
+#[cfg(feature = "distribution")]
+fn draw_dist_help(f: &mut Frame, area: Rect) {
+    let help = Line::from(vec![
+        Span::styled(
+            " Tab: views  \u{2191}\u{2193}: scroll  Esc: overview  q: quit",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
+    f.render_widget(Paragraph::new(help), area);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

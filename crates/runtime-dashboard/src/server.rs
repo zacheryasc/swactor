@@ -4,13 +4,21 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use std::collections::HashMap;
+
 use swactor::runtime::Runtime;
 
 use crate::actors_html::ACTORS_HTML;
 use crate::collector::StatsCollector;
 use crate::dashboard_html::DASHBOARD_HTML;
+use crate::investigate;
 use crate::layer::EventStore;
 use crate::trace::RuntimeTrace;
+
+#[cfg(feature = "distribution")]
+use crate::distribution_collector::DistributionStatsProvider;
+#[cfg(feature = "distribution")]
+use crate::distribution_html::DISTRIBUTION_HTML;
 
 /// Format a server-sent event.
 fn format_sse(event: &str, data: &str) -> Vec<u8> {
@@ -113,6 +121,8 @@ pub(crate) fn spawn_http_server(
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
     shutdown: Arc<AtomicBool>,
     port: u16,
+    #[cfg(feature = "distribution")]
+    distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
 ) {
     let addr = format!("0.0.0.0:{port}");
     let server = tiny_http::Server::http(&addr).expect("failed to bind HTTP server");
@@ -124,6 +134,8 @@ pub(crate) fn spawn_http_server(
         let runtime = Arc::clone(&runtime);
         let collector = Arc::clone(&collector);
         let shutdown = Arc::clone(&shutdown);
+        #[cfg(feature = "distribution")]
+        let distribution = Arc::clone(&distribution);
         thread::spawn(move || {
             loop {
                 let request = match server.recv() {
@@ -132,9 +144,12 @@ pub(crate) fn spawn_http_server(
                 };
 
                 let url = request.url().to_string();
-                match url.as_str() {
+                let path = url.split('?').next().unwrap_or(&url);
+                match path {
                     "/" => respond_html(request, DASHBOARD_HTML, "live"),
                     "/actors" => respond_html(request, ACTORS_HTML, "live"),
+                    #[cfg(feature = "distribution")]
+                    "/distribution" => respond_html(request, DISTRIBUTION_HTML, "live"),
                     "/events" => {
                         handle_live_sse(
                             request,
@@ -142,11 +157,21 @@ pub(crate) fn spawn_http_server(
                             Arc::clone(&runtime),
                             Arc::clone(&collector),
                             Arc::clone(&shutdown),
+                            #[cfg(feature = "distribution")]
+                            Arc::clone(&distribution),
                         );
                     }
                     "/api/stats" => {
                         handle_stats_api(
                             request,
+                            Arc::clone(&runtime),
+                            Arc::clone(&collector),
+                        );
+                    }
+                    "/api/investigate" => {
+                        handle_investigate_api(
+                            request,
+                            &url,
                             Arc::clone(&runtime),
                             Arc::clone(&collector),
                         );
@@ -164,6 +189,8 @@ fn handle_live_sse(
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "distribution")]
+    distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
 ) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let response = make_sse_response(rx);
@@ -184,6 +211,21 @@ fn handle_live_sse(
                     let json = serde_json::to_string(&stats).unwrap();
                     if tx.send(format_sse("stats", &json)).is_err() {
                         return;
+                    }
+                }
+            }
+
+            // Send distribution snapshot if provider is attached
+            #[cfg(feature = "distribution")]
+            {
+                let maybe_dist = distribution.lock().unwrap().clone();
+                if let Some(provider) = maybe_dist {
+                    if let Some(snapshot) = provider.snapshot() {
+                        if let Ok(json) = serde_json::to_string(&snapshot) {
+                            if tx.send(format_sse("distribution", &json)).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -234,6 +276,49 @@ fn handle_stats_api(
             .unwrap(),
     );
     let _ = request.respond(response);
+}
+
+fn handle_investigate_api(
+    request: tiny_http::Request,
+    url: &str,
+    runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
+    collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
+) {
+    let params = parse_query_string(url);
+    let cmd = params.get("cmd").map(|s| s.as_str()).unwrap_or("help");
+
+    let maybe_rt = runtime.lock().unwrap().clone();
+    let maybe_col = collector.lock().unwrap().clone();
+
+    let json = match (maybe_rt, maybe_col) {
+        (Some(rt), Some(col)) => investigate::dispatch_command(cmd, &params, &rt, &col),
+        _ => serde_json::json!({
+            "ok": false,
+            "command": cmd,
+            "error": "runtime not attached yet"
+        })
+        .to_string(),
+    };
+
+    let response = tiny_http::Response::from_string(json).with_header(
+        "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+fn parse_query_string(url: &str) -> HashMap<String, String> {
+    let mut params = HashMap::new();
+    if let Some(qs) = url.split('?').nth(1) {
+        for pair in qs.split('&') {
+            let mut kv = pair.splitn(2, '=');
+            if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
+                params.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    params
 }
 
 // ── Replay server ───────────────────────────────────────────────────────

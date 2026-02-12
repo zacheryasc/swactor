@@ -113,7 +113,7 @@ impl CodecRegistry {
     }
 
     /// Encode a type-erased message. Returns `(type_tag, payload_bytes)`.
-    pub(crate) fn encode(
+    pub fn encode(
         &self,
         type_id: TypeId,
         msg: Box<dyn Any + Send>,

@@ -146,6 +146,7 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
     <nav class="nav-links">
       <a href="/" class="nav-link">Overview</a>
       <a href="/actors" class="nav-link active">Actors</a>
+      <a href="/distribution" class="nav-link">Distribution</a>
     </nav>
   </div>
   <div class="header-right">

@@ -16,6 +16,7 @@
 //! ← {"ok":true,"command":"diff","data":{"elapsed_s":2.0,"delta_messages":8432,"msg_per_sec":4216.0,...}}
 //! ```
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,19 +45,11 @@ pub fn run_investigate(runtime: Arc<Runtime>, collector: Arc<StatsCollector>) ->
         let cmd = parts[0];
         let args = &parts[1..];
 
-        let response = match cmd {
-            "help" => cmd_help(),
-            "overview" => cmd_overview(&runtime, &collector),
-            "workers" => cmd_workers(&runtime),
-            "worker" => cmd_worker(&runtime, &collector, args),
-            "actors" => cmd_actors(&runtime, &collector, args),
-            "actor" => cmd_actor(&runtime, &collector, args),
-            "hot" => cmd_hot(&runtime, &collector, args),
-            "phases" => cmd_phases(&runtime, args),
-            "diff" => cmd_diff(&runtime, &collector, args),
-            "quit" | "exit" => break,
-            _ => err_response(cmd, &format!("unknown command `{cmd}` — try `help`")),
-        };
+        if cmd == "quit" || cmd == "exit" {
+            break;
+        }
+
+        let response = dispatch_repl(cmd, args, &runtime, &collector);
 
         stdout.write_all(response.as_bytes())?;
         stdout.write_all(b"\n")?;
@@ -64,6 +57,76 @@ pub fn run_investigate(runtime: Arc<Runtime>, collector: Arc<StatsCollector>) ->
     }
 
     Ok(())
+}
+
+fn dispatch_repl(cmd: &str, args: &[&str], runtime: &Runtime, collector: &StatsCollector) -> String {
+    match cmd {
+        "help" => cmd_help(),
+        "overview" => cmd_overview(runtime, collector),
+        "workers" => cmd_workers(runtime),
+        "worker" => cmd_worker(runtime, collector, args),
+        "actors" => cmd_actors(runtime, collector, args),
+        "actor" => cmd_actor(runtime, collector, args),
+        "hot" => cmd_hot(runtime, collector, args),
+        "phases" => cmd_phases(runtime, args),
+        "diff" => cmd_diff(runtime, collector, args),
+        _ => err_response(cmd, &format!("unknown command `{cmd}` — try `help`")),
+    }
+}
+
+/// Dispatch an investigate command from HTTP query parameters.
+///
+/// Maps `?cmd=overview`, `?cmd=hot&n=10`, etc. to the appropriate command function.
+pub fn dispatch_command(
+    cmd: &str,
+    params: &HashMap<String, String>,
+    runtime: &Runtime,
+    collector: &StatsCollector,
+) -> String {
+    match cmd {
+        "help" => cmd_help(),
+        "overview" => cmd_overview(runtime, collector),
+        "workers" => cmd_workers(runtime),
+        "worker" => {
+            let id = params.get("id").map(|s| s.as_str()).unwrap_or("");
+            cmd_worker(runtime, collector, &[id])
+        }
+        "actors" => {
+            let mut args = Vec::new();
+            if let Some(sort) = params.get("sort") {
+                args.push("--sort");
+                args.push(sort.as_str());
+            }
+            if let Some(limit) = params.get("limit") {
+                args.push("--limit");
+                args.push(limit.as_str());
+            }
+            if let Some(worker) = params.get("worker") {
+                args.push("--worker");
+                args.push(worker.as_str());
+            }
+            cmd_actors(runtime, collector, &args)
+        }
+        "actor" => {
+            let prefix = params.get("prefix").map(|s| s.as_str()).unwrap_or("");
+            cmd_actor(runtime, collector, &[prefix])
+        }
+        "hot" => {
+            let n = params.get("n").map(|s| s.as_str()).unwrap_or("10");
+            cmd_hot(runtime, collector, &[n])
+        }
+        "phases" => {
+            match params.get("worker") {
+                Some(w) => cmd_phases(runtime, &[w.as_str()]),
+                None => cmd_phases(runtime, &[]),
+            }
+        }
+        "diff" => {
+            let secs = params.get("seconds").map(|s| s.as_str()).unwrap_or("");
+            cmd_diff(runtime, collector, &[secs])
+        }
+        _ => err_response(cmd, &format!("unknown command `{cmd}` — try `help`")),
+    }
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -94,8 +157,6 @@ fn full_hex(addr: &swactor::actor::ActorAddress) -> String {
     addr.0.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
 fn enriched_stats(rt: &Runtime, col: &StatsCollector) -> RuntimeStats {
     let mut s = rt.stats();
     col.enrich(&mut s);
@@ -104,7 +165,7 @@ fn enriched_stats(rt: &Runtime, col: &StatsCollector) -> RuntimeStats {
 
 // ── Commands ────────────────────────────────────────────────────────────
 
-fn cmd_help() -> String {
+pub fn cmd_help() -> String {
     ok_response(
         "help",
         serde_json::json!({
@@ -123,7 +184,7 @@ fn cmd_help() -> String {
     )
 }
 
-fn cmd_overview(rt: &Runtime, col: &StatsCollector) -> String {
+pub fn cmd_overview(rt: &Runtime, col: &StatsCollector) -> String {
     let stats = enriched_stats(rt, col);
     let total_msgs: u64 = stats.workers.iter().map(|w| w.messages_processed).sum();
     let total_mailbox: usize = stats.workers.iter().map(|w| w.mailbox_depth).sum();
@@ -151,7 +212,7 @@ fn cmd_overview(rt: &Runtime, col: &StatsCollector) -> String {
     )
 }
 
-fn cmd_workers(rt: &Runtime) -> String {
+pub fn cmd_workers(rt: &Runtime) -> String {
     let stats = rt.stats();
     let workers: Vec<_> = stats
         .workers
@@ -173,7 +234,7 @@ fn cmd_workers(rt: &Runtime) -> String {
     ok_response("workers", workers)
 }
 
-fn cmd_worker(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
+pub fn cmd_worker(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     let id: usize = match args.first().and_then(|s| s.parse().ok()) {
         Some(id) => id,
         None => return err_response("worker", "usage: worker <id>"),
@@ -227,7 +288,7 @@ fn cmd_worker(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     )
 }
 
-fn cmd_actors(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
+pub fn cmd_actors(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     let stats = enriched_stats(rt, col);
     let mut actors = stats.actor_details.clone();
 
@@ -295,7 +356,7 @@ fn cmd_actors(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     )
 }
 
-fn cmd_actor(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
+pub fn cmd_actor(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     let prefix = match args.first() {
         Some(p) => *p,
         None => return err_response("actor", "usage: actor <hex_prefix>"),
@@ -329,7 +390,7 @@ fn cmd_actor(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     )
 }
 
-fn cmd_hot(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
+pub fn cmd_hot(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     let n: usize = args.first().and_then(|s| s.parse().ok()).unwrap_or(10);
     let stats = enriched_stats(rt, col);
 
@@ -355,7 +416,7 @@ fn cmd_hot(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     ok_response("hot", rows)
 }
 
-fn cmd_phases(rt: &Runtime, args: &[&str]) -> String {
+pub fn cmd_phases(rt: &Runtime, args: &[&str]) -> String {
     let stats = rt.stats();
 
     let worker_filter: Option<usize> = args.first().and_then(|s| s.parse().ok());
@@ -388,7 +449,7 @@ fn cmd_phases(rt: &Runtime, args: &[&str]) -> String {
     ok_response("phases", results)
 }
 
-fn cmd_diff(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
+pub fn cmd_diff(rt: &Runtime, col: &StatsCollector, args: &[&str]) -> String {
     let secs: f64 = match args.first().and_then(|s| s.parse().ok()) {
         Some(s) if s > 0.0 && s <= 30.0 => s,
         Some(_) => return err_response("diff", "seconds must be between 0 and 30"),
