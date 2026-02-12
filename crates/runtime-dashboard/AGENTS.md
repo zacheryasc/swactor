@@ -16,7 +16,7 @@ Or programmatically against any running runtime:
 
 ```rust
 use runtime_dashboard::investigate::run_investigate;
-run_investigate(runtime_arc)?;   // blocks on stdin
+run_investigate(runtime_arc, collector_arc)?;   // blocks on stdin
 ```
 
 ### Response Envelope
@@ -147,6 +147,29 @@ Returns all commands with usage strings.
 
 #### quit
 Exits the session.
+
+### HTTP API
+
+All investigate commands are available via HTTP when the dashboard server is
+running. The endpoint is `/api/investigate` with query parameters:
+
+```
+GET http://localhost:9090/api/investigate?cmd=overview
+GET http://localhost:9090/api/investigate?cmd=workers
+GET http://localhost:9090/api/investigate?cmd=worker&id=2
+GET http://localhost:9090/api/investigate?cmd=actors&sort=mailbox&limit=5&worker=0
+GET http://localhost:9090/api/investigate?cmd=actor&prefix=a1b2
+GET http://localhost:9090/api/investigate?cmd=hot&n=5
+GET http://localhost:9090/api/investigate?cmd=phases&worker=2
+GET http://localhost:9090/api/investigate?cmd=diff&seconds=2
+GET http://localhost:9090/api/investigate?cmd=help
+```
+
+The response format is identical to the stdin protocol — a single JSON object
+with `ok`, `command`, and `data` (or `error`) fields.
+
+Note: `diff` blocks the HTTP request for the specified number of seconds
+(max 30) while collecting the two snapshots.
 
 ### Investigation Playbook
 

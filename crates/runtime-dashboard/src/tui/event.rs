@@ -14,6 +14,10 @@ pub enum AppEvent {
         source: RuntimeEndpoint,
         stats: Box<RuntimeStats>,
     },
+    #[cfg(feature = "distribution")]
+    DistributionUpdate {
+        snapshot: Box<distribution::snapshot::DistributionNodeSnapshot>,
+    },
 }
 
 pub struct EventLoop {

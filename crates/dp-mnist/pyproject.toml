@@ -1,0 +1,17 @@
+[project]
+name = "dp-mnist"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = [
+    "swactor",
+    "torch",
+    "torchvision",
+    "numpy",
+]
+
+[tool.uv.sources]
+swactor = { path = "../python", editable = true }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"

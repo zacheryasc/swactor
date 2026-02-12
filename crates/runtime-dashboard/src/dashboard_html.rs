@@ -139,6 +139,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <nav class="nav-links">
       <a href="/" class="nav-link active">Overview</a>
       <a href="/actors" class="nav-link">Actors</a>
+      <a href="/distribution" class="nav-link">Distribution</a>
     </nav>
   </div>
   <div class="header-right">

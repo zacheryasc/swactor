@@ -62,6 +62,8 @@ impl SortColumn {
 pub enum ViewMode {
     Overview,
     WorkerDetail,
+    #[cfg(feature = "distribution")]
+    Distribution,
 }
 
 pub struct App {
@@ -78,6 +80,11 @@ pub struct App {
     pub num_workers: usize,
     pub view_mode: ViewMode,
     pub focused_worker: usize,
+
+    #[cfg(feature = "distribution")]
+    pub distribution: Option<distribution::snapshot::DistributionNodeSnapshot>,
+    #[cfg(feature = "distribution")]
+    pub dist_member_selected: usize,
 
     prev_messages: Vec<u64>,
     prev_time: Instant,
@@ -101,10 +108,21 @@ impl App {
             num_workers: 0,
             view_mode: ViewMode::Overview,
             focused_worker: 0,
+            #[cfg(feature = "distribution")]
+            distribution: None,
+            #[cfg(feature = "distribution")]
+            dist_member_selected: 0,
             prev_messages: Vec::new(),
             prev_time: Instant::now(),
             msg_rates: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "distribution")]
+    pub fn update_distribution(&mut self, snapshot: distribution::snapshot::DistributionNodeSnapshot) {
+        let max = if snapshot.members.is_empty() { 0 } else { snapshot.members.len() - 1 };
+        self.dist_member_selected = self.dist_member_selected.min(max);
+        self.distribution = Some(snapshot);
     }
 
     /// Actor rows filtered to the focused worker (for worker detail view).
@@ -247,7 +265,12 @@ impl App {
             KeyCode::Tab => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Overview => ViewMode::WorkerDetail,
+                    #[cfg(feature = "distribution")]
+                    ViewMode::WorkerDetail => ViewMode::Distribution,
+                    #[cfg(not(feature = "distribution"))]
                     ViewMode::WorkerDetail => ViewMode::Overview,
+                    #[cfg(feature = "distribution")]
+                    ViewMode::Distribution => ViewMode::Overview,
                 };
                 return;
             }
@@ -257,6 +280,8 @@ impl App {
         match self.view_mode {
             ViewMode::Overview => self.handle_key_overview(key),
             ViewMode::WorkerDetail => self.handle_key_worker_detail(key),
+            #[cfg(feature = "distribution")]
+            ViewMode::Distribution => self.handle_key_distribution(key),
         }
     }
 
@@ -308,6 +333,35 @@ impl App {
             }
             KeyCode::Home => { self.focused_worker = 0; }
             KeyCode::End => { self.focused_worker = max_w; }
+            _ => {}
+        }
+    }
+
+    #[cfg(feature = "distribution")]
+    fn handle_key_distribution(&mut self, key: KeyEvent) {
+        let max = self
+            .distribution
+            .as_ref()
+            .map(|d| if d.members.is_empty() { 0 } else { d.members.len() - 1 })
+            .unwrap_or(0);
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
+                self.view_mode = ViewMode::Overview;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.dist_member_selected = self.dist_member_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.dist_member_selected = (self.dist_member_selected + 1).min(max);
+            }
+            KeyCode::PageUp => {
+                self.dist_member_selected = self.dist_member_selected.saturating_sub(20);
+            }
+            KeyCode::PageDown => {
+                self.dist_member_selected = (self.dist_member_selected + 20).min(max);
+            }
+            KeyCode::Home => { self.dist_member_selected = 0; }
+            KeyCode::End => { self.dist_member_selected = max; }
             _ => {}
         }
     }

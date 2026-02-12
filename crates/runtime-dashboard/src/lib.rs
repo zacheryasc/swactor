@@ -1,4 +1,5 @@
 pub mod collector;
+pub mod investigate;
 pub mod layer;
 pub mod trace;
 mod actors_html;
@@ -8,7 +9,10 @@ mod server;
 #[cfg(feature = "tui")]
 pub mod tui;
 
-pub mod investigate;
+#[cfg(feature = "distribution")]
+mod distribution_html;
+#[cfg(feature = "distribution")]
+pub mod distribution_collector;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +81,8 @@ pub struct DashboardHandle {
     shutdown: Arc<AtomicBool>,
     stats_timeline: Arc<ArrayQueue<TimestampedStats>>,
     recording: bool,
+    #[cfg(feature = "distribution")]
+    distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>>,
 }
 
 impl DashboardHandle {
@@ -101,6 +107,12 @@ impl DashboardHandle {
     /// Whether trace recording is enabled.
     pub fn is_recording(&self) -> bool {
         self.recording
+    }
+
+    /// Attach a distribution stats provider, enabling the `/distribution` page.
+    #[cfg(feature = "distribution")]
+    pub fn set_distribution(&self, provider: Arc<dyn distribution_collector::DistributionStatsProvider>) {
+        *self.distribution.lock().unwrap() = Some(provider);
     }
 
     /// Signal the dashboard to shut down (SSE clients receive "done").
@@ -148,12 +160,18 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     let shutdown = Arc::new(AtomicBool::new(false));
     let stats_timeline = Arc::new(ArrayQueue::new(config.record_stats_capacity.max(1)));
 
+    #[cfg(feature = "distribution")]
+    let distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>> =
+        Arc::new(Mutex::new(None));
+
     server::spawn_http_server(
         Arc::clone(&store),
         Arc::clone(&runtime),
         Arc::clone(&collector),
         Arc::clone(&shutdown),
         config.port,
+        #[cfg(feature = "distribution")]
+        Arc::clone(&distribution),
     );
 
     // Start stats recorder thread when recording is enabled
@@ -193,6 +211,8 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         shutdown,
         stats_timeline,
         recording: config.record,
+        #[cfg(feature = "distribution")]
+        distribution,
     }
 }
 

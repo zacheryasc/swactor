@@ -16,6 +16,8 @@ use ratatui::widgets::TableState;
 use swactor::runtime::Runtime;
 
 use crate::collector::StatsCollector;
+#[cfg(feature = "distribution")]
+use crate::distribution_collector::DistributionStatsProvider;
 use self::app::App;
 use self::event::{AppEvent, EventLoop};
 use self::types::RuntimeEndpoint;
@@ -42,6 +44,8 @@ impl Default for TuiConfig {
 pub fn start_tui(
     runtime: Arc<Runtime>,
     collector: Arc<StatsCollector>,
+    #[cfg(feature = "distribution")]
+    distribution: Option<Arc<dyn DistributionStatsProvider>>,
     config: TuiConfig,
 ) -> io::Result<()> {
     // Set up terminal
@@ -61,7 +65,14 @@ pub fn start_tui(
     }));
 
     // Run main loop
-    let result = run_loop(&mut terminal, runtime, collector, config);
+    let result = run_loop(
+        &mut terminal,
+        runtime,
+        collector,
+        #[cfg(feature = "distribution")]
+        distribution,
+        config,
+    );
 
     // Restore terminal
     crossterm::terminal::disable_raw_mode()?;
@@ -78,6 +89,8 @@ fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     runtime: Arc<Runtime>,
     collector: Arc<StatsCollector>,
+    #[cfg(feature = "distribution")]
+    distribution: Option<Arc<dyn DistributionStatsProvider>>,
     config: TuiConfig,
 ) -> io::Result<()> {
     let mut app = App::new();
@@ -97,12 +110,22 @@ fn run_loop(
                 let mut stats = runtime.stats();
                 collector.enrich(&mut stats);
                 app.update(stats);
+                #[cfg(feature = "distribution")]
+                if let Some(ref provider) = distribution {
+                    if let Some(snapshot) = provider.snapshot() {
+                        app.update_distribution(snapshot);
+                    }
+                }
             }
             Ok(AppEvent::Key(key)) => {
                 app.handle_key(key);
             }
             Ok(AppEvent::StatsUpdate { stats, .. }) => {
                 app.update(*stats);
+            }
+            #[cfg(feature = "distribution")]
+            Ok(AppEvent::DistributionUpdate { snapshot }) => {
+                app.update_distribution(*snapshot);
             }
             Err(_) => {
                 // Channel closed, exit
@@ -176,6 +199,10 @@ fn run_loop_remote(
             }
             Ok(AppEvent::Key(key)) => {
                 app.handle_key(key);
+            }
+            #[cfg(feature = "distribution")]
+            Ok(AppEvent::DistributionUpdate { snapshot }) => {
+                app.update_distribution(*snapshot);
             }
             Err(_) => {
                 break;
