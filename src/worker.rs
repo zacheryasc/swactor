@@ -2,9 +2,9 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use crate::Instant;
 
 use crate::actor::{ActorAddress, ActorExited, AnyActor, CloneMsg, ContextInner, Ctx, ExitReason, StopReason, StopSignal, TimerRequest};
 use crate::channel::Receiver;
@@ -735,6 +735,7 @@ impl ActorPool {
                     slot.stopping = true;
                     stats.stops.fetch_add(1, Ordering::Relaxed);
                     slot.mailbox.clear();
+                    deaths.push((addr, ExitReason::Stopped));
                     #[cfg(feature = "tracing")]
                     tracing::info!(actor_addr = %addr, "actor.stop_requested");
                     break;

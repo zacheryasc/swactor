@@ -102,10 +102,20 @@ impl<M: Message> Router<M> {
                 Some(live[idx])
             }
             RoutingStrategy::Random => {
-                let mut buf = [0u8; 8];
-                getrandom::getrandom(&mut buf).expect("getrandom failed");
-                let r = u64::from_ne_bytes(buf) as usize;
-                Some(live[r % live.len()])
+                #[cfg(feature = "getrandom")]
+                {
+                    let mut buf = [0u8; 8];
+                    getrandom::getrandom(&mut buf).expect("getrandom failed");
+                    let r = u64::from_ne_bytes(buf) as usize;
+                    Some(live[r % live.len()])
+                }
+                #[cfg(not(feature = "getrandom"))]
+                {
+                    // Fallback to round-robin when getrandom is unavailable (wasm)
+                    let idx = self.rr_index % live.len();
+                    self.rr_index = self.rr_index.wrapping_add(1);
+                    Some(live[idx])
+                }
             }
             RoutingStrategy::Broadcast => None, // handled separately
         }

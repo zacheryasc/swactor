@@ -5,8 +5,9 @@ edition = "2024"
 
 [features]
 default = ["getrandom"]
-getrandom = ["dep:getrandom"]
+getrandom = ["dep:getrandom", "swactor/getrandom"]
+wasm = ["swactor/wasm"]
 
 [dependencies]
-swactor = { path = "../.." }
+swactor = { path = "../..", default-features = false }
 getrandom = { version = "0.2", optional = true }

@@ -2723,6 +2723,7 @@ dependencies = [
  "serde",
  "swactor-std",
  "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -3299,6 +3300,7 @@ name = "wasm"
 version = "0.1.0"
 dependencies = [
  "swactor",
+ "swactor-std",
  "wasm-bindgen",
 ]
 
@@ -3730,6 +3732,16 @@ name = "web-sys"
 version = "0.3.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "312e32e551d92129218ea9a2452120f4aabc03529ef03e4d0d82fb2780608598"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa30049b1c872b72c89866d458eae9f20380ab280ffd1b1e18df2d3e2d98cfe0"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

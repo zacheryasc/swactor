@@ -1,0 +1,570 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>swactor — In-Browser Runtime Demo</title>
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --dim: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+    --font: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: var(--font); background: var(--bg); color: var(--text); padding: 20px; }
+  h1 { font-size: 1.4em; margin-bottom: 4px; }
+  h1 span { color: var(--accent); }
+  .subtitle { color: var(--dim); font-size: 0.8em; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 300px 1fr 280px; gap: 16px; height: calc(100vh - 100px); }
+
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; overflow-y: auto; }
+  .panel h2 { font-size: 0.9em; color: var(--accent); margin-bottom: 12px; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
+
+  .stat-row { display: flex; justify-content: space-between; margin-bottom: 6px; font-size: 0.85em; }
+  .stat-label { color: var(--dim); }
+  .stat-value { color: var(--green); font-weight: bold; }
+
+  .btn {
+    display: inline-block; padding: 6px 12px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--text); border-radius: 4px;
+    cursor: pointer; font-family: var(--font); font-size: 0.8em; transition: 0.15s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn:active { transform: scale(0.97); }
+  .btn.danger:hover { border-color: var(--red); color: var(--red); }
+  .btn.small { padding: 3px 8px; font-size: 0.75em; }
+
+  .section { margin-bottom: 16px; }
+  .section h3 { font-size: 0.8em; color: var(--dim); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  input, select {
+    background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 8px; border-radius: 4px; font-family: var(--font); font-size: 0.8em; width: 100%;
+  }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+  .actor-card {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px; margin-bottom: 8px; font-size: 0.8em; position: relative;
+  }
+  .actor-card .type { color: var(--purple); font-weight: bold; }
+  .actor-card .addr { color: var(--dim); font-size: 0.9em; }
+  .actor-card .name-tag { color: var(--yellow); font-size: 0.85em; }
+  .actor-card .group-tag { color: var(--green); font-size: 0.85em; margin-left: 4px; }
+  .actor-card .actions { margin-top: 6px; display: flex; gap: 4px; flex-wrap: wrap; }
+
+  #log {
+    font-size: 0.75em; line-height: 1.6; padding: 8px;
+    background: var(--bg); border-radius: 4px; height: calc(100% - 40px); overflow-y: auto;
+  }
+  .log-entry { border-bottom: 1px solid var(--border); padding: 3px 0; }
+  .log-time { color: var(--dim); }
+  .log-spawn { color: var(--green); }
+  .log-msg { color: var(--accent); }
+  .log-recv { color: var(--yellow); }
+  .log-death { color: var(--red); }
+  .log-name { color: var(--purple); }
+  .log-group { color: var(--green); }
+
+  .tick-indicator {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+    background: var(--dim); margin-right: 6px; transition: 0.1s;
+  }
+  .tick-indicator.active { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+  .controls { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; }
+  .speed-label { font-size: 0.75em; color: var(--dim); }
+
+  #loading { text-align: center; padding: 40px; color: var(--dim); font-size: 1.2em; }
+  #app { display: none; }
+
+  .form-row { display: flex; gap: 6px; margin-bottom: 6px; }
+  .form-row input { flex: 1; }
+
+  .viz-canvas { width: 100%; height: 200px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); }
+</style>
+</head>
+<body>
+
+<h1><span>swactor</span> in-browser runtime</h1>
+<p class="subtitle">actor runtime compiled to WebAssembly, running right here</p>
+
+<div id="loading">Loading wasm module...</div>
+
+<div id="app">
+  <div class="grid">
+    <!-- LEFT: Controls -->
+    <div class="panel">
+      <h2>Controls</h2>
+
+      <div class="section">
+        <h3>Runtime</h3>
+        <div class="controls">
+          <span class="tick-indicator" id="tick-led"></span>
+          <button class="btn" id="btn-toggle">Start</button>
+          <button class="btn" id="btn-step">Step</button>
+          <div>
+            <input type="range" id="speed" min="1" max="60" value="20" style="width:80px">
+            <span class="speed-label" id="speed-label">20 tps</span>
+          </div>
+        </div>
+        <div class="stat-row"><span class="stat-label">Actors</span><span class="stat-value" id="s-actors">0</span></div>
+        <div class="stat-row"><span class="stat-label">Messages</span><span class="stat-value" id="s-msgs">0</span></div>
+        <div class="stat-row"><span class="stat-label">Panics</span><span class="stat-value" id="s-panics">0</span></div>
+        <div class="stat-row"><span class="stat-label">Uptime</span><span class="stat-value" id="s-uptime">0ms</span></div>
+        <div class="stat-row"><span class="stat-label">Ticks</span><span class="stat-value" id="s-ticks">0</span></div>
+      </div>
+
+      <div class="section">
+        <h3>Spawn Actor</h3>
+        <div class="form-row">
+          <select id="spawn-type">
+            <option value="counter">Counter</option>
+            <option value="relay">Relay</option>
+            <option value="group_member">Group Member</option>
+            <option value="sentinel">Sentinel</option>
+          </select>
+          <button class="btn" id="btn-spawn">Spawn</button>
+        </div>
+        <div id="spawn-opts"></div>
+      </div>
+
+      <div class="section">
+        <h3>Send Message</h3>
+        <div class="form-row">
+          <select id="send-target" style="flex:2"><option value="">— select actor —</option></select>
+          <input id="send-value" type="number" value="1" style="flex:1" placeholder="u32">
+        </div>
+        <button class="btn" id="btn-send" style="margin-top:4px">Send u32</button>
+      </div>
+
+      <div class="section">
+        <h3>Naming</h3>
+        <div class="form-row">
+          <input id="name-input" placeholder="name">
+          <select id="name-target" style="flex:1"><option value="">— actor —</option></select>
+        </div>
+        <div class="form-row">
+          <button class="btn small" id="btn-register">Register</button>
+          <button class="btn small" id="btn-lookup">Lookup</button>
+          <button class="btn small" id="btn-unreg">Unregister</button>
+        </div>
+        <div id="names-list" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
+      </div>
+
+      <div class="section">
+        <h3>Groups</h3>
+        <div class="form-row">
+          <input id="group-name" placeholder="group name" value="workers">
+        </div>
+        <div class="form-row">
+          <button class="btn small" id="btn-broadcast">Broadcast 42</button>
+        </div>
+        <div id="groups-list" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
+      </div>
+    </div>
+
+    <!-- CENTER: Actor Map + Visualization -->
+    <div class="panel">
+      <h2>Actors</h2>
+      <canvas id="viz" class="viz-canvas"></canvas>
+      <div id="actor-list" style="margin-top:12px"></div>
+    </div>
+
+    <!-- RIGHT: Event Log -->
+    <div class="panel">
+      <h2>Event Log</h2>
+      <div id="log"></div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import init, {
+  WasmRuntime, WasmAddr, WasmInboxU32, WasmInboxString,
+  spawn_counter, spawn_relay, spawn_sentinel, spawn_group_member,
+} from './pkg-web/wasm.js';
+
+await init();
+
+document.getElementById('loading').style.display = 'none';
+document.getElementById('app').style.display = 'block';
+
+// ─── State ─────────────────────────────────────────────────────────────
+const rt = new WasmRuntime();
+const actors = new Map();  // id -> { addr, type, name?, groups:Set, inbox? }
+let nextId = 1;
+let running = false;
+let tickCount = 0;
+let rafId = null;
+let lastTick = 0;
+
+// Global inboxes for polling
+const inboxes = [];  // { inbox, type: 'u32'|'string', label, actorId? }
+
+// ─── Logging ───────────────────────────────────────────────────────────
+const logEl = document.getElementById('log');
+function log(cls, msg) {
+  const t = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 2 });
+  const entry = document.createElement('div');
+  entry.className = 'log-entry';
+  entry.innerHTML = `<span class="log-time">${t}</span> <span class="${cls}">${msg}</span>`;
+  logEl.appendChild(entry);
+  logEl.scrollTop = logEl.scrollHeight;
+  // cap at 500 entries
+  while (logEl.children.length > 500) logEl.removeChild(logEl.firstChild);
+}
+
+// ─── Spawn helpers ─────────────────────────────────────────────────────
+function addActor(addr, type, extra = {}) {
+  const id = nextId++;
+  const entry = { id, addr, type, name: null, groups: new Set(), ...extra };
+  actors.set(id, entry);
+  log('log-spawn', `spawned <b>${type}</b> #${id} (${addr.toString()})`);
+  refreshActorUI();
+  return id;
+}
+
+function createInbox(type) {
+  if (type === 'u32') {
+    const inbox = rt.new_inbox_u32();
+    inboxes.push({ inbox, type: 'u32' });
+    return inbox;
+  } else if (type === 'string') {
+    const inbox = rt.new_inbox_string();
+    inboxes.push({ inbox, type: 'string' });
+    return inbox;
+  }
+}
+
+function doSpawn() {
+  const type = document.getElementById('spawn-type').value;
+  if (type === 'counter') {
+    const inbox = createInbox('u32');
+    const inboxAddr = inbox.addr();
+    const addr = spawn_counter(rt, inboxAddr);
+    const id = addActor(addr, 'Counter', { reportInbox: inbox });
+  } else if (type === 'relay') {
+    // relay needs a target — pick first available actor
+    const targetId = prompt('Target actor ID to relay to:');
+    const target = actors.get(Number(targetId));
+    if (!target) { log('log-death', 'invalid target'); return; }
+    const addr = spawn_relay(rt, target.addr);
+    addActor(addr, 'Relay', { relayTarget: targetId });
+  } else if (type === 'group_member') {
+    const group = document.getElementById('group-name').value || 'workers';
+    const inbox = createInbox('u32');
+    const inboxAddr = inbox.addr();
+    const addr = spawn_group_member(rt, group, inboxAddr);
+    const id = addActor(addr, 'GroupMember', { group, reportInbox: inbox });
+    actors.get(id).groups.add(group);
+  } else if (type === 'sentinel') {
+    const targetId = prompt('Actor ID to watch:');
+    const target = actors.get(Number(targetId));
+    if (!target) { log('log-death', 'invalid target'); return; }
+    const inbox = createInbox('string');
+    const addr = spawn_sentinel(rt, target.addr, inbox);
+    addActor(addr, 'Sentinel', { watching: targetId, deathInbox: inbox });
+  }
+}
+
+// ─── Tick loop ─────────────────────────────────────────────────────────
+function tickOnce() {
+  rt.tick();
+  tickCount++;
+  pollInboxes();
+  updateStats();
+}
+
+function pollInboxes() {
+  for (const ib of inboxes) {
+    let val;
+    while ((val = ib.inbox.try_recv()) !== undefined) {
+      if (ib.type === 'u32') {
+        log('log-recv', `inbox received <b>${val}</b>`);
+      } else {
+        log('log-death', `death notification: <b>${val}</b>`);
+      }
+    }
+  }
+}
+
+function getTickInterval() {
+  return 1000 / Number(document.getElementById('speed').value);
+}
+
+function loop(ts) {
+  if (!running) return;
+  if (ts - lastTick >= getTickInterval()) {
+    tickOnce();
+    flashLed();
+    lastTick = ts;
+  }
+  rafId = requestAnimationFrame(loop);
+}
+
+function flashLed() {
+  const led = document.getElementById('tick-led');
+  led.classList.add('active');
+  setTimeout(() => led.classList.remove('active'), 80);
+}
+
+function updateStats() {
+  document.getElementById('s-actors').textContent = rt.actor_count();
+  document.getElementById('s-msgs').textContent = rt.total_messages();
+  document.getElementById('s-panics').textContent = rt.total_panics();
+  document.getElementById('s-uptime').textContent = Math.round(rt.uptime_ms()) + 'ms';
+  document.getElementById('s-ticks').textContent = tickCount;
+
+  // names
+  const names = rt.registered_names();
+  document.getElementById('names-list').textContent = names ? `Registered: ${names}` : 'No names registered';
+
+  // groups
+  const groups = rt.group_names();
+  const parts = groups ? groups.split(',').map(g => `${g}(${rt.group_member_count(g)})`).join(', ') : 'none';
+  document.getElementById('groups-list').textContent = `Groups: ${parts}`;
+
+  refreshDropdowns();
+  drawViz();
+}
+
+// ─── Actor Cards ───────────────────────────────────────────────────────
+function refreshActorUI() {
+  const container = document.getElementById('actor-list');
+  container.innerHTML = '';
+  for (const [id, a] of actors) {
+    const card = document.createElement('div');
+    card.className = 'actor-card';
+    let meta = '';
+    if (a.name) meta += ` <span class="name-tag">@${a.name}</span>`;
+    if (a.groups.size) meta += ` <span class="group-tag">[${[...a.groups].join(',')}]</span>`;
+    if (a.relayTarget) meta += ` <span style="color:var(--dim)">→ #${a.relayTarget}</span>`;
+    if (a.watching) meta += ` <span style="color:var(--dim)">watching #${a.watching}</span>`;
+
+    card.innerHTML = `
+      <span class="type">${a.type}</span> <span style="color:var(--dim)">#${id}</span>${meta}
+      <br><span class="addr">${a.addr.toString()}</span>
+      <div class="actions">
+        <button class="btn small" onclick="window._send(${id})">Send 1</button>
+        <button class="btn small" onclick="window._send10(${id})">Send ×10</button>
+        <button class="btn small danger" onclick="window._stop(${id})">Stop</button>
+      </div>
+    `;
+    container.appendChild(card);
+  }
+  refreshDropdowns();
+}
+
+function refreshDropdowns() {
+  for (const sel of [document.getElementById('send-target'), document.getElementById('name-target')]) {
+    const prev = sel.value;
+    sel.innerHTML = '<option value="">— select —</option>';
+    for (const [id, a] of actors) {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = `#${id} ${a.type}${a.name ? ' @' + a.name : ''}`;
+      sel.appendChild(opt);
+    }
+    sel.value = prev;
+  }
+}
+
+// ─── Visualization ─────────────────────────────────────────────────────
+function drawViz() {
+  const canvas = document.getElementById('viz');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  const entries = [...actors.values()];
+  if (entries.length === 0) {
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '13px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('Spawn some actors to see them here', rect.width / 2, rect.height / 2);
+    return;
+  }
+
+  const colors = { Counter: '#58a6ff', Relay: '#bc8cff', GroupMember: '#3fb950', Sentinel: '#f85149' };
+  const cx = rect.width / 2;
+  const cy = rect.height / 2;
+  const radius = Math.min(cx, cy) - 40;
+
+  // Position actors in a circle
+  const positions = new Map();
+  entries.forEach((a, i) => {
+    const angle = (2 * Math.PI * i) / entries.length - Math.PI / 2;
+    const x = cx + radius * Math.cos(angle);
+    const y = cy + radius * Math.sin(angle);
+    positions.set(a.id, { x, y });
+  });
+
+  // Draw connections
+  ctx.lineWidth = 1;
+  for (const a of entries) {
+    const from = positions.get(a.id);
+    if (a.relayTarget && positions.has(Number(a.relayTarget))) {
+      const to = positions.get(Number(a.relayTarget));
+      ctx.strokeStyle = '#bc8cff44';
+      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+      drawArrow(ctx, from, to, '#bc8cff44');
+    }
+    if (a.watching && positions.has(Number(a.watching))) {
+      const to = positions.get(Number(a.watching));
+      ctx.strokeStyle = '#f8514944';
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath(); ctx.moveTo(from.x, from.y); ctx.lineTo(to.x, to.y); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // Draw actors
+  for (const a of entries) {
+    const pos = positions.get(a.id);
+    const color = colors[a.type] || '#c9d1d9';
+    // glow
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 12;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(pos.x, pos.y, 14, 0, 2 * Math.PI);
+    ctx.fill();
+    ctx.shadowBlur = 0;
+
+    // label
+    ctx.fillStyle = '#c9d1d9';
+    ctx.font = 'bold 10px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(`#${a.id}`, pos.x, pos.y + 4);
+
+    // type label below
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '9px monospace';
+    ctx.fillText(a.type, pos.x, pos.y + 28);
+    if (a.name) {
+      ctx.fillStyle = '#d29922';
+      ctx.fillText(`@${a.name}`, pos.x, pos.y + 38);
+    }
+  }
+}
+
+function drawArrow(ctx, from, to, color) {
+  const dx = to.x - from.x, dy = to.y - from.y;
+  const len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 30) return;
+  const ux = dx / len, uy = dy / len;
+  const tipX = to.x - ux * 18, tipY = to.y - uy * 18;
+  const sz = 6;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.moveTo(tipX, tipY);
+  ctx.lineTo(tipX - ux * sz - uy * sz * 0.5, tipY - uy * sz + ux * sz * 0.5);
+  ctx.lineTo(tipX - ux * sz + uy * sz * 0.5, tipY - uy * sz - ux * sz * 0.5);
+  ctx.fill();
+}
+
+// ─── Global handlers (for inline onclick) ──────────────────────────────
+window._send = (id) => {
+  const a = actors.get(id);
+  if (!a) return;
+  const val = Number(document.getElementById('send-value').value) || 1;
+  rt.send_u32(a.addr, val);
+  log('log-msg', `sent <b>${val}</b> → #${id} ${a.type}`);
+};
+
+window._send10 = (id) => {
+  const a = actors.get(id);
+  if (!a) return;
+  for (let i = 0; i < 10; i++) rt.send_u32(a.addr, 1);
+  log('log-msg', `sent <b>10×1</b> → #${id} ${a.type}`);
+};
+
+window._stop = (id) => {
+  const a = actors.get(id);
+  if (!a) return;
+  rt.stop_actor(a.addr);
+  log('log-death', `stopped #${id} ${a.type}`);
+  actors.delete(id);
+  refreshActorUI();
+};
+
+// ─── Button wiring ─────────────────────────────────────────────────────
+document.getElementById('btn-toggle').addEventListener('click', () => {
+  running = !running;
+  document.getElementById('btn-toggle').textContent = running ? 'Pause' : 'Start';
+  if (running) { lastTick = performance.now(); rafId = requestAnimationFrame(loop); }
+});
+
+document.getElementById('btn-step').addEventListener('click', () => {
+  tickOnce();
+  flashLed();
+});
+
+document.getElementById('speed').addEventListener('input', (e) => {
+  document.getElementById('speed-label').textContent = e.target.value + ' tps';
+});
+
+document.getElementById('btn-spawn').addEventListener('click', doSpawn);
+
+document.getElementById('btn-send').addEventListener('click', () => {
+  const id = Number(document.getElementById('send-target').value);
+  if (id) window._send(id);
+});
+
+document.getElementById('btn-register').addEventListener('click', () => {
+  const name = document.getElementById('name-input').value.trim();
+  const id = Number(document.getElementById('name-target').value);
+  const a = actors.get(id);
+  if (!name || !a) return;
+  const ok = rt.register_name(name, a.addr);
+  if (ok) {
+    a.name = name;
+    log('log-name', `registered <b>@${name}</b> → #${id}`);
+    refreshActorUI();
+  } else {
+    log('log-death', `name <b>@${name}</b> already taken`);
+  }
+});
+
+document.getElementById('btn-lookup').addEventListener('click', () => {
+  const name = document.getElementById('name-input').value.trim();
+  if (!name) return;
+  const found = rt.where_is(name);
+  if (found) {
+    log('log-name', `@${name} → ${found.toString()}`);
+  } else {
+    log('log-name', `@${name} not found`);
+  }
+});
+
+document.getElementById('btn-unreg').addEventListener('click', () => {
+  const name = document.getElementById('name-input').value.trim();
+  if (!name) return;
+  const prev = rt.unregister_name(name);
+  if (prev) {
+    for (const a of actors.values()) { if (a.name === name) a.name = null; }
+    log('log-name', `unregistered <b>@${name}</b>`);
+    refreshActorUI();
+  } else {
+    log('log-name', `@${name} was not registered`);
+  }
+});
+
+document.getElementById('btn-broadcast').addEventListener('click', () => {
+  const group = document.getElementById('group-name').value.trim();
+  if (!group) return;
+  const count = rt.publish_to_group_u32(group, 42);
+  log('log-group', `broadcast <b>42</b> to group "${group}" (${count} members)`);
+});
+
+// initial draw
+updateStats();
+log('log-spawn', 'runtime initialized — spawn some actors and hit <b>Start</b> or <b>Step</b>');
+</script>
+</body>
+</html>

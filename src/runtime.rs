@@ -2,8 +2,10 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::thread::{self, JoinHandle, Thread};
-use std::time::Instant;
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread::{self, JoinHandle};
+use std::thread::Thread;
+use crate::Instant;
 
 use crate::actor::{Actor, ActorAddress, ActorExited, ActorInterface, AnyActor, ExitReason, Message, StopSignal, TimerRequest};
 use crate::channel::{Receiver, Sender};
@@ -67,11 +69,13 @@ impl<R: Message> Ask<R> {
 }
 
 /// Handle for dealing with a runtime that has started via the `Runtime::run()` method.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct RuntimeHandle {
     pub runtime: Arc<Runtime>,
     threads: Vec<JoinHandle<()>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl RuntimeHandle {
     pub fn join(self) {
         for handle in self.threads {
@@ -333,6 +337,9 @@ impl Runtime {
     ///
     /// Works in both single-threaded and multi-threaded configurations.
     /// In single-threaded mode, one background thread is spawned.
+    ///
+    /// Not available on wasm32 — use the browser crate's Web Worker-based run instead.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn run(self) -> Result<RuntimeHandle, Error> {
         self.is_running.store(true, Ordering::Release);
 
