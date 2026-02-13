@@ -17,6 +17,9 @@ fn get_ext(rt: &Runtime) -> &StdExtension {
 /// Provides `spawn_named`, `where_is`, `unregister`, and `registered_names`
 /// via the [`StdExtension`] name registry.
 pub trait RuntimeNaming {
+    /// Register a name for an already-spawned actor. Returns `Err` if name is taken.
+    fn register_name(&self, name: impl Into<String>, addr: ActorAddress) -> Result<(), Error>;
+
     /// Spawn an actor with a registered name, returning its address.
     fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error>;
 
@@ -31,6 +34,10 @@ pub trait RuntimeNaming {
 }
 
 impl RuntimeNaming for Runtime {
+    fn register_name(&self, name: impl Into<String>, addr: ActorAddress) -> Result<(), Error> {
+        get_ext(self).name_registry.register(name.into(), addr)
+    }
+
     fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error> {
         let name = name.into();
         let addr = self.spawn(actor)?;
