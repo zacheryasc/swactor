@@ -61,6 +61,27 @@ impl RuntimeNaming for Runtime {
     }
 }
 
+/// Watching extension for [`Runtime`].
+///
+/// Provides `watch` / `unwatch` via the [`StdExtension`] watch registry.
+pub trait RuntimeWatching {
+    /// Register a watch: `watcher` receives `ActorExited` when `target` dies.
+    fn watch(&self, watcher: ActorAddress, target: ActorAddress);
+
+    /// Cancel a watch.
+    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress);
+}
+
+impl RuntimeWatching for Runtime {
+    fn watch(&self, watcher: ActorAddress, target: ActorAddress) {
+        get_ext(self).watch_registry.watch(watcher, target);
+    }
+
+    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress) {
+        get_ext(self).watch_registry.unwatch(watcher, target);
+    }
+}
+
 /// Group extension for [`Runtime`].
 ///
 /// Provides `join_group`, `leave_group`, `publish_to`, `group_members`,

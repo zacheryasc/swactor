@@ -722,6 +722,66 @@ fn registry_benchmarks(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Allocation decomposition — where does send_to time go?
+// ---------------------------------------------------------------------------
+
+fn allocation_benchmarks(c: &mut Criterion) {
+    let mut group = c.benchmark_group("allocation");
+
+    // D1 — Bare Box allocation + type erasure (no runtime, no channels)
+    for size in [0usize, 64, 256, 1024, 4096] {
+        let label = if size == 0 { "zero".to_string() } else { format!("{size}B") };
+        group.bench_with_input(
+            BenchmarkId::new("box_alloc_erase", &label),
+            &size,
+            |b, &size| {
+                b.iter(|| {
+                    let msg: Box<dyn std::any::Any + Send> = if size == 0 {
+                        Box::new(NoopMessage)
+                    } else {
+                        Box::new(SizedMessage { _payload: vec![0u8; size] })
+                    };
+                    std::hint::black_box(msg);
+                });
+            },
+        );
+    }
+
+    // D2 — Full send_to for comparison (same sizes as D1)
+    for size in [0usize, 64, 256, 1024, 4096] {
+        let label = if size == 0 { "zero".to_string() } else { format!("{size}B") };
+        group.bench_with_input(
+            BenchmarkId::new("full_send_to", &label),
+            &size,
+            |b, &size| {
+                b.iter_batched(
+                    || {
+                        let rt = Runtime::new(make_config(100, 100_000));
+                        let addr = if size == 0 {
+                            rt.spawn(NoopActor).unwrap()
+                        } else {
+                            rt.spawn(SizedSinkActor).unwrap()
+                        };
+                        rt.tick();
+                        (rt, addr, size)
+                    },
+                    |(rt, addr, sz)| {
+                        if sz == 0 {
+                            rt.send_to(addr, NoopMessage).unwrap();
+                        } else {
+                            rt.send_to(addr, SizedMessage { _payload: vec![0u8; sz] }).unwrap();
+                        }
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     latency_benchmarks,
@@ -731,5 +791,6 @@ criterion_group!(
     contention_benchmarks,
     placement_benchmarks,
     registry_benchmarks,
+    allocation_benchmarks,
 );
 criterion_main!(benches);

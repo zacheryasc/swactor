@@ -48,10 +48,12 @@
 │  │                                                                  │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                        │
-│  ┌─ TimerWheel ────────────────────────────────────────────────────┐  │
-│  │  current_tick: u64                                              │  │
-│  │  once_timers: Vec<OnceTimer>      -- fire_at, dest, msg         │  │
-│  │  interval_timers: Vec<IntervalTimer> -- period, dest, clone_msg │  │
+│  ┌─ worker_ext: Option<Box<dyn WorkerExtension>> ─────────────────┐  │
+│  │  Per-worker extension state, created by RuntimeExtension        │  │
+│  │  factory. StdExtension provides a TimerWheel here.              │  │
+│  │  on_tick() → fire due messages    (phase 2.5)                   │  │
+│  │  handle_request() → schedule timers etc.  (phase 5.5)           │  │
+│  │  gc_dead() → clean up dead actor state    (phase 7)             │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
@@ -69,11 +71,9 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  spawn_txs:         &[Sender]          -- one Sender per worker        │
 │  placement:         &Placement         -- load-aware worker picker     │
 │  inbox_registry:    &InboxRegistry     -- external Inbox<M> receivers  │
-│  name_registry:     &NameRegistry      -- String -> ActorAddress       │
-│  monitor_registry:  &MonitorRegistry   -- death watch subscriptions    │
-│  group_registry:    &GroupRegistry      -- pub-sub actor groups        │
 │  config:            &RuntimeConfig     -- budget, backoff, etc.        │
-│  stats_hook:        Option<&dyn Hook>  -- per-tick stats callback      │
+│  extension:         Option<&dyn RuntimeExtension> -- shared ext        │
+│  stats_hook:        Option<&dyn StatsHook> -- per-tick stats callback  │
 │  worker_threads:    &[OnceLock<Thread>] -- for unpark on send/spawn   │
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
@@ -147,19 +147,16 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  └────────────────────────────────────────────────────────────────────┘│
 │      │                                                                 │
 │      v                                                                 │
-│  PHASE 2.5 --- Fire Due Timers                                         │
+│  PHASE 2.5 --- Fire Per-Worker Extension                                │
 │  ┌────────────────────────────────────────────────────────────────────┐│
 │  │                                                                    ││
-│  │  timers.fire()  (advances tick counter, collects due messages)     ││
+│  │  worker_ext.on_tick() → Vec<(dest, msg)>                          ││
+│  │    (StdExtension provides TimerWheel: advances tick, fires due)    ││
 │  │       │                                                            ││
 │  │       v                                                            ││
-│  │  for (dest, msg) in timer_msgs:                                    ││
-│  │    ┌──────────────┬──────────────┬─────────────────┐               ││
-│  │    │ local actor  │ other worker │ inbox/unknown   │               ││
-│  │    │              │              │                 │               ││
-│  │    │ pool.deliver │ transfer_tx  │ inbox_registry  │               ││
-│  │    │              │ + unpark     │ .try_deliver()  │               ││
-│  │    └──────────────┴──────────────┴─────────────────┘               ││
+│  │  for (dest, msg) in ext_msgs:                                      ││
+│  │    route_to_pool_or_remote(pool, tc, dest, msg)                    ││
+│  │      local → pool.deliver | cross → transfer_tx | → inbox_registry ││
 │  │                                                                    ││
 │  └────────────────────────────────────────────────────────────────────┘│
 │      │                                                                 │
@@ -169,9 +166,9 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  │                                                                    ││
 │  │  ┌─ WorkerContext (on stack) ─────────────────────────────────┐    ││
 │  │  │  implements ContextInner                                   │    ││
-│  │  │  pending_local:  RefCell<Vec<(Addr, Box<Any>)>>            │    ││
-│  │  │  stop_requests:  RefCell<Vec<ActorAddress>>                │    ││
-│  │  │  timer_requests: RefCell<Vec<TimerRequest>>                │    ││
+│  │  │  pending_local:    RefCell<Vec<(Addr, Box<Any>)>>          │    ││
+│  │  │  stop_requests:    RefCell<Vec<ActorAddress>>              │    ││
+│  │  │  worker_requests:  RefCell<Vec<Box<dyn Any + Send>>>       │    ││
 │  │  └────────────────────────────────────────────────────────────┘    ││
 │  │                                                                    ││
 │  │  for each (addr, slot) in pool:                                    ││
@@ -214,11 +211,9 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  │    │    address_map.insert(addr, wid)                           │  ││
 │  │    │    spawn_txs[wid].send((addr, actor)) + unpark             │  ││
 │  │    │                                                            │  ││
-│  │    │  request_stop(addr):  → stop_requests.push(addr)           │  ││
-│  │    │  schedule_timer(req): → timer_requests.push(req)           │  ││
-│  │    │  where_is(name):      → name_registry.lookup(name)         │  ││
-│  │    │  monitor(w, t):       → monitor_registry.register(w, t)    │  ││
-│  │    │  join_group(a, g):    → group_registry.join(g, a)          │  ││
+│  │    │  request_stop(addr):      → stop_requests.push(addr)       │  ││
+│  │    │  post_worker_request(r): → worker_requests.push(r)        │  ││
+│  │    │  extension():            → tc.extension                    │  ││
 │  │    │                                                            │  ││
 │  │    └────────────────────────────────────────────────────────────┘  ││
 │  │                                                                    ││
@@ -242,12 +237,12 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  └────────────────────────────────────────────────────────────────────┘│
 │      │                                                                 │
 │      v                                                                 │
-│  PHASE 5.5 --- Drain Timer Requests                                    │
+│  PHASE 5.5 --- Drain Worker Extension Requests                          │
 │  ┌────────────────────────────────────────────────────────────────────┐│
 │  │                                                                    ││
-│  │  for request in timer_requests:                                    ││
-│  │    Once { dest, msg, ticks } → timers.add_once(dest, msg, ticks)  ││
-│  │    Interval { dest, msg, p } → timers.add_interval(dest, msg, p)  ││
+│  │  for request in worker_requests:                                   ││
+│  │    worker_ext.handle_request(request)                              ││
+│  │    (StdExtension: downcasts to TimerRequest, schedules timers)     ││
 │  │                                                                    ││
 │  └────────────────────────────────────────────────────────────────────┘│
 │      │                                                                 │
@@ -272,23 +267,20 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  │    stopping actors: call on_stop(&ctx) before removal             ││
 │  │    poisoned actors: skip on_stop (state may be corrupt)           ││
 │  │                                                                    ││
-│  │  for each dead (addr, reason):                                     ││
+│  │  for each dead addr:                                                ││
 │  │    address_map.remove(&addr)                                       ││
-│  │    name_registry.unregister_by_addr(&addr)                        ││
-│  │    group_registry.cleanup(&addr)                                   ││
+│  │                                                                    ││
+│  │  if extension installed:                                           ││
+│  │    notifications = ext.on_actor_death(&dead)                       ││
+│  │      (StdExtension: emits Down/ActorExited, unregisters names,    ││
+│  │       removes from groups, takes monitors)                        ││
+│  │    ext.cleanup_dead(&dead_addrs)                                   ││
+│  │    route notifications via route_to_pool_or_remote()               ││
 │  │                                                                    ││
 │  │  deliver any messages sent during on_stop callbacks                ││
 │  │                                                                    ││
-│  │  emit Down notifications for monitored dead actors:                ││
-│  │    for (addr, reason) in dead:                                     ││
-│  │      watchers = monitor_registry.take_monitors(&addr)             ││
-│  │      for each watcher: route Down { addr, reason }                ││
-│  │        same-worker → pool.deliver                                  ││
-│  │        cross-worker → transfer_tx + unpark                         ││
-│  │        inbox → inbox_registry.try_deliver                          ││
-│  │      monitor_registry.remove_watcher(&addr)                       ││
-│  │                                                                    ││
-│  │  timers.gc_dead_intervals(dead_addrs)                              ││
+│  │  worker_ext.gc_dead(&dead_addrs)                                   ││
+│  │    (StdExtension: removes orphaned interval timers)                ││
 │  │                                                                    ││
 │  └────────────────────────────────────────────────────────────────────┘│
 │                                                                        │
@@ -510,13 +502,12 @@ Who holds what:
 │ │ addr->wid │ │ load-aware │ │ addr->Sender│ │ AtomicBool │              │
 │ └─────┬─────┘ └──────┬─────┘ └──────┬──────┘ └──────┬─────┘              │
 │       │               │              │               │                    │
-│ ┌─────────────┐ ┌──────────────┐ ┌─────────────┐                         │
-│ │NameRegistry │ │MonitorRegist.│ │GroupRegistry │                         │
-│ │ name->addr  │ │ watched->    │ │ group->addrs │                         │
-│ │ addr->name  │ │   watchers   │ │ addr->groups │                         │
-│ └─────┬───────┘ └──────┬───────┘ └──────┬───────┘                         │
-│       │               │              │                                    │
-│ ┌─────┴───────────────┴──────────────┴───────────────────────────────┐   │
+│ ┌─ extension: Arc<dyn RuntimeExtension> ──────────────────────────┐      │
+│ │  StdExtension holds: NameRegistry, MonitorRegistry,             │      │
+│ │  GroupRegistry, WatchRegistry (accessed via downcast)            │      │
+│ └─────────────────────────────────┬───────────────────────────────┘      │
+│                                   │                                      │
+│ ┌─────────────────────────────────┴──────────────────────────────────┐   │
 │ │                  TickContext (borrows all above)                     │   │
 │ └──────────────────────────┬──────────────────────────────────────────┘   │
 │                            │                                              │

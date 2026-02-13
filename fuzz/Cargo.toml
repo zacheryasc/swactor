@@ -11,6 +11,7 @@ cargo-fuzz = true
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 arbitrary = { version = "1", features = ["derive"] }
 swactor = { path = "..", default-features = true }
+swactor-std = { path = "../crates/std" }
 
 # Prevent this from interfering with workspaces
 [workspace]

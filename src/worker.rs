@@ -1,199 +1,40 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use crate::Instant;
 
-use crate::actor::{ActorAddress, ActorExited, AnyActor, CloneMsg, ContextInner, Ctx, ExitReason, StopReason, StopSignal, TimerRequest};
+use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx, StopReason, StopSignal};
 use crate::channel::Receiver;
 use crate::config::MailboxOverflow;
 use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
 use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
 use crate::Error;
 
-// ─── Per-Worker Timer Wheel ─────────────────────────────────────────────────
+use crate::extension::WorkerExtension;
 
-struct OnceTimer {
-    fire_at: u64,
+/// Route a message: try local pool first, then address_map for cross-worker,
+/// then inbox_registry for external receivers.
+fn route_to_pool_or_remote(
+    pool: &mut ActorPool,
+    tc: &TickContext,
     dest: ActorAddress,
     msg: Box<dyn Any + Send>,
-}
-
-struct IntervalTimer {
-    next_fire: u64,
-    period: u64,
-    dest: ActorAddress,
-    msg: Box<dyn CloneMsg>,
-}
-
-/// Per-worker tick-counting timer wheel.
-///
-/// Timers are deterministic (tick-counted, not wall-clock). One-shot timers
-/// fire once and are consumed; interval timers fire repeatedly every N ticks.
-struct TimerWheel {
-    current_tick: u64,
-    once_timers: Vec<OnceTimer>,
-    interval_timers: Vec<IntervalTimer>,
-}
-
-impl TimerWheel {
-    fn new() -> Self {
-        Self {
-            current_tick: 0,
-            once_timers: Vec::new(),
-            interval_timers: Vec::new(),
-        }
-    }
-
-    /// Advance the tick counter and collect all due timer messages.
-    /// Returns the messages to be routed by the caller (may target local or remote actors/inboxes).
-    fn fire(&mut self) -> Vec<(ActorAddress, Box<dyn Any + Send>)> {
-        self.current_tick += 1;
-        let tick = self.current_tick;
-        let mut result = Vec::new();
-
-        // Fire one-shot timers (swap-remove for O(1) removal)
-        let mut i = 0;
-        while i < self.once_timers.len() {
-            if self.once_timers[i].fire_at <= tick {
-                let timer = self.once_timers.swap_remove(i);
-                result.push((timer.dest, timer.msg));
-            } else {
-                i += 1;
+) {
+    if pool.contains(&dest) {
+        pool.deliver(&dest, msg);
+    } else {
+        match tc.address_map.lookup(&dest) {
+            Some(wid) => {
+                tc.transfer_txs[wid.as_usize()].send(Envelope::new(dest, msg));
+                crate::runtime::notify_worker(tc.worker_threads, wid.as_usize());
+            }
+            None => {
+                let _ = tc.inbox_registry.try_deliver(dest, msg);
             }
         }
-
-        // Fire interval timers
-        for timer in &mut self.interval_timers {
-            if timer.next_fire <= tick {
-                let msg = timer.msg.clone_boxed();
-                result.push((timer.dest, msg));
-                timer.next_fire = tick + timer.period;
-            }
-        }
-
-        result
-    }
-
-    /// Remove interval timers whose target was just removed from the worker.
-    /// Only GCs timers for addresses in `dead` — inboxes and cross-worker actors
-    /// are not in the local pool but are still valid targets.
-    fn gc_dead_intervals(&mut self, dead: &[ActorAddress]) {
-        if dead.is_empty() {
-            return;
-        }
-        self.interval_timers.retain(|t| !dead.iter().any(|d| *d == t.dest));
-    }
-
-    /// Add a one-shot timer.
-    fn add_once(&mut self, dest: ActorAddress, msg: Box<dyn Any + Send>, ticks: u64) {
-        self.once_timers.push(OnceTimer {
-            fire_at: self.current_tick + ticks,
-            dest,
-            msg,
-        });
-    }
-
-    /// Add an interval timer. First fire is after `period` ticks.
-    fn add_interval(&mut self, dest: ActorAddress, msg: Box<dyn CloneMsg>, period: u64) {
-        let period = period.max(1); // prevent zero-period infinite loop
-        self.interval_timers.push(IntervalTimer {
-            next_fire: self.current_tick + period,
-            period,
-            dest,
-            msg,
-        });
-    }
-}
-
-// ─── Watch Registry ─────────────────────────────────────────────────────────
-
-/// Tracks watch relationships between actors.
-///
-/// Shared across workers via `Arc<Mutex<_>>`. Contention is negligible
-/// because watch/unwatch operations are rare relative to message sends.
-pub(crate) struct WatchRegistry {
-    /// target → set of watchers awaiting death notification
-    watchers: HashMap<ActorAddress, HashSet<ActorAddress>>,
-    /// watcher → set of targets it's watching (reverse index for cleanup)
-    watching: HashMap<ActorAddress, HashSet<ActorAddress>>,
-}
-
-impl WatchRegistry {
-    pub fn new() -> Self {
-        Self {
-            watchers: HashMap::new(),
-            watching: HashMap::new(),
-        }
-    }
-
-    pub fn watch(&mut self, watcher: ActorAddress, target: ActorAddress) {
-        self.watchers.entry(target).or_default().insert(watcher);
-        self.watching.entry(watcher).or_default().insert(target);
-    }
-
-    pub fn unwatch(&mut self, watcher: ActorAddress, target: ActorAddress) {
-        if let Some(set) = self.watchers.get_mut(&target) {
-            set.remove(&watcher);
-            if set.is_empty() {
-                self.watchers.remove(&target);
-            }
-        }
-        if let Some(set) = self.watching.get_mut(&watcher) {
-            set.remove(&target);
-            if set.is_empty() {
-                self.watching.remove(&watcher);
-            }
-        }
-    }
-
-    /// Called when an actor dies. Returns (watcher_addr, ActorExited) pairs.
-    pub fn notify_death(
-        &mut self,
-        target: ActorAddress,
-        reason: ExitReason,
-    ) -> Vec<(ActorAddress, ActorExited)> {
-        let notification = ActorExited {
-            addr: target,
-            reason,
-        };
-        let mut result = Vec::new();
-
-        if let Some(watcher_set) = self.watchers.remove(&target) {
-            for watcher in &watcher_set {
-                result.push((*watcher, notification.clone()));
-                // clean up reverse index
-                if let Some(set) = self.watching.get_mut(watcher) {
-                    set.remove(&target);
-                    if set.is_empty() {
-                        self.watching.remove(watcher);
-                    }
-                }
-            }
-        }
-
-        result
-    }
-
-    /// Called when a watcher itself dies. Cleans up all its watching entries.
-    pub fn cleanup_watcher(&mut self, watcher: &ActorAddress) {
-        if let Some(targets) = self.watching.remove(watcher) {
-            for target in targets {
-                if let Some(set) = self.watchers.get_mut(&target) {
-                    set.remove(watcher);
-                    if set.is_empty() {
-                        self.watchers.remove(&target);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Check if a target has any watchers registered.
-    pub fn has_watchers(&self, target: &ActorAddress) -> bool {
-        self.watchers.get(target).is_some_and(|s| !s.is_empty())
     }
 }
 
@@ -208,8 +49,8 @@ pub(crate) struct Worker {
     stats: Arc<WorkerStats>,
     /// Reusable scratch buffer for building per-actor snapshots.
     snapshot_buf: Vec<ActorSnapshot>,
-    /// Per-worker tick-counting timer wheel.
-    timers: TimerWheel,
+    /// Per-worker extension (e.g., timer wheel). Created by RuntimeExtension factory.
+    pub(crate) worker_ext: Option<Box<dyn WorkerExtension>>,
 }
 
 impl Worker {
@@ -228,19 +69,15 @@ impl Worker {
             spawn_rx,
             stats,
             snapshot_buf: Vec::new(),
-            timers: TimerWheel::new(),
+            worker_ext: None,
         }
     }
 
     /// Run one iteration of the worker loop. Returns `true` if any work was done.
-    pub(crate) fn tick_once(&mut self, tc: &TickContext) -> bool {
-        #[cfg(feature = "tracing")]
-        let _span = tracing::trace_span!("worker.tick", worker_id = self.id.0).entered();
-
+    /// Drain the spawn queue, inserting new actors into the pool.
+    /// Used in phases 1 and 4 of tick_once.
+    fn drain_spawns(&mut self) -> bool {
         let mut did_work = false;
-        let t0 = Instant::now();
-
-        // 1. Drain spawn queue → add actors to pool
         #[cfg(feature = "tracing")]
         let mut spawn_count: usize = 0;
         while let Some((addr, actor)) = self.spawn_rx.try_recv() {
@@ -253,6 +90,68 @@ impl Worker {
         if spawn_count > 0 {
             tracing::debug!(worker_id = self.id.0, count = spawn_count, "worker.spawns_drained");
         }
+        did_work
+    }
+
+    /// Phase 7: clean up dead actors, deliver death notifications, GC extension state.
+    fn cleanup_dead_actors(&mut self, tc: &TickContext) -> bool {
+        let cleanup_pending: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
+            RefCell::new(Vec::new());
+        let cleanup_stops: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
+        let cleanup_requests: RefCell<Vec<Box<dyn Any + Send>>> = RefCell::new(Vec::new());
+        let dead = {
+            let cleanup_ctx = WorkerContext {
+                worker_id: self.id,
+                tc,
+                pending_local: &cleanup_pending,
+                stop_requests: &cleanup_stops,
+                worker_requests: &cleanup_requests,
+                stats: &self.stats,
+            };
+            self.pool.cleanup_dead(&cleanup_ctx)
+        };
+
+        let had_dead = !dead.is_empty();
+        if had_dead {
+            for &(addr, _) in &dead {
+                tc.address_map.remove(&addr);
+            }
+
+            if let Some(ext) = tc.extension {
+                let notifications = ext.on_actor_death(&dead);
+                let dead_addrs: Vec<_> = dead.iter().map(|(a, _)| *a).collect();
+                ext.cleanup_dead(&dead_addrs);
+                for (dest, msg) in notifications {
+                    route_to_pool_or_remote(&mut self.pool, tc, dest, msg);
+                }
+            }
+
+            self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
+        }
+
+        // Deliver any messages sent during on_stop callbacks
+        for (addr, msg) in cleanup_pending.into_inner() {
+            self.pool.deliver(&addr, msg);
+        }
+
+        // GC per-worker extension state for dead actors
+        if let Some(ext) = &mut self.worker_ext {
+            let dead_addrs: Vec<ActorAddress> = dead.iter().map(|(a, _)| *a).collect();
+            ext.gc_dead(&dead_addrs);
+        }
+
+        had_dead
+    }
+
+    pub(crate) fn tick_once(&mut self, tc: &TickContext) -> bool {
+        #[cfg(feature = "tracing")]
+        let _span = tracing::trace_span!("worker.tick", worker_id = self.id.0).entered();
+
+        let mut did_work = false;
+        let t0 = Instant::now();
+
+        // 1. Drain spawn queue → add actors to pool
+        did_work |= self.drain_spawns();
         let t1 = Instant::now();
 
         // 2. Drain transfer queue → deliver envelopes to actors
@@ -264,24 +163,12 @@ impl Worker {
         }
         let t2 = Instant::now();
 
-        // 2.5. Fire due timers → deliver to mailboxes before tick_all
-        let timer_msgs = self.timers.fire();
-        for (dest, msg) in timer_msgs {
-            if self.pool.contains(&dest) {
-                // Same-worker: deliver directly to actor's mailbox
-                self.pool.deliver(&dest, msg);
-            } else {
-                // Inbox or cross-worker: route through address map / inbox registry
-                match tc.address_map.lookup(&dest) {
-                    Some(wid) => {
-                        tc.transfer_txs[wid.as_usize()].send(Envelope::new(dest, msg));
-                        crate::runtime::notify_worker(tc.worker_threads, wid.as_usize());
-                    }
-                    None => {
-                        let _ = tc.inbox_registry.try_deliver(dest, msg);
-                    }
-                }
-            }
+        // 2.5. Fire per-worker extension (e.g., timers) → deliver before tick_all
+        let ext_msgs: Vec<_> = self.worker_ext.as_mut()
+            .map(|ext| ext.on_tick())
+            .unwrap_or_default();
+        for (dest, msg) in ext_msgs {
+            route_to_pool_or_remote(&mut self.pool, tc, dest, msg);
             did_work = true;
         }
 
@@ -289,20 +176,19 @@ impl Worker {
         let pending_local: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
             RefCell::new(Vec::new());
         let stop_requests: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
-        let timer_requests: RefCell<Vec<TimerRequest>> = RefCell::new(Vec::new());
+        let worker_requests: RefCell<Vec<Box<dyn Any + Send>>> = RefCell::new(Vec::new());
 
         let processed;
-        let deaths;
         {
             let worker_ctx = WorkerContext {
                 worker_id: self.id,
                 tc,
                 pending_local: &pending_local,
                 stop_requests: &stop_requests,
-                timer_requests: &timer_requests,
+                worker_requests: &worker_requests,
                 stats: &self.stats,
             };
-            (processed, deaths) = self.pool.tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget, &stop_requests);
+            processed = self.pool.tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget, &stop_requests);
             if processed > 0 {
                 did_work = true;
             }
@@ -320,10 +206,7 @@ impl Worker {
 
         // 4. Drain spawn queue again — actors spawned during step 3
         //    must be in the pool before pending_local delivery.
-        while let Some((addr, actor)) = self.spawn_rx.try_recv() {
-            self.pool.insert(addr, actor);
-            did_work = true;
-        }
+        did_work |= self.drain_spawns();
         let t4 = Instant::now();
 
         // 5. Drain pending_local buffer → deliver to local actors
@@ -335,48 +218,10 @@ impl Worker {
             self.pool.deliver(&addr, msg);
         }
 
-        // 5.5. Process timer requests from handlers
-        for request in timer_requests.into_inner() {
-            match request {
-                TimerRequest::Once { dest, msg, ticks } => {
-                    self.timers.add_once(dest, msg, ticks);
-                }
-                TimerRequest::Interval { dest, msg, period } => {
-                    self.timers.add_interval(dest, msg, period);
-                }
-            }
-        }
-
-        // 5b. Process actor deaths → deliver ActorExited to watchers
-        if !deaths.is_empty() {
-            did_work = true;
-            if let Some(registry) = &tc.watch_registry {
-                let mut reg = registry.lock().unwrap();
-                for (dead_addr, reason) in deaths {
-                    let notifications = reg.notify_death(dead_addr, reason);
-                    for (watcher_addr, msg) in notifications {
-                        // Deliver ActorExited as a normal message via the address map
-                        match tc.address_map.lookup(&watcher_addr) {
-                            Some(wid) if wid == self.id => {
-                                self.pool.deliver(&watcher_addr, Box::new(msg));
-                            }
-                            Some(wid) => {
-                                tc.transfer_txs[wid.as_usize()]
-                                    .send(Envelope::new(watcher_addr, Box::new(msg)));
-                            }
-                            None => {
-                                // Watcher not in address map — may be an inbox or remote.
-                                // Try inbox registry as best effort.
-                                let _ = tc.inbox_registry.try_deliver(
-                                    watcher_addr,
-                                    Box::new(msg),
-                                );
-                            }
-                        }
-                    }
-                    // Clean up the dead actor's own watches (things it was watching)
-                    reg.cleanup_watcher(&dead_addr);
-                }
+        // 5.5. Process worker extension requests from handlers (e.g., timer scheduling)
+        if let Some(ext) = &mut self.worker_ext {
+            for request in worker_requests.into_inner() {
+                ext.handle_request(request);
             }
         }
 
@@ -427,67 +272,7 @@ impl Worker {
         }
 
         // 7. Clean up poisoned and stopping actors
-        //    on_stop() may send messages, so provide a fresh pending_local buffer.
-        let cleanup_pending: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
-            RefCell::new(Vec::new());
-        let cleanup_stops: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
-        let cleanup_timers: RefCell<Vec<TimerRequest>> = RefCell::new(Vec::new());
-        let dead = {
-            let cleanup_ctx = WorkerContext {
-                worker_id: self.id,
-                tc,
-                pending_local: &cleanup_pending,
-                stop_requests: &cleanup_stops,
-                timer_requests: &cleanup_timers,
-                stats: &self.stats,
-            };
-            let dead = self.pool.cleanup_dead(&cleanup_ctx);
-            if !dead.is_empty() {
-                for &(addr, _) in &dead {
-                    tc.address_map.remove(&addr);
-                }
-
-                if let Some(ext) = tc.extension {
-                    // Get death notifications (monitors) before cleaning up state
-                    let notifications = ext.on_actor_death(&dead);
-
-                    // Clean up extension state (names, groups, dead watcher monitors)
-                    let dead_addrs: Vec<_> = dead.iter().map(|(a, _)| *a).collect();
-                    ext.cleanup_dead(&dead_addrs);
-
-                    // Deliver Down notifications through normal routing
-                    for (dest, msg) in notifications {
-                        if self.pool.contains(&dest) {
-                            self.pool.deliver(&dest, msg);
-                        } else {
-                            match tc.address_map.lookup(&dest) {
-                                Some(wid) => {
-                                    tc.transfer_txs[wid.as_usize()]
-                                        .send(Envelope::new(dest, msg));
-                                    crate::runtime::notify_worker(tc.worker_threads, wid.as_usize());
-                                }
-                                None => {
-                                    let _ = tc.inbox_registry.try_deliver(dest, msg);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Re-publish num_actors after cleanup so stats reflect removal
-                self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
-                did_work = true;
-            }
-            dead
-        };
-        // Deliver any messages sent during on_stop callbacks
-        for (addr, msg) in cleanup_pending.into_inner() {
-            self.pool.deliver(&addr, msg);
-        }
-
-        // GC orphaned interval timers for actors that were just removed
-        let dead_addrs: Vec<ActorAddress> = dead.iter().map(|(a, _)| *a).collect();
-        self.timers.gc_dead_intervals(&dead_addrs);
+        did_work |= self.cleanup_dead_actors(tc);
 
         did_work
     }
@@ -531,7 +316,7 @@ struct WorkerContext<'a> {
     tc: &'a TickContext<'a>,
     pending_local: &'a RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>>,
     stop_requests: &'a RefCell<Vec<ActorAddress>>,
-    timer_requests: &'a RefCell<Vec<TimerRequest>>,
+    worker_requests: &'a RefCell<Vec<Box<dyn Any + Send>>>,
     stats: &'a WorkerStats,
 }
 
@@ -568,35 +353,12 @@ impl ContextInner for WorkerContext<'_> {
         self.stop_requests.borrow_mut().push(addr);
     }
 
-    fn schedule_timer(&self, request: TimerRequest) {
-        self.timer_requests.borrow_mut().push(request);
+    fn post_worker_request(&self, request: Box<dyn Any + Send>) {
+        self.worker_requests.borrow_mut().push(request);
     }
 
     fn extension(&self) -> Option<&dyn crate::extension::RuntimeExtension> {
         self.tc.extension
-    }
-
-    fn watch(&self, watcher: ActorAddress, target: ActorAddress) {
-        if let Some(registry) = &self.tc.watch_registry {
-            // Check if target exists in the address map
-            if self.tc.address_map.lookup(&target).is_some() {
-                registry.lock().unwrap().watch(watcher, target);
-            } else {
-                // Target not found — deliver ActorExited { reason: Stopped } immediately.
-                // Buffer in pending_local so it arrives on next tick.
-                let msg = ActorExited {
-                    addr: target,
-                    reason: ExitReason::Stopped,
-                };
-                self.pending_local.borrow_mut().push((watcher, Box::new(msg)));
-            }
-        }
-    }
-
-    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress) {
-        if let Some(registry) = &self.tc.watch_registry {
-            registry.lock().unwrap().unwatch(watcher, target);
-        }
     }
 }
 
@@ -681,7 +443,7 @@ impl ActorPool {
         std::mem::replace(&mut self.drops_this_tick, 0)
     }
 
-    /// Tick all actors in the pool. Returns (messages_processed, newly_dead_actors).
+    /// Tick all actors in the pool. Returns the number of messages processed.
     ///
     /// Each actor processes up to `budget` messages per tick (0 = unlimited).
     /// This prevents a single hot actor from starving others on the same worker.
@@ -691,9 +453,8 @@ impl ActorPool {
         stats: &WorkerStats,
         budget: usize,
         stop_requests: &RefCell<Vec<ActorAddress>>,
-    ) -> (usize, Vec<(ActorAddress, ExitReason)>) {
+    ) -> usize {
         let mut count = 0;
-        let mut deaths = Vec::new();
         for (&addr, slot) in self.actors.iter_mut() {
             if slot.poisoned || slot.stopping {
                 // Discard all messages for poisoned/stopping actors
@@ -741,7 +502,6 @@ impl ActorPool {
                     slot.stopping = true;
                     stats.stops.fetch_add(1, Ordering::Relaxed);
                     slot.mailbox.clear();
-                    deaths.push((addr, ExitReason::Stopped));
                     #[cfg(feature = "tracing")]
                     tracing::info!(actor_addr = %addr, "actor.stop_requested");
                     break;
@@ -762,7 +522,6 @@ impl ActorPool {
                         tracing::error!(actor_addr = %addr, "actor.panicked");
                         slot.poisoned = true;
                         slot.mailbox.clear();
-                        deaths.push((addr, ExitReason::Panicked));
                         break;
                     }
                     Ok(Some(type_name)) => {
@@ -785,7 +544,6 @@ impl ActorPool {
                         slot.stopping = true;
                         stats.stops.fetch_add(1, Ordering::Relaxed);
                         slot.mailbox.clear();
-                        deaths.push((addr, ExitReason::Stopped));
                         break;
                     }
                 }
@@ -795,7 +553,7 @@ impl ActorPool {
                 }
             }
         }
-        (count, deaths)
+        count
     }
 
     pub fn len(&self) -> usize {

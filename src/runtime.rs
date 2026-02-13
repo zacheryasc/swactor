@@ -1,13 +1,13 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
 use std::thread::Thread;
 use crate::Instant;
 
-use crate::actor::{Actor, ActorAddress, ActorExited, ActorInterface, AnyActor, ExitReason, Message, StopSignal, TimerRequest};
+use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message, StopSignal};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, MailboxOverflow, RuntimeConfig};
@@ -16,7 +16,7 @@ use crate::extension::RuntimeExtension;
 use crate::stats::{StatsHook, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
 pub use crate::stats::{RuntimeStats, WorkerInfo};
-use crate::worker::{WatchRegistry, Worker};
+use crate::worker::Worker;
 use crate::Error;
 
 /// Generic message inbox for receiving messages outside of the runtime.
@@ -107,7 +107,6 @@ pub struct Runtime {
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
     stats_hook: Option<Arc<dyn StatsHook>>,
-    watch_registry: Arc<Mutex<WatchRegistry>>,
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
     /// Thread handles for waking parked workers. Set by workers on startup via OnceLock.
@@ -203,7 +202,6 @@ impl Runtime {
             is_running: AtomicBool::new(false),
             worker_stats,
             stats_hook: None,
-            watch_registry: Arc::new(Mutex::new(WatchRegistry::new())),
             tick_workers: RefCell::new(workers),
             worker_threads,
             created_at: Instant::now(),
@@ -247,6 +245,12 @@ impl Runtime {
     ///
     /// Must be called before `run()` or `tick()`.
     pub fn with_extension(mut self, ext: Arc<dyn RuntimeExtension>) -> Self {
+        // Create per-worker extensions (e.g., timer wheels)
+        for worker in self.tick_workers.get_mut().iter_mut() {
+            if let Some(wext) = ext.create_worker_extension() {
+                worker.worker_ext = Some(wext);
+            }
+        }
         self.extension = Some(ext);
         self
     }
@@ -310,7 +314,6 @@ impl Runtime {
             extension: self.extension.as_deref(),
             stats_hook: self.stats_hook.as_deref(),
             worker_threads: &self.worker_threads,
-            watch_registry: Some(&self.watch_registry),
             #[cfg(feature = "transport")]
             codec_registry: self.codec_registry.as_deref(),
             #[cfg(feature = "transport")]
@@ -506,35 +509,13 @@ impl ContextInner for Runtime {
         }
     }
 
-    fn schedule_timer(&self, _request: TimerRequest) {
-        // Timers are per-worker and tick-counted; scheduling from outside
+    fn post_worker_request(&self, _request: Box<dyn Any + Send>) {
+        // Worker requests (e.g., timers) are per-worker; posting from outside
         // a worker context (e.g., rt.spawn() callback) is not supported.
-        // Use rt.send_to() with a delay loop instead.
-        eprintln!("swactor: schedule_timer called outside worker context — ignored");
+        eprintln!("swactor: post_worker_request called outside worker context — ignored");
     }
 
     fn extension(&self) -> Option<&dyn RuntimeExtension> {
         self.extension.as_deref()
-    }
-
-    fn watch(&self, watcher: ActorAddress, target: ActorAddress) {
-        if self.address_map.lookup(&target).is_some() {
-            self.watch_registry.lock().unwrap().watch(watcher, target);
-        } else {
-            // Target not found — deliver ActorExited immediately.
-            let msg = ActorExited {
-                addr: target,
-                reason: ExitReason::Stopped,
-            };
-            // Route to watcher via transfer queue
-            if let Some(wid) = self.address_map.lookup(&watcher) {
-                self.transfer_txs[wid.as_usize()]
-                    .send(Envelope::new(watcher, Box::new(msg)));
-            }
-        }
-    }
-
-    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress) {
-        self.watch_registry.lock().unwrap().unwatch(watcher, target);
     }
 }

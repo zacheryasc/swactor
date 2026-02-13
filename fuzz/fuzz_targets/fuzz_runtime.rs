@@ -7,9 +7,12 @@ use std::sync::OnceLock;
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 
+use std::sync::Arc;
+
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Ctx, Inbox, Runtime};
+use swactor_std::{CtxTimers, StdExtension};
 
 // ─── Run Logging ────────────────────────────────────────────────────────────
 //   FUZZ_LOG=1   → trace every run
@@ -881,7 +884,8 @@ fuzz_target!(|input: FuzzInput| {
         num_threads: 1,
         ..Default::default()
     };
-    let rt = Runtime::new(config);
+    let rt = Runtime::new(config)
+        .with_extension(Arc::new(StdExtension::new()));
     let mut state = FuzzState::new(rt, tracing);
 
     let scenario_limit = input.scenarios.len().min(64);

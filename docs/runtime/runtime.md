@@ -16,11 +16,11 @@ messages.
 │  │                                                                     │  │
 │  │  address_map:      Arc<AddressMap>       -- actor -> worker lookup   │  │
 │  │  inbox_registry:   Arc<InboxRegistry>    -- external inbox delivery  │  │
-│  │  name_registry:    Arc<NameRegistry>     -- name -> address lookup   │  │
-│  │  monitor_registry: Arc<MonitorRegistry>  -- death watch subscripts  │  │
-│  │  group_registry:   Arc<GroupRegistry>    -- pub-sub actor groups     │  │
 │  │  placement:        Placement             -- load-aware worker picker │  │
 │  │  worker_stats:     Vec<Arc<WorkerStats>> -- atomic stat counters     │  │
+│  │  extension:        Option<Arc<dyn RuntimeExtension>>                 │  │
+│  │    (StdExtension holds: NameRegistry, MonitorRegistry,              │  │
+│  │     GroupRegistry, WatchRegistry)                                   │  │
 │  │                                                                     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                           │
@@ -75,28 +75,34 @@ only way for actors to interact with the outside world.
 │  inner:     &dyn ContextInner     -- polymorphic dispatch                 │
 │  self_addr: ActorAddress          -- address of the current actor         │
 │                                                                           │
-│  ┌─ Public API ────────────────────────────────────────────────────────┐  │
+│  ┌─ Core API ─────────────────────────────────────────────────────────┐  │
 │  │                                                                     │  │
 │  │  ctx.self_addr()                   -> ActorAddress                  │  │
 │  │  ctx.send(addr, msg)               -> Result<(), Error>            │  │
 │  │  ctx.spawn(actor)                  -> Result<ActorAddress, Error>   │  │
-│  │  ctx.spawn_named(name, actor)      -> Result<ActorAddress, Error>   │  │
-│  │  ctx.spawn_restartable(a, f, max)  -> Result<ActorAddress, Error>   │  │
 │  │  ctx.stop_self()                                                    │  │
 │  │  ctx.stop_actor(addr)              -> Result<(), Error>             │  │
-│  │  ctx.where_is(name)                -> Option<ActorAddress>          │  │
-│  │  ctx.monitor(target)               -> MonitorRef                    │  │
-│  │  ctx.demonitor(mref)                                                │  │
-│  │  ctx.join_group(group)                                              │  │
-│  │  ctx.leave_group(group)                                             │  │
-│  │  ctx.publish(group, msg)           -> usize                         │  │
-│  │  ctx.group_members(group)          -> Vec<ActorAddress>             │  │
-│  │  ctx.send_after_ticks(addr, msg, n)                                 │  │
-│  │  ctx.send_interval_ticks(addr, msg, period)                         │  │
+│  │  ctx.extension()                   -> Option<&dyn RuntimeExtension> │  │
+│  │                                                                     │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
+│                                                                           │
+│  ┌─ Extension Traits (swactor-std) ──────────────────────────────────┐  │
+│  │                                                                     │  │
+│  │  CtxNaming:     spawn_named, where_is                               │  │
+│  │  CtxMonitoring: monitor, demonitor                                  │  │
+│  │  CtxWatching:   watch, unwatch                                      │  │
+│  │  CtxGroups:     join_group, leave_group, publish, group_members     │  │
+│  │  CtxTimers:     send_after_ticks, send_interval_ticks               │  │
+│  │                                                                     │  │
+│  │  These use ctx.extension() + downcast to StdExtension.              │  │
+│  │  Also: spawn_restartable (via CtxNaming)                            │  │
 │  │                                                                     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                           │
 │  ┌─ ContextInner dispatch ─────────────────────────────────────────────┐  │
+│  │                                                                     │  │
+│  │  Five methods: send_any, spawn_any, request_stop,                   │  │
+│  │                post_worker_request, extension                       │  │
 │  │                                                                     │  │
 │  │  In single-threaded mode:  inner = &Runtime                         │  │
 │  │    send → transfer_txs[wid], spawn → spawn_txs[wid]                 │  │
@@ -104,6 +110,7 @@ only way for actors to interact with the outside world.
 │  │  In multi-threaded mode:   inner = &WorkerContext                   │  │
 │  │    send → pending_local (same worker) or transfer_txs (cross)       │  │
 │  │    spawn → spawn_txs[target_wid]                                    │  │
+│  │    post_worker_request → worker_requests (drained phase 5.5)        │  │
 │  │                                                                     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                           │
@@ -287,14 +294,21 @@ Actors can stop other actors from handlers:
   ctx.stop_actor(other_addr)?;  // PoisonPill semantics — queued after existing msgs
 ```
 
-## Per-Worker Timers
+## Per-Worker Timers (swactor-std)
 
-Deterministic tick-counting timers (not wall-clock):
+Deterministic tick-counting timers (not wall-clock). Requires `StdExtension`
+and the `CtxTimers` extension trait:
 
 ```
+  use swactor_std::CtxTimers;
+
   ctx.send_after_ticks(addr, msg, 5);       // one-shot: fires after 5 ticks
   ctx.send_interval_ticks(addr, msg, 10);   // repeating: every 10 ticks
 ```
+
+The `TimerWheel` lives as a per-worker extension (`WorkerExtension`),
+created by `StdExtension::create_worker_extension()`. Timer requests are
+dispatched via `ctx.post_worker_request()` and processed in phase 5.5.
 
 ## RuntimeHandle
 
