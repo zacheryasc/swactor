@@ -178,6 +178,13 @@ pub(crate) fn spawn_http_server(
                             Arc::clone(&cmd_router),
                         );
                     }
+                    #[cfg(feature = "distribution")]
+                    "/api/distribution" => {
+                        handle_distribution_api(
+                            request,
+                            Arc::clone(&distribution),
+                        );
+                    }
                     _ => respond_404(request),
                 }
             }
@@ -312,6 +319,30 @@ fn handle_investigate_api(
             })
             .to_string()
         }
+    };
+
+    let response = tiny_http::Response::from_string(json).with_header(
+        "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+#[cfg(feature = "distribution")]
+fn handle_distribution_api(
+    request: tiny_http::Request,
+    distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
+) {
+    let json = match distribution.lock().unwrap().as_ref() {
+        Some(provider) => match provider.snapshot() {
+            Some(snapshot) => serde_json::to_string(&snapshot).unwrap_or_else(|_| "{}".into()),
+            None => "{}".to_string(),
+        },
+        None => serde_json::json!({
+            "error": "distribution provider not attached"
+        })
+        .to_string(),
     };
 
     let response = tiny_http::Response::from_string(json).with_header(

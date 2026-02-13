@@ -76,6 +76,14 @@ impl MemberList {
             .collect()
     }
 
+    /// All dead members (candidates for reprobe).
+    pub fn dead_members(&self) -> Vec<&MemberEntry> {
+        self.members
+            .values()
+            .filter(|e| e.state == MemberState::Dead)
+            .collect()
+    }
+
     /// All members regardless of state.
     pub fn all_members(&self) -> Vec<&MemberEntry> {
         self.members.values().collect()

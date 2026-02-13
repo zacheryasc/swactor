@@ -260,6 +260,18 @@ impl SwimNode {
         for pa in probe_actions {
             match pa {
                 SwimAction::SendPing { to, to_addr, sequence } => {
+                    // If the target is dead, re-enqueue the death declaration
+                    // so it piggybacks on this message. This is the key mechanism
+                    // for partition-heal recovery: the dead node learns it was
+                    // declared dead and refutes by bumping its incarnation.
+                    if let Some(entry) = self.members.get(&to) {
+                        if entry.state == MemberState::Dead {
+                            self.dissemination.enqueue(
+                                membership_update(to, to_addr, MemberState::Dead, entry.incarnation),
+                                self.cluster_size(),
+                            );
+                        }
+                    }
                     let pb = self.dissemination.pack_piggyback(self.max_piggyback);
                     actions.push(NodeAction::SendPing {
                         to,

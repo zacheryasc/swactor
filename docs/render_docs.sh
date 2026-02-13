@@ -4,7 +4,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DOCS_DIR="$SCRIPT_DIR"
+DIAGRAMS_DIR="$DOCS_DIR/diagrams"
 TOOLS_DIR="$ROOT_DIR/tools"
+
+mkdir -p "$DIAGRAMS_DIR"
 
 # --- Phase 1: Generate architecture.dot from source AST ---
 
@@ -23,8 +26,8 @@ fi
 render_with_dot() {
   for src in "${dots[@]}"; do
     name="$(basename "$src" .dot)"
-    echo "  dot: $name.dot -> $name.svg"
-    dot -Tsvg "$src" -o "$DOCS_DIR/$name.svg"
+    echo "  dot: $name.dot -> diagrams/$name.svg"
+    dot -Tsvg "$src" -o "$DIAGRAMS_DIR/$name.svg"
   done
 }
 
@@ -50,8 +53,8 @@ for (const file of dots) {
   const src  = readFileSync(join(docsDir, file), "utf-8");
   const name = basename(file, ".dot");
   const svg  = viz.renderString(src, { format: "svg" });
-  writeFileSync(join(docsDir, \`\${name}.svg\`), svg);
-  console.log(\`  viz-js: \${file} -> \${name}.svg\`);
+  writeFileSync(join(docsDir, "diagrams", \`\${name}.svg\`), svg);
+  console.log(\`  viz-js: \${file} -> diagrams/\${name}.svg\`);
 }
 NODEJS
 
@@ -79,4 +82,4 @@ else
   exit 1
 fi
 
-echo "==> Done. SVGs in $DOCS_DIR/"
+echo "==> Done. SVGs in $DIAGRAMS_DIR/"

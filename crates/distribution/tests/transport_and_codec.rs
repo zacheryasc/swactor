@@ -84,7 +84,9 @@ fn distribution_codec_encodes_and_decodes_ping() {
     let codecs = distribution_codec_registry();
     let ping = Ping {
         from: NodeId([0xAA; 32]),
+        from_addr: "127.0.0.1:7000".parse().unwrap(),
         sequence: 42,
+        piggyback: vec![],
     };
 
     let type_id = std::any::TypeId::of::<Ping>();
@@ -160,7 +162,9 @@ fn ping_message_survives_codec_and_tcp_roundtrip() {
     let dest = ActorAddress::new_random();
     let ping = Ping {
         from: NodeId([0xBB; 32]),
+        from_addr: "127.0.0.1:7001".parse().unwrap(),
         sequence: 99,
+        piggyback: vec![],
     };
 
     let type_id = std::any::TypeId::of::<Ping>();

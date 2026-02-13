@@ -11,10 +11,16 @@ use crate::types::{DirectoryEntry, MemberState, NodeId, NodeRecord};
 // ─── SWIM Protocol Messages ────────────────────────────────────────────────
 
 /// SWIM ping — "are you alive?"
+///
+/// Carries piggybacked membership gossip so that SWIM dissemination
+/// propagates cluster state changes on every protocol message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ping {
     pub from: NodeId,
+    pub from_addr: SocketAddr,
     pub sequence: u64,
+    #[serde(default)]
+    pub piggyback: Vec<u8>,
 }
 
 impl NetworkMessage for Ping {
@@ -24,10 +30,14 @@ impl NetworkMessage for Ping {
 }
 
 /// SWIM ack — "yes, I'm alive"
+///
+/// Carries piggybacked membership gossip (same as Ping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ack {
     pub from: NodeId,
     pub sequence: u64,
+    #[serde(default)]
+    pub piggyback: Vec<u8>,
 }
 
 impl NetworkMessage for Ack {
@@ -37,12 +47,16 @@ impl NetworkMessage for Ack {
 }
 
 /// SWIM indirect ping request — "please ping target on my behalf"
+///
+/// Carries piggybacked membership gossip (same as Ping).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PingReq {
     pub from: NodeId,
     pub target: NodeId,
     pub target_addr: SocketAddr,
     pub sequence: u64,
+    #[serde(default)]
+    pub piggyback: Vec<u8>,
 }
 
 impl NetworkMessage for PingReq {

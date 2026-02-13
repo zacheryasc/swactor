@@ -17,9 +17,9 @@ cargo test  --features transport
   No serde bounds — the codec defines what it needs from `M`.
 - **`Transport`** — WHERE bytes are sent. InMemory (testing), TCP, gRPC, etc.
 
-See [transport_routing.svg](../crates/runtime-dashboard/docs/transport_routing.svg)
+See [transport_routing.svg](../diagrams/transport_routing.svg)
 for the extended routing chain, and
-[transport_encode_decode.svg](../crates/runtime-dashboard/docs/transport_encode_decode.svg)
+[transport_encode_decode.svg](../diagrams/transport_encode_decode.svg)
 for the encode/decode data flow.
 
 ## Core Types
@@ -95,6 +95,15 @@ Addresses are **not automatically discovered**. Each runtime must be told
 which remote addresses exist via `router.add_route()`. Since addresses are
 32 random bytes, runtimes must exchange them out-of-band (e.g., over the TCP
 connection itself — see `examples/tcp_ping_pong.rs`).
+
+## Distribution Driver
+
+The distribution layer's `NodeDriver` (`crates/distribution/src/driver.rs`)
+is the primary consumer of the TCP transport. It uses `TcpTransport` for
+outgoing SWIM messages and `TcpAcceptor` for incoming, bypassing the
+`Codec<M>` trait in favor of direct `serde_json` serialization (see
+[DOCKER_REALIZATION.md](../development_history/DOCKER_REALIZATION.md)
+§10.2 for rationale).
 
 ## Limitations
 

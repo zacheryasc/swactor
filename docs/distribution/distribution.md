@@ -51,7 +51,7 @@ repair infrastructure into a single public API.
   leave() ──► disseminate Dead for self, graceful shutdown
 ```
 
-See [distribution_minor_flows.svg](distribution_minor_flows.svg) for the
+See [distribution_minor_flows.svg](../diagrams/distribution_minor_flows.svg) for the
 join handshake, dissemination piggybacking, and membership change cascade.
 
 ## Actor Registration
@@ -63,7 +63,7 @@ join handshake, dissemination piggybacking, and membership change cascade.
 4. Register with `RepublishTracker` for periodic re-STORE.
 5. Return the signed entry — caller STOREs to `r`-closest nodes.
 
-See [actor_resolution.svg](actor_resolution.svg) for the full datapath.
+See [actor_resolution.svg](../diagrams/actor_resolution.svg) for the full datapath.
 
 ## Actor Resolution
 
@@ -89,6 +89,41 @@ propagates effects through all subsystems:
 This cascade ensures that a single SWIM death detection triggers routing
 table cleanup, cache invalidation, and directory repair in one tick.
 
+## NodeDriver — TCP Network Bridge
+
+`NodeDriver` (`driver.rs`) bridges the pure state machine API with real TCP
+networking. It owns a `DistributedNode` plus a `TcpTransport` (connection
+pool) and `TcpAcceptor` (non-blocking listener).
+
+```
+┌─ NodeDriver ─────────────────────────────────────────────────┐
+│                                                               │
+│  node: DistributedNode     ← pure state machine              │
+│  transport: TcpTransport   ← connection pool for outgoing    │
+│  acceptor: TcpAcceptor     ← non-blocking listener           │
+│  streams: Vec<TcpStream>   ← accepted connections            │
+│                                                               │
+│  tick()  ──► node.tick() → map NodeAction → TCP send          │
+│  recv()  ──► acceptor.try_recv() → dispatch → handler calls   │
+│  join()  ──► node.join() → send JoinRequest via TCP           │
+│                                                               │
+└───────────────────────────────────────────────────────────────┘
+```
+
+The caller runs a loop: `recv()` → `tick()` → sleep. The driver handles
+all TCP I/O internally — the caller never touches sockets directly.
+
+See [DOCKER_REALIZATION.md](../development_history/DOCKER_REALIZATION.md)
+for implementation details of the driver, the node binary (`crates/node/`),
+and the Docker cluster integration tests.
+
+## Dashboard REST API
+
+The runtime dashboard exposes `/api/distribution` (feature-gated with
+`distribution`) which returns the `DistributionNodeSnapshot` as JSON.
+This supplements the SSE stream (`/events`) with a synchronous polling
+endpoint used by integration tests.
+
 ## Where Things Live
 
 | Type | File | Role |
@@ -96,6 +131,7 @@ table cleanup, cache invalidation, and directory repair in one tick.
 | `DistributedNode` | `node.rs` | Top-level integration facade |
 | `DistributedNodeConfig` | `node.rs` | Node configuration |
 | `ResolveResult` | `node.rs` | 3-tier resolution outcomes |
+| `NodeDriver` | `driver.rs` | TCP ↔ NodeAction bridge |
 | `LocationCache` | `cache.rs` | LRU actor→node cache |
 | `Keypair` | `crypto.rs` | Ed25519 keypair + signing |
 | `NodeId` | `types.rs` | 32-byte node identity |

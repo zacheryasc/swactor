@@ -7,7 +7,7 @@ deny reachability before the node is suspected and eventually declared dead.
 
 ## Probe Cycle
 
-See [swim_probe_cycle.svg](swim_probe_cycle.svg) for the full state machine.
+See [swim_probe_cycle.svg](../diagrams/swim_probe_cycle.svg) for the full state machine.
 
 The probe cycle is a pure state machine driven by ticks:
 
