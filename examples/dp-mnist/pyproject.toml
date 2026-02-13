@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-swactor = { path = "../python", editable = true }
+swactor = { path = "../../crates/python", editable = true }
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

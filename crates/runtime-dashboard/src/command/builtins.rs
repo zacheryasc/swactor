@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use swactor::actor::ActorAddress;
 use swactor::stats::TickTiming;
 
-use crate::{CommandContext, CommandHandler, CommandMeta, CommandResponse};
+use super::{CommandContext, CommandHandler, CommandMeta, CommandResponse};
 
 // ─── Arg helpers ─────────────────────────────────────────────────────────────
 

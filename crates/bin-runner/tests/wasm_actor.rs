@@ -1,6 +1,7 @@
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, Runtime, RuntimeConfig};
-use swactor_wasm_actor::{ByteMessage, SharedEngine, WasmActor, WasmActorBuilder, WasmActorError};
+use swactor_bin_runner::{ByteMessage, SharedEngine, WasmActor, WasmActorBuilder, WasmActorError};
+use swactor_std::CtxWatching;
 
 use proptest::prelude::*;
 

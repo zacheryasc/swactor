@@ -16,4 +16,4 @@ SWACTOR_TRACE_DIR="$DIR" cargo test -p simulation \
 COUNT=$(find "$DIR" -name '*.trace.json' 2>/dev/null | wc -l)
 echo "$COUNT traces in $DIR/"
 echo "Dashboard at http://localhost:$PORT"
-cargo run -p simulation-dashboard --example replay -- "$DIR" "$PORT"
+cargo run -p simulation --features dashboard --example replay -- "$DIR" "$PORT"

@@ -132,7 +132,7 @@ pub(crate) fn spawn_http_server(
     let addr = format!("0.0.0.0:{port}");
     let server = tiny_http::Server::http(&addr).expect("failed to bind HTTP server");
     let server = Arc::new(server);
-    let cmd_router = Arc::new(swactor_command::CommandRouter::with_builtins());
+    let cmd_router = Arc::new(crate::command::CommandRouter::with_builtins());
 
     for _ in 0..4 {
         let server = Arc::clone(&server);
@@ -362,7 +362,7 @@ fn handle_investigate_api(
     url: &str,
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
-    cmd_router: Arc<swactor_command::CommandRouter>,
+    cmd_router: Arc<crate::command::CommandRouter>,
 ) {
     let params = parse_query_string(url);
 
@@ -371,13 +371,13 @@ fn handle_investigate_api(
 
     let json = match (maybe_rt, maybe_col) {
         (Some(rt), Some(col)) => {
-            let ctx = swactor_command::CommandContext::with_enricher(rt, col);
-            let req = swactor_command::from_query_params(&params);
+            let ctx = crate::command::CommandContext::with_enricher(rt, col);
+            let req = crate::command::from_query_params(&params);
             cmd_router.dispatch(&req, &ctx).to_json_line()
         }
         (Some(rt), None) => {
-            let ctx = swactor_command::CommandContext::new(rt);
-            let req = swactor_command::from_query_params(&params);
+            let ctx = crate::command::CommandContext::new(rt);
+            let req = crate::command::from_query_params(&params);
             cmd_router.dispatch(&req, &ctx).to_json_line()
         }
         _ => {

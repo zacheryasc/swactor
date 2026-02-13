@@ -1,4 +1,4 @@
-use simulation_dashboard::serve_dashboard;
+use simulation::dashboard::serve_dashboard;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

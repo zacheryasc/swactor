@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::dashboard_html::DASHBOARD_HTML;
+use super::dashboard_html::DASHBOARD_HTML;
 
 // ── Trace directory scanning ──────────────────────────────────────────
 

@@ -1669,17 +1669,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "node"
-version = "0.1.0"
-dependencies = [
- "clap",
- "ctrlc",
- "distribution",
- "runtime-dashboard",
- "swactor",
-]
-
-[[package]]
 name = "nu-ansi-term"
 version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2294,6 +2283,7 @@ dependencies = [
 name = "runtime-dashboard"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "crossbeam-queue",
  "crossterm",
  "ctrlc",
@@ -2302,7 +2292,6 @@ dependencies = [
  "serde",
  "serde_json",
  "swactor",
- "swactor-command",
  "tiny_http",
  "tracing",
  "tracing-subscriber",
@@ -2610,15 +2599,6 @@ dependencies = [
  "serde_json",
  "simulation",
  "swactor",
-]
-
-[[package]]
-name = "simulation-dashboard"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "simulation",
  "tiny_http",
  "toml",
 ]
@@ -2727,12 +2707,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "swactor-command"
+name = "swactor-bin-runner"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
+ "proptest",
  "swactor",
+ "swactor-std",
+ "wasmtime",
+ "wat",
 ]
 
 [[package]]
@@ -2741,16 +2723,6 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "swactor",
-]
-
-[[package]]
-name = "swactor-wasm-actor"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "swactor",
- "wasmtime",
- "wat",
 ]
 
 [[package]]

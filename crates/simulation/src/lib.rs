@@ -6,3 +6,6 @@ pub mod distribution;
 
 #[cfg(feature = "gossip")]
 pub mod gossip;
+
+#[cfg(feature = "dashboard")]
+pub mod dashboard;

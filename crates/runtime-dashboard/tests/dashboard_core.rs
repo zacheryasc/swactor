@@ -13,6 +13,7 @@ fn make_event(message: &str) -> DashboardEvent {
         level: "INFO".into(),
         message: message.into(),
         worker_id: None,
+        actor_addr: None,
         fields: serde_json::Map::new(),
     }
 }
@@ -181,6 +182,7 @@ fn three_workers_report_independently_merged_view_is_complete() {
         last_msg_type: Some("Ping"),
         messages_processed: 100,
         poisoned: false,
+        message_type_counts: vec![],
     }]);
 
     // Worker 1 reports 1 actor
@@ -190,6 +192,7 @@ fn three_workers_report_independently_merged_view_is_complete() {
         last_msg_type: None,
         messages_processed: 50,
         poisoned: false,
+        message_type_counts: vec![],
     }]);
 
     // Worker 2 reports 1 actor (poisoned)
@@ -199,6 +202,7 @@ fn three_workers_report_independently_merged_view_is_complete() {
         last_msg_type: Some("BadMsg"),
         messages_processed: 10,
         poisoned: true,
+        message_type_counts: vec![],
     }]);
 
     // Dashboard reads merged view
@@ -228,6 +232,7 @@ fn worker_update_replaces_stale_snapshot() {
         last_msg_type: None,
         messages_processed: 10,
         poisoned: false,
+        message_type_counts: vec![],
     }]);
 
     assert_eq!(collector.actor_details().len(), 1);
@@ -240,6 +245,7 @@ fn worker_update_replaces_stale_snapshot() {
         last_msg_type: Some("Update"),
         messages_processed: 25,
         poisoned: false,
+        message_type_counts: vec![],
     }]);
 
     let details = collector.actor_details();
@@ -261,6 +267,7 @@ fn worker_reports_empty_after_all_actors_stop() {
         last_msg_type: None,
         messages_processed: 5,
         poisoned: false,
+        message_type_counts: vec![],
     }]);
     assert_eq!(collector.actor_details().len(), 1);
 
