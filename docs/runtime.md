@@ -14,10 +14,13 @@ messages.
 │                                                                           │
 │  ┌─ Shared State (lives on Arc<Runtime>) ──────────────────────────────┐  │
 │  │                                                                     │  │
-│  │  address_map:    Arc<AddressMap>      -- actor -> worker lookup      │  │
-│  │  inbox_registry: Arc<InboxRegistry>   -- external inbox delivery    │  │
-│  │  placement:      Placement            -- round-robin worker picker  │  │
-│  │  worker_stats:   Vec<Arc<WorkerStats>> -- atomic stat counters      │  │
+│  │  address_map:      Arc<AddressMap>       -- actor -> worker lookup   │  │
+│  │  inbox_registry:   Arc<InboxRegistry>    -- external inbox delivery  │  │
+│  │  name_registry:    Arc<NameRegistry>     -- name -> address lookup   │  │
+│  │  monitor_registry: Arc<MonitorRegistry>  -- death watch subscripts  │  │
+│  │  group_registry:   Arc<GroupRegistry>    -- pub-sub actor groups     │  │
+│  │  placement:        Placement             -- load-aware worker picker │  │
+│  │  worker_stats:     Vec<Arc<WorkerStats>> -- atomic stat counters     │  │
 │  │                                                                     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                           │
@@ -28,14 +31,8 @@ messages.
 │  │                                                                     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                           │
-│  ┌─ Mode ──────────────────────────────────────────────────────────────┐  │
-│  │                                                                     │  │
-│  │  SINGLE-THREADED:  single_worker: Some(RefCell<Worker>)             │  │
-│  │  MULTI-THREADED:   pending_workers: Some(Vec<Worker>)               │  │
-│  │                                                                     │  │
-│  │  After run() is called, both are None — workers move to threads.    │  │
-│  │                                                                     │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
+│  tick_workers: RefCell<Vec<Worker>>  -- for tick(); run() drains these   │
+│  worker_threads: Vec<OnceLock<Thread>>  -- for waking parked workers     │
 │                                                                           │
 └───────────────────────────────────────────────────────────────────────────┘
 ```
@@ -80,9 +77,22 @@ only way for actors to interact with the outside world.
 │                                                                           │
 │  ┌─ Public API ────────────────────────────────────────────────────────┐  │
 │  │                                                                     │  │
-│  │  ctx.self_addr()             -> ActorAddress                        │  │
-│  │  ctx.send(addr, msg)         -> Result<(), Error>                   │  │
-│  │  ctx.spawn(actor)            -> Result<ActorAddress, Error>         │  │
+│  │  ctx.self_addr()                   -> ActorAddress                  │  │
+│  │  ctx.send(addr, msg)               -> Result<(), Error>            │  │
+│  │  ctx.spawn(actor)                  -> Result<ActorAddress, Error>   │  │
+│  │  ctx.spawn_named(name, actor)      -> Result<ActorAddress, Error>   │  │
+│  │  ctx.spawn_restartable(a, f, max)  -> Result<ActorAddress, Error>   │  │
+│  │  ctx.stop_self()                                                    │  │
+│  │  ctx.stop_actor(addr)              -> Result<(), Error>             │  │
+│  │  ctx.where_is(name)                -> Option<ActorAddress>          │  │
+│  │  ctx.monitor(target)               -> MonitorRef                    │  │
+│  │  ctx.demonitor(mref)                                                │  │
+│  │  ctx.join_group(group)                                              │  │
+│  │  ctx.leave_group(group)                                             │  │
+│  │  ctx.publish(group, msg)           -> usize                         │  │
+│  │  ctx.group_members(group)          -> Vec<ActorAddress>             │  │
+│  │  ctx.send_after_ticks(addr, msg, n)                                 │  │
+│  │  ctx.send_interval_ticks(addr, msg, period)                         │  │
 │  │                                                                     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                           │
@@ -130,21 +140,160 @@ handler, etc.) receive typed messages from actors.
   │  if let Some(msg) = inbox.try_recv() { ... }                           │
   │                                                                        │
   └────────────────────────────────────────────────────────────────────────┘
+```
 
-  ┌─ Delivery Path ────────────────────────────────────────────────────────┐
-  │                                                                        │
-  │  actor calls ctx.send(inbox_addr, response)                            │
-  │       │                                                                │
-  │       v                                                                │
-  │  address_map.lookup(inbox_addr) → None  (inboxes aren't actors)        │
-  │       │                                                                │
-  │       v                                                                │
-  │  inbox_registry.try_deliver(addr, msg)                                 │
-  │       │                                                                │
-  │       v                                                                │
-  │  downcast Box<Any> → M, push into Receiver<M>                          │
-  │                                                                        │
-  └────────────────────────────────────────────────────────────────────────┘
+## Ask — Typed Request-Response
+
+`Ask<R>` wraps an `Inbox<R>` for convenient request-response:
+
+```
+  let response: Pong = rt.ask(actor, |reply_to| Ping { reply_to })?
+      .recv_ticking(&rt, 10)?;    // tick until response or timeout
+```
+
+## Named Actors
+
+Actors can be spawned with a registered name for discovery:
+
+```
+  let addr = rt.spawn_named("coordinator", my_actor)?;
+  let found = rt.where_is("coordinator");   // -> Some(addr)
+  // Names are auto-unregistered when the actor dies.
+```
+
+## Actor Monitoring (Death Watch)
+
+Subscribe to death notifications via `ctx.monitor()`:
+
+```
+  let mref = ctx.monitor(target_addr);
+  // When target dies, a Down { addr, reason } message arrives in
+  // the watcher's normal handle() method. No special callback needed.
+```
+
+`StopReason`: `Normal` (graceful stop) | `Panicked` (panic, not restartable)
+
+## Actor Groups (Pub-Sub)
+
+Named groups for broadcast messaging:
+
+```
+  ctx.join_group("workers");
+  ctx.publish("workers", StatusUpdate { ... });    // all members receive it
+  // Members auto-removed on death. Groups auto-deleted when empty.
+```
+
+## Lifecycle Hooks
+
+```
+  fn on_start(&mut self, ctx: &Ctx) {}   -- called once before first message
+  fn on_stop(&mut self, ctx: &Ctx) {}    -- called on graceful stop (not panic)
+```
+
+## Actor Recovery
+
+Factory-based restart after panic:
+
+```
+  rt.spawn_restartable(actor, || MyActor::new(), 3)?;
+  // On panic: mailbox cleared, factory creates fresh instance, up to 3 times.
+  // After max_restarts: permanently poisoned.
+```
+
+## Supervision Trees
+
+The `Supervisor` actor manages child actors with configurable restart policies:
+
+```
+  let sup = Supervisor::new(
+      SupervisorStrategy::OneForOne,   // only the failed child is restarted
+      // Also: OneForAll  — all children restarted when one fails
+      //        RestForOne — failed child + all children after it restarted
+      5,                                // max 5 restarts before meltdown
+      vec![
+          ChildSpec::new("worker_a", RestartPolicy::Permanent, |ctx| {
+              ctx.spawn(MyWorker::new())
+          }),
+          ChildSpec::new("worker_b", RestartPolicy::Transient, |ctx| {
+              ctx.spawn(MyOtherWorker::new())
+          }),
+      ],
+  );
+  let sup_addr = rt.spawn(sup)?;
+```
+
+Restart policies:
+- `Permanent`: always restart
+- `Transient`: restart only on panic, not normal stop
+- `Temporary`: never restart
+
+Strategies:
+- `OneForOne`: only the failed child is restarted (default)
+- `OneForAll`: all children are stopped and restarted when one fails
+- `RestForOne`: the failed child and all children after it (in spec order) are restarted
+
+Coordinated restart (OneForAll/RestForOne): the supervisor enters a `Stopping` phase,
+sends stop signals to affected siblings, waits for all `Down` confirmations, then
+restarts the full set in spec order. Already-dead children are handled immediately.
+
+Meltdown: supervisor stops itself when total restarts exceed `max_restarts`.
+Cascading: supervisor stops all children in `on_stop`.
+
+## Router — Actor Pool with Message Routing
+
+The `Router<M>` actor manages a pool of identical workers and distributes
+incoming messages across them. Callers send messages to the router's address,
+and the router forwards them according to the configured strategy.
+
+```
+  let router = Router::new(
+      RoutingStrategy::RoundRobin,
+      5,                                // pool size
+      |ctx| ctx.spawn(MyWorker::new()), // worker factory
+      10,                               // max restarts before meltdown
+  );
+  let router_addr = rt.spawn(router)?;
+  rt.send_to(router_addr, WorkerMsg::DoWork(42))?;
+```
+
+Routing strategies:
+- `RoundRobin`: sequential circular distribution
+- `Random`: random worker selection
+- `Broadcast`: clone message to all workers
+
+Workers are monitored and automatically replaced on failure. Meltdown
+protection stops the router when total restarts exceed `max_restarts`.
+
+### handle_down Callback
+
+Any actor can override `handle_down` to react to monitored actor deaths
+without making `Down` its `Incoming` type:
+
+```
+  impl ActorInterface for MyActor {
+      type Incoming = MyMsg;
+      // ...
+      fn handle_down(&mut self, ctx: &Ctx, down: Down) {
+          // React to monitored actor death
+      }
+  }
+```
+
+### ctx.stop_actor
+
+Actors can stop other actors from handlers:
+
+```
+  ctx.stop_actor(other_addr)?;  // PoisonPill semantics — queued after existing msgs
+```
+
+## Per-Worker Timers
+
+Deterministic tick-counting timers (not wall-clock):
+
+```
+  ctx.send_after_ticks(addr, msg, 5);       // one-shot: fires after 5 ticks
+  ctx.send_interval_ticks(addr, msg, 10);   // repeating: every 10 ticks
 ```
 
 ## RuntimeHandle
@@ -171,12 +320,18 @@ Returned by `run()`. Holds `Arc<Runtime>` and the thread `JoinHandle`s.
 ┌─ RuntimeStats ────────────────────────────────────────────────────────────┐
 │                                                                           │
 │  num_workers: usize                                                       │
+│  uptime_ms: u64                                                           │
 │  actors: Vec<(ActorAddress, worker_id)>     -- from AddressMap snapshot   │
 │  workers: Vec<WorkerInfo>                                                 │
 │    ├─ id: usize                                                           │
 │    ├─ num_actors: usize                     -- from atomic counter        │
 │    ├─ mailbox_depth: usize                  -- total queued messages      │
-│    └─ messages_processed: u64               -- cumulative count           │
+│    ├─ messages_processed: u64               -- cumulative count           │
+│    ├─ messages_dropped: u64                 -- overflow drops             │
+│    ├─ panics: u64                                                         │
+│    ├─ restarts: u64                                                       │
+│    └─ stops: u64                                                          │
+│  tick_timings: Vec<Vec<TickTiming>>         -- per-phase timing data      │
 │                                                                           │
 └───────────────────────────────────────────────────────────────────────────┘
 ```

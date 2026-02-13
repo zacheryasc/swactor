@@ -144,6 +144,51 @@ impl ActorInterface for WrongTypeActor {
     fn handle(&mut self, _ctx: &Ctx, _msg: WrongTypeMsg) {}
 }
 
+/// Timer actor: on message, schedules a one-shot timer to deliver the message
+/// to the given target after `delay` ticks.
+struct TimerSchedulerActor {
+    target: ActorAddress,
+    delay: u64,
+}
+impl ActorInterface for TimerSchedulerActor {
+    type Incoming = FuzzMsg;
+    type Response = ();
+    fn handle(&mut self, ctx: &Ctx, msg: FuzzMsg) {
+        ctx.send_after_ticks(self.target, msg, self.delay);
+    }
+}
+
+/// Interval timer actor: on start, schedules an interval timer to fire
+/// to the target every `period` ticks.
+struct IntervalSchedulerActor {
+    target: ActorAddress,
+    period: u64,
+}
+impl ActorInterface for IntervalSchedulerActor {
+    type Incoming = FuzzMsg;
+    type Response = ();
+    fn on_start(&mut self, ctx: &Ctx) {
+        ctx.send_interval_ticks(self.target, FuzzMsg { value: 0, reply_to_idx: None }, self.period);
+    }
+    fn handle(&mut self, _ctx: &Ctx, _msg: FuzzMsg) {}
+}
+
+/// Panicking echo: panics on value=0, otherwise echoes.
+struct PanickingEchoActor;
+impl ActorInterface for PanickingEchoActor {
+    type Incoming = FuzzMsg;
+    type Response = ();
+    fn handle(&mut self, ctx: &Ctx, msg: FuzzMsg) {
+        if msg.value == 0 {
+            panic!("fuzz: intentional panic");
+        }
+        if let Some(idx) = msg.reply_to_idx {
+            let reply = FuzzMsg { value: msg.value, reply_to_idx: None };
+            let _ = ctx.send(INBOX_ADDRS.lock_or_default().get(idx as usize), reply);
+        }
+    }
+}
+
 // ─── Shared Inbox Address Table ─────────────────────────────────────────────
 
 struct InboxAddrs(Vec<ActorAddress>);
@@ -205,6 +250,14 @@ enum RawAction {
     DrainAll,
     Tick,
     TickN { n: u8 },
+    /// Graceful stop an actor
+    StopActor { actor_idx: u8 },
+    /// Spawn a panicking echo actor (panics on value=0)
+    SpawnPanicking,
+    /// Schedule a one-shot timer from an actor to an inbox
+    ScheduleTimer { delay: u8 },
+    /// Schedule an interval timer from an actor to an inbox
+    ScheduleInterval { actor_idx: u8, period: u8 },
 }
 
 #[derive(Debug, Arbitrary)]
@@ -753,6 +806,50 @@ impl FuzzState {
             RawAction::DrainAll => { self.drain_all_inboxes(); }
             RawAction::Tick => { self.tick(); }
             RawAction::TickN { n } => { self.tick_n((*n).max(1).min(64) as usize); }
+            RawAction::StopActor { actor_idx } => {
+                if let Some(addr) = self.resolve_actor(*actor_idx) {
+                    let label = self.actor_label(addr);
+                    let _ = self.runtime.stop_actor(addr);
+                    self.log(format_args!("[STOP]   {label}"));
+                }
+            }
+            RawAction::SpawnPanicking => {
+                if let Ok(addr) = self.runtime.spawn(PanickingEchoActor) {
+                    let id = self.actors.len();
+                    self.actors.push((addr, ActorKind::Echo));
+                    self.total_spawned += 1;
+                    self.log(format_args!("[SPAWN]  PanickingEcho -> actor#{id}"));
+                }
+            }
+            RawAction::ScheduleTimer { delay } => {
+                // Create a timer scheduler actor, send it a message to trigger scheduling
+                let delay = (*delay).max(1).min(10) as u64;
+                if self.inboxes.is_empty() { self.new_inbox(); }
+                if let Some(idx) = self.resolve_inbox_idx(0) {
+                    let target = *self.inboxes[idx].addr();
+                    if let Ok(addr) = self.runtime.spawn(TimerSchedulerActor { target, delay }) {
+                        let id = self.actors.len();
+                        self.actors.push((addr, ActorKind::Echo));
+                        self.total_spawned += 1;
+                        self.tick(); // bring actor alive
+                        self.send_msg(addr, FuzzMsg { value: 42, reply_to_idx: None });
+                        self.log(format_args!("[TIMER]  actor#{id} -> inbox#{idx} delay={delay}"));
+                    }
+                }
+            }
+            RawAction::ScheduleInterval { actor_idx, period } => {
+                let period = (*period).max(1).min(5) as u64;
+                if self.inboxes.is_empty() { self.new_inbox(); }
+                if let Some(idx) = self.resolve_inbox_idx(*actor_idx) {
+                    let target = *self.inboxes[idx].addr();
+                    if let Ok(addr) = self.runtime.spawn(IntervalSchedulerActor { target, period }) {
+                        let id = self.actors.len();
+                        self.actors.push((addr, ActorKind::Echo));
+                        self.total_spawned += 1;
+                        self.log(format_args!("[INTVL]  actor#{id} -> inbox#{idx} period={period}"));
+                    }
+                }
+            }
         }
     }
 }

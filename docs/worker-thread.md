@@ -48,6 +48,12 @@
 │  │                                                                  │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                        │
+│  ┌─ TimerWheel ────────────────────────────────────────────────────┐  │
+│  │  current_tick: u64                                              │  │
+│  │  once_timers: Vec<OnceTimer>      -- fire_at, dest, msg         │  │
+│  │  interval_timers: Vec<IntervalTimer> -- period, dest, clone_msg │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,12 +64,17 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 ```
 ┌─ TickContext<'a> ──────────────────────────────────────────────────────┐
 │                                                                        │
-│  address_map:    &AddressMap     -- ActorAddress -> WorkerId lookup    │
-│  transfer_txs:   &[Sender]      -- one Sender per worker (cross-send)  │
-│  spawn_txs:      &[Sender]      -- one Sender per worker (spawn reqs)  │
-│  placement:      &Placement     -- round-robin next-worker picker      │
-│  inbox_registry: &InboxRegistry -- external Inbox<M> receivers         │
-│  config:         &RuntimeConfig -- waterlevel, backoff params, etc.    │
+│  address_map:       &AddressMap        -- ActorAddress -> WorkerId     │
+│  transfer_txs:      &[Sender]          -- one Sender per worker        │
+│  spawn_txs:         &[Sender]          -- one Sender per worker        │
+│  placement:         &Placement         -- load-aware worker picker     │
+│  inbox_registry:    &InboxRegistry     -- external Inbox<M> receivers  │
+│  name_registry:     &NameRegistry      -- String -> ActorAddress       │
+│  monitor_registry:  &MonitorRegistry   -- death watch subscriptions    │
+│  group_registry:    &GroupRegistry      -- pub-sub actor groups        │
+│  config:            &RuntimeConfig     -- budget, backoff, etc.        │
+│  stats_hook:        Option<&dyn Hook>  -- per-tick stats callback      │
+│  worker_threads:    &[OnceLock<Thread>] -- for unpark on send/spawn   │
 │                                                                        │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -89,11 +100,13 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │        v         v                               │                     │
 │  idle = 0    idle++                              │                     │
 │        │         │                               │                     │
-│        │    ┌────┴────────────────────────┐      │                     │
-│        │    │ idle < spin_thr:  spin      │      │                     │
-│        │    │ idle < yield_thr: yield     │      │                     │
-│        │    │ else: sleep(incr, capped)   │      │                     │
-│        │    └─────────────────────────┬───┘      │                     │
+│        │    ┌────┴──────────────────────────────┐  │                     │
+│        │    │ idle < spin_thr:  spin            │  │                     │
+│        │    │ idle < yield_thr: yield_now       │  │                     │
+│        │    │ else: park_timeout(incr, capped)  │  │                     │
+│        │    │   (instant wake via Thread::unpark │  │                     │
+│        │    │    when send/spawn targets worker) │  │                     │
+│        │    └──────────────────────────────┬─────┘  │                     │
 │        │                              │          │                     │
 │        └──────────┬───────────────────┘          │                     │
 │                   │                              │                     │
@@ -102,7 +115,7 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Tick Once (four phases)
+## Tick Once (eight phases)
 
 ```
 ┌─ tick_once ────────────────────────────────────────────────────────────┐
@@ -114,12 +127,9 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  │                                   │                                ││
 │  │                                   v                                ││
 │  │                          pool.insert(addr, actor)                  ││
-│  │                                   │                                ││
-│  │                                   v                                ││
-│  │                          ActorSlot {                               ││
-│  │                              mailbox: VecDeque::new()              ││
-│  │                              actor: <the new actor>                ││
-│  │                          }                                         ││
+│  │                            started: false                          ││
+│  │                            stopping: false                         ││
+│  │                            mailbox_capacity: from config           ││
 │  │                                                                    ││
 │  └────────────────────────────────────────────────────────────────────┘│
 │      │                                                                 │
@@ -131,10 +141,25 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  │                                         │                          ││
 │  │                                         v                          ││
 │  │                             pool.deliver(&dest, payload)           ││
-│  │                                         │                          ││
-│  │                                         v                          ││
-│  │                             slot.mailbox.push_back(msg)            ││
-│  │                             (untyped; type check at handle time)   ││
+│  │                               (enforces mailbox_capacity;          ││
+│  │                                drop newest/oldest on overflow)     ││
+│  │                                                                    ││
+│  └────────────────────────────────────────────────────────────────────┘│
+│      │                                                                 │
+│      v                                                                 │
+│  PHASE 2.5 --- Fire Due Timers                                         │
+│  ┌────────────────────────────────────────────────────────────────────┐│
+│  │                                                                    ││
+│  │  timers.fire()  (advances tick counter, collects due messages)     ││
+│  │       │                                                            ││
+│  │       v                                                            ││
+│  │  for (dest, msg) in timer_msgs:                                    ││
+│  │    ┌──────────────┬──────────────┬─────────────────┐               ││
+│  │    │ local actor  │ other worker │ inbox/unknown   │               ││
+│  │    │              │              │                 │               ││
+│  │    │ pool.deliver │ transfer_tx  │ inbox_registry  │               ││
+│  │    │              │ + unpark     │ .try_deliver()  │               ││
+│  │    └──────────────┴──────────────┴─────────────────┘               ││
 │  │                                                                    ││
 │  └────────────────────────────────────────────────────────────────────┘│
 │      │                                                                 │
@@ -144,25 +169,35 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  │                                                                    ││
 │  │  ┌─ WorkerContext (on stack) ─────────────────────────────────┐    ││
 │  │  │  implements ContextInner                                   │    ││
-│  │  │  owns pending_local: RefCell<Vec<(Addr, Box<Any>)>>        │    ││
+│  │  │  pending_local:  RefCell<Vec<(Addr, Box<Any>)>>            │    ││
+│  │  │  stop_requests:  RefCell<Vec<ActorAddress>>                │    ││
+│  │  │  timer_requests: RefCell<Vec<TimerRequest>>                │    ││
 │  │  └────────────────────────────────────────────────────────────┘    ││
 │  │                                                                    ││
 │  │  for each (addr, slot) in pool:                                    ││
+│  │    if poisoned or stopping → clear mailbox, skip                   ││
 │  │                                                                    ││
-│  │    ┌─ drain_count ──────────────────────────────────────────┐      ││
-│  │    │  len = slot.mailbox.len()                              │      ││
-│  │    │  len <  waterlevel --> n = len     (drain all)         │      ││
-│  │    │  len >= waterlevel --> n = len / 2 (backpressure)      │      ││
-│  │    └────────────────────────────────────────────────────────┘      ││
+│  │    ┌─ on_start (once per actor) ──────────────────────────────┐    ││
+│  │    │  if !slot.started:                                       │    ││
+│  │    │    catch_unwind(actor.on_start(&ctx))                    │    ││
+│  │    │      panic → poisoned (immediate, no messages)           │    ││
+│  │    │      ok    → started = true                              │    ││
+│  │    └──────────────────────────────────────────────────────────┘    ││
 │  │                                                                    ││
-│  │    ctx = Ctx { inner: &worker_ctx, self_addr: addr }               ││
-│  │                                                                    ││
-│  │    repeat n times:                                                 ││
-│  │      msg = slot.mailbox.pop_front()                                ││
-│  │      slot.actor.handle_any(&ctx, msg)                              ││
-│  │              │                                                     ││
-│  │              │ actor calls ctx.send() or ctx.spawn()               ││
-│  │              v                                                     ││
+│  │    ┌─ message loop (budget-limited) ──────────────────────────┐    ││
+│  │    │  repeat up to `budget` times (budget=0 → unlimited):     │    ││
+│  │    │    msg = slot.mailbox.pop_front()                        │    ││
+│  │    │                                                          │    ││
+│  │    │    if msg is StopSignal:                                 │    ││
+│  │    │      slot.stopping = true; clear mailbox; break          │    ││
+│  │    │                                                          │    ││
+│  │    │    catch_unwind(actor.handle_any(&ctx, msg))             │    ││
+│  │    │      panic → try_restart (factory) or poison             │    ││
+│  │    │      ok    → count += 1                                  │    ││
+│  │    │                                                          │    ││
+│  │    │    if stop_requests contains addr:                       │    ││
+│  │    │      slot.stopping = true; clear mailbox; break          │    ││
+│  │    └──────────────────────────────────────────────────────────┘    ││
 │  │                                                                    ││
 │  │    ┌─ WorkerContext routes ─────────────────────────────────────┐  ││
 │  │    │                                                            │  ││
@@ -171,27 +206,89 @@ Lives on `Arc<Runtime>`, shared read-only across all worker threads.
 │  │    │    │ same worker  │ other worker │ unknown addr    │       │  ││
 │  │    │    │              │              │                 │       │  ││
 │  │    │    │ pending_     │ transfer_tx  │ inbox_registry  │       │  ││
-│  │    │    │  local.push()│  [wid].send()│  .try_deliver() │       │  ││
+│  │    │    │  local.push()│  + unpark    │  .try_deliver() │       │  ││
 │  │    │    └──────────────┴──────────────┴─────────────────┘       │  ││
 │  │    │                                                            │  ││
 │  │    │  spawn_any(addr, actor):                                   │  ││
-│  │    │    wid = placement.next_worker()                           │  ││
+│  │    │    wid = placement.next_worker()  (load-aware)             │  ││
 │  │    │    address_map.insert(addr, wid)                           │  ││
-│  │    │    spawn_txs[wid].send((addr, actor))                      │  ││
+│  │    │    spawn_txs[wid].send((addr, actor)) + unpark             │  ││
+│  │    │                                                            │  ││
+│  │    │  request_stop(addr):  → stop_requests.push(addr)           │  ││
+│  │    │  schedule_timer(req): → timer_requests.push(req)           │  ││
+│  │    │  where_is(name):      → name_registry.lookup(name)         │  ││
+│  │    │  monitor(w, t):       → monitor_registry.register(w, t)    │  ││
+│  │    │  join_group(a, g):    → group_registry.join(g, a)          │  ││
 │  │    │                                                            │  ││
 │  │    └────────────────────────────────────────────────────────────┘  ││
 │  │                                                                    ││
 │  └────────────────────────────────────────────────────────────────────┘│
 │      │                                                                 │
 │      v                                                                 │
-│  PHASE 4 --- Drain Pending Local                                       │
+│  PHASE 4 --- Drain Spawn Queue (again)                                 │
+│  ┌────────────────────────────────────────────────────────────────────┐│
+│  │  Actors spawned during phase 3 must be in the pool before         ││
+│  │  pending_local delivery (phase 5).                                ││
+│  └────────────────────────────────────────────────────────────────────┘│
+│      │                                                                 │
+│      v                                                                 │
+│  PHASE 5 --- Drain Pending Local                                       │
 │  ┌────────────────────────────────────────────────────────────────────┐│
 │  │                                                                    ││
 │  │  for (addr, msg) in pending_local.into_inner():                    ││
 │  │      pool.deliver(&addr, msg)                                      ││
-│  │          --> slot.mailbox.push_back(msg)                           ││
-│  │                                                                    ││
 │  │  these sit in the mailbox until NEXT tick                          ││
+│  │                                                                    ││
+│  └────────────────────────────────────────────────────────────────────┘│
+│      │                                                                 │
+│      v                                                                 │
+│  PHASE 5.5 --- Drain Timer Requests                                    │
+│  ┌────────────────────────────────────────────────────────────────────┐│
+│  │                                                                    ││
+│  │  for request in timer_requests:                                    ││
+│  │    Once { dest, msg, ticks } → timers.add_once(dest, msg, ticks)  ││
+│  │    Interval { dest, msg, p } → timers.add_interval(dest, msg, p)  ││
+│  │                                                                    ││
+│  └────────────────────────────────────────────────────────────────────┘│
+│      │                                                                 │
+│      v                                                                 │
+│  PHASE 6 --- Publish Stats                                             │
+│  ┌────────────────────────────────────────────────────────────────────┐│
+│  │                                                                    ││
+│  │  if did_work:                                                      ││
+│  │    stats.num_actors, total_mailbox_depth, messages_processed       ││
+│  │    stats.messages_dropped (if any overflow drops)                  ││
+│  │    stats_hook.on_tick(worker_id, snapshots) if configured          ││
+│  │                                                                    ││
+│  │  record TickTiming (6-element phase_us array + processed + flag)   ││
+│  │                                                                    ││
+│  └────────────────────────────────────────────────────────────────────┘│
+│      │                                                                 │
+│      v                                                                 │
+│  PHASE 7 --- Cleanup Dead Actors                                       │
+│  ┌────────────────────────────────────────────────────────────────────┐│
+│  │                                                                    ││
+│  │  pool.cleanup_dead() → Vec<(ActorAddress, StopReason)>            ││
+│  │    stopping actors: call on_stop(&ctx) before removal             ││
+│  │    poisoned actors: skip on_stop (state may be corrupt)           ││
+│  │                                                                    ││
+│  │  for each dead (addr, reason):                                     ││
+│  │    address_map.remove(&addr)                                       ││
+│  │    name_registry.unregister_by_addr(&addr)                        ││
+│  │    group_registry.cleanup(&addr)                                   ││
+│  │                                                                    ││
+│  │  deliver any messages sent during on_stop callbacks                ││
+│  │                                                                    ││
+│  │  emit Down notifications for monitored dead actors:                ││
+│  │    for (addr, reason) in dead:                                     ││
+│  │      watchers = monitor_registry.take_monitors(&addr)             ││
+│  │      for each watcher: route Down { addr, reason }                ││
+│  │        same-worker → pool.deliver                                  ││
+│  │        cross-worker → transfer_tx + unpark                         ││
+│  │        inbox → inbox_registry.try_deliver                          ││
+│  │      monitor_registry.remove_watcher(&addr)                       ││
+│  │                                                                    ││
+│  │  timers.gc_dead_intervals(dead_addrs)                              ││
 │  │                                                                    ││
 │  └────────────────────────────────────────────────────────────────────┘│
 │                                                                        │
@@ -400,7 +497,9 @@ Who holds what:
 
 ```
 ┌─ User Code ────────────────────────────────────────────────────────────┐
-│ rt.spawn()      rt.send_to()      inbox.try_recv()    rt.shutdown()   │
+│ rt.spawn()       rt.send_to()       inbox.try_recv()   rt.shutdown()  │
+│ rt.spawn_named() rt.ask()           rt.where_is()      rt.stop_actor()│
+│ rt.join_group()  rt.publish_to()    rt.group_members()                │
 └────┬──────────────────┬──────────────────┬──────────────────┬──────────┘
      │                  │                  ^                  │
      v                  v                  │                  v
@@ -408,10 +507,16 @@ Who holds what:
 │                                                                           │
 │ ┌───────────┐ ┌────────────┐ ┌─────────────┐ ┌────────────┐              │
 │ │AddressMap │ │ Placement  │ │InboxRegistry│ │ is_running │              │
-│ │ addr->wid │ │ round-robin│ │ addr->Sender│ │ AtomicBool │              │
+│ │ addr->wid │ │ load-aware │ │ addr->Sender│ │ AtomicBool │              │
 │ └─────┬─────┘ └──────┬─────┘ └──────┬──────┘ └──────┬─────┘              │
 │       │               │              │               │                    │
-│ ┌─────┴───────────────┴──────────────┴───────────────┴────────────────┐   │
+│ ┌─────────────┐ ┌──────────────┐ ┌─────────────┐                         │
+│ │NameRegistry │ │MonitorRegist.│ │GroupRegistry │                         │
+│ │ name->addr  │ │ watched->    │ │ group->addrs │                         │
+│ │ addr->name  │ │   watchers   │ │ addr->groups │                         │
+│ └─────┬───────┘ └──────┬───────┘ └──────┬───────┘                         │
+│       │               │              │                                    │
+│ ┌─────┴───────────────┴──────────────┴───────────────────────────────┐   │
 │ │                  TickContext (borrows all above)                     │   │
 │ └──────────────────────────┬──────────────────────────────────────────┘   │
 │                            │                                              │

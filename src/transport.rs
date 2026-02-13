@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::actor::{ActorAddress, Message};
+use crate::delivery::{AddrBuildHasher, AddrMap};
 use crate::Error;
 
 // ─── Codec ──────────────────────────────────────────────────────────────────
@@ -150,13 +151,13 @@ impl CodecRegistry {
 
 /// Maps remote actor addresses to their [`Transport`].
 pub struct TransportRouter {
-    routes: RwLock<HashMap<ActorAddress, Arc<dyn Transport>>>,
+    routes: RwLock<AddrMap<Arc<dyn Transport>>>,
 }
 
 impl TransportRouter {
     pub fn new() -> Self {
         Self {
-            routes: RwLock::new(HashMap::new()),
+            routes: RwLock::new(HashMap::with_hasher(AddrBuildHasher)),
         }
     }
 

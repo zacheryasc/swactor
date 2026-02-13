@@ -282,6 +282,7 @@ impl From<PyRuntimeConfig> for RuntimeConfig {
                 sleep_increment_us: py.sleep_increment_us,
                 sleep_max_us: py.sleep_max_us,
             },
+            ..Default::default()
         }
     }
 }
