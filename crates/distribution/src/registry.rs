@@ -235,6 +235,17 @@ impl ClusterRegistry {
         }
     }
 
+    /// Re-enqueue all entries for dissemination (anti-entropy on membership change).
+    ///
+    /// Called when a previously-dead node comes back alive, ensuring that
+    /// registry state accumulated during a partition is gossiped to the
+    /// recovering node.
+    pub fn re_disseminate_all(&mut self, cluster_size: usize) {
+        for entry in self.entries.values().cloned().collect::<Vec<_>>() {
+            self.enqueue(entry, cluster_size);
+        }
+    }
+
     /// Periodic GC: remove tombstones past TTL with exhausted dissemination budgets.
     pub fn gc_tick(&mut self) {
         self.tick_count += 1;

@@ -13,6 +13,7 @@ struct TraceEntry {
     name: String,
     nodes: usize,
     events: usize,
+    trace_type: String,
 }
 
 fn scan_traces(dir: &Path) -> Vec<TraceEntry> {
@@ -51,11 +52,17 @@ fn scan_traces(dir: &Path) -> Vec<TraceEntry> {
             .and_then(|v| v.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
+        let trace_type = val
+            .get("trace_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("gossip")
+            .to_string();
         entries.push(TraceEntry {
             file: fname,
             name,
             nodes,
             events,
+            trace_type,
         });
     }
     entries.sort_by(|a, b| a.file.cmp(&b.file));

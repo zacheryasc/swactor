@@ -1,4 +1,3 @@
-CLAUDE/
 **/target
 **/node_modules/
 .vscode/
@@ -13,6 +12,5 @@ corpus
 docs/architecture.dot
 docs/architecture.html
 
-# Claude session files
-CLAUDE/
-.claude/
+# Simulation traces
+crates/simulation/traces

@@ -21,6 +21,19 @@ pub struct Partition {
     pub asymmetric: bool,
 }
 
+/// An action to execute at a specific round during the simulation.
+#[derive(Debug, Clone)]
+pub enum SimAction {
+    /// Register a name on the given node, binding it to a fresh random actor.
+    RegisterName { node_idx: usize, name: String },
+    /// Register a name on the given node, binding it to a specific actor address.
+    RegisterNameWithActor { node_idx: usize, name: String, actor: ActorAddress },
+    /// Unregister a name on the given node (creates a tombstone).
+    UnregisterName { node_idx: usize, name: String },
+    /// Graceful leave — node announces its own death before being removed.
+    GracefulLeave { node_idx: usize },
+}
+
 /// Schedule entry for network faults.
 #[derive(Debug, Clone)]
 pub enum NetworkFault {
@@ -49,6 +62,12 @@ pub struct DistributionSimConfig {
     pub cache_capacity: usize,
     /// Network fault schedule.
     pub network_faults: Vec<NetworkFault>,
+    /// Actions to execute at specific rounds (e.g. register/unregister names).
+    pub action_schedule: Vec<(usize, SimAction)>,
+    /// Custom registry config overrides.
+    pub registry_tombstone_ttl: Option<u64>,
+    pub registry_gc_interval: Option<u64>,
+    pub registry_dissemination_lambda: Option<usize>,
 }
 
 impl Default for DistributionSimConfig {
@@ -70,6 +89,10 @@ impl Default for DistributionSimConfig {
             revive_schedule: Vec::new(),
             cache_capacity: 100,
             network_faults: Vec::new(),
+            action_schedule: Vec::new(),
+            registry_tombstone_ttl: None,
+            registry_gc_interval: None,
+            registry_dissemination_lambda: None,
         }
     }
 }
@@ -132,13 +155,27 @@ impl NetworkState {
     }
 }
 
-type DistTrace = SimulationTrace<DistributionEventKind, DistributionSnapshot>;
+pub type DistTrace = SimulationTrace<DistributionEventKind, DistributionSnapshot>;
+
+/// Run a distribution simulation, returning both the trace and the final node states.
+///
+/// The returned `Vec<Option<DistributedNode>>` has the same length as `config.num_nodes`.
+/// Dead nodes are `None`.
+pub fn run_simulation_with_nodes(config: DistributionSimConfig) -> (DistTrace, Vec<Option<DistributedNode>>) {
+    let (trace, nodes, _) = run_simulation_inner(config);
+    (trace, nodes)
+}
 
 /// Run a distribution simulation.
 ///
 /// Creates N `DistributedNode` instances, forms a cluster via join protocol,
 /// registers actors, then runs rounds of tick + deliver + resolve.
 pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
+    let (trace, _, _) = run_simulation_inner(config);
+    trace
+}
+
+fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option<DistributedNode>>, Vec<NodeId>) {
     let mut events: Vec<Event<DistributionEventKind>> = Vec::new();
     let mut snapshots_per_round: Vec<Vec<(String, DistributionSnapshot)>> = Vec::new();
 
@@ -152,13 +189,14 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
 
     for i in 0..n {
         let addr: SocketAddr = format!("127.0.0.1:{}", 10001 + i).parse().unwrap();
-        let node_config = DistributedNodeConfig {
+        let mut node_config = DistributedNodeConfig {
             listen_addr: addr,
             swim: config.swim.clone(),
             cache_capacity: config.cache_capacity,
             republish_interval: 50,
             ..Default::default()
         };
+        apply_registry_overrides(&mut node_config, &config);
         let node = DistributedNode::new(node_config);
         node_ids.push(node.node_id());
         addrs.push(addr);
@@ -284,13 +322,14 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
         // Apply revive schedule.
         for &(revive_round, revive_idx) in &config.revive_schedule {
             if revive_round == round && revive_idx < n {
-                let node_config = DistributedNodeConfig {
+                let mut node_config = DistributedNodeConfig {
                     listen_addr: addrs[revive_idx],
                     swim: config.swim.clone(),
                     cache_capacity: config.cache_capacity,
                     republish_interval: 50,
                     ..Default::default()
                 };
+                apply_registry_overrides(&mut node_config, &config);
                 let revived = DistributedNode::new(node_config);
                 // Rejoin the cluster.
                 let join_actions = revived.join(&[seed_addr]);
@@ -325,6 +364,97 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
                     node_name: node_names[revive_idx].clone(),
                     kind: DistributionEventKind::NodeRevived,
                 });
+            }
+        }
+
+        // Execute scheduled actions for this round.
+        for (action_round, action) in &config.action_schedule {
+            if *action_round == round {
+                match action {
+                    SimAction::RegisterName { node_idx, name } => {
+                        if *node_idx < n {
+                            if let Some(ref mut node) = nodes[*node_idx] {
+                                let actor = ActorAddress::new_random();
+                                node.register_name(name.clone(), actor);
+                                events.push(Event {
+                                    tick: round as u64,
+                                    node_name: node_names[*node_idx].clone(),
+                                    kind: DistributionEventKind::NameRegistered {
+                                        name: name.clone(),
+                                        node_idx: *node_idx,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    SimAction::RegisterNameWithActor { node_idx, name, actor } => {
+                        if *node_idx < n {
+                            if let Some(ref mut node) = nodes[*node_idx] {
+                                node.register_name(name.clone(), *actor);
+                                events.push(Event {
+                                    tick: round as u64,
+                                    node_name: node_names[*node_idx].clone(),
+                                    kind: DistributionEventKind::NameRegistered {
+                                        name: name.clone(),
+                                        node_idx: *node_idx,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    SimAction::UnregisterName { node_idx, name } => {
+                        if *node_idx < n {
+                            if let Some(ref mut node) = nodes[*node_idx] {
+                                node.unregister_name(name);
+                                events.push(Event {
+                                    tick: round as u64,
+                                    node_name: node_names[*node_idx].clone(),
+                                    kind: DistributionEventKind::NameUnregistered {
+                                        name: name.clone(),
+                                        node_idx: *node_idx,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    SimAction::GracefulLeave { node_idx } => {
+                        if *node_idx < n {
+                            if let Some(ref mut node) = nodes[*node_idx] {
+                                let leave_actions = node.leave();
+                                // Deliver the leave actions (disseminate death announcement)
+                                let tagged_responses = deliver_actions_tagged_with_net(
+                                    &leave_actions,
+                                    *node_idx,
+                                    node_ids[*node_idx],
+                                    addrs[*node_idx],
+                                    &mut nodes,
+                                    &node_ids,
+                                    &addrs,
+                                    &mut net,
+                                );
+                                for (responder_idx, response_actions) in tagged_responses {
+                                    deliver_actions_tagged_with_net(
+                                        &response_actions,
+                                        responder_idx,
+                                        node_ids[responder_idx],
+                                        addrs[responder_idx],
+                                        &mut nodes,
+                                        &node_ids,
+                                        &addrs,
+                                        &mut net,
+                                    );
+                                }
+                            }
+                            // Remove the node after leave
+                            nodes[*node_idx] = None;
+                            events.push(Event {
+                                tick: round as u64,
+                                node_name: node_names[*node_idx].clone(),
+                                kind: DistributionEventKind::NodeKilled,
+                            });
+                        }
+                    }
+                }
             }
         }
 
@@ -393,6 +523,8 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
                     directory_entry_count: node.directory().entry_count(),
                     cache_size: node.cache().len(),
                     repair_queue_size: node.repair_queue().len(),
+                    registry_size: node.registry().len(),
+                    registry_tombstone_count: node.registry().tombstone_count(),
                     is_alive: true,
                 },
                 None => DistributionSnapshot {
@@ -401,6 +533,8 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
                     directory_entry_count: 0,
                     cache_size: 0,
                     repair_queue_size: 0,
+                    registry_size: 0,
+                    registry_tombstone_count: 0,
                     is_alive: false,
                 },
             };
@@ -414,13 +548,27 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
         .map(|i| (node_names[i].clone(), node_names[0].clone()))
         .collect();
 
-    SimulationTrace {
+    let trace = SimulationTrace {
         name: config.name,
+        trace_type: "distribution".into(),
         node_names,
         topology_edges,
         events,
         snapshots_per_round,
         num_rounds: config.num_rounds,
+    };
+    (trace, nodes, node_ids)
+}
+
+fn apply_registry_overrides(node_config: &mut DistributedNodeConfig, config: &DistributionSimConfig) {
+    if let Some(ttl) = config.registry_tombstone_ttl {
+        node_config.registry.tombstone_ttl = ttl;
+    }
+    if let Some(interval) = config.registry_gc_interval {
+        node_config.registry.gc_interval = interval;
+    }
+    if let Some(lambda) = config.registry_dissemination_lambda {
+        node_config.registry.dissemination_lambda = lambda;
     }
 }
 
