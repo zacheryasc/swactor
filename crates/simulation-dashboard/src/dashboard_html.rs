@@ -45,6 +45,11 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   td { padding: 3px 8px; border-bottom: 1px solid #1a1d2e; white-space: nowrap; }
   tr.highlight-push td { background: rgba(59,130,246,0.1); }
   tr.highlight-set td { background: rgba(34,197,94,0.1); }
+  tr.highlight-kill td { background: rgba(239,68,68,0.15); }
+  tr.highlight-revive td { background: rgba(34,197,94,0.15); }
+  tr.highlight-membership td { background: rgba(245,158,11,0.1); }
+  tr.highlight-registry td { background: rgba(168,85,247,0.1); }
+  tr.highlight-ping td { background: rgba(59,130,246,0.08); }
   .replay-controls { display: flex; align-items: center; gap: 8px; padding: 8px 16px; background: #161822; border-bottom: 1px solid #2a2d3a; }
   .replay-controls button { background: #2a2d3a; color: #e0e0e0; border: none; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 13px; }
   .replay-controls button:hover { background: #3b3f52; }
@@ -216,6 +221,17 @@ let metricNoPeers = 0;
 let cumulPushRecv = [];
 // round number for each event index: eventRoundIdx[evtIdx] = roundIdx into snapRounds
 let eventRoundMap = [];      // eventRoundMap[evtIdx] = tick
+
+// ── Distribution-specific state ────────────────────────────────
+let isDist = false;
+let snapMembers = [];    // snapMembers[roundIdx] = Int32Array(N) — member_count
+let snapRegistry = [];   // snapRegistry[roundIdx] = Int32Array(N) — registry_size
+let snapCache = [];      // snapCache[roundIdx] = Int32Array(N) — cache_size
+let snapAlive = [];      // snapAlive[roundIdx] = Uint8Array(N) — is_alive
+let snapRouting = [];    // snapRouting[roundIdx] = Int32Array(N) — routing_table_size
+let snapRepair = [];     // snapRepair[roundIdx] = Int32Array(N) — repair_queue_size
+let snapDirectory = [];  // snapDirectory[roundIdx] = Int32Array(N) — directory_entry_count
+let snapTombstone = [];  // snapTombstone[roundIdx] = Int32Array(N) — registry_tombstone_count
 
 // ── Community detection ──────────────────────────────────────────
 let community = new Int32Array(0);  // community[nodeIdx] = community id
@@ -492,11 +508,41 @@ function showNodeDetail(ni) {
   }
 
   let html = '';
-  html += '<div class="nd-row"><span class="nd-key">Community</span><span class="nd-val">' + (community[ni] !== undefined ? community[ni] : '-') + '</span></div>';
-  html += '<div class="nd-row"><span class="nd-key">Pushes Sent</span><span class="nd-val">' + (metricPushesSent[ni] || 0) + '</span></div>';
-  html += '<div class="nd-row"><span class="nd-key">Pushes Recv</span><span class="nd-val">' + (metricPushesRecv[ni] || 0) + '</span></div>';
-  html += '<div class="nd-row"><span class="nd-key">Keys</span><span class="nd-val">' + keyCount + '/' + totalKeys + '</span></div>';
-  html += '<div class="nd-row"><span class="nd-key">Peers</span><span class="nd-val">' + peerCount + '</span></div>';
+  if (isDist) {
+    // Find latest distribution snapshot for this node
+    let snap = null;
+    for (let r = snapRounds.length - 1; r >= 0; r--) {
+      if (snapRounds[r] <= curRound) {
+        snap = {
+          members: snapMembers[r][ni] || 0,
+          registry: snapRegistry[r][ni] || 0,
+          cache: snapCache[r][ni] || 0,
+          alive: snapAlive[r][ni],
+          routing: snapRouting[r][ni] || 0,
+          repair: snapRepair[r][ni] || 0,
+          directory: snapDirectory[r][ni] || 0,
+          tombstones: snapTombstone[r][ni] || 0,
+        };
+        break;
+      }
+    }
+    if (snap) {
+      html += '<div class="nd-row"><span class="nd-key">Status</span><span class="nd-val" style="color:' + (snap.alive ? '#22c55e' : '#ef4444') + '">' + (snap.alive ? 'Alive' : 'Dead') + '</span></div>';
+      html += '<div class="nd-row"><span class="nd-key">Members</span><span class="nd-val">' + snap.members + '</span></div>';
+      html += '<div class="nd-row"><span class="nd-key">Routing Table</span><span class="nd-val">' + snap.routing + '</span></div>';
+      html += '<div class="nd-row"><span class="nd-key">Directory</span><span class="nd-val">' + snap.directory + '</span></div>';
+      html += '<div class="nd-row"><span class="nd-key">Cache</span><span class="nd-val">' + snap.cache + '</span></div>';
+      html += '<div class="nd-row"><span class="nd-key">Registry</span><span class="nd-val">' + snap.registry + '</span></div>';
+      html += '<div class="nd-row"><span class="nd-key">Tombstones</span><span class="nd-val">' + snap.tombstones + '</span></div>';
+      html += '<div class="nd-row"><span class="nd-key">Repair Queue</span><span class="nd-val">' + snap.repair + '</span></div>';
+    }
+  } else {
+    html += '<div class="nd-row"><span class="nd-key">Community</span><span class="nd-val">' + (community[ni] !== undefined ? community[ni] : '-') + '</span></div>';
+    html += '<div class="nd-row"><span class="nd-key">Pushes Sent</span><span class="nd-val">' + (metricPushesSent[ni] || 0) + '</span></div>';
+    html += '<div class="nd-row"><span class="nd-key">Pushes Recv</span><span class="nd-val">' + (metricPushesRecv[ni] || 0) + '</span></div>';
+    html += '<div class="nd-row"><span class="nd-key">Keys</span><span class="nd-val">' + keyCount + '/' + totalKeys + '</span></div>';
+    html += '<div class="nd-row"><span class="nd-key">Peers</span><span class="nd-val">' + peerCount + '</span></div>';
+  }
   document.getElementById('ndStats').innerHTML = html;
 
   // Mini event log: last 20 events for this node up to cursor
@@ -584,6 +630,61 @@ function drawAllCharts() {
 
 function drawBadges() {
   const grid = document.getElementById('badgeGrid');
+
+  if (isDist) {
+    const hasSnaps = snapRounds.length > 0;
+    const lastRound = hasSnaps ? snapRounds.length - 1 : -1;
+
+    // Alive count
+    let aliveCount = N;
+    if (lastRound >= 0) {
+      aliveCount = 0;
+      for (let i = 0; i < N; i++) if (snapAlive[lastRound][i]) aliveCount++;
+    }
+
+    // Membership accuracy: fraction of alive nodes with correct member_count
+    let memAccuracy = 1.0;
+    if (lastRound >= 0) {
+      let correct = 0, alive = 0;
+      for (let i = 0; i < N; i++) {
+        if (!snapAlive[lastRound][i]) continue;
+        alive++;
+        if (snapMembers[lastRound][i] >= aliveCount - 1) correct++;
+      }
+      memAccuracy = alive > 0 ? correct / alive : 1;
+    }
+
+    // Registry max
+    let maxReg = 0;
+    if (lastRound >= 0) {
+      for (let i = 0; i < N; i++) if (snapRegistry[lastRound][i] > maxReg) maxReg = snapRegistry[lastRound][i];
+    }
+
+    // Cache total
+    let totalCache = 0;
+    if (lastRound >= 0) {
+      for (let i = 0; i < N; i++) if (snapAlive[lastRound][i]) totalCache += snapCache[lastRound][i];
+    }
+
+    // Repair queue total
+    let totalRepair = 0;
+    if (lastRound >= 0) {
+      for (let i = 0; i < N; i++) if (snapAlive[lastRound][i]) totalRepair += snapRepair[lastRound][i];
+    }
+
+    const memColor = memAccuracy >= 0.99 ? 'green' : memAccuracy >= 0.8 ? 'yellow' : 'red';
+    const aliveColor = aliveCount === N ? 'green' : aliveCount >= N * 0.8 ? 'yellow' : 'red';
+
+    grid.innerHTML =
+      badge(aliveColor, aliveCount + '/' + N, 'Alive Nodes') +
+      badge(memColor, (memAccuracy * 100).toFixed(0) + '%', 'Membership') +
+      badge('', maxReg, 'Registry Size') +
+      badge('', totalCache, 'Cache Total') +
+      badge(totalRepair > 0 ? 'yellow' : 'green', totalRepair, 'Repair Queue') +
+      badge('', allEvents.length, 'Events');
+    return;
+  }
+
   const hasSnaps = snapRounds.length > 0;
 
   // Delivery ratio
@@ -676,10 +777,26 @@ function drawConvergenceChart() {
 
   // Compute data points
   const pts = [];
-  for (let r = 0; r < snapRounds.length; r++) {
-    let full = 0;
-    for (let i = 0; i < N; i++) if (snapEntries[r][i] >= totalKeys) full++;
-    pts.push({ round: snapRounds[r], pct: N > 0 ? full / N * 100 : 0 });
+  if (isDist) {
+    // Membership convergence: fraction of alive nodes with correct member count per round
+    for (let r = 0; r < snapRounds.length; r++) {
+      let alive = 0, correct = 0;
+      let aliveCount = 0;
+      for (let i = 0; i < N; i++) if (snapAlive[r][i]) aliveCount++;
+      for (let i = 0; i < N; i++) {
+        if (!snapAlive[r][i]) continue;
+        alive++;
+        if (snapMembers[r][i] >= aliveCount - 1) correct++;
+      }
+      pts.push({ round: snapRounds[r], pct: alive > 0 ? correct / alive * 100 : 0 });
+    }
+  } else {
+    // existing gossip convergence
+    for (let r = 0; r < snapRounds.length; r++) {
+      let full = 0;
+      for (let i = 0; i < N; i++) if (snapEntries[r][i] >= totalKeys) full++;
+      pts.push({ round: snapRounds[r], pct: N > 0 ? full / N * 100 : 0 });
+    }
   }
 
   // Draw fill
@@ -803,7 +920,12 @@ function drawHeatmap() {
       const ni = sortedIdx[row];
       const entries = snapEntries[col][ni] || 0;
       const pct = totalKeys > 0 ? Math.round(entries / totalKeys * 100) : 0;
-      tooltip.textContent = nodeNames[ni] + ' at round ' + snapRounds[col] + ': ' + entries + '/' + totalKeys + ' keys (' + pct + '%)';
+      // Tooltip text depends on trace type
+      if (isDist) {
+        tooltip.textContent = nodeNames[ni] + ' at round ' + snapRounds[col] + ': registry ' + entries;
+      } else {
+        tooltip.textContent = nodeNames[ni] + ' at round ' + snapRounds[col] + ': ' + entries + '/' + totalKeys + ' keys (' + pct + '%)';
+      }
       tooltip.style.display = 'block';
       tooltip.style.left = (ex + 12) + 'px'; tooltip.style.top = (ey - 20) + 'px';
     } else { tooltip.style.display = 'none'; }
@@ -831,16 +953,28 @@ function drawLoadHistogram() {
   let curRound = 0;
   if (replayCursor > 0 && replayCursor <= allEvents.length) curRound = allEvents[replayCursor - 1].tick;
 
-  // Find the closest round in cumulPushRecv
-  let bestR = -1;
-  for (let r = 0; r < snapRounds.length; r++) {
-    if (snapRounds[r] <= curRound) bestR = r;
-  }
-
-  if (bestR >= 0 && cumulPushRecv.length > bestR) {
-    data = cumulPushRecv[bestR];
+  if (isDist) {
+    // Show cache size per node at current round
+    data = new Int32Array(N);
+    let bestR = -1;
+    for (let r = 0; r < snapRounds.length; r++) {
+      if (snapRounds[r] <= curRound) bestR = r;
+    }
+    if (bestR >= 0) {
+      for (let i = 0; i < N; i++) data[i] = snapCache[bestR][i];
+    }
   } else {
-    data = metricPushesRecv; // fallback: total
+    // Find the closest round in cumulPushRecv
+    let bestR = -1;
+    for (let r = 0; r < snapRounds.length; r++) {
+      if (snapRounds[r] <= curRound) bestR = r;
+    }
+
+    if (bestR >= 0 && cumulPushRecv.length > bestR) {
+      data = cumulPushRecv[bestR];
+    } else {
+      data = metricPushesRecv; // fallback: total
+    }
   }
 
   // Compute stats
@@ -998,37 +1132,76 @@ function drawGraph() {
     }
   }
 
-  // ── Nodes (community-colored) ──
+  // ── Nodes ──
   if (showNodes) {
-    const useCommunityColor = numCommunities > 1;
     let flashNodeI = -1;
 
-    if (useCommunityColor) {
-      // Batch by community color
-      for (let c = 0; c < numCommunities; c++) {
-        ctx2d.beginPath();
-        for (let i = 0; i < N; i++) {
-          if (community[i] !== c) continue;
-          const px = posX[i], py = posY[i];
-          if (px+baseR < v0x || px-baseR > v1x || py+baseR < v0y || py-baseR > v1y) continue;
-          if (hasNodeFlash && i === flashNode) { flashNodeI = i; continue; }
-          ctx2d.moveTo(px+baseR, py); ctx2d.arc(px, py, baseR, 0, 2*Math.PI);
-        }
-        ctx2d.fillStyle = communityColors[c % communityColors.length]; ctx2d.fill();
-        if (showStroke) { ctx2d.strokeStyle = '#1a1d2e'; ctx2d.lineWidth = 1/vs; ctx2d.stroke(); }
+    if (isDist) {
+      // Distribution: color by alive/dead
+      let curRound = 0;
+      if (replayCursor > 0 && replayCursor <= allEvents.length) curRound = allEvents[replayCursor - 1].tick;
+      let curAlive = null;
+      for (let r = snapRounds.length - 1; r >= 0; r--) {
+        if (snapRounds[r] <= curRound) { curAlive = snapAlive[r]; break; }
       }
-    } else {
+
+      // Draw alive nodes
       ctx2d.beginPath();
       for (let i = 0; i < N; i++) {
+        const alive = curAlive ? curAlive[i] : 1;
+        if (!alive) continue;
         const px = posX[i], py = posY[i];
         if (px+baseR < v0x || px-baseR > v1x || py+baseR < v0y || py-baseR > v1y) continue;
         if (hasNodeFlash && i === flashNode) { flashNodeI = i; continue; }
         ctx2d.moveTo(px+baseR, py); ctx2d.arc(px, py, baseR, 0, 2*Math.PI);
       }
-      ctx2d.fillStyle = '#6366f1'; ctx2d.fill();
-      if (showStroke) { ctx2d.strokeStyle = '#4f46e5'; ctx2d.lineWidth = 1.5/vs; ctx2d.stroke(); }
+      ctx2d.fillStyle = '#22c55e'; ctx2d.fill();
+      if (showStroke) { ctx2d.strokeStyle = '#16a34a'; ctx2d.lineWidth = 1.5/vs; ctx2d.stroke(); }
+
+      // Draw dead nodes
+      ctx2d.beginPath();
+      for (let i = 0; i < N; i++) {
+        const alive = curAlive ? curAlive[i] : 1;
+        if (alive) continue;
+        const px = posX[i], py = posY[i];
+        if (px+baseR < v0x || px-baseR > v1x || py+baseR < v0y || py-baseR > v1y) continue;
+        if (hasNodeFlash && i === flashNode) { flashNodeI = i; continue; }
+        ctx2d.moveTo(px+baseR, py); ctx2d.arc(px, py, baseR, 0, 2*Math.PI);
+      }
+      ctx2d.fillStyle = '#ef4444'; ctx2d.fill();
+      if (showStroke) { ctx2d.strokeStyle = '#dc2626'; ctx2d.lineWidth = 1.5/vs; ctx2d.stroke(); }
+    } else {
+      // Gossip: existing community/default coloring
+      const useCommunityColor = numCommunities > 1;
+
+      if (useCommunityColor) {
+        // Batch by community color
+        for (let c = 0; c < numCommunities; c++) {
+          ctx2d.beginPath();
+          for (let i = 0; i < N; i++) {
+            if (community[i] !== c) continue;
+            const px = posX[i], py = posY[i];
+            if (px+baseR < v0x || px-baseR > v1x || py+baseR < v0y || py-baseR > v1y) continue;
+            if (hasNodeFlash && i === flashNode) { flashNodeI = i; continue; }
+            ctx2d.moveTo(px+baseR, py); ctx2d.arc(px, py, baseR, 0, 2*Math.PI);
+          }
+          ctx2d.fillStyle = communityColors[c % communityColors.length]; ctx2d.fill();
+          if (showStroke) { ctx2d.strokeStyle = '#1a1d2e'; ctx2d.lineWidth = 1/vs; ctx2d.stroke(); }
+        }
+      } else {
+        ctx2d.beginPath();
+        for (let i = 0; i < N; i++) {
+          const px = posX[i], py = posY[i];
+          if (px+baseR < v0x || px-baseR > v1x || py+baseR < v0y || py-baseR > v1y) continue;
+          if (hasNodeFlash && i === flashNode) { flashNodeI = i; continue; }
+          ctx2d.moveTo(px+baseR, py); ctx2d.arc(px, py, baseR, 0, 2*Math.PI);
+        }
+        ctx2d.fillStyle = '#6366f1'; ctx2d.fill();
+        if (showStroke) { ctx2d.strokeStyle = '#4f46e5'; ctx2d.lineWidth = 1.5/vs; ctx2d.stroke(); }
+      }
     }
 
+    // Flash node (shared)
     if (flashNodeI >= 0) {
       const t = 1-(now-flashNodeT)/400, rad = baseR+6*t;
       ctx2d.beginPath();
@@ -1081,6 +1254,19 @@ function formatDetail(kind, detail) {
     case 'PeerRemoved': return '- ' + (detail.peer_name || detail.peer);
     case 'QueryReceived': return 'key=' + detail.key;
     case 'StateSnapshot': return detail.entries + ' entries, ' + detail.peer_count + ' peers';
+    case 'Joined': return 'seed: ' + detail.seed_addr;
+    case 'MembershipChanged': return detail.target + ' → ' + detail.new_state;
+    case 'PingSent': return '→ ' + detail.target;
+    case 'AckReceived': return '← ' + detail.from;
+    case 'ActorRegistered': return 'actor: ' + detail.actor_id;
+    case 'ActorStored': return detail.actor_id + ' on ' + detail.on_node;
+    case 'ActorResolved': return detail.actor_id + ' → ' + detail.found_on;
+    case 'ActorResolveFailed': return detail.actor_id + ': ' + detail.reason;
+    case 'NameRegistered': return '"' + detail.name + '" on node ' + detail.node_idx;
+    case 'NameUnregistered': return '"' + detail.name + '" on node ' + detail.node_idx;
+    case 'NameResolved': return '"' + detail.name + '" → ' + detail.result;
+    case 'NodeKilled': return '';
+    case 'NodeRevived': return '';
     default: return JSON.stringify(detail);
   }
 }
@@ -1089,6 +1275,11 @@ function makeRow(ev) {
   const tr = document.createElement('tr');
   if (ev.kind === 'GossipRoundStarted') tr.className = 'highlight-push';
   else if (ev.kind === 'LocalSet') tr.className = 'highlight-set';
+  else if (ev.kind === 'NodeKilled') tr.className = 'highlight-kill';
+  else if (ev.kind === 'NodeRevived') tr.className = 'highlight-revive';
+  else if (ev.kind === 'MembershipChanged') tr.className = 'highlight-membership';
+  else if (ev.kind === 'NameRegistered' || ev.kind === 'NameUnregistered') tr.className = 'highlight-registry';
+  else if (ev.kind === 'PingSent' || ev.kind === 'AckReceived') tr.className = 'highlight-ping';
   tr.innerHTML = '<td>'+ev.seq+'</td><td>'+ev.tick+'</td><td>'+(ev.thread||'-')+'</td><td>'+ev.node+'</td><td>'+ev.kind+'</td><td>'+formatDetail(ev.kind, ev.detail)+'</td>';
   return tr;
 }
@@ -1200,6 +1391,14 @@ function replayToImpl(pos) {
       const f = ev.detail.from_name || ev.detail.from;
       if (f) { flashSrc = nodeIdx.get(f) ?? -1; flashDst = nodeIdx.get(ev.node) ?? -1; flashEdgeT = performance.now(); }
     }
+    if (ev.kind === 'PingSent' && ev.detail) {
+      const t = ev.detail.target;
+      if (t) { flashSrc = nodeIdx.get(ev.node) ?? -1; flashDst = nodeIdx.get(t) ?? -1; flashEdgeT = performance.now(); }
+    }
+    if (ev.kind === 'AckReceived' && ev.detail) {
+      const f = ev.detail.from;
+      if (f) { flashSrc = nodeIdx.get(f) ?? -1; flashDst = nodeIdx.get(ev.node) ?? -1; flashEdgeT = performance.now(); }
+    }
   }
 
   document.getElementById('replaySlider').value = pos;
@@ -1229,6 +1428,9 @@ function resetState() {
   metricPushesSent = new Int32Array(0); metricPushesRecv = new Int32Array(0);
   metricRedundant = 0; metricTotalPushes = 0; metricNoPeers = 0;
   cumulPushRecv = []; eventRoundMap = [];
+  isDist = false;
+  snapMembers = []; snapRegistry = []; snapCache = []; snapAlive = [];
+  snapRouting = []; snapRepair = []; snapDirectory = []; snapTombstone = [];
   community = new Int32Array(0); numCommunities = 0; communityHulls = [];
   document.getElementById('eventTableBody').textContent = '';
   document.getElementById('workerColumns').innerHTML = '';
@@ -1247,6 +1449,7 @@ async function loadTrace(file) {
   const resp = await fetch('/trace.json?file=' + encodeURIComponent(file));
   if (!resp.ok) { dot.className = 'status-dot error'; statusText.textContent = 'Failed to load trace'; return; }
   const trace = await resp.json();
+  isDist = (trace.trace_type === 'distribution');
 
   // Build node index
   nodeNames = trace.node_names;
@@ -1271,85 +1474,138 @@ async function loadTrace(file) {
   allEvents = [];
   numRounds = trace.num_rounds || 0;
 
-  // First pass: collect snapshots grouped by tick
-  const snapByTick = new Map(); // tick -> Map(nodeIdx -> {entries, peer_count})
-  for (const ev of trace.events) {
-    const isObj = typeof ev.kind === 'object';
-    if (isObj && 'StateSnapshot' in ev.kind) {
-      const snap = ev.kind.StateSnapshot.snapshot || ev.kind.StateSnapshot;
-      const ni = nodeIdx.get(ev.node_name);
-      if (ni === undefined) continue;
-      const entriesCount = snap.entries ? Object.keys(snap.entries).length : 0;
-      const peerCount = snap.peer_count || 0;
-      if (!snapByTick.has(ev.tick)) snapByTick.set(ev.tick, new Map());
-      snapByTick.get(ev.tick).set(ni, { entries: entriesCount, peer_count: peerCount });
-      if (entriesCount > totalKeys) totalKeys = entriesCount;
-      continue;
+  if (isDist) {
+    // Distribution: snapshots come from trace.snapshots_per_round directly
+    snapRounds = [];
+    for (let r = 0; r < (trace.snapshots_per_round || []).length; r++) {
+      const roundSnaps = trace.snapshots_per_round[r];
+      snapRounds.push(r + 1); // 1-indexed round
+      const memArr = new Int32Array(N);
+      const regArr = new Int32Array(N);
+      const cacheArr = new Int32Array(N);
+      const aliveArr = new Uint8Array(N);
+      const routingArr = new Int32Array(N);
+      const repairArr = new Int32Array(N);
+      const dirArr = new Int32Array(N);
+      const tombArr = new Int32Array(N);
+      for (const [nodeName, snap] of roundSnaps) {
+        const ni = nodeIdx.get(nodeName);
+        if (ni === undefined) continue;
+        memArr[ni] = snap.member_count || 0;
+        regArr[ni] = snap.registry_size || 0;
+        cacheArr[ni] = snap.cache_size || 0;
+        aliveArr[ni] = snap.is_alive ? 1 : 0;
+        routingArr[ni] = snap.routing_table_size || 0;
+        repairArr[ni] = snap.repair_queue_size || 0;
+        dirArr[ni] = snap.directory_entry_count || 0;
+        tombArr[ni] = snap.registry_tombstone_count || 0;
+      }
+      snapMembers.push(memArr);
+      snapRegistry.push(regArr);
+      snapCache.push(cacheArr);
+      snapAlive.push(aliveArr);
+      snapRouting.push(routingArr);
+      snapRepair.push(repairArr);
+      snapDirectory.push(dirArr);
+      snapTombstone.push(tombArr);
+      // For convergence chart compatibility, use registry_size as "entries"
+      snapEntries.push(regArr);
+      snapPeerCount.push(memArr);
+      // Track max for heatmap scaling
+      for (let i = 0; i < N; i++) {
+        if (regArr[i] > totalKeys) totalKeys = regArr[i];
+      }
     }
-    if (!isObj && ev.kind === 'StateSnapshot') continue;
-    let kind, detail;
-    if (isObj) { for (kind in ev.kind) break; detail = ev.kind[kind] || null; }
-    else { kind = ev.kind; detail = null; }
-    allEvents.push({ seq: seq++, tick: ev.tick, node: ev.node_name, thread: ev.thread_name, kind, detail });
-  }
 
-  // Build snapshot arrays sorted by round
-  snapRounds = Array.from(snapByTick.keys()).sort((a, b) => a - b);
-  snapEntries = []; snapPeerCount = [];
-  for (const tick of snapRounds) {
-    const eArr = new Int32Array(N);
-    const pArr = new Int32Array(N);
-    const m = snapByTick.get(tick);
-    for (const [ni, d] of m) { eArr[ni] = d.entries; pArr[ni] = d.peer_count; }
-    snapEntries.push(eArr);
-    snapPeerCount.push(pArr);
-  }
-
-  // Compute per-node metrics from events
-  metricPushesSent = new Int32Array(N);
-  metricPushesRecv = new Int32Array(N);
-  metricRedundant = 0; metricTotalPushes = 0; metricNoPeers = 0;
-
-  // Also build cumulative push-recv per round
-  const roundSet = new Set(snapRounds);
-  cumulPushRecv = [];
-  let runningRecv = new Int32Array(N);
-
-  for (let i = 0; i < allEvents.length; i++) {
-    const ev = allEvents[i];
-    const ni = nodeIdx.get(ev.node);
-    if (ni === undefined) continue;
-    if (ev.kind === 'GossipRoundStarted') {
-      metricPushesSent[ni]++;
-      metricTotalPushes++;
+    // Distribution events (no StateSnapshot filtering needed)
+    for (const ev of trace.events) {
+      const isObj = typeof ev.kind === 'object';
+      let kind, detail;
+      if (isObj) { for (kind in ev.kind) break; detail = ev.kind[kind] || null; }
+      else { kind = ev.kind; detail = null; }
+      allEvents.push({ seq: seq++, tick: ev.tick, node: ev.node_name, thread: null, kind, detail });
     }
-    if (ev.kind === 'PushReceived') {
-      metricPushesRecv[ni]++;
-      runningRecv[ni]++;
-      if (ev.detail && ev.detail.keys_updated === 0) metricRedundant++;
+  } else {
+    // First pass: collect snapshots grouped by tick
+    const snapByTick = new Map(); // tick -> Map(nodeIdx -> {entries, peer_count})
+    for (const ev of trace.events) {
+      const isObj = typeof ev.kind === 'object';
+      if (isObj && 'StateSnapshot' in ev.kind) {
+        const snap = ev.kind.StateSnapshot.snapshot || ev.kind.StateSnapshot;
+        const ni = nodeIdx.get(ev.node_name);
+        if (ni === undefined) continue;
+        const entriesCount = snap.entries ? Object.keys(snap.entries).length : 0;
+        const peerCount = snap.peer_count || 0;
+        if (!snapByTick.has(ev.tick)) snapByTick.set(ev.tick, new Map());
+        snapByTick.get(ev.tick).set(ni, { entries: entriesCount, peer_count: peerCount });
+        if (entriesCount > totalKeys) totalKeys = entriesCount;
+        continue;
+      }
+      if (!isObj && ev.kind === 'StateSnapshot') continue;
+      let kind, detail;
+      if (isObj) { for (kind in ev.kind) break; detail = ev.kind[kind] || null; }
+      else { kind = ev.kind; detail = null; }
+      allEvents.push({ seq: seq++, tick: ev.tick, node: ev.node_name, thread: ev.thread_name, kind, detail });
     }
-    if (ev.kind === 'GossipRoundNoPeers') { metricNoPeers++; }
-  }
 
-  // Build cumulative recv snapshots aligned to snap rounds
-  // Re-scan to build per-round cumulative
-  if (snapRounds.length > 0) {
-    const cumRecv = new Int32Array(N);
-    let sri = 0;
-    for (let i = 0; i < allEvents.length && sri < snapRounds.length; i++) {
+    // Build snapshot arrays sorted by round
+    snapRounds = Array.from(snapByTick.keys()).sort((a, b) => a - b);
+    snapEntries = []; snapPeerCount = [];
+    for (const tick of snapRounds) {
+      const eArr = new Int32Array(N);
+      const pArr = new Int32Array(N);
+      const m = snapByTick.get(tick);
+      for (const [ni, d] of m) { eArr[ni] = d.entries; pArr[ni] = d.peer_count; }
+      snapEntries.push(eArr);
+      snapPeerCount.push(pArr);
+    }
+
+    // Compute per-node metrics from events
+    metricPushesSent = new Int32Array(N);
+    metricPushesRecv = new Int32Array(N);
+    metricRedundant = 0; metricTotalPushes = 0; metricNoPeers = 0;
+
+    // Also build cumulative push-recv per round
+    const roundSet = new Set(snapRounds);
+    cumulPushRecv = [];
+    let runningRecv = new Int32Array(N);
+
+    for (let i = 0; i < allEvents.length; i++) {
       const ev = allEvents[i];
+      const ni = nodeIdx.get(ev.node);
+      if (ni === undefined) continue;
+      if (ev.kind === 'GossipRoundStarted') {
+        metricPushesSent[ni]++;
+        metricTotalPushes++;
+      }
       if (ev.kind === 'PushReceived') {
-        const ni = nodeIdx.get(ev.node);
-        if (ni !== undefined) cumRecv[ni]++;
+        metricPushesRecv[ni]++;
+        runningRecv[ni]++;
+        if (ev.detail && ev.detail.keys_updated === 0) metricRedundant++;
       }
-      // When we pass a snapshot round boundary, save
-      while (sri < snapRounds.length && ev.tick >= snapRounds[sri]) {
-        cumulPushRecv.push(new Int32Array(cumRecv));
-        sri++;
-      }
+      if (ev.kind === 'GossipRoundNoPeers') { metricNoPeers++; }
     }
-    // Fill remaining
-    while (sri < snapRounds.length) { cumulPushRecv.push(new Int32Array(cumRecv)); sri++; }
+
+    // Build cumulative recv snapshots aligned to snap rounds
+    // Re-scan to build per-round cumulative
+    if (snapRounds.length > 0) {
+      const cumRecv = new Int32Array(N);
+      let sri = 0;
+      for (let i = 0; i < allEvents.length && sri < snapRounds.length; i++) {
+        const ev = allEvents[i];
+        if (ev.kind === 'PushReceived') {
+          const ni = nodeIdx.get(ev.node);
+          if (ni !== undefined) cumRecv[ni]++;
+        }
+        // When we pass a snapshot round boundary, save
+        while (sri < snapRounds.length && ev.tick >= snapRounds[sri]) {
+          cumulPushRecv.push(new Int32Array(cumRecv));
+          sri++;
+        }
+      }
+      // Fill remaining
+      while (sri < snapRounds.length) { cumulPushRecv.push(new Int32Array(cumRecv)); sri++; }
+    }
   }
 
   // Index PeerAdded edges
@@ -1395,9 +1651,32 @@ async function loadTrace(file) {
   computeCommunityHulls();
 
   dot.className = 'status-dot ready';
-  statusText.textContent = trace.name + ' (' + allEvents.length + ' events)';
+  statusText.textContent = trace.name + (isDist ? ' [distribution]' : ' [gossip]') + ' (' + allEvents.length + ' events)';
   drawGraph();
   drawAllCharts();
+
+  // Update panel labels
+  document.querySelector('.worker-panel h2').textContent = isDist ? 'Node Status' : 'Worker Logs';
+  document.querySelector('#heatSection h3').textContent = isDist ? 'Registry Propagation' : 'Propagation Heatmap';
+  document.querySelector('#loadSection h3').textContent = isDist ? 'Cache Utilization' : 'Load Distribution';
+  document.querySelector('#convSection h3').textContent = isDist ? 'Membership Convergence' : 'Convergence Curve';
+
+  // Update stat labels
+  if (isDist) {
+    document.querySelectorAll('.stat-label')[1].textContent = 'Alive';
+  } else {
+    document.querySelectorAll('.stat-label')[1].textContent = 'Edges';
+  }
+
+  // Update stats with distribution-specific values
+  if (isDist && snapAlive.length > 0) {
+    let alive = 0;
+    const lastSnap = snapAlive[snapAlive.length - 1];
+    for (let i = 0; i < N; i++) if (lastSnap[i]) alive++;
+    updateStats(N, alive, allEvents.length, numRounds, numRounds);
+  } else {
+    updateStats(N, totalEdges, allEvents.length, numRounds, numRounds);
+  }
 
   // Replay controls
   document.getElementById('replayControls').style.display = 'flex';
@@ -1426,7 +1705,7 @@ resizeCanvas();
   catch { dot.className='status-dot error'; statusText.textContent='Failed to fetch trace list'; select.innerHTML='<option value="">Error</option>'; return; }
   if (!traces.length) { dot.className='status-dot error'; statusText.textContent='No traces found'; select.innerHTML='<option value="">No traces found</option>'; return; }
   select.innerHTML = '';
-  traces.forEach(t => { const o = document.createElement('option'); o.value = t.file; o.textContent = t.name+' ('+t.nodes+' nodes, '+t.events+' events)'; select.appendChild(o); });
+  traces.forEach(t => { const o = document.createElement('option'); o.value = t.file; o.textContent = '[' + (t.trace_type || 'gossip') + '] ' + t.name+' ('+t.nodes+' nodes, '+t.events+' events)'; select.appendChild(o); });
   select.disabled = false;
   select.onchange = () => { if (select.value) loadTrace(select.value); };
   loadTrace(traces[0].file);

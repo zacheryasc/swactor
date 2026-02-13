@@ -326,3 +326,173 @@ pub fn check_convergence(
         description: "Membership views converge after faults stabilize".into(),
     }
 }
+
+// ─── Registry & Lifecycle Property Checks ─────────────────────────────────
+
+/// Check that all alive nodes have at least `min_registry_size` registry entries at the end.
+pub fn check_registry_propagation(
+    trace: &DistTrace,
+    min_registry_size: usize,
+) -> crate::properties::PropertyResult {
+    let passed = if let Some(last_round) = trace.snapshots_per_round.last() {
+        last_round
+            .iter()
+            .filter(|(_, s)| s.is_alive)
+            .all(|(_, s)| s.registry_size >= min_registry_size)
+    } else {
+        false
+    };
+    let actual = if let Some(last_round) = trace.snapshots_per_round.last() {
+        let sizes: Vec<usize> = last_round
+            .iter()
+            .filter(|(_, s)| s.is_alive)
+            .map(|(_, s)| s.registry_size)
+            .collect();
+        format!("{sizes:?}")
+    } else {
+        "no data".into()
+    };
+    crate::properties::PropertyResult {
+        name: "registry_propagation".into(),
+        category: "Registry".into(),
+        passed,
+        expected: format!("all alive nodes have ≥{min_registry_size} registry entries"),
+        actual,
+        description: "Registry entries propagate to all nodes via gossip".into(),
+    }
+}
+
+/// Check that all alive nodes agree on registry tombstone count at the end.
+pub fn check_registry_tombstones(
+    trace: &DistTrace,
+    min_tombstones: usize,
+) -> crate::properties::PropertyResult {
+    let passed = if let Some(last_round) = trace.snapshots_per_round.last() {
+        last_round
+            .iter()
+            .filter(|(_, s)| s.is_alive)
+            .all(|(_, s)| s.registry_tombstone_count >= min_tombstones)
+    } else {
+        false
+    };
+    let actual = if let Some(last_round) = trace.snapshots_per_round.last() {
+        let counts: Vec<usize> = last_round
+            .iter()
+            .filter(|(_, s)| s.is_alive)
+            .map(|(_, s)| s.registry_tombstone_count)
+            .collect();
+        format!("{counts:?}")
+    } else {
+        "no data".into()
+    };
+    crate::properties::PropertyResult {
+        name: "registry_tombstones".into(),
+        category: "Registry".into(),
+        passed,
+        expected: format!("all alive nodes have ≥{min_tombstones} tombstones"),
+        actual,
+        description: "Registry tombstones propagate to all nodes".into(),
+    }
+}
+
+/// Check that at least one survivor has a non-empty repair queue after a node death.
+pub fn check_repair_queue_populated(
+    trace: &DistTrace,
+    after_round: usize,
+) -> crate::properties::PropertyResult {
+    let populated = trace
+        .snapshots_per_round
+        .iter()
+        .skip(after_round)
+        .any(|round_snaps| {
+            round_snaps
+                .iter()
+                .any(|(_, s)| s.is_alive && s.repair_queue_size > 0)
+        });
+    crate::properties::PropertyResult {
+        name: "repair_queue_populated".into(),
+        category: "Lifecycle".into(),
+        passed: populated,
+        expected: format!("repair queue populated after round {after_round}"),
+        actual: if populated {
+            "populated".into()
+        } else {
+            let final_sizes: Vec<usize> = trace
+                .snapshots_per_round
+                .last()
+                .map(|r| {
+                    r.iter()
+                        .filter(|(_, s)| s.is_alive)
+                        .map(|(_, s)| s.repair_queue_size)
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("final repair_queue_sizes: {final_sizes:?}")
+        },
+        description: "Repair queue populated after node death".into(),
+    }
+}
+
+/// Check that routing_table_size ≤ alive_count for all alive nodes at every round.
+pub fn check_routing_table_bounded(
+    trace: &DistTrace,
+) -> crate::properties::PropertyResult {
+    let mut violation = None;
+
+    for (round_idx, round_snaps) in trace.snapshots_per_round.iter().enumerate() {
+        let alive_count = round_snaps.iter().filter(|(_, s)| s.is_alive).count();
+        for (name, snap) in round_snaps {
+            if snap.is_alive && snap.routing_table_size > alive_count {
+                violation = Some(format!(
+                    "round {}: {} has routing_table_size={} but alive_count={}",
+                    round_idx + 1, name, snap.routing_table_size, alive_count
+                ));
+                break;
+            }
+        }
+        if violation.is_some() {
+            break;
+        }
+    }
+
+    crate::properties::PropertyResult {
+        name: "routing_table_bounded".into(),
+        category: "Invariant".into(),
+        passed: violation.is_none(),
+        expected: "routing_table_size ≤ alive_count at every round".into(),
+        actual: violation.unwrap_or_else(|| "all within bounds".into()),
+        description: "Routing table never exceeds alive membership".into(),
+    }
+}
+
+/// Check that cache_size ≤ cache_capacity for all alive nodes at every round.
+pub fn check_cache_bounded(
+    trace: &DistTrace,
+    cache_capacity: usize,
+) -> crate::properties::PropertyResult {
+    let mut violation = None;
+
+    for (round_idx, round_snaps) in trace.snapshots_per_round.iter().enumerate() {
+        for (name, snap) in round_snaps {
+            if snap.is_alive && snap.cache_size > cache_capacity {
+                violation = Some(format!(
+                    "round {}: {} has cache_size={} but capacity={}",
+                    round_idx + 1, name, snap.cache_size, cache_capacity
+                ));
+                break;
+            }
+        }
+        if violation.is_some() {
+            break;
+        }
+    }
+
+    crate::properties::PropertyResult {
+        name: "cache_bounded".into(),
+        category: "Invariant".into(),
+        passed: violation.is_none(),
+        expected: format!("cache_size ≤ {cache_capacity} at every round"),
+        actual: violation.unwrap_or_else(|| "all within bounds".into()),
+        description: "Cache never exceeds configured capacity".into(),
+    }
+}

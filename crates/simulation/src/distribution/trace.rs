@@ -11,6 +11,9 @@ pub enum DistributionEventKind {
     ActorStored { actor_id: String, on_node: String },
     ActorResolved { actor_id: String, found_on: String },
     ActorResolveFailed { actor_id: String, reason: String },
+    NameRegistered { name: String, node_idx: usize },
+    NameUnregistered { name: String, node_idx: usize },
+    NameResolved { name: String, result: String },
     NodeKilled,
     NodeRevived,
 }
@@ -23,5 +26,7 @@ pub struct DistributionSnapshot {
     pub directory_entry_count: usize,
     pub cache_size: usize,
     pub repair_queue_size: usize,
+    pub registry_size: usize,
+    pub registry_tombstone_count: usize,
     pub is_alive: bool,
 }

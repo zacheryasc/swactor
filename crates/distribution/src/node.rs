@@ -14,7 +14,7 @@ use crate::kademlia::repair::{RepairQueue, RepublishTracker};
 use crate::kademlia::routing_table::RoutingTable;
 use crate::registry::{
     pack_combined_piggyback, unpack_combined_piggyback, ClusterRegistry, RegistryConfig,
-    RegistryEvent,
+    RegistryEntry, RegistryEvent,
 };
 use crate::swim::node::{NodeAction, SwimNode};
 use crate::swim::probe::SwimConfig;
@@ -137,17 +137,7 @@ impl DistributedNode {
         let actions = self.swim.tick();
 
         // Process membership changes from SWIM
-        let membership_changes: Vec<_> = actions
-            .iter()
-            .filter_map(|a| match a {
-                NodeAction::MembershipChanged { node_id, state, .. } => Some((*node_id, *state)),
-                _ => None,
-            })
-            .collect();
-
-        for (node_id, state) in membership_changes {
-            self.handle_membership_change(node_id, state);
-        }
+        self.process_membership_changes(&actions);
 
         // Periodic republish
         let to_republish = self.republish.tick(self.tick_count);
@@ -167,21 +157,30 @@ impl DistributedNode {
     // ─── SWIM message handling (delegate to SwimNode) ───────────────────
 
     pub fn handle_ping(&mut self, from: NodeId, from_addr: SocketAddr, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        let membership_bytes = self.extract_registry_piggyback(piggyback);
+        let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
         let actions = self.swim.handle_ping(from, from_addr, sequence, &membership_bytes);
+        // Process membership BEFORE merging registry — otherwise a death
+        // notification in this same piggyback would immediately tombstone
+        // freshly received registry entries instead of pre-existing ones.
+        self.process_membership_changes(&actions);
+        self.merge_registry_entries(registry_entries);
         self.maybe_update_routing_table(from, from_addr);
         self.inject_registry_piggyback(actions)
     }
 
     pub fn handle_ack(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        let membership_bytes = self.extract_registry_piggyback(piggyback);
+        let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
         let actions = self.swim.handle_ack(from, sequence, &membership_bytes);
+        self.process_membership_changes(&actions);
+        self.merge_registry_entries(registry_entries);
         self.inject_registry_piggyback(actions)
     }
 
     pub fn handle_ping_req(&mut self, from: NodeId, target: NodeId, target_addr: SocketAddr, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        let membership_bytes = self.extract_registry_piggyback(piggyback);
+        let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
         let actions = self.swim.handle_ping_req(from, target, target_addr, sequence, &membership_bytes);
+        self.process_membership_changes(&actions);
+        self.merge_registry_entries(registry_entries);
         self.inject_registry_piggyback(actions)
     }
 
@@ -310,12 +309,23 @@ impl DistributedNode {
         self.routing_table.insert(node_id, addr);
     }
 
+    fn process_membership_changes(&mut self, actions: &[NodeAction]) {
+        for action in actions {
+            if let NodeAction::MembershipChanged { node_id, state, .. } = action {
+                self.handle_membership_change(*node_id, *state);
+            }
+        }
+    }
+
     fn handle_membership_change(&mut self, node_id: NodeId, state: MemberState) {
         match state {
             MemberState::Alive => {
                 if let Some(entry) = self.swim.members().get(&node_id) {
                     self.routing_table.insert(node_id, entry.addr);
                 }
+                // Re-disseminate registry entries so the recovering node
+                // catches up on state accumulated during the partition.
+                self.registry.re_disseminate_all(self.cluster_size());
             }
             MemberState::Dead => {
                 self.routing_table.remove(&node_id);
@@ -358,13 +368,11 @@ impl DistributedNode {
             .collect()
     }
 
-    /// Extract registry entries from incoming piggyback, merge them, return membership-only bytes.
-    fn extract_registry_piggyback(&mut self, bytes: &[u8]) -> Vec<u8> {
-        let (membership_bytes, registry_entries) = unpack_combined_piggyback(bytes);
-        if !registry_entries.is_empty() {
-            self.registry.merge_batch(registry_entries, self.cluster_size());
+    /// Merge registry entries received from a piggyback payload.
+    fn merge_registry_entries(&mut self, entries: Vec<RegistryEntry>) {
+        if !entries.is_empty() {
+            self.registry.merge_batch(entries, self.cluster_size());
         }
-        membership_bytes
     }
 }
 

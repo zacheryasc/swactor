@@ -126,8 +126,9 @@ fn cluster_converges_under_10_percent_message_loss() {
     // Given: 5 nodes with 10% message loss from the start.
     // 10% loss is significant for SWIM because it can hit both direct probe
     // AND indirect probes in the same cycle, causing false suspicions.
-    // We verify the cluster degrades but doesn't crash, and at least some
-    // membership information survives.
+    // Dead reprobe is enabled so false deaths can self-correct — without it,
+    // correct death dissemination (via piggyback) causes cascading false deaths
+    // that collapse the entire cluster under even modest message loss.
     let config = DistributionSimConfig {
         name: "message-loss-10pct".into(),
         num_nodes: 5,
@@ -137,9 +138,9 @@ fn cluster_converges_under_10_percent_message_loss() {
         swim: distribution::swim::probe::SwimConfig {
             probe_interval: 1,
             probe_timeout: 5,
-            indirect_probes: 2,
-            suspicion_timeout: 20,
-            dead_reprobe_interval: 0,
+            indirect_probes: 3,
+            suspicion_timeout: 60,
+            dead_reprobe_interval: 15,
         },
         network_faults: vec![NetworkFault::SetDropRate {
             round: 1,
@@ -151,8 +152,8 @@ fn cluster_converges_under_10_percent_message_loss() {
     let trace = run_simulation(config);
     let metrics = analyze(&trace);
 
-    // With 10% loss and the deterministic LCG, SWIM's probe cycle is disrupted
-    // enough to cause false deaths. The test verifies:
+    // With 10% loss, SWIM's probe cycle is disrupted enough to cause
+    // false suspicions. Dead reprobe allows recovery. We verify:
     // 1. The simulation completes without panic (implicit — we got here)
     // 2. At least partial membership is maintained (some nodes still know about others)
     let result = check_membership_accuracy(&metrics, 0.15);
@@ -629,7 +630,9 @@ fn sequential_partitions_fragment_cluster() {
 #[test]
 fn cluster_survives_brief_message_loss() {
     // Given: 5 nodes with 15% loss for a brief window, then clean network.
-    // High suspicion timeout prevents false positives during the loss period.
+    // High suspicion timeout + dead reprobe prevents permanent false positives.
+    // Without dead reprobe, correct death dissemination causes cascading
+    // false deaths that collapse the cluster.
     let config = DistributionSimConfig {
         name: "brief-loss-recovery".into(),
         num_nodes: 5,
@@ -639,9 +642,9 @@ fn cluster_survives_brief_message_loss() {
         swim: distribution::swim::probe::SwimConfig {
             probe_interval: 1,
             probe_timeout: 5,
-            indirect_probes: 2,
-            suspicion_timeout: 20,
-            dead_reprobe_interval: 0,
+            indirect_probes: 3,
+            suspicion_timeout: 60,
+            dead_reprobe_interval: 15,
         },
         network_faults: vec![
             NetworkFault::SetDropRate {
