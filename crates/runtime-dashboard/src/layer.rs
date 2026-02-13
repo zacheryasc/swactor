@@ -20,6 +20,7 @@ pub struct DashboardEvent {
     pub level: String,
     pub message: String,
     pub worker_id: Option<usize>,
+    pub actor_addr: Option<String>,
     pub fields: serde_json::Map<String, serde_json::Value>,
 }
 
@@ -81,6 +82,28 @@ impl EventStore {
         let batch: Vec<DashboardEvent> = events.iter().skip(start).cloned().collect();
         let new_cursor = last_seq + 1;
         (batch, new_cursor)
+    }
+
+    /// Read recent events for a specific actor address (hex prefix match).
+    /// Returns up to `limit` most recent matching events.
+    pub fn read_for_actor(&self, actor_hex: &str, limit: usize) -> Vec<DashboardEvent> {
+        let events = self.events.lock().unwrap();
+        let lower = actor_hex.to_lowercase();
+        events
+            .iter()
+            .rev()
+            .filter(|e| {
+                e.actor_addr
+                    .as_ref()
+                    .map(|a| a.to_lowercase().starts_with(&lower) || a.to_lowercase().contains(&lower))
+                    .unwrap_or(false)
+            })
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect()
     }
 
     /// Drains the full recording log. Only available when recording is enabled.
@@ -183,22 +206,37 @@ where
         let mut visitor = FieldVisitor::new();
         event.record(&mut visitor);
 
-        // Walk span context to find worker_id
+        // Walk span context to find worker_id and actor_addr
         let mut worker_id = None;
+        let mut actor_addr = None;
         if let Some(scope) = ctx.event_scope(event) {
             for span in scope {
                 let exts = span.extensions();
-                if let Some(wid) = exts.get::<WorkerIdField>() {
-                    worker_id = Some(wid.0);
+                if worker_id.is_none() {
+                    if let Some(wid) = exts.get::<WorkerIdField>() {
+                        worker_id = Some(wid.0);
+                    }
+                }
+                if actor_addr.is_none() {
+                    if let Some(aa) = exts.get::<ActorAddrField>() {
+                        actor_addr = Some(aa.0.clone());
+                    }
+                }
+                if worker_id.is_some() && actor_addr.is_some() {
                     break;
                 }
             }
         }
 
-        // Also check if worker_id was a field on the event itself
+        // Also check if worker_id or actor_addr was a field on the event itself
         if worker_id.is_none() {
             if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id") {
                 worker_id = n.as_u64().map(|v| v as usize);
+            }
+        }
+        if actor_addr.is_none() {
+            if let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
+                actor_addr = Some(s.clone());
             }
         }
 
@@ -208,6 +246,7 @@ where
             level: event.metadata().level().to_string(),
             message: visitor.message,
             worker_id,
+            actor_addr,
             fields: visitor.fields,
         };
 
@@ -215,15 +254,18 @@ where
     }
 
     fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        // Extract worker_id from span fields and store in extensions
+        // Extract worker_id and actor_addr from span fields and store in extensions
         let mut visitor = FieldVisitor::new();
         attrs.record(&mut visitor);
 
-        if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id") {
-            if let Some(wid) = n.as_u64() {
-                if let Some(span) = ctx.span(id) {
+        if let Some(span) = ctx.span(id) {
+            if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id") {
+                if let Some(wid) = n.as_u64() {
                     span.extensions_mut().insert(WorkerIdField(wid as usize));
                 }
+            }
+            if let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
+                span.extensions_mut().insert(ActorAddrField(s.clone()));
             }
         }
     }
@@ -231,3 +273,6 @@ where
 
 /// Stored in span extensions to propagate worker_id to child events.
 struct WorkerIdField(usize);
+
+/// Stored in span extensions to propagate actor_addr to child events.
+struct ActorAddrField(String);

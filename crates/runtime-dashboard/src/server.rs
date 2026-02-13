@@ -8,11 +8,16 @@ use std::collections::HashMap;
 
 use swactor::runtime::Runtime;
 
+use crate::actor_detail_html::ACTOR_DETAIL_HTML;
 use crate::actors_html::ACTORS_HTML;
 use crate::collector::StatsCollector;
 use crate::dashboard_html::DASHBOARD_HTML;
+use crate::history::DashboardHistory;
 use crate::layer::EventStore;
+use crate::topology;
+use crate::topology_html::TOPOLOGY_HTML;
 use crate::trace::RuntimeTrace;
+use crate::warnings::{WarningConfig, WarningDetector};
 
 #[cfg(feature = "distribution")]
 use crate::distribution_collector::DistributionStatsProvider;
@@ -119,6 +124,7 @@ pub(crate) fn spawn_http_server(
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
     shutdown: Arc<AtomicBool>,
+    history: Arc<DashboardHistory>,
     port: u16,
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
@@ -134,6 +140,7 @@ pub(crate) fn spawn_http_server(
         let runtime = Arc::clone(&runtime);
         let collector = Arc::clone(&collector);
         let shutdown = Arc::clone(&shutdown);
+        let history = Arc::clone(&history);
         let cmd_router = Arc::clone(&cmd_router);
         #[cfg(feature = "distribution")]
         let distribution = Arc::clone(&distribution);
@@ -149,6 +156,7 @@ pub(crate) fn spawn_http_server(
                 match path {
                     "/" => respond_html(request, DASHBOARD_HTML, "live"),
                     "/actors" => respond_html(request, ACTORS_HTML, "live"),
+                    "/topology" => respond_html(request, TOPOLOGY_HTML, "live"),
                     #[cfg(feature = "distribution")]
                     "/distribution" => respond_html(request, DISTRIBUTION_HTML, "live"),
                     "/events" => {
@@ -158,12 +166,23 @@ pub(crate) fn spawn_http_server(
                             Arc::clone(&runtime),
                             Arc::clone(&collector),
                             Arc::clone(&shutdown),
+                            Arc::clone(&history),
                             #[cfg(feature = "distribution")]
                             Arc::clone(&distribution),
                         );
                     }
                     "/api/stats" => {
                         handle_stats_api(
+                            request,
+                            Arc::clone(&runtime),
+                            Arc::clone(&collector),
+                        );
+                    }
+                    "/api/history" => {
+                        handle_history_api(request, Arc::clone(&history));
+                    }
+                    "/api/topology" => {
+                        handle_topology_api(
                             request,
                             Arc::clone(&runtime),
                             Arc::clone(&collector),
@@ -185,11 +204,30 @@ pub(crate) fn spawn_http_server(
                             Arc::clone(&distribution),
                         );
                     }
+                    "/api/logs" => {
+                        handle_logs_api(request, &url, Arc::clone(&store));
+                    }
+                    _ if path.starts_with("/actor/") => {
+                        let hex = &path[7..]; // strip "/actor/"
+                        respond_actor_detail(request, hex);
+                    }
                     _ => respond_404(request),
                 }
             }
         });
     }
+}
+
+fn respond_actor_detail(request: tiny_http::Request, hex_addr: &str) {
+    let html = ACTOR_DETAIL_HTML
+        .replace("__DASHBOARD_MODE__", "live")
+        .replace("__ACTOR_ADDR__", hex_addr);
+    let response = tiny_http::Response::from_string(html).with_header(
+        "Content-Type: text/html; charset=utf-8"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
 }
 
 fn handle_live_sse(
@@ -198,6 +236,7 @@ fn handle_live_sse(
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
     shutdown: Arc<AtomicBool>,
+    history: Arc<DashboardHistory>,
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
 ) {
@@ -207,6 +246,14 @@ fn handle_live_sse(
     // Spawn producer thread
     thread::spawn(move || {
         let mut cursor: u64 = 0;
+        let mut warning_detector = WarningDetector::new(WarningConfig::default());
+        let mut tick_count: u64 = 0;
+
+        // Send initial history snapshot so sparklines render immediately
+        if history.sample_count() > 0 {
+            let json = history.worker_history_json();
+            let _ = tx.send(format_sse("history", &json));
+        }
 
         loop {
             // Send stats if runtime is available
@@ -217,9 +264,32 @@ fn handle_live_sse(
                     if let Some(col) = collector.lock().unwrap().as_ref() {
                         col.enrich(&mut stats);
                     }
+                    history.record(&stats);
+
+                    // Run warning detection
+                    let warnings = warning_detector.check(&stats);
+                    if !warnings.is_empty() {
+                        if let Ok(wjson) = serde_json::to_string(&warnings) {
+                            if tx.send(format_sse("warnings", &wjson)).is_err() {
+                                return;
+                            }
+                        }
+                    }
+
                     let json = serde_json::to_string(&stats).unwrap();
                     if tx.send(format_sse("stats", &json)).is_err() {
                         return;
+                    }
+
+                    // Send topology every 5th tick (~1/sec)
+                    tick_count += 1;
+                    if tick_count % 5 == 0 {
+                        let topo = topology::worker_topology(&stats);
+                        if let Ok(tjson) = serde_json::to_string(&topo) {
+                            if tx.send(format_sse("topology", &tjson)).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -345,6 +415,67 @@ fn handle_distribution_api(
         .to_string(),
     };
 
+    let response = tiny_http::Response::from_string(json).with_header(
+        "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+fn handle_topology_api(
+    request: tiny_http::Request,
+    runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
+    collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
+) {
+    let maybe_rt = runtime.lock().unwrap().clone();
+    let json = match maybe_rt {
+        Some(rt) => {
+            let mut stats = rt.stats();
+            if let Some(col) = collector.lock().unwrap().as_ref() {
+                col.enrich(&mut stats);
+            }
+            let topo = topology::worker_topology(&stats);
+            serde_json::to_string(&topo).unwrap_or_else(|_| "{}".into())
+        }
+        None => "{}".to_string(),
+    };
+    let response = tiny_http::Response::from_string(json).with_header(
+        "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+fn handle_logs_api(request: tiny_http::Request, url: &str, store: Arc<EventStore>) {
+    let params = parse_query_string(url);
+    let actor = params.get("actor").cloned().unwrap_or_default();
+    let limit: usize = params
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
+    let level = params.get("level").cloned();
+
+    let mut events = store.read_for_actor(&actor, limit);
+
+    // Filter by level if specified
+    if let Some(ref lvl) = level {
+        let lvl_upper = lvl.to_uppercase();
+        events.retain(|e| e.level == lvl_upper);
+    }
+
+    let json = serde_json::to_string(&events).unwrap_or_else(|_| "[]".into());
+    let response = tiny_http::Response::from_string(json).with_header(
+        "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+fn handle_history_api(request: tiny_http::Request, history: Arc<DashboardHistory>) {
+    let json = history.worker_history_json();
     let response = tiny_http::Response::from_string(json).with_header(
         "Content-Type: application/json"
             .parse::<tiny_http::Header>()

@@ -120,6 +120,8 @@ pub struct ActorSnapshot {
     pub last_msg_type: Option<&'static str>,
     pub messages_processed: u64,
     pub poisoned: bool,
+    /// Per-message-type counts, sorted descending by count.
+    pub message_type_counts: Vec<(&'static str, u64)>,
 }
 
 /// Observer hook called by workers after productive ticks.
@@ -150,6 +152,9 @@ pub struct ActorInfo {
     /// Whether the actor has panicked and is no longer processing messages.
     #[cfg_attr(feature = "serde", serde(default))]
     pub poisoned: bool,
+    /// Per-message-type counts, sorted descending by count. Top 32 types.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub message_type_counts: Vec<(String, u64)>,
 }
 
 /// Snapshot of overall runtime state.
