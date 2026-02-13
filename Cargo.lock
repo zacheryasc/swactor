@@ -2747,6 +2747,7 @@ dependencies = [
 name = "swactor-wasm-actor"
 version = "0.1.0"
 dependencies = [
+ "proptest",
  "swactor",
  "wasmtime",
  "wat",

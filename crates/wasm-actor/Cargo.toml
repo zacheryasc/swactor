@@ -10,3 +10,4 @@ wasmtime = "29"
 [dev-dependencies]
 swactor = { path = "../..", features = ["getrandom"] }
 wat = "1"
+proptest = "1"
