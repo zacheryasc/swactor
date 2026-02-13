@@ -199,53 +199,21 @@ pub struct Down {
 /// Not a `Message` — intercepted in `tick_all` before reaching `handle_any`.
 pub(crate) struct StopSignal;
 
-/// Type-erased cloneable message for interval timers.
-/// Since `Message: Clone`, all actor messages can implement this.
-pub(crate) trait CloneMsg: Send {
-    fn clone_boxed(&self) -> Box<dyn Any + Send>;
-}
-
-impl<M: Message> CloneMsg for M {
-    fn clone_boxed(&self) -> Box<dyn Any + Send> {
-        Box::new(self.clone())
-    }
-}
-
-/// Timer request from a handler, queued for processing after tick_all.
-pub(crate) enum TimerRequest {
-    /// One-shot: deliver `msg` to `dest` after `ticks` worker ticks.
-    Once {
-        dest: ActorAddress,
-        msg: Box<dyn Any + Send>,
-        ticks: u64,
-    },
-    /// Repeating: deliver a clone of `msg` to `dest` every `period` ticks.
-    Interval {
-        dest: ActorAddress,
-        msg: Box<dyn CloneMsg>,
-        period: u64,
-    },
-}
-
 /// Object-safe inner trait for sending type-erased messages.
 ///
-/// Minimal core interface: send, spawn, stop, timers, and extension access.
-/// Registry methods (naming, monitoring, groups) are provided by extension
-/// traits in `swactor-std`.
+/// Minimal core interface: send, spawn, stop, and extension access.
+/// Registry methods (naming, monitoring, groups) and timer scheduling
+/// are provided by extension traits in `swactor-std`.
 #[allow(private_interfaces)]
 pub trait ContextInner {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
     fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>);
     /// Request graceful stop for an actor. Takes effect after the current message.
     fn request_stop(&self, addr: ActorAddress);
-    /// Schedule a timer (one-shot or interval).
-    fn schedule_timer(&self, request: TimerRequest);
+    /// Post a request to the per-worker extension (e.g., timer scheduling).
+    fn post_worker_request(&self, request: Box<dyn Any + Send>);
     /// Access the runtime extension (if installed).
     fn extension(&self) -> Option<&dyn crate::extension::RuntimeExtension>;
-    /// Register a watch: watcher receives ActorExited when target dies.
-    fn watch(&self, watcher: ActorAddress, target: ActorAddress);
-    /// Cancel a watch.
-    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress);
 }
 
 /// Actor syscall interface — passed to `ActorInterface::handle()`.
@@ -307,46 +275,4 @@ impl<'a> Ctx<'a> {
         self.inner.send_any(addr, Box::new(StopSignal))
     }
 
-    /// Schedule a one-shot timer: deliver `msg` to `addr` after `ticks` worker ticks.
-    ///
-    /// The message is delivered as a normal mailbox message during the fire tick,
-    /// before `tick_all` processes messages. The timer is tick-counted (deterministic),
-    /// not wall-clock based.
-    pub fn send_after_ticks<M: Message>(&self, addr: ActorAddress, msg: M, ticks: u64) {
-        self.inner.schedule_timer(TimerRequest::Once {
-            dest: addr,
-            msg: Box::new(msg),
-            ticks,
-        });
-    }
-
-    /// Schedule a repeating timer: deliver a clone of `msg` to `addr` every `period` ticks.
-    ///
-    /// The first delivery happens after `period` ticks. The message is cloned for each
-    /// delivery. The timer continues until the target actor is stopped/poisoned.
-    pub fn send_interval_ticks<M: Message>(&self, addr: ActorAddress, msg: M, period: u64) {
-        self.inner.schedule_timer(TimerRequest::Interval {
-            dest: addr,
-            msg: Box::new(msg),
-            period,
-        });
-    }
-
-    /// Watch another actor's liveness. If the target dies, this actor
-    /// receives an `ActorExited` message in its mailbox.
-    ///
-    /// Watching an already-dead or non-existent actor delivers
-    /// `ActorExited { reason: Stopped }` on the next tick.
-    ///
-    /// Calling watch() multiple times on the same target is idempotent —
-    /// only one notification is delivered.
-    pub fn watch(&self, target: ActorAddress) {
-        self.inner.watch(self.self_addr, target);
-    }
-
-    /// Stop watching an actor. No notification will be delivered if the
-    /// target subsequently dies.
-    pub fn unwatch(&self, target: ActorAddress) {
-        self.inner.unwatch(self.self_addr, target);
-    }
 }

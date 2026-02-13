@@ -8,9 +8,12 @@ use std::collections::HashMap;
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
 
+use std::sync::Arc;
+
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::{MailboxOverflow, RuntimeConfig};
 use swactor::runtime::{Ctx, Inbox, Runtime};
+use swactor_std::{CtxTimers, StdExtension};
 
 // ─── Shared Actor Types ────────────────────────────────────────────────────
 
@@ -141,7 +144,8 @@ proptest! {
     /// One-shot timer fires at exactly the right tick for any delay.
     #[test]
     fn one_shot_timer_fires_at_correct_tick(delay in 1u64..20) {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let rt = Runtime::new(RuntimeConfig::default())
+            .with_extension(Arc::new(StdExtension::new()));
         let inbox = rt.new_inbox::<Ping>().unwrap();
 
         struct TimerActor { target: ActorAddress, delay: u64 }
@@ -175,7 +179,8 @@ proptest! {
     /// Interval timer fires at correct periodic ticks for any period.
     #[test]
     fn interval_timer_fires_at_correct_period(period in 1u64..10) {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let rt = Runtime::new(RuntimeConfig::default())
+            .with_extension(Arc::new(StdExtension::new()));
         let inbox = rt.new_inbox::<Ping>().unwrap();
 
         struct IntervalActor { target: ActorAddress, period: u64 }
