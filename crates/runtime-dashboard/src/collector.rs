@@ -60,6 +60,7 @@ impl StatsHook for StatsCollector {
                 last_msg_type: s.last_msg_type.map(|t| t.to_string()),
                 messages_processed: s.messages_processed,
                 poisoned: s.poisoned,
+                message_type_counts: s.message_type_counts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
             }));
         }
     }

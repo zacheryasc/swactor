@@ -40,9 +40,9 @@ pub const DISTRIBUTION_HTML: &str = r##"<!DOCTYPE html>
 
   .graph-panel {
     grid-row: 1 / 3; border-right: 1px solid #2a2d3e; position: relative;
-    min-height: 0;
+    min-height: 0; overflow: hidden;
   }
-  .graph-panel canvas { width: 100%; height: 100%; display: block; }
+  .graph-panel canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: block; }
 
   .side-panel { display: flex; flex-direction: column; overflow: hidden; min-height: 0; }
 
@@ -176,8 +176,17 @@ pub const DISTRIBUTION_HTML: &str = r##"<!DOCTYPE html>
       </div>
     </div>
     <div class="bottom-section">
-      <h2>Recent Probes</h2>
-      <div class="scroll-wrap" id="probesWrap"></div>
+      <h2>Recent Probes <span id="probeCount" style="color:#555;font-weight:400;"></span></h2>
+      <div class="scroll-wrap">
+        <table style="width:100%;border-collapse:collapse;">
+          <thead><tr>
+            <th style="color:#888;font-weight:500;font-size:11px;">State</th>
+            <th style="color:#888;font-weight:500;font-size:11px;">Node</th>
+            <th style="color:#888;font-weight:500;font-size:11px;">Address</th>
+          </tr></thead>
+          <tbody id="probesBody"></tbody>
+        </table>
+      </div>
     </div>
     <div class="bottom-section">
       <h2>Routing Buckets</h2>
@@ -653,14 +662,26 @@ pub const DISTRIBUTION_HTML: &str = r##"<!DOCTYPE html>
       cacheBody.appendChild(tr);
     }
 
-    // Recent probes
-    var probesWrap = document.getElementById('probesWrap');
-    probesWrap.innerHTML = '';
+    // Recent probes — cross-reference with members for state + address
+    var memberMap = {};
+    for (var i = 0; i < d.members.length; i++) {
+      memberMap[d.members[i].node_id] = d.members[i];
+    }
+    var probesBody = document.getElementById('probesBody');
+    probesBody.innerHTML = '';
+    document.getElementById('probeCount').textContent = '(' + d.recent_probe_targets.length + ')';
     for (var i = d.recent_probe_targets.length - 1; i >= 0; i--) {
-      var div = document.createElement('div');
-      div.style.cssText = 'padding:2px 0;color:#aaa;font-size:11px;border-bottom:1px solid #1c1f2e;';
-      div.textContent = d.recent_probe_targets[i].substring(0, 16) + '\u2026';
-      probesWrap.appendChild(div);
+      var pid = d.recent_probe_targets[i];
+      var mem = memberMap[pid];
+      var state = mem ? mem.state : 'unknown';
+      var addr = mem ? mem.addr : '\u2014';
+      var cls = 'state-' + state;
+      var tr = document.createElement('tr');
+      tr.innerHTML =
+        '<td class="' + cls + '" style="font-size:10px;">' + state + '</td>' +
+        '<td style="color:#aaa;font-size:10px;">' + pid.substring(0, 12) + '\u2026</td>' +
+        '<td style="font-size:10px;">' + addr + '</td>';
+      probesBody.appendChild(tr);
     }
 
     // Routing bucket histogram

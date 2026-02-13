@@ -77,6 +77,17 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .chart-panel { grid-row: span 2; }
   canvas#workerChart { width: 100%; height: 200px; }
 
+  .worker-cards { display: flex; flex-direction: column; gap: 6px; }
+  .worker-card {
+    display: flex; align-items: center; gap: 10px;
+    background: #1c1f2e; border-radius: 4px; padding: 6px 10px;
+  }
+  .worker-card .wc-id { font-weight: 700; min-width: 32px; }
+  .worker-card .wc-bar-wrap { flex: 1; height: 14px; background: #0f1117; border-radius: 2px; overflow: hidden; display: flex; }
+  .worker-card .wc-bar-seg { height: 100%; }
+  .worker-card .wc-stats { font-size: 11px; color: #888; min-width: 200px; text-align: right; }
+  .worker-card .wc-spark { display: inline-flex; gap: 4px; margin-left: 6px; }
+
   .actor-table-wrap { max-height: 200px; overflow-y: auto; }
   .actor-table-wrap table { width: 100%; border-collapse: collapse; }
   .actor-table-wrap th, .actor-table-wrap td {
@@ -113,6 +124,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   .worker-group-header .wid { font-weight: 700; }
   .worker-group-header .summary { color: #888; font-size: 11px; }
   .worker-group-header .toggle { color: #555; font-size: 14px; }
+  .worker-group-header .sparkline-wrap { display: inline-flex; gap: 8px; margin-left: 12px; }
+  .worker-group-header .sparkline-wrap svg { vertical-align: middle; }
   .worker-group-body { display: none; }
   .worker-group.open .worker-group-body { display: block; }
   .worker-group-body table { width: 100%; border-collapse: collapse; }
@@ -152,11 +165,17 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   <div id="progressFill" class="progress-fill"></div>
 </div>
 
+<div id="warningBanner" style="display:none;padding:8px 20px;background:#1c1f2e;border-bottom:1px solid #2a2d3e;font-size:12px;"></div>
 <div class="grid">
   <div class="panel chart-panel">
-    <h2>Worker Distribution</h2>
-    <canvas id="workerChart"></canvas>
-    <div id="workerLegend" style="margin-top:8px;font-size:11px;color:#888;"></div>
+    <h2>Worker Utilization</h2>
+    <div id="workerCards" class="worker-cards"></div>
+    <div style="margin-top:6px;font-size:10px;color:#555;">
+      <span style="color:#4caf50;">\u25A0</span> processing
+      <span style="color:#2196f3;">\u25A0</span> delivery
+      <span style="color:#00bcd4;">\u25A0</span> spawns
+      <span style="color:#f44336;">\u25A0</span> overhead
+    </div>
   </div>
 
   <div class="panel">
@@ -203,6 +222,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   var isReplay = (DASHBOARD_MODE === 'replay');
   var lastUptimeMs = null;
   var lastStatsTime = null;
+  var workerHistory = {}; // { id: { message_rates: [], mailbox_depths: [] } }
 
   var dot = document.getElementById('statusDot');
   var uptimeLabel = document.getElementById('uptimeLabel');
@@ -240,48 +260,83 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   }
   setInterval(updateUptime, 1000);
 
-  var canvas = document.getElementById('workerChart');
-  var ctx = canvas.getContext('2d');
   var colors = ['#4caf50','#2196f3','#ff9800','#f44336','#9c27b0','#00bcd4','#ffeb3b','#e91e63'];
 
-  function drawWorkerChart(workers) {
-    var dpr = window.devicePixelRatio || 1;
-    var rect = canvas.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = rect.height * dpr;
-    ctx.scale(dpr, dpr);
-    var W = rect.width, H = rect.height;
-    ctx.clearRect(0, 0, W, H);
+  var phaseColors = ['#4caf50', '#2196f3', '#00bcd4', '#f44336'];
+  // Group tick phases: processing=2, delivery=1+4, spawns=0+3, overhead=5
 
-    if (!workers || workers.length === 0) return;
+  function computePhases(timings) {
+    if (!timings || timings.length === 0) return [0.25, 0.25, 0.25, 0.25];
+    var sums = [0,0,0,0,0,0];
+    var active = 0;
+    for (var i = 0; i < timings.length; i++) {
+      var t = timings[i];
+      if (t.did_work) active++;
+      for (var p = 0; p < 6 && p < t.phase_us.length; p++) sums[p] += t.phase_us[p];
+    }
+    var total = sums.reduce(function(a,b) { return a+b; }, 0);
+    if (total === 0) return [0.25, 0.25, 0.25, 0.25];
+    var processing = sums[2] / total;
+    var delivery = (sums[1] + sums[4]) / total;
+    var spawns = (sums[0] + sums[3]) / total;
+    var overhead = sums[5] / total;
+    var load = timings.length > 0 ? active / timings.length : 0;
+    return { fracs: [processing, delivery, spawns, overhead], load: load };
+  }
 
-    var maxActors = Math.max(1, Math.max.apply(null, workers.map(function(w) { return w.num_actors; })));
-    var barW = Math.max(8, Math.floor((W - 40) / workers.length) - 6);
-    var chartH = H - 30;
+  function renderWorkerCards(data) {
+    var container = document.getElementById('workerCards');
+    if (!data.workers) return;
+    container.innerHTML = '';
 
-    workers.forEach(function(w, i) {
-      var x = 20 + i * (barW + 6);
-      var h = (w.num_actors / maxActors) * (chartH * 0.45);
-      ctx.fillStyle = colors[i % colors.length];
-      ctx.globalAlpha = 0.8;
-      ctx.fillRect(x, chartH * 0.5 - h, barW, h);
+    data.workers.forEach(function(w, idx) {
+      var timings = data.tick_timings ? data.tick_timings[idx] : null;
+      var phases = computePhases(timings);
+      var load = phases.load || 0;
+      var fracs = phases.fracs || [0.25, 0.25, 0.25, 0.25];
 
-      var mh = Math.min(w.mailbox_depth * 2, chartH * 0.4);
-      ctx.globalAlpha = 0.4;
-      ctx.fillRect(x, chartH * 0.55, barW, mh);
+      var card = document.createElement('div');
+      card.className = 'worker-card';
 
-      ctx.globalAlpha = 1;
-      ctx.fillStyle = '#888';
-      ctx.font = '10px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText('W' + w.id, x + barW / 2, H - 2);
+      // ID
+      var idSpan = document.createElement('span');
+      idSpan.className = 'wc-id';
+      idSpan.style.color = colors[w.id % colors.length];
+      idSpan.textContent = 'W' + w.id;
+      card.appendChild(idSpan);
+
+      // Phase bar
+      var barWrap = document.createElement('span');
+      barWrap.className = 'wc-bar-wrap';
+      var filledPct = Math.round(load * 100);
+      for (var p = 0; p < 4; p++) {
+        var seg = document.createElement('span');
+        seg.className = 'wc-bar-seg';
+        seg.style.width = (fracs[p] * filledPct) + '%';
+        seg.style.background = phaseColors[p];
+        barWrap.appendChild(seg);
+      }
+      card.appendChild(barWrap);
+
+      // Sparklines
+      var sparkWrap = document.createElement('span');
+      sparkWrap.className = 'wc-spark';
+      var wh = workerHistory[w.id];
+      if (wh) {
+        sparkWrap.innerHTML = renderSparklineSvg(wh.message_rates, 60, 14, '#4caf50');
+      }
+      card.appendChild(sparkWrap);
+
+      // Stats
+      var statsSpan = document.createElement('span');
+      statsSpan.className = 'wc-stats';
+      statsSpan.textContent = w.num_actors + ' actors  ' +
+        w.messages_processed.toLocaleString() + ' msgs  mbox ' + w.mailbox_depth +
+        '  ' + Math.round(load * 100) + '%';
+      card.appendChild(statsSpan);
+
+      container.appendChild(card);
     });
-
-    var legend = document.getElementById('workerLegend');
-    legend.innerHTML = workers.map(function(w, i) {
-      return '<span style="color:' + colors[i % colors.length] + '">W' + w.id +
-        ': ' + w.num_actors + ' actors, ' + w.messages_processed + ' msgs, mbox ' + w.mailbox_depth + '</span>';
-    }).join(' &nbsp;|&nbsp; ');
   }
 
   function updateStats(data) {
@@ -298,7 +353,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     document.getElementById('statWorkers').textContent = data.num_workers || 0;
     document.getElementById('statMailbox').textContent = totalMailbox;
 
-    drawWorkerChart(data.workers);
+    renderWorkerCards(data);
 
     var tbody = document.getElementById('actorTableBody');
     tbody.innerHTML = '';
@@ -316,7 +371,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           hex += '\u2026';
         }
         var tr = document.createElement('tr');
-        tr.innerHTML = '<td style="color:#aaa;font-size:11px;">' + hex + '</td><td>W' + wid + '</td>';
+        tr.innerHTML = '<td style="color:#aaa;font-size:11px;"><a href="/actor/' + hex + '" style="color:#aaa;text-decoration:none;">' + hex + '</a></td><td>W' + wid + '</td>';
         tbody.appendChild(tr);
       });
       if (data.actors.length > 200) {
@@ -345,6 +400,34 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     if (!full) return '';
     var parts = full.split('::');
     return parts[parts.length - 1];
+  }
+
+  function renderSparklineSvg(data, w, h, color) {
+    if (!data || data.length < 2) return '';
+    var max = Math.max.apply(null, data);
+    if (max === 0) max = 1;
+    var step = w / (data.length - 1);
+    var points = data.map(function(v, i) {
+      return (i * step).toFixed(1) + ',' + (h - (v / max) * (h - 2) - 1).toFixed(1);
+    }).join(' ');
+    return '<svg width="' + w + '" height="' + h + '" style="vertical-align:middle">' +
+      '<polyline fill="none" stroke="' + color + '" stroke-width="1.5" points="' + points + '"/></svg>';
+  }
+
+  function pushHistorySample(stats) {
+    if (!stats.workers) return;
+    stats.workers.forEach(function(w) {
+      if (!workerHistory[w.id]) {
+        workerHistory[w.id] = { message_rates: [], mailbox_depths: [], prev_msgs: w.messages_processed };
+      }
+      var wh = workerHistory[w.id];
+      var rate = w.messages_processed - wh.prev_msgs;
+      if (rate < 0) rate = 0;
+      wh.prev_msgs = w.messages_processed;
+      wh.message_rates.push(rate);
+      wh.mailbox_depths.push(w.mailbox_depth);
+      if (wh.message_rates.length > 300) { wh.message_rates.shift(); wh.mailbox_depths.shift(); }
+    });
   }
 
   function updateWorkerDetails(data) {
@@ -377,8 +460,17 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       var hdr = document.createElement('div');
       hdr.className = 'worker-group-header';
       var panicHtml = g.info.panics > 0 ? ', <span style="color:#f44336">' + g.info.panics + ' panics</span>' : '';
+      var wh = workerHistory[wid];
+      var sparkHtml = '';
+      if (wh) {
+        sparkHtml = '<span class="sparkline-wrap">' +
+          renderSparklineSvg(wh.message_rates, 80, 16, '#4caf50') +
+          renderSparklineSvg(wh.mailbox_depths, 80, 16, '#2196f3') +
+          '</span>';
+      }
       hdr.innerHTML =
         '<span class="wid" style="color:' + colors[wid % colors.length] + '">W' + wid + '</span>' +
+        sparkHtml +
         '<span class="summary">' + g.actors.length + ' actors, ' +
           g.info.messages_processed.toLocaleString() + ' msgs, mbox ' + g.info.mailbox_depth + panicHtml + '</span>' +
         '<span class="toggle">' + (isOpen ? '\u25BC' : '\u25B6') + '</span>';
@@ -400,7 +492,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
           var msgShort = hasMsg ? shortTypeName(a.last_msg_type) : 'none';
           var msgClass = hasMsg ? 'msg-type' : 'msg-type none';
           var title = hasMsg ? ' title="' + escapeHtml(a.last_msg_type) + '"' : '';
-          rows += '<tr><td style="color:#aaa;">' + hex + '</td>' +
+          rows += '<tr><td style="color:#aaa;"><a href="/actor/' + hex + '" style="color:#aaa;text-decoration:none;">' + hex + '</a></td>' +
             '<td>' + a.mailbox_depth + '</td>' +
             '<td class="' + msgClass + '"' + title + '>' + escapeHtml(msgShort) + '</td></tr>';
         });
@@ -467,7 +559,44 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   var es = new EventSource('/events');
 
   es.addEventListener('stats', function(e) {
-    try { updateStats(JSON.parse(e.data)); } catch(err) { console.error('stats parse error', err); }
+    try {
+      var data = JSON.parse(e.data);
+      pushHistorySample(data);
+      updateStats(data);
+    } catch(err) { console.error('stats parse error', err); }
+  });
+
+  es.addEventListener('history', function(e) {
+    try {
+      var data = JSON.parse(e.data);
+      if (data.workers) {
+        data.workers.forEach(function(w) {
+          workerHistory[w.id] = {
+            message_rates: w.message_rates || [],
+            mailbox_depths: w.mailbox_depths || [],
+            prev_msgs: 0
+          };
+        });
+      }
+    } catch(err) { console.error('history parse error', err); }
+  });
+
+  es.addEventListener('warnings', function(e) {
+    try {
+      var warnings = JSON.parse(e.data);
+      var banner = document.getElementById('warningBanner');
+      if (warnings.length === 0) {
+        banner.style.display = 'none';
+        return;
+      }
+      banner.style.display = 'block';
+      var sevColors = {critical:'#f44336',high:'#ff5722',medium:'#ff9800',low:'#888'};
+      var html = warnings.map(function(w) {
+        var c = sevColors[w.severity] || '#888';
+        return '<span style="color:' + c + ';">\u26A0 ' + w.description + '</span>';
+      }).join(' &nbsp; ');
+      banner.innerHTML = '<span style="color:#ff9800;font-weight:700;">WARNINGS (' + warnings.length + ')</span> &nbsp; ' + html;
+    } catch(err) { console.error('warnings parse error', err); }
   });
 
   es.addEventListener('activity', function(e) {

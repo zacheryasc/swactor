@@ -610,6 +610,8 @@ struct ActorSlot {
     started: bool,
     last_msg_type: Option<&'static str>,
     messages_processed: u64,
+    /// Per-message-type counters (bounded to 32 entries).
+    msg_type_counts: HashMap<&'static str, u64>,
     /// Per-actor mailbox capacity. 0 = unbounded.
     mailbox_capacity: usize,
     overflow_policy: MailboxOverflow,
@@ -645,6 +647,7 @@ impl ActorPool {
             started: false,
             last_msg_type: None,
             messages_processed: 0,
+            msg_type_counts: HashMap::new(),
             mailbox_capacity: self.default_mailbox_capacity,
             overflow_policy: self.default_overflow_policy,
         });
@@ -697,6 +700,9 @@ impl ActorPool {
                 slot.mailbox.clear();
                 continue;
             }
+
+            #[cfg(feature = "tracing")]
+            let _actor_span = tracing::trace_span!("actor.tick", actor_addr = %addr).entered();
 
             let ctx = Ctx::new(inner, addr);
 
@@ -762,6 +768,10 @@ impl ActorPool {
                     Ok(Some(type_name)) => {
                         slot.last_msg_type = Some(type_name);
                         slot.messages_processed += 1;
+                        // Track per-type counts (bounded to 32 distinct types)
+                        if slot.msg_type_counts.len() < 32 || slot.msg_type_counts.contains_key(type_name) {
+                            *slot.msg_type_counts.entry(type_name).or_insert(0) += 1;
+                        }
                     }
                 }
                 count += 1;
@@ -834,12 +844,16 @@ impl ActorPool {
     pub fn mailbox_depths_into(&self, out: &mut Vec<ActorSnapshot>) {
         out.clear();
         out.extend(self.actors.iter().map(|(&addr, slot)| {
+            let mut type_counts: Vec<(&'static str, u64)> =
+                slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
+            type_counts.sort_by(|a, b| b.1.cmp(&a.1));
             ActorSnapshot {
                 address: addr,
                 mailbox_depth: slot.mailbox.len(),
                 last_msg_type: slot.last_msg_type,
                 messages_processed: slot.messages_processed,
                 poisoned: slot.poisoned,
+                message_type_counts: type_counts,
             }
         }));
     }

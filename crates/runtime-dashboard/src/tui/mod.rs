@@ -18,6 +18,7 @@ use swactor::runtime::Runtime;
 use crate::collector::StatsCollector;
 #[cfg(feature = "distribution")]
 use crate::distribution_collector::DistributionStatsProvider;
+use crate::layer::EventStore;
 use self::app::App;
 use self::event::{AppEvent, EventLoop};
 use self::types::RuntimeEndpoint;
@@ -47,6 +48,7 @@ pub fn start_tui(
     #[cfg(feature = "distribution")]
     distribution: Option<Arc<dyn DistributionStatsProvider>>,
     config: TuiConfig,
+    event_store: Option<Arc<EventStore>>,
 ) -> io::Result<()> {
     // Set up terminal
     crossterm::terminal::enable_raw_mode()?;
@@ -72,6 +74,7 @@ pub fn start_tui(
         #[cfg(feature = "distribution")]
         distribution,
         config,
+        event_store,
     );
 
     // Restore terminal
@@ -92,8 +95,12 @@ fn run_loop(
     #[cfg(feature = "distribution")]
     distribution: Option<Arc<dyn DistributionStatsProvider>>,
     config: TuiConfig,
+    event_store: Option<Arc<EventStore>>,
 ) -> io::Result<()> {
     let mut app = App::new();
+    if let Some(store) = event_store {
+        app.set_event_store(store);
+    }
     let mut table_state = TableState::default();
     let events = EventLoop::new(config.poll_interval_ms);
 

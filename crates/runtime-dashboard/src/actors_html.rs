@@ -60,7 +60,7 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
 
   .panel {
     background: #161822; border: 1px solid #2a2d3e; border-radius: 6px;
-    padding: 14px; overflow: hidden;
+    padding: 14px; overflow: visible;
   }
   .panel h2 { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px; }
 
@@ -75,7 +75,7 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
   .stat-card .value { font-size: 22px; font-weight: 700; color: #fff; }
   .stat-card .label { font-size: 10px; color: #888; text-transform: uppercase; margin-top: 2px; }
 
-  canvas { width: 100%; height: 200px; }
+  canvas { width: 100%; height: 220px; }
 
   .search-wrap { margin-bottom: 10px; display: flex; align-items: center; gap: 12px; }
   .search-input {
@@ -109,7 +109,12 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
   tr.clickable { cursor: pointer; }
   tr.clickable:hover { background: #1a1d2c; }
 
-  .detail-panel { display: none; }
+  .detail-panel {
+    display: none; position: fixed; bottom: 12px; right: 12px;
+    width: 420px; max-height: 320px; overflow-y: auto;
+    background: #161822; border: 1px solid #2a2d3e; border-radius: 6px;
+    padding: 14px; z-index: 100; box-shadow: 0 4px 24px rgba(0,0,0,0.5);
+  }
   .detail-panel.visible { display: block; }
   .detail-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
   .detail-close {
@@ -118,17 +123,17 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
   }
   .detail-close:hover { color: #e0e0e0; border-color: #555; }
   .detail-grid {
-    display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 12px;
+    display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 10px;
   }
-  .detail-item { background: #1c1f2e; border-radius: 4px; padding: 8px 10px; }
+  .detail-item { background: #1c1f2e; border-radius: 4px; padding: 6px 8px; }
   .detail-item .d-label { font-size: 10px; color: #888; text-transform: uppercase; }
-  .detail-item .d-value { font-size: 14px; font-weight: 700; color: #fff; margin-top: 2px; word-break: break-all; }
+  .detail-item .d-value { font-size: 13px; font-weight: 700; color: #fff; margin-top: 2px; word-break: break-all; }
   .poisoned-badge {
     background: #f44336; color: #fff; font-size: 10px; font-weight: 700;
     padding: 2px 6px; border-radius: 3px; letter-spacing: 0.5px;
   }
   .healthy-badge { color: #4caf50; font-size: 12px; }
-  canvas.sparkline { width: 100%; height: 60px; }
+  canvas.sparkline { width: 100%; height: 50px; }
 
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: #0f1117; }
@@ -187,7 +192,16 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
   <div class="panel full-width">
     <h2>All Actors <span id="actorCount" style="color:#555;font-weight:400;"></span></h2>
     <div class="search-wrap">
-      <input type="text" id="actorSearch" class="search-input" placeholder="Filter by address or worker..." />
+      <input type="text" id="actorSearch" class="search-input" placeholder="Filter by address, type, or worker..." />
+      <select id="workerFilter" class="search-input" style="width:120px;">
+        <option value="">All Workers</option>
+      </select>
+      <select id="statusFilter" class="search-input" style="width:120px;">
+        <option value="">All Status</option>
+        <option value="healthy">Healthy</option>
+        <option value="poisoned">Poisoned</option>
+      </select>
+      <input type="number" id="minDepth" class="search-input" style="width:100px;" placeholder="Min depth" min="0" />
       <span id="searchInfo" class="search-info"></span>
     </div>
     <div class="actor-list-wrap">
@@ -207,23 +221,25 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
     </div>
   </div>
 
-  <!-- Actor detail panel -->
-  <div id="detailPanel" class="panel full-width detail-panel">
-    <div class="detail-header">
-      <h2>Actor Detail <span id="detailAddr" style="color:#aaa;font-weight:400;"></span></h2>
-      <button class="detail-close" id="detailClose">Close</button>
-    </div>
-    <div class="detail-grid">
-      <div class="detail-item"><div class="d-label">Full Address</div><div class="d-value" id="detailFullAddr" style="font-size:11px;"></div></div>
-      <div class="detail-item"><div class="d-label">Worker</div><div class="d-value" id="detailWorker"></div></div>
-      <div class="detail-item"><div class="d-label">Mailbox Depth</div><div class="d-value" id="detailMailbox"></div></div>
-      <div class="detail-item"><div class="d-label">Messages Processed</div><div class="d-value" id="detailMsgCount"></div></div>
-      <div class="detail-item"><div class="d-label">Last Message Type</div><div class="d-value" id="detailLastMsg"></div></div>
-      <div class="detail-item"><div class="d-label">Status</div><div class="d-value" id="detailStatus"></div></div>
-    </div>
-    <h2>Mailbox Depth History</h2>
-    <canvas id="sparkline" class="sparkline"></canvas>
+
+</div>
+
+<!-- Actor detail overlay (fixed position, doesn't affect grid layout) -->
+<div id="detailPanel" class="detail-panel">
+  <div class="detail-header">
+    <h2 style="font-size:12px;color:#888;text-transform:uppercase;letter-spacing:1px;">Actor <span id="detailAddr" style="color:#aaa;font-weight:400;"></span></h2>
+    <button class="detail-close" id="detailClose">&times;</button>
   </div>
+  <div class="detail-grid">
+    <div class="detail-item"><div class="d-label">Address</div><div class="d-value" id="detailFullAddr" style="font-size:10px;"></div></div>
+    <div class="detail-item"><div class="d-label">Worker</div><div class="d-value" id="detailWorker"></div></div>
+    <div class="detail-item"><div class="d-label">Mailbox</div><div class="d-value" id="detailMailbox"></div></div>
+    <div class="detail-item"><div class="d-label">Messages</div><div class="d-value" id="detailMsgCount"></div></div>
+    <div class="detail-item"><div class="d-label">Last Type</div><div class="d-value" id="detailLastMsg"></div></div>
+    <div class="detail-item"><div class="d-label">Status</div><div class="d-value" id="detailStatus"></div></div>
+  </div>
+  <div style="font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">Mailbox History</div>
+  <canvas id="sparkline" class="sparkline"></canvas>
 </div>
 
 <script>
@@ -374,11 +390,12 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
 
     var maxCount = Math.max(1, Math.max.apply(null, counts));
     var barW = Math.max(12, Math.floor((W - 40) / buckets.length) - 8);
+    var topPad = 20;
     var chartH = H - 35;
 
     for (var i = 0; i < buckets.length; i++) {
       var x = 20 + i * (barW + 8);
-      var h = (counts[i] / maxCount) * (chartH - 10);
+      var h = (counts[i] / maxCount) * (chartH - topPad);
       depthCtx.fillStyle = bucketColors[i];
       depthCtx.globalAlpha = 0.85;
       depthCtx.fillRect(x, chartH - h, barW, h);
@@ -424,11 +441,12 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
 
     var maxCount = Math.max(1, Math.max.apply(null, entries.map(function(e) { return e.count; })));
     var barW = Math.max(12, Math.floor((W - 40) / entries.length) - 8);
+    var topPad = 20;
     var chartH = H - 35;
 
     for (var i = 0; i < entries.length; i++) {
       var x = 20 + i * (barW + 8);
-      var h = (entries[i].count / maxCount) * (chartH - 10);
+      var h = (entries[i].count / maxCount) * (chartH - topPad);
       workerCtx.fillStyle = colors[entries[i].id % colors.length];
       workerCtx.globalAlpha = 0.85;
       workerCtx.fillRect(x, chartH - h, barW, h);
@@ -449,13 +467,29 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
 
   function renderActorTable() {
     var filter = document.getElementById('actorSearch').value.toLowerCase();
-    var filtered = currentActors;
-    if (filter) {
-      filtered = currentActors.filter(function(a) {
+    var workerFilter = document.getElementById('workerFilter').value;
+    var statusFilter = document.getElementById('statusFilter').value;
+    var minDepthVal = document.getElementById('minDepth').value;
+    var minDepth = minDepthVal ? parseInt(minDepthVal, 10) : 0;
+
+    var filtered = currentActors.filter(function(a) {
+      // Text search
+      if (filter) {
         var hex = addrToHex(a.address).toLowerCase();
-        return hex.indexOf(filter) >= 0 || ('w' + a.worker_id).indexOf(filter) >= 0;
-      });
-    }
+        var msgType = (a.last_msg_type || '').toLowerCase();
+        if (hex.indexOf(filter) < 0 && ('w' + a.worker_id).indexOf(filter) < 0 && msgType.indexOf(filter) < 0) {
+          return false;
+        }
+      }
+      // Worker filter
+      if (workerFilter && a.worker_id !== parseInt(workerFilter, 10)) return false;
+      // Status filter
+      if (statusFilter === 'healthy' && a.poisoned) return false;
+      if (statusFilter === 'poisoned' && !a.poisoned) return false;
+      // Min depth
+      if (minDepth > 0 && a.mailbox_depth < minDepth) return false;
+      return true;
+    });
 
     // Sort
     filtered.sort(function(a, b) {
@@ -531,14 +565,14 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
   // ── Focus / detail panel ───────────────────────────────
   function focusActor(fullHex) {
     focusedAddrHex = fullHex;
-    document.getElementById('detailPanel').className = 'panel full-width detail-panel visible';
+    document.getElementById('detailPanel').className = 'detail-panel visible';
     updateDetailPanel();
     renderActorTable();
   }
 
   function clearFocus() {
     focusedAddrHex = null;
-    document.getElementById('detailPanel').className = 'panel full-width detail-panel';
+    document.getElementById('detailPanel').className = 'detail-panel';
     renderActorTable();
   }
 
@@ -558,8 +592,8 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
       return;
     }
 
-    document.getElementById('detailAddr').textContent = addrToHex(actor.address);
-    document.getElementById('detailFullAddr').textContent = focusedAddrHex;
+    document.getElementById('detailAddr').innerHTML = '<a href="/actor/' + focusedAddrHex + '" style="color:#aaa;text-decoration:none;">' + escapeHtml(addrToHex(actor.address)) + '</a>';
+    document.getElementById('detailFullAddr').innerHTML = '<a href="/actor/' + focusedAddrHex + '" style="color:#fff;text-decoration:none;">' + escapeHtml(focusedAddrHex) + '</a>';
     document.getElementById('detailWorker').textContent = 'W' + actor.worker_id;
     document.getElementById('detailMailbox').textContent = actor.mailbox_depth;
     document.getElementById('detailMsgCount').textContent = (actor.messages_processed || 0).toLocaleString();
@@ -647,8 +681,14 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
     });
   }
 
-  // ── Search handler ─────────────────────────────────────
+  // ── Search/filter handlers ─────────────────────────────
   document.getElementById('actorSearch').addEventListener('keyup', function() {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(renderActorTable, 150);
+  });
+  document.getElementById('workerFilter').addEventListener('change', renderActorTable);
+  document.getElementById('statusFilter').addEventListener('change', renderActorTable);
+  document.getElementById('minDepth').addEventListener('input', function() {
     clearTimeout(searchTimer);
     searchTimer = setTimeout(renderActorTable, 150);
   });
@@ -696,6 +736,21 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
       for (var key in depthHistory) {
         if (!liveAddrs[key]) delete depthHistory[key];
       }
+
+      // Update worker filter dropdown
+      var wSelect = document.getElementById('workerFilter');
+      var curVal = wSelect.value;
+      var workerIds = {};
+      for (var i = 0; i < currentActors.length; i++) workerIds[currentActors[i].worker_id] = true;
+      var wids = Object.keys(workerIds).sort(function(a,b) { return +a - +b; });
+      wSelect.innerHTML = '<option value="">All Workers</option>';
+      wids.forEach(function(wid) {
+        var opt = document.createElement('option');
+        opt.value = wid;
+        opt.textContent = 'W' + wid;
+        wSelect.appendChild(opt);
+      });
+      wSelect.value = curVal;
 
       renderActorTable();
       if (focusedAddrHex) updateDetailPanel();

@@ -1,10 +1,15 @@
 pub mod collector;
+pub mod history;
 pub mod investigate;
 pub mod layer;
 pub mod trace;
+pub mod warnings;
+mod actor_detail_html;
 mod actors_html;
 mod dashboard_html;
 mod server;
+pub mod topology;
+mod topology_html;
 
 #[cfg(feature = "tui")]
 pub mod tui;
@@ -27,6 +32,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::collector::StatsCollector;
+use crate::history::{DashboardHistory, HistoryConfig};
 use crate::layer::{now_ms, DashboardLayer, EventStore};
 use crate::trace::{RuntimeTrace, TimestampedStats};
 
@@ -80,6 +86,7 @@ pub struct DashboardHandle {
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
     shutdown: Arc<AtomicBool>,
     stats_timeline: Arc<ArrayQueue<TimestampedStats>>,
+    history: Arc<DashboardHistory>,
     recording: bool,
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>>,
@@ -113,6 +120,11 @@ impl DashboardHandle {
     #[cfg(feature = "distribution")]
     pub fn set_distribution(&self, provider: Arc<dyn distribution_collector::DistributionStatsProvider>) {
         *self.distribution.lock().unwrap() = Some(provider);
+    }
+
+    /// Access the time-series history store (for TUI sparklines, etc.).
+    pub fn history(&self) -> &Arc<DashboardHistory> {
+        &self.history
     }
 
     /// Signal the dashboard to shut down (SSE clients receive "done").
@@ -159,6 +171,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     let collector: Arc<Mutex<Option<Arc<StatsCollector>>>> = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(AtomicBool::new(false));
     let stats_timeline = Arc::new(ArrayQueue::new(config.record_stats_capacity.max(1)));
+    let history = Arc::new(DashboardHistory::new(HistoryConfig::default()));
 
     #[cfg(feature = "distribution")]
     let distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>> =
@@ -169,6 +182,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         Arc::clone(&runtime),
         Arc::clone(&collector),
         Arc::clone(&shutdown),
+        Arc::clone(&history),
         config.port,
         #[cfg(feature = "distribution")]
         Arc::clone(&distribution),
@@ -210,6 +224,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         collector,
         shutdown,
         stats_timeline,
+        history,
         recording: config.record,
         #[cfg(feature = "distribution")]
         distribution,
