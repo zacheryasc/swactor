@@ -73,6 +73,7 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
             swim: config.swim.clone(),
             cache_capacity: config.cache_capacity,
             republish_interval: 50,
+            ..Default::default()
         };
         let node = DistributedNode::new(node_config);
         node_ids.push(node.node_id());
@@ -184,6 +185,7 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
                     swim: config.swim.clone(),
                     cache_capacity: config.cache_capacity,
                     republish_interval: 50,
+                    ..Default::default()
                 };
                 let revived = DistributedNode::new(node_config);
                 // Rejoin the cluster.

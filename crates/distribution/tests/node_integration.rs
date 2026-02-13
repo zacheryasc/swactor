@@ -9,6 +9,7 @@ use swactor::actor::ActorAddress;
 use distribution::crypto::Keypair;
 use distribution::node::{DistributedNode, DistributedNodeConfig, ResolveResult};
 use distribution::swim::node::NodeAction;
+use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
 use distribution::types::NodeId;
 
@@ -23,6 +24,7 @@ fn test_config(addr: &str) -> DistributedNodeConfig {
         },
         cache_capacity: 100,
         republish_interval: 50,
+        registry: RegistryConfig::default(),
     }
 }
 

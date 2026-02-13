@@ -11,3 +11,7 @@ corpus
 **/deps.html
 docs/architecture.dot
 docs/architecture.html
+
+# Claude session files
+CLAUDE/
+.claude/

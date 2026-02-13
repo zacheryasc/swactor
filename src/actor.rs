@@ -2,6 +2,31 @@ use std::any::Any;
 
 use crate::Error;
 
+/// Why an actor exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ExitReason {
+    /// Actor was explicitly stopped or removed from the pool.
+    Stopped,
+    /// Actor panicked during message handling.
+    Panicked,
+    /// The node hosting the actor left the cluster (SWIM Dead).
+    NodeDown,
+}
+
+/// Delivered to watchers when a watched actor exits.
+///
+/// Implements `Message` (Clone + Send + Sync + 'static) so it can be
+/// delivered through normal mailbox channels.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActorExited {
+    /// The address of the actor that died.
+    pub addr: ActorAddress,
+    /// Why it exited.
+    pub reason: ExitReason,
+}
+
 /// The primary trait defining data that can be passed to and from actor processes
 pub trait Message: 'static + Sized + Clone + Send + Sync {}
 impl<T: 'static + Sized + Clone + Send + Sync> Message for T {}
@@ -32,6 +57,11 @@ pub trait ActorInterface: 'static + Send {
     /// If your `Incoming` type IS `Down`, this method is never called — the
     /// normal `handle()` receives the message instead.
     fn handle_down(&mut self, _ctx: &Ctx, _down: Down) {}
+
+    /// Called when a watched actor exits. Override to react to death notifications.
+    ///
+    /// Default: no-op (notification is silently consumed).
+    fn on_actor_exit(&mut self, _ctx: &Ctx, _exited: ActorExited) {}
 }
 
 /// A unique address for this actor. 32 bytes is overkill for a small application,
@@ -106,10 +136,17 @@ where
             }
             Err(msg) => msg,
         };
-        match msg.downcast::<Down>() {
+        let msg = match msg.downcast::<Down>() {
             Ok(down) => {
                 self.inner.handle_down(ctx, *down);
-                Some("swactor::actor::Down")
+                return Some("swactor::actor::Down");
+            }
+            Err(msg) => msg,
+        };
+        match msg.downcast::<ActorExited>() {
+            Ok(exited) => {
+                self.inner.on_actor_exit(ctx, *exited);
+                Some("ActorExited")
             }
             Err(_) => None,
         }
@@ -205,6 +242,10 @@ pub trait ContextInner {
     fn schedule_timer(&self, request: TimerRequest);
     /// Access the runtime extension (if installed).
     fn extension(&self) -> Option<&dyn crate::extension::RuntimeExtension>;
+    /// Register a watch: watcher receives ActorExited when target dies.
+    fn watch(&self, watcher: ActorAddress, target: ActorAddress);
+    /// Cancel a watch.
+    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress);
 }
 
 /// Actor syscall interface — passed to `ActorInterface::handle()`.
@@ -289,5 +330,23 @@ impl<'a> Ctx<'a> {
             msg: Box::new(msg),
             period,
         });
+    }
+
+    /// Watch another actor's liveness. If the target dies, this actor
+    /// receives an `ActorExited` message in its mailbox.
+    ///
+    /// Watching an already-dead or non-existent actor delivers
+    /// `ActorExited { reason: Stopped }` on the next tick.
+    ///
+    /// Calling watch() multiple times on the same target is idempotent —
+    /// only one notification is delivered.
+    pub fn watch(&self, target: ActorAddress) {
+        self.inner.watch(self.self_addr, target);
+    }
+
+    /// Stop watching an actor. No notification will be delivered if the
+    /// target subsequently dies.
+    pub fn unwatch(&self, target: ActorAddress) {
+        self.inner.unwatch(self.self_addr, target);
     }
 }

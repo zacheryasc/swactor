@@ -12,6 +12,10 @@ use crate::crypto::Keypair;
 use crate::kademlia::directory::{actor_addr_as_node_id, DirectoryShard};
 use crate::kademlia::repair::{RepairQueue, RepublishTracker};
 use crate::kademlia::routing_table::RoutingTable;
+use crate::registry::{
+    pack_combined_piggyback, unpack_combined_piggyback, ClusterRegistry, RegistryConfig,
+    RegistryEvent,
+};
 use crate::swim::node::{NodeAction, SwimNode};
 use crate::swim::probe::SwimConfig;
 use crate::types::{MemberState, NodeId, NodeRecord};
@@ -22,6 +26,7 @@ pub struct DistributedNodeConfig {
     pub swim: SwimConfig,
     pub cache_capacity: usize,
     pub republish_interval: u64,
+    pub registry: RegistryConfig,
 }
 
 impl Default for DistributedNodeConfig {
@@ -31,6 +36,7 @@ impl Default for DistributedNodeConfig {
             swim: SwimConfig::default(),
             cache_capacity: 10_000,
             republish_interval: 1000,
+            registry: RegistryConfig::default(),
         }
     }
 }
@@ -47,6 +53,7 @@ pub struct DistributedNode {
     cache: LocationCache,
     repair_queue: RepairQueue,
     republish: RepublishTracker,
+    registry: ClusterRegistry,
     tick_count: u64,
 }
 
@@ -67,6 +74,7 @@ impl DistributedNode {
             cache: LocationCache::new(config.cache_capacity),
             repair_queue: RepairQueue::new(),
             republish: RepublishTracker::new(config.republish_interval),
+            registry: ClusterRegistry::new(config.registry),
             tick_count: 0,
             keypair,
         }
@@ -149,23 +157,32 @@ impl DistributedNode {
             // re-sign and re-STORE these entries.
         }
 
-        actions
+        // Registry GC
+        self.registry.gc_tick();
+
+        // Wrap outgoing piggyback with registry entries
+        self.inject_registry_piggyback(actions)
     }
 
     // ─── SWIM message handling (delegate to SwimNode) ───────────────────
 
     pub fn handle_ping(&mut self, from: NodeId, from_addr: SocketAddr, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        let actions = self.swim.handle_ping(from, from_addr, sequence, piggyback);
+        let membership_bytes = self.extract_registry_piggyback(piggyback);
+        let actions = self.swim.handle_ping(from, from_addr, sequence, &membership_bytes);
         self.maybe_update_routing_table(from, from_addr);
-        actions
+        self.inject_registry_piggyback(actions)
     }
 
     pub fn handle_ack(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        self.swim.handle_ack(from, sequence, piggyback)
+        let membership_bytes = self.extract_registry_piggyback(piggyback);
+        let actions = self.swim.handle_ack(from, sequence, &membership_bytes);
+        self.inject_registry_piggyback(actions)
     }
 
     pub fn handle_ping_req(&mut self, from: NodeId, target: NodeId, target_addr: SocketAddr, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        self.swim.handle_ping_req(from, target, target_addr, sequence, piggyback)
+        let membership_bytes = self.extract_registry_piggyback(piggyback);
+        let actions = self.swim.handle_ping_req(from, target, target_addr, sequence, &membership_bytes);
+        self.inject_registry_piggyback(actions)
     }
 
     pub fn handle_join_request(&mut self, from: NodeId, from_addr: SocketAddr) -> Vec<NodeAction> {
@@ -233,6 +250,33 @@ impl DistributedNode {
         self.cache.invalidate(actor_addr);
     }
 
+    // ─── Registry (name → actor mapping) ──────────────────────────────
+
+    /// Register a human-readable name for an actor on this node.
+    pub fn register_name(&mut self, name: String, actor_addr: ActorAddress) {
+        self.registry.register(name, actor_addr, self.node_id(), self.cluster_size());
+    }
+
+    /// Unregister a name (creates a tombstone).
+    pub fn unregister_name(&mut self, name: &str) {
+        self.registry.unregister(name, self.node_id(), self.cluster_size());
+    }
+
+    /// Resolve a name to its current (ActorAddress, NodeId).
+    pub fn resolve_name(&self, name: &str) -> Option<(ActorAddress, NodeId)> {
+        self.registry.resolve(name)
+    }
+
+    /// Drain registry events (Registered / Unregistered).
+    pub fn registry_events(&mut self) -> Vec<RegistryEvent> {
+        self.registry.drain_events()
+    }
+
+    /// Read-only access to the registry.
+    pub fn registry(&self) -> &ClusterRegistry {
+        &self.registry
+    }
+
     // ─── Accessors ──────────────────────────────────────────────────────
 
     pub fn routing_table(&self) -> &RoutingTable {
@@ -277,11 +321,50 @@ impl DistributedNode {
                 self.routing_table.remove(&node_id);
                 self.cache.invalidate_node(&node_id);
                 self.repair_queue.on_node_death(&node_id, &mut self.directory);
+                self.registry.tombstone_node(node_id, self.cluster_size());
             }
             MemberState::Suspect => {
                 // Keep in routing table but could downprioritize
             }
         }
+    }
+
+    fn cluster_size(&self) -> usize {
+        self.swim.members().alive_count() + 1 // +1 for self
+    }
+
+    /// Post-process outgoing actions: wrap each piggyback with registry entries.
+    fn inject_registry_piggyback(&mut self, actions: Vec<NodeAction>) -> Vec<NodeAction> {
+        actions
+            .into_iter()
+            .map(|action| match action {
+                NodeAction::SendPing { to, to_addr, sequence, piggyback } => {
+                    let registry_entries = self.registry.take_pending(8);
+                    let combined = pack_combined_piggyback(piggyback, registry_entries);
+                    NodeAction::SendPing { to, to_addr, sequence, piggyback: combined }
+                }
+                NodeAction::SendAck { to, to_addr, sequence, piggyback } => {
+                    let registry_entries = self.registry.take_pending(8);
+                    let combined = pack_combined_piggyback(piggyback, registry_entries);
+                    NodeAction::SendAck { to, to_addr, sequence, piggyback: combined }
+                }
+                NodeAction::SendPingReq { relay, relay_addr, target, target_addr, sequence, piggyback } => {
+                    let registry_entries = self.registry.take_pending(8);
+                    let combined = pack_combined_piggyback(piggyback, registry_entries);
+                    NodeAction::SendPingReq { relay, relay_addr, target, target_addr, sequence, piggyback: combined }
+                }
+                other => other,
+            })
+            .collect()
+    }
+
+    /// Extract registry entries from incoming piggyback, merge them, return membership-only bytes.
+    fn extract_registry_piggyback(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let (membership_bytes, registry_entries) = unpack_combined_piggyback(bytes);
+        if !registry_entries.is_empty() {
+            self.registry.merge_batch(registry_entries, self.cluster_size());
+        }
+        membership_bytes
     }
 }
 
