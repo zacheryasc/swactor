@@ -181,3 +181,148 @@ pub fn check_failure_detection(
         description: "Survivors detect node death".into(),
     }
 }
+
+/// SWIM Completeness: every killed node is eventually detected by all survivors.
+///
+/// Scans all rounds after `killed_at_round`. Passes if there exists a round where
+/// every surviving node's member_count has decreased below the original count.
+pub fn check_completeness(
+    trace: &DistTrace,
+    killed_at_round: usize,
+    original_alive: usize,
+) -> crate::properties::PropertyResult {
+    let detected = trace
+        .snapshots_per_round
+        .iter()
+        .skip(killed_at_round)
+        .any(|round_snaps| {
+            let survivors: Vec<_> = round_snaps.iter().filter(|(_, s)| s.is_alive).collect();
+            !survivors.is_empty()
+                && survivors
+                    .iter()
+                    .all(|(_, s)| s.member_count < original_alive)
+        });
+    crate::properties::PropertyResult {
+        name: "completeness".into(),
+        category: "SWIM Invariant".into(),
+        passed: detected,
+        expected: format!("all survivors detect death (member_count < {original_alive})"),
+        actual: if detected {
+            "all survivors detected".into()
+        } else {
+            let final_counts: Vec<usize> = trace
+                .snapshots_per_round
+                .last()
+                .map(|r| {
+                    r.iter()
+                        .filter(|(_, s)| s.is_alive)
+                        .map(|(_, s)| s.member_count)
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("final member_counts: {final_counts:?}")
+        },
+        description: "Every killed node detected by all survivors".into(),
+    }
+}
+
+/// SWIM Accuracy: no alive node is permanently declared dead.
+///
+/// At end of simulation, every node that is actually alive should appear
+/// in at least `min_fraction` of other alive nodes' member lists.
+pub fn check_accuracy(
+    trace: &DistTrace,
+    min_fraction: f64,
+) -> crate::properties::PropertyResult {
+    let last_round = match trace.snapshots_per_round.last() {
+        Some(r) => r,
+        None => {
+            return crate::properties::PropertyResult {
+                name: "accuracy".into(),
+                category: "SWIM Invariant".into(),
+                passed: false,
+                expected: "trace data".into(),
+                actual: "no rounds".into(),
+                description: "No alive node permanently dead".into(),
+            }
+        }
+    };
+
+    let alive_count = last_round.iter().filter(|(_, s)| s.is_alive).count();
+    if alive_count <= 1 {
+        return crate::properties::PropertyResult {
+            name: "accuracy".into(),
+            category: "SWIM Invariant".into(),
+            passed: true,
+            expected: format!("≥ {min_fraction:.0}% nodes well-connected"),
+            actual: "≤1 alive node".into(),
+            description: "No alive node permanently dead".into(),
+        };
+    }
+
+    // Fraction of alive nodes that see at least (alive_count - 1) members
+    let well_connected = last_round
+        .iter()
+        .filter(|(_, s)| s.is_alive && s.member_count >= alive_count - 1)
+        .count();
+    let fraction = well_connected as f64 / alive_count as f64;
+    let passed = fraction >= min_fraction;
+
+    crate::properties::PropertyResult {
+        name: "accuracy".into(),
+        category: "SWIM Invariant".into(),
+        passed,
+        expected: format!("≥ {:.0}% of alive nodes well-connected", min_fraction * 100.0),
+        actual: format!("{well_connected}/{alive_count} = {fraction:.2}"),
+        description: "No alive node permanently declared dead".into(),
+    }
+}
+
+/// SWIM Convergence: after all faults stabilize, surviving nodes' member_count
+/// values converge to the same value within a bounded number of rounds.
+pub fn check_convergence(
+    trace: &DistTrace,
+    stable_after_round: usize,
+    tolerance: usize,
+) -> crate::properties::PropertyResult {
+    let converged = trace
+        .snapshots_per_round
+        .iter()
+        .skip(stable_after_round)
+        .any(|round_snaps| {
+            let counts: Vec<usize> = round_snaps
+                .iter()
+                .filter(|(_, s)| s.is_alive)
+                .map(|(_, s)| s.member_count)
+                .collect();
+            if counts.is_empty() {
+                return true;
+            }
+            let min = *counts.iter().min().unwrap();
+            let max = *counts.iter().max().unwrap();
+            max - min <= tolerance
+        });
+
+    crate::properties::PropertyResult {
+        name: "convergence".into(),
+        category: "SWIM Invariant".into(),
+        passed: converged,
+        expected: format!("member_counts converge (spread ≤ {tolerance}) after round {stable_after_round}"),
+        actual: if converged {
+            "converged".into()
+        } else {
+            let final_counts: Vec<usize> = trace
+                .snapshots_per_round
+                .last()
+                .map(|r| {
+                    r.iter()
+                        .filter(|(_, s)| s.is_alive)
+                        .map(|(_, s)| s.member_count)
+                        .collect()
+                })
+                .unwrap_or_default();
+            format!("final spread: {:?}", final_counts)
+        },
+        description: "Membership views converge after faults stabilize".into(),
+    }
+}

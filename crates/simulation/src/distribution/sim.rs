@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::net::SocketAddr;
 
 use distribution::node::{DistributedNode, DistributedNodeConfig, ResolveResult};
@@ -9,6 +10,27 @@ use swactor::actor::ActorAddress;
 use crate::trace::{Event, SimulationTrace};
 
 use super::trace::{DistributionEventKind, DistributionSnapshot};
+
+/// A network partition between two sets of nodes.
+/// Nodes in `side_a` cannot communicate with nodes in `side_b`.
+#[derive(Debug, Clone)]
+pub struct Partition {
+    pub side_a: Vec<usize>,
+    pub side_b: Vec<usize>,
+    /// If true, A→B is blocked but B→A works (asymmetric).
+    pub asymmetric: bool,
+}
+
+/// Schedule entry for network faults.
+#[derive(Debug, Clone)]
+pub enum NetworkFault {
+    /// Introduce a partition at the given round.
+    Partition { round: usize, partition: Partition },
+    /// Heal a partition at the given round (restores full connectivity).
+    Heal { round: usize },
+    /// Set message drop rate (0.0 = no drops, 1.0 = drop all).
+    SetDropRate { round: usize, rate: f64 },
+}
 
 /// Configuration for a distribution simulation run.
 #[derive(Debug, Clone)]
@@ -25,6 +47,8 @@ pub struct DistributionSimConfig {
     /// (round, node_idx) — revive the node at the specified round.
     pub revive_schedule: Vec<(usize, usize)>,
     pub cache_capacity: usize,
+    /// Network fault schedule.
+    pub network_faults: Vec<NetworkFault>,
 }
 
 impl Default for DistributionSimConfig {
@@ -39,12 +63,72 @@ impl Default for DistributionSimConfig {
                 probe_timeout: 3,
                 indirect_probes: 1,
                 suspicion_timeout: 5,
+                dead_reprobe_interval: 10,
             },
             actors_per_node: 2,
             kill_schedule: Vec::new(),
             revive_schedule: Vec::new(),
             cache_capacity: 100,
+            network_faults: Vec::new(),
         }
+    }
+}
+
+/// Tracks active network state during simulation.
+struct NetworkState {
+    /// Set of (from_idx, to_idx) pairs where messages are blocked.
+    blocked: HashSet<(usize, usize)>,
+    /// Probability of dropping a message [0.0, 1.0].
+    drop_rate: f64,
+    /// Simple counter-based deterministic "random" for drop decisions.
+    drop_counter: u64,
+}
+
+impl NetworkState {
+    fn new() -> Self {
+        Self {
+            blocked: HashSet::new(),
+            drop_rate: 0.0,
+            drop_counter: 0x853c49e6748fea9b, // Non-zero seed for better distribution
+        }
+    }
+
+    fn apply_fault(&mut self, fault: &NetworkFault, num_nodes: usize) {
+        match fault {
+            NetworkFault::Partition { partition, .. } => {
+                for &a in &partition.side_a {
+                    for &b in &partition.side_b {
+                        if a < num_nodes && b < num_nodes {
+                            self.blocked.insert((a, b));
+                            if !partition.asymmetric {
+                                self.blocked.insert((b, a));
+                            }
+                        }
+                    }
+                }
+            }
+            NetworkFault::Heal { .. } => {
+                self.blocked.clear();
+            }
+            NetworkFault::SetDropRate { rate, .. } => {
+                self.drop_rate = rate.clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    /// Returns true if this message should be delivered.
+    fn should_deliver(&mut self, from_idx: usize, to_idx: usize) -> bool {
+        if self.blocked.contains(&(from_idx, to_idx)) {
+            return false;
+        }
+        if self.drop_rate > 0.0 {
+            self.drop_counter = self.drop_counter.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let r = (self.drop_counter >> 33) as f64 / (u32::MAX as f64);
+            if r < self.drop_rate {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -93,30 +177,36 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
             },
         });
 
-        // Deliver join actions and responses.
-        let tagged_responses = deliver_actions_tagged(
+        // Deliver join actions and responses (no network faults during setup).
+        let mut clean_net = NetworkState::new();
+        let tagged_responses = deliver_actions_tagged_with_net(
             &join_actions,
+            i,
             node_ids[i],
             addrs[i],
             &mut nodes,
             &node_ids,
             &addrs,
+            &mut clean_net,
         );
         for (responder_idx, response_actions) in tagged_responses {
-            deliver_actions_tagged(
+            deliver_actions_tagged_with_net(
                 &response_actions,
+                responder_idx,
                 node_ids[responder_idx],
                 addrs[responder_idx],
                 &mut nodes,
                 &node_ids,
                 &addrs,
+                &mut clean_net,
             );
         }
     }
 
     // Tick-settle: several rounds to let SWIM converge initial membership.
+    let mut clean_net = NetworkState::new();
     for _ in 0..10 {
-        tick_all_and_deliver(&mut nodes, &node_ids, &addrs, &mut events, &node_names, 0);
+        tick_all_and_deliver(&mut nodes, &node_ids, &addrs, &mut events, &node_names, 0, &mut clean_net);
     }
 
     // Register actors on each node, then propagate entries.
@@ -164,7 +254,21 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
 
     // Run simulation rounds.
     let mut rng_buf = [0u8; 8];
+    let mut net = NetworkState::new();
+
     for round in 1..=config.num_rounds {
+        // Apply network faults for this round.
+        for fault in &config.network_faults {
+            let fault_round = match fault {
+                NetworkFault::Partition { round, .. } => *round,
+                NetworkFault::Heal { round } => *round,
+                NetworkFault::SetDropRate { round, .. } => *round,
+            };
+            if fault_round == round {
+                net.apply_fault(fault, n);
+            }
+        }
+
         // Apply kill schedule.
         for &(kill_round, kill_idx) in &config.kill_schedule {
             if kill_round == round && kill_idx < n {
@@ -193,22 +297,26 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
                 nodes[revive_idx] = Some(revived);
                 node_ids[revive_idx] = nodes[revive_idx].as_ref().unwrap().node_id();
 
-                let tagged_responses = deliver_actions_tagged(
+                let tagged_responses = deliver_actions_tagged_with_net(
                     &join_actions,
+                    revive_idx,
                     node_ids[revive_idx],
                     addrs[revive_idx],
                     &mut nodes,
                     &node_ids,
                     &addrs,
+                    &mut net,
                 );
                 for (responder_idx, response_actions) in tagged_responses {
-                    deliver_actions_tagged(
+                    deliver_actions_tagged_with_net(
                         &response_actions,
+                        responder_idx,
                         node_ids[responder_idx],
                         addrs[responder_idx],
                         &mut nodes,
                         &node_ids,
                         &addrs,
+                        &mut net,
                     );
                 }
 
@@ -229,6 +337,7 @@ pub fn run_simulation(config: DistributionSimConfig) -> DistTrace {
                 &mut events,
                 &node_names,
                 round as u64,
+                &mut net,
             );
         }
 
@@ -323,6 +432,7 @@ fn tick_all_and_deliver(
     events: &mut Vec<Event<DistributionEventKind>>,
     node_names: &[String],
     tick: u64,
+    net: &mut NetworkState,
 ) {
     let n = nodes.len();
 
@@ -354,38 +464,44 @@ fn tick_all_and_deliver(
 
     // Deliver all actions and collect responses.
     for (sender_idx, actions) in all_actions {
-        let tagged_responses = deliver_actions_tagged(
+        let tagged_responses = deliver_actions_tagged_with_net(
             &actions,
+            sender_idx,
             node_ids[sender_idx],
             addrs[sender_idx],
             nodes,
             node_ids,
             addrs,
+            net,
         );
         // Deliver responses back, using the actual responder's identity.
         for (responder_idx, response_actions) in tagged_responses {
-            deliver_actions_tagged(
+            deliver_actions_tagged_with_net(
                 &response_actions,
+                responder_idx,
                 node_ids[responder_idx],
                 addrs[responder_idx],
                 nodes,
                 node_ids,
                 addrs,
+                net,
             );
         }
     }
 }
 
-/// Deliver actions to the appropriate target nodes.
+/// Deliver actions to the appropriate target nodes, respecting network conditions.
 /// Returns responses tagged with the index of the responding node.
 /// `None` nodes (killed) silently drop actions — simulates network loss.
-fn deliver_actions_tagged(
+fn deliver_actions_tagged_with_net(
     actions: &[NodeAction],
+    sender_idx: usize,
     sender_id: NodeId,
     sender_addr: SocketAddr,
     nodes: &mut [Option<DistributedNode>],
     node_ids: &[NodeId],
     node_addrs: &[SocketAddr],
+    net: &mut NetworkState,
 ) -> Vec<(usize, Vec<NodeAction>)> {
     let mut tagged_responses: Vec<(usize, Vec<NodeAction>)> = Vec::new();
 
@@ -398,11 +514,13 @@ fn deliver_actions_tagged(
                 ..
             } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == to) {
-                    if let Some(ref mut node) = nodes[idx] {
-                        let resp =
-                            node.handle_ping(sender_id, sender_addr, *sequence, piggyback);
-                        if !resp.is_empty() {
-                            tagged_responses.push((idx, resp));
+                    if net.should_deliver(sender_idx, idx) {
+                        if let Some(ref mut node) = nodes[idx] {
+                            let resp =
+                                node.handle_ping(sender_id, sender_addr, *sequence, piggyback);
+                            if !resp.is_empty() {
+                                tagged_responses.push((idx, resp));
+                            }
                         }
                     }
                 }
@@ -414,30 +532,36 @@ fn deliver_actions_tagged(
                 ..
             } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == to) {
-                    if let Some(ref mut node) = nodes[idx] {
-                        let resp = node.handle_ack(sender_id, *sequence, piggyback);
-                        if !resp.is_empty() {
-                            tagged_responses.push((idx, resp));
+                    if net.should_deliver(sender_idx, idx) {
+                        if let Some(ref mut node) = nodes[idx] {
+                            let resp = node.handle_ack(sender_id, *sequence, piggyback);
+                            if !resp.is_empty() {
+                                tagged_responses.push((idx, resp));
+                            }
                         }
                     }
                 }
             }
             NodeAction::SendJoinRequest { to_addr } => {
                 if let Some(idx) = node_addrs.iter().position(|a| a == to_addr) {
-                    if let Some(ref mut node) = nodes[idx] {
-                        let resp = node.handle_join_request(sender_id, sender_addr);
-                        if !resp.is_empty() {
-                            tagged_responses.push((idx, resp));
+                    if net.should_deliver(sender_idx, idx) {
+                        if let Some(ref mut node) = nodes[idx] {
+                            let resp = node.handle_join_request(sender_id, sender_addr);
+                            if !resp.is_empty() {
+                                tagged_responses.push((idx, resp));
+                            }
                         }
                     }
                 }
             }
             NodeAction::SendJoinResponse { to, members, .. } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == to) {
-                    if let Some(ref mut node) = nodes[idx] {
-                        let resp = node.handle_join_response(members.clone());
-                        if !resp.is_empty() {
-                            tagged_responses.push((idx, resp));
+                    if net.should_deliver(sender_idx, idx) {
+                        if let Some(ref mut node) = nodes[idx] {
+                            let resp = node.handle_join_response(members.clone());
+                            if !resp.is_empty() {
+                                tagged_responses.push((idx, resp));
+                            }
                         }
                     }
                 }
@@ -451,16 +575,18 @@ fn deliver_actions_tagged(
                 ..
             } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == relay) {
-                    if let Some(ref mut node) = nodes[idx] {
-                        let resp = node.handle_ping_req(
-                            sender_id,
-                            *target,
-                            *target_addr,
-                            *sequence,
-                            piggyback,
-                        );
-                        if !resp.is_empty() {
-                            tagged_responses.push((idx, resp));
+                    if net.should_deliver(sender_idx, idx) {
+                        if let Some(ref mut node) = nodes[idx] {
+                            let resp = node.handle_ping_req(
+                                sender_id,
+                                *target,
+                                *target_addr,
+                                *sequence,
+                                piggyback,
+                            );
+                            if !resp.is_empty() {
+                                tagged_responses.push((idx, resp));
+                            }
                         }
                     }
                 }

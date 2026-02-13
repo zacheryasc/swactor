@@ -37,7 +37,7 @@ lookups and for selecting STORE targets.
 
 ## Iterative Lookup
 
-See [actor_resolution.svg](actor_resolution.svg) for the registration and
+See [actor_resolution.svg](../diagrams/actor_resolution.svg) for the registration and
 resolution datapaths.
 
 The `NodeLookup` state machine drives iterative `FIND_NODE`:

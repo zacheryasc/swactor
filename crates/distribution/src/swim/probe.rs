@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
-use crate::types::NodeId;
+use crate::types::{MemberState, NodeId};
 
 use super::member_list::MemberList;
 
@@ -26,6 +26,9 @@ pub struct SwimConfig {
     pub indirect_probes: usize,
     /// Ticks a node stays in Suspect before being declared Dead.
     pub suspicion_timeout: u64,
+    /// Ticks between dead-node reprobe attempts. 0 = disabled.
+    /// When enabled, periodically pings dead nodes to detect partition heals.
+    pub dead_reprobe_interval: u64,
 }
 
 impl Default for SwimConfig {
@@ -35,6 +38,7 @@ impl Default for SwimConfig {
             probe_timeout: 3,
             indirect_probes: 3,
             suspicion_timeout: 30,
+            dead_reprobe_interval: 50,
         }
     }
 }
@@ -118,12 +122,23 @@ pub struct SwimProbe {
     suspicion_timers: Vec<SuspicionTimer>,
     /// Ring buffer of recent probe targets (most recent at back).
     recent_targets: VecDeque<NodeId>,
+    /// Tick at which the next dead-node reprobe should fire.
+    next_reprobe_tick: u64,
+    /// Round-robin index into the dead member list for reprobe target selection.
+    reprobe_index: usize,
 }
 
 impl SwimProbe {
     pub fn new(config: SwimConfig) -> Self {
+        let next_reprobe = if config.dead_reprobe_interval > 0 {
+            config.dead_reprobe_interval
+        } else {
+            u64::MAX
+        };
         Self {
             next_probe_tick: config.probe_interval,
+            next_reprobe_tick: next_reprobe,
+            reprobe_index: 0,
             config,
             tick: 0,
             sequence: 0,
@@ -145,6 +160,7 @@ impl SwimProbe {
                 self.check_probe_timeout(members, &mut actions);
                 self.check_suspicion_timeouts(members, &mut actions);
                 self.maybe_start_probe(members, &mut actions);
+                self.maybe_reprobe_dead(members, &mut actions);
             }
             SwimEvent::AckReceived { from, sequence } => {
                 self.handle_ack(from, sequence, members, &mut actions);
@@ -340,6 +356,38 @@ impl SwimProbe {
             }
             self.cancel_suspicion_timer(node_id);
         }
+    }
+
+    /// Periodically ping a dead node to detect partition heals.
+    ///
+    /// Runs independently of the normal probe cycle. The piggyback exchange
+    /// triggers the dead node's refutation mechanism (incarnation bump),
+    /// which propagates back and resurrects the node.
+    fn maybe_reprobe_dead(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
+        if self.config.dead_reprobe_interval == 0 {
+            return;
+        }
+        if self.tick < self.next_reprobe_tick {
+            return;
+        }
+
+        self.next_reprobe_tick = self.tick + self.config.dead_reprobe_interval;
+
+        let dead = members.dead_members();
+        if dead.is_empty() {
+            return;
+        }
+
+        let idx = self.reprobe_index % dead.len();
+        self.reprobe_index = self.reprobe_index.wrapping_add(1);
+
+        let target = &dead[idx];
+        let seq = self.next_sequence();
+        actions.push(SwimAction::SendPing {
+            to: target.node_id,
+            to_addr: target.addr,
+            sequence: seq,
+        });
     }
 }
 

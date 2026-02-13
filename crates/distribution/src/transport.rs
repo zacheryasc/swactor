@@ -67,12 +67,23 @@ impl TcpTransport {
     }
 
     /// Send an envelope to a specific address.
+    ///
+    /// If the write fails (e.g. stale connection from a dead peer), evicts
+    /// the pooled connection and retries once with a fresh one.
     pub fn send_to(&self, addr: SocketAddr, envelope: WireEnvelope) -> Result<(), Error> {
-        let mut stream = self.get_or_connect(addr)?;
         let buf = encode_wire_envelope(&envelope);
-        stream
-            .write_all(&buf)
-            .map_err(|e| Error::from(format!("TCP send to {addr}: {e}")))
+        let mut stream = self.get_or_connect(addr)?;
+        match stream.write_all(&buf) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                // Evict stale connection and retry once
+                self.pool.lock().unwrap().remove(&addr);
+                let mut stream = self.get_or_connect(addr)?;
+                stream
+                    .write_all(&buf)
+                    .map_err(|e| Error::from(format!("TCP send to {addr}: {e}")))
+            }
+        }
     }
 }
 

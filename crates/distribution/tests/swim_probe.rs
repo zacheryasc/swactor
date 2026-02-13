@@ -100,6 +100,7 @@ fn probe_sends_ping_after_interval() {
         probe_timeout: 3,
         indirect_probes: 2,
         suspicion_timeout: 20,
+        dead_reprobe_interval: 0,
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -122,6 +123,7 @@ fn probe_ack_completes_cycle() {
         probe_timeout: 3,
         indirect_probes: 2,
         suspicion_timeout: 20,
+        dead_reprobe_interval: 0,
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -151,6 +153,7 @@ fn probe_timeout_triggers_indirect_probes() {
         probe_timeout: 3,
         indirect_probes: 2,
         suspicion_timeout: 20,
+        dead_reprobe_interval: 0,
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -177,6 +180,7 @@ fn no_ack_at_all_causes_suspicion() {
         probe_timeout: 3,
         indirect_probes: 2,
         suspicion_timeout: 20,
+        dead_reprobe_interval: 0,
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -205,6 +209,7 @@ fn suspicion_timeout_causes_death_declaration() {
         probe_timeout: 3,
         indirect_probes: 0,
         suspicion_timeout: 10,
+        dead_reprobe_interval: 0,
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -238,6 +243,7 @@ fn indirect_ack_rescues_suspected_node() {
         probe_timeout: 3,
         indirect_probes: 2,
         suspicion_timeout: 20,
+        dead_reprobe_interval: 0,
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -277,4 +283,76 @@ fn probe_with_no_members_is_idle() {
     // Many ticks with no members — nothing should happen
     let actions = tick_n(&mut probe, &mut members, 100);
     assert!(actions.is_empty());
+}
+
+// ─── Dead-node reprobe tests ──────────────────────────────────────────────
+
+#[test]
+fn reprobe_sends_ping_to_dead_node() {
+    let config = SwimConfig {
+        probe_interval: 5,
+        probe_timeout: 3,
+        indirect_probes: 0,
+        suspicion_timeout: 10,
+        dead_reprobe_interval: 20,
+    };
+    let mut probe = SwimProbe::new(config);
+    let mut members = MemberList::new(node(0));
+    members.apply(node(1), addr(8001), MemberState::Alive, 0);
+    members.apply(node(2), addr(8002), MemberState::Dead, 0);
+
+    // Tick to the reprobe interval
+    let actions = tick_n(&mut probe, &mut members, 20);
+
+    // Should have sent a ping to the dead node (node 2)
+    let dead_pings: Vec<_> = actions
+        .iter()
+        .filter(|a| matches!(a, SwimAction::SendPing { to, .. } if *to == node(2)))
+        .collect();
+    assert!(!dead_pings.is_empty(), "should ping dead node during reprobe");
+}
+
+#[test]
+fn reprobe_disabled_when_interval_is_zero() {
+    let config = SwimConfig {
+        probe_interval: 5,
+        probe_timeout: 3,
+        indirect_probes: 0,
+        suspicion_timeout: 10,
+        dead_reprobe_interval: 0,
+    };
+    let mut probe = SwimProbe::new(config);
+    let mut members = MemberList::new(node(0));
+    members.apply(node(1), addr(8001), MemberState::Dead, 0);
+
+    // Tick a lot — should never ping the dead node
+    let actions = tick_n(&mut probe, &mut members, 200);
+    let dead_pings: Vec<_> = actions
+        .iter()
+        .filter(|a| matches!(a, SwimAction::SendPing { to, .. } if *to == node(1)))
+        .collect();
+    assert!(dead_pings.is_empty(), "reprobe disabled, should not ping dead node");
+}
+
+#[test]
+fn reprobe_does_nothing_when_no_dead_members() {
+    let config = SwimConfig {
+        probe_interval: 100, // high to avoid normal probe noise
+        probe_timeout: 3,
+        indirect_probes: 0,
+        suspicion_timeout: 10,
+        dead_reprobe_interval: 20,
+    };
+    let mut probe = SwimProbe::new(config);
+    let mut members = MemberList::new(node(0));
+    members.apply(node(1), addr(8001), MemberState::Alive, 0);
+
+    // Tick past reprobe interval — no dead members to reprobe
+    let actions = tick_n(&mut probe, &mut members, 25);
+    // The only pings should be to the alive member (if probe_interval fires)
+    for action in &actions {
+        if let SwimAction::SendPing { to, .. } = action {
+            assert_eq!(*to, node(1), "should only ping alive members, not dead");
+        }
+    }
 }

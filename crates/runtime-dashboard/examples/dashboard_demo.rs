@@ -277,6 +277,7 @@ fn main() {
         probe_timeout: 2,
         indirect_probes: 2,
         suspicion_timeout: 20,
+        dead_reprobe_interval: 50,
     };
 
     let num_nodes = 9; // 1 main + 8 peers

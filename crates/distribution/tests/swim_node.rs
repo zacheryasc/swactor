@@ -16,6 +16,7 @@ fn fast_config() -> SwimConfig {
         probe_timeout: 3,
         indirect_probes: 2,
         suspicion_timeout: 10,
+        dead_reprobe_interval: 0,
     }
 }
 

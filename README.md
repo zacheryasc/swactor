@@ -53,8 +53,8 @@ a different worker thread, an external inbox, or a remote process.
 Single-threaded mode (`rt.tick()`) gives deterministic frame-level control.
 Multi-threaded mode (`rt.run()`) spawns OS threads with adaptive backoff.
 
-See [docs/actor-model.md](docs/actor-model.md) and
-[docs/runtime.md](docs/runtime.md) for the full model.
+See [docs/runtime/actor-model.md](docs/runtime/actor-model.md) and
+[docs/runtime/runtime.md](docs/runtime/runtime.md) for the full model.
 
 ### Transport
 
@@ -68,7 +68,7 @@ cargo run --example tcp_ping_pong --features transport -- receiver  # terminal 1
 cargo run --example tcp_ping_pong --features transport -- sender    # terminal 2
 ```
 
-See [docs/transport.md](docs/transport.md) for the routing chain, codec
+See [docs/distribution/transport.md](docs/distribution/transport.md) for the routing chain, codec
 registry, and address resolution.
 
 ### Runtime Dashboard
@@ -115,7 +115,7 @@ cargo run --manifest-path tools/depgraph/Cargo.toml -- --src-dir src/ --output d
 python tools/spectral/spectral_analysis.py deps.dot
 ```
 
-See [docs/connectome.md](docs/connectome.md) for metric interpretation.
+See [docs/connectome/connectome.md](docs/connectome/connectome.md) for metric interpretation.
 
 ## Building & Testing
 
@@ -142,10 +142,11 @@ cargo bench                             # benchmarks (criterion)
 
 | Document | Covers |
 |----------|--------|
-| [Actor Model](docs/actor-model.md) | Traits, type erasure, addresses |
-| [Runtime](docs/runtime.md) | Runtime, Ctx, Inbox, RuntimeHandle, stats |
-| [Worker Thread](docs/worker-thread.md) | Tick phases, backoff, routing, full system topology |
-| [Channels](docs/channels.md) | HybridChannel, AddressMap, Placement |
-| [Transport](docs/transport.md) | Codec, Transport, remote messaging, address resolution |
-| [Connectome](docs/connectome.md) | CCI metrics, spectral analysis interpretation |
+| [Actor Model](docs/runtime/actor-model.md) | Traits, type erasure, addresses |
+| [Runtime](docs/runtime/runtime.md) | Runtime, Ctx, Inbox, RuntimeHandle, stats |
+| [Worker Thread](docs/runtime/worker-thread.md) | Tick phases, backoff, routing, full system topology |
+| [Channels](docs/runtime/channels.md) | HybridChannel, AddressMap, Placement |
+| [Transport](docs/distribution/transport.md) | Codec, Transport, remote messaging, address resolution |
+| [Distribution](docs/distribution/distribution.md) | SWIM membership, Kademlia, NodeDriver |
+| [Connectome](docs/connectome/connectome.md) | CCI metrics, spectral analysis interpretation |
 | [Dashboard](crates/runtime-dashboard/README.md) | Live web UI, trace recording, diagram index |
