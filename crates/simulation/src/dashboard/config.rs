@@ -3,8 +3,8 @@ use std::fs;
 use std::io;
 
 use serde::Deserialize;
-use simulation::gossip::sim::GossipSimConfig;
-use simulation::topology::Topology;
+use crate::gossip::sim::GossipSimConfig;
+use crate::topology::Topology;
 
 #[derive(Deserialize)]
 pub struct SimFileConfig {

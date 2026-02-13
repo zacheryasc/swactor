@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::CommandRequest;
+use super::CommandRequest;
 
 /// Parse a REPL text line into a [`CommandRequest`].
 ///

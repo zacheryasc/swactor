@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use swactor::actor::ActorInterface;
 use swactor::runtime::{Ctx, Runtime, RuntimeConfig};
-use swactor_command::{
+use runtime_dashboard::command::{
     from_query_params, parse_line, CommandContext, CommandRequest, CommandResponse, CommandRouter,
 };
 
@@ -310,9 +310,9 @@ fn from_query_params_defaults_to_help() {
 #[test]
 fn custom_command_handler() {
     struct PingCommand;
-    impl swactor_command::CommandHandler for PingCommand {
-        fn meta(&self) -> swactor_command::CommandMeta {
-            swactor_command::CommandMeta {
+    impl runtime_dashboard::command::CommandHandler for PingCommand {
+        fn meta(&self) -> runtime_dashboard::command::CommandMeta {
+            runtime_dashboard::command::CommandMeta {
                 name: "ping",
                 description: "Respond with pong",
                 usage: "ping",

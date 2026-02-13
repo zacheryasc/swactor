@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use simulation_dashboard::config::SimFileConfig;
-use simulation_dashboard::save_trace;
+use simulation::dashboard::config::SimFileConfig;
+use simulation::dashboard::save_trace;
 use simulation::gossip::sim::run_simulation;
 
 const CONFIGS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/configs");
@@ -54,7 +54,7 @@ fn main() {
             trace.events.len()
         );
     }
-    eprintln!("Done. View with: cargo run -p simulation-dashboard --example replay -- {out_dir}");
+    eprintln!("Done. View with: cargo run -p simulation --features dashboard --example replay -- {out_dir}");
 }
 
 fn collect_configs(dir: &str) -> Vec<PathBuf> {

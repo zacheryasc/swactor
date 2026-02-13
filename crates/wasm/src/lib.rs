@@ -4,7 +4,7 @@ use wasm_bindgen::prelude::*;
 
 use swactor::actor::{ActorAddress, ActorExited, ActorInterface};
 use swactor::runtime::{Ctx, Inbox, Runtime, RuntimeConfig};
-use swactor_std::{CtxGroups, RuntimeNaming, RuntimeGroups, StdExtension};
+use swactor_std::{CtxGroups, CtxWatching, RuntimeNaming, RuntimeGroups, StdExtension};
 
 // ─── Core JS-facing types ───────────────────────────────────────────────────
 

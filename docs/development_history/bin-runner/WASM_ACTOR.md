@@ -1,6 +1,6 @@
 # Wasm Actor Crate — Development History
 
-> Adds a new crate (`crates/wasm-actor/`) that runs WebAssembly guest code
+> Adds a new crate (`crates/bin-runner/`) that runs WebAssembly guest code
 > **inside** a swactor actor. The Wasm instance lives in the actor — not as a
 > separate OS process. Messages arrive as bytes, get written into Wasm linear
 > memory, and the guest's `handle` export is called.
@@ -30,7 +30,7 @@ Swactor already supported running *inside* a browser via `crates/wasm/`
 plugins, multi-language actors, and capability-restricted compute.
 
 The main swactor crate has no wasmtime dependency — all Wasm machinery is
-isolated in `crates/wasm-actor/`.
+isolated in `crates/bin-runner/`.
 
 ---
 
@@ -38,14 +38,14 @@ isolated in `crates/wasm-actor/`.
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
-| `swactor-wasm-actor` crate | `crates/wasm-actor/` | Host-side: engine, builder, actor impl |
-| 3 guest crates | `crates/wasm-actor/tests/guests/{echo,double,silent}/` | `#![no_std]` Wasm modules for testing |
-| Integration tests | `crates/wasm-actor/tests/wasm_actor.rs` | 7 behavioral tests |
+| `swactor-bin-runner` crate | `crates/bin-runner/` | Host-side: engine, builder, actor impl |
+| 3 guest crates | `crates/bin-runner/tests/guests/{echo,double,silent}/` | `#![no_std]` Wasm modules for testing |
+| Integration tests | `crates/bin-runner/tests/wasm_actor.rs` | 7 behavioral tests |
 
 ### Crate modules
 
 ```
-crates/wasm-actor/src/
+crates/bin-runner/src/
   lib.rs        — ByteMessage, re-exports
   engine.rs     — SharedEngine (Arc<wasmtime::Engine>)
   builder.rs    — WasmActorBuilder (compile + link + instantiate)
@@ -138,9 +138,9 @@ This allows guests to send replies without hardcoding addresses.
 ```bash
 rustup target add wasm32-unknown-unknown   # one-time
 
-cd crates/wasm-actor/tests/guests/echo   && cargo build --target wasm32-unknown-unknown --release
-cd crates/wasm-actor/tests/guests/double && cargo build --target wasm32-unknown-unknown --release
-cd crates/wasm-actor/tests/guests/silent && cargo build --target wasm32-unknown-unknown --release
+cd crates/bin-runner/tests/guests/echo   && cargo build --target wasm32-unknown-unknown --release
+cd crates/bin-runner/tests/guests/double && cargo build --target wasm32-unknown-unknown --release
+cd crates/bin-runner/tests/guests/silent && cargo build --target wasm32-unknown-unknown --release
 ```
 
 Each guest crate has its own `[workspace]` marker to stay independent of the
@@ -178,7 +178,7 @@ root workspace.
 
 ## 8. Test Coverage Summary
 
-7 behavioral tests in `crates/wasm-actor/tests/wasm_actor.rs`:
+7 behavioral tests in `crates/bin-runner/tests/wasm_actor.rs`:
 
 | Test | Scenario |
 |------|----------|

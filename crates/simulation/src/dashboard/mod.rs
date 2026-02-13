@@ -7,7 +7,7 @@ pub use server::serve_dashboard;
 use std::fs;
 use std::io;
 
-use simulation::gossip::trace::SimulationTrace;
+use crate::gossip::trace::SimulationTrace;
 
 pub fn save_trace(trace: &SimulationTrace, path: &str) -> io::Result<()> {
     let json = serde_json::to_string_pretty(trace)

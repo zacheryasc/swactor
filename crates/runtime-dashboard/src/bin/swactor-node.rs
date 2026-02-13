@@ -116,6 +116,7 @@ fn main() {
         swim: swim_config,
         cache_capacity: 1000,
         republish_interval: 500,
+        ..Default::default()
     };
     let mut driver = NodeDriver::new(node_config).expect("failed to create node driver");
 

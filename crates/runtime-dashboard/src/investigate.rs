@@ -1,6 +1,6 @@
 //! Line-oriented diagnostic protocol for LLM-driven runtime investigation.
 //!
-//! Delegates all command logic to the `swactor-command` crate.
+//! Delegates all command logic to the `command` module.
 //!
 //! Send text commands on stdin, receive JSON responses on stdout (one per line).
 //! All human-readable diagnostics go to stderr.
@@ -23,7 +23,7 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use swactor::runtime::Runtime;
-use swactor_command::{CommandContext, CommandRouter};
+use crate::command::{CommandContext, CommandRouter};
 
 use crate::collector::StatsCollector;
 
@@ -47,7 +47,7 @@ pub fn run_investigate(runtime: Arc<Runtime>, collector: Arc<StatsCollector>) ->
             break;
         }
 
-        let req = swactor_command::parse_line(line);
+        let req = crate::command::parse_line(line);
         let resp = router.dispatch(&req, &ctx);
 
         stdout.write_all(resp.to_json_line().as_bytes())?;
@@ -66,6 +66,6 @@ pub fn dispatch_command(
     router: &CommandRouter,
     ctx: &CommandContext,
 ) -> String {
-    let req = swactor_command::from_query_params(params);
+    let req = crate::command::from_query_params(params);
     router.dispatch(&req, ctx).to_json_line()
 }
