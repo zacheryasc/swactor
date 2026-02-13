@@ -1,4 +1,3 @@
-
 use std::sync::Arc;
 
 use crossbeam_queue::{ArrayQueue, SegQueue};

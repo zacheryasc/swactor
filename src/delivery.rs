@@ -1,12 +1,64 @@
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::thread::Thread;
 
 use crate::actor::{ActorAddress, AnyActor, Message};
 use crate::channel::Sender;
 use crate::config::RuntimeConfig;
+use crate::stats::WorkerStats;
 use crate::Error;
+
+// ─── Identity Hasher for ActorAddress ───────────────────────────────────────
+
+/// Identity hasher for ActorAddress keys.
+///
+/// ActorAddress contains 32 cryptographically random bytes. The custom `Hash`
+/// impl on ActorAddress writes only the first 8 bytes as a `u64`. This hasher
+/// passes that u64 through as the hash value directly — no mixing, no SipHash.
+///
+/// This is safe because the input is already random (uniform distribution),
+/// so additional mixing would be redundant.
+pub struct AddrHasher(u64);
+
+impl Hasher for AddrHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, _bytes: &[u8]) {
+        // Unused — ActorAddress::hash calls write_u64 directly.
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.0 = i;
+    }
+}
+
+/// BuildHasher for creating AddrHasher instances.
+#[derive(Default, Clone)]
+pub struct AddrBuildHasher;
+
+impl BuildHasher for AddrBuildHasher {
+    type Hasher = AddrHasher;
+
+    #[inline]
+    fn build_hasher(&self) -> AddrHasher {
+        AddrHasher(0)
+    }
+}
+
+/// HashMap optimized for ActorAddress keys.
+/// Uses identity hashing since ActorAddress bytes are already random.
+pub type AddrMap<V> = HashMap<ActorAddress, V, AddrBuildHasher>;
+
+/// HashSet optimized for ActorAddress keys.
+pub type AddrSet = HashSet<ActorAddress, AddrBuildHasher>;
 
 // ─── Address Map Types ───────────────────────────────────────────────────────
 
@@ -24,13 +76,13 @@ impl WorkerId {
 ///
 /// `RwLock<HashMap>` — zero contention for parallel reads, write-rare (only on spawn).
 pub(crate) struct AddressMap {
-    inner: RwLock<HashMap<ActorAddress, WorkerId>>,
+    inner: RwLock<AddrMap<WorkerId>>,
 }
 
 impl AddressMap {
     pub fn with_capacity(cap: usize) -> Self {
         Self {
-            inner: RwLock::new(HashMap::with_capacity(cap)),
+            inner: RwLock::new(HashMap::with_capacity_and_hasher(cap, AddrBuildHasher)),
         }
     }
 
@@ -40,6 +92,11 @@ impl AddressMap {
 
     pub fn lookup(&self, addr: &ActorAddress) -> Option<WorkerId> {
         self.inner.read().unwrap().get(addr).copied()
+    }
+
+    /// Remove an actor address from the map (e.g., after permanent poisoning).
+    pub fn remove(&self, addr: &ActorAddress) {
+        self.inner.write().unwrap().remove(addr);
     }
 
     /// Returns a snapshot of all (address, worker) pairs.
@@ -53,23 +110,50 @@ impl AddressMap {
     }
 }
 
-/// Round-robin actor placement strategy.
+/// Load-aware actor placement strategy.
+///
+/// Picks the worker with the lowest load score (actor count + mailbox depth).
+/// When all workers have equal load (e.g., before any ticks), falls back to
+/// round-robin via a rotating start position for the scan.
 pub(crate) struct Placement {
     next: AtomicUsize,
     num_workers: usize,
+    worker_stats: Vec<Arc<WorkerStats>>,
 }
 
 impl Placement {
-    pub fn new(num_workers: usize) -> Self {
+    pub fn new(num_workers: usize, worker_stats: Vec<Arc<WorkerStats>>) -> Self {
         Self {
             next: AtomicUsize::new(0),
             num_workers,
+            worker_stats,
         }
     }
 
     pub fn next_worker(&self) -> WorkerId {
-        let id = self.next.fetch_add(1, Ordering::Relaxed) % self.num_workers;
-        WorkerId(id)
+        let n = self.num_workers;
+        if n == 1 {
+            return WorkerId(0);
+        }
+
+        // Rotate the scan start for round-robin tie-breaking
+        let rr = self.next.fetch_add(1, Ordering::Relaxed);
+
+        let mut best_id = rr % n;
+        let mut best_score = usize::MAX;
+
+        for offset in 0..n {
+            let i = (rr + offset) % n;
+            let actors = self.worker_stats[i].num_actors.load(Ordering::Relaxed);
+            let depth = self.worker_stats[i].total_mailbox_depth.load(Ordering::Relaxed);
+            let score = actors + depth;
+            if score < best_score {
+                best_score = score;
+                best_id = i;
+            }
+        }
+
+        WorkerId(best_id)
     }
 }
 
@@ -112,13 +196,13 @@ impl<M: Message> SenderT for Sender<M> {
 
 /// Registry of external inboxes — replaces the Router's role for non-actor receivers.
 pub(crate) struct InboxRegistry {
-    senders: RwLock<HashMap<ActorAddress, Arc<dyn SenderT>>>,
+    senders: RwLock<AddrMap<Arc<dyn SenderT>>>,
 }
 
 impl InboxRegistry {
     pub fn new() -> Self {
         Self {
-            senders: RwLock::new(HashMap::new()),
+            senders: RwLock::new(HashMap::with_hasher(AddrBuildHasher)),
         }
     }
 
@@ -127,6 +211,7 @@ impl InboxRegistry {
     }
 
     /// Check if an address is registered without consuming a message.
+    #[cfg(feature = "transport")]
     pub fn contains(&self, addr: &ActorAddress) -> bool {
         self.senders.read().unwrap().contains_key(addr)
     }
@@ -154,7 +239,10 @@ pub(crate) struct TickContext<'a> {
     pub(crate) placement: &'a Placement,
     pub(crate) inbox_registry: &'a InboxRegistry,
     pub(crate) config: &'a RuntimeConfig,
+    pub(crate) extension: Option<&'a dyn crate::extension::RuntimeExtension>,
     pub(crate) stats_hook: Option<&'a dyn crate::stats::StatsHook>,
+    /// Thread handles for waking parked workers on cross-worker sends.
+    pub(crate) worker_threads: &'a [OnceLock<Thread>],
     #[cfg(feature = "transport")]
     pub(crate) codec_registry: Option<&'a crate::transport::CodecRegistry>,
     #[cfg(feature = "transport")]

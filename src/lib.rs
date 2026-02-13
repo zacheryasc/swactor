@@ -1,10 +1,13 @@
 pub mod actor;
+pub mod extension;
 pub mod worker;
 
 pub(crate) mod channel;
 pub(crate) mod error;
 pub use error::Error;
 
+// Re-export identity hashing types for ActorAddress-keyed collections.
+pub use delivery::{AddrBuildHasher, AddrMap, AddrSet};
 
 pub mod config;
 pub(crate) mod delivery;

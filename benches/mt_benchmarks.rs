@@ -22,6 +22,7 @@ fn mt_config(threads: usize, max_actors: usize, max_messages: usize) -> RuntimeC
             sleep_increment_us: 10,
             sleep_max_us: 100,
         },
+        ..Default::default()
     }
 }
 

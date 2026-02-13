@@ -87,6 +87,7 @@ fn bench_config(threads: usize, max_actors: usize, max_messages: usize) -> Runti
             sleep_increment_us: 10,
             sleep_max_us: 100,
         },
+        ..Default::default()
     }
 }
 

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/python", "crates/wasm", "crates/simulation", "crates/runtime-dashboard", "crates/distribution", "crates/simulation-dashboard"]
+members = [".", "crates/python", "crates/wasm", "crates/simulation", "crates/runtime-dashboard", "crates/distribution", "crates/simulation-dashboard", "crates/std"]
 exclude = ["tools/depgraph"]
 
 [package]
@@ -32,6 +32,9 @@ crossbeam-utils = "0.8.21"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1"
+proptest-state-machine = "0.3"
+swactor-std = { path = "crates/std" }
 
 [[bench]]
 name = "runtime_benchmarks"
@@ -39,6 +42,10 @@ harness = false
 
 [[bench]]
 name = "mt_benchmarks"
+harness = false
+
+[[bench]]
+name = "hasher_benchmarks"
 harness = false
 
 [[example]]

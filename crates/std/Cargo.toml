@@ -1,0 +1,12 @@
+[package]
+name = "swactor-std"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["getrandom"]
+getrandom = ["dep:getrandom"]
+
+[dependencies]
+swactor = { path = "../.." }
+getrandom = { version = "0.2", optional = true }

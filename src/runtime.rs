@@ -1,15 +1,16 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, OnceLock};
+use std::thread::{self, JoinHandle, Thread};
 use std::time::Instant;
 
-use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message};
+use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message, StopSignal, TimerRequest};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
-pub use crate::config::{BackoffPolicy, RuntimeConfig};
+pub use crate::config::{BackoffPolicy, MailboxOverflow, RuntimeConfig};
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
+use crate::extension::RuntimeExtension;
 use crate::stats::{StatsHook, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
 pub use crate::stats::{RuntimeStats, WorkerInfo};
@@ -29,6 +30,39 @@ impl<M: Message> Inbox<M> {
 
     pub fn try_recv(&self) -> Option<M> {
         self.inner.try_recv()
+    }
+}
+
+/// Pending ask response — wraps an inbox with convenience recv methods.
+///
+/// Created by [`Runtime::ask`]. Provides `try_recv()` for polling and
+/// `recv_ticking()` for automatic tick-until-response.
+pub struct Ask<R: Message> {
+    inbox: Inbox<R>,
+}
+
+impl<R: Message> Ask<R> {
+    /// Try to receive the response without ticking.
+    pub fn try_recv(&self) -> Option<R> {
+        self.inbox.try_recv()
+    }
+
+    /// Tick the runtime until a response arrives or `max_ticks` is exhausted.
+    ///
+    /// Only valid for single-threaded runtimes (panics if `num_threads >= 2`).
+    pub fn recv_ticking(&self, rt: &Runtime, max_ticks: usize) -> Result<R, Error> {
+        for _ in 0..max_ticks {
+            rt.tick();
+            if let Some(resp) = self.inbox.try_recv() {
+                return Ok(resp);
+            }
+        }
+        Err(Error::from("ask timeout: no response within max_ticks"))
+    }
+
+    /// Get the reply address (for manual message construction).
+    pub fn reply_addr(&self) -> &ActorAddress {
+        self.inbox.addr()
     }
 }
 
@@ -62,6 +96,7 @@ pub struct Runtime {
     config: RuntimeConfig,
     address_map: Arc<AddressMap>,
     inbox_registry: Arc<InboxRegistry>,
+    extension: Option<Arc<dyn RuntimeExtension>>,
     transfer_txs: Vec<Sender<Envelope>>,
     spawn_txs: Vec<Sender<(ActorAddress, Box<dyn AnyActor>)>>,
     placement: Placement,
@@ -70,6 +105,8 @@ pub struct Runtime {
     stats_hook: Option<Arc<dyn StatsHook>>,
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
+    /// Thread handles for waking parked workers. Set by workers on startup via OnceLock.
+    worker_threads: Vec<OnceLock<Thread>>,
     created_at: Instant,
     #[cfg(feature = "transport")]
     codec_registry: Option<Arc<crate::transport::CodecRegistry>>,
@@ -117,7 +154,6 @@ impl Runtime {
 
         let address_map = Arc::new(AddressMap::with_capacity(config.max_actors));
         let inbox_registry = Arc::new(InboxRegistry::new());
-        let placement = Placement::new(num_workers);
 
         let mut transfer_txs = Vec::with_capacity(num_workers);
         let mut spawn_txs = Vec::with_capacity(num_workers);
@@ -136,13 +172,26 @@ impl Runtime {
 
             let stats = Arc::new(WorkerStats::new());
             worker_stats.push(stats.clone());
-            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats));
+            workers.push(Worker::new(
+                WorkerId(i),
+                transfer_rx,
+                spawn_rx,
+                stats,
+                config.default_mailbox_capacity,
+                config.mailbox_overflow,
+            ));
         }
+
+        let placement = Placement::new(num_workers, worker_stats.clone());
+
+        let worker_threads: Vec<OnceLock<Thread>> =
+            (0..num_workers).map(|_| OnceLock::new()).collect();
 
         let rt = Self {
             config,
             address_map,
             inbox_registry,
+            extension: None,
             transfer_txs,
             spawn_txs,
             placement,
@@ -150,6 +199,7 @@ impl Runtime {
             worker_stats,
             stats_hook: None,
             tick_workers: RefCell::new(workers),
+            worker_threads,
             created_at: Instant::now(),
             #[cfg(feature = "transport")]
             codec_registry: None,
@@ -186,6 +236,41 @@ impl Runtime {
         Ok(addr)
     }
 
+    /// Install a runtime extension. Extensions provide higher-level features
+    /// (naming, monitoring, groups) via lifecycle hooks.
+    ///
+    /// Must be called before `run()` or `tick()`.
+    pub fn with_extension(mut self, ext: Arc<dyn RuntimeExtension>) -> Self {
+        self.extension = Some(ext);
+        self
+    }
+
+    /// Access the installed runtime extension (if any).
+    pub fn extension(&self) -> Option<&dyn RuntimeExtension> {
+        self.extension.as_deref()
+    }
+
+    /// Send a request and get a handle for the response.
+    ///
+    /// Creates a temporary inbox, calls `msg_builder` with the inbox's address
+    /// (so you can embed it as `reply_to`), sends the message, and returns an
+    /// [`Ask`] handle for receiving the response.
+    ///
+    /// ```ignore
+    /// let ask = rt.ask(actor, |reply_to| GetValue { reply_to })?;
+    /// let value = ask.recv_ticking(&rt, 10)?;
+    /// ```
+    pub fn ask<Req: Message, Resp: Message>(
+        &self,
+        addr: ActorAddress,
+        msg_builder: impl FnOnce(ActorAddress) -> Req,
+    ) -> Result<Ask<Resp>, Error> {
+        let inbox = self.new_inbox::<Resp>()?;
+        let msg = msg_builder(*inbox.addr());
+        self.send_to(addr, msg)?;
+        Ok(Ask { inbox })
+    }
+
     /// Send a message to an actor address
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
         let result = self.send_any(addr, Box::new(msg));
@@ -216,7 +301,9 @@ impl Runtime {
             placement: &self.placement,
             inbox_registry: &self.inbox_registry,
             config: &self.config,
+            extension: self.extension.as_deref(),
             stats_hook: self.stats_hook.as_deref(),
+            worker_threads: &self.worker_threads,
             #[cfg(feature = "transport")]
             codec_registry: self.codec_registry.as_deref(),
             #[cfg(feature = "transport")]
@@ -256,10 +343,13 @@ impl Runtime {
 
         for mut worker in workers {
             let rt_clone = rt.clone();
-            let name = format!("swactor-worker-{}", worker.id.0);
+            let worker_id = worker.id.0;
+            let name = format!("swactor-worker-{}", worker_id);
             let handle = thread::Builder::new()
                 .name(name)
                 .spawn(move || {
+                    // Register this thread so send_to/spawn can unpark us
+                    let _ = rt_clone.worker_threads[worker_id].set(thread::current());
                     let tc = rt_clone.make_tick_context();
                     worker.run(&tc, &rt_clone.is_running);
                 })
@@ -294,12 +384,36 @@ impl Runtime {
         RuntimeStats { num_workers, uptime_ms, actors, workers, actor_details: Vec::new(), tick_timings }
     }
 
-    /// Signal all workers to stop
+    /// Request an actor to stop gracefully.
+    ///
+    /// The actor's `on_stop()` hook is called before removal. Pending messages
+    /// in the mailbox are discarded. The stop takes effect on the next tick.
+    ///
+    /// Returns `Err` if the actor address is not found in the runtime.
+    pub fn stop_actor(&self, addr: ActorAddress) -> Result<(), Error> {
+        match self.address_map.lookup(&addr) {
+            Some(wid) => {
+                self.transfer_txs[wid.as_usize()]
+                    .send(Envelope::new(addr, Box::new(StopSignal)));
+                notify_worker(&self.worker_threads, wid.as_usize());
+                Ok(())
+            }
+            None => Err(Error::from("Actor not found")),
+        }
+    }
+
+    /// Signal all workers to stop and wake any that are parked.
     pub fn shutdown(&self) {
         #[cfg(feature = "tracing")]
         tracing::info!("runtime.shutdown");
 
         self.is_running.store(false, Ordering::Release);
+        // Wake all parked workers so they see the shutdown flag immediately
+        for thread in &self.worker_threads {
+            if let Some(t) = thread.get() {
+                t.unpark();
+            }
+        }
     }
 
     /// Set a stats hook to receive per-actor snapshots from workers.
@@ -342,12 +456,23 @@ impl Runtime {
     }
 }
 
+/// Wake a parked worker thread so it can process new work.
+/// No-op if the thread handle hasn't been registered yet (single-threaded tick mode).
+#[inline]
+pub(crate) fn notify_worker(threads: &[OnceLock<Thread>], wid: usize) {
+    if let Some(t) = threads.get(wid).and_then(|o| o.get()) {
+        t.unpark();
+    }
+}
+
+#[allow(private_interfaces)]
 impl ContextInner for Runtime {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
             Some(wid) => {
                 self.transfer_txs[wid.as_usize()]
                     .send(Envelope::new(addr, msg));
+                notify_worker(&self.worker_threads, wid.as_usize());
                 Ok(())
             }
             None => self.make_tick_context().route_nonlocal(addr, msg),
@@ -359,5 +484,26 @@ impl ContextInner for Runtime {
         self.address_map.insert(addr, worker_id);
         self.spawn_txs[worker_id.as_usize()]
             .send((addr, actor));
+        notify_worker(&self.worker_threads, worker_id.as_usize());
+    }
+
+    fn request_stop(&self, addr: ActorAddress) {
+        // From spawn context (outside worker), send StopSignal through transfer queue
+        if let Some(wid) = self.address_map.lookup(&addr) {
+            self.transfer_txs[wid.as_usize()]
+                .send(Envelope::new(addr, Box::new(StopSignal)));
+            notify_worker(&self.worker_threads, wid.as_usize());
+        }
+    }
+
+    fn schedule_timer(&self, _request: TimerRequest) {
+        // Timers are per-worker and tick-counted; scheduling from outside
+        // a worker context (e.g., rt.spawn() callback) is not supported.
+        // Use rt.send_to() with a delay loop instead.
+        eprintln!("swactor: schedule_timer called outside worker context — ignored");
+    }
+
+    fn extension(&self) -> Option<&dyn RuntimeExtension> {
+        self.extension.as_deref()
     }
 }
