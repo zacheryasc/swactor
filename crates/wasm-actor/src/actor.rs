@@ -41,12 +41,16 @@ impl ActorInterface for WasmActor {
         };
 
         // 2. Write message bytes into guest memory
-        self.memory.data_mut(&mut self.store)
-            [ptr as usize..(ptr as usize + bytes.len())]
-            .copy_from_slice(bytes);
+        let mem = self.memory.data_mut(&mut self.store);
+        let end = (ptr as usize).saturating_add(bytes.len());
+        if end > mem.len() {
+            return; // alloc returned OOB pointer — drop message
+        }
+        mem[ptr as usize..end].copy_from_slice(bytes);
 
         // 3. Call guest handle
         if self.handle.call(&mut self.store, (ptr, len)).is_err() {
+            self.store.data_mut().outbox.clear(); // discard sends from incomplete operation
             return; // handle trapped — drop message, keep actor alive
         }
 
