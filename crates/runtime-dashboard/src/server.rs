@@ -11,7 +11,6 @@ use swactor::runtime::Runtime;
 use crate::actors_html::ACTORS_HTML;
 use crate::collector::StatsCollector;
 use crate::dashboard_html::DASHBOARD_HTML;
-use crate::investigate;
 use crate::layer::EventStore;
 use crate::trace::RuntimeTrace;
 
@@ -127,6 +126,7 @@ pub(crate) fn spawn_http_server(
     let addr = format!("0.0.0.0:{port}");
     let server = tiny_http::Server::http(&addr).expect("failed to bind HTTP server");
     let server = Arc::new(server);
+    let cmd_router = Arc::new(swactor_command::CommandRouter::with_builtins());
 
     for _ in 0..4 {
         let server = Arc::clone(&server);
@@ -134,6 +134,7 @@ pub(crate) fn spawn_http_server(
         let runtime = Arc::clone(&runtime);
         let collector = Arc::clone(&collector);
         let shutdown = Arc::clone(&shutdown);
+        let cmd_router = Arc::clone(&cmd_router);
         #[cfg(feature = "distribution")]
         let distribution = Arc::clone(&distribution);
         thread::spawn(move || {
@@ -174,6 +175,7 @@ pub(crate) fn spawn_http_server(
                             &url,
                             Arc::clone(&runtime),
                             Arc::clone(&collector),
+                            Arc::clone(&cmd_router),
                         );
                     }
                     _ => respond_404(request),
@@ -283,21 +285,33 @@ fn handle_investigate_api(
     url: &str,
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
+    cmd_router: Arc<swactor_command::CommandRouter>,
 ) {
     let params = parse_query_string(url);
-    let cmd = params.get("cmd").map(|s| s.as_str()).unwrap_or("help");
 
     let maybe_rt = runtime.lock().unwrap().clone();
     let maybe_col = collector.lock().unwrap().clone();
 
     let json = match (maybe_rt, maybe_col) {
-        (Some(rt), Some(col)) => investigate::dispatch_command(cmd, &params, &rt, &col),
-        _ => serde_json::json!({
-            "ok": false,
-            "command": cmd,
-            "error": "runtime not attached yet"
-        })
-        .to_string(),
+        (Some(rt), Some(col)) => {
+            let ctx = swactor_command::CommandContext::with_enricher(rt, col);
+            let req = swactor_command::from_query_params(&params);
+            cmd_router.dispatch(&req, &ctx).to_json_line()
+        }
+        (Some(rt), None) => {
+            let ctx = swactor_command::CommandContext::new(rt);
+            let req = swactor_command::from_query_params(&params);
+            cmd_router.dispatch(&req, &ctx).to_json_line()
+        }
+        _ => {
+            let cmd = params.get("cmd").map(|s| s.as_str()).unwrap_or("help");
+            serde_json::json!({
+                "ok": false,
+                "command": cmd,
+                "error": "runtime not attached yet"
+            })
+            .to_string()
+        }
     };
 
     let response = tiny_http::Response::from_string(json).with_header(

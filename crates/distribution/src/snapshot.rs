@@ -33,6 +33,15 @@ pub struct CacheEntryInfo {
     pub node_id: String,
 }
 
+/// Snapshot of a single registry entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryEntryInfo {
+    pub name: String,
+    pub actor_addr: String,
+    pub node_id: String,
+    pub tombstone: bool,
+}
+
 /// Complete snapshot of a `DistributedNode`'s observable state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DistributionNodeSnapshot {
@@ -70,6 +79,14 @@ pub struct DistributionNodeSnapshot {
     pub directory_entry_count: usize,
     /// Number of entries pending re-replication.
     pub repair_queue_size: usize,
+
+    // ─── Registry ────────────────────────────────────────────────────
+    /// Number of entries in the cluster registry (including tombstones).
+    pub registry_size: usize,
+    /// Number of tombstoned entries.
+    pub registry_tombstones: usize,
+    /// All registry entries.
+    pub registry_entries: Vec<RegistryEntryInfo>,
 
     // ─── Gossip pairs ────────────────────────────────────────────────
     /// Recent SWIM probe targets (most recent last).
@@ -136,6 +153,17 @@ impl DistributedNode {
             .map(|id| node_id_hex(id))
             .collect();
 
+        let registry = self.registry();
+        let registry_entries: Vec<RegistryEntryInfo> = registry
+            .entries()
+            .map(|e| RegistryEntryInfo {
+                name: e.name.clone(),
+                actor_addr: format!("{}", e.actor_addr),
+                node_id: node_id_hex(&e.node_id),
+                tombstone: e.tombstone,
+            })
+            .collect();
+
         DistributionNodeSnapshot {
             node_id: node_id_hex(&self.node_id()),
             listen_addr: addr_str(&self.listen_addr()),
@@ -150,6 +178,9 @@ impl DistributedNode {
             cache_entries,
             directory_entry_count: self.directory().entry_count(),
             repair_queue_size: self.repair_queue_len(),
+            registry_size: registry.len(),
+            registry_tombstones: registry.tombstone_count(),
+            registry_entries,
             recent_probe_targets: recent_targets,
         }
     }

@@ -2,13 +2,14 @@ use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::Thread;
 
 use crate::actor::{ActorAddress, AnyActor, Message};
 use crate::channel::Sender;
 use crate::config::RuntimeConfig;
 use crate::stats::WorkerStats;
+use crate::worker::WatchRegistry;
 use crate::Error;
 
 // ─── Identity Hasher for ActorAddress ───────────────────────────────────────
@@ -243,6 +244,7 @@ pub(crate) struct TickContext<'a> {
     pub(crate) stats_hook: Option<&'a dyn crate::stats::StatsHook>,
     /// Thread handles for waking parked workers on cross-worker sends.
     pub(crate) worker_threads: &'a [OnceLock<Thread>],
+    pub(crate) watch_registry: Option<&'a Arc<Mutex<WatchRegistry>>>,
     #[cfg(feature = "transport")]
     pub(crate) codec_registry: Option<&'a crate::transport::CodecRegistry>,
     #[cfg(feature = "transport")]

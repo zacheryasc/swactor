@@ -291,6 +291,7 @@ fn main() {
             swim: swim_config.clone(),
             cache_capacity: if i == 0 { 1000 } else { 100 },
             republish_interval: 500,
+            ..Default::default()
         };
         let node = DistributedNode::new(config);
         node_ids.push(node.node_id());
@@ -448,6 +449,7 @@ fn main() {
                     swim: swim_config.clone(),
                     cache_capacity: 100,
                     republish_interval: 500,
+                    ..Default::default()
                 };
                 let revived = DistributedNode::new(config);
                 let join_actions = revived.join(&[seed_addr]);
@@ -512,6 +514,7 @@ fn main() {
                     swim: swim_config.clone(),
                     cache_capacity: 100,
                     republish_interval: 500,
+                    ..Default::default()
                 };
                 let revived = DistributedNode::new(config);
                 let join_actions = revived.join(&[seed_addr]);

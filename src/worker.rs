@@ -1,12 +1,12 @@
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
-use crate::actor::{ActorAddress, AnyActor, CloneMsg, ContextInner, Ctx, StopReason, StopSignal, TimerRequest};
+use crate::actor::{ActorAddress, ActorExited, AnyActor, CloneMsg, ContextInner, Ctx, ExitReason, StopReason, StopSignal, TimerRequest};
 use crate::channel::Receiver;
 use crate::config::MailboxOverflow;
 use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
@@ -108,6 +108,95 @@ impl TimerWheel {
     }
 }
 
+// ─── Watch Registry ─────────────────────────────────────────────────────────
+
+/// Tracks watch relationships between actors.
+///
+/// Shared across workers via `Arc<Mutex<_>>`. Contention is negligible
+/// because watch/unwatch operations are rare relative to message sends.
+pub(crate) struct WatchRegistry {
+    /// target → set of watchers awaiting death notification
+    watchers: HashMap<ActorAddress, HashSet<ActorAddress>>,
+    /// watcher → set of targets it's watching (reverse index for cleanup)
+    watching: HashMap<ActorAddress, HashSet<ActorAddress>>,
+}
+
+impl WatchRegistry {
+    pub fn new() -> Self {
+        Self {
+            watchers: HashMap::new(),
+            watching: HashMap::new(),
+        }
+    }
+
+    pub fn watch(&mut self, watcher: ActorAddress, target: ActorAddress) {
+        self.watchers.entry(target).or_default().insert(watcher);
+        self.watching.entry(watcher).or_default().insert(target);
+    }
+
+    pub fn unwatch(&mut self, watcher: ActorAddress, target: ActorAddress) {
+        if let Some(set) = self.watchers.get_mut(&target) {
+            set.remove(&watcher);
+            if set.is_empty() {
+                self.watchers.remove(&target);
+            }
+        }
+        if let Some(set) = self.watching.get_mut(&watcher) {
+            set.remove(&target);
+            if set.is_empty() {
+                self.watching.remove(&watcher);
+            }
+        }
+    }
+
+    /// Called when an actor dies. Returns (watcher_addr, ActorExited) pairs.
+    pub fn notify_death(
+        &mut self,
+        target: ActorAddress,
+        reason: ExitReason,
+    ) -> Vec<(ActorAddress, ActorExited)> {
+        let notification = ActorExited {
+            addr: target,
+            reason,
+        };
+        let mut result = Vec::new();
+
+        if let Some(watcher_set) = self.watchers.remove(&target) {
+            for watcher in &watcher_set {
+                result.push((*watcher, notification.clone()));
+                // clean up reverse index
+                if let Some(set) = self.watching.get_mut(watcher) {
+                    set.remove(&target);
+                    if set.is_empty() {
+                        self.watching.remove(watcher);
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Called when a watcher itself dies. Cleans up all its watching entries.
+    pub fn cleanup_watcher(&mut self, watcher: &ActorAddress) {
+        if let Some(targets) = self.watching.remove(watcher) {
+            for target in targets {
+                if let Some(set) = self.watchers.get_mut(&target) {
+                    set.remove(watcher);
+                    if set.is_empty() {
+                        self.watchers.remove(&target);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if a target has any watchers registered.
+    pub fn has_watchers(&self, target: &ActorAddress) -> bool {
+        self.watchers.get(target).is_some_and(|s| !s.is_empty())
+    }
+}
+
 // ─── Worker ─────────────────────────────────────────────────────────────────
 
 /// A worker owns a set of actors and runs them in a loop.
@@ -203,6 +292,7 @@ impl Worker {
         let timer_requests: RefCell<Vec<TimerRequest>> = RefCell::new(Vec::new());
 
         let processed;
+        let deaths;
         {
             let worker_ctx = WorkerContext {
                 worker_id: self.id,
@@ -212,7 +302,7 @@ impl Worker {
                 timer_requests: &timer_requests,
                 stats: &self.stats,
             };
-            processed = self.pool.tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget, &stop_requests);
+            (processed, deaths) = self.pool.tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget, &stop_requests);
             if processed > 0 {
                 did_work = true;
             }
@@ -256,6 +346,40 @@ impl Worker {
                 }
             }
         }
+
+        // 5b. Process actor deaths → deliver ActorExited to watchers
+        if !deaths.is_empty() {
+            did_work = true;
+            if let Some(registry) = &tc.watch_registry {
+                let mut reg = registry.lock().unwrap();
+                for (dead_addr, reason) in deaths {
+                    let notifications = reg.notify_death(dead_addr, reason);
+                    for (watcher_addr, msg) in notifications {
+                        // Deliver ActorExited as a normal message via the address map
+                        match tc.address_map.lookup(&watcher_addr) {
+                            Some(wid) if wid == self.id => {
+                                self.pool.deliver(&watcher_addr, Box::new(msg));
+                            }
+                            Some(wid) => {
+                                tc.transfer_txs[wid.as_usize()]
+                                    .send(Envelope::new(watcher_addr, Box::new(msg)));
+                            }
+                            None => {
+                                // Watcher not in address map — may be an inbox or remote.
+                                // Try inbox registry as best effort.
+                                let _ = tc.inbox_registry.try_deliver(
+                                    watcher_addr,
+                                    Box::new(msg),
+                                );
+                            }
+                        }
+                    }
+                    // Clean up the dead actor's own watches (things it was watching)
+                    reg.cleanup_watcher(&dead_addr);
+                }
+            }
+        }
+
         let t5 = Instant::now();
 
         // 6. Publish stats (skip entirely when idle to avoid allocation + mutex)
@@ -451,6 +575,29 @@ impl ContextInner for WorkerContext<'_> {
     fn extension(&self) -> Option<&dyn crate::extension::RuntimeExtension> {
         self.tc.extension
     }
+
+    fn watch(&self, watcher: ActorAddress, target: ActorAddress) {
+        if let Some(registry) = &self.tc.watch_registry {
+            // Check if target exists in the address map
+            if self.tc.address_map.lookup(&target).is_some() {
+                registry.lock().unwrap().watch(watcher, target);
+            } else {
+                // Target not found — deliver ActorExited { reason: Stopped } immediately.
+                // Buffer in pending_local so it arrives on next tick.
+                let msg = ActorExited {
+                    addr: target,
+                    reason: ExitReason::Stopped,
+                };
+                self.pending_local.borrow_mut().push((watcher, Box::new(msg)));
+            }
+        }
+    }
+
+    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress) {
+        if let Some(registry) = &self.tc.watch_registry {
+            registry.lock().unwrap().unwatch(watcher, target);
+        }
+    }
 }
 
 struct ActorSlot {
@@ -531,7 +678,7 @@ impl ActorPool {
         std::mem::replace(&mut self.drops_this_tick, 0)
     }
 
-    /// Tick all actors in the pool. Returns the number of messages processed.
+    /// Tick all actors in the pool. Returns (messages_processed, newly_dead_actors).
     ///
     /// Each actor processes up to `budget` messages per tick (0 = unlimited).
     /// This prevents a single hot actor from starving others on the same worker.
@@ -541,8 +688,9 @@ impl ActorPool {
         stats: &WorkerStats,
         budget: usize,
         stop_requests: &RefCell<Vec<ActorAddress>>,
-    ) -> usize {
+    ) -> (usize, Vec<(ActorAddress, ExitReason)>) {
         let mut count = 0;
+        let mut deaths = Vec::new();
         for (&addr, slot) in self.actors.iter_mut() {
             if slot.poisoned || slot.stopping {
                 // Discard all messages for poisoned/stopping actors
@@ -606,6 +754,8 @@ impl ActorPool {
                         #[cfg(feature = "tracing")]
                         tracing::error!(actor_addr = %addr, "actor.panicked");
                         slot.poisoned = true;
+                        slot.mailbox.clear();
+                        deaths.push((addr, ExitReason::Panicked));
                         break;
                     }
                     Ok(Some(type_name)) => {
@@ -624,6 +774,7 @@ impl ActorPool {
                         slot.stopping = true;
                         stats.stops.fetch_add(1, Ordering::Relaxed);
                         slot.mailbox.clear();
+                        deaths.push((addr, ExitReason::Stopped));
                         break;
                     }
                 }
@@ -633,7 +784,7 @@ impl ActorPool {
                 }
             }
         }
-        count
+        (count, deaths)
     }
 
     pub fn len(&self) -> usize {

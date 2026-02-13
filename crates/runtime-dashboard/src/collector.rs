@@ -42,6 +42,12 @@ impl StatsCollector {
     }
 }
 
+impl swactor_command::StatsEnricher for StatsCollector {
+    fn enrich(&self, stats: &mut swactor::stats::RuntimeStats) {
+        stats.actor_details = self.actor_details();
+    }
+}
+
 impl StatsHook for StatsCollector {
     fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]) {
         if let Some(slot) = self.slots.get(worker_id) {

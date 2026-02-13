@@ -1,11 +1,11 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, Thread};
 use std::time::Instant;
 
-use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message, StopSignal, TimerRequest};
+use crate::actor::{Actor, ActorAddress, ActorExited, ActorInterface, AnyActor, ExitReason, Message, StopSignal, TimerRequest};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, MailboxOverflow, RuntimeConfig};
@@ -14,7 +14,7 @@ use crate::extension::RuntimeExtension;
 use crate::stats::{StatsHook, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
 pub use crate::stats::{RuntimeStats, WorkerInfo};
-use crate::worker::Worker;
+use crate::worker::{WatchRegistry, Worker};
 use crate::Error;
 
 /// Generic message inbox for receiving messages outside of the runtime.
@@ -103,6 +103,7 @@ pub struct Runtime {
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
     stats_hook: Option<Arc<dyn StatsHook>>,
+    watch_registry: Arc<Mutex<WatchRegistry>>,
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
     /// Thread handles for waking parked workers. Set by workers on startup via OnceLock.
@@ -198,6 +199,7 @@ impl Runtime {
             is_running: AtomicBool::new(false),
             worker_stats,
             stats_hook: None,
+            watch_registry: Arc::new(Mutex::new(WatchRegistry::new())),
             tick_workers: RefCell::new(workers),
             worker_threads,
             created_at: Instant::now(),
@@ -304,6 +306,7 @@ impl Runtime {
             extension: self.extension.as_deref(),
             stats_hook: self.stats_hook.as_deref(),
             worker_threads: &self.worker_threads,
+            watch_registry: Some(&self.watch_registry),
             #[cfg(feature = "transport")]
             codec_registry: self.codec_registry.as_deref(),
             #[cfg(feature = "transport")]
@@ -505,5 +508,26 @@ impl ContextInner for Runtime {
 
     fn extension(&self) -> Option<&dyn RuntimeExtension> {
         self.extension.as_deref()
+    }
+
+    fn watch(&self, watcher: ActorAddress, target: ActorAddress) {
+        if self.address_map.lookup(&target).is_some() {
+            self.watch_registry.lock().unwrap().watch(watcher, target);
+        } else {
+            // Target not found — deliver ActorExited immediately.
+            let msg = ActorExited {
+                addr: target,
+                reason: ExitReason::Stopped,
+            };
+            // Route to watcher via transfer queue
+            if let Some(wid) = self.address_map.lookup(&watcher) {
+                self.transfer_txs[wid.as_usize()]
+                    .send(Envelope::new(watcher, Box::new(msg)));
+            }
+        }
+    }
+
+    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress) {
+        self.watch_registry.lock().unwrap().unwatch(watcher, target);
     }
 }

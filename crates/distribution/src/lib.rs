@@ -7,4 +7,5 @@ pub mod swim;
 pub mod kademlia;
 pub mod cache;
 pub mod node;
+pub mod registry;
 pub mod snapshot;
