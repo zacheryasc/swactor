@@ -14,6 +14,7 @@ use crate::types::NodeId;
 // ─── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for the cluster registry.
+#[derive(Clone)]
 pub struct RegistryConfig {
     /// Maximum number of events to buffer before dropping old ones.
     pub max_events: usize,

@@ -5,16 +5,12 @@ fn node(byte: u8) -> NodeId {
     NodeId([byte; 32])
 }
 
-fn addr(port: u16) -> std::net::SocketAddr {
-    format!("127.0.0.1:{port}").parse().unwrap()
-}
-
 // ─── Basic operations ───────────────────────────────────────────────────────
 
 #[test]
 fn insert_and_contains() {
     let mut rt = RoutingTable::new(node(0));
-    assert!(rt.insert(node(1), addr(8001)));
+    assert!(rt.insert(node(1)));
     assert!(rt.contains(&node(1)));
     assert!(!rt.contains(&node(2)));
 }
@@ -22,14 +18,14 @@ fn insert_and_contains() {
 #[test]
 fn insert_self_is_rejected() {
     let mut rt = RoutingTable::new(node(0));
-    assert!(!rt.insert(node(0), addr(8000)));
+    assert!(!rt.insert(node(0)));
     assert_eq!(rt.len(), 0);
 }
 
 #[test]
 fn remove_node() {
     let mut rt = RoutingTable::new(node(0));
-    rt.insert(node(1), addr(8001));
+    rt.insert(node(1));
     assert!(rt.remove(&node(1)));
     assert!(!rt.contains(&node(1)));
     assert_eq!(rt.len(), 0);
@@ -44,10 +40,10 @@ fn remove_nonexistent_returns_false() {
 #[test]
 fn duplicate_insert_updates_position() {
     let mut rt = RoutingTable::new(node(0));
-    rt.insert(node(1), addr(8001));
-    rt.insert(node(2), addr(8002));
+    rt.insert(node(1));
+    rt.insert(node(2));
     // Re-insert node 1 — should move to most-recently-seen
-    assert!(rt.insert(node(1), addr(8001)));
+    assert!(rt.insert(node(1)));
     assert_eq!(rt.len(), 2);
 }
 
@@ -62,7 +58,7 @@ fn closest_returns_k_nearest_by_xor() {
     for i in 1..=10u8 {
         let mut bytes = [0u8; 32];
         bytes[0] = i;
-        rt.insert(NodeId(bytes), addr(8000 + i as u16));
+        rt.insert(NodeId(bytes));
     }
 
     let target = NodeId([0x00; 32]); // same as self, closest by XOR
@@ -78,8 +74,8 @@ fn closest_returns_k_nearest_by_xor() {
 #[test]
 fn closest_returns_all_when_fewer_than_count() {
     let mut rt = RoutingTable::new(node(0));
-    rt.insert(node(1), addr(8001));
-    rt.insert(node(2), addr(8002));
+    rt.insert(node(1));
+    rt.insert(node(2));
 
     let closest = rt.closest(&node(0), 10);
     assert_eq!(closest.len(), 2);
@@ -93,12 +89,12 @@ fn closest_to_specific_target() {
     // Node A: XOR distance to target [0xFF...] is [0xFF ^ 0x01, ...] = [0xFE, ...]
     let mut a = [0u8; 32];
     a[0] = 0x01;
-    rt.insert(NodeId(a), addr(8001));
+    rt.insert(NodeId(a));
 
     // Node B: XOR distance to target [0xFF...] is [0xFF ^ 0xFE, ...] = [0x01, ...]
     let mut b = [0u8; 32];
     b[0] = 0xFE;
-    rt.insert(NodeId(b), addr(8002));
+    rt.insert(NodeId(b));
 
     let target = NodeId([0xFF; 32]);
     let closest = rt.closest(&target, 1);
@@ -121,9 +117,9 @@ fn bucket_overflow_goes_to_replacement_cache() {
     let mut bytes_b = [0u8; 32]; bytes_b[0] = 0xC0;
     let mut bytes_c = [0u8; 32]; bytes_c[0] = 0xA0;
 
-    assert!(rt.insert(NodeId(bytes_a), addr(8001)));   // fits
-    assert!(rt.insert(NodeId(bytes_b), addr(8002)));   // fits
-    assert!(!rt.insert(NodeId(bytes_c), addr(8003)));  // goes to replacement
+    assert!(rt.insert(NodeId(bytes_a)));   // fits
+    assert!(rt.insert(NodeId(bytes_b)));   // fits
+    assert!(!rt.insert(NodeId(bytes_c)));  // goes to replacement
 
     assert_eq!(rt.len(), 2);
     assert!(rt.contains(&NodeId(bytes_a)));
@@ -140,9 +136,9 @@ fn removing_node_promotes_from_replacement() {
     let mut bytes_b = [0u8; 32]; bytes_b[0] = 0xC0;
     let mut bytes_c = [0u8; 32]; bytes_c[0] = 0xA0;
 
-    rt.insert(NodeId(bytes_a), addr(8001));
-    rt.insert(NodeId(bytes_b), addr(8002));
-    rt.insert(NodeId(bytes_c), addr(8003)); // replacement
+    rt.insert(NodeId(bytes_a));
+    rt.insert(NodeId(bytes_b));
+    rt.insert(NodeId(bytes_c)); // replacement
 
     // Remove A — C should be promoted
     rt.remove(&NodeId(bytes_a));
@@ -171,7 +167,7 @@ fn closest_ordering_is_stable_with_many_nodes() {
         let mut bytes = [0u8; 32];
         bytes[0] = i;
         bytes[1] = i.wrapping_mul(37);
-        rt.insert(NodeId(bytes), addr(8000 + i as u16));
+        rt.insert(NodeId(bytes));
     }
 
     let target = NodeId([0x10; 32]);

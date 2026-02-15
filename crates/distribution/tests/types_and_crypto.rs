@@ -131,7 +131,6 @@ fn node_record_serde_roundtrip() {
     let kp = Keypair::generate();
     let record = NodeRecord {
         node_id: kp.node_id(),
-        addr: "127.0.0.1:8080".parse().unwrap(),
         state: MemberState::Alive,
         incarnation: 5,
     };

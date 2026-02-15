@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::net::SocketAddr;
 
 use distribution::node::{DistributedNode, DistributedNodeConfig, ResolveResult};
 use distribution::swim::node::NodeAction;
@@ -182,15 +181,12 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
     let n = config.num_nodes;
     let node_names: Vec<String> = (0..n).map(|i| format!("node-{i}")).collect();
 
-    // Create nodes with sequential addresses.
+    // Create nodes.
     let mut nodes: Vec<Option<DistributedNode>> = Vec::with_capacity(n);
-    let mut addrs: Vec<SocketAddr> = Vec::with_capacity(n);
     let mut node_ids: Vec<NodeId> = Vec::with_capacity(n);
 
-    for i in 0..n {
-        let addr: SocketAddr = format!("127.0.0.1:{}", 10001 + i).parse().unwrap();
+    for _i in 0..n {
         let mut node_config = DistributedNodeConfig {
-            listen_addr: addr,
             swim: config.swim.clone(),
             cache_capacity: config.cache_capacity,
             republish_interval: 50,
@@ -199,32 +195,30 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
         apply_registry_overrides(&mut node_config, &config);
         let node = DistributedNode::new(node_config);
         node_ids.push(node.node_id());
-        addrs.push(addr);
         nodes.push(Some(node));
     }
 
     // Form cluster: nodes[1..] join via seed (node 0).
-    let seed_addr = addrs[0];
+    let seed_id = node_ids[0];
     for i in 1..n {
-        let join_actions = nodes[i].as_ref().unwrap().join(&[seed_addr]);
+        // Seed handles join request from node i
+        let join_actions = nodes[0].as_mut().unwrap().handle_join_request(node_ids[i]);
         events.push(Event {
             tick: 0,
             node_name: node_names[i].clone(),
             kind: DistributionEventKind::Joined {
-                seed_addr: seed_addr.to_string(),
+                seed_addr: format!("node-0 ({seed_id:?})"),
             },
         });
 
-        // Deliver join actions and responses (no network faults during setup).
+        // Deliver join response to node i (no network faults during setup).
         let mut clean_net = NetworkState::new();
         let tagged_responses = deliver_actions_tagged_with_net(
             &join_actions,
-            i,
-            node_ids[i],
-            addrs[i],
+            0,
+            seed_id,
             &mut nodes,
             &node_ids,
-            &addrs,
             &mut clean_net,
         );
         for (responder_idx, response_actions) in tagged_responses {
@@ -232,10 +226,8 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                 &response_actions,
                 responder_idx,
                 node_ids[responder_idx],
-                addrs[responder_idx],
                 &mut nodes,
                 &node_ids,
-                &addrs,
                 &mut clean_net,
             );
         }
@@ -244,7 +236,7 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
     // Tick-settle: several rounds to let SWIM converge initial membership.
     let mut clean_net = NetworkState::new();
     for _ in 0..10 {
-        tick_all_and_deliver(&mut nodes, &node_ids, &addrs, &mut events, &node_names, 0, &mut clean_net);
+        tick_all_and_deliver(&mut nodes, &node_ids, &mut events, &node_names, 0, &mut clean_net);
     }
 
     // Register actors on each node, then propagate entries.
@@ -323,7 +315,6 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
         for &(revive_round, revive_idx) in &config.revive_schedule {
             if revive_round == round && revive_idx < n {
                 let mut node_config = DistributedNodeConfig {
-                    listen_addr: addrs[revive_idx],
                     swim: config.swim.clone(),
                     cache_capacity: config.cache_capacity,
                     republish_interval: 50,
@@ -331,19 +322,18 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                 };
                 apply_registry_overrides(&mut node_config, &config);
                 let revived = DistributedNode::new(node_config);
-                // Rejoin the cluster.
-                let join_actions = revived.join(&[seed_addr]);
+                node_ids[revive_idx] = revived.node_id();
                 nodes[revive_idx] = Some(revived);
-                node_ids[revive_idx] = nodes[revive_idx].as_ref().unwrap().node_id();
+
+                // Rejoin the cluster via seed.
+                let join_actions = nodes[0].as_mut().unwrap().handle_join_request(node_ids[revive_idx]);
 
                 let tagged_responses = deliver_actions_tagged_with_net(
                     &join_actions,
-                    revive_idx,
-                    node_ids[revive_idx],
-                    addrs[revive_idx],
+                    0,
+                    node_ids[0],
                     &mut nodes,
                     &node_ids,
-                    &addrs,
                     &mut net,
                 );
                 for (responder_idx, response_actions) in tagged_responses {
@@ -351,10 +341,8 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                         &response_actions,
                         responder_idx,
                         node_ids[responder_idx],
-                        addrs[responder_idx],
                         &mut nodes,
                         &node_ids,
-                        &addrs,
                         &mut net,
                     );
                 }
@@ -426,10 +414,8 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                                     &leave_actions,
                                     *node_idx,
                                     node_ids[*node_idx],
-                                    addrs[*node_idx],
                                     &mut nodes,
                                     &node_ids,
-                                    &addrs,
                                     &mut net,
                                 );
                                 for (responder_idx, response_actions) in tagged_responses {
@@ -437,10 +423,8 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                                         &response_actions,
                                         responder_idx,
                                         node_ids[responder_idx],
-                                        addrs[responder_idx],
                                         &mut nodes,
                                         &node_ids,
-                                        &addrs,
                                         &mut net,
                                     );
                                 }
@@ -463,7 +447,6 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
             tick_all_and_deliver(
                 &mut nodes,
                 &node_ids,
-                &addrs,
                 &mut events,
                 &node_names,
                 round as u64,
@@ -576,7 +559,6 @@ fn apply_registry_overrides(node_config: &mut DistributedNodeConfig, config: &Di
 fn tick_all_and_deliver(
     nodes: &mut [Option<DistributedNode>],
     node_ids: &[NodeId],
-    addrs: &[SocketAddr],
     events: &mut Vec<Event<DistributionEventKind>>,
     node_names: &[String],
     tick: u64,
@@ -616,10 +598,8 @@ fn tick_all_and_deliver(
             &actions,
             sender_idx,
             node_ids[sender_idx],
-            addrs[sender_idx],
             nodes,
             node_ids,
-            addrs,
             net,
         );
         // Deliver responses back, using the actual responder's identity.
@@ -628,10 +608,8 @@ fn tick_all_and_deliver(
                 &response_actions,
                 responder_idx,
                 node_ids[responder_idx],
-                addrs[responder_idx],
                 nodes,
                 node_ids,
-                addrs,
                 net,
             );
         }
@@ -645,10 +623,8 @@ fn deliver_actions_tagged_with_net(
     actions: &[NodeAction],
     sender_idx: usize,
     sender_id: NodeId,
-    sender_addr: SocketAddr,
     nodes: &mut [Option<DistributedNode>],
     node_ids: &[NodeId],
-    node_addrs: &[SocketAddr],
     net: &mut NetworkState,
 ) -> Vec<(usize, Vec<NodeAction>)> {
     let mut tagged_responses: Vec<(usize, Vec<NodeAction>)> = Vec::new();
@@ -665,7 +641,7 @@ fn deliver_actions_tagged_with_net(
                     if net.should_deliver(sender_idx, idx) {
                         if let Some(ref mut node) = nodes[idx] {
                             let resp =
-                                node.handle_ping(sender_id, sender_addr, *sequence, piggyback);
+                                node.handle_ping(sender_id, *sequence, piggyback);
                             if !resp.is_empty() {
                                 tagged_responses.push((idx, resp));
                             }
@@ -690,18 +666,6 @@ fn deliver_actions_tagged_with_net(
                     }
                 }
             }
-            NodeAction::SendJoinRequest { to_addr } => {
-                if let Some(idx) = node_addrs.iter().position(|a| a == to_addr) {
-                    if net.should_deliver(sender_idx, idx) {
-                        if let Some(ref mut node) = nodes[idx] {
-                            let resp = node.handle_join_request(sender_id, sender_addr);
-                            if !resp.is_empty() {
-                                tagged_responses.push((idx, resp));
-                            }
-                        }
-                    }
-                }
-            }
             NodeAction::SendJoinResponse { to, members, .. } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == to) {
                     if net.should_deliver(sender_idx, idx) {
@@ -717,7 +681,6 @@ fn deliver_actions_tagged_with_net(
             NodeAction::SendPingReq {
                 relay,
                 target,
-                target_addr,
                 sequence,
                 piggyback,
                 ..
@@ -728,7 +691,6 @@ fn deliver_actions_tagged_with_net(
                             let resp = node.handle_ping_req(
                                 sender_id,
                                 *target,
-                                *target_addr,
                                 *sequence,
                                 piggyback,
                             );

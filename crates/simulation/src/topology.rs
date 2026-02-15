@@ -67,15 +67,28 @@ impl Topology {
     }
 
     /// Partition healing edges: bidirectional links between the two halves.
+    ///
+    /// Connects up to 3 evenly-spaced node pairs across the partition boundary.
+    /// A single bridge link is unreliable under random peer selection: with half=50,
+    /// there is only a 1/50 chance per round that the bridge node gossips across,
+    /// giving a ~1.7% probability of zero crossings in 200 rounds.
     pub fn heal_edges(&self, num_nodes: usize) -> Vec<(usize, usize)> {
         if !matches!(self, Topology::Partitioned) {
             return Vec::new();
         }
         let half = num_nodes / 2;
-        if half > 0 && half < num_nodes {
-            vec![(half - 1, half), (half, half - 1)]
-        } else {
-            Vec::new()
+        if half == 0 || half >= num_nodes {
+            return Vec::new();
         }
+        let right = num_nodes - half;
+        let num_bridges = half.min(3);
+        let mut edges = Vec::with_capacity(num_bridges * 2);
+        for b in 0..num_bridges {
+            let a_node = b * half / num_bridges;
+            let b_node = half + b * right / num_bridges;
+            edges.push((a_node, b_node));
+            edges.push((b_node, a_node));
+        }
+        edges
     }
 }

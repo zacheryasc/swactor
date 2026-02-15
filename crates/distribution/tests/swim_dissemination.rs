@@ -5,17 +5,13 @@ fn node(byte: u8) -> NodeId {
     NodeId([byte; 32])
 }
 
-fn addr(port: u16) -> std::net::SocketAddr {
-    format!("127.0.0.1:{port}").parse().unwrap()
-}
-
 // ─── Basic queue operations ─────────────────────────────────────────────────
 
 #[test]
 fn enqueue_and_take_single_update() {
     let mut q = DisseminationQueue::new(3);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 0),
+        membership_update(node(1), MemberState::Alive, 0),
         5,
     );
     assert_eq!(q.len(), 1);
@@ -30,7 +26,7 @@ fn take_respects_max_count() {
     let mut q = DisseminationQueue::new(3);
     for i in 1..=5 {
         q.enqueue(
-            membership_update(node(i), addr(8000 + i as u16), MemberState::Alive, 0),
+            membership_update(node(i), MemberState::Alive, 0),
             10,
         );
     }
@@ -44,15 +40,15 @@ fn take_respects_max_count() {
 fn dead_updates_are_prioritized_over_suspect_and_alive() {
     let mut q = DisseminationQueue::new(3);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 0),
+        membership_update(node(1), MemberState::Alive, 0),
         10,
     );
     q.enqueue(
-        membership_update(node(2), addr(8002), MemberState::Dead, 0),
+        membership_update(node(2), MemberState::Dead, 0),
         10,
     );
     q.enqueue(
-        membership_update(node(3), addr(8003), MemberState::Suspect, 0),
+        membership_update(node(3), MemberState::Suspect, 0),
         10,
     );
 
@@ -69,7 +65,7 @@ fn entries_evicted_after_transmit_budget_exhausted() {
     // lambda=1, cluster_size=2 → budget = 1 * ceil(log2(2)) = 1
     let mut q = DisseminationQueue::new(1);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 0),
+        membership_update(node(1), MemberState::Alive, 0),
         2,
     );
 
@@ -88,7 +84,7 @@ fn larger_cluster_gives_higher_transmit_budget() {
     // lambda=2, cluster_size=16 → budget = 2 * ceil(log2(16)) = 2 * 4 = 8
     let mut q = DisseminationQueue::new(2);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 0),
+        membership_update(node(1), MemberState::Alive, 0),
         16,
     );
 
@@ -108,11 +104,11 @@ fn larger_cluster_gives_higher_transmit_budget() {
 fn newer_update_for_same_node_replaces_older() {
     let mut q = DisseminationQueue::new(3);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 0),
+        membership_update(node(1), MemberState::Alive, 0),
         10,
     );
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Suspect, 0),
+        membership_update(node(1), MemberState::Suspect, 0),
         10,
     );
 
@@ -125,12 +121,12 @@ fn newer_update_for_same_node_replaces_older() {
 fn higher_incarnation_replaces_lower() {
     let mut q = DisseminationQueue::new(3);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Dead, 5),
+        membership_update(node(1), MemberState::Dead, 5),
         10,
     );
     // Same node, higher incarnation, Alive (incarnation wins over state)
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 6),
+        membership_update(node(1), MemberState::Alive, 6),
         10,
     );
 
@@ -144,11 +140,11 @@ fn higher_incarnation_replaces_lower() {
 fn lower_incarnation_is_ignored() {
     let mut q = DisseminationQueue::new(3);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 5),
+        membership_update(node(1), MemberState::Alive, 5),
         10,
     );
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Dead, 3),
+        membership_update(node(1), MemberState::Dead, 3),
         10,
     );
 
@@ -163,11 +159,11 @@ fn lower_incarnation_is_ignored() {
 fn pack_and_unpack_piggyback_roundtrip() {
     let mut q = DisseminationQueue::new(3);
     q.enqueue(
-        membership_update(node(1), addr(8001), MemberState::Alive, 0),
+        membership_update(node(1), MemberState::Alive, 0),
         10,
     );
     q.enqueue(
-        membership_update(node(2), addr(8002), MemberState::Dead, 3),
+        membership_update(node(2), MemberState::Dead, 3),
         10,
     );
 

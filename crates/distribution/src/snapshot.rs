@@ -3,8 +3,6 @@
 //! Used by the runtime-dashboard to display distribution monitoring data
 //! for a single node without reaching out to other nodes.
 
-use std::net::SocketAddr;
-
 use serde::{Deserialize, Serialize};
 
 use crate::node::DistributedNode;
@@ -14,7 +12,7 @@ use crate::types::{MemberState, NodeId};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemberInfo {
     pub node_id: String,
-    pub addr: String,
+    pub addr: Option<String>,
     pub state: String,
     pub incarnation: u64,
 }
@@ -23,7 +21,7 @@ pub struct MemberInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NeighborInfo {
     pub node_id: String,
-    pub addr: String,
+    pub addr: Option<String>,
 }
 
 /// Snapshot of a single LRU cache entry.
@@ -47,8 +45,8 @@ pub struct RegistryEntryInfo {
 pub struct DistributionNodeSnapshot {
     /// This node's ID (hex-encoded).
     pub node_id: String,
-    /// This node's listen address.
-    pub listen_addr: String,
+    /// This node's listen address (filled by driver, None for protocol-only snapshots).
+    pub listen_addr: Option<String>,
 
     // ─── SWIM membership ─────────────────────────────────────────────
     /// All known members with their state.
@@ -97,10 +95,6 @@ fn node_id_hex(id: &NodeId) -> String {
     id.0.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn addr_str(addr: &SocketAddr) -> String {
-    addr.to_string()
-}
-
 fn state_str(state: MemberState) -> String {
     match state {
         MemberState::Alive => "alive".into(),
@@ -111,13 +105,16 @@ fn state_str(state: MemberState) -> String {
 
 impl DistributedNode {
     /// Capture a serializable snapshot of this node's current state.
+    ///
+    /// Address fields are left as `None` — the driver layer enriches them
+    /// from its own address book.
     pub fn snapshot(&self) -> DistributionNodeSnapshot {
         let all_members = self.all_members();
         let members: Vec<MemberInfo> = all_members
             .iter()
             .map(|m| MemberInfo {
                 node_id: node_id_hex(&m.node_id),
-                addr: addr_str(&m.addr),
+                addr: None,
                 state: state_str(m.state),
                 incarnation: m.incarnation,
             })
@@ -133,7 +130,7 @@ impl DistributedNode {
             .iter()
             .map(|n| NeighborInfo {
                 node_id: node_id_hex(&n.node_id),
-                addr: addr_str(&n.addr),
+                addr: None,
             })
             .collect();
 
@@ -166,7 +163,7 @@ impl DistributedNode {
 
         DistributionNodeSnapshot {
             node_id: node_id_hex(&self.node_id()),
-            listen_addr: addr_str(&self.listen_addr()),
+            listen_addr: None,
             members,
             alive_count,
             suspect_count,

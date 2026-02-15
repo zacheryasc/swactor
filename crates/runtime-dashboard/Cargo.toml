@@ -16,12 +16,15 @@ crossterm = { version = "0.28", optional = true }
 distribution = { path = "../distribution", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = "3"
+iroh = { version = "0.96", optional = true }
 
 [features]
 default = ["distribution"]
 tui = ["dep:ratatui", "dep:crossterm"]
 distribution = ["dep:distribution"]
-node = ["distribution", "dep:clap", "swactor/transport"]
+node = ["distribution", "dep:clap", "swactor/transport", "tcp"]
+tcp = ["distribution/tcp"]
+iroh = ["distribution/iroh", "dep:iroh"]
 
 [[bin]]
 name = "swactor-tui"
