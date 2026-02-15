@@ -1,7 +1,7 @@
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, Runtime, RuntimeConfig};
 use swactor_bin_runner::{ByteMessage, SharedEngine, WasmActor, WasmActorBuilder, WasmActorError};
-use swactor_std::CtxWatching;
+use swactor_std::{CtxWatching, StdExtension};
 
 use proptest::prelude::*;
 
@@ -719,7 +719,8 @@ impl ActorInterface for DeathCounter {
 #[test]
 fn watch_notification() {
     let engine = SharedEngine::new().unwrap();
-    let rt = Runtime::new(RuntimeConfig::default());
+    let rt = Runtime::new(RuntimeConfig::default())
+        .with_extension(std::sync::Arc::new(StdExtension::new()));
 
     let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let target = WasmActorBuilder::new(engine, guest_wasm("silent")).build().unwrap();

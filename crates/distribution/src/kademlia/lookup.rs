@@ -10,7 +10,6 @@
 //! translates into real network requests.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 
 use crate::types::NodeId;
 use super::routing_table::{RoutingTable, K};
@@ -25,9 +24,9 @@ const MAX_ROUNDS: usize = 20;
 #[derive(Debug, Clone)]
 pub enum LookupAction {
     /// Send a FIND_NODE query to this node.
-    Query { node_id: NodeId, addr: SocketAddr },
+    Query { node_id: NodeId },
     /// The lookup is complete — here are the k closest nodes found.
-    Done { closest: Vec<(NodeId, SocketAddr)> },
+    Done { closest: Vec<NodeId> },
 }
 
 /// State of a single iterative FIND_NODE lookup.
@@ -36,7 +35,7 @@ pub struct NodeLookup {
     k: usize,
     alpha: usize,
     /// All nodes discovered during the lookup, with their distances.
-    known: HashMap<NodeId, (SocketAddr, [u8; 32])>,
+    known: HashMap<NodeId, [u8; 32]>,
     /// Nodes we've already queried.
     queried: HashSet<NodeId>,
     /// Nodes we've sent queries to but haven't received responses yet.
@@ -63,7 +62,7 @@ impl NodeLookup {
         let mut known = HashMap::new();
         for entry in &seeds {
             let dist = entry.node_id.xor_distance(&target);
-            known.insert(entry.node_id, (entry.addr, dist));
+            known.insert(entry.node_id, dist);
         }
 
         let mut lookup = Self {
@@ -85,7 +84,7 @@ impl NodeLookup {
     pub fn handle_response(
         &mut self,
         from: NodeId,
-        closer_nodes: Vec<(NodeId, SocketAddr)>,
+        closer_nodes: Vec<NodeId>,
     ) -> Vec<LookupAction> {
         if self.done {
             return vec![self.done_action()];
@@ -94,14 +93,13 @@ impl NodeLookup {
         self.pending.remove(&from);
 
         // Incorporate newly discovered nodes
-        for (node_id, addr) in closer_nodes {
+        for node_id in closer_nodes {
             if node_id == self.target {
                 // Skip the target itself (it's what we're looking for)
                 continue;
             }
             self.known.entry(node_id).or_insert_with(|| {
-                let dist = node_id.xor_distance(&self.target);
-                (addr, dist)
+                node_id.xor_distance(&self.target)
             });
         }
 
@@ -140,10 +138,10 @@ impl NodeLookup {
             .known
             .iter()
             .filter(|(id, _)| !self.queried.contains(id))
-            .map(|(id, (addr, dist))| (*id, *addr, *dist))
+            .map(|(id, dist)| (*id, *dist))
             .collect();
 
-        candidates.sort_by(|a, b| a.2.cmp(&b.2));
+        candidates.sort_by(|a, b| a.1.cmp(&b.1));
         candidates.truncate(self.alpha);
 
         if candidates.is_empty() {
@@ -157,7 +155,7 @@ impl NodeLookup {
         let all_k_queried = all_known_sorted
             .iter()
             .take(self.k)
-            .all(|(id, _)| self.queried.contains(id));
+            .all(|id| self.queried.contains(id));
 
         if all_k_queried && !all_known_sorted.is_empty() {
             self.done = true;
@@ -165,24 +163,24 @@ impl NodeLookup {
         }
 
         let mut actions = Vec::new();
-        for (node_id, addr, _) in candidates {
+        for (node_id, _) in candidates {
             self.queried.insert(node_id);
             self.pending.insert(node_id);
-            actions.push(LookupAction::Query { node_id, addr });
+            actions.push(LookupAction::Query { node_id });
         }
 
         actions
     }
 
-    fn k_closest(&self) -> Vec<(NodeId, SocketAddr)> {
+    fn k_closest(&self) -> Vec<NodeId> {
         let mut sorted: Vec<_> = self
             .known
             .iter()
-            .map(|(id, (addr, dist))| (*id, *addr, *dist))
+            .map(|(id, dist)| (*id, *dist))
             .collect();
-        sorted.sort_by(|a, b| a.2.cmp(&b.2));
+        sorted.sort_by(|a, b| a.1.cmp(&b.1));
         sorted.truncate(self.k);
-        sorted.into_iter().map(|(id, addr, _)| (id, addr)).collect()
+        sorted.into_iter().map(|(id, _)| id).collect()
     }
 
     fn done_action(&self) -> LookupAction {

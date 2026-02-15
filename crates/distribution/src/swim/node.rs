@@ -3,8 +3,6 @@
 //! This is the top-level SWIM state machine that a `DistributedNode` will drive.
 //! It produces `SwimAction`s that the caller translates into real network I/O.
 
-use std::net::SocketAddr;
-
 use crate::messages::MembershipUpdate;
 use crate::types::{MemberState, NodeId, NodeRecord};
 
@@ -18,22 +16,18 @@ use super::probe::{SwimAction, SwimConfig, SwimEvent, SwimProbe};
 #[derive(Debug, Clone)]
 pub enum NodeAction {
     /// Send a SWIM ping.
-    SendPing { to: NodeId, to_addr: SocketAddr, sequence: u64, piggyback: Vec<u8> },
+    SendPing { to: NodeId, sequence: u64, piggyback: Vec<u8> },
     /// Send an indirect ping request through a relay.
     SendPingReq {
         relay: NodeId,
-        relay_addr: SocketAddr,
         target: NodeId,
-        target_addr: SocketAddr,
         sequence: u64,
         piggyback: Vec<u8>,
     },
     /// Send a SWIM ack.
-    SendAck { to: NodeId, to_addr: SocketAddr, sequence: u64, piggyback: Vec<u8> },
-    /// Send a join request to a seed.
-    SendJoinRequest { to_addr: SocketAddr },
+    SendAck { to: NodeId, sequence: u64, piggyback: Vec<u8> },
     /// Send a join response with the current member list.
-    SendJoinResponse { to: NodeId, to_addr: SocketAddr, members: Vec<NodeRecord> },
+    SendJoinResponse { to: NodeId, members: Vec<NodeRecord> },
     /// Notification: a node state changed (for wiring into Kademlia).
     MembershipChanged { node_id: NodeId, state: MemberState, incarnation: u64 },
 }
@@ -44,28 +38,22 @@ pub struct SwimNode {
     members: MemberList,
     probe: SwimProbe,
     dissemination: DisseminationQueue,
-    self_addr: SocketAddr,
     /// Maximum piggybacked updates per message.
     max_piggyback: usize,
 }
 
 impl SwimNode {
-    pub fn new(self_id: NodeId, self_addr: SocketAddr, config: SwimConfig) -> Self {
+    pub fn new(self_id: NodeId, config: SwimConfig) -> Self {
         Self {
             members: MemberList::new(self_id),
             probe: SwimProbe::new(config),
             dissemination: DisseminationQueue::new(3), // Λ = 3
-            self_addr,
             max_piggyback: 8,
         }
     }
 
     pub fn self_id(&self) -> NodeId {
         self.members.self_id()
-    }
-
-    pub fn self_addr(&self) -> SocketAddr {
-        self.self_addr
     }
 
     pub fn members(&self) -> &MemberList {
@@ -84,17 +72,16 @@ impl SwimNode {
     }
 
     /// Handle a received ping.
-    pub fn handle_ping(&mut self, from: NodeId, from_addr: SocketAddr, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
+    pub fn handle_ping(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
         let mut actions = self.apply_piggyback(piggyback);
 
         // Ensure the sender is in our member list
-        self.members.apply(from, from_addr, MemberState::Alive, 0);
+        self.members.apply(from, MemberState::Alive, 0);
 
         // Reply with ack
         let pb = self.dissemination.pack_piggyback(self.max_piggyback);
         actions.push(NodeAction::SendAck {
             to: from,
-            to_addr: from_addr,
             sequence,
             piggyback: pb,
         });
@@ -117,7 +104,6 @@ impl SwimNode {
         &mut self,
         _from: NodeId,
         target: NodeId,
-        target_addr: SocketAddr,
         sequence: u64,
         piggyback: &[u8],
     ) -> Vec<NodeAction> {
@@ -127,7 +113,6 @@ impl SwimNode {
         let pb = self.dissemination.pack_piggyback(self.max_piggyback);
         actions.push(NodeAction::SendPing {
             to: target,
-            to_addr: target_addr,
             sequence,
             piggyback: pb,
         });
@@ -135,15 +120,15 @@ impl SwimNode {
     }
 
     /// Handle a join request from a new node.
-    pub fn handle_join_request(&mut self, from: NodeId, from_addr: SocketAddr) -> Vec<NodeAction> {
+    pub fn handle_join_request(&mut self, from: NodeId) -> Vec<NodeAction> {
         // Add the new node to our member list
-        let changed = self.members.apply(from, from_addr, MemberState::Alive, 0);
+        let changed = self.members.apply(from, MemberState::Alive, 0);
         let mut actions = Vec::new();
 
         if changed {
             // Enqueue the join for dissemination
             self.dissemination.enqueue(
-                membership_update(from, from_addr, MemberState::Alive, 0),
+                membership_update(from, MemberState::Alive, 0),
                 self.cluster_size(),
             );
             actions.push(NodeAction::MembershipChanged {
@@ -157,13 +142,11 @@ impl SwimNode {
         let mut members = self.members.snapshot();
         members.push(NodeRecord {
             node_id: self.members.self_id(),
-            addr: self.self_addr,
             state: MemberState::Alive,
             incarnation: self.members.self_incarnation(),
         });
         actions.push(NodeAction::SendJoinResponse {
             to: from,
-            to_addr: from_addr,
             members,
         });
 
@@ -176,7 +159,6 @@ impl SwimNode {
         for record in members {
             let changed = self.members.apply(
                 record.node_id,
-                record.addr,
                 record.state,
                 record.incarnation,
             );
@@ -191,20 +173,11 @@ impl SwimNode {
         actions
     }
 
-    /// Initiate joining a cluster by contacting seed nodes.
-    pub fn join(&self, seeds: &[SocketAddr]) -> Vec<NodeAction> {
-        seeds
-            .iter()
-            .map(|addr| NodeAction::SendJoinRequest { to_addr: *addr })
-            .collect()
-    }
-
     /// Announce ourselves as dead (graceful leave).
     pub fn leave(&mut self) -> Vec<NodeAction> {
         self.dissemination.enqueue(
             membership_update(
                 self.members.self_id(),
-                self.self_addr,
                 MemberState::Dead,
                 self.members.self_incarnation(),
             ),
@@ -235,7 +208,6 @@ impl SwimNode {
                 self.dissemination.enqueue(
                     membership_update(
                         self.members.self_id(),
-                        self.self_addr,
                         MemberState::Alive,
                         new_inc,
                     ),
@@ -247,14 +219,13 @@ impl SwimNode {
 
         let changed = self.members.apply(
             update.node_id,
-            update.addr,
             update.state,
             update.incarnation,
         );
         if changed {
             // Re-disseminate the update
             self.dissemination.enqueue(
-                membership_update(update.node_id, update.addr, update.state, update.incarnation),
+                membership_update(update.node_id, update.state, update.incarnation),
                 self.cluster_size(),
             );
             vec![NodeAction::MembershipChanged {
@@ -271,7 +242,7 @@ impl SwimNode {
         let mut actions = Vec::new();
         for pa in probe_actions {
             match pa {
-                SwimAction::SendPing { to, to_addr, sequence } => {
+                SwimAction::SendPing { to, sequence } => {
                     // If the target is suspect or dead, re-enqueue its state
                     // so it piggybacks on this message. This is the key mechanism
                     // for partition-heal recovery: the target learns it was
@@ -279,7 +250,7 @@ impl SwimNode {
                     if let Some(entry) = self.members.get(&to) {
                         if entry.state == MemberState::Dead || entry.state == MemberState::Suspect {
                             self.dissemination.enqueue(
-                                membership_update(to, to_addr, entry.state, entry.incarnation),
+                                membership_update(to, entry.state, entry.incarnation),
                                 self.cluster_size(),
                             );
                         }
@@ -287,18 +258,15 @@ impl SwimNode {
                     let pb = self.dissemination.pack_piggyback(self.max_piggyback);
                     actions.push(NodeAction::SendPing {
                         to,
-                        to_addr,
                         sequence,
                         piggyback: pb,
                     });
                 }
-                SwimAction::SendPingReq { relay, relay_addr, target, target_addr, sequence } => {
+                SwimAction::SendPingReq { relay, target, sequence } => {
                     let pb = self.dissemination.pack_piggyback(self.max_piggyback);
                     actions.push(NodeAction::SendPingReq {
                         relay,
-                        relay_addr,
                         target,
-                        target_addr,
                         sequence,
                         piggyback: pb,
                     });
@@ -307,7 +275,7 @@ impl SwimNode {
                     if self.members.suspect(node_id) {
                         if let Some(entry) = self.members.get(&node_id) {
                             self.dissemination.enqueue(
-                                membership_update(node_id, entry.addr, MemberState::Suspect, entry.incarnation),
+                                membership_update(node_id, MemberState::Suspect, entry.incarnation),
                                 self.cluster_size(),
                             );
                         }
@@ -319,14 +287,10 @@ impl SwimNode {
                     }
                 }
                 SwimAction::DeclareDead(node_id) => {
-                    // Note: declare_dead() was already called by SwimProbe::check_suspicion_timeouts(),
-                    // so we must NOT call it again (it would return false since state is already Dead).
-                    // We just need to disseminate the update and emit the MembershipChanged action.
                     if let Some(entry) = self.members.get(&node_id) {
                         let inc = entry.incarnation;
-                        let addr = entry.addr;
                         self.dissemination.enqueue(
-                            membership_update(node_id, addr, MemberState::Dead, inc),
+                            membership_update(node_id, MemberState::Dead, inc),
                             self.cluster_size(),
                         );
                         actions.push(NodeAction::MembershipChanged {
@@ -340,7 +304,6 @@ impl SwimNode {
                     self.dissemination.enqueue(
                         membership_update(
                             self.members.self_id(),
-                            self.self_addr,
                             MemberState::Alive,
                             new_incarnation,
                         ),

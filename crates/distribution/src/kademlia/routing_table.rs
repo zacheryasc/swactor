@@ -6,7 +6,6 @@
 //! replacement cache and only promote when an existing node is evicted.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 
 use crate::types::NodeId;
 
@@ -20,7 +19,6 @@ const NUM_BUCKETS: usize = 256;
 #[derive(Debug, Clone)]
 pub struct NodeEntry {
     pub node_id: NodeId,
-    pub addr: SocketAddr,
 }
 
 /// A single k-bucket with an LRU list and replacement cache.
@@ -119,12 +117,12 @@ impl RoutingTable {
     }
 
     /// Insert or update a node in the routing table.
-    pub fn insert(&mut self, node_id: NodeId, addr: SocketAddr) -> bool {
+    pub fn insert(&mut self, node_id: NodeId) -> bool {
         if node_id == self.self_id {
             return false;
         }
         let idx = self.bucket_index(&node_id);
-        self.buckets[idx].insert(NodeEntry { node_id, addr })
+        self.buckets[idx].insert(NodeEntry { node_id })
     }
 
     /// Remove a node from the routing table.

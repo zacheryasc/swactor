@@ -6,8 +6,6 @@
 //!
 //! Priority ordering: Dead > Suspect > Alive (most urgent first).
 
-use std::net::SocketAddr;
-
 use crate::messages::MembershipUpdate;
 use crate::types::{MemberState, NodeId};
 
@@ -121,13 +119,11 @@ impl DisseminationQueue {
 /// Convenience: create a `MembershipUpdate` from components.
 pub fn membership_update(
     node_id: NodeId,
-    addr: SocketAddr,
     state: MemberState,
     incarnation: u64,
 ) -> MembershipUpdate {
     MembershipUpdate {
         node_id,
-        addr,
         state,
         incarnation,
     }

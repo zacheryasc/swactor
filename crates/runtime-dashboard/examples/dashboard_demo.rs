@@ -1,4 +1,3 @@
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -86,7 +85,6 @@ impl DistributionStatsProvider for SnapshotProvider {
 fn tick_all_and_deliver(
     nodes: &mut [Option<DistributedNode>],
     node_ids: &[NodeId],
-    addrs: &[SocketAddr],
 ) {
     let n = nodes.len();
 
@@ -106,19 +104,15 @@ fn tick_all_and_deliver(
         let tagged_responses = deliver_actions_tagged(
             &actions,
             node_ids[sender_idx],
-            addrs[sender_idx],
             nodes,
             node_ids,
-            addrs,
         );
         for (responder_idx, response_actions) in tagged_responses {
             deliver_actions_tagged(
                 &response_actions,
                 node_ids[responder_idx],
-                addrs[responder_idx],
                 nodes,
                 node_ids,
-                addrs,
             );
         }
     }
@@ -130,10 +124,8 @@ fn tick_all_and_deliver(
 fn deliver_actions_tagged(
     actions: &[NodeAction],
     sender_id: NodeId,
-    sender_addr: SocketAddr,
     nodes: &mut [Option<DistributedNode>],
     node_ids: &[NodeId],
-    node_addrs: &[SocketAddr],
 ) -> Vec<(usize, Vec<NodeAction>)> {
     let mut tagged_responses: Vec<(usize, Vec<NodeAction>)> = Vec::new();
 
@@ -143,12 +135,11 @@ fn deliver_actions_tagged(
                 to,
                 sequence,
                 piggyback,
-                ..
             } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == to) {
                     if let Some(ref mut node) = nodes[idx] {
                         let resp =
-                            node.handle_ping(sender_id, sender_addr, *sequence, piggyback);
+                            node.handle_ping(sender_id, *sequence, piggyback);
                         if !resp.is_empty() {
                             tagged_responses.push((idx, resp));
                         }
@@ -159,21 +150,10 @@ fn deliver_actions_tagged(
                 to,
                 sequence,
                 piggyback,
-                ..
             } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == to) {
                     if let Some(ref mut node) = nodes[idx] {
                         let resp = node.handle_ack(sender_id, *sequence, piggyback);
-                        if !resp.is_empty() {
-                            tagged_responses.push((idx, resp));
-                        }
-                    }
-                }
-            }
-            NodeAction::SendJoinRequest { to_addr } => {
-                if let Some(idx) = node_addrs.iter().position(|a| a == to_addr) {
-                    if let Some(ref mut node) = nodes[idx] {
-                        let resp = node.handle_join_request(sender_id, sender_addr);
                         if !resp.is_empty() {
                             tagged_responses.push((idx, resp));
                         }
@@ -193,17 +173,14 @@ fn deliver_actions_tagged(
             NodeAction::SendPingReq {
                 relay,
                 target,
-                target_addr,
                 sequence,
                 piggyback,
-                ..
             } => {
                 if let Some(idx) = node_ids.iter().position(|id| id == relay) {
                     if let Some(ref mut node) = nodes[idx] {
                         let resp = node.handle_ping_req(
                             sender_id,
                             *target,
-                            *target_addr,
                             *sequence,
                             piggyback,
                         );
@@ -220,6 +197,31 @@ fn deliver_actions_tagged(
     }
 
     tagged_responses
+}
+
+/// Simulate a join handshake: the joining node sends a join request to the
+/// seed, and the seed's response is delivered back.
+fn simulate_join(
+    joining_idx: usize,
+    seed_idx: usize,
+    nodes: &mut [Option<DistributedNode>],
+    node_ids: &[NodeId],
+) {
+    let joining_id = node_ids[joining_idx];
+
+    // Seed handles the join request
+    let response_actions = if let Some(ref mut seed) = nodes[seed_idx] {
+        seed.handle_join_request(joining_id)
+    } else {
+        return;
+    };
+
+    // Deliver responses (SendJoinResponse) back to the joining node
+    let seed_id = node_ids[seed_idx];
+    let tagged = deliver_actions_tagged(&response_actions, seed_id, nodes, node_ids);
+    for (responder_idx, response_actions) in tagged {
+        deliver_actions_tagged(&response_actions, node_ids[responder_idx], nodes, node_ids);
+    }
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
@@ -283,12 +285,9 @@ fn main() {
     let num_nodes = 9; // 1 main + 8 peers
     let mut nodes: Vec<Option<DistributedNode>> = Vec::with_capacity(num_nodes);
     let mut node_ids: Vec<NodeId> = Vec::with_capacity(num_nodes);
-    let mut addrs: Vec<SocketAddr> = Vec::with_capacity(num_nodes);
 
     for i in 0..num_nodes {
-        let addr: SocketAddr = format!("127.0.0.1:{}", 7000 + i).parse().unwrap();
         let config = DistributedNodeConfig {
-            listen_addr: addr,
             swim: swim_config.clone(),
             cache_capacity: if i == 0 { 1000 } else { 100 },
             republish_interval: 500,
@@ -296,37 +295,17 @@ fn main() {
         };
         let node = DistributedNode::new(config);
         node_ids.push(node.node_id());
-        addrs.push(addr);
         nodes.push(Some(node));
     }
 
     // Join handshakes: nodes[1..] join via seed (node 0).
-    let seed_addr = addrs[0];
     for i in 1..num_nodes {
-        let join_actions = nodes[i].as_ref().unwrap().join(&[seed_addr]);
-        let tagged_responses = deliver_actions_tagged(
-            &join_actions,
-            node_ids[i],
-            addrs[i],
-            &mut nodes,
-            &node_ids,
-            &addrs,
-        );
-        for (responder_idx, response_actions) in tagged_responses {
-            deliver_actions_tagged(
-                &response_actions,
-                node_ids[responder_idx],
-                addrs[responder_idx],
-                &mut nodes,
-                &node_ids,
-                &addrs,
-            );
-        }
+        simulate_join(i, 0, &mut nodes, &node_ids);
     }
 
     // Settle: let SWIM converge initial membership.
     for _ in 0..5 {
-        tick_all_and_deliver(&mut nodes, &node_ids, &addrs);
+        tick_all_and_deliver(&mut nodes, &node_ids);
     }
 
     // Register spawned actors in the main node's directory.
@@ -387,7 +366,7 @@ fn main() {
         }
 
         // Tick all distribution nodes and deliver SWIM actions
-        tick_all_and_deliver(&mut nodes, &node_ids, &addrs);
+        tick_all_and_deliver(&mut nodes, &node_ids);
 
         // Periodically resolve actors from main node
         if round % 50 == 25 {
@@ -446,35 +425,15 @@ fn main() {
             // Revive peer 8 (new node + rejoin)
             if churn_pos == 150 {
                 let config = DistributedNodeConfig {
-                    listen_addr: addrs[8],
                     swim: swim_config.clone(),
                     cache_capacity: 100,
                     republish_interval: 500,
                     ..Default::default()
                 };
                 let revived = DistributedNode::new(config);
-                let join_actions = revived.join(&[seed_addr]);
                 nodes[8] = Some(revived);
                 node_ids[8] = nodes[8].as_ref().unwrap().node_id();
-
-                let tagged_responses = deliver_actions_tagged(
-                    &join_actions,
-                    node_ids[8],
-                    addrs[8],
-                    &mut nodes,
-                    &node_ids,
-                    &addrs,
-                );
-                for (responder_idx, response_actions) in tagged_responses {
-                    deliver_actions_tagged(
-                        &response_actions,
-                        node_ids[responder_idx],
-                        addrs[responder_idx],
-                        &mut nodes,
-                        &node_ids,
-                        &addrs,
-                    );
-                }
+                simulate_join(8, 0, &mut nodes, &node_ids);
                 tracing::info!("revived peer 8 (rejoined cluster)");
             }
 
@@ -488,19 +447,15 @@ fn main() {
                     let tagged_responses = deliver_actions_tagged(
                         &leave_actions,
                         node_ids[7],
-                        addrs[7],
                         &mut nodes,
                         &node_ids,
-                        &addrs,
                     );
                     for (responder_idx, response_actions) in tagged_responses {
                         deliver_actions_tagged(
                             &response_actions,
                             node_ids[responder_idx],
-                            addrs[responder_idx],
                             &mut nodes,
                             &node_ids,
-                            &addrs,
                         );
                     }
                 }
@@ -511,35 +466,15 @@ fn main() {
             // Rejoin peer 7
             if churn_pos == 350 {
                 let config = DistributedNodeConfig {
-                    listen_addr: addrs[7],
                     swim: swim_config.clone(),
                     cache_capacity: 100,
                     republish_interval: 500,
                     ..Default::default()
                 };
                 let revived = DistributedNode::new(config);
-                let join_actions = revived.join(&[seed_addr]);
                 nodes[7] = Some(revived);
                 node_ids[7] = nodes[7].as_ref().unwrap().node_id();
-
-                let tagged_responses = deliver_actions_tagged(
-                    &join_actions,
-                    node_ids[7],
-                    addrs[7],
-                    &mut nodes,
-                    &node_ids,
-                    &addrs,
-                );
-                for (responder_idx, response_actions) in tagged_responses {
-                    deliver_actions_tagged(
-                        &response_actions,
-                        node_ids[responder_idx],
-                        addrs[responder_idx],
-                        &mut nodes,
-                        &node_ids,
-                        &addrs,
-                    );
-                }
+                simulate_join(7, 0, &mut nodes, &node_ids);
                 tracing::info!("peer 7 rejoined the cluster");
             }
         }

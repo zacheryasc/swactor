@@ -2,6 +2,7 @@ pub mod types;
 pub mod crypto;
 pub mod messages;
 pub mod codec;
+#[cfg(feature = "tcp")]
 pub mod transport;
 pub mod swim;
 pub mod kademlia;
@@ -9,4 +10,7 @@ pub mod cache;
 pub mod node;
 pub mod registry;
 pub mod snapshot;
+#[cfg(feature = "tcp")]
 pub mod driver;
+#[cfg(feature = "iroh")]
+pub mod iroh_driver;

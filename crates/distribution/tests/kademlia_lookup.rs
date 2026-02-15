@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::net::SocketAddr;
-
 use distribution::kademlia::lookup::{LookupAction, NodeLookup};
 use distribution::kademlia::routing_table::RoutingTable;
 use distribution::types::NodeId;
@@ -9,18 +6,14 @@ fn node(byte: u8) -> NodeId {
     NodeId([byte; 32])
 }
 
-fn addr(port: u16) -> SocketAddr {
-    format!("127.0.0.1:{port}").parse().unwrap()
-}
-
 // ─── Basic lookup ───────────────────────────────────────────────────────────
 
 #[test]
 fn lookup_queries_closest_seeds_first() {
     let mut rt = RoutingTable::with_k(node(0), 20);
-    rt.insert(node(1), addr(8001));
-    rt.insert(node(2), addr(8002));
-    rt.insert(node(3), addr(8003));
+    rt.insert(node(1));
+    rt.insert(node(2));
+    rt.insert(node(3));
 
     let target = node(0x10);
     let (lookup, actions) = NodeLookup::start_with_params(target, &rt, 3, 3);
@@ -37,8 +30,8 @@ fn lookup_queries_closest_seeds_first() {
 #[test]
 fn lookup_terminates_when_no_new_closer_nodes() {
     let mut rt = RoutingTable::with_k(node(0), 3);
-    rt.insert(node(1), addr(8001));
-    rt.insert(node(2), addr(8002));
+    rt.insert(node(1));
+    rt.insert(node(2));
 
     let target = node(0x10);
     let (mut lookup, _initial_actions) = NodeLookup::start_with_params(target, &rt, 3, 3);
@@ -56,15 +49,15 @@ fn lookup_terminates_when_no_new_closer_nodes() {
 #[test]
 fn lookup_discovers_closer_nodes_through_responses() {
     let mut rt = RoutingTable::with_k(node(0), 3);
-    rt.insert(node(1), addr(8001));
+    rt.insert(node(1));
 
     let target = node(0x10);
     let (mut lookup, _) = NodeLookup::start_with_params(target, &rt, 3, 3);
 
     // node(1) responds with closer nodes
     let actions = lookup.handle_response(node(1), vec![
-        (node(0x11), addr(8011)), // very close to target 0x10
-        (node(0x12), addr(8012)),
+        node(0x11), // very close to target 0x10
+        node(0x12),
     ]);
 
     // Should query the newly discovered closer nodes
@@ -84,7 +77,7 @@ fn lookup_result_contains_k_closest() {
     for i in 1..=10u8 {
         let mut bytes = [0u8; 32];
         bytes[0] = i;
-        rt.insert(NodeId(bytes), addr(8000 + i as u16));
+        rt.insert(NodeId(bytes));
     }
 
     let target = node(0x05);
@@ -113,9 +106,9 @@ fn lookup_result_contains_k_closest() {
 #[test]
 fn lookup_handles_node_failures() {
     let mut rt = RoutingTable::with_k(node(0), 20);
-    rt.insert(node(1), addr(8001));
-    rt.insert(node(2), addr(8002));
-    rt.insert(node(3), addr(8003));
+    rt.insert(node(1));
+    rt.insert(node(2));
+    rt.insert(node(3));
 
     let target = node(0x10);
     let (mut lookup, _) = NodeLookup::start_with_params(target, &rt, 3, 3);
@@ -147,7 +140,7 @@ fn lookup_with_empty_routing_table_completes_immediately() {
 fn lookup_converges_through_multiple_hops() {
     // Simulate: node 0 → knows node 1 → knows node 2 → knows node 3 (closest to target)
     let mut rt = RoutingTable::with_k(node(0), 20);
-    rt.insert(node(1), addr(8001));
+    rt.insert(node(1));
 
     let target = NodeId([0xFF; 32]);
     let (mut lookup, initial) = NodeLookup::start_with_params(target, &rt, 3, 3);
@@ -156,14 +149,14 @@ fn lookup_converges_through_multiple_hops() {
     assert!(initial.iter().any(|a| matches!(a, LookupAction::Query { node_id, .. } if *node_id == node(1))));
 
     // node 1 returns node 2
-    let actions = lookup.handle_response(node(1), vec![(node(2), addr(8002))]);
+    let actions = lookup.handle_response(node(1), vec![node(2)]);
     assert!(actions.iter().any(|a| matches!(a, LookupAction::Query { node_id, .. } if *node_id == node(2))));
 
     // node 2 returns node 3 (very close to target)
     let mut close_bytes = [0xFFu8; 32];
     close_bytes[31] = 0xFE;
     let close_node = NodeId(close_bytes);
-    let actions = lookup.handle_response(node(2), vec![(close_node, addr(8003))]);
+    let actions = lookup.handle_response(node(2), vec![close_node]);
 
     // Should query the close node
     assert!(actions.iter().any(|a| matches!(a, LookupAction::Query { node_id, .. } if *node_id == close_node)));
@@ -174,6 +167,6 @@ fn lookup_converges_through_multiple_hops() {
 
     // The done result should include the close node
     if let Some(LookupAction::Done { closest }) = actions.iter().find(|a| matches!(a, LookupAction::Done { .. })) {
-        assert!(closest.iter().any(|(id, _)| *id == close_node));
+        assert!(closest.iter().any(|id| *id == close_node));
     }
 }

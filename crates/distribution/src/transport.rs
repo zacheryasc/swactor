@@ -5,6 +5,8 @@
 //!   [32 bytes: dest address]
 //!   [4 bytes: type_tag len (BE u32)]
 //!   [N bytes: type_tag UTF-8]
+//!   [4 bytes: hints len (BE u32)]
+//!   [M bytes: hints (JSON, may be empty)]
 //!   [remaining: payload bytes]
 
 use std::collections::HashMap;
@@ -47,7 +49,7 @@ impl TcpTransport {
         }
     }
 
-    fn get_or_connect(&self, addr: SocketAddr) -> Result<TcpStream, Error> {
+    pub fn get_or_connect(&self, addr: SocketAddr) -> Result<TcpStream, Error> {
         let mut pool = self.pool.lock().unwrap();
         if let Some(stream) = pool.get(&addr) {
             match stream.try_clone() {
@@ -64,6 +66,11 @@ impl TcpTransport {
             .map_err(|e| Error::from(format!("set_nodelay: {e}")))?;
         pool.insert(addr, stream.try_clone().unwrap());
         Ok(stream)
+    }
+
+    /// Evict a pooled connection for an address.
+    pub fn evict(&self, addr: SocketAddr) {
+        self.pool.lock().unwrap().remove(&addr);
     }
 
     /// Send an envelope to a specific address.
@@ -121,7 +128,8 @@ impl TcpAcceptor {
 
     /// Non-blocking: accept new connections, read complete envelopes from them.
     /// Returns all envelopes that could be read without blocking.
-    pub fn try_recv(&self, streams: &mut Vec<TcpStream>) -> Vec<(WireEnvelope, SocketAddr)> {
+    /// Each entry contains (envelope, peer address, raw address hint bytes).
+    pub fn try_recv(&self, streams: &mut Vec<TcpStream>) -> Vec<(WireEnvelope, SocketAddr, Vec<u8>)> {
         // Accept new connections
         loop {
             match self.listener.accept() {
@@ -142,7 +150,7 @@ impl TcpAcceptor {
             let peer = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
             loop {
                 match read_wire_envelope(stream) {
-                    Ok(env) => envelopes.push((env, peer)),
+                    Ok((env, hints)) => envelopes.push((env, peer, hints)),
                     Err(ReadError::WouldBlock) => break,
                     Err(ReadError::Disconnected) => {
                         dead.push(i);
@@ -172,13 +180,14 @@ impl TcpAcceptor {
 /// Encode a WireEnvelope to bytes in the length-prefixed wire format.
 pub fn encode_wire_envelope(envelope: &WireEnvelope) -> Vec<u8> {
     let tag_bytes = envelope.type_tag.as_bytes();
-    let frame_len: u32 = (32 + 4 + tag_bytes.len() + envelope.payload.len()) as u32;
+    let frame_len: u32 = (32 + 4 + tag_bytes.len() + 4 + envelope.payload.len()) as u32;
 
     let mut buf = Vec::with_capacity(4 + frame_len as usize);
     buf.extend_from_slice(&frame_len.to_be_bytes());
     buf.extend_from_slice(&envelope.dest.0);
     buf.extend_from_slice(&(tag_bytes.len() as u32).to_be_bytes());
     buf.extend_from_slice(tag_bytes);
+    buf.extend_from_slice(&0u32.to_be_bytes()); // hints_len = 0
     buf.extend_from_slice(&envelope.payload);
     buf
 }
@@ -200,8 +209,8 @@ impl From<std::io::Error> for ReadError {
     }
 }
 
-/// Read one WireEnvelope from a TCP stream.
-fn read_wire_envelope(stream: &mut TcpStream) -> Result<WireEnvelope, ReadError> {
+/// Read one WireEnvelope and address hints from a TCP stream.
+fn read_wire_envelope(stream: &mut TcpStream) -> Result<(WireEnvelope, Vec<u8>), ReadError> {
     let mut len_buf = [0u8; 4];
     stream.read_exact(&mut len_buf)?;
     let frame_len = u32::from_be_bytes(len_buf) as usize;
@@ -215,17 +224,23 @@ fn read_wire_envelope(stream: &mut TcpStream) -> Result<WireEnvelope, ReadError>
     let tag_len = u32::from_be_bytes(frame[32..36].try_into().unwrap()) as usize;
     let type_tag = String::from_utf8_lossy(&frame[36..36 + tag_len]).to_string();
 
-    let payload = frame[36 + tag_len..].to_vec();
+    let after_tag = 36 + tag_len;
+    let hints_len = u32::from_be_bytes(frame[after_tag..after_tag + 4].try_into().unwrap()) as usize;
+    let hints_bytes = frame[after_tag + 4..after_tag + 4 + hints_len].to_vec();
+    let payload = frame[after_tag + 4 + hints_len..].to_vec();
 
-    Ok(WireEnvelope {
-        dest: ActorAddress(dest),
-        type_tag,
-        payload,
-    })
+    Ok((
+        WireEnvelope {
+            dest: ActorAddress(dest),
+            type_tag,
+            payload,
+        },
+        hints_bytes,
+    ))
 }
 
-/// Read a single envelope from a blocking stream. Public for use in tests/examples.
-pub fn read_envelope_blocking(stream: &mut TcpStream) -> Result<WireEnvelope, Error> {
+/// Read a single envelope and hints from a blocking stream. Public for use in tests/examples.
+pub fn read_envelope_blocking(stream: &mut TcpStream) -> Result<(WireEnvelope, Vec<u8>), Error> {
     // Temporarily set blocking mode
     stream
         .set_nonblocking(false)
@@ -247,13 +262,19 @@ pub fn read_envelope_blocking(stream: &mut TcpStream) -> Result<WireEnvelope, Er
     let tag_len = u32::from_be_bytes(frame[32..36].try_into().unwrap()) as usize;
     let type_tag = String::from_utf8_lossy(&frame[36..36 + tag_len]).to_string();
 
-    let payload = frame[36 + tag_len..].to_vec();
+    let after_tag = 36 + tag_len;
+    let hints_len = u32::from_be_bytes(frame[after_tag..after_tag + 4].try_into().unwrap()) as usize;
+    let hints_bytes = frame[after_tag + 4..after_tag + 4 + hints_len].to_vec();
+    let payload = frame[after_tag + 4 + hints_len..].to_vec();
 
     let _ = stream.set_nonblocking(true);
 
-    Ok(WireEnvelope {
-        dest: ActorAddress(dest),
-        type_tag,
-        payload,
-    })
+    Ok((
+        WireEnvelope {
+            dest: ActorAddress(dest),
+            type_tag,
+            payload,
+        },
+        hints_bytes,
+    ))
 }

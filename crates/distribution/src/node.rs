@@ -3,8 +3,6 @@
 //! Composes SWIM membership, Kademlia routing, directory, cache, and
 //! transport into a single public API.
 
-use std::net::SocketAddr;
-
 use swactor::actor::ActorAddress;
 
 use crate::cache::LocationCache;
@@ -21,8 +19,8 @@ use crate::swim::probe::SwimConfig;
 use crate::types::{MemberState, NodeId, NodeRecord};
 
 /// Configuration for a distributed node.
+#[derive(Clone)]
 pub struct DistributedNodeConfig {
-    pub listen_addr: SocketAddr,
     pub swim: SwimConfig,
     pub cache_capacity: usize,
     pub republish_interval: u64,
@@ -32,7 +30,6 @@ pub struct DistributedNodeConfig {
 impl Default for DistributedNodeConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "127.0.0.1:0".parse().unwrap(),
             swim: SwimConfig::default(),
             cache_capacity: 10_000,
             republish_interval: 1000,
@@ -68,7 +65,7 @@ impl DistributedNode {
     pub fn with_keypair(keypair: Keypair, config: DistributedNodeConfig) -> Self {
         let node_id = keypair.node_id();
         Self {
-            swim: SwimNode::new(node_id, config.listen_addr, config.swim),
+            swim: SwimNode::new(node_id, config.swim),
             routing_table: RoutingTable::new(node_id),
             directory: DirectoryShard::new(),
             cache: LocationCache::new(config.cache_capacity),
@@ -86,20 +83,11 @@ impl DistributedNode {
         self.keypair.node_id()
     }
 
-    pub fn listen_addr(&self) -> SocketAddr {
-        self.swim.self_addr()
-    }
-
     pub fn keypair(&self) -> &Keypair {
         &self.keypair
     }
 
     // ─── Cluster operations ─────────────────────────────────────────────
-
-    /// Join a cluster by contacting seed nodes.
-    pub fn join(&self, seeds: &[SocketAddr]) -> Vec<NodeAction> {
-        self.swim.join(seeds)
-    }
 
     /// Leave the cluster gracefully.
     pub fn leave(&mut self) -> Vec<NodeAction> {
@@ -156,15 +144,12 @@ impl DistributedNode {
 
     // ─── SWIM message handling (delegate to SwimNode) ───────────────────
 
-    pub fn handle_ping(&mut self, from: NodeId, from_addr: SocketAddr, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
+    pub fn handle_ping(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
         let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
-        let actions = self.swim.handle_ping(from, from_addr, sequence, &membership_bytes);
-        // Process membership BEFORE merging registry — otherwise a death
-        // notification in this same piggyback would immediately tombstone
-        // freshly received registry entries instead of pre-existing ones.
+        let actions = self.swim.handle_ping(from, sequence, &membership_bytes);
         self.process_membership_changes(&actions);
         self.merge_registry_entries(registry_entries);
-        self.maybe_update_routing_table(from, from_addr);
+        self.maybe_update_routing_table(from);
         self.inject_registry_piggyback(actions)
     }
 
@@ -176,24 +161,24 @@ impl DistributedNode {
         self.inject_registry_piggyback(actions)
     }
 
-    pub fn handle_ping_req(&mut self, from: NodeId, target: NodeId, target_addr: SocketAddr, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
+    pub fn handle_ping_req(&mut self, from: NodeId, target: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
         let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
-        let actions = self.swim.handle_ping_req(from, target, target_addr, sequence, &membership_bytes);
+        let actions = self.swim.handle_ping_req(from, target, sequence, &membership_bytes);
         self.process_membership_changes(&actions);
         self.merge_registry_entries(registry_entries);
         self.inject_registry_piggyback(actions)
     }
 
-    pub fn handle_join_request(&mut self, from: NodeId, from_addr: SocketAddr) -> Vec<NodeAction> {
-        let actions = self.swim.handle_join_request(from, from_addr);
-        self.maybe_update_routing_table(from, from_addr);
+    pub fn handle_join_request(&mut self, from: NodeId) -> Vec<NodeAction> {
+        let actions = self.swim.handle_join_request(from);
+        self.maybe_update_routing_table(from);
         actions
     }
 
     pub fn handle_join_response(&mut self, members: Vec<NodeRecord>) -> Vec<NodeAction> {
         for m in &members {
             if m.state != MemberState::Dead {
-                self.routing_table.insert(m.node_id, m.addr);
+                self.routing_table.insert(m.node_id);
             }
         }
         self.swim.handle_join_response(members)
@@ -240,7 +225,7 @@ impl DistributedNode {
         }
 
         ResolveResult::NeedsLookup {
-            closest_nodes: closest.into_iter().map(|e| (e.node_id, e.addr)).collect(),
+            closest_nodes: closest.into_iter().map(|e| e.node_id).collect(),
         }
     }
 
@@ -305,8 +290,8 @@ impl DistributedNode {
 
     // ─── Internal ───────────────────────────────────────────────────────
 
-    fn maybe_update_routing_table(&mut self, node_id: NodeId, addr: SocketAddr) {
-        self.routing_table.insert(node_id, addr);
+    fn maybe_update_routing_table(&mut self, node_id: NodeId) {
+        self.routing_table.insert(node_id);
     }
 
     fn process_membership_changes(&mut self, actions: &[NodeAction]) {
@@ -320,9 +305,7 @@ impl DistributedNode {
     fn handle_membership_change(&mut self, node_id: NodeId, state: MemberState) {
         match state {
             MemberState::Alive => {
-                if let Some(entry) = self.swim.members().get(&node_id) {
-                    self.routing_table.insert(node_id, entry.addr);
-                }
+                self.routing_table.insert(node_id);
                 // Re-disseminate registry entries so the recovering node
                 // catches up on state accumulated during the partition.
                 self.registry.re_disseminate_all(self.cluster_size());
@@ -348,20 +331,20 @@ impl DistributedNode {
         actions
             .into_iter()
             .map(|action| match action {
-                NodeAction::SendPing { to, to_addr, sequence, piggyback } => {
+                NodeAction::SendPing { to, sequence, piggyback } => {
                     let registry_entries = self.registry.take_pending(8);
                     let combined = pack_combined_piggyback(piggyback, registry_entries);
-                    NodeAction::SendPing { to, to_addr, sequence, piggyback: combined }
+                    NodeAction::SendPing { to, sequence, piggyback: combined }
                 }
-                NodeAction::SendAck { to, to_addr, sequence, piggyback } => {
+                NodeAction::SendAck { to, sequence, piggyback } => {
                     let registry_entries = self.registry.take_pending(8);
                     let combined = pack_combined_piggyback(piggyback, registry_entries);
-                    NodeAction::SendAck { to, to_addr, sequence, piggyback: combined }
+                    NodeAction::SendAck { to, sequence, piggyback: combined }
                 }
-                NodeAction::SendPingReq { relay, relay_addr, target, target_addr, sequence, piggyback } => {
+                NodeAction::SendPingReq { relay, target, sequence, piggyback } => {
                     let registry_entries = self.registry.take_pending(8);
                     let combined = pack_combined_piggyback(piggyback, registry_entries);
-                    NodeAction::SendPingReq { relay, relay_addr, target, target_addr, sequence, piggyback: combined }
+                    NodeAction::SendPingReq { relay, target, sequence, piggyback: combined }
                 }
                 other => other,
             })
@@ -382,7 +365,7 @@ pub enum ResolveResult {
     /// Found in cache or local directory.
     Cached(NodeId),
     /// Need to do a Kademlia FIND_VALUE — here are the closest known nodes.
-    NeedsLookup { closest_nodes: Vec<(NodeId, SocketAddr)> },
+    NeedsLookup { closest_nodes: Vec<NodeId> },
     /// No nodes known at all.
     NotFound,
 }

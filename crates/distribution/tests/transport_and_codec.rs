@@ -1,81 +1,6 @@
-use swactor::actor::ActorAddress;
-use swactor::transport::WireEnvelope;
-
 use distribution::codec::distribution_codec_registry;
 use distribution::messages::*;
-use distribution::transport::{TcpAcceptor, TcpTransport};
 use distribution::types::NodeId;
-
-// ─── Wire format round-trip ─────────────────────────────────────────────────
-
-#[test]
-fn wire_envelope_roundtrips_through_tcp() {
-    let acceptor = TcpAcceptor::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = acceptor.local_addr();
-
-    let original = WireEnvelope {
-        dest: ActorAddress::new_random(),
-        type_tag: "test::Msg".to_string(),
-        payload: vec![1, 2, 3, 4, 5],
-    };
-
-    let original_clone = original.clone();
-    let sender = std::thread::spawn(move || {
-        let transport = TcpTransport::new(addr);
-        transport.send_to(addr, original_clone).unwrap();
-    });
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let mut streams = Vec::new();
-    let envelopes = loop {
-        let envs = acceptor.try_recv(&mut streams);
-        if !envs.is_empty() {
-            break envs;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-
-    sender.join().unwrap();
-
-    assert_eq!(envelopes.len(), 1);
-    let (received, _peer) = &envelopes[0];
-    assert_eq!(received.dest, original.dest);
-    assert_eq!(received.type_tag, original.type_tag);
-    assert_eq!(received.payload, original.payload);
-}
-
-#[test]
-fn wire_envelope_minimal_roundtrips() {
-    let acceptor = TcpAcceptor::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let addr = acceptor.local_addr();
-
-    let original = WireEnvelope {
-        dest: ActorAddress::new_random(),
-        type_tag: "test::Minimal".to_string(),
-        payload: vec![42],
-    };
-
-    let original_clone = original.clone();
-    let sender = std::thread::spawn(move || {
-        let transport = TcpTransport::new(addr);
-        transport.send_to(addr, original_clone).unwrap();
-    });
-
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let mut streams = Vec::new();
-    let envelopes = loop {
-        let envs = acceptor.try_recv(&mut streams);
-        if !envs.is_empty() {
-            break envs;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
-
-    sender.join().unwrap();
-
-    let (received, _) = &envelopes[0];
-    assert_eq!(received.payload, vec![42]);
-}
 
 // ─── Codec registry ─────────────────────────────────────────────────────────
 
@@ -84,7 +9,6 @@ fn distribution_codec_encodes_and_decodes_ping() {
     let codecs = distribution_codec_registry();
     let ping = Ping {
         from: NodeId([0xAA; 32]),
-        from_addr: "127.0.0.1:7000".parse().unwrap(),
         sequence: 42,
         piggyback: vec![],
     };
@@ -104,8 +28,8 @@ fn distribution_codec_encodes_and_decodes_find_value_response() {
     let codecs = distribution_codec_registry();
 
     let resp = FindValueResponse::Closer(vec![
-        (NodeId([0x11; 32]), "127.0.0.1:8080".parse().unwrap()),
-        (NodeId([0x22; 32]), "127.0.0.1:8081".parse().unwrap()),
+        NodeId([0x11; 32]),
+        NodeId([0x22; 32]),
     ]);
 
     let type_id = std::any::TypeId::of::<FindValueResponse>();
@@ -116,7 +40,7 @@ fn distribution_codec_encodes_and_decodes_find_value_response() {
     match decoded {
         FindValueResponse::Closer(nodes) => {
             assert_eq!(nodes.len(), 2);
-            assert_eq!(nodes[0].0, NodeId([0x11; 32]));
+            assert_eq!(nodes[0], NodeId([0x11; 32]));
         }
         _ => panic!("expected Closer variant"),
     }
@@ -150,55 +74,175 @@ fn all_message_types_registered_in_codec_registry() {
     }
 }
 
-// ─── End-to-end: codec + TCP transport ──────────────────────────────────────
+// ─── TCP transport tests (require "tcp" feature) ────────────────────────────
 
-#[test]
-fn ping_message_survives_codec_and_tcp_roundtrip() {
-    let codecs = distribution_codec_registry();
+#[cfg(feature = "tcp")]
+mod tcp_transport {
+    use swactor::actor::ActorAddress;
+    use swactor::transport::WireEnvelope;
 
-    let acceptor = TcpAcceptor::bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let server_addr = acceptor.local_addr();
+    use distribution::codec::distribution_codec_registry;
+    use distribution::messages::*;
+    use distribution::transport::{TcpAcceptor, TcpTransport};
+    use distribution::types::NodeId;
 
-    let dest = ActorAddress::new_random();
-    let ping = Ping {
-        from: NodeId([0xBB; 32]),
-        from_addr: "127.0.0.1:7001".parse().unwrap(),
-        sequence: 99,
-        piggyback: vec![],
-    };
+    #[test]
+    fn wire_envelope_roundtrips_through_tcp() {
+        let acceptor = TcpAcceptor::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = acceptor.local_addr();
 
-    let type_id = std::any::TypeId::of::<Ping>();
-    let (tag, payload) = codecs.encode(type_id, Box::new(ping.clone())).unwrap();
+        let original = WireEnvelope {
+            dest: ActorAddress::new_random(),
+            type_tag: "test::Msg".to_string(),
+            payload: vec![1, 2, 3, 4, 5],
+        };
 
-    let envelope = WireEnvelope {
-        dest,
-        type_tag: tag,
-        payload,
-    };
+        let original_clone = original.clone();
+        let sender = std::thread::spawn(move || {
+            let transport = TcpTransport::new(addr);
+            transport.send_to(addr, original_clone).unwrap();
+        });
 
-    let envelope_clone = envelope.clone();
-    let sender = std::thread::spawn(move || {
-        let transport = TcpTransport::new(server_addr);
-        transport.send_to(server_addr, envelope_clone).unwrap();
-    });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut streams = Vec::new();
+        let envelopes = loop {
+            let envs = acceptor.try_recv(&mut streams);
+            if !envs.is_empty() {
+                break envs;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
 
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    let mut streams = Vec::new();
-    let envelopes = loop {
-        let envs = acceptor.try_recv(&mut streams);
-        if !envs.is_empty() {
-            break envs;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
+        sender.join().unwrap();
 
-    sender.join().unwrap();
+        assert_eq!(envelopes.len(), 1);
+        let (received, _peer, hints) = &envelopes[0];
+        assert_eq!(received.dest, original.dest);
+        assert_eq!(received.type_tag, original.type_tag);
+        assert_eq!(received.payload, original.payload);
+        assert!(hints.is_empty(), "no hints expected from plain send_to");
+    }
 
-    let (received, _) = &envelopes[0];
+    #[test]
+    fn wire_envelope_minimal_roundtrips() {
+        let acceptor = TcpAcceptor::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = acceptor.local_addr();
 
-    let (addr, msg_any) = codecs.receive(received.clone()).unwrap();
-    assert_eq!(addr, dest);
-    let decoded: &Ping = msg_any.downcast_ref().unwrap();
-    assert_eq!(decoded.from, NodeId([0xBB; 32]));
-    assert_eq!(decoded.sequence, 99);
+        let original = WireEnvelope {
+            dest: ActorAddress::new_random(),
+            type_tag: "test::Minimal".to_string(),
+            payload: vec![42],
+        };
+
+        let original_clone = original.clone();
+        let sender = std::thread::spawn(move || {
+            let transport = TcpTransport::new(addr);
+            transport.send_to(addr, original_clone).unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut streams = Vec::new();
+        let envelopes = loop {
+            let envs = acceptor.try_recv(&mut streams);
+            if !envs.is_empty() {
+                break envs;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        sender.join().unwrap();
+
+        let (received, _, _hints) = &envelopes[0];
+        assert_eq!(received.payload, vec![42]);
+    }
+
+    #[test]
+    fn two_drivers_complete_join_handshake() {
+        use distribution::driver::NodeDriver;
+        use distribution::node::DistributedNodeConfig;
+
+        let mut driver_a = NodeDriver::new(
+            "127.0.0.1:0".parse().unwrap(),
+            DistributedNodeConfig::default(),
+        )
+        .unwrap();
+
+        let mut driver_b = NodeDriver::new(
+            "127.0.0.1:0".parse().unwrap(),
+            DistributedNodeConfig::default(),
+        )
+        .unwrap();
+
+        let b_addr = driver_b.listen_addr();
+
+        // A sends JoinRequest to B
+        driver_a.join(&[b_addr]);
+
+        // B receives the JoinRequest, learns A's address from hints, sends JoinResponse
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        driver_b.recv();
+
+        // A receives the JoinResponse with member list
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        driver_a.recv();
+
+        // A should now have members — proving the full roundtrip worked.
+        // If hints were broken, B couldn't resolve A's address to send the
+        // JoinResponse, so A's member list would stay empty.
+        let members = driver_a.node().members();
+        assert!(
+            !members.is_empty(),
+            "join handshake should complete: A needs members from JoinResponse"
+        );
+    }
+
+    #[test]
+    fn ping_message_survives_codec_and_tcp_roundtrip() {
+        let codecs = distribution_codec_registry();
+
+        let acceptor = TcpAcceptor::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = acceptor.local_addr();
+
+        let dest = ActorAddress::new_random();
+        let ping = Ping {
+            from: NodeId([0xBB; 32]),
+            sequence: 99,
+            piggyback: vec![],
+        };
+
+        let type_id = std::any::TypeId::of::<Ping>();
+        let (tag, payload) = codecs.encode(type_id, Box::new(ping.clone())).unwrap();
+
+        let envelope = WireEnvelope {
+            dest,
+            type_tag: tag,
+            payload,
+        };
+
+        let envelope_clone = envelope.clone();
+        let sender = std::thread::spawn(move || {
+            let transport = TcpTransport::new(server_addr);
+            transport.send_to(server_addr, envelope_clone).unwrap();
+        });
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let mut streams = Vec::new();
+        let envelopes = loop {
+            let envs = acceptor.try_recv(&mut streams);
+            if !envs.is_empty() {
+                break envs;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        sender.join().unwrap();
+
+        let (received, _, _hints) = &envelopes[0];
+
+        let (addr, msg_any) = codecs.receive(received.clone()).unwrap();
+        assert_eq!(addr, dest);
+        let decoded: &Ping = msg_any.downcast_ref().unwrap();
+        assert_eq!(decoded.from, NodeId([0xBB; 32]));
+        assert_eq!(decoded.sequence, 99);
+    }
 }

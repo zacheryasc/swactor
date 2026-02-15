@@ -6,7 +6,6 @@
 //! 2. Same incarnation: higher-priority state wins (Dead > Suspect > Alive).
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 
 use crate::types::{MemberState, NodeId, NodeRecord};
 
@@ -14,7 +13,6 @@ use crate::types::{MemberState, NodeId, NodeRecord};
 #[derive(Debug, Clone)]
 pub struct MemberEntry {
     pub node_id: NodeId,
-    pub addr: SocketAddr,
     pub state: MemberState,
     pub incarnation: u64,
 }
@@ -23,7 +21,6 @@ impl MemberEntry {
     pub fn to_record(&self) -> NodeRecord {
         NodeRecord {
             node_id: self.node_id,
-            addr: self.addr,
             state: self.state,
             incarnation: self.incarnation,
         }
@@ -108,7 +105,7 @@ impl MemberList {
     /// - Higher incarnation always wins.
     /// - Same incarnation: higher-priority state wins.
     /// - Lower incarnation is ignored.
-    pub fn apply(&mut self, node_id: NodeId, addr: SocketAddr, state: MemberState, incarnation: u64) -> bool {
+    pub fn apply(&mut self, node_id: NodeId, state: MemberState, incarnation: u64) -> bool {
         // Don't store entries about ourselves
         if node_id == self.self_id {
             return false;
@@ -117,7 +114,6 @@ impl MemberList {
         match self.members.get_mut(&node_id) {
             Some(existing) => {
                 if incarnation > existing.incarnation {
-                    existing.addr = addr;
                     existing.state = state;
                     existing.incarnation = incarnation;
                     true
@@ -131,7 +127,6 @@ impl MemberList {
             None => {
                 self.members.insert(node_id, MemberEntry {
                     node_id,
-                    addr,
                     state,
                     incarnation,
                 });
@@ -151,10 +146,11 @@ impl MemberList {
         false
     }
 
-    /// Mark a node as dead.
+    /// Mark a node as dead. Only transitions from Suspect → Dead,
+    /// enforcing the SWIM lifecycle invariant (Alive → Suspect → Dead).
     pub fn declare_dead(&mut self, node_id: NodeId) -> bool {
         if let Some(entry) = self.members.get_mut(&node_id) {
-            if entry.state != MemberState::Dead {
+            if entry.state == MemberState::Suspect {
                 entry.state = MemberState::Dead;
                 return true;
             }

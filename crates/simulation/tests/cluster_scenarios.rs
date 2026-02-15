@@ -835,3 +835,78 @@ fn convergence_after_partition_heal() {
         result.actual
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// Postmortem 3f — suspect→refute race: no false death after refutation
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn suspect_refuted_before_timeout_no_false_death() {
+    // Scenario from SWIM flaky test postmortem (recommendation 3f):
+    // 3-node cluster, asymmetric partitions make node 1 unreachable by
+    // probes from nodes 0 and 2, but node 1's outgoing messages still
+    // reach them. Heal before the suspicion timer fires, so node 1 learns
+    // about its suspicion via gossip, bumps incarnation, and refutes back
+    // to Alive. The suspicion timer then fires but sees Alive (not Suspect)
+    // and does nothing — exercising the Bug 1 fix.
+    //
+    // Timing: partition at round 10 (tick 30), heal at round 20 (tick 60).
+    // Suspicion starts ~tick 36. With suspicion_timeout=50, timer fires
+    // ~tick 86 — 26 ticks after heal, giving ample time for refutation.
+    let config = DistributionSimConfig {
+        name: "suspect-refute-race".into(),
+        num_nodes: 3,
+        num_rounds: 60,
+        ticks_per_round: 3,
+        actors_per_node: 0,
+        swim: distribution::swim::probe::SwimConfig {
+            probe_interval: 1,
+            probe_timeout: 3,
+            indirect_probes: 1,
+            suspicion_timeout: 50,
+            dead_reprobe_interval: 0, // disabled — refutation must happen before death
+        },
+        network_faults: vec![
+            // Block 0→1 (but 1→0 still works)
+            NetworkFault::Partition {
+                round: 10,
+                partition: Partition {
+                    side_a: vec![0],
+                    side_b: vec![1],
+                    asymmetric: true,
+                },
+            },
+            // Block 2→1 (but 1→2 still works)
+            NetworkFault::Partition {
+                round: 10,
+                partition: Partition {
+                    side_a: vec![2],
+                    side_b: vec![1],
+                    asymmetric: true,
+                },
+            },
+            // Heal all partitions before suspicion timeout fires
+            NetworkFault::Heal { round: 20 },
+        ],
+        ..default_config()
+    };
+
+    let trace = run_simulation(config);
+
+    // All 3 nodes must be alive in the final snapshot — no false deaths
+    let last_round = trace.snapshots_per_round.last().unwrap();
+    for (name, snap) in last_round {
+        assert!(
+            snap.is_alive,
+            "{name} should be alive but was marked dead (false death after refutation)"
+        );
+    }
+
+    // 100% accuracy: every alive node sees all others as alive
+    let result = check_accuracy(&trace, 1.0);
+    assert!(
+        result.passed,
+        "all nodes should see full membership after refutation: {}",
+        result.actual
+    );
+}

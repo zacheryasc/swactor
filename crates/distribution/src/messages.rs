@@ -1,7 +1,5 @@
 //! Protocol messages for SWIM membership and Kademlia directory.
 
-use std::net::SocketAddr;
-
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 use swactor::transport::NetworkMessage;
@@ -17,7 +15,6 @@ use crate::types::{DirectoryEntry, MemberState, NodeId, NodeRecord};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ping {
     pub from: NodeId,
-    pub from_addr: SocketAddr,
     pub sequence: u64,
     #[serde(default)]
     pub piggyback: Vec<u8>,
@@ -53,7 +50,6 @@ impl NetworkMessage for Ack {
 pub struct PingReq {
     pub from: NodeId,
     pub target: NodeId,
-    pub target_addr: SocketAddr,
     pub sequence: u64,
     #[serde(default)]
     pub piggyback: Vec<u8>,
@@ -69,7 +65,6 @@ impl NetworkMessage for PingReq {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub from: NodeId,
-    pub addr: SocketAddr,
 }
 
 impl NetworkMessage for JoinRequest {
@@ -96,7 +91,6 @@ impl NetworkMessage for JoinResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipUpdate {
     pub node_id: NodeId,
-    pub addr: SocketAddr,
     pub state: MemberState,
     pub incarnation: u64,
 }
@@ -119,7 +113,7 @@ impl NetworkMessage for FindNodeRequest {
 /// Kademlia FIND_NODE response — closest known nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FindNodeResponse {
-    pub closest: Vec<(NodeId, SocketAddr)>,
+    pub closest: Vec<NodeId>,
 }
 
 impl NetworkMessage for FindNodeResponse {
@@ -159,7 +153,7 @@ pub enum FindValueResponse {
     /// Found the actor — here's the directory entry.
     Found(DirectoryEntry),
     /// Don't have it — here are closer nodes to ask.
-    Closer(Vec<(NodeId, SocketAddr)>),
+    Closer(Vec<NodeId>),
 }
 
 impl NetworkMessage for FindValueResponse {

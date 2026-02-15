@@ -4,7 +4,6 @@
 //! No I/O, no timers — the caller drives the clock.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
 
 use crate::types::{MemberState, NodeId};
 
@@ -62,13 +61,11 @@ pub enum SwimEvent {
 #[derive(Debug, Clone)]
 pub enum SwimAction {
     /// Send a direct ping to a node.
-    SendPing { to: NodeId, to_addr: SocketAddr, sequence: u64 },
+    SendPing { to: NodeId, sequence: u64 },
     /// Send an indirect ping request through a relay.
     SendPingReq {
         relay: NodeId,
-        relay_addr: SocketAddr,
         target: NodeId,
-        target_addr: SocketAddr,
         sequence: u64,
     },
     /// A node is now suspected.
@@ -88,7 +85,6 @@ enum ProbePhase {
     /// Direct ping sent, waiting for ack.
     WaitingDirectAck {
         target: NodeId,
-        target_addr: SocketAddr,
         sequence: u64,
         sent_at: u64,
     },
@@ -184,7 +180,7 @@ impl SwimProbe {
     }
 
     /// Pick the next probe target using round-robin over a shuffled order.
-    fn pick_probe_target(&mut self, members: &MemberList) -> Option<(NodeId, SocketAddr)> {
+    fn pick_probe_target(&mut self, members: &MemberList) -> Option<NodeId> {
         let alive = members.alive_members();
         if alive.is_empty() {
             return None;
@@ -205,11 +201,11 @@ impl SwimProbe {
         let target_id = self.probe_order[self.probe_index];
         self.probe_index += 1;
 
-        members.get(&target_id).map(|e| (e.node_id, e.addr))
+        Some(target_id)
     }
 
     /// Pick `k` random relay nodes (excluding `target`).
-    fn pick_relays(&self, members: &MemberList, target: NodeId) -> Vec<(NodeId, SocketAddr)> {
+    fn pick_relays(&self, members: &MemberList, target: NodeId) -> Vec<NodeId> {
         let alive: Vec<_> = members
             .alive_members()
             .into_iter()
@@ -222,7 +218,7 @@ impl SwimProbe {
         let mut relays = Vec::with_capacity(k);
         for i in 0..k {
             let idx = (start + i) % alive.len();
-            relays.push((alive[idx].node_id, alive[idx].addr));
+            relays.push(alive[idx].node_id);
         }
         relays
     }
@@ -237,7 +233,7 @@ impl SwimProbe {
 
         self.next_probe_tick = self.tick + self.config.probe_interval;
 
-        if let Some((target, target_addr)) = self.pick_probe_target(&mut MemberList::clone_shallow(members)) {
+        if let Some(target) = self.pick_probe_target(&mut MemberList::clone_shallow(members)) {
             // Record this probe target in history
             if self.recent_targets.len() >= PROBE_HISTORY_SIZE {
                 self.recent_targets.pop_front();
@@ -247,12 +243,10 @@ impl SwimProbe {
             let seq = self.next_sequence();
             actions.push(SwimAction::SendPing {
                 to: target,
-                to_addr: target_addr,
                 sequence: seq,
             });
             self.phase = ProbePhase::WaitingDirectAck {
                 target,
-                target_addr,
                 sequence: seq,
                 sent_at: self.tick,
             };
@@ -261,20 +255,17 @@ impl SwimProbe {
 
     fn check_probe_timeout(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
         match &self.phase {
-            ProbePhase::WaitingDirectAck { target, target_addr, sequence, sent_at } => {
+            ProbePhase::WaitingDirectAck { target, sequence, sent_at } => {
                 if self.tick - sent_at >= self.config.probe_timeout {
                     let target = *target;
-                    let target_addr = *target_addr;
                     let sequence = *sequence;
 
                     // Send indirect probes through relays
                     let relays = self.pick_relays(members, target);
-                    for (relay, relay_addr) in relays {
+                    for relay in relays {
                         actions.push(SwimAction::SendPingReq {
                             relay,
-                            relay_addr,
                             target,
-                            target_addr,
                             sequence,
                         });
                     }
@@ -351,18 +342,32 @@ impl SwimProbe {
             .collect();
 
         for node_id in expired {
-            if members.declare_dead(node_id) {
+            // Only declare dead if still suspect. A refutation (Alive with
+            // higher incarnation) clears the suspect state in MemberList;
+            // honour that by dropping the stale timer instead of killing the node.
+            let still_suspect = members
+                .get(&node_id)
+                .is_some_and(|e| e.state == MemberState::Suspect);
+
+            if still_suspect && members.declare_dead(node_id) {
                 actions.push(SwimAction::DeclareDead(node_id));
+                // If we're currently probing the dead node, cancel immediately
+                // so we can probe live members on this same tick.
+                match &self.phase {
+                    ProbePhase::WaitingDirectAck { target, .. }
+                    | ProbePhase::WaitingIndirectAck { target, .. }
+                        if *target == node_id =>
+                    {
+                        self.phase = ProbePhase::Idle;
+                    }
+                    _ => {}
+                }
             }
             self.cancel_suspicion_timer(node_id);
         }
     }
 
     /// Periodically ping a dead node to detect partition heals.
-    ///
-    /// Runs independently of the normal probe cycle. The piggyback exchange
-    /// triggers the dead node's refutation mechanism (incarnation bump),
-    /// which propagates back and resurrects the node.
     fn maybe_reprobe_dead(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
         if self.config.dead_reprobe_interval == 0 {
             return;
@@ -385,7 +390,6 @@ impl SwimProbe {
         let seq = self.next_sequence();
         actions.push(SwimAction::SendPing {
             to: target.node_id,
-            to_addr: target.addr,
             sequence: seq,
         });
     }
@@ -394,11 +398,11 @@ impl SwimProbe {
 // Helper: we need a read-only borrow of members in pick_probe_target
 // while also having &mut self. Use a shallow clone pattern.
 impl MemberList {
-    /// Cheap snapshot of just the IDs and addresses for probe target selection.
+    /// Cheap snapshot of just the IDs for probe target selection.
     fn clone_shallow(original: &MemberList) -> MemberList {
         let mut copy = MemberList::new(original.self_id());
         for entry in original.all_members() {
-            copy.apply(entry.node_id, entry.addr, entry.state, entry.incarnation);
+            copy.apply(entry.node_id, entry.state, entry.incarnation);
         }
         copy
     }

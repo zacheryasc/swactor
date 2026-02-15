@@ -279,23 +279,14 @@ pub fn heal_partition_via_handle(
     addrs: &[ActorAddress],
     names: &[String],
 ) -> Vec<(String, String)> {
-    if !matches!(topology, Topology::Partitioned) {
-        return Vec::new();
-    }
-    let n = addrs.len();
-    let half = n / 2;
+    let heal_edges = topology.heal_edges(addrs.len());
     let mut new_edges = Vec::new();
-    if half > 0 && half < n {
+    for (from, to) in heal_edges {
         handle
             .runtime
-            .send_to(addrs[half - 1], GossipMessage::AddPeer(addrs[half]))
+            .send_to(addrs[from], GossipMessage::AddPeer(addrs[to]))
             .unwrap();
-        handle
-            .runtime
-            .send_to(addrs[half], GossipMessage::AddPeer(addrs[half - 1]))
-            .unwrap();
-        new_edges.push((names[half - 1].clone(), names[half].clone()));
-        new_edges.push((names[half].clone(), names[half - 1].clone()));
+        new_edges.push((names[from].clone(), names[to].clone()));
     }
     new_edges
 }

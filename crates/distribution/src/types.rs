@@ -1,5 +1,4 @@
 use std::fmt;
-use std::net::SocketAddr;
 
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
@@ -137,7 +136,6 @@ impl Ord for MemberState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub node_id: NodeId,
-    pub addr: SocketAddr,
     pub state: MemberState,
     /// Incarnation number — bumped by the node itself to refute suspicion.
     pub incarnation: u64,

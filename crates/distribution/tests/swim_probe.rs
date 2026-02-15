@@ -1,15 +1,9 @@
-use std::net::SocketAddr;
-
 use distribution::swim::member_list::MemberList;
 use distribution::swim::probe::{SwimAction, SwimConfig, SwimEvent, SwimProbe};
 use distribution::types::{MemberState, NodeId};
 
 fn node(byte: u8) -> NodeId {
     NodeId([byte; 32])
-}
-
-fn addr(port: u16) -> SocketAddr {
-    format!("127.0.0.1:{port}").parse().unwrap()
 }
 
 fn tick_n(probe: &mut SwimProbe, members: &mut MemberList, n: u64) -> Vec<SwimAction> {
@@ -25,7 +19,7 @@ fn tick_n(probe: &mut SwimProbe, members: &mut MemberList, n: u64) -> Vec<SwimAc
 #[test]
 fn member_list_apply_new_node() {
     let mut ml = MemberList::new(node(0));
-    let changed = ml.apply(node(1), addr(8001), MemberState::Alive, 0);
+    let changed = ml.apply(node(1), MemberState::Alive, 0);
     assert!(changed);
     assert_eq!(ml.alive_count(), 1);
 }
@@ -33,7 +27,7 @@ fn member_list_apply_new_node() {
 #[test]
 fn member_list_ignores_self() {
     let mut ml = MemberList::new(node(0));
-    let changed = ml.apply(node(0), addr(8000), MemberState::Alive, 0);
+    let changed = ml.apply(node(0), MemberState::Alive, 0);
     assert!(!changed);
     assert_eq!(ml.len(), 0);
 }
@@ -41,15 +35,15 @@ fn member_list_ignores_self() {
 #[test]
 fn member_list_higher_incarnation_wins() {
     let mut ml = MemberList::new(node(0));
-    ml.apply(node(1), addr(8001), MemberState::Alive, 5);
+    ml.apply(node(1), MemberState::Alive, 5);
 
     // Lower incarnation ignored
-    let changed = ml.apply(node(1), addr(8001), MemberState::Dead, 3);
+    let changed = ml.apply(node(1), MemberState::Dead, 3);
     assert!(!changed);
     assert_eq!(ml.get(&node(1)).unwrap().state, MemberState::Alive);
 
     // Higher incarnation overrides
-    let changed = ml.apply(node(1), addr(8001), MemberState::Dead, 6);
+    let changed = ml.apply(node(1), MemberState::Dead, 6);
     assert!(changed);
     assert_eq!(ml.get(&node(1)).unwrap().state, MemberState::Dead);
 }
@@ -57,15 +51,15 @@ fn member_list_higher_incarnation_wins() {
 #[test]
 fn member_list_same_incarnation_higher_priority_wins() {
     let mut ml = MemberList::new(node(0));
-    ml.apply(node(1), addr(8001), MemberState::Alive, 0);
+    ml.apply(node(1), MemberState::Alive, 0);
 
     // Suspect overrides Alive at same incarnation
-    let changed = ml.apply(node(1), addr(8001), MemberState::Suspect, 0);
+    let changed = ml.apply(node(1), MemberState::Suspect, 0);
     assert!(changed);
     assert_eq!(ml.get(&node(1)).unwrap().state, MemberState::Suspect);
 
     // Alive does NOT override Suspect at same incarnation
-    let changed = ml.apply(node(1), addr(8001), MemberState::Alive, 0);
+    let changed = ml.apply(node(1), MemberState::Alive, 0);
     assert!(!changed);
     assert_eq!(ml.get(&node(1)).unwrap().state, MemberState::Suspect);
 }
@@ -73,7 +67,7 @@ fn member_list_same_incarnation_higher_priority_wins() {
 #[test]
 fn member_list_suspect_and_declare_dead() {
     let mut ml = MemberList::new(node(0));
-    ml.apply(node(1), addr(8001), MemberState::Alive, 0);
+    ml.apply(node(1), MemberState::Alive, 0);
 
     assert!(ml.suspect(node(1)));
     assert_eq!(ml.get(&node(1)).unwrap().state, MemberState::Suspect);
@@ -104,7 +98,7 @@ fn probe_sends_ping_after_interval() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
+    members.apply(node(1), MemberState::Alive, 0);
 
     // Ticks 1-4: nothing happens
     let actions = tick_n(&mut probe, &mut members, 4);
@@ -127,7 +121,7 @@ fn probe_ack_completes_cycle() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
+    members.apply(node(1), MemberState::Alive, 0);
 
     // Trigger probe
     tick_n(&mut probe, &mut members, 5);
@@ -157,9 +151,9 @@ fn probe_timeout_triggers_indirect_probes() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
-    members.apply(node(2), addr(8002), MemberState::Alive, 0);
-    members.apply(node(3), addr(8003), MemberState::Alive, 0);
+    members.apply(node(1), MemberState::Alive, 0);
+    members.apply(node(2), MemberState::Alive, 0);
+    members.apply(node(3), MemberState::Alive, 0);
 
     // Fire probe
     tick_n(&mut probe, &mut members, 5);
@@ -184,7 +178,7 @@ fn no_ack_at_all_causes_suspicion() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
+    members.apply(node(1), MemberState::Alive, 0);
 
     // Fire probe
     tick_n(&mut probe, &mut members, 5);
@@ -213,7 +207,7 @@ fn suspicion_timeout_causes_death_declaration() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
+    members.apply(node(1), MemberState::Alive, 0);
 
     // Fire probe, let it timeout fully (direct + indirect)
     tick_n(&mut probe, &mut members, 5); // ping sent
@@ -247,8 +241,8 @@ fn indirect_ack_rescues_suspected_node() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
-    members.apply(node(2), addr(8002), MemberState::Alive, 0);
+    members.apply(node(1), MemberState::Alive, 0);
+    members.apply(node(2), MemberState::Alive, 0);
 
     // Fire probe (assume target is node 1)
     let actions = tick_n(&mut probe, &mut members, 5);
@@ -298,8 +292,8 @@ fn reprobe_sends_ping_to_dead_node() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
-    members.apply(node(2), addr(8002), MemberState::Dead, 0);
+    members.apply(node(1), MemberState::Alive, 0);
+    members.apply(node(2), MemberState::Dead, 0);
 
     // Tick to the reprobe interval
     let actions = tick_n(&mut probe, &mut members, 20);
@@ -323,7 +317,7 @@ fn reprobe_disabled_when_interval_is_zero() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Dead, 0);
+    members.apply(node(1), MemberState::Dead, 0);
 
     // Tick a lot — should never ping the dead node
     let actions = tick_n(&mut probe, &mut members, 200);
@@ -345,7 +339,7 @@ fn reprobe_does_nothing_when_no_dead_members() {
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
-    members.apply(node(1), addr(8001), MemberState::Alive, 0);
+    members.apply(node(1), MemberState::Alive, 0);
 
     // Tick past reprobe interval — no dead members to reprobe
     let actions = tick_n(&mut probe, &mut members, 25);
