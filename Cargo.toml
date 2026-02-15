@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/python", "crates/wasm", "crates/bin-runner", "crates/simulation", "crates/runtime-dashboard", "crates/distribution", "crates/std", "tests/docker"]
+members = [".", "crates/python", "crates/wasm", "crates/bin-runner", "crates/simulation", "crates/runtime-dashboard", "crates/distribution", "crates/std", "crates/datastore", "tests/docker", "xtask"]
 exclude = ["tools/depgraph"]
 
 [package]

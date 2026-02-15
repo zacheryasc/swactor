@@ -121,6 +121,7 @@ pub const DISTRIBUTION_HTML: &str = r##"<!DOCTYPE html>
       <a href="/" class="nav-link">Overview</a>
       <a href="/actors" class="nav-link">Actors</a>
       <a href="/distribution" class="nav-link active">Distribution</a>
+      <a href="/datastore" class="nav-link">Datastore</a>
     </nav>
   </div>
   <div class="header-right">

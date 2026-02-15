@@ -1,0 +1,372 @@
+//! Protocol messages for the distributed datastore.
+//!
+//! Split into two categories:
+//! - **Inter-node messages** — travel over the wire (iroh/QUIC) between nodes.
+//!   Each implements `NetworkMessage` with a stable `type_tag()`.
+//! - **Intra-node messages** — actor-to-actor within a single node.
+//!   Plain enums routed through the local actor system.
+
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::net::SocketAddr;
+
+use serde::{Deserialize, Serialize};
+use swactor::actor::ActorAddress;
+use swactor::transport::NetworkMessage;
+
+use distribution::types::NodeId;
+
+use crate::types::{ContentHash, ObjectEntry, ObjectManifest};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Inter-node messages (wire protocol over iroh)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── Chunk transfer ─────────────────────────────────────────────────────────
+
+/// Request a chunk by its content hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetChunkRequest {
+    pub from: NodeId,
+    pub hash: ContentHash,
+}
+
+impl NetworkMessage for GetChunkRequest {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::GetChunkRequest"
+    }
+}
+
+/// Response to a chunk request. `data` is `None` if the chunk is not found.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetChunkResponse {
+    pub hash: ContentHash,
+    pub data: Option<Vec<u8>>,
+}
+
+impl NetworkMessage for GetChunkResponse {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::GetChunkResponse"
+    }
+}
+
+// ─── Object metadata (DHT operations) ───────────────────────────────────────
+
+/// Store object metadata in the DHT (Kademlia STORE).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoreObjectRequest {
+    pub entry: ObjectEntry,
+}
+
+impl NetworkMessage for StoreObjectRequest {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::StoreObjectRequest"
+    }
+}
+
+/// Look up object metadata by content hash (Kademlia FIND_VALUE).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FindObjectRequest {
+    pub from: NodeId,
+    pub content_hash: ContentHash,
+}
+
+impl NetworkMessage for FindObjectRequest {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::FindObjectRequest"
+    }
+}
+
+/// Response to a FIND_VALUE for object metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FindObjectResponse {
+    /// Found the object — here's the metadata entry.
+    Found(ObjectEntry),
+    /// Don't have it — here are closer nodes to ask.
+    Closer(Vec<(NodeId, SocketAddr)>),
+}
+
+impl NetworkMessage for FindObjectResponse {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::FindObjectResponse"
+    }
+}
+
+/// Request an object manifest by its content hash.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetManifestRequest {
+    pub from: NodeId,
+    pub hash: ContentHash,
+}
+
+impl NetworkMessage for GetManifestRequest {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::GetManifestRequest"
+    }
+}
+
+/// Response to a manifest request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetManifestResponse {
+    pub manifest: Option<ObjectManifest>,
+}
+
+impl NetworkMessage for GetManifestResponse {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::GetManifestResponse"
+    }
+}
+
+// ─── Listing ────────────────────────────────────────────────────────────────
+
+/// List objects stored on a specific node, optionally filtered by name substring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListObjectsRequest {
+    pub from: NodeId,
+    pub name_filter: Option<String>,
+}
+
+impl NetworkMessage for ListObjectsRequest {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::ListObjectsRequest"
+    }
+}
+
+/// Response to a list request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListObjectsResponse {
+    pub entries: Vec<ObjectEntry>,
+}
+
+impl NetworkMessage for ListObjectsResponse {
+    fn type_tag() -> &'static str {
+        "swactor_datastore::ListObjectsResponse"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Intra-node messages (actor-to-actor)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ─── BlobStoreMsg ───────────────────────────────────────────────────────────
+
+/// Messages handled by the `BlobStoreActor`.
+#[derive(Debug, Clone)]
+pub enum BlobStoreMsg {
+    /// Write a chunk to disk. The hash must match `ContentHash::of(data)`.
+    WriteChunk {
+        hash: ContentHash,
+        data: Vec<u8>,
+        reply_to: ActorAddress,
+    },
+    /// Read a chunk from disk by its content hash.
+    ReadChunk {
+        hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+    /// Delete a chunk from disk.
+    DeleteChunk { hash: ContentHash },
+    /// Check whether a chunk exists locally.
+    HasChunk {
+        hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+    /// List all chunk hashes stored locally.
+    ListChunks { reply_to: ActorAddress },
+    /// Garbage-collect chunks not in the referenced set.
+    GcUnreferenced { referenced: HashSet<ContentHash> },
+    /// Store a manifest to disk.
+    WriteManifest {
+        manifest: ObjectManifest,
+        reply_to: ActorAddress,
+    },
+    /// Read a manifest from disk by its content hash.
+    ReadManifest {
+        hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+}
+
+// ─── MetadataMsg ────────────────────────────────────────────────────────────
+
+/// Messages handled by the `MetadataActor`.
+#[derive(Debug, Clone)]
+pub enum MetadataMsg {
+    /// Store object metadata and manifest locally, then replicate to DHT.
+    PutObject {
+        entry: ObjectEntry,
+        manifest: ObjectManifest,
+        reply_to: ActorAddress,
+    },
+    /// Look up an object by content hash (local first, then DHT).
+    GetObject {
+        content_hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+    /// Delete an object by content hash (remove from local index).
+    DeleteObject {
+        content_hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+    /// List objects stored on this node, optionally filtered by name substring.
+    ListLocal {
+        name_filter: Option<String>,
+        reply_to: ActorAddress,
+    },
+    /// Fan-out list to all known alive nodes, merge results.
+    ListSwarm {
+        name_filter: Option<String>,
+        reply_to: ActorAddress,
+    },
+    /// Handle an incoming FIND_VALUE request from the DHT.
+    HandleFindObject {
+        from: NodeId,
+        content_hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+    /// Handle an incoming STORE request from the DHT.
+    HandleStoreObject {
+        entry: ObjectEntry,
+        manifest: Option<ObjectManifest>,
+    },
+    /// Set the list of peer MetadataActor addresses for dissemination.
+    SetPeers { peers: Vec<ActorAddress> },
+    /// Trigger one round of epidemic dissemination to peers.
+    DisseminateTick,
+    /// Periodic garbage collection tick.
+    GcTick,
+}
+
+// ─── TransferMsg ────────────────────────────────────────────────────────────
+
+/// Messages handled by the `TransferActor` (ephemeral, one per download).
+#[derive(Debug, Clone)]
+pub enum TransferMsg {
+    /// Start downloading an object from a remote node.
+    StartDownload {
+        manifest: ObjectManifest,
+        source_node: NodeId,
+        reply_to: ActorAddress,
+    },
+    /// A chunk has been received from the remote node.
+    ChunkReceived {
+        hash: ContentHash,
+        data: Vec<u8>,
+    },
+    /// A chunk fetch failed.
+    ChunkFailed {
+        hash: ContentHash,
+        reason: String,
+    },
+    /// Cancel this transfer.
+    Cancel,
+}
+
+// ─── DatastoreNodeMsg ───────────────────────────────────────────────────────
+
+/// Messages handled by the `DatastoreNode` coordinator actor.
+#[derive(Debug, Clone)]
+pub enum DatastoreNodeMsg {
+    // ── User-facing commands ────────────────────────────────────────────
+    /// Store a blob with optional name and tags.
+    Put {
+        data: Vec<u8>,
+        name: Option<String>,
+        tags: BTreeMap<String, String>,
+        reply_to: ActorAddress,
+    },
+    /// Retrieve object metadata and manifest by content hash.
+    Get {
+        content_hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+    /// Delete an object by content hash.
+    Delete {
+        content_hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+    /// List stored objects with optional name filter.
+    List {
+        name_filter: Option<String>,
+        all: bool,
+        reply_to: ActorAddress,
+    },
+    /// Query node identity.
+    Status { reply_to: ActorAddress },
+    /// Read a single chunk by hash.
+    ReadChunk {
+        hash: ContentHash,
+        reply_to: ActorAddress,
+    },
+
+    // ── Incoming network protocol ───────────────────────────────────────
+    /// Route an incoming GetChunk request to BlobStoreActor.
+    IncomingGetChunk {
+        request: GetChunkRequest,
+        reply_to: ActorAddress,
+    },
+    /// Route an incoming GetManifest request to BlobStoreActor.
+    IncomingGetManifest {
+        request: GetManifestRequest,
+        reply_to: ActorAddress,
+    },
+    /// Route an incoming StoreObject request to MetadataActor.
+    IncomingStoreObject { request: StoreObjectRequest },
+    /// Route an incoming FindObject request to MetadataActor.
+    IncomingFindObject {
+        request: FindObjectRequest,
+        reply_to: ActorAddress,
+    },
+    /// Route an incoming ListObjects request to MetadataActor.
+    IncomingListObjects {
+        request: ListObjectsRequest,
+        reply_to: ActorAddress,
+    },
+}
+
+// ─── DatastoreResponse ──────────────────────────────────────────────────────
+
+/// Response messages sent back to the requester by datastore actors.
+#[derive(Debug, Clone)]
+pub enum DatastoreResponse {
+    /// Object was stored successfully.
+    PutOk {
+        content_hash: ContentHash,
+    },
+    /// Object was found — here's the metadata and manifest.
+    GetOk {
+        entry: ObjectEntry,
+        manifest: ObjectManifest,
+    },
+    /// Object was deleted.
+    DeleteOk {
+        content_hash: ContentHash,
+    },
+    /// List of matching objects.
+    ListOk { entries: Vec<ObjectEntry> },
+    /// Chunk data retrieved.
+    ChunkOk {
+        hash: ContentHash,
+        data: Vec<u8>,
+    },
+    /// Chunk was stored successfully.
+    ChunkStored { hash: ContentHash },
+    /// Manifest stored successfully.
+    ManifestStored { hash: ContentHash },
+    /// Manifest retrieved.
+    ManifestOk { manifest: ObjectManifest },
+    /// Transfer completed — all chunks downloaded.
+    TransferComplete { content_hash: ContentHash },
+    /// Transfer failed.
+    TransferFailed { reason: String },
+    /// Node identity status response.
+    NodeStatus { node_id: NodeId },
+    /// Requested resource was not found.
+    NotFound,
+    /// An error occurred.
+    Error { reason: String },
+    /// Boolean response (e.g. HasChunk).
+    Bool(bool),
+    /// List of chunk hashes.
+    ChunkList { hashes: Vec<ContentHash> },
+}

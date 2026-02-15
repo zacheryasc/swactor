@@ -1,0 +1,170 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 600" font-family="system-ui, sans-serif">
+  <defs>
+    <filter id="shadow" x="-4%" y="-4%" width="108%" height="108%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-color="#000" flood-opacity="0.10"/>
+    </filter>
+    <marker id="arrow-gray" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#5f6368">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#34a853">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 7" refX="10" refY="3.5"
+            markerWidth="10" markerHeight="7" orient="auto-start-reverse" fill="#ea4335">
+      <polygon points="0 0, 10 3.5, 0 7"/>
+    </marker>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1000" height="600" rx="8" fill="#f8f9fb" stroke="#e0e3e8" stroke-width="1.5"/>
+
+  <!-- Title -->
+  <text x="500" y="42" text-anchor="middle" font-size="20" font-weight="bold" fill="#202124">Chunk Lifecycle</text>
+  <text x="500" y="62" text-anchor="middle" font-size="12" fill="#5f6368">chunking.rs &#xB7; storage.rs &#xB7; actors/blob_store.rs</text>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!-- Row 1: Creation -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <!-- Blob Data -->
+  <rect x="40" y="100" width="120" height="50" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="100" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">Blob Data</text>
+  <text x="100" y="140" text-anchor="middle" font-size="10" fill="#5f6368">raw bytes</text>
+
+  <!-- Arrow -->
+  <line x1="160" y1="125" x2="210" y2="125" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- blake3 hash -->
+  <rect x="222" y="100" width="130" height="50" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="287" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#e37400">blake3 hash</text>
+  <text x="287" y="140" text-anchor="middle" font-size="10" fill="#5f6368">ContentHash</text>
+
+  <!-- Arrow -->
+  <line x1="352" y1="125" x2="405" y2="125" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <!-- chunk_blob() -->
+  <rect x="417" y="100" width="140" height="50" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="487" y="125" text-anchor="middle" font-size="13" font-weight="600" fill="#137333">chunk_blob()</text>
+  <text x="487" y="140" text-anchor="middle" font-size="10" fill="#5f6368">split by chunk_size</text>
+
+  <!-- Arrow fan-out -->
+  <line x1="557" y1="115" x2="620" y2="105" stroke="#34a853" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="557" y1="125" x2="620" y2="125" stroke="#34a853" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+  <line x1="557" y1="135" x2="620" y2="145" stroke="#34a853" stroke-width="1.5" marker-end="url(#arrow-green)"/>
+
+  <!-- ChunkRef boxes -->
+  <rect x="630" y="88" width="110" height="30" rx="6" fill="#e6f4ea" stroke="#34a853" stroke-width="1.2"/>
+  <text x="685" y="108" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">ChunkRef[0]</text>
+
+  <rect x="630" y="122" width="110" height="30" rx="6" fill="#e6f4ea" stroke="#34a853" stroke-width="1.2"/>
+  <text x="685" y="142" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">ChunkRef[1]</text>
+
+  <rect x="630" y="156" width="110" height="30" rx="6" fill="#e6f4ea" stroke="#34a853" stroke-width="1.2"/>
+  <text x="685" y="176" text-anchor="middle" font-size="11" font-weight="600" fill="#137333">ChunkRef[N]</text>
+
+  <!-- Brace → ObjectManifest -->
+  <line x1="740" y1="103" x2="770" y2="137" stroke="#5f6368" stroke-width="1"/>
+  <line x1="740" y1="137" x2="770" y2="137" stroke="#5f6368" stroke-width="1"/>
+  <line x1="740" y1="171" x2="770" y2="137" stroke="#5f6368" stroke-width="1"/>
+  <line x1="770" y1="137" x2="800" y2="137" stroke="#5f6368" stroke-width="1.5" marker-end="url(#arrow-gray)"/>
+
+  <rect x="812" y="112" width="155" height="50" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="889" y="137" text-anchor="middle" font-size="13" font-weight="600" fill="#e37400">ObjectManifest</text>
+  <text x="889" y="152" text-anchor="middle" font-size="10" fill="#5f6368">chunks + total_size</text>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!-- Row 2: Storage -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <text x="500" y="220" text-anchor="middle" font-size="14" font-weight="600" fill="#202124">Storage</text>
+
+  <!-- WriteChunk -->
+  <rect x="100" y="240" width="200" height="50" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="200" y="260" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">BlobStoreMsg</text>
+  <text x="200" y="278" text-anchor="middle" font-size="10" fill="#5f6368">::WriteChunk { hash, data }</text>
+
+  <line x1="300" y1="265" x2="380" y2="265" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+
+  <!-- StorageBackend -->
+  <rect x="392" y="240" width="220" height="50" rx="12" fill="#e6f4ea" stroke="#34a853" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="502" y="260" text-anchor="middle" font-size="13" font-weight="600" fill="#137333">StorageBackend</text>
+  <text x="502" y="278" text-anchor="middle" font-size="10" fill="#5f6368">::write_chunk(hash, data)</text>
+
+  <line x1="612" y1="265" x2="690" y2="265" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+
+  <!-- Disk/Memory -->
+  <rect x="702" y="240" width="180" height="50" rx="12" fill="#f1f3f4" stroke="#9aa0a6" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="792" y="260" text-anchor="middle" font-size="13" font-weight="600" fill="#5f6368">Filesystem /</text>
+  <text x="792" y="278" text-anchor="middle" font-size="10" fill="#5f6368">InMemoryBackend</text>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!-- Row 3: Reference tracking -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <text x="500" y="340" text-anchor="middle" font-size="14" font-weight="600" fill="#202124">Reference Tracking</text>
+
+  <rect x="100" y="360" width="200" height="50" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="200" y="380" text-anchor="middle" font-size="13" font-weight="600" fill="#e37400">ObjectManifest</text>
+  <text x="200" y="398" text-anchor="middle" font-size="10" fill="#5f6368">references chunk hashes</text>
+
+  <line x1="300" y1="385" x2="380" y2="385" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="340" y="377" text-anchor="middle" font-size="10" fill="#5f6368">owns</text>
+
+  <rect x="392" y="360" width="220" height="50" rx="12" fill="#e8f0fe" stroke="#4285f4" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="502" y="385" text-anchor="middle" font-size="13" font-weight="600" fill="#1a73e8">MetadataActor</text>
+
+  <text x="502" y="398" text-anchor="middle" font-size="10" fill="#5f6368">tracks all manifests</text>
+
+  <!-- ═══════════════════════════════════════════════════════════ -->
+  <!-- Row 4: GC -->
+  <!-- ═══════════════════════════════════════════════════════════ -->
+
+  <text x="500" y="460" text-anchor="middle" font-size="14" font-weight="600" fill="#202124">Garbage Collection</text>
+
+  <rect x="60" y="480" width="150" height="50" rx="12" fill="#fce8e6" stroke="#ea4335" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="135" y="505" text-anchor="middle" font-size="13" font-weight="600" fill="#c5221f">GcTick</text>
+  <text x="135" y="520" text-anchor="middle" font-size="10" fill="#5f6368">periodic trigger</text>
+
+  <line x1="210" y1="505" x2="280" y2="505" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <rect x="292" y="480" width="200" height="50" rx="12" fill="#fef7e0" stroke="#f9ab00" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="392" y="500" text-anchor="middle" font-size="12" font-weight="600" fill="#e37400">Collect referenced</text>
+  <text x="392" y="518" text-anchor="middle" font-size="10" fill="#5f6368">hashes from manifests</text>
+
+  <line x1="492" y1="505" x2="560" y2="505" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+
+  <rect x="572" y="480" width="200" height="50" rx="12" fill="#fce8e6" stroke="#ea4335" stroke-width="1.8" filter="url(#shadow)"/>
+  <text x="672" y="500" text-anchor="middle" font-size="12" font-weight="600" fill="#c5221f">GcUnreferenced</text>
+  <text x="672" y="518" text-anchor="middle" font-size="10" fill="#5f6368">delete orphan chunks</text>
+
+  <line x1="772" y1="505" x2="830" y2="505" stroke="#ea4335" stroke-width="1.8" marker-end="url(#arrow-red)"/>
+
+  <!-- Deleted -->
+  <rect x="842" y="488" width="100" height="34" rx="8" fill="#f1f3f4" stroke="#9aa0a6" stroke-width="1.5"/>
+  <text x="892" y="510" text-anchor="middle" font-size="12" font-weight="600" fill="#5f6368">Deleted</text>
+
+  <!-- ============================================ -->
+  <!-- Legend -->
+  <rect x="50" y="555" width="900" height="30" rx="6" fill="none" stroke="#e0e3e8" stroke-width="1"/>
+  <text x="70" y="575" font-size="11" font-weight="600" fill="#202124">Legend</text>
+
+  <line x1="130" y1="572" x2="160" y2="572" stroke="#5f6368" stroke-width="1.8" marker-end="url(#arrow-gray)"/>
+  <text x="168" y="576" font-size="10" fill="#5f6368">Transition</text>
+
+  <line x1="260" y1="572" x2="290" y2="572" stroke="#34a853" stroke-width="1.8" marker-end="url(#arrow-green)"/>
+  <text x="298" y="576" font-size="10" fill="#34a853">Data flow</text>
+
+  <line x1="380" y1="572" x2="410" y2="572" stroke="#ea4335" stroke-width="1.8" marker-end="url(#arrow-red)"/>
+  <text x="418" y="576" font-size="10" fill="#ea4335">Deletion</text>
+
+  <rect x="510" y="564" width="40" height="16" rx="4" fill="#e8f0fe" stroke="#4285f4" stroke-width="1"/>
+  <text x="560" y="576" font-size="10" fill="#4285f4">Actor / Component</text>
+
+  <rect x="680" y="564" width="40" height="16" rx="4" fill="#fef7e0" stroke="#f9ab00" stroke-width="1"/>
+  <text x="730" y="576" font-size="10" fill="#e37400">Data type</text>
+
+  <rect x="810" y="564" width="40" height="16" rx="4" fill="#e6f4ea" stroke="#34a853" stroke-width="1"/>
+  <text x="860" y="576" font-size="10" fill="#34a853">Success state</text>
+</svg>

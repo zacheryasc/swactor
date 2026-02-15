@@ -8,7 +8,7 @@ use std::sync::Arc;
 use swactor::actor::ActorInterface;
 use swactor::runtime::{Ctx, Runtime, RuntimeConfig};
 use runtime_dashboard::command::{
-    from_query_params, parse_line, CommandContext, CommandRequest, CommandResponse, CommandRouter,
+    from_query_params, parse_line, CommandContext, CommandResponse, CommandRouter,
 };
 
 // ── Test Helpers ─────────────────────────────────────────────────────────────

@@ -20,6 +20,9 @@ mod distribution_html;
 #[cfg(feature = "distribution")]
 pub mod distribution_collector;
 
+mod datastore_html;
+pub mod datastore_collector;
+
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -91,6 +94,7 @@ pub struct DashboardHandle {
     recording: bool,
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>>,
+    datastore: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreStatsProvider>>>>,
 }
 
 impl DashboardHandle {
@@ -121,6 +125,11 @@ impl DashboardHandle {
     #[cfg(feature = "distribution")]
     pub fn set_distribution(&self, provider: Arc<dyn distribution_collector::DistributionStatsProvider>) {
         *self.distribution.lock().unwrap() = Some(provider);
+    }
+
+    /// Attach a datastore stats provider, enabling the `/datastore` page.
+    pub fn set_datastore(&self, provider: Arc<dyn datastore_collector::DatastoreStatsProvider>) {
+        *self.datastore.lock().unwrap() = Some(provider);
     }
 
     /// Access the time-series history store (for TUI sparklines, etc.).
@@ -178,6 +187,9 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     let distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>> =
         Arc::new(Mutex::new(None));
 
+    let datastore: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreStatsProvider>>>> =
+        Arc::new(Mutex::new(None));
+
     server::spawn_http_server(
         Arc::clone(&store),
         Arc::clone(&runtime),
@@ -187,6 +199,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         config.port,
         #[cfg(feature = "distribution")]
         Arc::clone(&distribution),
+        Arc::clone(&datastore),
     );
 
     // Start stats recorder thread when recording is enabled
@@ -229,6 +242,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         recording: config.record,
         #[cfg(feature = "distribution")]
         distribution,
+        datastore,
     }
 }
 

@@ -3,6 +3,7 @@
 //! `TestCluster` makes sender-misattribution structurally impossible by
 //! tagging every response with the responder's index, mirroring the
 //! simulation crate's `deliver_actions_tagged_with_net`.
+#![allow(dead_code)]
 
 use distribution::node::{DistributedNode, DistributedNodeConfig};
 use distribution::registry::RegistryConfig;

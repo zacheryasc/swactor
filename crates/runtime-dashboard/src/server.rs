@@ -24,6 +24,9 @@ use crate::distribution_collector::DistributionStatsProvider;
 #[cfg(feature = "distribution")]
 use crate::distribution_html::DISTRIBUTION_HTML;
 
+use crate::datastore_collector::DatastoreStatsProvider;
+use crate::datastore_html::DATASTORE_HTML;
+
 /// Format a server-sent event.
 fn format_sse(event: &str, data: &str) -> Vec<u8> {
     format!("event: {event}\ndata: {data}\n\n").into_bytes()
@@ -128,6 +131,7 @@ pub(crate) fn spawn_http_server(
     port: u16,
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
+    datastore: Arc<Mutex<Option<Arc<dyn DatastoreStatsProvider>>>>,
 ) {
     let addr = format!("0.0.0.0:{port}");
     let server = tiny_http::Server::http(&addr).expect("failed to bind HTTP server");
@@ -144,6 +148,7 @@ pub(crate) fn spawn_http_server(
         let cmd_router = Arc::clone(&cmd_router);
         #[cfg(feature = "distribution")]
         let distribution = Arc::clone(&distribution);
+        let datastore = Arc::clone(&datastore);
         thread::spawn(move || {
             loop {
                 let request = match server.recv() {
@@ -159,6 +164,7 @@ pub(crate) fn spawn_http_server(
                     "/topology" => respond_html(request, TOPOLOGY_HTML, "live"),
                     #[cfg(feature = "distribution")]
                     "/distribution" => respond_html(request, DISTRIBUTION_HTML, "live"),
+                    "/datastore" => respond_html(request, DATASTORE_HTML, "live"),
                     "/events" => {
                         handle_live_sse(
                             request,
@@ -169,6 +175,7 @@ pub(crate) fn spawn_http_server(
                             Arc::clone(&history),
                             #[cfg(feature = "distribution")]
                             Arc::clone(&distribution),
+                            Arc::clone(&datastore),
                         );
                     }
                     "/api/stats" => {
@@ -202,6 +209,12 @@ pub(crate) fn spawn_http_server(
                         handle_distribution_api(
                             request,
                             Arc::clone(&distribution),
+                        );
+                    }
+                    "/api/datastore" => {
+                        handle_datastore_api(
+                            request,
+                            Arc::clone(&datastore),
                         );
                     }
                     "/api/logs" => {
@@ -239,6 +252,7 @@ fn handle_live_sse(
     history: Arc<DashboardHistory>,
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
+    datastore: Arc<Mutex<Option<Arc<dyn DatastoreStatsProvider>>>>,
 ) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let response = make_sse_response(rx);
@@ -304,6 +318,18 @@ fn handle_live_sse(
                             if tx.send(format_sse("distribution", &json)).is_err() {
                                 return;
                             }
+                        }
+                    }
+                }
+            }
+
+            // Send datastore snapshot if provider is attached
+            {
+                let maybe_ds = datastore.lock().unwrap().clone();
+                if let Some(provider) = maybe_ds {
+                    if let Some(json) = provider.snapshot_json() {
+                        if tx.send(format_sse("datastore", &json)).is_err() {
+                            return;
                         }
                     }
                 }
@@ -411,6 +437,26 @@ fn handle_distribution_api(
         },
         None => serde_json::json!({
             "error": "distribution provider not attached"
+        })
+        .to_string(),
+    };
+
+    let response = tiny_http::Response::from_string(json).with_header(
+        "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+fn handle_datastore_api(
+    request: tiny_http::Request,
+    datastore: Arc<Mutex<Option<Arc<dyn DatastoreStatsProvider>>>>,
+) {
+    let json = match datastore.lock().unwrap().as_ref() {
+        Some(provider) => provider.snapshot_json().unwrap_or_else(|| "{}".into()),
+        None => serde_json::json!({
+            "error": "datastore provider not attached"
         })
         .to_string(),
     };
