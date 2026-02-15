@@ -3,7 +3,7 @@ use distribution::crypto::Keypair;
 use distribution::kademlia::directory::{
     actor_addr_as_node_id, resolve_quorum, DirectoryShard, QuorumResult,
 };
-use distribution::types::{DirectoryEntry, NodeId, Signature};
+use distribution::types::{NodeId, Signature};
 
 // ─── DirectoryShard ─────────────────────────────────────────────────────────
 

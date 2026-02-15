@@ -96,7 +96,6 @@ impl KBucket {
 pub struct RoutingTable {
     self_id: NodeId,
     buckets: Vec<KBucket>,
-    k: usize,
 }
 
 impl RoutingTable {
@@ -109,7 +108,7 @@ impl RoutingTable {
         for _ in 0..NUM_BUCKETS {
             buckets.push(KBucket::new(k));
         }
-        Self { self_id, buckets, k }
+        Self { self_id, buckets }
     }
 
     pub fn self_id(&self) -> NodeId {

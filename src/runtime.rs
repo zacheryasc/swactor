@@ -265,11 +265,6 @@ impl Runtime {
     /// Creates a temporary inbox, calls `msg_builder` with the inbox's address
     /// (so you can embed it as `reply_to`), sends the message, and returns an
     /// [`Ask`] handle for receiving the response.
-    ///
-    /// ```ignore
-    /// let ask = rt.ask(actor, |reply_to| GetValue { reply_to })?;
-    /// let value = ask.recv_ticking(&rt, 10)?;
-    /// ```
     pub fn ask<Req: Message, Resp: Message>(
         &self,
         addr: ActorAddress,

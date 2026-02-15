@@ -123,6 +123,8 @@ pub const ACTOR_DETAIL_HTML: &str = r##"<!DOCTYPE html>
     <nav class="nav-links">
       <a href="/" class="nav-link">Overview</a>
       <a href="/actors" class="nav-link">Actors</a>
+      <a href="/distribution" class="nav-link">Distribution</a>
+      <a href="/datastore" class="nav-link">Datastore</a>
     </nav>
   </div>
 </div>

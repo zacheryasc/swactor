@@ -1,0 +1,41 @@
+[package]
+name = "swactor-datastore"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+swactor = { path = "../..", features = ["serde", "transport"] }
+distribution = { path = "../distribution" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+tiny_http = { version = "0.12", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+ureq = { version = "2", features = ["json"], optional = true }
+ctrlc = { version = "3", optional = true }
+runtime-dashboard = { path = "../runtime-dashboard", optional = true }
+toml = { version = "0.8", optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+proptest = "1"
+tempfile = "3"
+swactor = { path = "../.." }
+swactor-std = { path = "../std" }
+ureq = { version = "2", features = ["json"] }
+tiny_http = "0.12"
+runtime-dashboard = { path = "../runtime-dashboard" }
+
+[features]
+node = ["dep:tiny_http", "dep:clap", "dep:ctrlc", "dep:runtime-dashboard", "dep:toml"]
+cli = ["dep:clap", "dep:ureq"]
+
+[[bin]]
+name = "swactor-store-node"
+path = "src/bin/store_node.rs"
+required-features = ["node"]
+
+[[bin]]
+name = "swactor-store"
+path = "src/bin/store_cli.rs"
+required-features = ["cli"]

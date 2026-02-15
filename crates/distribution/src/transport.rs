@@ -195,6 +195,7 @@ pub fn encode_wire_envelope(envelope: &WireEnvelope) -> Vec<u8> {
 enum ReadError {
     WouldBlock,
     Disconnected,
+    #[allow(dead_code)]
     Other(std::io::Error),
 }
 
