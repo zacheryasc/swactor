@@ -10,6 +10,7 @@ iroh = ["dep:iroh", "dep:tokio"]
 
 [dependencies]
 swactor = { path = "../..", features = ["serde", "transport"] }
+shared-types = { path = "../shared-types" }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }

@@ -158,6 +158,11 @@ impl MetadataActor {
         entry.node_id = self.node_id;
         self.entries.insert(content_hash, entry.clone());
 
+        // Persist entry to disk via BlobStoreActor.
+        if let Some(addr) = self.blob_store_addr {
+            let _ = ctx.send(addr, BlobStoreMsg::WriteEntry { entry: entry.clone() });
+        }
+
         // Enqueue for DHT dissemination (include manifest for peer replication).
         self.enqueue(entry, Some(manifest), 3);
 
@@ -196,6 +201,10 @@ impl MetadataActor {
     fn handle_delete_object(&mut self, ctx: &Ctx, content_hash: ContentHash, reply_to: ActorAddress) {
         if self.entries.remove(&content_hash).is_some() {
             self.manifests.remove(&content_hash);
+            // Delete persisted entry from disk.
+            if let Some(addr) = self.blob_store_addr {
+                let _ = ctx.send(addr, BlobStoreMsg::DeleteEntry { hash: content_hash });
+            }
             let _ = ctx.send(reply_to, DatastoreResponse::DeleteOk { content_hash });
         } else {
             let _ = ctx.send(reply_to, DatastoreResponse::NotFound);
@@ -287,7 +296,7 @@ impl MetadataActor {
         }
     }
 
-    fn handle_store_object(&mut self, entry: ObjectEntry, manifest: Option<ObjectManifest>) {
+    fn handle_store_object(&mut self, ctx: &Ctx, entry: ObjectEntry, manifest: Option<ObjectManifest>) {
         // Insert if absent — content-addressed entries don't conflict.
         let content_hash = entry.content_hash;
         if !self.entries.contains_key(&content_hash) {
@@ -295,7 +304,19 @@ impl MetadataActor {
                 self.manifests.insert(content_hash, m.clone());
             }
             self.entries.insert(content_hash, entry.clone());
+            // Persist entry to disk via BlobStoreActor.
+            if let Some(addr) = self.blob_store_addr {
+                let _ = ctx.send(addr, BlobStoreMsg::WriteEntry { entry: entry.clone() });
+            }
             self.enqueue(entry, manifest, 3);
+        }
+    }
+
+    fn handle_bulk_load(&mut self, entries: Vec<(ObjectEntry, ObjectManifest)>) {
+        for (entry, manifest) in entries {
+            let hash = entry.content_hash;
+            self.entries.insert(hash, entry);
+            self.manifests.insert(hash, manifest);
         }
     }
 }
@@ -329,11 +350,12 @@ impl ActorInterface for MetadataActor {
                 reply_to,
             } => self.handle_find_object(ctx, from, content_hash, reply_to),
             MetadataMsg::HandleStoreObject { entry, manifest } => {
-                self.handle_store_object(entry, manifest)
+                self.handle_store_object(ctx, entry, manifest)
             }
             MetadataMsg::SetPeers { peers } => self.handle_set_peers(peers),
             MetadataMsg::DisseminateTick => self.handle_disseminate_tick(ctx),
             MetadataMsg::GcTick => self.gc_tick(ctx),
+            MetadataMsg::BulkLoad { entries } => self.handle_bulk_load(entries),
         }
     }
 }

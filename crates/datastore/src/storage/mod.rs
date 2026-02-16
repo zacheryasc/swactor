@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::types::{ContentHash, ObjectManifest};
+use crate::types::{ContentHash, ObjectEntry, ObjectManifest};
 
 pub use in_memory::InMemoryBackend;
 
@@ -24,6 +24,10 @@ pub trait StorageBackend: Send {
     fn write_manifest(&mut self, manifest: &ObjectManifest) -> Result<(), std::io::Error>;
     fn read_manifest(&self, content_hash: &ContentHash) -> Result<Option<ObjectManifest>, std::io::Error>;
     fn delete_manifest(&mut self, content_hash: &ContentHash) -> Result<(), std::io::Error>;
+    fn write_entry(&mut self, entry: &ObjectEntry) -> Result<(), std::io::Error>;
+    fn read_entry(&self, hash: &ContentHash) -> Result<Option<ObjectEntry>, std::io::Error>;
+    fn delete_entry(&mut self, hash: &ContentHash) -> Result<(), std::io::Error>;
+    fn list_entries(&self) -> Result<Vec<ObjectEntry>, std::io::Error>;
 }
 
 /// Filesystem-backed storage with 2-level directory sharding.
@@ -32,7 +36,8 @@ pub trait StorageBackend: Send {
 /// ```text
 /// {root}/
 /// ├── chunks/{hex[0..2]}/{hex[2..4]}/{full_hex_hash}
-/// └── manifests/{hex[0..2]}/{hex[2..4]}/{full_hex_hash}
+/// ├── manifests/{hex[0..2]}/{hex[2..4]}/{full_hex_hash}
+/// └── entries/{hex[0..2]}/{hex[2..4]}/{full_hex_hash}
 /// ```
 pub struct FilesystemBackend {
     root: PathBuf,
@@ -62,6 +67,15 @@ impl FilesystemBackend {
         let hex = hash.to_hex();
         self.root
             .join("manifests")
+            .join(&hex[..2])
+            .join(&hex[2..4])
+            .join(&hex)
+    }
+
+    fn entry_path(&self, hash: &ContentHash) -> PathBuf {
+        let hex = hash.to_hex();
+        self.root
+            .join("entries")
             .join(&hex[..2])
             .join(&hex[2..4])
             .join(&hex)
@@ -170,6 +184,64 @@ impl StorageBackend for FilesystemBackend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn write_entry(&mut self, entry: &ObjectEntry) -> Result<(), std::io::Error> {
+        let path = self.entry_path(&entry.content_hash);
+        let data = serde_json::to_vec(entry)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Self::write_and_sync(&path, &data)
+    }
+
+    fn read_entry(&self, hash: &ContentHash) -> Result<Option<ObjectEntry>, std::io::Error> {
+        let path = self.entry_path(hash);
+        match fs::read(&path) {
+            Ok(data) => {
+                let entry: ObjectEntry = serde_json::from_slice(&data)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(Some(entry))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn delete_entry(&mut self, hash: &ContentHash) -> Result<(), std::io::Error> {
+        let path = self.entry_path(hash);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn list_entries(&self) -> Result<Vec<ObjectEntry>, std::io::Error> {
+        let entries_dir = self.root.join("entries");
+        if !entries_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut entries = Vec::new();
+        let level1 = fs::read_dir(&entries_dir)?;
+        for d1 in level1.flatten() {
+            let Ok(level2) = fs::read_dir(d1.path()) else {
+                continue;
+            };
+            for d2 in level2.flatten() {
+                let Ok(files) = fs::read_dir(d2.path()) else {
+                    continue;
+                };
+                for file in files.flatten() {
+                    let data = fs::read(file.path())?;
+                    match serde_json::from_slice::<ObjectEntry>(&data) {
+                        Ok(entry) => entries.push(entry),
+                        Err(e) => {
+                            eprintln!("warning: skipping corrupt entry file {}: {e}", file.path().display());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(entries)
     }
 }
 

@@ -12,8 +12,11 @@ use std::time::{Duration, Instant};
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Inbox, Runtime};
 
+use distribution::types::NodeId;
+
+use crate::auth::SignedRequest;
 use crate::chunking::reassemble_blob;
-use crate::messages::{BlobStoreMsg, DatastoreNodeMsg, DatastoreResponse, MetadataMsg};
+use crate::messages::{BlobStoreMsg, DatastoreNodeMsg, DatastoreResponse, GatewayMsg, MetadataMsg};
 use crate::metrics::DatastoreMetrics;
 use crate::types::ContentHash;
 
@@ -30,9 +33,12 @@ struct ApiState {
     datastore_addr: ActorAddress,
     metadata_addr: ActorAddress,
     blob_store_addr: ActorAddress,
+    gateway_addr: Option<ActorAddress>,
     peers: Arc<Mutex<Vec<PeerInfo>>>,
     metrics: Arc<DatastoreMetrics>,
 }
+
+const CRYPTO_WASM: &[u8] = include_bytes!("crypto_wasm.wasm");
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(1);
@@ -48,6 +54,107 @@ fn poll_response(inbox: &Inbox<DatastoreResponse>, timeout: Duration) -> Option<
             return None;
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Check auth and return the caller's identity (public key).
+/// Returns Ok(NodeId) if no gateway is configured (zero NodeId) or if authorized.
+/// Returns Err((status_code, message)) if denied.
+fn check_auth_identity(request: &tiny_http::Request, state: &ApiState) -> Result<NodeId, (u16, String)> {
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => return Ok(NodeId([0; 32])), // no auth configured
+    };
+
+    let header_value = request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-signed-request"))
+        .map(|h| h.value.as_str().to_string());
+
+    let header_value = match header_value {
+        Some(v) => v,
+        None => return Err((401, "missing X-Signed-Request header".to_string())),
+    };
+
+    let signed_request: SignedRequest = serde_json::from_str(&header_value)
+        .map_err(|e| (400, format!("invalid X-Signed-Request: {e}")))?;
+
+    let public_key = signed_request.public_key;
+
+    let inbox = state
+        .runtime
+        .new_inbox::<DatastoreResponse>()
+        .map_err(|_| (500, "failed to create inbox".to_string()))?;
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::Authorize {
+            request: signed_request,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::Bool(true)) => Ok(public_key),
+        Some(DatastoreResponse::Denied { reason }) => {
+            Err((403, format!("{reason:?}")))
+        }
+        _ => Err((504, "auth timeout".to_string())),
+    }
+}
+
+/// Check auth by sending a GatewayMsg::Authorize to the gateway actor.
+/// Returns Ok(()) if no gateway is configured or if authorized.
+/// Returns Err((status_code, message)) if denied.
+fn check_auth(request: &tiny_http::Request, state: &ApiState) -> Result<(), (u16, String)> {
+    check_auth_identity(request, state).map(|_| ())
+}
+
+/// Verify the signature only (no ACL check).
+/// Used for endpoints where the caller proves key ownership without needing authorization.
+/// Returns Ok(NodeId) on valid signature, Err on failure.
+fn check_auth_signature_only(request: &tiny_http::Request, state: &ApiState) -> Result<NodeId, (u16, String)> {
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => return Ok(NodeId([0; 32])),
+    };
+
+    let header_value = request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("x-signed-request"))
+        .map(|h| h.value.as_str().to_string());
+
+    let header_value = match header_value {
+        Some(v) => v,
+        None => return Err((401, "missing X-Signed-Request header".to_string())),
+    };
+
+    let signed_request: SignedRequest = serde_json::from_str(&header_value)
+        .map_err(|e| (400, format!("invalid X-Signed-Request: {e}")))?;
+
+    let public_key = signed_request.public_key;
+
+    let inbox = state
+        .runtime
+        .new_inbox::<DatastoreResponse>()
+        .map_err(|_| (500, "failed to create inbox".to_string()))?;
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::VerifySignature {
+            request: signed_request,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::Bool(true)) => Ok(public_key),
+        Some(DatastoreResponse::Denied { reason }) => {
+            Err((403, format!("{reason:?}")))
+        }
+        _ => Err((504, "auth timeout".to_string())),
     }
 }
 
@@ -72,6 +179,25 @@ fn respond_bytes(request: tiny_http::Request, data: &[u8]) {
 fn respond_html(request: tiny_http::Request) {
     let response =
         tiny_http::Response::from_string(crate::ui_html::DATASTORE_UI_HTML).with_header(
+            "Content-Type: text/html; charset=utf-8"
+                .parse::<tiny_http::Header>()
+                .unwrap(),
+        );
+    let _ = request.respond(response);
+}
+
+fn respond_wasm(request: tiny_http::Request) {
+    let response = tiny_http::Response::from_data(CRYPTO_WASM.to_vec()).with_header(
+        "Content-Type: application/wasm"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+fn respond_admin_html(request: tiny_http::Request) {
+    let response =
+        tiny_http::Response::from_string(crate::ui_html::DATASTORE_ADMIN_HTML).with_header(
             "Content-Type: text/html; charset=utf-8"
                 .parse::<tiny_http::Header>()
                 .unwrap(),
@@ -181,6 +307,10 @@ fn entries_to_json(entries: &[crate::types::ObjectEntry]) -> Vec<serde_json::Val
 // ── PUT handler ─────────────────────────────────────────────────────────
 
 fn handle_put(mut request: tiny_http::Request, url: &str, state: &ApiState) {
+    if let Err((status, msg)) = check_auth(&request, state) {
+        respond_error(request, status, &msg);
+        return;
+    }
     let params = parse_query_string(url);
     let name = params.get("name").cloned();
 
@@ -241,6 +371,10 @@ fn handle_put(mut request: tiny_http::Request, url: &str, state: &ApiState) {
 // ── GET handler (metadata) ──────────────────────────────────────────────
 
 fn handle_get(request: tiny_http::Request, url: &str, state: &ApiState) {
+    if let Err((status, msg)) = check_auth(&request, state) {
+        respond_error(request, status, &msg);
+        return;
+    }
     let params = parse_query_string(url);
     let hash_hex = match params.get("hash") {
         Some(h) => h,
@@ -299,6 +433,10 @@ fn handle_get(request: tiny_http::Request, url: &str, state: &ApiState) {
 // ── DATA handler (reassembled binary) ───────────────────────────────────
 
 fn handle_data(request: tiny_http::Request, url: &str, state: &ApiState) {
+    if let Err((status, msg)) = check_auth(&request, state) {
+        respond_error(request, status, &msg);
+        return;
+    }
     let params = parse_query_string(url);
     let hash_hex = match params.get("hash") {
         Some(h) => h,
@@ -398,6 +536,10 @@ fn handle_data(request: tiny_http::Request, url: &str, state: &ApiState) {
 // ── DELETE handler ──────────────────────────────────────────────────────
 
 fn handle_delete(request: tiny_http::Request, url: &str, state: &ApiState) {
+    if let Err((status, msg)) = check_auth(&request, state) {
+        respond_error(request, status, &msg);
+        return;
+    }
     let params = parse_query_string(url);
     let hash_hex = match params.get("hash") {
         Some(h) => h,
@@ -453,6 +595,10 @@ fn handle_delete(request: tiny_http::Request, url: &str, state: &ApiState) {
 // ── LIST handler ────────────────────────────────────────────────────────
 
 fn handle_list(request: tiny_http::Request, url: &str, state: &ApiState) {
+    if let Err((status, msg)) = check_auth(&request, state) {
+        respond_error(request, status, &msg);
+        return;
+    }
     let params = parse_query_string(url);
     let name_filter = params.get("name").cloned();
     let all = params.get("all").map_or(false, |v| v == "true" || v == "1");
@@ -724,6 +870,415 @@ fn try_remote_get(
     None
 }
 
+// ── Auth grant/revoke handlers ──────────────────────────────────────────
+
+fn parse_node_id_hex(hex: &str) -> Option<NodeId> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = hex_val(chunk[0])?;
+        let lo = hex_val(chunk[1])?;
+        bytes[i] = (hi << 4) | lo;
+    }
+    Some(NodeId(bytes))
+}
+
+fn handle_auth_grant(request: tiny_http::Request, url: &str, state: &ApiState) {
+    let requester = match check_auth_identity(&request, state) {
+        Ok(id) => id,
+        Err((status, msg)) => {
+            respond_error(request, status, &msg);
+            return;
+        }
+    };
+
+    let params = parse_query_string(url);
+    let key_hex = match params.get("key") {
+        Some(k) => k,
+        None => {
+            respond_error(request, 400, "missing ?key= parameter");
+            return;
+        }
+    };
+
+    let key = match parse_node_id_hex(key_hex) {
+        Some(k) => k,
+        None => {
+            respond_error(request, 400, "invalid key hex (expected 64 hex chars)");
+            return;
+        }
+    };
+
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => {
+            respond_error(request, 400, "auth not enabled on this node");
+            return;
+        }
+    };
+
+    let inbox = match state.runtime.new_inbox::<DatastoreResponse>() {
+        Ok(i) => i,
+        Err(_) => {
+            respond_error(request, 500, "failed to create inbox");
+            return;
+        }
+    };
+
+    let label = params.get("name").cloned();
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::Grant {
+            requester,
+            key,
+            label,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::Bool(true)) => {
+            respond_json(request, &serde_json::json!({ "ok": true }).to_string());
+        }
+        Some(DatastoreResponse::Denied { reason }) => {
+            respond_error(request, 403, &format!("{reason:?}"));
+        }
+        _ => {
+            respond_error(request, 504, "timeout");
+        }
+    }
+}
+
+fn handle_auth_revoke(request: tiny_http::Request, url: &str, state: &ApiState) {
+    let requester = match check_auth_identity(&request, state) {
+        Ok(id) => id,
+        Err((status, msg)) => {
+            respond_error(request, status, &msg);
+            return;
+        }
+    };
+
+    let params = parse_query_string(url);
+    let key_hex = match params.get("key") {
+        Some(k) => k,
+        None => {
+            respond_error(request, 400, "missing ?key= parameter");
+            return;
+        }
+    };
+
+    let key = match parse_node_id_hex(key_hex) {
+        Some(k) => k,
+        None => {
+            respond_error(request, 400, "invalid key hex (expected 64 hex chars)");
+            return;
+        }
+    };
+
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => {
+            respond_error(request, 400, "auth not enabled on this node");
+            return;
+        }
+    };
+
+    let inbox = match state.runtime.new_inbox::<DatastoreResponse>() {
+        Ok(i) => i,
+        Err(_) => {
+            respond_error(request, 500, "failed to create inbox");
+            return;
+        }
+    };
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::Revoke {
+            requester,
+            key,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::Bool(true)) => {
+            respond_json(request, &serde_json::json!({ "ok": true }).to_string());
+        }
+        Some(DatastoreResponse::Denied { reason }) => {
+            respond_error(request, 403, &format!("{reason:?}"));
+        }
+        _ => {
+            respond_error(request, 504, "timeout");
+        }
+    }
+}
+
+// ── Access request handlers ──────────────────────────────────────────────
+
+fn handle_auth_request(mut request: tiny_http::Request, state: &ApiState) {
+    let caller = match check_auth_signature_only(&request, state) {
+        Ok(id) => id,
+        Err((status, msg)) => {
+            respond_error(request, status, &msg);
+            return;
+        }
+    };
+
+    // Read JSON body
+    let mut body_bytes = Vec::new();
+    if request.as_reader().read_to_end(&mut body_bytes).is_err() {
+        return;
+    }
+
+    let body: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            respond_error(request, 400, &format!("invalid JSON: {e}"));
+            return;
+        }
+    };
+
+    let name = match body.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => {
+            respond_error(request, 400, "name is required");
+            return;
+        }
+    };
+
+    if name.len() > 64 {
+        respond_error(request, 400, "name must be 64 characters or fewer");
+        return;
+    }
+
+    let message = body
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    if message.len() > 256 {
+        respond_error(request, 400, "message must be 256 characters or fewer");
+        return;
+    }
+
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => {
+            respond_error(request, 400, "auth not enabled on this node");
+            return;
+        }
+    };
+
+    let inbox = match state.runtime.new_inbox::<DatastoreResponse>() {
+        Ok(i) => i,
+        Err(_) => {
+            respond_error(request, 500, "failed to create inbox");
+            return;
+        }
+    };
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::SubmitAccessRequest {
+            key: caller,
+            name,
+            message,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::Bool(true)) => {
+            respond_json(request, &serde_json::json!({ "ok": true }).to_string());
+        }
+        _ => {
+            respond_error(request, 504, "timeout");
+        }
+    }
+}
+
+fn handle_auth_requests_list(request: tiny_http::Request, state: &ApiState) {
+    let requester = match check_auth_identity(&request, state) {
+        Ok(id) => id,
+        Err((status, msg)) => {
+            respond_error(request, status, &msg);
+            return;
+        }
+    };
+
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => {
+            respond_error(request, 400, "auth not enabled on this node");
+            return;
+        }
+    };
+
+    let inbox = match state.runtime.new_inbox::<DatastoreResponse>() {
+        Ok(i) => i,
+        Err(_) => {
+            respond_error(request, 500, "failed to create inbox");
+            return;
+        }
+    };
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::ListAccessRequests {
+            requester,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::AccessRequests { requests }) => {
+            let json_list: Vec<serde_json::Value> = requests
+                .iter()
+                .map(|r| {
+                    let key_hex: String = r.key.0.iter().map(|b| format!("{b:02x}")).collect();
+                    serde_json::json!({
+                        "key": key_hex,
+                        "name": r.name,
+                        "message": r.message,
+                        "requested_at": r.requested_at,
+                    })
+                })
+                .collect();
+            respond_json(request, &serde_json::json!(json_list).to_string());
+        }
+        Some(DatastoreResponse::Denied { reason }) => {
+            respond_error(request, 403, &format!("{reason:?}"));
+        }
+        _ => {
+            respond_error(request, 504, "timeout");
+        }
+    }
+}
+
+fn handle_auth_keys_list(request: tiny_http::Request, state: &ApiState) {
+    let requester = match check_auth_identity(&request, state) {
+        Ok(id) => id,
+        Err((status, msg)) => {
+            respond_error(request, status, &msg);
+            return;
+        }
+    };
+
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => {
+            respond_error(request, 400, "auth not enabled on this node");
+            return;
+        }
+    };
+
+    let inbox = match state.runtime.new_inbox::<DatastoreResponse>() {
+        Ok(i) => i,
+        Err(_) => {
+            respond_error(request, 500, "failed to create inbox");
+            return;
+        }
+    };
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::ListAuthorizedKeys {
+            requester,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::AuthorizedKeys { keys }) => {
+            let json_list: Vec<serde_json::Value> = keys
+                .iter()
+                .map(|k| {
+                    let key_hex: String = k.key.0.iter().map(|b| format!("{b:02x}")).collect();
+                    serde_json::json!({
+                        "key": key_hex,
+                        "label": k.label,
+                    })
+                })
+                .collect();
+            respond_json(request, &serde_json::json!(json_list).to_string());
+        }
+        Some(DatastoreResponse::Denied { reason }) => {
+            respond_error(request, 403, &format!("{reason:?}"));
+        }
+        _ => {
+            respond_error(request, 504, "timeout");
+        }
+    }
+}
+
+fn handle_auth_deny(request: tiny_http::Request, url: &str, state: &ApiState) {
+    let requester = match check_auth_identity(&request, state) {
+        Ok(id) => id,
+        Err((status, msg)) => {
+            respond_error(request, status, &msg);
+            return;
+        }
+    };
+
+    let params = parse_query_string(url);
+    let key_hex = match params.get("key") {
+        Some(k) => k,
+        None => {
+            respond_error(request, 400, "missing ?key= parameter");
+            return;
+        }
+    };
+
+    let key = match parse_node_id_hex(key_hex) {
+        Some(k) => k,
+        None => {
+            respond_error(request, 400, "invalid key hex (expected 64 hex chars)");
+            return;
+        }
+    };
+
+    let gateway_addr = match state.gateway_addr {
+        Some(addr) => addr,
+        None => {
+            respond_error(request, 400, "auth not enabled on this node");
+            return;
+        }
+    };
+
+    let inbox = match state.runtime.new_inbox::<DatastoreResponse>() {
+        Ok(i) => i,
+        Err(_) => {
+            respond_error(request, 500, "failed to create inbox");
+            return;
+        }
+    };
+
+    let _ = state.runtime.send_to(
+        gateway_addr,
+        GatewayMsg::DenyAccessRequest {
+            requester,
+            key,
+            reply_to: *inbox.addr(),
+        },
+    );
+
+    match poll_response(&inbox, POLL_TIMEOUT) {
+        Some(DatastoreResponse::Bool(true)) => {
+            respond_json(request, &serde_json::json!({ "ok": true }).to_string());
+        }
+        Some(DatastoreResponse::Denied { reason }) => {
+            respond_error(request, 403, &format!("{reason:?}"));
+        }
+        _ => {
+            respond_error(request, 504, "timeout");
+        }
+    }
+}
+
 // ── Server startup ──────────────────────────────────────────────────────
 
 /// Start the HTTP API server for the datastore.
@@ -735,6 +1290,7 @@ pub fn start_api_server(
     datastore_addr: ActorAddress,
     metadata_addr: ActorAddress,
     blob_store_addr: ActorAddress,
+    gateway_addr: Option<ActorAddress>,
     port: u16,
     metrics: Arc<DatastoreMetrics>,
 ) -> (Arc<AtomicBool>, Arc<Mutex<Vec<PeerInfo>>>) {
@@ -746,6 +1302,7 @@ pub fn start_api_server(
         datastore_addr,
         metadata_addr,
         blob_store_addr,
+        gateway_addr,
         peers: Arc::clone(&peers),
         metrics,
     });
@@ -780,7 +1337,15 @@ pub fn start_api_server(
                     ("POST", "/api/delete") => handle_delete(request, &url, &state),
                     ("GET", "/api/list") => handle_list(request, &url, &state),
                     ("GET", "/api/status") => handle_status(request, &state),
+                    ("POST", "/api/auth/grant") => handle_auth_grant(request, &url, &state),
+                    ("POST", "/api/auth/revoke") => handle_auth_revoke(request, &url, &state),
+                    ("POST", "/api/auth/request") => handle_auth_request(request, &state),
+                    ("GET", "/api/auth/requests") => handle_auth_requests_list(request, &state),
+                    ("GET", "/api/auth/keys") => handle_auth_keys_list(request, &state),
+                    ("POST", "/api/auth/deny") => handle_auth_deny(request, &url, &state),
                     ("GET", "/") => respond_html(request),
+                    ("GET", "/crypto.wasm") => respond_wasm(request),
+                    ("GET", "/admin") => respond_admin_html(request),
                     _ => {
                         respond_error(request, 404, "not found");
                     }
