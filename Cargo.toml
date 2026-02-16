@@ -1,5 +1,22 @@
 [workspace]
-members = [".", "crates/python", "crates/wasm", "crates/bin-runner", "crates/simulation", "crates/runtime-dashboard", "crates/distribution", "crates/std", "crates/datastore", "crates/shared-types", "crates/crypto-wasm", "tests/docker", "xtask"]
+members = [
+    ".",
+    "crates/python",
+    "crates/wasm",
+    "crates/bin-runner",
+    "crates/simulation",
+    "crates/runtime-dashboard",
+    "crates/distribution",
+    "crates/std",
+    "crates/datastore",
+    "crates/shared-types",
+    "crates/crypto-wasm",
+    "tests/docker",
+    "crates/ci",
+    "crates/local-runner",
+    "crates/ci-relay",
+    "xtask",
+]
 exclude = ["tools/depgraph"]
 
 [package]
@@ -9,8 +26,8 @@ edition = "2024"
 autobenches = false
 
 [profile.bench]
-debug = true       
-strip = false      
+debug = true
+strip = false
 
 [lib]
 crate-type = ["rlib"]
@@ -21,7 +38,8 @@ getrandom = ["dep:getrandom"]
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 no_random = [] # compile without access to a source of randomness
-transport = []  # transport-agnostic messaging (no mandatory deps; codec is user-provided)
+transport = [
+] # transport-agnostic messaging (no mandatory deps; codec is user-provided)
 wasm = ["no_random", "dep:web-time"] # browser/wasm32 target support
 
 [dependencies]

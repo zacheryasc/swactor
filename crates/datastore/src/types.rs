@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use distribution::types::NodeId;
 
+// Re-export the shared ContentHash — single canonical type across the crate ecosystem.
 pub use shared_types::ContentHash;
 
 // ─── ObjectEntry ────────────────────────────────────────────────────────────

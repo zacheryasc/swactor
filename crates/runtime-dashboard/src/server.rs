@@ -27,6 +27,9 @@ use crate::distribution_html::DISTRIBUTION_HTML;
 use crate::datastore_collector::DatastoreStatsProvider;
 use crate::datastore_html::DATASTORE_HTML;
 
+#[cfg(feature = "ci")]
+use crate::ci_collector::CiStatsProvider;
+
 /// Format a server-sent event.
 fn format_sse(event: &str, data: &str) -> Vec<u8> {
     format!("event: {event}\ndata: {data}\n\n").into_bytes()
@@ -132,6 +135,8 @@ pub(crate) fn spawn_http_server(
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
     datastore: Arc<Mutex<Option<Arc<dyn DatastoreStatsProvider>>>>,
+    #[cfg(feature = "ci")]
+    ci: Arc<Mutex<Option<Arc<dyn CiStatsProvider>>>>,
 ) {
     let addr = format!("0.0.0.0:{port}");
     let server = tiny_http::Server::http(&addr).expect("failed to bind HTTP server");
@@ -149,6 +154,8 @@ pub(crate) fn spawn_http_server(
         #[cfg(feature = "distribution")]
         let distribution = Arc::clone(&distribution);
         let datastore = Arc::clone(&datastore);
+        #[cfg(feature = "ci")]
+        let ci = Arc::clone(&ci);
         thread::spawn(move || {
             loop {
                 let request = match server.recv() {
@@ -176,6 +183,8 @@ pub(crate) fn spawn_http_server(
                             #[cfg(feature = "distribution")]
                             Arc::clone(&distribution),
                             Arc::clone(&datastore),
+                            #[cfg(feature = "ci")]
+                            Arc::clone(&ci),
                         );
                     }
                     "/api/stats" => {
@@ -220,6 +229,10 @@ pub(crate) fn spawn_http_server(
                     "/api/logs" => {
                         handle_logs_api(request, &url, Arc::clone(&store));
                     }
+                    #[cfg(feature = "ci")]
+                    _ if path.starts_with("/api/ci/") => {
+                        handle_ci_api(request, path, Arc::clone(&ci));
+                    }
                     _ if path.starts_with("/actor/") => {
                         let hex = &path[7..]; // strip "/actor/"
                         respond_actor_detail(request, hex);
@@ -253,6 +266,8 @@ fn handle_live_sse(
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn DistributionStatsProvider>>>>,
     datastore: Arc<Mutex<Option<Arc<dyn DatastoreStatsProvider>>>>,
+    #[cfg(feature = "ci")]
+    ci: Arc<Mutex<Option<Arc<dyn CiStatsProvider>>>>,
 ) {
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     let response = make_sse_response(rx);
@@ -329,6 +344,20 @@ fn handle_live_sse(
                 if let Some(provider) = maybe_ds {
                     if let Some(json) = provider.snapshot_json() {
                         if tx.send(format_sse("datastore", &json)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+
+            // Send CI snapshot if provider is attached
+            #[cfg(feature = "ci")]
+            {
+                let maybe_ci = ci.lock().unwrap().clone();
+                if let Some(provider) = maybe_ci {
+                    let snapshot = provider.snapshot();
+                    if let Ok(json) = serde_json::to_string(&snapshot) {
+                        if tx.send(format_sse("ci", &json)).is_err() {
                             return;
                         }
                     }
@@ -457,6 +486,35 @@ fn handle_datastore_api(
         Some(provider) => provider.snapshot_json().unwrap_or_else(|| "{}".into()),
         None => serde_json::json!({
             "error": "datastore provider not attached"
+        })
+        .to_string(),
+    };
+
+    let response = tiny_http::Response::from_string(json).with_header(
+        "Content-Type: application/json"
+            .parse::<tiny_http::Header>()
+            .unwrap(),
+    );
+    let _ = request.respond(response);
+}
+
+#[cfg(feature = "ci")]
+fn handle_ci_api(
+    request: tiny_http::Request,
+    path: &str,
+    ci: Arc<Mutex<Option<Arc<dyn CiStatsProvider>>>>,
+) {
+    use crate::ci_collector;
+
+    let route = ci_collector::parse_route(path);
+    let json = match ci.lock().unwrap().as_ref() {
+        Some(provider) => {
+            let snapshot = provider.snapshot();
+            ci_collector::handle_route(&route, &snapshot)
+                .unwrap_or_else(|| r#"{"error":"not found"}"#.to_string())
+        }
+        None => serde_json::json!({
+            "error": "CI provider not attached"
         })
         .to_string(),
     };

@@ -9,3 +9,6 @@ pub mod gossip;
 
 #[cfg(feature = "dashboard")]
 pub mod dashboard;
+
+#[cfg(feature = "ci")]
+pub mod ci;

@@ -23,6 +23,9 @@ pub mod distribution_collector;
 mod datastore_html;
 pub mod datastore_collector;
 
+#[cfg(feature = "ci")]
+pub mod ci_collector;
+
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -95,6 +98,8 @@ pub struct DashboardHandle {
     #[cfg(feature = "distribution")]
     distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>>,
     datastore: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreStatsProvider>>>>,
+    #[cfg(feature = "ci")]
+    ci: Arc<Mutex<Option<Arc<dyn ci_collector::CiStatsProvider>>>>,
 }
 
 impl DashboardHandle {
@@ -130,6 +135,12 @@ impl DashboardHandle {
     /// Attach a datastore stats provider, enabling the `/datastore` page.
     pub fn set_datastore(&self, provider: Arc<dyn datastore_collector::DatastoreStatsProvider>) {
         *self.datastore.lock().unwrap() = Some(provider);
+    }
+
+    /// Attach a CI stats provider, enabling the `/api/ci/*` endpoints.
+    #[cfg(feature = "ci")]
+    pub fn set_ci(&self, provider: Arc<dyn ci_collector::CiStatsProvider>) {
+        *self.ci.lock().unwrap() = Some(provider);
     }
 
     /// Access the time-series history store (for TUI sparklines, etc.).
@@ -190,6 +201,10 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     let datastore: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreStatsProvider>>>> =
         Arc::new(Mutex::new(None));
 
+    #[cfg(feature = "ci")]
+    let ci: Arc<Mutex<Option<Arc<dyn ci_collector::CiStatsProvider>>>> =
+        Arc::new(Mutex::new(None));
+
     server::spawn_http_server(
         Arc::clone(&store),
         Arc::clone(&runtime),
@@ -200,6 +215,8 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         #[cfg(feature = "distribution")]
         Arc::clone(&distribution),
         Arc::clone(&datastore),
+        #[cfg(feature = "ci")]
+        Arc::clone(&ci),
     );
 
     // Start stats recorder thread when recording is enabled
@@ -243,6 +260,8 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         #[cfg(feature = "distribution")]
         distribution,
         datastore,
+        #[cfg(feature = "ci")]
+        ci,
     }
 }
 

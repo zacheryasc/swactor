@@ -17,6 +17,7 @@ distribution = { path = "../distribution", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = "3"
 iroh = { version = "0.96", optional = true }
+swactor-ci = { path = "../ci", optional = true }
 
 [features]
 default = ["distribution"]
@@ -25,6 +26,7 @@ distribution = ["dep:distribution"]
 node = ["distribution", "dep:clap", "swactor/transport", "tcp"]
 tcp = ["distribution/tcp"]
 iroh = ["distribution/iroh", "dep:iroh"]
+ci = ["dep:swactor-ci"]
 
 [[bin]]
 name = "swactor-tui"

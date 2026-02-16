@@ -1,0 +1,16 @@
+pipelines:
+  ci:
+    triggers:
+      - event: push
+        branches: ["*"]
+    jobs:
+      check:
+        run: echo "HOME=$HOME PATH=$PATH" && . "$HOME/.cargo/env" && which cargo && cargo check --workspace
+        timeout: 600
+      clippy:
+        run: . "$HOME/.cargo/env" && cargo clippy --workspace --all-targets -- -D warnings
+        timeout: 600
+      test:
+        needs: [check]
+        run: . "$HOME/.cargo/env" && cargo xtask test essential
+        timeout: 900
