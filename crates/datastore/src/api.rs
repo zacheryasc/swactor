@@ -473,6 +473,7 @@ fn handle_data(request: tiny_http::Request, url: &str, state: &ApiState) {
 
     state.metrics.record_get(&content_hash.to_hex());
 
+
     let (entry, manifest) = match poll_response(&inbox, POLL_TIMEOUT) {
         Some(DatastoreResponse::GetOk { entry, manifest }) => (entry, manifest),
         Some(DatastoreResponse::NotFound) => {
@@ -830,6 +831,7 @@ fn try_remote_get(
         }
 
         state.metrics.end_transfer(&hash_hex);
+
 
         if !all_ok {
             continue;

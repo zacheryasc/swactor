@@ -7,6 +7,7 @@ edition = "2024"
 default = []
 gossip = ["dep:log"]
 dashboard = ["gossip", "dep:tiny_http", "dep:toml"]
+ci = ["dep:swactor-ci"]
 
 [dependencies]
 distribution = { path = "../distribution" }
@@ -17,9 +18,11 @@ getrandom = "0.2"
 log = { version = "0.4", optional = true }
 tiny_http = { version = "0.12", optional = true }
 toml = { version = "0.8", optional = true }
+swactor-ci = { path = "../ci", optional = true }
 
 [dev-dependencies]
-simulation = { path = ".", features = ["gossip"] }
+simulation = { path = ".", features = ["gossip", "ci"] }
+swactor-ci = { path = "../ci" }
 
 [[example]]
 name = "gossip_sim"

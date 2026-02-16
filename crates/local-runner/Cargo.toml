@@ -1,0 +1,18 @@
+[package]
+name = "local-runner"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "local-runner"
+path = "src/main.rs"
+
+[dependencies]
+swactor = { path = "../..", features = ["serde"] }
+swactor-ci = { path = "../ci", features = ["local"] }
+runtime-dashboard = { path = "../runtime-dashboard", features = ["ci"] }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+iroh = "0.96"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+serde_json = "1"
