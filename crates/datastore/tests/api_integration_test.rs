@@ -69,6 +69,7 @@ fn http_crud_lifecycle() {
         datastore_addr,
         metadata_addr,
         blob_store_addr,
+        None,
         port,
         Arc::clone(&metrics),
     );

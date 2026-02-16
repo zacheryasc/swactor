@@ -3,6 +3,7 @@ pub mod messages;
 pub mod chunking;
 pub mod storage;
 pub mod actors;
+pub mod auth;
 pub mod cli;
 pub mod metrics;
 #[cfg(feature = "node")]

@@ -1129,6 +1129,7 @@ dependencies = [
  "rand_core 0.6.4",
  "serde",
  "serde_json",
+ "shared-types",
  "swactor",
  "tokio",
 ]
@@ -4095,6 +4096,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "shared-types"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "serde",
+]
+
+[[package]]
 name = "shlex"
 version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4376,6 +4385,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "swactor-crypto-wasm"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek 2.2.0",
+]
+
+[[package]]
 name = "swactor-datastore"
 version = "0.1.0"
 dependencies = [
@@ -4383,10 +4399,12 @@ dependencies = [
  "clap",
  "ctrlc",
  "distribution",
+ "getrandom 0.2.17",
  "proptest",
  "runtime-dashboard",
  "serde",
  "serde_json",
+ "shared-types",
  "swactor",
  "swactor-std",
  "tempfile",
@@ -6235,6 +6253,12 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "libc",
+ "serde",
+ "toml",
+]
 
 [[package]]
 name = "yoke"

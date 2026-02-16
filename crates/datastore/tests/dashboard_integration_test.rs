@@ -94,6 +94,7 @@ fn dashboard_reflects_datastore_operations() {
         datastore_addr,
         metadata_addr,
         blob_store_addr,
+        None,
         api_port,
         Arc::clone(&metrics),
     );

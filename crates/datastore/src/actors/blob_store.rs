@@ -140,6 +140,54 @@ impl BlobStoreActor {
             }
         }
     }
+
+    fn handle_write_entry(&mut self, entry: crate::types::ObjectEntry) {
+        if let Err(e) = self.backend.write_entry(&entry) {
+            eprintln!("warning: write entry failed: {e}");
+        }
+    }
+
+    fn handle_delete_entry(&mut self, hash: ContentHash) {
+        if let Err(e) = self.backend.delete_entry(&hash) {
+            eprintln!("warning: delete entry failed: {e}");
+        }
+    }
+
+    fn handle_load_all(&self, ctx: &Ctx, reply_to: swactor::actor::ActorAddress) {
+        match self.backend.list_entries() {
+            Ok(entries) => {
+                let mut pairs = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    match self.backend.read_manifest(&entry.content_hash) {
+                        Ok(Some(manifest)) => {
+                            pairs.push((entry, manifest));
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "warning: entry {} has no manifest, skipping",
+                                entry.content_hash
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: failed to read manifest for {}: {e}",
+                                entry.content_hash
+                            );
+                        }
+                    }
+                }
+                let _ = ctx.send(reply_to, DatastoreResponse::LoadedAll { entries: pairs });
+            }
+            Err(e) => {
+                let _ = ctx.send(
+                    reply_to,
+                    DatastoreResponse::Error {
+                        reason: format!("list entries failed: {e}"),
+                    },
+                );
+            }
+        }
+    }
 }
 
 impl ActorInterface for BlobStoreActor {
@@ -173,6 +221,9 @@ impl ActorInterface for BlobStoreActor {
             BlobStoreMsg::ReadManifest { hash, reply_to } => {
                 self.handle_read_manifest(ctx, hash, reply_to)
             }
+            BlobStoreMsg::WriteEntry { entry } => self.handle_write_entry(entry),
+            BlobStoreMsg::DeleteEntry { hash } => self.handle_delete_entry(hash),
+            BlobStoreMsg::LoadAll { reply_to } => self.handle_load_all(ctx, reply_to),
         }
     }
 }

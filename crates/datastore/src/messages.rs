@@ -16,6 +16,7 @@ use swactor::transport::NetworkMessage;
 
 use distribution::types::NodeId;
 
+use crate::auth::{AccessRequestInfo, AuthorizedKeyInfo, DeniedReason, SignedRequest};
 use crate::types::{ContentHash, ObjectEntry, ObjectManifest};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -185,6 +186,12 @@ pub enum BlobStoreMsg {
         hash: ContentHash,
         reply_to: ActorAddress,
     },
+    /// Write an entry to disk (fire-and-forget).
+    WriteEntry { entry: ObjectEntry },
+    /// Delete an entry from disk (fire-and-forget).
+    DeleteEntry { hash: ContentHash },
+    /// Load all persisted entries + their manifests at startup.
+    LoadAll { reply_to: ActorAddress },
 }
 
 // ─── MetadataMsg ────────────────────────────────────────────────────────────
@@ -235,6 +242,10 @@ pub enum MetadataMsg {
     DisseminateTick,
     /// Periodic garbage collection tick.
     GcTick,
+    /// Bulk-load entries and manifests from storage at startup.
+    BulkLoad {
+        entries: Vec<(ObjectEntry, ObjectManifest)>,
+    },
 }
 
 // ─── TransferMsg ────────────────────────────────────────────────────────────
@@ -365,8 +376,87 @@ pub enum DatastoreResponse {
     NotFound,
     /// An error occurred.
     Error { reason: String },
+    /// Request was denied by the auth layer.
+    Denied { reason: DeniedReason },
     /// Boolean response (e.g. HasChunk).
     Bool(bool),
     /// List of chunk hashes.
     ChunkList { hashes: Vec<ContentHash> },
+    /// All persisted entries loaded at startup.
+    LoadedAll {
+        entries: Vec<(ObjectEntry, ObjectManifest)>,
+    },
+    /// List of pending access requests.
+    AccessRequests {
+        requests: Vec<AccessRequestInfo>,
+    },
+    /// List of authorized keys with labels.
+    AuthorizedKeys {
+        keys: Vec<AuthorizedKeyInfo>,
+    },
+}
+
+// ─── GatewayMsg ────────────────────────────────────────────────────────────
+
+/// Messages handled by the `GatewayActor` — the auth enforcement point.
+#[derive(Debug, Clone)]
+pub enum GatewayMsg {
+    /// Auth Path 2: verify a signed request and dispatch if allowed.
+    HandleSignedRequest {
+        request: SignedRequest,
+        reply_to: ActorAddress,
+    },
+    /// Auth Path 1: check whether a node is authorized for connection.
+    CheckConnection {
+        node_id: NodeId,
+        reply_to: ActorAddress,
+    },
+    /// Owner-only: grant access to a key.
+    Grant {
+        requester: NodeId,
+        key: NodeId,
+        label: Option<String>,
+        reply_to: ActorAddress,
+    },
+    /// Owner-only: revoke access from a key.
+    Revoke {
+        requester: NodeId,
+        key: NodeId,
+        reply_to: ActorAddress,
+    },
+    /// Auth-only check: verify a signed request without forwarding the action.
+    Authorize {
+        request: SignedRequest,
+        reply_to: ActorAddress,
+    },
+    /// Verify signature only (no ACL check) — for access request submissions.
+    VerifySignature {
+        request: SignedRequest,
+        reply_to: ActorAddress,
+    },
+    /// Submit an access request from a browser user.
+    SubmitAccessRequest {
+        key: NodeId,
+        name: String,
+        message: String,
+        reply_to: ActorAddress,
+    },
+    /// List pending access requests (owner-only).
+    ListAccessRequests {
+        requester: NodeId,
+        reply_to: ActorAddress,
+    },
+    /// Deny (dismiss) a pending access request (owner-only).
+    DenyAccessRequest {
+        requester: NodeId,
+        key: NodeId,
+        reply_to: ActorAddress,
+    },
+    /// List all authorized keys with labels (owner-only).
+    ListAuthorizedKeys {
+        requester: NodeId,
+        reply_to: ActorAddress,
+    },
+    /// Periodic nonce garbage collection tick.
+    NonceGcTick,
 }
