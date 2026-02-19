@@ -17,3 +17,11 @@ crates/simulation/traces
 
 # xtask personal config
 xtask/config.toml
+
+# Deploy config (machine-specific)
+deploy.toml
+.deploy/*
+!.deploy/deploy.example.toml
+
+# Local dev node state
+.dev-node/

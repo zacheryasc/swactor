@@ -15,6 +15,12 @@ pub struct MemberInfo {
     pub addr: Option<String>,
     pub state: String,
     pub incarnation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_authorized: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
 }
 
 /// Snapshot of a node in the Kademlia routing table.
@@ -89,6 +95,26 @@ pub struct DistributionNodeSnapshot {
     // ─── Gossip pairs ────────────────────────────────────────────────
     /// Recent SWIM probe targets (most recent last).
     pub recent_probe_targets: Vec<String>,
+
+    // ─── Peer auth ──────────────────────────────────────────────────
+    /// "open" or "allow-list".
+    #[serde(default)]
+    pub peer_auth_mode: String,
+    /// Number of authorized peers (None if open mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorized_peer_count: Option<usize>,
+
+    /// Human-readable node name (e.g. "swift-falcon").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub node_name: Option<String>,
+
+    /// Base58-encoded invite code for this node.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub invite_code: Option<String>,
+
+    /// This node's relay URL, if running an embedded relay server.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub relay_url: Option<String>,
 }
 
 fn node_id_hex(id: &NodeId) -> String {
@@ -117,6 +143,9 @@ impl DistributedNode {
                 addr: None,
                 state: state_str(m.state),
                 incarnation: m.incarnation,
+                is_authorized: None,
+                label: None,
+                relay_url: self.metadata().relay_url(&m.node_id).map(String::from),
             })
             .collect();
 
@@ -179,6 +208,11 @@ impl DistributedNode {
             registry_tombstones: registry.tombstone_count(),
             registry_entries,
             recent_probe_targets: recent_targets,
+            peer_auth_mode: "open".into(),
+            authorized_peer_count: None,
+            node_name: None,
+            invite_code: None,
+            relay_url: self.metadata().relay_url(&self.node_id()).map(String::from),
         }
     }
 }

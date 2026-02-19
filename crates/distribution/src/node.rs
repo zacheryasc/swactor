@@ -10,6 +10,7 @@ use crate::crypto::Keypair;
 use crate::kademlia::directory::{actor_addr_as_node_id, DirectoryShard};
 use crate::kademlia::repair::{RepairQueue, RepublishTracker};
 use crate::kademlia::routing_table::RoutingTable;
+use crate::node_metadata::{NodeMetadataDisseminator, NodeMetadataEntry};
 use crate::registry::{
     pack_combined_piggyback, unpack_combined_piggyback, ClusterRegistry, RegistryConfig,
     RegistryEntry, RegistryEvent,
@@ -25,6 +26,8 @@ pub struct DistributedNodeConfig {
     pub cache_capacity: usize,
     pub republish_interval: u64,
     pub registry: RegistryConfig,
+    /// Dissemination multiplier for node metadata (default: 3).
+    pub metadata_lambda: usize,
 }
 
 impl Default for DistributedNodeConfig {
@@ -34,6 +37,7 @@ impl Default for DistributedNodeConfig {
             cache_capacity: 10_000,
             republish_interval: 1000,
             registry: RegistryConfig::default(),
+            metadata_lambda: 3,
         }
     }
 }
@@ -51,6 +55,7 @@ pub struct DistributedNode {
     repair_queue: RepairQueue,
     republish: RepublishTracker,
     registry: ClusterRegistry,
+    metadata: NodeMetadataDisseminator,
     tick_count: u64,
 }
 
@@ -72,6 +77,7 @@ impl DistributedNode {
             repair_queue: RepairQueue::new(),
             republish: RepublishTracker::new(config.republish_interval),
             registry: ClusterRegistry::new(config.registry),
+            metadata: NodeMetadataDisseminator::new(config.metadata_lambda),
             tick_count: 0,
             keypair,
         }
@@ -138,35 +144,51 @@ impl DistributedNode {
         // Registry GC
         self.registry.gc_tick();
 
-        // Wrap outgoing piggyback with registry entries
-        self.inject_registry_piggyback(actions)
+        // Wrap outgoing piggyback with registry + metadata entries
+        self.inject_piggyback(actions)
     }
 
     // ─── SWIM message handling (delegate to SwimNode) ───────────────────
 
     pub fn handle_ping(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
+        let (membership_bytes, registry_entries, metadata_entries) =
+            unpack_combined_piggyback(piggyback);
         let actions = self.swim.handle_ping(from, sequence, &membership_bytes);
         self.process_membership_changes(&actions);
         self.merge_registry_entries(registry_entries);
+        self.merge_metadata_entries(metadata_entries);
         self.maybe_update_routing_table(from);
-        self.inject_registry_piggyback(actions)
+        self.inject_piggyback(actions)
     }
 
     pub fn handle_ack(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
+        let (membership_bytes, registry_entries, metadata_entries) =
+            unpack_combined_piggyback(piggyback);
         let actions = self.swim.handle_ack(from, sequence, &membership_bytes);
         self.process_membership_changes(&actions);
         self.merge_registry_entries(registry_entries);
-        self.inject_registry_piggyback(actions)
+        self.merge_metadata_entries(metadata_entries);
+        self.inject_piggyback(actions)
     }
 
     pub fn handle_ping_req(&mut self, from: NodeId, target: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        let (membership_bytes, registry_entries) = unpack_combined_piggyback(piggyback);
+        let (membership_bytes, registry_entries, metadata_entries) =
+            unpack_combined_piggyback(piggyback);
         let actions = self.swim.handle_ping_req(from, target, sequence, &membership_bytes);
         self.process_membership_changes(&actions);
         self.merge_registry_entries(registry_entries);
-        self.inject_registry_piggyback(actions)
+        self.merge_metadata_entries(metadata_entries);
+        self.inject_piggyback(actions)
+    }
+
+    pub fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
+        let (membership_bytes, registry_entries, metadata_entries) =
+            unpack_combined_piggyback(piggyback);
+        let actions = self.swim.handle_indirect_ack(target, sequence, &membership_bytes);
+        self.process_membership_changes(&actions);
+        self.merge_registry_entries(registry_entries);
+        self.merge_metadata_entries(metadata_entries);
+        self.inject_piggyback(actions)
     }
 
     pub fn handle_join_request(&mut self, from: NodeId) -> Vec<NodeAction> {
@@ -261,6 +283,24 @@ impl DistributedNode {
         &self.registry
     }
 
+    // ─── Node metadata (relay URL) ─────────────────────────────────────
+
+    /// Set this node's relay URL and begin gossiping it to the cluster.
+    pub fn set_relay_url(&mut self, url: Option<String>) {
+        self.metadata
+            .set_local(self.node_id(), url, self.cluster_size());
+    }
+
+    /// Look up a node's relay URL.
+    pub fn relay_url(&self, node_id: &NodeId) -> Option<&str> {
+        self.metadata.relay_url(node_id)
+    }
+
+    /// Read-only access to the metadata disseminator.
+    pub fn metadata(&self) -> &NodeMetadataDisseminator {
+        &self.metadata
+    }
+
     // ─── Accessors ──────────────────────────────────────────────────────
 
     pub fn routing_table(&self) -> &RoutingTable {
@@ -306,15 +346,18 @@ impl DistributedNode {
         match state {
             MemberState::Alive => {
                 self.routing_table.insert(node_id);
-                // Re-disseminate registry entries so the recovering node
-                // catches up on state accumulated during the partition.
-                self.registry.re_disseminate_all(self.cluster_size());
+                // Re-disseminate registry + metadata entries so the recovering
+                // node catches up on state accumulated during the partition.
+                let size = self.cluster_size();
+                self.registry.re_disseminate_all(size);
+                self.metadata.re_disseminate_all(size);
             }
             MemberState::Dead => {
                 self.routing_table.remove(&node_id);
                 self.cache.invalidate_node(&node_id);
                 self.repair_queue.on_node_death(&node_id, &mut self.directory);
                 self.registry.tombstone_node(node_id, self.cluster_size());
+                self.metadata.remove_node(&node_id);
             }
             MemberState::Suspect => {
                 // Keep in routing table but could downprioritize
@@ -326,25 +369,34 @@ impl DistributedNode {
         self.swim.members().alive_count() + 1 // +1 for self
     }
 
-    /// Post-process outgoing actions: wrap each piggyback with registry entries.
-    fn inject_registry_piggyback(&mut self, actions: Vec<NodeAction>) -> Vec<NodeAction> {
+    /// Post-process outgoing actions: wrap each piggyback with registry + metadata entries.
+    fn inject_piggyback(&mut self, actions: Vec<NodeAction>) -> Vec<NodeAction> {
         actions
             .into_iter()
             .map(|action| match action {
                 NodeAction::SendPing { to, sequence, piggyback } => {
                     let registry_entries = self.registry.take_pending(8);
-                    let combined = pack_combined_piggyback(piggyback, registry_entries);
+                    let metadata_entries = self.metadata.take_pending(4);
+                    let combined = pack_combined_piggyback(piggyback, registry_entries, metadata_entries);
                     NodeAction::SendPing { to, sequence, piggyback: combined }
                 }
                 NodeAction::SendAck { to, sequence, piggyback } => {
                     let registry_entries = self.registry.take_pending(8);
-                    let combined = pack_combined_piggyback(piggyback, registry_entries);
+                    let metadata_entries = self.metadata.take_pending(4);
+                    let combined = pack_combined_piggyback(piggyback, registry_entries, metadata_entries);
                     NodeAction::SendAck { to, sequence, piggyback: combined }
                 }
                 NodeAction::SendPingReq { relay, target, sequence, piggyback } => {
                     let registry_entries = self.registry.take_pending(8);
-                    let combined = pack_combined_piggyback(piggyback, registry_entries);
+                    let metadata_entries = self.metadata.take_pending(4);
+                    let combined = pack_combined_piggyback(piggyback, registry_entries, metadata_entries);
                     NodeAction::SendPingReq { relay, target, sequence, piggyback: combined }
+                }
+                NodeAction::ForwardAck { to, target, sequence, piggyback } => {
+                    let registry_entries = self.registry.take_pending(8);
+                    let metadata_entries = self.metadata.take_pending(4);
+                    let combined = pack_combined_piggyback(piggyback, registry_entries, metadata_entries);
+                    NodeAction::ForwardAck { to, target, sequence, piggyback: combined }
                 }
                 other => other,
             })
@@ -355,6 +407,13 @@ impl DistributedNode {
     fn merge_registry_entries(&mut self, entries: Vec<RegistryEntry>) {
         if !entries.is_empty() {
             self.registry.merge_batch(entries, self.cluster_size());
+        }
+    }
+
+    /// Merge metadata entries received from a piggyback payload.
+    fn merge_metadata_entries(&mut self, entries: Vec<NodeMetadataEntry>) {
+        if !entries.is_empty() {
+            self.metadata.apply_incoming(entries, self.cluster_size());
         }
     }
 }

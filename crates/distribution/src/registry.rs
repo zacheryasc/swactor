@@ -9,6 +9,7 @@ use std::collections::{HashMap, VecDeque};
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 
+use crate::node_metadata::NodeMetadataEntry;
 use crate::types::NodeId;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
@@ -53,13 +54,16 @@ pub struct RegistryEntry {
     pub tombstone: bool,
 }
 
-/// Combined piggyback payload: membership bytes + registry entries.
+/// Combined piggyback payload: membership bytes + registry entries + node metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PiggybackPayload {
     /// Raw SWIM membership piggyback bytes (opaque to registry).
     pub membership: Vec<u8>,
     /// Registry entries to disseminate.
     pub registry: Vec<RegistryEntry>,
+    /// Node metadata entries (relay URLs, etc.) to disseminate.
+    #[serde(default)]
+    pub node_metadata: Vec<NodeMetadataEntry>,
 }
 
 // ─── Events ─────────────────────────────────────────────────────────────────
@@ -367,20 +371,30 @@ fn lww_wins(incoming: &RegistryEntry, existing: &RegistryEntry) -> bool {
 
 // ─── Piggyback pack/unpack ──────────────────────────────────────────────────
 
-/// Combine membership piggyback bytes and registry entries into a single payload.
-pub fn pack_combined_piggyback(membership: Vec<u8>, registry: Vec<RegistryEntry>) -> Vec<u8> {
-    let payload = PiggybackPayload { membership, registry };
+/// Combine membership piggyback bytes, registry entries, and node metadata into a single payload.
+pub fn pack_combined_piggyback(
+    membership: Vec<u8>,
+    registry: Vec<RegistryEntry>,
+    node_metadata: Vec<NodeMetadataEntry>,
+) -> Vec<u8> {
+    let payload = PiggybackPayload {
+        membership,
+        registry,
+        node_metadata,
+    };
     serde_json::to_vec(&payload).unwrap_or_default()
 }
 
-/// Split a combined piggyback payload into membership bytes and registry entries.
+/// Split a combined piggyback payload into membership bytes, registry entries, and node metadata.
 /// If deserialization fails, treats the entire blob as membership bytes (backwards compat).
-pub fn unpack_combined_piggyback(bytes: &[u8]) -> (Vec<u8>, Vec<RegistryEntry>) {
+pub fn unpack_combined_piggyback(
+    bytes: &[u8],
+) -> (Vec<u8>, Vec<RegistryEntry>, Vec<NodeMetadataEntry>) {
     if bytes.is_empty() {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     match serde_json::from_slice::<PiggybackPayload>(bytes) {
-        Ok(payload) => (payload.membership, payload.registry),
-        Err(_) => (bytes.to_vec(), Vec::new()),
+        Ok(payload) => (payload.membership, payload.registry, payload.node_metadata),
+        Err(_) => (bytes.to_vec(), Vec::new(), Vec::new()),
     }
 }

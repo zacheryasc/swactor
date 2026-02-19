@@ -316,6 +316,75 @@ fn resolve_authorized_key(base: &str, name_input: &str, kp: &Keypair) -> String 
     }
 }
 
+// ── Key file helpers ────────────────────────────────────────────────────────
+
+fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks(2) {
+        let hi = hex_digit(chunk[0])?;
+        let lo = hex_digit(chunk[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Some(bytes)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn load_keypair(path: &std::path::Path) -> Keypair {
+    let data = fs::read_to_string(path).unwrap_or_else(|e| {
+        eprintln!("Error reading key file {}: {e}", path.display());
+        std::process::exit(1);
+    });
+    let json: serde_json::Value = serde_json::from_str(&data).unwrap_or_else(|e| {
+        eprintln!("Error parsing key file: {e}");
+        std::process::exit(1);
+    });
+    let secret_hex = json
+        .get("secret_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| {
+            eprintln!("Key file missing secret_key field");
+            std::process::exit(1);
+        });
+    let secret_bytes = hex_decode(secret_hex).unwrap_or_else(|| {
+        eprintln!("Invalid secret_key hex in key file");
+        std::process::exit(1);
+    });
+    let secret: [u8; 32] = secret_bytes.try_into().unwrap_or_else(|_| {
+        eprintln!("secret_key must be exactly 32 bytes");
+        std::process::exit(1);
+    });
+    Keypair::from_bytes(&secret)
+}
+
+// ── Auth signing ────────────────────────────────────────────────────────────
+
+fn sign_action(keypair: &Keypair, action: DatastoreAction) -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).expect("failed to generate random nonce");
+    let payload = SignedRequestPayload {
+        action,
+        timestamp,
+        nonce,
+    };
+    let signed = sign_request(keypair, payload);
+    serde_json::to_string(&signed).expect("SignedRequest is always serializable")
+}
+
 fn main() {
     let args = Args::parse();
     let base = args.url.trim_end_matches('/');

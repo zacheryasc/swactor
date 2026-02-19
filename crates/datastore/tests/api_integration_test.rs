@@ -1,5 +1,3 @@
-#![cfg(feature = "node")]
-
 //! Integration test: spins up a real datastore node with HTTP API and exercises
 //! the full CRUD lifecycle over HTTP.
 
@@ -34,7 +32,7 @@ fn http_crud_lifecycle() {
     let base = format!("http://127.0.0.1:{port}");
 
     // Set up runtime with worker threads (needed for HTTP server)
-    let collector = runtime_dashboard::collector::StatsCollector::new(2);
+    let collector = dashboard::collector::StatsCollector::new(2);
     let mut rt = Runtime::new(RuntimeConfig {
         num_threads: 2,
         max_actors: 1024,

@@ -152,6 +152,9 @@ pub struct ActorInfo {
     /// Whether the actor has panicked and is no longer processing messages.
     #[cfg_attr(feature = "serde", serde(default))]
     pub poisoned: bool,
+    /// Human-readable name from the name registry (if registered).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub name: Option<String>,
     /// Per-message-type counts, sorted descending by count. Top 32 types.
     #[cfg_attr(feature = "serde", serde(default))]
     pub message_type_counts: Vec<(String, u64)>,

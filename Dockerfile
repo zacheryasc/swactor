@@ -1,8 +1,3 @@
-FROM rust:1.93-slim AS builder
-WORKDIR /build
-COPY . .
-RUN cargo build --release -p runtime-dashboard --features node
-
-FROM debian:bookworm-slim
-COPY --from=builder /build/target/release/swactor-node /usr/local/bin/
-ENTRYPOINT ["swactor-node"]
+FROM scratch
+COPY target/x86_64-unknown-linux-musl/release/swactor /swactor
+ENTRYPOINT ["/swactor"]

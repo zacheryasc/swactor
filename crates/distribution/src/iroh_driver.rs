@@ -8,16 +8,17 @@
 //! (`tick()`, `recv()`, `join()`) to match the existing main loop pattern.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iroh::endpoint::Connection;
-use iroh::{Endpoint, PublicKey, RelayMode, SecretKey};
+use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
 use tokio::runtime::Runtime as TokioRuntime;
-
 
 use crate::crypto::Keypair;
 use crate::messages::*;
 use crate::node::{DistributedNode, DistributedNodeConfig};
+use crate::peer_auth::PeerAllowList;
 use crate::snapshot::DistributionNodeSnapshot;
 use crate::swim::node::NodeAction;
 use crate::types::NodeId;
@@ -37,6 +38,26 @@ pub struct IrohDriverConfig {
     pub relay_mode: RelayMode,
     /// Protocol-layer configuration.
     pub node: DistributedNodeConfig,
+    /// Optional peer allow-list. If provided, only allowed peers can connect.
+    pub peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
+    /// If set, start an embedded relay server on this address.
+    /// Requires the `relay` feature. On success, the driver uses the embedded
+    /// relay for `RelayMode::Custom`; on failure, falls back to `relay_mode`.
+    #[cfg(feature = "relay")]
+    pub embedded_relay_bind: Option<std::net::SocketAddr>,
+    /// Public IP to advertise in the relay URL instead of the bind address.
+    /// When `Some`, the relay URL uses this IP; when `None`, falls back to the
+    /// bind address (which may be `0.0.0.0`).
+    #[cfg(feature = "relay")]
+    pub relay_public_ip: Option<std::net::IpAddr>,
+}
+
+// ─── Pending join result ────────────────────────────────────────────────────
+
+/// Result of a background join attempt, collected during `recv()`.
+struct JoinResult {
+    node_id: NodeId,
+    conn: Connection,
 }
 
 // ─── Driver ─────────────────────────────────────────────────────────────────
@@ -50,6 +71,18 @@ pub struct IrohDriver {
     endpoint: Endpoint,
     rt: TokioRuntime,
     connections: HashMap<NodeId, Connection>,
+    peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
+    /// Collects connections from background join tasks.
+    pending_joins: Arc<Mutex<Vec<JoinResult>>>,
+    /// Connections accepted by the background accept loop.
+    accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
+    /// Relay URLs learned from join seeds, used for reconnection.
+    peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
+    /// Embedded relay server (if started).
+    #[cfg(feature = "relay")]
+    relay_server: Option<iroh_relay::server::Server>,
+    /// URL of the embedded relay server (if started).
+    relay_url: Option<String>,
 }
 
 impl IrohDriver {
@@ -57,15 +90,40 @@ impl IrohDriver {
     ///
     /// Builds a tokio runtime, creates an iroh `Endpoint`, and initializes
     /// the protocol-layer `DistributedNode`.
+    ///
+    /// If `embedded_relay_bind` is set (requires `relay` feature), the driver
+    /// starts an embedded relay server on the tokio runtime before creating
+    /// the endpoint. On success the endpoint uses the embedded relay; on
+    /// failure it falls back to `config.relay_mode`.
     pub fn new(config: IrohDriverConfig) -> Result<Self, Box<dyn std::error::Error>> {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
 
+        // Try to start embedded relay if configured
+        #[cfg(feature = "relay")]
+        let (relay_server, relay_url, effective_relay_mode) = match config.embedded_relay_bind {
+            Some(bind_addr) => {
+                match rt.block_on(start_embedded_relay(bind_addr, config.relay_public_ip)) {
+                    Ok((server, url)) => {
+                        let url_str = url.to_string();
+                        eprintln!("Relay: embedded relay started at {url}");
+                        (Some(server), Some(url_str), RelayMode::Custom(url.into()))
+                    }
+                    Err(e) => {
+                        eprintln!("Relay: failed to start embedded relay: {e}, falling back");
+                        (None, None, config.relay_mode)
+                    }
+                }
+            }
+            None => (None, None, config.relay_mode),
+        };
+        #[cfg(not(feature = "relay"))]
+        let (relay_url, effective_relay_mode) = (None::<String>, config.relay_mode);
+
         let endpoint = rt.block_on(async {
-            let mut builder = Endpoint::builder()
-                .alpns(vec![ALPN.to_vec()])
-                .relay_mode(config.relay_mode);
+            let mut builder = Endpoint::empty_builder(effective_relay_mode)
+                .alpns(vec![ALPN.to_vec()]);
 
             if let Some(key) = config.secret_key {
                 builder = builder.secret_key(key);
@@ -80,17 +138,98 @@ impl IrohDriver {
         let keypair = Keypair::from_bytes(&iroh_secret);
         let node = DistributedNode::with_keypair(keypair, config.node);
 
+        // Spawn background accept loop so incoming connections are never missed
+        let accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        {
+            let ep = endpoint.clone();
+            let peer_auth = config.peer_auth.clone();
+            let buf = Arc::clone(&accepted_conns);
+            rt.spawn(async move {
+                loop {
+                    match ep.accept().await {
+                        Some(incoming) => match incoming.await {
+                            Ok(conn) => {
+                                let remote_id = conn.remote_id();
+                                let node_id = NodeId(*remote_id.as_bytes());
+                                // Peer auth check
+                                let allowed = match &peer_auth {
+                                    None => true,
+                                    Some(auth) => auth.lock().unwrap().is_allowed(&node_id),
+                                };
+                                if !allowed {
+                                    eprintln!(
+                                        "iroh driver: rejected connection from unauthorized peer {}",
+                                        crate::identity::hex_encode(&node_id.0[..4])
+                                    );
+                                    conn.close(0u32.into(), b"unauthorized");
+                                    continue;
+                                }
+                                eprintln!(
+                                    "iroh driver: accepted connection from {}",
+                                    crate::identity::hex_encode(&node_id.0[..4])
+                                );
+                                buf.lock().unwrap().push((node_id, conn));
+                            }
+                            Err(e) => {
+                                eprintln!("iroh driver: incoming connection error: {e}");
+                            }
+                        },
+                        None => break, // endpoint closed
+                    }
+                }
+            });
+        }
+
         Ok(Self {
             node,
             endpoint,
             rt,
             connections: HashMap::new(),
+            peer_auth: config.peer_auth,
+            pending_joins: Arc::new(Mutex::new(Vec::new())),
+            accepted_conns,
+            peer_relay_urls: HashMap::new(),
+            #[cfg(feature = "relay")]
+            relay_server,
+            relay_url,
         })
+    }
+
+    /// Get a handle to the tokio runtime owned by this driver.
+    pub fn tokio_handle(&self) -> tokio::runtime::Handle {
+        self.rt.handle().clone()
     }
 
     /// The node's identity.
     pub fn node_id(&self) -> NodeId {
         self.node.node_id()
+    }
+
+    /// The endpoint's full address (public key + direct socket addresses).
+    ///
+    /// Constructs the address from the endpoint's public key and bound
+    /// sockets. Unspecified addresses (`0.0.0.0` / `[::]`) are mapped to
+    /// their loopback equivalents so peers on the same host can connect.
+    pub fn endpoint_addr(&self) -> EndpointAddr {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+        let key = PublicKey::from_bytes(&self.node.node_id().0)
+            .expect("node_id is a valid public key");
+        let mut addr = EndpointAddr::new(key);
+        for sock in self.endpoint.bound_sockets() {
+            let resolved = match sock.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => {
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), sock.port())
+                }
+                IpAddr::V6(ip) if ip.is_unspecified() => {
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), sock.port())
+                }
+                _ => sock,
+            };
+            addr = addr.with_ip_addr(resolved);
+        }
+        addr
     }
 
     /// Access the underlying node (read-only).
@@ -116,38 +255,98 @@ impl IrohDriver {
 
     /// Join a cluster by connecting to seed nodes via iroh.
     ///
-    /// Each seed is identified by its iroh `PublicKey` (= our `NodeId`).
-    pub fn join(&mut self, seeds: &[PublicKey]) {
-        for seed_key in seeds {
-            let seed_node_id = NodeId(*seed_key.as_bytes());
-            if let Err(e) = self.send_join_request(*seed_key, seed_node_id) {
-                eprintln!("iroh driver: join error to {seed_key}: {e}");
+    /// Each seed is identified by its `EndpointAddr` (public key + optional
+    /// direct addresses). Connect+send is spawned as a background task so
+    /// that the peer can accept the connection during its `recv()` cycle.
+    /// Results are collected in the next `recv()` call.
+    pub fn join(&mut self, seeds: &[EndpointAddr]) {
+        for seed_addr in seeds {
+            // Store relay URL for future reconnection
+            let seed_node_id = NodeId(*seed_addr.id.as_bytes());
+            if let Some(relay) = seed_addr.relay_urls().next() {
+                self.peer_relay_urls.insert(seed_node_id, relay.clone());
             }
+            self.spawn_join_request(seed_addr.clone());
         }
     }
 
-    fn send_join_request(
-        &mut self,
-        seed_key: PublicKey,
-        seed_node_id: NodeId,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn spawn_join_request(&self, seed_addr: EndpointAddr) {
         let msg = JoinRequest {
             from: self.node.node_id(),
         };
-        let payload = serde_json::to_vec(&msg)?;
+        let payload = serde_json::to_vec(&msg).expect("serialize JoinRequest");
         let tag = <JoinRequest as swactor::transport::NetworkMessage>::type_tag();
-
         let endpoint = self.endpoint.clone();
-        let conn = self.rt.block_on(async {
-            let conn = endpoint.connect(seed_key, ALPN).await?;
-            let mut send = conn.open_uni().await?;
-            write_message(&mut send, tag.as_bytes(), &payload).await?;
-            send.finish()?;
-            Ok::<_, Box<dyn std::error::Error>>(conn)
-        })?;
+        let seed_node_id = NodeId(*seed_addr.id.as_bytes());
+        let pending = Arc::clone(&self.pending_joins);
 
-        self.connections.insert(seed_node_id, conn);
-        Ok(())
+        self.rt.spawn(async move {
+            let mut delay = Duration::from_secs(2);
+            let max_delay = Duration::from_secs(30);
+            let max_attempts = 5;
+
+            for attempt in 1..=max_attempts {
+                if attempt > 1 {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(max_delay);
+                }
+
+                eprintln!("iroh driver: join attempt {attempt}/{max_attempts} connecting to {}...", seed_addr.id);
+                let connect_result = tokio::time::timeout(
+                    Duration::from_secs(10),
+                    endpoint.connect(seed_addr.clone(), ALPN),
+                ).await;
+
+                match connect_result {
+                    Ok(Ok(conn)) => {
+                        eprintln!("iroh driver: join attempt {attempt}/{max_attempts} connected to {}, sending...", seed_addr.id);
+                        let send_result: Result<(), String> = async {
+                            let mut send = conn.open_uni().await.map_err(|e| e.to_string())?;
+                            let tag_len = (tag.len() as u32).to_be_bytes();
+                            send.write_all(&tag_len).await.map_err(|e| e.to_string())?;
+                            send.write_all(tag.as_bytes()).await.map_err(|e| e.to_string())?;
+                            send.write_all(&payload).await.map_err(|e| e.to_string())?;
+                            send.finish().map_err(|e| e.to_string())?;
+                            Ok(())
+                        }
+                        .await;
+
+                        match send_result {
+                            Ok(()) => {
+                                eprintln!("iroh driver: join attempt {attempt}/{max_attempts} sent to {}", seed_addr.id);
+                                pending.lock().unwrap().push(JoinResult {
+                                    node_id: seed_node_id,
+                                    conn,
+                                });
+                                return;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "iroh driver: join attempt {attempt}/{max_attempts} send error to {}: {e}",
+                                    seed_addr.id
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!(
+                            "iroh driver: join attempt {attempt}/{max_attempts} connect error to {}: {e}",
+                            seed_addr.id
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "iroh driver: join attempt {attempt}/{max_attempts} connect timeout to {}",
+                            seed_addr.id
+                        );
+                        continue;
+                    }
+                }
+            }
+            eprintln!("iroh driver: join failed after {max_attempts} attempts to {}", seed_addr.id);
+        });
     }
 
     /// Advance the node by one tick.
@@ -158,12 +357,23 @@ impl IrohDriver {
 
     /// Process incoming iroh connections and messages (non-blocking).
     pub fn recv(&mut self) {
+        // Collect completed background join connections
+        {
+            let mut pending = self.pending_joins.lock().unwrap();
+            if !pending.is_empty() {
+                eprintln!("iroh driver: collecting {} pending join connection(s)", pending.len());
+            }
+            for result in pending.drain(..) {
+                self.connections.insert(result.node_id, result.conn);
+            }
+        }
+
         let (incoming, new_conns) = self.rt.block_on(async {
             self.receive_pending().await
         });
-        // Cache connections accepted from remote peers
+        // Cache connections accepted from remote peers (replace stale ones)
         for (node_id, conn) in new_conns {
-            self.connections.entry(node_id).or_insert(conn);
+            self.connections.insert(node_id, conn);
         }
         for (tag, payload, from_key) in incoming {
             let from = NodeId(*from_key.as_bytes());
@@ -232,6 +442,11 @@ impl IrohDriver {
                 self.send_message(to, &msg)
             }
 
+            NodeAction::ForwardAck { to, target, sequence, piggyback } => {
+                let msg = IndirectAck { target: *target, sequence: *sequence, piggyback: piggyback.clone() };
+                self.send_message(to, &msg)
+            }
+
             NodeAction::MembershipChanged { .. } => Ok(()),
         }
     }
@@ -274,6 +489,15 @@ impl IrohDriver {
         node_id: NodeId,
         key: PublicKey,
     ) -> Result<Connection, Box<dyn std::error::Error>> {
+        // Defense in depth: check peer auth before connecting
+        if !self.is_peer_allowed(&node_id) {
+            return Err(format!(
+                "peer {} not in allow-list",
+                crate::identity::hex_encode(&node_id.0[..4])
+            )
+            .into());
+        }
+
         // Check for cached connection that's still open
         if let Some(conn) = self.connections.get(&node_id) {
             if conn.close_reason().is_none() {
@@ -284,9 +508,16 @@ impl IrohDriver {
         }
 
         let endpoint = self.endpoint.clone();
-        let conn = self.rt.block_on(async {
-            endpoint.connect(key, ALPN).await
-        })?;
+        let conn = if let Some(relay) = self.peer_relay_urls.get(&node_id) {
+            let addr = EndpointAddr::new(key).with_relay_url(relay.clone());
+            self.rt.block_on(async {
+                endpoint.connect(addr, ALPN).await
+            })?
+        } else {
+            self.rt.block_on(async {
+                endpoint.connect(key, ALPN).await
+            })?
+        };
 
         self.connections.insert(node_id, conn.clone());
         Ok(conn)
@@ -294,26 +525,26 @@ impl IrohDriver {
 
     // ─── Incoming: iroh → handler ────────────────────────────────────
 
+    fn is_peer_allowed(&self, node_id: &NodeId) -> bool {
+        match &self.peer_auth {
+            None => true,
+            Some(auth) => auth.lock().unwrap().is_allowed(node_id),
+        }
+    }
+
     async fn receive_pending(&self) -> (Vec<(String, Vec<u8>, PublicKey)>, Vec<(NodeId, Connection)>) {
         let mut messages = Vec::new();
-        let mut new_connections = Vec::new();
 
-        // Poll for incoming connections with a short timeout
-        loop {
-            let accept_fut = self.endpoint.accept();
-            let result = tokio::time::timeout(Duration::from_millis(1), accept_fut).await;
+        // Drain connections accepted by the background accept loop
+        let new_connections: Vec<(NodeId, Connection)> = {
+            let mut buf = self.accepted_conns.lock().unwrap();
+            buf.drain(..).collect()
+        };
 
-            match result {
-                Ok(Some(incoming)) => {
-                    if let Ok(conn) = incoming.await {
-                        let remote_id = conn.remote_id();
-                        self.read_streams(&conn, remote_id, &mut messages).await;
-                        let node_id = NodeId(*remote_id.as_bytes());
-                        new_connections.push((node_id, conn));
-                    }
-                }
-                _ => break,
-            }
+        // Read streams from newly accepted connections
+        for (node_id, conn) in &new_connections {
+            let remote_id = PublicKey::from_bytes(&node_id.0).unwrap();
+            self.read_streams(conn, remote_id, &mut messages).await;
         }
 
         // Also read from existing cached connections
@@ -326,6 +557,10 @@ impl IrohDriver {
         for (node_id, conn) in conn_snapshot {
             let remote_id = PublicKey::from_bytes(&node_id.0).unwrap();
             self.read_streams(&conn, remote_id, &mut messages).await;
+        }
+
+        if !messages.is_empty() {
+            eprintln!("iroh driver: received {} message(s)", messages.len());
         }
 
         (messages, new_connections)
@@ -409,6 +644,14 @@ impl IrohDriver {
                 }
             }
 
+            "swactor_dist::IndirectAck" => match serde_json::from_slice::<IndirectAck>(payload) {
+                Ok(msg) => self.node.handle_indirect_ack(msg.target, msg.sequence, &msg.piggyback),
+                Err(e) => {
+                    eprintln!("iroh driver: decode IndirectAck: {e}");
+                    Vec::new()
+                }
+            },
+
             other => {
                 eprintln!("iroh driver: unknown message type: {other}");
                 Vec::new()
@@ -416,12 +659,63 @@ impl IrohDriver {
         }
     }
 
-    /// Shut down the iroh endpoint.
-    pub fn shutdown(&self) {
+    /// URL of the embedded relay server, if one was started.
+    pub fn relay_url(&self) -> Option<&str> {
+        self.relay_url.as_deref()
+    }
+
+    /// The endpoint's home relay URL (from RelayMode::Custom), if connected.
+    pub fn home_relay_url(&self) -> Option<iroh::RelayUrl> {
+        self.endpoint.addr().relay_urls().next().cloned()
+    }
+
+    /// Shut down the driver: stop the embedded relay (if any), then close the
+    /// iroh endpoint.
+    pub fn shutdown(&mut self) {
+        // Shut down embedded relay first (must stop before endpoint closes)
+        #[cfg(feature = "relay")]
+        if let Some(server) = self.relay_server.take() {
+            self.rt.block_on(async {
+                let _ = server.shutdown().await;
+            });
+        }
         self.rt.block_on(async {
             self.endpoint.close().await;
         });
     }
+}
+
+// ─── Embedded Relay ─────────────────────────────────────────────────────────
+
+#[cfg(feature = "relay")]
+async fn start_embedded_relay(
+    bind_addr: std::net::SocketAddr,
+    public_ip: Option<std::net::IpAddr>,
+) -> Result<(iroh_relay::server::Server, iroh::RelayUrl), Box<dyn std::error::Error>> {
+    let server = iroh_relay::server::Server::spawn(
+        iroh_relay::server::ServerConfig::<(), ()> {
+            relay: Some(iroh_relay::server::RelayConfig {
+                http_bind_addr: bind_addr,
+                tls: None,
+                limits: Default::default(),
+                key_cache_capacity: Some(256),
+                access: iroh_relay::server::AccessConfig::Everyone,
+            }),
+            quic: None,
+            metrics_addr: None,
+        },
+    )
+    .await?;
+
+    let url: iroh::RelayUrl = match server.http_addr() {
+        Some(addr) => {
+            let host = public_ip.unwrap_or_else(|| addr.ip());
+            format!("http://{}:{}/", host, addr.port()).parse()?
+        }
+        None => return Err("relay server has no HTTP address".into()),
+    };
+
+    Ok((server, url))
 }
 
 // ─── Wire Framing Over QUIC Streams ─────────────────────────────────────────

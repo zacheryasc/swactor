@@ -1,0 +1,27 @@
+[package]
+name = "swactor-node"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+swactor = { path = "../..", features = ["serde", "tracing", "transport"] }
+swactor-std = { path = "../std" }
+dashboard = { path = "../dashboard", features = ["distribution"] }
+swactor-datastore = { path = "../datastore" }
+distribution = { path = "../distribution" }
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+iroh = { version = "0.96", optional = true }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+libc = "0.2"
+
+[features]
+default = ["iroh", "relay"]
+tcp = ["distribution/tcp"]
+iroh = ["distribution/iroh", "dep:iroh"]
+relay = ["iroh", "distribution/relay"]
+
+[[bin]]
+name = "swactor"
+path = "src/main.rs"

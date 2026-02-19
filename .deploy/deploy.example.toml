@@ -1,0 +1,20 @@
+# Deploy configuration for `cargo xtask deploy`
+# Copy to .deploy/deploy.toml (native) or .deploy/docker.toml (Docker)
+# and fill in your machine details.
+
+[defaults]
+dashboard_port = 9090
+relay_port = 3340
+# image = "swactor"       # Required for --docker mode
+# container = "swactor"   # Required for --docker mode
+# relay_hosts = ["1.2.3.4"]
+# swactor_flags = ["--auth"]
+
+[[machines]]
+name = "local-node"
+local = true
+
+# [[machines]]
+# name = "remote-node"
+# ssh = "my-server"           # SSH alias from ~/.ssh/config
+# swactor_flags = ["--storage-path", "/var/lib/swactor/data"]

@@ -52,6 +52,11 @@ impl NameRegistry {
         }
     }
 
+    /// Look up the name bound to an actor address (reverse lookup).
+    pub fn lookup_by_addr(&self, addr: &ActorAddress) -> Option<String> {
+        self.reverse.read().unwrap().get(addr).cloned()
+    }
+
     /// Return all registered names.
     pub fn registered_names(&self) -> Vec<String> {
         self.names.read().unwrap().keys().cloned().collect()

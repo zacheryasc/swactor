@@ -16,6 +16,8 @@ pub enum DistributionEventKind {
     NameResolved { name: String, result: String },
     NodeKilled,
     NodeRevived,
+    MidSimJoin { node_idx: usize, seed_idx: usize },
+    PeerIntroduced { node_a: usize, node_b: usize },
 }
 
 /// Per-node snapshot for distribution simulation.

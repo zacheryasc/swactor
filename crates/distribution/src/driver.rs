@@ -95,6 +95,25 @@ impl NodeDriver {
         })
     }
 
+    /// Create a driver with a specific keypair for persistent identity.
+    pub fn with_keypair(
+        listen_addr: SocketAddr,
+        keypair: crate::crypto::Keypair,
+        config: DistributedNodeConfig,
+    ) -> Result<Self, swactor::Error> {
+        let acceptor = TcpAcceptor::bind(listen_addr)?;
+        let actual_addr = acceptor.local_addr();
+        let node = DistributedNode::with_keypair(keypair, config);
+        Ok(Self {
+            node,
+            transport: TcpTransport::pool(),
+            acceptor,
+            streams: Vec::new(),
+            address_book: PeerAddressBook::new(),
+            listen_addr: actual_addr,
+        })
+    }
+
     /// The node's identity.
     pub fn node_id(&self) -> NodeId {
         self.node.node_id()
@@ -192,6 +211,42 @@ impl NodeDriver {
         }
     }
 
+    /// Process incoming TCP messages with peer auth filtering.
+    ///
+    /// Same as `recv()`, but checks the sender's NodeId against the
+    /// peer allow-list before dispatching. Unauthorized messages are dropped.
+    pub fn recv_with_auth(
+        &mut self,
+        peer_auth: &std::sync::Arc<std::sync::Mutex<crate::peer_auth::PeerAllowList>>,
+    ) {
+        let envelopes = self.acceptor.try_recv(&mut self.streams);
+        for (envelope, _peer_addr, hints_bytes) in envelopes {
+            // Extract sender NodeId from hints
+            let mut sender_node_id = None;
+            if !hints_bytes.is_empty() {
+                if let Ok(hints) = serde_json::from_slice::<Vec<AddressHint>>(&hints_bytes) {
+                    if let Some(first) = hints.first() {
+                        sender_node_id = Some(first.node_id);
+                    }
+                    self.learn_hints(&hints);
+                }
+            }
+
+            // Check peer auth if we know the sender
+            if let Some(node_id) = sender_node_id {
+                let allowed = peer_auth.lock().unwrap().is_allowed(&node_id);
+                if !allowed {
+                    let hex: String = node_id.0[..4].iter().map(|b| format!("{b:02x}")).collect();
+                    eprintln!("driver: rejected message from unauthorized peer {hex}");
+                    continue;
+                }
+            }
+
+            let response_actions = self.dispatch_incoming(envelope);
+            self.send_actions(&response_actions);
+        }
+    }
+
     // ─── Outgoing: NodeAction → TCP ─────────────────────────────────────
 
     fn send_actions(&mut self, actions: &[NodeAction]) {
@@ -280,6 +335,21 @@ impl NodeDriver {
                     }
                 }
                 self.send_wire_with_hints::<JoinResponse>(&msg, dest, &hints)
+            }
+
+            NodeAction::ForwardAck {
+                to,
+                target,
+                sequence,
+                piggyback,
+            } => {
+                let dest = self.resolve_addr(to)?;
+                let msg = IndirectAck {
+                    target: *target,
+                    sequence: *sequence,
+                    piggyback: piggyback.clone(),
+                };
+                self.send_wire_with_hints::<IndirectAck>(&msg, dest, &[sender_hint])
             }
 
             NodeAction::MembershipChanged { .. } => {
@@ -382,6 +452,14 @@ impl NodeDriver {
                 Ok(msg) => self.node.handle_join_response(msg.members),
                 Err(e) => {
                     eprintln!("driver: decode JoinResponse: {e}");
+                    Vec::new()
+                }
+            },
+
+            "swactor_dist::IndirectAck" => match decode::<IndirectAck>(&envelope.payload) {
+                Ok(msg) => self.node.handle_indirect_ack(msg.target, msg.sequence, &msg.piggyback),
+                Err(e) => {
+                    eprintln!("driver: decode IndirectAck: {e}");
                     Vec::new()
                 }
             },

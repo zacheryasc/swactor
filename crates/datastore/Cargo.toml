@@ -10,32 +10,22 @@ shared-types = { path = "../shared-types" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
-tiny_http = { version = "0.12", optional = true }
+tiny_http = "0.12"
 clap = { version = "4", features = ["derive"], optional = true }
 ureq = { version = "2", features = ["json"], optional = true }
 getrandom = { version = "0.2", optional = true }
-ctrlc = { version = "3", optional = true }
-runtime-dashboard = { path = "../runtime-dashboard", optional = true }
-toml = { version = "0.8", optional = true }
+dashboard = { path = "../dashboard" }
+swactor-std = { path = "../std" }
 
 [dev-dependencies]
 serde_json = "1"
 proptest = "1"
 tempfile = "3"
 swactor = { path = "../.." }
-swactor-std = { path = "../std" }
 ureq = { version = "2", features = ["json"] }
-tiny_http = "0.12"
-runtime-dashboard = { path = "../runtime-dashboard" }
 
 [features]
-node = ["dep:tiny_http", "dep:clap", "dep:ctrlc", "dep:runtime-dashboard", "dep:toml"]
 cli = ["dep:clap", "dep:ureq", "dep:getrandom"]
-
-[[bin]]
-name = "swactor-store-node"
-path = "src/bin/store_node.rs"
-required-features = ["node"]
 
 [[bin]]
 name = "swactor-store"
