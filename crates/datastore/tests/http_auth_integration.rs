@@ -4,8 +4,6 @@
 //! and uses ureq to prove that authorized requests succeed while unauthorized
 //! ones get 403 and missing-auth requests get 401.
 
-#![cfg(feature = "node")]
-
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

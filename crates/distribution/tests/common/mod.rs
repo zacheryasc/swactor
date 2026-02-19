@@ -25,6 +25,7 @@ pub fn test_config() -> DistributedNodeConfig {
         cache_capacity: 100,
         republish_interval: 50,
         registry: RegistryConfig::default(),
+        metadata_lambda: 3,
     }
 }
 
@@ -93,6 +94,16 @@ fn deliver_actions_tagged(
                     if !excluded.contains(&idx) {
                         let resp =
                             nodes[idx].handle_ping_req(sender_id, *target, *sequence, piggyback);
+                        if !resp.is_empty() {
+                            tagged.push((idx, resp));
+                        }
+                    }
+                }
+            }
+            NodeAction::ForwardAck { to, target, sequence, piggyback } => {
+                if let Some(idx) = ids.iter().position(|id| id == to) {
+                    if !excluded.contains(&idx) {
+                        let resp = nodes[idx].handle_indirect_ack(*target, *sequence, piggyback);
                         if !resp.is_empty() {
                             tagged.push((idx, resp));
                         }
@@ -206,3 +217,6 @@ impl IndexMut<usize> for TestCluster {
         &mut self.nodes[idx]
     }
 }
+
+#[cfg(feature = "iroh")]
+pub mod iroh;

@@ -61,6 +61,24 @@ impl NetworkMessage for PingReq {
     }
 }
 
+/// SWIM indirect ack — "the target you asked me to ping is alive"
+///
+/// Sent by a relay node back to the original prober after the relay
+/// receives an ack from the indirect-ping target.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndirectAck {
+    pub target: NodeId,
+    pub sequence: u64,
+    #[serde(default)]
+    pub piggyback: Vec<u8>,
+}
+
+impl NetworkMessage for IndirectAck {
+    fn type_tag() -> &'static str {
+        "swactor_dist::IndirectAck"
+    }
+}
+
 /// SWIM join request — "I want to join the cluster"
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JoinRequest {

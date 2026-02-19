@@ -496,3 +496,268 @@ pub fn check_cache_bounded(
         description: "Cache never exceeds configured capacity".into(),
     }
 }
+
+// ─── Deployment Topology Property Checks ────────────────────────────────────
+
+/// Check convergence within a specific group of nodes (not the whole cluster).
+///
+/// Passes if there exists a round after `after_round` where all alive nodes
+/// in `group_indices` have member_count within `tolerance` of each other.
+pub fn check_group_convergence(
+    trace: &DistTrace,
+    group_indices: &[usize],
+    after_round: usize,
+    tolerance: usize,
+) -> crate::properties::PropertyResult {
+    let converged = trace
+        .snapshots_per_round
+        .iter()
+        .skip(after_round)
+        .any(|round_snaps| {
+            let counts: Vec<usize> = group_indices
+                .iter()
+                .filter_map(|&idx| {
+                    if idx < round_snaps.len() {
+                        let (_, s) = &round_snaps[idx];
+                        if s.is_alive { Some(s.member_count) } else { None }
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            if counts.is_empty() {
+                return true;
+            }
+            let min = *counts.iter().min().unwrap();
+            let max = *counts.iter().max().unwrap();
+            max - min <= tolerance
+        });
+
+    crate::properties::PropertyResult {
+        name: "group_convergence".into(),
+        category: "Deployment Topology".into(),
+        passed: converged,
+        expected: format!(
+            "group {:?} converges (spread ≤ {tolerance}) after round {after_round}",
+            group_indices
+        ),
+        actual: if converged {
+            "converged".into()
+        } else {
+            let final_counts: Vec<usize> = group_indices
+                .iter()
+                .filter_map(|&idx| {
+                    trace.snapshots_per_round.last().and_then(|r| {
+                        if idx < r.len() {
+                            let (_, s) = &r[idx];
+                            if s.is_alive { Some(s.member_count) } else { None }
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .collect();
+            format!("final group member_counts: {final_counts:?}")
+        },
+        description: "Membership views converge within a node group".into(),
+    }
+}
+
+/// Detects membership oscillation (suspect→dead→alive cycling).
+///
+/// For each alive node, counts how many times `member_count` changes direction
+/// (increase→decrease or vice versa) after `after_round`. Fails if any node
+/// exceeds `max_flips`.
+pub fn check_membership_stability(
+    trace: &DistTrace,
+    after_round: usize,
+    max_flips: usize,
+) -> crate::properties::PropertyResult {
+    let mut worst_node = String::new();
+    let mut worst_flips = 0usize;
+
+    let num_nodes = trace.node_names.len();
+    for node_idx in 0..num_nodes {
+        let rounds: Vec<(usize, bool)> = trace
+            .snapshots_per_round
+            .iter()
+            .skip(after_round)
+            .map(|round_snaps| {
+                let (_, s) = &round_snaps[node_idx];
+                (s.member_count, s.is_alive)
+            })
+            .collect();
+
+        let mut flips = 0usize;
+        // Track direction: +1 = increasing, -1 = decreasing, 0 = no change yet
+        let mut direction: i32 = 0;
+        let mut prev_count: Option<usize> = None;
+
+        for (count, is_alive) in &rounds {
+            if !is_alive {
+                prev_count = None;
+                direction = 0;
+                continue;
+            }
+            if let Some(prev) = prev_count {
+                let new_dir = if *count > prev {
+                    1
+                } else if *count < prev {
+                    -1
+                } else {
+                    direction // no change keeps previous direction
+                };
+                if direction != 0 && new_dir != 0 && new_dir != direction {
+                    flips += 1;
+                }
+                if new_dir != 0 {
+                    direction = new_dir;
+                }
+            }
+            prev_count = Some(*count);
+        }
+
+        if flips > worst_flips {
+            worst_flips = flips;
+            worst_node = trace.node_names[node_idx].clone();
+        }
+    }
+
+    crate::properties::PropertyResult {
+        name: "membership_stability".into(),
+        category: "Topology Adversarial".into(),
+        passed: worst_flips <= max_flips,
+        expected: format!("≤{max_flips} direction flips per node after round {after_round}"),
+        actual: format!("{worst_node} had {worst_flips} flips"),
+        description: "Membership count does not oscillate excessively".into(),
+    }
+}
+
+/// Checks that the spread (max - min) of `member_count` across alive nodes
+/// stays within `max_spread` for at least one round after `after_round`.
+///
+/// Asymmetric relay links cause some nodes to see the full cluster while others
+/// see a reduced view — this detects that divergence.
+pub fn check_view_asymmetry(
+    trace: &DistTrace,
+    after_round: usize,
+    max_spread: usize,
+) -> crate::properties::PropertyResult {
+    let within_spread = trace
+        .snapshots_per_round
+        .iter()
+        .skip(after_round)
+        .any(|round_snaps| {
+            let counts: Vec<usize> = round_snaps
+                .iter()
+                .filter(|(_, s)| s.is_alive)
+                .map(|(_, s)| s.member_count)
+                .collect();
+            if counts.is_empty() {
+                return true;
+            }
+            let min = *counts.iter().min().unwrap();
+            let max = *counts.iter().max().unwrap();
+            max - min <= max_spread
+        });
+
+    let final_spread = trace
+        .snapshots_per_round
+        .last()
+        .map(|round_snaps| {
+            let counts: Vec<usize> = round_snaps
+                .iter()
+                .filter(|(_, s)| s.is_alive)
+                .map(|(_, s)| s.member_count)
+                .collect();
+            if counts.is_empty() {
+                return (0, Vec::new());
+            }
+            let min = *counts.iter().min().unwrap();
+            let max = *counts.iter().max().unwrap();
+            (max - min, counts)
+        })
+        .unwrap_or((0, Vec::new()));
+
+    crate::properties::PropertyResult {
+        name: "view_asymmetry".into(),
+        category: "Topology Adversarial".into(),
+        passed: within_spread,
+        expected: format!("member_count spread ≤{max_spread} for at least one round after {after_round}"),
+        actual: format!("final spread={}, counts={:?}", final_spread.0, final_spread.1),
+        description: "Membership views across alive nodes do not diverge excessively".into(),
+    }
+}
+
+/// Detect total convergence failure: all alive nodes have member_count == 0
+/// for every round after `after_round`. This catches the deploy auth race
+/// failure mode where peer introductions happen but SWIM joins never complete.
+pub fn check_zero_convergence(
+    trace: &DistTrace,
+    after_round: usize,
+) -> crate::properties::PropertyResult {
+    let all_zero = trace
+        .snapshots_per_round
+        .iter()
+        .skip(after_round)
+        .all(|round_snaps| {
+            let alive: Vec<_> = round_snaps.iter().filter(|(_, s)| s.is_alive).collect();
+            !alive.is_empty() && alive.iter().all(|(_, s)| s.member_count == 0)
+        });
+
+    crate::properties::PropertyResult {
+        name: "zero_convergence".into(),
+        category: "Cluster Formation".into(),
+        passed: !all_zero,
+        expected: format!("at least one alive node has member_count > 0 after round {after_round}"),
+        actual: if all_zero {
+            "all alive nodes stuck at member_count=0".into()
+        } else {
+            "membership progressing".into()
+        },
+        description: "Detects total SWIM convergence failure (auth race / join never completed)".into(),
+    }
+}
+
+/// Check that staggered-join nodes eventually reach min_members by a deadline.
+///
+/// Passes if by `by_round`, at least `min_members` of the `expected_joined` nodes
+/// are alive and have member_count >= 1.
+pub fn check_staggered_join(
+    trace: &DistTrace,
+    expected_joined: &[usize],
+    min_members: usize,
+    by_round: usize,
+) -> crate::properties::PropertyResult {
+    let joined_count = trace
+        .snapshots_per_round
+        .iter()
+        .take(by_round)
+        .last()
+        .map(|round_snaps| {
+            expected_joined
+                .iter()
+                .filter(|&&idx| {
+                    if idx < round_snaps.len() {
+                        let (_, s) = &round_snaps[idx];
+                        s.is_alive && s.member_count >= 1
+                    } else {
+                        false
+                    }
+                })
+                .count()
+        })
+        .unwrap_or(0);
+
+    crate::properties::PropertyResult {
+        name: "staggered_join".into(),
+        category: "Deployment Topology".into(),
+        passed: joined_count >= min_members,
+        expected: format!(
+            "≥{min_members} of {:?} joined with ≥1 member by round {by_round}",
+            expected_joined
+        ),
+        actual: format!("{joined_count} nodes joined"),
+        description: "Staggered-join nodes reach membership by deadline".into(),
+    }
+}

@@ -391,6 +391,22 @@ pub fn wait_for_lan_convergence(
     }
 }
 
+// ── Deploy simulation helpers ────────────────────────────────────────────────
+
+/// Restart a specific container with fresh flags (simulates deploy lifecycle).
+pub fn redeploy_node(service: &str) {
+    let status = Command::new("docker")
+        .args(["compose", "-f", &compose_file(), "up", "-d", "--force-recreate", service])
+        .status()
+        .expect("failed to redeploy node");
+    assert!(status.success(), "docker compose force-recreate {service} failed");
+}
+
+/// Fetch the node_id from a node's distribution snapshot.
+pub fn get_node_id(port: u16) -> Option<String> {
+    poll_distribution(port).map(|snap| snap.node_id)
+}
+
 fn lan_hpz_compose_path() -> String {
     let mut p = PathBuf::from(COMPOSE_DIR);
     p.push("docker-compose.lan-hpz.yml");

@@ -1,5 +1,7 @@
 pub mod types;
 pub mod crypto;
+pub mod identity;
+pub mod peer_auth;
 pub mod messages;
 pub mod codec;
 #[cfg(feature = "tcp")]
@@ -9,6 +11,7 @@ pub mod kademlia;
 pub mod cache;
 pub mod node;
 pub mod registry;
+pub mod node_metadata;
 pub mod snapshot;
 #[cfg(feature = "tcp")]
 pub mod driver;

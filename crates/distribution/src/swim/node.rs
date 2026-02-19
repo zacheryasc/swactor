@@ -3,6 +3,7 @@
 //! This is the top-level SWIM state machine that a `DistributedNode` will drive.
 //! It produces `SwimAction`s that the caller translates into real network I/O.
 
+use crate::identity::hex_encode;
 use crate::messages::MembershipUpdate;
 use crate::types::{MemberState, NodeId, NodeRecord};
 
@@ -26,6 +27,8 @@ pub enum NodeAction {
     },
     /// Send a SWIM ack.
     SendAck { to: NodeId, sequence: u64, piggyback: Vec<u8> },
+    /// Forward an indirect ack back to the original prober.
+    ForwardAck { to: NodeId, target: NodeId, sequence: u64, piggyback: Vec<u8> },
     /// Send a join response with the current member list.
     SendJoinResponse { to: NodeId, members: Vec<NodeRecord> },
     /// Notification: a node state changed (for wiring into Kademlia).
@@ -40,6 +43,9 @@ pub struct SwimNode {
     dissemination: DisseminationQueue,
     /// Maximum piggybacked updates per message.
     max_piggyback: usize,
+    /// PingReqs we forwarded: (requester, target, sequence).
+    /// When we receive an ack matching (target, sequence), forward it to requester.
+    pending_relays: Vec<(NodeId, NodeId, u64)>,
 }
 
 impl SwimNode {
@@ -49,6 +55,7 @@ impl SwimNode {
             probe: SwimProbe::new(config),
             dissemination: DisseminationQueue::new(3), // Λ = 3
             max_piggyback: 8,
+            pending_relays: Vec::new(),
         }
     }
 
@@ -96,18 +103,34 @@ impl SwimNode {
             &mut self.members,
         );
         actions.extend(self.translate_probe_actions(probe_actions));
+
+        // Check if this ack completes a pending relay (indirect ping path)
+        if let Some(pos) = self.pending_relays.iter().position(|(_, t, s)| *t == from && *s == sequence) {
+            let (requester, target, seq) = self.pending_relays.remove(pos);
+            let pb = self.dissemination.pack_piggyback(self.max_piggyback);
+            actions.push(NodeAction::ForwardAck {
+                to: requester, target, sequence: seq, piggyback: pb,
+            });
+        }
+
         actions
     }
 
     /// Handle a received indirect ping request.
     pub fn handle_ping_req(
         &mut self,
-        _from: NodeId,
+        from: NodeId,
         target: NodeId,
         sequence: u64,
         piggyback: &[u8],
     ) -> Vec<NodeAction> {
         let mut actions = self.apply_piggyback(piggyback);
+
+        // Record the pending relay so we can forward the ack back
+        if self.pending_relays.len() >= 16 {
+            self.pending_relays.remove(0);
+        }
+        self.pending_relays.push((from, target, sequence));
 
         // Forward a ping to the target on behalf of the requester
         let pb = self.dissemination.pack_piggyback(self.max_piggyback);
@@ -116,6 +139,17 @@ impl SwimNode {
             sequence,
             piggyback: pb,
         });
+        actions
+    }
+
+    /// Handle a received indirect ack (forwarded by a relay node).
+    pub fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
+        let mut actions = self.apply_piggyback(piggyback);
+        let probe_actions = self.probe.step(
+            SwimEvent::IndirectAckReceived { target, sequence },
+            &mut self.members,
+        );
+        actions.extend(self.translate_probe_actions(probe_actions));
         actions
     }
 
@@ -223,6 +257,9 @@ impl SwimNode {
             update.incarnation,
         );
         if changed {
+            if update.state == MemberState::Alive {
+                eprintln!("SWIM: alive {}", &hex_encode(&update.node_id.0)[..8]);
+            }
             // Re-disseminate the update
             self.dissemination.enqueue(
                 membership_update(update.node_id, update.state, update.incarnation),
@@ -272,6 +309,7 @@ impl SwimNode {
                     });
                 }
                 SwimAction::Suspect(node_id) => {
+                    eprintln!("SWIM: suspect {}", &hex_encode(&node_id.0)[..8]);
                     if self.members.suspect(node_id) {
                         if let Some(entry) = self.members.get(&node_id) {
                             self.dissemination.enqueue(
@@ -287,6 +325,7 @@ impl SwimNode {
                     }
                 }
                 SwimAction::DeclareDead(node_id) => {
+                    eprintln!("SWIM: dead {}", &hex_encode(&node_id.0)[..8]);
                     if let Some(entry) = self.members.get(&node_id) {
                         let inc = entry.incarnation;
                         self.dissemination.enqueue(

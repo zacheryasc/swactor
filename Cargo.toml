@@ -2,22 +2,20 @@
 members = [
     ".",
     "crates/python",
-    "crates/wasm",
+    "crates/wasm/runtime",
     "crates/bin-runner",
     "crates/simulation",
-    "crates/runtime-dashboard",
+    "crates/dashboard",
     "crates/distribution",
     "crates/std",
     "crates/datastore",
     "crates/shared-types",
-    "crates/crypto-wasm",
+    "crates/swactor-node",
     "tests/docker",
     "crates/ci",
-    "crates/local-runner",
-    "crates/ci-relay",
     "xtask",
 ]
-exclude = ["tools/depgraph"]
+exclude = ["tools/depgraph", "crates/wasm/crypto"]
 
 [package]
 name = "swactor"

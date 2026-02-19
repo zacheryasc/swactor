@@ -186,10 +186,9 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-// ── Dashboard integration (only when runtime-dashboard is available) ────────
+// ── Dashboard integration ────────────────────────────────────────────────────
 
-#[cfg(feature = "node")]
-impl runtime_dashboard::datastore_collector::DatastoreStatsProvider for DatastoreMetrics {
+impl dashboard::datastore_collector::DatastoreStatsProvider for DatastoreMetrics {
     fn snapshot_json(&self) -> Option<String> {
         let snap = self.snapshot();
         serde_json::to_string(&snap).ok()

@@ -28,6 +28,11 @@ impl StdExtension {
             group_registry: GroupRegistry::new(),
         }
     }
+
+    /// Resolve a human-readable name for an actor address (reverse lookup).
+    pub fn resolve_name(&self, addr: &ActorAddress) -> Option<String> {
+        self.name_registry.lookup_by_addr(addr)
+    }
 }
 
 impl Default for StdExtension {

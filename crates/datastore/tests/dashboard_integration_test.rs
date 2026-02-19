@@ -1,5 +1,3 @@
-#![cfg(feature = "node")]
-
 //! End-to-end integration test: spins up a datastore node with an HTTP API
 //! **and** a runtime dashboard, performs CRUD over HTTP, then verifies:
 //!
@@ -46,12 +44,12 @@ fn dashboard_reflects_datastore_operations() {
 
     // ── Infrastructure: runtime + actors + dashboard + API ──────────────
 
-    let dash = runtime_dashboard::start_dashboard(runtime_dashboard::DashboardConfig {
+    let dash = dashboard::start_dashboard(dashboard::DashboardConfig {
         port: dash_port,
         ..Default::default()
     });
 
-    let collector = runtime_dashboard::collector::StatsCollector::new(2);
+    let collector = dashboard::collector::StatsCollector::new(2);
     let mut rt = Runtime::new(RuntimeConfig {
         num_threads: 2,
         max_actors: 1024,
@@ -86,7 +84,7 @@ fn dashboard_reflects_datastore_operations() {
     dash.set_runtime(handle.runtime.clone(), collector);
     dash.set_datastore(
         Arc::clone(&metrics)
-            as Arc<dyn runtime_dashboard::datastore_collector::DatastoreStatsProvider>,
+            as Arc<dyn dashboard::datastore_collector::DatastoreStatsProvider>,
     );
 
     let (api_shutdown, _peers) = start_api_server(
