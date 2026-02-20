@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use swactor::actor::{ActorAddress, ActorExited, ExitReason};
+use swactor::actor::{ActorAddress, ActorExited, ExitReason, ExitValue};
 
 /// Tracks watch relationships between actors.
 ///
@@ -55,11 +55,13 @@ impl WatchRegistry {
         &self,
         target: ActorAddress,
         reason: ExitReason,
+        exit_value: Option<ExitValue>,
     ) -> Vec<(ActorAddress, ActorExited)> {
         let mut state = self.inner.lock().unwrap();
         let notification = ActorExited {
             addr: target,
             reason,
+            exit_value,
         };
         let mut result = Vec::new();
 

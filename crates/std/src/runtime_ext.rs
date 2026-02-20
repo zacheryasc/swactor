@@ -1,4 +1,4 @@
-use swactor::actor::{ActorAddress, ActorInterface, Message};
+use swactor::actor::{ActorAddress, ActorInterface, EnvironmentBuilder, LogicalName, Message};
 use swactor::runtime::Runtime;
 use swactor::Error;
 
@@ -40,7 +40,10 @@ impl RuntimeNaming for Runtime {
 
     fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error> {
         let name = name.into();
-        let addr = self.spawn(actor)?;
+        let env = EnvironmentBuilder::new()
+            .set(LogicalName(name.clone()))
+            .build();
+        let addr = self.spawn_with_env(actor, env)?;
         if let Err(e) = get_ext(self).name_registry.register(name, addr) {
             let _ = self.stop_actor(addr);
             return Err(e);
@@ -130,5 +133,23 @@ impl RuntimeGroups for Runtime {
 
     fn groups(&self) -> Vec<String> {
         get_ext(self).group_registry.group_names()
+    }
+}
+
+/// Service registry extension for [`Runtime`].
+///
+/// Allows registering typed service bindings that are automatically injected
+/// into every actor's environment at spawn time.
+pub trait RuntimeResources {
+    /// Register a service address under marker type `S`.
+    ///
+    /// All actors spawned after this call will have `ServiceBinding<S>` in
+    /// their environment (unless overridden via `spawn_builder`).
+    fn register_service<S: 'static + Send + Sync>(&self, addr: ActorAddress);
+}
+
+impl RuntimeResources for Runtime {
+    fn register_service<S: 'static + Send + Sync>(&self, addr: ActorAddress) {
+        get_ext(self).service_registry.register::<S>(addr);
     }
 }

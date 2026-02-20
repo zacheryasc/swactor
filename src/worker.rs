@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use crate::Instant;
 
-use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx, StopReason, StopSignal};
+use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx, Environment, ExitValue, ResumeSignal, SpawnRequest, StopReason, StopSignal, StopWithSignal, SystemInfo};
 use crate::channel::Receiver;
 use crate::config::MailboxOverflow;
 use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
@@ -45,7 +45,7 @@ pub(crate) struct Worker {
     pub(crate) id: WorkerId,
     pub(crate) pool: ActorPool,
     transfer_rx: Receiver<Envelope>,
-    spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
+    spawn_rx: Receiver<SpawnRequest>,
     stats: Arc<WorkerStats>,
     /// Reusable scratch buffer for building per-actor snapshots.
     snapshot_buf: Vec<ActorSnapshot>,
@@ -57,7 +57,7 @@ impl Worker {
     pub(crate) fn new(
         id: WorkerId,
         transfer_rx: Receiver<Envelope>,
-        spawn_rx: Receiver<(ActorAddress, Box<dyn AnyActor>)>,
+        spawn_rx: Receiver<SpawnRequest>,
         stats: Arc<WorkerStats>,
         default_mailbox_capacity: usize,
         default_overflow_policy: MailboxOverflow,
@@ -76,12 +76,15 @@ impl Worker {
     /// Run one iteration of the worker loop. Returns `true` if any work was done.
     /// Drain the spawn queue, inserting new actors into the pool.
     /// Used in phases 1 and 4 of tick_once.
-    fn drain_spawns(&mut self) -> bool {
+    fn drain_spawns(&mut self, tc: &TickContext) -> bool {
         let mut did_work = false;
         #[cfg(feature = "tracing")]
         let mut spawn_count: usize = 0;
-        while let Some((addr, actor)) = self.spawn_rx.try_recv() {
-            self.pool.insert(addr, actor);
+        while let Some(mut req) = self.spawn_rx.try_recv() {
+            if let Some(ext) = tc.extension {
+                req.env = ext.on_spawn(req.addr, req.parent, req.env, tc.created_at.elapsed().as_millis() as u64);
+            }
+            self.pool.insert(req);
             #[cfg(feature = "tracing")]
             { spawn_count += 1; }
             did_work = true;
@@ -98,6 +101,8 @@ impl Worker {
         let cleanup_pending: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
             RefCell::new(Vec::new());
         let cleanup_stops: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
+        let cleanup_stop_withs: RefCell<Vec<(ActorAddress, ExitValue)>> = RefCell::new(Vec::new());
+        let cleanup_suspends: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
         let cleanup_requests: RefCell<Vec<Box<dyn Any + Send>>> = RefCell::new(Vec::new());
         let dead = {
             let cleanup_ctx = WorkerContext {
@@ -105,6 +110,8 @@ impl Worker {
                 tc,
                 pending_local: &cleanup_pending,
                 stop_requests: &cleanup_stops,
+                stop_with_values: &cleanup_stop_withs,
+                suspend_requests: &cleanup_suspends,
                 worker_requests: &cleanup_requests,
                 stats: &self.stats,
             };
@@ -113,13 +120,13 @@ impl Worker {
 
         let had_dead = !dead.is_empty();
         if had_dead {
-            for &(addr, _) in &dead {
-                tc.address_map.remove(&addr);
+            for (addr, _, _) in &dead {
+                tc.address_map.remove(addr);
             }
 
             if let Some(ext) = tc.extension {
                 let notifications = ext.on_actor_death(&dead);
-                let dead_addrs: Vec<_> = dead.iter().map(|(a, _)| *a).collect();
+                let dead_addrs: Vec<_> = dead.iter().map(|(a, _, _)| *a).collect();
                 ext.cleanup_dead(&dead_addrs);
                 for (dest, msg) in notifications {
                     route_to_pool_or_remote(&mut self.pool, tc, dest, msg);
@@ -136,7 +143,7 @@ impl Worker {
 
         // GC per-worker extension state for dead actors
         if let Some(ext) = &mut self.worker_ext {
-            let dead_addrs: Vec<ActorAddress> = dead.iter().map(|(a, _)| *a).collect();
+            let dead_addrs: Vec<ActorAddress> = dead.iter().map(|(a, _, _)| *a).collect();
             ext.gc_dead(&dead_addrs);
         }
 
@@ -151,7 +158,7 @@ impl Worker {
         let t0 = Instant::now();
 
         // 1. Drain spawn queue → add actors to pool
-        did_work |= self.drain_spawns();
+        did_work |= self.drain_spawns(tc);
         let t1 = Instant::now();
 
         // 2. Drain transfer queue → deliver envelopes to actors
@@ -176,6 +183,8 @@ impl Worker {
         let pending_local: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
             RefCell::new(Vec::new());
         let stop_requests: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
+        let stop_with_values: RefCell<Vec<(ActorAddress, ExitValue)>> = RefCell::new(Vec::new());
+        let suspend_requests: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
         let worker_requests: RefCell<Vec<Box<dyn Any + Send>>> = RefCell::new(Vec::new());
 
         let processed;
@@ -185,10 +194,12 @@ impl Worker {
                 tc,
                 pending_local: &pending_local,
                 stop_requests: &stop_requests,
+                stop_with_values: &stop_with_values,
+                suspend_requests: &suspend_requests,
                 worker_requests: &worker_requests,
                 stats: &self.stats,
             };
-            processed = self.pool.tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget, &stop_requests);
+            processed = self.pool.tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget, &stop_requests, &stop_with_values, &suspend_requests);
             if processed > 0 {
                 did_work = true;
             }
@@ -206,7 +217,7 @@ impl Worker {
 
         // 4. Drain spawn queue again — actors spawned during step 3
         //    must be in the pool before pending_local delivery.
-        did_work |= self.drain_spawns();
+        did_work |= self.drain_spawns(tc);
         let t4 = Instant::now();
 
         // 5. Drain pending_local buffer → deliver to local actors
@@ -316,6 +327,8 @@ struct WorkerContext<'a> {
     tc: &'a TickContext<'a>,
     pending_local: &'a RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>>,
     stop_requests: &'a RefCell<Vec<ActorAddress>>,
+    stop_with_values: &'a RefCell<Vec<(ActorAddress, ExitValue)>>,
+    suspend_requests: &'a RefCell<Vec<ActorAddress>>,
     worker_requests: &'a RefCell<Vec<Box<dyn Any + Send>>>,
     stats: &'a WorkerStats,
 }
@@ -341,16 +354,30 @@ impl ContextInner for WorkerContext<'_> {
         }
     }
 
-    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) {
+    fn spawn_any(&self, request: SpawnRequest) {
         let worker_id = self.tc.placement.next_worker();
-        self.tc.address_map.insert(addr, worker_id);
+        self.tc.address_map.insert(request.addr, worker_id);
         self.tc.spawn_txs[worker_id.as_usize()]
-            .send((addr, actor));
+            .send(request);
         crate::runtime::notify_worker(self.tc.worker_threads, worker_id.as_usize());
     }
 
     fn request_stop(&self, addr: ActorAddress) {
         self.stop_requests.borrow_mut().push(addr);
+    }
+
+    fn request_stop_with(&self, addr: ActorAddress, value: ExitValue) {
+        self.stop_with_values.borrow_mut().push((addr, value));
+    }
+
+    fn request_suspend(&self, addr: ActorAddress) {
+        self.suspend_requests.borrow_mut().push(addr);
+    }
+
+    fn request_resume(&self, addr: ActorAddress) {
+        // Same-worker: buffer as pending_local ResumeSignal
+        // Cross-worker: would go through transfer queue (handled by Runtime impl)
+        self.pending_local.borrow_mut().push((addr, Box::new(ResumeSignal)));
     }
 
     fn post_worker_request(&self, request: Box<dyn Any + Send>) {
@@ -359,6 +386,19 @@ impl ContextInner for WorkerContext<'_> {
 
     fn extension(&self) -> Option<&dyn crate::extension::RuntimeExtension> {
         self.tc.extension
+    }
+
+    fn system_info(&self) -> SystemInfo {
+        let num_workers = self.tc.config.num_threads.max(1);
+        let total_actors: usize = self.tc.worker_stats.iter()
+            .map(|ws| ws.num_actors.load(Ordering::Relaxed))
+            .sum();
+        SystemInfo {
+            worker_id: self.worker_id.0,
+            num_workers,
+            total_actors,
+            uptime_ms: self.tc.created_at.elapsed().as_millis() as u64,
+        }
     }
 }
 
@@ -370,6 +410,8 @@ struct ActorSlot {
     stopping: bool,
     /// Whether on_start has been called for this actor.
     started: bool,
+    /// Actor is suspended — messages queue but are not processed.
+    suspended: bool,
     last_msg_type: Option<&'static str>,
     messages_processed: u64,
     /// Per-message-type counters (bounded to 32 entries).
@@ -377,6 +419,12 @@ struct ActorSlot {
     /// Per-actor mailbox capacity. 0 = unbounded.
     mailbox_capacity: usize,
     overflow_policy: MailboxOverflow,
+    /// Address of the actor that spawned this one, or `None` for externally-spawned actors.
+    parent_addr: Option<ActorAddress>,
+    /// Inherited environment from parent (or empty for runtime-spawned actors).
+    env: Environment,
+    /// Typed exit value set by `ctx.stop_with()`.
+    exit_value: Option<ExitValue>,
 }
 
 /// Per-worker actor storage. Owns per-actor mailboxes.
@@ -398,20 +446,24 @@ impl ActorPool {
         }
     }
 
-    pub fn insert(&mut self, addr: ActorAddress, actor: Box<dyn AnyActor>) {
+    pub fn insert(&mut self, req: SpawnRequest) {
         let cap = self.default_mailbox_capacity;
         let prealloc = if cap > 0 { cap.min(64) } else { 16 };
-        self.actors.insert(addr, ActorSlot {
+        self.actors.insert(req.addr, ActorSlot {
             mailbox: VecDeque::with_capacity(prealloc),
-            actor,
+            actor: req.actor,
             poisoned: false,
             stopping: false,
             started: false,
+            suspended: false,
             last_msg_type: None,
             messages_processed: 0,
             msg_type_counts: HashMap::new(),
             mailbox_capacity: self.default_mailbox_capacity,
             overflow_policy: self.default_overflow_policy,
+            parent_addr: req.parent,
+            env: req.env,
+            exit_value: None,
         });
     }
 
@@ -419,6 +471,27 @@ impl ActorPool {
     /// Returns `true` if the actor exists (message handled or dropped; type check deferred to tick).
     pub fn deliver(&mut self, addr: &ActorAddress, msg: Box<dyn Any + Send>) -> bool {
         if let Some(slot) = self.actors.get_mut(addr) {
+            // Intercept control signals for suspended actors: they skip tick_all
+            // so we must handle resume/stop at delivery time.
+            if slot.suspended {
+                if msg.is::<ResumeSignal>() {
+                    slot.suspended = false;
+                    return true;
+                }
+                if msg.is::<StopSignal>() {
+                    slot.stopping = true;
+                    slot.mailbox.clear();
+                    return true;
+                }
+                if msg.is::<StopWithSignal>() {
+                    if let Ok(sig) = msg.downcast::<StopWithSignal>() {
+                        slot.exit_value = Some(sig.0);
+                    }
+                    slot.stopping = true;
+                    slot.mailbox.clear();
+                    return true;
+                }
+            }
             if slot.mailbox_capacity > 0 && slot.mailbox.len() >= slot.mailbox_capacity {
                 match slot.overflow_policy {
                     MailboxOverflow::DropNewest => {
@@ -453,6 +526,8 @@ impl ActorPool {
         stats: &WorkerStats,
         budget: usize,
         stop_requests: &RefCell<Vec<ActorAddress>>,
+        stop_with_values: &RefCell<Vec<(ActorAddress, ExitValue)>>,
+        suspend_requests: &RefCell<Vec<ActorAddress>>,
     ) -> usize {
         let mut count = 0;
         for (&addr, slot) in self.actors.iter_mut() {
@@ -462,10 +537,22 @@ impl ActorPool {
                 continue;
             }
 
+            // Skip suspended actors — messages keep queueing
+            if slot.suspended {
+                continue;
+            }
+
             #[cfg(feature = "tracing")]
             let _actor_span = tracing::trace_span!("actor.tick", actor_addr = %addr).entered();
 
-            let ctx = Ctx::new(inner, addr);
+            // Snapshot self-stats before creating Ctx
+            let snap_processed = slot.messages_processed;
+            let snap_depth = slot.mailbox.len();
+            let mut snap_type_counts: Vec<(&'static str, u64)> =
+                slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
+            snap_type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+
+            let ctx = Ctx::new(inner, addr, slot.parent_addr, slot.env.clone(), snap_processed, snap_depth, snap_type_counts);
 
             // Call on_start once, before first message
             if !slot.started {
@@ -482,7 +569,7 @@ impl ActorPool {
                     slot.mailbox.clear();
                     continue;
                 }
-                // Check if on_start requested stop
+                // Check if on_start requested stop or stop_with
                 {
                     let stops = stop_requests.borrow();
                     if !stops.is_empty() && stops.contains(&addr) {
@@ -490,6 +577,33 @@ impl ActorPool {
                         slot.stopping = true;
                         stats.stops.fetch_add(1, Ordering::Relaxed);
                         slot.mailbox.clear();
+                        // Check for stop_with value
+                        let mut sws = stop_with_values.borrow_mut();
+                        if let Some(pos) = sws.iter().position(|(a, _)| *a == addr) {
+                            let (_, val) = sws.swap_remove(pos);
+                            slot.exit_value = Some(val);
+                        }
+                        continue;
+                    }
+                }
+                // Check if on_start requested stop_with (without plain stop)
+                {
+                    let mut sws = stop_with_values.borrow_mut();
+                    if let Some(pos) = sws.iter().position(|(a, _)| *a == addr) {
+                        let (_, val) = sws.swap_remove(pos);
+                        slot.exit_value = Some(val);
+                        slot.stopping = true;
+                        stats.stops.fetch_add(1, Ordering::Relaxed);
+                        slot.mailbox.clear();
+                        continue;
+                    }
+                }
+                // Check if on_start requested suspend
+                {
+                    let suspends = suspend_requests.borrow();
+                    if !suspends.is_empty() && suspends.contains(&addr) {
+                        drop(suspends);
+                        slot.suspended = true;
                         continue;
                     }
                 }
@@ -504,6 +618,17 @@ impl ActorPool {
                     slot.mailbox.clear();
                     #[cfg(feature = "tracing")]
                     tracing::info!(actor_addr = %addr, "actor.stop_requested");
+                    break;
+                }
+
+                // Intercept StopWithSignal (from external runtime)
+                if msg.is::<StopWithSignal>() {
+                    if let Ok(sig) = msg.downcast::<StopWithSignal>() {
+                        slot.exit_value = Some(sig.0);
+                    }
+                    slot.stopping = true;
+                    stats.stops.fetch_add(1, Ordering::Relaxed);
+                    slot.mailbox.clear();
                     break;
                 }
 
@@ -536,15 +661,36 @@ impl ActorPool {
                 count += 1;
                 actor_count += 1;
 
-                // Check if handler requested self-stop (via ctx.stop_self())
+                // Check if handler requested self-stop or stop_with
                 {
                     let stops = stop_requests.borrow();
-                    if !stops.is_empty() && stops.contains(&addr) {
-                        drop(stops);
+                    let has_stop = !stops.is_empty() && stops.contains(&addr);
+                    drop(stops);
+
+                    let mut sws = stop_with_values.borrow_mut();
+                    let sw_pos = sws.iter().position(|(a, _)| *a == addr);
+
+                    if has_stop || sw_pos.is_some() {
+                        if let Some(pos) = sw_pos {
+                            let (_, val) = sws.swap_remove(pos);
+                            slot.exit_value = Some(val);
+                        }
+                        drop(sws);
                         slot.stopping = true;
                         stats.stops.fetch_add(1, Ordering::Relaxed);
                         slot.mailbox.clear();
                         break;
+                    }
+                    drop(sws);
+                }
+
+                // Check if handler requested suspend
+                {
+                    let suspends = suspend_requests.borrow();
+                    if !suspends.is_empty() && suspends.contains(&addr) {
+                        drop(suspends);
+                        slot.suspended = true;
+                        break; // stop processing this actor's messages this tick
                     }
                 }
 
@@ -568,30 +714,45 @@ impl ActorPool {
         self.actors.values().map(|slot| slot.mailbox.len()).sum()
     }
 
-    /// Remove poisoned and stopping actors, returning their addresses and stop reasons.
+    /// Remove poisoned and stopping actors, returning their addresses, stop reasons,
+    /// and optional exit values.
     /// Called after tick_all so the caller can clean up the address map.
     ///
     /// For stopping actors: calls `on_stop()` before removal (wrapped in catch_unwind).
     /// For poisoned actors: `on_stop()` is NOT called (state may be corrupt).
-    pub fn cleanup_dead(&mut self, inner: &dyn ContextInner) -> Vec<(ActorAddress, StopReason)> {
-        let dead: Vec<(ActorAddress, StopReason)> = self
+    pub fn cleanup_dead(&mut self, inner: &dyn ContextInner) -> Vec<(ActorAddress, StopReason, Option<ExitValue>)> {
+        let dead_addrs: Vec<ActorAddress> = self
             .actors
             .iter()
             .filter(|(_, slot)| slot.poisoned || slot.stopping)
-            .map(|(&addr, slot)| {
-                let reason = if slot.poisoned { StopReason::Panicked } else { StopReason::Normal };
-                (addr, reason)
-            })
+            .map(|(&addr, _)| addr)
             .collect();
-        for &(addr, _) in &dead {
+        let mut dead = Vec::with_capacity(dead_addrs.len());
+        for addr in dead_addrs {
             if let Some(mut slot) = self.actors.remove(&addr) {
+                let reason = if slot.poisoned {
+                    StopReason::Panicked
+                } else if slot.exit_value.is_some() {
+                    StopReason::Completed
+                } else {
+                    StopReason::Normal
+                };
                 // Call on_stop for gracefully stopping actors only
                 if slot.stopping && !slot.poisoned {
-                    let ctx = Ctx::new(inner, addr);
+                    let mut type_counts: Vec<(&'static str, u64)> =
+                        slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
+                    type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    let ctx = Ctx::new(
+                        inner, addr, slot.parent_addr, slot.env.clone(),
+                        slot.messages_processed,
+                        slot.mailbox.len(),
+                        type_counts,
+                    );
                     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         slot.actor.on_stop(&ctx);
                     }));
                 }
+                dead.push((addr, reason, slot.exit_value.take()));
                 // slot is dropped here — actor resources freed
             }
         }

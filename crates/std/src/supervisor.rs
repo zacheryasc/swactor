@@ -3,6 +3,7 @@ use std::sync::Arc;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx, Down, MonitorRef, StopReason};
 use swactor::Error;
 
+use crate::ctx_ext::get_ext;
 use crate::CtxMonitoring;
 
 /// How a child should be restarted when it dies.
@@ -140,7 +141,8 @@ impl Supervisor {
 
     fn start_child(&mut self, ctx: &Ctx, idx: usize) -> Result<(), Error> {
         let addr = (self.specs[idx].start)(ctx)?;
-        let mref = ctx.monitor(addr);
+        let mref = ctx.monitor(addr)?;
+        get_ext(ctx).supervisor_registry.register(ctx.self_addr(), addr);
         self.children[idx] = Some(ActiveChild {
             addr,
             _monitor_ref: mref,

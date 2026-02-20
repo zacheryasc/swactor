@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-use ::swactor::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Ctx};
+use ::swactor::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest};
 use ::swactor::config::{BackoffPolicy, RuntimeConfig};
 use ::swactor::runtime::{Inbox, Runtime, RuntimeHandle};
 
@@ -182,7 +182,12 @@ impl ActorInterface for PyActor {
                         Effect::Spawn { addr, handler } => {
                             let actor = PyActor::new(handler);
                             let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-                            let _ = ctx.raw_inner().spawn_any(addr, boxed);
+                            ctx.raw_inner().spawn_any(SpawnRequest {
+                                addr,
+                                actor: boxed,
+                                parent: Some(ctx.self_addr()),
+                                env: Environment::new(),
+                            });
                         }
                     }
                 }

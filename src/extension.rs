@@ -1,6 +1,6 @@
 use std::any::Any;
 
-use crate::actor::{ActorAddress, StopReason};
+use crate::actor::{ActorAddress, Environment, ExitValue, StopReason};
 
 /// Extension hook for runtime lifecycle events.
 ///
@@ -17,11 +17,22 @@ pub trait RuntimeExtension: Send + Sync {
     /// The core delivers these through normal routing (pending_local or transfer queue).
     fn on_actor_death(
         &self,
-        dead: &[(ActorAddress, StopReason)],
+        dead: &[(ActorAddress, StopReason, Option<ExitValue>)],
     ) -> Vec<(ActorAddress, Box<dyn Any + Send>)>;
 
     /// Clean up extension state for dead actors (names, groups, monitors).
     fn cleanup_dead(&self, dead: &[ActorAddress]);
+
+    /// Called for each newly spawned actor, before it enters the pool.
+    /// Extensions can enrich the actor's environment (e.g., inject SpawnTimestamp).
+    /// `child` is the address of the newly spawned actor.
+    /// `parent` is the address of the spawning actor, or `None` for runtime-spawned actors.
+    /// `uptime_ms` is milliseconds since runtime creation.
+    /// Default: no-op (returns env unchanged).
+    fn on_spawn(&self, child: ActorAddress, parent: Option<ActorAddress>, env: Environment, uptime_ms: u64) -> Environment {
+        let _ = (child, parent, uptime_ms);
+        env
+    }
 
     /// Downcast support for Ctx extension traits.
     fn as_any(&self) -> &dyn Any;

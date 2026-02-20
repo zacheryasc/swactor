@@ -69,7 +69,7 @@ impl<M: Message> Router<M> {
 
     fn start_worker(&mut self, ctx: &Ctx, idx: usize) -> Result<(), Error> {
         let addr = (self.factory)(ctx)?;
-        let mref = ctx.monitor(addr);
+        let mref = ctx.monitor(addr)?;
         self.workers[idx] = Some(ActiveChild {
             addr,
             _monitor_ref: mref,

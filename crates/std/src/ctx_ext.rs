@@ -1,10 +1,11 @@
-use swactor::actor::{ActorAddress, ActorInterface, Ctx, Message, MonitorRef};
+use swactor::actor::{ActorAddress, ActorInterface, Ctx, Environment, LogicalName, Message, MonitorRef, SystemInfo};
 use swactor::Error;
 
+use crate::resource_handle::ResourceHandle;
 use crate::StdExtension;
 use crate::timer_wheel::{CloneMsg, TimerRequest};
 
-fn get_ext<'a>(ctx: &'a Ctx) -> &'a StdExtension {
+pub(crate) fn get_ext<'a>(ctx: &'a Ctx) -> &'a StdExtension {
     ctx.extension()
         .expect("StdExtension not installed — use Runtime::with_extension()")
         .as_any()
@@ -18,15 +19,18 @@ fn get_ext<'a>(ctx: &'a Ctx) -> &'a StdExtension {
 pub trait CtxMonitoring {
     /// Subscribe to death notifications from `target`. Returns a [`MonitorRef`]
     /// that can be used to cancel the subscription.
-    fn monitor(&self, target: ActorAddress) -> MonitorRef;
+    fn monitor(&self, target: ActorAddress) -> Result<MonitorRef, Error>;
 
     /// Cancel a monitor subscription.
     fn demonitor(&self, mref: MonitorRef);
 }
 
 impl CtxMonitoring for Ctx<'_> {
-    fn monitor(&self, target: ActorAddress) -> MonitorRef {
-        get_ext(self).monitor_registry.register(self.self_addr(), target)
+    fn monitor(&self, target: ActorAddress) -> Result<MonitorRef, Error> {
+        if let Some(caps) = self.env::<swactor::CapabilitySet>() {
+            caps.check_monitor(target)?;
+        }
+        Ok(get_ext(self).monitor_registry.register(self.self_addr(), target))
     }
 
     fn demonitor(&self, mref: MonitorRef) {
@@ -60,7 +64,7 @@ impl CtxNaming for Ctx<'_> {
 
     fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error> {
         let name = name.into();
-        let addr = self.spawn(actor)?;
+        let addr = self.spawn_builder(actor).env(LogicalName(name.clone())).finish()?;
         if let Err(e) = get_ext(self).name_registry.register(name, addr) {
             let _ = self.stop_actor(addr);
             return Err(e);
@@ -175,5 +179,219 @@ impl CtxGroups for Ctx<'_> {
 
     fn group_members(&self, group: &str) -> Vec<ActorAddress> {
         get_ext(self).group_registry.members(group)
+    }
+}
+
+/// System introspection extension for [`Ctx`].
+///
+/// Provides convenience accessors for system-level information. Does NOT
+/// require [`StdExtension`] — the data comes from the core runtime.
+pub trait CtxSystem {
+    /// Returns the full [`SystemInfo`] snapshot.
+    fn system_info(&self) -> SystemInfo;
+
+    /// Index of the worker thread this actor is running on.
+    fn worker_id(&self) -> usize;
+
+    /// Total number of worker threads in the runtime.
+    fn num_workers(&self) -> usize;
+
+    /// Total number of live actors across all workers.
+    fn total_actors(&self) -> usize;
+
+    /// Milliseconds since the runtime was created.
+    fn uptime_ms(&self) -> u64;
+}
+
+impl CtxSystem for Ctx<'_> {
+    fn system_info(&self) -> SystemInfo {
+        Ctx::system_info(self)
+    }
+
+    fn worker_id(&self) -> usize {
+        Ctx::system_info(self).worker_id
+    }
+
+    fn num_workers(&self) -> usize {
+        Ctx::system_info(self).num_workers
+    }
+
+    fn total_actors(&self) -> usize {
+        Ctx::system_info(self).total_actors
+    }
+
+    fn uptime_ms(&self) -> u64 {
+        Ctx::system_info(self).uptime_ms
+    }
+}
+
+/// Lineage extension for [`Ctx`].
+///
+/// Exposes the actor's parent and supervisor. `parent()` does NOT require
+/// [`StdExtension`] — the data is stored in core per-actor state.
+/// `supervisor()` returns `None` gracefully when StdExtension is absent.
+pub trait CtxLineage {
+    /// Returns the address of the actor that spawned this one, or `None`
+    /// if this actor was spawned externally via `Runtime::spawn`.
+    fn parent(&self) -> Option<ActorAddress>;
+
+    /// Returns the address of this actor's supervisor, or `None` if
+    /// unsupervised or StdExtension is not installed.
+    fn supervisor(&self) -> Option<ActorAddress>;
+}
+
+impl CtxLineage for Ctx<'_> {
+    fn parent(&self) -> Option<ActorAddress> {
+        Ctx::parent(self)
+    }
+
+    fn supervisor(&self) -> Option<ActorAddress> {
+        let ext = self.extension()?
+            .as_any()
+            .downcast_ref::<StdExtension>()?;
+        ext.supervisor_registry.lookup(&self.self_addr())
+    }
+}
+
+/// Per-actor self-introspection extension for [`Ctx`].
+///
+/// Exposes the actor's own operational metrics. Does NOT require
+/// [`StdExtension`] — the data is snapshotted from core before each tick.
+pub trait CtxSelfStats {
+    /// Total messages this actor has successfully processed (before the current tick).
+    fn messages_processed(&self) -> u64;
+
+    /// Number of messages in this actor's mailbox at the start of the current tick.
+    fn mailbox_depth(&self) -> usize;
+
+    /// Per-message-type counts for this actor, sorted descending by count.
+    fn message_type_counts(&self) -> &[(&'static str, u64)];
+}
+
+impl CtxSelfStats for Ctx<'_> {
+    fn messages_processed(&self) -> u64 {
+        Ctx::messages_processed(self)
+    }
+
+    fn mailbox_depth(&self) -> usize {
+        Ctx::mailbox_depth(self)
+    }
+
+    fn message_type_counts(&self) -> &[(&'static str, u64)] {
+        Ctx::message_type_counts(self)
+    }
+}
+
+/// Service resource extension for [`Ctx`].
+///
+/// Provides typed service discovery via the environment. Does NOT require
+/// [`StdExtension`] — reads from the core environment (same as [`CtxEnvironment`]).
+pub trait CtxResources {
+    /// Look up a service address by marker type `S`.
+    ///
+    /// Returns `None` if no `ServiceBinding<S>` is present in the environment.
+    fn resource<S: 'static + Send + Sync>(&self) -> Option<ActorAddress>;
+}
+
+impl CtxResources for Ctx<'_> {
+    fn resource<S: 'static + Send + Sync>(&self) -> Option<ActorAddress> {
+        if let Some(caps) = self.env::<swactor::CapabilitySet>() {
+            if caps.check_service::<S>().is_err() {
+                return None;
+            }
+        }
+        self.env::<swactor::ServiceBinding<S>>().map(|b| b.addr)
+    }
+}
+
+/// Environment extension for [`Ctx`].
+///
+/// Provides access to the actor's inherited typed key-value environment.
+/// Does NOT require [`StdExtension`] — the data is stored in core per-actor state.
+pub trait CtxEnvironment {
+    /// Read a typed value from this actor's environment.
+    fn env<T: std::any::Any + Send + Sync>(&self) -> Option<&T>;
+
+    /// Access this actor's full environment.
+    fn environment(&self) -> &Environment;
+}
+
+impl CtxEnvironment for Ctx<'_> {
+    fn env<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        Ctx::env(self)
+    }
+
+    fn environment(&self) -> &Environment {
+        Ctx::environment(self)
+    }
+}
+
+/// Resource handle extension for [`Ctx`].
+///
+/// Provides `handle::<H>()` to construct typed proxy structs wrapping service
+/// addresses for ergonomic domain-specific APIs. See [`ResourceHandle`] for
+/// how to define a handle type.
+pub trait CtxHandles {
+    /// Construct a typed resource handle from the service registry.
+    ///
+    /// Returns `None` if no `ServiceBinding<H::Service>` is present in the
+    /// actor's environment (consistent with `ctx.resource()`, `ctx.where_is()`, etc).
+    fn handle<H: ResourceHandle>(&self) -> Option<H>;
+}
+
+impl CtxHandles for Ctx<'_> {
+    fn handle<H: ResourceHandle>(&self) -> Option<H> {
+        let binding = self.env::<swactor::ServiceBinding<H::Service>>()?;
+        Some(H::from_parts(binding.addr, self.self_addr()))
+    }
+}
+
+/// Lifecycle extension for [`Ctx`].
+///
+/// Provides suspend/resume capabilities with authorization:
+/// only the actor itself or its supervisor can resume it.
+pub trait CtxLifecycle {
+    /// Suspend this actor. Messages continue to queue but are not processed
+    /// until resumed by self or supervisor.
+    fn suspend_self(&self);
+
+    /// Resume a suspended actor. Only the actor itself or its supervisor
+    /// may call this. Returns `Err` if the caller is not authorized.
+    fn resume(&self, target: ActorAddress) -> Result<(), Error>;
+}
+
+impl CtxLifecycle for Ctx<'_> {
+    fn suspend_self(&self) {
+        Ctx::suspend_self(self);
+    }
+
+    fn resume(&self, target: ActorAddress) -> Result<(), Error> {
+        // Self-resume is always allowed
+        if target == self.self_addr() {
+            self.raw_inner().request_resume(target);
+            return Ok(());
+        }
+        // Supervisor can resume its child
+        let ext = get_ext(self);
+        if ext.supervisor_registry.lookup(&target) == Some(self.self_addr()) {
+            self.raw_inner().request_resume(target);
+            return Ok(());
+        }
+        Err(Error::from("resume denied: caller is not self or supervisor"))
+    }
+}
+
+/// Capability introspection extension for [`Ctx`].
+pub trait CtxCapabilities {
+    fn capabilities(&self) -> Option<&swactor::CapabilitySet>;
+    fn is_restricted(&self) -> bool;
+}
+
+impl CtxCapabilities for Ctx<'_> {
+    fn capabilities(&self) -> Option<&swactor::CapabilitySet> {
+        Ctx::env(self)
+    }
+    fn is_restricted(&self) -> bool {
+        self.env::<swactor::CapabilitySet>().is_some()
     }
 }

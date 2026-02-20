@@ -6,13 +6,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 pub use swactor::actor::{
-    ActorAddress, ActorExited, ActorInterface, Down, ExitReason, MonitorRef, StopReason,
+    ActorAddress, ActorExited, ActorInterface, CapabilitySet, Down, Environment, EnvironmentBuilder,
+    ExitReason, ExitValue, LogicalName, MonitorRef, ServiceBinding, SpawnBuilder, SpawnTimestamp,
+    StopReason,
 };
 pub use swactor::runtime::{Ctx, Inbox, MailboxOverflow, Runtime, RuntimeConfig};
 pub use swactor_std::{
-    ChildSpec, CtxGroups, CtxMonitoring, CtxNaming, CtxTimers, CtxWatching, RestartPolicy, Router,
-    RoutingStrategy, RuntimeGroups, RuntimeNaming, RuntimeWatching, StdExtension, Supervisor,
-    SupervisorStrategy,
+    ChildSpec, CtxCapabilities, CtxEnvironment, CtxGroups, CtxHandles, CtxLifecycle, CtxLineage,
+    CtxMonitoring, CtxNaming, CtxResources, CtxSelfStats, CtxSystem, CtxTimers, CtxWatching,
+    ResourceHandle, RestartPolicy, Router, RoutingStrategy, RuntimeGroups, RuntimeNaming,
+    RuntimeResources, RuntimeWatching, StdExtension, Supervisor, SupervisorStrategy,
 };
 
 // ── Messages ────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread::Thread;
 
-use crate::actor::{ActorAddress, AnyActor, Message};
+use crate::actor::{ActorAddress, Message, SpawnRequest};
 use crate::channel::Sender;
 use crate::config::RuntimeConfig;
 use crate::stats::WorkerStats;
@@ -235,7 +235,7 @@ impl InboxRegistry {
 pub(crate) struct TickContext<'a> {
     pub(crate) address_map: &'a AddressMap,
     pub(crate) transfer_txs: &'a [Sender<Envelope>],
-    pub(crate) spawn_txs: &'a [Sender<(ActorAddress, Box<dyn AnyActor>)>],
+    pub(crate) spawn_txs: &'a [Sender<SpawnRequest>],
     pub(crate) placement: &'a Placement,
     pub(crate) inbox_registry: &'a InboxRegistry,
     pub(crate) config: &'a RuntimeConfig,
@@ -243,6 +243,10 @@ pub(crate) struct TickContext<'a> {
     pub(crate) stats_hook: Option<&'a dyn crate::stats::StatsHook>,
     /// Thread handles for waking parked workers on cross-worker sends.
     pub(crate) worker_threads: &'a [OnceLock<Thread>],
+    /// Per-worker stats for summing total_actors across workers.
+    pub(crate) worker_stats: &'a [Arc<WorkerStats>],
+    /// Runtime creation time for computing uptime_ms.
+    pub(crate) created_at: crate::Instant,
     #[cfg(feature = "transport")]
     pub(crate) codec_registry: Option<&'a crate::transport::CodecRegistry>,
     #[cfg(feature = "transport")]

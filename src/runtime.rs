@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::thread::Thread;
 use crate::Instant;
 
-use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Message, StopSignal};
+use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Environment, ExitValue, Message, ResumeSignal, SpawnRequest, StopSignal, StopWithSignal, SystemInfo};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::{BackoffPolicy, MailboxOverflow, RuntimeConfig};
@@ -102,7 +102,7 @@ pub struct Runtime {
     inbox_registry: Arc<InboxRegistry>,
     extension: Option<Arc<dyn RuntimeExtension>>,
     transfer_txs: Vec<Sender<Envelope>>,
-    spawn_txs: Vec<Sender<(ActorAddress, Box<dyn AnyActor>)>>,
+    spawn_txs: Vec<Sender<SpawnRequest>>,
     placement: Placement,
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
@@ -170,7 +170,7 @@ impl Runtime {
             transfer_txs.push(transfer_tx);
 
             let spawn_rx =
-                Receiver::<(ActorAddress, Box<dyn AnyActor>)>::new(config.max_actors);
+                Receiver::<SpawnRequest>::new(config.max_actors);
             let spawn_tx = spawn_rx.new_sender();
             spawn_txs.push(spawn_tx);
 
@@ -228,7 +228,26 @@ impl Runtime {
         self.address_map.insert(addr, worker_id);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
         self.spawn_txs[worker_id.as_usize()]
-            .send((addr, boxed));
+            .send(SpawnRequest { addr, actor: boxed, parent: None, env: Environment::new() });
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            actor_addr = %addr,
+            worker_id = worker_id.as_usize(),
+            "actor.spawned"
+        );
+
+        Ok(addr)
+    }
+
+    /// Spawn an actor with a pre-built environment, returns its address.
+    pub fn spawn_with_env<A: ActorInterface>(&self, actor: A, env: Environment) -> Result<ActorAddress, Error> {
+        let addr = ActorAddress::new_random();
+        let worker_id = self.placement.next_worker();
+        self.address_map.insert(addr, worker_id);
+        let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
+        self.spawn_txs[worker_id.as_usize()]
+            .send(SpawnRequest { addr, actor: boxed, parent: None, env });
 
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -309,6 +328,8 @@ impl Runtime {
             extension: self.extension.as_deref(),
             stats_hook: self.stats_hook.as_deref(),
             worker_threads: &self.worker_threads,
+            worker_stats: &self.worker_stats,
+            created_at: self.created_at,
             #[cfg(feature = "transport")]
             codec_registry: self.codec_registry.as_deref(),
             #[cfg(feature = "transport")]
@@ -487,11 +508,11 @@ impl ContextInner for Runtime {
         }
     }
 
-    fn spawn_any(&self, addr: ActorAddress, actor: Box<dyn AnyActor>) {
+    fn spawn_any(&self, request: SpawnRequest) {
         let worker_id = self.placement.next_worker();
-        self.address_map.insert(addr, worker_id);
+        self.address_map.insert(request.addr, worker_id);
         self.spawn_txs[worker_id.as_usize()]
-            .send((addr, actor));
+            .send(request);
         notify_worker(&self.worker_threads, worker_id.as_usize());
     }
 
@@ -504,6 +525,27 @@ impl ContextInner for Runtime {
         }
     }
 
+    fn request_stop_with(&self, addr: ActorAddress, value: ExitValue) {
+        if let Some(wid) = self.address_map.lookup(&addr) {
+            self.transfer_txs[wid.as_usize()]
+                .send(Envelope::new(addr, Box::new(StopWithSignal(value))));
+            notify_worker(&self.worker_threads, wid.as_usize());
+        }
+    }
+
+    fn request_suspend(&self, addr: ActorAddress) {
+        // Outside worker context — not supported (suspend is per-actor, from handler)
+        eprintln!("swactor: request_suspend called outside worker context for {addr} — ignored");
+    }
+
+    fn request_resume(&self, addr: ActorAddress) {
+        if let Some(wid) = self.address_map.lookup(&addr) {
+            self.transfer_txs[wid.as_usize()]
+                .send(Envelope::new(addr, Box::new(ResumeSignal)));
+            notify_worker(&self.worker_threads, wid.as_usize());
+        }
+    }
+
     fn post_worker_request(&self, _request: Box<dyn Any + Send>) {
         // Worker requests (e.g., timers) are per-worker; posting from outside
         // a worker context (e.g., rt.spawn() callback) is not supported.
@@ -512,5 +554,18 @@ impl ContextInner for Runtime {
 
     fn extension(&self) -> Option<&dyn RuntimeExtension> {
         self.extension.as_deref()
+    }
+
+    fn system_info(&self) -> SystemInfo {
+        let num_workers = self.config.num_threads.max(1);
+        let total_actors: usize = self.worker_stats.iter()
+            .map(|ws| ws.num_actors.load(Ordering::Relaxed))
+            .sum();
+        SystemInfo {
+            worker_id: 0,
+            num_workers,
+            total_actors,
+            uptime_ms: self.created_at.elapsed().as_millis() as u64,
+        }
     }
 }
