@@ -216,7 +216,7 @@ impl ActorInterface for MonitorWatcherActor {
     type Incoming = Down;
     type Response = ();
     fn on_start(&mut self, ctx: &Ctx) {
-        self.mref = Some(ctx.monitor(self.watch_target));
+        self.mref = Some(ctx.monitor(self.watch_target).unwrap());
     }
     fn handle(&mut self, ctx: &Ctx, msg: Down) {
         ctx.send(self.reply_to, msg).unwrap();
@@ -233,7 +233,7 @@ impl ActorInterface for DemonitorActor {
     type Incoming = Ping;
     type Response = ();
     fn on_start(&mut self, ctx: &Ctx) {
-        self.mref = Some(ctx.monitor(self.watch_target));
+        self.mref = Some(ctx.monitor(self.watch_target).unwrap());
     }
     fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
         if let Some(mref) = self.mref.take() {
@@ -705,8 +705,8 @@ fn monitor_death_notification_contract() {
         type Incoming = Down;
         type Response = ();
         fn on_start(&mut self, ctx: &Ctx) {
-            ctx.monitor(self.target);
-            ctx.monitor(self.target);
+            ctx.monitor(self.target).unwrap();
+            ctx.monitor(self.target).unwrap();
         }
         fn handle(&mut self, ctx: &Ctx, msg: Down) {
             ctx.send(self.reply_to, msg).unwrap();
@@ -734,7 +734,7 @@ fn monitor_death_notification_contract() {
         type Incoming = Ping;
         type Response = ();
         fn on_start(&mut self, ctx: &Ctx) {
-            ctx.monitor(self.target);
+            ctx.monitor(self.target).unwrap();
         }
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let _ = ctx.send(self.inbox, Count(self.downs.len()));
@@ -768,7 +768,7 @@ fn monitor_death_notification_contract() {
         type Incoming = Down;
         type Response = ();
         fn on_start(&mut self, ctx: &Ctx) {
-            ctx.monitor(self.target);
+            ctx.monitor(self.target).unwrap();
         }
         fn handle(&mut self, ctx: &Ctx, msg: Down) {
             let _ = ctx.send(self.inbox, msg);

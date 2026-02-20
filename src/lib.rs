@@ -2,6 +2,9 @@ pub mod actor;
 pub mod extension;
 pub mod worker;
 
+// Re-export well-known environment key types for convenient access.
+pub use actor::{SpawnTimestamp, LogicalName, ServiceBinding, ExitValue, CapabilitySet};
+
 pub(crate) mod channel;
 pub(crate) mod error;
 pub use error::Error;
