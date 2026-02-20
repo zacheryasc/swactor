@@ -25,3 +25,5 @@ deploy.toml
 
 # Local dev node state
 .dev-node/
+.dev-cluster/
+.sim-cluster/

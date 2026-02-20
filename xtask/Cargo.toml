@@ -9,3 +9,6 @@ toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+iroh-relay = { version = "0.96", features = ["server"] }

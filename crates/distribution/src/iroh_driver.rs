@@ -507,15 +507,31 @@ impl IrohDriver {
             self.connections.remove(&node_id);
         }
 
+        // Resolve relay URL: explicit cache → SWIM metadata gossip → own home relay
+        let relay = self.peer_relay_urls.get(&node_id).cloned()
+            .or_else(|| {
+                self.node
+                    .relay_url(&node_id)
+                    .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
+            })
+            .or_else(|| self.endpoint.addr().relay_urls().next().cloned());
+
         let endpoint = self.endpoint.clone();
-        let conn = if let Some(relay) = self.peer_relay_urls.get(&node_id) {
-            let addr = EndpointAddr::new(key).with_relay_url(relay.clone());
+        let connect_timeout = Duration::from_secs(2);
+        let conn = if let Some(relay) = relay {
+            let addr = EndpointAddr::new(key).with_relay_url(relay);
             self.rt.block_on(async {
-                endpoint.connect(addr, ALPN).await
+                match tokio::time::timeout(connect_timeout, endpoint.connect(addr, ALPN)).await {
+                    Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) }),
+                    Err(_) => Err("connect timeout".into()),
+                }
             })?
         } else {
             self.rt.block_on(async {
-                endpoint.connect(key, ALPN).await
+                match tokio::time::timeout(connect_timeout, endpoint.connect(key, ALPN)).await {
+                    Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) }),
+                    Err(_) => Err("connect timeout".into()),
+                }
             })?
         };
 
