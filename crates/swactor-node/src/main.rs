@@ -789,8 +789,16 @@ fn run_iroh(
         let seed_bytes = parse_node_id_str(&seed_str).expect("invalid seed node ID (expected hex or base58)");
         let seed_key =
             iroh::PublicKey::from_bytes(&seed_bytes).expect("invalid seed public key");
+        let mut seed_addr = iroh::EndpointAddr::from(seed_key);
+        // Include relay URLs so iroh can locate the seed through the relay
+        for host in &relay_hosts {
+            let url_str = format!("http://{host}:{relay_port}/");
+            if let Ok(url) = url_str.parse::<iroh::RelayUrl>() {
+                seed_addr = seed_addr.with_relay_url(url);
+            }
+        }
         eprintln!("Joining cluster via seed {}", base58_encode(&seed_bytes));
-        driver.join(&[iroh::EndpointAddr::from(seed_key)]);
+        driver.join(&[seed_addr]);
     }
 
     // Spawn and register actors

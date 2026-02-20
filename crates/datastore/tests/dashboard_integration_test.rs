@@ -48,6 +48,7 @@ fn dashboard_reflects_datastore_operations() {
         port: dash_port,
         ..Default::default()
     });
+    dash.start_http_standalone();
 
     let collector = dashboard::collector::StatsCollector::new(2);
     let mut rt = Runtime::new(RuntimeConfig {

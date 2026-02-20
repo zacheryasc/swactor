@@ -6949,9 +6949,12 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "iroh-relay",
  "libc",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tokio",
  "toml 0.8.23",
 ]
 

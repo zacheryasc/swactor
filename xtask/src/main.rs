@@ -1,4 +1,5 @@
 mod deploy;
+mod sim_cluster;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -105,6 +106,13 @@ enum Cmd {
     GenPeers {
         /// Identity directories to include
         dirs: Vec<String>,
+    },
+
+    /// Launch a local sim-cluster (relay + N nodes) for development
+    SimCluster {
+        /// Number of nodes (default: 5)
+        #[arg(long, default_value = "5")]
+        nodes: usize,
     },
 
     /// Deploy swactor to remote machines
@@ -285,6 +293,7 @@ TEST GROUPS:
   distribution  Distribution protocol + datastore
   cluster-sims  Deterministic cluster simulations
   integrated    HTTP API + dashboard end-to-end tests
+  sim-cluster   Multi-process cluster with local iroh relay
   essential     core + distribution + integrated (merge gate)
   all           Every test group
 
@@ -317,6 +326,7 @@ fn print_list() {
         println!();
     }
 
+    println!("  {:<14}Multi-process cluster with local iroh relay", "sim-cluster");
     println!("  {:<14}core + distribution + integrated (merge gate)", "essential");
     println!("  {:<14}Every test group", "all");
 }
@@ -336,6 +346,11 @@ fn run_test(group: Option<String>, list: bool) {
             std::process::exit(1);
         }
     };
+
+    if group_name == "sim-cluster" {
+        sim_cluster::run();
+        return;
+    }
 
     let groups = match groups_for(&group_name) {
         Some(g) => g,
@@ -930,6 +945,7 @@ fn main() {
         } => run_cli(url, key, extra, &config.cli),
         Cmd::InitNode { role, dir } => run_init_node(&role, dir.as_deref()),
         Cmd::GenPeers { dirs } => run_gen_peers(&dirs),
+        Cmd::SimCluster { nodes } => sim_cluster::run_interactive(nodes),
         Cmd::Deploy { docker, config, skip_build, skip_verify, skip_peers } => {
             let config = config.unwrap_or_else(|| {
                 if docker { ".deploy/docker.toml" } else { ".deploy/deploy.toml" }.into()
