@@ -9,12 +9,15 @@
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
+use swactor::runtime::Runtime;
 use swactor::transport::NetworkMessage;
 
 use distribution::types::NodeId;
+use swactor_streams::types::StreamId;
 
 use crate::auth::{AccessRequestInfo, AuthorizedKeyInfo, DeniedReason, SignedRequest};
 use crate::types::{ContentHash, ObjectEntry, ObjectManifest};
@@ -276,7 +279,7 @@ pub enum TransferMsg {
 // ─── DatastoreNodeMsg ───────────────────────────────────────────────────────
 
 /// Messages handled by the `DatastoreNode` coordinator actor.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum DatastoreNodeMsg {
     // ── User-facing commands ────────────────────────────────────────────
     /// Store a blob with optional name and tags.
@@ -333,6 +336,64 @@ pub enum DatastoreNodeMsg {
         request: ListObjectsRequest,
         reply_to: ActorAddress,
     },
+
+    // ── Stream-based blob transfer ─────────────────────────────────────
+    /// Download a blob via QUIC stream from a remote node.
+    DownloadViaStream {
+        content_hash: ContentHash,
+        source_node: [u8; 32],
+        reply_to: ActorAddress,
+    },
+    /// Handle an incoming stream offer (from StreamListener).
+    HandleStreamOffer {
+        stream_id: StreamId,
+        content_hash: ContentHash,
+        from_node: [u8; 32],
+        stream_manager: ActorAddress,
+        resume_from_chunk: u64,
+    },
+    /// A stream download completed successfully.
+    StreamDownloadComplete {
+        content_hash: ContentHash,
+        manifest: ObjectManifest,
+        reply_to: ActorAddress,
+    },
+    /// A stream download failed.
+    StreamDownloadFailed {
+        content_hash: ContentHash,
+        reason: String,
+        chunks_completed: u64,
+        reply_to: ActorAddress,
+    },
+    /// Configure stream support (StreamManager address + tokio handle).
+    ConfigureStreams {
+        stream_manager: ActorAddress,
+        tokio_handle: tokio::runtime::Handle,
+        runtime: Arc<Runtime>,
+    },
+}
+
+impl std::fmt::Debug for DatastoreNodeMsg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Put { name, .. } => f.debug_struct("Put").field("name", name).finish_non_exhaustive(),
+            Self::Get { content_hash, .. } => f.debug_struct("Get").field("content_hash", content_hash).finish_non_exhaustive(),
+            Self::Delete { content_hash, .. } => f.debug_struct("Delete").field("content_hash", content_hash).finish_non_exhaustive(),
+            Self::List { name_filter, all, .. } => f.debug_struct("List").field("name_filter", name_filter).field("all", all).finish_non_exhaustive(),
+            Self::Status { .. } => write!(f, "Status"),
+            Self::ReadChunk { hash, .. } => f.debug_struct("ReadChunk").field("hash", hash).finish_non_exhaustive(),
+            Self::IncomingGetChunk { .. } => write!(f, "IncomingGetChunk"),
+            Self::IncomingGetManifest { .. } => write!(f, "IncomingGetManifest"),
+            Self::IncomingStoreObject { .. } => write!(f, "IncomingStoreObject"),
+            Self::IncomingFindObject { .. } => write!(f, "IncomingFindObject"),
+            Self::IncomingListObjects { .. } => write!(f, "IncomingListObjects"),
+            Self::DownloadViaStream { content_hash, .. } => f.debug_struct("DownloadViaStream").field("content_hash", content_hash).finish_non_exhaustive(),
+            Self::HandleStreamOffer { stream_id, content_hash, resume_from_chunk, .. } => f.debug_struct("HandleStreamOffer").field("stream_id", stream_id).field("content_hash", content_hash).field("resume_from_chunk", resume_from_chunk).finish_non_exhaustive(),
+            Self::StreamDownloadComplete { content_hash, .. } => f.debug_struct("StreamDownloadComplete").field("content_hash", content_hash).finish_non_exhaustive(),
+            Self::StreamDownloadFailed { content_hash, reason, chunks_completed, .. } => f.debug_struct("StreamDownloadFailed").field("content_hash", content_hash).field("reason", reason).field("chunks_completed", chunks_completed).finish_non_exhaustive(),
+            Self::ConfigureStreams { stream_manager, .. } => f.debug_struct("ConfigureStreams").field("stream_manager", stream_manager).finish_non_exhaustive(),
+        }
+    }
 }
 
 // ─── DatastoreResponse ──────────────────────────────────────────────────────

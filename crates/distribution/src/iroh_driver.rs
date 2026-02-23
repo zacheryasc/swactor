@@ -40,6 +40,8 @@ pub struct IrohDriverConfig {
     pub node: DistributedNodeConfig,
     /// Optional peer allow-list. If provided, only allowed peers can connect.
     pub peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
+    /// Additional ALPNs to register beyond SWIM. Opaque to the driver.
+    pub additional_alpns: Vec<Vec<u8>>,
     /// If set, start an embedded relay server on this address.
     /// Requires the `relay` feature. On success, the driver uses the embedded
     /// relay for `RelayMode::Custom`; on failure, falls back to `relay_mode`.
@@ -74,8 +76,10 @@ pub struct IrohDriver {
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     /// Collects connections from background join tasks.
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
-    /// Connections accepted by the background accept loop.
+    /// Connections accepted by the background accept loop (SWIM ALPN).
     accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
+    /// Connections accepted on non-SWIM ALPNs (streams, etc.).
+    other_accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
     /// Relay URLs learned from join seeds, used for reconnection.
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
     /// Embedded relay server (if started).
@@ -122,8 +126,10 @@ impl IrohDriver {
         let (relay_url, effective_relay_mode) = (None::<String>, config.relay_mode);
 
         let endpoint = rt.block_on(async {
+            let mut alpns = vec![ALPN.to_vec()];
+            alpns.extend(config.additional_alpns.iter().cloned());
             let mut builder = Endpoint::empty_builder(effective_relay_mode)
-                .alpns(vec![ALPN.to_vec()]);
+                .alpns(alpns);
 
             if let Some(key) = config.secret_key {
                 builder = builder.secret_key(key);
@@ -141,10 +147,13 @@ impl IrohDriver {
         // Spawn background accept loop so incoming connections are never missed
         let accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>> =
             Arc::new(Mutex::new(Vec::new()));
+        let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>> =
+            Arc::new(Mutex::new(Vec::new()));
         {
             let ep = endpoint.clone();
             let peer_auth = config.peer_auth.clone();
-            let buf = Arc::clone(&accepted_conns);
+            let swim_buf = Arc::clone(&accepted_conns);
+            let other_buf = Arc::clone(&other_accepted_conns);
             rt.spawn(async move {
                 loop {
                     match ep.accept().await {
@@ -165,11 +174,22 @@ impl IrohDriver {
                                     conn.close(0u32.into(), b"unauthorized");
                                     continue;
                                 }
-                                eprintln!(
-                                    "iroh driver: accepted connection from {}",
-                                    crate::identity::hex_encode(&node_id.0[..4])
-                                );
-                                buf.lock().unwrap().push((node_id, conn));
+                                // Route by negotiated ALPN
+                                let negotiated_alpn = conn.alpn();
+                                if negotiated_alpn == ALPN {
+                                    eprintln!(
+                                        "iroh driver: accepted SWIM connection from {}",
+                                        crate::identity::hex_encode(&node_id.0[..4])
+                                    );
+                                    swim_buf.lock().unwrap().push((node_id, conn));
+                                } else {
+                                    eprintln!(
+                                        "iroh driver: accepted non-SWIM connection from {} (ALPN: {})",
+                                        crate::identity::hex_encode(&node_id.0[..4]),
+                                        String::from_utf8_lossy(&negotiated_alpn),
+                                    );
+                                    other_buf.lock().unwrap().push((node_id, conn));
+                                }
                             }
                             Err(e) => {
                                 eprintln!("iroh driver: incoming connection error: {e}");
@@ -189,6 +209,7 @@ impl IrohDriver {
             peer_auth: config.peer_auth,
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             accepted_conns,
+            other_accepted_conns,
             peer_relay_urls: HashMap::new(),
             #[cfg(feature = "relay")]
             relay_server,
@@ -199,6 +220,16 @@ impl IrohDriver {
     /// Get a handle to the tokio runtime owned by this driver.
     pub fn tokio_handle(&self) -> tokio::runtime::Handle {
         self.rt.handle().clone()
+    }
+
+    /// Get a reference to the iroh endpoint (for creating outbound connections).
+    pub fn endpoint(&self) -> &Endpoint {
+        &self.endpoint
+    }
+
+    /// Drain connections accepted on non-SWIM ALPNs.
+    pub fn drain_other_connections(&self) -> Vec<(NodeId, Connection)> {
+        self.other_accepted_conns.lock().unwrap().drain(..).collect()
     }
 
     /// The node's identity.

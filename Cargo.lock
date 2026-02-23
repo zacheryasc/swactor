@@ -5693,14 +5693,17 @@ dependencies = [
  "dashboard",
  "distribution",
  "getrandom 0.2.17",
+ "iroh",
  "proptest",
  "serde",
  "serde_json",
  "shared-types",
  "swactor",
  "swactor-std",
+ "swactor-streams",
  "tempfile",
  "tiny_http",
+ "tokio",
  "ureq",
 ]
 
@@ -5718,6 +5721,7 @@ dependencies = [
  "swactor",
  "swactor-datastore",
  "swactor-std",
+ "swactor-streams",
  "toml 0.8.23",
 ]
 
@@ -5742,6 +5746,23 @@ version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
  "swactor",
+]
+
+[[package]]
+name = "swactor-streams"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "crossbeam-queue",
+ "distribution",
+ "getrandom 0.2.17",
+ "iroh",
+ "proptest",
+ "serde",
+ "shared-types",
+ "swactor",
+ "swactor-std",
+ "tokio",
 ]
 
 [[package]]

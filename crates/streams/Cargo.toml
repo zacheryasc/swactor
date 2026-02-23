@@ -1,0 +1,20 @@
+[package]
+name = "swactor-streams"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+swactor = { path = "../..", features = ["serde"] }
+swactor-std = { path = "../std" }
+shared-types = { path = "../shared-types" }
+distribution = { path = "../distribution" }
+crossbeam-queue = "0.3.12"
+tokio = { version = "1", features = ["sync", "io-util"] }
+iroh = { version = "0.96" }
+blake3 = "1"
+serde = { version = "1", features = ["derive"] }
+getrandom = "0.2"
+
+[dev-dependencies]
+proptest = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util", "io-util"] }

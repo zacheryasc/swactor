@@ -12,6 +12,7 @@ members = [
     "crates/datastore",
     "crates/shared-types",
     "crates/swactor-node",
+    "crates/streams",
     "tests/docker",
     "crates/ci",
     "xtask",
