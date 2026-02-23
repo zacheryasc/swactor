@@ -55,6 +55,14 @@ pub(crate) struct Sender<T> {
     queue: Arc<HybridChannel<T>>,
 }
 
+impl<T> Clone for Sender<T> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+        }
+    }
+}
+
 impl<T> Sender<T> {
     pub fn send(&self, value: T) {
         self.queue.push(value)

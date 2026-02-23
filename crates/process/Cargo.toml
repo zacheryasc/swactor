@@ -1,0 +1,21 @@
+[package]
+name = "swactor-process"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+ssh = ["dep:russh", "dep:russh-keys", "dep:tokio", "dep:async-trait"]
+
+[dependencies]
+swactor = { path = "../..", default-features = false, features = ["no_random"] }
+crossbeam-queue = "0.3.12"
+libc = "0.2"
+russh = { version = "0.46", optional = true }
+russh-keys = { version = "0.46", optional = true }
+tokio = { version = "1", features = ["rt", "time", "sync"], optional = true }
+async-trait = { version = "0.1", optional = true }
+
+[dev-dependencies]
+proptest = "1"
+proptest-state-machine = "0.3"

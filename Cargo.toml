@@ -8,6 +8,7 @@ members = [
     "crates/dashboard",
     "crates/distribution",
     "crates/std",
+    "crates/process",
     "crates/datastore",
     "crates/shared-types",
     "crates/swactor-node",
