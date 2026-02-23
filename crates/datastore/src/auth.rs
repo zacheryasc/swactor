@@ -278,6 +278,9 @@ impl AuthzEngine {
         if *requester != self.acl.owner {
             return Err(DeniedReason::NotAuthorized);
         }
+        if key == self.acl.owner {
+            return Ok(()); // Owner has implicit access — no-op
+        }
         self.acl.authorized_keys.insert(key);
         if let Some(name) = label {
             let hex: String = key.0.iter().map(|b| format!("{b:02x}")).collect();
