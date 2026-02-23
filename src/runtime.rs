@@ -110,7 +110,7 @@ pub struct Runtime {
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
     /// Thread handles for waking parked workers. Set by workers on startup via OnceLock.
-    worker_threads: Vec<OnceLock<Thread>>,
+    worker_threads: Arc<Vec<OnceLock<Thread>>>,
     created_at: Instant,
     #[cfg(feature = "transport")]
     codec_registry: Option<Arc<crate::transport::CodecRegistry>>,
@@ -143,6 +143,50 @@ impl RuntimeAddress {
         let mut bytes = [0u8; 32];
         crate::get_random(&mut bytes);
         Self(bytes)
+    }
+}
+
+/// A cloneable, `Send + Sync` handle for injecting messages into actor mailboxes
+/// from any thread — including non-actor I/O threads.
+///
+/// Created via [`Runtime::create_sender`]. The primary use case is bridging
+/// background I/O (e.g., pipe readers, network listeners) with the tick-based
+/// actor system.
+pub struct ExternalSender {
+    address_map: Arc<AddressMap>,
+    transfer_txs: Vec<Sender<Envelope>>,
+    worker_threads: Arc<Vec<OnceLock<Thread>>>,
+}
+
+impl Clone for ExternalSender {
+    fn clone(&self) -> Self {
+        Self {
+            address_map: self.address_map.clone(),
+            transfer_txs: self.transfer_txs.clone(),
+            worker_threads: self.worker_threads.clone(),
+        }
+    }
+}
+
+// Safety: All fields are Send+Sync (Arc<AddressMap> uses RwLock,
+// Sender<Envelope> wraps Arc<HybridChannel>, Thread is Send+Sync).
+unsafe impl Send for ExternalSender {}
+unsafe impl Sync for ExternalSender {}
+
+impl ExternalSender {
+    /// Send a typed message to an actor address, waking the owning worker thread.
+    ///
+    /// Returns `Err` if the address is not found in the runtime's address map.
+    pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
+        match self.address_map.lookup(&addr) {
+            Some(wid) => {
+                self.transfer_txs[wid.as_usize()]
+                    .send(Envelope::new(addr, Box::new(msg)));
+                notify_worker(&self.worker_threads, wid.as_usize());
+                Ok(())
+            }
+            None => Err(Error::from("Address not found")),
+        }
     }
 }
 
@@ -188,8 +232,8 @@ impl Runtime {
 
         let placement = Placement::new(num_workers, worker_stats.clone());
 
-        let worker_threads: Vec<OnceLock<Thread>> =
-            (0..num_workers).map(|_| OnceLock::new()).collect();
+        let worker_threads: Arc<Vec<OnceLock<Thread>>> =
+            Arc::new((0..num_workers).map(|_| OnceLock::new()).collect());
 
         let rt = Self {
             config,
@@ -317,6 +361,18 @@ impl Runtime {
         })
     }
 
+    /// Create an [`ExternalSender`] handle for injecting messages from any thread.
+    ///
+    /// The returned handle is `Clone + Send + Sync` and can be moved into
+    /// background I/O threads to bridge external events into the actor system.
+    pub fn create_sender(&self) -> ExternalSender {
+        ExternalSender {
+            address_map: self.address_map.clone(),
+            transfer_txs: self.transfer_txs.iter().map(|tx| tx.clone()).collect(),
+            worker_threads: self.worker_threads.clone(),
+        }
+    }
+
     fn make_tick_context(&self) -> TickContext<'_> {
         TickContext {
             address_map: &self.address_map,
@@ -438,7 +494,7 @@ impl Runtime {
 
         self.is_running.store(false, Ordering::Release);
         // Wake all parked workers so they see the shutdown flag immediately
-        for thread in &self.worker_threads {
+        for thread in self.worker_threads.iter() {
             if let Some(t) = thread.get() {
                 t.unpark();
             }
