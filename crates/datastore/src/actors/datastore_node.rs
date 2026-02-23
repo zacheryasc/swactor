@@ -5,17 +5,27 @@
 //! Delete, List, Status) and receive responses. Also routes incoming network
 //! protocol messages to the appropriate internal actors.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
+use swactor::runtime::Runtime;
 
 use distribution::types::NodeId;
 
+use crate::actors::stream_downloader::StreamDownloader;
+use crate::actors::stream_server::StreamServer;
 use crate::chunking::chunk_blob;
 use crate::messages::{
     BlobStoreMsg, DatastoreNodeMsg, DatastoreResponse, MetadataMsg,
 };
-use crate::types::{ContentHash, DatastoreConfig, ObjectEntry};
+use crate::types::{ContentHash, DatastoreConfig, ObjectEntry, ObjectManifest};
+
+/// Progress from a partially-completed stream download, used for resume.
+struct PartialDownload {
+    _source_node: [u8; 32],
+    chunks_completed: u64,
+}
 
 /// Top-level coordinator actor for the datastore.
 ///
@@ -26,6 +36,12 @@ pub struct DatastoreNode {
     blob_store: ActorAddress,
     metadata: ActorAddress,
     config: DatastoreConfig,
+    // Stream support (configured lazily via ConfigureStreams)
+    runtime: Option<Arc<Runtime>>,
+    tokio_handle: Option<tokio::runtime::Handle>,
+    stream_manager: Option<ActorAddress>,
+    // Resume state for interrupted stream downloads
+    partial_downloads: HashMap<ContentHash, PartialDownload>,
 }
 
 impl DatastoreNode {
@@ -40,6 +56,10 @@ impl DatastoreNode {
             blob_store,
             metadata,
             config,
+            runtime: None,
+            tokio_handle: None,
+            stream_manager: None,
+            partial_downloads: HashMap::new(),
         }
     }
 
@@ -231,6 +251,138 @@ impl DatastoreNode {
             },
         );
     }
+
+    // ── Stream-based transfer handlers ───────────────────────────────────
+
+    fn handle_configure_streams(
+        &mut self,
+        stream_manager: ActorAddress,
+        tokio_handle: tokio::runtime::Handle,
+        runtime: Arc<Runtime>,
+    ) {
+        self.stream_manager = Some(stream_manager);
+        self.tokio_handle = Some(tokio_handle);
+        self.runtime = Some(runtime);
+    }
+
+    fn handle_download_via_stream(
+        &self,
+        ctx: &Ctx,
+        content_hash: ContentHash,
+        source_node: [u8; 32],
+        reply_to: ActorAddress,
+    ) {
+        let (stream_manager, tokio_handle, runtime) =
+            match (&self.stream_manager, &self.tokio_handle, &self.runtime) {
+                (Some(sm), Some(th), Some(rt)) => (*sm, th.clone(), Arc::clone(rt)),
+                _ => {
+                    let _ = ctx.send(
+                        reply_to,
+                        DatastoreResponse::TransferFailed {
+                            reason: "stream support not configured".into(),
+                        },
+                    );
+                    return;
+                }
+            };
+
+        // Check for partial progress from a previous attempt
+        let skip_chunks = self
+            .partial_downloads
+            .get(&content_hash)
+            .map(|p| p.chunks_completed)
+            .unwrap_or(0);
+
+        let downloader = StreamDownloader::new(
+            content_hash,
+            source_node,
+            ctx.self_addr(),
+            self.blob_store,
+            reply_to,
+            stream_manager,
+            tokio_handle,
+            runtime,
+            skip_chunks,
+        );
+        let _ = ctx.spawn(downloader);
+    }
+
+    fn handle_stream_offer(
+        &self,
+        ctx: &Ctx,
+        stream_id: swactor_streams::types::StreamId,
+        content_hash: ContentHash,
+        _from_node: [u8; 32],
+        stream_manager: ActorAddress,
+        resume_from_chunk: u64,
+    ) {
+        let (tokio_handle, runtime) = match (&self.tokio_handle, &self.runtime) {
+            (Some(th), Some(rt)) => (th.clone(), Arc::clone(rt)),
+            _ => return,
+        };
+
+        let server = StreamServer::new(
+            stream_id,
+            content_hash,
+            self.blob_store,
+            stream_manager,
+            tokio_handle,
+            runtime,
+            resume_from_chunk,
+        );
+        let _ = ctx.spawn(server);
+    }
+
+    fn handle_stream_download_complete(
+        &mut self,
+        ctx: &Ctx,
+        content_hash: ContentHash,
+        manifest: ObjectManifest,
+        reply_to: ActorAddress,
+    ) {
+        // Clear any partial progress now that download is complete
+        self.partial_downloads.remove(&content_hash);
+
+        let entry = ObjectEntry {
+            content_hash,
+            name: None,
+            node_id: self.node_id,
+            tags: BTreeMap::new(),
+            size_bytes: manifest.total_size,
+            created_at: 0,
+        };
+
+        let _ = ctx.send(
+            self.metadata,
+            MetadataMsg::PutObject {
+                entry,
+                manifest,
+                reply_to,
+            },
+        );
+    }
+
+    fn handle_stream_download_failed(
+        &mut self,
+        ctx: &Ctx,
+        content_hash: ContentHash,
+        reason: String,
+        chunks_completed: u64,
+        source_node: [u8; 32],
+        reply_to: ActorAddress,
+    ) {
+        // Store partial progress so next attempt can resume
+        if chunks_completed > 0 {
+            self.partial_downloads.insert(
+                content_hash,
+                PartialDownload {
+                    _source_node: source_node,
+                    chunks_completed,
+                },
+            );
+        }
+        let _ = ctx.send(reply_to, DatastoreResponse::TransferFailed { reason });
+    }
 }
 
 impl ActorInterface for DatastoreNode {
@@ -277,6 +429,34 @@ impl ActorInterface for DatastoreNode {
             DatastoreNodeMsg::IncomingListObjects { request, reply_to } => {
                 self.handle_incoming_list_objects(ctx, request, reply_to)
             }
+            DatastoreNodeMsg::DownloadViaStream {
+                content_hash,
+                source_node,
+                reply_to,
+            } => self.handle_download_via_stream(ctx, content_hash, source_node, reply_to),
+            DatastoreNodeMsg::HandleStreamOffer {
+                stream_id,
+                content_hash,
+                from_node,
+                stream_manager,
+                resume_from_chunk,
+            } => self.handle_stream_offer(ctx, stream_id, content_hash, from_node, stream_manager, resume_from_chunk),
+            DatastoreNodeMsg::StreamDownloadComplete {
+                content_hash,
+                manifest,
+                reply_to,
+            } => self.handle_stream_download_complete(ctx, content_hash, manifest, reply_to),
+            DatastoreNodeMsg::StreamDownloadFailed {
+                content_hash,
+                reason,
+                chunks_completed,
+                reply_to,
+            } => self.handle_stream_download_failed(ctx, content_hash, reason, chunks_completed, [0; 32], reply_to),
+            DatastoreNodeMsg::ConfigureStreams {
+                stream_manager,
+                tokio_handle,
+                runtime,
+            } => self.handle_configure_streams(stream_manager, tokio_handle, runtime),
         }
     }
 }

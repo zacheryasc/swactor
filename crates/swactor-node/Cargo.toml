@@ -9,6 +9,7 @@ swactor-std = { path = "../std" }
 dashboard = { path = "../dashboard", features = ["distribution"] }
 swactor-datastore = { path = "../datastore" }
 distribution = { path = "../distribution" }
+swactor-streams = { path = "../streams" }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 iroh = { version = "0.96", optional = true }

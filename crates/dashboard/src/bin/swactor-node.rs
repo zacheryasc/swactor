@@ -221,6 +221,7 @@ fn run_iroh(
         relay_mode: RelayMode::Default,
         node: node_config,
         peer_auth: None,
+        additional_alpns: vec![],
     };
     let mut driver = IrohDriver::new(iroh_config).expect("failed to create iroh driver");
 

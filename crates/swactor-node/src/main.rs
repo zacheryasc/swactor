@@ -713,6 +713,7 @@ fn run_iroh(
 ) {
     use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
     use iroh::{RelayMode, SecretKey};
+    use swactor_std::RuntimeNaming;
 
     // Evaluate relay candidacy and determine embedded relay bind address
     #[cfg(feature = "relay")]
@@ -775,12 +776,33 @@ fn run_iroh(
         relay_mode,
         node: node_config,
         peer_auth: Some(peer_auth.clone()),
+        additional_alpns: vec![swactor_streams::ALPN.to_vec()],
         #[cfg(feature = "relay")]
         embedded_relay_bind,
         #[cfg(feature = "relay")]
         relay_public_ip,
     };
     let mut driver = IrohDriver::new(iroh_config).expect("failed to create iroh driver");
+
+    // Spawn StreamManager actor
+    let stream_mgr = swactor_streams::StreamManager::new(
+        driver.endpoint().clone(),
+        driver.tokio_handle(),
+        Arc::clone(&handle.runtime),
+    );
+    let stream_mgr_addr = handle
+        .runtime
+        .spawn(stream_mgr)
+        .expect("spawn StreamManager");
+    handle
+        .runtime
+        .register_name(swactor_streams::STREAM_MANAGER_NAME, stream_mgr_addr)
+        .expect("register StreamManager");
+
+    // Wire streams into the datastore
+    if let Some(group) = ds_group {
+        group.configure_streams(stream_mgr_addr, driver.tokio_handle());
+    }
 
     eprintln!("Node {} started (iroh)", hex(&driver.node_id().0[..4]));
 
@@ -834,6 +856,25 @@ fn run_iroh(
 
         driver.recv();
         driver.tick();
+
+        // Forward incoming stream connections to StreamManager
+        for (node_id, conn) in driver.drain_other_connections() {
+            let rt_clone = Arc::clone(&handle.runtime);
+            let mgr_addr = stream_mgr_addr;
+            let node_bytes = node_id.0;
+            driver.tokio_handle().spawn(async move {
+                match swactor_streams::accept::handle_incoming(
+                    node_bytes, conn, &rt_clone, mgr_addr,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        eprintln!("stream accept: failed to handle incoming: {e}");
+                    }
+                }
+            });
+        }
 
         // Drain discovered peers (dashboard "Add Peer") and auto-join them
         {

@@ -8,6 +8,7 @@ pub mod cli;
 pub mod metrics;
 pub mod api;
 pub mod ui_html;
+pub mod blob_transfer;
 pub mod bridge;
 
 pub use types::{ChunkRef, ContentHash, DatastoreConfig, ObjectEntry, ObjectManifest};

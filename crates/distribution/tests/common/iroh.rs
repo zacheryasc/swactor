@@ -22,6 +22,7 @@ pub fn make_driver() -> IrohDriver {
         relay_mode: RelayMode::Disabled,
         node: test_config(),
         peer_auth: None,
+        additional_alpns: vec![],
         #[cfg(feature = "relay")]
         embedded_relay_bind: None,
         #[cfg(feature = "relay")]
@@ -36,6 +37,7 @@ pub fn make_driver_with_auth(auth: Arc<Mutex<PeerAllowList>>) -> IrohDriver {
         relay_mode: RelayMode::Disabled,
         node: test_config(),
         peer_auth: Some(auth),
+        additional_alpns: vec![],
         #[cfg(feature = "relay")]
         embedded_relay_bind: None,
         #[cfg(feature = "relay")]
@@ -50,6 +52,7 @@ pub fn make_driver_with_relay(relay_url: iroh::RelayUrl) -> IrohDriver {
         relay_mode: RelayMode::Custom(relay_url.into()),
         node: test_config(),
         peer_auth: None,
+        additional_alpns: vec![],
         #[cfg(feature = "relay")]
         embedded_relay_bind: None,
         #[cfg(feature = "relay")]

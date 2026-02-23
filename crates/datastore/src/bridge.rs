@@ -381,6 +381,7 @@ pub struct DatastoreAuthConfig {
 /// Owns the full lifecycle of a datastore actor group: BlobStore, Metadata,
 /// DatastoreNode, and optional GatewayActor.
 pub struct DatastoreGroup {
+    datastore_addr: ActorAddress,
     metadata_addr: ActorAddress,
     gateway_addr: Option<ActorAddress>,
     bridge: Arc<dyn DatastoreStatsProvider>,
@@ -472,6 +473,7 @@ impl DatastoreGroup {
         }
 
         Ok(Self {
+            datastore_addr,
             metadata_addr,
             gateway_addr,
             bridge,
@@ -499,6 +501,30 @@ impl DatastoreGroup {
     /// Access the bridge (as a trait object for the dashboard).
     pub fn bridge(&self) -> &Arc<dyn DatastoreStatsProvider> {
         &self.bridge
+    }
+
+    /// Configure stream support: sends ConfigureStreams to DatastoreNode and
+    /// spawns a StreamListener actor.
+    pub fn configure_streams(
+        &self,
+        stream_manager: ActorAddress,
+        tokio_handle: tokio::runtime::Handle,
+    ) {
+        let _ = self.runtime.send_to(
+            self.datastore_addr,
+            DatastoreNodeMsg::ConfigureStreams {
+                stream_manager,
+                tokio_handle,
+                runtime: Arc::clone(&self.runtime),
+            },
+        );
+
+        // Spawn StreamListener
+        use crate::actors::stream_listener::StreamListener;
+        use swactor_std::RuntimeNaming;
+        if let Ok(addr) = self.runtime.spawn(StreamListener::new(self.datastore_addr, stream_manager)) {
+            let _ = self.runtime.register_name("StreamListener", addr);
+        }
     }
 }
 
