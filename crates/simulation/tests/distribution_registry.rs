@@ -1,3 +1,4 @@
+#![cfg(feature = "distribution")]
 //! Registry simulation tests — cluster registry CRDT behavior under gossip.
 //!
 //! Tests that registry names propagate, converge, and resolve correctly

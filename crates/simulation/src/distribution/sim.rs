@@ -1,44 +1,14 @@
-use std::collections::{HashMap, HashSet};
-
 use distribution::node::{DistributedNode, DistributedNodeConfig, ResolveResult};
 use distribution::swim::node::NodeAction;
 use distribution::swim::probe::SwimConfig;
 use distribution::types::NodeId;
 use swactor::actor::ActorAddress;
 
+use crate::runner::NetworkState;
+pub use crate::runner::{NetworkFault, NetworkTopology, NodeLocation, Partition};
 use crate::trace::{Event, SimulationTrace};
 
 use super::trace::{DistributionEventKind, DistributionSnapshot};
-
-/// Network location of a simulated node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NodeLocation {
-    /// Publicly reachable (e.g. cloud VPS). Can receive inbound from anyone.
-    Public,
-    /// Behind NAT. Can only receive inbound from same LAN group or via relay.
-    Nat { group: String },
-    /// Completely firewalled — no inbound or outbound.
-    Firewalled,
-}
-
-/// Network topology describing NAT/firewall/relay placement.
-#[derive(Debug, Clone)]
-pub struct NetworkTopology {
-    /// Per-node location (indexed by node_idx). Length must equal num_nodes.
-    pub locations: Vec<NodeLocation>,
-    /// Node indices that act as relay forwarders for cross-NAT traffic.
-    pub relay_nodes: Vec<usize>,
-}
-
-/// A network partition between two sets of nodes.
-/// Nodes in `side_a` cannot communicate with nodes in `side_b`.
-#[derive(Debug, Clone)]
-pub struct Partition {
-    pub side_a: Vec<usize>,
-    pub side_b: Vec<usize>,
-    /// If true, A→B is blocked but B→A works (asymmetric).
-    pub asymmetric: bool,
-}
 
 /// An action to execute at a specific round during the simulation.
 #[derive(Debug, Clone)]
@@ -55,21 +25,6 @@ pub enum SimAction {
     Join { node_idx: usize, seed_idx: usize },
     /// Bidirectional introduction (models POST /api/peers/add from deploy script).
     Introduce { node_a: usize, node_b: usize },
-}
-
-/// Schedule entry for network faults.
-#[derive(Debug, Clone)]
-pub enum NetworkFault {
-    /// Introduce a partition at the given round.
-    Partition { round: usize, partition: Partition },
-    /// Heal a partition at the given round (restores full connectivity).
-    Heal { round: usize },
-    /// Set message drop rate (0.0 = no drops, 1.0 = drop all).
-    SetDropRate { round: usize, rate: f64 },
-    /// Per-link drop rate. rate=0.0 clears the fault.
-    LinkFault { round: usize, from: usize, to: usize, rate: f64, bidirectional: bool },
-    /// Relay penalty — extra drop probability for relay-routed messages.
-    SetRelayPenalty { round: usize, rate: f64 },
 }
 
 /// Configuration for a distribution simulation run.
@@ -127,185 +82,6 @@ impl Default for DistributionSimConfig {
             topology: None,
             deferred_join: Vec::new(),
         }
-    }
-}
-
-/// Tracks active network state during simulation.
-struct NetworkState {
-    /// Set of (from_idx, to_idx) pairs where messages are blocked.
-    blocked: HashSet<(usize, usize)>,
-    /// Probability of dropping a message [0.0, 1.0].
-    drop_rate: f64,
-    /// Simple counter-based deterministic "random" for drop decisions.
-    drop_counter: u64,
-    /// Optional NAT/firewall topology.
-    topology: Option<NetworkTopology>,
-    /// Per-node alive status (indexed by node_idx).
-    alive: Vec<bool>,
-    /// Per-link drop rates (from, to) -> rate.
-    link_drop_rates: HashMap<(usize, usize), f64>,
-    /// Extra drop probability for relay-routed messages.
-    relay_penalty: f64,
-}
-
-impl NetworkState {
-    fn new() -> Self {
-        Self {
-            blocked: HashSet::new(),
-            drop_rate: 0.0,
-            drop_counter: 0x853c49e6748fea9b,
-            topology: None,
-            alive: Vec::new(),
-            link_drop_rates: HashMap::new(),
-            relay_penalty: 0.0,
-        }
-    }
-
-    fn new_with_topology(topology: Option<NetworkTopology>, num_nodes: usize) -> Self {
-        Self {
-            blocked: HashSet::new(),
-            drop_rate: 0.0,
-            drop_counter: 0x853c49e6748fea9b,
-            topology,
-            alive: vec![true; num_nodes],
-            link_drop_rates: HashMap::new(),
-            relay_penalty: 0.0,
-        }
-    }
-
-    fn set_alive(&mut self, idx: usize, alive: bool) {
-        if idx < self.alive.len() {
-            self.alive[idx] = alive;
-        }
-    }
-
-    fn apply_fault(&mut self, fault: &NetworkFault, num_nodes: usize) {
-        match fault {
-            NetworkFault::Partition { partition, .. } => {
-                for &a in &partition.side_a {
-                    for &b in &partition.side_b {
-                        if a < num_nodes && b < num_nodes {
-                            self.blocked.insert((a, b));
-                            if !partition.asymmetric {
-                                self.blocked.insert((b, a));
-                            }
-                        }
-                    }
-                }
-            }
-            NetworkFault::Heal { .. } => {
-                self.blocked.clear();
-            }
-            NetworkFault::SetDropRate { rate, .. } => {
-                self.drop_rate = rate.clamp(0.0, 1.0);
-            }
-            NetworkFault::LinkFault { from, to, rate, bidirectional, .. } => {
-                let rate = rate.clamp(0.0, 1.0);
-                if rate == 0.0 {
-                    self.link_drop_rates.remove(&(*from, *to));
-                    if *bidirectional {
-                        self.link_drop_rates.remove(&(*to, *from));
-                    }
-                } else {
-                    self.link_drop_rates.insert((*from, *to), rate);
-                    if *bidirectional {
-                        self.link_drop_rates.insert((*to, *from), rate);
-                    }
-                }
-            }
-            NetworkFault::SetRelayPenalty { rate, .. } => {
-                self.relay_penalty = rate.clamp(0.0, 1.0);
-            }
-        }
-    }
-
-    /// Check if `from` can directly initiate a connection to `to`.
-    fn directly_reachable(&self, from: usize, to: usize) -> bool {
-        let topo = match &self.topology {
-            Some(t) => t,
-            None => return true, // No topology = full connectivity
-        };
-        if from >= topo.locations.len() || to >= topo.locations.len() {
-            return true;
-        }
-        match (&topo.locations[from], &topo.locations[to]) {
-            (_, NodeLocation::Firewalled) => false,
-            (NodeLocation::Firewalled, _) => false,
-            (_, NodeLocation::Public) => true,    // Anyone can reach public
-            (NodeLocation::Public, NodeLocation::Nat { .. }) => false, // Can't initiate inbound to NAT
-            (NodeLocation::Nat { group: g1 }, NodeLocation::Nat { group: g2 }) => g1 == g2, // Same LAN
-        }
-    }
-
-    /// Check if two nodes can communicate (bidirectional once established).
-    /// Either direct reachability in either direction, or via a relay.
-    fn can_reach(&self, from: usize, to: usize) -> bool {
-        let topo = match &self.topology {
-            Some(t) => t,
-            None => return true,
-        };
-        // Direct: if either side can initiate, the connection is bidirectional
-        if self.directly_reachable(from, to) || self.directly_reachable(to, from) {
-            return true;
-        }
-        // Relay path: any alive relay R where both endpoints can bidirectionally reach R
-        for &r in &topo.relay_nodes {
-            if r == from || r == to {
-                continue;
-            }
-            if !self.alive.get(r).copied().unwrap_or(false) {
-                continue;
-            }
-            let from_reaches_r = self.directly_reachable(from, r) || self.directly_reachable(r, from);
-            let to_reaches_r = self.directly_reachable(to, r) || self.directly_reachable(r, to);
-            if from_reaches_r && to_reaches_r {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Returns true when neither direction is directly reachable but a relay path exists.
-    fn requires_relay(&self, from: usize, to: usize) -> bool {
-        if self.topology.is_none() {
-            return false;
-        }
-        if self.directly_reachable(from, to) || self.directly_reachable(to, from) {
-            return false;
-        }
-        self.can_reach(from, to)
-    }
-
-    /// Returns true if this message should be delivered.
-    fn should_deliver(&mut self, from_idx: usize, to_idx: usize) -> bool {
-        // 1. Check partition blocks
-        if self.blocked.contains(&(from_idx, to_idx)) {
-            return false;
-        }
-        // 2. Check NAT reachability (only if topology is set)
-        if self.topology.is_some() && !self.can_reach(from_idx, to_idx) {
-            return false;
-        }
-        // 3. Determine effective drop rate: per-link if set, else global
-        let base_rate = self.link_drop_rates
-            .get(&(from_idx, to_idx))
-            .copied()
-            .unwrap_or(self.drop_rate);
-        // 4. Compose relay penalty if applicable
-        let effective_rate = if self.relay_penalty > 0.0 && self.requires_relay(from_idx, to_idx) {
-            1.0 - (1.0 - base_rate) * (1.0 - self.relay_penalty)
-        } else {
-            base_rate
-        };
-        // 5. Apply effective rate via LCG PRNG
-        if effective_rate > 0.0 {
-            self.drop_counter = self.drop_counter.wrapping_mul(6364136223846793005).wrapping_add(1);
-            let r = (self.drop_counter >> 33) as f64 / (u32::MAX as f64);
-            if r < effective_rate {
-                return false;
-            }
-        }
-        true
     }
 }
 
@@ -424,8 +200,8 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
     for (entry, actor, owner_idx) in &pending_entries {
         let actor_id = format!("{:?}", &actor.0[..4]);
         for other_idx in 0..n {
-            if other_idx != *owner_idx {
-                if let Some(ref mut other_node) = nodes[other_idx] {
+            if other_idx != *owner_idx
+                && let Some(ref mut other_node) = nodes[other_idx] {
                     other_node.store_directory_entry(entry.clone());
                     events.push(Event {
                         tick: 0,
@@ -436,7 +212,6 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                         },
                     });
                 }
-            }
         }
     }
 
@@ -447,14 +222,7 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
     for round in 1..=config.num_rounds {
         // Apply network faults for this round.
         for fault in &config.network_faults {
-            let fault_round = match fault {
-                NetworkFault::Partition { round, .. } => *round,
-                NetworkFault::Heal { round } => *round,
-                NetworkFault::SetDropRate { round, .. } => *round,
-                NetworkFault::LinkFault { round, .. } => *round,
-                NetworkFault::SetRelayPenalty { round, .. } => *round,
-            };
-            if fault_round == round {
+            if fault.round() == round {
                 net.apply_fault(fault, n);
             }
         }
@@ -522,8 +290,8 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
             if *action_round == round {
                 match action {
                     SimAction::RegisterName { node_idx, name } => {
-                        if *node_idx < n {
-                            if let Some(ref mut node) = nodes[*node_idx] {
+                        if *node_idx < n
+                            && let Some(ref mut node) = nodes[*node_idx] {
                                 let actor = ActorAddress::new_random();
                                 node.register_name(name.clone(), actor);
                                 events.push(Event {
@@ -535,11 +303,10 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                                     },
                                 });
                             }
-                        }
                     }
                     SimAction::RegisterNameWithActor { node_idx, name, actor } => {
-                        if *node_idx < n {
-                            if let Some(ref mut node) = nodes[*node_idx] {
+                        if *node_idx < n
+                            && let Some(ref mut node) = nodes[*node_idx] {
                                 node.register_name(name.clone(), *actor);
                                 events.push(Event {
                                     tick: round as u64,
@@ -550,11 +317,10 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                                     },
                                 });
                             }
-                        }
                     }
                     SimAction::UnregisterName { node_idx, name } => {
-                        if *node_idx < n {
-                            if let Some(ref mut node) = nodes[*node_idx] {
+                        if *node_idx < n
+                            && let Some(ref mut node) = nodes[*node_idx] {
                                 node.unregister_name(name);
                                 events.push(Event {
                                     tick: round as u64,
@@ -565,7 +331,6 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                                     },
                                 });
                             }
-                        }
                     }
                     SimAction::GracefulLeave { node_idx } => {
                         if *node_idx < n {
@@ -886,17 +651,15 @@ fn deliver_actions_tagged_with_net(
                 piggyback,
                 ..
             } => {
-                if let Some(idx) = node_ids.iter().position(|id| id == to) {
-                    if net.should_deliver(sender_idx, idx) {
-                        if let Some(ref mut node) = nodes[idx] {
+                if let Some(idx) = node_ids.iter().position(|id| id == to)
+                    && net.should_deliver(sender_idx, idx)
+                        && let Some(ref mut node) = nodes[idx] {
                             let resp =
                                 node.handle_ping(sender_id, *sequence, piggyback);
                             if !resp.is_empty() {
                                 tagged_responses.push((idx, resp));
                             }
                         }
-                    }
-                }
             }
             NodeAction::SendAck {
                 to,
@@ -904,28 +667,24 @@ fn deliver_actions_tagged_with_net(
                 piggyback,
                 ..
             } => {
-                if let Some(idx) = node_ids.iter().position(|id| id == to) {
-                    if net.should_deliver(sender_idx, idx) {
-                        if let Some(ref mut node) = nodes[idx] {
+                if let Some(idx) = node_ids.iter().position(|id| id == to)
+                    && net.should_deliver(sender_idx, idx)
+                        && let Some(ref mut node) = nodes[idx] {
                             let resp = node.handle_ack(sender_id, *sequence, piggyback);
                             if !resp.is_empty() {
                                 tagged_responses.push((idx, resp));
                             }
                         }
-                    }
-                }
             }
             NodeAction::SendJoinResponse { to, members, .. } => {
-                if let Some(idx) = node_ids.iter().position(|id| id == to) {
-                    if net.should_deliver(sender_idx, idx) {
-                        if let Some(ref mut node) = nodes[idx] {
+                if let Some(idx) = node_ids.iter().position(|id| id == to)
+                    && net.should_deliver(sender_idx, idx)
+                        && let Some(ref mut node) = nodes[idx] {
                             let resp = node.handle_join_response(members.clone());
                             if !resp.is_empty() {
                                 tagged_responses.push((idx, resp));
                             }
                         }
-                    }
-                }
             }
             NodeAction::SendPingReq {
                 relay,
@@ -934,9 +693,9 @@ fn deliver_actions_tagged_with_net(
                 piggyback,
                 ..
             } => {
-                if let Some(idx) = node_ids.iter().position(|id| id == relay) {
-                    if net.should_deliver(sender_idx, idx) {
-                        if let Some(ref mut node) = nodes[idx] {
+                if let Some(idx) = node_ids.iter().position(|id| id == relay)
+                    && net.should_deliver(sender_idx, idx)
+                        && let Some(ref mut node) = nodes[idx] {
                             let resp = node.handle_ping_req(
                                 sender_id,
                                 *target,
@@ -947,20 +706,16 @@ fn deliver_actions_tagged_with_net(
                                 tagged_responses.push((idx, resp));
                             }
                         }
-                    }
-                }
             }
             NodeAction::ForwardAck { to, target, sequence, piggyback } => {
-                if let Some(idx) = node_ids.iter().position(|id| id == to) {
-                    if net.should_deliver(sender_idx, idx) {
-                        if let Some(ref mut node) = nodes[idx] {
+                if let Some(idx) = node_ids.iter().position(|id| id == to)
+                    && net.should_deliver(sender_idx, idx)
+                        && let Some(ref mut node) = nodes[idx] {
                             let resp = node.handle_indirect_ack(*target, *sequence, piggyback);
                             if !resp.is_empty() {
                                 tagged_responses.push((idx, resp));
                             }
                         }
-                    }
-                }
             }
             NodeAction::MembershipChanged { .. } => {
                 // Notifications — no delivery needed

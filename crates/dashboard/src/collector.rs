@@ -55,7 +55,7 @@ pub fn enrich_names(stats: &mut RuntimeStats, runtime: &Runtime) {
         Some(ext) => ext,
         None => return,
     };
-    let std_ext = match ext.as_any().downcast_ref::<swactor_std::StdExtension>() {
+    let std_ext = match ext.as_any().downcast_ref::<swactor::std::StdExtension>() {
         Some(ext) => ext,
         None => return,
     };

@@ -5,18 +5,17 @@ edition = "2024"
 
 [features]
 default = ["tcp"]
-tcp = []
+tcp = ["dep:swactor-transport", "swactor-transport/tcp"]
 iroh = ["dep:iroh", "dep:tokio"]
 relay = ["iroh", "dep:iroh-relay"]
 
 [dependencies]
 swactor = { path = "../..", features = ["serde", "transport"] }
-shared-types = { path = "../shared-types" }
+swactor-transport = { path = "../transport", optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bs58 = "0.5"
 iroh = { version = "0.96", optional = true }
 iroh-relay = { version = "0.96", features = ["server"], optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }

@@ -1,3 +1,4 @@
+#![cfg(feature = "distribution")]
 //! Deployment topology simulation scenarios — NAT, relay, firewall, staggered join.
 //!
 //! These tests model real deployment topologies (home NAT + cloud VPS) to catch

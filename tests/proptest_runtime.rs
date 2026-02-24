@@ -13,7 +13,7 @@ use std::sync::Arc;
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::{MailboxOverflow, RuntimeConfig};
 use swactor::runtime::{Ctx, Inbox, Runtime};
-use swactor_std::{CtxTimers, StdExtension};
+use swactor::std::{CtxTimers, StdExtension};
 
 // ─── Shared Actor Types ────────────────────────────────────────────────────
 

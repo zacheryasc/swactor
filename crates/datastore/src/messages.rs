@@ -16,8 +16,8 @@ use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor::transport::NetworkMessage;
 
-use distribution::types::NodeId;
-use swactor_streams::types::StreamId;
+use swactor::transport::NodeId;
+use crate::streams::types::StreamId;
 
 use crate::auth::{AccessRequestInfo, AuthorizedKeyInfo, DeniedReason, SignedRequest};
 use crate::types::{ContentHash, ObjectEntry, ObjectManifest};

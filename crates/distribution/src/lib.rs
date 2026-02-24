@@ -1,11 +1,8 @@
 pub mod types;
 pub mod crypto;
-pub mod identity;
 pub mod peer_auth;
 pub mod messages;
 pub mod codec;
-#[cfg(feature = "tcp")]
-pub mod transport;
 pub mod swim;
 pub mod kademlia;
 pub mod cache;

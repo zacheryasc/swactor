@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Inbox, Runtime};
 
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
 use crate::auth::SignedRequest;
 use crate::chunking::reassemble_blob;
@@ -753,7 +753,7 @@ fn try_remote_get(
         let _ = state.runtime.send_to(
             peer.metadata,
             MetadataMsg::HandleFindObject {
-                from: distribution::types::NodeId([0; 32]), // placeholder
+                from: swactor::transport::NodeId([0; 32]), // placeholder
                 content_hash,
                 reply_to: *find_inbox.addr(),
             },

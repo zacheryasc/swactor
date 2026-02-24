@@ -10,8 +10,8 @@ use std::sync::Arc;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::Runtime;
 
-use swactor_streams::messages::{StreamManagerMsg, StreamNotification};
-use swactor_streams::types::{StreamConfig, StreamMode};
+use crate::streams::messages::{StreamManagerMsg, StreamNotification};
+use crate::streams::types::{StreamConfig, StreamMode};
 
 use crate::blob_transfer::{encode_metadata, recv_blob, BlobTransferMetadata};
 use crate::messages::{BlobStoreMsg, DatastoreNodeMsg};

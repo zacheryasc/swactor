@@ -5,12 +5,15 @@ pub mod event;
 pub mod local;
 pub mod message;
 pub mod mock;
+pub mod pipeline;
+pub mod pipeline_types;
 pub mod queue;
 pub mod session;
 pub mod spawn;
 pub mod subscriber;
 pub mod types;
 pub mod waker;
+pub mod yaml;
 
 #[cfg(feature = "ssh")]
 pub mod ssh;

@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
 use crate::messages::{BlobStoreMsg, DatastoreResponse, MetadataMsg};
 use crate::types::{ContentHash, DatastoreConfig, ObjectEntry, ObjectManifest};
@@ -120,7 +120,7 @@ impl MetadataActor {
     /// `GcUnreferenced` to BlobStoreActor to delete orphaned chunks.
     fn gc_tick(&mut self, ctx: &Ctx) {
         self.tick_count += 1;
-        if self.tick_count % self.gc_interval != 0 {
+        if !self.tick_count.is_multiple_of(self.gc_interval) {
             return;
         }
 

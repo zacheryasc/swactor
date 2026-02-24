@@ -19,7 +19,7 @@ use crate::messages::*;
 use crate::node::{DistributedNode, DistributedNodeConfig};
 use crate::snapshot::DistributionNodeSnapshot;
 use crate::swim::node::NodeAction;
-use crate::transport::{TcpAcceptor, TcpTransport};
+use swactor_transport::tcp::{TcpAcceptor, TcpTransport, encode_wire_envelope_with_hints};
 use crate::types::NodeId;
 
 /// Dummy destination address used in wire envelopes for SWIM protocol messages.
@@ -43,6 +43,12 @@ pub struct AddressHint {
 
 /// Maps NodeId → SocketAddr. Maintained by the TCP driver layer.
 pub struct PeerAddressBook(HashMap<NodeId, SocketAddr>);
+
+impl Default for PeerAddressBook {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PeerAddressBook {
     pub fn new() -> Self {
@@ -142,20 +148,18 @@ impl NodeDriver {
 
         // Enrich member addresses from address book
         for member in &mut snap.members {
-            if let Some(node_id) = parse_node_id_hex(&member.node_id) {
-                if let Some(addr) = self.address_book.resolve(&node_id) {
+            if let Some(node_id) = parse_node_id_hex(&member.node_id)
+                && let Some(addr) = self.address_book.resolve(&node_id) {
                     member.addr = Some(addr.to_string());
                 }
-            }
         }
 
         // Enrich routing neighbor addresses from address book
         for neighbor in &mut snap.routing_neighbors {
-            if let Some(node_id) = parse_node_id_hex(&neighbor.node_id) {
-                if let Some(addr) = self.address_book.resolve(&node_id) {
+            if let Some(node_id) = parse_node_id_hex(&neighbor.node_id)
+                && let Some(addr) = self.address_book.resolve(&node_id) {
                     neighbor.addr = Some(addr.to_string());
                 }
-            }
         }
 
         snap
@@ -201,11 +205,10 @@ impl NodeDriver {
     pub fn recv(&mut self) {
         let envelopes = self.acceptor.try_recv(&mut self.streams);
         for (envelope, _peer_addr, hints_bytes) in envelopes {
-            if !hints_bytes.is_empty() {
-                if let Ok(hints) = serde_json::from_slice::<Vec<AddressHint>>(&hints_bytes) {
+            if !hints_bytes.is_empty()
+                && let Ok(hints) = serde_json::from_slice::<Vec<AddressHint>>(&hints_bytes) {
                     self.learn_hints(&hints);
                 }
-            }
             let response_actions = self.dispatch_incoming(envelope);
             self.send_actions(&response_actions);
         }
@@ -223,14 +226,13 @@ impl NodeDriver {
         for (envelope, _peer_addr, hints_bytes) in envelopes {
             // Extract sender NodeId from hints
             let mut sender_node_id = None;
-            if !hints_bytes.is_empty() {
-                if let Ok(hints) = serde_json::from_slice::<Vec<AddressHint>>(&hints_bytes) {
+            if !hints_bytes.is_empty()
+                && let Ok(hints) = serde_json::from_slice::<Vec<AddressHint>>(&hints_bytes) {
                     if let Some(first) = hints.first() {
                         sender_node_id = Some(first.node_id);
                     }
                     self.learn_hints(&hints);
                 }
-            }
 
             // Check peer auth if we know the sender
             if let Some(node_id) = sender_node_id {
@@ -492,21 +494,3 @@ fn parse_node_id_hex(hex: &str) -> Option<NodeId> {
     Some(NodeId(bytes))
 }
 
-/// Encode a wire envelope with address hints appended after the payload.
-///
-/// Extended frame format:
-///   [4B frame_len][32B dest][4B tag_len][tag][4B hints_len][hints][payload]
-fn encode_wire_envelope_with_hints(envelope: &WireEnvelope, hints_bytes: &[u8]) -> Vec<u8> {
-    let tag_bytes = envelope.type_tag.as_bytes();
-    let frame_len: u32 = (32 + 4 + tag_bytes.len() + 4 + hints_bytes.len() + envelope.payload.len()) as u32;
-
-    let mut buf = Vec::with_capacity(4 + frame_len as usize);
-    buf.extend_from_slice(&frame_len.to_be_bytes());
-    buf.extend_from_slice(&envelope.dest.0);
-    buf.extend_from_slice(&(tag_bytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(tag_bytes);
-    buf.extend_from_slice(&(hints_bytes.len() as u32).to_be_bytes());
-    buf.extend_from_slice(hints_bytes);
-    buf.extend_from_slice(&envelope.payload);
-    buf
-}

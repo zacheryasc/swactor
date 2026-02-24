@@ -79,8 +79,6 @@ pub enum ViewMode {
     Overview,
     WorkerDetail,
     ActorDetail,
-    #[cfg(feature = "distribution")]
-    Distribution,
 }
 
 pub struct App {
@@ -103,11 +101,6 @@ pub struct App {
     pub search_query: String,
     pub search_locked: bool,
     pub warnings: Vec<Warning>,
-
-    #[cfg(feature = "distribution")]
-    pub distribution: Option<distribution::snapshot::DistributionNodeSnapshot>,
-    #[cfg(feature = "distribution")]
-    pub dist_member_selected: usize,
 
     prev_messages: Vec<u64>,
     prev_time: Instant,
@@ -152,10 +145,6 @@ impl App {
             search_query: String::new(),
             search_locked: false,
             warnings: Vec::new(),
-            #[cfg(feature = "distribution")]
-            distribution: None,
-            #[cfg(feature = "distribution")]
-            dist_member_selected: 0,
             prev_messages: Vec::new(),
             prev_time: Instant::now(),
             msg_rates: Vec::new(),
@@ -173,13 +162,6 @@ impl App {
     /// Set the event store for per-actor log retrieval.
     pub fn set_event_store(&mut self, store: Arc<EventStore>) {
         self.event_store = Some(store);
-    }
-
-    #[cfg(feature = "distribution")]
-    pub fn update_distribution(&mut self, snapshot: distribution::snapshot::DistributionNodeSnapshot) {
-        let max = if snapshot.members.is_empty() { 0 } else { snapshot.members.len() - 1 };
-        self.dist_member_selected = self.dist_member_selected.min(max);
-        self.distribution = Some(snapshot);
     }
 
     /// Get visible actor rows (filtered by search query if active).
@@ -451,12 +433,7 @@ impl App {
                 self.view_mode = match self.view_mode {
                     ViewMode::Overview => ViewMode::WorkerDetail,
                     ViewMode::ActorDetail => ViewMode::Overview,
-                    #[cfg(feature = "distribution")]
-                    ViewMode::WorkerDetail => ViewMode::Distribution,
-                    #[cfg(not(feature = "distribution"))]
                     ViewMode::WorkerDetail => ViewMode::Overview,
-                    #[cfg(feature = "distribution")]
-                    ViewMode::Distribution => ViewMode::Overview,
                 };
                 return;
             }
@@ -467,8 +444,6 @@ impl App {
             ViewMode::Overview => self.handle_key_overview(key),
             ViewMode::WorkerDetail => self.handle_key_worker_detail(key),
             ViewMode::ActorDetail => self.handle_key_actor_detail(key),
-            #[cfg(feature = "distribution")]
-            ViewMode::Distribution => self.handle_key_distribution(key),
         }
     }
 
@@ -556,35 +531,6 @@ impl App {
             KeyCode::Char('3') => self.toggle_log_level(2),
             KeyCode::Char('4') => self.toggle_log_level(3),
             KeyCode::Char('5') => self.toggle_log_level(4),
-            _ => {}
-        }
-    }
-
-    #[cfg(feature = "distribution")]
-    fn handle_key_distribution(&mut self, key: KeyEvent) {
-        let max = self
-            .distribution
-            .as_ref()
-            .map(|d| if d.members.is_empty() { 0 } else { d.members.len() - 1 })
-            .unwrap_or(0);
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
-                self.view_mode = ViewMode::Overview;
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.dist_member_selected = self.dist_member_selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.dist_member_selected = (self.dist_member_selected + 1).min(max);
-            }
-            KeyCode::PageUp => {
-                self.dist_member_selected = self.dist_member_selected.saturating_sub(20);
-            }
-            KeyCode::PageDown => {
-                self.dist_member_selected = (self.dist_member_selected + 20).min(max);
-            }
-            KeyCode::Home => { self.dist_member_selected = 0; }
-            KeyCode::End => { self.dist_member_selected = max; }
             _ => {}
         }
     }

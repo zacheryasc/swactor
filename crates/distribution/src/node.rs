@@ -6,7 +6,7 @@
 use swactor::actor::ActorAddress;
 
 use crate::cache::LocationCache;
-use crate::crypto::Keypair;
+use crate::crypto::{Keypair, KeypairExt};
 use crate::kademlia::directory::{actor_addr_as_node_id, DirectoryShard};
 use crate::kademlia::repair::{RepairQueue, RepublishTracker};
 use crate::kademlia::routing_table::RoutingTable;
@@ -232,12 +232,11 @@ impl DistributedNode {
         }
 
         // 2. Check local directory shard
-        if let Some(entries) = self.directory.get(actor_addr) {
-            if let Some(entry) = entries.first() {
+        if let Some(entries) = self.directory.get(actor_addr)
+            && let Some(entry) = entries.first() {
                 self.cache.insert(*actor_addr, entry.node_id);
                 return ResolveResult::Cached(entry.node_id);
             }
-        }
 
         // 3. Need to do a Kademlia lookup
         let target = actor_addr_as_node_id(actor_addr);

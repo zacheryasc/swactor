@@ -11,7 +11,7 @@ pub use swactor::actor::{
     StopReason,
 };
 pub use swactor::runtime::{Ctx, Inbox, MailboxOverflow, Runtime, RuntimeConfig};
-pub use swactor_std::{
+pub use swactor::std::{
     ChildSpec, CtxCapabilities, CtxEnvironment, CtxGroups, CtxHandles, CtxLifecycle, CtxLineage,
     CtxMonitoring, CtxNaming, CtxResources, CtxSelfStats, CtxSystem, CtxTimers, CtxWatching,
     ResourceHandle, RestartPolicy, Router, RoutingStrategy, RuntimeGroups, RuntimeNaming,

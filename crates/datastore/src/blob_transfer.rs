@@ -18,7 +18,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use swactor::runtime::Inbox;
 use swactor::actor::Message;
-use swactor_streams::handle::{RecvHalf, SendHalf};
+use crate::streams::handle::{RecvHalf, SendHalf};
 
 use crate::types::{ContentHash, ObjectManifest};
 
@@ -264,8 +264,8 @@ pub async fn poll_inbox<M: Message>(inbox: &Inbox<M>, timeout: Duration) -> Opti
 mod tests {
     use super::*;
     use crate::chunking::chunk_blob;
-    use swactor_streams::handle::create_stream_handle;
-    use swactor_streams::types::{StreamConfig, StreamId};
+    use crate::streams::handle::create_stream_handle;
+    use crate::streams::types::{StreamConfig, StreamId};
 
     /// Helper: create a pair of (SendHalf, RecvHalf) connected via tokio tasks
     /// that relay data through a DuplexStream.
@@ -299,39 +299,39 @@ mod tests {
     }
 
     fn spawn_send_task(
-        mut cmd_rx: tokio::sync::mpsc::Receiver<swactor_streams::channel::SendCommand>,
-        evt_tx: tokio::sync::mpsc::Sender<swactor_streams::channel::SendEvent>,
-        pool: swactor_streams::BufferPool,
+        mut cmd_rx: tokio::sync::mpsc::Receiver<crate::streams::channel::SendCommand>,
+        evt_tx: tokio::sync::mpsc::Sender<crate::streams::channel::SendEvent>,
+        pool: crate::streams::BufferPool,
         mut writer: tokio::io::WriteHalf<tokio::io::DuplexStream>,
     ) {
         use tokio::io::AsyncWriteExt;
         tokio::spawn(async move {
             while let Some(cmd) = cmd_rx.recv().await {
                 match cmd {
-                    swactor_streams::channel::SendCommand::Data(buf) => {
+                    crate::streams::channel::SendCommand::Data(buf) => {
                         let data = buf.written();
                         // Write length-prefixed frame
                         let len = (data.len() as u32).to_be_bytes();
                         if writer.write_all(&len).await.is_err() {
                             pool.checkin(buf);
-                            let _ = evt_tx.send(swactor_streams::channel::SendEvent::Error(
-                                swactor_streams::StreamError::Disconnected,
+                            let _ = evt_tx.send(crate::streams::channel::SendEvent::Error(
+                                crate::streams::StreamError::Disconnected,
                             )).await;
                             return;
                         }
                         if writer.write_all(data).await.is_err() {
                             pool.checkin(buf);
-                            let _ = evt_tx.send(swactor_streams::channel::SendEvent::Error(
-                                swactor_streams::StreamError::Disconnected,
+                            let _ = evt_tx.send(crate::streams::channel::SendEvent::Error(
+                                crate::streams::StreamError::Disconnected,
                             )).await;
                             return;
                         }
                         pool.checkin(buf);
                     }
-                    swactor_streams::channel::SendCommand::Flush => {
+                    crate::streams::channel::SendCommand::Flush => {
                         let _ = writer.flush().await;
                     }
-                    swactor_streams::channel::SendCommand::Close => {
+                    crate::streams::channel::SendCommand::Close => {
                         let _ = writer.shutdown().await;
                         break;
                     }
@@ -342,8 +342,8 @@ mod tests {
 
     fn spawn_recv_task(
         mut reader: tokio::io::ReadHalf<tokio::io::DuplexStream>,
-        evt_tx: tokio::sync::mpsc::Sender<swactor_streams::channel::RecvEvent>,
-        pool: swactor_streams::BufferPool,
+        evt_tx: tokio::sync::mpsc::Sender<crate::streams::channel::RecvEvent>,
+        pool: crate::streams::BufferPool,
     ) {
         use tokio::io::AsyncReadExt;
         tokio::spawn(async move {
@@ -353,7 +353,7 @@ mod tests {
                 match reader.read_exact(&mut len_buf).await {
                     Ok(_) => {}
                     Err(_) => {
-                        let _ = evt_tx.send(swactor_streams::channel::RecvEvent::Closed).await;
+                        let _ = evt_tx.send(crate::streams::channel::RecvEvent::Closed).await;
                         return;
                     }
                 }
@@ -362,7 +362,7 @@ mod tests {
                 match reader.read_exact(&mut data).await {
                     Ok(_) => {}
                     Err(_) => {
-                        let _ = evt_tx.send(swactor_streams::channel::RecvEvent::Closed).await;
+                        let _ = evt_tx.send(crate::streams::channel::RecvEvent::Closed).await;
                         return;
                     }
                 }
@@ -373,15 +373,15 @@ mod tests {
                     let mut buf = match pool.checkout() {
                         Some(b) => b,
                         None => {
-                            let _ = evt_tx.send(swactor_streams::channel::RecvEvent::Error(
-                                swactor_streams::StreamError::BufferExhausted,
+                            let _ = evt_tx.send(crate::streams::channel::RecvEvent::Error(
+                                crate::streams::StreamError::BufferExhausted,
                             )).await;
                             return;
                         }
                     };
                     let written = buf.write(&data[offset..]);
                     offset += written;
-                    let _ = evt_tx.send(swactor_streams::channel::RecvEvent::Data(buf)).await;
+                    let _ = evt_tx.send(crate::streams::channel::RecvEvent::Data(buf)).await;
                 }
             }
         });

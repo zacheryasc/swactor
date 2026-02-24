@@ -169,7 +169,7 @@ impl IrohDriver {
                                 if !allowed {
                                     eprintln!(
                                         "iroh driver: rejected connection from unauthorized peer {}",
-                                        crate::identity::hex_encode(&node_id.0[..4])
+                                        swactor::transport::hex_encode(&node_id.0[..4])
                                     );
                                     conn.close(0u32.into(), b"unauthorized");
                                     continue;
@@ -179,14 +179,14 @@ impl IrohDriver {
                                 if negotiated_alpn == ALPN {
                                     eprintln!(
                                         "iroh driver: accepted SWIM connection from {}",
-                                        crate::identity::hex_encode(&node_id.0[..4])
+                                        swactor::transport::hex_encode(&node_id.0[..4])
                                     );
                                     swim_buf.lock().unwrap().push((node_id, conn));
                                 } else {
                                     eprintln!(
                                         "iroh driver: accepted non-SWIM connection from {} (ALPN: {})",
-                                        crate::identity::hex_encode(&node_id.0[..4]),
-                                        String::from_utf8_lossy(&negotiated_alpn),
+                                        swactor::transport::hex_encode(&node_id.0[..4]),
+                                        String::from_utf8_lossy(negotiated_alpn),
                                     );
                                     other_buf.lock().unwrap().push((node_id, conn));
                                 }
@@ -524,7 +524,7 @@ impl IrohDriver {
         if !self.is_peer_allowed(&node_id) {
             return Err(format!(
                 "peer {} not in allow-list",
-                crate::identity::hex_encode(&node_id.0[..4])
+                swactor::transport::hex_encode(&node_id.0[..4])
             )
             .into());
         }

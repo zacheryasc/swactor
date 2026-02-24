@@ -1,6 +1,6 @@
 //! Serializable snapshot of a `DistributedNode`'s state.
 //!
-//! Used by the runtime-dashboard to display distribution monitoring data
+//! Used by the dashboard to display distribution monitoring data
 //! for a single node without reaching out to other nodes.
 
 use serde::{Deserialize, Serialize};
@@ -176,7 +176,7 @@ impl DistributedNode {
         let recent_targets: Vec<String> = self
             .recent_probe_targets()
             .iter()
-            .map(|id| node_id_hex(id))
+            .map(node_id_hex)
             .collect();
 
         let registry = self.registry();

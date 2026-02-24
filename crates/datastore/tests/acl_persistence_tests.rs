@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use distribution::crypto::Keypair;
+use swactor_datastore::crypto::Keypair;
 use swactor_datastore::auth::AccessControlList;
 
 // ═══════════════════════════════════════════════════════════════════════════

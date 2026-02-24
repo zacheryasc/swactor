@@ -3,13 +3,14 @@
 //! Spins up a full actor runtime with GatewayActor, starts the HTTP API server,
 //! and uses ureq to prove that authorized requests succeed while unauthorized
 //! ones get 403 and missing-auth requests get 401.
+#![cfg(feature = "node")]
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use distribution::crypto::Keypair;
-use shared_types::ContentHash;
+use swactor_datastore::crypto::Keypair;
+use swactor_datastore::content_hash::ContentHash;
 use swactor::config::RuntimeConfig;
 use swactor::runtime::Runtime;
 use swactor_datastore::actors::{BlobStoreActor, DatastoreNode, GatewayActor, MetadataActor};

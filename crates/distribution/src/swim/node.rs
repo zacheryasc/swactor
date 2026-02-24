@@ -3,7 +3,7 @@
 //! This is the top-level SWIM state machine that a `DistributedNode` will drive.
 //! It produces `SwimAction`s that the caller translates into real network I/O.
 
-use crate::identity::hex_encode;
+use swactor::transport::hex_encode;
 use crate::messages::MembershipUpdate;
 use crate::types::{MemberState, NodeId, NodeRecord};
 
@@ -284,14 +284,13 @@ impl SwimNode {
                     // so it piggybacks on this message. This is the key mechanism
                     // for partition-heal recovery: the target learns it was
                     // suspected/declared dead and refutes by bumping its incarnation.
-                    if let Some(entry) = self.members.get(&to) {
-                        if entry.state == MemberState::Dead || entry.state == MemberState::Suspect {
+                    if let Some(entry) = self.members.get(&to)
+                        && (entry.state == MemberState::Dead || entry.state == MemberState::Suspect) {
                             self.dissemination.enqueue(
                                 membership_update(to, entry.state, entry.incarnation),
                                 self.cluster_size(),
                             );
                         }
-                    }
                     let pb = self.dissemination.pack_piggyback(self.max_piggyback);
                     actions.push(NodeAction::SendPing {
                         to,

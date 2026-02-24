@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
 /// Top-level CLI commands for `swactor-store`.
 #[derive(Debug, Clone)]

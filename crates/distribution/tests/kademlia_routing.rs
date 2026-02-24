@@ -1,5 +1,5 @@
 use distribution::kademlia::routing_table::RoutingTable;
-use distribution::types::NodeId;
+use distribution::types::{NodeId, NodeIdDistance};
 
 fn node(byte: u8) -> NodeId {
     NodeId([byte; 32])

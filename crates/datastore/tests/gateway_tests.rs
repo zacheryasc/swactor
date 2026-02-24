@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use common::{spawn_blob_store, spawn_metadata, test_runtime, tick_until_recv};
 
-use distribution::crypto::Keypair;
-use shared_types::ContentHash;
+use swactor_datastore::crypto::Keypair;
+use swactor_datastore::content_hash::ContentHash;
 use swactor_datastore::actors::{DatastoreNode, GatewayActor};
 use swactor_datastore::auth::{
     sign_request, AccessControlList, AuthzEngine, DatastoreAction, DeniedReason,

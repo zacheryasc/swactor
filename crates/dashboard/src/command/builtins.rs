@@ -1,6 +1,6 @@
 //! Built-in command handlers for runtime inspection and management.
 //!
-//! Extracted from `crates/runtime-dashboard/src/investigate.rs`.
+//! Extracted from `crates/dashboard/src/investigate.rs`.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -435,11 +435,10 @@ impl CommandHandler for PhasesCommand {
 
         let mut results = Vec::new();
         for (i, timings) in stats.tick_timings.iter().enumerate() {
-            if let Some(wid) = worker_filter {
-                if i != wid {
+            if let Some(wid) = worker_filter
+                && i != wid {
                     continue;
                 }
-            }
             let breakdown = compute_phase_breakdown(timings);
             results.push(serde_json::json!({
                 "worker_id": i,

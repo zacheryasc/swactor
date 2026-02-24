@@ -46,8 +46,8 @@ pub const TOPOLOGY_HTML: &str = r##"<!DOCTYPE html>
       <a href="/" class="nav-link">Overview</a>
       <a href="/actors" class="nav-link">Actors</a>
       <a href="/topology" class="nav-link active">Topology</a>
-      <a href="/distribution" class="nav-link">Distribution</a>
-      <a href="/datastore" class="nav-link">Datastore</a>
+      <a href="/plugin/distribution" class="nav-link">Distribution</a>
+      <a href="/plugin/datastore" class="nav-link">Datastore</a>
     </nav>
   </div>
 </div>

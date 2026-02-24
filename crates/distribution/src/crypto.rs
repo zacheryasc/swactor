@@ -1,6 +1,48 @@
-use ed25519_dalek::{Signer, Verifier};
+//! Ed25519 cryptographic primitives for distribution.
 
-use crate::types::{DirectoryEntry, DirectoryEntryPayload, NodeId, Signature};
+use std::fmt;
+
+use ed25519_dalek::{Signer, Verifier};
+use serde::{Deserialize, Serialize};
+
+use crate::types::{DirectoryEntry, DirectoryEntryPayload, NodeId};
+
+// ─── Signature ──────────────────────────────────────────────────────────────
+
+/// An ed25519 signature (64 bytes).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Signature(pub [u8; 64]);
+
+impl Serialize for Signature {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Signature {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
+        if bytes.len() != 64 {
+            return Err(serde::de::Error::custom(format!(
+                "expected 64 bytes for Signature, got {}",
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 64];
+        arr.copy_from_slice(&bytes);
+        Ok(Signature(arr))
+    }
+}
+
+impl fmt::Debug for Signature {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Sig(")?;
+        for b in &self.0[..4] {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\u{2026})")
+    }
+}
 
 // ─── Keypair ────────────────────────────────────────────────────────────────
 
@@ -40,9 +82,33 @@ impl Keypair {
         let sig = self.inner.sign(msg);
         Signature(sig.to_bytes())
     }
+}
 
+// ─── Verification ───────────────────────────────────────────────────────────
+
+/// Verify a signature against a `NodeId` (public key) and message bytes.
+pub fn verify(node_id: &NodeId, msg: &[u8], sig: &Signature) -> bool {
+    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&node_id.0) else {
+        return false;
+    };
+    let signature = ed25519_dalek::Signature::from_bytes(&sig.0);
+    vk.verify(msg, &signature).is_ok()
+}
+
+// ─── Directory Entry Helpers ────────────────────────────────────────────────
+
+/// Extension methods for Keypair specific to distribution directory entries.
+pub trait KeypairExt {
     /// Sign a directory entry payload, returning a complete `DirectoryEntry`.
-    pub fn sign_directory_entry(
+    fn sign_directory_entry(
+        &self,
+        actor_addr: swactor::actor::ActorAddress,
+        generation: u64,
+    ) -> DirectoryEntry;
+}
+
+impl KeypairExt for Keypair {
+    fn sign_directory_entry(
         &self,
         actor_addr: swactor::actor::ActorAddress,
         generation: u64,
@@ -61,17 +127,6 @@ impl Keypair {
             signature,
         }
     }
-}
-
-// ─── Verification ───────────────────────────────────────────────────────────
-
-/// Verify a signature against a `NodeId` (public key) and message bytes.
-pub fn verify(node_id: &NodeId, msg: &[u8], sig: &Signature) -> bool {
-    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&node_id.0) else {
-        return false;
-    };
-    let signature = ed25519_dalek::Signature::from_bytes(&sig.0);
-    vk.verify(msg, &signature).is_ok()
 }
 
 /// Verify a `DirectoryEntry`'s signature against its embedded `node_id`.

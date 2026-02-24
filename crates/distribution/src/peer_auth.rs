@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{hex_decode, hex_encode};
+use swactor::transport::{hex_decode, hex_encode};
 use crate::types::NodeId;
 
 /// A single trusted peer entry.
@@ -55,11 +55,10 @@ impl PeerAllowList {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             let mut map = HashMap::new();
             for entry in file.peers {
-                if let Some(bytes) = hex_decode(&entry.node_id) {
-                    if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
+                if let Some(bytes) = hex_decode(&entry.node_id)
+                    && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
                         map.insert(NodeId(arr), entry);
                     }
-                }
             }
             map
         } else {
@@ -134,7 +133,7 @@ impl PeerAllowList {
         }
 
         let json = serde_json::to_string_pretty(&file)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::other(e))?;
         std::fs::write(path, json)
     }
 }

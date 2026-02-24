@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::types::NodeId;
+use crate::types::{NodeId, NodeIdDistance};
 use super::routing_table::{RoutingTable, K};
 
 /// Concurrency parameter — how many queries to issue in parallel per round.

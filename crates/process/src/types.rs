@@ -60,12 +60,8 @@ pub enum ProcessError {
 
 /// Passive tracking of stdin backpressure.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub struct FlowControl {
     pub pending_stdin_bytes: usize,
 }
 
-impl Default for FlowControl {
-    fn default() -> Self {
-        Self { pending_stdin_bytes: 0 }
-    }
-}

@@ -1,3 +1,5 @@
+#![cfg(feature = "gossip")]
+
 use simulation::gossip::properties::*;
 use simulation::gossip::sim::{run_simulation, GossipSimConfig};
 use simulation::gossip::trace::SimulationTrace;

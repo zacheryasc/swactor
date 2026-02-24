@@ -1,5 +1,5 @@
 use swactor::actor::ActorAddress;
-use distribution::crypto::Keypair;
+use distribution::crypto::{Keypair, KeypairExt};
 use distribution::kademlia::directory::{
     actor_addr_as_node_id, resolve_quorum, DirectoryShard, QuorumResult,
 };

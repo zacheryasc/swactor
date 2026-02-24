@@ -40,6 +40,12 @@ pub struct WorkerStats {
     tick_timings: ArrayQueue<TickTiming>,
 }
 
+impl Default for WorkerStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorkerStats {
     pub fn new() -> Self {
         Self {

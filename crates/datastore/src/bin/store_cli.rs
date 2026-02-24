@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand};
 
-use distribution::crypto::Keypair;
-use shared_types::ContentHash;
+use swactor_datastore::crypto::Keypair;
+use swactor_datastore::content_hash::ContentHash;
 use swactor_datastore::auth::{sign_request, DatastoreAction, SignedRequestPayload};
 
 #[derive(Parser)]
