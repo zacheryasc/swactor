@@ -1,3 +1,4 @@
+#![cfg(feature = "distribution")]
 //! Adversarial network topology simulation scenarios.
 //!
 //! These tests model per-link heterogeneity, relay penalties, and topology-aware

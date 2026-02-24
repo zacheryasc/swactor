@@ -98,11 +98,10 @@ impl FilesystemBackend {
                     continue;
                 };
                 for file in files.flatten() {
-                    if let Some(name) = file.file_name().to_str() {
-                        if let Some(hash) = ContentHash::from_hex(name) {
+                    if let Some(name) = file.file_name().to_str()
+                        && let Some(hash) = ContentHash::from_hex(name) {
                             self.chunk_index.insert(hash);
                         }
-                    }
                 }
             }
         }

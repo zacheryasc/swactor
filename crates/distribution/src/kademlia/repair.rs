@@ -17,6 +17,12 @@ pub struct RepairQueue {
     pending: HashMap<ActorAddress, DirectoryEntry>,
 }
 
+impl Default for RepairQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RepairQueue {
     pub fn new() -> Self {
         Self {

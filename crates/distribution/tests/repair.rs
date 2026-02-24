@@ -6,7 +6,7 @@
 //! - Repair queue can be drained by the caller
 
 use swactor::actor::ActorAddress;
-use distribution::crypto::Keypair;
+use distribution::crypto::{Keypair, KeypairExt};
 use distribution::kademlia::directory::DirectoryShard;
 use distribution::kademlia::repair::{RepairQueue, RepublishTracker};
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::Runtime;
 
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
 use crate::actors::stream_downloader::StreamDownloader;
 use crate::actors::stream_server::StreamServer;
@@ -310,7 +310,7 @@ impl DatastoreNode {
     fn handle_stream_offer(
         &self,
         ctx: &Ctx,
-        stream_id: swactor_streams::types::StreamId,
+        stream_id: crate::streams::types::StreamId,
         content_hash: ContentHash,
         _from_node: [u8; 32],
         stream_manager: ActorAddress,

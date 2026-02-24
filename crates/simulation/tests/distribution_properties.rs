@@ -1,3 +1,4 @@
+#![cfg(feature = "distribution")]
 //! Property-based distribution tests — invariants that must hold across configs.
 //!
 //! Each test verifies a structural property across multiple simulation

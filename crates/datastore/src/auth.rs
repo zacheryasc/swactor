@@ -12,9 +12,10 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use distribution::crypto;
-use distribution::types::{NodeId, Signature};
-use shared_types::ContentHash;
+use crate::crypto;
+use swactor::transport::NodeId;
+use crate::crypto::Signature;
+use crate::content_hash::ContentHash;
 
 // ─── Access Request / Authorized Key Info ──────────────────────────────────
 
@@ -132,7 +133,7 @@ impl AccessControlList {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::other(e))?;
         std::fs::write(path, json)
     }
 }
@@ -228,7 +229,7 @@ impl AuthzEngine {
 
         // 2. Timestamp freshness
         let ts = request.payload.timestamp;
-        let diff = if now >= ts { now - ts } else { ts - now };
+        let diff = now.abs_diff(ts);
         if diff > self.timestamp_window {
             return AuthzResult::Denied(DeniedReason::RequestExpired);
         }
@@ -257,7 +258,7 @@ impl AuthzEngine {
 
         // 2. Timestamp freshness
         let ts = request.payload.timestamp;
-        let diff = if now >= ts { now - ts } else { ts - now };
+        let diff = now.abs_diff(ts);
         if diff > self.timestamp_window {
             return AuthzResult::Denied(DeniedReason::RequestExpired);
         }
@@ -320,7 +321,7 @@ impl AuthzEngine {
     /// Evict nonces whose timestamps fall outside the current window.
     pub fn gc_nonces(&mut self, now: u64) {
         self.seen_nonces.retain(|_nonce, ts| {
-            let diff = if now >= *ts { now - *ts } else { *ts - now };
+            let diff = now.abs_diff(*ts);
             diff <= self.timestamp_window
         });
     }

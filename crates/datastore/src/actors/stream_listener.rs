@@ -3,8 +3,8 @@
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 
-use swactor_streams::messages::{StreamManagerMsg, StreamNotification};
-use swactor_streams::types::StreamMode;
+use crate::streams::messages::{StreamManagerMsg, StreamNotification};
+use crate::streams::types::StreamMode;
 
 use crate::blob_transfer::parse_metadata;
 use crate::messages::DatastoreNodeMsg;

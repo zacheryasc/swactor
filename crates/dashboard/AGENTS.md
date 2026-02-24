@@ -9,13 +9,13 @@ to stdout (one object per line). Human-readable output goes to stderr.
 ### Launching
 
 ```bash
-cargo run -p runtime-dashboard --example investigate_demo
+cargo run -p dashboard --example investigate_demo
 ```
 
 Or programmatically against any running runtime:
 
 ```rust
-use runtime_dashboard::investigate::run_investigate;
+use dashboard::investigate::run_investigate;
 run_investigate(runtime_arc, collector_arc)?;   // blocks on stdin
 ```
 

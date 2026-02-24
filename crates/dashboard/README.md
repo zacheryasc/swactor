@@ -1,4 +1,4 @@
-# runtime-dashboard
+# dashboard
 
 Visual dashboard for the swactor runtime. Provides a live HTTP dashboard, a
 terminal UI (TUI), trace recording/replay, and an HTTP API for programmatic
@@ -16,7 +16,7 @@ runtime investigation.
 Start the dashboard demo and open it in a browser:
 
 ```bash
-cargo run -p runtime-dashboard --example dashboard_demo
+cargo run -p dashboard --example dashboard_demo
 ```
 
 Pages:
@@ -33,9 +33,9 @@ membership and actor registrations in the directory/cache.
 A standalone binary that connects to any running dashboard over SSE:
 
 ```bash
-cargo run -p runtime-dashboard --features tui --bin swactor-tui
+cargo run -p dashboard --features tui --bin swactor-tui
 # or point at a specific endpoint
-cargo run -p runtime-dashboard --features tui --bin swactor-tui -- http://localhost:9090
+cargo run -p dashboard --features tui --bin swactor-tui -- http://localhost:9090
 ```
 
 Views (cycle with Tab):
@@ -70,7 +70,7 @@ All examples are run from the workspace root.
 **HTTP dashboard** — live workload with distribution cluster, Ctrl+C to stop:
 
 ```bash
-cargo run -p runtime-dashboard --example dashboard_demo
+cargo run -p dashboard --example dashboard_demo
 # http://localhost:9090              — runtime overview
 # http://localhost:9090/distribution — cluster view
 ```
@@ -78,14 +78,14 @@ cargo run -p runtime-dashboard --example dashboard_demo
 **Benchmarks** — four automated scenarios (~20 s total):
 
 ```bash
-cargo run -p runtime-dashboard --example bench_dashboard
+cargo run -p dashboard --example bench_dashboard
 # open http://localhost:9090
 ```
 
 **Record & replay** — records ~10 s of activity, then serves a replay:
 
 ```bash
-cargo run -p runtime-dashboard --example record_and_replay_demo
+cargo run -p dashboard --example record_and_replay_demo
 # live dashboard at http://localhost:9090 during recording
 # replay dashboard at http://localhost:9091 after recording finishes
 # Ctrl+C to stop

@@ -1,3 +1,4 @@
+#![cfg(feature = "distribution")]
 //! Lifecycle simulation tests — death/repair/cache/routing behavior.
 //!
 //! Tests that node death correctly triggers:

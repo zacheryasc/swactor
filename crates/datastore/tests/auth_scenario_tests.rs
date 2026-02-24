@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use distribution::crypto::Keypair;
-use shared_types::ContentHash;
+use swactor_datastore::crypto::Keypair;
+use swactor_datastore::content_hash::ContentHash;
 use swactor_datastore::auth::{
     sign_request, AccessControlList, AuthzEngine, AuthzResult, DatastoreAction, DeniedReason,
     SignedRequestPayload,

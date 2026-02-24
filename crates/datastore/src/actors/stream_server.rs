@@ -11,8 +11,8 @@ use std::time::Duration;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::Runtime;
 
-use swactor_streams::messages::{StreamManagerMsg, StreamNotification};
-use swactor_streams::types::StreamId;
+use crate::streams::messages::{StreamManagerMsg, StreamNotification};
+use crate::streams::types::StreamId;
 
 use crate::blob_transfer::{poll_inbox, send_blob, BlobTransferError};
 use crate::messages::{BlobStoreMsg, DatastoreResponse};

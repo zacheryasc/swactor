@@ -6,7 +6,7 @@ use swactor_datastore::chunking::{chunk_blob, reassemble_blob, verify_integrity}
 use swactor_datastore::messages::{BlobStoreMsg, DatastoreResponse, TransferMsg};
 use swactor_datastore::types::{ChunkRef, ContentHash, ObjectManifest};
 
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
 use common::{
     spawn_blob_store, spawn_transfer, test_runtime, tick_and_drain, tick_n, tick_until_recv,

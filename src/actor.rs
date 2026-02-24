@@ -639,11 +639,10 @@ impl<'a> Ctx<'a> {
 
     /// Send a typed message to an actor address.
     pub fn send<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
-        if let Some(caps) = self.capabilities() {
-            if addr != self.self_addr {
+        if let Some(caps) = self.capabilities()
+            && addr != self.self_addr {
                 caps.check_send::<M>(addr)?;
             }
-        }
         self.inner.send_any(addr, Box::new(msg))
     }
 

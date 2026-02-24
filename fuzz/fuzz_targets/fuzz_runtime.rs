@@ -12,7 +12,7 @@ use std::sync::Arc;
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Ctx, Inbox, Runtime};
-use swactor_std::{CtxTimers, StdExtension};
+use swactor::std::{CtxTimers, StdExtension};
 
 // ─── Run Logging ────────────────────────────────────────────────────────────
 //   FUZZ_LOG=1   → trace every run

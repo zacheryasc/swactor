@@ -7,7 +7,7 @@ use swactor::{
     config::RuntimeConfig,
     runtime::{Ctx, Runtime},
 };
-use swactor_std::{RuntimeGroups, RuntimeNaming, StdExtension};
+use swactor::std::{RuntimeGroups, RuntimeNaming, StdExtension};
 
 // ---------------------------------------------------------------------------
 // Helper

@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use proptest::prelude::*;
 use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
 
-use distribution::crypto::Keypair;
+use swactor_datastore::crypto::Keypair;
 use swactor_datastore::auth::{
     sign_request, AccessControlList, AuthzEngine, AuthzResult, DatastoreAction, DeniedReason,
     SignedRequestPayload,

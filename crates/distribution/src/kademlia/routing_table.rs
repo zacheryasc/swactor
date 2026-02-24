@@ -7,7 +7,7 @@
 
 use std::collections::VecDeque;
 
-use crate::types::NodeId;
+use crate::types::{NodeId, NodeIdDistance};
 
 /// Default replication parameter.
 pub const K: usize = 20;

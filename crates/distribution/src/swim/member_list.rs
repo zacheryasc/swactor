@@ -137,24 +137,22 @@ impl MemberList {
 
     /// Mark a node as suspect (if currently alive and same/higher incarnation).
     pub fn suspect(&mut self, node_id: NodeId) -> bool {
-        if let Some(entry) = self.members.get_mut(&node_id) {
-            if entry.state == MemberState::Alive {
+        if let Some(entry) = self.members.get_mut(&node_id)
+            && entry.state == MemberState::Alive {
                 entry.state = MemberState::Suspect;
                 return true;
             }
-        }
         false
     }
 
     /// Mark a node as dead. Only transitions from Suspect → Dead,
     /// enforcing the SWIM lifecycle invariant (Alive → Suspect → Dead).
     pub fn declare_dead(&mut self, node_id: NodeId) -> bool {
-        if let Some(entry) = self.members.get_mut(&node_id) {
-            if entry.state == MemberState::Suspect {
+        if let Some(entry) = self.members.get_mut(&node_id)
+            && entry.state == MemberState::Suspect {
                 entry.state = MemberState::Dead;
                 return true;
             }
-        }
         false
     }
 

@@ -368,7 +368,7 @@ impl Runtime {
     pub fn create_sender(&self) -> ExternalSender {
         ExternalSender {
             address_map: self.address_map.clone(),
-            transfer_txs: self.transfer_txs.iter().map(|tx| tx.clone()).collect(),
+            transfer_txs: self.transfer_txs.iter().cloned().collect(),
             worker_threads: self.worker_threads.clone(),
         }
     }

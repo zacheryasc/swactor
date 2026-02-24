@@ -17,7 +17,7 @@ use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 
 use crate::auth::{AccessRequestInfo, AuthzEngine, AuthzResult, DatastoreAction, DeniedReason};
 use crate::messages::{DatastoreNodeMsg, DatastoreResponse, GatewayMsg};
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
 /// The auth gateway actor wrapping an `AuthzEngine`.
 pub struct GatewayActor {

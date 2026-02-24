@@ -21,12 +21,15 @@ pub mod runtime;
 #[cfg(feature = "transport")]
 pub mod transport;
 
+#[cfg(feature = "std")]
+pub mod std;
+
 // Platform-aware Instant: web_time on wasm, std::time on native.
 // web_time is a no-op re-export of std::time::Instant on non-wasm targets.
 #[cfg(feature = "wasm")]
 pub(crate) use web_time::Instant;
 #[cfg(not(feature = "wasm"))]
-pub(crate) use std::time::Instant;
+pub(crate) use ::std::time::Instant;
 
 #[cfg(feature = "getrandom")]
 pub(crate) fn get_random(buf: &mut [u8]) {

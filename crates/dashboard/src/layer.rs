@@ -212,16 +212,14 @@ where
         if let Some(scope) = ctx.event_scope(event) {
             for span in scope {
                 let exts = span.extensions();
-                if worker_id.is_none() {
-                    if let Some(wid) = exts.get::<WorkerIdField>() {
+                if worker_id.is_none()
+                    && let Some(wid) = exts.get::<WorkerIdField>() {
                         worker_id = Some(wid.0);
                     }
-                }
-                if actor_addr.is_none() {
-                    if let Some(aa) = exts.get::<ActorAddrField>() {
+                if actor_addr.is_none()
+                    && let Some(aa) = exts.get::<ActorAddrField>() {
                         actor_addr = Some(aa.0.clone());
                     }
-                }
                 if worker_id.is_some() && actor_addr.is_some() {
                     break;
                 }
@@ -229,16 +227,14 @@ where
         }
 
         // Also check if worker_id or actor_addr was a field on the event itself
-        if worker_id.is_none() {
-            if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id") {
+        if worker_id.is_none()
+            && let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id") {
                 worker_id = n.as_u64().map(|v| v as usize);
             }
-        }
-        if actor_addr.is_none() {
-            if let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
+        if actor_addr.is_none()
+            && let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
                 actor_addr = Some(s.clone());
             }
-        }
 
         let dashboard_event = DashboardEvent {
             seq: 0, // filled by push()
@@ -259,11 +255,10 @@ where
         attrs.record(&mut visitor);
 
         if let Some(span) = ctx.span(id) {
-            if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id") {
-                if let Some(wid) = n.as_u64() {
+            if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id")
+                && let Some(wid) = n.as_u64() {
                     span.extensions_mut().insert(WorkerIdField(wid as usize));
                 }
-            }
             if let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
                 span.extensions_mut().insert(ActorAddrField(s.clone()));
             }

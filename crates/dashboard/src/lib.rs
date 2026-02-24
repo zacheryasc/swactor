@@ -3,6 +3,7 @@ pub mod command;
 pub mod history;
 pub mod investigate;
 pub mod layer;
+pub mod plugin;
 pub mod trace;
 pub mod warnings;
 mod actor_detail_html;
@@ -14,16 +15,6 @@ mod topology_html;
 
 #[cfg(feature = "tui")]
 pub mod tui;
-
-#[cfg(feature = "distribution")]
-mod distribution_html;
-#[cfg(feature = "distribution")]
-pub mod distribution_collector;
-
-mod datastore_html;
-pub mod datastore_collector;
-
-pub mod ci_collector;
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +31,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use crate::collector::StatsCollector;
 use crate::history::{DashboardHistory, HistoryConfig};
 use crate::layer::{now_ms, DashboardLayer, EventStore};
+use crate::plugin::PluginRegistry;
 use crate::trace::{RuntimeTrace, TimestampedStats};
 
 /// Peer info sent through the join channel: (public_key, optional_relay_url).
@@ -99,13 +91,7 @@ pub struct DashboardHandle {
     history: Arc<DashboardHistory>,
     recording: bool,
     port: u16,
-    #[cfg(feature = "distribution")]
-    distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>>,
-    datastore: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreStatsProvider>>>>,
-    datastore_factory: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreFactory>>>>,
-    ci: Arc<Mutex<Option<Arc<dyn ci_collector::CiStatsProvider>>>>,
-    peer_auth: Arc<Mutex<Option<Arc<Mutex<distribution::peer_auth::PeerAllowList>>>>>,
-    join_sender: Arc<Mutex<Option<std::sync::mpsc::Sender<JoinPeerInfo>>>>,
+    plugin_registry: Arc<PluginRegistry>,
     standalone_rt: Mutex<Option<tokio::runtime::Runtime>>,
 }
 
@@ -133,40 +119,9 @@ impl DashboardHandle {
         self.recording
     }
 
-    /// Attach a distribution stats provider, enabling the `/distribution` page.
-    #[cfg(feature = "distribution")]
-    pub fn set_distribution(&self, provider: Arc<dyn distribution_collector::DistributionStatsProvider>) {
-        *self.distribution.lock().unwrap() = Some(provider);
-    }
-
-    /// Attach a datastore stats provider, enabling the `/datastore` page.
-    pub fn set_datastore(&self, provider: Arc<dyn datastore_collector::DatastoreStatsProvider>) {
-        *self.datastore.lock().unwrap() = Some(provider);
-    }
-
-    /// Attach a datastore factory, enabling start/stop from the dashboard.
-    pub fn set_datastore_factory(&self, factory: Arc<dyn datastore_collector::DatastoreFactory>) {
-        *self.datastore_factory.lock().unwrap() = Some(factory);
-    }
-
-    /// Get the shared datastore provider mutex (for external wiring).
-    pub fn datastore_provider(&self) -> &Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreStatsProvider>>>> {
-        &self.datastore
-    }
-
-    /// Attach a CI stats provider, enabling the `/api/ci/*` endpoints.
-    pub fn set_ci(&self, provider: Arc<dyn ci_collector::CiStatsProvider>) {
-        *self.ci.lock().unwrap() = Some(provider);
-    }
-
-    /// Attach a peer allow-list for the peer management API.
-    pub fn set_peer_auth(&self, auth: Arc<Mutex<distribution::peer_auth::PeerAllowList>>) {
-        *self.peer_auth.lock().unwrap() = Some(auth);
-    }
-
-    /// Set a sender that triggers `driver.join()` when a peer is added via the dashboard.
-    pub fn set_join_sender(&self, tx: std::sync::mpsc::Sender<JoinPeerInfo>) {
-        *self.join_sender.lock().unwrap() = Some(tx);
+    /// Register a plugin with the dashboard.
+    pub fn register_plugin(&self, plugin: Arc<dyn plugin::DashboardPlugin>) {
+        self.plugin_registry.register(plugin);
     }
 
     /// Access the time-series history store (for TUI sparklines, etc.).
@@ -212,13 +167,7 @@ impl DashboardHandle {
             shutdown_notify: Arc::clone(&self.shutdown_notify),
             history: Arc::clone(&self.history),
             cmd_router: Arc::new(crate::command::CommandRouter::with_builtins()),
-            #[cfg(feature = "distribution")]
-            distribution: Arc::clone(&self.distribution),
-            datastore: Arc::clone(&self.datastore),
-            datastore_factory: Arc::clone(&self.datastore_factory),
-                        ci: Arc::clone(&self.ci),
-            peer_auth: Arc::clone(&self.peer_auth),
-            join_sender: Arc::clone(&self.join_sender),
+            plugins: Arc::clone(&self.plugin_registry),
         }
     }
 
@@ -228,8 +177,7 @@ impl DashboardHandle {
     /// This drains the recording buffers — each call consumes the buffered data.
     pub fn save_trace(&self, path: &str) -> io::Result<()> {
         let events = self.store.all_events().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 "recording not enabled (set DashboardConfig::record = true)",
             )
         })?;
@@ -242,7 +190,7 @@ impl DashboardHandle {
             stats_timeline,
         };
         let json = serde_json::to_string(&trace)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(|e| io::Error::other(e))?;
         std::fs::write(path, json)
     }
 }
@@ -265,25 +213,6 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let stats_timeline = Arc::new(ArrayQueue::new(config.record_stats_capacity.max(1)));
     let history = Arc::new(DashboardHistory::new(HistoryConfig::default()));
-
-    #[cfg(feature = "distribution")]
-    let distribution: Arc<Mutex<Option<Arc<dyn distribution_collector::DistributionStatsProvider>>>> =
-        Arc::new(Mutex::new(None));
-
-    let datastore: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreStatsProvider>>>> =
-        Arc::new(Mutex::new(None));
-
-    let datastore_factory: Arc<Mutex<Option<Arc<dyn datastore_collector::DatastoreFactory>>>> =
-        Arc::new(Mutex::new(None));
-
-        let ci: Arc<Mutex<Option<Arc<dyn ci_collector::CiStatsProvider>>>> =
-        Arc::new(Mutex::new(None));
-
-    let peer_auth: Arc<Mutex<Option<Arc<Mutex<distribution::peer_auth::PeerAllowList>>>>> =
-        Arc::new(Mutex::new(None));
-
-    let join_sender: Arc<Mutex<Option<std::sync::mpsc::Sender<JoinPeerInfo>>>> =
-        Arc::new(Mutex::new(None));
 
     // Start stats recorder thread when recording is enabled
     if config.record {
@@ -314,6 +243,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     }
 
     let port = config.port;
+    let plugin_registry = Arc::new(PluginRegistry::new());
 
     DashboardHandle {
         store,
@@ -325,13 +255,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         history,
         recording: config.record,
         port,
-        #[cfg(feature = "distribution")]
-        distribution,
-        datastore,
-        datastore_factory,
-                ci,
-        peer_auth,
-        join_sender,
+        plugin_registry,
         standalone_rt: Mutex::new(None),
     }
 }
@@ -368,7 +292,7 @@ pub fn serve_replay(path: &str, config: ReplayConfig) -> io::Result<()> {
         .worker_threads(1)
         .enable_all()
         .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(|e| io::Error::other(e))?;
 
     let state = server::ReplayState {
         trace: Arc::new(trace),

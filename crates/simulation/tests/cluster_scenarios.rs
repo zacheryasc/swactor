@@ -1,3 +1,4 @@
+#![cfg(feature = "distribution")]
 //! Cluster simulation scenarios — breadth-first coverage of failure modes.
 //!
 //! Inspired by Hashicorp memberlist test suite, FoundationDB simulation testing,

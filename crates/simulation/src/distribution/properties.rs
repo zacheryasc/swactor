@@ -733,7 +733,7 @@ pub fn check_staggered_join(
         .snapshots_per_round
         .iter()
         .take(by_round)
-        .last()
+        .next_back()
         .map(|round_snaps| {
             expected_joined
                 .iter()

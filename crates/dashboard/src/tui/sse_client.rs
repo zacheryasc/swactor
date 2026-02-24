@@ -151,27 +151,6 @@ fn parse_sse_events<R: BufRead>(
                 debug_log("received done event");
                 return Ok(());
             }
-            #[cfg(feature = "distribution")]
-            if current_event == "distribution" && !data_buf.is_empty() {
-                match serde_json::from_str::<distribution::snapshot::DistributionNodeSnapshot>(&data_buf) {
-                    Ok(snapshot) => {
-                        let event = AppEvent::DistributionUpdate {
-                            snapshot: Box::new(snapshot),
-                        };
-                        if tx.send(event).is_err() {
-                            debug_log("channel closed, exiting");
-                            return Ok(());
-                        }
-                    }
-                    Err(e) => {
-                        debug_log(&format!(
-                            "distribution JSON parse error: {} data={}",
-                            e,
-                            &data_buf[..data_buf.len().min(200)]
-                        ));
-                    }
-                }
-            }
             current_event.clear();
             data_buf.clear();
         } else if let Some(event_type) = trimmed.strip_prefix("event: ") {

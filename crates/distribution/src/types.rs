@@ -1,19 +1,22 @@
-use std::fmt;
-
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 
-// ─── NodeId ─────────────────────────────────────────────────────────────────
+pub use swactor::transport::NodeId;
+pub use crate::crypto::Signature;
 
-/// A node's identity — the raw bytes of an ed25519 public key.
-///
-/// Also serves as the Kademlia key for XOR distance calculations.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub [u8; 32]);
+// ─── NodeId extensions (Kademlia-specific) ─────────────────────────────────
 
-impl NodeId {
+/// Kademlia XOR distance operations on NodeId.
+pub trait NodeIdDistance {
     /// XOR distance between two node IDs (Kademlia metric).
-    pub fn xor_distance(&self, other: &NodeId) -> [u8; 32] {
+    fn xor_distance(&self, other: &NodeId) -> [u8; 32];
+    /// Number of leading zero bits in the XOR distance to `other`.
+    /// Returns 0..=256. Used to select the k-bucket index.
+    fn xor_leading_zeros(&self, other: &NodeId) -> u32;
+}
+
+impl NodeIdDistance for NodeId {
+    fn xor_distance(&self, other: &NodeId) -> [u8; 32] {
         let mut out = [0u8; 32];
         for i in 0..32 {
             out[i] = self.0[i] ^ other.0[i];
@@ -21,9 +24,7 @@ impl NodeId {
         out
     }
 
-    /// Number of leading zero bits in the XOR distance to `other`.
-    /// Returns 0..=256. Used to select the k-bucket index.
-    pub fn xor_leading_zeros(&self, other: &NodeId) -> u32 {
+    fn xor_leading_zeros(&self, other: &NodeId) -> u32 {
         let dist = self.xor_distance(other);
         let mut zeros = 0u32;
         for byte in dist {
@@ -35,62 +36,6 @@ impl NodeId {
             }
         }
         zeros
-    }
-}
-
-impl fmt::Debug for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "NodeId(")?;
-        for b in &self.0[..4] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "\u{2026})")
-    }
-}
-
-impl fmt::Display for NodeId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for b in &self.0[..8] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "\u{2026}")
-    }
-}
-
-// ─── Signature ──────────────────────────────────────────────────────────────
-
-/// An ed25519 signature (64 bytes).
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Signature(pub [u8; 64]);
-
-impl Serialize for Signature {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_bytes(&self.0)
-    }
-}
-
-impl<'de> Deserialize<'de> for Signature {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let bytes: Vec<u8> = Deserialize::deserialize(deserializer)?;
-        if bytes.len() != 64 {
-            return Err(serde::de::Error::custom(format!(
-                "expected 64 bytes for Signature, got {}",
-                bytes.len()
-            )));
-        }
-        let mut arr = [0u8; 64];
-        arr.copy_from_slice(&bytes);
-        Ok(Signature(arr))
-    }
-}
-
-impl fmt::Debug for Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Sig(")?;
-        for b in &self.0[..4] {
-            write!(f, "{:02x}", b)?;
-        }
-        write!(f, "\u{2026})")
     }
 }
 

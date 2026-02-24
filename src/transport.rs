@@ -16,6 +16,65 @@ use crate::actor::{ActorAddress, Message};
 use crate::delivery::{AddrBuildHasher, AddrMap};
 use crate::Error;
 
+// ─── NodeId ─────────────────────────────────────────────────────────────────
+
+/// A node's identity — 32 opaque bytes.
+///
+/// Typically the raw bytes of an ed25519 public key, but this type
+/// carries no cryptographic semantics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct NodeId(pub [u8; 32]);
+
+impl core::fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "NodeId(")?;
+        for b in &self.0[..4] {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\u{2026})")
+    }
+}
+
+impl core::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        for b in &self.0[..8] {
+            write!(f, "{:02x}", b)?;
+        }
+        write!(f, "\u{2026}")
+    }
+}
+
+// ─── Hex encoding ───────────────────────────────────────────────────────────
+
+/// Hex-encode a byte slice.
+pub fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hex-decode a string into bytes. Returns `None` on invalid input.
+pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    if hex.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks(2) {
+        let hi = hex_digit(chunk[0])?;
+        let lo = hex_digit(chunk[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    Some(bytes)
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 // ─── Codec ──────────────────────────────────────────────────────────────────
 
 /// User-implemented codec for a specific message type.
@@ -78,6 +137,12 @@ type DecodeFn = Box<dyn Fn(&[u8]) -> Result<Box<dyn Any + Send>, Error> + Send +
 pub struct CodecRegistry {
     encoders: HashMap<TypeId, EncodeFn>,
     decoders: HashMap<String, DecodeFn>,
+}
+
+impl Default for CodecRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CodecRegistry {
@@ -152,6 +217,12 @@ impl CodecRegistry {
 /// Maps remote actor addresses to their [`Transport`].
 pub struct TransportRouter {
     routes: RwLock<AddrMap<Arc<dyn Transport>>>,
+}
+
+impl Default for TransportRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TransportRouter {

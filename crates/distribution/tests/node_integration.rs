@@ -7,7 +7,7 @@ mod common;
 
 use swactor::actor::ActorAddress;
 use common::{test_config, TestCluster};
-use distribution::crypto::Keypair;
+use distribution::crypto::{Keypair, KeypairExt};
 use distribution::node::{DistributedNode, DistributedNodeConfig, ResolveResult};
 use distribution::swim::node::NodeAction;
 

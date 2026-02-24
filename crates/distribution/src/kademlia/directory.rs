@@ -16,6 +16,12 @@ pub struct DirectoryShard {
     entries: HashMap<ActorAddress, Vec<DirectoryEntry>>,
 }
 
+impl Default for DirectoryShard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl DirectoryShard {
     pub fn new() -> Self {
         Self {
@@ -56,7 +62,7 @@ impl DirectoryShard {
         let mut removed = Vec::new();
         for entries in self.entries.values_mut() {
             let _before = entries.len();
-            let drained: Vec<_> = entries.drain(..).collect();
+            let drained: Vec<_> = std::mem::take(entries);
             for entry in drained {
                 if entry.node_id == *node_id {
                     removed.push(entry);
@@ -74,7 +80,7 @@ impl DirectoryShard {
     pub fn remove_where<F: Fn(&DirectoryEntry) -> bool>(&mut self, predicate: F) -> Vec<DirectoryEntry> {
         let mut removed = Vec::new();
         for entries in self.entries.values_mut() {
-            let drained: Vec<_> = entries.drain(..).collect();
+            let drained: Vec<_> = std::mem::take(entries);
             for entry in drained {
                 if predicate(&entry) {
                     removed.push(entry);

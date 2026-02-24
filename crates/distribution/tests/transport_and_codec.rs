@@ -83,7 +83,7 @@ mod tcp_transport {
 
     use distribution::codec::distribution_codec_registry;
     use distribution::messages::*;
-    use distribution::transport::{TcpAcceptor, TcpTransport};
+    use swactor_transport::tcp::{TcpAcceptor, TcpTransport};
     use distribution::types::NodeId;
 
     #[test]

@@ -153,6 +153,12 @@ pub struct CommandRouter {
     handlers: HashMap<String, Box<dyn CommandHandler>>,
 }
 
+impl Default for CommandRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CommandRouter {
     pub fn new() -> Self {
         Self {

@@ -1,3 +1,5 @@
+#![cfg(feature = "gossip")]
+
 use swactor::config::RuntimeConfig;
 use swactor::runtime::Runtime;
 use simulation::gossip::{GossipActor, GossipMessage, GossipQueryResponse};

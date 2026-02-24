@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use swactor::actor::{ActorAddress, Message};
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
-use swactor_std::StdExtension;
+use swactor::std::StdExtension;
 
 use swactor_datastore::chunking::chunk_blob;
 use swactor_datastore::messages::{BlobStoreMsg, DatastoreResponse, MetadataMsg};
@@ -15,7 +15,7 @@ use swactor_datastore::storage::InMemoryBackend;
 use swactor_datastore::types::{ChunkRef, ContentHash, DatastoreConfig, ObjectEntry, ObjectManifest};
 use swactor_datastore::{BlobStoreActor, DatastoreNode, MetadataActor, TransferActor};
 
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
 /// Create a single-threaded runtime with StdExtension.
 pub fn test_runtime() -> Runtime {

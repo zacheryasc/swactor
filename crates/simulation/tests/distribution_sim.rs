@@ -1,3 +1,5 @@
+#![cfg(feature = "distribution")]
+
 use simulation::distribution::properties::{
     analyze, check_actor_resolution, check_failure_detection, check_join_convergence,
     check_membership_accuracy,

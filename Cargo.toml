@@ -1,23 +1,20 @@
 [workspace]
 members = [
     ".",
-    "crates/python",
-    "crates/wasm/runtime",
-    "crates/bin-runner",
+    "crates/bindings/python",
+    "crates/bindings/wasm-runtime",
     "crates/simulation",
     "crates/dashboard",
     "crates/distribution",
-    "crates/std",
     "crates/process",
     "crates/datastore",
-    "crates/shared-types",
-    "crates/swactor-node",
-    "crates/streams",
+    "crates/transport",
+    "crates/node",
     "tests/docker",
-    "crates/ci",
+    "tests/integration",
     "xtask",
 ]
-exclude = ["tools/depgraph", "crates/wasm/crypto"]
+exclude = ["crates/bindings/wasm-crypto"]
 
 [package]
 name = "swactor"
@@ -33,7 +30,8 @@ strip = false
 crate-type = ["rlib"]
 
 [features]
-default = ["getrandom"]
+default = ["getrandom", "std"]
+std = [] # OTP patterns: supervisors, registries, timers, routers
 getrandom = ["dep:getrandom"]
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
@@ -54,7 +52,6 @@ crossbeam-utils = "0.8.21"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 proptest-state-machine = "0.3"
-swactor-std = { path = "crates/std" }
 
 [[bench]]
 name = "runtime_benchmarks"
@@ -68,6 +65,3 @@ harness = false
 name = "hasher_benchmarks"
 harness = false
 
-[[example]]
-name = "tcp_ping_pong"
-required-features = ["transport"]

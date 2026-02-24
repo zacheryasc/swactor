@@ -8,10 +8,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use distribution::types::NodeId;
+use swactor::transport::NodeId;
 
-// Re-export the shared ContentHash — single canonical type across the crate ecosystem.
-pub use shared_types::ContentHash;
+pub use crate::content_hash::ContentHash;
 
 // ─── ObjectEntry ────────────────────────────────────────────────────────────
 

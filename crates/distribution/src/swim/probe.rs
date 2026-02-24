@@ -233,7 +233,7 @@ impl SwimProbe {
 
         self.next_probe_tick = self.tick + self.config.probe_interval;
 
-        if let Some(target) = self.pick_probe_target(&mut MemberList::clone_shallow(members)) {
+        if let Some(target) = self.pick_probe_target(&MemberList::clone_shallow(members)) {
             // Record this probe target in history
             if self.recent_targets.len() >= PROBE_HISTORY_SIZE {
                 self.recent_targets.pop_front();
@@ -305,14 +305,11 @@ impl SwimProbe {
     }
 
     fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, _members: &mut MemberList, _actions: &mut Vec<SwimAction>) {
-        match &self.phase {
-            ProbePhase::WaitingIndirectAck { target: expected, sequence: expected_seq, .. } => {
-                if target == *expected && sequence == *expected_seq {
-                    self.cancel_suspicion_timer(target);
-                    self.phase = ProbePhase::Idle;
-                }
+        if let ProbePhase::WaitingIndirectAck { target: expected, sequence: expected_seq, .. } = &self.phase {
+            if target == *expected && sequence == *expected_seq {
+                self.cancel_suspicion_timer(target);
+                self.phase = ProbePhase::Idle;
             }
-            _ => {}
         }
     }
 

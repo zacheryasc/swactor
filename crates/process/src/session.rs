@@ -182,13 +182,12 @@ impl ProcessSession {
                     });
                 }
                 // Backpressure: buffer if over limit
-                if let Some(limit) = self.spec.stdin_buffer_limit {
-                    if self.flow.pending_stdin_bytes >= limit {
+                if let Some(limit) = self.spec.stdin_buffer_limit
+                    && self.flow.pending_stdin_bytes >= limit {
                         self.stdin_buffer_bytes += data.len();
                         self.stdin_buffer.push_back(data);
                         return vec![];
                     }
-                }
                 self.flow.pending_stdin_bytes += data.len();
                 vec![ProcessAction::WriteStdin { data }]
             }

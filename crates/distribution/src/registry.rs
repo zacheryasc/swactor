@@ -167,11 +167,10 @@ impl ClusterRegistry {
 
     /// Merge a single remote entry. Returns true if state changed.
     pub fn merge(&mut self, remote: RegistryEntry) -> bool {
-        if let Some(existing) = self.entries.get(&remote.name) {
-            if !lww_wins(&remote, existing) {
+        if let Some(existing) = self.entries.get(&remote.name)
+            && !lww_wins(&remote, existing) {
                 return false;
             }
-        }
 
         let changed = match self.entries.get(&remote.name) {
             Some(existing) => existing != &remote,
@@ -254,7 +253,7 @@ impl ClusterRegistry {
     /// Periodic GC: remove tombstones past TTL with exhausted dissemination budgets.
     pub fn gc_tick(&mut self) {
         self.tick_count += 1;
-        if self.tick_count % self.config.gc_interval != 0 {
+        if !self.tick_count.is_multiple_of(self.config.gc_interval) {
             return;
         }
 

@@ -1,8 +1,8 @@
-//! Thread-safe metrics for the datastore, consumed by the runtime dashboard.
+//! Thread-safe metrics for the datastore.
 //!
 //! `DatastoreMetrics` accumulates counters and event history from any thread
 //! (API handlers run on `tiny_http` worker threads). The dashboard polls
-//! `snapshot()` every ~200ms via the `DatastoreStatsProvider` trait.
+//! `snapshot()` every ~200ms via the plugin system.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,6 +69,12 @@ pub struct DatastoreMetrics {
     objects: Mutex<Vec<ObjectSummary>>,
     events: Mutex<VecDeque<DatastoreEvent>>,
     transfers: Mutex<Vec<TransferProgress>>,
+}
+
+impl Default for DatastoreMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DatastoreMetrics {
@@ -186,11 +192,3 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-// ── Dashboard integration ────────────────────────────────────────────────────
-
-impl dashboard::datastore_collector::DatastoreStatsProvider for DatastoreMetrics {
-    fn snapshot_json(&self) -> Option<String> {
-        let snap = self.snapshot();
-        serde_json::to_string(&snap).ok()
-    }
-}
