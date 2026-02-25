@@ -94,6 +94,11 @@ impl MemberList {
             .count()
     }
 
+    /// Remove a member entry entirely.
+    pub fn remove(&mut self, node_id: &NodeId) -> bool {
+        self.members.remove(node_id).is_some()
+    }
+
     /// Total members including dead.
     pub fn len(&self) -> usize {
         self.members.len()

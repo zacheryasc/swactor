@@ -20,6 +20,8 @@ fn make_driver_with_streams() -> IrohDriver {
         node: DistributedNodeConfig::default(),
         peer_auth: None,
         additional_alpns: vec![swactor_datastore::streams::ALPN.to_vec()],
+        embedded_relay_bind: None,
+        relay_public_ip: None,
     })
     .expect("create iroh driver")
 }

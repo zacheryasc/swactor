@@ -4,14 +4,12 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["tcp"]
-tcp = ["dep:swactor-transport", "swactor-transport/tcp"]
+default = []
 iroh = ["dep:iroh", "dep:tokio"]
 relay = ["iroh", "dep:iroh-relay"]
 
 [dependencies]
 swactor = { path = "../..", features = ["serde", "transport"] }
-swactor-transport = { path = "../transport", optional = true }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }

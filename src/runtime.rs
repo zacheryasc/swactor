@@ -10,7 +10,7 @@ use crate::Instant;
 use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Environment, ExitValue, Message, ResumeSignal, SpawnRequest, StopSignal, StopWithSignal, SystemInfo};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
-pub use crate::config::{BackoffPolicy, MailboxOverflow, RuntimeConfig};
+pub use crate::config::{MailboxOverflow, RuntimeConfig};
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
 use crate::extension::RuntimeExtension;
 use crate::stats::{StatsHook, WorkerStats};

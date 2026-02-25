@@ -95,6 +95,7 @@ fn probe_sends_ping_after_interval() {
         indirect_probes: 2,
         suspicion_timeout: 20,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -118,6 +119,7 @@ fn probe_ack_completes_cycle() {
         indirect_probes: 2,
         suspicion_timeout: 20,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -148,6 +150,7 @@ fn probe_timeout_triggers_indirect_probes() {
         indirect_probes: 2,
         suspicion_timeout: 20,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -175,6 +178,7 @@ fn no_ack_at_all_causes_suspicion() {
         indirect_probes: 2,
         suspicion_timeout: 20,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -204,6 +208,7 @@ fn suspicion_timeout_causes_death_declaration() {
         indirect_probes: 0,
         suspicion_timeout: 10,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -238,6 +243,7 @@ fn indirect_ack_rescues_suspected_node() {
         indirect_probes: 2,
         suspicion_timeout: 20,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -289,6 +295,7 @@ fn reprobe_sends_ping_to_dead_node() {
         indirect_probes: 0,
         suspicion_timeout: 10,
         dead_reprobe_interval: 20,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -314,6 +321,7 @@ fn reprobe_disabled_when_interval_is_zero() {
         indirect_probes: 0,
         suspicion_timeout: 10,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));
@@ -336,6 +344,7 @@ fn reprobe_does_nothing_when_no_dead_members() {
         indirect_probes: 0,
         suspicion_timeout: 10,
         dead_reprobe_interval: 20,
+        ..SwimConfig::default()
     };
     let mut probe = SwimProbe::new(config);
     let mut members = MemberList::new(node(0));

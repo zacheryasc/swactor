@@ -578,6 +578,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   }
 
   var es = new EventSource('/events');
+  window.addEventListener('beforeunload', function() { es.close(); });
 
   es.addEventListener('stats', function(e) {
     try {

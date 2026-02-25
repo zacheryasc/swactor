@@ -721,6 +721,7 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
 
   // ── SSE connection ─────────────────────────────────────
   var es = new EventSource('/events');
+  window.addEventListener('beforeunload', function() { es.close(); });
 
   es.addEventListener('stats', function(e) {
     try {

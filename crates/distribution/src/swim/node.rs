@@ -67,6 +67,21 @@ impl SwimNode {
         &self.members
     }
 
+    /// Clear a Dead member entry so a subsequent JoinResponse can re-establish it.
+    ///
+    /// Used by the re-peer flow: a JoinResponse carries the remote node's
+    /// self-report as `(Alive, incarnation)`, but SWIM merge semantics reject
+    /// Alive at the same incarnation when the local entry is Dead.  Removing
+    /// the stale Dead entry lets the fresh Alive record take effect.
+    pub fn clear_dead_member(&mut self, node_id: NodeId) {
+        if let Some(entry) = self.members.get(&node_id) {
+            if entry.state == MemberState::Dead {
+                self.members.remove(&node_id);
+                self.dissemination.purge_node(&node_id);
+            }
+        }
+    }
+
     /// Recent probe targets from the SWIM probe cycle.
     pub fn recent_probe_targets(&self) -> &std::collections::VecDeque<NodeId> {
         self.probe.recent_probe_targets()
@@ -142,6 +157,15 @@ impl SwimNode {
         actions
     }
 
+    /// Report that a send to `target` failed, triggering a reactive probe.
+    pub fn report_send_failure(&mut self, target: NodeId) -> Vec<NodeAction> {
+        let probe_actions = self.probe.step(
+            SwimEvent::SendFailed { to: target },
+            &mut self.members,
+        );
+        self.translate_probe_actions(probe_actions)
+    }
+
     /// Handle a received indirect ack (forwarded by a relay node).
     pub fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
         let mut actions = self.apply_piggyback(piggyback);
@@ -202,6 +226,11 @@ impl SwimNode {
                     state: record.state,
                     incarnation: record.incarnation,
                 });
+                // In reactive mode, probe newly discovered alive peers so they
+                // don't decay to dead before we ever exchange a ping/ack.
+                if record.state == MemberState::Alive && record.node_id != self.members.self_id() {
+                    self.probe.enqueue_demand_probe(record.node_id);
+                }
             }
         }
         actions
@@ -259,6 +288,9 @@ impl SwimNode {
         if changed {
             if update.state == MemberState::Alive {
                 eprintln!("SWIM: alive {}", &hex_encode(&update.node_id.0)[..8]);
+                // In reactive mode, probe newly discovered alive peers so they
+                // don't decay to dead before we ever exchange a ping/ack.
+                self.probe.enqueue_demand_probe(update.node_id);
             }
             // Re-disseminate the update
             self.dissemination.enqueue(

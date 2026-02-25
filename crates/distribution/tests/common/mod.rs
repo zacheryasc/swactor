@@ -21,6 +21,7 @@ pub fn test_config() -> DistributedNodeConfig {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 0,
+            ..SwimConfig::default()
         },
         cache_capacity: 100,
         republish_interval: 50,

@@ -314,6 +314,7 @@ fn asymmetric_partition_registry_converges_after_heal() {
             indirect_probes: 1,
             suspicion_timeout: 200,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..DistributionSimConfig::default()
     };
@@ -556,6 +557,7 @@ fn three_way_partition_heals_and_converges() {
             // Must exceed partition duration (50 rounds × 3 ticks = 150 ticks)
             suspicion_timeout: 200,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..DistributionSimConfig::default()
     };

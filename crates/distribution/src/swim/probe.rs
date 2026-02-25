@@ -14,10 +14,20 @@ const PROBE_HISTORY_SIZE: usize = 16;
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
+/// Controls how the probe cycle triggers probes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProbeMode {
+    /// Classic SWIM: probe one random member every `probe_interval` ticks.
+    Periodic,
+    /// No periodic probing. Probes triggered externally via `SendFailed`.
+    /// Safety sweep probes one random member every `safety_sweep_interval` ticks.
+    Reactive { safety_sweep_interval: u64 },
+}
+
 /// SWIM protocol configuration.
 #[derive(Debug, Clone)]
 pub struct SwimConfig {
-    /// Ticks between probe cycles.
+    /// Ticks between probe cycles (used in Periodic mode).
     pub probe_interval: u64,
     /// Ticks to wait for a direct ack before sending indirect probes.
     pub probe_timeout: u64,
@@ -28,6 +38,8 @@ pub struct SwimConfig {
     /// Ticks between dead-node reprobe attempts. 0 = disabled.
     /// When enabled, periodically pings dead nodes to detect partition heals.
     pub dead_reprobe_interval: u64,
+    /// Probe mode: Periodic (default) or Reactive (probe-on-failure).
+    pub probe_mode: ProbeMode,
 }
 
 impl Default for SwimConfig {
@@ -38,6 +50,7 @@ impl Default for SwimConfig {
             indirect_probes: 3,
             suspicion_timeout: 30,
             dead_reprobe_interval: 50,
+            probe_mode: ProbeMode::Periodic,
         }
     }
 }
@@ -53,6 +66,8 @@ pub enum SwimEvent {
     AckReceived { from: NodeId, sequence: u64 },
     /// Received an indirect ack (forwarded through a relay).
     IndirectAckReceived { target: NodeId, sequence: u64 },
+    /// A send to the given peer failed (reactive probe trigger).
+    SendFailed { to: NodeId },
 }
 
 // ─── Actions (outputs) ──────────────────────────────────────────────────────
@@ -103,6 +118,9 @@ struct SuspicionTimer {
     started_at: u64,
 }
 
+/// Maximum demand queue size to prevent unbounded growth.
+const MAX_DEMAND_QUEUE: usize = 32;
+
 /// The SWIM probe state machine.
 pub struct SwimProbe {
     config: SwimConfig,
@@ -122,6 +140,10 @@ pub struct SwimProbe {
     next_reprobe_tick: u64,
     /// Round-robin index into the dead member list for reprobe target selection.
     reprobe_index: usize,
+    /// Peers needing probes due to send failures (reactive mode).
+    demand_queue: VecDeque<NodeId>,
+    /// Tick at which the next safety sweep fires (reactive mode).
+    next_sweep_tick: u64,
 }
 
 impl SwimProbe {
@@ -130,6 +152,10 @@ impl SwimProbe {
             config.dead_reprobe_interval
         } else {
             u64::MAX
+        };
+        let next_sweep = match &config.probe_mode {
+            ProbeMode::Reactive { safety_sweep_interval } => *safety_sweep_interval,
+            ProbeMode::Periodic => u64::MAX,
         };
         Self {
             next_probe_tick: config.probe_interval,
@@ -143,6 +169,8 @@ impl SwimProbe {
             probe_order: Vec::new(),
             suspicion_timers: Vec::new(),
             recent_targets: VecDeque::with_capacity(PROBE_HISTORY_SIZE),
+            demand_queue: VecDeque::new(),
+            next_sweep_tick: next_sweep,
         }
     }
 
@@ -155,7 +183,15 @@ impl SwimProbe {
                 self.tick += 1;
                 self.check_probe_timeout(members, &mut actions);
                 self.check_suspicion_timeouts(members, &mut actions);
-                self.maybe_start_probe(members, &mut actions);
+                match &self.config.probe_mode {
+                    ProbeMode::Periodic => {
+                        self.maybe_start_probe(members, &mut actions);
+                    }
+                    ProbeMode::Reactive { .. } => {
+                        self.maybe_start_demand_probe(members, &mut actions);
+                        self.maybe_safety_sweep(members, &mut actions);
+                    }
+                }
                 self.maybe_reprobe_dead(members, &mut actions);
             }
             SwimEvent::AckReceived { from, sequence } => {
@@ -163,6 +199,9 @@ impl SwimProbe {
             }
             SwimEvent::IndirectAckReceived { target, sequence } => {
                 self.handle_indirect_ack(target, sequence, members, &mut actions);
+            }
+            SwimEvent::SendFailed { to } => {
+                self.handle_send_failed(to, members, &mut actions);
             }
         }
 
@@ -389,6 +428,115 @@ impl SwimProbe {
             to: target.node_id,
             sequence: seq,
         });
+    }
+
+    // ─── Reactive mode ─────────────────────────────────────────────────
+
+    /// Enqueue a demand probe for a newly discovered peer (reactive mode only).
+    ///
+    /// Called when gossip or a join response introduces a new Alive member.
+    /// In Periodic mode this is a no-op (periodic probing covers it).
+    pub fn enqueue_demand_probe(&mut self, target: NodeId) {
+        if matches!(self.config.probe_mode, ProbeMode::Periodic) {
+            return;
+        }
+        if self.is_currently_probing(target) || self.demand_queue.contains(&target) {
+            return;
+        }
+        if self.demand_queue.len() < MAX_DEMAND_QUEUE {
+            self.demand_queue.push_back(target);
+        }
+    }
+
+    /// Handle a send failure: start a probe immediately or queue it.
+    fn handle_send_failed(&mut self, target: NodeId, members: &MemberList, actions: &mut Vec<SwimAction>) {
+        // Ignore failures for dead peers, self, or already-queued targets
+        if let Some(entry) = members.get(&target) {
+            if entry.state == MemberState::Dead {
+                return;
+            }
+        } else {
+            // Unknown peer — nothing to probe
+            return;
+        }
+
+        // Ignore if we're already probing this target
+        if self.is_currently_probing(target) {
+            return;
+        }
+
+        // Ignore if already in demand queue
+        if self.demand_queue.contains(&target) {
+            return;
+        }
+
+        if matches!(self.phase, ProbePhase::Idle) {
+            // Start probe immediately
+            self.start_probe_for(target, actions);
+        } else {
+            // Queue it (capped)
+            if self.demand_queue.len() < MAX_DEMAND_QUEUE {
+                self.demand_queue.push_back(target);
+            }
+        }
+    }
+
+    /// Start a directed probe to a specific target.
+    fn start_probe_for(&mut self, target: NodeId, actions: &mut Vec<SwimAction>) {
+        if self.recent_targets.len() >= PROBE_HISTORY_SIZE {
+            self.recent_targets.pop_front();
+        }
+        self.recent_targets.push_back(target);
+
+        let seq = self.next_sequence();
+        actions.push(SwimAction::SendPing {
+            to: target,
+            sequence: seq,
+        });
+        self.phase = ProbePhase::WaitingDirectAck {
+            target,
+            sequence: seq,
+            sent_at: self.tick,
+        };
+    }
+
+    /// On each tick in reactive mode, if idle and queue non-empty, pop and probe.
+    fn maybe_start_demand_probe(&mut self, _members: &MemberList, actions: &mut Vec<SwimAction>) {
+        if !matches!(self.phase, ProbePhase::Idle) {
+            return;
+        }
+        if let Some(target) = self.demand_queue.pop_front() {
+            self.start_probe_for(target, actions);
+        }
+    }
+
+    /// At safety_sweep_interval, probe one random alive member.
+    fn maybe_safety_sweep(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
+        if self.tick < self.next_sweep_tick {
+            return;
+        }
+        let interval = match &self.config.probe_mode {
+            ProbeMode::Reactive { safety_sweep_interval } => *safety_sweep_interval,
+            ProbeMode::Periodic => return,
+        };
+        self.next_sweep_tick = self.tick + interval;
+
+        if !matches!(self.phase, ProbePhase::Idle) {
+            return;
+        }
+
+        if let Some(target) = self.pick_probe_target(&MemberList::clone_shallow(members)) {
+            self.start_probe_for(target, actions);
+        }
+    }
+
+    /// Check if we are currently probing a specific target.
+    fn is_currently_probing(&self, target: NodeId) -> bool {
+        match &self.phase {
+            ProbePhase::WaitingDirectAck { target: t, .. }
+            | ProbePhase::WaitingIndirectAck { target: t, .. } => *t == target,
+            ProbePhase::Idle => false,
+        }
     }
 }
 

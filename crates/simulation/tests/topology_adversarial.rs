@@ -43,6 +43,7 @@ fn per_link_degradation_causes_asymmetric_views() {
             indirect_probes: 2,
             suspicion_timeout: 8,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![
@@ -133,6 +134,7 @@ fn relay_penalty_causes_false_suspicions() {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![
@@ -195,6 +197,7 @@ fn asymmetric_relay_links_create_view_divergence() {
             indirect_probes: 2,
             suspicion_timeout: 8,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![
@@ -265,6 +268,7 @@ fn relay_flapping_causes_membership_oscillation() {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 8,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![
@@ -335,6 +339,7 @@ fn hub_saturation_degrades_spoke_connectivity() {
             indirect_probes: 2,
             suspicion_timeout: 8,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![
@@ -405,6 +410,7 @@ fn correlated_nat_gateway_failure() {
             indirect_probes: 2,
             suspicion_timeout: 8,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![
@@ -483,6 +489,7 @@ fn split_brain_with_dual_relays() {
             indirect_probes: 2,
             suspicion_timeout: 8,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![
@@ -578,6 +585,7 @@ fn relay_is_target_causes_isolation_on_death() {
             indirect_probes: 2,
             suspicion_timeout: 8,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         topology: Some(NetworkTopology {
             locations: vec![

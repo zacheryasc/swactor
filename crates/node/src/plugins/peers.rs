@@ -108,7 +108,7 @@ impl PeersPlugin {
             Err(e) => return PluginResponse::error(400, format!("invalid JSON: {e}")),
         };
 
-        let node_id_str = match parsed.get("node_id").and_then(|v| v.as_str()) {
+        let raw_node_id = match parsed.get("node_id").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return PluginResponse::error(400, "missing node_id field"),
         };
@@ -117,6 +117,30 @@ impl PeersPlugin {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+
+        // Parse rich invite code: <base58>#<addr1>,<addr2>@<relay_url>
+        // Split on last '@' for relay, then '#' for direct addrs
+        let (left, invite_relay_url) = match raw_node_id.rfind('@') {
+            Some(idx) => (&raw_node_id[..idx], Some(raw_node_id[idx + 1..].to_string())),
+            None => (raw_node_id, None),
+        };
+        let (node_id_str, invite_addrs_str) = match left.find('#') {
+            Some(idx) => (&left[..idx], Some(&left[idx + 1..])),
+            None => (left, None),
+        };
+
+        // Parse direct addrs from invite code or explicit body field
+        let direct_addrs_str = parsed
+            .get("direct_addrs")
+            .and_then(|v| v.as_str())
+            .or(invite_addrs_str);
+        let direct_addrs: Vec<std::net::SocketAddr> = direct_addrs_str
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|a| a.trim().parse::<std::net::SocketAddr>().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let bytes: [u8; 32] = if let Some(b) = hex_decode(node_id_str) {
             match b.try_into() {
@@ -131,10 +155,12 @@ impl PeersPlugin {
             return PluginResponse::error(400, "invalid node_id (expected 64-char hex or base58)");
         };
 
+        // Explicit relay_url field takes precedence, then invite code's @relay
         let relay_url = parsed
             .get("relay_url")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            .or(invite_relay_url);
 
         let node_id = NodeId(bytes);
         let mut list = self.peer_auth.lock().unwrap();
@@ -145,11 +171,21 @@ impl PeersPlugin {
         drop(list);
 
         // Trigger a SWIM join for the newly added peer
+        let has_direct = !direct_addrs.is_empty();
+        let direct_count = direct_addrs.len();
         if let Some(tx) = &self.join_sender {
-            let _ = tx.send((bytes, relay_url));
+            let _ = tx.send(JoinPeerInfo {
+                node_id: bytes,
+                relay_url: relay_url.clone(),
+                direct_addrs,
+            });
         }
 
-        PluginResponse::json(r#"{"ok":true}"#.to_string())
+        let has_relay = relay_url.is_some();
+        let node_id_hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+        PluginResponse::json(format!(
+            r#"{{"ok":true,"has_relay":{has_relay},"has_direct":{has_direct},"direct_count":{direct_count},"node_id":"{node_id_hex}"}}"#
+        ))
     }
 
     fn handle_sync(&self, body: &[u8]) -> PluginResponse {
@@ -236,7 +272,11 @@ impl PeersPlugin {
                 });
 
                 if let Some(tx) = &self.join_sender {
-                    let _ = tx.send((bytes, relay_url));
+                    let _ = tx.send(JoinPeerInfo {
+                        node_id: bytes,
+                        relay_url,
+                        direct_addrs: vec![],
+                    });
                 }
             }
         }
@@ -261,11 +301,15 @@ impl PeersPlugin {
             None => return PluginResponse::error(400, "missing node_id field"),
         };
 
-        let bytes = match hex_decode(node_id_hex) {
-            Some(b) if b.len() == 32 => b,
-            _ => {
-                return PluginResponse::error(400, "invalid node_id hex (must be 64 hex chars)");
+        let bytes: Vec<u8> = if let Some(b) = hex_decode(node_id_hex) {
+            if b.len() != 32 {
+                return PluginResponse::error(400, "invalid node_id (hex decoded to wrong length)");
             }
+            b
+        } else if let Some(arr) = base58_decode(node_id_hex) {
+            arr.to_vec()
+        } else {
+            return PluginResponse::error(400, "invalid node_id (expected 64-char hex or base58)");
         };
 
         let node_id = NodeId(bytes.try_into().unwrap());

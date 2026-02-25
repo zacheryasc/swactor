@@ -28,6 +28,10 @@ impl<T> HybridChannel<T> {
     pub fn pop(&self) -> Option<T> {
         self.ring.pop().or_else(|| self.overflow.pop())
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.ring.is_empty() && self.overflow.is_empty()
+    }
 }
 
 pub(crate) struct Receiver<T> {
@@ -42,6 +46,10 @@ impl<T> Receiver<T> {
     }
     pub fn try_recv(&self) -> Option<T> {
         self.queue.pop()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
     }
 
     pub fn new_sender(&self) -> Sender<T> {

@@ -69,6 +69,7 @@ impl Default for DistributionSimConfig {
                 indirect_probes: 1,
                 suspicion_timeout: 5,
                 dead_reprobe_interval: 10,
+                probe_mode: distribution::swim::probe::ProbeMode::Periodic,
             },
             actors_per_node: 2,
             kill_schedule: Vec::new(),
@@ -365,6 +366,11 @@ fn run_simulation_inner(config: DistributionSimConfig) -> (DistTrace, Vec<Option
                     }
                     SimAction::Join { node_idx, seed_idx } => {
                         if *node_idx < n && *seed_idx < n {
+                            // Mirror IrohDriver::join(): clear dead state before re-peering
+                            // so stale Dead gossip doesn't leak from the dissemination queue.
+                            if let Some(ref mut joining_node) = nodes[*node_idx] {
+                                joining_node.clear_dead_member(node_ids[*seed_idx]);
+                            }
                             if let Some(ref mut seed_node) = nodes[*seed_idx] {
                                 let join_actions = seed_node.handle_join_request(node_ids[*node_idx]);
                                 let tagged_responses = deliver_actions_tagged_with_net(

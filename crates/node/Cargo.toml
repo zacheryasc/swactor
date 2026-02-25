@@ -23,7 +23,6 @@ path = "src/lib.rs"
 
 [features]
 default = ["iroh", "relay"]
-tcp = ["distribution/tcp"]
 iroh = ["distribution/iroh", "dep:iroh"]
 relay = ["iroh", "distribution/relay"]
 
