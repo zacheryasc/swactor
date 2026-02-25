@@ -6,7 +6,7 @@
 //! # Two layers of pluggability
 //!
 //! - **[`Codec<M>`]**: HOW bytes are encoded — gRPC/protobuf, bincode, custom, etc.
-//! - **[`Transport`]**: WHERE bytes are sent — in-memory, gRPC channel, TCP, etc.
+//! - **[`Transport`]**: WHERE bytes are sent — in-memory, gRPC channel, etc.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;

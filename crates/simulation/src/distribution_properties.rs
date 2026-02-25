@@ -1,4 +1,4 @@
-use crate::trace::SimulationTrace;
+use crate::SimulationTrace;
 
 use super::trace::{DistributionEventKind, DistributionSnapshot};
 

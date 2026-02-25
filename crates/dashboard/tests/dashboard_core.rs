@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use dashboard::collector::StatsCollector;
 use dashboard::layer::{DashboardEvent, EventStore};
-use dashboard::trace::RuntimeTrace;
+use dashboard::RuntimeTrace;
 use swactor::actor::ActorAddress;
 use swactor::stats::{ActorSnapshot, StatsHook};
 

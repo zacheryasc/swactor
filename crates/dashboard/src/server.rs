@@ -16,20 +16,17 @@ use tokio_stream::StreamExt;
 
 use swactor::runtime::Runtime;
 
-use crate::actor_detail_html::ACTOR_DETAIL_HTML;
-use crate::actors_html::ACTORS_HTML;
 use crate::collector::StatsCollector;
 use crate::command::CommandRouter;
-use crate::dashboard_html::DASHBOARD_HTML;
 use crate::history::DashboardHistory;
+use crate::html::{ACTOR_DETAIL_HTML, ACTORS_HTML, DASHBOARD_HTML, TOPOLOGY_HTML};
 use crate::layer::EventStore;
 use crate::topology;
-use crate::topology_html::TOPOLOGY_HTML;
 use crate::warnings::{WarningConfig, WarningDetector};
 
 use crate::plugin::PluginRegistry;
 
-use crate::trace::RuntimeTrace;
+use crate::RuntimeTrace;
 
 /// Format a server-sent event.
 fn format_sse(event: &str, data: &str) -> Event {

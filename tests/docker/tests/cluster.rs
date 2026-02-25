@@ -2,7 +2,7 @@
 //!
 //! These tests mirror the simulation tests in
 //! `crates/simulation/tests/distribution_sim.rs` but run against real
-//! Docker containers communicating over TCP.
+//! Docker containers communicating over iroh/QUIC.
 //!
 //! Run with: `cargo test -p docker-tests -- --ignored`
 //! Requires: Docker with compose v2

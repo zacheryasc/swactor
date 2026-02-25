@@ -5,13 +5,10 @@ use swactor::runtime::ExternalSender;
 use swactor::Error;
 
 use crate::actor::ProcessActor;
-use crate::driver::ProcessDriver;
 use crate::local::LocalDriver;
 use crate::message::ProcessCommand;
-use crate::queue::EventQueue;
 use crate::session::ProcessSession;
-use crate::types::ProcessSpec;
-use crate::waker::ProcessWaker;
+use crate::types::{EventQueue, ProcessDriver, ProcessSpec, ProcessWaker};
 
 /// Spawn a process actor using the real `LocalDriver` (OS subprocess).
 ///

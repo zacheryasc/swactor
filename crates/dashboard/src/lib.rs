@@ -4,14 +4,10 @@ pub mod history;
 pub mod investigate;
 pub mod layer;
 pub mod plugin;
-pub mod trace;
 pub mod warnings;
-mod actor_detail_html;
-mod actors_html;
-mod dashboard_html;
+mod html;
 mod server;
 pub mod topology;
-mod topology_html;
 
 #[cfg(feature = "tui")]
 pub mod tui;
@@ -28,11 +24,29 @@ use swactor::runtime::{Runtime, RuntimeHandle};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+use serde::{Deserialize, Serialize};
+use swactor::stats::RuntimeStats;
+
 use crate::collector::StatsCollector;
 use crate::history::{DashboardHistory, HistoryConfig};
-use crate::layer::{now_ms, DashboardLayer, EventStore};
+use crate::layer::{now_ms, DashboardEvent, DashboardLayer, EventStore};
 use crate::plugin::PluginRegistry;
-use crate::trace::{RuntimeTrace, TimestampedStats};
+
+// ─── Trace Types ────────────────────────────────────────────────────────────
+
+/// Complete trace of a runtime execution, suitable for saving/loading.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RuntimeTrace {
+    pub events: Vec<DashboardEvent>,
+    pub stats_timeline: Vec<TimestampedStats>,
+}
+
+/// A stats snapshot with a wall-clock timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimestampedStats {
+    pub timestamp_ms: u64,
+    pub stats: RuntimeStats,
+}
 
 /// Peer info sent through the join channel.
 pub struct JoinPeerInfo {
@@ -150,7 +164,7 @@ impl DashboardHandle {
     }
 
     /// Start the HTTP server on a standalone tokio runtime (1 worker thread).
-    /// Use this when no external tokio runtime is available (e.g. TCP transport).
+    /// Use this when no external tokio runtime is available (e.g. non-async transport).
     pub fn start_http_standalone(&self) {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)

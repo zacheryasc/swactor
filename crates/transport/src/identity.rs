@@ -66,7 +66,7 @@ pub fn load_or_generate_keypair(path: &Path) -> Keypair {
 }
 
 /// Simple ISO-8601 UTC timestamp from epoch seconds.
-pub fn format_timestamp(secs: u64) -> String {
+fn format_timestamp(secs: u64) -> String {
     let s = secs % 60;
     let m = (secs / 60) % 60;
     let h = (secs / 3600) % 24;
@@ -77,7 +77,7 @@ pub fn format_timestamp(secs: u64) -> String {
 
 /// Convert days since epoch to (year, month, day).
 /// Algorithm from <http://howardhinnant.github.io/date_algorithms.html>.
-pub fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
+fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
     days += 719468;
     let era = days / 146097;
     let doe = days - era * 146097;

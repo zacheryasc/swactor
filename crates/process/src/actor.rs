@@ -3,11 +3,10 @@ use std::sync::{Arc, OnceLock};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 
 use crate::action::ProcessAction;
-use crate::driver::ProcessDriver;
 use crate::event::ProcessEvent;
 use crate::message::{ProcessCommand, ProcessNotification};
 use crate::session::ProcessSession;
-use crate::waker::ProcessWaker;
+use crate::types::{ProcessDriver, ProcessWaker};
 
 /// Actor wrapper around a `ProcessSession` and its driver.
 ///
