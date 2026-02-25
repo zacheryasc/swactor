@@ -1,18 +1,13 @@
 pub mod action;
 pub mod actor;
-pub mod driver;
 pub mod event;
 pub mod local;
 pub mod message;
 pub mod mock;
 pub mod pipeline;
-pub mod pipeline_types;
-pub mod queue;
 pub mod session;
 pub mod spawn;
-pub mod subscriber;
 pub mod types;
-pub mod waker;
 pub mod yaml;
 
 #[cfg(feature = "ssh")]
@@ -20,17 +15,17 @@ pub mod ssh;
 
 pub use action::{OutputStream, ProcessAction};
 pub use actor::ProcessActor;
-pub use driver::ProcessDriver;
 pub use event::ProcessEvent;
 pub use local::LocalDriver;
 pub use message::{ProcessCommand, ProcessNotification};
 pub use mock::MockDriver;
-pub use queue::EventQueue;
+pub use pipeline::{
+    JobComplete, JobDefinition, JobFailure, JobId, JobProgress, JobStatus, JobSuccess,
+    LocalPipelineConfig, LocalStartJob, PipelineId, PipelineStatus,
+};
 pub use session::{ProcessSession, ProcessState};
 pub use spawn::{spawn_local_process, spawn_process};
-pub use subscriber::SubscriberSet;
-pub use types::{ExitStatus, FlowControl, ProcessError, ProcessMode, ProcessSpec, PtySize, Signal};
-pub use waker::ProcessWaker;
+pub use types::{EventQueue, ExitStatus, FlowControl, ProcessDriver, ProcessError, ProcessMode, ProcessSpec, ProcessWaker, PtySize, Signal};
 
 #[cfg(feature = "ssh")]
 pub use ssh::{SshConfig, SshDriver};

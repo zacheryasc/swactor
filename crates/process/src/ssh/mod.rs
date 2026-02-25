@@ -1,5 +1,4 @@
 pub mod config;
-mod handler;
 mod task;
 
 use std::sync::{Arc, OnceLock};
@@ -7,10 +6,8 @@ use std::sync::{Arc, OnceLock};
 use tokio::sync::mpsc;
 
 use crate::action::ProcessAction;
-use crate::driver::ProcessDriver;
 use crate::event::ProcessEvent;
-use crate::queue::EventQueue;
-use crate::waker::ProcessWaker;
+use crate::types::{EventQueue, ProcessDriver, ProcessWaker};
 
 pub use config::SshConfig;
 use task::SshCommand;

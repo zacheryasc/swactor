@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::action::ProcessAction;
-use crate::driver::ProcessDriver;
 use crate::event::ProcessEvent;
+use crate::types::ProcessDriver;
 
 /// A test-oriented driver that records executed actions and lets you inject events.
 pub struct MockDriver {

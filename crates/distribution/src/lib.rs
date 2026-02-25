@@ -2,7 +2,6 @@ pub mod types;
 pub mod crypto;
 pub mod peer_auth;
 pub mod messages;
-pub mod codec;
 pub mod swim;
 pub mod kademlia;
 pub mod cache;

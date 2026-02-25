@@ -1,4 +1,3 @@
-use distribution::codec::distribution_codec_registry;
 use distribution::messages::*;
 use distribution::types::NodeId;
 

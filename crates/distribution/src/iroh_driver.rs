@@ -1,6 +1,6 @@
 //! iroh-based P2P network driver for `DistributedNode`.
 //!
-//! Provides the same driver pattern as `NodeDriver` (TCP), but uses iroh's
+//! Provides the same driver pattern as `NodeDriver`, but uses iroh's
 //! QUIC-based peer-to-peer transport with built-in TLS, NAT hole-punching,
 //! and relay server fallback.
 //!

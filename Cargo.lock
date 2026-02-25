@@ -1327,13 +1327,12 @@ dependencies = [
 name = "distribution"
 version = "0.1.0"
 dependencies = [
- "ed25519-dalek 2.2.0",
  "iroh",
  "iroh-relay",
- "rand_core 0.6.4",
  "serde",
  "serde_json",
  "swactor",
+ "swactor-transport",
  "tokio",
 ]
 
@@ -5337,16 +5336,15 @@ dependencies = [
  "clap",
  "crossbeam-queue",
  "ctrlc",
- "ed25519-dalek 2.2.0",
  "getrandom 0.2.17",
  "iroh",
  "proptest",
  "proptest-state-machine",
- "rand_core 0.6.4",
  "serde",
  "serde_json",
  "stateright",
  "swactor",
+ "swactor-transport",
  "tempfile",
  "tiny_http",
  "tokio",

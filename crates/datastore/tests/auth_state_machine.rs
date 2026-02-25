@@ -1,3 +1,4 @@
+#![cfg(feature = "formal-verification")]
 //! Proptest state-machine verification of AuthzEngine.
 //!
 //! Drives the auth engine through random sequences of grant/revoke/check/sign

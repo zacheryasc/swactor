@@ -1,17 +1,33 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use russh::client;
 use russh::{ChannelMsg, Sig};
+use russh_keys::key::PublicKey;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until};
 
 use crate::event::ProcessEvent;
-use crate::queue::EventQueue;
+use crate::types::EventQueue;
 use crate::types::{ExitStatus, ProcessMode, ProcessSpec, Signal};
-use crate::waker::ProcessWaker;
+use crate::types::ProcessWaker;
 
 use super::config::SshConfig;
-use super::handler::SshHandler;
+
+/// Minimal SSH client handler that accepts all host keys.
+pub(super) struct SshHandler;
+
+#[async_trait::async_trait]
+impl client::Handler for SshHandler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
 
 /// Commands sent from the SshDriver to the background task.
 pub(super) enum SshCommand {

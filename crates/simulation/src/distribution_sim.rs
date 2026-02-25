@@ -6,7 +6,7 @@ use swactor::actor::ActorAddress;
 
 use crate::runner::NetworkState;
 pub use crate::runner::{NetworkFault, NetworkTopology, NodeLocation, Partition};
-use crate::trace::{Event, SimulationTrace};
+use crate::{Event, SimulationTrace};
 
 use super::trace::{DistributionEventKind, DistributionSnapshot};
 

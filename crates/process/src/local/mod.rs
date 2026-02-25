@@ -1,18 +1,123 @@
-mod pipes;
-mod signal;
-mod wait;
-
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use crate::action::ProcessAction;
-use crate::driver::ProcessDriver;
+use crate::types::ProcessDriver;
 use crate::event::ProcessEvent;
-use crate::queue::EventQueue;
-use crate::types::ProcessSpec;
-use crate::waker::ProcessWaker;
+use crate::types::EventQueue;
+use crate::types::{ExitStatus, ProcessSpec, Signal};
+use crate::types::ProcessWaker;
+
+// ─── Signal ────────────────────────────────────────────────────────────────
+
+/// Map a `Signal` enum variant to the corresponding libc signal constant.
+fn signal_to_libc(signal: Signal) -> libc::c_int {
+    match signal {
+        Signal::Terminate => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+        Signal::Hangup => libc::SIGHUP,
+        Signal::Interrupt => libc::SIGINT,
+        Signal::Other(n) => n,
+    }
+}
+
+/// Send a signal to a process by PID. Returns `Ok(())` on success.
+fn send_signal(pid: u32, signal: Signal) -> Result<(), String> {
+    let sig = signal_to_libc(signal);
+    // Safety: kill() is safe to call with any pid/signal combo;
+    // it returns -1 on error which we check.
+    let ret = unsafe { libc::kill(pid as libc::pid_t, sig) };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "kill({}, {}) failed: {}",
+            pid,
+            sig,
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+// ─── Pipes ─────────────────────────────────────────────────────────────────
+
+/// Read from a pipe in a loop, pushing events to the queue and waking the actor.
+///
+/// Runs in a background thread. Exits when the pipe reaches EOF or errors.
+fn read_pipe(
+    mut pipe: impl Read + Send + 'static,
+    is_stderr: bool,
+    queue: EventQueue,
+    waker: Arc<OnceLock<ProcessWaker>>,
+) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                queue.push(ProcessEvent::OutputReceived {
+                    data: buf[..n].to_vec(),
+                    is_stderr,
+                });
+                if let Some(w) = waker.get() {
+                    w.wake();
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+// ─── Wait ──────────────────────────────────────────────────────────────────
+
+/// Wait for a child process to exit, then push the appropriate event.
+///
+/// Runs in a background thread. Uses `libc::waitpid` for accurate exit status.
+/// After waitpid returns, joins the pipe reader threads so all buffered
+/// stdout/stderr is drained before the `Exited` event is enqueued.
+fn wait_for_exit(
+    pid: u32,
+    reader_threads: Vec<JoinHandle<()>>,
+    queue: EventQueue,
+    waker: Arc<OnceLock<ProcessWaker>>,
+) {
+    let mut status: libc::c_int = 0;
+    let ret = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+
+    let exit_status = if ret < 0 {
+        ExitStatus::Unknown
+    } else {
+        decode_wait_status(status)
+    };
+
+    // Wait for pipe readers to finish draining all output before signaling exit.
+    // Once the process exits, its pipe ends close, so readers will hit EOF shortly.
+    for handle in reader_threads {
+        let _ = handle.join();
+    }
+
+    queue.push(ProcessEvent::Exited {
+        status: exit_status,
+    });
+    if let Some(w) = waker.get() {
+        w.wake();
+    }
+}
+
+fn decode_wait_status(status: libc::c_int) -> ExitStatus {
+    if libc::WIFEXITED(status) {
+        ExitStatus::Code(libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        ExitStatus::Signal(libc::WTERMSIG(status))
+    } else {
+        ExitStatus::Unknown
+    }
+}
+
+// ─── LocalDriver ───────────────────────────────────────────────────────────
 
 /// A `ProcessDriver` that spawns real OS subprocesses via `std::process::Command`.
 ///
@@ -23,7 +128,6 @@ pub struct LocalDriver {
     waker_slot: Arc<OnceLock<ProcessWaker>>,
     child: Option<Child>,
     stdin: Option<ChildStdin>,
-    _reader_threads: Vec<JoinHandle<()>>,
     _wait_thread: Option<JoinHandle<()>>,
 }
 
@@ -34,7 +138,6 @@ impl LocalDriver {
             waker_slot,
             child: None,
             stdin: None,
-            _reader_threads: Vec::new(),
             _wait_thread: None,
         }
     }
@@ -60,13 +163,14 @@ impl LocalDriver {
                 self.stdin = child.stdin.take();
 
                 // Spawn stdout reader thread
+                let mut reader_threads = Vec::new();
                 if let Some(stdout) = child.stdout.take() {
                     let queue = self.queue.clone();
                     let waker = self.waker_slot.clone();
-                    self._reader_threads.push(
+                    reader_threads.push(
                         thread::Builder::new()
                             .name(format!("proc-{}-stdout", pid))
-                            .spawn(move || pipes::read_pipe(stdout, false, queue, waker))
+                            .spawn(move || read_pipe(stdout, false, queue, waker))
                             .expect("failed to spawn stdout reader"),
                     );
                 }
@@ -75,21 +179,22 @@ impl LocalDriver {
                 if let Some(stderr) = child.stderr.take() {
                     let queue = self.queue.clone();
                     let waker = self.waker_slot.clone();
-                    self._reader_threads.push(
+                    reader_threads.push(
                         thread::Builder::new()
                             .name(format!("proc-{}-stderr", pid))
-                            .spawn(move || pipes::read_pipe(stderr, true, queue, waker))
+                            .spawn(move || read_pipe(stderr, true, queue, waker))
                             .expect("failed to spawn stderr reader"),
                     );
                 }
 
-                // Spawn wait thread
+                // Spawn wait thread — it joins the reader threads before pushing Exited,
+                // ensuring all output is drained before the exit event.
                 let queue = self.queue.clone();
                 let waker = self.waker_slot.clone();
                 self._wait_thread = Some(
                     thread::Builder::new()
                         .name(format!("proc-{}-wait", pid))
-                        .spawn(move || wait::wait_for_exit(pid, queue, waker))
+                        .spawn(move || wait_for_exit(pid, reader_threads, queue, waker))
                         .expect("failed to spawn wait thread"),
                 );
 
@@ -130,7 +235,7 @@ impl ProcessDriver for LocalDriver {
             ProcessAction::SendSignal { signal } => {
                 if let Some(ref child) = self.child {
                     let pid = child.id();
-                    match signal::send_signal(pid, signal) {
+                    match send_signal(pid, signal) {
                         Ok(()) => {
                             self.queue.push(ProcessEvent::SignalSent);
                         }

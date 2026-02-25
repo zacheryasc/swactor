@@ -8,7 +8,6 @@ pub mod actors;
 pub mod auth;
 pub mod blob_transfer;
 pub mod bridge;
-pub mod cli;
 pub mod metrics;
 pub mod streams;
 #[cfg(feature = "node")]

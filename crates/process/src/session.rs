@@ -1,9 +1,46 @@
 use std::collections::VecDeque;
 
+use swactor::actor::ActorAddress;
+
 use crate::action::{OutputStream, ProcessAction};
 use crate::event::ProcessEvent;
-use crate::subscriber::SubscriberSet;
 use crate::types::{ExitStatus, FlowControl, ProcessError, ProcessMode, ProcessSpec, Signal};
+
+// ─── SubscriberSet ─────────────────────────────────────────────────────────
+
+/// A deduplicated collection of subscriber addresses.
+#[derive(Debug, Clone)]
+pub(crate) struct SubscriberSet {
+    inner: Vec<ActorAddress>,
+}
+
+impl SubscriberSet {
+    pub(crate) fn new() -> Self {
+        Self { inner: Vec::new() }
+    }
+
+    /// Add an address. No-op if already present.
+    pub(crate) fn add(&mut self, address: ActorAddress) {
+        if !self.inner.contains(&address) {
+            self.inner.push(address);
+        }
+    }
+
+    /// Remove an address. No-op if not present.
+    pub(crate) fn remove(&mut self, address: &ActorAddress) {
+        self.inner.retain(|a| a != address);
+    }
+
+    /// Snapshot of current subscribers.
+    pub(crate) fn snapshot(&self) -> Vec<ActorAddress> {
+        self.inner.clone()
+    }
+
+    /// Number of subscribers.
+    pub(crate) fn count(&self) -> usize {
+        self.inner.len()
+    }
+}
 
 /// The lifecycle states of a process session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

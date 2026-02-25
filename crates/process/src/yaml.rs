@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::pipeline_types::JobDefinition;
+use crate::pipeline::JobDefinition;
 
 /// Root of a `.ci.yml` file.
 #[derive(Debug, Clone, Serialize, Deserialize)]

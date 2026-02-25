@@ -10,8 +10,7 @@ relay = ["iroh", "dep:iroh-relay"]
 
 [dependencies]
 swactor = { path = "../..", features = ["serde", "transport"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+swactor-transport = { path = "../transport" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 iroh = { version = "0.96", optional = true }

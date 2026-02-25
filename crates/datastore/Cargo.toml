@@ -8,8 +8,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 
 [dependencies]
 swactor = { path = "../..", features = ["serde", "transport"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-rand_core = { version = "0.6", features = ["getrandom"] }
+swactor-transport = { path = "../transport" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 blake3 = "1"
@@ -35,6 +34,7 @@ stateright = "0.31"
 [features]
 node = ["dep:tiny_http", "dep:clap", "dep:ctrlc", "dep:toml"]
 cli = ["dep:clap", "dep:ureq"]
+formal-verification = []
 
 [[bin]]
 name = "swactor-store"

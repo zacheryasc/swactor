@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["tcp"]
-tcp = []
 iroh = ["dep:iroh", "dep:tokio"]
 relay = ["iroh", "dep:iroh-relay"]
 

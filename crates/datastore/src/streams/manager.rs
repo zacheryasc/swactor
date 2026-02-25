@@ -7,7 +7,6 @@ use tokio::io::AsyncWriteExt;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx, Down};
 use swactor::runtime::Runtime;
 
-use crate::streams::connection::StreamConnectionCache;
 use crate::streams::data_plane;
 use crate::streams::handle::{create_stream_handle, StreamHandle};
 use crate::streams::messages::{OneShot, StreamManagerMsg, StreamNotification};
@@ -23,16 +22,10 @@ const ACCEPT_BYTE: u8 = 0x01;
 const REJECT_BYTE: u8 = 0x00;
 
 struct StreamState {
-    _stream_id: StreamId,
     owner: ActorAddress,
-    _mode: StreamMode,
-    _remote_node: [u8; 32],
 }
 
 struct PendingIncoming {
-    _node_id: [u8; 32],
-    _stream_id: StreamId,
-    _mode: StreamMode,
     config: StreamConfig,
     conn: OneShot<iroh::endpoint::Connection>,
 }
@@ -41,8 +34,6 @@ pub struct StreamManager {
     streams: HashMap<StreamId, StreamState>,
     pending_incoming: HashMap<StreamId, PendingIncoming>,
     listeners: HashMap<StreamMode, Vec<ActorAddress>>,
-    #[allow(dead_code)]
-    conn_cache: StreamConnectionCache,
     endpoint: Endpoint,
     tokio_handle: tokio::runtime::Handle,
     runtime: Arc<Runtime>,
@@ -59,7 +50,6 @@ impl StreamManager {
             streams: HashMap::new(),
             pending_incoming: HashMap::new(),
             listeners: HashMap::new(),
-            conn_cache: StreamConnectionCache::new(),
             endpoint,
             tokio_handle,
             runtime,
@@ -102,10 +92,7 @@ impl StreamManager {
                 self.streams.insert(
                     stream_id,
                     StreamState {
-                        _stream_id: stream_id,
                         owner: reply_to,
-                        _mode: StreamMode::BlobTransfer,
-                        _remote_node: [0; 32],
                     },
                 );
                 let notif = StreamNotification::StreamReady {
@@ -154,9 +141,6 @@ impl StreamManager {
         self.pending_incoming.insert(
             stream_id,
             PendingIncoming {
-                _node_id: node_id,
-                _stream_id: stream_id,
-                _mode: mode,
                 config,
                 conn,
             },
@@ -207,10 +191,7 @@ impl StreamManager {
                 self.streams.insert(
                     stream_id,
                     StreamState {
-                        _stream_id: stream_id,
                         owner: reply_to,
-                        _mode: StreamMode::BlobTransfer,
-                        _remote_node: [0; 32],
                     },
                 );
                 let notif = StreamNotification::StreamReady {
