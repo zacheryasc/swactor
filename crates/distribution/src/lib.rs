@@ -10,7 +10,5 @@ pub mod node;
 pub mod registry;
 pub mod node_metadata;
 pub mod snapshot;
-#[cfg(feature = "tcp")]
-pub mod driver;
 #[cfg(feature = "iroh")]
 pub mod iroh_driver;

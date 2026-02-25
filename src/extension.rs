@@ -53,6 +53,10 @@ pub trait RuntimeExtension: Send + Sync {
 /// - `handle_request`: phase 5.5 — processes deferred requests from handlers
 /// - `gc_dead`: after cleanup_dead — removes state for dead actors
 pub trait WorkerExtension: Send {
+    /// Returns `true` if this extension has pending work (e.g., active timers).
+    /// Used by the fast idle path to avoid unnecessary ticks.
+    fn has_pending_work(&self) -> bool { false }
+
     /// Called each tick before tick_all. Returns messages to deliver.
     fn on_tick(&mut self) -> Vec<(ActorAddress, Box<dyn Any + Send>)>;
 

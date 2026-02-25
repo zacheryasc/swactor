@@ -543,6 +543,7 @@
   // ── SSE connection ───────────────────────────────────────────────────
 
   var es = new EventSource('/events');
+  window.addEventListener('beforeunload', function() { es.close(); });
 
   es.addEventListener('datastore', function(e) {
     try {

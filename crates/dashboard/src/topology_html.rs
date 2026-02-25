@@ -263,6 +263,7 @@ pub const TOPOLOGY_HTML: &str = r##"<!DOCTYPE html>
   tick();
 
   var es = new EventSource('/events');
+  window.addEventListener('beforeunload', function() { es.close(); });
 
   es.addEventListener('topology', function(e) {
     try { updateTopology(JSON.parse(e.data)); } catch(err) { console.error(err); }

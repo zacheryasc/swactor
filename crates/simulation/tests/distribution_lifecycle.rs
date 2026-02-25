@@ -196,6 +196,7 @@ fn routing_table_recovers_after_partition_heals() {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![
             NetworkFault::Partition {
@@ -296,6 +297,7 @@ fn partition_then_death_during_partition_then_heal() {
             // after kill, well after partition heals.
             suspicion_timeout: 100,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };
@@ -453,6 +455,7 @@ fn asymmetric_one_way_block_does_not_kill_node() {
             // Gossip through intermediate nodes refutes suspicion each cycle.
             suspicion_timeout: 500,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         action_schedule: vec![
             (5, SimAction::RegisterName { node_idx: 5, name: "target-svc".into() }),
@@ -518,6 +521,7 @@ fn names_registered_during_partition_propagate_after_heal() {
             // High timeout: cross-partition nodes stay Suspect during 40-round partition
             suspicion_timeout: 200,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };
@@ -581,6 +585,7 @@ fn bidirectional_suspicion_both_nodes_recover() {
             // Must exceed partition duration (20 rounds × 3 ticks = 60 ticks)
             suspicion_timeout: 100,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };

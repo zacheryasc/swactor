@@ -8,8 +8,9 @@
 //! (`tick()`, `recv()`, `join()`) to match the existing main loop pattern.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
@@ -62,6 +63,94 @@ struct JoinResult {
     conn: Connection,
 }
 
+// ─── LAN IP Discovery ──────────────────────────────────────────────────────
+
+/// Discover all non-loopback LAN IP addresses on this host.
+///
+/// Uses UDP socket tricks to multiple broadcast destinations to find
+/// addresses across different subnets. Also parses `/proc/net/if_inet6`
+/// for IPv6 addresses on Linux.
+pub fn discover_lan_ips() -> Vec<IpAddr> {
+    let mut ips = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // UDP socket trick: connect to a broadcast-ish address, read local_addr
+    let targets: &[&str] = &[
+        "10.255.255.255:1",
+        "192.168.255.255:1",
+        "172.31.255.255:1",
+    ];
+    for target in targets {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect(target).is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    let ip = local.ip();
+                    if !ip.is_loopback() && !ip.is_unspecified() && seen.insert(ip) {
+                        ips.push(ip);
+                    }
+                }
+            }
+        }
+    }
+
+    // Parse /proc/net/if_inet6 for IPv6 addresses (Linux only)
+    if let Ok(contents) = std::fs::read_to_string("/proc/net/if_inet6") {
+        for line in contents.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                let hex = parts[0];
+                if hex.len() == 32 {
+                    let mut bytes = [0u8; 16];
+                    let mut valid = true;
+                    for i in 0..16 {
+                        match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
+                            Ok(b) => bytes[i] = b,
+                            Err(_) => { valid = false; break; }
+                        }
+                    }
+                    if valid {
+                        let ip = IpAddr::V6(std::net::Ipv6Addr::from(bytes));
+                        if !ip.is_loopback() && !ip.is_unspecified() {
+                            // Skip link-local (fe80::)
+                            if let IpAddr::V6(v6) = ip {
+                                if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                                    continue;
+                                }
+                            }
+                            if seen.insert(ip) {
+                                ips.push(ip);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ips
+}
+
+// ─── Join Status ───────────────────────────────────────────────────────────
+
+/// Phase of a join attempt.
+#[derive(Debug, Clone)]
+pub enum JoinPhase {
+    Connecting { attempt: u32, max_attempts: u32 },
+    Sending { attempt: u32, max_attempts: u32 },
+    Sent,
+    Failed { error: String },
+}
+
+/// Real-time status of a join attempt to a specific peer.
+#[derive(Debug, Clone)]
+pub struct JoinStatus {
+    pub phase: JoinPhase,
+    pub has_relay: bool,
+    pub has_direct: bool,
+    pub direct_addr_count: usize,
+    pub updated_at: Instant,
+}
+
 // ─── Driver ─────────────────────────────────────────────────────────────────
 
 /// iroh P2P network driver.
@@ -82,6 +171,8 @@ pub struct IrohDriver {
     other_accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
     /// Relay URLs learned from join seeds, used for reconnection.
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
+    /// Real-time join status for each peer being joined.
+    join_statuses: Arc<Mutex<HashMap<NodeId, JoinStatus>>>,
     /// Embedded relay server (if started).
     #[cfg(feature = "relay")]
     relay_server: Option<iroh_relay::server::Server>,
@@ -211,6 +302,7 @@ impl IrohDriver {
             accepted_conns,
             other_accepted_conns,
             peer_relay_urls: HashMap::new(),
+            join_statuses: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "relay")]
             relay_server,
             relay_url,
@@ -240,27 +332,53 @@ impl IrohDriver {
     /// The endpoint's full address (public key + direct socket addresses).
     ///
     /// Constructs the address from the endpoint's public key and bound
-    /// sockets. Unspecified addresses (`0.0.0.0` / `[::]`) are mapped to
-    /// their loopback equivalents so peers on the same host can connect.
+    /// sockets. For sockets bound to `0.0.0.0`, emits one address per
+    /// discovered LAN IP so that peers on the same network can connect
+    /// directly. IPv6 unspecified is mapped to localhost.
     pub fn endpoint_addr(&self) -> EndpointAddr {
-        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
         let key = PublicKey::from_bytes(&self.node.node_id().0)
             .expect("node_id is a valid public key");
         let mut addr = EndpointAddr::new(key);
-        for sock in self.endpoint.bound_sockets() {
-            let resolved = match sock.ip() {
-                IpAddr::V4(ip) if ip.is_unspecified() => {
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), sock.port())
-                }
-                IpAddr::V6(ip) if ip.is_unspecified() => {
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), sock.port())
-                }
-                _ => sock,
-            };
-            addr = addr.with_ip_addr(resolved);
+        for sa in self.direct_addresses() {
+            addr = addr.with_ip_addr(sa);
         }
         addr
+    }
+
+    /// Compute direct socket addresses from bound sockets + LAN discovery.
+    ///
+    /// For sockets bound to `0.0.0.0`, emits one `SocketAddr` per discovered
+    /// LAN IP using the bound port. Specific-IP binds are kept as-is.
+    pub fn direct_addresses(&self) -> Vec<SocketAddr> {
+        let lan_ips = discover_lan_ips();
+        let mut addrs = Vec::new();
+        for sock in self.endpoint.bound_sockets() {
+            match sock.ip() {
+                IpAddr::V4(ip) if ip.is_unspecified() => {
+                    // Emit one address per discovered LAN IP
+                    for lip in &lan_ips {
+                        if lip.is_ipv4() {
+                            addrs.push(SocketAddr::new(*lip, sock.port()));
+                        }
+                    }
+                    // Also include localhost for same-host connectivity
+                    addrs.push(SocketAddr::new(
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        sock.port(),
+                    ));
+                }
+                IpAddr::V6(ip) if ip.is_unspecified() => {
+                    addrs.push(SocketAddr::new(
+                        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+                        sock.port(),
+                    ));
+                }
+                _ => {
+                    addrs.push(sock);
+                }
+            }
+        }
+        addrs
     }
 
     /// Access the underlying node (read-only).
@@ -284,6 +402,24 @@ impl IrohDriver {
         snap
     }
 
+    /// Get a snapshot of all join statuses.
+    pub fn join_statuses(&self) -> HashMap<NodeId, JoinStatus> {
+        self.join_statuses.lock().unwrap().clone()
+    }
+
+    /// Clear join statuses for the given node IDs (e.g. peers that are now alive).
+    pub fn clear_join_statuses(&self, node_ids: &[NodeId]) {
+        let mut map = self.join_statuses.lock().unwrap();
+        for id in node_ids {
+            map.remove(id);
+        }
+    }
+
+    /// Clear a single join status entry.
+    pub fn clear_join_status(&self, node_id: &NodeId) {
+        self.join_statuses.lock().unwrap().remove(node_id);
+    }
+
     /// Join a cluster by connecting to seed nodes via iroh.
     ///
     /// Each seed is identified by its `EndpointAddr` (public key + optional
@@ -297,7 +433,31 @@ impl IrohDriver {
             if let Some(relay) = seed_addr.relay_urls().next() {
                 self.peer_relay_urls.insert(seed_node_id, relay.clone());
             }
-            self.spawn_join_request(seed_addr.clone());
+            // Clear any Dead entry so the JoinResponse can re-establish it.
+            // Without this, SWIM merge semantics reject Alive at the same
+            // incarnation when the local entry is Dead (Dead > Alive).
+            self.node.clear_dead_member(seed_node_id);
+            // Drop stale cached connection so iroh establishes a fresh one
+            self.connections.remove(&seed_node_id);
+            // Enrich the seed addr with a cached relay URL if it doesn't
+            // have one. The re-peer flow sends only a bare public key
+            // because metadata (including relay URL) is stripped when a
+            // node is declared dead. Without a relay URL iroh cannot
+            // reach the peer through NAT.
+            let enriched = if seed_addr.relay_urls().next().is_none() {
+                if let Some(relay) = self.peer_relay_urls.get(&seed_node_id).cloned()
+                    .or_else(|| self.node.relay_url(&seed_node_id)
+                        .and_then(|s| s.parse::<iroh::RelayUrl>().ok()))
+                    .or_else(|| self.endpoint.addr().relay_urls().next().cloned())
+                {
+                    seed_addr.clone().with_relay_url(relay)
+                } else {
+                    seed_addr.clone()
+                }
+            } else {
+                seed_addr.clone()
+            };
+            self.spawn_join_request(enriched);
         }
     }
 
@@ -310,16 +470,33 @@ impl IrohDriver {
         let endpoint = self.endpoint.clone();
         let seed_node_id = NodeId(*seed_addr.id.as_bytes());
         let pending = Arc::clone(&self.pending_joins);
+        let statuses = Arc::clone(&self.join_statuses);
+
+        let has_relay = seed_addr.relay_urls().next().is_some();
+        let direct_addr_count = seed_addr.ip_addrs().count();
+        let has_direct = direct_addr_count > 0;
 
         self.rt.spawn(async move {
             let mut delay = Duration::from_secs(2);
             let max_delay = Duration::from_secs(30);
-            let max_attempts = 5;
+            let max_attempts: u32 = 5;
 
             for attempt in 1..=max_attempts {
                 if attempt > 1 {
                     tokio::time::sleep(delay).await;
                     delay = (delay * 2).min(max_delay);
+                }
+
+                // Update status: Connecting
+                {
+                    let mut map = statuses.lock().unwrap();
+                    map.insert(seed_node_id, JoinStatus {
+                        phase: JoinPhase::Connecting { attempt, max_attempts },
+                        has_relay,
+                        has_direct,
+                        direct_addr_count,
+                        updated_at: Instant::now(),
+                    });
                 }
 
                 eprintln!("iroh driver: join attempt {attempt}/{max_attempts} connecting to {}...", seed_addr.id);
@@ -330,6 +507,18 @@ impl IrohDriver {
 
                 match connect_result {
                     Ok(Ok(conn)) => {
+                        // Update status: Sending
+                        {
+                            let mut map = statuses.lock().unwrap();
+                            map.insert(seed_node_id, JoinStatus {
+                                phase: JoinPhase::Sending { attempt, max_attempts },
+                                has_relay,
+                                has_direct,
+                                direct_addr_count,
+                                updated_at: Instant::now(),
+                            });
+                        }
+
                         eprintln!("iroh driver: join attempt {attempt}/{max_attempts} connected to {}, sending...", seed_addr.id);
                         let send_result: Result<(), String> = async {
                             let mut send = conn.open_uni().await.map_err(|e| e.to_string())?;
@@ -345,6 +534,17 @@ impl IrohDriver {
                         match send_result {
                             Ok(()) => {
                                 eprintln!("iroh driver: join attempt {attempt}/{max_attempts} sent to {}", seed_addr.id);
+                                // Update status: Sent
+                                {
+                                    let mut map = statuses.lock().unwrap();
+                                    map.insert(seed_node_id, JoinStatus {
+                                        phase: JoinPhase::Sent,
+                                        has_relay,
+                                        has_direct,
+                                        direct_addr_count,
+                                        updated_at: Instant::now(),
+                                    });
+                                }
                                 pending.lock().unwrap().push(JoinResult {
                                     node_id: seed_node_id,
                                     conn,
@@ -375,6 +575,17 @@ impl IrohDriver {
                         continue;
                     }
                 }
+            }
+            // Update status: Failed
+            {
+                let mut map = statuses.lock().unwrap();
+                map.insert(seed_node_id, JoinStatus {
+                    phase: JoinPhase::Failed { error: "all attempts exhausted".into() },
+                    has_relay,
+                    has_direct,
+                    direct_addr_count,
+                    updated_at: Instant::now(),
+                });
             }
             eprintln!("iroh driver: join failed after {max_attempts} attempts to {}", seed_addr.id);
         });
@@ -416,9 +627,24 @@ impl IrohDriver {
     // ─── Outgoing: NodeAction → iroh ─────────────────────────────────
 
     fn send_actions(&mut self, actions: &[NodeAction]) {
+        let mut failure_targets: Vec<NodeId> = Vec::new();
         for action in actions {
             if let Err(e) = self.send_action(action) {
                 eprintln!("iroh driver: send error: {e}");
+                if let Some(target) = action_target(action) {
+                    if !failure_targets.contains(&target) {
+                        failure_targets.push(target);
+                    }
+                }
+            }
+        }
+        for target in failure_targets {
+            let probe_actions = self.node.report_send_failure(target);
+            // Best-effort send of probe actions — no recursion on failure
+            for action in &probe_actions {
+                if let Err(e) = self.send_action(action) {
+                    eprintln!("iroh driver: probe send error: {e}");
+                }
             }
         }
     }
@@ -763,6 +989,20 @@ async fn start_embedded_relay(
     };
 
     Ok((server, url))
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Extract the send target from a node action (if it has one).
+fn action_target(action: &NodeAction) -> Option<NodeId> {
+    match action {
+        NodeAction::SendPing { to, .. } => Some(*to),
+        NodeAction::SendAck { to, .. } => Some(*to),
+        NodeAction::SendPingReq { relay, .. } => Some(*relay),
+        NodeAction::SendJoinResponse { to, .. } => Some(*to),
+        NodeAction::ForwardAck { to, .. } => Some(*to),
+        NodeAction::MembershipChanged { .. } => None,
+    }
 }
 
 // ─── Wire Framing Over QUIC Streams ─────────────────────────────────────────

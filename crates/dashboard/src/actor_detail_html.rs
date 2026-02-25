@@ -392,6 +392,7 @@ pub const ACTOR_DETAIL_HTML: &str = r##"<!DOCTYPE html>
 
   // ─── SSE ────────────────────────────────────────────────────
   var es = new EventSource('/events');
+  window.addEventListener('beforeunload', function() { es.close(); });
 
   es.addEventListener('stats', function(e) {
     try { updateDetail(JSON.parse(e.data)); } catch(err) { console.error(err); }

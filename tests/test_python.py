@@ -38,10 +38,6 @@ class TestRuntimeConfig(unittest.TestCase):
         self.assertEqual(cfg.num_threads, 1)
         self.assertEqual(cfg.max_actors, 1000)
         self.assertEqual(cfg.channel_buffer_size, 1000)
-        self.assertEqual(cfg.spin_threshold, 64)
-        self.assertEqual(cfg.yield_threshold, 256)
-        self.assertEqual(cfg.sleep_increment_us, 50)
-        self.assertEqual(cfg.sleep_max_us, 1000)
 
     def test_custom(self):
         cfg = RuntimeConfig(num_threads=4, max_actors=500)

@@ -108,6 +108,15 @@ impl DisseminationQueue {
         self.entries.is_empty()
     }
 
+    /// Remove all pending updates for a given node.
+    ///
+    /// Called when clearing a Dead member before re-peering, so stale
+    /// `(node_id, Dead, incarnation)` gossip doesn't leak out and re-infect
+    /// the cluster.
+    pub fn purge_node(&mut self, node_id: &NodeId) {
+        self.entries.retain(|e| e.update.node_id != *node_id);
+    }
+
     /// Compute the transmit budget: `Λ * ceil(log2(max(n, 2)))`.
     fn transmit_budget(&self, cluster_size: usize) -> usize {
         let n = cluster_size.max(2) as f64;

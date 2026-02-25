@@ -127,7 +127,14 @@ impl TimerWheel {
 }
 
 impl WorkerExtension for TimerWheel {
+    fn has_pending_work(&self) -> bool {
+        !self.once_timers.is_empty() || !self.interval_timers.is_empty()
+    }
+
     fn on_tick(&mut self) -> Vec<(ActorAddress, Box<dyn Any + Send>)> {
+        if self.once_timers.is_empty() && self.interval_timers.is_empty() {
+            return Vec::new();
+        }
         self.fire()
     }
 

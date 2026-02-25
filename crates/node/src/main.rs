@@ -73,19 +73,7 @@ struct Args {
     #[arg(long)]
     config: Option<std::path::PathBuf>,
 
-    /// Transport to use: iroh or tcp
-    #[arg(long, default_value = "iroh")]
-    transport: String,
-
-    /// Address to listen on for TCP transport (e.g. 10.0.1.10:7000)
-    #[arg(long)]
-    listen: Option<std::net::SocketAddr>,
-
-    /// Seed node address to join (TCP mode: host:port)
-    #[arg(long)]
-    seed: Option<String>,
-
-    /// Seed node's iroh public key (iroh mode: hex-encoded 32-byte key)
+    /// Seed node's iroh public key (hex-encoded 32-byte key)
     #[arg(long)]
     seed_node_id: Option<String>,
 
@@ -188,6 +176,9 @@ fn generate_default_config(config_dir: &std::path::Path) -> std::path::PathBuf {
         });
     }
 
+    // Auto-detect public IP for relay_hosts
+    let relay_hosts_line = detect_public_ip_for_config();
+
     // Write default config with absolute paths
     let contents = format!(
         r#"transport = "iroh"
@@ -199,8 +190,9 @@ auth = true
 auth_dir = "{dir}/auth"
 relay = true
 relay_port = 3340
-"#,
+{relay_hosts}"#,
         dir = config_dir.display(),
+        relay_hosts = relay_hosts_line,
     );
     std::fs::write(&config_path, &contents).unwrap_or_else(|e| {
         eprintln!("Failed to write {}: {e}", config_path.display());
@@ -218,6 +210,41 @@ relay_port = 3340
 
     eprintln!("Generated default config: {}", config_path.display());
     config_path
+}
+
+/// Detect outbound IP; if public, return a `relay_hosts = ["<ip>"]` TOML line.
+fn detect_public_ip_for_config() -> String {
+    let public_ip = (|| -> Option<std::net::IpAddr> {
+        let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        sock.connect("192.0.2.1:80").ok()?; // RFC 5737 TEST-NET-1
+        let ip = sock.local_addr().ok()?.ip();
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                if !v4.is_loopback() && !v4.is_private()
+                    && !v4.is_link_local() && !v4.is_unspecified()
+                {
+                    Some(ip)
+                } else {
+                    None
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if !v6.is_loopback() && !v6.is_unspecified() {
+                    Some(ip)
+                } else {
+                    None
+                }
+            }
+        }
+    })();
+
+    match public_ip {
+        Some(ip) => {
+            eprintln!("Detected public IP {ip} — adding to relay_hosts");
+            format!("relay_hosts = [\"{ip}\"]")
+        }
+        None => String::new(),
+    }
 }
 
 fn main() {
@@ -272,11 +299,6 @@ fn main() {
     // Layer: CLI > config > defaults
     // For args with default values, we check if the user explicitly provided
     // the CLI flag; if not, we fall back to config, then to the default.
-    let transport = if args.transport != "iroh" {
-        args.transport.clone()
-    } else {
-        cfg.transport.unwrap_or_else(|| args.transport.clone())
-    };
     let dashboard_port = if args.dashboard_port != 9090 {
         args.dashboard_port
     } else {
@@ -295,8 +317,6 @@ fn main() {
     let storage_path = args.storage_path.clone().or(cfg.storage_path);
     let peers_file = args.peers_file.clone().or(cfg.peers_file);
     let seed_node_id = args.seed_node_id.clone().or(cfg.seed_node_id);
-    #[cfg(feature = "tcp")]
-    let seed = args.seed.clone().or(cfg.seed);
     let auth_enabled = args.auth || cfg.auth.unwrap_or(false);
     let actors = if args.actors != 0 {
         args.actors
@@ -331,11 +351,6 @@ fn main() {
         cfg.relay_bind.unwrap_or_else(|| args.relay_bind.clone())
     };
     let relay_hosts = cfg.relay_hosts.unwrap_or_default();
-    #[cfg(feature = "tcp")]
-    let listen = args.listen.or_else(|| {
-        cfg.listen.as_ref().and_then(|s| s.parse().ok())
-    });
-
     // Signal handler — second Ctrl+C forces immediate exit
     {
         let stop = Arc::clone(&stop);
@@ -384,11 +399,18 @@ fn main() {
             return;
         }
         Some(Subcmd::Invite) => {
-            println!("{invite_code}");
+            let rich = if let Some(host) = relay_hosts.first() {
+                format!("{invite_code}@http://{host}:{relay_port}/")
+            } else {
+                invite_code.clone()
+            };
+            println!("{rich}");
             return;
         }
         Some(Subcmd::Join { code }) => {
-            let peer_bytes = base58_decode(code).unwrap_or_else(|| {
+            // Parse rich invite code: <base58>#<addrs>@<relay>
+            let (node_id_str, _direct_addrs_str, relay_str) = parse_rich_invite(code);
+            let peer_bytes = base58_decode(&node_id_str).unwrap_or_else(|| {
                 eprintln!("Invalid invite code (expected base58-encoded 32-byte key)");
                 std::process::exit(1);
             });
@@ -413,9 +435,17 @@ fn main() {
                 std::process::exit(1);
             });
 
-            // Persist seed_node_id into config so the next startup auto-joins
+            // Persist seed_node_id and relay host into config
             if let Some(config_path) = &resolved_config_path {
                 persist_config_key(config_path, "seed_node_id", &peer_hex);
+
+                // Extract relay host from invite URL and save to config
+                if let Some(ref relay_url) = relay_str {
+                    if let Some(host) = extract_relay_host(relay_url) {
+                        persist_config_array_key(config_path, "relay_hosts", &[&host]);
+                        eprintln!("Relay host saved: {host}");
+                    }
+                }
             }
 
             eprintln!("Peer added: {} ({})", code, &peer_hex[..8]);
@@ -529,13 +559,16 @@ fn main() {
     };
 
     // Distribution config
-    eprintln!("Distribution: SWIM (transport: {transport})");
+    eprintln!("Distribution: SWIM (transport: iroh, mode: reactive)");
     let swim_config = SwimConfig {
-        probe_interval: 5,
-        probe_timeout: 6,       // 600ms — allows relay round-trip
+        probe_interval: 10,       // unused in Reactive mode, kept for compat
+        probe_timeout: 15,        // 1.5s — generous for relay roundtrips
         indirect_probes: 2,
-        suspicion_timeout: 40,   // 4s — gives refutation time to piggyback
-        dead_reprobe_interval: 50,
+        suspicion_timeout: 80,    // 8s — gives refutation time to gossip back
+        dead_reprobe_interval: 100,
+        probe_mode: distribution::swim::probe::ProbeMode::Reactive {
+            safety_sweep_interval: 3000, // 5 minutes at 100ms/tick
+        },
     };
     let node_config = DistributedNodeConfig {
         swim: swim_config,
@@ -544,8 +577,9 @@ fn main() {
         ..Default::default()
     };
 
-    // Channel for triggering SWIM joins (fed by peers plugin "Add Peer")
+    // Channel for triggering SWIM joins (fed by peers plugin "Add Peer" and distribution "Re-peer")
     let (join_tx, join_rx) = std::sync::mpsc::channel::<dashboard::JoinPeerInfo>();
+    let join_tx_dist = join_tx.clone();
 
     // Register peers plugin
     let peers_plugin = plugins::peers::PeersPlugin::new(
@@ -554,141 +588,37 @@ fn main() {
     );
     dash.register_plugin(Arc::new(peers_plugin));
 
-    match transport.as_str() {
-        #[cfg(feature = "iroh")]
-        "iroh" => run_iroh(
-            seed_node_id,
-            dashboard_port,
-            actors,
-            node_config,
-            keypair,
-            Arc::clone(&peer_auth),
-            &handle,
-            &dash,
-            &stop,
-            &ds_group,
-            node_name,
-            invite_code,
-            join_rx,
-            relay_enabled,
-            &relay_bind,
-            relay_port,
-            relay_hosts,
-        ),
-        #[cfg(feature = "tcp")]
-        "tcp" => run_tcp(
-            listen,
-            seed,
-            dashboard_port,
-            actors,
-            node_config,
-            keypair,
-            Arc::clone(&peer_auth),
-            &handle,
-            &dash,
-            &stop,
-            &ds_group,
-            node_name,
-            invite_code,
-            join_rx,
-        ),
-        other => {
-            eprintln!("Unknown or unavailable transport: {other}");
-            eprintln!("Available transports:");
-            #[cfg(feature = "iroh")]
-            eprintln!("  iroh");
-            #[cfg(feature = "tcp")]
-            eprintln!("  tcp");
-            std::process::exit(1);
-        }
+    #[cfg(feature = "iroh")]
+    run_iroh(
+        seed_node_id,
+        dashboard_port,
+        actors,
+        node_config,
+        keypair,
+        Arc::clone(&peer_auth),
+        &handle,
+        &dash,
+        &stop,
+        &ds_group,
+        node_name,
+        invite_code,
+        join_rx,
+        join_tx_dist,
+        relay_enabled,
+        &relay_bind,
+        relay_port,
+        relay_hosts,
+    );
+
+    #[cfg(not(feature = "iroh"))]
+    {
+        eprintln!("iroh feature is required but not enabled");
+        std::process::exit(1);
     }
 
     handle.shutdown();
     dash.shutdown();
     handle.join();
-}
-
-// ── TCP transport ────────────────────────────────────────────────────────
-
-#[cfg(feature = "tcp")]
-fn run_tcp(
-    listen: Option<std::net::SocketAddr>,
-    seed: Option<String>,
-    dashboard_port: u16,
-    actors: usize,
-    node_config: DistributedNodeConfig,
-    keypair: Keypair,
-    peer_auth: Arc<Mutex<PeerAllowList>>,
-    handle: &swactor::runtime::RuntimeHandle,
-    dash: &dashboard::DashboardHandle,
-    stop: &Arc<AtomicBool>,
-    ds_group: &Option<DatastoreGroup>,
-    node_name: String,
-    invite_code: String,
-    _join_rx: std::sync::mpsc::Receiver<dashboard::JoinPeerInfo>,
-) {
-    use distribution::driver::NodeDriver;
-
-    let listen_addr = listen.expect("--listen is required for TCP mode");
-    let dist_keypair = distribution::crypto::Keypair::from_bytes(&keypair.secret_bytes());
-    let mut driver = NodeDriver::with_keypair(listen_addr, dist_keypair, node_config)
-        .expect("failed to create node driver");
-
-    eprintln!(
-        "Node {} listening on {} (TCP)",
-        hex(&driver.node_id().0[..4]),
-        driver.listen_addr(),
-    );
-
-    // Join seed if provided
-    if let Some(seed) = seed {
-        let seed_addr: std::net::SocketAddr = seed.parse().expect("invalid seed address");
-        eprintln!("Joining cluster via seed {seed_addr}");
-        driver.join(&[seed_addr]);
-    }
-
-    // Spawn and register actors
-    let actor_addrs = spawn_actors(actors, handle, driver.node_mut());
-
-    // Wire distribution snapshot to dashboard via plugin
-    let mut snap = driver.snapshot();
-    snap.node_name = Some(node_name.clone());
-    snap.invite_code = Some(invite_code.clone());
-    let cached_snapshot: Arc<Mutex<Option<DistributionNodeSnapshot>>> =
-        Arc::new(Mutex::new(Some(snap)));
-    let dist_plugin = plugins::distribution::DistributionPlugin::new(
-        Arc::clone(&cached_snapshot),
-    );
-    dash.register_plugin(Arc::new(dist_plugin));
-
-    // Start dashboard HTTP on a standalone tokio runtime (no iroh runtime in TCP mode)
-    dash.start_http_standalone();
-    eprintln!("Dashboard at http://0.0.0.0:{dashboard_port}");
-
-    // Main loop
-    let mut round: u64 = 0;
-    while !stop.load(Ordering::Relaxed) {
-        round += 1;
-
-        driver.recv_with_auth(&peer_auth);
-        driver.tick();
-
-        for addr in &actor_addrs {
-            let _ = handle.runtime.send_to(*addr, Heartbeat);
-        }
-
-        let mut snap = driver.snapshot();
-        snap.node_name = Some(node_name.clone());
-        snap.invite_code = Some(invite_code.clone());
-        *cached_snapshot.lock().unwrap() = Some(snap);
-
-        // Datastore ticks
-        if let Some(group) = ds_group {
-            group.tick(round);
-        }
-
-        thread::sleep(Duration::from_millis(100));
-    }
 }
 
 // ── iroh transport ───────────────────────────────────────────────────────
@@ -708,6 +638,7 @@ fn run_iroh(
     node_name: String,
     invite_code: String,
     join_rx: std::sync::mpsc::Receiver<dashboard::JoinPeerInfo>,
+    join_tx_dist: std::sync::mpsc::Sender<dashboard::JoinPeerInfo>,
     relay_enabled: bool,
     relay_bind: &str,
     relay_port: u16,
@@ -766,7 +697,12 @@ fn run_iroh(
             })
             .collect();
         if urls.is_empty() {
-            RelayMode::Disabled
+            if relay_enabled {
+                eprintln!("Relay: no hosts configured, using iroh default relays");
+                RelayMode::Default
+            } else {
+                RelayMode::Disabled
+            }
         } else {
             eprintln!("Relay: using {} known relay(s)", urls.len());
             RelayMode::Custom(urls.into_iter().collect::<iroh::RelayMap>())
@@ -828,7 +764,8 @@ fn run_iroh(
     // Spawn and register actors
     let actor_addrs = spawn_actors(actors, handle, driver.node_mut());
 
-    // Announce relay URL to cluster gossip
+    // Announce node name and relay URL to cluster gossip
+    driver.node_mut().set_node_name(node_name.clone());
     let mut home_relay_set = if let Some(url) = driver.relay_url().map(|u| u.to_string()) {
         driver.node_mut().set_relay_url(Some(url));
         true
@@ -840,11 +777,14 @@ fn run_iroh(
     let mut snap = driver.snapshot();
     snap.node_name = Some(node_name.clone());
     snap.invite_code = Some(invite_code.clone());
+    snap.version = Some(VERSION.to_string());
     let cached_snapshot: Arc<Mutex<Option<DistributionNodeSnapshot>>> =
         Arc::new(Mutex::new(Some(snap)));
     let dist_plugin = plugins::distribution::DistributionPlugin::new(
         Arc::clone(&cached_snapshot),
+        Some(join_tx_dist),
     );
+    let dismissed_statuses = dist_plugin.dismissed_statuses();
     dash.register_plugin(Arc::new(dist_plugin));
 
     // Start dashboard HTTP on IrohDriver's tokio runtime
@@ -880,7 +820,7 @@ fn run_iroh(
 
         // Drain discovered peers (dashboard "Add Peer") and auto-join them
         {
-            let mut new_peers = Vec::new();
+            let mut new_peers: Vec<dashboard::JoinPeerInfo> = Vec::new();
             while let Ok(info) = join_rx.try_recv() {
                 new_peers.push(info);
             }
@@ -888,22 +828,25 @@ fn run_iroh(
                 let own_id = driver.node_id().0;
                 let addrs: Vec<iroh::EndpointAddr> = new_peers
                     .iter()
-                    .filter(|(bytes, _)| *bytes != own_id)
-                    .filter_map(|(bytes, relay_url)| {
-                        iroh::PublicKey::from_bytes(bytes).ok().map(|k| {
+                    .filter(|info| info.node_id != own_id)
+                    .filter_map(|info| {
+                        iroh::PublicKey::from_bytes(&info.node_id).ok().map(|k| {
                             let mut addr = iroh::EndpointAddr::from(k);
-                            if let Some(url_str) = relay_url {
+                            if let Some(url_str) = &info.relay_url {
                                 match url_str.parse::<iroh::RelayUrl>() {
                                     Ok(url) => {
-                                        eprintln!("Auto-joining peer {} via relay {}", base58_encode(bytes), url);
+                                        eprintln!("Auto-joining peer {} via relay {}", base58_encode(&info.node_id), url);
                                         addr = addr.with_relay_url(url);
                                     }
                                     Err(e) => {
-                                        eprintln!("Auto-joining peer {} (bad relay URL {}: {e})", base58_encode(bytes), url_str);
+                                        eprintln!("Auto-joining peer {} (bad relay URL {}: {e})", base58_encode(&info.node_id), url_str);
                                     }
                                 }
                             } else {
-                                eprintln!("Auto-joining peer {} (no relay URL)", base58_encode(bytes));
+                                eprintln!("Auto-joining peer {} (no relay URL)", base58_encode(&info.node_id));
+                            }
+                            for sa in &info.direct_addrs {
+                                addr = addr.with_ip_addr(*sa);
                             }
                             addr
                         })
@@ -929,7 +872,83 @@ fn run_iroh(
 
         let mut snap = driver.snapshot();
         snap.node_name = Some(node_name.clone());
-        snap.invite_code = Some(invite_code.clone());
+
+        // Build rich invite code: <base58>#<addr1>,<addr2>@<relay_url>
+        {
+            let direct_addrs = driver.direct_addresses();
+            let addrs_part = if direct_addrs.is_empty() {
+                String::new()
+            } else {
+                let addrs_str: Vec<String> = direct_addrs.iter().map(|a| a.to_string()).collect();
+                format!("#{}", addrs_str.join(","))
+            };
+            let relay_part = match &snap.relay_url {
+                Some(relay) => format!("@{}", relay),
+                None => String::new(),
+            };
+            snap.invite_code = Some(format!("{}{}{}", invite_code, addrs_part, relay_part));
+        }
+
+        // Drain dismissed join statuses from the dashboard
+        {
+            let mut dismissed = dismissed_statuses.lock().unwrap();
+            for bytes in dismissed.drain(..) {
+                driver.clear_join_status(&swactor::transport::NodeId(bytes));
+            }
+        }
+
+        // Populate join statuses, auto-clearing alive peers
+        {
+            use distribution::iroh_driver::JoinPhase;
+            use distribution::snapshot::JoinStatusInfo;
+
+            let statuses = driver.join_statuses();
+            let alive_node_ids: Vec<swactor::transport::NodeId> = snap.members.iter()
+                .filter(|m| m.state == "alive")
+                .filter_map(|m| {
+                    let mut bytes = [0u8; 32];
+                    if m.node_id.len() == 64 {
+                        for i in 0..32 {
+                            bytes[i] = u8::from_str_radix(&m.node_id[i*2..i*2+2], 16).unwrap_or(0);
+                        }
+                        Some(swactor::transport::NodeId(bytes))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Clear statuses for alive peers
+            if !alive_node_ids.is_empty() {
+                driver.clear_join_statuses(&alive_node_ids);
+            }
+
+            // Convert remaining statuses to snapshot format
+            snap.join_statuses = statuses.iter()
+                .filter(|(nid, _)| !alive_node_ids.contains(nid))
+                .map(|(nid, status)| {
+                    let node_id_hex: String = nid.0.iter().map(|b| format!("{:02x}", b)).collect();
+                    let (phase_str, detail) = match &status.phase {
+                        JoinPhase::Connecting { attempt, max_attempts } =>
+                            ("connecting".into(), Some(format!("{}/{}", attempt, max_attempts))),
+                        JoinPhase::Sending { attempt, max_attempts } =>
+                            ("sending".into(), Some(format!("{}/{}", attempt, max_attempts))),
+                        JoinPhase::Sent => ("sent".into(), None),
+                        JoinPhase::Failed { error } => ("failed".into(), Some(error.clone())),
+                    };
+                    JoinStatusInfo {
+                        node_id: node_id_hex,
+                        phase: phase_str,
+                        detail,
+                        has_relay: status.has_relay,
+                        has_direct: status.has_direct,
+                        direct_addr_count: status.direct_addr_count,
+                    }
+                })
+                .collect();
+        }
+
+        snap.version = Some(VERSION.to_string());
         *cached_snapshot.lock().unwrap() = Some(snap);
 
         // Datastore ticks
@@ -1040,6 +1059,79 @@ fn persist_config_key(path: &std::path::Path, key: &str, value: &str) {
     if let Err(e) = std::fs::write(path, &updated) {
         eprintln!("Warning: could not persist {key} to {}: {e}", path.display());
     }
+}
+
+/// Extract hostname from a relay URL like `http://167.71.x.x:3340/`.
+fn extract_relay_host(url: &str) -> Option<String> {
+    let stripped = url.strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let host_port = stripped.trim_end_matches('/');
+    // Handle bracket-enclosed IPv6: [::1]:3340
+    if host_port.starts_with('[') {
+        let end = host_port.find(']')?;
+        Some(host_port[1..end].to_string())
+    } else {
+        let host = match host_port.rfind(':') {
+            Some(idx) => &host_port[..idx],
+            None => host_port,
+        };
+        if host.is_empty() { None } else { Some(host.to_string()) }
+    }
+}
+
+/// Persist a TOML array key into an existing config file.
+fn persist_config_array_key(path: &std::path::Path, key: &str, values: &[&str]) {
+    let contents = std::fs::read_to_string(path).unwrap_or_default();
+    let array_str = values
+        .iter()
+        .map(|v| format!("\"{v}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let new_line = format!("{key} = [{array_str}]");
+
+    let updated = if contents.contains(key) {
+        contents
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with(key) {
+                    new_line.as_str()
+                } else {
+                    line
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n"
+    } else {
+        let mut s = contents;
+        if !s.ends_with('\n') && !s.is_empty() {
+            s.push('\n');
+        }
+        s.push_str(&new_line);
+        s.push('\n');
+        s
+    };
+
+    if let Err(e) = std::fs::write(path, &updated) {
+        eprintln!("Warning: could not persist {key} to {}: {e}", path.display());
+    }
+}
+
+/// Parse a rich invite code: `<base58>#<addr1>,<addr2>@<relay_url>`
+///
+/// Returns (node_id_str, optional_direct_addrs_csv, optional_relay_url).
+fn parse_rich_invite(raw: &str) -> (String, Option<String>, Option<String>) {
+    // Split on last '@' for relay
+    let (left, relay) = match raw.rfind('@') {
+        Some(idx) => (&raw[..idx], Some(raw[idx + 1..].to_string())),
+        None => (raw, None),
+    };
+    // Split on '#' for direct addrs
+    let (node_id, addrs) = match left.find('#') {
+        Some(idx) => (&left[..idx], Some(left[idx + 1..].to_string())),
+        None => (left, None),
+    };
+    (node_id.to_string(), addrs, relay)
 }
 
 /// Parse a node ID from either hex (64 chars) or base58 (~44 chars).

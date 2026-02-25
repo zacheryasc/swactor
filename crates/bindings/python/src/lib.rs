@@ -5,7 +5,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
 use ::swactor::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest};
-use ::swactor::config::{BackoffPolicy, RuntimeConfig};
+use ::swactor::config::RuntimeConfig;
 use ::swactor::runtime::{Inbox, Runtime, RuntimeHandle};
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
@@ -231,14 +231,6 @@ pub struct PyRuntimeConfig {
     max_actors: usize,
     #[pyo3(get, set)]
     channel_buffer_size: usize,
-    #[pyo3(get, set)]
-    spin_threshold: u32,
-    #[pyo3(get, set)]
-    yield_threshold: u32,
-    #[pyo3(get, set)]
-    sleep_increment_us: u64,
-    #[pyo3(get, set)]
-    sleep_max_us: u64,
 }
 
 #[pymethods]
@@ -249,28 +241,16 @@ impl PyRuntimeConfig {
         num_threads = 1,
         max_actors = 1_000,
         channel_buffer_size = 1_000,
-        spin_threshold = 64,
-        yield_threshold = 256,
-        sleep_increment_us = 50,
-        sleep_max_us = 1_000,
     ))]
     fn new(
         num_threads: usize,
         max_actors: usize,
         channel_buffer_size: usize,
-        spin_threshold: u32,
-        yield_threshold: u32,
-        sleep_increment_us: u64,
-        sleep_max_us: u64,
     ) -> Self {
         Self {
             num_threads,
             max_actors,
             channel_buffer_size,
-            spin_threshold,
-            yield_threshold,
-            sleep_increment_us,
-            sleep_max_us,
         }
     }
 }
@@ -281,12 +261,6 @@ impl From<PyRuntimeConfig> for RuntimeConfig {
             num_threads: py.num_threads,
             max_actors: py.max_actors,
             channel_buffer_size: py.channel_buffer_size,
-            backoff_policy: BackoffPolicy {
-                spin_threshold: py.spin_threshold,
-                yield_threshold: py.yield_threshold,
-                sleep_increment_us: py.sleep_increment_us,
-                sleep_max_us: py.sleep_max_us,
-            },
             ..Default::default()
         }
     }

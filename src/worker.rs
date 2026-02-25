@@ -51,6 +51,9 @@ pub(crate) struct Worker {
     snapshot_buf: Vec<ActorSnapshot>,
     /// Per-worker extension (e.g., timer wheel). Created by RuntimeExtension factory.
     pub(crate) worker_ext: Option<Box<dyn WorkerExtension>>,
+    /// True if the previous tick did work — ensures one full tick follows a productive
+    /// tick so pending_local messages delivered to mailboxes get drained.
+    has_backlog: bool,
 }
 
 impl Worker {
@@ -70,6 +73,7 @@ impl Worker {
             stats,
             snapshot_buf: Vec::new(),
             worker_ext: None,
+            has_backlog: false,
         }
     }
 
@@ -153,6 +157,16 @@ impl Worker {
     pub(crate) fn tick_once(&mut self, tc: &TickContext) -> bool {
         #[cfg(feature = "tracing")]
         let _span = tracing::trace_span!("worker.tick", worker_id = self.id.0).entered();
+
+        // Fast idle path: skip the entire tick when nothing could have changed.
+        // Cost: ~3 atomic loads, zero syscalls, zero actor iteration.
+        if !self.has_backlog
+            && self.spawn_rx.is_empty()
+            && self.transfer_rx.is_empty()
+            && !self.worker_ext.as_ref().map_or(false, |e| e.has_pending_work())
+        {
+            return false;
+        }
 
         let mut did_work = false;
         let t0 = Instant::now();
@@ -285,6 +299,7 @@ impl Worker {
         // 7. Clean up poisoned and stopping actors
         did_work |= self.cleanup_dead_actors(tc);
 
+        self.has_backlog = did_work;
         did_work
     }
 
@@ -292,27 +307,11 @@ impl Worker {
         #[cfg(feature = "tracing")]
         let _span = tracing::info_span!("worker.run", worker_id = self.id.0).entered();
 
-        let backoff = &tc.config.backoff_policy;
-        let mut idle_count: u32 = 0;
         while is_running.load(Ordering::Acquire) {
-            let did_work = self.tick_once(tc);
-            if did_work {
-                idle_count = 0;
-            } else {
-                idle_count = idle_count.saturating_add(1);
-                if idle_count < backoff.spin_threshold {
-                    // Hot spin
-                } else if idle_count < backoff.yield_threshold {
-                    thread::yield_now();
-                } else {
-                    let micros = std::cmp::min(
-                        (idle_count - backoff.yield_threshold) as u64 * backoff.sleep_increment_us,
-                        backoff.sleep_max_us,
-                    );
-                    // park_timeout allows instant wakeup via Thread::unpark()
-                    // when new work arrives (send_to/spawn notify the target worker)
-                    thread::park_timeout(std::time::Duration::from_micros(micros));
-                }
+            if !self.tick_once(tc) {
+                // Park indefinitely — woken by unpark() from send_to/spawn/stop/shutdown.
+                // Spurious wakes hit the fast idle path (~3 atomic loads) and park again.
+                thread::park();
             }
         }
     }

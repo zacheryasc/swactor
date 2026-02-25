@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use swactor::{
     actor::{ActorAddress, ActorInterface},
-    config::{BackoffPolicy, RuntimeConfig},
+    config::RuntimeConfig,
     runtime::{Ctx, Runtime},
 };
 
@@ -16,12 +16,6 @@ fn mt_config(threads: usize, max_actors: usize, max_messages: usize) -> RuntimeC
         num_threads: threads,
         max_actors,
         channel_buffer_size: max_messages,
-        backoff_policy: BackoffPolicy {
-            spin_threshold: 32,
-            yield_threshold: 64,
-            sleep_increment_us: 10,
-            sleep_max_us: 100,
-        },
         ..Default::default()
     }
 }

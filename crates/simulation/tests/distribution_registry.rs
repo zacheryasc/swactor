@@ -120,6 +120,7 @@ fn split_brain_naming_converges_after_partition_heals() {
             // re_disseminate_all which propagates both sides' registry entries.
             suspicion_timeout: 200,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };
@@ -564,6 +565,7 @@ fn registry_converges_despite_message_loss() {
             // High timeout prevents false deaths during the loss window.
             suspicion_timeout: 200,
             dead_reprobe_interval: 15,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };
@@ -668,6 +670,7 @@ fn suspected_name_owner_recovers_and_registry_survives() {
             // Node stays Suspect during the 10-round partition (30 ticks < 200)
             suspicion_timeout: 200,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };

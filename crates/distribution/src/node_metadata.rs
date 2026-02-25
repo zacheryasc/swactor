@@ -15,6 +15,8 @@ use crate::types::NodeId;
 pub struct NodeMetadataEntry {
     pub node_id: NodeId,
     pub relay_url: Option<String>,
+    #[serde(default)]
+    pub node_name: Option<String>,
     pub generation: u64,
 }
 
@@ -43,12 +45,19 @@ impl NodeMetadataDisseminator {
         }
     }
 
-    /// Set this node's relay URL and enqueue for dissemination.
-    pub fn set_local(&mut self, node_id: NodeId, relay_url: Option<String>, cluster_size: usize) {
+    /// Set this node's metadata and enqueue for dissemination.
+    pub fn set_local(
+        &mut self,
+        node_id: NodeId,
+        relay_url: Option<String>,
+        node_name: Option<String>,
+        cluster_size: usize,
+    ) {
         self.local_generation += 1;
         let entry = NodeMetadataEntry {
             node_id,
             relay_url,
+            node_name,
             generation: self.local_generation,
         };
         self.store.insert(node_id, entry.clone());
@@ -89,6 +98,13 @@ impl NodeMetadataDisseminator {
         self.store
             .get(node_id)
             .and_then(|e| e.relay_url.as_deref())
+    }
+
+    /// Look up a node's human-readable name.
+    pub fn node_name(&self, node_id: &NodeId) -> Option<&str> {
+        self.store
+            .get(node_id)
+            .and_then(|e| e.node_name.as_deref())
     }
 
     /// Remove metadata for a dead node.

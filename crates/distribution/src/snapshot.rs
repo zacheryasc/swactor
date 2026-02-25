@@ -21,6 +21,8 @@ pub struct MemberInfo {
     pub label: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relay_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub node_name: Option<String>,
 }
 
 /// Snapshot of a node in the Kademlia routing table.
@@ -44,6 +46,20 @@ pub struct RegistryEntryInfo {
     pub actor_addr: String,
     pub node_id: String,
     pub tombstone: bool,
+}
+
+/// Snapshot of a join attempt's real-time status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JoinStatusInfo {
+    pub node_id: String,
+    /// "connecting", "sending", "sent", "failed"
+    pub phase: String,
+    /// E.g. "2/5" for attempt progress, or error message for failed
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub has_relay: bool,
+    pub has_direct: bool,
+    pub direct_addr_count: usize,
 }
 
 /// Complete snapshot of a `DistributedNode`'s observable state.
@@ -115,6 +131,14 @@ pub struct DistributionNodeSnapshot {
     /// This node's relay URL, if running an embedded relay server.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub relay_url: Option<String>,
+
+    /// Build version string (e.g. "branch @ hash").
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub version: Option<String>,
+
+    /// Real-time join statuses for peers being connected to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub join_statuses: Vec<JoinStatusInfo>,
 }
 
 fn node_id_hex(id: &NodeId) -> String {
@@ -146,6 +170,7 @@ impl DistributedNode {
                 is_authorized: None,
                 label: None,
                 relay_url: self.metadata().relay_url(&m.node_id).map(String::from),
+                node_name: self.metadata().node_name(&m.node_id).map(String::from),
             })
             .collect();
 
@@ -210,9 +235,11 @@ impl DistributedNode {
             recent_probe_targets: recent_targets,
             peer_auth_mode: "open".into(),
             authorized_peer_count: None,
-            node_name: None,
+            node_name: self.metadata().node_name(&self.node_id()).map(String::from),
             invite_code: None,
             relay_url: self.metadata().relay_url(&self.node_id()).map(String::from),
+            version: None,
+            join_statuses: Vec::new(),
         }
     }
 }

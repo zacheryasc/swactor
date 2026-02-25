@@ -13,6 +13,7 @@ fn fast_config() -> SwimConfig {
         indirect_probes: 2,
         suspicion_timeout: 10,
         dead_reprobe_interval: 0,
+        ..SwimConfig::default()
     }
 }
 

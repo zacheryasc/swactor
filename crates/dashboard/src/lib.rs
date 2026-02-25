@@ -34,8 +34,12 @@ use crate::layer::{now_ms, DashboardLayer, EventStore};
 use crate::plugin::PluginRegistry;
 use crate::trace::{RuntimeTrace, TimestampedStats};
 
-/// Peer info sent through the join channel: (public_key, optional_relay_url).
-pub type JoinPeerInfo = ([u8; 32], Option<String>);
+/// Peer info sent through the join channel.
+pub struct JoinPeerInfo {
+    pub node_id: [u8; 32],
+    pub relay_url: Option<String>,
+    pub direct_addrs: Vec<std::net::SocketAddr>,
+}
 
 /// Configuration for the runtime dashboard.
 #[derive(Debug, Clone)]

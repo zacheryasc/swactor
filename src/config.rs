@@ -1,28 +1,3 @@
-/// Backoff policy for worker threads when idle.
-///
-/// Workers spin → yield → sleep with increasing delay when no work is available.
-pub struct BackoffPolicy {
-    /// Number of idle ticks before switching from spin to yield.
-    pub spin_threshold: u32,
-    /// Number of idle ticks before switching from yield to sleep.
-    pub yield_threshold: u32,
-    /// Microseconds added per tick beyond the yield threshold.
-    pub sleep_increment_us: u64,
-    /// Maximum sleep duration in microseconds.
-    pub sleep_max_us: u64,
-}
-
-impl Default for BackoffPolicy {
-    fn default() -> Self {
-        Self {
-            spin_threshold: 64,
-            yield_threshold: 256,
-            sleep_increment_us: 50,
-            sleep_max_us: 1000,
-        }
-    }
-}
-
 /// What to do when a bounded mailbox is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MailboxOverflow {
@@ -37,7 +12,6 @@ pub struct RuntimeConfig {
     pub max_actors: usize,
     pub channel_buffer_size: usize,
     pub num_threads: usize,
-    pub backoff_policy: BackoffPolicy,
     /// Maximum messages processed per actor per tick.
     /// Prevents a single actor with a large mailbox from starving others.
     /// `0` means unlimited (drain entire mailbox).
@@ -67,7 +41,6 @@ impl Default for RuntimeConfig {
             max_actors: DEFAULT_MAX_ACTORS,
             channel_buffer_size: DEFAULT_CHANNEL_BUFFER_SIZE,
             num_threads: 1,
-            backoff_policy: BackoffPolicy::default(),
             actor_message_budget: DEFAULT_ACTOR_MESSAGE_BUDGET,
             default_mailbox_capacity: 0,
             mailbox_overflow: MailboxOverflow::DropNewest,

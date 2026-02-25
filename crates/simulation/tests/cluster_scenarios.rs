@@ -142,6 +142,7 @@ fn cluster_converges_under_10_percent_message_loss() {
             indirect_probes: 3,
             suspicion_timeout: 60,
             dead_reprobe_interval: 15,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![NetworkFault::SetDropRate {
             round: 1,
@@ -182,6 +183,7 @@ fn heavy_message_loss_causes_membership_instability() {
             indirect_probes: 2,
             suspicion_timeout: 15,
             dead_reprobe_interval: 0,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![NetworkFault::SetDropRate {
             round: 1,
@@ -329,6 +331,7 @@ fn cluster_of_fifty_converges() {
             indirect_probes: 2,
             suspicion_timeout: 10,
             dead_reprobe_interval: 0,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };
@@ -415,6 +418,7 @@ fn graceful_leave_detected_faster_than_crash() {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 0,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };
@@ -559,6 +563,7 @@ fn membership_changes_disseminate_to_all_nodes() {
             indirect_probes: 2,
             suspicion_timeout: 8,
             dead_reprobe_interval: 0,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         ..default_config()
     };
@@ -646,6 +651,7 @@ fn cluster_survives_brief_message_loss() {
             indirect_probes: 3,
             suspicion_timeout: 60,
             dead_reprobe_interval: 15,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![
             NetworkFault::SetDropRate {
@@ -698,6 +704,7 @@ fn partition_heals_via_dead_reprobe() {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![
             NetworkFault::Partition {
@@ -771,6 +778,7 @@ fn accuracy_no_false_permanent_deaths() {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![
             NetworkFault::Partition {
@@ -812,6 +820,7 @@ fn convergence_after_partition_heal() {
             indirect_probes: 1,
             suspicion_timeout: 5,
             dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![
             NetworkFault::Partition {
@@ -835,6 +844,86 @@ fn convergence_after_partition_heal() {
         "convergence failed: {}",
         result.actual
     );
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 16. Re-peer after partition death — stale Dead gossip must not re-kill
+// ────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn repeer_after_partition_death_stays_alive() {
+    // Scenario: 3 nodes. Partition isolates node 2. Node 2 gets declared Dead
+    // by nodes 0 and 1 (and vice versa). Partition heals. SimAction::Join
+    // re-peers all pairs. All nodes must converge to full alive membership.
+    //
+    // The purge_node fix ensures that clear_dead_member removes stale
+    // (node_id, Dead, incarnation) updates from the DisseminationQueue,
+    // preventing stale Dead gossip from leaking out on subsequent messages
+    // and re-infecting the cluster during the recovery window.
+    use simulation::distribution::sim::SimAction;
+
+    let config = DistributionSimConfig {
+        name: "repeer-after-partition-death".into(),
+        num_nodes: 3,
+        num_rounds: 100,
+        ticks_per_round: 3,
+        actors_per_node: 0,
+        swim: distribution::swim::probe::SwimConfig {
+            probe_interval: 1,
+            probe_timeout: 3,
+            indirect_probes: 1,
+            suspicion_timeout: 5,
+            dead_reprobe_interval: 10,
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
+        },
+        network_faults: vec![
+            // Isolate node 2 from nodes 0 and 1
+            NetworkFault::Partition {
+                round: 5,
+                partition: Partition {
+                    side_a: vec![0, 1],
+                    side_b: vec![2],
+                    asymmetric: false,
+                },
+            },
+            // Heal the partition before the re-peer
+            NetworkFault::Heal { round: 20 },
+        ],
+        // Re-peer all cross-partition pairs after heal
+        action_schedule: vec![
+            (25, SimAction::Join { node_idx: 0, seed_idx: 2 }),
+            (25, SimAction::Join { node_idx: 2, seed_idx: 0 }),
+            (25, SimAction::Join { node_idx: 1, seed_idx: 2 }),
+            (25, SimAction::Join { node_idx: 2, seed_idx: 1 }),
+        ],
+        ..default_config()
+    };
+
+    let trace = run_simulation(config);
+
+    // After re-peer + refutation cycles, all 3 nodes should converge.
+    // Check the last 10 rounds: every node must be alive and see ≥2 members.
+    for round_idx in (trace.num_rounds - 10)..trace.num_rounds {
+        let round_snaps = &trace.snapshots_per_round[round_idx];
+        for (name, snap) in round_snaps {
+            assert!(
+                snap.is_alive,
+                "round {}: {name} should be alive",
+                round_idx + 1
+            );
+        }
+        let min_members = round_snaps
+            .iter()
+            .filter(|(_, s)| s.is_alive)
+            .map(|(_, s)| s.member_count)
+            .min()
+            .unwrap_or(0);
+        assert!(
+            min_members >= 2,
+            "round {}: all nodes should see full membership (min member_count = {min_members})",
+            round_idx + 1
+        );
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -866,6 +955,7 @@ fn suspect_refuted_before_timeout_no_false_death() {
             indirect_probes: 1,
             suspicion_timeout: 50,
             dead_reprobe_interval: 0, // disabled — refutation must happen before death
+            probe_mode: distribution::swim::probe::ProbeMode::Periodic,
         },
         network_faults: vec![
             // Block 0→1 (but 1→0 still works)

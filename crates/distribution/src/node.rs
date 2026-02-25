@@ -191,6 +191,18 @@ impl DistributedNode {
         self.inject_piggyback(actions)
     }
 
+    /// Report that a send to `target` failed, triggering a reactive probe.
+    pub fn report_send_failure(&mut self, target: NodeId) -> Vec<NodeAction> {
+        let actions = self.swim.report_send_failure(target);
+        self.process_membership_changes(&actions);
+        self.inject_piggyback(actions)
+    }
+
+    /// Clear a Dead member so a subsequent JoinResponse can re-establish it.
+    pub fn clear_dead_member(&mut self, node_id: NodeId) {
+        self.swim.clear_dead_member(node_id);
+    }
+
     pub fn handle_join_request(&mut self, from: NodeId) -> Vec<NodeAction> {
         let actions = self.swim.handle_join_request(from);
         self.maybe_update_routing_table(from);
@@ -286,13 +298,26 @@ impl DistributedNode {
 
     /// Set this node's relay URL and begin gossiping it to the cluster.
     pub fn set_relay_url(&mut self, url: Option<String>) {
+        let name = self.metadata.node_name(&self.node_id()).map(String::from);
         self.metadata
-            .set_local(self.node_id(), url, self.cluster_size());
+            .set_local(self.node_id(), url, name, self.cluster_size());
+    }
+
+    /// Set this node's human-readable name and begin gossiping it to the cluster.
+    pub fn set_node_name(&mut self, name: String) {
+        let relay_url = self.metadata.relay_url(&self.node_id()).map(String::from);
+        self.metadata
+            .set_local(self.node_id(), relay_url, Some(name), self.cluster_size());
     }
 
     /// Look up a node's relay URL.
     pub fn relay_url(&self, node_id: &NodeId) -> Option<&str> {
         self.metadata.relay_url(node_id)
+    }
+
+    /// Look up a node's human-readable name.
+    pub fn node_name(&self, node_id: &NodeId) -> Option<&str> {
+        self.metadata.node_name(node_id)
     }
 
     /// Read-only access to the metadata disseminator.
