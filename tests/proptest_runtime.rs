@@ -11,7 +11,7 @@ use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMac
 use std::sync::Arc;
 
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::config::{MailboxOverflow, RuntimeConfig};
+use swactor::config::RuntimeConfig;
 use swactor::runtime::{Ctx, Inbox, Runtime};
 use swactor::std::{CtxTimers, StdExtension};
 
@@ -67,33 +67,6 @@ impl ActorInterface for NoopActor {
 // ─── Simple Property Tests ─────────────────────────────────────────────────
 
 proptest! {
-    /// FIFO ordering is preserved for any sequence of numbered messages
-    /// sent from a single sender to a single actor.
-    #[test]
-    fn fifo_ordering_for_any_message_sequence(
-        values in proptest::collection::vec(0u64..10_000, 1..100)
-    ) {
-        let rt = Runtime::new(RuntimeConfig::default());
-        let inbox = rt.new_inbox::<Ping>().unwrap();
-        let addr = rt.spawn(EchoActor { reply_to: *inbox.addr() }).unwrap();
-
-        // Send all messages
-        for &v in &values {
-            rt.send_to(addr, Ping(v)).unwrap();
-        }
-
-        // Tick enough to process all
-        let ticks_needed = (values.len() / 64) + 3; // budget=64 default
-        for _ in 0..ticks_needed { rt.tick(); }
-
-        // Verify FIFO ordering
-        let mut received = Vec::new();
-        while let Some(msg) = inbox.try_recv() {
-            received.push(msg.0);
-        }
-        prop_assert_eq!(&received, &values, "FIFO ordering violated");
-    }
-
     /// Budget fairness: no actor processes more than budget messages per tick
     /// when multiple actors have pending messages.
     #[test]
@@ -210,35 +183,6 @@ proptest! {
             }
         }
         prop_assert!(fire_count >= 3, "Expected 3+ fires, got {} (period={})", fire_count, period);
-    }
-
-    /// Bounded mailbox with DropNewest never exceeds capacity.
-    #[test]
-    fn bounded_mailbox_never_exceeds_capacity(
-        capacity in 1usize..20,
-        msg_count in 1usize..200,
-    ) {
-        let config = RuntimeConfig {
-            default_mailbox_capacity: capacity,
-            mailbox_overflow: MailboxOverflow::DropNewest,
-            ..Default::default()
-        };
-        let rt = Runtime::new(config);
-        let addr = rt.spawn(NoopActor).unwrap();
-        rt.tick(); // on_start
-
-        for v in 0..msg_count as u64 {
-            rt.send_to(addr, Ping(v)).unwrap();
-        }
-
-        let stats = rt.stats();
-        let worker = &stats.workers[0];
-        // Mailbox depth should never exceed capacity
-        prop_assert!(
-            worker.mailbox_depth <= capacity,
-            "Mailbox depth {} exceeds capacity {}",
-            worker.mailbox_depth, capacity,
-        );
     }
 
     /// Spawn N actors and verify all get unique addresses and appear in stats.

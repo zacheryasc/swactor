@@ -10,7 +10,7 @@ pub use swactor::actor::{
     ExitReason, ExitValue, LogicalName, MonitorRef, ServiceBinding, SpawnBuilder, SpawnTimestamp,
     StopReason,
 };
-pub use swactor::runtime::{Ctx, Inbox, MailboxOverflow, Runtime, RuntimeConfig};
+pub use swactor::runtime::{Ctx, Inbox, Runtime, RuntimeConfig};
 pub use swactor::std::{
     ChildSpec, CtxCapabilities, CtxEnvironment, CtxGroups, CtxHandles, CtxLifecycle, CtxLineage,
     CtxMonitoring, CtxNaming, CtxResources, CtxSelfStats, CtxSystem, CtxTimers, CtxWatching,

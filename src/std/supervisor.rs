@@ -7,7 +7,7 @@ use super::ctx_ext::get_ext;
 use super::CtxMonitoring;
 
 /// How a child should be restarted when it dies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RestartPolicy {
     /// Always restart, regardless of stop reason.
     Permanent,
@@ -18,7 +18,7 @@ pub enum RestartPolicy {
 }
 
 /// Strategy for handling child failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SupervisorStrategy {
     /// Only restart the failed child. Other children are unaffected.
     OneForOne,
@@ -29,11 +29,33 @@ pub enum SupervisorStrategy {
     RestForOne,
 }
 
+impl RestartPolicy {
+    // Pure functions for kani model checking
+
+    /// Whether this policy permits restarting a child that died for the given reason.
+    pub fn should_restart(self, reason: StopReason) -> bool {
+        match self {
+            RestartPolicy::Permanent => true,
+            RestartPolicy::Transient => reason == StopReason::Panicked,
+            RestartPolicy::Temporary => false,
+        }
+    }
+}
+
+/// Compute which child indices should be restarted given a supervision strategy
+pub fn compute_restart_set(
+    strategy: SupervisorStrategy,
+    dead_idx: usize,
+    num_children: usize,
+) -> Vec<usize> {
+    match strategy {
+        SupervisorStrategy::OneForOne => vec![dead_idx],
+        SupervisorStrategy::OneForAll => (0..num_children).collect(),
+        SupervisorStrategy::RestForOne => (dead_idx..num_children).collect(),
+    }
+}
+
 /// Specification for a supervised child actor.
-///
-/// The `start` closure is called with `&Ctx` and should spawn the child actor
-/// (typically via `ctx.spawn()`). The supervisor monitors the returned address
-/// and applies the restart policy when the child dies.
 pub struct ChildSpec {
     /// Unique identifier for this child.
     pub id: String,
@@ -260,13 +282,7 @@ impl ActorInterface for Supervisor {
         };
         self.children[idx] = None;
 
-        let should_restart = match self.specs[idx].restart {
-            RestartPolicy::Permanent => true,
-            RestartPolicy::Transient => down.reason == StopReason::Panicked,
-            RestartPolicy::Temporary => false,
-        };
-
-        if !should_restart {
+        if !self.specs[idx].restart.should_restart(down.reason) {
             return;
         }
 
@@ -279,6 +295,7 @@ impl ActorInterface for Supervisor {
             return;
         }
 
+        let restart_indices = compute_restart_set(self.strategy, idx, self.specs.len());
         match self.strategy {
             SupervisorStrategy::OneForOne => {
                 if let Err(e) = self.start_child(ctx, idx) {
@@ -288,14 +305,7 @@ impl ActorInterface for Supervisor {
                     );
                 }
             }
-            SupervisorStrategy::OneForAll => {
-                // Stop all other living children, then restart all in order.
-                let restart_indices: Vec<usize> = (0..self.specs.len()).collect();
-                self.begin_coordinated_restart(ctx, restart_indices);
-            }
-            SupervisorStrategy::RestForOne => {
-                // Stop children after the failed one, then restart failed + rest.
-                let restart_indices: Vec<usize> = (idx..self.specs.len()).collect();
+            _ => {
                 self.begin_coordinated_restart(ctx, restart_indices);
             }
         }

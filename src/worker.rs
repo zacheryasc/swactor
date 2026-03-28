@@ -8,12 +8,35 @@ use crate::Instant;
 
 use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx, Environment, ExitValue, ResumeSignal, SpawnRequest, StopReason, StopSignal, StopWithSignal, SystemInfo};
 use crate::channel::Receiver;
-use crate::config::MailboxOverflow;
 use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
 use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
 use crate::Error;
 
 use crate::extension::WorkerExtension;
+
+
+// Extracted pure functions for use in kani to prove guarantees
+
+/// Whether an actor should be skipped during `tick_all`.
+pub(crate) fn should_skip_actor(poisoned: bool, stopping: bool, suspended: bool) -> bool {
+    poisoned || stopping || suspended
+}
+
+/// Whether `on_stop` should fire for an actor being cleaned up.
+pub(crate) fn is_on_stop_eligible(stopping: bool, poisoned: bool) -> bool {
+    stopping && !poisoned
+}
+
+/// Determine the `StopReason` for a dead actor based on its flags.
+pub(crate) fn determine_stop_reason(poisoned: bool, has_exit_value: bool) -> StopReason {
+    if poisoned {
+        StopReason::Panicked
+    } else if has_exit_value {
+        StopReason::Completed
+    } else {
+        StopReason::Normal
+    }
+}
 
 /// Route a message: try local pool first, then address_map for cross-worker,
 /// then inbox_registry for external receivers.
@@ -62,12 +85,10 @@ impl Worker {
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<SpawnRequest>,
         stats: Arc<WorkerStats>,
-        default_mailbox_capacity: usize,
-        default_overflow_policy: MailboxOverflow,
     ) -> Self {
         Self {
             id,
-            pool: ActorPool::new(default_mailbox_capacity, default_overflow_policy),
+            pool: ActorPool::new(),
             transfer_rx,
             spawn_rx,
             stats,
@@ -253,14 +274,10 @@ impl Worker {
         let t5 = Instant::now();
 
         // 6. Publish stats (skip entirely when idle to avoid allocation + mutex)
-        let drops = self.pool.take_drops();
         if did_work {
             self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
             self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
             self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
-            if drops > 0 {
-                self.stats.messages_dropped.fetch_add(drops as u64, Ordering::Relaxed);
-            }
 
             if let Some(hook) = tc.stats_hook {
                 self.pool.mailbox_depths_into(&mut self.snapshot_buf);
@@ -415,9 +432,6 @@ struct ActorSlot {
     messages_processed: u64,
     /// Per-message-type counters (bounded to 32 entries).
     msg_type_counts: HashMap<&'static str, u64>,
-    /// Per-actor mailbox capacity. 0 = unbounded.
-    mailbox_capacity: usize,
-    overflow_policy: MailboxOverflow,
     /// Address of the actor that spawned this one, or `None` for externally-spawned actors.
     parent_addr: Option<ActorAddress>,
     /// Inherited environment from parent (or empty for runtime-spawned actors).
@@ -429,27 +443,18 @@ struct ActorSlot {
 /// Per-worker actor storage. Owns per-actor mailboxes.
 pub(crate) struct ActorPool {
     actors: AddrMap<ActorSlot>,
-    default_mailbox_capacity: usize,
-    default_overflow_policy: MailboxOverflow,
-    /// Messages dropped this tick due to mailbox overflow. Reset after publishing to stats.
-    drops_this_tick: usize,
 }
 
 impl ActorPool {
-    pub fn new(default_mailbox_capacity: usize, default_overflow_policy: MailboxOverflow) -> Self {
+    pub fn new() -> Self {
         Self {
             actors: HashMap::with_hasher(AddrBuildHasher),
-            default_mailbox_capacity,
-            default_overflow_policy,
-            drops_this_tick: 0,
         }
     }
 
     pub fn insert(&mut self, req: SpawnRequest) {
-        let cap = self.default_mailbox_capacity;
-        let prealloc = if cap > 0 { cap.min(64) } else { 16 };
         self.actors.insert(req.addr, ActorSlot {
-            mailbox: VecDeque::with_capacity(prealloc),
+            mailbox: VecDeque::with_capacity(16),
             actor: req.actor,
             poisoned: false,
             stopping: false,
@@ -458,8 +463,6 @@ impl ActorPool {
             last_msg_type: None,
             messages_processed: 0,
             msg_type_counts: HashMap::new(),
-            mailbox_capacity: self.default_mailbox_capacity,
-            overflow_policy: self.default_overflow_policy,
             parent_addr: req.parent,
             env: req.env,
             exit_value: None,
@@ -467,7 +470,7 @@ impl ActorPool {
     }
 
     /// Deliver a type-erased message to the actor at `addr`.
-    /// Returns `true` if the actor exists (message handled or dropped; type check deferred to tick).
+    /// Returns `true` if the actor exists (message enqueued; type check deferred to tick).
     pub fn deliver(&mut self, addr: &ActorAddress, msg: Box<dyn Any + Send>) -> bool {
         if let Some(slot) = self.actors.get_mut(addr) {
             // Intercept control signals for suspended actors: they skip tick_all
@@ -491,28 +494,11 @@ impl ActorPool {
                     return true;
                 }
             }
-            if slot.mailbox_capacity > 0 && slot.mailbox.len() >= slot.mailbox_capacity {
-                match slot.overflow_policy {
-                    MailboxOverflow::DropNewest => {
-                        self.drops_this_tick += 1;
-                        return true;
-                    }
-                    MailboxOverflow::DropOldest => {
-                        slot.mailbox.pop_front();
-                        self.drops_this_tick += 1;
-                    }
-                }
-            }
             slot.mailbox.push_back(msg);
             true
         } else {
             false
         }
-    }
-
-    /// Take and reset the drop counter for this tick.
-    pub fn take_drops(&mut self) -> usize {
-        std::mem::replace(&mut self.drops_this_tick, 0)
     }
 
     /// Tick all actors in the pool. Returns the number of messages processed.
@@ -530,16 +516,18 @@ impl ActorPool {
     ) -> usize {
         let mut count = 0;
         for (&addr, slot) in self.actors.iter_mut() {
-            if slot.poisoned || slot.stopping {
-                // Discard all messages for poisoned/stopping actors
-                slot.mailbox.clear();
+            if should_skip_actor(slot.poisoned, slot.stopping, slot.suspended) {
+                // Discard all messages for poisoned/stopping actors (not suspended — those queue)
+                if slot.poisoned || slot.stopping {
+                    slot.mailbox.clear();
+                }
                 continue;
             }
 
-            // Skip suspended actors — messages keep queueing
-            if slot.suspended {
-                continue;
-            }
+            debug_assert!(
+                !slot.poisoned && !slot.stopping && !slot.suspended,
+                "G4: non-processable actor reached processing"
+            );
 
             #[cfg(feature = "tracing")]
             let _actor_span = tracing::trace_span!("actor.tick", actor_addr = %addr).entered();
@@ -729,15 +717,13 @@ impl ActorPool {
         let mut dead = Vec::with_capacity(dead_addrs.len());
         for addr in dead_addrs {
             if let Some(mut slot) = self.actors.remove(&addr) {
-                let reason = if slot.poisoned {
-                    StopReason::Panicked
-                } else if slot.exit_value.is_some() {
-                    StopReason::Completed
-                } else {
-                    StopReason::Normal
-                };
+                let reason = determine_stop_reason(slot.poisoned, slot.exit_value.is_some());
                 // Call on_stop for gracefully stopping actors only
-                if slot.stopping && !slot.poisoned {
+                debug_assert!(
+                    slot.poisoned || slot.stopping,
+                    "G4: non-dead actor reached cleanup_dead"
+                );
+                if is_on_stop_eligible(slot.stopping, slot.poisoned) {
                     let mut type_counts: Vec<(&'static str, u64)> =
                         slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
                     type_counts.sort_by(|a, b| b.1.cmp(&a.1));

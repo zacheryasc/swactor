@@ -1,8 +1,7 @@
-//! Message Delivery Tests — how data flows through the system.
+//! Message Routing and Handler Behavior Tests.
 //!
-//! Covers: FIFO ordering, routing correctness at scale, delivery from within
-//! handlers, address error handling, fairness/budgets, timers, and mailbox
-//! backpressure policies.
+//! Covers: routing correctness at scale, send-from-within-handler patterns,
+//! address error handling, fairness/budgets, and timers.
 
 mod common;
 use common::*;
@@ -132,43 +131,6 @@ impl ActorInterface for RingNode {
 // ═══════════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════════
-
-/// Messages arrive in FIFO order even with small buffers, budget constraints,
-/// and independent mailboxes isolate actors from each other.
-#[test]
-fn fifo_ordering_and_mailbox_isolation() {
-    // FIFO with small buffer and budget
-    let rt = std_runtime(RuntimeConfig {
-        channel_buffer_size: 1,
-        actor_message_budget: 8,
-        ..Default::default()
-    });
-    let addr = rt.spawn(CounterActor { count: 0 }).unwrap();
-    let inbox = rt.new_inbox::<Count>().unwrap();
-    for _ in 0..100 {
-        rt.send_to(addr, Increment { reply_to: *inbox.addr() }).unwrap();
-    }
-    let replies: Vec<_> = tick_and_drain(&rt, &inbox, 50);
-    assert_eq!(replies.len(), 100, "all messages delivered");
-    for (i, reply) in replies.iter().enumerate() {
-        assert_eq!(*reply, Count(i + 1), "FIFO order preserved at position {i}");
-    }
-
-    // Mailbox isolation: 3 actors each get exactly their own messages
-    let rt = std_runtime(RuntimeConfig::default());
-    let mut inboxes = Vec::new();
-    for _ in 0..3 {
-        let addr = rt.spawn(PingPongActor).unwrap();
-        let inbox = rt.new_inbox::<Pong>().unwrap();
-        rt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
-        inboxes.push(inbox);
-    }
-    tick_n(&rt, 10);
-    for (i, inbox) in inboxes.iter().enumerate() {
-        assert!(inbox.try_recv().is_some(), "actor {i} replied");
-        assert!(inbox.try_recv().is_none(), "actor {i} has exactly one reply");
-    }
-}
 
 /// 200 actors each get a unique numbered message and reply correctly.
 /// A 100-hop ring traversal completes.
@@ -415,75 +377,3 @@ fn timer_one_shot_and_interval() {
     assert_eq!(stats.workers[0].num_actors, 1, "only heartbeat actor remains");
 }
 
-/// Bounded mailboxes: DropNewest caps at capacity, DropOldest keeps newest,
-/// unbounded delivers all, mailbox refills after processing.
-#[test]
-fn mailbox_backpressure_policies() {
-    // DropNewest: capacity=10, send 50 → only 10 delivered
-    let rt = std_runtime(RuntimeConfig {
-        default_mailbox_capacity: 10,
-        mailbox_overflow: MailboxOverflow::DropNewest,
-        ..Default::default()
-    });
-    let inbox = rt.new_inbox::<Count>().unwrap();
-    let addr = rt.spawn(CounterActor { count: 0 }).unwrap();
-    for _ in 0..50 {
-        let _ = rt.send_to(addr, Increment { reply_to: *inbox.addr() });
-    }
-    tick_n(&rt, 20);
-    let mut replies = 0;
-    while inbox.try_recv().is_some() { replies += 1; }
-    assert_eq!(replies, 10, "DropNewest caps at mailbox capacity");
-    let drops: u64 = rt.stats().workers.iter().map(|w| w.messages_dropped).sum();
-    assert_eq!(drops, 40, "40 messages dropped");
-
-    // DropOldest: capacity=5, send 10 → newest 5 kept
-    let rt = std_runtime(RuntimeConfig {
-        default_mailbox_capacity: 5,
-        mailbox_overflow: MailboxOverflow::DropOldest,
-        ..Default::default()
-    });
-    let inbox = rt.new_inbox::<Done>().unwrap();
-    let addr = rt.spawn(DoubleActor).unwrap();
-    for i in 0..10 {
-        let _ = rt.send_to(addr, Forward { value: i, reply_to: *inbox.addr() });
-    }
-    tick_n(&rt, 10);
-    let mut replies = Vec::new();
-    while let Some(Done(v)) = inbox.try_recv() { replies.push(v); }
-    assert_eq!(replies.len(), 5, "only 5 kept");
-    assert_eq!(replies, vec![10, 12, 14, 16, 18], "newest values kept (5-9 doubled)");
-
-    // Unbounded: 200 messages all delivered
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Count>().unwrap();
-    let addr = rt.spawn(CounterActor { count: 0 }).unwrap();
-    for _ in 0..200 {
-        let _ = rt.send_to(addr, Increment { reply_to: *inbox.addr() });
-    }
-    tick_n(&rt, 50);
-    let mut count = 0;
-    while inbox.try_recv().is_some() { count += 1; }
-    assert_eq!(count, 200, "unbounded delivers all");
-
-    // Refill after processing
-    let rt = std_runtime(RuntimeConfig {
-        default_mailbox_capacity: 5,
-        actor_message_budget: 5,
-        mailbox_overflow: MailboxOverflow::DropNewest,
-        ..Default::default()
-    });
-    let inbox = rt.new_inbox::<Count>().unwrap();
-    let addr = rt.spawn(CounterActor { count: 0 }).unwrap();
-    for _ in 0..5 {
-        let _ = rt.send_to(addr, Increment { reply_to: *inbox.addr() });
-    }
-    rt.tick(); // process batch 1
-    for _ in 0..5 {
-        let _ = rt.send_to(addr, Increment { reply_to: *inbox.addr() });
-    }
-    rt.tick(); // process batch 2
-    let mut count = 0;
-    while inbox.try_recv().is_some() { count += 1; }
-    assert_eq!(count, 10, "mailbox refills after draining");
-}

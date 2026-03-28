@@ -5,6 +5,7 @@
 __pycache__
 fuzz/artifacts/**
 corpus
+.loop/
 
 # Analysis artifacts (depgraph + spectral)
 **/deps.dot
