@@ -1,4 +1,4 @@
-mod supervisor;
+pub(crate) mod supervisor;
 mod router;
 pub mod name_registry;
 pub mod monitor_registry;

@@ -10,7 +10,7 @@ use crate::Instant;
 use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Environment, ExitValue, Message, ResumeSignal, SpawnRequest, StopSignal, StopWithSignal, SystemInfo};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
-pub use crate::config::{MailboxOverflow, RuntimeConfig};
+pub use crate::config::RuntimeConfig;
 use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
 use crate::extension::RuntimeExtension;
 use crate::stats::{StatsHook, WorkerStats};
@@ -176,6 +176,10 @@ unsafe impl Sync for ExternalSender {}
 impl ExternalSender {
     /// Send a typed message to an actor address, waking the owning worker thread.
     ///
+    /// Returns `Ok(())` if the message was accepted for routing. This does **not**
+    /// guarantee delivery — the recipient may stop before processing it. If
+    /// delivery confirmation is needed, implement an application-level ACK.
+    ///
     /// Returns `Err` if the address is not found in the runtime's address map.
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
@@ -225,8 +229,6 @@ impl Runtime {
                 transfer_rx,
                 spawn_rx,
                 stats,
-                config.default_mailbox_capacity,
-                config.mailbox_overflow,
             ));
         }
 
@@ -339,7 +341,13 @@ impl Runtime {
         Ok(Ask { inbox })
     }
 
-    /// Send a message to an actor address
+    /// Send a message to an actor address.
+    ///
+    /// Returns `Ok(())` if the message was accepted for routing. This does **not**
+    /// guarantee delivery — the recipient may stop before processing it. If
+    /// delivery confirmation is needed, implement an application-level ACK.
+    ///
+    /// Returns `Err` if the address is unknown to the runtime.
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
         let result = self.send_any(addr, Box::new(msg));
 

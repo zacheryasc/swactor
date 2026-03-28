@@ -48,6 +48,9 @@ web-time = { version = "0.2", optional = true }
 crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"

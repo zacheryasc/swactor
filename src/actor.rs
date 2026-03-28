@@ -638,6 +638,12 @@ impl<'a> Ctx<'a> {
     }
 
     /// Send a typed message to an actor address.
+    ///
+    /// Returns `Ok(())` if the message was accepted for routing. This does **not**
+    /// guarantee delivery — the recipient may stop before processing it. If
+    /// delivery confirmation is needed, implement an application-level ACK.
+    ///
+    /// Returns `Err` if the address is unknown to the runtime.
     pub fn send<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
         if let Some(caps) = self.capabilities()
             && addr != self.self_addr {

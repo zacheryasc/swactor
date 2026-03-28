@@ -36,6 +36,9 @@ pub(crate) fn get_random(buf: &mut [u8]) {
     getrandom::getrandom(buf).unwrap()
 }
 
+#[cfg(any(kani, test))]
+mod guarantees;
+
 #[cfg(all(feature = "no_random", not(feature = "getrandom")))]
 pub(crate) fn get_random(buf: &mut [u8]) {
     use core::sync::atomic::{AtomicUsize, Ordering};
