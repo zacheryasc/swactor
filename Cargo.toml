@@ -14,7 +14,7 @@ members = [
     "tests/integration",
     "xtask",
 ]
-exclude = ["crates/bindings/wasm-crypto"]
+exclude = ["crates/bindings/wasm-crypto", "examples"]
 
 [package]
 name = "swactor"
