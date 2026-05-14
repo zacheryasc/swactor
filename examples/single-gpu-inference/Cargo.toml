@@ -1,0 +1,29 @@
+[workspace]
+
+[package]
+name = "single-gpu-inference"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+swactor = { path = "../..", features = ["transport", "serde", "std"] }
+swactor-process = { path = "../../crates/process" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+distribution = { path = "../../crates/distribution", features = ["iroh"] }
+iroh = "0.96"
+urlencoding = "2"
+
+[[bin]]
+name = "gpu-node"
+path = "src/bin/gpu_node.rs"
+
+[[bin]]
+name = "single-gpu-inference"
+path = "src/bin/single_gpu_inference.rs"
+
+[dev-dependencies]
+wiremock = "0.6"
