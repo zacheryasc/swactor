@@ -2,3 +2,6 @@
 !target/x86_64-unknown-linux-musl/release/swactor
 !examples/single-gpu-inference/target/release/gpu-node
 !examples/single-gpu-inference/tinygrad_worker.py
+!examples/pipeline-parallel-inference/target/release/pp-gpu-node
+!examples/pipeline-parallel-inference/target/release/pp-smoke-run
+!examples/pipeline-parallel-inference/pp_tinygrad_worker.py
