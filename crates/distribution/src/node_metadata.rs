@@ -113,6 +113,28 @@ impl NodeMetadataDisseminator {
         self.pending.retain(|e| &e.entry.node_id != node_id);
     }
 
+    /// Current local generation — bumped each time
+    /// [`Self::set_local`] runs. Useful for diagnostics that want to
+    /// surface this node's outgoing metadata version without taking a
+    /// mutable handle.
+    pub fn local_version(&self) -> u64 {
+        self.local_generation
+    }
+
+    /// Latest known generation for a remote node, if we have any
+    /// metadata for them. `None` if we have never received an entry
+    /// for `node_id`.
+    pub fn peer_version(&self, node_id: &NodeId) -> Option<u64> {
+        self.store.get(node_id).map(|e| e.generation)
+    }
+
+    /// Iterate `(node_id, generation)` over every node we have a
+    /// metadata entry for. Useful for diagnostics that want to fan
+    /// the current state out to a separate observer.
+    pub fn all_versions(&self) -> impl Iterator<Item = (NodeId, u64)> + '_ {
+        self.store.values().map(|e| (e.node_id, e.generation))
+    }
+
     /// Re-enqueue all entries for dissemination (anti-entropy on membership recovery).
     pub fn re_disseminate_all(&mut self, cluster_size: usize) {
         for entry in self.store.values().cloned().collect::<Vec<_>>() {

@@ -1,22 +1,36 @@
-//! Stage actors — `Stage0Actor` and `Stage1Actor`.
+//! Stage actor — a single `StageActor` parameterised by `StageRole`.
 //!
-//! Each stage actor owns one Python worker subprocess (via `swactor_process`)
-//! and translates pipeline messages into stdin JSON / parses stdout JSON. The
-//! ProcessBridge / RequestBridge pattern mirrors the single-GPU example.
+//! Each `StageActor` owns one Python worker subprocess (via
+//! `swactor_process`) and translates pipeline messages into stdin JSON /
+//! parses stdout JSON. The role is fixed at construction time and decides
+//! which incoming messages produce outbound traffic; messages outside the
+//! role's set are dropped without panic (defensive drops).
 //!
-//! Stage 0:
-//! * On `InferenceRequest`: tokenize the prompt (stub: whitespace split),
-//!   send `embed_and_forward` to the worker, then forward the resulting
-//!   hidden state to the next stage as `StageActivation { is_prefill: true }`.
-//! * On `NextToken { done: false }`: send `decode_step` to the worker, then
-//!   forward the resulting hidden state as `StageActivation { is_prefill: false, seq_len: 1 }`.
-//! * On `NextToken { done: true }`: no further activations — the decode loop
-//!   has terminated.
+//! `StageRole::First`:
+//! * On `Inference`: tokenize the prompt (in-actor whitespace stub by
+//!   default; worker `tokenize` op when configured for real mode), send
+//!   `embed_and_forward` to the worker, forward the resulting hidden
+//!   state to `next_stage_addr` as a `StageActivation { is_prefill: true }`.
+//! * On `NextToken { done: false }`: send `decode_step` to the worker,
+//!   forward the resulting hidden state as
+//!   `StageActivation { is_prefill: false, seq_len: 1 }`.
+//! * On `NextToken { done: true }`: no further activations.
 //!
-//! Stage 1:
-//! * On `StageActivation`: send `forward_and_sample` to the worker, accumulate
-//!   the sampled token, emit `NextToken` to the previous stage, and emit
+//! `StageRole::Middle`: on `Activation`, send `forward_range` to the worker
+//! and forward the resulting hidden state to `next_stage_addr` as a fresh
+//! `StageActivation` that echoes the inbound `request_id`, `position`,
+//! `seq_len`, and `is_prefill`. Middle stages are stateless passes from the
+//! orchestrator's perspective; only `hidden` changes across the hop.
+//!
+//! `StageRole::Last`:
+//! * On `Activation`: send `forward_and_sample` to the worker, accumulate
+//!   the sampled token, emit `NextToken` to `prev_stage_addr`, and emit
 //!   `InferenceResponse` to `reply_to` when EOS or `max_tokens` is reached.
+//!
+//! The three bridges (`RequestBridge`, `NextTokenBridge`, `ActivationBridge`)
+//! are thin adapters that wrap a single network message type into the
+//! unified `StageMsg`; they exist because actor inboxes are typed per
+//! message and the network arrives one type at a time.
 
 use std::collections::HashMap;
 
@@ -31,10 +45,54 @@ use swactor_process::{
 
 use crate::messages::{InferenceRequest, InferenceResponse, NextToken, StageActivation};
 
-// ─── Common status notifications ──────────────────────────────────────────
+// ─── Stage role ───────────────────────────────────────────────────────────
+
+/// Pipeline role of a stage. Derived once at boot from `(STAGE, NUM_STAGES)`
+/// and never changes. The `StageActor` branches its per-message logic on
+/// the role; the binary uses it to pick which neighbours to resolve.
+/// `Middle` only exists for `N >= 3` — a 2-stage chain has a `First` and a
+/// `Last` and nothing in between.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StageRole {
+    /// `stage == 0`. Owns prompt entry, tokenizer, embed + first range.
+    First,
+    /// `0 < stage < num_stages - 1`. Owns a middle block range; no
+    /// tokenizer, no sampler. Requires `num_stages >= 3`.
+    Middle,
+    /// `stage == num_stages - 1`. Owns last block range, output head,
+    /// sampler, detokenizer.
+    Last,
+}
+
+impl StageRole {
+    /// Classify a stage by `(stage, num_stages)`. `num_stages < 2` or
+    /// `stage >= num_stages` is a programmer error; this function panics
+    /// rather than silently producing a wrong role, because the binary
+    /// validates the env vars before ever calling it.
+    pub fn for_stage(stage: u32, num_stages: u32) -> StageRole {
+        assert!(
+            num_stages >= 2,
+            "StageRole::for_stage requires num_stages >= 2 (got {num_stages}); \
+             N=1 is not supported by this example",
+        );
+        assert!(
+            stage < num_stages,
+            "StageRole::for_stage requires stage < num_stages (got stage={stage}, num_stages={num_stages})",
+        );
+        if stage == 0 {
+            StageRole::First
+        } else if stage == num_stages - 1 {
+            StageRole::Last
+        } else {
+            StageRole::Middle
+        }
+    }
+}
+
+// ─── Status / message types ───────────────────────────────────────────────
 
 /// Lifecycle notifications emitted to an optional observer address. Same
-/// shape for both stages so tests share their startup helpers.
+/// shape for every role so tests share their startup helpers.
 #[derive(Clone, Debug)]
 pub enum StageActorStatus {
     ProcessStarted,
@@ -42,21 +100,109 @@ pub enum StageActorStatus {
     ProcessExited { status: ExitStatus },
 }
 
-// ─── Shared worker bookkeeping ────────────────────────────────────────────
+/// Union of messages the `StageActor` accepts. Network arrivals
+/// (`InferenceRequest`, `NextToken`, `StageActivation`) are adapted into
+/// this enum by the bridge actors; `Process` is adapted from the worker
+/// subprocess; `SetNeighbors` and `Reset` are control messages.
+///
+/// `SetNeighbors` is a one-shot setup message used by the `pp-gpu-node`
+/// binary to inject the resolved addresses of neighbouring stages and the
+/// orchestrator after SWIM gossip has propagated them. Each field is
+/// optional; only the fields relevant to the actor's role need to be set.
+///
+/// `Reset` clears all per-request state so a single long-lived pipeline
+/// can serve multiple prompts back-to-back.
+#[derive(Clone, Debug)]
+pub enum StageMsg {
+    Inference(InferenceRequest),
+    NextToken(NextToken),
+    Activation(StageActivation),
+    Process(ProcessNotification),
+    SetNeighbors {
+        prev_stage: Option<ActorAddress>,
+        next_stage: Option<ActorAddress>,
+        reply_to: Option<ActorAddress>,
+    },
+    Reset,
+}
+
+// ─── Bridges (one per inbound network message type) ───────────────────────
+
+/// Routes inbound `InferenceRequest` messages from the network into a
+/// `StageActor`. Conventionally only wired on a `StageRole::First` node;
+/// targeting a non-First actor is harmless — the actor drops it
+/// defensively.
+pub struct RequestBridge {
+    pub target: ActorAddress,
+}
+
+impl ActorInterface for RequestBridge {
+    type Incoming = InferenceRequest;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, msg: InferenceRequest) {
+        let _ = ctx.send(self.target, StageMsg::Inference(msg));
+    }
+}
+
+/// Routes inbound `NextToken` messages from the network into a
+/// `StageActor`. Conventionally only wired on a `StageRole::First` node.
+pub struct NextTokenBridge {
+    pub target: ActorAddress,
+}
+
+impl ActorInterface for NextTokenBridge {
+    type Incoming = NextToken;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, msg: NextToken) {
+        let _ = ctx.send(self.target, StageMsg::NextToken(msg));
+    }
+}
+
+/// Routes inbound `StageActivation` messages from the network into a
+/// `StageActor`. Wired on `Middle` and `Last` roles — anything downstream
+/// of the first stage in the chain.
+pub struct ActivationBridge {
+    pub target: ActorAddress,
+}
+
+impl ActorInterface for ActivationBridge {
+    type Incoming = StageActivation;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, msg: StageActivation) {
+        let _ = ctx.send(self.target, StageMsg::Activation(msg));
+    }
+}
+
+/// Adapts `ProcessNotification`s from the worker subprocess into the
+/// actor's `StageMsg::Process` variant. Internal — the binary and tests
+/// never construct it directly.
+struct ProcessBridge {
+    target: ActorAddress,
+}
+
+impl ActorInterface for ProcessBridge {
+    type Incoming = ProcessNotification;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, msg: ProcessNotification) {
+        let _ = ctx.send(self.target, StageMsg::Process(msg));
+    }
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────
 
 /// Tokenize a prompt for the stub worker. Splits on whitespace. The token
 /// count returned here is exactly the `seq_len` the actor will emit in the
-/// resulting `StageActivation`, so callers (including tests) can predict it
-/// directly from the input string.
+/// resulting `StageActivation`, so callers (including tests) can predict
+/// it directly from the input string.
 pub fn stub_tokenize_prompt(prompt: &str) -> Vec<i64> {
     prompt
         .split_whitespace()
         .enumerate()
         .map(|(i, word)| {
-            // Sum of bytes, salted by word index, keeps tokens in a small
-            // range and ensures distinct words produce distinct ids in
-            // typical inputs. Exact mapping is not part of the actor's
-            // contract.
             let s: u32 = word.bytes().map(u32::from).sum();
             ((s % 1024) as i64) + (i as i64)
         })
@@ -72,129 +218,167 @@ fn parse_status_line(val: &serde_json::Value) -> Option<Option<u32>> {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Stage 0
-// ═══════════════════════════════════════════════════════════════════════
+// ─── Stage actor ──────────────────────────────────────────────────────────
 
-/// Union of messages the `Stage0Actor` accepts internally. Network arrivals
-/// (`InferenceRequest`, `NextToken`) and child-process notifications are
-/// adapted to this enum by the bridge actors below.
-///
-/// `SetNextStage` is a one-shot setup message used by the `pp-gpu-node`
-/// binary to inject the resolved address of `pp-stage-1` after SWIM
-/// gossip has propagated it. Tests construct the actor with the real
-/// address up front and never send it.
-///
-/// `Reset` clears all per-request state (pending worker round-trips). Used
-/// by the equivalence tests to drive multiple prompts through a single
-/// long-lived pipeline; the worker's per-block KV cache resets implicitly
-/// when the next request's prefill rewrites positions `[0, prompt_len)`.
-#[derive(Clone, Debug)]
-pub enum Stage0Msg {
-    Inference(InferenceRequest),
-    NextToken(NextToken),
-    Process(ProcessNotification),
-    SetNextStage(ActorAddress),
-    Reset,
-}
+const PLACEHOLDER_ADDR: ActorAddress = ActorAddress([0; 32]);
 
-struct Stage0ProcessBridge {
-    target: ActorAddress,
-}
-
-impl ActorInterface for Stage0ProcessBridge {
-    type Incoming = ProcessNotification;
-    type Response = ();
-
-    fn handle(&mut self, ctx: &Ctx, msg: ProcessNotification) {
-        let _ = ctx.send(self.target, Stage0Msg::Process(msg));
-    }
-}
-
-/// Routes raw `InferenceRequest` messages from the network into the actor.
-pub struct Stage0RequestBridge {
-    pub target: ActorAddress,
-}
-
-impl ActorInterface for Stage0RequestBridge {
-    type Incoming = InferenceRequest;
-    type Response = ();
-
-    fn handle(&mut self, ctx: &Ctx, msg: InferenceRequest) {
-        let _ = ctx.send(self.target, Stage0Msg::Inference(msg));
-    }
-}
-
-/// Routes raw `NextToken` messages from the network into the actor.
-pub struct Stage0NextTokenBridge {
-    pub target: ActorAddress,
-}
-
-impl ActorInterface for Stage0NextTokenBridge {
-    type Incoming = NextToken;
-    type Response = ();
-
-    fn handle(&mut self, ctx: &Ctx, msg: NextToken) {
-        let _ = ctx.send(self.target, Stage0Msg::NextToken(msg));
-    }
-}
-
-struct Stage0Pending {
+/// Pending forward request (First or Middle): one entry per in-flight
+/// `embed_and_forward` / `decode_step` / `forward_range` round-trip. The
+/// fields are echoed back on the resulting `StageActivation`.
+struct FwdPending {
     request_id: u64,
     position: u32,
     is_prefill: bool,
+    seq_len: u32,
 }
 
-/// One entry per in-flight `tokenize` round-trip. When the worker replies
-/// with the token ids, the actor uses `forward_request_id` as the rid for
-/// the follow-up `embed_and_forward` request.
-struct Stage0Tokenize {
+/// Pending tokenize round-trip (First only). When the worker replies with
+/// the token ids the actor uses `forward_request_id` as the rid for the
+/// follow-up `embed_and_forward` request.
+struct FirstTokenize {
     forward_request_id: u64,
 }
 
-pub struct Stage0Actor {
+/// Pending sample round-trip (Last only).
+struct LastPending {
+    request_id: u64,
+    /// Position the worker forwarded at, i.e. `activation.position`. The
+    /// next decode step's position is `position + seq_len`.
+    next_position: u32,
+}
+
+/// A single stage actor. The role is fixed at construction and chooses
+/// which incoming messages are acted on; out-of-role messages are dropped
+/// silently.
+///
+/// Routing addresses (`prev_stage_addr`, `next_stage_addr`, `reply_to`)
+/// default to a sentinel and are typically populated post-spawn via
+/// `StageMsg::SetNeighbors`. Sending an outbound message to the sentinel
+/// is harmless on localhost (the transport router has no route for it and
+/// drops the send); in deployments the binary refuses to enter the main
+/// pump loop until every role-required neighbour has been resolved.
+pub struct StageActor {
+    role: StageRole,
     spec: ProcessSpec,
     sender: ExternalSender,
+
+    prev_stage_addr: ActorAddress,
     next_stage_addr: ActorAddress,
+    reply_to: ActorAddress,
+
     status_addr: Option<ActorAddress>,
-    /// When true, tokenize the prompt via the worker's `tokenize` op
-    /// instead of the in-actor whitespace stub. Required for real-mode
-    /// workers since their `embed_and_forward` expects real GGUF vocab
-    /// ids, not synthetic ones.
+    /// Optional address that receives a clone of every `NextToken` the
+    /// actor emits (in addition to the regular `prev_stage_addr` send).
+    /// Used by tests to inspect the sampled token stream without
+    /// intercepting the actor-to-actor decode loop. Last-only.
+    token_observer: Option<ActorAddress>,
+
+    max_tokens: u32,
+    eos_token_id: Option<u32>,
+    /// Route tokenization through the worker's `tokenize` op. Required
+    /// for real-mode First workers (synthetic stub ids cannot be embedded
+    /// against a real GGUF vocabulary).
     tokenize_via_worker: bool,
+    /// Route final detokenization through the worker's `detokenize` op so
+    /// the response is human-readable text. Real-mode Last only.
+    detokenize_via_worker: bool,
 
     process_addr: Option<ActorAddress>,
     bridge_addr: Option<ActorAddress>,
     ready: bool,
     process_alive: bool,
     output_buffer: String,
-
     next_request_id: u64,
-    pending_worker: HashMap<u64, Stage0Pending>,
-    pending_tokenize: HashMap<u64, Stage0Tokenize>,
+
+    pending_fwd: HashMap<u64, FwdPending>,
+    pending_first_tokenize: HashMap<u64, FirstTokenize>,
+    pending_last: HashMap<u64, LastPending>,
+    pending_last_detokenize: Option<u64>,
+    accumulated: Vec<u32>,
+    finished: bool,
 }
 
-impl Stage0Actor {
-    pub fn new(
-        spec: ProcessSpec,
-        sender: ExternalSender,
-        next_stage_addr: ActorAddress,
-    ) -> Self {
+impl StageActor {
+    fn empty(role: StageRole, spec: ProcessSpec, sender: ExternalSender) -> Self {
         Self {
+            role,
             spec,
             sender,
-            next_stage_addr,
+            prev_stage_addr: PLACEHOLDER_ADDR,
+            next_stage_addr: PLACEHOLDER_ADDR,
+            reply_to: PLACEHOLDER_ADDR,
             status_addr: None,
+            token_observer: None,
+            max_tokens: 0,
+            eos_token_id: None,
             tokenize_via_worker: false,
+            detokenize_via_worker: false,
             process_addr: None,
             bridge_addr: None,
             ready: false,
             process_alive: false,
             output_buffer: String::new(),
             next_request_id: 1,
-            pending_worker: HashMap::new(),
-            pending_tokenize: HashMap::new(),
+            pending_fwd: HashMap::new(),
+            pending_first_tokenize: HashMap::new(),
+            pending_last: HashMap::new(),
+            pending_last_detokenize: None,
+            accumulated: Vec::new(),
+            finished: false,
         }
+    }
+
+    /// Build a first-stage (`StageRole::First`) actor. `next_stage_addr`
+    /// is the address that outbound `StageActivation`s are sent to —
+    /// usually the next stage's `ActivationBridge`. Wire the real address
+    /// post-spawn via `StageMsg::SetNeighbors { next_stage: Some(_), .. }`
+    /// when the resolved address is not known at construction time.
+    pub fn first(
+        spec: ProcessSpec,
+        sender: ExternalSender,
+        next_stage_addr: ActorAddress,
+    ) -> Self {
+        let mut a = Self::empty(StageRole::First, spec, sender);
+        a.next_stage_addr = next_stage_addr;
+        a
+    }
+
+    /// Build a middle-stage (`StageRole::Middle`) actor. The Middle role's
+    /// `forward_range` behaviour itself lands at Stage 4; at Stage 3 the
+    /// actor is constructible and defensively drops every incoming
+    /// pipeline message. `next_stage_addr` is the address activations are
+    /// forwarded to once Stage 4's behaviour is in place.
+    pub fn middle(
+        spec: ProcessSpec,
+        sender: ExternalSender,
+        next_stage_addr: ActorAddress,
+    ) -> Self {
+        let mut a = Self::empty(StageRole::Middle, spec, sender);
+        a.next_stage_addr = next_stage_addr;
+        a
+    }
+
+    /// Build a last-stage (`StageRole::Last`) actor. `prev_stage_addr` is
+    /// the address `NextToken`s are sent to (the first stage's
+    /// `NextTokenBridge`). `reply_to` is the orchestrator's inbox for the
+    /// final `InferenceResponse`. `max_tokens` caps the decode loop.
+    pub fn last(
+        spec: ProcessSpec,
+        sender: ExternalSender,
+        prev_stage_addr: ActorAddress,
+        reply_to: ActorAddress,
+        max_tokens: u32,
+    ) -> Self {
+        let mut a = Self::empty(StageRole::Last, spec, sender);
+        a.prev_stage_addr = prev_stage_addr;
+        a.reply_to = reply_to;
+        a.max_tokens = max_tokens;
+        a
+    }
+
+    /// The role this actor was constructed for. Immutable post-construction.
+    pub fn role(&self) -> StageRole {
+        self.role
     }
 
     pub fn with_status_addr(mut self, addr: ActorAddress) -> Self {
@@ -203,390 +387,29 @@ impl Stage0Actor {
     }
 
     /// Route prompt tokenization through the worker's `tokenize` op. Use
-    /// this with real-mode workers; the default (stub) path bypasses the
-    /// worker and uses an in-actor whitespace splitter, which produces
+    /// this with real-mode First workers; the default (stub) path bypasses
+    /// the worker and uses an in-actor whitespace splitter, which produces
     /// synthetic ids that real GGUF vocabularies cannot embed.
     pub fn with_real_tokenization(mut self) -> Self {
+        assert_eq!(
+            self.role,
+            StageRole::First,
+            "with_real_tokenization only applies to StageRole::First",
+        );
         self.tokenize_via_worker = true;
         self
     }
 
-    fn write_to_worker(&self, ctx: &Ctx, json: serde_json::Value) {
-        let Some(proc_addr) = self.process_addr else {
-            return;
-        };
-        let mut data = serde_json::to_vec(&json).unwrap_or_default();
-        data.push(b'\n');
-        let _ = ctx.send(proc_addr, ProcessCommand::WriteStdin { data });
-    }
-
-    fn handle_worker_line(&mut self, ctx: &Ctx, line: &str) {
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
-            if !line.is_empty() {
-                eprintln!("pp-stage-0 worker: {line}");
-            }
-            return;
-        };
-
-        if let Some(pid) = parse_status_line(&val) {
-            self.ready = true;
-            if let Some(addr) = self.status_addr {
-                let _ = ctx.send(addr, StageActorStatus::WorkerReady { pid });
-            }
-            return;
-        }
-
-        if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
-            eprintln!("pp-stage-0 worker error: {err}");
-            if let Some(rid) = val.get("request_id").and_then(|v| v.as_u64()) {
-                self.pending_worker.remove(&rid);
-                self.pending_tokenize.remove(&rid);
-            }
-            return;
-        }
-
-        // Tokenize reply (real-mode path): `{"request_id": rid, "tokens": [..]}`.
-        // No `hidden_b64`. Convert tokens into the follow-up `embed_and_forward`
-        // request, re-using the forward rid stashed when we sent `tokenize`.
-        if let (Some(rid), Some(tokens_val), None) = (
-            val.get("request_id").and_then(|v| v.as_u64()),
-            val.get("tokens").and_then(|v| v.as_array()),
-            val.get("hidden_b64"),
-        ) {
-            if let Some(pending) = self.pending_tokenize.remove(&rid) {
-                let tokens: Vec<i64> =
-                    tokens_val.iter().filter_map(|v| v.as_i64()).collect();
-                if tokens.is_empty() {
-                    eprintln!(
-                        "pp-stage-0: tokenize reply for rid {rid} had no usable token ids"
-                    );
-                    return;
-                }
-                let forward_rid = pending.forward_request_id;
-                self.pending_worker.insert(
-                    forward_rid,
-                    Stage0Pending {
-                        request_id: forward_rid,
-                        position: 0,
-                        is_prefill: true,
-                    },
-                );
-                self.write_to_worker(
-                    ctx,
-                    serde_json::json!({
-                        "op": "embed_and_forward",
-                        "request_id": forward_rid,
-                        "tokens": tokens,
-                        "position": 0,
-                    }),
-                );
-                return;
-            }
-        }
-
-        let (Some(rid), Some(hidden_b64), Some(seq_len)) = (
-            val.get("request_id").and_then(|v| v.as_u64()),
-            val.get("hidden_b64").and_then(|v| v.as_str()),
-            val.get("seq_len").and_then(|v| v.as_u64()),
-        ) else {
-            return;
-        };
-        let Some(pending) = self.pending_worker.remove(&rid) else {
-            return;
-        };
-        let hidden = match B64.decode(hidden_b64) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("pp-stage-0: base64 decode error for rid {rid}: {e}");
-                return;
-            }
-        };
-        let _ = ctx.send(
-            self.next_stage_addr,
-            StageActivation {
-                request_id: pending.request_id,
-                position: pending.position,
-                hidden,
-                seq_len: seq_len as u32,
-                is_prefill: pending.is_prefill,
-            },
-        );
-    }
-}
-
-impl ActorInterface for Stage0Actor {
-    type Incoming = Stage0Msg;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
-        let proc_addr = spawn_local_process(ctx, &self.sender, self.spec.clone())
-            .expect("failed to spawn stage-0 worker process");
-        let bridge = Stage0ProcessBridge { target: ctx.self_addr() };
-        let bridge_addr = ctx.spawn(bridge).expect("failed to spawn stage-0 process bridge");
-        let _ = ctx.send(proc_addr, ProcessCommand::Subscribe { address: bridge_addr });
-        self.process_addr = Some(proc_addr);
-        self.bridge_addr = Some(bridge_addr);
-    }
-
-    fn handle(&mut self, ctx: &Ctx, msg: Stage0Msg) {
-        match msg {
-            Stage0Msg::Inference(req) => {
-                if !self.ready || !self.process_alive {
-                    return;
-                }
-                if self.tokenize_via_worker {
-                    // Real-mode path: ask the worker to tokenize. The
-                    // follow-up embed_and_forward is issued from
-                    // handle_worker_line when the tokenize reply arrives.
-                    let tokenize_rid = self.next_request_id;
-                    self.next_request_id += 1;
-                    let forward_rid = self.next_request_id;
-                    self.next_request_id += 1;
-                    self.pending_tokenize.insert(
-                        tokenize_rid,
-                        Stage0Tokenize { forward_request_id: forward_rid },
-                    );
-                    self.write_to_worker(
-                        ctx,
-                        serde_json::json!({
-                            "op": "tokenize",
-                            "request_id": tokenize_rid,
-                            "prompt": req.prompt,
-                        }),
-                    );
-                    return;
-                }
-                let tokens = stub_tokenize_prompt(&req.prompt);
-                if tokens.is_empty() {
-                    return;
-                }
-                let rid = self.next_request_id;
-                self.next_request_id += 1;
-                let position = 0u32;
-                self.pending_worker.insert(
-                    rid,
-                    Stage0Pending { request_id: rid, position, is_prefill: true },
-                );
-                self.write_to_worker(
-                    ctx,
-                    serde_json::json!({
-                        "op": "embed_and_forward",
-                        "request_id": rid,
-                        "tokens": tokens,
-                        "position": position,
-                    }),
-                );
-            }
-            Stage0Msg::NextToken(nt) => {
-                if nt.done {
-                    return;
-                }
-                if !self.ready || !self.process_alive {
-                    return;
-                }
-                self.pending_worker.insert(
-                    nt.request_id,
-                    Stage0Pending {
-                        request_id: nt.request_id,
-                        position: nt.position,
-                        is_prefill: false,
-                    },
-                );
-                self.write_to_worker(
-                    ctx,
-                    serde_json::json!({
-                        "op": "decode_step",
-                        "request_id": nt.request_id,
-                        "token_id": nt.token_id,
-                        "position": nt.position,
-                    }),
-                );
-            }
-            Stage0Msg::SetNextStage(addr) => {
-                self.next_stage_addr = addr;
-            }
-            Stage0Msg::Reset => {
-                self.pending_worker.clear();
-                self.pending_tokenize.clear();
-            }
-            Stage0Msg::Process(notif) => match notif {
-                ProcessNotification::Started { .. } => {
-                    self.process_alive = true;
-                    if let Some(addr) = self.status_addr {
-                        let _ = ctx.send(addr, StageActorStatus::ProcessStarted);
-                    }
-                }
-                ProcessNotification::Output { data, .. } => {
-                    let text = String::from_utf8_lossy(&data);
-                    self.output_buffer.push_str(&text);
-                    while let Some(pos) = self.output_buffer.find('\n') {
-                        let line = self.output_buffer[..pos].to_string();
-                        self.output_buffer = self.output_buffer[pos + 1..].to_string();
-                        self.handle_worker_line(ctx, line.trim());
-                    }
-                }
-                ProcessNotification::Exited { status, .. } => {
-                    self.process_alive = false;
-                    self.ready = false;
-                    self.pending_worker.clear();
-                    self.pending_tokenize.clear();
-                    if let Some(addr) = self.status_addr {
-                        let _ = ctx.send(addr, StageActorStatus::ProcessExited { status });
-                    }
-                }
-                ProcessNotification::Error { .. } => {
-                    self.process_alive = false;
-                    self.ready = false;
-                }
-            },
-        }
-    }
-
-    fn on_stop(&mut self, ctx: &Ctx) {
-        if let Some(proc_addr) = self.process_addr {
-            let _ = ctx.send(proc_addr, ProcessCommand::Close);
-            let _ = ctx.stop_actor(proc_addr);
-        }
-        if let Some(bridge_addr) = self.bridge_addr {
-            let _ = ctx.stop_actor(bridge_addr);
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Stage 1
-// ═══════════════════════════════════════════════════════════════════════
-
-/// `SetNeighbors` is a one-shot setup message used by the `pp-gpu-node`
-/// binary to inject the addresses of `pp-stage-0` (the prev stage) and
-/// the orchestrator's `InferenceResponse` inbox after SWIM gossip
-/// propagates them.
-///
-/// `Reset` clears the accumulated-token buffer and per-request bookkeeping
-/// so the actor can serve a second prompt without being respawned. The
-/// pp-smoke-run binary still treats every request as one-shot; this is
-/// used by the equivalence tests to amortize worker boot across multiple
-/// prompts.
-#[derive(Clone, Debug)]
-pub enum Stage1Msg {
-    Activation(StageActivation),
-    Process(ProcessNotification),
-    SetNeighbors {
-        prev_stage: ActorAddress,
-        reply_to: ActorAddress,
-    },
-    Reset,
-}
-
-struct Stage1ProcessBridge {
-    target: ActorAddress,
-}
-
-impl ActorInterface for Stage1ProcessBridge {
-    type Incoming = ProcessNotification;
-    type Response = ();
-
-    fn handle(&mut self, ctx: &Ctx, msg: ProcessNotification) {
-        let _ = ctx.send(self.target, Stage1Msg::Process(msg));
-    }
-}
-
-pub struct Stage1ActivationBridge {
-    pub target: ActorAddress,
-}
-
-impl ActorInterface for Stage1ActivationBridge {
-    type Incoming = StageActivation;
-    type Response = ();
-
-    fn handle(&mut self, ctx: &Ctx, msg: StageActivation) {
-        let _ = ctx.send(self.target, Stage1Msg::Activation(msg));
-    }
-}
-
-struct Stage1Pending {
-    request_id: u64,
-    /// Position the worker forwarded at, i.e. `activation.position`. The
-    /// next decode step's position is `position + seq_len`.
-    next_position: u32,
-}
-
-pub struct Stage1Actor {
-    spec: ProcessSpec,
-    sender: ExternalSender,
-    prev_stage_addr: ActorAddress,
-    reply_to: ActorAddress,
-    max_tokens: u32,
-    eos_token_id: Option<u32>,
-    status_addr: Option<ActorAddress>,
-    /// Optional address that receives a copy of every `NextToken` the
-    /// actor emits (in addition to the regular `prev_stage_addr` send).
-    /// Used by tests to inspect the sampled token stream without
-    /// intercepting the actor-to-actor decode loop.
-    token_observer: Option<ActorAddress>,
-
-    process_addr: Option<ActorAddress>,
-    bridge_addr: Option<ActorAddress>,
-    ready: bool,
-    process_alive: bool,
-    output_buffer: String,
-
-    pending_worker: HashMap<u64, Stage1Pending>,
-    accumulated: Vec<u32>,
-    finished: bool,
-
-    /// When true, route the final detokenization through the worker's
-    /// `detokenize` op (mirrors `Stage0Actor::tokenize_via_worker`).
-    /// Required for real-mode workers so the response is human-readable
-    /// text instead of a stringified id array.
-    detokenize_via_worker: bool,
-    next_request_id: u64,
-    /// In-flight detokenize round-trip. We only ever have one terminal
-    /// detok per request, so a single `Option` suffices.
-    pending_detokenize: Option<u64>,
-}
-
-impl Stage1Actor {
-    pub fn new(
-        spec: ProcessSpec,
-        sender: ExternalSender,
-        prev_stage_addr: ActorAddress,
-        reply_to: ActorAddress,
-        max_tokens: u32,
-    ) -> Self {
-        Self {
-            spec,
-            sender,
-            prev_stage_addr,
-            reply_to,
-            max_tokens,
-            eos_token_id: None,
-            status_addr: None,
-            token_observer: None,
-            process_addr: None,
-            bridge_addr: None,
-            ready: false,
-            process_alive: false,
-            output_buffer: String::new(),
-            pending_worker: HashMap::new(),
-            accumulated: Vec::new(),
-            finished: false,
-            detokenize_via_worker: false,
-            next_request_id: 1,
-            pending_detokenize: None,
-        }
-    }
-
-    pub fn with_status_addr(mut self, addr: ActorAddress) -> Self {
-        self.status_addr = Some(addr);
-        self
-    }
-
     /// Route the final detokenization through the worker's `detokenize`
-    /// op instead of the in-actor stub. Required for real-mode workers so
-    /// the `InferenceResponse.text` is human-readable model output rather
-    /// than a stringified id array.
+    /// op instead of the in-actor stub. Required for real-mode Last
+    /// workers so the `InferenceResponse.text` is human-readable model
+    /// output rather than a stringified id array.
     pub fn with_real_detokenization(mut self) -> Self {
+        assert_eq!(
+            self.role,
+            StageRole::Last,
+            "with_real_detokenization only applies to StageRole::Last",
+        );
         self.detokenize_via_worker = true;
         self
     }
@@ -594,19 +417,38 @@ impl Stage1Actor {
     /// Configure an EOS token id. When the sampled token matches, the
     /// decode loop terminates: `NextToken { done: true }` is sent to the
     /// previous stage and `InferenceResponse` is sent to `reply_to`.
+    /// Last-only.
     pub fn with_eos_token_id(mut self, eos: u32) -> Self {
+        assert_eq!(
+            self.role,
+            StageRole::Last,
+            "with_eos_token_id only applies to StageRole::Last",
+        );
         self.eos_token_id = Some(eos);
         self
     }
 
     /// Configure an observer that receives a clone of every `NextToken`
-    /// produced by this actor. The observer is independent of the prev-
-    /// stage route; the actor still sends `NextToken` to `prev_stage_addr`
-    /// to drive the decode loop. Intended for tests that want to inspect
-    /// the sampled token sequence directly.
+    /// produced by this actor. Last-only. The observer is independent of
+    /// the prev-stage route; the actor still sends `NextToken` to
+    /// `prev_stage_addr` to drive the decode loop. Intended for tests
+    /// that want to inspect the sampled token sequence directly.
     pub fn with_token_observer(mut self, addr: ActorAddress) -> Self {
+        assert_eq!(
+            self.role,
+            StageRole::Last,
+            "with_token_observer only applies to StageRole::Last",
+        );
         self.token_observer = Some(addr);
         self
+    }
+
+    fn label(&self) -> &'static str {
+        match self.role {
+            StageRole::First => "pp-stage(first)",
+            StageRole::Middle => "pp-stage(middle)",
+            StageRole::Last => "pp-stage(last)",
+        }
     }
 
     fn write_to_worker(&self, ctx: &Ctx, json: serde_json::Value) {
@@ -630,10 +472,17 @@ impl Stage1Actor {
         format!("tokens: [{body}]")
     }
 
+    fn clear_pending_state(&mut self) {
+        self.pending_fwd.clear();
+        self.pending_first_tokenize.clear();
+        self.pending_last.clear();
+        self.pending_last_detokenize = None;
+    }
+
     fn handle_worker_line(&mut self, ctx: &Ctx, line: &str) {
         let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
             if !line.is_empty() {
-                eprintln!("pp-stage-1 worker: {line}");
+                eprintln!("{} worker: {line}", self.label());
             }
             return;
         };
@@ -647,11 +496,15 @@ impl Stage1Actor {
         }
 
         if let Some(err) = val.get("error").and_then(|v| v.as_str()) {
-            eprintln!("pp-stage-1 worker error: {err}");
+            eprintln!("{} worker error: {err}", self.label());
             if let Some(rid) = val.get("request_id").and_then(|v| v.as_u64()) {
-                self.pending_worker.remove(&rid);
-                if self.pending_detokenize == Some(rid) {
-                    self.pending_detokenize = None;
+                self.pending_fwd.remove(&rid);
+                self.pending_first_tokenize.remove(&rid);
+                self.pending_last.remove(&rid);
+                if self.pending_last_detokenize == Some(rid) {
+                    self.pending_last_detokenize = None;
+                    // Best-effort stub response so the orchestrator is
+                    // not left hanging after a detok error.
                     let text = Self::detokenize_stub(&self.accumulated);
                     let _ = ctx.send(self.reply_to, InferenceResponse { text });
                 }
@@ -659,105 +512,283 @@ impl Stage1Actor {
             return;
         }
 
-        // Detokenize reply: { request_id, text } — the only worker reply
-        // that carries a `text` field. Match it before the token-id reply
-        // since both share `request_id`.
-        if let (Some(rid), Some(text)) = (
+        // Tokenize reply (First only): request_id + tokens, no hidden_b64.
+        if let (Some(rid), Some(tokens_val), None) = (
             val.get("request_id").and_then(|v| v.as_u64()),
-            val.get("text").and_then(|v| v.as_str()),
+            val.get("tokens").and_then(|v| v.as_array()),
+            val.get("hidden_b64"),
         ) {
-            if self.pending_detokenize == Some(rid) {
-                self.pending_detokenize = None;
-                let _ = ctx.send(
-                    self.reply_to,
-                    InferenceResponse { text: text.to_string() },
+            if let Some(pending) = self.pending_first_tokenize.remove(&rid) {
+                let tokens: Vec<i64> =
+                    tokens_val.iter().filter_map(|v| v.as_i64()).collect();
+                if tokens.is_empty() {
+                    eprintln!(
+                        "{}: tokenize reply for rid {rid} had no usable token ids",
+                        self.label()
+                    );
+                    return;
+                }
+                let forward_rid = pending.forward_request_id;
+                let seq_len = tokens.len() as u32;
+                self.pending_fwd.insert(
+                    forward_rid,
+                    FwdPending {
+                        request_id: forward_rid,
+                        position: 0,
+                        is_prefill: true,
+                        seq_len,
+                    },
+                );
+                self.write_to_worker(
+                    ctx,
+                    serde_json::json!({
+                        "op": "embed_and_forward",
+                        "request_id": forward_rid,
+                        "tokens": tokens,
+                        "position": 0,
+                    }),
                 );
                 return;
             }
         }
 
-        let (Some(rid), Some(token_id)) = (
+        // Detokenize reply (Last only): request_id + text.
+        if let (Some(rid), Some(text)) = (
+            val.get("request_id").and_then(|v| v.as_u64()),
+            val.get("text").and_then(|v| v.as_str()),
+        ) {
+            if self.pending_last_detokenize == Some(rid) {
+                self.pending_last_detokenize = None;
+                let _ = ctx.send(
+                    self.reply_to,
+                    InferenceResponse {
+                        text: text.to_string(),
+                    },
+                );
+                return;
+            }
+        }
+
+        // Forward reply (First and Middle): request_id + hidden_b64 + seq_len.
+        if let (Some(rid), Some(hidden_b64), Some(reply_seq_len)) = (
+            val.get("request_id").and_then(|v| v.as_u64()),
+            val.get("hidden_b64").and_then(|v| v.as_str()),
+            val.get("seq_len").and_then(|v| v.as_u64()),
+        ) {
+            if let Some(pending) = self.pending_fwd.remove(&rid) {
+                let hidden = match B64.decode(hidden_b64) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        eprintln!(
+                            "{}: base64 decode error for rid {rid}: {e}",
+                            self.label()
+                        );
+                        return;
+                    }
+                };
+                let _ = ctx.send(
+                    self.next_stage_addr,
+                    StageActivation {
+                        request_id: pending.request_id,
+                        position: pending.position,
+                        hidden,
+                        seq_len: reply_seq_len as u32,
+                        is_prefill: pending.is_prefill,
+                    },
+                );
+                let _ = pending.seq_len; // pending.seq_len kept for symmetry / future asserts
+                return;
+            }
+        }
+
+        // Sample reply (Last only): request_id + token_id.
+        if let (Some(rid), Some(token_id)) = (
             val.get("request_id").and_then(|v| v.as_u64()),
             val.get("token_id").and_then(|v| v.as_u64()),
-        ) else {
-            return;
-        };
-        let Some(pending) = self.pending_worker.remove(&rid) else {
-            return;
-        };
-        if self.finished {
-            return;
-        }
-
-        let token_id = token_id as u32;
-        self.accumulated.push(token_id);
-
-        let hit_eos = self.eos_token_id == Some(token_id);
-        let hit_cap = self.accumulated.len() as u32 >= self.max_tokens;
-        let done = hit_eos || hit_cap;
-
-        let next_token = NextToken {
-            request_id: pending.request_id,
-            token_id,
-            position: pending.next_position,
-            done,
-        };
-        let _ = ctx.send(self.prev_stage_addr, next_token.clone());
-        if let Some(observer) = self.token_observer {
-            let _ = ctx.send(observer, next_token);
-        }
-
-        if done {
-            self.finished = true;
-            if self.detokenize_via_worker {
-                let detok_rid = self.next_request_id;
-                self.next_request_id += 1;
-                self.pending_detokenize = Some(detok_rid);
-                let tokens_json: Vec<serde_json::Value> = self
-                    .accumulated
-                    .iter()
-                    .map(|t| serde_json::Value::from(*t))
-                    .collect();
-                self.write_to_worker(
-                    ctx,
-                    serde_json::json!({
-                        "op": "detokenize",
-                        "request_id": detok_rid,
-                        "tokens": tokens_json,
-                    }),
-                );
-            } else {
-                let text = Self::detokenize_stub(&self.accumulated);
-                let _ = ctx.send(self.reply_to, InferenceResponse { text });
+        ) {
+            let Some(pending) = self.pending_last.remove(&rid) else {
+                return;
+            };
+            if self.finished {
+                return;
+            }
+            let token_id = token_id as u32;
+            self.accumulated.push(token_id);
+            let hit_eos = self.eos_token_id == Some(token_id);
+            let hit_cap = self.accumulated.len() as u32 >= self.max_tokens;
+            let done = hit_eos || hit_cap;
+            let next_token = NextToken {
+                request_id: pending.request_id,
+                token_id,
+                position: pending.next_position,
+                done,
+            };
+            let _ = ctx.send(self.prev_stage_addr, next_token.clone());
+            if let Some(observer) = self.token_observer {
+                let _ = ctx.send(observer, next_token);
+            }
+            if done {
+                self.finished = true;
+                if self.detokenize_via_worker {
+                    let detok_rid = self.next_request_id;
+                    self.next_request_id += 1;
+                    self.pending_last_detokenize = Some(detok_rid);
+                    let tokens_json: Vec<serde_json::Value> = self
+                        .accumulated
+                        .iter()
+                        .map(|t| serde_json::Value::from(*t))
+                        .collect();
+                    self.write_to_worker(
+                        ctx,
+                        serde_json::json!({
+                            "op": "detokenize",
+                            "request_id": detok_rid,
+                            "tokens": tokens_json,
+                        }),
+                    );
+                } else {
+                    let text = Self::detokenize_stub(&self.accumulated);
+                    let _ = ctx.send(self.reply_to, InferenceResponse { text });
+                }
             }
         }
     }
-}
 
-impl ActorInterface for Stage1Actor {
-    type Incoming = Stage1Msg;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
-        let proc_addr = spawn_local_process(ctx, &self.sender, self.spec.clone())
-            .expect("failed to spawn stage-1 worker process");
-        let bridge = Stage1ProcessBridge { target: ctx.self_addr() };
-        let bridge_addr = ctx.spawn(bridge).expect("failed to spawn stage-1 process bridge");
-        let _ = ctx.send(proc_addr, ProcessCommand::Subscribe { address: bridge_addr });
-        self.process_addr = Some(proc_addr);
-        self.bridge_addr = Some(bridge_addr);
+    fn handle_inference(&mut self, ctx: &Ctx, req: InferenceRequest) {
+        if self.role != StageRole::First {
+            return;
+        }
+        if !self.ready || !self.process_alive {
+            return;
+        }
+        if self.tokenize_via_worker {
+            let tokenize_rid = self.next_request_id;
+            self.next_request_id += 1;
+            let forward_rid = self.next_request_id;
+            self.next_request_id += 1;
+            self.pending_first_tokenize.insert(
+                tokenize_rid,
+                FirstTokenize {
+                    forward_request_id: forward_rid,
+                },
+            );
+            self.write_to_worker(
+                ctx,
+                serde_json::json!({
+                    "op": "tokenize",
+                    "request_id": tokenize_rid,
+                    "prompt": req.prompt,
+                }),
+            );
+            return;
+        }
+        let tokens = stub_tokenize_prompt(&req.prompt);
+        if tokens.is_empty() {
+            return;
+        }
+        let rid = self.next_request_id;
+        self.next_request_id += 1;
+        let seq_len = tokens.len() as u32;
+        self.pending_fwd.insert(
+            rid,
+            FwdPending {
+                request_id: rid,
+                position: 0,
+                is_prefill: true,
+                seq_len,
+            },
+        );
+        self.write_to_worker(
+            ctx,
+            serde_json::json!({
+                "op": "embed_and_forward",
+                "request_id": rid,
+                "tokens": tokens,
+                "position": 0,
+            }),
+        );
     }
 
-    fn handle(&mut self, ctx: &Ctx, msg: Stage1Msg) {
-        match msg {
-            Stage1Msg::Activation(act) => {
+    fn handle_next_token(&mut self, ctx: &Ctx, nt: NextToken) {
+        if self.role != StageRole::First {
+            return;
+        }
+        if nt.done {
+            return;
+        }
+        if !self.ready || !self.process_alive {
+            return;
+        }
+        self.pending_fwd.insert(
+            nt.request_id,
+            FwdPending {
+                request_id: nt.request_id,
+                position: nt.position,
+                is_prefill: false,
+                seq_len: 1,
+            },
+        );
+        self.write_to_worker(
+            ctx,
+            serde_json::json!({
+                "op": "decode_step",
+                "request_id": nt.request_id,
+                "token_id": nt.token_id,
+                "position": nt.position,
+            }),
+        );
+    }
+
+    fn handle_activation(&mut self, ctx: &Ctx, act: StageActivation) {
+        match self.role {
+            // First never accepts activations — they flow forward, not back
+            // to the entry stage. Drop without side-effect.
+            StageRole::First => {}
+            StageRole::Middle => {
+                if !self.ready || !self.process_alive {
+                    return;
+                }
+                // Echo the inbound control fields onto the resulting
+                // activation. The worker round-trip only transforms
+                // `hidden`; `request_id`, `position`, `seq_len`, and
+                // `is_prefill` must pass through unchanged so that
+                // (a) the orchestrator can match the eventual
+                // `InferenceResponse` to the right request, and
+                // (b) Last computes the next decode position from the
+                // same `(position, seq_len)` pair the chain has been
+                // carrying since First.
+                self.pending_fwd.insert(
+                    act.request_id,
+                    FwdPending {
+                        request_id: act.request_id,
+                        position: act.position,
+                        is_prefill: act.is_prefill,
+                        seq_len: act.seq_len,
+                    },
+                );
+                let hidden_b64 = B64.encode(&act.hidden);
+                self.write_to_worker(
+                    ctx,
+                    serde_json::json!({
+                        "op": "forward_range",
+                        "request_id": act.request_id,
+                        "hidden_b64": hidden_b64,
+                        "position": act.position,
+                        "seq_len": act.seq_len,
+                    }),
+                );
+            }
+            StageRole::Last => {
                 if !self.ready || !self.process_alive || self.finished {
                     return;
                 }
                 let next_position = act.position.saturating_add(act.seq_len);
-                self.pending_worker.insert(
+                self.pending_last.insert(
                     act.request_id,
-                    Stage1Pending { request_id: act.request_id, next_position },
+                    LastPending {
+                        request_id: act.request_id,
+                        next_position,
+                    },
                 );
                 let hidden_b64 = B64.encode(&act.hidden);
                 self.write_to_worker(
@@ -771,19 +802,61 @@ impl ActorInterface for Stage1Actor {
                     }),
                 );
             }
-            Stage1Msg::SetNeighbors {
+        }
+    }
+
+    fn handle_reset(&mut self) {
+        self.clear_pending_state();
+        self.accumulated.clear();
+        self.finished = false;
+    }
+}
+
+impl ActorInterface for StageActor {
+    type Incoming = StageMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        let proc_addr = spawn_local_process(ctx, &self.sender, self.spec.clone())
+            .expect("failed to spawn stage worker process");
+        let bridge = ProcessBridge {
+            target: ctx.self_addr(),
+        };
+        let bridge_addr = ctx
+            .spawn(bridge)
+            .expect("failed to spawn stage process bridge");
+        let _ = ctx.send(
+            proc_addr,
+            ProcessCommand::Subscribe {
+                address: bridge_addr,
+            },
+        );
+        self.process_addr = Some(proc_addr);
+        self.bridge_addr = Some(bridge_addr);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, msg: StageMsg) {
+        match msg {
+            StageMsg::Inference(req) => self.handle_inference(ctx, req),
+            StageMsg::NextToken(nt) => self.handle_next_token(ctx, nt),
+            StageMsg::Activation(act) => self.handle_activation(ctx, act),
+            StageMsg::SetNeighbors {
                 prev_stage,
+                next_stage,
                 reply_to,
             } => {
-                self.prev_stage_addr = prev_stage;
-                self.reply_to = reply_to;
+                if let Some(addr) = prev_stage {
+                    self.prev_stage_addr = addr;
+                }
+                if let Some(addr) = next_stage {
+                    self.next_stage_addr = addr;
+                }
+                if let Some(addr) = reply_to {
+                    self.reply_to = addr;
+                }
             }
-            Stage1Msg::Reset => {
-                self.accumulated.clear();
-                self.finished = false;
-                self.pending_worker.clear();
-            }
-            Stage1Msg::Process(notif) => match notif {
+            StageMsg::Reset => self.handle_reset(),
+            StageMsg::Process(notif) => match notif {
                 ProcessNotification::Started { .. } => {
                     self.process_alive = true;
                     if let Some(addr) = self.status_addr {
@@ -802,7 +875,7 @@ impl ActorInterface for Stage1Actor {
                 ProcessNotification::Exited { status, .. } => {
                     self.process_alive = false;
                     self.ready = false;
-                    self.pending_worker.clear();
+                    self.clear_pending_state();
                     if let Some(addr) = self.status_addr {
                         let _ = ctx.send(addr, StageActorStatus::ProcessExited { status });
                     }

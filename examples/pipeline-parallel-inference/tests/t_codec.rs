@@ -50,6 +50,52 @@ fn sample_activation() -> StageActivation {
 
 // ─── Roundtrip Tests (TEST_SPEC §1) ───────────────────────────────────────
 
+/// Prefill (`seq_len` == prompt length) and decode (`seq_len == 1`) both
+/// flow through the same codec. This sweep proves the codec is shape-
+/// agnostic — varying `seq_len` does not change roundtrip identity, so a
+/// chain at any `N` can carry prefill or decode hops on the same wire.
+#[test]
+fn stage_activation_roundtrips_with_varied_seq_len() {
+    let codec = activation_codec();
+    let registry = inference_codec_registry();
+    let hidden_dim_bytes = 32; // arbitrary; the codec is shape-agnostic.
+
+    for &seq_len in &[1u32, 2, 32, 256] {
+        let len = (seq_len as usize) * hidden_dim_bytes;
+        let original = StageActivation {
+            request_id: 0xABCD_0000 ^ u64::from(seq_len),
+            position: seq_len.saturating_mul(7),
+            hidden: sample_hidden(len),
+            seq_len,
+            is_prefill: seq_len > 1,
+        };
+        assert_eq!(original.hidden.len(), len, "sanity: payload size matches seq_len");
+
+        let bytes = codec.encode(&original).expect("encode should succeed");
+        let decoded = codec.decode(&bytes).expect("decode should succeed");
+        assert_eq!(decoded, original, "direct roundtrip differs at seq_len={seq_len}");
+        assert_eq!(
+            decoded.hidden, original.hidden,
+            "binary payload must survive at seq_len={seq_len}",
+        );
+
+        let (tag, payload) = registry
+            .encode(
+                std::any::TypeId::of::<StageActivation>(),
+                Box::new(original.clone()),
+            )
+            .expect("registry encode should succeed");
+        assert_eq!(tag, "pp::StageActivation");
+        let any_msg = registry
+            .decode(&tag, &payload)
+            .expect("registry decode should succeed");
+        let decoded = any_msg
+            .downcast::<StageActivation>()
+            .expect("downcast should succeed");
+        assert_eq!(*decoded, original, "registry roundtrip differs at seq_len={seq_len}");
+    }
+}
+
 #[test]
 fn stage_activation_roundtrips_through_codec_and_registry() {
     let original = sample_activation();
@@ -325,4 +371,72 @@ fn empty_bytes_produce_error() {
             "registry must reject empty payload under tag {tag}"
         );
     }
+}
+
+/// Every `NetworkMessage` the pipeline defines must be reachable from the
+/// type-erased registry: encode under its `TypeId`, decode under its
+/// `type_tag`, downcast back to the original concrete type. Catches the
+/// "forgot to register one of the four" regression.
+#[test]
+fn codec_registry_dispatches_all_four_types() {
+    let registry = inference_codec_registry();
+
+    let request = InferenceRequest {
+        reply_to: ActorAddress::new_random(),
+        prompt: "dispatch me".into(),
+        max_tokens: 16,
+    };
+    let response = InferenceResponse { text: "dispatched".into() };
+    let activation = sample_activation();
+    let next_token = NextToken {
+        request_id: 11,
+        token_id: 22,
+        position: 33,
+        done: true,
+    };
+
+    // (tag, encode under TypeId<T>, then decode + downcast back to T).
+    let (req_tag, req_bytes) = registry
+        .encode(
+            std::any::TypeId::of::<InferenceRequest>(),
+            Box::new(request.clone()),
+        )
+        .expect("InferenceRequest must be registered");
+    assert_eq!(req_tag, "pp::InferenceRequest");
+    let req_any = registry.decode(&req_tag, &req_bytes).unwrap();
+    let req_decoded = *req_any.downcast::<InferenceRequest>().unwrap();
+    assert_eq!(req_decoded, request);
+
+    let (resp_tag, resp_bytes) = registry
+        .encode(
+            std::any::TypeId::of::<InferenceResponse>(),
+            Box::new(response.clone()),
+        )
+        .expect("InferenceResponse must be registered");
+    assert_eq!(resp_tag, "pp::InferenceResponse");
+    let resp_any = registry.decode(&resp_tag, &resp_bytes).unwrap();
+    let resp_decoded = *resp_any.downcast::<InferenceResponse>().unwrap();
+    assert_eq!(resp_decoded, response);
+
+    let (act_tag, act_bytes) = registry
+        .encode(
+            std::any::TypeId::of::<StageActivation>(),
+            Box::new(activation.clone()),
+        )
+        .expect("StageActivation must be registered");
+    assert_eq!(act_tag, "pp::StageActivation");
+    let act_any = registry.decode(&act_tag, &act_bytes).unwrap();
+    let act_decoded = *act_any.downcast::<StageActivation>().unwrap();
+    assert_eq!(act_decoded, activation);
+
+    let (nt_tag, nt_bytes) = registry
+        .encode(
+            std::any::TypeId::of::<NextToken>(),
+            Box::new(next_token.clone()),
+        )
+        .expect("NextToken must be registered");
+    assert_eq!(nt_tag, "pp::NextToken");
+    let nt_any = registry.decode(&nt_tag, &nt_bytes).unwrap();
+    let nt_decoded = *nt_any.downcast::<NextToken>().unwrap();
+    assert_eq!(nt_decoded, next_token);
 }

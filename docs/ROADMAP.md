@@ -40,7 +40,8 @@ This document sets the sequencing. Each rung gets its own spec
 
 ### 3.1 Rung 1 — generalise PP from 2 → N stages
 
-Spec: [`n-stage-pp-spec.md`](./n-stage-pp-spec.md).
+Spec: [`../examples/pipeline-parallel-inference/SPEC.md`](../examples/pipeline-parallel-inference/SPEC.md).
+Test enumeration: [`../examples/pipeline-parallel-inference/TEST_SPEC.md`](../examples/pipeline-parallel-inference/TEST_SPEC.md).
 
 The current PP example is hardcoded to two stages
 (`pp_gpu_node.rs:214` rejects `NUM_STAGES != 2`; there are two distinct
@@ -51,7 +52,7 @@ and computes its layer range generically — but the orchestrator and the
 actor structure do not.
 
 **Outcome.** A linear chain of N ≥ 2 stages runs the same `llama3.2:1b`
-end-to-end via `pp-smoke-run --vastai --num-stages N`. N=4 on vast.ai is
+end-to-end via `pp-smoke-run --vastai --num-stages N`. N=5 on vast.ai is
 the acceptance test.
 
 **Why first.** Smallest delta against existing code. Surfaces the first
@@ -69,7 +70,9 @@ Spec: [`topology-planner-spec.md`](./topology-planner-spec.md).
 
 Today, "stage 0 owns layers `[0..k)`, stage 1 owns `[k..N)` with
 `k = N/2`" is hand-coded in the worker. Adding more stages means
-spreading more hand-coding across more places. The planner takes
+spreading more hand-coding across more places. (user note: we should
+develop our own language to express more complex graphs and eventually
+allow for efficient search and compilation) The planner takes
 `(model_layout, [node_descriptor])` and emits a `Plan` describing what
 runs where. The orchestrator consumes the `Plan` to drive
 `create_instance` calls and the per-stage env injection.

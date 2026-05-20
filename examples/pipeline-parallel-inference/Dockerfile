@@ -1,6 +1,10 @@
-FROM nvidia/cuda:12.6.3-devel-ubuntu24.04
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 
-# Install Python 3, pip, and CUDA runtime compiler (tinygrad compiles kernels via NVRTC)
+# Runtime base — no CUDA dev headers, no nvcc. tinygrad's CUDA backend
+# compiles kernels via NVRTC which is part of the runtime image, so we
+# do not need the devel image (that base alone is ~5 GB and dominated
+# the 7.55 GB total of the previous build, blowing past the vastai
+# image-pull budget).
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 \

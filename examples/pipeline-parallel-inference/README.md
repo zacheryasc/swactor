@@ -36,7 +36,8 @@ examples/pipeline-parallel-inference/
     ├── t_cluster.rs        # §6
     ├── t_vastai.rs         # §7
     ├── t_integration.rs    # §8 (stub) + §9 equivalence (#[ignore])
-    └── t_binary.rs         # §10
+    ├── t_binary.rs         # §10
+    └── t_docker.rs         # §13b (Docker-coordinated E2E, #[ignore])
 ```
 
 ---
@@ -152,6 +153,52 @@ returning.
 | `--image <name>` | `swactor-pp-gpu:latest` | container image (`--vastai` only) |
 
 ---
+
+## Docker-coordinated localhost run (the pre-deploy gate)
+
+`scripts/docker-e2e.sh N` is the one-line pre-deploy gate (TEST_SPEC
+§13b). It builds the release binaries, packages them into a CPU-only
+stub-mode container image, brings up `N` containers on the host
+network, drives one inference request through them, prints the
+response, and tears everything down — failing fast if any container
+exits prematurely or any container survives the run.
+
+```sh
+examples/pipeline-parallel-inference/scripts/docker-e2e.sh 3
+```
+
+Useful environment overrides:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PP_IMAGE` | `pp-gpu-node-stub:latest` | image tag to build/use |
+| `PP_CONTAINER_PREFIX` | `pp-stage` | container name prefix (each container is `<prefix>-<stage>`) |
+| `PP_MAX_TOKENS` | `4` | per-request decode cap (stub workers are deterministic, 4 keeps it fast) |
+| `PP_PROMPT` | `Say hello` | inference prompt |
+| `PP_SKIP_BUILD` | unset | skip `cargo build --release` when artefacts are already present |
+| `PP_SKIP_IMAGE_BUILD` | unset | skip the `docker build` step when the image is already current |
+
+What the script asserts:
+
+* `pp-smoke-run` exits 0.
+* The response banner (`=== pipeline-parallel Inference Response ===`)
+  appears on stdout with a non-empty body.
+* No container whose name matches `^<prefix>-[0-9]+$` survives the
+  run.
+
+The script can be rerun safely — TEST_SPEC §13b includes an
+idempotency test that runs the harness twice back-to-back. If you
+need to reproduce the failure path that drives the script's fail-fast
+behaviour, launch `pp-smoke-run` with the docker shim manually and
+`docker kill` one stage mid-run; the orchestrator exits non-zero
+within seconds.
+
+Same machinery is exercised under `cargo test` as `t_docker.rs`:
+
+```sh
+cargo test --manifest-path examples/pipeline-parallel-inference/Cargo.toml \
+    --test t_docker -- --ignored
+```
 
 ## vast.ai mode (documented, not executed here)
 

@@ -1,0 +1,36 @@
+# Diagnostics e2e stack.
+#
+# The collector service runs in its own container with the bundles dir
+# bind-mounted from the host so the harness can read the finalized
+# tarball. Both the collector and the pp processes use the host network
+# namespace, so the stage children (spawned by `pp-smoke-run` via
+# `docker-gpu-node.sh`) share localhost reachability with the
+# collector — `SWACTOR_DIAG_COLLECTOR_URL=http://127.0.0.1:9080` works
+# uniformly from every actor in the run.
+#
+# The host network choice mirrors the existing `docker-e2e.sh` shape:
+# pp-smoke-run runs on the host (orchestrator) and each
+# `pp-gpu-node` runs in its own container under `--network host`. The
+# collector container just adds one more service to that arrangement.
+#
+# Used by `scripts/docker-diag-e2e.sh`. Direct `docker compose up`
+# without the wrapper is fine for manual collector-only operation, but
+# the orchestrator-side wiring (env-var injection, bundle assertions)
+# lives in the script.
+
+services:
+  collector:
+    image: ${PP_DIAG_IMAGE:-pp-diag:latest}
+    container_name: ${PP_DIAG_COLLECTOR_NAME:-pp-diag-collector}
+    network_mode: host
+    command:
+      - swactor-diag-collector
+      - --bind
+      - 127.0.0.1:9080
+      - --root
+      - /var/lib/swactor-diag
+      - --udp
+      - 127.0.0.1:9081
+    volumes:
+      - ${PP_DIAG_BUNDLES_DIR:?PP_DIAG_BUNDLES_DIR must be set}:/var/lib/swactor-diag
+    restart: "no"

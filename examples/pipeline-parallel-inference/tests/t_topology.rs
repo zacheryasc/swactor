@@ -268,3 +268,225 @@ fn last_stage_has_no_next_neighbor() {
     assert_eq!(next_stage_name(3, 4), None);
     assert_eq!(next_stage_name(7, 8), None);
 }
+
+// ── §4 N-generic helper tests (TEST_SPEC §4) ──────────────────────────────
+//
+// The 2-stage tests above remain unchanged (the SPEC's invariant is that we
+// do not delete the existing scaffolding). These additional tests cover the
+// same surface at the N-generic shape the SPEC requires.
+
+/// `stage_name(i)` is purely formatted from `i`; no chain length involved.
+/// Exercise the full range we plan to test against (up to N=16).
+#[test]
+fn stage_name_uses_pp_prefix() {
+    for i in 0..16 {
+        assert_eq!(stage_name(i), format!("pp-stage-{i}"));
+    }
+}
+
+#[test]
+fn first_stage_has_no_prev() {
+    assert_eq!(prev_stage_name(0), None);
+}
+
+/// `next_stage_name(N-1, N) == None` for every N in our supported range —
+/// the last stage of a chain never produces a successor name.
+#[test]
+fn last_stage_has_no_next() {
+    for n in 2..=8u32 {
+        assert_eq!(
+            next_stage_name(n - 1, n),
+            None,
+            "last stage of {n} should have no next",
+        );
+    }
+}
+
+/// Every interior stage has both a `prev` and a `next` neighbour, and the
+/// two names differ. The first-and-last asymmetry shows up only at the
+/// chain ends.
+#[test]
+fn middle_stage_has_both_neighbours() {
+    for n in 3..=8u32 {
+        for i in 1..(n - 1) {
+            let prev = prev_stage_name(i).unwrap_or_else(|| {
+                panic!("interior stage {i} of {n} should have a prev")
+            });
+            let next = next_stage_name(i, n).unwrap_or_else(|| {
+                panic!("interior stage {i} of {n} should have a next")
+            });
+            assert_ne!(
+                prev, next,
+                "interior stage {i} of {n}: prev and next must differ",
+            );
+            assert_eq!(prev, stage_name(i - 1));
+            assert_eq!(next, stage_name(i + 1));
+        }
+    }
+}
+
+/// First stage registers both `pp-entry` and its per-index name, and both
+/// resolve to the same address. Generalised over N up to 8.
+#[test]
+fn first_stage_registers_entry_and_index() {
+    for n in 2..=8 {
+        let mut driver = make_driver();
+        let stage_addr = ActorAddress::new_random();
+
+        let registered = register_stage_names(driver.node_mut(), 0, n, stage_addr);
+
+        assert!(
+            registered.contains(&ENTRY_NAME.to_string()),
+            "N={n}: first stage should register pp-entry",
+        );
+        assert!(
+            registered.contains(&stage_name(0)),
+            "N={n}: first stage should register pp-stage-0",
+        );
+
+        let entry = driver.node().resolve_name(ENTRY_NAME).expect("pp-entry");
+        let idx = driver.node().resolve_name(&stage_name(0)).expect("pp-stage-0");
+        assert_eq!(entry.0, stage_addr);
+        assert_eq!(idx.0, stage_addr);
+        assert_eq!(entry, idx);
+
+        driver.shutdown();
+    }
+}
+
+/// Last stage registers both `pp-exit` and its per-index name, and both
+/// resolve to the same address. Generalised over N up to 8.
+#[test]
+fn last_stage_registers_exit_and_index() {
+    for n in 2..=8u32 {
+        let last = n - 1;
+        let mut driver = make_driver();
+        let stage_addr = ActorAddress::new_random();
+
+        let registered = register_stage_names(driver.node_mut(), last, n, stage_addr);
+
+        assert!(
+            registered.contains(&EXIT_NAME.to_string()),
+            "N={n}: last stage should register pp-exit",
+        );
+        assert!(
+            registered.contains(&stage_name(last)),
+            "N={n}: last stage should register pp-stage-{last}",
+        );
+
+        let exit = driver.node().resolve_name(EXIT_NAME).expect("pp-exit");
+        let idx = driver
+            .node()
+            .resolve_name(&stage_name(last))
+            .expect("per-index name");
+        assert_eq!(exit.0, stage_addr);
+        assert_eq!(idx.0, stage_addr);
+        assert_eq!(exit, idx);
+
+        driver.shutdown();
+    }
+}
+
+/// A middle stage registers only its per-index name — never `pp-entry` or
+/// `pp-exit`. Exercised across every interior index for N ∈ {3..=8}.
+#[test]
+fn middle_stage_registers_index_only() {
+    for n in 3..=8u32 {
+        for i in 1..(n - 1) {
+            let mut driver = make_driver();
+            let stage_addr = ActorAddress::new_random();
+
+            let registered = register_stage_names(driver.node_mut(), i, n, stage_addr);
+
+            assert!(
+                registered.contains(&stage_name(i)),
+                "N={n} stage {i}: middle should register its per-index name",
+            );
+            assert!(
+                !registered.contains(&ENTRY_NAME.to_string()),
+                "N={n} stage {i}: middle must not register pp-entry",
+            );
+            assert!(
+                !registered.contains(&EXIT_NAME.to_string()),
+                "N={n} stage {i}: middle must not register pp-exit",
+            );
+            assert_eq!(
+                driver.node().resolve_name(ENTRY_NAME),
+                None,
+                "N={n} stage {i}: middle must not expose pp-entry",
+            );
+            assert_eq!(
+                driver.node().resolve_name(EXIT_NAME),
+                None,
+                "N={n} stage {i}: middle must not expose pp-exit",
+            );
+            let idx = driver
+                .node()
+                .resolve_name(&stage_name(i))
+                .expect("per-index name");
+            assert_eq!(idx.0, stage_addr);
+
+            driver.shutdown();
+        }
+    }
+}
+
+/// The returned `Vec<String>` length tracks the role: 2 for First and Last
+/// (per-index + entry/exit), 1 for Middle.
+#[test]
+fn register_stage_names_count_matches_role() {
+    for n in 3..=8u32 {
+        for stage in 0..n {
+            let mut driver = make_driver();
+            let addr = ActorAddress::new_random();
+            let registered = register_stage_names(driver.node_mut(), stage, n, addr);
+
+            let expected_len = if stage == 0 || stage == n - 1 { 2 } else { 1 };
+            assert_eq!(
+                registered.len(),
+                expected_len,
+                "N={n} stage {stage}: expected {expected_len} registered names, got {:?}",
+                registered,
+            );
+            driver.shutdown();
+        }
+    }
+}
+
+/// Across every stage in a chain, the per-index names are pairwise distinct,
+/// `pp-entry` is registered exactly once (by stage 0), and `pp-exit` is
+/// registered exactly once (by the last stage).
+#[test]
+fn register_stage_names_uniqueness() {
+    use std::collections::HashSet;
+
+    for n in 2..=8u32 {
+        let mut idx_names = HashSet::new();
+        let mut entry_count = 0u32;
+        let mut exit_count = 0u32;
+        for stage in 0..n {
+            let mut driver = make_driver();
+            let addr = ActorAddress::new_random();
+            let names = register_stage_names(driver.node_mut(), stage, n, addr);
+
+            // The per-index name is always included; track it for the
+            // pairwise-distinct check across stages.
+            let inserted = idx_names.insert(stage_name(stage));
+            assert!(
+                inserted,
+                "N={n}: per-index name pp-stage-{stage} must be unique across stages",
+            );
+
+            if names.contains(&ENTRY_NAME.to_string()) {
+                entry_count += 1;
+            }
+            if names.contains(&EXIT_NAME.to_string()) {
+                exit_count += 1;
+            }
+            driver.shutdown();
+        }
+        assert_eq!(idx_names.len() as u32, n, "N={n}: every stage owns a unique pp-stage-i");
+        assert_eq!(entry_count, 1, "N={n}: pp-entry must be registered exactly once");
+        assert_eq!(exit_count, 1, "N={n}: pp-exit must be registered exactly once");
+    }
+}
