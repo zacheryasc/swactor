@@ -9,5 +9,6 @@ pub mod node;
 pub mod registry;
 pub mod node_metadata;
 pub mod snapshot;
+pub mod diagnostics;
 #[cfg(feature = "iroh")]
 pub mod iroh_driver;

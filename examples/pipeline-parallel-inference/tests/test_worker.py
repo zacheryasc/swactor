@@ -103,6 +103,36 @@ def stage1():
         _shutdown(proc)
 
 
+@pytest.fixture
+def first_of_four():
+    """Stage 0 of a 4-stage pipeline — the First role with two middles below."""
+    proc = _spawn(0, 4)
+    try:
+        yield proc
+    finally:
+        _shutdown(proc)
+
+
+@pytest.fixture
+def middle_of_four():
+    """Stage 1 of a 4-stage pipeline — a Middle role."""
+    proc = _spawn(1, 4)
+    try:
+        yield proc
+    finally:
+        _shutdown(proc)
+
+
+@pytest.fixture
+def last_of_four():
+    """Stage 3 of a 4-stage pipeline — the Last role."""
+    proc = _spawn(3, 4)
+    try:
+        yield proc
+    finally:
+        _shutdown(proc)
+
+
 # ---------------------------------------------------------------------------
 # §2 — pure helper tests
 
@@ -125,11 +155,69 @@ class TestLayerMath:
             _, end = worker.compute_layer_range(1, 2, total)
             assert end == total
 
+    def test_stage_0_layer_range_starts_at_zero(self):
+        # The first stage always owns blocks starting at 0, irrespective of N.
+        for n in range(2, 9):
+            start, _ = worker.compute_layer_range(0, n, 64)
+            assert start == 0, f"stage 0 of {n}: start should be 0"
+
+    def test_last_stage_layer_range_reaches_total(self):
+        # The final stage's end equals total_blocks, including when total is
+        # not evenly divisible — the last stage absorbs the remainder.
+        for n in range(2, 9):
+            for total in (n, n + 1, n * 7, n * 7 + (n - 1)):
+                _, end = worker.compute_layer_range(n - 1, n, total)
+                assert end == total, (
+                    f"last stage of {n} on {total} blocks should end at total"
+                )
+
+    def test_layer_range_each_stage_owns_at_least_one_block(self):
+        # For any NUM_STAGES <= total, every stage owns a non-empty range.
+        for n in range(2, 9):
+            for total in (n, n + 1, n * 3, 100):
+                for s in range(n):
+                    start, end = worker.compute_layer_range(s, n, total)
+                    assert end > start, (
+                        f"stage {s} of {n} on {total} blocks got empty "
+                        f"range [{start},{end})"
+                    )
+
+    def test_layer_range_partition_for_indivisible_totals(self):
+        # total=17, N=4 must yield four contiguous ranges covering [0, 17)
+        # whose lengths differ by at most one.
+        ranges = [worker.compute_layer_range(s, 4, 17) for s in range(4)]
+        starts = [r[0] for r in ranges]
+        ends = [r[1] for r in ranges]
+        lengths = [e - s for s, e in ranges]
+        assert starts[0] == 0
+        assert ends[-1] == 17
+        for i in range(len(ranges) - 1):
+            assert ends[i] == starts[i + 1], (
+                f"ranges {ranges[i]} and {ranges[i+1]} are not contiguous"
+            )
+        assert max(lengths) - min(lengths) <= 1, lengths
+
+    def test_layer_range_rejects_num_stages_one(self):
+        # The example does not serve single-node configurations. N=1 must
+        # be rejected as a configuration error rather than silently treated
+        # as "one stage with all the blocks".
+        with pytest.raises(ValueError):
+            worker.compute_layer_range(0, 1, 16)
+
+    def test_layer_range_rejects_num_stages_zero_or_oversize(self):
+        # Defensive on bad inputs from above (negative or zero N, or a stage
+        # index that is out of range).
+        with pytest.raises(ValueError):
+            worker.compute_layer_range(0, 0, 16)
+        with pytest.raises(ValueError):
+            worker.compute_layer_range(4, 4, 16)
+        with pytest.raises(ValueError):
+            worker.compute_layer_range(-1, 4, 16)
+
     def test_layer_range_partition_is_total_coverage(self):
-        # For 2-, 3-, 4-stage splits, the union of all stage ranges must equal
-        # [0, total) exactly — no gaps, no overlap. Generalises early because
-        # the only marginal cost is a few asserts.
-        for num_stages in (2, 3, 4):
+        # For 2..8-stage splits, the union of all stage ranges must equal
+        # [0, total) exactly — no gaps, no overlap. Property-shaped.
+        for num_stages in range(2, 9):
             # Include totals divisible by num_stages and totals that leave a
             # remainder, so we exercise the "last stage absorbs remainder" path.
             for total in (
@@ -373,6 +461,334 @@ class TestStage1Operations:
         assert "error" not in ok, ok
 
 
+# ---------------------------------------------------------------------------
+# §5.2 — TestFirstStageOperations (N=4, STAGE=0).
+#
+# At N=4 the first stage has Middle and Last stages downstream. Beyond the
+# stage-0 ops covered above (under TestStage0Operations at N=2, which still
+# stand), the first stage must reject the ops belonging to other roles.
+
+
+class TestFirstStageOperations:
+    def test_tokenize_returns_token_ids_for_prompt(self, first_of_four):
+        _read_reply(first_of_four)
+        _send(
+            first_of_four,
+            {"op": "tokenize", "request_id": 1, "prompt": "the quick brown fox"},
+        )
+        reply = _read_reply(first_of_four)
+        assert "error" not in reply, reply
+        assert reply["request_id"] == 1
+        tokens = reply["tokens"]
+        assert isinstance(tokens, list) and len(tokens) > 0
+        assert all(isinstance(t, int) for t in tokens)
+
+    def test_first_stage_rejects_forward_range(self, first_of_four):
+        _read_reply(first_of_four)
+        hidden_b64 = base64.b64encode(b"\x01" * STUB_HIDDEN_BYTES_PER_POS).decode()
+        _send(
+            first_of_four,
+            {
+                "op": "forward_range",
+                "request_id": 11,
+                "hidden_b64": hidden_b64,
+                "position": 0,
+                "seq_len": 1,
+            },
+        )
+        err = _read_reply(first_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 11
+        # Worker stays up: a valid first-stage op still works.
+        _send(
+            first_of_four,
+            {"op": "decode_step", "request_id": 12, "token_id": 1, "position": 0},
+        )
+        ok = _read_reply(first_of_four)
+        assert "error" not in ok, ok
+        assert ok["request_id"] == 12
+
+    def test_first_stage_rejects_forward_and_sample(self, first_of_four):
+        _read_reply(first_of_four)
+        hidden_b64 = base64.b64encode(b"\x01" * STUB_HIDDEN_BYTES_PER_POS).decode()
+        _send(
+            first_of_four,
+            {
+                "op": "forward_and_sample",
+                "request_id": 21,
+                "hidden_b64": hidden_b64,
+                "position": 0,
+                "seq_len": 1,
+            },
+        )
+        err = _read_reply(first_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 21
+        # Worker stays up.
+        _send(
+            first_of_four,
+            {"op": "decode_step", "request_id": 22, "token_id": 2, "position": 0},
+        )
+        ok = _read_reply(first_of_four)
+        assert "error" not in ok, ok
+
+
+# ---------------------------------------------------------------------------
+# §5.3 — TestMiddleStageOperations (N=4, STAGE=1).
+
+
+class TestMiddleStageOperations:
+    @staticmethod
+    def _send_forward_range(
+        proc: subprocess.Popen,
+        *,
+        request_id: int,
+        hidden_bytes: bytes,
+        position: int,
+        seq_len: int,
+    ) -> dict:
+        _send(
+            proc,
+            {
+                "op": "forward_range",
+                "request_id": request_id,
+                "hidden_b64": base64.b64encode(hidden_bytes).decode("ascii"),
+                "position": position,
+                "seq_len": seq_len,
+            },
+        )
+        return _read_reply(proc)
+
+    def test_forward_range_returns_hidden_with_input_seq_len(self, middle_of_four):
+        _read_reply(middle_of_four)
+        for seq_len in (1, 3, 7):
+            payload = bytes(((i * 13 + seq_len) & 0xFF) for i in range(seq_len * STUB_HIDDEN_BYTES_PER_POS))
+            reply = self._send_forward_range(
+                middle_of_four,
+                request_id=seq_len,
+                hidden_bytes=payload,
+                position=seq_len,
+                seq_len=seq_len,
+            )
+            assert "error" not in reply, (seq_len, reply)
+            assert reply["request_id"] == seq_len
+            assert reply["seq_len"] == seq_len
+            out = base64.b64decode(reply["hidden_b64"])
+            assert len(out) == seq_len * STUB_HIDDEN_BYTES_PER_POS, (
+                f"seq_len={seq_len}: got {len(out)} bytes"
+            )
+            # Non-trivial payload: a `b"\x00" * N` echo would also satisfy
+            # the length assertion, so explicitly reject all-zero output.
+            assert any(b != 0 for b in out), seq_len
+
+    def test_forward_range_is_deterministic_for_same_input(self, middle_of_four):
+        _read_reply(middle_of_four)
+        payload = bytes(range(STUB_HIDDEN_BYTES_PER_POS * 2))
+        observed: list[str] = []
+        for rid in (1, 2, 3, 4):
+            reply = self._send_forward_range(
+                middle_of_four,
+                request_id=rid,
+                hidden_bytes=payload,
+                position=11,
+                seq_len=2,
+            )
+            assert "error" not in reply, reply
+            observed.append(reply["hidden_b64"])
+        assert len(set(observed)) == 1, f"non-deterministic forward_range: {observed}"
+
+    def test_forward_range_kv_cache_advances_with_position(self, middle_of_four):
+        _read_reply(middle_of_four)
+        # Prefill-like step at position 0 with a multi-token chunk.
+        prompt_len = 5
+        prefill = bytes((i & 0xFF) for i in range(prompt_len * STUB_HIDDEN_BYTES_PER_POS))
+        reply = self._send_forward_range(
+            middle_of_four,
+            request_id=1,
+            hidden_bytes=prefill,
+            position=0,
+            seq_len=prompt_len,
+        )
+        assert "error" not in reply, reply
+        assert reply["seq_len"] == prompt_len
+        # Subsequent decode-shaped steps advance position monotonically.
+        outputs: set[str] = set()
+        single = bytes(range(STUB_HIDDEN_BYTES_PER_POS))
+        for i, pos in enumerate((prompt_len, prompt_len + 1, prompt_len + 2)):
+            reply = self._send_forward_range(
+                middle_of_four,
+                request_id=100 + i,
+                hidden_bytes=single,
+                position=pos,
+                seq_len=1,
+            )
+            assert "error" not in reply, (pos, reply)
+            assert reply["seq_len"] == 1
+            outputs.add(reply["hidden_b64"])
+        # Position must influence output — if it does not, a real KV cache
+        # would be corrupted by silently reusing stale rows.
+        assert len(outputs) > 1, outputs
+
+    def test_middle_stage_rejects_embed_and_forward(self, middle_of_four):
+        _read_reply(middle_of_four)
+        _send(
+            middle_of_four,
+            {"op": "embed_and_forward", "request_id": 1, "tokens": [1, 2], "position": 0},
+        )
+        err = _read_reply(middle_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 1
+
+    def test_middle_stage_rejects_decode_step(self, middle_of_four):
+        _read_reply(middle_of_four)
+        _send(
+            middle_of_four,
+            {"op": "decode_step", "request_id": 2, "token_id": 3, "position": 0},
+        )
+        err = _read_reply(middle_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 2
+
+    def test_middle_stage_rejects_forward_and_sample(self, middle_of_four):
+        _read_reply(middle_of_four)
+        hidden_b64 = base64.b64encode(b"\x00" * STUB_HIDDEN_BYTES_PER_POS).decode()
+        _send(
+            middle_of_four,
+            {
+                "op": "forward_and_sample",
+                "request_id": 3,
+                "hidden_b64": hidden_b64,
+                "position": 0,
+                "seq_len": 1,
+            },
+        )
+        err = _read_reply(middle_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 3
+
+    def test_middle_stage_rejects_tokenize(self, middle_of_four):
+        _read_reply(middle_of_four)
+        _send(middle_of_four, {"op": "tokenize", "request_id": 4, "prompt": "hi"})
+        err = _read_reply(middle_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 4
+
+    def test_middle_stage_rejects_detokenize(self, middle_of_four):
+        _read_reply(middle_of_four)
+        _send(
+            middle_of_four,
+            {"op": "detokenize", "request_id": 5, "tokens": [1, 2, 3]},
+        )
+        err = _read_reply(middle_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 5
+
+    def test_forward_range_rejects_seq_len_mismatch(self, middle_of_four):
+        _read_reply(middle_of_four)
+        # Declared seq_len longer than the actual hidden payload.
+        short = b"\x00" * STUB_HIDDEN_BYTES_PER_POS  # one token's worth
+        _send(
+            middle_of_four,
+            {
+                "op": "forward_range",
+                "request_id": 1,
+                "hidden_b64": base64.b64encode(short).decode("ascii"),
+                "position": 0,
+                "seq_len": 3,
+            },
+        )
+        err = _read_reply(middle_of_four)
+        assert "error" in err, err
+        # Inverse mismatch: payload longer than declared seq_len.
+        long = b"\x00" * (STUB_HIDDEN_BYTES_PER_POS * 4)
+        _send(
+            middle_of_four,
+            {
+                "op": "forward_range",
+                "request_id": 2,
+                "hidden_b64": base64.b64encode(long).decode("ascii"),
+                "position": 0,
+                "seq_len": 1,
+            },
+        )
+        err2 = _read_reply(middle_of_four)
+        assert "error" in err2, err2
+        # Worker still serves a well-formed follow-up.
+        good = b"\x11" * STUB_HIDDEN_BYTES_PER_POS
+        ok_reply = self._send_forward_range(
+            middle_of_four,
+            request_id=3,
+            hidden_bytes=good,
+            position=0,
+            seq_len=1,
+        )
+        assert "error" not in ok_reply, ok_reply
+
+
+# ---------------------------------------------------------------------------
+# §5.4 — TestLastStageOperations (N=4, STAGE=N-1).
+#
+# The positive-path tests for the last role (forward_and_sample,
+# detokenize) are also exercised at N=2 above. Here we add the rejection
+# tests that prove the last stage refuses ops belonging to other roles.
+
+
+class TestLastStageOperations:
+    def test_last_stage_rejects_embed_and_forward(self, last_of_four):
+        _read_reply(last_of_four)
+        _send(
+            last_of_four,
+            {"op": "embed_and_forward", "request_id": 1, "tokens": [1, 2], "position": 0},
+        )
+        err = _read_reply(last_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 1
+        # Worker stays up: its own op still works.
+        hidden_b64 = base64.b64encode(b"\x00" * STUB_HIDDEN_BYTES_PER_POS).decode()
+        _send(
+            last_of_four,
+            {
+                "op": "forward_and_sample",
+                "request_id": 2,
+                "hidden_b64": hidden_b64,
+                "position": 0,
+                "seq_len": 1,
+            },
+        )
+        ok = _read_reply(last_of_four)
+        assert "error" not in ok, ok
+
+    def test_last_stage_rejects_forward_range(self, last_of_four):
+        _read_reply(last_of_four)
+        hidden_b64 = base64.b64encode(b"\x00" * STUB_HIDDEN_BYTES_PER_POS).decode()
+        _send(
+            last_of_four,
+            {
+                "op": "forward_range",
+                "request_id": 11,
+                "hidden_b64": hidden_b64,
+                "position": 0,
+                "seq_len": 1,
+            },
+        )
+        err = _read_reply(last_of_four)
+        assert "error" in err, err
+        assert err.get("request_id") == 11
+        # Worker stays up.
+        _send(
+            last_of_four,
+            {
+                "op": "forward_and_sample",
+                "request_id": 12,
+                "hidden_b64": hidden_b64,
+                "position": 0,
+                "seq_len": 1,
+            },
+        )
+        ok = _read_reply(last_of_four)
+        assert "error" not in ok, ok
+
+
 class TestWorkerMalformedInput:
     def test_malformed_json_returns_error_and_continues(self, stage0):
         _read_reply(stage0)
@@ -403,6 +819,26 @@ class TestWorkerMalformedInput:
         _send(
             stage0,
             {"op": "decode_step", "request_id": 2, "token_id": 1, "position": 0},
+        )
+        ok = _read_reply(stage0)
+        assert "error" not in ok, ok
+
+    def test_unknown_op_returns_error(self, stage0):
+        # A typo or wrong-version client must not crash the worker. The
+        # reply carries the request_id so the caller can correlate it.
+        _read_reply(stage0)
+        _send(stage0, {"op": "frobnicate", "request_id": 1, "x": 0})
+        err = _read_reply(stage0)
+        assert "error" in err, err
+        assert err.get("request_id") == 1
+        # Empty-string op is "unknown" too.
+        _send(stage0, {"op": "", "request_id": 2})
+        err2 = _read_reply(stage0)
+        assert "error" in err2, err2
+        # Worker survives.
+        _send(
+            stage0,
+            {"op": "decode_step", "request_id": 3, "token_id": 1, "position": 0},
         )
         ok = _read_reply(stage0)
         assert "error" not in ok, ok

@@ -1,0 +1,88 @@
+pp-smoke-run (--seed --num-stages 3): orchestrator node 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a, direct=[192.168.1.3:41895, 127.0.0.1:41895, [::1]:43893]
+pp-smoke-run: spawning scripts/docker-gpu-node.sh STAGE=0 NUM_STAGES=3
+pp-gpu-node: stage 0/3 (First) started (node_id: cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a)
+pp-gpu-node: joining seed 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a
+iroh driver: join attempt 1/5 connecting to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a...
+pp-smoke-run: spawning scripts/docker-gpu-node.sh STAGE=1 NUM_STAGES=3
+iroh driver: join attempt 1/5 connected to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a, sending...
+iroh driver: join attempt 1/5 sent to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a
+iroh driver: accepted SWIM connection from cabf12db
+iroh driver: collecting 1 pending join connection(s)
+pp-gpu-node: stage 1/3 (Middle) started (node_id: b6cbe708a4a9e90d681e0c71bdf2f336ca8b0e03bc7936712d805ed875a34aec)
+pp-gpu-node: also joining peer cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a
+pp-gpu-node: also joining first-stage peer cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a
+pp-gpu-node: joining seed 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a
+iroh driver: join attempt 1/5 connecting to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a...
+iroh driver: join attempt 1/5 connecting to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a...
+iroh driver: join attempt 1/5 connecting to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a...
+pp-smoke-run: spawning scripts/docker-gpu-node.sh STAGE=2 NUM_STAGES=3
+iroh driver: join attempt 1/5 connected to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a, sending...
+iroh driver: join attempt 1/5 sent to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a
+iroh driver: accepted SWIM connection from b6cbe708
+iroh driver: join attempt 1/5 connected to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a, sending...
+iroh driver: join attempt 1/5 sent to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a
+iroh driver: accepted SWIM connection from b6cbe708
+iroh driver: join attempt 1/5 connected to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a, sending...
+iroh driver: join attempt 1/5 sent to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a
+iroh driver: accepted SWIM connection from b6cbe708
+iroh driver: received 2 message(s)
+pp-gpu-node: cluster converged
+pp-gpu-node: registered pp-stage-0 -> ActorAddress([147, 225, 78, 200, 4, 23, 28, 104, 0, 149, 221, 190, 49, 123, 185, 178, 51, 195, 253, 144, 50, 116, 99, 7, 138, 179, 215, 194, 149, 78, 196, 5])
+iroh driver: collecting 3 pending join connection(s)
+iroh driver: received 2 message(s)
+pp-gpu-node: cluster converged
+pp-gpu-node: registered pp-stage-1 -> ActorAddress([185, 128, 177, 254, 216, 234, 238, 194, 242, 70, 204, 102, 195, 165, 88, 222, 126, 92, 36, 138, 104, 125, 91, 146, 5, 125, 250, 193, 207, 158, 192, 247])
+pp-gpu-node: worker process started
+pp-gpu-node: worker ready (pid: Some(21))
+pp-gpu-node: resolving pp-stage-1...
+iroh driver: received 1 message(s)
+pp-gpu-node: worker process started
+pp-gpu-node: worker ready (pid: Some(22))
+pp-gpu-node: resolving pp-stage-2...
+pp-gpu-node: stage 2/3 (Last) started (node_id: c72bac8626e835e2664b452229e05dc064f88490464fb6ebfc1ff56a7689aa35)
+pp-gpu-node: also joining peer b6cbe708a4a9e90d681e0c71bdf2f336ca8b0e03bc7936712d805ed875a34aec
+pp-gpu-node: also joining first-stage peer cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a
+pp-gpu-node: joining seed 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a
+iroh driver: join attempt 1/5 connecting to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a...
+iroh driver: join attempt 1/5 connecting to b6cbe708a4a9e90d681e0c71bdf2f336ca8b0e03bc7936712d805ed875a34aec...
+iroh driver: join attempt 1/5 connecting to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a...
+pp-smoke-run: spawned 3 stage children
+pp-smoke-run: waiting for cluster convergence (3 alive peers)...
+iroh driver: join attempt 1/5 connected to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a, sending...
+iroh driver: join attempt 1/5 sent to 5bd301d0a49e3787c688ccfb5a7d6daaa206f1c47f6e72e04541334136daf41a
+iroh driver: accepted SWIM connection from c72bac86
+iroh driver: join attempt 1/5 connected to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a, sending...
+iroh driver: join attempt 1/5 sent to cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a
+iroh driver: join attempt 1/5 connected to b6cbe708a4a9e90d681e0c71bdf2f336ca8b0e03bc7936712d805ed875a34aec, sending...
+iroh driver: join attempt 1/5 sent to b6cbe708a4a9e90d681e0c71bdf2f336ca8b0e03bc7936712d805ed875a34aec
+iroh driver: received 2 message(s)
+iroh driver: accepted SWIM connection from c72bac86
+iroh driver: accepted SWIM connection from c72bac86
+iroh driver: received 3 message(s)
+pp-gpu-node: resolved pp-stage-1 -> ActorAddress([185, 128, 177, 254, 216, 234, 238, 194, 242, 70, 204, 102, 195, 165, 88, 222, 126, 92, 36, 138, 104, 125, 91, 146, 5, 125, 250, 193, 207, 158, 192, 247]) on b6cbe708a4a9e90d681e0c71bdf2f336ca8b0e03bc7936712d805ed875a34aec
+iroh driver: collecting 3 pending join connection(s)
+iroh driver: received 2 message(s)
+iroh driver: received 1 message(s)
+pp-gpu-node: cluster converged
+pp-gpu-node: registered pp-stage-2 -> ActorAddress([168, 91, 23, 196, 115, 196, 151, 137, 191, 120, 131, 206, 132, 106, 14, 249, 128, 200, 246, 172, 246, 156, 132, 90, 198, 191, 150, 160, 68, 91, 33, 153])
+iroh driver: received 1 message(s)
+pp-smoke-run: registered pp-orchestrator -> ActorAddress([154, 202, 234, 152, 25, 231, 231, 64, 79, 201, 135, 65, 146, 198, 139, 107, 228, 126, 121, 65, 7, 192, 6, 150, 89, 213, 140, 149, 42, 59, 35, 191])
+pp-smoke-run: cluster converged
+pp-smoke-run: resolving pp-entry...
+iroh driver: received 1 message(s)
+pp-gpu-node: registered pp-entry -> ActorAddress([102, 84, 124, 231, 194, 117, 20, 233, 54, 1, 61, 183, 148, 203, 44, 234, 75, 185, 32, 104, 239, 15, 213, 239, 85, 163, 50, 25, 64, 147, 91, 120])
+pp-gpu-node: entering main pump loop
+iroh driver: received 1 message(s)
+iroh driver: received 1 message(s)
+pp-gpu-node: worker process started
+iroh driver: received 1 message(s)
+pp-smoke-run: pp-entry -> ActorAddress([102, 84, 124, 231, 194, 117, 20, 233, 54, 1, 61, 183, 148, 203, 44, 234, 75, 185, 32, 104, 239, 15, 213, 239, 85, 163, 50, 25, 64, 147, 91, 120]) on cabf12db9b4d99a2a04c84ffb74ed2d055b6f226116cff1c3b733a8d5d98b00a
+pp-smoke-run: sending InferenceRequest (prompt="Say hello", max_tokens=64)
+iroh driver: accepted non-SWIM connection from 5bd301d0 (ALPN: swactor/actor/1)
+pp-gpu-node: worker ready (pid: Some(21))
+pp-gpu-node: resolving pp-stage-0...
+pp-smoke-run: stage 1 child pid 7558 exited prematurely with ExitStatus(unix_wait_status(35072))
+iroh driver: received 1 message(s)
+pp-smoke-run: stopped stage 0 child pid 7518
+pp-smoke-run: stopped stage 1 child pid 7558
+pp-smoke-run: stopped stage 2 child pid 7597

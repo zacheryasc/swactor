@@ -26,6 +26,54 @@ pub struct InstanceInfo {
     pub contract_id: u64,
 }
 
+/// Diagnostics env-var bundle forwarded to rented stage containers.
+///
+/// `pp-gpu-node::diag::install_from_env` reads `SWACTOR_DIAG_*` on boot
+/// inside each container to decide whether to enable the aggregator and
+/// where to ship to. The orchestrator-side caller of [`lease_chain`]
+/// builds this from its own process env (typically the same vars the
+/// orchestrator itself read), and `create_instance` injects them — plus
+/// the per-stage `STAGE_INDEX` / `STAGE_COUNT` / `NODE_ROLE=stage` — into
+/// each container's env on creation. Leaving `collector_url` `None`
+/// disables the whole forwarding path; rented containers then start with
+/// no `SWACTOR_DIAG_*` vars and run as if diagnostics were off.
+#[derive(Debug, Clone, Default)]
+pub struct DiagEnv {
+    pub collector_url: Option<String>,
+    pub run_id: Option<String>,
+    pub udp_echo: Option<String>,
+    pub iroh_relay_url: Option<String>,
+}
+
+impl DiagEnv {
+    /// Read the standard `SWACTOR_DIAG_*` vars from the current process
+    /// env. Returns an instance with all fields `None` when nothing is
+    /// set — callers can still pass it and `create_instance` will skip
+    /// the injection.
+    pub fn from_process_env() -> Self {
+        fn nonempty(v: &str) -> Option<String> {
+            std::env::var(v)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        }
+        Self {
+            collector_url: nonempty("SWACTOR_DIAG_COLLECTOR_URL"),
+            run_id: nonempty("SWACTOR_DIAG_RUN_ID"),
+            udp_echo: nonempty("SWACTOR_DIAG_UDP_ECHO"),
+            iroh_relay_url: nonempty(crate::relay_config::ENV_IROH_RELAY_URL),
+        }
+    }
+
+    /// `true` when there is anything worth propagating into stage container
+    /// env. A custom iroh relay alone (no collector URL) is enough — that
+    /// path is what makes the cluster come up; collector-only is the
+    /// observability path.
+    pub fn is_enabled(&self) -> bool {
+        self.collector_url.is_some() || self.iroh_relay_url.is_some()
+    }
+}
+
 /// A vast.ai offer (GPU rental option) returned by [`find_offer`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Offer {
@@ -81,12 +129,19 @@ pub async fn find_offer(
     gpu_name: &str,
     exclude_ids: &[u64],
 ) -> Result<Offer, String> {
+    // Filter goals beyond "rentable, fast, verified":
+    //   - reliability2 >= 0.995 (>= 0.99 still surfaces hosts that recurrently
+    //     fail container init; tightening shrinks the candidate pool to
+    //     hosts with very few historical job failures).
+    //   - cuda_max_good >= 12.6 matches our CUDA-12.6 base image. Cheaper
+    //     offers without a modern host CUDA stack were the source of the
+    //     `unresolvable CDI devices` failures we saw earlier.
     let query = serde_json::json!({
         "gpu_name": {"eq": gpu_name},
         "rentable": {"eq": true},
         "rented": {"eq": false},
-        "reliability2": {"gte": 0.99},
-        "cuda_max_good": {"gte": 12.0},
+        "reliability2": {"gte": 0.995},
+        "cuda_max_good": {"gte": 12.6},
         "verified": {"eq": true},
         "direct_port_count": {"gte": 1},
         "inet_down": {"gte": 100.0},
@@ -125,15 +180,25 @@ pub async fn find_offer(
         })
         .collect();
 
-    let candidates: Vec<Offer> = filtered
+    let mut candidates: Vec<Offer> = filtered
         .into_iter()
         .filter(|o| !exclude_ids.contains(&o.id))
         .collect();
+    if candidates.is_empty() {
+        return Err("no offers available (after geo/exclusion filter)".to_string());
+    }
 
-    candidates
-        .into_iter()
-        .min_by(|a, b| a.dph_total.partial_cmp(&b.dph_total).unwrap())
-        .ok_or_else(|| "no offers available (after geo/exclusion filter)".to_string())
+    // Pick the median-priced offer rather than the cheapest. Cheap RTX 4090
+    // offers on vast.ai have been consistently failing CDI device injection
+    // at container start (per-instance dynamic CDI specs written too late
+    // or with mismatched shas — the reliability score does not reflect
+    // these container-runtime failures because they happen before the job
+    // starts running). The median strikes a balance: it skips the bottom
+    // tier of misconfigured hosts without paying for the most expensive
+    // ones in the candidate set.
+    candidates.sort_by(|a, b| a.dph_total.partial_cmp(&b.dph_total).unwrap());
+    let median_idx = candidates.len() / 2;
+    Ok(candidates.swap_remove(median_idx))
 }
 
 /// Poll vast.ai until the instance reaches `running`, then extract IP + port.
@@ -252,7 +317,10 @@ pub async fn fetch_logs(client: &Client, log_url: &str) -> Result<String, String
 ///
 /// `stage` and `num_stages` are forwarded as `STAGE` / `NUM_STAGES` so the
 /// worker can compute its layer range on boot. `seed_addr` is forwarded so
-/// the new node knows where to join the SWIM cluster.
+/// the new node knows where to join the SWIM cluster. When `diag_env` is
+/// `Some(..)` with a collector URL set, the corresponding `SWACTOR_DIAG_*`
+/// vars are also added so the rented container reports into the same
+/// diagnostics bundle as the orchestrator — see [`DiagEnv`].
 pub async fn create_instance(
     client: &Client,
     base_url: &str,
@@ -263,6 +331,7 @@ pub async fn create_instance(
     seed_addr: &str,
     seed_relay: Option<&str>,
     image: &str,
+    diag_env: Option<&DiagEnv>,
 ) -> Result<InstanceInfo, String> {
     let url = format!("{base_url}/api/v0/asks/{offer_id}/");
     let mut env = serde_json::json!({
@@ -272,6 +341,36 @@ pub async fn create_instance(
     });
     if let Some(relay) = seed_relay {
         env["SEED_RELAY"] = serde_json::Value::String(relay.to_string());
+    }
+    // Pass through select orchestrator-side env to every rented stage so a
+    // smoke run can flip e.g. stub mode or python interpreter without
+    // rebuilding the docker image. Whitelist (not pass-everything) keeps
+    // the container payload predictable.
+    for var in ["PP_WORKER_STUB", "PYTHON", "MODEL", "CUDA", "MAX_TOKENS"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                env[var] = serde_json::Value::String(v);
+            }
+        }
+    }
+    if let Some(diag) = diag_env {
+        if let Some(url) = diag.collector_url.as_deref() {
+            env["SWACTOR_DIAG_COLLECTOR_URL"] = serde_json::Value::String(url.to_string());
+            env["SWACTOR_DIAG_NODE_ROLE"] = serde_json::Value::String("stage".to_string());
+            env["SWACTOR_DIAG_STAGE_INDEX"] = serde_json::Value::String(stage.to_string());
+            env["SWACTOR_DIAG_STAGE_COUNT"] =
+                serde_json::Value::String(num_stages.to_string());
+            if let Some(run_id) = diag.run_id.as_deref() {
+                env["SWACTOR_DIAG_RUN_ID"] = serde_json::Value::String(run_id.to_string());
+            }
+            if let Some(echo) = diag.udp_echo.as_deref() {
+                env["SWACTOR_DIAG_UDP_ECHO"] = serde_json::Value::String(echo.to_string());
+            }
+        }
+        if let Some(relay_url) = diag.iroh_relay_url.as_deref() {
+            env[crate::relay_config::ENV_IROH_RELAY_URL] =
+                serde_json::Value::String(relay_url.to_string());
+        }
     }
     let body = serde_json::json!({
         "image": image,
@@ -351,6 +450,7 @@ pub async fn create_pipeline_instances(
     seed_addr: &str,
     seed_relay: Option<&str>,
     image: &str,
+    diag_env: Option<&DiagEnv>,
 ) -> Result<Vec<InstanceInfo>, String> {
     let num_stages = offer_ids.len() as u32;
     let mut created: Vec<InstanceInfo> = Vec::with_capacity(offer_ids.len());
@@ -367,6 +467,7 @@ pub async fn create_pipeline_instances(
             seed_addr,
             seed_relay,
             image,
+            diag_env,
         )
         .await
         {
@@ -397,4 +498,151 @@ pub async fn destroy_all_instances(
         results.push(destroy_instance(client, base_url, api_key, id).await);
     }
     results
+}
+
+/// Find `num_stages` distinct offers for the same GPU type. Each call to
+/// [`find_offer`] excludes every offer id returned by the previous calls,
+/// so the result is `num_stages` pairwise-distinct offers.
+///
+/// If fewer than `num_stages` matching offers exist, the call that runs
+/// out propagates the [`find_offer`] error to the caller (no rollback is
+/// needed — nothing was created).
+pub async fn find_offer_chain(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    gpu_name: &str,
+    num_stages: u32,
+) -> Result<Vec<Offer>, String> {
+    let mut chosen: Vec<Offer> = Vec::with_capacity(num_stages as usize);
+    for i in 0..num_stages {
+        let exclude: Vec<u64> = chosen.iter().map(|o| o.id).collect();
+        match find_offer(client, base_url, api_key, gpu_name, &exclude).await {
+            Ok(o) => chosen.push(o),
+            Err(e) => {
+                return Err(format!(
+                    "find_offer_chain: offer {}/{} for {gpu_name} not available: {e}",
+                    i + 1,
+                    num_stages,
+                ));
+            }
+        }
+    }
+    Ok(chosen)
+}
+
+/// Rent `num_stages` vast.ai instances and wait for each to reach
+/// `running`. Combines [`find_offer_chain`], [`create_pipeline_instances`]
+/// and [`wait_for_running`] into one all-or-nothing helper.
+///
+/// On any failure (no matching offers, partial creation, a contract that
+/// never reaches running), every instance that was created during this
+/// call is destroyed best-effort before the error returns. Destroy errors
+/// during rollback are swallowed — they would only mask the original
+/// failure the caller actually needs to see.
+pub async fn lease_chain(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    gpu_name: &str,
+    num_stages: u32,
+    seed_addr: &str,
+    seed_relay: Option<&str>,
+    image: &str,
+    poll_interval: Duration,
+    max_polls: u32,
+    diag_env: Option<&DiagEnv>,
+) -> Result<Vec<InstanceInfo>, String> {
+    // Find + create per stage, retrying the find when an offer is snatched
+    // between selection and creation. With tight reliability filters the
+    // candidate pool is small enough that the race window matters at
+    // N >= 3 — a single up-front `find_offer_chain` followed by a batch
+    // `create_pipeline_instances` was losing the third offer to other
+    // renters. Up to `max_create_attempts` per stage.
+    const MAX_CREATE_ATTEMPTS: u32 = 5;
+    let mut tried_offer_ids: Vec<u64> = Vec::new();
+    let mut created: Vec<InstanceInfo> = Vec::with_capacity(num_stages as usize);
+    for stage in 0..num_stages {
+        let mut last_err: Option<String> = None;
+        let mut info_opt: Option<InstanceInfo> = None;
+        for attempt in 1..=MAX_CREATE_ATTEMPTS {
+            let offer = match find_offer(
+                client,
+                base_url,
+                api_key,
+                gpu_name,
+                &tried_offer_ids,
+            )
+            .await
+            {
+                Ok(o) => o,
+                Err(e) => {
+                    last_err = Some(format!("find_offer for stage {stage}: {e}"));
+                    break;
+                }
+            };
+            tried_offer_ids.push(offer.id);
+            match create_instance(
+                client,
+                base_url,
+                api_key,
+                offer.id,
+                stage,
+                num_stages,
+                seed_addr,
+                seed_relay,
+                image,
+                diag_env,
+            )
+            .await
+            {
+                Ok(info) => {
+                    info_opt = Some(info);
+                    break;
+                }
+                Err(e) => {
+                    eprintln!(
+                        "lease_chain: stage {stage} create on offer {} failed (attempt {attempt}/{MAX_CREATE_ATTEMPTS}): {e}",
+                        offer.id,
+                    );
+                    last_err = Some(e);
+                    // Try the next-best offer; the loop excludes the
+                    // already-tried id via `tried_offer_ids`.
+                }
+            }
+        }
+        match info_opt {
+            Some(info) => created.push(info),
+            None => {
+                let ids: Vec<u64> = created.iter().map(|c| c.contract_id).collect();
+                let _ = destroy_all_instances(client, base_url, api_key, &ids).await;
+                return Err(format!(
+                    "lease_chain: stage {stage} could not be created after {MAX_CREATE_ATTEMPTS} attempts: {}",
+                    last_err.unwrap_or_default(),
+                ));
+            }
+        }
+    }
+
+    for info in &created {
+        if let Err(e) = wait_for_running(
+            client,
+            base_url,
+            api_key,
+            info.contract_id,
+            poll_interval,
+            max_polls,
+        )
+        .await
+        {
+            let ids: Vec<u64> = created.iter().map(|c| c.contract_id).collect();
+            let _ = destroy_all_instances(client, base_url, api_key, &ids).await;
+            return Err(format!(
+                "lease_chain: contract {} did not reach running: {e}",
+                info.contract_id,
+            ));
+        }
+    }
+
+    Ok(created)
 }

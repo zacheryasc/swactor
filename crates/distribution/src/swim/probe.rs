@@ -213,6 +213,13 @@ impl SwimProbe {
         &self.recent_targets
     }
 
+    /// Read-only access to the configured timeouts and fanouts. Used
+    /// by the diagnostics layer to capture protocol parameters into
+    /// tier-2 snapshots without having to thread them in separately.
+    pub fn config(&self) -> &SwimConfig {
+        &self.config
+    }
+
     fn next_sequence(&mut self) -> u64 {
         self.sequence += 1;
         self.sequence

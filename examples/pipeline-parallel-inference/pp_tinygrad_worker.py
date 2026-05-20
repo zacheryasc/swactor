@@ -27,7 +27,11 @@ The worker runs in one of two modes:
 
 Protocol — one JSON line in, one JSON line out.
 
-Stage-0 ops::
+Each op is restricted to the role that owns it (First = stage 0,
+Last = stage N-1, Middle = anything in between). Ops invoked on the
+wrong role return ``{"error": ...}`` and the worker keeps serving.
+
+First-stage ops (``STAGE == 0``)::
 
     -> {"op": "embed_and_forward", "request_id": <int>,
         "tokens": [<int>, ...], "position": <int>}
@@ -37,16 +41,20 @@ Stage-0 ops::
         "token_id": <int>, "position": <int>}
     <- {"request_id": <int>, "hidden_b64": "<base64>", "seq_len": 1}
 
-Final-stage op::
+    -> {"op": "tokenize", "request_id": <int>, "prompt": "<text>"}
+    <- {"request_id": <int>, "tokens": [<int>, ...]}
+
+Middle-stage op (``0 < STAGE < NUM_STAGES - 1``)::
+
+    -> {"op": "forward_range", "request_id": <int>,
+        "hidden_b64": "<base64>", "position": <int>, "seq_len": <int>}
+    <- {"request_id": <int>, "hidden_b64": "<base64>", "seq_len": <int>}
+
+Last-stage ops (``STAGE == NUM_STAGES - 1``)::
 
     -> {"op": "forward_and_sample", "request_id": <int>,
         "hidden_b64": "<base64>", "position": <int>, "seq_len": <int>}
     <- {"request_id": <int>, "token_id": <int>}
-
-Any-stage ops::
-
-    -> {"op": "tokenize", "request_id": <int>, "prompt": "<text>"}
-    <- {"request_id": <int>, "tokens": [<int>, ...]}
 
     -> {"op": "detokenize", "request_id": <int>, "tokens": [<int>, ...]}
     <- {"request_id": <int>, "text": "<text>"}
@@ -83,10 +91,13 @@ def compute_layer_range(stage: int, num_stages: int, total_blocks: int) -> tuple
     """Return the half-open ``[start, end)`` block range owned by ``stage``.
 
     The split is ``total_blocks // num_stages`` per stage; the final stage
-    absorbs any remainder. Raises ``ValueError`` on out-of-range inputs.
+    absorbs any remainder. ``num_stages`` must be ``>= 2`` — the example
+    does not serve single-node configurations (see
+    ``examples/single-gpu-inference`` for that). Raises ``ValueError``
+    on out-of-range inputs.
     """
-    if num_stages < 1:
-        raise ValueError(f"num_stages must be >= 1, got {num_stages}")
+    if num_stages < 2:
+        raise ValueError(f"num_stages must be >= 2, got {num_stages}")
     if not (0 <= stage < num_stages):
         raise ValueError(f"stage {stage} out of range [0, {num_stages})")
     if total_blocks < num_stages:
@@ -129,6 +140,26 @@ def _stub_hidden_bytes(tokens: Sequence[int], position: int) -> bytes:
         + b",".join(str(int(t)).encode() for t in tokens)
     ).digest()
     n_bytes = len(tokens) * STUB_HIDDEN_DIM * BYTES_PER_ELEM
+    out = bytearray()
+    counter = 0
+    while len(out) < n_bytes:
+        out.extend(hashlib.sha256(seed + counter.to_bytes(8, "little")).digest())
+        counter += 1
+    return bytes(out[:n_bytes])
+
+
+def _stub_forward_range_bytes(hidden: bytes, position: int, seq_len: int) -> bytes:
+    """Deterministic pseudo-bf16 bytes for a middle stage's ``forward_range``.
+
+    Output length is ``seq_len * STUB_HIDDEN_DIM * 2`` (matches the input
+    hidden's expected length). Same ``(hidden, position, seq_len)`` always
+    produce the same bytes; differing inputs almost always differ. Used
+    only in stub mode.
+    """
+    n_bytes = seq_len * STUB_HIDDEN_DIM * BYTES_PER_ELEM
+    seed = hashlib.sha256(
+        b"pp-stub-fr:" + position.to_bytes(8, "little", signed=False) + hidden
+    ).digest()
     out = bytearray()
     counter = 0
     while len(out) < n_bytes:
@@ -259,6 +290,36 @@ class _RealModelState:
         arr = x.numpy()  # shape (1, seq_len, hidden_dim), dtype float16
         return arr.tobytes(), int(arr.shape[1])
 
+    def forward_range(
+        self, hidden_bytes: bytes, position: int, seq_len: int
+    ) -> tuple[bytes, int]:
+        """Run this middle stage's block range over an incoming hidden state.
+
+        Input is a flat float16 buffer of shape ``(1, seq_len, hidden_dim)``;
+        output is the same shape after applying ``model.blk[start:end]``
+        with KV-cache ``position``. Returns ``(bytes, out_seq_len)``.
+        """
+        np = self._np
+        Tensor = self._Tensor
+        expected = seq_len * self.hidden_dim * BYTES_PER_ELEM
+        if len(hidden_bytes) != expected:
+            raise ValueError(
+                f"hidden length {len(hidden_bytes)} does not match "
+                f"seq_len*hidden_dim*2 ({seq_len}*{self.hidden_dim}*{BYTES_PER_ELEM} "
+                f"= {expected})"
+            )
+        arr = (
+            np.frombuffer(hidden_bytes, dtype=np.float16)
+            .reshape((1, seq_len, self.hidden_dim))
+            .copy()
+        )
+        x = Tensor(arr)
+        for block in self.model.blk[self.start : self.end]:
+            x = block(x, position)
+        x = x.cast("half").realize()
+        out = x.numpy()
+        return out.tobytes(), int(out.shape[1])
+
     def forward_and_sample(
         self, hidden_bytes: bytes, position: int, seq_len: int
     ) -> int:
@@ -354,10 +415,18 @@ def _handle_request(
     op = req["op"]
     is_first = stage == 0
     is_last = stage == num_stages - 1
+    is_middle = not is_first and not is_last
 
-    # Tokenize / detokenize are not stage-restricted: every worker loads
-    # the tokenizer in real mode, and in stub mode the operation is pure.
+    # Tokenize lives on the first stage; detokenize on the last. Routing
+    # both through their natural roles avoids ambiguity when an N-stage
+    # cluster has a tokenizer-bearing worker on every node (real mode).
     if op == "tokenize":
+        if not is_first:
+            return {
+                "request_id": rid,
+                "error": f"op {op!r} is only valid on stage 0 "
+                f"(this worker is stage {stage} of {num_stages})",
+            }
         prompt = req.get("prompt")
         if not isinstance(prompt, str):
             return {"request_id": rid, "error": "'prompt' must be a string"}
@@ -370,6 +439,12 @@ def _handle_request(
         return {"request_id": rid, "tokens": tokens}
 
     if op == "detokenize":
+        if not is_last:
+            return {
+                "request_id": rid,
+                "error": f"op {op!r} is only valid on the final stage "
+                f"(this worker is stage {stage} of {num_stages})",
+            }
         tokens = req.get("tokens")
         err = _validate_tokens_list(tokens)
         if err is not None:
@@ -425,13 +500,55 @@ def _handle_request(
             "seq_len": out_seq_len,
         }
 
+    if op == "forward_range":
+        if not is_middle:
+            return {
+                "request_id": rid,
+                "error": f"op {op!r} is only valid on a middle stage "
+                f"(this worker is stage {stage} of {num_stages})",
+            }
+        hidden_b64 = req.get("hidden_b64")
+        position = req.get("position")
+        seq_len = req.get("seq_len")
+        if not isinstance(hidden_b64, str):
+            return {"request_id": rid, "error": "'hidden_b64' must be a string"}
+        if not _is_nonneg_int(position):
+            return {"request_id": rid, "error": "'position' must be a non-negative int"}
+        if not _is_nonneg_int(seq_len) or seq_len == 0:
+            return {"request_id": rid, "error": "'seq_len' must be a positive int"}
+        try:
+            hidden = base64.b64decode(hidden_b64, validate=True)
+        except (base64.binascii.Error, ValueError) as e:
+            return {"request_id": rid, "error": f"invalid base64 in hidden_b64: {e}"}
+        hidden_dim = real_state.hidden_dim if real_state is not None else STUB_HIDDEN_DIM
+        expected = seq_len * hidden_dim * BYTES_PER_ELEM
+        if len(hidden) != expected:
+            return {
+                "request_id": rid,
+                "error": (
+                    f"hidden length {len(hidden)} does not match "
+                    f"seq_len*hidden_dim*2 ({seq_len}*{hidden_dim}*{BYTES_PER_ELEM} "
+                    f"= {expected})"
+                ),
+            }
+        if real_state is not None:
+            hidden_out, out_seq_len = real_state.forward_range(hidden, position, seq_len)
+        else:
+            hidden_out = _stub_forward_range_bytes(hidden, position, seq_len)
+            out_seq_len = seq_len
+        return {
+            "request_id": rid,
+            "hidden_b64": base64.b64encode(hidden_out).decode("ascii"),
+            "seq_len": out_seq_len,
+        }
+
     if op == "generate_full":
         # Reference path used by the sliced-vs-full equivalence tests. Always
         # runs over the full block range, so the worker's STAGE/NUM_STAGES
-        # are ignored here — typically the reference worker is spawned with
-        # STAGE=0, NUM_STAGES=1 (range = [0, total_blocks)) but a 2-stage
-        # worker would behave identically since the op iterates ``model.blk``
-        # directly.
+        # are ignored here — any ``NUM_STAGES >= 2`` works since the op
+        # iterates ``model.blk`` directly. The example does not boot at
+        # ``NUM_STAGES=1`` (single-node configurations belong to
+        # ``examples/single-gpu-inference``).
         if real_state is None:
             return {
                 "request_id": rid,
@@ -524,8 +641,11 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stage = _parse_env_int("STAGE")
     num_stages = _parse_env_int("NUM_STAGES")
-    if num_stages < 1:
-        _die(f"NUM_STAGES must be >= 1, got {num_stages}")
+    if num_stages < 2:
+        _die(
+            f"NUM_STAGES must be >= 2 (single-node configurations are not "
+            f"served by this example), got {num_stages}"
+        )
     if not (0 <= stage < num_stages):
         _die(f"STAGE {stage} out of range [0, {num_stages})")
 

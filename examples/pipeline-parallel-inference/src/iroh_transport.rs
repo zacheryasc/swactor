@@ -54,15 +54,49 @@ impl Transport for IrohActorTransport {
         let target = self.target_addr.clone();
         let cached = self.conn.lock().unwrap().clone();
 
+        // The actor transport shares a fate with the SWIM driver: on a
+        // canary-relay WAN, a single iroh dial occasionally takes
+        // multiple seconds and is the difference between a token round-
+        // tripping or the pipeline silently stalling. Retry the dial a
+        // few times before giving up; the cached connection short-
+        // circuits when it's still open.
         let conn = self.handle.block_on(async move {
             if let Some(c) = cached {
                 if c.close_reason().is_none() {
-                    return Ok(c);
+                    return Ok::<_, Error>(c);
                 }
             }
-            ep.connect(target, ACTOR_ALPN)
-                .await
-                .map_err(|e| Error::from(format!("iroh connect: {e}")))
+            const ATTEMPTS: u32 = 3;
+            const PER_ATTEMPT: Duration = Duration::from_secs(10);
+            let mut last_err: Option<Error> = None;
+            for attempt in 1..=ATTEMPTS {
+                let target = target.clone();
+                match tokio::time::timeout(PER_ATTEMPT, ep.connect(target, ACTOR_ALPN)).await {
+                    Ok(Ok(c)) => return Ok(c),
+                    Ok(Err(e)) => {
+                        if attempt < ATTEMPTS {
+                            eprintln!(
+                                "iroh actor transport: connect attempt {attempt}/{ATTEMPTS} failed: {e}"
+                            );
+                        }
+                        last_err = Some(Error::from(format!("iroh connect: {e}")));
+                    }
+                    Err(_) => {
+                        if attempt < ATTEMPTS {
+                            eprintln!(
+                                "iroh actor transport: connect attempt {attempt}/{ATTEMPTS} timed out"
+                            );
+                        }
+                        last_err = Some(Error::from("iroh connect: timeout"));
+                    }
+                }
+                if attempt == 1 {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                } else if attempt == 2 {
+                    tokio::time::sleep(Duration::from_millis(600)).await;
+                }
+            }
+            Err(last_err.unwrap_or_else(|| Error::from("iroh connect: failed")))
         })?;
 
         *self.conn.lock().unwrap() = Some(conn.clone());

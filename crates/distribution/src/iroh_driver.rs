@@ -17,6 +17,13 @@ use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
 use tokio::runtime::Runtime as TokioRuntime;
 
 use crate::crypto::Keypair;
+use crate::diagnostics::{
+    noop_emitter, Aggregator, ConnectionCacheTracker, DialOutcome as DiagDialOutcome, DynEmitter,
+    Event as DiagEvent, EventEmitter, IrohIntrospect, IrohIntrospector, Sink as DiagSink,
+    SwimIntrospector,
+};
+use crate::diagnostics::iroh_introspect::IntrospectConfig;
+use crate::diagnostics::wall_ms_now;
 use crate::messages::*;
 use crate::node::{DistributedNode, DistributedNodeConfig};
 use crate::peer_auth::PeerAllowList;
@@ -178,6 +185,21 @@ pub struct IrohDriver {
     relay_server: Option<iroh_relay::server::Server>,
     /// URL of the embedded relay server (if started).
     relay_url: Option<String>,
+    /// Diagnostics emitter. Defaults to no-op so callers that don't
+    /// opt in pay no overhead. Set via [`Self::set_diagnostics`].
+    diagnostics: DynEmitter,
+    /// Per-peer connection-cache lifecycle aggregate (T2.4). Owns
+    /// `generation`, `created_at_ms`, last successful send/failure
+    /// timestamps. Shared with the iroh introspector so its tier-2
+    /// snapshots include the same numbers the per-touch events
+    /// already carry. Always allocated; the cost is one
+    /// `Arc<Mutex<HashMap>>` per driver.
+    connection_cache_tracker: Arc<ConnectionCacheTracker>,
+    /// Tier-2 iroh introspector. Owns the polling task that scrapes
+    /// `RemoteInfo` and `iroh-metrics` into the snapshot body, plus
+    /// the home-relay watcher that emits `RelayChanged`. Installed
+    /// via [`Self::install_iroh_introspect`].
+    iroh_introspect: Option<Arc<IrohIntrospect>>,
 }
 
 impl IrohDriver {
@@ -306,7 +328,82 @@ impl IrohDriver {
             #[cfg(feature = "relay")]
             relay_server,
             relay_url,
+            diagnostics: noop_emitter(),
+            connection_cache_tracker: Arc::new(ConnectionCacheTracker::new()),
+            iroh_introspect: None,
         })
+    }
+
+    /// Install a diagnostics emitter so dial attempts, message I/O, and
+    /// connection-cache lifecycle surface as structured events. Also
+    /// forwards to the inner [`DistributedNode`] so SWIM transitions
+    /// are captured under the same emitter.
+    pub fn set_diagnostics(&mut self, emitter: DynEmitter) {
+        self.node.set_diagnostics(emitter.clone());
+        self.diagnostics = emitter;
+    }
+
+    /// Install diagnostics with full tier-2 iroh introspection.
+    ///
+    /// Equivalent to [`Self::set_diagnostics`] plus spinning up an
+    /// [`IrohIntrospect`] bound to this driver's endpoint, registering
+    /// it on the aggregator (so tier-2 fields land in every snapshot),
+    /// and spawning the home-relay watcher that emits `RelayChanged`.
+    ///
+    /// Use this in production / e2e wiring. The plain
+    /// [`Self::set_diagnostics`] is enough for callers that only want
+    /// tier-1 event emission.
+    pub fn install_diagnostics<S>(&mut self, aggregator: Arc<Aggregator<S>>)
+    where
+        S: DiagSink + Send + Sync + 'static,
+    {
+        self.install_diagnostics_with_config(aggregator, IntrospectConfig::default());
+    }
+
+    /// Variant of [`Self::install_diagnostics`] taking an explicit
+    /// scrape-interval config. Useful in tests that want to dial down
+    /// the polling cadence without `sleep`-ing.
+    pub fn install_diagnostics_with_config<S>(
+        &mut self,
+        aggregator: Arc<Aggregator<S>>,
+        config: IntrospectConfig,
+    ) where
+        S: DiagSink + Send + Sync + 'static,
+    {
+        self.set_diagnostics(aggregator.clone());
+        let intro = Arc::new(IrohIntrospect::start(
+            self.endpoint.clone(),
+            self.rt.handle().clone(),
+            self.diagnostics.clone(),
+            config,
+            Arc::clone(&self.connection_cache_tracker),
+        ));
+        aggregator.set_iroh_introspector(intro.clone() as Arc<dyn IrohIntrospector>);
+        self.iroh_introspect = Some(intro);
+        // Tier-2 SWIM scrape: install the introspector on the SWIM
+        // node and register the same Arc with the aggregator so every
+        // snapshot also includes the SWIM block.
+        let swim_intro = self.node.install_swim_introspect();
+        aggregator.set_swim_introspector(swim_intro as Arc<dyn SwimIntrospector>);
+    }
+
+    /// Register a peer with the iroh introspector (if installed) so
+    /// its tier-2 `RemoteInfo` is included in future snapshots. No-op
+    /// when no introspector is wired.
+    pub fn register_diagnostics_peer(&self, node_id: NodeId) {
+        if let Some(intro) = &self.iroh_introspect {
+            intro.register_peer(node_id);
+        }
+    }
+
+    /// Force the introspector to refresh its tier-2 cache right now.
+    /// Used by tests so an assertion against snapshot contents need
+    /// not wait for the next polling tick. No-op when no introspector
+    /// is wired.
+    pub fn force_iroh_introspect_refresh(&self) {
+        if let Some(intro) = &self.iroh_introspect {
+            intro.force_refresh_blocking(&self.endpoint, self.rt.handle());
+        }
     }
 
     /// Get a handle to the tokio runtime owned by this driver.
@@ -432,6 +529,24 @@ impl IrohDriver {
             let seed_node_id = NodeId(*seed_addr.id.as_bytes());
             if let Some(relay) = seed_addr.relay_urls().next() {
                 self.peer_relay_urls.insert(seed_node_id, relay.clone());
+                // We just learned a relay URL from a join seed. Iroh
+                // doesn't have a separate add_node_addr() in 0.96 —
+                // the equivalent is feeding the addr into endpoint
+                // .connect(), which spawn_join_request does below.
+                // Emit the NodeMapUpdate here so the bundle reader
+                // sees "learned from join seed" even if the connect
+                // itself never fires (e.g. shutdown beats it).
+                self.diagnostics.emit_event(DiagEvent::NodeMapUpdate {
+                    peer: seed_node_id,
+                    from_source: "join_seed".into(),
+                    accepted: true,
+                });
+            } else if seed_addr.ip_addrs().next().is_some() {
+                self.diagnostics.emit_event(DiagEvent::NodeMapUpdate {
+                    peer: seed_node_id,
+                    from_source: "join_seed_direct".into(),
+                    accepted: true,
+                });
             }
             // Clear any Dead entry so the JoinResponse can re-establish it.
             // Without this, SWIM merge semantics reject Alive at the same
@@ -471,6 +586,8 @@ impl IrohDriver {
         let seed_node_id = NodeId(*seed_addr.id.as_bytes());
         let pending = Arc::clone(&self.pending_joins);
         let statuses = Arc::clone(&self.join_statuses);
+        let diagnostics = self.diagnostics.clone();
+        self.register_diagnostics_peer(seed_node_id);
 
         let has_relay = seed_addr.relay_urls().next().is_some();
         let direct_addr_count = seed_addr.ip_addrs().count();
@@ -480,6 +597,7 @@ impl IrohDriver {
             let mut delay = Duration::from_secs(2);
             let max_delay = Duration::from_secs(30);
             let max_attempts: u32 = 5;
+            let per_attempt_timeout = Duration::from_secs(10);
 
             for attempt in 1..=max_attempts {
                 if attempt > 1 {
@@ -500,13 +618,60 @@ impl IrohDriver {
                 }
 
                 eprintln!("iroh driver: join attempt {attempt}/{max_attempts} connecting to {}...", seed_addr.id);
+                diagnostics.emit_event(DiagEvent::DialStarted {
+                    peer: seed_node_id,
+                    attempt,
+                    timeout_ms: per_attempt_timeout.as_millis() as u64,
+                });
+                // Bare-seed dial: iroh has only a public key (no relay
+                // and no direct addresses), so the connect call runs
+                // iroh's discovery layer. Wrap the call in a
+                // `discovery_resolve_*` event pair so the bundle
+                // reader can tell the discovery layer was even
+                // exercised (T2.7).
+                let runs_discovery = !has_relay && !has_direct;
+                let peer_hex = swactor::transport::hex_encode(&seed_node_id.0);
+                if runs_discovery {
+                    diagnostics.emit_event(DiagEvent::Custom {
+                        kind: "discovery_resolve_started".into(),
+                        fields: serde_json::json!({
+                            "peer_node_id_hex": peer_hex,
+                            "attempt": attempt,
+                            "site": "join",
+                        }),
+                    });
+                }
+                let attempt_start = Instant::now();
                 let connect_result = tokio::time::timeout(
-                    Duration::from_secs(10),
+                    per_attempt_timeout,
                     endpoint.connect(seed_addr.clone(), ALPN),
                 ).await;
 
+                let duration_ms = attempt_start.elapsed().as_millis() as u64;
+                if runs_discovery {
+                    let outcome_str = match &connect_result {
+                        Ok(Ok(_)) => "resolved",
+                        _ => "failed",
+                    };
+                    diagnostics.emit_event(DiagEvent::Custom {
+                        kind: "discovery_resolve_completed".into(),
+                        fields: serde_json::json!({
+                            "peer_node_id_hex": peer_hex,
+                            "attempt": attempt,
+                            "duration_ms": duration_ms,
+                            "outcome": outcome_str,
+                            "site": "join",
+                        }),
+                    });
+                }
                 match connect_result {
                     Ok(Ok(conn)) => {
+                        diagnostics.emit_event(DiagEvent::DialOutcome {
+                            peer: seed_node_id,
+                            attempt,
+                            outcome: DiagDialOutcome::Success,
+                            duration_ms,
+                        });
                         // Update status: Sending
                         {
                             let mut map = statuses.lock().unwrap();
@@ -534,6 +699,11 @@ impl IrohDriver {
                         match send_result {
                             Ok(()) => {
                                 eprintln!("iroh driver: join attempt {attempt}/{max_attempts} sent to {}", seed_addr.id);
+                                diagnostics.emit_event(DiagEvent::MessageSent {
+                                    peer: seed_node_id,
+                                    kind: tag.to_string(),
+                                    size: payload.len() as u32,
+                                });
                                 // Update status: Sent
                                 {
                                     let mut map = statuses.lock().unwrap();
@@ -556,6 +726,11 @@ impl IrohDriver {
                                     "iroh driver: join attempt {attempt}/{max_attempts} send error to {}: {e}",
                                     seed_addr.id
                                 );
+                                diagnostics.emit_event(DiagEvent::Error {
+                                    component: "iroh_driver".into(),
+                                    message: format!("join send error: {e}"),
+                                    peer: Some(seed_node_id),
+                                });
                                 continue;
                             }
                         }
@@ -565,6 +740,13 @@ impl IrohDriver {
                             "iroh driver: join attempt {attempt}/{max_attempts} connect error to {}: {e}",
                             seed_addr.id
                         );
+                        let outcome = classify_dial_error_str(&e.to_string());
+                        diagnostics.emit_event(DiagEvent::DialOutcome {
+                            peer: seed_node_id,
+                            attempt,
+                            outcome,
+                            duration_ms,
+                        });
                         continue;
                     }
                     Err(_) => {
@@ -572,6 +754,12 @@ impl IrohDriver {
                             "iroh driver: join attempt {attempt}/{max_attempts} connect timeout to {}",
                             seed_addr.id
                         );
+                        diagnostics.emit_event(DiagEvent::DialOutcome {
+                            peer: seed_node_id,
+                            attempt,
+                            outcome: DiagDialOutcome::Timeout,
+                            duration_ms,
+                        });
                         continue;
                     }
                 }
@@ -606,6 +794,8 @@ impl IrohDriver {
                 eprintln!("iroh driver: collecting {} pending join connection(s)", pending.len());
             }
             for result in pending.drain(..) {
+                self.connection_cache_tracker
+                    .note_dial_success(result.node_id, wall_ms_now());
                 self.connections.insert(result.node_id, result.conn);
             }
         }
@@ -615,6 +805,8 @@ impl IrohDriver {
         });
         // Cache connections accepted from remote peers (replace stale ones)
         for (node_id, conn) in new_conns {
+            self.connection_cache_tracker
+                .note_dial_success(node_id, wall_ms_now());
             self.connections.insert(node_id, conn);
         }
         for (tag, payload, from_key) in incoming {
@@ -631,7 +823,13 @@ impl IrohDriver {
         for action in actions {
             if let Err(e) = self.send_action(action) {
                 eprintln!("iroh driver: send error: {e}");
-                if let Some(target) = action_target(action) {
+                let target = action_target(action);
+                self.diagnostics.emit_event(DiagEvent::Error {
+                    component: "iroh_driver".into(),
+                    message: format!("send error: {e}"),
+                    peer: target,
+                });
+                if let Some(target) = target {
                     if !failure_targets.contains(&target) {
                         failure_targets.push(target);
                     }
@@ -716,6 +914,7 @@ impl IrohDriver {
         let tag = M::type_tag();
         let payload = serde_json::to_vec(msg)?;
         let target_key = PublicKey::from_bytes(&to.0)?;
+        let payload_size = payload.len() as u32;
 
         let conn = self.get_or_connect(*to, target_key)?;
 
@@ -726,9 +925,19 @@ impl IrohDriver {
             Ok::<_, Box<dyn std::error::Error>>(())
         });
 
-        if let Err(_) = result {
+        if let Err(e) = result {
             // Connection may be stale, remove and retry once
             self.connections.remove(to);
+            let generation = self.connection_cache_tracker.generation_for(*to);
+            let reason = format!("send-failed: {e}");
+            self.connection_cache_tracker
+                .note_failure(*to, wall_ms_now(), &reason);
+            self.diagnostics
+                .emit_event(DiagEvent::ConnectionCacheInvalidated {
+                    peer: *to,
+                    generation,
+                    reason: "send-failed".into(),
+                });
             let conn = self.get_or_connect(*to, target_key)?;
             self.rt.block_on(async {
                 let mut send = conn.open_uni().await?;
@@ -738,6 +947,14 @@ impl IrohDriver {
             })?;
         }
 
+        self.connection_cache_tracker
+            .note_send_success(*to, wall_ms_now());
+        self.diagnostics.emit_event(DiagEvent::MessageSent {
+            peer: *to,
+            kind: tag.to_string(),
+            size: payload_size,
+        });
+
         Ok(())
     }
 
@@ -746,8 +963,14 @@ impl IrohDriver {
         node_id: NodeId,
         key: PublicKey,
     ) -> Result<Connection, Box<dyn std::error::Error>> {
+        self.register_diagnostics_peer(node_id);
         // Defense in depth: check peer auth before connecting
         if !self.is_peer_allowed(&node_id) {
+            self.diagnostics.emit_event(DiagEvent::Error {
+                component: "iroh_driver".into(),
+                message: "peer not in allow-list".into(),
+                peer: Some(node_id),
+            });
             return Err(format!(
                 "peer {} not in allow-list",
                 swactor::transport::hex_encode(&node_id.0[..4])
@@ -758,41 +981,185 @@ impl IrohDriver {
         // Check for cached connection that's still open
         if let Some(conn) = self.connections.get(&node_id) {
             if conn.close_reason().is_none() {
+                let generation = self.connection_cache_tracker.generation_for(node_id);
+                self.diagnostics.emit_event(DiagEvent::ConnectionCacheHit {
+                    peer: node_id,
+                    generation,
+                });
                 return Ok(conn.clone());
             }
             // Connection closed, remove it
             self.connections.remove(&node_id);
+            let generation = self.connection_cache_tracker.generation_for(node_id);
+            self.connection_cache_tracker.note_failure(
+                node_id,
+                wall_ms_now(),
+                "connection-closed",
+            );
+            self.diagnostics
+                .emit_event(DiagEvent::ConnectionCacheInvalidated {
+                    peer: node_id,
+                    generation,
+                    reason: "connection-closed".into(),
+                });
         }
+        // We're about to dial. Whether we had a stale entry above or
+        // never had one, this is a miss from the lookup's perspective.
+        self.diagnostics
+            .emit_event(DiagEvent::ConnectionCacheMiss { peer: node_id });
 
         // Resolve relay URL: explicit cache → SWIM metadata gossip → own home relay
-        let relay = self.peer_relay_urls.get(&node_id).cloned()
-            .or_else(|| {
-                self.node
-                    .relay_url(&node_id)
-                    .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
-            })
-            .or_else(|| self.endpoint.addr().relay_urls().next().cloned());
-
-        let endpoint = self.endpoint.clone();
-        let connect_timeout = Duration::from_secs(2);
-        let conn = if let Some(relay) = relay {
-            let addr = EndpointAddr::new(key).with_relay_url(relay);
-            self.rt.block_on(async {
-                match tokio::time::timeout(connect_timeout, endpoint.connect(addr, ALPN)).await {
-                    Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) }),
-                    Err(_) => Err("connect timeout".into()),
-                }
-            })?
+        let (relay, relay_source) = if let Some(r) = self.peer_relay_urls.get(&node_id).cloned() {
+            (Some(r), "explicit_relay_cache")
+        } else if let Some(r) = self
+            .node
+            .relay_url(&node_id)
+            .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
+        {
+            (Some(r), "swim_metadata")
+        } else if let Some(r) = self.endpoint.addr().relay_urls().next().cloned() {
+            (Some(r), "home_relay_fallback")
         } else {
-            self.rt.block_on(async {
-                match tokio::time::timeout(connect_timeout, endpoint.connect(key, ALPN)).await {
-                    Ok(result) => result.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) }),
-                    Err(_) => Err("connect timeout".into()),
-                }
-            })?
+            (None, "none")
         };
 
+        // Emit NodeMapUpdate whenever we are about to feed iroh a peer
+        // address (relay URL). The bare-public-key path below is *not*
+        // an addr-injection — it just asks iroh to look up the peer.
+        if relay.is_some() {
+            self.diagnostics.emit_event(DiagEvent::NodeMapUpdate {
+                peer: node_id,
+                from_source: relay_source.to_string(),
+                accepted: true,
+            });
+        }
+
+        let endpoint = self.endpoint.clone();
+        // SWIM probes used a 2s connect-timeout with no in-call retry. On a
+        // WAN mesh where the home-relay path adds 100-500 ms latency and
+        // packets are occasionally dropped, that was too tight: a single
+        // slow handshake marked the peer suspect, then dead. Bumping the
+        // per-attempt budget and retrying inside the dial keeps SWIM
+        // convergence stable across the canary-relay endpoints that
+        // iroh 0.96 routes to by default.
+        const ATTEMPTS: u32 = 3;
+        let per_attempt_timeout = Duration::from_secs(10);
+        let addr_for_dial = relay.as_ref().map(|r| {
+            EndpointAddr::new(key).with_relay_url(r.clone())
+        });
+        let mut last_err: Option<Box<dyn std::error::Error>> = None;
+        let mut conn_opt: Option<Connection> = None;
+        let timeout_ms = per_attempt_timeout.as_millis() as u64;
+        let peer_hex = swactor::transport::hex_encode(&node_id.0);
+        for attempt in 1..=ATTEMPTS {
+            self.diagnostics.emit_event(DiagEvent::DialStarted {
+                peer: node_id,
+                attempt,
+                timeout_ms,
+            });
+            // Bare-key dial: iroh has only the public key and must
+            // run its discovery layer to find an address. Emit a
+            // `discovery_resolve_*` pair around the call so the
+            // bundle reader can distinguish "discovery never started"
+            // from "discovery started but never resolved" (T2.7).
+            let bare_key_dial = addr_for_dial.is_none();
+            if bare_key_dial {
+                self.diagnostics.emit_event(DiagEvent::Custom {
+                    kind: "discovery_resolve_started".into(),
+                    fields: serde_json::json!({
+                        "peer_node_id_hex": peer_hex,
+                        "attempt": attempt,
+                    }),
+                });
+            }
+            let attempt_start = Instant::now();
+            let addr_clone = addr_for_dial.clone();
+            let endpoint = endpoint.clone();
+            let dial: Result<Connection, Box<dyn std::error::Error>> =
+                self.rt.block_on(async move {
+                    let result = match addr_clone {
+                        Some(a) => {
+                            tokio::time::timeout(
+                                per_attempt_timeout,
+                                endpoint.connect(a, ALPN),
+                            )
+                            .await
+                        }
+                        None => {
+                            tokio::time::timeout(
+                                per_attempt_timeout,
+                                endpoint.connect(key, ALPN),
+                            )
+                            .await
+                        }
+                    };
+                    match result {
+                        Ok(r) => r.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) }),
+                        Err(_) => Err("connect timeout".into()),
+                    }
+                });
+            let duration_ms = attempt_start.elapsed().as_millis() as u64;
+            if bare_key_dial {
+                let outcome_str = match &dial {
+                    Ok(_) => "resolved",
+                    Err(_) => "failed",
+                };
+                self.diagnostics.emit_event(DiagEvent::Custom {
+                    kind: "discovery_resolve_completed".into(),
+                    fields: serde_json::json!({
+                        "peer_node_id_hex": peer_hex,
+                        "attempt": attempt,
+                        "duration_ms": duration_ms,
+                        "outcome": outcome_str,
+                    }),
+                });
+            }
+            match dial {
+                Ok(c) => {
+                    self.diagnostics.emit_event(DiagEvent::DialOutcome {
+                        peer: node_id,
+                        attempt,
+                        outcome: DiagDialOutcome::Success,
+                        duration_ms,
+                    });
+                    conn_opt = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    let outcome = classify_dial_error(&e);
+                    self.diagnostics.emit_event(DiagEvent::DialOutcome {
+                        peer: node_id,
+                        attempt,
+                        outcome,
+                        duration_ms,
+                    });
+                    if attempt < ATTEMPTS {
+                        eprintln!(
+                            "iroh driver: connect attempt {attempt}/{ATTEMPTS} to {} failed: {e}",
+                            swactor::transport::hex_encode(&node_id.0[..4]),
+                        );
+                    }
+                    last_err = Some(e);
+                    // Short backoff so a transient relay-side hiccup has
+                    // time to recover before the next attempt. Linear
+                    // 0/200/600 ms across 3 attempts.
+                    if attempt == 1 {
+                        std::thread::sleep(Duration::from_millis(200));
+                    } else if attempt == 2 {
+                        std::thread::sleep(Duration::from_millis(600));
+                    }
+                }
+            }
+        }
+        let conn = conn_opt.ok_or_else(|| {
+            last_err.unwrap_or_else(|| -> Box<dyn std::error::Error> {
+                "connect failed".into()
+            })
+        })?;
+
         self.connections.insert(node_id, conn.clone());
+        self.connection_cache_tracker
+            .note_dial_success(node_id, wall_ms_now());
         Ok(conn)
     }
 
@@ -867,8 +1234,14 @@ impl IrohDriver {
         &mut self,
         tag: &str,
         payload: &[u8],
-        _from: NodeId,
+        from: NodeId,
     ) -> Vec<NodeAction> {
+        self.register_diagnostics_peer(from);
+        self.diagnostics.emit_event(DiagEvent::MessageReceived {
+            peer: from,
+            kind: tag.to_string(),
+            size: payload.len() as u32,
+        });
         match tag {
             "swactor_dist::Ping" => match serde_json::from_slice::<Ping>(payload) {
                 Ok(msg) => self.node.handle_ping(msg.from, msg.sequence, &msg.piggyback),
@@ -992,6 +1365,26 @@ async fn start_embedded_relay(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Bucket a dial error into one of the diagnostic outcome categories.
+/// Falls back to `Error(msg)` for anything we can't classify so the
+/// post-processor still sees the original error text.
+fn classify_dial_error(err: &Box<dyn std::error::Error>) -> DiagDialOutcome {
+    classify_dial_error_str(&err.to_string())
+}
+
+fn classify_dial_error_str(msg: &str) -> DiagDialOutcome {
+    let lower = msg.to_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        DiagDialOutcome::Timeout
+    } else if lower.contains("refused") {
+        DiagDialOutcome::Refused
+    } else if lower.contains("no route") || lower.contains("unreachable") {
+        DiagDialOutcome::NoRoute
+    } else {
+        DiagDialOutcome::Error(msg.to_string())
+    }
+}
 
 /// Extract the send target from a node action (if it has one).
 fn action_target(action: &NodeAction) -> Option<NodeId> {

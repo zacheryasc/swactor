@@ -7,6 +7,10 @@ use swactor::actor::ActorAddress;
 
 use crate::cache::LocationCache;
 use crate::crypto::{Keypair, KeypairExt};
+use std::sync::Arc;
+
+use crate::diagnostics::DynEmitter;
+use crate::diagnostics::swim_introspect::SwimIntrospect;
 use crate::kademlia::directory::{actor_addr_as_node_id, DirectoryShard};
 use crate::kademlia::repair::{RepairQueue, RepublishTracker};
 use crate::kademlia::routing_table::RoutingTable;
@@ -91,6 +95,27 @@ impl DistributedNode {
 
     pub fn keypair(&self) -> &Keypair {
         &self.keypair
+    }
+
+    /// Install a diagnostics emitter. Forwards to the underlying SWIM
+    /// node so membership transitions surface as structured events.
+    pub fn set_diagnostics(&mut self, emitter: DynEmitter) {
+        self.swim.set_diagnostics(emitter);
+    }
+
+    /// Install the tier-2 SWIM introspector and return its `Arc`. The
+    /// caller is expected to register the same `Arc` with the
+    /// diagnostics aggregator via
+    /// [`crate::diagnostics::Aggregator::set_swim_introspector`].
+    ///
+    /// Also primes the introspector with the disseminator's current
+    /// local metadata generation so the first snapshot reports a
+    /// non-zero version when this node already set its relay URL
+    /// before diagnostics were wired up.
+    pub fn install_swim_introspect(&mut self) -> Arc<SwimIntrospect> {
+        let introspect = self.swim.install_introspect();
+        introspect.note_metadata_local_version(self.metadata.local_version());
+        introspect
     }
 
     // ─── Cluster operations ─────────────────────────────────────────────
@@ -301,6 +326,7 @@ impl DistributedNode {
         let name = self.metadata.node_name(&self.node_id()).map(String::from);
         self.metadata
             .set_local(self.node_id(), url, name, self.cluster_size());
+        self.publish_metadata_version_to_introspect();
     }
 
     /// Set this node's human-readable name and begin gossiping it to the cluster.
@@ -308,6 +334,13 @@ impl DistributedNode {
         let relay_url = self.metadata.relay_url(&self.node_id()).map(String::from);
         self.metadata
             .set_local(self.node_id(), relay_url, Some(name), self.cluster_size());
+        self.publish_metadata_version_to_introspect();
+    }
+
+    fn publish_metadata_version_to_introspect(&self) {
+        if let Some(intro) = self.swim.introspect() {
+            intro.note_metadata_local_version(self.metadata.local_version());
+        }
     }
 
     /// Look up a node's relay URL.
@@ -436,8 +469,19 @@ impl DistributedNode {
 
     /// Merge metadata entries received from a piggyback payload.
     fn merge_metadata_entries(&mut self, entries: Vec<NodeMetadataEntry>) {
-        if !entries.is_empty() {
-            self.metadata.apply_incoming(entries, self.cluster_size());
+        if entries.is_empty() {
+            return;
+        }
+        let intro = self.swim.introspect().cloned();
+        self.metadata.apply_incoming(entries, self.cluster_size());
+        if let Some(intro) = intro {
+            let self_id = self.node_id();
+            for (node_id, version) in self.metadata.all_versions() {
+                if node_id == self_id {
+                    continue;
+                }
+                intro.note_peer_metadata_version(node_id, version);
+            }
         }
     }
 }

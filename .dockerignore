@@ -1,5 +1,7 @@
 *
 !target/x86_64-unknown-linux-musl/release/swactor
+!target/release/swactor-diag-collector
+!target/release/swactor-diag-postproc
 !examples/single-gpu-inference/target/release/gpu-node
 !examples/single-gpu-inference/tinygrad_worker.py
 !examples/pipeline-parallel-inference/target/release/pp-gpu-node
