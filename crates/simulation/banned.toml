@@ -1,0 +1,134 @@
+# Banned-API set enforced by the lint-deterministic scanner.
+#
+# Closed list per TESTING_SPEC §4.1. Items can be added but not
+# removed without a separate `parity-bar: update lock` commit
+# (TESTING_SPEC §12.1).
+#
+# `pattern` is a substring match against source text. Comments and
+# string literals are *not* stripped first — false positives in
+# such cases can be silenced inline with the marker:
+#
+#     // lint-deterministic: allow <pattern>
+#
+# placed on the same line. The marker is checked verbatim by the
+# scanner, so it's auditable in `git grep`.
+
+[[banned]]
+pattern = "std::time::SystemTime"
+replacement = "Facade::clock().now() (runtime-facade::Clock)"
+
+[[banned]]
+pattern = "std::time::Instant"
+replacement = "Facade::clock().now() (runtime-facade::Clock)"
+
+[[banned]]
+pattern = "std::thread::sleep"
+replacement = "Facade::clock().sleep_until(...) (runtime-facade::Clock)"
+
+[[banned]]
+pattern = "std::thread::spawn"
+replacement = "Facade::spawn(...) (runtime-facade::Spawn)"
+
+[[banned]]
+pattern = "tokio::spawn"
+replacement = "Facade::spawn(...) (runtime-facade::Spawn)"
+
+[[banned]]
+pattern = "tokio::time::sleep"
+replacement = "Facade::clock().sleep_until(...) (runtime-facade::Clock)"
+
+[[banned]]
+pattern = "tokio::time::Instant"
+replacement = "Facade::clock().now() (runtime-facade::Clock)"
+
+[[banned]]
+pattern = "std::collections::HashMap"
+replacement = "indexmap::IndexMap or std::collections::BTreeMap"
+
+[[banned]]
+pattern = "std::collections::HashSet"
+replacement = "indexmap::IndexSet or std::collections::BTreeSet"
+
+[[banned]]
+pattern = "rand::thread_rng"
+replacement = "Facade::rng(stream_label) (runtime-facade::Rng)"
+
+[[banned]]
+pattern = "getrandom::getrandom"
+replacement = "Facade::rng(stream_label) (runtime-facade::Rng)"
+
+[[banned]]
+pattern = "std::env::var"
+replacement = "Facade::env(name) (runtime-facade::Env)"
+
+[[banned]]
+pattern = "std::env::vars"
+replacement = "Facade::env_iter() (runtime-facade::Env)"
+
+[[banned]]
+pattern = "std::fs"
+replacement = "Facade::fs() (runtime-facade::Fs, sandboxed per node)"
+
+[[banned]]
+pattern = "std::net"
+replacement = "Facade::udp() / Facade::tcp() (runtime-facade::Udp/Tcp)"
+
+[[banned]]
+pattern = "std::process::Command"
+replacement = "Facade::process(...) (errors in sim)"
+
+# ── Scope ─────────────────────────────────────────────────────────
+# Paths the scanner inspects. Allowlist paths are exempt — they
+# *are* the facade implementations, so they have to call the real
+# APIs.
+
+[scope]
+# Peer-code paths the scanner audits. This is the closed list of
+# crates that have been migrated onto runtime-facade. Stage 6
+# widens the list to include `crates/distribution` and friends.
+#
+# xtask, examples/, top-level swactor (src/), and the binding
+# crates are intentionally absent: xtask is build tooling (not
+# peer code), and the rest are out of facade scope until Stage 6.
+include = [
+    "crates/simulation/src",
+]
+# Allowlisted paths inside `include` are skipped because they are
+# the facade impls themselves (which have to call the real std/tokio
+# surface to do their job), the detector probes (which name the std
+# surfaces by design), or the scanner itself (which lists the banned
+# strings as patterns).
+allowlist = [
+    "crates/simulation/src/runtime",
+    "crates/simulation/src/facade/sim",
+    "crates/simulation/src/detector.rs",
+    "crates/simulation/src/lint.rs",
+    "crates/simulation/src/bin",
+]
+
+# ── Parity-test hygiene (TESTING_SPEC §12.2/§12.3/§12.4) ──────────
+# Applied only under `--check-parity-bar`.
+
+[parity_bar]
+root = "crates/simulation/tests/parity-bar"
+
+# §12.2 — no probabilistic primitives.
+banned_substrings = [
+    "proptest::",
+    "quickcheck::",
+    "rand::random",
+    "rand::thread_rng",
+]
+banned_fn_prefixes = ["fuzz_"]
+
+# §12.3 — no conditional skips.
+banned_attrs = [
+    "#[ignore]",
+    "#[cfg(not(",
+    "#[cfg_attr(",
+]
+
+# Env-driven skip pattern (substring match — heuristic).
+banned_skip_patterns = [
+    "std::env::var",
+]

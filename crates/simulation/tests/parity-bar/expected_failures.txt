@@ -1,0 +1,70 @@
+# Engine-side checks expected to FAIL during Phase 1.
+#
+# `cargo xtask parity-bar --phase 1` reads this file: any FAILED
+# test whose `<binary>::<name>` appears below counts as an expected
+# Phase-1 outcome. Tests not listed must pass. Tests listed but
+# observed passing don't fail the run — they just mean a Phase-2
+# stage's work has landed early.
+#
+# Format: one fully-qualified test path per line. Comments start
+# with `#`. Whitespace-only lines are ignored.
+#
+# Phase-2 stage that flips each item is in parentheses.
+
+# §2 — determinism oracle. Flipped green by Stage 4 (engine core +
+# deterministic bundle writer). Kept here as a header for the audit
+# trail; no entries remain.
+
+# §3 — replay isomorphism. `mutations_preserved` flipped green by
+# Stage 5 (mutation Custom events on every host's events stream).
+# The remaining three depend on the diagnostics / bundle pipeline
+# Stage 7 ships; they pass trivially at Stage 5 because the engine
+# is still deterministic over a deeply-similar augmented spec, but
+# Stage 7 is what discharges the actual round-trip contract.
+t_replay::self_replay_identical                   # (Stage 7)
+t_replay::replay_from_prod_shape_only             # (Stage 7)
+t_replay::vastai_n3_replays                       # (Stage 7)
+
+# §5 — same-binary invariant. `shared_load_bearing` and
+# `symbol_overlap` both depend on `crates/distribution` (excluded
+# from the workspace until Stage 6) and on the sim-driver binary
+# (lands at Stage 6). `no_transport_forks` passes at Stage 3.
+# (shared_load_bearing and no_transport_forks both pass after the
+# simulation-crate consolidation; symbol_overlap was removed because
+# the sim-driver force-link gimmick it relied on no longer exists.)
+
+# §6 — schema floor coverage. All four read a bundle the engine
+# produces.
+t_schema_coverage::corpus_kinds                   # (Stage 7)
+t_schema_coverage::no_phantom_records             # (Stage 7)
+t_schema_coverage::no_silent_none                 # (Stage 7)
+t_schema_coverage::all_event_variants_fire        # (Stage 7)
+
+# §7 — schema round-trip. All four read a bundle the engine
+# produces (plus run the post-processor against it, which lands
+# at Stage 7).
+t_round_trip::prod_parser_reads_sim_bundle        # (Stage 7)
+t_round_trip::sim_replay_parser_reads_prod_bundle # (Stage 7)
+t_round_trip::bundle_layout_matches_spec          # (Stage 7)
+t_round_trip::schema_version_pinned               # (Stage 7)
+
+# §8 — causality / time invariants. Flipped green by Stage 5 (per-
+# host monotonic_seq under each boot envelope, wall_ms ratcheted by
+# the virtual-time queue, deterministic tiebreaker confirmed by
+# rerunning the same scenario). Kept here as a header for the audit
+# trail; no entries remain.
+
+# §9 — equivariance. Flipped green by Stage 5: bundle file contents
+# are stripped of host-name/role strings (paths carry identity), and
+# same-tick mutations are canonically sorted before the engine
+# assigns an event_seq. No entries remain.
+
+# §11 — lifecycle observability. Flipped green by Stage 5: each
+# epoch keeps its own boot.json / finalize-NNN.json, crashed nodes
+# emit a Custom record on their events stream, and hosts alive at
+# end-of-run receive a synthetic clean finalize. No entries remain.
+
+# §10 — adversarial sim-detector. `sim_indistinguishable` runs the
+# detector inside a sim scenario (needs engine). `prod_baseline`
+# only invokes the detector binary; passes at Stage 3.
+t_detector::sim_indistinguishable                 # (Stage 8)

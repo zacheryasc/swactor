@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "kind": "snapshot",
+  "snapshot_id": "0000-stage-0",
+  "run_id": "vastai-N3-1",
+  "node_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+  "boot_sequence": 0,
+  "wall_ms": 30000,
+  "monotonic_seq": 320,
+  "trigger": "Periodic",
+  "identity": {
+    "node_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "node_id_short": "11111111",
+    "role": "stage",
+    "stage_index": 0,
+    "stage_count": 3,
+    "run_id": "vastai-N3-1",
+    "vastai_contract_id": "20251201",
+    "host_ip_public": "203.0.113.10",
+    "host_country": "US",
+    "datacenter_id": "vastai-us-east-1",
+    "hostname": "pp-stage-0",
+    "container_id": "d11cc185",
+    "process_start_unix_ms": 1747728003000,
+    "boot_sequence": 0,
+    "binary_version": "0.1.0+ds-inference",
+    "git_sha": "deadbeefcafef00d",
+    "iroh_version": "0.96.1",
+    "home_relay_url_at_boot": "http://146.190.110.128:7843/"
+  },
+  "body": {
+    "reachability": [
+      {
+        "peer_node_id_hex": "5f8ac0a2613b4c11bd95e91d04f55c2a0b3a8d7c6e5f4d3c2b1a0987654321ff",
+        "last_inbound_packet_at_ms": 29900,
+        "via_relay_url": "http://146.190.110.128:7843/",
+        "last_outbound_success_at_ms": 29950,
+        "last_dial_started_at_ms": 1500,
+        "last_dial_outcome": "ok",
+        "last_dial_duration_ms": 420,
+        "current_swim_opinion": "Alive",
+        "current_swim_opinion_since_ms": 2200,
+        "swim_transition_history": [
+          {"from": "Unknown", "to": "Alive", "at_ms": 2200, "reason": "probe-ok"}
+        ],
+        "metadata_version_seen": 3,
+        "metadata_relay_url_seen": "http://146.190.110.128:7843/"
+      }
+    ],
+    "events": [],
+    "iroh": null,
+    "swim": null,
+    "host": null,
+    "probes": null,
+    "vastai": null,
+    "process": null
+  }
+}

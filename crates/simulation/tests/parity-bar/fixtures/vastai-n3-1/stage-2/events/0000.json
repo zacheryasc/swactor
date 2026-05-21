@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "kind": "events",
+  "node_id_hex": "3333333333333333333333333333333333333333333333333333333333333333",
+  "run_id": "vastai-N3-1",
+  "boot_sequence": 0,
+  "records": [
+    {"variant": "MessageReceived", "wall_ms": 4000, "monotonic_seq": 10, "peer": "2222222222222222222222222222222222222222222222222222222222222222", "kind": "swim.ping", "size": 6400},
+    {"variant": "MessageSent", "wall_ms": 4020, "monotonic_seq": 11, "peer": "2222222222222222222222222222222222222222222222222222222222222222", "kind": "swim.ack", "size": 6450}
+  ]
+}

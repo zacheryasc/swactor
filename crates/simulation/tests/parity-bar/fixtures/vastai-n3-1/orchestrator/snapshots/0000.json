@@ -1,0 +1,172 @@
+{
+  "schema_version": 1,
+  "kind": "snapshot",
+  "snapshot_id": "0000-orch",
+  "run_id": "vastai-N3-1",
+  "node_id_hex": "5f8ac0a2613b4c11bd95e91d04f55c2a0b3a8d7c6e5f4d3c2b1a0987654321ff",
+  "boot_sequence": 0,
+  "wall_ms": 30000,
+  "monotonic_seq": 410,
+  "trigger": "Periodic",
+  "identity": {
+    "node_id_hex": "5f8ac0a2613b4c11bd95e91d04f55c2a0b3a8d7c6e5f4d3c2b1a0987654321ff",
+    "node_id_short": "5f8ac0a2",
+    "role": "orchestrator",
+    "stage_index": null,
+    "stage_count": 3,
+    "run_id": "vastai-N3-1",
+    "vastai_contract_id": "20251142",
+    "host_ip_public": "146.190.110.128",
+    "host_country": "US",
+    "datacenter_id": "vastai-us-east-1",
+    "hostname": "pp-orch",
+    "container_id": "c0a261b2",
+    "process_start_unix_ms": 1747728002000,
+    "boot_sequence": 0,
+    "binary_version": "0.1.0+ds-inference",
+    "git_sha": "deadbeefcafef00d",
+    "iroh_version": "0.96.1",
+    "home_relay_url_at_boot": "http://146.190.110.128:7843/"
+  },
+  "body": {
+    "reachability": [
+      {
+        "peer_node_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+        "last_inbound_packet_at_ms": 29800,
+        "via_relay_url": "http://146.190.110.128:7843/",
+        "last_outbound_success_at_ms": 29900,
+        "last_dial_started_at_ms": 2000,
+        "last_dial_outcome": "ok",
+        "last_dial_duration_ms": 480,
+        "current_swim_opinion": "Alive",
+        "current_swim_opinion_since_ms": 2500,
+        "swim_transition_history": [
+          {"from": "Unknown", "to": "Alive", "at_ms": 2500, "reason": "probe-ok"}
+        ],
+        "metadata_version_seen": 3,
+        "metadata_relay_url_seen": "http://146.190.110.128:7843/"
+      }
+    ],
+    "events": [],
+    "iroh": {
+      "home_relay_url": "http://146.190.110.128:7843/",
+      "peers": [
+        {
+          "peer_node_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+          "conn_type": "Relay",
+          "latency_ms": null,
+          "last_used_ms": null,
+          "last_received_ms": null,
+          "direct_addresses": [],
+          "relay_urls": ["http://146.190.110.128:7843/"],
+          "addr_sources": null
+        }
+      ],
+      "metrics": [
+        {"name": "iroh.messages_sent_total", "value": 77, "unit": "count"},
+        {"name": "iroh.messages_received_total", "value": 71, "unit": "count"}
+      ],
+      "connection_cache": [
+        {
+          "peer_node_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+          "generation": 1,
+          "created_at_ms": 2500,
+          "last_successful_send_at_ms": 29900,
+          "last_failure_at_ms": null,
+          "last_failure_reason": null,
+          "observed_conn_type_at_last_use": "Relay"
+        }
+      ],
+      "api_gaps": ["latency_ms", "last_used_ms", "last_received_ms", "addr_sources"],
+      "scraped_at_ms": 30000
+    },
+    "swim": {
+      "config": {
+        "probe_ticks": 5,
+        "probe_timeout_ticks": 15,
+        "suspicion_timeout_ticks": 60,
+        "dead_reprobe_interval_ticks": 30,
+        "indirect_probes_k": 2,
+        "gossip_fanout": 3,
+        "max_piggyback": 6,
+        "probe_mode": "direct-then-indirect"
+      },
+      "self_node_id_hex": "5f8ac0a2613b4c11bd95e91d04f55c2a0b3a8d7c6e5f4d3c2b1a0987654321ff",
+      "self_incarnation": 0,
+      "metadata_local_version": 1,
+      "peers": [
+        {
+          "peer_node_id_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+          "state": "Alive",
+          "incarnation": 0,
+          "last_ping_sent_ms": 29500,
+          "last_ack_received_ms": 29700,
+          "last_ping_received_ms": 29400,
+          "suspect_started_ms": null,
+          "metadata_version_seen": 1
+        }
+      ],
+      "recent_messages": [
+        {"kind": "Ping", "peer": "1111111111111111111111111111111111111111111111111111111111111111", "at_ms": 29500, "sequence": 12}
+      ],
+      "scraped_at_ms": 30000
+    },
+    "host": {
+      "interfaces": [
+        {"name": "eth0", "addresses": ["10.0.0.5"], "mtu": 1500, "up": true}
+      ],
+      "default_routes": [
+        {"family": "v4", "destination": "0.0.0.0/0", "gateway": "10.0.0.1", "interface": "eth0"}
+      ],
+      "udp_sockets": [
+        {"local_addr": "0.0.0.0:60001", "remote_addr": "0.0.0.0:0", "state": "UNCONN", "inode": 9001}
+      ],
+      "conntrack_count": null,
+      "ipv6_enabled": false,
+      "resolv_conf_nameservers": ["1.1.1.1"],
+      "refreshed_at_ms": 30000,
+      "dns": [
+        {
+          "hostname": "146.190.110.128",
+          "a_records": ["146.190.110.128"],
+          "aaaa_records": [],
+          "ttl_seconds": 60,
+          "resolver_used": "1.1.1.1",
+          "resolved_at_ms": 100,
+          "error": null
+        }
+      ]
+    },
+    "probes": [
+      {
+        "target": "146.190.110.128:9081",
+        "kind": "udp_echo",
+        "resolved_addr": "146.190.110.128:9081",
+        "last_attempted_at_ms": 29000,
+        "last_outcome": "ok",
+        "last_rtt_ms": 14,
+        "last_error": null,
+        "attempts": 6,
+        "successes": 6
+      }
+    ],
+    "vastai": {
+      "container_id": "c0a261b2",
+      "hostname": "pp-orch",
+      "env_vars": {"VAST_CONTRACT_ID": "20251142"},
+      "process_start_ms": 1747728002000,
+      "captured_at_ms": 1747728002100
+    },
+    "process": {
+      "rss_bytes": 142000000,
+      "vm_size_bytes": 480000000,
+      "open_fd_count": 64,
+      "cpu_ms": 880,
+      "tokio": {"flavor": "multi_thread"},
+      "captured_at_ms": 30000
+    },
+    "clock_samples": [
+      {"node_send_ms": 29950, "node_send_ms_echoed": 29950, "collector_recv_ms": 29953, "collector_send_ms": 29953, "wall_ms_at_receive": 29956}
+    ]
+  }
+}

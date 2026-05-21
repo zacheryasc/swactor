@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "kind": "events",
+  "node_id_hex": "5f8ac0a2613b4c11bd95e91d04f55c2a0b3a8d7c6e5f4d3c2b1a0987654321ff",
+  "run_id": "vastai-N3-1",
+  "boot_sequence": 0,
+  "records": [
+    {"variant": "DialStarted", "wall_ms": 2000, "monotonic_seq": 10, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "attempt": 1, "timeout_ms": 10000},
+    {"variant": "DialOutcome", "wall_ms": 2480, "monotonic_seq": 11, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "attempt": 1, "outcome": "ok", "duration_ms": 480},
+    {"variant": "ConnectionCacheMiss", "wall_ms": 2480, "monotonic_seq": 12, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "generation": 1, "reason": "first-dial"},
+    {"variant": "MessageSent", "wall_ms": 2600, "monotonic_seq": 13, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "kind": "swim.ping", "size": 7500},
+    {"variant": "MessageReceived", "wall_ms": 2700, "monotonic_seq": 14, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "kind": "swim.ack", "size": 9870},
+    {"variant": "IrohConnTypeChanged", "wall_ms": 2710, "monotonic_seq": 15, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "old": "None", "new": "Relay"},
+    {"variant": "SwimTransition", "wall_ms": 2500, "monotonic_seq": 16, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "from": "Unknown", "to": "Alive", "reason": "probe-ok"},
+    {"variant": "SwimMetadataSent", "wall_ms": 2510, "monotonic_seq": 17, "version": 1, "payload_hash": "0xab12cd34ef560011"},
+    {"variant": "SwimMetadataReceived", "wall_ms": 2620, "monotonic_seq": 18, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "version": 1, "payload_hash": "0xab12cd34ef560011"},
+    {"variant": "NodeMapUpdate", "wall_ms": 2810, "monotonic_seq": 19, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "from_source": "swim-piggyback", "accepted": true},
+    {"variant": "ConnectionCacheHit", "wall_ms": 5200, "monotonic_seq": 24, "peer": "1111111111111111111111111111111111111111111111111111111111111111", "generation": 1},
+    {"variant": "RelayChanged", "wall_ms": 5300, "monotonic_seq": 25, "old_url": null, "new_url": "http://146.190.110.128:7843/"},
+    {"variant": "ProbeSent", "wall_ms": 10000, "monotonic_seq": 60, "target": "146.190.110.128:9081", "kind": "udp_echo"},
+    {"variant": "ProbeReceived", "wall_ms": 10014, "monotonic_seq": 61, "target": "146.190.110.128:9081", "kind": "udp_echo", "rtt_ms": 14, "outcome": "ok"},
+    {"variant": "ConnectionCacheInvalidated", "wall_ms": 47000, "monotonic_seq": 200, "peer": "2222222222222222222222222222222222222222222222222222222222222222", "generation": 1, "reason": "connection-closed"},
+    {"variant": "Error", "wall_ms": 60000, "monotonic_seq": 260, "component": "host_introspect", "message": "conntrack_count unavailable: kernel-module missing", "peer": null},
+    {"variant": "Custom", "wall_ms": 320000, "monotonic_seq": 2300, "user_kind": "register_name", "fields": {"name": "pp-entry", "addr": "stage-0", "peer_node_id": "1111111111111111111111111111111111111111111111111111111111111111"}}
+  ]
+}
