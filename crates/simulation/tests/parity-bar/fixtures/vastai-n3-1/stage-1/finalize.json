@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "kind": "finalize",
+  "node_id_hex": "2222222222222222222222222222222222222222222222222222222222222222",
+  "run_id": "vastai-N3-1",
+  "boot_sequence": 0,
+  "wall_ms": 425000,
+  "monotonic_seq": 1300,
+  "shutdown_reason": "clean",
+  "events_emitted": 280,
+  "snapshots_emitted": 85
+}

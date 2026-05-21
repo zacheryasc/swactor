@@ -2,34 +2,103 @@
 name = "simulation"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
-[features]
-default = []
-distribution = ["dep:distribution"]
-gossip = ["dep:log"]
-dashboard = ["gossip", "dep:tiny_http", "dep:toml"]
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sim-driver"
+path = "src/bin/sim-driver.rs"
+
+[[bin]]
+name = "sim-detector"
+path = "src/bin/sim-detector.rs"
+
+[[bin]]
+name = "lint-deterministic"
+path = "src/bin/lint-deterministic.rs"
 
 [dependencies]
-distribution = { path = "../distribution", optional = true }
-swactor = { path = "../..", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-getrandom = "0.2"
-log = { version = "0.4", optional = true }
-tiny_http = { version = "0.12", optional = true }
-toml = { version = "0.8", optional = true }
+sha2 = "0.10"
+toml = "0.8"
+
+[build-dependencies]
+# The runtime surface descriptor is derived from `src/runtime/mod.rs`
+# at build time. `surface.lock` records the expected SHA-256; a trait
+# edit that does not also update the lock fails `tests/surface_locked.rs`.
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
 
 [dev-dependencies]
-simulation = { path = ".", features = ["gossip", "distribution"] }
+# Tests use the production post-processor (TESTING_SPEC §7.1) and
+# the in-memory tar+gzip helpers needed to feed an on-disk sim
+# bundle into it.
+distribution = { path = "../distribution", features = ["iroh", "collector"] }
+flate2 = "1"
+tar = "0.4"
+# Parity-bar t_facade re-derives the surface from runtime source to
+# catch tampering with build.rs.
+syn = { version = "2", features = ["full", "parsing"] }
+quote = "1"
 
-[[example]]
-name = "gossip_sim"
-required-features = ["gossip"]
+[features]
+# `_facade-test` is the default marker that lets `cargo test -p
+# simulation` build the crate without picking a backend. It is
+# stripped by `--no-default-features`, which then trips the
+# neither-feature const-panic in `src/runtime/mod.rs`.
+default = ["_facade-test"]
+# Mutually exclusive — exactly one selects the active `runtime::facade()`.
+facade-prod = []
+facade-sim = []
+_facade-test = []
 
-[[example]]
-name = "replay"
-required-features = ["dashboard"]
+[[test]]
+name = "corpus_loads"
+path = "tests/corpus_loads.rs"
 
-[[example]]
-name = "generate_traces"
-required-features = ["dashboard"]
+[[test]]
+name = "surface_locked"
+path = "tests/surface_locked.rs"
+
+[[test]]
+name = "t_determinism"
+path = "tests/parity-bar/t_determinism.rs"
+
+[[test]]
+name = "t_replay"
+path = "tests/parity-bar/t_replay.rs"
+
+[[test]]
+name = "t_facade"
+path = "tests/parity-bar/t_facade.rs"
+
+[[test]]
+name = "t_same_binary"
+path = "tests/parity-bar/t_same_binary.rs"
+
+[[test]]
+name = "t_schema_coverage"
+path = "tests/parity-bar/t_schema_coverage.rs"
+
+[[test]]
+name = "t_round_trip"
+path = "tests/parity-bar/t_round_trip.rs"
+
+[[test]]
+name = "t_causality"
+path = "tests/parity-bar/t_causality.rs"
+
+[[test]]
+name = "t_equivariance"
+path = "tests/parity-bar/t_equivariance.rs"
+
+[[test]]
+name = "t_lifecycle"
+path = "tests/parity-bar/t_lifecycle.rs"
+
+[[test]]
+name = "t_detector"
+path = "tests/parity-bar/t_detector.rs"

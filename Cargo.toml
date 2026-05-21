@@ -5,15 +5,21 @@ members = [
     "crates/bindings/wasm-runtime",
     "crates/simulation",
     "crates/dashboard",
-    "crates/distribution",
     "crates/process",
-    "crates/datastore",
     "crates/transport",
+    "crates/distribution",
+    "crates/datastore",
     "crates/node",
     "tests/docker",
     "tests/integration",
     "xtask",
 ]
+# Stage 6 iteration 8: all production crates and integration
+# tests are back in the workspace. The vendored
+# `ed25519-dalek 3.0.0-pre.1` patch below unblocks the iroh
+# umbrella crate, which datastore/node/tests-integration pull
+# in via `iroh = "0.96"` (datastore/node) and
+# `distribution/iroh,relay` (tests-integration).
 exclude = ["crates/bindings/wasm-crypto", "examples"]
 
 [package]
@@ -68,3 +74,13 @@ harness = false
 name = "hasher_benchmarks"
 harness = false
 
+# Vendored `ed25519-dalek 3.0.0-pre.1` to fix two upstream
+# compile errors (E0277, E0308) at `src/signing.rs:714,717`.
+# Upstream encodes `pkcs8::Error::KeyMalformed` as a unit
+# variant, but the resolved `pkcs8 0.11.0` re-exports it as
+# `KeyMalformed(KeyError)`. The strict `=3.0.0-pre.1` pin
+# from `iroh-base 0.96.1` forbids using a newer prerelease,
+# so we vendor the published 3.0.0-pre.1 and apply a 2-line
+# tuple-variant fix. See `.loop/notes.md` (Stage 6 iteration 8).
+[patch.crates-io]
+ed25519-dalek = { path = "vendor/ed25519-dalek" }

@@ -1,0 +1,33 @@
+# Hello-world sim spec — the smallest valid topology.
+#
+# Two peers, one link, no mutations. Boots them at t=0, runs for
+# 1 second of virtual time, shuts down cleanly. The engine writes
+# a SPEC §6.4 bundle to disk; the bundle path goes to stdout.
+
+run_id = "hello-world"
+seed = 0
+duration_ms = 1000
+
+[host_defaults]
+mtu = 1500
+nat = "FullCone"
+
+[[hosts]]
+name = "alice"
+role = "peer"
+start_at_ms = 0
+stop_at_ms = 1000
+
+[[hosts]]
+name = "bob"
+role = "peer"
+start_at_ms = 0
+stop_at_ms = 1000
+
+[[links]]
+a = "alice"
+b = "bob"
+bandwidth_bps = 100_000_000
+one_way_delay_ms = 5
+jitter_ms = 0
+loss = 0.0
