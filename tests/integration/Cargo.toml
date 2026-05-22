@@ -9,6 +9,6 @@ swactor-datastore = { path = "../../crates/datastore", features = ["node"] }
 distribution = { path = "../../crates/distribution", features = ["iroh", "relay"] }
 dashboard = { path = "../../crates/dashboard" }
 swactor = { path = "../..", features = ["serde", "transport"] }
-iroh = "0.96"
+iroh = "0.98"
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
