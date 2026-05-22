@@ -778,6 +778,30 @@ scenario on every supported architecture and compares the checksum to the
 stored value. A mismatch is either a deliberate spec amendment (with
 justification) or a bug.
 
+### 7.7 Scope of determinism
+
+The contracts in §4.10, §6.4, and §7.3 bind the simulator's own
+components — the §3.1 list. Production code that a host adapter wraps
+(the SWIM host adapter wraps `crates/distribution/src/swim/`) is a
+dependency, not a §3.1 component. Hidden state inside a wrapped
+dependency — allocator state, `std::collections::HashMap` `RandomState`,
+any process-local entropy that does not flow through the §7.2
+randomness tree — is out of scope. The simulator does not promise to
+fix, mirror, or compensate for non-determinism inside a wrapped
+dependency.
+
+"Same RNG seed" in §6.4 is the simulator-controlled seed handed to the
+host adapter via the §7.2 randomness tree. "Same seed" in §4.10 is the
+scenario seed. Neither extends to hidden entropy held inside a wrapped
+dependency.
+
+A property test that compares two independently-allocated instances of
+a wrapped state machine and asserts identical behaviour is testing the
+dependency, not the simulator. The spec does not require it. Do not
+write such a test; if one exists, delete it rather than propose a §15
+amendment to relax a contract that, on this reading, the spec is not
+making.
+
 ---
 
 ## 8. The scenario format
