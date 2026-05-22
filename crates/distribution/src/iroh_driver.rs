@@ -241,7 +241,8 @@ impl IrohDriver {
         let endpoint = rt.block_on(async {
             let mut alpns = vec![ALPN.to_vec()];
             alpns.extend(config.additional_alpns.iter().cloned());
-            let mut builder = Endpoint::empty_builder(effective_relay_mode)
+            let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(effective_relay_mode)
                 .alpns(alpns);
 
             if let Some(key) = config.secret_key {
