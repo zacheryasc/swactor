@@ -392,6 +392,53 @@ The engine's virtual clock is in integer nanoseconds. The manifest records
 the unit so post-processors render times consistently. Sub-nanosecond
 ordering is not modelled.
 
+### 4.10 Behavioral tests
+
+The engine's contract is the dispatch and action-processing behaviour of
+§4. Its tests assert that it has the properties below; how each is
+verified is the test author's call.
+
+**Tick cadence.** Each host receives ticks at its declared period,
+starting at a stable seed-derived offset. The offset is identical
+across runs and differs across hosts in the same scenario.
+
+**Action ordering.** A host's emitted actions are processed in returned
+order. The effects of action N are fully observable before action N+1's
+effects begin.
+
+**Send semantics.** A `Send` whose network query returns `Arrive` results
+in the recipient's `recv` being called at the returned arrival time with
+the codec-produced bytes. A `Send` the network drops results in the
+sender's `recv` being called with `SendFailed`, a `DropOnSend` record in
+the bundle, and no recipient call.
+
+**Timer fidelity.** A `ScheduleTimer { at_ns, token }` causes a
+`TimerFired(token)` envelope to reach the host's `recv` at exactly
+`at_ns`.
+
+**Halt.** A halted host receives no further ticks; it continues to
+receive deliveries.
+
+**Closed action set.** An action outside the closed set §4.6 names
+aborts the run with a structured error. The engine never silently
+ignores or invents an action.
+
+**Tie-break.** Events scheduled at the same virtual time pop in enqueue
+order. The order is identical across runs and architectures.
+
+**Mutation propagation.** Deliveries the network invalidates are removed
+from the engine's queue; each emits a `DropOnDelivery` record at the
+mutation's virtual time. No invalidated delivery reaches a host's `recv`.
+
+**Snapshot fanout.** A scheduled snapshot produces exactly one record
+per live host at the scheduled virtual time.
+
+**Early termination is clean.** Every record emitted before the
+termination time is preserved; no record carries a later virtual time.
+
+**Determinism.** Same scenario, same seed ⇒ byte-identical
+`events.ndjson`.
+
 ---
 
 ## 5. The network
@@ -506,6 +553,66 @@ style backpressure, NAT state, or inter-peer clock skew. These limits are
 named in the known-gaps document and re-entered when an algorithm under
 test is sensitive to them.
 
+### 5.8 Behavioral tests
+
+The network is a pure function of (state, query). Its tests assert that
+it has the properties §5 names; how each property is verified is the
+test author's call.
+
+**Reachability.** A `send` over an ordered pair returns `Arrive` iff
+that pair is declared as an edge and the active partition set does not
+cut it. A `send` the network refuses leaves the network's state
+unchanged.
+
+**Partition heals to identity.** A `Partition` followed by a `Heal` at
+later virtual times leaves the network indistinguishable on subsequent
+sends from one that experienced neither.
+
+**Mutation invalidation is exact.** Every delivery a mutation renders
+impossible appears in the mutation's invalidated-deliveries return. No
+delivery the mutation does not invalidate appears in that return.
+
+**Loss is Bernoulli.** Drops on a link are independent draws with the
+link's declared probability. A `LossBurst` substitutes its override
+probability for the duration it names and only the duration it names.
+
+**Bandwidth serializes.** A link with finite bandwidth never overlaps
+two messages' wire-occupancy intervals: each message's arrival is
+delayed at least until the previous message's arrival plus that
+message's transmission time.
+
+**Latency is additive.** A send's arrival decomposes into base latency,
+serialization delay, jitter, cold-dial penalty when applicable, and the
+contributions of active mutations. The terms are independent in the
+policy and combine without interaction beyond what §5.4 specifies.
+
+**Jitter is symmetric and integer-valued.** Jitter samples come from
+the precomputed table of §7, are symmetric around zero, and are never
+non-integer.
+
+**Cache state follows traffic.** The link's `cache_state` reflects
+recent traffic: warm after sufficient activity, cold again after
+sufficient idleness, with the thresholds the policy names. The
+cold-dial penalty is paid by exactly the sends the network classifies
+cold.
+
+**Cache transitions are observable.** Every cold↔warm transition emits
+exactly one `CacheStateChange` notification at the transition's virtual
+time. No transition is silent and no notification fires without a
+transition.
+
+**Mutation scoping.** A mutation affects exactly the links its `links`
+field names and exactly the duration it declares. Sends on other links,
+or on the named links outside the duration, are unaffected.
+
+**Substream isolation.** Editing one link's policy does not change any
+draw the network makes on any other link. This is the property that
+makes bisecting scenario edits possible.
+
+**Determinism.** Same topology, same seed, same query sequence ⇒
+identical `SendOutcome` sequence and identical invalidated-deliveries
+returns.
+
 ---
 
 ## 6. Hosting an entity
@@ -569,6 +676,38 @@ Adding a new host kind is a strict superset operation:
 Existing host kinds continue to work without change. The network, the
 bundle writer, the engine main loop, and the determinism contract are
 host-kind-agnostic.
+
+### 6.4 Behavioral tests
+
+Host-kind tests come in two layers: kind-agnostic properties every
+registered kind must satisfy, and per-kind properties specific to the
+algorithm a kind hosts. The list below is what the tests must assert;
+how is the test author's call.
+
+**Trait conformance (every kind).** The kind exposes the §6.1 surface
+with the §6.1 signatures. `kind_tag()` is a non-empty string unique
+among registered kinds.
+
+**Codec is invertible (every kind).** Encoding then decoding a message
+is the identity on the kind's message type.
+
+**Host determinism (every kind).** Same `HostKindConfig`, same RNG
+seed, same `tick`/`recv` sequence ⇒ identical action sequence.
+
+**SWIM emits no novel kinds.** Every event a SWIM host emits is of a
+kind production's diagnostics also emits. The simulator invents no SWIM
+event kind for itself.
+
+**SWIM codec parity with production.** The SWIM host's encoding of an
+outgoing message is byte-identical to the production transport's
+encoding of the same message. Drift breaks the build.
+
+**SWIM snapshot parity with production.** A SWIM host's `snapshot()`
+conforms to the production tier-2 SWIM-state schema.
+
+**SWIM unknown-output is loud.** A production state-machine output the
+SWIM adapter does not route aborts the run with a structured error.
+Silent fallback is a test failure.
 
 ---
 
@@ -729,6 +868,34 @@ Every scenario carries a top-of-file prose comment naming what it
 reproduces, the expected verdict (pass-now / fail-until-fix /
 sensitivity-study), and any base scenario it extends.
 
+### 8.4 Behavioral tests
+
+The loader's contract is the schema and validation rules of §8. Its
+tests assert that it has the properties below.
+
+**Examples are well-formed.** Every shipped example scenario parses
+and satisfies every rule in §8.2.
+
+**Parse is invertible.** Parsing, re-emitting to TOML, and re-parsing
+is the identity on scenario values.
+
+**Validation is complete.** Every rule §8.2 names is enforced. A
+scenario violating any rule is rejected; a scenario violating none is
+accepted.
+
+**Errors are structured.** A rejection names the file, the offending
+field, and the violated rule in one line each. Generic errors are a
+test failure.
+
+**Host-kind validation is delegated.** A host-kind-config error
+surfaces the kind's own rule, not a loader-generic one.
+
+**Merge is leaves-override, lists-append.** Extending a base scenario
+replaces leaf values and appends list entries, with no other effect.
+
+**Loading is pure.** Loading the same file twice produces equal values
+and performs no filesystem writes.
+
 ---
 
 ## 9. The bundle
@@ -805,6 +972,35 @@ The bundle is renderable by the same post-processor production uses. If
 the renderer requires inputs the simulator does not have (collector-side
 receive timestamps, for instance), the simulator substitutes the virtual-
 clock equivalent and records the substitution in the manifest.
+
+### 9.6 Behavioral tests
+
+The writer's contract is the layout and schema of §9. Its tests assert
+that it has the properties below.
+
+**Layout.** Every produced bundle has the §9.1 entries. (`verdicts.json`
+is the assertion evaluator's responsibility; §10.5.)
+
+**Envelope conformance.** Every line of `events.ndjson` is valid JSON
+conforming to the §9.2 envelope shape.
+
+**Hash integrity.** Every manifest-recorded hash equals the actual hash
+of the file it names.
+
+**Snapshot organization.** Each `SnapshotRecord` corresponds to exactly
+one file at `snapshots/<host_id>/<snapshot_seq>.json`. Sequence numbers
+are monotonically increasing per host from zero.
+
+**Ordering is deterministic and documented.** Identical record streams
+produce byte-identical bundles. The ordering rule is named in §9 and the
+writer obeys it.
+
+**Arrival-order independence.** Records may arrive in any order; the
+produced bundle depends only on the multiset of records and the
+documented ordering rule, not on arrival order.
+
+**Idempotency.** Writing the same record stream to a fresh output path
+twice produces byte-identical bundles.
 
 ---
 
@@ -888,6 +1084,35 @@ events are emitted, the evaluator may resolve assertions whose verdicts
 are determinable from the prefix. The engine polls this side after each
 event dispatch. The streaming side is an optimization; the post-run side
 remains the authoritative source for `verdicts.json`.
+
+### 10.5 Behavioral tests
+
+The evaluator's contract is the assertion catalog of §10.1, the verdict
+shape of §10.2, and the streaming side of §10.4. Its tests assert that
+it has the properties below.
+
+**Per-kind soundness.** For every kind in §10.1: `Pass` is returned
+exactly when the kind's stated condition holds over the bundle; `Fail`
+exactly when the condition is violated; `Inconclusive` exactly when the
+preconditions did not fire.
+
+**Verdict shape.** Every verdict conforms to §10.2. `Fail` verdicts
+carry evidence referencing the event or snapshot responsible.
+
+**Verdict order is scenario-declared.** `verdicts.json` lists verdicts
+in the order the scenario declared the corresponding assertions.
+
+**Streaming agrees with post-run.** On any bundle, the streaming side
+either does not resolve or resolves to the same verdict the post-run
+side will return. The two are never inconsistent.
+
+**Streaming resolves as early as possible.** When a verdict is
+determinable from a prefix, the streaming side resolves no later than
+the end of that prefix.
+
+**Property failures replay exactly.** A library-property failure
+recorded with seed S, replayed with seed S, produces the identical
+scenario and the identical `Fail` verdict.
 
 ---
 
