@@ -4920,6 +4920,7 @@ version = "1.0.149"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83fc039473c5595ace860d8c4fafa220ff474b3fc6bfdb4293327f1a37e94d86"
 dependencies = [
+ "indexmap",
  "itoa",
  "memchr",
  "serde",
@@ -5129,15 +5130,20 @@ name = "simulation"
 version = "0.1.0"
 dependencies = [
  "distribution",
- "flate2",
- "quote",
+ "proptest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
- "syn",
- "tar",
+ "siphasher",
+ "tempfile",
  "toml 0.8.23",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "slab"
@@ -5776,6 +5782,7 @@ version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
 dependencies = [
+ "indexmap",
  "serde",
  "serde_spanned 0.6.9",
  "toml_datetime 0.6.11",

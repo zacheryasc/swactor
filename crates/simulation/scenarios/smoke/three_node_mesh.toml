@@ -1,0 +1,65 @@
+# Three-node SWIM mesh, no impairments. Asserts continuous Alive.
+# Expected verdict: pass-now.
+
+name = "three_node_mesh"
+seed = 1
+duration_ns = 60_000_000_000  # 60 seconds
+
+[default_tick]
+period_ns = 200_000_000  # 200 ms
+
+[default_link]
+latency_ns = 5_000_000  # 5 ms
+jitter_stddev_ns = 1_000_000  # 1 ms
+loss_prob_ppm = 0
+reorder_prob_ppm = 0
+bandwidth_bps = 100_000_000  # 100 Mb/s
+cold_dial_penalty_ns = 50_000_000  # 50 ms
+cache_warm_after_ns = 100_000_000  # 100 ms
+cache_invalidate_after_idle_ns = 30_000_000_000  # 30 s
+
+[[peers]]
+id = "a"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+
+[[peers]]
+id = "b"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+
+[[peers]]
+id = "c"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+
+[[links]]
+from = "a"
+to = "b"
+[[links]]
+from = "b"
+to = "a"
+[[links]]
+from = "a"
+to = "c"
+[[links]]
+from = "c"
+to = "a"
+[[links]]
+from = "b"
+to = "c"
+[[links]]
+from = "c"
+to = "b"
+
+[[snapshots]]
+at_ns = 30_000_000_000
+
+[[assertions]]
+kind = "all_alive_throughout"
+window_start_ns = 5_000_000_000
+window_end_ns = 60_000_000_000
+peers = ["a", "b", "c"]

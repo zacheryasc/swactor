@@ -1,0 +1,78 @@
+# Short SWIM integration scenario — exercises the full pipeline end
+# to end (scenario loader → engine → SwimHostFactory → network →
+# bundle writer → assertion evaluator) at small enough scale to fit
+# in a unit-test run.
+#
+# This is NOT the gossip-flap reproduction (see gossip_flap.toml for
+# that long-form scenario). It is the smoke test that the §6.2 SWIM
+# host adapter wires up correctly with the rest of the simulator.
+
+name = "swim_integration_smoke"
+seed = 7
+duration_ns = 5_000_000_000  # 5 seconds simulated
+
+[default_tick]
+period_ns = 50_000_000  # 50ms
+
+[default_link]
+latency_ns = 1_000_000  # 1ms — single-region
+jitter_stddev_ns = 0
+loss_prob_ppm = 0
+reorder_prob_ppm = 0
+bandwidth_bps = 1_000_000_000  # 1 Gbps
+cold_dial_penalty_ns = 10_000_000  # 10ms
+cache_warm_after_ns = 100_000_000  # 100ms
+cache_invalidate_after_idle_ns = 30_000_000_000  # 30s
+
+[[peers]]
+id = "alpha"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 200_000_000, suspicion_timeout_ns = 1_000_000_000 }
+
+[[peers]]
+id = "bravo"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 200_000_000, suspicion_timeout_ns = 1_000_000_000 }
+
+[[peers]]
+id = "charlie"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 200_000_000, suspicion_timeout_ns = 1_000_000_000 }
+
+[[links]]
+from = "alpha"
+to = "bravo"
+[[links]]
+from = "alpha"
+to = "charlie"
+[[links]]
+from = "bravo"
+to = "alpha"
+[[links]]
+from = "bravo"
+to = "charlie"
+[[links]]
+from = "charlie"
+to = "alpha"
+[[links]]
+from = "charlie"
+to = "bravo"
+
+[[snapshots]]
+at_ns = 2_500_000_000
+
+# Bounds-style assertions that the smoke run satisfies. The
+# reproduction-specific `no_flap_while_probes_ok` is in
+# gossip_flap.toml, not here.
+[[assertions]]
+kind = "self_incarnation_bounded"
+peer = "alpha"
+max_value = 1000
+
+[[assertions]]
+kind = "event_count"
+event_kind = "state_transition"
+max = 10000

@@ -1,0 +1,71 @@
+# Partition the cluster into {a} | {b, c} for 5s, then heal. Asserts the
+# cluster converges back to all-Alive within a bounded window.
+# Expected verdict: pass-now.
+
+name = "partition_heal"
+seed = 7
+duration_ns = 90_000_000_000
+
+[default_tick]
+period_ns = 200_000_000
+
+[default_link]
+latency_ns = 5_000_000
+jitter_stddev_ns = 1_000_000
+loss_prob_ppm = 0
+reorder_prob_ppm = 0
+bandwidth_bps = 100_000_000
+cold_dial_penalty_ns = 50_000_000
+cache_warm_after_ns = 100_000_000
+cache_invalidate_after_idle_ns = 30_000_000_000
+
+[[peers]]
+id = "a"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+[[peers]]
+id = "b"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+[[peers]]
+id = "c"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+
+[[links]]
+from = "a"
+to = "b"
+[[links]]
+from = "b"
+to = "a"
+[[links]]
+from = "a"
+to = "c"
+[[links]]
+from = "c"
+to = "a"
+[[links]]
+from = "b"
+to = "c"
+[[links]]
+from = "c"
+to = "b"
+
+[[mutations]]
+kind = "partition"
+at_ns = 10_000_000_000
+peers_a = ["a"]
+peers_b = ["b", "c"]
+
+[[mutations]]
+kind = "heal"
+at_ns = 30_000_000_000
+
+[[assertions]]
+kind = "convergence_after"
+after_ns = 30_000_000_000
+within_ns = 30_000_000_000
+peers = ["a", "b", "c"]
