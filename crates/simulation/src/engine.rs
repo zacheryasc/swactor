@@ -1,885 +1,791 @@
-//! Discrete-event engine core (SPEC §2.2, §2.3, §2.4).
+//! The engine (SIM_SPEC §4).
 //!
-//! The engine drives a virtual-time priority queue ordered by
-//! `(virtual_time, node_id, fiber_id, event_seq)` per SPEC §2.3.
-//! Lifecycle events drain to per-node record streams, mutations land on
-//! a sim-only log and broadcast as `Custom` events, and a synthetic
-//! `loopback` host emits one of every Event variant the corpus
-//! exercises so the schema-floor parity bars (TESTING_SPEC §6) bind to
-//! real engine output.
+//! Owns the virtual clock, the scheduling queue, the host table, the
+//! network, and the bundle writer. Pops one event at a time, advances
+//! the clock to the event's time, dispatches by kind, and processes
+//! returned host actions in order.
 //!
-//! Every value that ends up in the bundle is reachable from the
-//! `(spec, seed)` pair via a pure function — no wall-clock reads, no
-//! floating-point arithmetic on hot paths, no iteration order that
-//! depends on hash randomisation.
+//! The engine never reads any clock other than the popped event's
+//! `virtual_time_ns`. It never re-orders host actions. It treats
+//! message bytes as opaque.
 
-use std::cmp::Ordering;
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use serde::{Deserialize, Serialize};
+use crate::bundle::{
+    BundleRecord, BundleWriter, DeliveryDropReason, EventPayload, EventRecord, MutationRecord,
+    SnapshotRecord,
+};
+use crate::evaluator::{EventLine, SnapshotEntry, StreamingEvaluator};
+use crate::host::{Action, Host, HostFactory, HostId, HostMessage};
+use crate::network::{DeliveryId, Network, NetworkNotification, SendOutcome};
+use crate::rng::{SubstreamKey, SubstreamRng};
+use crate::scenario::{Mutation, MutationKind, Scenario};
 
-use crate::spec::{Host, Mutation, MutationKind, ParsedSpec};
+// ──────────────────────────────────────────────────────────────────────
+// Public surface
+// ──────────────────────────────────────────────────────────────────────
 
-// ── Public engine surface ──────────────────────────────────────────
-
-/// Result of running an engine to completion. Owns every record the
-/// bundle writer needs.
-#[derive(Debug)]
-pub struct RunRecords {
-    pub boots: BTreeMap<String, Vec<BootRecord>>,
-    pub finalizes: BTreeMap<String, Vec<FinalizeRecord>>,
-    pub mutations_log: Vec<MutationLogEntry>,
-    pub custom_events: BTreeMap<String, Vec<EventRecord>>,
-    pub snapshots: BTreeMap<String, Vec<SnapshotRecord>>,
-    pub links_applied: Vec<LinkApplied>,
-    pub summary: RunSummary,
+/// A fatal violation: the host produced something the engine cannot
+/// route. Distinct from a routine drop or refused send; the run aborts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineAbort {
+    /// A host referenced an id the engine has never heard of.
+    UnknownDestination { from: String, to: String },
+    /// A host attempted to send to itself, which the spec leaves
+    /// undefined and we refuse.
+    SelfSend { host: String },
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct BootRecord {
-    pub node_id: String,
-    pub stage_index: Option<u32>,
-    pub boot_sequence: u32,
-    pub wall_ms: u64,
-    pub monotonic_seq: u64,
-    pub run_id: String,
-    pub schema_version: u32,
+/// Termination cause; tests inspect this to verify §4.8 / §4.10.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminationReason {
+    DurationReached,
+    EarlyAllAssertionsResolved,
+    Aborted(EngineAbort),
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct FinalizeRecord {
-    pub node_id: String,
-    pub boot_sequence: u32,
-    pub wall_ms: u64,
-    pub monotonic_seq: u64,
-    pub run_id: String,
-    pub shutdown_reason: String,
-    pub schema_version: u32,
+pub struct Engine<W: BundleWriter> {
+    network: Network,
+    writer: W,
+    hosts: BTreeMap<HostId, Box<dyn Host>>,
+    /// Hosts that returned `Action::Halt`. Per §4.6 Halt suppresses
+    /// further ticks but recv still flows.
+    halted: BTreeMap<HostId, bool>,
+    /// Hosts a `PeerKill` mutation has stopped. Per §5.5 a killed
+    /// peer's ticks are stopped, its in-flight deliveries are
+    /// invalidated, and the engine treats it as not-live (no
+    /// snapshots, no future deliveries) until a `PeerResurrect`
+    /// brings it back.
+    killed: BTreeSet<HostId>,
+    /// Hosts whose `recv` returned `Action::Halt`. Per §4.6 "Inbound
+    /// recv still flows … *until the host's `recv` itself returns
+    /// `Halt`*" — i.e. Halt-from-recv terminates recv flow too,
+    /// while Halt-from-tick only suppresses ticks.
+    recv_halted: BTreeSet<HostId>,
+    tick_period_ns: BTreeMap<HostId, u64>,
+    /// Per-peer construction specs the engine retains so it can
+    /// rebuild a host via the registered factory on a
+    /// `PeerResurrect { preserve_state: false }` mutation.
+    peer_specs: BTreeMap<HostId, PeerSpec>,
+    /// Roster of every declared peer id, kept in scenario order so
+    /// each freshly built host gets the full neighbour list.
+    peer_roster: Vec<HostId>,
+    /// Per-kind host factories. None registered ⇒ tests
+    /// pre-install hosts via `install_host`. Both modes coexist.
+    factories: BTreeMap<&'static str, Box<dyn HostFactory>>,
+    queue: BinaryHeap<Reverse<QueueEntry>>,
+    next_seq: u64,
+    /// Delivery ids the engine has already invalidated; deliveries
+    /// referencing them are dropped at the mutation's time.
+    invalidated: BTreeMap<DeliveryId, DeliveryDropReason>,
+    now_ns: u64,
+    duration_ns: u64,
+    /// Optional bound on how many pops to make; tests use it to
+    /// guard against runaway loops. None ⇒ unbounded.
+    pop_budget: Option<u64>,
+    /// §10.4 streaming evaluator — fed the same record stream the
+    /// bundle writer sees, so the engine can ask `all_resolved()`
+    /// for §4.8 early-termination. None ⇒ early termination is off.
+    streaming: Option<StreamingEvaluator>,
+    /// Tracks whether `scenario.early_terminate_on_all_assertions_resolved`
+    /// is set; the engine only honours the streaming evaluator's
+    /// `all_resolved` when this is true.
+    early_terminate_on_resolved: bool,
+    /// Monotonic line counter the streaming evaluator uses to label
+    /// EventLines. Mirrors the bundle writer's ordering rule
+    /// in spirit (the engine emits records in dispatch order; the
+    /// streaming side sees them in that same order).
+    next_event_line_idx: usize,
+    /// Per-host monotonic snapshot counter for the streaming side.
+    next_snapshot_seq: BTreeMap<HostId, u32>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct EventRecord {
-    /// The discriminated `variant` carried by the on-disk record
-    /// (`Custom`, `MessageSent`, `DialStarted`, …).
-    pub variant: String,
-    /// For `variant = "Custom"`, the user-supplied sub-kind.
-    pub user_kind: Option<String>,
-    pub wall_ms: u64,
-    pub monotonic_seq: u64,
-    pub boot_sequence: u32,
-    /// Variant-specific fields, merged into the JSON record at write
-    /// time. Must not contain node-name strings — the rename test
-    /// substring-replaces names across the spec and the bundle must
-    /// stay byte-identical after the rename (TESTING_SPEC §9.1).
-    pub fields: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SnapshotRecord {
-    pub snapshot_id: String,
-    pub boot_sequence: u32,
-    pub wall_ms: u64,
-    pub monotonic_seq: u64,
-    pub trigger: String,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct MutationLogEntry {
-    pub at_ms: u64,
-    pub kind: String,
-    pub detail: serde_json::Value,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct LinkApplied {
-    pub at_ms: u64,
-    pub a: String,
-    pub b: String,
-    pub bandwidth_bps: u64,
-    pub one_way_delay_ms: u32,
-    pub jitter_ms: u32,
-    pub loss_ppm: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct RunSummary {
-    pub run_id: String,
-    pub seed: u64,
-    pub schema_version: u32,
-    pub duration_ms: u64,
-    pub node_count: usize,
-    pub mutation_count: usize,
-    pub link_count: usize,
-}
-
-pub const SCHEMA_VERSION: u32 = 1;
-
-/// Synthetic host that emits every Event variant in the corpus so the
-/// schema-floor parity bar (TESTING_SPEC §6.4) can bind. The name
-/// `loopback` is chosen because it is **not** in the rename-test map
-/// (TESTING_SPEC §9.1) — content that mentions the name survives the
-/// rename unchanged, so MessageSent / MessageReceived events can carry
-/// `peer = "loopback"` (which is also the host's directory name) and
-/// satisfy `t_causality::send_precedes_receive` without breaking
-/// rename equivariance.
-pub const LOOPBACK_HOST: &str = "loopback";
-
-/// Event variants the corpus exhibits (TESTING_SPEC §6.4). The
-/// loopback host emits one of each at its boot tick so the reference
-/// bundle covers the same variant set as the prod corpus.
-pub const EVENT_VARIANTS: &[&str] = &[
-    "DialStarted",
-    "DialOutcome",
-    "ConnectionCacheMiss",
-    "MessageSent",
-    "MessageReceived",
-    "IrohConnTypeChanged",
-    "SwimTransition",
-    "SwimMetadataSent",
-    "SwimMetadataReceived",
-    "NodeMapUpdate",
-    "ConnectionCacheHit",
-    "RelayChanged",
-    "ProbeSent",
-    "ProbeReceived",
-    "ConnectionCacheInvalidated",
-    "Error",
-    "Custom",
-];
-
-// ── Event queue ────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Eq, PartialEq)]
-struct EventKey {
-    virtual_time_ms: u64,
-    node_id: String,
-    fiber_id: u32,
-    event_seq: u64,
-}
-
-impl Ord for EventKey {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .virtual_time_ms
-            .cmp(&self.virtual_time_ms)
-            .then(other.node_id.cmp(&self.node_id))
-            .then(other.fiber_id.cmp(&self.fiber_id))
-            .then(other.event_seq.cmp(&self.event_seq))
-    }
-}
-
-impl PartialOrd for EventKey {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug)]
-struct ScheduledEvent {
-    key: EventKey,
-    payload: EventPayload,
-}
-
-impl PartialEq for ScheduledEvent {
-    fn eq(&self, other: &Self) -> bool {
-        self.key == other.key
-    }
-}
-
-impl Eq for ScheduledEvent {}
-
-impl Ord for ScheduledEvent {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.key.cmp(&other.key)
-    }
-}
-
-impl PartialOrd for ScheduledEvent {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
+/// Whether a Vec<Action> came from a host's `tick` or its `recv`.
+/// §4.6 differentiates Halt behaviour by source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionSource {
+    Tick,
+    Recv,
 }
 
 #[derive(Debug, Clone)]
-enum EventPayload {
-    HostStart { name: String },
-    HostStop { name: String, reason: String },
-    HostCrash { name: String },
-    HostRestart { name: String },
-    Snapshot { name: String },
-    Mutation { mutation: Mutation },
-    EndOfRun,
+struct PeerSpec {
+    kind: String,
+    kind_config: toml::value::Table,
+    tick_period_ns: u64,
 }
 
-// ── Engine state ───────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub struct Engine {
-    pub spec: ParsedSpec,
-    pub seed: u64,
-    virtual_time_ms: u64,
-    event_seq: u64,
-    queue: BinaryHeap<ScheduledEvent>,
-    host_state: BTreeMap<String, HostState>,
-}
-
-#[derive(Debug)]
-struct HostState {
-    stage_index: Option<u32>,
-    boot_sequence: u32,
-    monotonic_seq: u64,
-    alive: bool,
-    boots: Vec<BootRecord>,
-    finalizes: Vec<FinalizeRecord>,
-    custom_events: Vec<EventRecord>,
-    snapshots: Vec<SnapshotRecord>,
-    crashed: bool,
-}
-
-impl Engine {
-    pub fn new(mut spec: ParsedSpec, seed: u64) -> Self {
-        ensure_loopback_host(&mut spec);
-        let mut engine = Self {
-            spec,
-            seed,
-            virtual_time_ms: 0,
-            event_seq: 0,
+impl<W: BundleWriter> Engine<W> {
+    pub fn new(scenario: &Scenario, network: Network, writer: W) -> Self {
+        let hosts: BTreeMap<HostId, Box<dyn Host>> = BTreeMap::new();
+        let mut halted = BTreeMap::new();
+        let mut tick_period_ns = BTreeMap::new();
+        let mut peer_specs = BTreeMap::new();
+        let mut peer_roster = Vec::new();
+        for peer in &scenario.peers {
+            let period = peer
+                .tick_period_ns_override
+                .unwrap_or(scenario.default_tick.period_ns);
+            tick_period_ns.insert(peer.id.clone(), period);
+            halted.insert(peer.id.clone(), false);
+            peer_specs.insert(
+                peer.id.clone(),
+                PeerSpec {
+                    kind: peer.kind.clone(),
+                    kind_config: peer.kind_config.clone(),
+                    tick_period_ns: period,
+                },
+            );
+            peer_roster.push(peer.id.clone());
+        }
+        let mut e = Self {
+            network,
+            writer,
+            hosts,
+            halted,
+            killed: BTreeSet::new(),
+            recv_halted: BTreeSet::new(),
+            tick_period_ns,
+            peer_specs,
+            peer_roster,
+            factories: BTreeMap::new(),
             queue: BinaryHeap::new(),
-            host_state: BTreeMap::new(),
+            next_seq: 0,
+            invalidated: BTreeMap::new(),
+            now_ns: 0,
+            duration_ns: scenario.duration_ns,
+            pop_budget: None,
+            streaming: None,
+            early_terminate_on_resolved: scenario.early_terminate_on_all_assertions_resolved,
+            next_event_line_idx: 0,
+            next_snapshot_seq: BTreeMap::new(),
         };
-        engine.bootstrap();
-        engine
+        // §4.1 pre-population: tick per host (with offset), mutation per
+        // scenario mutation, snapshot per scenario snapshot, terminate at
+        // duration_ns.
+        for peer in &scenario.peers {
+            let offset = tick_offset_ns(
+                scenario.seed,
+                &peer.id,
+                e.tick_period_ns[&peer.id],
+            );
+            e.enqueue(offset, EventKind::Tick { host: peer.id.clone() });
+        }
+        for m in &scenario.mutations {
+            e.enqueue(m.at_ns, EventKind::Mutation { mutation: m.clone() });
+        }
+        for s in &scenario.snapshots {
+            e.enqueue(s.at_ns, EventKind::Snapshot);
+        }
+        e.enqueue(scenario.duration_ns, EventKind::Terminate);
+        e
     }
 
-    fn bootstrap(&mut self) {
-        let hosts = self.spec.hosts.clone();
-        for host in &hosts {
-            self.host_state.insert(
-                host.name.clone(),
-                HostState {
-                    stage_index: host.stage_index,
-                    boot_sequence: 0,
-                    monotonic_seq: 0,
-                    alive: false,
-                    boots: Vec::new(),
-                    finalizes: Vec::new(),
-                    custom_events: Vec::new(),
-                    snapshots: Vec::new(),
-                    crashed: false,
-                },
-            );
+    /// Install a host instance. Hosts must be installed before `run`
+    /// is called; once `run` starts the host table is frozen *unless*
+    /// a `PeerResurrect { preserve_state: false }` mutation fires and
+    /// a factory is registered for the host's kind.
+    pub fn install_host(&mut self, host: Box<dyn Host>) {
+        self.hosts.insert(host.id().to_string(), host);
+    }
 
-            self.schedule(
-                host.start_at_ms,
-                &host.name,
-                FIBER_LIFECYCLE,
-                EventPayload::HostStart {
-                    name: host.name.clone(),
-                },
-            );
-            for restart_at in &host.restart_at_ms {
-                self.schedule(
-                    *restart_at,
-                    &host.name,
-                    FIBER_LIFECYCLE,
-                    EventPayload::HostRestart {
-                        name: host.name.clone(),
-                    },
-                );
-            }
-            if let Some(stop_at) = host.stop_at_ms {
-                self.schedule(
-                    stop_at,
-                    &host.name,
-                    FIBER_LIFECYCLE,
-                    EventPayload::HostStop {
-                        name: host.name.clone(),
-                        reason: "clean".into(),
-                    },
-                );
-            }
-            if let Some(crash_at) = host.crash_at_ms {
-                self.schedule(
-                    crash_at,
-                    &host.name,
-                    FIBER_LIFECYCLE,
-                    EventPayload::HostCrash {
-                        name: host.name.clone(),
-                    },
-                );
-            }
+    /// Register a host factory for a kind tag. The engine uses it on
+    /// `auto_install_hosts` and on `PeerResurrect { preserve_state:
+    /// false }` to (re)build a host instance from the scenario's
+    /// `peer.kind_config`.
+    pub fn register_factory(&mut self, factory: Box<dyn HostFactory>) {
+        self.factories.insert(factory.kind_tag(), factory);
+    }
 
-            // Stage hosts receive a snapshot tick at start_at_ms +
-            // SNAPSHOT_OFFSET_MS so the schema floor (TESTING_SPEC §6)
-            // has a `kind = "snapshot"` record to bind to. Anchoring on
-            // `stage_index` keeps the snapshot set stable under the
-            // rename test (TESTING_SPEC §9.1) — name strings never
-            // appear in the snapshot file content.
-            if host.stage_index.is_some() {
-                let snap_at = host.start_at_ms + SNAPSHOT_OFFSET_MS;
-                if snap_at < self.spec.duration_ms {
-                    self.schedule(
-                        snap_at,
-                        &host.name,
-                        FIBER_SNAPSHOT,
-                        EventPayload::Snapshot {
-                            name: host.name.clone(),
+    /// Build a fresh host instance for every declared peer whose kind
+    /// has a registered factory. Tests with manually installed stub
+    /// hosts skip this; integration code calls it once after
+    /// `Engine::new` + `register_factory`.
+    pub fn auto_install_hosts(&mut self) {
+        let specs: Vec<(HostId, PeerSpec)> = self
+            .peer_specs
+            .iter()
+            .map(|(id, spec)| (id.clone(), spec.clone()))
+            .collect();
+        for (id, spec) in specs {
+            if self.hosts.contains_key(&id) {
+                continue;
+            }
+            if let Some(factory) = self.factories.get(spec.kind.as_str()) {
+                let host = factory.build(
+                    &id,
+                    &spec.kind_config,
+                    &self.peer_roster,
+                    spec.tick_period_ns,
+                );
+                self.hosts.insert(id, host);
+            }
+        }
+    }
+
+    pub fn set_pop_budget(&mut self, n: u64) {
+        self.pop_budget = Some(n);
+    }
+
+    /// Install a §10.4 streaming evaluator. The engine forwards every
+    /// record it writes into the evaluator and, if the scenario set
+    /// `early_terminate_on_all_assertions_resolved = true`, halts the
+    /// main loop as soon as every assertion is resolved (§4.8).
+    pub fn enable_streaming(&mut self, evaluator: StreamingEvaluator) {
+        self.streaming = Some(evaluator);
+    }
+
+    /// Forward a `BundleRecord` to both the bundle writer and (if
+    /// enabled) the streaming evaluator. Every code path in the
+    /// engine writes records through here.
+    fn write_record(&mut self, rec: BundleRecord) {
+        if let Some(streamer) = self.streaming.as_mut() {
+            match &rec {
+                BundleRecord::Event(e) => {
+                    let line = EventLine::from_event_record(e, self.next_event_line_idx);
+                    streamer.feed_event(line);
+                    self.next_event_line_idx += 1;
+                }
+                BundleRecord::Mutation(m) => {
+                    let line = EventLine::from_mutation_record(m, self.next_event_line_idx);
+                    streamer.feed_event(line);
+                    self.next_event_line_idx += 1;
+                }
+                BundleRecord::Snapshot(s) => {
+                    let seq = self
+                        .next_snapshot_seq
+                        .entry(s.host_id.clone())
+                        .or_insert(0);
+                    let entry = SnapshotEntry::from_snapshot_record(s, *seq);
+                    *seq += 1;
+                    streamer.feed_snapshot(s.host_id.clone(), entry);
+                }
+            }
+        }
+        self.writer.write(rec);
+    }
+
+    pub fn writer(&self) -> &W {
+        &self.writer
+    }
+
+    pub fn into_writer(self) -> W {
+        self.writer
+    }
+
+    pub fn now_ns(&self) -> u64 {
+        self.now_ns
+    }
+
+    /// Drive the main loop until `Terminate` pops (or the pop budget
+    /// runs out). Returns the termination cause.
+    pub fn run(&mut self) -> TerminationReason {
+        let mut pops = 0u64;
+        loop {
+            if let Some(b) = self.pop_budget {
+                if pops >= b {
+                    return TerminationReason::DurationReached;
+                }
+            }
+            pops += 1;
+            let Some(Reverse(entry)) = self.queue.pop() else {
+                return TerminationReason::DurationReached;
+            };
+            self.now_ns = entry.time_ns;
+            match entry.kind {
+                EventKind::Terminate => {
+                    return TerminationReason::DurationReached;
+                }
+                EventKind::Tick { host } => {
+                    if let Err(abort) = self.dispatch_tick(host) {
+                        return TerminationReason::Aborted(abort);
+                    }
+                }
+                EventKind::Deliver { from, to, delivery_id, encoded } => {
+                    if let Some(reason) = self.invalidated.remove(&delivery_id) {
+                        // Already accounted for at the mutation's time
+                        // via DropOnDelivery; do not deliver.
+                        let _ = reason;
+                        continue;
+                    }
+                    if let Err(abort) = self.dispatch_deliver(from, to, delivery_id, encoded) {
+                        return TerminationReason::Aborted(abort);
+                    }
+                }
+                EventKind::LocalRecv { to, message } => {
+                    if let Err(abort) = self.dispatch_local_recv(to, message) {
+                        return TerminationReason::Aborted(abort);
+                    }
+                }
+                EventKind::Mutation { mutation } => self.dispatch_mutation(mutation),
+                EventKind::Snapshot => self.dispatch_snapshot(),
+            }
+            // §4.8 early termination — after every dispatch, ask the
+            // streaming evaluator whether every assertion is resolved.
+            // Only honour the answer when the scenario opted in.
+            if self.early_terminate_on_resolved {
+                if let Some(streamer) = self.streaming.as_ref() {
+                    if streamer.all_resolved() {
+                        return TerminationReason::EarlyAllAssertionsResolved;
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Dispatch ────────────────────────────────────────────────────
+
+    fn dispatch_tick(&mut self, host_id: HostId) -> Result<(), EngineAbort> {
+        let period = *self
+            .tick_period_ns
+            .get(&host_id)
+            .expect("tick scheduled for unknown host");
+        // §4.3 — schedule next tick after dispatch so action-emitted
+        // events at `now_ns` precede the next tick at
+        // `now_ns + period`. Halt (§4.6) and PeerKill (§5.5) both
+        // suppress the call; PeerKill additionally stops the next
+        // tick from being scheduled until PeerResurrect.
+        let killed = self.killed.contains(&host_id);
+        let halted = *self.halted.get(&host_id).unwrap_or(&false);
+        if !killed && !halted {
+            let now = self.now_ns;
+            let Some(mut host) = self.hosts.remove(&host_id) else {
+                // Host installed only by id table; if missing, treat as halted.
+                self.enqueue(now.saturating_add(period), EventKind::Tick { host: host_id });
+                return Ok(());
+            };
+            let actions = host.tick(now);
+            self.hosts.insert(host_id.clone(), host);
+            self.process_actions(&host_id, actions, ActionSource::Tick)?;
+        }
+        if killed {
+            // §5.5 — no further ticks until resurrected; the
+            // PeerResurrect handler re-arms one.
+            return Ok(());
+        }
+        let next = self.now_ns.saturating_add(period);
+        if next < self.duration_ns {
+            self.enqueue(next, EventKind::Tick { host: host_id });
+        }
+        Ok(())
+    }
+
+    fn dispatch_deliver(
+        &mut self,
+        from: HostId,
+        to: HostId,
+        delivery_id: DeliveryId,
+        encoded: Vec<u8>,
+    ) -> Result<(), EngineAbort> {
+        let now = self.now_ns;
+        // §4.4 — if destination is killed (PeerKill) or has terminated
+        // recv via a Halt-from-recv (§4.6 "until the host's recv itself
+        // returns Halt"), drop and emit DropOnDelivery. Action::Halt
+        // from `tick` does NOT suppress recv.
+        if self.killed.contains(&to) {
+            self.write_record(BundleRecord::Event(EventRecord {
+                virtual_time_ns: now,
+                host_id: Some(to.clone()),
+                kind_tag: "engine".into(),
+                event: EventPayload::DropOnDelivery {
+                    to: to.clone(),
+                    reason: DeliveryDropReason::HostKilled,
+                },
+            }));
+            // Tell the network this delivery is done so it doesn't
+            // sit in `in_flight` forever.
+            self.network.notify_delivered(&from, &to, delivery_id);
+            return Ok(());
+        }
+        if self.recv_halted.contains(&to) {
+            self.write_record(BundleRecord::Event(EventRecord {
+                virtual_time_ns: now,
+                host_id: Some(to.clone()),
+                kind_tag: "engine".into(),
+                event: EventPayload::DropOnDelivery {
+                    to: to.clone(),
+                    reason: DeliveryDropReason::HostHalted,
+                },
+            }));
+            self.network.notify_delivered(&from, &to, delivery_id);
+            return Ok(());
+        }
+        let Some(mut host) = self.hosts.remove(&to) else {
+            self.write_record(BundleRecord::Event(EventRecord {
+                virtual_time_ns: now,
+                host_id: Some(to.clone()),
+                kind_tag: "engine".into(),
+                event: EventPayload::DropOnDelivery {
+                    to: to.clone(),
+                    reason: DeliveryDropReason::HostHalted,
+                },
+            }));
+            self.network.notify_delivered(&from, &to, delivery_id);
+            return Ok(());
+        };
+        let actions = host.recv(HostMessage::App(encoded), now);
+        self.hosts.insert(to.clone(), host);
+        // §3.2 invariant: the network's in_flight list must not
+        // include deliveries that have already been processed.
+        self.network.notify_delivered(&from, &to, delivery_id);
+        self.process_actions(&to, actions, ActionSource::Recv)
+    }
+
+    fn dispatch_local_recv(
+        &mut self,
+        to: HostId,
+        message: HostMessage,
+    ) -> Result<(), EngineAbort> {
+        let now = self.now_ns;
+        // Local recv (timer / send-failed) does not touch the network.
+        // PeerKill (§5.5) and Halt-from-recv (§4.6) both suppress recv.
+        if self.killed.contains(&to) || self.recv_halted.contains(&to) {
+            return Ok(());
+        }
+        let Some(mut host) = self.hosts.remove(&to) else {
+            return Ok(());
+        };
+        let actions = host.recv(message, now);
+        self.hosts.insert(to.clone(), host);
+        self.process_actions(&to, actions, ActionSource::Recv)
+    }
+
+    fn dispatch_mutation(&mut self, mutation: Mutation) {
+        let at = self.now_ns;
+        let invalidated = self.network.apply_mutation(&mutation, at);
+        // The drop reason for invalidated deliveries depends on which
+        // mutation invalidated them. Partition → `Partition`,
+        // PeerKill → `HostKilled`; nothing else invalidates deliveries
+        // today (LatencySpike / LossBurst / RelayBuffer / Heal /
+        // PeerResurrect all return an empty list from the network).
+        let drop_reason = match &mutation.kind {
+            MutationKind::Partition { .. } => DeliveryDropReason::Partition,
+            MutationKind::PeerKill { .. } => DeliveryDropReason::HostKilled,
+            _ => DeliveryDropReason::HostKilled,
+        };
+        // §5.5 — PeerKill / PeerResurrect are engine-observable
+        // events: the engine, not the network, decides whether the
+        // host receives ticks and snapshots.
+        match &mutation.kind {
+            MutationKind::PeerKill { peer } => {
+                self.killed.insert(peer.clone());
+            }
+            MutationKind::PeerResurrect { peer, preserve_state } => {
+                // §4.3 calls PeerResurrect the *only* mechanism to
+                // un-halt. So clear kill and both halt-flavours;
+                // re-arm the cadence if the peer was suppressed
+                // under any flag.
+                let was_killed = self.killed.remove(peer);
+                let was_halted = self
+                    .halted
+                    .get(peer)
+                    .copied()
+                    .unwrap_or(false);
+                if was_halted {
+                    self.halted.insert(peer.clone(), false);
+                }
+                let was_recv_halted = self.recv_halted.remove(peer);
+                let was_halted = was_halted || was_recv_halted;
+                // §5.5 — `preserve_state = false` means rebuild the
+                // host from its scenario declaration. If no factory
+                // is registered for the host's kind, the engine
+                // leaves the existing instance alone and records the
+                // omission via the mutation record (the caller can
+                // detect it by reading the bundle).
+                if !*preserve_state {
+                    let rebuilt = self
+                        .peer_specs
+                        .get(peer)
+                        .cloned()
+                        .and_then(|spec| {
+                            self.factories.get(spec.kind.as_str()).map(|f| {
+                                f.build(
+                                    peer,
+                                    &spec.kind_config,
+                                    &self.peer_roster,
+                                    spec.tick_period_ns,
+                                )
+                            })
+                        });
+                    if let Some(host) = rebuilt {
+                        self.hosts.insert(peer.clone(), host);
+                    }
+                }
+                if was_killed || was_halted {
+                    if let Some(period) = self.tick_period_ns.get(peer).copied() {
+                        let next = at.saturating_add(period);
+                        if next < self.duration_ns {
+                            self.enqueue(next, EventKind::Tick { host: peer.clone() });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        // Record the mutation itself.
+        self.write_record(BundleRecord::Mutation(MutationRecord {
+            virtual_time_ns: at,
+            mutation,
+        }));
+        // For each invalidated delivery: emit DropOnDelivery now,
+        // remember the delivery id so the actual Deliver pop is
+        // skipped.
+        for inv in invalidated {
+            self.invalidated.insert(inv.delivery_id, drop_reason);
+            self.write_record(BundleRecord::Event(EventRecord {
+                virtual_time_ns: at,
+                host_id: Some(inv.to.clone()),
+                kind_tag: "engine".into(),
+                event: EventPayload::DropOnDelivery {
+                    to: inv.to,
+                    reason: drop_reason,
+                },
+            }));
+        }
+        self.drain_network_notifications();
+    }
+
+    fn dispatch_snapshot(&mut self) {
+        let at = self.now_ns;
+        // §4.5: snapshots ask "every live host". §7.3: iterate in
+        // BTreeMap (key-sorted) order. Killed peers are not live.
+        let ids: Vec<HostId> = self
+            .hosts
+            .keys()
+            .filter(|id| !self.killed.contains(*id))
+            .cloned()
+            .collect();
+        for id in ids {
+            let kind_tag = self.hosts[&id].kind_tag().to_string();
+            let bytes = self.hosts[&id].snapshot();
+            self.write_record(BundleRecord::Snapshot(SnapshotRecord {
+                virtual_time_ns: at,
+                host_id: id,
+                kind_tag,
+                snapshot: bytes,
+            }));
+        }
+    }
+
+    // ── Action processing ───────────────────────────────────────────
+
+    fn process_actions(
+        &mut self,
+        host_id: &str,
+        actions: Vec<Action>,
+        source: ActionSource,
+    ) -> Result<(), EngineAbort> {
+        for action in actions {
+            match action {
+                Action::Send { to, encoded } => {
+                    self.process_send(host_id, &to, encoded)?;
+                }
+                Action::RecordEvent { kind_tag, event } => {
+                    self.write_record(BundleRecord::Event(EventRecord {
+                        virtual_time_ns: self.now_ns,
+                        host_id: Some(host_id.to_string()),
+                        kind_tag,
+                        event: EventPayload::Bytes(event),
+                    }));
+                }
+                Action::ScheduleTimer { at_ns, token } => {
+                    self.enqueue(
+                        at_ns,
+                        EventKind::LocalRecv {
+                            to: host_id.to_string(),
+                            message: HostMessage::TimerFired { token },
                         },
                     );
                 }
-            }
-        }
-
-        // Canonical scheduling of mutations: sort by (at_ms,
-        // canonical_form) before assigning the per-tick event_seq so
-        // two specs that differ only in the *declaration order* of
-        // same-tick mutations produce byte-identical bundles
-        // (TESTING_SPEC §9.3).
-        let mut mutations = self.spec.mutations.clone();
-        mutations.sort_by(|a, b| {
-            a.at_ms
-                .cmp(&b.at_ms)
-                .then_with(|| mutation_canonical_form(a).cmp(&mutation_canonical_form(b)))
-                .then_with(|| a.spec_index.cmp(&b.spec_index))
-        });
-        for (canonical_index, mutation) in mutations.into_iter().enumerate() {
-            let key = EventKey {
-                virtual_time_ms: mutation.at_ms,
-                node_id: String::new(),
-                fiber_id: FIBER_MUTATIONS,
-                event_seq: canonical_index as u64,
-            };
-            self.event_seq = self.event_seq.max(canonical_index as u64 + 1);
-            self.queue.push(ScheduledEvent {
-                key,
-                payload: EventPayload::Mutation { mutation },
-            });
-        }
-
-        // End-of-run sentinel at duration_ms.
-        let duration = self.spec.duration_ms;
-        self.queue.push(ScheduledEvent {
-            key: EventKey {
-                virtual_time_ms: duration,
-                node_id: "~end".into(),
-                fiber_id: FIBER_END,
-                event_seq: u64::MAX,
-            },
-            payload: EventPayload::EndOfRun,
-        });
-    }
-
-    fn schedule(&mut self, at_ms: u64, node_id: &str, fiber_id: u32, payload: EventPayload) {
-        self.event_seq += 1;
-        let key = EventKey {
-            virtual_time_ms: at_ms,
-            node_id: node_id.to_string(),
-            fiber_id,
-            event_seq: self.event_seq,
-        };
-        self.queue.push(ScheduledEvent { key, payload });
-    }
-
-    pub fn run(mut self) -> RunRecords {
-        let mut mutations_log: Vec<MutationLogEntry> = Vec::new();
-        let mut links_applied: Vec<LinkApplied> = Vec::new();
-
-        // Initial link snapshot at t=0.
-        for link in &self.spec.links {
-            links_applied.push(LinkApplied {
-                at_ms: 0,
-                a: link.a.clone(),
-                b: link.b.clone(),
-                bandwidth_bps: link.bandwidth_bps,
-                one_way_delay_ms: link.one_way_delay_ms,
-                jitter_ms: link.jitter_ms,
-                loss_ppm: link.loss_ppm,
-            });
-        }
-
-        let mut partitioned: BTreeSet<(String, String)> = BTreeSet::new();
-
-        while let Some(event) = self.queue.pop() {
-            self.virtual_time_ms = event.key.virtual_time_ms;
-            match event.payload {
-                EventPayload::HostStart { name } => {
-                    self.do_host_start(&name);
-                }
-                EventPayload::HostStop { name, reason } => {
-                    self.do_host_stop(&name, &reason);
-                }
-                EventPayload::HostCrash { name } => {
-                    self.do_host_crash(&name);
-                }
-                EventPayload::HostRestart { name } => {
-                    self.do_host_restart(&name);
-                }
-                EventPayload::Snapshot { name } => {
-                    self.do_snapshot(&name);
-                }
-                EventPayload::Mutation { mutation } => {
-                    let entry = self.apply_mutation(&mutation, &mut partitioned);
-                    self.emit_mutation_event(&entry);
-                    mutations_log.push(entry);
-                }
-                EventPayload::EndOfRun => {
-                    self.virtual_time_ms = self.spec.duration_ms;
-                    break;
+                Action::Halt => {
+                    self.halted.insert(host_id.to_string(), true);
+                    // §4.6 "until the host's recv itself returns
+                    // Halt": Halt-from-recv terminates recv flow
+                    // too. Halt-from-tick only suppresses ticks.
+                    if source == ActionSource::Recv {
+                        self.recv_halted.insert(host_id.to_string());
+                    }
                 }
             }
         }
-
-        let names: Vec<String> = self.host_state.keys().cloned().collect();
-        for name in names {
-            let alive = self.host_state.get(&name).map(|h| h.alive).unwrap_or(false);
-            if alive {
-                self.do_host_stop(&name, "end_of_run");
-            }
-        }
-
-        let mut boots: BTreeMap<String, Vec<BootRecord>> = BTreeMap::new();
-        let mut finalizes: BTreeMap<String, Vec<FinalizeRecord>> = BTreeMap::new();
-        let mut custom_events: BTreeMap<String, Vec<EventRecord>> = BTreeMap::new();
-        let mut snapshots: BTreeMap<String, Vec<SnapshotRecord>> = BTreeMap::new();
-        let mut node_count = 0;
-        for (name, state) in &self.host_state {
-            node_count += 1;
-            boots.insert(name.clone(), state.boots.clone());
-            finalizes.insert(name.clone(), state.finalizes.clone());
-            custom_events.insert(name.clone(), state.custom_events.clone());
-            snapshots.insert(name.clone(), state.snapshots.clone());
-        }
-
-        let summary = RunSummary {
-            run_id: self.spec.run_id.clone(),
-            seed: self.seed,
-            schema_version: SCHEMA_VERSION,
-            duration_ms: self.spec.duration_ms,
-            node_count,
-            mutation_count: self.spec.mutations.len(),
-            link_count: self.spec.links.len(),
-        };
-
-        RunRecords {
-            boots,
-            finalizes,
-            mutations_log,
-            custom_events,
-            snapshots,
-            links_applied,
-            summary,
-        }
+        Ok(())
     }
 
-    fn do_host_start(&mut self, name: &str) {
-        let wall_ms = self.virtual_time_ms;
-        let run_id = self.spec.run_id.clone();
-        let mut emit_synthetic = false;
-        let mut emit_introspect_gap = false;
-        if let Some(state) = self.host_state.get_mut(name) {
-            if state.alive || state.crashed {
-                return;
-            }
-            state.alive = true;
-            state.monotonic_seq += 1;
-            state.boots.push(BootRecord {
-                node_id: name.to_string(),
-                stage_index: state.stage_index,
-                boot_sequence: state.boot_sequence,
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                run_id,
-                schema_version: SCHEMA_VERSION,
-            });
-            emit_synthetic = name == LOOPBACK_HOST && state.boot_sequence == 0;
-            // Stage hosts publish a paired introspector-gap `Error`
-            // event so the snapshot fields that the sim cannot
-            // populate (per OBSERVABILITY §6 rule 1, e.g.
-            // `conntrack_count`, `cpu_ms`) are *explicitly* `None`
-            // rather than silently. The schema-floor parity bar
-            // (TESTING_SPEC §6.3) reads this Error component when
-            // proving null fields are paired.
-            emit_introspect_gap = state.stage_index.is_some() && state.boot_sequence == 0;
-        }
-        if emit_synthetic {
-            self.emit_loopback_variants(name);
-        }
-        if emit_introspect_gap {
-            self.emit_introspect_gap_error(name);
-        }
-    }
-
-    fn emit_introspect_gap_error(&mut self, name: &str) {
-        let wall_ms = self.virtual_time_ms;
-        if let Some(state) = self.host_state.get_mut(name) {
-            state.monotonic_seq += 1;
-            state.custom_events.push(EventRecord {
-                variant: "Error".into(),
-                user_kind: None,
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                boot_sequence: state.boot_sequence,
-                fields: serde_json::json!({
-                    "component": "host_introspect",
-                    "message": "introspector fields unpopulated in sim host",
-                    "peer": null,
-                }),
-            });
-        }
-    }
-
-    fn do_host_stop(&mut self, name: &str, reason: &str) {
-        let wall_ms = self.virtual_time_ms;
-        let run_id = self.spec.run_id.clone();
-        if let Some(state) = self.host_state.get_mut(name) {
-            if !state.alive {
-                return;
-            }
-            state.alive = false;
-            state.monotonic_seq += 1;
-            state.finalizes.push(FinalizeRecord {
-                node_id: name.to_string(),
-                boot_sequence: state.boot_sequence,
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                run_id,
-                shutdown_reason: reason.to_string(),
-                schema_version: SCHEMA_VERSION,
-            });
-        }
-    }
-
-    fn do_host_crash(&mut self, name: &str) {
-        let wall_ms = self.virtual_time_ms;
-        if let Some(state) = self.host_state.get_mut(name) {
-            if !state.alive {
-                return;
-            }
-            state.alive = false;
-            state.crashed = true;
-            state.monotonic_seq += 1;
-            state.custom_events.push(EventRecord {
-                variant: "Custom".into(),
-                user_kind: Some("crash".into()),
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                boot_sequence: state.boot_sequence,
-                fields: serde_json::Value::Null,
-            });
-        }
-    }
-
-    fn do_host_restart(&mut self, name: &str) {
-        let wall_ms = self.virtual_time_ms;
-        let run_id = self.spec.run_id.clone();
-        if let Some(state) = self.host_state.get_mut(name) {
-            if state.alive {
-                state.alive = false;
-                state.monotonic_seq += 1;
-                state.finalizes.push(FinalizeRecord {
-                    node_id: name.to_string(),
-                    boot_sequence: state.boot_sequence,
-                    wall_ms,
-                    monotonic_seq: state.monotonic_seq,
-                    run_id: run_id.clone(),
-                    shutdown_reason: "restart".into(),
-                    schema_version: SCHEMA_VERSION,
-                });
-            }
-            state.boot_sequence += 1;
-            state.alive = true;
-            state.crashed = false;
-            state.monotonic_seq += 1;
-            state.boots.push(BootRecord {
-                node_id: name.to_string(),
-                stage_index: state.stage_index,
-                boot_sequence: state.boot_sequence,
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                run_id,
-                schema_version: SCHEMA_VERSION,
-            });
-        }
-    }
-
-    fn do_snapshot(&mut self, name: &str) {
-        let wall_ms = self.virtual_time_ms;
-        if let Some(state) = self.host_state.get_mut(name) {
-            if !state.alive {
-                return;
-            }
-            state.monotonic_seq += 1;
-            // snapshot_id encodes the host's stage_index (rename-stable
-            // numeric scalar) and the per-host monotonic_seq, giving
-            // a globally unique id without leaking the host name into
-            // the file content.
-            let snapshot_id = format!(
-                "snap-{:04}-{:08}",
-                state.stage_index.unwrap_or(u32::MAX),
-                state.monotonic_seq
-            );
-            state.snapshots.push(SnapshotRecord {
-                snapshot_id,
-                boot_sequence: state.boot_sequence,
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                trigger: "Periodic".into(),
-            });
-        }
-    }
-
-    fn emit_loopback_variants(&mut self, name: &str) {
-        let wall_ms = self.virtual_time_ms;
-        let state = match self.host_state.get_mut(name) {
-            Some(s) => s,
-            None => return,
-        };
-        for variant in EVENT_VARIANTS {
-            state.monotonic_seq += 1;
-            let (user_kind, fields) = synthetic_event_fields(variant);
-            state.custom_events.push(EventRecord {
-                variant: (*variant).to_string(),
-                user_kind,
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                boot_sequence: state.boot_sequence,
-                fields,
-            });
-        }
-    }
-
-    fn emit_mutation_event(&mut self, entry: &MutationLogEntry) {
-        let wall_ms = entry.at_ms;
-        let kind = entry.kind.clone();
-        let names: Vec<String> = self.host_state.keys().cloned().collect();
-        for name in names {
-            let state = self
-                .host_state
-                .get_mut(&name)
-                .expect("name from keys() must exist");
-            if !state.alive {
-                continue;
-            }
-            state.monotonic_seq += 1;
-            state.custom_events.push(EventRecord {
-                variant: "Custom".into(),
-                user_kind: Some(kind.clone()),
-                wall_ms,
-                monotonic_seq: state.monotonic_seq,
-                boot_sequence: state.boot_sequence,
-                fields: serde_json::Value::Null,
-            });
-        }
-    }
-
-    fn apply_mutation(
+    fn process_send(
         &mut self,
-        mutation: &Mutation,
-        partitioned: &mut BTreeSet<(String, String)>,
-    ) -> MutationLogEntry {
-        match &mutation.kind {
-            MutationKind::Partition { edges } => {
-                let mut listed: Vec<serde_json::Value> = Vec::new();
-                for (a, b) in edges {
-                    partitioned.insert((a.clone(), b.clone()));
-                    partitioned.insert((b.clone(), a.clone()));
-                    listed.push(serde_json::json!([a, b]));
-                }
-                MutationLogEntry {
-                    at_ms: mutation.at_ms,
-                    kind: "partition".into(),
-                    detail: serde_json::json!({ "edges": listed }),
-                }
-            }
-            MutationKind::Heal { edges } => {
-                let mut listed: Vec<serde_json::Value> = Vec::new();
-                for (a, b) in edges {
-                    partitioned.remove(&(a.clone(), b.clone()));
-                    partitioned.remove(&(b.clone(), a.clone()));
-                    listed.push(serde_json::json!([a, b]));
-                }
-                MutationLogEntry {
-                    at_ms: mutation.at_ms,
-                    kind: "heal".into(),
-                    detail: serde_json::json!({ "edges": listed }),
-                }
-            }
-            MutationKind::Restart { node } => {
-                // Restart is a host-lifecycle event (SPEC §5.3) — the
-                // host's own `restart_at_ms` is the authoritative
-                // trigger. The mutation is just the broadcast Custom
-                // record observers see; do not double-fire the
-                // restart by also calling `do_host_restart` here.
-                MutationLogEntry {
-                    at_ms: mutation.at_ms,
-                    kind: "restart".into(),
-                    detail: serde_json::json!({ "node": node }),
-                }
-            }
-            MutationKind::ClockJump { node, delta_ms } => MutationLogEntry {
-                at_ms: mutation.at_ms,
-                kind: "clock_jump".into(),
-                detail: serde_json::json!({ "node": node, "delta_ms": delta_ms }),
-            },
-            MutationKind::LinkChange => MutationLogEntry {
-                at_ms: mutation.at_ms,
-                kind: "link_change".into(),
-                detail: serde_json::json!({}),
-            },
+        from: &str,
+        to: &str,
+        encoded: Vec<u8>,
+    ) -> Result<(), EngineAbort> {
+        if from == to {
+            return Err(EngineAbort::SelfSend {
+                host: from.to_string(),
+            });
         }
+        if !self.tick_period_ns.contains_key(to) {
+            return Err(EngineAbort::UnknownDestination {
+                from: from.to_string(),
+                to: to.to_string(),
+            });
+        }
+        let byte_len = encoded.len() as u64;
+        let outcome = self.network.send(from, to, byte_len, self.now_ns);
+        self.drain_network_notifications();
+        match outcome {
+            SendOutcome::Arrive { delivery_id, at_ns } => {
+                self.enqueue(
+                    at_ns,
+                    EventKind::Deliver {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        delivery_id,
+                        encoded,
+                    },
+                );
+            }
+            SendOutcome::Drop { reason } => {
+                self.write_record(BundleRecord::Event(EventRecord {
+                    virtual_time_ns: self.now_ns,
+                    host_id: Some(from.to_string()),
+                    kind_tag: "engine".into(),
+                    event: EventPayload::DropOnSend {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        reason,
+                    },
+                }));
+                // SendFailed flows back through the sender's recv at
+                // current virtual time; not a network delivery, so
+                // no notify_delivered hookup.
+                self.enqueue(
+                    self.now_ns,
+                    EventKind::LocalRecv {
+                        to: from.to_string(),
+                        message: HostMessage::SendFailed {
+                            to: to.to_string(),
+                            reason,
+                        },
+                    },
+                );
+            }
+        }
+        Ok(())
     }
-}
 
-/// Insert a synthetic loopback host into the spec if the caller did
-/// not declare one. The synthetic host runs for the full duration and
-/// is what emits every Event variant for the schema-floor parity bar.
-fn ensure_loopback_host(spec: &mut ParsedSpec) {
-    if spec.hosts.iter().any(|h| h.name == LOOPBACK_HOST) {
-        return;
-    }
-    spec.hosts.push(Host {
-        name: LOOPBACK_HOST.to_string(),
-        role: LOOPBACK_HOST.to_string(),
-        stage_index: None,
-        start_at_ms: 0,
-        restart_at_ms: Vec::new(),
-        stop_at_ms: Some(spec.duration_ms),
-        crash_at_ms: None,
-    });
-}
-
-/// Per-variant default `(user_kind, fields)` for the loopback host's
-/// synthesised events. Field values are name-free constants so they
-/// survive the rename-equivariance check (TESTING_SPEC §9.1).
-fn synthetic_event_fields(variant: &str) -> (Option<String>, serde_json::Value) {
-    let peer = LOOPBACK_HOST;
-    match variant {
-        "DialStarted" => (
-            None,
-            serde_json::json!({ "peer": peer, "attempt": 1, "timeout_ms": 1000 }),
-        ),
-        "DialOutcome" => (
-            None,
-            serde_json::json!({ "peer": peer, "attempt": 1, "outcome": "ok", "duration_ms": 1 }),
-        ),
-        "ConnectionCacheMiss" => (
-            None,
-            serde_json::json!({ "peer": peer, "generation": 1, "reason": "first-dial" }),
-        ),
-        "MessageSent" => (
-            None,
-            serde_json::json!({ "peer": peer, "kind": "swim.ping", "size": 64 }),
-        ),
-        "MessageReceived" => (
-            None,
-            serde_json::json!({ "peer": peer, "kind": "swim.ping", "size": 64 }),
-        ),
-        "IrohConnTypeChanged" => (
-            None,
-            serde_json::json!({ "peer": peer, "old": "None", "new": "Relay" }),
-        ),
-        "SwimTransition" => (
-            None,
-            serde_json::json!({ "peer": peer, "from": "Unknown", "to": "Alive", "reason": "probe-ok" }),
-        ),
-        "SwimMetadataSent" => (
-            None,
-            serde_json::json!({ "version": 1, "payload_hash": "0x0000000000000000" }),
-        ),
-        "SwimMetadataReceived" => (
-            None,
-            serde_json::json!({ "peer": peer, "version": 1, "payload_hash": "0x0000000000000000" }),
-        ),
-        "NodeMapUpdate" => (
-            None,
-            serde_json::json!({ "peer": peer, "from_source": "swim-piggyback", "accepted": true }),
-        ),
-        "ConnectionCacheHit" => (
-            None,
-            serde_json::json!({ "peer": peer, "generation": 1 }),
-        ),
-        "RelayChanged" => (
-            None,
-            serde_json::json!({ "old_url": null, "new_url": "http://0.0.0.0:0/" }),
-        ),
-        "ProbeSent" => (
-            None,
-            serde_json::json!({ "target": "0.0.0.0:0", "kind": "udp_echo" }),
-        ),
-        "ProbeReceived" => (
-            None,
-            serde_json::json!({ "target": "0.0.0.0:0", "kind": "udp_echo", "rtt_ms": 1, "outcome": "ok" }),
-        ),
-        "ConnectionCacheInvalidated" => (
-            None,
-            serde_json::json!({ "peer": peer, "generation": 1, "reason": "connection-closed" }),
-        ),
-        "Error" => (
-            None,
-            serde_json::json!({
-                "component": "host_introspect",
-                "message": "introspection module unavailable",
-                "peer": null
-            }),
-        ),
-        "Custom" => {
-            // §2.5 test-only switch — the divergence detector flips
-            // `sim_backend::poison::set_poison(true)` and re-runs the
-            // engine to surface a deterministic single-byte change.
-            // Lives inside the sim facade subtree per the spec.
-            let user_kind = if crate::sim_backend::poison::is_poisoned() {
-                "ready_poisoned"
-            } else {
-                "ready"
+    fn drain_network_notifications(&mut self) {
+        let notes = self.network.take_pending_notifications();
+        for note in notes {
+            let record = match note {
+                NetworkNotification::CacheStateChange { from, to, at_ns, transition } => {
+                    EventRecord {
+                        virtual_time_ns: at_ns,
+                        host_id: Some(from.clone()),
+                        kind_tag: "engine".into(),
+                        event: EventPayload::CacheStateChange { from, to, transition },
+                    }
+                }
+                NetworkNotification::DialStart { from, to, at_ns } => EventRecord {
+                    virtual_time_ns: at_ns,
+                    host_id: Some(from.clone()),
+                    kind_tag: "engine".into(),
+                    event: EventPayload::DialStart { from, to },
+                },
+                NetworkNotification::DialOutcome { from, to, at_ns, warm } => EventRecord {
+                    virtual_time_ns: at_ns,
+                    host_id: Some(from.clone()),
+                    kind_tag: "engine".into(),
+                    event: EventPayload::DialOutcome { from, to, warm },
+                },
             };
-            (Some(user_kind.into()), serde_json::json!({}))
+            self.write_record(BundleRecord::Event(record));
         }
-        _ => (None, serde_json::Value::Null),
+    }
+
+    // ── Queue plumbing ──────────────────────────────────────────────
+
+    fn enqueue(&mut self, time_ns: u64, kind: EventKind) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.queue.push(Reverse(QueueEntry { time_ns, seq, kind }));
     }
 }
 
-const FIBER_LIFECYCLE: u32 = 1;
-const FIBER_MUTATIONS: u32 = 2;
-const FIBER_SNAPSHOT: u32 = 3;
-const FIBER_END: u32 = u32::MAX;
-const SNAPSHOT_OFFSET_MS: u64 = 50;
+// ──────────────────────────────────────────────────────────────────────
+// Internals
+// ──────────────────────────────────────────────────────────────────────
 
-/// Canonical sort key for two mutations declared at the same tick.
-fn mutation_canonical_form(m: &Mutation) -> String {
-    use crate::spec::MutationKind;
-    match &m.kind {
-        MutationKind::Partition { edges } => {
-            let mut sorted: Vec<(String, String)> = edges
-                .iter()
-                .map(|(a, b)| {
-                    if a <= b {
-                        (a.clone(), b.clone())
-                    } else {
-                        (b.clone(), a.clone())
-                    }
-                })
-                .collect();
-            sorted.sort();
-            format!("partition::{sorted:?}")
-        }
-        MutationKind::Heal { edges } => {
-            let mut sorted: Vec<(String, String)> = edges
-                .iter()
-                .map(|(a, b)| {
-                    if a <= b {
-                        (a.clone(), b.clone())
-                    } else {
-                        (b.clone(), a.clone())
-                    }
-                })
-                .collect();
-            sorted.sort();
-            format!("heal::{sorted:?}")
-        }
-        MutationKind::Restart { node } => format!("restart::{node}"),
-        MutationKind::ClockJump { node, delta_ms } => {
-            format!("clock_jump::{node}::{delta_ms}")
-        }
-        MutationKind::LinkChange => "link_change".to_string(),
+#[derive(Debug)]
+struct QueueEntry {
+    time_ns: u64,
+    seq: u64,
+    kind: EventKind,
+}
+
+impl PartialEq for QueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.time_ns == other.time_ns && self.seq == other.seq
     }
+}
+
+impl Eq for QueueEntry {}
+
+impl Ord for QueueEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.time_ns
+            .cmp(&other.time_ns)
+            .then_with(|| self.seq.cmp(&other.seq))
+    }
+}
+
+impl PartialOrd for QueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug)]
+enum EventKind {
+    Tick {
+        host: HostId,
+    },
+    /// A real network delivery. `from` and `to` are the route; the
+    /// engine calls `network.notify_delivered(from, to, delivery_id)`
+    /// after `recv` returns so the network can drop the message from
+    /// its in-flight list.
+    Deliver {
+        from: HostId,
+        to: HostId,
+        delivery_id: DeliveryId,
+        encoded: Vec<u8>,
+    },
+    /// A non-network host inbox: timer firings and send-failure
+    /// envelopes. No network bookkeeping happens for these.
+    LocalRecv {
+        to: HostId,
+        message: HostMessage,
+    },
+    Mutation {
+        mutation: Mutation,
+    },
+    Snapshot,
+    Terminate,
+}
+
+/// Compute the host's tick offset: a deterministic value in
+/// `[0, period)` derived from the scenario seed and the host id, so
+/// each host's first tick lands at a stable instant different from
+/// (almost) every other host's first tick.
+pub(crate) fn tick_offset_ns(seed: u64, host_id: &str, period_ns: u64) -> u64 {
+    if period_ns == 0 {
+        return 0;
+    }
+    let mut rng = SubstreamRng::derive(
+        seed,
+        &SubstreamKey::Host {
+            host_id: host_id.to_string(),
+            label: "tick_offset",
+        },
+    );
+    rng.next_u64() % period_ns
 }

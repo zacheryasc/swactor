@@ -2,103 +2,77 @@
 name = "simulation"
 version = "0.1.0"
 edition = "2024"
-build = "build.rs"
 
 [lib]
 path = "src/lib.rs"
 
-[[bin]]
-name = "sim-driver"
-path = "src/bin/sim-driver.rs"
-
-[[bin]]
-name = "sim-detector"
-path = "src/bin/sim-detector.rs"
-
-[[bin]]
-name = "lint-deterministic"
-path = "src/bin/lint-deterministic.rs"
-
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = { version = "0.8", features = ["preserve_order"] }
+# SipHash-2-4 for the §7.2 substream derivation. Pure-Rust, no float
+# math, identical output on every architecture.
+siphasher = "1"
+# SHA-256 for the §9.4 manifest hash integrity field. Pure-Rust.
 sha2 = "0.10"
-toml = "0.8"
-
-[build-dependencies]
-# The runtime surface descriptor is derived from `src/runtime/mod.rs`
-# at build time. `surface.lock` records the expected SHA-256; a trait
-# edit that does not also update the lock fails `tests/surface_locked.rs`.
-syn = { version = "2", features = ["full", "parsing"] }
-quote = "1"
+# §3.3 / §6.4 — the simulator re-uses production's SWIM message
+# types and JSON codec so the bytes its bandwidth model carries match
+# the bytes production puts on the wire. Default features only — no
+# iroh, no tokio, no axum.
+distribution = { path = "../distribution" }
 
 [dev-dependencies]
-# Tests use the production post-processor (TESTING_SPEC §7.1) and
-# the in-memory tar+gzip helpers needed to feed an on-disk sim
-# bundle into it.
-distribution = { path = "../distribution", features = ["iroh", "collector"] }
-flate2 = "1"
-tar = "0.4"
-# Parity-bar t_facade re-derives the surface from runtime source to
-# catch tampering with build.rs.
-syn = { version = "2", features = ["full", "parsing"] }
-quote = "1"
-
-[features]
-# `_facade-test` is the default marker that lets `cargo test -p
-# simulation` build the crate without picking a backend. It is
-# stripped by `--no-default-features`, which then trips the
-# neither-feature const-panic in `src/runtime/mod.rs`.
-default = ["_facade-test"]
-# Mutually exclusive — exactly one selects the active `runtime::facade()`.
-facade-prod = []
-facade-sim = []
-_facade-test = []
+proptest = "1"
+tempfile = "3"
 
 [[test]]
-name = "corpus_loads"
-path = "tests/corpus_loads.rs"
+name = "scenario_examples"
+path = "tests/scenario_examples.rs"
 
 [[test]]
-name = "surface_locked"
-path = "tests/surface_locked.rs"
+name = "scenario_validation"
+path = "tests/scenario_validation.rs"
 
 [[test]]
-name = "t_determinism"
-path = "tests/parity-bar/t_determinism.rs"
+name = "scenario_invariants"
+path = "tests/scenario_invariants.rs"
 
 [[test]]
-name = "t_replay"
-path = "tests/parity-bar/t_replay.rs"
+name = "network_invariants"
+path = "tests/network_invariants.rs"
 
 [[test]]
-name = "t_facade"
-path = "tests/parity-bar/t_facade.rs"
+name = "engine_invariants"
+path = "tests/engine_invariants.rs"
 
 [[test]]
-name = "t_same_binary"
-path = "tests/parity-bar/t_same_binary.rs"
+name = "bundle_invariants"
+path = "tests/bundle_invariants.rs"
 
 [[test]]
-name = "t_schema_coverage"
-path = "tests/parity-bar/t_schema_coverage.rs"
+name = "evaluator_invariants"
+path = "tests/evaluator_invariants.rs"
 
 [[test]]
-name = "t_round_trip"
-path = "tests/parity-bar/t_round_trip.rs"
+name = "cross_arch_parity"
+path = "tests/cross_arch_parity.rs"
 
 [[test]]
-name = "t_causality"
-path = "tests/parity-bar/t_causality.rs"
+name = "swim_codec_parity"
+path = "tests/swim_codec_parity.rs"
 
 [[test]]
-name = "t_equivariance"
-path = "tests/parity-bar/t_equivariance.rs"
+name = "swim_host_invariants"
+path = "tests/swim_host_invariants.rs"
 
 [[test]]
-name = "t_lifecycle"
-path = "tests/parity-bar/t_lifecycle.rs"
+name = "early_termination"
+path = "tests/early_termination.rs"
 
 [[test]]
-name = "t_detector"
-path = "tests/parity-bar/t_detector.rs"
+name = "swim_integration"
+path = "tests/swim_integration.rs"
+
+[[test]]
+name = "property_runner"
+path = "tests/property_runner.rs"

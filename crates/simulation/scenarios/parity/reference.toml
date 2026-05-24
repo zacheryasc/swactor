@@ -1,0 +1,66 @@
+# SIM_SPEC §7.6 cross-architecture parity reference scenario.
+# The simulator's events.ndjson hash for this scenario is checked in
+# next to the test (`tests/cross_arch_parity.rs`). A mismatch is either
+# a deliberate spec amendment with justification, or a determinism bug.
+
+name = "parity_reference_v1"
+seed = 0x0dead_beef_cafe_b0
+duration_ns = 10_000_000
+
+[default_tick]
+period_ns = 2_000_000
+
+[default_link]
+latency_ns = 100_000
+jitter_stddev_ns = 0
+loss_prob_ppm = 0
+reorder_prob_ppm = 0
+bandwidth_bps = 1_000_000_000
+cold_dial_penalty_ns = 50_000
+cache_warm_after_ns = 1_000_000
+cache_invalidate_after_idle_ns = 100_000_000_000
+
+[[peers]]
+id = "alpha"
+kind = "parity_stub"
+initial_state = "ready"
+kind_config = { peers = ["alpha", "bravo", "charlie"] }
+
+[[peers]]
+id = "bravo"
+kind = "parity_stub"
+initial_state = "ready"
+kind_config = { peers = ["alpha", "bravo", "charlie"] }
+
+[[peers]]
+id = "charlie"
+kind = "parity_stub"
+initial_state = "ready"
+kind_config = { peers = ["alpha", "bravo", "charlie"] }
+
+[[links]]
+from = "alpha"
+to = "bravo"
+
+[[links]]
+from = "alpha"
+to = "charlie"
+
+[[links]]
+from = "bravo"
+to = "alpha"
+
+[[links]]
+from = "bravo"
+to = "charlie"
+
+[[links]]
+from = "charlie"
+to = "alpha"
+
+[[links]]
+from = "charlie"
+to = "bravo"
+
+[[snapshots]]
+at_ns = 5_000_000
