@@ -51,7 +51,10 @@ cold_start_penalty_ns = 0
 id = "orchestrator"
 kind = "swim"
 initial_state = "alive"
-kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+# Mirrors `SwimConfig::default()` at the scenario's 200 ms tick:
+# probe_interval = 10 ticks = 2 s, probe_timeout = 15 ticks = 3 s,
+# suspicion_timeout = 75 ticks = 15 s, indirect_ping_fanout = 2.
+kind_config = { probe_interval_ns = 2_000_000_000, probe_timeout_ns = 3_000_000_000, suspicion_timeout_ns = 15_000_000_000, indirect_ping_fanout = 2 }
 
 [[peers]]
 id = "stage_0"
@@ -116,6 +119,14 @@ at_ns = 50_000_000_000
 at_ns = 200_000_000_000
 [[snapshots]]
 at_ns = 400_000_000_000
+
+# Tuning envelope (SWIM_TUNING_REPORT.md). With the tuned probe
+# budget on the own-relay policy, the orchestrator's self_incarnation
+# does not bump past 1 across the 412 s run.
+[[assertions]]
+kind = "self_incarnation_bounded"
+peer = "orchestrator"
+max_value = 1
 
 # `relay_queue_depth_bounded` should Pass now (the calibration pass
 # will verify the actual `enqueued_bytes` distribution stays under the

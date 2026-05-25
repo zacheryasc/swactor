@@ -74,7 +74,10 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
+import threading
+import time
 from typing import Sequence
 
 # Stub-mode constants — small so test payloads stay tiny. Both values
@@ -196,6 +199,124 @@ def _write(obj) -> None:
     sys.stdout.flush()
 
 
+# ─── Lifecycle event emission ─────────────────────────────────────────────
+#
+# The Rust StageActor parses every stdout line as JSON; any line carrying
+# `"event": "<kind>"` is re-emitted as `Custom("worker_<kind>")` into the
+# diagnostic bundle. The worker subprocess is otherwise opaque to the
+# Rust side, so these are the only diagnostic signal the bundle ever sees
+# from the Python layer (apart from exit code + stderr tail). We do NOT
+# emit a `request_id` on event lines so the actor never confuses an event
+# with an op reply.
+
+_WORKER_START_MONOTONIC = time.monotonic()
+_REQUESTS_SERVED = 0
+
+
+def _emit_event(kind: str, **fields) -> None:
+    """Emit a structured lifecycle event on stdout. The Rust actor folds
+    these into the diag bundle as `Custom("worker_<kind>")`."""
+    payload = {"event": kind, **fields}
+    try:
+        sys.stdout.write(json.dumps(payload) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        # Best-effort: never let a logging failure crash the worker.
+        pass
+
+
+def _uptime_ms() -> int:
+    return int((time.monotonic() - _WORKER_START_MONOTONIC) * 1000)
+
+
+def _rss_mb() -> "int | None":
+    """Resident-set size in MB, read from /proc/self/status (Linux).
+    Returns None on non-Linux or when the read fails — the field is
+    informational, never required."""
+    try:
+        with open("/proc/self/status", "r") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    # VmRSS:    12345 kB
+                    return int(parts[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _install_excepthook() -> None:
+    """Catch every uncaught exception and emit a structured event before
+    the interpreter prints the traceback to stderr (which the actor's
+    ring buffer will also capture)."""
+
+    def _hook(exc_type, exc_value, exc_tb):
+        import traceback
+
+        tb_text = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+        _emit_event(
+            "uncaught_exception",
+            type=exc_type.__name__,
+            value=str(exc_value),
+            traceback=tb_text,
+            uptime_ms=_uptime_ms(),
+        )
+        # Preserve the default behaviour so stderr still shows the trace
+        # (the actor's stderr ring buffer is a belt-and-braces backup).
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
+
+
+def _install_signal_handlers() -> None:
+    """Emit `signal_received` and exit cleanly on SIGTERM/SIGINT.
+    SIGKILL and SIGSEGV cannot be caught — the Rust side relies on the
+    exit code / signal field of the eventual `worker_exited` Custom
+    event for those."""
+
+    def _on_signal(signum, _frame):
+        try:
+            name = signal.Signals(signum).name
+        except ValueError:
+            name = f"signal-{signum}"
+        _emit_event(
+            "signal_received",
+            signum=signum,
+            name=name,
+            uptime_ms=_uptime_ms(),
+        )
+        # 128 + signum is the conventional exit code for signal-driven
+        # termination; matches what /bin/sh reports.
+        sys.exit(128 + signum)
+
+    for s in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(s, _on_signal)
+        except (ValueError, OSError):
+            # Some environments (e.g. non-main thread) don't allow
+            # signal install — silently skip rather than crash here.
+            pass
+
+
+def _start_heartbeat(interval_s: float = 30.0) -> None:
+    """Daemon thread emitting `heartbeat` events. Lets the post-processor
+    distinguish *hung* (heartbeats stop but process alive — no exit event)
+    from *dead* (no heartbeat AND no exit — likely SIGKILL/SIGSEGV)."""
+
+    def _loop():
+        while True:
+            time.sleep(interval_s)
+            _emit_event(
+                "heartbeat",
+                uptime_ms=_uptime_ms(),
+                rss_mb=_rss_mb(),
+                requests_served=_REQUESTS_SERVED,
+            )
+
+    t = threading.Thread(target=_loop, name="pp-worker-heartbeat", daemon=True)
+    t.start()
+
+
 def _is_nonneg_int(x) -> bool:
     # ``bool`` is a subclass of ``int`` in Python; reject it explicitly so
     # ``{"position": true}`` doesn't sneak through.
@@ -210,30 +331,57 @@ class _RealModelState:
     """
 
     def __init__(self, model_name: str, stage: int, num_stages: int):
-        # Import tinygrad lazily so stub-mode never touches it.
+        # Import tinygrad lazily so stub-mode never touches it. This is
+        # the most likely crash site in real mode — emit lifecycle
+        # events around the import so the bundle records exactly when
+        # the worker started loading and how long it took.
+        _emit_event("importing_tinygrad", stage=stage)
+        _import_start = time.monotonic()
         import numpy as np
         from tinygrad import Tensor
         from tinygrad.helpers import fetch
         from tinygrad.apps.llm import Transformer, SimpleTokenizer, models
+
+        _emit_event(
+            "tinygrad_imported",
+            stage=stage,
+            elapsed_ms=int((time.monotonic() - _import_start) * 1000),
+        )
 
         if model_name not in models:
             available = ", ".join(sorted(models.keys()))
             _die(f"unknown MODEL {model_name!r}; available: {available}")
 
         url = models[model_name]
+        _emit_event("fetching_model", stage=stage, model=model_name, url=url)
         print(
             f"pp_tinygrad_worker: stage={stage}/{num_stages} fetching {model_name}",
             file=sys.stderr,
             flush=True,
         )
+        _fetch_start = time.monotonic()
         gguf_path = fetch(url)
+        _emit_event(
+            "model_fetched",
+            stage=stage,
+            elapsed_ms=int((time.monotonic() - _fetch_start) * 1000),
+            gguf_path=str(gguf_path),
+        )
         print(
             f"pp_tinygrad_worker: stage={stage} loading model from {gguf_path}",
             file=sys.stderr,
             flush=True,
         )
+        _emit_event("loading_model", stage=stage, model=model_name)
+        _load_start = time.monotonic()
         model, kv = Transformer.from_gguf(Tensor(gguf_path), max_context=512)
         tokenizer = SimpleTokenizer.from_gguf_kv(kv)
+        _emit_event(
+            "model_loaded",
+            stage=stage,
+            elapsed_ms=int((time.monotonic() - _load_start) * 1000),
+            rss_mb=_rss_mb(),
+        )
 
         arch = kv["general.architecture"]
         hidden_dim = int(kv[f"{arch}.embedding_length"])
@@ -624,6 +772,11 @@ def _stub_tokenize(prompt: str) -> list[int]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Install diagnostic hooks first thing so any failure during arg
+    # parsing or env validation still produces a structured event.
+    _install_excepthook()
+    _install_signal_handlers()
+
     parser = argparse.ArgumentParser(description="pipeline-parallel tinygrad worker")
     parser.add_argument(
         "--stub",
@@ -641,6 +794,19 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     stage = _parse_env_int("STAGE")
     num_stages = _parse_env_int("NUM_STAGES")
+
+    _emit_event(
+        "starting",
+        pid=os.getpid(),
+        stage=stage,
+        num_stages=num_stages,
+        stub=stub_mode,
+        model=(args.model or os.environ.get("MODEL", "")).strip() or None,
+        python_version=sys.version.split()[0],
+        argv=list(sys.argv),
+    )
+    _start_heartbeat()
+
     if num_stages < 2:
         _die(
             f"NUM_STAGES must be >= 2 (single-node configurations are not "
@@ -659,7 +825,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception as e:
             import traceback
 
-            print(traceback.format_exc(), file=sys.stderr, flush=True)
+            tb_text = traceback.format_exc()
+            _emit_event(
+                "model_load_failed",
+                stage=stage,
+                model=model_name,
+                type=type(e).__name__,
+                value=str(e),
+                traceback=tb_text,
+            )
+            print(tb_text, file=sys.stderr, flush=True)
             _die(f"failed to load model {model_name!r}: {e}")
 
     ready: dict = {"status": "ready", "pid": os.getpid(), "stage": stage}
@@ -670,7 +845,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         ready["layer_range"] = [real_state.start, real_state.end]
         ready["eos_token_ids"] = real_state.eos_ids
     _write(ready)
+    # Mirror ready as a structured event so the bundle records it under
+    # the same `worker_*` kind family as the rest of the lifecycle. The
+    # `status: "ready"` line above is kept for back-compat with the Rust
+    # `parse_status_line` helper that drives the actor's ready signal.
+    _emit_event(
+        "ready",
+        pid=os.getpid(),
+        stage=stage,
+        uptime_ms=_uptime_ms(),
+        rss_mb=_rss_mb(),
+    )
 
+    global _REQUESTS_SERVED
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -691,7 +878,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(traceback.format_exc(), file=sys.stderr, flush=True)
             reply = {"request_id": req.get("request_id"), "error": f"internal: {e}"}
         _write(reply)
+        _REQUESTS_SERVED += 1
 
+    _emit_event(
+        "exiting",
+        reason="eof",
+        uptime_ms=_uptime_ms(),
+        requests_served=_REQUESTS_SERVED,
+    )
     return 0
 
 

@@ -44,11 +44,28 @@ pub struct SwimConfig {
 
 impl Default for SwimConfig {
     fn default() -> Self {
+        // Tuned against the N3 calibration scenarios per
+        // `crates/simulation/SWIM_TUNING_REPORT.md`. Tick units; the
+        // production runtime chooses the tick period.
+        //
+        // The protocol period (`probe_interval`) is unchanged from
+        // the previous defaults; what moved is the *budget within a
+        // probe cycle*: `probe_timeout` is 5× longer (so a probe has
+        // 1.5× the cycle to land its direct ack before the indirect
+        // fanout runs — beyond the cycle is fine because the state
+        // machine waits to be idle), `suspicion_timeout` is 2.5×
+        // longer (covering several refute round-trips), and the
+        // indirect fanout is one peer smaller (less wire amplification
+        // per probe burst). Together these collapse the gossip-flap
+        // refutation rate by an order of magnitude under WAN latency
+        // in the §10.3 gossip-flap library property: peak
+        // self_incarnation ≈85 → ≈8 over a 20-second window with the
+        // same seed and topology.
         Self {
             probe_interval: 10,
-            probe_timeout: 3,
-            indirect_probes: 3,
-            suspicion_timeout: 30,
+            probe_timeout: 15,
+            indirect_probes: 2,
+            suspicion_timeout: 75,
             dead_reprobe_interval: 50,
             probe_mode: ProbeMode::Periodic,
         }

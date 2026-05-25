@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
@@ -19,6 +19,10 @@ use serde_json::Value;
 use super::protocol::{Manifest, ManifestNode};
 use super::state::CollectorState;
 
+/// Assemble the canonical bundle on disk. Used by the `/diag/finalize`
+/// handler when a run finalizes cleanly. The synthesized tarball lands
+/// at `state.bundle_path(run_id)` so subsequent `GET /diag/bundle/<run>`
+/// calls serve it from the cache without re-walking staging.
 pub fn assemble(state: &CollectorState, run_id: &str) -> io::Result<PathBuf> {
     let run_dir = state.run_dir(run_id);
     if !run_dir.is_dir() {
@@ -30,13 +34,47 @@ pub fn assemble(state: &CollectorState, run_id: &str) -> io::Result<PathBuf> {
     let bundles_dir = state.bundles_dir();
     std::fs::create_dir_all(&bundles_dir)?;
     let bundle_path = state.bundle_path(run_id);
+    let file = File::create(&bundle_path)?;
+    assemble_into(state, run_id, file)?;
+    Ok(bundle_path)
+}
 
+/// Assemble the bundle for `run_id` in memory and return the bytes
+/// (spec §7, gap 7). Used by `GET /diag/bundle/<run>` when no
+/// canonical tarball exists yet — typically because the orchestrator
+/// died before sending the finalize record. The resulting bundle's
+/// `MANIFEST.json` carries `finalize_received: false`, matching
+/// whatever the collector observed for the run.
+///
+/// Returns `Err(NotFound)` when the run has no staging directory at
+/// all (truly unknown run id); a partial run with even one boot
+/// record returns Ok.
+pub fn assemble_bytes(state: &CollectorState, run_id: &str) -> io::Result<Vec<u8>> {
+    let run_dir = state.run_dir(run_id);
+    if !run_dir.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no records on disk for run_id {run_id}"),
+        ));
+    }
+    let mut buf = Vec::new();
+    assemble_into(state, run_id, &mut buf)?;
+    Ok(buf)
+}
+
+/// Shared core: write the gzipped tar of `run_id` into `writer`. The
+/// public callers wrap this with either a `File` (canonical
+/// on-finalize path) or a `Vec<u8>` (on-demand HTTP path).
+fn assemble_into<W: Write>(
+    state: &CollectorState,
+    run_id: &str,
+    writer: W,
+) -> io::Result<()> {
     let stats = state.run_stats(run_id);
     let labels = build_labels(&stats);
     let manifest = build_manifest(run_id, &stats, &labels);
 
-    let file = File::create(&bundle_path)?;
-    let gz = GzEncoder::new(file, Compression::default());
+    let gz = GzEncoder::new(writer, Compression::default());
     let mut tar = tar::Builder::new(gz);
     tar.mode(tar::HeaderMode::Deterministic);
 
@@ -67,11 +105,11 @@ pub fn assemble(state: &CollectorState, run_id: &str) -> io::Result<PathBuf> {
     }
 
     tar.finish()?;
-    Ok(bundle_path)
+    Ok(())
 }
 
-fn append_node_dir(
-    tar: &mut tar::Builder<GzEncoder<File>>,
+fn append_node_dir<W: Write>(
+    tar: &mut tar::Builder<GzEncoder<W>>,
     src: &Path,
     dst_prefix: &str,
 ) -> io::Result<()> {
@@ -144,8 +182,8 @@ fn append_node_dir(
     Ok(())
 }
 
-fn append_under(
-    tar: &mut tar::Builder<GzEncoder<File>>,
+fn append_under<W: Write>(
+    tar: &mut tar::Builder<GzEncoder<W>>,
     src: &Path,
     dst_dir: &str,
 ) -> io::Result<()> {
@@ -156,8 +194,8 @@ fn append_under(
     append_file(tar, src, &format!("{dst_dir}/{name}"))
 }
 
-fn append_file(
-    tar: &mut tar::Builder<GzEncoder<File>>,
+fn append_file<W: Write>(
+    tar: &mut tar::Builder<GzEncoder<W>>,
     src: &Path,
     dst: &str,
 ) -> io::Result<()> {
@@ -172,7 +210,7 @@ fn append_file(
     tar.append_data(&mut header, dst, &mut f)
 }
 
-fn append_dir(tar: &mut tar::Builder<GzEncoder<File>>, dst: &str) -> io::Result<()> {
+fn append_dir<W: Write>(tar: &mut tar::Builder<GzEncoder<W>>, dst: &str) -> io::Result<()> {
     let mut header = tar::Header::new_gnu();
     header.set_size(0);
     header.set_mode(0o755);
@@ -183,8 +221,8 @@ fn append_dir(tar: &mut tar::Builder<GzEncoder<File>>, dst: &str) -> io::Result<
     tar.append_data(&mut header, path, &mut io::empty())
 }
 
-fn append_bytes(
-    tar: &mut tar::Builder<GzEncoder<File>>,
+fn append_bytes<W: Write>(
+    tar: &mut tar::Builder<GzEncoder<W>>,
     dst: &str,
     bytes: &[u8],
 ) -> io::Result<()> {

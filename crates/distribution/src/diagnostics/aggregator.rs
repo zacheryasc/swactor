@@ -19,8 +19,9 @@ use crate::diagnostics::identity::Identity;
 use crate::diagnostics::reachability::{PeerReachability, StateTransition, node_id_hex};
 use crate::diagnostics::sink::{EventEmitter, Sink};
 use crate::diagnostics::snapshot::{
-    HostIntrospector, IrohIntrospector, ProbeIntrospector, ProcessIntrospector, Snapshot,
-    SnapshotBody, SnapshotTrigger, SwimIntrospector, VastaiIntrospector,
+    HostIntrospector, IrohIntrospector, ProbeIntrospector, ProcessIntrospector,
+    RegistryIntrospector, RelayServerIntrospector, Snapshot, SnapshotBody, SnapshotTrigger,
+    SubprocessIntrospector, SwimIntrospector, VastaiIntrospector,
 };
 use crate::types::NodeId;
 
@@ -43,6 +44,9 @@ pub struct Aggregator<S: Sink> {
     probe_introspector: Mutex<Option<Arc<dyn ProbeIntrospector>>>,
     vastai_introspector: Mutex<Option<Arc<dyn VastaiIntrospector>>>,
     process_introspector: Mutex<Option<Arc<dyn ProcessIntrospector>>>,
+    registry_introspector: Mutex<Option<Arc<dyn RegistryIntrospector>>>,
+    relay_server_introspector: Mutex<Option<Arc<dyn RelayServerIntrospector>>>,
+    subprocess_introspector: Mutex<Option<Arc<dyn SubprocessIntrospector>>>,
 }
 
 /// Configuration for the periodic snapshot task spawned by
@@ -109,6 +113,9 @@ impl<S: Sink> Aggregator<S> {
             probe_introspector: Mutex::new(None),
             vastai_introspector: Mutex::new(None),
             process_introspector: Mutex::new(None),
+            registry_introspector: Mutex::new(None),
+            relay_server_introspector: Mutex::new(None),
+            subprocess_introspector: Mutex::new(None),
         }
     }
 
@@ -253,6 +260,84 @@ impl<S: Sink> Aggregator<S> {
         *slot = None;
     }
 
+    /// Install a registry introspector. After this returns, every
+    /// snapshot will include a [`Tier2Registry`] populated by the
+    /// introspector.
+    ///
+    /// [`Tier2Registry`]: crate::diagnostics::snapshot::Tier2Registry
+    pub fn set_registry_introspector(&self, introspector: Arc<dyn RegistryIntrospector>) {
+        let mut slot = self
+            .registry_introspector
+            .lock()
+            .expect("aggregator registry_introspector mutex poisoned");
+        *slot = Some(introspector);
+    }
+
+    /// Remove any installed registry introspector.
+    pub fn clear_registry_introspector(&self) {
+        let mut slot = self
+            .registry_introspector
+            .lock()
+            .expect("aggregator registry_introspector mutex poisoned");
+        *slot = None;
+    }
+
+    /// Install a relay-server introspector (spec §1). After this
+    /// returns, every snapshot will include a [`Tier3RelayServer`]
+    /// populated by the introspector. Only relay binaries should
+    /// install one — node-role and orchestrator-role processes leave
+    /// it unset.
+    ///
+    /// [`Tier3RelayServer`]: crate::diagnostics::snapshot::Tier3RelayServer
+    pub fn set_relay_server_introspector(
+        &self,
+        introspector: Arc<dyn RelayServerIntrospector>,
+    ) {
+        let mut slot = self
+            .relay_server_introspector
+            .lock()
+            .expect("aggregator relay_server_introspector mutex poisoned");
+        *slot = Some(introspector);
+    }
+
+    /// Remove any installed relay-server introspector.
+    pub fn clear_relay_server_introspector(&self) {
+        let mut slot = self
+            .relay_server_introspector
+            .lock()
+            .expect("aggregator relay_server_introspector mutex poisoned");
+        *slot = None;
+    }
+
+    /// Install a subprocess introspector (spec §4). After this
+    /// returns, every snapshot will include a [`Tier3SubprocessState`]
+    /// populated by the introspector — one entry per subprocess the
+    /// caller has registered. Generic-over-use-case: the trait
+    /// surface is intentionally tiny so a future caller of
+    /// `swactor_process` can opt in without going through any
+    /// production code path.
+    ///
+    /// [`Tier3SubprocessState`]: crate::diagnostics::snapshot::Tier3SubprocessState
+    pub fn set_subprocess_introspector(
+        &self,
+        introspector: Arc<dyn SubprocessIntrospector>,
+    ) {
+        let mut slot = self
+            .subprocess_introspector
+            .lock()
+            .expect("aggregator subprocess_introspector mutex poisoned");
+        *slot = Some(introspector);
+    }
+
+    /// Remove any installed subprocess introspector.
+    pub fn clear_subprocess_introspector(&self) {
+        let mut slot = self
+            .subprocess_introspector
+            .lock()
+            .expect("aggregator subprocess_introspector mutex poisoned");
+        *slot = None;
+    }
+
     /// Toggle the local-transition trigger (T1.4). When enabled
     /// (default), every [`Event::SwimTransition`] emit fires an
     /// in-line [`SnapshotTrigger::Transition`] snapshot before
@@ -340,6 +425,24 @@ impl<S: Sink> Aggregator<S> {
             .expect("aggregator process_introspector mutex poisoned")
             .as_ref()
             .map(|intro| intro.capture());
+        let registry = self
+            .registry_introspector
+            .lock()
+            .expect("aggregator registry_introspector mutex poisoned")
+            .as_ref()
+            .map(|intro| intro.capture());
+        let relay_server = self
+            .relay_server_introspector
+            .lock()
+            .expect("aggregator relay_server_introspector mutex poisoned")
+            .as_ref()
+            .map(|intro| intro.capture());
+        let subprocess = self
+            .subprocess_introspector
+            .lock()
+            .expect("aggregator subprocess_introspector mutex poisoned")
+            .as_ref()
+            .map(|intro| intro.capture());
         let body = SnapshotBody {
             reachability: self.reachability_log(),
             events: Vec::new(),
@@ -349,6 +452,9 @@ impl<S: Sink> Aggregator<S> {
             probes,
             vastai,
             process,
+            registry,
+            relay_server,
+            subprocess,
         };
         let snap = Snapshot {
             identity: self.identity.clone(),

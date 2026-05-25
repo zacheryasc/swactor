@@ -32,18 +32,34 @@
 //! unified `StageMsg`; they exist because actor inboxes are typed per
 //! message and the network arrives one type at a time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
+use std::sync::Arc;
+
+use distribution::diagnostics::event::Event;
+use distribution::diagnostics::sink::DynEmitter;
+use distribution::diagnostics::subprocess_introspect::SubprocessIntrospect;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
 use swactor_process::{
-    ExitStatus, ProcessCommand, ProcessNotification, ProcessSpec, spawn_local_process,
+    ExitStatus, OutputStream, ProcessCommand, ProcessNotification, ProcessSpec,
+    spawn_local_process,
 };
 
 use crate::messages::{InferenceRequest, InferenceResponse, NextToken, StageActivation};
+
+/// Per-process stderr ring buffer cap. Lines beyond this are dropped
+/// from the front. Sized to capture a substantial Python traceback
+/// plus pre-crash log context without bloating the diagnostic bundle.
+pub const STDERR_TAIL_LINES: usize = 256;
+/// Per-line truncation cap for the stderr ring buffer. Lines longer
+/// than this are truncated at the byte boundary nearest the limit;
+/// anything past is dropped silently.
+pub const STDERR_LINE_BYTES: usize = 4 * 1024;
 
 // ─── Stage role ───────────────────────────────────────────────────────────
 
@@ -296,6 +312,37 @@ pub struct StageActor {
     pending_last_detokenize: Option<u64>,
     accumulated: Vec<u32>,
     finished: bool,
+
+    /// Diagnostics emitter for worker lifecycle Custom events. `None`
+    /// when not wired (tests, smoke runs without `SWACTOR_DIAG_*`).
+    diagnostics: Option<DynEmitter>,
+    /// App-specific stage index attached to every worker_exited /
+    /// worker_event Custom emission. `None` for non-pipeline uses.
+    stage_idx: Option<u32>,
+    /// Bounded ring of recent stderr lines from the worker subprocess.
+    /// Drained into `Custom("worker_exited")` on exit.
+    stderr_tail: VecDeque<String>,
+    /// In-progress stderr line being assembled across multiple
+    /// `ProcessNotification::Output { is_stderr: true }` chunks. Pushed
+    /// to `stderr_tail` on newline.
+    stderr_buf: String,
+    /// Most recent worker uncaught_exception traceback (if any). Stashed
+    /// here so the eventual `worker_exited` event can carry it even if
+    /// the event stream truncates the per-line event.
+    last_python_traceback: Option<String>,
+    /// Wall-clock at the moment the worker subprocess started — used
+    /// to compute `uptime_ms` on the worker_exited event.
+    process_started_at: Option<Instant>,
+    /// OS PID of the spawned worker, learned from
+    /// `ProcessNotification::Started`. Stored so the matching
+    /// `SubprocessExited` event can carry it and the introspector
+    /// can be told which entry to mark exited
+    /// (`N3_OBSERVABILITY_UPGRADE_SPEC.md` §4 wiring contract).
+    worker_pid: Option<u32>,
+    /// Generic subprocess introspector this actor forwards
+    /// `register`/`note_exited` into when the worker spawns/exits.
+    /// `None` when not wired (tests).
+    subprocess_introspect: Option<Arc<SubprocessIntrospect>>,
 }
 
 impl StageActor {
@@ -325,6 +372,14 @@ impl StageActor {
             pending_last_detokenize: None,
             accumulated: Vec::new(),
             finished: false,
+            diagnostics: None,
+            stage_idx: None,
+            stderr_tail: VecDeque::with_capacity(STDERR_TAIL_LINES),
+            stderr_buf: String::new(),
+            last_python_traceback: None,
+            process_started_at: None,
+            worker_pid: None,
+            subprocess_introspect: None,
         }
     }
 
@@ -384,6 +439,90 @@ impl StageActor {
     pub fn with_status_addr(mut self, addr: ActorAddress) -> Self {
         self.status_addr = Some(addr);
         self
+    }
+
+    /// Attach a diagnostics emitter. The actor uses it to publish
+    /// typed lifecycle events (`SubprocessSpawned` / `SubprocessExited`)
+    /// and to re-emit worker-side `{"event": ...}` lifecycle lines as
+    /// `Custom("worker_<event_kind>")`. The `worker_ready` Custom
+    /// stays because functioning-as-a-pipeline-worker is not a
+    /// generic subprocess concept (per spec §4). No-op when not
+    /// wired.
+    pub fn with_diagnostics(mut self, emitter: DynEmitter) -> Self {
+        self.diagnostics = Some(emitter);
+        self
+    }
+
+    /// Attach a [`SubprocessIntrospect`] so this actor forwards its
+    /// subprocess's `(label, PID)` into the introspector on spawn
+    /// and `(PID, exit code)` on exit. The introspector itself
+    /// populates the per-snapshot `Tier3SubprocessState`; the actor's
+    /// job is the wiring contract (spec §4).
+    pub fn with_subprocess_introspect(
+        mut self,
+        intro: Arc<SubprocessIntrospect>,
+    ) -> Self {
+        self.subprocess_introspect = Some(intro);
+        self
+    }
+
+    /// Attach a stage index, surfaced on the `worker_exited` and
+    /// `worker_<event>` Custom events so a multi-stage bundle can be
+    /// disambiguated without joining against the snapshot identity.
+    pub fn with_stage_idx(mut self, stage: u32) -> Self {
+        self.stage_idx = Some(stage);
+        self
+    }
+
+    fn role_str(&self) -> &'static str {
+        match self.role {
+            StageRole::First => "first",
+            StageRole::Middle => "middle",
+            StageRole::Last => "last",
+        }
+    }
+
+    fn push_stderr_line(&mut self, mut line: String) {
+        if line.len() > STDERR_LINE_BYTES {
+            // Truncate at a UTF-8 char boundary at or below the cap.
+            let mut end = STDERR_LINE_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            line.truncate(end);
+        }
+        if self.stderr_tail.len() >= STDERR_TAIL_LINES {
+            self.stderr_tail.pop_front();
+        }
+        self.stderr_tail.push_back(line);
+    }
+
+    fn drain_stderr_tail(&mut self) -> Vec<String> {
+        let lines: Vec<String> = self.stderr_tail.drain(..).collect();
+        if !self.stderr_buf.is_empty() {
+            // Surface any unterminated trailing fragment so a crash that
+            // truncates mid-line still produces visible bytes.
+            let frag = std::mem::take(&mut self.stderr_buf);
+            let mut out = lines;
+            out.push(frag);
+            out
+        } else {
+            lines
+        }
+    }
+
+    fn emit_diag(&self, kind: &str, mut fields: serde_json::Value) {
+        let Some(emitter) = &self.diagnostics else {
+            return;
+        };
+        if let Some(stage) = self.stage_idx {
+            fields["stage_idx"] = serde_json::json!(stage);
+        }
+        fields["role"] = serde_json::json!(self.role_str());
+        emitter.emit_event(Event::Custom {
+            kind: kind.to_string(),
+            fields,
+        });
     }
 
     /// Route prompt tokenization through the worker's `tokenize` op. Use
@@ -451,6 +590,16 @@ impl StageActor {
         }
     }
 
+    /// Label fed to the generic `SubprocessIntrospect`. Includes the
+    /// stage index when known so a multi-stage bundle gives each
+    /// worker a distinct row in `Tier3SubprocessState.subprocesses`.
+    fn subprocess_label(&self) -> String {
+        match self.stage_idx {
+            Some(i) => format!("pp-worker-stage-{i}"),
+            None => "pp-worker".to_string(),
+        }
+    }
+
     fn write_to_worker(&self, ctx: &Ctx, json: serde_json::Value) {
         let Some(proc_addr) = self.process_addr else {
             return;
@@ -492,6 +641,21 @@ impl StageActor {
             if let Some(addr) = self.status_addr {
                 let _ = ctx.send(addr, StageActorStatus::WorkerReady { pid });
             }
+            return;
+        }
+
+        // Worker-side lifecycle event: any `{"event": "<kind>", ...}` line
+        // is re-emitted as `Custom("worker_<kind>")` and otherwise ignored
+        // (it carries no protocol payload). We stash the traceback off any
+        // `uncaught_exception` so the eventual `worker_exited` event can
+        // carry it even if the per-line event is truncated.
+        if let Some(event_kind) = val.get("event").and_then(|v| v.as_str()) {
+            if event_kind == "uncaught_exception" {
+                if let Some(tb) = val.get("traceback").and_then(|v| v.as_str()) {
+                    self.last_python_traceback = Some(tb.to_string());
+                }
+            }
+            self.emit_diag(&format!("worker_{event_kind}"), val.clone());
             return;
         }
 
@@ -857,25 +1021,110 @@ impl ActorInterface for StageActor {
             }
             StageMsg::Reset => self.handle_reset(),
             StageMsg::Process(notif) => match notif {
-                ProcessNotification::Started { .. } => {
+                ProcessNotification::Started { pid, .. } => {
                     self.process_alive = true;
+                    self.process_started_at = Some(Instant::now());
+                    self.worker_pid = pid;
+                    // Fresh process — drop any stale buffered output
+                    // from an ancestor invocation so the next exit's
+                    // tail reflects this process only. (Stages don't
+                    // respawn today, but the contract should be
+                    // per-process so the helper is correct if they
+                    // ever do.)
+                    self.stderr_tail.clear();
+                    self.stderr_buf.clear();
+                    self.last_python_traceback = None;
+                    // Spec §4 wiring contract: forward (label, PID)
+                    // into the subprocess introspector — which is the
+                    // canonical owner of the lifecycle event per the
+                    // introspector's doc comment ("emits the typed
+                    // lifecycle events on register/note_exited"). The
+                    // actor does NOT also emit `SubprocessSpawned`
+                    // through `self.diagnostics`; that would double-
+                    // emit the same fact through the same channel
+                    // (the actor's emitter and the introspector's
+                    // emitter resolve to the same aggregator).
+                    if let Some(pid) = pid {
+                        if let Some(intro) = self.subprocess_introspect.as_ref() {
+                            intro.register(
+                                self.subprocess_label(),
+                                pid,
+                                self.spec.command.clone(),
+                                Some(std::process::id()),
+                            );
+                        }
+                    }
                     if let Some(addr) = self.status_addr {
                         let _ = ctx.send(addr, StageActorStatus::ProcessStarted);
                     }
                 }
-                ProcessNotification::Output { data, .. } => {
+                ProcessNotification::Output { data, stream, .. } => {
                     let text = String::from_utf8_lossy(&data);
-                    self.output_buffer.push_str(&text);
-                    while let Some(pos) = self.output_buffer.find('\n') {
-                        let line = self.output_buffer[..pos].to_string();
-                        self.output_buffer = self.output_buffer[pos + 1..].to_string();
-                        self.handle_worker_line(ctx, line.trim());
+                    if stream == OutputStream::Stderr {
+                        // Line-buffer stderr into the ring; do NOT feed
+                        // the protocol parser. Workers may also emit
+                        // diagnostic events on stderr in some setups,
+                        // but the contract here is strict: stdout = JSON
+                        // protocol, stderr = human-readable logs.
+                        self.stderr_buf.push_str(&text);
+                        while let Some(pos) = self.stderr_buf.find('\n') {
+                            let line = self.stderr_buf[..pos].to_string();
+                            self.stderr_buf = self.stderr_buf[pos + 1..].to_string();
+                            self.push_stderr_line(line);
+                        }
+                    } else {
+                        self.output_buffer.push_str(&text);
+                        while let Some(pos) = self.output_buffer.find('\n') {
+                            let line = self.output_buffer[..pos].to_string();
+                            self.output_buffer = self.output_buffer[pos + 1..].to_string();
+                            self.handle_worker_line(ctx, line.trim());
+                        }
                     }
                 }
                 ProcessNotification::Exited { status, .. } => {
                     self.process_alive = false;
                     self.ready = false;
                     self.clear_pending_state();
+
+                    let (exit_code, signal, normal_exit) = match status {
+                        ExitStatus::Code(c) => (Some(c), None, c == 0),
+                        ExitStatus::Signal(s) => (None, Some(s), false),
+                        ExitStatus::Unknown => (None, None, false),
+                    };
+                    let stderr_tail = self.drain_stderr_tail();
+                    let traceback = self.last_python_traceback.take();
+
+                    // Spec §4: typed SubprocessExited carries the
+                    // generic per-process exit facts (label, PID,
+                    // command, code/signal, uptime). The pipeline-
+                    // specific stderr tail + python traceback stay
+                    // on a Custom event so the generic and the
+                    // worker-specific signals are reported through
+                    // their own channels.
+                    //
+                    // The introspector owns the typed event emission
+                    // (mirrors the spawn path above) — the actor
+                    // does not also emit `SubprocessExited` through
+                    // `self.diagnostics`. The `uptime_ms` the
+                    // introspector emits is computed from the spawn
+                    // time it stamped on `register`, which matches
+                    // the actor's `process_started_at` to within the
+                    // emit-event latency.
+                    if let Some(pid) = self.worker_pid {
+                        if let Some(intro) = self.subprocess_introspect.as_ref() {
+                            intro.note_exited(pid, exit_code, signal);
+                        }
+                    }
+                    let mut detail = serde_json::json!({
+                        "normal_exit": normal_exit,
+                        "stderr_tail": stderr_tail,
+                    });
+                    if let Some(tb) = traceback {
+                        detail["python_traceback"] = serde_json::json!(tb);
+                    }
+                    self.emit_diag("worker_exit_detail", detail);
+                    self.worker_pid = None;
+
                     if let Some(addr) = self.status_addr {
                         let _ = ctx.send(addr, StageActorStatus::ProcessExited { status });
                     }

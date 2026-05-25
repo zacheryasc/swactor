@@ -207,6 +207,24 @@ pub enum MutationKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         queue_depth_bytes: Option<u64>,
     },
+    /// Spec §"Sim cross-pollination" F3 — cut the (`relay`,
+    /// `from`, `to`) relay-mediated peer-connection while leaving
+    /// the relay itself otherwise functional for every other pair.
+    /// Distinct from `RelayKill` (which takes the entire relay
+    /// down) and from `Partition` (which cuts traffic regardless of
+    /// the route). Models the 2026-05-25 "tunnel up, peer-via-
+    /// tunnel down" asymmetry: stage-2's tunnel to the relay stays
+    /// alive but the relay→stage-2 leg silently drops, so the
+    /// orchestrator's relay-mediated sends to stage-2 fail while
+    /// stage-2 itself sees no tunnel-state change. `duration_ns =
+    /// 0` means permanent (until run end).
+    RelayPeerConnDown {
+        relay: String,
+        from: String,
+        to: String,
+        #[serde(default)]
+        duration_ns: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1446,6 +1464,25 @@ fn parse_mutation(
                 ingress_capacity_bps: ingress,
                 egress_capacity_bps_per_link: egress,
                 queue_depth_bytes: depth,
+            }
+        }
+        "relay_peer_conn_down" => {
+            let relay = relay_field(path, &field("relay"), table.get("relay"), relays)?;
+            let from = peer_field(path, &field("from"), table.get("from"), peers)?;
+            let to = peer_field(path, &field("to"), table.get("to"), peers)?;
+            let duration_ns = match table.get("duration_ns") {
+                None => 0u64,
+                Some(v) => v
+                    .as_integer()
+                    .ok_or_else(|| err(path, field("duration_ns"), "must be an integer"))?
+                    .try_into()
+                    .map_err(|_| err(path, field("duration_ns"), "must be non-negative"))?,
+            };
+            MutationKind::RelayPeerConnDown {
+                relay,
+                from,
+                to,
+                duration_ns,
             }
         }
         other => {

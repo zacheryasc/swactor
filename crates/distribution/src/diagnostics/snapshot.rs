@@ -84,6 +84,28 @@ pub struct SnapshotBody {
     /// `diagnostics::process_stats::ProcessStats`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub process: Option<Tier3ProcessStats>,
+    /// Local name→address registry view. `None` when no registry
+    /// introspector is installed; populated by
+    /// `diagnostics::registry_introspect::RegistryIntrospect` from
+    /// the local `ClusterRegistry`. Lets the post-processor answer
+    /// "did this node ever register `pp-entry`?" without inferring it
+    /// from gossip-receive events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<Tier2Registry>,
+    /// Relay-side server view (spec §1). Populated only by relay
+    /// binaries — node-role and orchestrator-role snapshots leave it
+    /// `None`. Carries end-of-run totals (active sessions, opens,
+    /// closes, bytes, breakdown by close reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_server: Option<Tier3RelayServer>,
+    /// Tier-3 subprocesses owned by this node (spec §4). Populated
+    /// only when a [`SubprocessIntrospector`] has been installed.
+    /// Generic over the calling use case: the introspector knows
+    /// about (label, PID, parent PID); decisions about *which*
+    /// subprocesses to register live in the calling crate. The
+    /// existing `process_stats` block remains for the *parent* process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subprocess: Option<Tier3SubprocessState>,
 }
 
 /// Iroh-internal snapshot fields (`DIAGNOSTICS_PLAN.md` T2.1 + T2.2 + T2.3).
@@ -115,12 +137,81 @@ pub struct Tier2IrohState {
     /// Fields the current iroh version does not expose, listed once
     /// per snapshot so the bundle reader does not confuse "absent"
     /// with "zero." Matches the `iroh_api_missing` event kinds.
+    ///
+    /// Computed from observed per-peer field population each scrape:
+    /// a candidate field name is included iff no scraped peer carried
+    /// a natively-sourced value for it. Bumping iroh to a version that
+    /// populates a previously-missing field causes the gap to vanish
+    /// from this list without further code changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_gaps: Vec<String>,
+    /// Version of the `iroh` crate this binary was linked against,
+    /// taken from `Cargo.lock` at build time. Tier-2 carries it on
+    /// every snapshot so the bundle reader does not need to scan the
+    /// event stream to know what iroh version ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iroh_version: Option<String>,
+    /// State of this node's tunnel to its home relay (spec §2). This
+    /// is the answer to "is my tunnel up right now," kept separate
+    /// from per-peer connection state — a peer connection going dead
+    /// does not by itself prove the underlying relay tunnel died.
+    /// `None` when no relay introspector has populated it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_session: Option<Tier2RelaySession>,
     /// Wall-clock millis at the moment the introspector last
     /// refreshed its cache.
     #[serde(default)]
     pub scraped_at_ms: u64,
+}
+
+/// State of a node's tunnel to its home relay
+/// (`N3_OBSERVABILITY_UPGRADE_SPEC.md` §2).
+///
+/// The discriminator pattern: `status_source` says where `status` came
+/// from. `"iroh"` means we read it natively from the transport
+/// library; `"derived"` means we inferred it from address-watcher
+/// state. When `status` is `"unknown"`, the reader knows we genuinely
+/// couldn't ask — versus an `"unknown"` that means "the tunnel is in
+/// an unknown sub-state." The spec is explicit: a bundle reader must
+/// never have to guess which of those is meant.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tier2RelaySession {
+    /// Relay URL the node is currently using. `None` when iroh has
+    /// not picked (or no longer holds) a home relay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_url: Option<String>,
+    /// One of `"connected"`, `"connecting"`, `"disconnected"`, or
+    /// `"unknown"`. Strings so the wire stays forgiving when iroh
+    /// adds new states.
+    pub status: String,
+    /// `"iroh"` when the value came from a native iroh API,
+    /// `"derived"` when the introspector synthesized it from other
+    /// signals (e.g. presence of a home-relay URL in `watch_addr()`).
+    pub status_source: String,
+    /// Wall-clock millis of the most recent transition between two
+    /// distinct `status` values. `None` until at least one transition
+    /// has been observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_changed_at_ms: Option<u64>,
+    /// Wall-clock millis at which the current status was first
+    /// entered. Equals `status_changed_at_ms` after the first change;
+    /// equals the introspector's first observation otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_entered_at_ms: Option<u64>,
+    /// Last moment the node successfully sent bytes over the tunnel.
+    /// `None` when the linked iroh version does not expose this and
+    /// the introspector has no other way to know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_send_at_ms: Option<u64>,
+    /// Last moment the node received bytes over the tunnel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_recv_at_ms: Option<u64>,
+    /// Lifetime byte counters in each direction over the tunnel.
+    /// `None` when not exposed; see `api_gaps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tx_bytes_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rx_bytes_total: Option<u64>,
 }
 
 /// Per-peer iroh-side view (`DIAGNOSTICS_PLAN.md` T2.1). Fields that
@@ -129,30 +220,134 @@ pub struct Tier2IrohState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tier2Peer {
     pub peer_node_id_hex: String,
-    /// Derived from address usage when iroh doesn't expose a direct
-    /// `conn_type`. `Direct` if any active IP addr exists, `Relay` if
-    /// any active relay addr exists, `Mixed` if both, `None` if iroh
-    /// has no active path. `None` is *not* the same as "iroh hasn't
-    /// heard of this peer" — that case yields a peer entry whose
-    /// vectors are empty and `conn_type` is `None`.
+    /// `Direct` if any active IP addr exists, `Relay` if any active
+    /// relay addr exists, `Mixed` if both, `None` if iroh has no active
+    /// path. `None` is *not* the same as "iroh hasn't heard of this
+    /// peer" — that case yields a peer entry whose vectors are empty
+    /// and `conn_type` is `None`. The corresponding `conn_type_source`
+    /// disambiguates whether the value came from iroh natively or was
+    /// derived from address-usage signal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conn_type: Option<ConnType>,
-    /// Not exposed by iroh 0.96; reported in `api_gaps`.
+    /// Source of `conn_type` for this peer. `"iroh"` when iroh's
+    /// `RemoteInfo` exposes a connection-type field directly,
+    /// `"derived"` when synthesized from address usage. Absent only
+    /// when `conn_type` itself is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conn_type_source: Option<String>,
+    /// Latency in milliseconds reported by iroh's `RemoteInfo`. `None`
+    /// when the linked iroh version does not expose it; in that case
+    /// the canonical field name appears in [`Tier2IrohState::api_gaps`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
-    /// Not exposed by iroh 0.96; reported in `api_gaps`.
+    /// Wall-clock millis of the last time iroh used this peer's
+    /// connection. `None` when the linked iroh version does not expose
+    /// it; see `api_gaps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_used_ms: Option<u64>,
-    /// Not exposed by iroh 0.96; reported in `api_gaps`.
+    /// Wall-clock millis of the last time iroh received from this peer.
+    /// `None` when the linked iroh version does not expose it; see
+    /// `api_gaps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_received_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub direct_addresses: Vec<TransportAddrWire>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relay_urls: Vec<TransportAddrWire>,
-    /// Not exposed by iroh 0.96; reported in `api_gaps`.
+    /// Per-address provenance strings (e.g. which discovery method
+    /// produced each entry). `None` when the linked iroh version does
+    /// not expose it; see `api_gaps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr_sources: Option<Vec<String>>,
+}
+
+impl Tier2IrohState {
+    /// Canonical field-name list for *per-peer* fields the bundle
+    /// reader may expect iroh to populate. Used by
+    /// [`Self::compute_api_gaps`] to derive the runtime gap list from
+    /// observed peer slots.
+    pub const CANDIDATE_PEER_FIELDS: &'static [&'static str] = &[
+        "RemoteInfo.conn_type",
+        "RemoteInfo.latency_ms",
+        "RemoteInfo.last_used_ms",
+        "RemoteInfo.last_received_ms",
+        "TransportAddrInfo.source",
+    ];
+
+    /// Canonical field-name list for *relay-tunnel* fields the bundle
+    /// reader may expect iroh to populate. Computed against the
+    /// observed [`Tier2RelaySession`] (spec §2 cross-references §6 —
+    /// when the linked iroh doesn't expose tunnel state natively, the
+    /// field is reported as `unknown` + derived, and its canonical
+    /// name lands in `api_gaps`).
+    pub const CANDIDATE_RELAY_FIELDS: &'static [&'static str] = &[
+        "RelayTunnel.status",
+        "RelayTunnel.last_send_at_ms",
+        "RelayTunnel.last_recv_at_ms",
+        "RelayTunnel.tx_bytes_total",
+        "RelayTunnel.rx_bytes_total",
+    ];
+
+    /// Compute the list of API gaps for a set of peers just scraped
+    /// from iroh. Backwards-compatible name for callers that only
+    /// have peer data; prefer [`Self::compute_api_gaps_full`] when
+    /// the relay session is also available.
+    pub fn compute_api_gaps(peers: &[Tier2Peer]) -> Vec<String> {
+        Self::compute_api_gaps_full(peers, None)
+    }
+
+    /// Compute the list of API gaps for a scrape, considering both
+    /// per-peer fields and the relay-tunnel state.
+    ///
+    /// A candidate appears in the result iff the corresponding
+    /// observation slot is not natively populated. For `conn_type`
+    /// "native" means `conn_type_source == "iroh"`; for relay-tunnel
+    /// status, "native" means `status_source == "iroh"`; for the
+    /// pure `Option` fields, "native" means `Some(_)`. When nothing
+    /// has been scraped at all, every candidate stays in the gap
+    /// list — the bundle reader has no evidence iroh exposes
+    /// anything.
+    pub fn compute_api_gaps_full(
+        peers: &[Tier2Peer],
+        relay: Option<&Tier2RelaySession>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = Self::CANDIDATE_PEER_FIELDS
+            .iter()
+            .filter(|name| !peers.iter().any(|p| Self::peer_populates_field(p, name)))
+            .map(|s| (*s).to_string())
+            .collect();
+        for name in Self::CANDIDATE_RELAY_FIELDS {
+            let populated = relay
+                .map(|r| Self::relay_populates_field(r, name))
+                .unwrap_or(false);
+            if !populated {
+                out.push((*name).to_string());
+            }
+        }
+        out
+    }
+
+    fn peer_populates_field(peer: &Tier2Peer, field: &str) -> bool {
+        match field {
+            "RemoteInfo.conn_type" => peer.conn_type_source.as_deref() == Some("iroh"),
+            "RemoteInfo.latency_ms" => peer.latency_ms.is_some(),
+            "RemoteInfo.last_used_ms" => peer.last_used_ms.is_some(),
+            "RemoteInfo.last_received_ms" => peer.last_received_ms.is_some(),
+            "TransportAddrInfo.source" => peer.addr_sources.is_some(),
+            _ => false,
+        }
+    }
+
+    fn relay_populates_field(relay: &Tier2RelaySession, field: &str) -> bool {
+        match field {
+            "RelayTunnel.status" => relay.status_source == "iroh",
+            "RelayTunnel.last_send_at_ms" => relay.last_send_at_ms.is_some(),
+            "RelayTunnel.last_recv_at_ms" => relay.last_recv_at_ms.is_some(),
+            "RelayTunnel.tx_bytes_total" => relay.tx_bytes_total.is_some(),
+            "RelayTunnel.rx_bytes_total" => relay.rx_bytes_total.is_some(),
+            _ => false,
+        }
+    }
 }
 
 /// Per-peer connection-cache aggregate (`DIAGNOSTICS_PLAN.md` T2.4).
@@ -348,6 +543,68 @@ pub trait SwimIntrospector: Send + Sync {
     fn capture(&self) -> Tier2SwimState;
 }
 
+/// Local name registry view (name → actor address). The post-processor
+/// uses this to verify name-publication independent of gossip — every
+/// snapshot from a node that owns a name carries it here, so absence
+/// at scrape time means the node never called `register_name` (vs.
+/// "called it but gossip never propagated").
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tier2Registry {
+    /// One entry per known name (live or tombstoned).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<Tier2RegistryEntry>,
+    /// Cached count of tombstone entries. Redundant with iterating
+    /// `entries`, but cheap and lets the post-processor render the
+    /// "N live, M tombstone" summary without a scan.
+    pub tombstone_count: u64,
+    /// Monotonic logical clock from the local registry at scrape time.
+    /// Lets the post-processor order two snapshots from the same node
+    /// even when wall-clock samples collide.
+    pub clock: u64,
+    /// Wall-clock millis at the moment the introspector built this
+    /// snapshot.
+    #[serde(default)]
+    pub scraped_at_ms: u64,
+}
+
+/// One name in the registry as the local node sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tier2RegistryEntry {
+    pub name: String,
+    /// Hex-encoded `ActorAddress`. 32-byte address rendered as 64 hex
+    /// chars; matches the format used for `peer_node_id_hex`.
+    pub actor_addr_hex: String,
+    /// Hex-encoded `NodeId` of the node that owns this binding. Equal
+    /// to `Tier2Registry`'s containing identity when the local node
+    /// owns the name; different when the entry was learned via gossip.
+    pub owner_node_id_hex: String,
+    /// Per-name dissemination generation. Bumped each time the owner
+    /// re-registers under the same name.
+    pub generation: u64,
+    /// Logical timestamp from the local registry's clock at the moment
+    /// this entry was inserted/updated. Not wall-clock; useful only for
+    /// ordering relative to other entries from the *same* node.
+    #[serde(default)]
+    pub logical_timestamp: u64,
+    /// `true` for unregistered names that are still being gossiped as
+    /// tombstones. Lets the post-processor distinguish "never seen"
+    /// from "seen and revoked."
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_tombstone: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Registry-side analogue of [`SwimIntrospector`]. Installed on the
+/// aggregator via [`crate::diagnostics::Aggregator::set_registry_introspector`].
+/// Production wires up
+/// `crate::diagnostics::registry_introspect::RegistryIntrospect`.
+pub trait RegistryIntrospector: Send + Sync {
+    fn capture(&self) -> Tier2Registry;
+}
+
 /// Host-side snapshot fields (`DIAGNOSTICS_PLAN.md` T3.1 + T3.2).
 ///
 /// `network` and `dns` are independently refreshed at ~30s cadence —
@@ -398,9 +655,46 @@ pub struct Tier3HostNetwork {
     /// Nameservers listed in `/etc/resolv.conf`, in declaration order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resolv_conf_nameservers: Vec<String>,
+    /// Kernel UDP counters from `/proc/net/snmp` (spec §11).
+    /// `None` on non-Linux, when the file could not be read, or when
+    /// the kernel did not expose the row we expected. Bundle reader
+    /// must treat absent as "we couldn't ask", never as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub udp_kernel_stats: Option<Tier3UdpKernelStats>,
     /// Wall-clock millis at the moment of this scrape.
     #[serde(default)]
     pub refreshed_at_ms: u64,
+}
+
+/// UDP-layer kernel counters parsed from `/proc/net/snmp` (spec §11).
+///
+/// All fields are best-effort `Option<u64>`. A field that the kernel's
+/// `Udp:` row does not include stays `None` — the bundle reader can
+/// then distinguish "kernel didn't expose this counter" from "kernel
+/// reported zero." Deltas across consecutive snapshots tell the
+/// investigator whether packet loss was happening at the UDP layer
+/// (send/receive errors rising) or above it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tier3UdpKernelStats {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_datagrams: Option<u64>,
+    /// Datagrams that arrived with no listening socket. Rising values
+    /// here on the receiver mean the path got through but nothing was
+    /// bound to consume it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no_ports: Option<u64>,
+    /// Packets discarded because of a checksum or framing error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_errors: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub out_datagrams: Option<u64>,
+    /// Receiver-side socket buffer overflows — the kernel had no room
+    /// to queue the packet for the application.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rcvbuf_errors: Option<u64>,
+    /// Sender-side socket buffer overflows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sndbuf_errors: Option<u64>,
 }
 
 /// A single network interface as seen by the host scrape.
@@ -414,6 +708,27 @@ pub struct Tier3Interface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtu: Option<u32>,
     pub up: bool,
+    /// Per-interface kernel counters from `/proc/net/dev` (spec §11).
+    /// `None` when the row was unreadable or unavailable; never
+    /// silently zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counters: Option<Tier3InterfaceCounters>,
+}
+
+/// Per-interface byte/packet/drop/error counters from `/proc/net/dev`.
+///
+/// Same best-effort honesty as [`Tier3UdpKernelStats`]: every counter
+/// is `u64` and the whole block is wrapped in `Option` upstream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tier3InterfaceCounters {
+    pub rx_bytes: u64,
+    pub rx_packets: u64,
+    pub rx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_bytes: u64,
+    pub tx_packets: u64,
+    pub tx_errors: u64,
+    pub tx_dropped: u64,
 }
 
 /// A default-route entry from `/proc/net/route` or `/proc/net/ipv6_route`.
@@ -620,6 +935,128 @@ pub trait ProcessIntrospector: Send + Sync {
     fn capture(&self) -> Tier3ProcessStats;
 }
 
+/// Relay-side observability totals (spec §1).
+///
+/// Populated only by relay binaries (role `"relay"`). The bundle
+/// reader sees one such block per snapshot from each relay that opted
+/// into observability. End-of-run totals answer "how busy was the
+/// relay, what closed the most sessions, and how many bytes
+/// transited?" without needing an external metrics store.
+///
+/// Per-session detail lives on the event stream as
+/// [`crate::diagnostics::Event::RelaySessionOpened`] /
+/// [`crate::diagnostics::Event::RelaySessionClosed`] — the snapshot
+/// is the current-value view; events are the lifecycle view.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tier3RelayServer {
+    /// Sessions the relay considers open right now.
+    pub active_sessions: u64,
+    /// Total sessions opened over this relay's lifetime in the run.
+    pub total_opens: u64,
+    /// Total sessions closed over this relay's lifetime in the run.
+    pub total_closes: u64,
+    /// Bytes received from clients across all sessions, summed.
+    pub bytes_rx_total: u64,
+    /// Bytes sent to clients across all sessions, summed.
+    pub bytes_tx_total: u64,
+    /// Count of closes broken down by `close_reason`. Sorted by reason
+    /// for stable rendering. An empty vec means no closes observed (or
+    /// the relay couldn't classify them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub closes_by_reason: Vec<(String, u64)>,
+    /// Wall-clock millis at the moment of this scrape.
+    #[serde(default)]
+    pub scraped_at_ms: u64,
+}
+
+/// Relay-server analogue of [`HostIntrospector`] / [`ProcessIntrospector`].
+/// Installed on a relay binary's aggregator via
+/// [`crate::diagnostics::Aggregator::set_relay_server_introspector`].
+/// Production wires up `crate::diagnostics::relay_observability::RelayObservability`.
+pub trait RelayServerIntrospector: Send + Sync {
+    fn capture(&self) -> Tier3RelayServer;
+}
+
+/// Tier-3 subprocess snapshot block (spec §4).
+///
+/// One [`Tier3Subprocess`] entry per subprocess the owning actor
+/// registered with the [`SubprocessIntrospector`] — generic over the
+/// use case: the introspector only knows about a label, a PID, and a
+/// parent PID. Deciding which subprocesses to track is the *calling
+/// crate's* responsibility, not the introspector's.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Tier3SubprocessState {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subprocesses: Vec<Tier3Subprocess>,
+    /// Wall-clock millis at the moment of this scrape.
+    #[serde(default)]
+    pub scraped_at_ms: u64,
+}
+
+/// Per-subprocess entry (spec §4 behavior contract).
+///
+/// All resource fields are `Option<u64>` so the bundle reader can
+/// always tell "we couldn't read /proc" from "the process is using
+/// zero bytes." The status discriminator is a string for forward
+/// compatibility — adding a new state (e.g. `"zombie"`) does not
+/// break the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tier3Subprocess {
+    /// Caller-supplied label. The introspector never invents one —
+    /// the calling crate decides whether this is `"pp-worker"`,
+    /// `"helper-script"`, etc.
+    pub label: String,
+    pub pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_pid: Option<u32>,
+    /// `"running"`, `"exited"`, or `"unknown"`. Strings so the wire
+    /// stays forgiving when new states (e.g. `"zombie"`) are added.
+    pub status: String,
+    /// Wall-clock millis when the subprocess was registered with
+    /// the introspector. Distinct from kernel-side start time —
+    /// this is the actor's view of "we asked it to run."
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_at_ms: Option<u64>,
+    /// Process exit code, if the subprocess exited normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Terminating signal number, if the subprocess was killed by
+    /// a signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    /// Resident set size in bytes, from `/proc/<pid>/status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rss_bytes: Option<u64>,
+    /// Virtual memory size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_size_bytes: Option<u64>,
+    /// Count of entries under `/proc/<pid>/fd`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_fd_count: Option<u64>,
+    /// CPU time in milliseconds since this subprocess started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_ms: Option<u64>,
+    /// Truncated `/proc/<pid>/cmdline` (first 256 bytes), joined by
+    /// spaces. `None` when the file is unreadable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmdline: Option<String>,
+}
+
+/// Subprocess-side analogue of [`HostIntrospector`] / [`ProcessIntrospector`].
+/// Installed on the aggregator via
+/// [`crate::diagnostics::Aggregator::set_subprocess_introspector`].
+///
+/// Generic over the use case (spec §4 explicit requirement): the
+/// trait surface is one method that returns a [`Tier3SubprocessState`].
+/// Tests can install any implementation that fits their assertion;
+/// production wires up
+/// `crate::diagnostics::subprocess_introspect::SubprocessIntrospect`.
+pub trait SubprocessIntrospector: Send + Sync {
+    fn capture(&self) -> Tier3SubprocessState;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -649,6 +1086,9 @@ mod tests {
                 probes: None,
                 vastai: None,
                 process: None,
+                registry: None,
+                relay_server: None,
+                subprocess: None,
             },
         };
         let s = serde_json::to_string(&snap).unwrap();

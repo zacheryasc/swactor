@@ -15,13 +15,17 @@
 //! never changes behavior of code that does not opt in.
 
 pub mod aggregator;
+pub mod dep_versions;
 pub mod event;
 pub mod host_introspect;
 pub mod identity;
 pub mod probes;
 pub mod process_stats;
 pub mod reachability;
+pub mod registry_introspect;
+pub mod relay_observability;
 pub mod sink;
+pub mod subprocess_introspect;
 pub mod snapshot;
 pub mod spool;
 pub mod swim_introspect;
@@ -37,8 +41,9 @@ pub mod postproc;
 pub mod signal;
 
 pub use aggregator::Aggregator;
+pub use dep_versions::{GIT_SHA, IROH_VERSION};
 pub use event::{ConnType, DialOutcome, Event, EventRecord, PeerState};
-pub use identity::{Identity, Role};
+pub use identity::{HostContext, Identity, Role};
 pub use reachability::{PeerReachability, StateTransition};
 pub use sink::{
     DynEmitter, DynSink, EventEmitter, InMemorySink, NoopEmitter, NoopSink, Sink, noop_emitter,
@@ -50,14 +55,20 @@ pub use signal::SnapshotSignal;
 pub use host_introspect::HostIntrospect;
 pub use probes::ProbeScheduler;
 pub use process_stats::ProcessStats;
+pub use relay_observability::RelayObservability;
 pub use snapshot::{
     HostIntrospector, IrohIntrospector, MetricSample, MetricValueWire, ProbeIntrospector,
-    ProcessIntrospector, Snapshot, SnapshotBody, SnapshotTrigger, SwimIntrospector,
-    Tier2ConnectionCache, Tier2IrohState, Tier2Peer, Tier2SwimConfig, Tier2SwimMessage,
-    Tier2SwimPeer, Tier2SwimState, Tier3DnsResolution, Tier3HostNetwork, Tier3HostState,
-    Tier3Interface, Tier3Probe, Tier3ProbeState, Tier3ProcessStats, Tier3Route, Tier3TokioStats,
-    Tier3UdpSocket, Tier3VastaiContext, TransportAddrWire, VastaiIntrospector,
+    ProcessIntrospector, RegistryIntrospector, RelayServerIntrospector, Snapshot, SnapshotBody,
+    SnapshotTrigger, SubprocessIntrospector, SwimIntrospector, Tier2ConnectionCache,
+    Tier2IrohState, Tier2Peer, Tier2Registry, Tier2RegistryEntry, Tier2RelaySession,
+    Tier2SwimConfig, Tier2SwimMessage, Tier2SwimPeer, Tier2SwimState, Tier3DnsResolution,
+    Tier3HostNetwork, Tier3HostState, Tier3Interface, Tier3InterfaceCounters, Tier3Probe,
+    Tier3ProbeState, Tier3ProcessStats, Tier3RelayServer, Tier3Route, Tier3Subprocess,
+    Tier3SubprocessState, Tier3TokioStats, Tier3UdpKernelStats, Tier3UdpSocket,
+    Tier3VastaiContext, TransportAddrWire, VastaiIntrospector,
 };
+pub use subprocess_introspect::SubprocessIntrospect;
+pub use registry_introspect::RegistryIntrospect;
 pub use swim_introspect::SwimIntrospect;
 pub use vastai_context::VastaiContext;
 #[cfg(feature = "iroh")]

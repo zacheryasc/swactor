@@ -218,8 +218,9 @@ fn build_route(
     )))
 }
 
-fn register_name(driver: &mut IrohDriver, name: &str, addr: ActorAddress) {
+fn register_name(driver: &mut IrohDriver, name: &str, addr: ActorAddress, stage: u32) {
     driver.node_mut().register_name(name.into(), addr);
+    diag::emit_register_name(driver, name, addr, Some(stage));
     eprintln!("pp-gpu-node: registered {name} -> {addr:?}");
 }
 
@@ -338,6 +339,9 @@ fn main() {
     // would race the orchestrator's authoritative finalize record. The
     // background drainer keeps streaming events until SIGKILL.
     let _diag = diag::install_from_env(&mut driver, DiagRole::stage());
+    let subprocess_introspect = _diag
+        .as_ref()
+        .map(|d| d.subprocess_introspect().clone());
 
     let my_id = driver.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
@@ -457,7 +461,7 @@ fn main() {
 
     run_stage(
         driver, rt, codecs, router, sender, status_inbox, role, stage, num_stages,
-        max_tokens,
+        max_tokens, subprocess_introspect,
     );
 }
 
@@ -526,6 +530,7 @@ fn run_stage(
     stage: u32,
     num_stages: u32,
     max_tokens: u32,
+    subprocess_introspect: Option<Arc<distribution::diagnostics::subprocess_introspect::SubprocessIntrospect>>,
 ) {
     // Construct the role-appropriate actor with placeholder routing
     // addresses. SetNeighbors overwrites them once SWIM resolution
@@ -535,20 +540,31 @@ fn run_stage(
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
 
+    let diag_emitter = driver.diagnostics().clone();
+    let attach_subprocess = |mut a: StageActor| {
+        if let Some(intro) = subprocess_introspect.as_ref() {
+            a = a.with_subprocess_introspect(intro.clone());
+        }
+        a
+    };
     let actor = match role {
         StageRole::First => {
             let mut a =
                 StageActor::first(worker_spec(stage, num_stages), sender, placeholder)
-                    .with_status_addr(*status_inbox.addr());
+                    .with_status_addr(*status_inbox.addr())
+                    .with_diagnostics(diag_emitter.clone())
+                    .with_stage_idx(stage);
             if !stub_mode {
                 a = a.with_real_tokenization();
             }
-            a
+            attach_subprocess(a)
         }
-        StageRole::Middle => {
+        StageRole::Middle => attach_subprocess(
             StageActor::middle(worker_spec(stage, num_stages), sender, placeholder)
                 .with_status_addr(*status_inbox.addr())
-        }
+                .with_diagnostics(diag_emitter.clone())
+                .with_stage_idx(stage),
+        ),
         StageRole::Last => {
             let mut a = StageActor::last(
                 worker_spec(stage, num_stages),
@@ -557,11 +573,13 @@ fn run_stage(
                 placeholder,
                 max_tokens,
             )
-            .with_status_addr(*status_inbox.addr());
+            .with_status_addr(*status_inbox.addr())
+            .with_diagnostics(diag_emitter.clone())
+            .with_stage_idx(stage);
             if !stub_mode {
                 a = a.with_real_detokenization();
             }
-            a
+            attach_subprocess(a)
         }
     };
     let stage_actor_addr = rt.spawn(actor).unwrap();
@@ -610,12 +628,20 @@ fn run_stage(
         StageRole::First => next_token_bridge_addr.unwrap(),
         StageRole::Middle | StageRole::Last => activation_bridge_addr.unwrap(),
     };
-    register_name(&mut driver, &stage_name(stage), per_index_bridge_addr);
+    register_name(&mut driver, &stage_name(stage), per_index_bridge_addr, stage);
 
     // Worker boot can take time even in stub mode (Python startup +
     // tinygrad import on real mode). Generous timeout.
     if !wait_for_worker_ready(&rt, &mut driver, &status_inbox, Duration::from_secs(600)) {
         eprintln!("pp-gpu-node: stage-{stage} worker did not become ready");
+        // The StageActor already emitted Custom("worker_exited") in
+        // response to ProcessNotification::Exited. Give the HTTP-sink
+        // drainer enough time to flush it before we tear the process
+        // down — the bundle is otherwise the only place this signal
+        // lands, and on vast.ai the container is destroyed immediately
+        // after exit so stderr is unreachable. The sink's default
+        // batch interval is 1s, so we wait two batches' worth.
+        std::thread::sleep(Duration::from_millis(2_500));
         std::process::exit(1);
     }
 
@@ -706,10 +732,10 @@ fn run_stage(
     // requests) and pp-exit on Last (informational). Middle has neither.
     match role {
         StageRole::First => {
-            register_name(&mut driver, ENTRY_NAME, request_bridge_addr.unwrap());
+            register_name(&mut driver, ENTRY_NAME, request_bridge_addr.unwrap(), stage);
         }
         StageRole::Last => {
-            register_name(&mut driver, EXIT_NAME, activation_bridge_addr.unwrap());
+            register_name(&mut driver, EXIT_NAME, activation_bridge_addr.unwrap(), stage);
         }
         StageRole::Middle => {}
     }

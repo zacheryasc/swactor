@@ -15,6 +15,11 @@
 - **stage-1** (role=stage, node_id=30303030…)
   snapshots=1, events=2, finalize_recorded=false
 
+## Hosts
+- orchestrator: rental=? ip=? dc=? country=? container=? hostname=? relay=? iroh=? git=?
+- stage-0: rental=? ip=? dc=? country=? container=? hostname=? relay=? iroh=? git=?
+- stage-1: rental=? ip=? dc=? country=? container=? hostname=? relay=? iroh=? git=?
+
 ## First peer to go Dead
 - **orchestrator** marked **stage-1** (30303030…) Dead at t=5100 ms
   reason: "suspicion-timeout"
@@ -23,8 +28,25 @@
   observer probes_ok_at_transition=yes
   peer probes_ok_at_transition=unknown
 
+## Relay sessions
+- No relay observability data in this bundle (gap 1). To enable: run `swactor-iroh-relay` with `SWACTOR_DIAG_COLLECTOR_URL` set so the relay reports into the same bundle as the nodes.
+
 ## Probe outcomes
 - orchestrator: udp_echo/collector-udp-echo → ok (rtt=7ms, 3/3 ok)
+
+## Kernel network drops
+- No non-zero UDP/interface drop deltas observed.
+
+## Gossip receipts (by node, by kind)
+- No GossipReceived events captured (no node ran a gossip-emitting source).
+
+## Per-peer dials
+- totals: started=3, succeeded=2, failed=1, in-flight=0
+
+| peer | started | succeeded | failed | in-flight | last_outcome | last_outcome_at_ms |
+|------|---------|-----------|--------|-----------|--------------|--------------------|
+| stage-0 | 1 | 1 | 0 | 0 | Success | 1012 |
+| stage-1 | 2 | 1 | 1 | 0 | Timeout | 4000 |
 
 ## Event totals (by type)
 - ConnectionCacheInvalidated: 1

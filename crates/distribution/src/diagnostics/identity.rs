@@ -118,6 +118,137 @@ impl Identity {
         self.boot_sequence = seq;
         self
     }
+
+    /// Overlay a [`HostContext`] onto the identity. Each non-`None`
+    /// field of `ctx` replaces the corresponding identity field; `None`
+    /// fields leave the existing value untouched. The cloud-provider
+    /// fields (`host_ip_public`, `host_country`, `datacenter_id`,
+    /// `vastai_contract_id`) stay absent when the host context did not
+    /// carry them — the bundle reader can distinguish "not on a
+    /// provider with this metadata" from "we couldn't look it up", per
+    /// spec §5.
+    pub fn with_host_context(mut self, ctx: HostContext) -> Self {
+        if ctx.host_ip_public.is_some() {
+            self.host_ip_public = ctx.host_ip_public;
+        }
+        if ctx.host_country.is_some() {
+            self.host_country = ctx.host_country;
+        }
+        if ctx.datacenter_id.is_some() {
+            self.datacenter_id = ctx.datacenter_id;
+        }
+        if ctx.vastai_contract_id.is_some() {
+            self.vastai_contract_id = ctx.vastai_contract_id;
+        }
+        if ctx.container_id.is_some() {
+            self.container_id = ctx.container_id;
+        }
+        if ctx.hostname.is_some() {
+            self.hostname = ctx.hostname;
+        }
+        if ctx.home_relay_url_at_boot.is_some() {
+            self.home_relay_url_at_boot = ctx.home_relay_url_at_boot;
+        }
+        if ctx.git_sha.is_some() {
+            self.git_sha = ctx.git_sha;
+        }
+        if ctx.iroh_version.is_some() {
+            self.iroh_version = ctx.iroh_version;
+        }
+        if ctx.binary_version.is_some() {
+            self.binary_version = ctx.binary_version;
+        }
+        self
+    }
+}
+
+/// Optional host-side context for a node's boot identity (spec §5).
+///
+/// Sourced piecemeal — the cloud-provider fields come from whatever
+/// channel the rental flow uses to forward them (env vars set by the
+/// orchestrator, vast.ai-native env vars, or a side-channel fetch).
+/// The transport / build fields come from the running binary itself.
+///
+/// Every field is `Option<String>`. Missing means "we don't know" —
+/// callers must not synthesize placeholder strings. Per spec §5: a
+/// node running outside the rental flow leaves the cloud fields
+/// absent, never blank or wrong.
+#[derive(Debug, Clone, Default)]
+pub struct HostContext {
+    pub host_ip_public: Option<String>,
+    pub host_country: Option<String>,
+    pub datacenter_id: Option<String>,
+    pub vastai_contract_id: Option<String>,
+    pub container_id: Option<String>,
+    pub hostname: Option<String>,
+    pub home_relay_url_at_boot: Option<String>,
+    pub git_sha: Option<String>,
+    pub iroh_version: Option<String>,
+    pub binary_version: Option<String>,
+}
+
+impl HostContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a context from the current process environment.
+    ///
+    /// The env var names below are the orchestrator/container-side
+    /// contract for spec §5 — the orchestrator sets them when it has
+    /// the values, the container reads them at boot.
+    ///
+    /// | Field | Env var |
+    /// |---|---|
+    /// | `host_ip_public`      | `SWACTOR_DIAG_HOST_IP_PUBLIC`     |
+    /// | `host_country`        | `SWACTOR_DIAG_HOST_COUNTRY`       |
+    /// | `datacenter_id`       | `SWACTOR_DIAG_DATACENTER_ID`      |
+    /// | `vastai_contract_id`  | `SWACTOR_DIAG_VASTAI_CONTRACT_ID` |
+    /// | `container_id`        | `CONTAINER_ID` (vast.ai native)   |
+    /// | `hostname`            | `HOSTNAME`                        |
+    /// | `git_sha`             | `SWACTOR_DIAG_GIT_SHA`            |
+    pub fn from_env() -> Self {
+        let env = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        };
+        Self {
+            host_ip_public: env("SWACTOR_DIAG_HOST_IP_PUBLIC"),
+            host_country: env("SWACTOR_DIAG_HOST_COUNTRY"),
+            datacenter_id: env("SWACTOR_DIAG_DATACENTER_ID"),
+            vastai_contract_id: env("SWACTOR_DIAG_VASTAI_CONTRACT_ID"),
+            container_id: env("CONTAINER_ID"),
+            hostname: env("HOSTNAME"),
+            home_relay_url_at_boot: None,
+            git_sha: env("SWACTOR_DIAG_GIT_SHA"),
+            iroh_version: None,
+            binary_version: None,
+        }
+    }
+
+    pub fn with_home_relay_url(mut self, url: Option<String>) -> Self {
+        self.home_relay_url_at_boot = url;
+        self
+    }
+
+    pub fn with_iroh_version(mut self, version: impl Into<String>) -> Self {
+        self.iroh_version = Some(version.into());
+        self
+    }
+
+    pub fn with_binary_version(mut self, version: Option<String>) -> Self {
+        self.binary_version = version;
+        self
+    }
+
+    pub fn with_git_sha(mut self, git_sha: Option<String>) -> Self {
+        if git_sha.is_some() {
+            self.git_sha = git_sha;
+        }
+        self
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

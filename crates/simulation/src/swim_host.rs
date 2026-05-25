@@ -436,6 +436,12 @@ fn diag_event_payload(ev: &DiagEvent) -> Vec<u8> {
         | DiagEvent::DialOutcome { .. }
         | DiagEvent::IrohConnTypeChanged { .. }
         | DiagEvent::RelayChanged { .. }
+        | DiagEvent::RelaySessionStateChanged { .. }
+        | DiagEvent::RelaySessionOpened { .. }
+        | DiagEvent::RelaySessionClosed { .. }
+        | DiagEvent::SubprocessSpawned { .. }
+        | DiagEvent::SubprocessExited { .. }
+        | DiagEvent::GossipReceived { .. }
         | DiagEvent::SwimMetadataSent { .. }
         | DiagEvent::SwimMetadataReceived { .. }
         | DiagEvent::ConnectionCacheHit { .. }

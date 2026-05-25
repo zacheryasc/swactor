@@ -1100,11 +1100,13 @@ dependencies = [
 name = "dashboard"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "clap",
  "crossbeam-queue",
  "crossterm",
  "ctrlc",
+ "distribution",
  "ratatui",
  "serde",
  "serde_json",

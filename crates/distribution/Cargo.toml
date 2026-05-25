@@ -8,6 +8,7 @@ default = []
 iroh = ["dep:iroh", "dep:tokio", "dep:iroh-metrics"]
 relay = [
     "iroh",
+    "collector",
     "dep:iroh-relay",
     "tokio/macros",
     "tokio/signal",

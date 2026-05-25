@@ -131,26 +131,65 @@ async fn download_bundle(
     State(state): State<Arc<CollectorState>>,
     Path(run_id): Path<String>,
 ) -> Response {
+    // Spec §7 (gap 7) — `GET /diag/bundle/<run>` succeeds whether or
+    // not a finalize record was received:
+    //   1. canonical tarball exists on disk (finalize landed cleanly)
+    //      → serve it; cheap, no synthesis.
+    //   2. canonical tarball missing but staging files present
+    //      → synthesize on-demand from staging; the manifest carries
+    //      `finalize_received: false` so the bundle reader is never
+    //      left guessing. Per spec: "the latency is fine because
+    //      unfinalized bundles are by definition retrieved during
+    //      incident response."
+    //   3. neither tarball nor staging → 404 (truly unknown run).
     let path = state.bundle_path(&run_id);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/gzip")
-            .header(
-                header::CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{run_id}.tar.gz\""),
-            )
-            .body(Body::from(bytes))
-            .unwrap(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => error_response(
+    let canonical = tokio::fs::read(&path).await;
+    match canonical {
+        Ok(bytes) => return ok_response(&run_id, bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Fall through to on-demand synthesis.
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("could not read bundle: {e}"),
+            );
+        }
+    }
+
+    let run_id_for_blocking = run_id.clone();
+    let state_for_blocking = Arc::clone(&state);
+    let synth = tokio::task::spawn_blocking(move || {
+        bundle::assemble_bytes(&state_for_blocking, &run_id_for_blocking)
+    })
+    .await;
+    match synth {
+        Ok(Ok(bytes)) => ok_response(&run_id, bytes),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => error_response(
             StatusCode::NOT_FOUND,
-            format!("no bundle yet for run_id {run_id}"),
+            format!("no records on disk for run_id {run_id}"),
+        ),
+        Ok(Err(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not synthesize bundle: {e}"),
         ),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not read bundle: {e}"),
+            format!("synthesis task failed: {e}"),
         ),
     }
+}
+
+fn ok_response(run_id: &str, bytes: Vec<u8>) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{run_id}.tar.gz\""),
+        )
+        .body(Body::from(bytes))
+        .unwrap()
 }
 
 fn finish_response(

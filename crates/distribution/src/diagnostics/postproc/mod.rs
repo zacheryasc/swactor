@@ -27,7 +27,10 @@ mod parse;
 mod render;
 
 pub use parse::{Bundle, NodeData, ParseError, PostprocManifest, PostprocManifestNode};
-pub use render::{render_diff, render_reachability_tsv, render_summary, render_timeline_tsv};
+pub use render::{
+    PerPeerDialRollup, per_peer_dial_rollup, render_diff, render_reachability_tsv,
+    render_summary, render_timeline_tsv,
+};
 
 use std::collections::BTreeSet;
 use std::fs;

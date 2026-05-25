@@ -28,3 +28,6 @@ deploy.toml
 .dev-node/
 .dev-cluster/
 .sim-cluster/
+
+# vast.ai run logs/artifacts
+.vastai-logs/

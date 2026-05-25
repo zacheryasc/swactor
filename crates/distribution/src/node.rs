@@ -10,6 +10,7 @@ use crate::crypto::{Keypair, KeypairExt};
 use std::sync::Arc;
 
 use crate::diagnostics::DynEmitter;
+use crate::diagnostics::registry_introspect::RegistryIntrospect;
 use crate::diagnostics::swim_introspect::SwimIntrospect;
 use crate::kademlia::directory::{actor_addr_as_node_id, DirectoryShard};
 use crate::kademlia::repair::{RepairQueue, RepublishTracker};
@@ -61,6 +62,7 @@ pub struct DistributedNode {
     registry: ClusterRegistry,
     metadata: NodeMetadataDisseminator,
     tick_count: u64,
+    registry_introspect: Option<Arc<RegistryIntrospect>>,
 }
 
 impl DistributedNode {
@@ -83,6 +85,7 @@ impl DistributedNode {
             registry: ClusterRegistry::new(config.registry),
             metadata: NodeMetadataDisseminator::new(config.metadata_lambda),
             tick_count: 0,
+            registry_introspect: None,
             keypair,
         }
     }
@@ -116,6 +119,25 @@ impl DistributedNode {
         let introspect = self.swim.install_introspect();
         introspect.note_metadata_local_version(self.metadata.local_version());
         introspect
+    }
+
+    /// Install the registry introspector and return its `Arc`. The
+    /// caller is expected to register the same `Arc` with the
+    /// diagnostics aggregator via
+    /// [`crate::diagnostics::Aggregator::set_registry_introspector`].
+    /// Primes the introspector with the current registry contents so
+    /// the first snapshot reflects any names already registered.
+    pub fn install_registry_introspect(&mut self) -> Arc<RegistryIntrospect> {
+        let introspect = Arc::new(RegistryIntrospect::new());
+        introspect.capture_now(&self.registry);
+        self.registry_introspect = Some(introspect.clone());
+        introspect
+    }
+
+    fn refresh_registry_introspect(&self) {
+        if let Some(intro) = &self.registry_introspect {
+            intro.capture_now(&self.registry);
+        }
     }
 
     // ─── Cluster operations ─────────────────────────────────────────────
@@ -168,6 +190,11 @@ impl DistributedNode {
 
         // Registry GC
         self.registry.gc_tick();
+        // Refresh the introspect view once per tick so peer-learned
+        // entries (via gossip merge) and tombstones from dead-node
+        // sweeps land in the next snapshot even when the call paths
+        // bypass register_name / unregister_name.
+        self.refresh_registry_introspect();
 
         // Wrap outgoing piggyback with registry + metadata entries
         self.inject_piggyback(actions)
@@ -297,11 +324,13 @@ impl DistributedNode {
     /// Register a human-readable name for an actor on this node.
     pub fn register_name(&mut self, name: String, actor_addr: ActorAddress) {
         self.registry.register(name, actor_addr, self.node_id(), self.cluster_size());
+        self.refresh_registry_introspect();
     }
 
     /// Unregister a name (creates a tombstone).
     pub fn unregister_name(&mut self, name: &str) {
         self.registry.unregister(name, self.node_id(), self.cluster_size());
+        self.refresh_registry_introspect();
     }
 
     /// Resolve a name to its current (ActorAddress, NodeId).
@@ -464,6 +493,7 @@ impl DistributedNode {
     fn merge_registry_entries(&mut self, entries: Vec<RegistryEntry>) {
         if !entries.is_empty() {
             self.registry.merge_batch(entries, self.cluster_size());
+            self.refresh_registry_introspect();
         }
     }
 
