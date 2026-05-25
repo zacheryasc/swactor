@@ -158,6 +158,7 @@ impl Host for ScriptedHost {
                     DropReason::Lossy => "lossy",
                     DropReason::RelayQueueFull => "relay_queue_full",
                     DropReason::RelayDown => "relay_down",
+                    DropReason::RelayPeerConnDown => "relay_peer_conn_down",
                 },
             },
             HostMessage::WorkerExit { reason, .. } => HostMessageLite::WorkerExit {

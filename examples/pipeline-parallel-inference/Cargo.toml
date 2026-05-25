@@ -14,7 +14,7 @@ serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 distribution = { path = "../../crates/distribution", features = ["iroh", "collector"] }
-iroh = "0.96"
+iroh = "0.98"
 urlencoding = "2"
 base64 = "0.22"
 libc = "0.2"

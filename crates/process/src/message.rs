@@ -29,7 +29,19 @@ pub enum ProcessCommand {
 #[derive(Debug, Clone)]
 pub enum ProcessNotification {
     /// The process started successfully.
-    Started { process: ActorAddress },
+    ///
+    /// `pid` is `Some(u32)` when the underlying driver knows the OS
+    /// pid (real `LocalDriver`) and `None` when it doesn't
+    /// (mock drivers, future SSH-tunnel-style drivers). Observability
+    /// hooks read this to register the subprocess with the
+    /// `SubprocessIntrospector` from
+    /// `distribution::diagnostics`
+    /// (`N3_OBSERVABILITY_UPGRADE_SPEC.md` §4).
+    Started {
+        process: ActorAddress,
+        #[doc(hidden)]
+        pid: Option<u32>,
+    },
     /// Output was received from the process.
     Output {
         process: ActorAddress,

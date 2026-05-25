@@ -430,6 +430,7 @@ fn run_seed(args: &Args) -> i32 {
         driver
             .node_mut()
             .register_name(ORCHESTRATOR_NAME.into(), inbox_addr);
+        diag::emit_register_name(&driver, ORCHESTRATOR_NAME, inbox_addr, None);
         eprintln!("pp-smoke-run: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
         if let Err(e) = conv_res {
             eprintln!("pp-smoke-run: {e}");
@@ -804,6 +805,7 @@ fn run_vastai(args: &Args) -> i32 {
         driver
             .node_mut()
             .register_name(ORCHESTRATOR_NAME.into(), inbox_addr);
+        diag::emit_register_name(&driver, ORCHESTRATOR_NAME, inbox_addr, None);
         eprintln!("pp-smoke-run: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
 
         // Resolve stage 0. Bumped to 300s for vast.ai cold starts: stage 0 only

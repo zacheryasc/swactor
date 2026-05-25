@@ -31,6 +31,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::diagnostics::sink::{DynEmitter, noop_emitter};
+#[cfg(target_os = "linux")]
+use crate::diagnostics::snapshot::{Tier3InterfaceCounters, Tier3UdpKernelStats};
 use crate::diagnostics::snapshot::{
     HostIntrospector, Tier3DnsResolution, Tier3HostNetwork, Tier3HostState,
 };
@@ -294,7 +296,16 @@ mod linux {
         emitter: &Mutex<DynEmitter>,
         conntrack_gap_reported: &AtomicBool,
     ) -> Tier3HostNetwork {
-        let interfaces = read_interfaces();
+        let mut interfaces = read_interfaces();
+        // Spec §11: per-interface counters from /proc/net/dev. Folded
+        // into the interface struct so a bundle reader sees the link
+        // and its drops together.
+        let counters = read_interface_counters();
+        for iface in interfaces.iter_mut() {
+            if let Some(c) = counters.get(&iface.name) {
+                iface.counters = Some(c.clone());
+            }
+        }
         let default_routes = read_routes();
         let mut udp_sockets = read_udp("/proc/net/udp");
         udp_sockets.extend(read_udp6("/proc/net/udp6"));
@@ -302,6 +313,7 @@ mod linux {
             read_conntrack(emitter, conntrack_gap_reported);
         let ipv6_enabled = read_ipv6_enabled();
         let resolv_conf_nameservers = read_all_nameservers();
+        let udp_kernel_stats = read_udp_kernel_stats();
         Tier3HostNetwork {
             interfaces,
             default_routes,
@@ -309,8 +321,90 @@ mod linux {
             conntrack_count,
             ipv6_enabled,
             resolv_conf_nameservers,
+            udp_kernel_stats,
             refreshed_at_ms: wall_ms_now(),
         }
+    }
+
+    /// Parse `/proc/net/dev`. Each line is `name: rx_bytes rx_packets
+    /// rx_errs rx_drop ... tx_bytes tx_packets tx_errs tx_drop ...`.
+    /// 8 rx + 8 tx columns. We surface the four that matter for
+    /// post-hoc loss attribution: bytes, packets, errs, drop on both
+    /// sides.
+    fn read_interface_counters() -> BTreeMap<String, Tier3InterfaceCounters> {
+        let mut out: BTreeMap<String, Tier3InterfaceCounters> = BTreeMap::new();
+        let body = match std::fs::read_to_string("/proc/net/dev") {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        for line in body.lines().skip(2) {
+            let Some((name_part, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let name = name_part.trim().to_string();
+            if name.is_empty() {
+                continue;
+            }
+            let cols: Vec<u64> = rest
+                .split_whitespace()
+                .filter_map(|c| c.parse::<u64>().ok())
+                .collect();
+            if cols.len() < 16 {
+                continue;
+            }
+            out.insert(
+                name,
+                Tier3InterfaceCounters {
+                    rx_bytes: cols[0],
+                    rx_packets: cols[1],
+                    rx_errors: cols[2],
+                    rx_dropped: cols[3],
+                    tx_bytes: cols[8],
+                    tx_packets: cols[9],
+                    tx_errors: cols[10],
+                    tx_dropped: cols[11],
+                },
+            );
+        }
+        out
+    }
+
+    /// Parse the `Udp:` row of `/proc/net/snmp`. The file holds
+    /// header/value line pairs per protocol; we only need UDP.
+    fn read_udp_kernel_stats() -> Option<Tier3UdpKernelStats> {
+        let body = std::fs::read_to_string("/proc/net/snmp").ok()?;
+        let mut header_cols: Option<Vec<String>> = None;
+        for line in body.lines() {
+            let Some(rest) = line.strip_prefix("Udp:") else {
+                continue;
+            };
+            let cols: Vec<&str> = rest.split_whitespace().collect();
+            // The header has non-numeric tokens (`InDatagrams`, etc.);
+            // the values line has numeric tokens. Distinguish by
+            // attempting to parse the first column as a u64.
+            let first_is_num = cols.first().is_some_and(|c| c.parse::<u64>().is_ok());
+            if !first_is_num {
+                header_cols = Some(cols.iter().map(|s| s.to_string()).collect());
+                continue;
+            }
+            let header = header_cols.as_ref()?;
+            let mut stats = Tier3UdpKernelStats::default();
+            for (i, h) in header.iter().enumerate() {
+                let Some(raw) = cols.get(i) else { continue };
+                let Ok(v) = raw.parse::<u64>() else { continue };
+                match h.as_str() {
+                    "InDatagrams" => stats.in_datagrams = Some(v),
+                    "NoPorts" => stats.no_ports = Some(v),
+                    "InErrors" => stats.in_errors = Some(v),
+                    "OutDatagrams" => stats.out_datagrams = Some(v),
+                    "RcvbufErrors" => stats.rcvbuf_errors = Some(v),
+                    "SndbufErrors" => stats.sndbuf_errors = Some(v),
+                    _ => {}
+                }
+            }
+            return Some(stats);
+        }
+        None
     }
 
     fn read_interfaces() -> Vec<Tier3Interface> {
@@ -329,6 +423,7 @@ mod linux {
                         addresses: Vec::new(),
                         mtu: None,
                         up: false,
+                        counters: None,
                     });
                 }
             }
@@ -361,6 +456,7 @@ mod linux {
                 addresses: Vec::new(),
                 mtu: None,
                 up: false,
+                counters: None,
             });
             for a in addrs {
                 if !entry.addresses.contains(&a) {

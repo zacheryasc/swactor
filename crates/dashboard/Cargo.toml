@@ -17,12 +17,23 @@ ratatui = { version = "0.29", optional = true, default-features = false, feature
 crossterm = { version = "0.28", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = "3"
+anyhow = { version = "1", optional = true }
+distribution = { path = "../distribution", optional = true }
 
 [features]
 default = []
 tui = ["dep:ratatui", "dep:crossterm"]
+# Offline replay viewer example: loads a finalized diagnostics bundle
+# (tarball or spool dir) and serves a localhost web UI for scrubbing
+# through the event timeline.
+replay-viewer = ["dep:anyhow", "dep:distribution", "distribution/collector"]
 
 [[bin]]
 name = "swactor-tui"
 path = "src/bin/tui.rs"
 required-features = ["tui"]
+
+[[example]]
+name = "replay_viewer"
+path = "examples/replay_viewer.rs"
+required-features = ["replay-viewer"]

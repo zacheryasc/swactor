@@ -47,22 +47,53 @@ def _spawn(stage: int, num_stages: int, *, extra_env=None) -> subprocess.Popen:
 
 
 def _read_reply(proc: subprocess.Popen, timeout: float = 5.0) -> dict:
+    """Read the next protocol reply from the worker, transparently
+    skipping lifecycle event lines (`{"event": "...", ...}`). The
+    Rust StageActor folds event lines into the diag bundle; tests
+    that exercise the JSON op protocol don't care about them."""
     sel = selectors.DefaultSelector()
     sel.register(proc.stdout, selectors.EVENT_READ)
     try:
-        if not sel.select(timeout=timeout):
-            stderr = ""
-            try:
-                stderr = proc.stderr.read() or ""
-            except Exception:
-                pass
-            raise TimeoutError(f"No worker reply within {timeout}s; stderr: {stderr!r}")
-        line = proc.stdout.readline()
+        while True:
+            if not sel.select(timeout=timeout):
+                stderr = ""
+                try:
+                    stderr = proc.stderr.read() or ""
+                except Exception:
+                    pass
+                raise TimeoutError(
+                    f"No worker reply within {timeout}s; stderr: {stderr!r}"
+                )
+            line = proc.stdout.readline()
+            if not line:
+                raise EOFError("Worker closed stdout before replying")
+            obj = json.loads(line.strip())
+            if "event" in obj and "request_id" not in obj:
+                # Lifecycle event — skip and keep reading.
+                continue
+            return obj
     finally:
         sel.close()
-    if not line:
-        raise EOFError("Worker closed stdout before replying")
-    return json.loads(line.strip())
+
+
+def _read_event(proc: subprocess.Popen, kind: str, timeout: float = 5.0) -> dict:
+    """Wait for a specific lifecycle event by kind, returning its
+    payload. Useful for tests that assert on the event surface
+    rather than the op protocol."""
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            if not sel.select(timeout=timeout):
+                raise TimeoutError(f"No `event: {kind}` within {timeout}s")
+            line = proc.stdout.readline()
+            if not line:
+                raise EOFError("Worker closed stdout before emitting event")
+            obj = json.loads(line.strip())
+            if obj.get("event") == kind:
+                return obj
+    finally:
+        sel.close()
 
 
 def _send(proc: subprocess.Popen, obj: dict) -> None:
@@ -895,6 +926,92 @@ class TestWorkerEOFShutdown:
         stage0.stdin.close()
         exit_code = stage0.wait(timeout=5)
         assert exit_code == 0, f"worker exited with code {exit_code}, expected 0"
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle event surface
+#
+# The worker emits structured `{"event": "<kind>", ...}` lines that the
+# Rust StageActor re-emits as `Custom("worker_<kind>")`. These tests
+# pin the contract from the worker side: which events fire, in what
+# order, with what fields. The Rust side has its own coverage of the
+# re-emit path.
+
+
+class TestLifecycleEvents:
+    def test_starting_event_precedes_ready(self, stage0):
+        """First stdout line after boot is `event=starting`, before any
+        op reply. Lets the bundle correlate a known process_started_at
+        with PID and stage."""
+        starting = _read_event(stage0, "starting")
+        assert starting["pid"] == stage0.pid
+        assert starting["stage"] == 0
+        assert starting["num_stages"] == 2
+        assert starting["stub"] is True
+
+    def test_ready_event_carries_stage_and_uptime(self, stage0):
+        """A parallel `event=ready` line accompanies the back-compat
+        `status=ready` line so the bundle records readiness in the
+        same event-kind family as the rest of the lifecycle."""
+        # Drain starting event first.
+        _read_event(stage0, "starting")
+        ready = _read_event(stage0, "ready")
+        assert ready["pid"] == stage0.pid
+        assert ready["stage"] == 0
+        assert "uptime_ms" in ready
+
+    def test_exiting_event_fires_on_eof(self, stage0):
+        # Drain startup events + ready line.
+        _read_event(stage0, "starting")
+        _read_reply(stage0)
+        # Close stdin → main loop exits cleanly → `event=exiting`.
+        stage0.stdin.close()
+        exit_evt = _read_event(stage0, "exiting", timeout=5)
+        assert exit_evt["reason"] == "eof"
+        assert stage0.wait(timeout=5) == 0
+
+    def test_uncaught_exception_emits_structured_event(self, tmp_path):
+        """A worker that raises during startup emits a structured
+        `uncaught_exception` event carrying type, value, and the full
+        traceback — so the diag bundle records the Python failure
+        even though the process exits before it can send a real
+        protocol reply."""
+        # Force the worker to crash by importing a module that doesn't
+        # exist, via a thin shim script. We can't easily make the
+        # in-tree worker raise without ripping it apart, so drive a
+        # small inline crash that exercises the excepthook directly.
+        script = tmp_path / "crash.py"
+        script.write_text(
+            "import sys, os; "
+            f"sys.path.insert(0, {repr(str(WORKER.parent))}); "
+            "import pp_tinygrad_worker as w; "
+            "w._install_excepthook(); "
+            "raise RuntimeError('boom-for-test')\n"
+        )
+        proc = subprocess.Popen(
+            [PYTHON, str(script)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        # Find the event line on stdout.
+        events = [
+            json.loads(line)
+            for line in stdout.splitlines()
+            if line.strip().startswith("{")
+        ]
+        crashes = [e for e in events if e.get("event") == "uncaught_exception"]
+        assert len(crashes) == 1, f"expected 1 uncaught_exception event, got {events}"
+        crash = crashes[0]
+        assert crash["type"] == "RuntimeError"
+        assert "boom-for-test" in crash["value"]
+        assert "boom-for-test" in crash["traceback"]
+        assert proc.returncode != 0
 
 
 # ---------------------------------------------------------------------------

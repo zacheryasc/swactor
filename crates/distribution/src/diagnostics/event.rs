@@ -73,9 +73,99 @@ pub enum Event {
         old: ConnType,
         new: ConnType,
     },
+    /// Home-relay change (spec §3 home-change variant). Fired by the
+    /// iroh introspector's relay watcher when the URL the node uses
+    /// as home changes — including transitions to/from `None`.
     RelayChanged {
         old_url: Option<String>,
         new_url: Option<String>,
+    },
+    /// Tunnel-state transition between two distinct status values
+    /// (spec §3 session-state variant). The authoritative source for
+    /// "did the tunnel flap" — a grep for this variant across the
+    /// bundle tells you which nodes saw flaps and when. The
+    /// corresponding snapshot field is
+    /// [`crate::diagnostics::snapshot::Tier2RelaySession::status`];
+    /// counters (e.g. `relay_home_change`) are retained for sanity
+    /// totals.
+    RelaySessionStateChanged {
+        relay_url: Option<String>,
+        from_status: String,
+        to_status: String,
+        /// Short reason string when available; `None` when the
+        /// transport library does not supply one.
+        reason: Option<String>,
+    },
+    /// Relay-side: a remote node opened a session against this relay
+    /// (spec §1). Emitted by the relay binary, not by node-side code.
+    /// `peer_node_id_hex` is the hex of the remote node's public key
+    /// as observed by the relay; the bundle reader can correlate
+    /// against the same hex on the node-side `peers` block.
+    RelaySessionOpened {
+        peer_node_id_hex: String,
+        at_ms: u64,
+    },
+    /// Relay-side: a session ended (spec §1). Carries everything a
+    /// bundle reader needs to answer "who closed and why" without
+    /// consulting an external system:
+    ///   - `close_initiator`: `"relay"` | `"remote"` | `"idle_timeout"`
+    ///   - `close_reason`: short string the relay assigned
+    ///   - `duration_ms`, `bytes_rx`, `bytes_tx`: per-session totals
+    RelaySessionClosed {
+        peer_node_id_hex: String,
+        opened_at_ms: u64,
+        closed_at_ms: u64,
+        duration_ms: u64,
+        close_initiator: String,
+        close_reason: String,
+        bytes_rx: u64,
+        bytes_tx: u64,
+    },
+    /// A payload arrived through the gossip / dissemination layer —
+    /// SWIM membership piggyback, name-registry update, anything
+    /// similar (spec §10, gap 10). The authoritative source for "did
+    /// node X ever hear about name Y from peer Z"; the existing
+    /// coarse [`Event::MessageReceived`] counter stays for backward
+    /// compatibility, but bundle readers should prefer this typed
+    /// event when reconstructing dissemination paths.
+    GossipReceived {
+        source_peer: NodeId,
+        /// Free-form string, extensible. Today's emitters use
+        /// `"swim_piggyback"` for SWIM membership gossip; future
+        /// callers (registry layer, etc.) supply their own kind.
+        payload_kind: String,
+        payload_bytes: u32,
+        /// Number of items inside the payload (e.g. number of
+        /// piggybacked membership updates). `0` is meaningful — an
+        /// empty payload still counts as a receipt.
+        item_count: u32,
+    },
+    /// A subprocess this node owns has been spawned (spec §4
+    /// lifecycle contract). Replaces the ad-hoc
+    /// `Custom { kind: "worker_starting" }` strings the example crate
+    /// used to emit. Carries `label` so a bundle reader can answer
+    /// "did the actor ever ask the OS to spawn this child?" without
+    /// inferring from output. Stage-agnostic and worker-agnostic —
+    /// the introspector only knows about (label, PID, command).
+    SubprocessSpawned {
+        label: String,
+        pid: u32,
+        command: String,
+    },
+    /// A subprocess this node owned has exited (spec §4 lifecycle
+    /// contract). Replaces the ad-hoc
+    /// `Custom { kind: "worker_exited" }` strings. The bundle reader
+    /// can immediately distinguish "spawned then crashed" (this
+    /// event + `exit_code`/`exit_signal`) from "spawned and stayed
+    /// alive but never produced protocol output" (no
+    /// `SubprocessExited`, no `worker_ready` Custom event).
+    SubprocessExited {
+        label: String,
+        pid: u32,
+        command: String,
+        exit_code: Option<i32>,
+        exit_signal: Option<i32>,
+        uptime_ms: Option<u64>,
     },
     SwimMetadataSent {
         version: u64,

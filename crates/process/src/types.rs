@@ -83,6 +83,22 @@ pub trait ProcessDriver: Send {
 
     /// Poll for new events from the underlying process.
     fn poll(&mut self) -> Vec<ProcessEvent>;
+
+    /// PID of the underlying OS process when the driver knows one.
+    ///
+    /// Returns `None` before the child has spawned, after it has been
+    /// reaped, or for drivers that do not run an OS process (mocks,
+    /// SSH-tunnel drivers that wrap a remote shell). The default
+    /// impl returns `None` so existing drivers compile unchanged.
+    ///
+    /// Read by [`crate::actor::ProcessActor`] when it builds the
+    /// outbound `ProcessNotification::Started { pid }` — this is the
+    /// channel observability hooks use to learn the subprocess's PID
+    /// without coupling to a particular driver implementation
+    /// (`N3_OBSERVABILITY_UPGRADE_SPEC.md` §4 wiring contract).
+    fn pid(&self) -> Option<u32> {
+        None
+    }
 }
 
 // ─── ProcessWaker ──────────────────────────────────────────────────────────

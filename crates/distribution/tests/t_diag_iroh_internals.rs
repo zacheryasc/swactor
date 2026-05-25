@@ -8,8 +8,8 @@
 //!
 //! - per-remote-peer entries in `body.iroh.peers` with classified
 //!   direct/relay addresses,
-//! - an `iroh_api_missing` Custom event listing fields iroh 0.96 does
-//!   not expose,
+//! - an `iroh_api_missing` Custom event listing fields the linked iroh
+//!   version does not expose,
 //! - at least one `iroh-metrics` sample,
 //! - a populated `body.iroh` block on every node.
 //!
@@ -101,12 +101,14 @@ fn two_node_cluster_produces_tier2_iroh_snapshot_block() {
         .as_ref()
         .expect("B's snapshot must include the tier-2 iroh block");
 
-    // The introspector lists the iroh-0.96 API gaps so the post-
-    // processor can render "absent" vs "zero" honestly.
+    // The introspector lists the iroh API gaps so the post-processor
+    // can render "absent" vs "zero" honestly. The gap list is computed
+    // from observed peer slots — for the linked iroh version, derived
+    // conn_type and unpopulated latency_ms should still show up.
     let gaps_present = !iroh_a.api_gaps.is_empty() && !iroh_b.api_gaps.is_empty();
     assert!(
         gaps_present,
-        "tier-2 iroh state should list api_gaps for fields iroh 0.96 does not expose",
+        "tier-2 iroh state should list api_gaps for fields the linked iroh version does not expose",
     );
     assert!(
         iroh_a

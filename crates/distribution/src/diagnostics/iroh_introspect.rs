@@ -12,21 +12,24 @@
 //! [`Tier2IrohState`] cache that the [`IrohIntrospector`] trait reads
 //! on every snapshot.
 //!
-//! ## What iroh 0.96 does *not* expose
+//! ## API gaps
 //!
-//! `RemoteInfo` in 0.96 carries `id` and a list of `TransportAddrInfo`
-//! (address + `Active`/`Inactive`). It does not expose `conn_type`,
-//! `latency_ms`, `last_used_ms`, `last_received_ms`, or per-address
-//! provenance. Those become explicit `None`s in the snapshot, and a
-//! one-time `Custom { kind: "iroh_api_missing", ... }` event lists the
-//! gaps so the post-processor can render them rather than treat
-//! missing data as zero.
+//! `RemoteInfo` in the iroh versions this driver has been written
+//! against carries `id` and a list of `TransportAddrInfo` (address +
+//! `Active`/`Inactive`). Fields like `latency_ms`, `last_used_ms`,
+//! `last_received_ms`, and per-address provenance may not be exposed
+//! depending on version. Those become explicit `None`s in the
+//! snapshot, and the canonical names land in
+//! [`Tier2IrohState::api_gaps`] for the bundle reader to consult
+//! rather than confusing "absent" with "zero".
 //!
-//! `conn_type` is *derived* from the address-usage view (Direct if any
-//! active IP addr exists, Relay if any active relay addr exists, Mixed
-//! if both, None otherwise). Heuristic — the post-processor reading
-//! the bundle should compare against actual message flow before
-//! concluding anything.
+//! `conn_type` is *derived* here from the address-usage view (Direct
+//! if any active IP addr exists, Relay if any active relay addr
+//! exists, Mixed if both, None otherwise). The per-peer
+//! `conn_type_source` field carries `"derived"` so the bundle reader
+//! can tell our heuristic from a hypothetical future-iroh native value
+//! — and the gap list above stays honest when iroh keeps reporting it
+//! itself.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -36,11 +39,12 @@ use iroh::{Endpoint, PublicKey, Watcher};
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use crate::diagnostics::dep_versions::IROH_VERSION;
 use crate::diagnostics::event::{ConnType, Event};
 use crate::diagnostics::sink::DynEmitter;
 use crate::diagnostics::snapshot::{
     IrohIntrospector, MetricSample, MetricValueWire, Tier2ConnectionCache, Tier2IrohState,
-    Tier2Peer, TransportAddrWire,
+    Tier2Peer, Tier2RelaySession, TransportAddrWire,
 };
 use crate::diagnostics::wall_ms_now;
 use crate::types::NodeId;
@@ -76,6 +80,7 @@ struct Shared {
     peers: Mutex<HashSet<NodeId>>,
     last_conn_types: Mutex<HashMap<NodeId, Option<ConnType>>>,
     last_home_relay: Mutex<Option<String>>,
+    relay_session: Mutex<Tier2RelaySession>,
     cache_tracker: Arc<ConnectionCacheTracker>,
 }
 
@@ -220,24 +225,34 @@ impl IrohIntrospect {
         config: IntrospectConfig,
         cache_tracker: Arc<ConnectionCacheTracker>,
     ) -> Self {
+        // Pre-populate the relay session in the "unknown / derived"
+        // honesty state before the watcher reports anything. Spec §2:
+        // the bundle reader must never have to guess whether
+        // `unknown` means "tunnel is unknown" vs "we couldn't ask".
+        let initial_relay = unknown_relay_session(wall_ms_now());
+        let initial_gaps =
+            Tier2IrohState::compute_api_gaps_full(&[], Some(&initial_relay));
         let shared = Arc::new(Shared {
             state: Mutex::new(Tier2IrohState {
-                api_gaps: api_gaps(),
+                api_gaps: initial_gaps.clone(),
+                iroh_version: Some(IROH_VERSION.to_string()),
+                relay_session: Some(initial_relay.clone()),
                 ..Tier2IrohState::default()
             }),
             peers: Mutex::new(HashSet::new()),
             last_conn_types: Mutex::new(HashMap::new()),
             last_home_relay: Mutex::new(None),
+            relay_session: Mutex::new(initial_relay),
             cache_tracker,
         });
 
         emitter.emit_event(Event::Custom {
             kind: "iroh_api_missing".into(),
             fields: serde_json::json!({
-                "iroh_version": "0.96",
-                "fields": api_gaps(),
-                "note": "iroh 0.96 RemoteInfo exposes id + addrs only; \
-                         conn_type derived heuristically from address usage",
+                "iroh_version": IROH_VERSION,
+                "fields": initial_gaps,
+                "note": "fields not exposed natively by the linked iroh RemoteInfo; \
+                         conn_type is derived heuristically from address usage",
             }),
         });
 
@@ -287,12 +302,55 @@ impl IrohIntrospect {
         let home = home_relay_str(endpoint);
         let peers_state = runtime.block_on(collect_peer_states(endpoint, peers.iter().copied()));
         let connection_cache = build_cache_snapshot(&self.shared.cache_tracker, &peers_state);
+        let now = wall_ms_now();
+        // Re-evaluate the relay session for the snapshot using the
+        // current home URL — the watcher task does this too on URL
+        // changes, but force_refresh_blocking is the sync entry point
+        // tests use and may run before the watcher fires.
+        let derived_status = derived_status_from_url(home.as_deref());
+        self.update_relay_session(home.clone(), derived_status, now);
+        let relay_session = {
+            let g = self
+                .shared
+                .relay_session
+                .lock()
+                .expect("iroh introspect relay_session poisoned");
+            g.clone()
+        };
+        let api_gaps =
+            Tier2IrohState::compute_api_gaps_full(&peers_state, Some(&relay_session));
         let mut state = self.shared.state.lock().expect("iroh introspect state poisoned");
         state.home_relay_url = home;
         state.peers = peers_state;
         state.metrics = metrics;
         state.connection_cache = connection_cache;
-        state.scraped_at_ms = wall_ms_now();
+        state.api_gaps = api_gaps;
+        state.iroh_version = Some(IROH_VERSION.to_string());
+        state.relay_session = Some(relay_session);
+        state.scraped_at_ms = now;
+    }
+
+    fn update_relay_session(
+        &self,
+        relay_url: Option<String>,
+        new_status: &'static str,
+        now: u64,
+    ) {
+        let mut g = self
+            .shared
+            .relay_session
+            .lock()
+            .expect("iroh introspect relay_session poisoned");
+        let changed = g.status != new_status;
+        g.relay_url = relay_url;
+        if changed {
+            g.status_changed_at_ms = Some(now);
+            g.status_entered_at_ms = Some(now);
+            g.status = new_status.to_string();
+        } else if g.status_entered_at_ms.is_none() {
+            g.status_entered_at_ms = Some(now);
+        }
+        g.status_source = "derived".to_string();
     }
 }
 
@@ -356,6 +414,15 @@ fn spawn_scrape_task(
 
             let connection_cache =
                 build_cache_snapshot(&shared.cache_tracker, &peers_state);
+            let now = wall_ms_now();
+            update_shared_relay_session(&shared, home.clone(), derived_status_from_url(home.as_deref()), now);
+            let relay_session = shared
+                .relay_session
+                .lock()
+                .expect("iroh introspect relay_session poisoned")
+                .clone();
+            let api_gaps =
+                Tier2IrohState::compute_api_gaps_full(&peers_state, Some(&relay_session));
             let mut state = shared
                 .state
                 .lock()
@@ -364,7 +431,10 @@ fn spawn_scrape_task(
             state.peers = peers_state;
             state.metrics = metrics;
             state.connection_cache = connection_cache;
-            state.scraped_at_ms = wall_ms_now();
+            state.api_gaps = api_gaps;
+            state.iroh_version = Some(IROH_VERSION.to_string());
+            state.relay_session = Some(relay_session);
+            state.scraped_at_ms = now;
         }
     })
 }
@@ -401,7 +471,12 @@ fn spawn_relay_watcher(
         loop {
             let addr = watcher.get();
             let new_url = addr.relay_urls().next().map(|u| u.to_string());
-            let old = {
+            let now = wall_ms_now();
+            let new_status = derived_status_from_url(new_url.as_deref());
+
+            // Track URL changes (home-relay change event — spec §3
+            // home-change variant).
+            let url_changed = {
                 let mut slot = shared
                     .last_home_relay
                     .lock()
@@ -414,7 +489,7 @@ fn spawn_relay_watcher(
                     None
                 }
             };
-            if let Some(prev) = old {
+            if let Some(prev) = url_changed {
                 // Suppress the very first "no relay yet → no relay
                 // yet" transition; only emit when something actually
                 // changed.
@@ -423,11 +498,91 @@ fn spawn_relay_watcher(
                     new_url: new_url.clone(),
                 });
             }
+
+            // Track tunnel-status transitions (spec §3 session-state
+            // variant — populated under §2's status discriminator).
+            let prev_status = {
+                let mut g = shared
+                    .relay_session
+                    .lock()
+                    .expect("iroh introspect relay_session poisoned");
+                let prev = g.status.clone();
+                let changed = g.status != new_status;
+                g.relay_url = new_url.clone();
+                if changed {
+                    g.status_changed_at_ms = Some(now);
+                    g.status_entered_at_ms = Some(now);
+                    g.status = new_status.to_string();
+                } else if g.status_entered_at_ms.is_none() {
+                    g.status_entered_at_ms = Some(now);
+                }
+                g.status_source = "derived".to_string();
+                if changed { Some(prev) } else { None }
+            };
+            if let Some(prev) = prev_status {
+                emitter.emit_event(Event::RelaySessionStateChanged {
+                    relay_url: new_url.clone(),
+                    from_status: prev,
+                    to_status: new_status.to_string(),
+                    reason: None,
+                });
+            }
+
             if watcher.updated().await.is_err() {
                 break;
             }
         }
     })
+}
+
+/// Helper: read the current status that should be derived from the
+/// presence/absence of a home relay URL. When iroh exposes tunnel
+/// state natively the introspector should set `status_source =
+/// "iroh"` and skip this helper.
+fn derived_status_from_url(url: Option<&str>) -> &'static str {
+    match url {
+        Some(u) if !u.is_empty() => "connected",
+        Some(_) => "disconnected",
+        None => "disconnected",
+    }
+}
+
+/// Default "we genuinely don't know yet" relay-session — used at
+/// introspector start before any watcher tick fires.
+fn unknown_relay_session(now: u64) -> Tier2RelaySession {
+    Tier2RelaySession {
+        relay_url: None,
+        status: "unknown".to_string(),
+        status_source: "derived".to_string(),
+        status_changed_at_ms: None,
+        status_entered_at_ms: Some(now),
+        last_send_at_ms: None,
+        last_recv_at_ms: None,
+        tx_bytes_total: None,
+        rx_bytes_total: None,
+    }
+}
+
+fn update_shared_relay_session(
+    shared: &Shared,
+    relay_url: Option<String>,
+    new_status: &'static str,
+    now: u64,
+) {
+    let mut g = shared
+        .relay_session
+        .lock()
+        .expect("iroh introspect relay_session poisoned");
+    let changed = g.status != new_status;
+    g.relay_url = relay_url;
+    if changed {
+        g.status_changed_at_ms = Some(now);
+        g.status_entered_at_ms = Some(now);
+        g.status = new_status.to_string();
+    } else if g.status_entered_at_ms.is_none() {
+        g.status_entered_at_ms = Some(now);
+    }
+    g.status_source = "derived".to_string();
 }
 
 async fn collect_peer_states(
@@ -492,9 +647,11 @@ fn remote_info_to_wire(hex: String, info: iroh::endpoint::RemoteInfo) -> Tier2Pe
             Some(ConnType::None)
         }
     };
+    let conn_type_source = conn_type.map(|_| "derived".to_string());
     Tier2Peer {
         peer_node_id_hex: hex,
         conn_type,
+        conn_type_source,
         latency_ms: None,
         last_used_ms: None,
         last_received_ms: None,
@@ -508,6 +665,7 @@ fn empty_peer(hex: String) -> Tier2Peer {
     Tier2Peer {
         peer_node_id_hex: hex,
         conn_type: None,
+        conn_type_source: None,
         latency_ms: None,
         last_used_ms: None,
         last_received_ms: None,
@@ -542,16 +700,6 @@ fn scrape_metrics(endpoint: &Endpoint) -> Vec<MetricSample> {
 
 fn home_relay_str(endpoint: &Endpoint) -> Option<String> {
     endpoint.addr().relay_urls().next().map(|u| u.to_string())
-}
-
-fn api_gaps() -> Vec<String> {
-    vec![
-        "RemoteInfo.conn_type".into(),
-        "RemoteInfo.latency_ms".into(),
-        "RemoteInfo.last_used_ms".into(),
-        "RemoteInfo.last_received_ms".into(),
-        "TransportAddrInfo.source".into(),
-    ]
 }
 
 fn node_id_hex_lower(id: &NodeId) -> String {

@@ -272,6 +272,10 @@ impl ProcessDriver for LocalDriver {
     fn poll(&mut self) -> Vec<ProcessEvent> {
         self.queue.drain()
     }
+
+    fn pid(&self) -> Option<u32> {
+        self.child.as_ref().map(|c| c.id())
+    }
 }
 
 impl Drop for LocalDriver {

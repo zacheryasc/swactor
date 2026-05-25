@@ -78,11 +78,18 @@ pub struct SwimNode {
 impl SwimNode {
     pub fn new(self_id: NodeId, config: SwimConfig) -> Self {
         const GOSSIP_LAMBDA: usize = 3;
+        // Maximum membership updates piggybacked per outgoing message.
+        // Lowered from 8 to 6 as part of the N3 tuning pass (see
+        // `crates/simulation/SWIM_TUNING_REPORT.md`): smaller piggybacks
+        // cap the wire size each refute-cascade can balloon to without
+        // visibly slowing convergence at the cluster sizes the §10.3
+        // gossip-flap property exercises.
+        const MAX_PIGGYBACK: usize = 6;
         Self {
             members: MemberList::new(self_id),
             probe: SwimProbe::new(config),
             dissemination: DisseminationQueue::new(GOSSIP_LAMBDA),
-            max_piggyback: 8,
+            max_piggyback: MAX_PIGGYBACK,
             pending_relays: Vec::new(),
             diagnostics: noop_emitter(),
             introspect: None,
@@ -210,7 +217,7 @@ impl SwimNode {
         if let Some(intro) = &self.introspect {
             intro.note_ping_received(from, sequence);
         }
-        let mut actions = self.apply_piggyback(piggyback);
+        let mut actions = self.apply_piggyback(from, piggyback);
 
         // Ensure the sender is in our member list
         let prior = self
@@ -237,7 +244,7 @@ impl SwimNode {
         if let Some(intro) = &self.introspect {
             intro.note_ack_received(from, sequence);
         }
-        let mut actions = self.apply_piggyback(piggyback);
+        let mut actions = self.apply_piggyback(from, piggyback);
         let probe_actions = self.probe.step(
             SwimEvent::AckReceived { from, sequence },
             &mut self.members,
@@ -267,7 +274,7 @@ impl SwimNode {
         if let Some(intro) = &self.introspect {
             intro.note_ping_req_received(from, target, sequence);
         }
-        let mut actions = self.apply_piggyback(piggyback);
+        let mut actions = self.apply_piggyback(from, piggyback);
 
         // Record the pending relay so we can forward the ack back
         if self.pending_relays.len() >= 16 {
@@ -299,7 +306,11 @@ impl SwimNode {
         if let Some(intro) = &self.introspect {
             intro.note_indirect_ack_received(target, sequence);
         }
-        let mut actions = self.apply_piggyback(piggyback);
+        // `target` is the indirectly-probed peer; the membership data
+        // ultimately came from there even though a relay forwarded it.
+        // Crediting `target` as the gossip source matches the bundle
+        // reader's intent ("which peer's news is this").
+        let mut actions = self.apply_piggyback(target, piggyback);
         let probe_actions = self.probe.step(
             SwimEvent::IndirectAckReceived { target, sequence },
             &mut self.members,
@@ -414,8 +425,20 @@ impl SwimNode {
         self.members.alive_count() + 1 // +1 for self
     }
 
-    fn apply_piggyback(&mut self, bytes: &[u8]) -> Vec<NodeAction> {
+    fn apply_piggyback(&mut self, from: NodeId, bytes: &[u8]) -> Vec<NodeAction> {
         let updates = DisseminationQueue::unpack_piggyback(bytes);
+        // Spec §10 (gap 10): typed receipt event per piggyback. Fires
+        // for every payload-bearing receipt so a bundle reader can
+        // reconstruct gossip propagation per (source, kind) without
+        // grepping the SWIM internals.
+        if !bytes.is_empty() {
+            self.diagnostics.emit_event(DiagEvent::GossipReceived {
+                source_peer: from,
+                payload_kind: "swim_piggyback".to_string(),
+                payload_bytes: bytes.len().min(u32::MAX as usize) as u32,
+                item_count: updates.len().min(u32::MAX as usize) as u32,
+            });
+        }
         let mut actions = Vec::new();
         for update in updates {
             actions.extend(self.apply_membership_update(update));

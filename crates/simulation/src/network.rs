@@ -56,6 +56,12 @@ pub enum DropReason {
     /// The route is through a relay that has been `RelayKill`-ed.
     /// RELAY_SPEC §4.5.
     RelayDown,
+    /// Spec §"Sim cross-pollination" (N3 upgrade spec F3): the relay
+    /// is still up and other peer pairs through it work fine, but a
+    /// `RelayPeerConnDown` mutation has selectively cut this
+    /// (from, to) pair's relay-mediated path. Models the
+    /// 2026-05-25 "tunnel up, peer-via-tunnel down" asymmetry.
+    RelayPeerConnDown,
 }
 
 /// Side-channel notification the engine consumes after each query.
@@ -113,6 +119,10 @@ pub enum NetworkNotification {
 pub enum RelayDropReason {
     QueueFull,
     Down,
+    /// Spec F3 — peer-via-tunnel down. Distinguished from `Down` so
+    /// the bundle reader can answer "did the relay die or did this
+    /// specific peer's path through it die?" without inference.
+    PeerConnDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,6 +157,10 @@ pub struct Network {
     active_latency_spike: Vec<TimedEffect<LatencySpike>>,
     active_loss_burst: Vec<TimedEffect<LossBurst>>,
     active_relay_buffer: Vec<TimedEffect<RelayBuffer>>,
+    /// F3 — selectively-cut (relay, from, to) triples. While active,
+    /// `send_relayed` drops with `RelayPeerConnDown` but the relay
+    /// stays available for other pairs.
+    active_relay_peer_down: Vec<TimedEffect<RelayPeerDown>>,
     /// Killed peers. Their inbound deliveries are invalidated when the
     /// kill mutation runs; later sends to them still return NoRoute is
     /// the engine's job (the kill is a peer-state thing the engine
@@ -255,6 +269,13 @@ struct RelayBuffer {
     floor_ns: u64,
 }
 
+#[derive(Debug, Clone)]
+struct RelayPeerDown {
+    relay: String,
+    from: String,
+    to: String,
+}
+
 impl Network {
     pub fn new(scenario: &Scenario) -> Self {
         let mut edges = BTreeMap::new();
@@ -318,6 +339,7 @@ impl Network {
             active_latency_spike: Vec::new(),
             active_loss_burst: Vec::new(),
             active_relay_buffer: Vec::new(),
+            active_relay_peer_down: Vec::new(),
             killed_peers: BTreeSet::new(),
             relays,
             routes,
@@ -527,6 +549,26 @@ impl Network {
                 });
             return SendOutcome::Drop {
                 reason: DropReason::RelayDown,
+            };
+        }
+
+        // F3 (sim spec §"cross-pollination"): selective drop of
+        // (relay, from, to). Relay is otherwise healthy — other
+        // pairs' traffic through it is unaffected. Returned reason
+        // is a *distinct* variant from `RelayDown` so the bundle
+        // reader can tell "tunnel down" from "peer-via-tunnel down."
+        if self.is_relay_peer_down(relay, from, to, sent_at_ns) {
+            self.pending_notifications
+                .push(NetworkNotification::RelayDrop {
+                    relay: relay.to_string(),
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    byte_len,
+                    reason: RelayDropReason::PeerConnDown,
+                    at_ns: sent_at_ns,
+                });
+            return SendOutcome::Drop {
+                reason: DropReason::RelayPeerConnDown,
             };
         }
 
@@ -817,6 +859,35 @@ impl Network {
                 Vec::new()
             }
             MutationKind::RelayKill { relay } => self.apply_relay_kill(relay, at_ns),
+            MutationKind::RelayPeerConnDown {
+                relay,
+                from,
+                to,
+                duration_ns,
+            } => {
+                // duration_ns == 0 ⇒ permanent for the rest of the
+                // run (until u64::MAX). Matches the spec's expected
+                // "set and forget" use case for incident-replay
+                // scenarios.
+                let end_ns = if *duration_ns == 0 {
+                    u64::MAX
+                } else {
+                    at_ns.saturating_add(*duration_ns)
+                };
+                self.active_relay_peer_down.push(TimedEffect {
+                    start_ns: at_ns,
+                    end_ns,
+                    payload: RelayPeerDown {
+                        relay: relay.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                    },
+                });
+                // Invalidate any in-flight delivery on the outbound
+                // leg from this relay to `to` — same shape as
+                // `PeerKill` cleans up in-flight deliveries.
+                self.drain_in_flight_for(relay, to)
+            }
             MutationKind::RelayBoot { relay } => {
                 self.apply_relay_boot(relay, at_ns);
                 Vec::new()
@@ -904,6 +975,19 @@ impl Network {
     fn is_partitioned(&self, from: &str, to: &str) -> bool {
         let pair = sorted_pair(from, to);
         self.partitioned.contains(&pair)
+    }
+
+    /// F3: is the (relay, from, to) triple currently cut by an
+    /// active `RelayPeerConnDown` mutation? Directional — a cut from
+    /// A→B does not imply B→A is cut.
+    fn is_relay_peer_down(&self, relay: &str, from: &str, to: &str, now_ns: u64) -> bool {
+        self.active_relay_peer_down.iter().any(|effect| {
+            now_ns >= effect.start_ns
+                && now_ns < effect.end_ns
+                && effect.payload.relay == relay
+                && effect.payload.from == from
+                && effect.payload.to == to
+        })
     }
 
     fn effective_loss_ppm(&self, key: &(String, String), now_ns: u64) -> u32 {

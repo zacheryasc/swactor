@@ -300,6 +300,7 @@ fn drop_reason_str(r: &DropReason) -> &'static str {
         DropReason::Lossy => "lossy",
         DropReason::RelayQueueFull => "relay_queue_full",
         DropReason::RelayDown => "relay_down",
+        DropReason::RelayPeerConnDown => "relay_peer_conn_down",
     }
 }
 
@@ -307,6 +308,7 @@ fn relay_drop_reason_str(r: &RelayDropReason) -> &'static str {
     match r {
         RelayDropReason::QueueFull => "queue_full",
         RelayDropReason::Down => "down",
+        RelayDropReason::PeerConnDown => "peer_conn_down",
     }
 }
 

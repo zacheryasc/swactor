@@ -228,6 +228,7 @@ fn payload_to_json(p: &crate::bundle::EventPayload) -> serde_json::Value {
                 DropReason::Lossy => "lossy",
                 DropReason::RelayQueueFull => "relay_queue_full",
                 DropReason::RelayDown => "relay_down",
+                DropReason::RelayPeerConnDown => "relay_peer_conn_down",
             },
         }),
         EventPayload::DropOnDelivery { to, reason } => serde_json::json!({
@@ -283,6 +284,7 @@ fn payload_to_json(p: &crate::bundle::EventPayload) -> serde_json::Value {
             "reason": match reason {
                 crate::network::RelayDropReason::QueueFull => "queue_full",
                 crate::network::RelayDropReason::Down => "down",
+                crate::network::RelayDropReason::PeerConnDown => "peer_conn_down",
             },
         }),
     }

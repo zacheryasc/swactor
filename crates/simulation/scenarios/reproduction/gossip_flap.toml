@@ -47,24 +47,31 @@ cold_dial_penalty_ns = 200_000_000
 cache_warm_after_ns = 200_000_000
 cache_invalidate_after_idle_ns = 10_000_000_000
 
-# Tight probe_timeout (100ms ≈ 2 ticks) below the RTT (~120ms+jitter)
-# is what reliably trips the bug — without it, the dynamic depends on
-# rare loss events and is not reliably reproducible per-run.
+# The kind_config below mirrors the post-tuning `SwimConfig::default()`
+# at the scenario's 50 ms tick:
+#   probe_interval_ns = 10 ticks * 50 ms = 500 ms,
+#   probe_timeout_ns  = 15 ticks * 50 ms = 750 ms,
+#   suspicion_timeout_ns = 75 ticks * 50 ms = 3 750 ms.
+# Even with the tuned defaults the §10.3 gossip-flap dynamic still
+# fires under multi-region jitter and intermittent loss — the residual
+# refute storm is the Layer B1 bug in
+# `crates/distribution/src/swim/node.rs::apply_membership_update`
+# (refute-on-stale-Suspect), which tuning cannot fix.
 [[peers]]
 id = "orchestrator"
 kind = "swim"
 initial_state = "alive"
-kind_config = { probe_interval_ns = 500_000_000, probe_timeout_ns = 100_000_000, suspicion_timeout_ns = 2_000_000_000 }
+kind_config = { probe_interval_ns = 500_000_000, probe_timeout_ns = 750_000_000, suspicion_timeout_ns = 3_750_000_000, indirect_ping_fanout = 2 }
 [[peers]]
 id = "worker_a"
 kind = "swim"
 initial_state = "alive"
-kind_config = { probe_interval_ns = 500_000_000, probe_timeout_ns = 100_000_000, suspicion_timeout_ns = 2_000_000_000 }
+kind_config = { probe_interval_ns = 500_000_000, probe_timeout_ns = 750_000_000, suspicion_timeout_ns = 3_750_000_000, indirect_ping_fanout = 2 }
 [[peers]]
 id = "worker_b"
 kind = "swim"
 initial_state = "alive"
-kind_config = { probe_interval_ns = 500_000_000, probe_timeout_ns = 100_000_000, suspicion_timeout_ns = 2_000_000_000 }
+kind_config = { probe_interval_ns = 500_000_000, probe_timeout_ns = 750_000_000, suspicion_timeout_ns = 3_750_000_000, indirect_ping_fanout = 2 }
 
 [[links]]
 from = "orchestrator"
@@ -108,10 +115,16 @@ at_ns = 18_000_000_000
 [[snapshots]]
 at_ns = 19_500_000_000
 
-# The bound: under the production source, the orchestrator rebuts
-# enough piggybacked Suspect claims to far exceed 2. A passing fix
-# keeps self_incarnation at most 2 (one initial 0→1 bootstrap bump is
-# the most that should ever happen in a clean cluster).
+# The bound stays at the algorithmic ideal (2 — one bootstrap bump
+# plus a single legitimate refute). The scenario's job is to keep
+# *failing* this assertion under the current SWIM source so the bug
+# stays observable; the §10.3 gossip-flap property in
+# `crates/simulation/SWIM_TUNING_REPORT.md` documents the order-of-
+# magnitude reduction tuning achieves (~90 → ~20) and the residual
+# floor the Layer B1 refute-stale-Suspect bug in
+# `crates/distribution/src/swim/node.rs::apply_membership_update`
+# locks in. The companion calibration scenarios assert the
+# tuning-side envelope at the bound tuning *can* hit.
 [[assertions]]
 kind = "self_incarnation_bounded"
 peer = "orchestrator"

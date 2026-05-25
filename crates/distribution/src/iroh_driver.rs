@@ -344,6 +344,21 @@ impl IrohDriver {
         self.diagnostics = emitter;
     }
 
+    /// Borrow the installed diagnostics emitter. Returns the no-op
+    /// emitter (cheap clone) when diagnostics are not installed, so
+    /// callers can `.clone()` it unconditionally without branching.
+    pub fn diagnostics(&self) -> &DynEmitter {
+        &self.diagnostics
+    }
+
+    /// Forward an event into the installed diagnostics emitter. App
+    /// code that holds `&IrohDriver` can emit `Event::Custom` records
+    /// through this without acquiring the aggregator directly. No-op
+    /// when diagnostics are not installed.
+    pub fn emit(&self, event: DiagEvent) {
+        self.diagnostics.emit_event(event);
+    }
+
     /// Install diagnostics with full tier-2 iroh introspection.
     ///
     /// Equivalent to [`Self::set_diagnostics`] plus spinning up an
@@ -386,6 +401,11 @@ impl IrohDriver {
         // snapshot also includes the SWIM block.
         let swim_intro = self.node.install_swim_introspect();
         aggregator.set_swim_introspector(swim_intro as Arc<dyn SwimIntrospector>);
+        // Same dance for the local name-registry view.
+        let registry_intro = self.node.install_registry_introspect();
+        aggregator.set_registry_introspector(
+            registry_intro as Arc<dyn crate::diagnostics::RegistryIntrospector>,
+        );
     }
 
     /// Register a peer with the iroh introspector (if installed) so

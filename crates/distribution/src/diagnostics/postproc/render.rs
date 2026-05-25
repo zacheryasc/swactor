@@ -85,6 +85,18 @@ pub fn render_summary(bundle: &Bundle) -> String {
     }
     let _ = writeln!(out);
 
+    // -- Host context per node (spec §5) --
+    let _ = writeln!(out, "## Hosts");
+    let host_lines = host_context_lines(bundle);
+    if host_lines.is_empty() {
+        let _ = writeln!(out, "- No boot identities captured.");
+    } else {
+        for line in host_lines {
+            let _ = writeln!(out, "- {line}");
+        }
+    }
+    let _ = writeln!(out);
+
     // -- First-Dead analysis --
     let _ = writeln!(out, "## First peer to go Dead");
     match first_dead_transition(bundle) {
@@ -98,6 +110,17 @@ pub fn render_summary(bundle: &Bundle) -> String {
     }
     let _ = writeln!(out);
 
+    // -- Relay sessions (spec §1) --
+    // Always rendered: when no relay observability data is in the
+    // bundle, the section explains the gap and points the reader at
+    // it instead of silently omitting itself.
+    let _ = writeln!(out, "## Relay sessions");
+    let relay_lines = relay_session_lines(bundle);
+    for line in relay_lines {
+        let _ = writeln!(out, "- {line}");
+    }
+    let _ = writeln!(out);
+
     // -- Probe summary --
     let _ = writeln!(out, "## Probe outcomes");
     let probe_lines = probe_summary_lines(bundle);
@@ -106,6 +129,81 @@ pub fn render_summary(bundle: &Bundle) -> String {
     } else {
         for line in probe_lines {
             let _ = writeln!(out, "- {line}");
+        }
+    }
+    let _ = writeln!(out);
+
+    // -- Kernel-level UDP / interface drops across the run window
+    //    (spec §11). A line per (node, counter) only when the delta is
+    //    non-zero; nothing rendered when every counter is clean.
+    let _ = writeln!(out, "## Kernel network drops");
+    let drops = kernel_drop_lines(bundle);
+    if drops.is_empty() {
+        let _ = writeln!(out, "- No non-zero UDP/interface drop deltas observed.");
+    } else {
+        for line in drops {
+            let _ = writeln!(out, "- {line}");
+        }
+    }
+    let _ = writeln!(out);
+
+    // -- Gossip receipts per node, broken down by payload kind
+    //    (spec §10). "Stage-2 never received any name-registry gossip
+    //    from anyone" is supposed to be a one-line answer.
+    let _ = writeln!(out, "## Gossip receipts (by node, by kind)");
+    let gossip_lines = gossip_receipt_lines(bundle);
+    if gossip_lines.is_empty() {
+        let _ = writeln!(
+            out,
+            "- No GossipReceived events captured (no node ran a gossip-emitting source)."
+        );
+    } else {
+        for line in gossip_lines {
+            let _ = writeln!(out, "- {line}");
+        }
+    }
+    let _ = writeln!(out);
+
+    // -- Per-peer dial rollup --
+    let _ = writeln!(out, "## Per-peer dials");
+    let rollups = per_peer_dial_rollup(bundle);
+    if rollups.is_empty() {
+        let _ = writeln!(out, "- No DialStarted events captured.");
+    } else {
+        let totals = rollups_totals(&rollups);
+        let _ = writeln!(
+            out,
+            "- totals: started={}, succeeded={}, failed={}, in-flight={}",
+            totals.started, totals.succeeded, totals.failed, totals.in_flight,
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "| peer | started | succeeded | failed | in-flight | last_outcome | last_outcome_at_ms |"
+        );
+        let _ = writeln!(
+            out,
+            "|------|---------|-----------|--------|-----------|--------------|--------------------|"
+        );
+        for row in &rollups {
+            let last_outcome = row
+                .last_outcome
+                .as_deref()
+                .unwrap_or("-")
+                .to_string();
+            let last_at = row
+                .last_outcome_at_ms
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let _ = writeln!(
+                out,
+                "| {peer} | {started} | {succeeded} | {failed} | {in_flight} | {last_outcome} | {last_at} |",
+                peer = row.peer_label,
+                started = row.started,
+                succeeded = row.succeeded,
+                failed = row.failed,
+                in_flight = row.in_flight(),
+            );
         }
     }
     let _ = writeln!(out);
@@ -122,6 +220,108 @@ pub fn render_summary(bundle: &Bundle) -> String {
     }
 
     out
+}
+
+/// Per-target-peer dial-event rollup
+/// (spec §9 / `N3_OBSERVABILITY_UPGRADE_SPEC.md` gap 9).
+///
+/// Aggregates `DialStarted` / `DialOutcome` events across every
+/// observer in the bundle. `in_flight = started - succeeded - failed`
+/// surfaces the dials that never completed — the 3-event drift
+/// (`DialStarted: 83`, `DialOutcome: 80`) attributed to a specific
+/// peer in the table.
+#[derive(Debug, Clone)]
+pub struct PerPeerDialRollup {
+    pub peer_hex: String,
+    pub peer_label: String,
+    pub started: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub last_outcome: Option<String>,
+    pub last_outcome_at_ms: Option<u64>,
+}
+
+impl PerPeerDialRollup {
+    pub fn in_flight(&self) -> u64 {
+        self.started
+            .saturating_sub(self.succeeded.saturating_add(self.failed))
+    }
+}
+
+pub fn per_peer_dial_rollup(bundle: &Bundle) -> Vec<PerPeerDialRollup> {
+    use crate::diagnostics::event::DialOutcome as DialOutcomeKind;
+    let mut by_peer: BTreeMap<String, PerPeerDialRollup> = BTreeMap::new();
+    for node in bundle.nodes.values() {
+        for rec in &node.events {
+            match &rec.event {
+                Event::DialStarted { peer, .. } => {
+                    let hex = node_id_hex(peer);
+                    let entry = by_peer.entry(hex.clone()).or_insert_with(|| {
+                        PerPeerDialRollup {
+                            peer_label: bundle.label_for_hex(&hex),
+                            peer_hex: hex,
+                            started: 0,
+                            succeeded: 0,
+                            failed: 0,
+                            last_outcome: None,
+                            last_outcome_at_ms: None,
+                        }
+                    });
+                    entry.started += 1;
+                }
+                Event::DialOutcome { peer, outcome, .. } => {
+                    let hex = node_id_hex(peer);
+                    let entry = by_peer.entry(hex.clone()).or_insert_with(|| {
+                        PerPeerDialRollup {
+                            peer_label: bundle.label_for_hex(&hex),
+                            peer_hex: hex,
+                            started: 0,
+                            succeeded: 0,
+                            failed: 0,
+                            last_outcome: None,
+                            last_outcome_at_ms: None,
+                        }
+                    });
+                    match outcome {
+                        DialOutcomeKind::Success => entry.succeeded += 1,
+                        _ => entry.failed += 1,
+                    }
+                    let outcome_str = format!("{outcome:?}");
+                    let stamp_better = match entry.last_outcome_at_ms {
+                        Some(prev) => rec.wall_ms >= prev,
+                        None => true,
+                    };
+                    if stamp_better {
+                        entry.last_outcome = Some(outcome_str);
+                        entry.last_outcome_at_ms = Some(rec.wall_ms);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out: Vec<PerPeerDialRollup> = by_peer.into_values().collect();
+    out.sort_by(|a, b| a.peer_label.cmp(&b.peer_label).then(a.peer_hex.cmp(&b.peer_hex)));
+    out
+}
+
+#[derive(Debug, Default)]
+struct DialTotals {
+    started: u64,
+    succeeded: u64,
+    failed: u64,
+    in_flight: u64,
+}
+
+fn rollups_totals(rollups: &[PerPeerDialRollup]) -> DialTotals {
+    let mut t = DialTotals::default();
+    for r in rollups {
+        t.started = t.started.saturating_add(r.started);
+        t.succeeded = t.succeeded.saturating_add(r.succeeded);
+        t.failed = t.failed.saturating_add(r.failed);
+        t.in_flight = t.in_flight.saturating_add(r.in_flight());
+    }
+    t
 }
 
 /// What we learned from the first SWIM `-> Dead` transition.
@@ -253,6 +453,327 @@ fn nearest_snapshot(snaps: &[Snapshot], t: u64) -> Option<&Snapshot> {
     })
 }
 
+/// One compact line per node summarising the host context the boot
+/// record carries (spec §5). Missing fields render as `?` so the bundle
+/// reader can tell "absent" from "blank" at a glance.
+fn host_context_lines(bundle: &Bundle) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for node in &bundle.manifest.nodes {
+        let Some(data) = bundle.nodes.get(&node.label) else {
+            continue;
+        };
+        let Some(id) = data.identity.as_ref() else {
+            out.push(format!("{}: boot record absent", node.label));
+            continue;
+        };
+        let contract = id.vastai_contract_id.as_deref().unwrap_or("?");
+        let ip = id.host_ip_public.as_deref().unwrap_or("?");
+        let dc = id.datacenter_id.as_deref().unwrap_or("?");
+        let country = id.host_country.as_deref().unwrap_or("?");
+        let container = id.container_id.as_deref().unwrap_or("?");
+        let hostname = id.hostname.as_deref().unwrap_or("?");
+        let relay = id.home_relay_url_at_boot.as_deref().unwrap_or("?");
+        let iroh = id.iroh_version.as_deref().unwrap_or("?");
+        let git = id.git_sha.as_deref().unwrap_or("?");
+        out.push(format!(
+            "{label}: rental={contract} ip={ip} dc={dc} country={country} container={container} \
+             hostname={hostname} relay={relay} iroh={iroh} git={git}",
+            label = node.label,
+        ));
+    }
+    out
+}
+
+/// One line per (node, counter) where the delta between the first and
+/// last snapshot of the run is non-zero (spec §11). Counters that came
+/// back `None` are skipped — the bundle reader should never see a
+/// silent zero for "kernel didn't expose this".
+fn kernel_drop_lines(bundle: &Bundle) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (label, node) in &bundle.nodes {
+        let mut snaps = node.snapshots.iter().filter_map(|s| s.body.host.as_ref());
+        let first = snaps.next();
+        let mut last_with_data = first;
+        for s in snaps {
+            if s.network.is_some() {
+                last_with_data = Some(s);
+            }
+        }
+        let (Some(first), Some(last)) = (first, last_with_data) else {
+            continue;
+        };
+        let first_net = first.network.as_ref();
+        let last_net = last.network.as_ref();
+        if let (Some(a), Some(b)) = (first_net, last_net) {
+            // UDP-side deltas
+            if let (Some(au), Some(bu)) = (a.udp_kernel_stats.as_ref(), b.udp_kernel_stats.as_ref()) {
+                let entries: [(&str, Option<u64>, Option<u64>); 4] = [
+                    ("udp.no_ports", au.no_ports, bu.no_ports),
+                    ("udp.in_errors", au.in_errors, bu.in_errors),
+                    ("udp.rcvbuf_errors", au.rcvbuf_errors, bu.rcvbuf_errors),
+                    ("udp.sndbuf_errors", au.sndbuf_errors, bu.sndbuf_errors),
+                ];
+                for (name, before, after) in entries {
+                    let (Some(before), Some(after)) = (before, after) else {
+                        continue;
+                    };
+                    let delta = after.saturating_sub(before);
+                    if delta > 0 {
+                        out.push(format!("{label}: {name} +{delta}"));
+                    }
+                }
+            }
+            // Per-interface drop deltas. A counter absent in the
+            // baseline is treated as zero — the interface either just
+            // came up or we simply weren't capturing yet, and either
+            // way the delta is upper-bounded by the late value.
+            let zero = crate::diagnostics::snapshot::Tier3InterfaceCounters::default();
+            for iface_b in &b.interfaces {
+                let Some(cb) = iface_b.counters.as_ref() else {
+                    continue;
+                };
+                let ca = a
+                    .interfaces
+                    .iter()
+                    .find(|i| i.name == iface_b.name)
+                    .and_then(|i| i.counters.as_ref())
+                    .unwrap_or(&zero);
+                let rx_drop = cb.rx_dropped.saturating_sub(ca.rx_dropped);
+                let tx_drop = cb.tx_dropped.saturating_sub(ca.tx_dropped);
+                let rx_err = cb.rx_errors.saturating_sub(ca.rx_errors);
+                let tx_err = cb.tx_errors.saturating_sub(ca.tx_errors);
+                if rx_drop > 0 {
+                    out.push(format!("{label}: {}.rx_dropped +{rx_drop}", iface_b.name));
+                }
+                if tx_drop > 0 {
+                    out.push(format!("{label}: {}.tx_dropped +{tx_drop}", iface_b.name));
+                }
+                if rx_err > 0 {
+                    out.push(format!("{label}: {}.rx_errors +{rx_err}", iface_b.name));
+                }
+                if tx_err > 0 {
+                    out.push(format!("{label}: {}.tx_errors +{tx_err}", iface_b.name));
+                }
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Per-peer "relay sessions" correlation (spec §1).
+///
+/// Walks every node in the bundle:
+/// - relay-role nodes contribute `RelaySessionClosed` events plus the
+///   end-of-run `Tier3RelayServer` totals;
+/// - non-relay nodes contribute their `iroh.connection_cache[peer]`
+///   tail, specifically `last_failure_reason`.
+///
+/// Output: one summary line per (peer, last close), suffixed with the
+/// node-side `last_failure_reason` when one is present. When no
+/// relay-role node is in the bundle, returns a single line that names
+/// the gap explicitly so the bundle reader is never left wondering
+/// whether the relay was quiet or unobserved.
+fn relay_session_lines(bundle: &Bundle) -> Vec<String> {
+    let mut relay_labels: Vec<&str> = bundle
+        .manifest
+        .nodes
+        .iter()
+        .filter(|n| n.role.as_deref() == Some("relay"))
+        .map(|n| n.label.as_str())
+        .collect();
+    relay_labels.sort();
+
+    if relay_labels.is_empty() {
+        return vec![
+            "No relay observability data in this bundle (gap 1). To enable: run \
+             `swactor-iroh-relay` with `SWACTOR_DIAG_COLLECTOR_URL` set so the relay \
+             reports into the same bundle as the nodes."
+                .to_string(),
+        ];
+    }
+
+    let mut out: Vec<String> = Vec::new();
+
+    // Node-side cache map: peer_hex -> (node_label, last_failure_reason).
+    let mut node_cache_failure: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for (label, node) in &bundle.nodes {
+        // Skip the relay's own snapshot — its iroh cache is irrelevant
+        // here; we want the *clients'* view of what they saw.
+        if relay_labels.contains(&label.as_str()) {
+            continue;
+        }
+        // Use the latest snapshot's iroh.connection_cache entries.
+        let Some(snap) = node.snapshots.last() else {
+            continue;
+        };
+        let Some(iroh) = snap.body.iroh.as_ref() else {
+            continue;
+        };
+        for entry in &iroh.connection_cache {
+            if let Some(reason) = entry.last_failure_reason.as_ref() {
+                node_cache_failure
+                    .entry(entry.peer_node_id_hex.to_lowercase())
+                    .or_insert_with(|| (label.clone(), reason.clone()));
+            }
+        }
+    }
+
+    // Per-relay aggregate totals.
+    for relay_label in &relay_labels {
+        let Some(node) = bundle.nodes.get(*relay_label) else {
+            continue;
+        };
+        if let Some(latest) = node
+            .snapshots
+            .iter()
+            .rev()
+            .find(|s| s.body.relay_server.is_some())
+        {
+            if let Some(rs) = latest.body.relay_server.as_ref() {
+                let reasons = if rs.closes_by_reason.is_empty() {
+                    "(no classified closes)".to_string()
+                } else {
+                    rs.closes_by_reason
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                out.push(format!(
+                    "relay {relay_label}: active={active} opens={opens} closes={closes} \
+                     rx={rx}B tx={tx}B closes_by_reason=[{reasons}]",
+                    active = rs.active_sessions,
+                    opens = rs.total_opens,
+                    closes = rs.total_closes,
+                    rx = rs.bytes_rx_total,
+                    tx = rs.bytes_tx_total,
+                ));
+            }
+        }
+
+        // Per-session closed events keyed by peer; latest close wins.
+        let mut last_close: BTreeMap<String, RelayCloseDetail> = BTreeMap::new();
+        for rec in &node.events {
+            if let Event::RelaySessionClosed {
+                peer_node_id_hex,
+                opened_at_ms,
+                closed_at_ms,
+                duration_ms,
+                close_initiator,
+                close_reason,
+                bytes_rx,
+                bytes_tx,
+            } = &rec.event
+            {
+                let hex_lower = peer_node_id_hex.to_lowercase();
+                let detail = RelayCloseDetail {
+                    opened_at_ms: *opened_at_ms,
+                    closed_at_ms: *closed_at_ms,
+                    duration_ms: *duration_ms,
+                    close_initiator: close_initiator.clone(),
+                    close_reason: close_reason.clone(),
+                    bytes_rx: *bytes_rx,
+                    bytes_tx: *bytes_tx,
+                };
+                let replace = last_close
+                    .get(&hex_lower)
+                    .map(|prev| prev.closed_at_ms < detail.closed_at_ms)
+                    .unwrap_or(true);
+                if replace {
+                    last_close.insert(hex_lower, detail);
+                }
+            }
+        }
+
+        if last_close.is_empty() {
+            out.push(format!(
+                "relay {relay_label}: no RelaySessionClosed events captured (relay binary may \
+                 not be wired to emit per-session lifecycle yet)"
+            ));
+            continue;
+        }
+        for (peer_hex, d) in &last_close {
+            let peer_label = bundle.label_for_hex(peer_hex);
+            let node_view = node_cache_failure
+                .get(peer_hex)
+                .map(|(observer, reason)| {
+                    format!(" | node-side cache ({observer}): last_failure_reason=\"{reason}\"")
+                })
+                .unwrap_or_else(|| " | node-side cache: no last_failure_reason recorded".into());
+            out.push(format!(
+                "relay {relay_label} → {peer_label} ({peer_hex_short}…): closed by \
+                 {initiator} reason=\"{reason}\" duration={duration}ms rx={rx}B tx={tx}B{node_view}",
+                peer_hex_short = short_hex(peer_hex),
+                initiator = d.close_initiator,
+                reason = d.close_reason,
+                duration = d.duration_ms,
+                rx = d.bytes_rx,
+                tx = d.bytes_tx,
+            ));
+        }
+    }
+    out
+}
+
+#[derive(Debug, Clone)]
+struct RelayCloseDetail {
+    #[allow(dead_code)]
+    opened_at_ms: u64,
+    closed_at_ms: u64,
+    duration_ms: u64,
+    close_initiator: String,
+    close_reason: String,
+    bytes_rx: u64,
+    bytes_tx: u64,
+}
+
+/// Per-node breakdown of `GossipReceived` events by payload kind
+/// (spec §10). Lines look like
+/// `stage-2: swim_piggyback × 17 (12345 bytes, 34 items)`. Empty when
+/// no node observed any gossip; rendered as a single zero-line
+/// elsewhere.
+fn gossip_receipt_lines(bundle: &Bundle) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut totals: BTreeMap<(String, String), GossipTotals> = BTreeMap::new();
+    for (label, node) in &bundle.nodes {
+        for rec in &node.events {
+            if let Event::GossipReceived {
+                payload_kind,
+                payload_bytes,
+                item_count,
+                ..
+            } = &rec.event
+            {
+                let entry = totals
+                    .entry((label.clone(), payload_kind.clone()))
+                    .or_default();
+                entry.receipts = entry.receipts.saturating_add(1);
+                entry.bytes = entry.bytes.saturating_add(*payload_bytes as u64);
+                entry.items = entry.items.saturating_add(*item_count as u64);
+            }
+        }
+    }
+    totals
+        .into_iter()
+        .map(|((label, kind), t)| {
+            format!(
+                "{label}: {kind} × {receipts} ({bytes} bytes, {items} items)",
+                receipts = t.receipts,
+                bytes = t.bytes,
+                items = t.items,
+            )
+        })
+        .collect()
+}
+
+#[derive(Debug, Default)]
+struct GossipTotals {
+    receipts: u64,
+    bytes: u64,
+    items: u64,
+}
+
 fn probe_summary_lines(bundle: &Bundle) -> Vec<String> {
     let mut out = Vec::new();
     for (label, node) in &bundle.nodes {
@@ -302,6 +823,12 @@ fn event_kind(event: &Event) -> String {
         Event::DialOutcome { .. } => "DialOutcome".into(),
         Event::IrohConnTypeChanged { .. } => "IrohConnTypeChanged".into(),
         Event::RelayChanged { .. } => "RelayChanged".into(),
+        Event::RelaySessionStateChanged { .. } => "RelaySessionStateChanged".into(),
+        Event::RelaySessionOpened { .. } => "RelaySessionOpened".into(),
+        Event::RelaySessionClosed { .. } => "RelaySessionClosed".into(),
+        Event::SubprocessSpawned { .. } => "SubprocessSpawned".into(),
+        Event::SubprocessExited { .. } => "SubprocessExited".into(),
+        Event::GossipReceived { .. } => "GossipReceived".into(),
         Event::SwimMetadataSent { .. } => "SwimMetadataSent".into(),
         Event::SwimMetadataReceived { .. } => "SwimMetadataReceived".into(),
         Event::ConnectionCacheHit { .. } => "ConnectionCacheHit".into(),

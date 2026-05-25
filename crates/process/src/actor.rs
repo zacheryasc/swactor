@@ -65,7 +65,10 @@ impl<D: ProcessDriver> ProcessActor<D> {
 
                 // Subscriber notifications — send to each subscriber
                 ProcessAction::NotifyStarted { subscribers } => {
-                    let notif = ProcessNotification::Started { process: self_addr };
+                    let notif = ProcessNotification::Started {
+                        process: self_addr,
+                        pid: self.driver.pid(),
+                    };
                     for sub in subscribers {
                         let _ = ctx.send(sub, notif.clone());
                     }
