@@ -13,5 +13,6 @@ pub mod parity_host;
 pub mod property;
 pub mod rng;
 pub mod scenario;
+pub mod stage_host;
 pub mod swim_codec;
 pub mod swim_host;

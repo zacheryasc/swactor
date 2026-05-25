@@ -96,6 +96,7 @@ enum HostMessageLite {
     App(Vec<u8>),
     TimerFired { token: u64 },
     SendFailed { to: String, reason_tag: &'static str },
+    WorkerExit { reason: String },
 }
 
 struct ScriptedHost {
@@ -155,7 +156,12 @@ impl Host for ScriptedHost {
                     DropReason::NoRoute => "no_route",
                     DropReason::Partitioned => "partitioned",
                     DropReason::Lossy => "lossy",
+                    DropReason::RelayQueueFull => "relay_queue_full",
+                    DropReason::RelayDown => "relay_down",
                 },
+            },
+            HostMessage::WorkerExit { reason, .. } => HostMessageLite::WorkerExit {
+                reason: reason.clone(),
             },
         };
         self.log

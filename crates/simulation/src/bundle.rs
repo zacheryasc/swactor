@@ -4,7 +4,7 @@
 //! that cross the engine→writer boundary. The on-disk layout of §9
 //! lives behind that trait in a later implementation.
 
-use crate::network::{CacheTransition, DropReason};
+use crate::network::{CacheTransition, DropReason, RelayDropReason};
 use crate::scenario::Mutation;
 
 /// One record the engine produces. The writer is append-only and may
@@ -56,6 +56,31 @@ pub enum EventPayload {
         from: String,
         to: String,
         warm: bool,
+    },
+    /// RELAY_SPEC §9.1. Emitted at the message's arrival at the
+    /// relay. `kind_tag = "relay"`, `host_id = None`.
+    RelayEnqueue {
+        relay: String,
+        from: String,
+        to: String,
+        byte_len: u64,
+    },
+    /// RELAY_SPEC §9.1. Emitted at the message's egress-end time.
+    /// `kind_tag = "relay"`, `host_id = None`.
+    RelayDequeue {
+        relay: String,
+        from: String,
+        to: String,
+        byte_len: u64,
+    },
+    /// RELAY_SPEC §9.1. Emitted on `RelayQueueFull` and on
+    /// `RelayDown` drops. `kind_tag = "relay"`, `host_id = None`.
+    RelayDrop {
+        relay: String,
+        from: String,
+        to: String,
+        byte_len: u64,
+        reason: RelayDropReason,
     },
 }
 

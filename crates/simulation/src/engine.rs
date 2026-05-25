@@ -35,6 +35,17 @@ pub enum EngineAbort {
     /// A host attempted to send to itself, which the spec leaves
     /// undefined and we refuse.
     SelfSend { host: String },
+    /// RELAY_SPEC §5.3 — a `WorkerExit` mutation targeted a host of a
+    /// kind that does not accept the envelope. The MVP only the
+    /// `stage` host kind accepts `WorkerExit`; anything else aborts
+    /// rather than silently dropping the envelope (the entire point
+    /// of the mutation being explicit is that targeting the wrong
+    /// kind should be loud).
+    WorkerExitOnWrongKind {
+        peer: String,
+        kind: String,
+        mutation_index: usize,
+    },
 }
 
 /// Termination cause; tests inspect this to verify §4.8 / §4.10.
@@ -172,8 +183,14 @@ impl<W: BundleWriter> Engine<W> {
             );
             e.enqueue(offset, EventKind::Tick { host: peer.id.clone() });
         }
-        for m in &scenario.mutations {
-            e.enqueue(m.at_ns, EventKind::Mutation { mutation: m.clone() });
+        for (idx, m) in scenario.mutations.iter().enumerate() {
+            e.enqueue(
+                m.at_ns,
+                EventKind::Mutation {
+                    mutation: m.clone(),
+                    index: idx,
+                },
+            );
         }
         for s in &scenario.snapshots {
             e.enqueue(s.at_ns, EventKind::Snapshot);
@@ -318,7 +335,11 @@ impl<W: BundleWriter> Engine<W> {
                         return TerminationReason::Aborted(abort);
                     }
                 }
-                EventKind::Mutation { mutation } => self.dispatch_mutation(mutation),
+                EventKind::Mutation { mutation, index } => {
+                    if let Err(abort) = self.dispatch_mutation(mutation, index) {
+                        return TerminationReason::Aborted(abort);
+                    }
+                }
                 EventKind::Snapshot => self.dispatch_snapshot(),
             }
             // §4.8 early termination — after every dispatch, ask the
@@ -451,14 +472,79 @@ impl<W: BundleWriter> Engine<W> {
         self.process_actions(&to, actions, ActionSource::Recv)
     }
 
-    fn dispatch_mutation(&mut self, mutation: Mutation) {
+    fn dispatch_mutation(
+        &mut self,
+        mutation: Mutation,
+        index: usize,
+    ) -> Result<(), EngineAbort> {
         let at = self.now_ns;
+        // RELAY_SPEC §5.3 / §6.1 — `WorkerExit` is special-cased:
+        // it is a mutation whose effect is to deliver a `recv`
+        // envelope to a host, not to mutate the network. Validate
+        // the target kind here so the abort surfaces before any
+        // record is written.
+        if let MutationKind::WorkerExit {
+            peer,
+            reason,
+            status_code,
+            signal,
+        } = &mutation.kind
+        {
+            let spec_kind = self
+                .peer_specs
+                .get(peer)
+                .map(|s| s.kind.as_str())
+                .unwrap_or("");
+            if spec_kind != "stage" {
+                return Err(EngineAbort::WorkerExitOnWrongKind {
+                    peer: peer.clone(),
+                    kind: spec_kind.to_string(),
+                    mutation_index: index,
+                });
+            }
+            // Record the mutation itself (mirrors the parent's §4.5
+            // emission). The WorkerExit envelope is dispatched
+            // *synchronously* — i.e. the host's `recv` is called
+            // before this method returns, and the recorded events
+            // reach the bundle writer before the main loop has a
+            // chance to pop anything else at the same virtual time.
+            //
+            // The synchronous dispatch is normative per §6A.3:
+            // "the event must reach the bundle writer before the
+            // engine acts on the halt." With an enqueued LocalRecv,
+            // a `Terminate` whose sequence number was assigned at
+            // construction (and so lower than the just-now-enqueued
+            // LocalRecv) would pop first and the worker_exited
+            // event would be lost — that is exactly the boundary
+            // failure §6A.6 names as "Event-before-halt is
+            // observable."
+            self.write_record(BundleRecord::Mutation(MutationRecord {
+                virtual_time_ns: at,
+                mutation: mutation.clone(),
+            }));
+            let envelope = HostMessage::WorkerExit {
+                reason: reason.clone(),
+                status_code: *status_code,
+                signal: *signal,
+            };
+            // Mirror dispatch_local_recv's pre-checks: PeerKill and
+            // Halt-from-recv both suppress recv.
+            if self.killed.contains(peer) || self.recv_halted.contains(peer) {
+                return Ok(());
+            }
+            if let Some(mut host) = self.hosts.remove(peer) {
+                let actions = host.recv(envelope, at);
+                self.hosts.insert(peer.clone(), host);
+                return self.process_actions(peer, actions, ActionSource::Recv);
+            }
+            return Ok(());
+        }
         let invalidated = self.network.apply_mutation(&mutation, at);
         // The drop reason for invalidated deliveries depends on which
         // mutation invalidated them. Partition → `Partition`,
-        // PeerKill → `HostKilled`; nothing else invalidates deliveries
-        // today (LatencySpike / LossBurst / RelayBuffer / Heal /
-        // PeerResurrect all return an empty list from the network).
+        // PeerKill → `HostKilled`, RelayKill → `HostKilled` (the
+        // outbound peer never got the message); nothing else
+        // invalidates deliveries today.
         let drop_reason = match &mutation.kind {
             MutationKind::Partition { .. } => DeliveryDropReason::Partition,
             MutationKind::PeerKill { .. } => DeliveryDropReason::HostKilled,
@@ -544,6 +630,7 @@ impl<W: BundleWriter> Engine<W> {
             }));
         }
         self.drain_network_notifications();
+        Ok(())
     }
 
     fn dispatch_snapshot(&mut self) {
@@ -697,6 +784,35 @@ impl<W: BundleWriter> Engine<W> {
                     kind_tag: "engine".into(),
                     event: EventPayload::DialOutcome { from, to, warm },
                 },
+                NetworkNotification::RelayEnqueue { relay, from, to, byte_len, at_ns } => {
+                    EventRecord {
+                        virtual_time_ns: at_ns,
+                        host_id: None,
+                        kind_tag: "relay".into(),
+                        event: EventPayload::RelayEnqueue { relay, from, to, byte_len },
+                    }
+                }
+                NetworkNotification::RelayDequeue { relay, from, to, byte_len, at_ns } => {
+                    EventRecord {
+                        virtual_time_ns: at_ns,
+                        host_id: None,
+                        kind_tag: "relay".into(),
+                        event: EventPayload::RelayDequeue { relay, from, to, byte_len },
+                    }
+                }
+                NetworkNotification::RelayDrop {
+                    relay,
+                    from,
+                    to,
+                    byte_len,
+                    reason,
+                    at_ns,
+                } => EventRecord {
+                    virtual_time_ns: at_ns,
+                    host_id: None,
+                    kind_tag: "relay".into(),
+                    event: EventPayload::RelayDrop { relay, from, to, byte_len, reason },
+                },
             };
             self.write_record(BundleRecord::Event(record));
         }
@@ -767,6 +883,7 @@ enum EventKind {
     },
     Mutation {
         mutation: Mutation,
+        index: usize,
     },
     Snapshot,
     Terminate,

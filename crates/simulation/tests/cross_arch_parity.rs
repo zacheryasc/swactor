@@ -33,14 +33,17 @@ use simulation::scenario::{HostKindRegistry, Scenario, load_from_path};
 /// SHA-256 of `events.ndjson` for the reference scenario at
 /// `scenarios/parity/reference.toml`. Checked in; updated only as
 /// part of a deliberate spec amendment.
-// Updated in iteration 10 when DialOutcome's `at_ns` was corrected
-// from the pre-penalty arrival to the post-penalty arrival (the
-// judge's finding 1 against §5.4 step 8). Bundle events now record
-// the message arrival time on the cold-dial path instead of the
-// pre-penalty timestamp, so the digest of `events.ndjson` shifts
-// for any scenario whose cold-dial penalty is non-zero.
+// Updated when the parity reference scenario gained a relayed route
+// (RELAY_SPEC §13 — "the cross-architecture parity test extended to
+// cover relay-mediated routes"). The alpha↔charlie pair now routes
+// through relay `R`, so the bundle stream contains `relay_enqueue` /
+// `relay_dequeue` records and the alpha↔charlie arrival times shift
+// to reflect the relay's ingress + egress serialization.
+//
+// Previous value, from iteration 10's DialOutcome correction:
+//   a76b557d3da7a5d0f393446231669b8f7b1945a251805bed33fa09fb27ab3db0
 const EXPECTED_EVENTS_NDJSON_SHA256: &str =
-    "a76b557d3da7a5d0f393446231669b8f7b1945a251805bed33fa09fb27ab3db0";
+    "c7ee2a328c796f482b6c62694fc27936aa58a959b17f59fedd14a3f8c20ad2f2";
 
 fn registry() -> HostKindRegistry {
     let mut r = HostKindRegistry::with_swim();

@@ -1,8 +1,14 @@
-//! The network (SIM_SPEC §5).
+//! The network (SIM_SPEC §5 + RELAY_SPEC §4).
 //!
 //! A directed-graph link model with deterministic per-edge state, the
 //! §5.4 send algorithm, the §5.5 mutation suite, and a §7-conformant
 //! integer-only computation path (no floats touch any decision).
+//!
+//! RELAY_SPEC §4 adds the relay vertex: a first-class non-host node in
+//! the topology with its own ingress and per-egress queues, head-of-
+//! line serialization, queue-overflow drops, and cold-start penalty.
+//! Relayed routes (RELAY_SPEC §4.1) are composed inside the network's
+//! `send`; the engine sees one `SendOutcome` per query regardless.
 //!
 //! The network owns no schedule of its own; the engine pops events and
 //! queries the network. Each query mutates per-link state but never
@@ -11,7 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::rng::{SubstreamKey, SubstreamRng, jitter_sample};
-use crate::scenario::{LinkPolicy, LinkRef, Mutation, MutationKind, Scenario};
+use crate::scenario::{
+    HostRoute, LinkPolicy, LinkRef, Mutation, MutationKind, Relay, Scenario,
+};
 
 // ──────────────────────────────────────────────────────────────────────
 // Public types
@@ -36,12 +44,18 @@ pub enum SendOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DropReason {
-    /// The (from, to) pair has no declared edge.
+    /// The (from, to) pair has no declared edge or route.
     NoRoute,
     /// The active partition set cuts this edge.
     Partitioned,
     /// The Bernoulli loss draw for the edge fired.
     Lossy,
+    /// The relay's queue would overflow if this message were enqueued.
+    /// RELAY_SPEC §4.4 step 2.
+    RelayQueueFull,
+    /// The route is through a relay that has been `RelayKill`-ed.
+    /// RELAY_SPEC §4.5.
+    RelayDown,
 }
 
 /// Side-channel notification the engine consumes after each query.
@@ -65,6 +79,40 @@ pub enum NetworkNotification {
         at_ns: u64,
         warm: bool,
     },
+    /// RELAY_SPEC §4.4 step 7 / §9.1. The message reached the relay
+    /// and was enqueued (or accounted for in the ingress) at `at_ns`.
+    RelayEnqueue {
+        relay: String,
+        from: String,
+        to: String,
+        byte_len: u64,
+        at_ns: u64,
+    },
+    /// RELAY_SPEC §4.4 step 7 / §9.1. The relay finished serving the
+    /// message on its outbound egress at `at_ns`.
+    RelayDequeue {
+        relay: String,
+        from: String,
+        to: String,
+        byte_len: u64,
+        at_ns: u64,
+    },
+    /// RELAY_SPEC §4.4 step 2 / §4.5 / §9.1. The relay refused the
+    /// message at `at_ns`.
+    RelayDrop {
+        relay: String,
+        from: String,
+        to: String,
+        byte_len: u64,
+        reason: RelayDropReason,
+        at_ns: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayDropReason {
+    QueueFull,
+    Down,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +153,12 @@ pub struct Network {
     /// owns). The network exposes a list of in-flight deliveries to
     /// the killed peer for invalidation.
     killed_peers: BTreeSet<String>,
+    /// RELAY_SPEC §4 relay vertices, indexed by id.
+    relays: BTreeMap<String, RelayState>,
+    /// RELAY_SPEC §4.1 — per ordered host pair, the resolved route
+    /// (direct or relayed-through-a-named-relay). Pairs absent from
+    /// here drop with `NoRoute`.
+    routes: BTreeMap<(String, String), HostRoute>,
     seed: u64,
     next_delivery_id: u64,
     pending_notifications: Vec<NetworkNotification>,
@@ -121,6 +175,45 @@ struct EdgeState {
     in_flight: Vec<InFlight>,
 }
 
+#[derive(Debug)]
+struct RelayState {
+    policy: Relay,
+    /// Per outbound link (keyed by destination node id), the virtual
+    /// time at which the last scheduled message finishes serialization.
+    egress_queue_tail_ns: BTreeMap<String, u64>,
+    /// Across the single shared ingress, the virtual time at which the
+    /// last scheduled message finishes serialization.
+    ingress_queue_tail_ns: u64,
+    /// In-flight messages currently between ingress-enqueue and
+    /// egress-dequeue. Tracked so `RelayKill` returns the right set.
+    in_flight: Vec<RelayInFlight>,
+    boot_state: BootState,
+    /// Has the relay been killed by a `RelayKill` mutation? After
+    /// kill, no more messages forward until `RelayBoot`.
+    killed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootState {
+    Booted,
+    /// The relay has just been booted; the next forwarded message
+    /// pays the cold-start penalty. `since_ns` is informational.
+    Booting { since_ns: u64 },
+}
+
+#[derive(Debug, Clone)]
+struct RelayInFlight {
+    delivery_id: DeliveryId,
+    from_host: String,
+    to_host: String,
+    byte_len: u64,
+    /// Final arrival time at the destination host (post-egress + outbound leg).
+    arrival_at_ns: u64,
+    /// Virtual time the message left the relay's egress (used for
+    /// `enqueued_bytes` bookkeeping in `decrement_after_egress`).
+    egress_end_ns: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CacheState {
     Cold,
@@ -132,6 +225,9 @@ enum CacheState {
 struct InFlight {
     delivery_id: DeliveryId,
     scheduled_at_ns: u64,
+    /// For relayed routes, the relay through which this delivery is
+    /// being forwarded. `None` for direct edges.
+    via_relay: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +278,40 @@ impl Network {
                 },
             );
         }
+        let mut relays = BTreeMap::new();
+        for r in &scenario.relays {
+            relays.insert(
+                r.id.clone(),
+                RelayState {
+                    policy: r.clone(),
+                    egress_queue_tail_ns: BTreeMap::new(),
+                    ingress_queue_tail_ns: 0,
+                    in_flight: Vec::new(),
+                    boot_state: BootState::Booted,
+                    killed: false,
+                },
+            );
+        }
+        let mut routes = BTreeMap::new();
+        for r in &scenario.routes {
+            routes.insert((r.from().to_string(), r.to().to_string()), r.clone());
+        }
+        // If the scenario has no relays and no `via` shorthand, the
+        // `routes` field may be empty; in that case build a direct
+        // route per declared host-to-host edge. This preserves
+        // backward compatibility with scenarios written before the
+        // relay extension.
+        if routes.is_empty() {
+            for (key, _edge) in edges.iter() {
+                routes.insert(
+                    key.clone(),
+                    HostRoute::Direct {
+                        from: key.0.clone(),
+                        to: key.1.clone(),
+                    },
+                );
+            }
+        }
         Self {
             edges,
             partitioned: BTreeSet::new(),
@@ -189,6 +319,8 @@ impl Network {
             active_loss_burst: Vec::new(),
             active_relay_buffer: Vec::new(),
             killed_peers: BTreeSet::new(),
+            relays,
+            routes,
             seed: scenario.seed,
             next_delivery_id: 0,
             pending_notifications: Vec::new(),
@@ -200,13 +332,47 @@ impl Network {
         std::mem::take(&mut self.pending_notifications)
     }
 
-    /// Read-only test hook: total number of in-flight deliveries.
+    /// Read-only test hook: total number of in-flight deliveries
+    /// across every edge.
     pub fn in_flight_count(&self) -> usize {
         self.edges.values().map(|e| e.in_flight.len()).sum()
     }
 
-    /// Per §3.2 / §5.4.
+    /// Read-only test hook: number of messages currently in the named
+    /// relay's queues (between ingress enqueue and egress dequeue).
+    pub fn relay_in_flight_count(&self, relay: &str) -> usize {
+        self.relays.get(relay).map(|r| r.in_flight.len()).unwrap_or(0)
+    }
+
+    /// Per §3.2 / §5.4 plus RELAY_SPEC §4.4 composition.
     pub fn send(&mut self, from: &str, to: &str, byte_len: u64, sent_at_ns: u64) -> SendOutcome {
+        let route_key = (from.to_string(), to.to_string());
+        let Some(route) = self.routes.get(&route_key).cloned() else {
+            return SendOutcome::Drop {
+                reason: DropReason::NoRoute,
+            };
+        };
+        match route {
+            HostRoute::Direct { .. } => self.send_direct(from, to, byte_len, sent_at_ns, None),
+            HostRoute::Relayed { relay, .. } => {
+                self.send_relayed(from, &relay, to, byte_len, sent_at_ns)
+            }
+        }
+    }
+
+    /// Direct (or single-leg) send along one declared edge. When
+    /// `relay_context` is `Some`, the in-flight entry is tagged with
+    /// the originating relay so `RelayKill` can invalidate the right
+    /// deliveries. The composed `send_relayed` path uses this for the
+    /// outbound leg.
+    fn send_direct(
+        &mut self,
+        from: &str,
+        to: &str,
+        byte_len: u64,
+        sent_at_ns: u64,
+        relay_context: Option<&str>,
+    ) -> SendOutcome {
         // 1. No declared edge → NoRoute. State unchanged.
         if !self.edges.contains_key(&(from.to_string(), to.to_string())) {
             return SendOutcome::Drop {
@@ -234,8 +400,7 @@ impl Network {
             };
         }
 
-        // Pre-step: idle cooling. If last_send_ns - now > cache_invalidate_after_idle_ns,
-        // transition to Cold and emit a CacheStateChange.
+        // Pre-step: idle cooling.
         self.maybe_idle_cool(&key, sent_at_ns);
 
         // 4. serialization_start = max(sent_at, last_arrive_ns).
@@ -263,19 +428,16 @@ impl Network {
         };
         let mut arrival = serialization_end.saturating_add(scaled_additive);
 
-        // 7. RelayBuffer floor: arrival = max(arrival, sent_at + floor_ns).
+        // 7. RelayBuffer (legacy per-link floor) — applies to direct
+        // edges; the new relay vertex has its own delay model.
         if let Some(floor_ns) = self.effective_relay_floor(&key, sent_at_ns) {
             arrival = arrival.max(sent_at_ns.saturating_add(floor_ns));
         }
 
-        // 8. Cold-dial penalty. If the cache is Cold, add the penalty;
-        // emit DialStart and DialOutcome notifications.
+        // 8. Cold-dial penalty.
         let cache_was_cold = matches!(self.edges[&key].cache, CacheState::Cold);
         if cache_was_cold {
             arrival = arrival.saturating_add(policy.cold_dial_penalty_ns);
-            // §5.4 step 8 says "DialOutcome at the arrival time" —
-            // the only `arrival` in scope at that point is the
-            // post-penalty value, so capture *after* the add.
             let dial_outcome_at = arrival;
             self.pending_notifications.push(NetworkNotification::DialStart {
                 from: from.to_string(),
@@ -288,17 +450,11 @@ impl Network {
                 at_ns: dial_outcome_at,
                 warm: true,
             });
-            // §5.4 step 8 — transition Cold → Warming(sent_at_ns).
-            // No CacheStateChange notification here; per §5.4 step 10
-            // the Warmed event fires only when Warming→Warm crosses
-            // the cache_warm_after_ns threshold.
             let edge = self.edges.get_mut(&key).unwrap();
             edge.cache = CacheState::Warming { since_ns: sent_at_ns };
         }
 
-        // 9. Reorder draw. If it fires, push arrival past the next
-        // scheduled delivery on this edge. We pick the latest
-        // in-flight arrival on the edge plus a small delta.
+        // 9. Reorder draw.
         let reorder_draw = {
             let edge = self.edges.get_mut(&key).unwrap();
             edge.rng.next_u32() % 1_000_000
@@ -321,14 +477,6 @@ impl Network {
         edge.last_send_ns = Some(sent_at_ns);
         edge.last_arrive_ns = Some(arrival);
 
-        // §5.4 step 10 — if Warming and the cumulative warm-after
-        // threshold has been crossed, transition Warming → Warm and
-        // emit the single CacheStateChange{Warmed} notification.
-        // The notification carries the actual transition time
-        // (`since_ns + cache_warm_after_ns`) rather than the
-        // observing send's `sent_at_ns`; the bundle reader sees the
-        // moment the link became warm, not the moment the engine
-        // happened to detect it.
         if let CacheState::Warming { since_ns } = edge.cache {
             if sent_at_ns.saturating_sub(since_ns) >= policy.cache_warm_after_ns {
                 edge.cache = CacheState::Warm;
@@ -342,28 +490,223 @@ impl Network {
             }
         }
 
-        // Record in-flight.
         let delivery_id = DeliveryId(self.next_delivery_id);
         self.next_delivery_id += 1;
         edge.in_flight.push(InFlight {
             delivery_id,
             scheduled_at_ns: arrival,
+            via_relay: relay_context.map(|s| s.to_string()),
         });
 
         SendOutcome::Arrive { delivery_id, at_ns: arrival }
     }
 
-    /// Inform the network that the engine has delivered (or otherwise
-    /// removed) a previously-scheduled delivery. The network drops
-    /// the corresponding in-flight entry; this is how `in_flight`
-    /// stays accurate for mutation invalidation.
-    pub fn notify_delivered(&mut self, from: &str, to: &str, delivery_id: DeliveryId) {
-        if let Some(edge) = self.edges.get_mut(&(from.to_string(), to.to_string())) {
+    /// RELAY_SPEC §4.4 composition. Inbound leg via direct edge, then
+    /// relay processing (ingress + egress with optional cold-start),
+    /// then outbound leg via direct edge.
+    fn send_relayed(
+        &mut self,
+        from: &str,
+        relay: &str,
+        to: &str,
+        byte_len: u64,
+        sent_at_ns: u64,
+    ) -> SendOutcome {
+        // RELAY_SPEC §4.5 — sends through a killed relay drop with
+        // `RelayDown`. The inbound leg's state is not consulted: the
+        // relay's deadness is an out-of-band fact about the route.
+        if self.relays.get(relay).map(|r| r.killed).unwrap_or(false) {
+            self.pending_notifications
+                .push(NetworkNotification::RelayDrop {
+                    relay: relay.to_string(),
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    byte_len,
+                    reason: RelayDropReason::Down,
+                    at_ns: sent_at_ns,
+                });
+            return SendOutcome::Drop {
+                reason: DropReason::RelayDown,
+            };
+        }
+
+        // RELAY_SPEC §4.4 step 1 — inbound leg. Use the *internal*
+        // send_direct so the inbound edge's state evolves the same way
+        // a normal direct edge would, but the returned arrival time
+        // becomes the relay-ingress arrival.
+        let inbound = self.send_direct(from, relay, byte_len, sent_at_ns, None);
+        let arrival_at_r = match inbound {
+            SendOutcome::Arrive { delivery_id, at_ns } => {
+                // We tracked an in-flight on the inbound edge as a
+                // bookkeeping artefact; for relayed routes the
+                // *outbound* leg's in-flight is the canonical one.
+                // Drop the inbound bookkeeping so PeerKill / Partition
+                // on the inbound leg do not see a phantom message.
+                self.discard_inbound_inflight(from, relay, delivery_id);
+                at_ns
+            }
+            SendOutcome::Drop { reason } => return SendOutcome::Drop { reason },
+        };
+
+        // RELAY_SPEC §4.4 step 2 — enqueue at the relay; check
+        // queue-overflow exact (over-strict: only refuse when adding
+        // would push beyond the bound).
+        let Some(relay_state) = self.relays.get_mut(relay) else {
+            return SendOutcome::Drop {
+                reason: DropReason::NoRoute,
+            };
+        };
+        let cleanup_at = arrival_at_r;
+        relay_state.cleanup_finished(cleanup_at);
+        let enqueued_bytes: u64 = relay_state.in_flight.iter().map(|m| m.byte_len).sum();
+        if enqueued_bytes.saturating_add(byte_len) > relay_state.policy.queue_depth_bytes {
+            self.pending_notifications
+                .push(NetworkNotification::RelayDrop {
+                    relay: relay.to_string(),
+                    from: from.to_string(),
+                    to: to.to_string(),
+                    byte_len,
+                    reason: RelayDropReason::QueueFull,
+                    at_ns: arrival_at_r,
+                });
+            return SendOutcome::Drop {
+                reason: DropReason::RelayQueueFull,
+            };
+        }
+        // RELAY_SPEC §4.4 step 3 — ingress serialization.
+        let ingress_capacity = relay_state.policy.ingress_capacity_bps;
+        let ingress_serialization = ((byte_len as u128).saturating_mul(1_000_000_000u128)
+            / (ingress_capacity as u128)) as u64;
+        let ingress_end = arrival_at_r
+            .max(relay_state.ingress_queue_tail_ns)
+            .saturating_add(ingress_serialization);
+        relay_state.ingress_queue_tail_ns = ingress_end;
+
+        // RELAY_SPEC §4.4 step 4 — egress serialization. Cold start
+        // penalty fires once per `Booting` state.
+        let egress_capacity = relay_state.policy.egress_capacity_bps_per_link;
+        let egress_serialization = ((byte_len as u128).saturating_mul(1_000_000_000u128)
+            / (egress_capacity as u128)) as u64;
+        let egress_tail = *relay_state
+            .egress_queue_tail_ns
+            .get(to)
+            .unwrap_or(&0);
+        let mut egress_start = ingress_end.max(egress_tail);
+        if let BootState::Booting { .. } = relay_state.boot_state {
+            egress_start = egress_start.saturating_add(relay_state.policy.cold_start_penalty_ns);
+            relay_state.boot_state = BootState::Booted;
+        }
+        let egress_end = egress_start.saturating_add(egress_serialization);
+        relay_state
+            .egress_queue_tail_ns
+            .insert(to.to_string(), egress_end);
+
+        // RELAY_SPEC §4.4 step 7 — emit enqueue/dequeue notifications.
+        self.pending_notifications
+            .push(NetworkNotification::RelayEnqueue {
+                relay: relay.to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+                byte_len,
+                at_ns: arrival_at_r,
+            });
+        self.pending_notifications
+            .push(NetworkNotification::RelayDequeue {
+                relay: relay.to_string(),
+                from: from.to_string(),
+                to: to.to_string(),
+                byte_len,
+                at_ns: egress_end,
+            });
+
+        // RELAY_SPEC §4.4 step 5 — outbound leg. The outbound edge's
+        // own bandwidth model serializes on top of the relay's egress.
+        let outbound = self.send_direct(relay, to, byte_len, egress_end, Some(relay));
+        let final_arrival = match outbound {
+            SendOutcome::Arrive { at_ns, .. } => at_ns,
+            SendOutcome::Drop { reason } => {
+                // The relay scheduling has already happened; we still
+                // emit the dequeue notification (it represents the
+                // relay's view) but the composed send drops.
+                return SendOutcome::Drop { reason };
+            }
+        };
+
+        // Record on the relay's in-flight so RelayKill can invalidate.
+        let delivery_id = match self.last_outbound_delivery_id(relay, to) {
+            Some(d) => d,
+            None => DeliveryId(self.next_delivery_id.saturating_sub(1)),
+        };
+        let relay_state = self.relays.get_mut(relay).unwrap();
+        relay_state.in_flight.push(RelayInFlight {
+            delivery_id,
+            from_host: from.to_string(),
+            to_host: to.to_string(),
+            byte_len,
+            arrival_at_ns: final_arrival,
+            egress_end_ns: egress_end,
+        });
+
+        SendOutcome::Arrive {
+            delivery_id,
+            at_ns: final_arrival,
+        }
+    }
+
+    /// Forget the inbound-leg bookkeeping created by
+    /// `send_direct(from, relay, …)`. The outbound leg owns the
+    /// canonical in-flight entry for relayed routes.
+    fn discard_inbound_inflight(&mut self, from: &str, relay: &str, delivery_id: DeliveryId) {
+        if let Some(edge) = self
+            .edges
+            .get_mut(&(from.to_string(), relay.to_string()))
+        {
             edge.in_flight.retain(|f| f.delivery_id != delivery_id);
         }
     }
 
-    /// Per §3.2 / §5.5.
+    /// The delivery id the last-issued outbound `send_direct` returned
+    /// (it pushes onto the outbound edge's `in_flight`; the relay
+    /// then mirrors that id into its own in-flight).
+    fn last_outbound_delivery_id(&self, relay: &str, to: &str) -> Option<DeliveryId> {
+        self.edges
+            .get(&(relay.to_string(), to.to_string()))?
+            .in_flight
+            .last()
+            .map(|f| f.delivery_id)
+    }
+
+    /// Inform the network that the engine has delivered (or otherwise
+    /// removed) a previously-scheduled delivery.
+    pub fn notify_delivered(&mut self, from: &str, to: &str, delivery_id: DeliveryId) {
+        // Direct edge bookkeeping.
+        if let Some(edge) = self.edges.get_mut(&(from.to_string(), to.to_string())) {
+            edge.in_flight.retain(|f| f.delivery_id != delivery_id);
+        }
+        // For relayed routes, the canonical edge is `relay → to`; the
+        // engine still calls us with `(from = original sender, to)`.
+        // Look up the route to find the relay.
+        let via_relay = self
+            .routes
+            .get(&(from.to_string(), to.to_string()))
+            .and_then(|r| match r {
+                HostRoute::Relayed { relay, .. } => Some(relay.clone()),
+                HostRoute::Direct { .. } => None,
+            });
+        if let Some(relay) = via_relay {
+            if let Some(edge) = self
+                .edges
+                .get_mut(&(relay.clone(), to.to_string()))
+            {
+                edge.in_flight.retain(|f| f.delivery_id != delivery_id);
+            }
+            if let Some(rs) = self.relays.get_mut(&relay) {
+                rs.in_flight.retain(|m| m.delivery_id != delivery_id);
+            }
+        }
+    }
+
+    /// Per §3.2 / §5.5 + RELAY_SPEC §4.5 / §6.1.
     pub fn apply_mutation(
         &mut self,
         mutation: &Mutation,
@@ -439,7 +782,6 @@ impl Network {
             }
             MutationKind::PeerKill { peer } => {
                 self.killed_peers.insert(peer.clone());
-                // Invalidate every delivery destined to the peer.
                 let mut invalidated = Vec::new();
                 let edge_keys: Vec<(String, String)> = self
                     .edges
@@ -450,8 +792,6 @@ impl Network {
                 for (from, to) in edge_keys {
                     invalidated.extend(self.drain_in_flight_for(&from, &to));
                     let edge = self.edges.get_mut(&(from.clone(), to.clone())).unwrap();
-                    // Invalidate cache for that edge per §5.5 (kill
-                    // resets the link). Emit a notification.
                     if !matches!(edge.cache, CacheState::Cold) {
                         edge.cache = CacheState::Cold;
                         self.pending_notifications.push(
@@ -470,10 +810,93 @@ impl Network {
                 self.killed_peers.remove(peer);
                 Vec::new()
             }
+            MutationKind::WorkerExit { .. } => {
+                // RELAY_SPEC §6.1 — `WorkerExit` is engine-side; the
+                // network has nothing to invalidate. The engine
+                // dispatches it as a recv envelope to the target host.
+                Vec::new()
+            }
+            MutationKind::RelayKill { relay } => self.apply_relay_kill(relay, at_ns),
+            MutationKind::RelayBoot { relay } => {
+                self.apply_relay_boot(relay, at_ns);
+                Vec::new()
+            }
+            MutationKind::RelayCapacityChange {
+                relay,
+                ingress_capacity_bps,
+                egress_capacity_bps_per_link,
+                queue_depth_bytes,
+            } => {
+                self.apply_relay_capacity_change(
+                    relay,
+                    *ingress_capacity_bps,
+                    *egress_capacity_bps_per_link,
+                    *queue_depth_bytes,
+                );
+                Vec::new()
+            }
         }
         // `_seed` is captured at construction; we keep it on the type
-        // so future randomness in mutations (none currently) can derive
-        // a substream from `("mutation", index)`.
+        // so future randomness in mutations (none currently do) can
+        // derive a substream from `("mutation", index)`.
+    }
+
+    // ── Relay mutation helpers ───────────────────────────────────────
+
+    fn apply_relay_kill(&mut self, relay: &str, _at_ns: u64) -> Vec<InvalidatedDelivery> {
+        let Some(rs) = self.relays.get_mut(relay) else {
+            return Vec::new();
+        };
+        rs.killed = true;
+        let drained = std::mem::take(&mut rs.in_flight);
+        // Each drained entry has a canonical in-flight on the outbound
+        // edge (relay → to_host). Drop it there too, so the engine
+        // doesn't think the delivery is still pending.
+        let invalidated: Vec<_> = drained
+            .into_iter()
+            .map(|m| InvalidatedDelivery {
+                delivery_id: m.delivery_id,
+                from: m.from_host,
+                to: m.to_host,
+                scheduled_at_ns: m.arrival_at_ns,
+            })
+            .collect();
+        for inv in &invalidated {
+            if let Some(edge) = self.edges.get_mut(&(relay.to_string(), inv.to.clone())) {
+                edge.in_flight.retain(|f| f.delivery_id != inv.delivery_id);
+            }
+        }
+        invalidated
+    }
+
+    fn apply_relay_boot(&mut self, relay: &str, at_ns: u64) {
+        if let Some(rs) = self.relays.get_mut(relay) {
+            rs.killed = false;
+            rs.in_flight.clear();
+            rs.egress_queue_tail_ns.clear();
+            rs.ingress_queue_tail_ns = 0;
+            rs.boot_state = BootState::Booting { since_ns: at_ns };
+        }
+    }
+
+    fn apply_relay_capacity_change(
+        &mut self,
+        relay: &str,
+        ingress: Option<u64>,
+        egress: Option<u64>,
+        depth: Option<u64>,
+    ) {
+        if let Some(rs) = self.relays.get_mut(relay) {
+            if let Some(v) = ingress {
+                rs.policy.ingress_capacity_bps = v;
+            }
+            if let Some(v) = egress {
+                rs.policy.egress_capacity_bps_per_link = v;
+            }
+            if let Some(v) = depth {
+                rs.policy.queue_depth_bytes = v;
+            }
+        }
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
@@ -547,6 +970,16 @@ impl Network {
             return Vec::new();
         };
         let drained = std::mem::take(&mut edge.in_flight);
+        // For each drained entry, also remove the mirror from the
+        // relay (if any) so RelayKill semantics stay consistent with
+        // PeerKill semantics for relayed routes.
+        for f in &drained {
+            if let Some(relay) = f.via_relay.clone() {
+                if let Some(rs) = self.relays.get_mut(&relay) {
+                    rs.in_flight.retain(|m| m.delivery_id != f.delivery_id);
+                }
+            }
+        }
         drained
             .into_iter()
             .map(|f| InvalidatedDelivery {
@@ -563,6 +996,15 @@ impl Network {
     #[allow(dead_code)]
     pub(crate) fn seed(&self) -> u64 {
         self.seed
+    }
+}
+
+impl RelayState {
+    /// Drop in-flight entries whose `arrival_at_ns` is at or before
+    /// `now_ns`. RELAY_SPEC §4.4 step 6 — the relay decrements
+    /// `enqueued_bytes` lazily once the message clears egress.
+    fn cleanup_finished(&mut self, now_ns: u64) {
+        self.in_flight.retain(|m| m.egress_end_ns > now_ns);
     }
 }
 

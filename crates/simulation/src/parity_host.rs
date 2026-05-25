@@ -147,6 +147,11 @@ impl Host for ParityStubHost {
                 "host": self.id,
                 "to": to,
             }),
+            HostMessage::WorkerExit { .. } => {
+                panic!(
+                    "parity_stub host kind cannot receive WorkerExit; the engine's WorkerExitOnWrongKind gate is broken"
+                );
+            }
         };
         vec![Action::RecordEvent {
             kind_tag: "parity_stub".into(),

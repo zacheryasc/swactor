@@ -1,0 +1,143 @@
+# Calibration scenario paired with bundle `vastai-N3-2`.
+# RELAY_SPEC §10.1.
+#
+# Topology: same three SWIM/stage hosts and one relay as
+# `n3_canary_relay_real_worker.toml`, but with the relay widened to the
+# own-relay's measured shape (high egress per link, modest queue, no
+# cold-start penalty). The worker_exit mutations stay — under run #2
+# the relay is no longer the bottleneck but the stages still die at
+# 75s / 191s / 51s, proving stage death is a worker bug, not a cluster
+# bug (deployment report TL;DR Layer C).
+#
+# Expected verdict under the widened policy:
+#   - `relay_queue_depth_bounded` Passes (the own relay does not buffer
+#     gossip beyond the bound).
+#   - `worker_alive_throughout` over [0, 60s] still Fails on stage_0's
+#     51s exit. Stage death is independent of the relay fix.
+#   - `name_resolves_within` Passes for pp-stage-0 (the own relay
+#     forwards SWIM gossip in seconds, not minutes).
+#
+# Placeholder numerics — first calibration pass replaces them with
+# measured values from the bundle in a follow-up commit per
+# SIM_SPEC §11.3.
+
+name = "n3_own_relay_real_worker"
+seed = 2
+duration_ns = 412_000_000_000  # 412 s — the live run's duration
+
+[default_tick]
+period_ns = 200_000_000  # 200 ms
+
+[default_link]
+latency_ns = 60_000_000
+jitter_stddev_ns = 15_000_000
+loss_prob_ppm = 0
+reorder_prob_ppm = 0
+bandwidth_bps = 25_000_000
+cold_dial_penalty_ns = 200_000_000
+cache_warm_after_ns = 200_000_000
+cache_invalidate_after_idle_ns = 30_000_000_000
+
+# Own-relay policy: wider egress, smaller queue, no cold start. This
+# is the only difference from `n3_canary_relay_real_worker.toml`.
+[[relays]]
+id = "own_relay"
+ingress_capacity_bps = 1_000_000_000           # 1 Gb/s combined ingress
+egress_capacity_bps_per_link = 100_000_000     # 100 Mb/s per outbound link
+queue_depth_bytes = 65_536                     # 64 KB
+cold_start_penalty_ns = 0
+
+[[peers]]
+id = "orchestrator"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+
+[[peers]]
+id = "stage_0"
+kind = "stage"
+initial_state = "cold"
+kind_config = { name = "pp-stage-0", address = "10.0.0.10:7700" }
+
+[[peers]]
+id = "stage_1"
+kind = "stage"
+initial_state = "cold"
+kind_config = { name = "pp-stage-1", address = "10.0.0.11:7700" }
+
+[[links]]
+from = "orchestrator"
+to = "stage_0"
+via = "own_relay"
+[[links]]
+from = "stage_0"
+to = "orchestrator"
+via = "own_relay"
+[[links]]
+from = "orchestrator"
+to = "stage_1"
+via = "own_relay"
+[[links]]
+from = "stage_1"
+to = "orchestrator"
+via = "own_relay"
+[[links]]
+from = "stage_0"
+to = "stage_1"
+via = "own_relay"
+[[links]]
+from = "stage_1"
+to = "stage_0"
+via = "own_relay"
+
+# Same worker_exits as run #2's live timings: stage_0 at 75s
+# (the report quotes 75s for stage-0 in run #2), stage_1 at 191s.
+[[mutations]]
+at_ns = 75_000_000_000
+kind = "worker_exit"
+peer = "stage_0"
+reason = "tinygrad worker crashed (placeholder)"
+status_code = 1
+
+[[mutations]]
+at_ns = 191_000_000_000
+kind = "worker_exit"
+peer = "stage_1"
+reason = "tinygrad worker crashed (placeholder)"
+status_code = 1
+
+[[snapshots]]
+at_ns = 1_000_000_000
+[[snapshots]]
+at_ns = 10_000_000_000
+[[snapshots]]
+at_ns = 50_000_000_000
+[[snapshots]]
+at_ns = 200_000_000_000
+[[snapshots]]
+at_ns = 400_000_000_000
+
+# `relay_queue_depth_bounded` should Pass now (the calibration pass
+# will verify the actual `enqueued_bytes` distribution stays under the
+# bound, separating run #2 from run #1).
+[[assertions]]
+kind = "relay_queue_depth_bounded"
+relay = "own_relay"
+max_bytes = 65_536
+
+# `worker_alive_throughout` still Fails on stage_0's 75s exit — the
+# Layer C bug is independent of the relay fix.
+[[assertions]]
+kind = "worker_alive_throughout"
+peer = "stage_0"
+window_start_ns = 0
+window_end_ns = 90_000_000_000
+
+# Name registry: pp-stage-0 should resolve fast under the own-relay
+# policy.
+[[assertions]]
+kind = "name_resolves_within"
+name = "pp-stage-0"
+observers = ["orchestrator"]
+within_ns = 5_000_000_000
+from_ns = 0

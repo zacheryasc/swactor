@@ -43,6 +43,15 @@ pub enum HostMessage {
     /// A `Send` the network refused. The sender — not the destination
     /// — receives this so the host can react (re-queue, log, etc.).
     SendFailed { to: HostId, reason: DropReason },
+    /// RELAY_SPEC §3.1 / §5.3 — an internal worker-exit signal. The
+    /// stage host kind consumes this; other kinds refuse it and the
+    /// engine aborts the run with a structured error if it is
+    /// delivered to a kind that does not accept it.
+    WorkerExit {
+        reason: String,
+        status_code: Option<i32>,
+        signal: Option<i32>,
+    },
 }
 
 /// One thing a host's `tick` or `recv` can ask the engine to do.

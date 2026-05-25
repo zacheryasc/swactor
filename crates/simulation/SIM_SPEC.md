@@ -22,25 +22,38 @@ the first such host kind; the second is whatever we need next.
 ## 0. Motivation
 
 The pipeline-parallel-inference example failed eight live N≥3 vast.ai deploys.
-The session report (`N3_DEPLOYMENT_REPORT.md`, next to this file) traces the
-failure to a SWIM gossip-flap bug ("B1"): in a seven-minute run, the
-orchestrator refuted Suspect claims against itself 228 times — roughly once
-every 1.8 seconds — and one peer ended the run marked Dead despite probes
-succeeding in both directions on both sides of the link. The bug is not
-visible in any test we have today. It only appears with three or more peers,
-multi-region latency, and enough cumulative gossip state for piggybacked
-membership updates to grow into the multi-kilobyte range.
+The session report (`N3_DEPLOYMENT_REPORT.md`, next to this file) decomposes
+the failure into three independent bugs stacked:
 
-Catching that bug in production costs about two dollars of GPU rental per
-attempt, forty-five to ninety minutes of engineer time per iteration, and
-produces one non-reproducible bundle of evidence per run. The same source,
-run twice, produces different outcomes.
+- **Layer A — relay-mediated head-of-line blocking.** iroh 0.96's
+  `RelayMode::Default` routed gossip through n0's canary relay, which
+  buffered SWIM traffic for 187 seconds. A shared queue servicing
+  multiple peers couples otherwise-independent traffic: a 9.8 KB Ack
+  from one peer delays every probe behind it on the same egress.
+- **Layer B — SWIM gossip-flap (B1).** In a seven-minute run, the
+  orchestrator refuted Suspect claims against itself 228 times —
+  roughly once every 1.8 seconds — and one peer ended the run marked
+  Dead despite probes succeeding in both directions on both sides of
+  the link. The bug only appears with three or more peers, multi-
+  region latency, and enough cumulative gossip state for piggybacked
+  membership updates to grow into the multi-kilobyte range.
+- **Layer C — internal-cause peer death.** Pipeline stages died
+  51–191 seconds into run #2 from worker-process exits, not from
+  network. The orchestrator recorded "connect timeout" because the
+  peer was gone. The failure mode is internal: the host emits a
+  diagnostic record and then halts of its own accord.
 
-The simulator exists to make the iteration loop sub-second and the outcomes
-byte-identical for a fixed seed. It is not a complete model of production;
-it is the smallest model that lets us tune SWIM without deploying. Future
-algorithms layer onto the same engine without changing the SWIM behaviour
-this MVP guarantees.
+Catching any of these in production costs about two dollars of GPU rental
+per attempt, forty-five to ninety minutes of engineer time per iteration,
+and produces one non-reproducible bundle of evidence per run. The same
+source, run twice, produces different outcomes.
+
+The simulator exists to make the iteration loop sub-second and the
+outcomes byte-identical for a fixed seed. It is not a complete model of
+production; it is the smallest model that lets us reproduce A, B, and C
+deterministically and tune SWIM (and the relay, and the stage lifecycle)
+without deploying. Future algorithms layer onto the same engine without
+changing the behaviour this MVP guarantees.
 
 ---
 
@@ -48,18 +61,34 @@ this MVP guarantees.
 
 The MVP ships when these are simultaneously true.
 
-A property test reproduces the gossip-flap bug deterministically against the
-current SWIM source. The same scenario with the same seed produces byte-
-identical output across runs and across the architectures we claim to
-support.
+A property test reproduces the gossip-flap bug (Layer B) deterministically
+against the current SWIM source. The same scenario with the same seed
+produces byte-identical output across runs and across the architectures we
+claim to support.
+
+A property test reproduces the relay-HOL flap (Layer A) deterministically
+against the current SWIM source: a multi-peer scenario routed through one
+relay with bounded egress, with cumulative gossip state growing into the
+multi-kilobyte range, exhibits probe timeouts that disappear when the
+relay's egress capacity is widened or the message-size cap from §10.1 is
+enforced.
+
+A scenario reproduces the run-#2 stage-death failure mode (Layer C): a
+stage declared with a scheduled internal exit dies on schedule, emits a
+`worker_exited` record with the declared reason, halts, and is observed by
+the rest of the cluster through the same diagnostic channel production
+uses.
 
 The fix workflow does not deploy. A developer writes a property, runs the
-sim, sees it fail, edits the SWIM source, re-runs, sees it pass — all
-locally, in under a second per iteration.
+sim, sees it fail, edits the SWIM source (or the relay policy, or the
+stage-supervisor lifecycle), re-runs, sees it pass — all locally, in under
+a second per iteration.
 
-The simulator is calibration-grounded against the three N3 bundles we have.
-Distributions emitted by the sim, when configured to mirror a given N3 run,
-are within declared tolerances of the corresponding live bundle.
+The simulator is calibration-grounded against the three N3 bundles we have
+(`vastai-N3-1` canary relay + real worker; `vastai-N3-2` own relay + real
+worker; `vastai-N3-stub` own relay + stub worker). Distributions emitted
+by the sim, when configured to mirror a given N3 run, are within declared
+tolerances of the corresponding live bundle.
 
 Each known live failure mode has at least one scenario in the library, with
 a prose comment naming what it reproduces.
@@ -125,12 +154,19 @@ given a parsed scenario, run to completion. §4 specifies behaviour.
 **Network.** A directed-graph link model. Answers send queries
 deterministically and accepts mutations on a timeline. Holds no schedule of
 its own; the engine pops events, the network answers questions. §5
-specifies behaviour.
+specifies behaviour. The network also owns the **relay vertices** (§5A): a
+relay is a first-class vertex of the network graph that is not a host. It
+has one ingress queue and one egress queue per outbound link, drains them
+at policy-declared capacities, and applies head-of-line ordering. Hosts do
+not see whether their traffic was direct or relayed; the relay is opaque
+to the host layer.
 
 **Host.** An instance of some host kind, one per peer in the scenario. The
-host kind for the MVP is the production SWIM state machine wrapped in a
-thin adapter. The host trait — what the engine calls and what the host
-returns — is §6.
+host kinds for the MVP are two: the production SWIM state machine wrapped
+in a thin adapter (§6.2) and the **pipeline-stage host kind** (§6A) that
+wraps the production stage supervisor lifecycle and emits the diagnostic
+records the N3 deployment report's C.1–C.3 findings require. The host
+trait — what the engine calls and what the host returns — is §6.
 
 **Bundle writer.** The only filesystem-touching component. Receives event
 and snapshot records from the engine, serializes them to the production
@@ -503,13 +539,33 @@ Supported kinds:
 - `LossBurst { links, prob_ppm, duration_ns }` — override loss probability
   on named links for a duration.
 - `RelayBuffer { links, floor_ns, duration_ns }` — impose a minimum
-  delivery delay on named links for a duration.
+  delivery delay on named links for a duration. (Legacy per-edge floor;
+  the relay vertex of §5A models shared-queue HOL more faithfully.)
 - `PeerKill { peer }` — drop the peer's inbox. In-flight deliveries to the
   peer are invalidated. The peer's ticks are stopped by the engine.
 - `PeerResurrect { peer, preserve_state }` — restart the peer. If
   `preserve_state`, the engine reuses the host instance; otherwise a fresh
   host of the same kind is instantiated from the scenario's peer
   declaration.
+- `WorkerExit { peer, reason, status_code?, signal? }` — delivers a
+  `WorkerExit` envelope to the named peer at the mutation's time via the
+  same recv path that `TimerFired` and `SendFailed` use today. The host
+  kind decides what to do with it; the stage host (§6A) emits a
+  `worker_exited` event and returns `Halt`. Targeting a host kind that
+  does not accept the envelope (e.g. the SWIM kind) aborts the run with a
+  structured error — silent fallback is the bug class the simulator
+  exists to prevent.
+- `RelayKill { relay }` — the relay stops forwarding. All currently
+  queued messages are returned in the invalidated-deliveries list.
+  Subsequent sends through the relay drop with reason `RelayDown`.
+- `RelayBoot { relay }` — the relay returns to service. Its queues are
+  empty; the next forwarded message pays the `cold_start_penalty_ns`.
+- `RelayCapacityChange { relay, ingress_capacity_bps?,
+  egress_capacity_bps_per_link?, queue_depth_bytes? }` — at the named
+  time, replace any subset of the three relay policy fields (§5A.2).
+  In-flight messages already past ingress complete at their previously-
+  computed arrival times; messages that arrive after the mutation use
+  the new policy.
 
 ### 5.6 Determinism within the network
 
@@ -576,6 +632,121 @@ makes bisecting scenario edits possible.
 **Determinism.** Same topology, same seed, same query sequence ⇒
 identical `SendOutcome` sequence and identical invalidated-deliveries
 returns.
+
+---
+
+## 5A. The relay vertex
+
+A relay is a vertex of the network's directed graph that is not a host.
+Relay IDs share the ID namespace with host IDs (§5.1 and §8 of this
+spec together require uniqueness across both sets). An edge's `from`
+and `to` may name either.
+
+A route between two hosts is either direct — exactly one edge from `A`
+to `B` — or relayed — an edge `A→R`, the relay `R`, and an edge
+`R→B`. Multi-hop relayed routes (`A→R₁→R₂→B`) are out of scope; the
+scenario loader rejects them in §8.2.
+
+If a scenario declares both a direct `A→B` edge and a relayed `A→R→B`
+route, the scenario loader rejects the ambiguity. Each ordered host
+pair has at most one route.
+
+### 5A.2 Relay policy
+
+Each relay declares the following integer-valued fields:
+
+- `ingress_capacity_bps` — maximum bytes per second the relay accepts
+  *across all inbound links combined*.
+- `egress_capacity_bps_per_link` — maximum bytes per second the relay
+  serves *per outbound link*.
+- `queue_depth_bytes` — maximum bytes buffered across all egress
+  queues combined. A message that would push the total beyond this
+  limit at enqueue time is dropped.
+- `queue_discipline` — `Fifo` is the only value the MVP accepts.
+- `cold_start_penalty_ns` — extra latency added to the first message
+  the relay forwards after a `RelayBoot` mutation.
+
+A relay has no jitter, loss, or cache-state fields of its own; the
+edges feeding it carry their own such fields per §5.2. A relay's drop
+reasons are exclusively queue-overflow and `RelayDown`; lossy drops
+remain a property of edges.
+
+### 5A.3 The forward algorithm
+
+When the network receives `send(from, to, byte_len, sent_at_ns)` and
+the configured route is relayed through `R`, the composition is:
+
+1. Resolve the inbound edge `from → R`. Apply §5.4 for the inbound
+   leg. If that leg drops, the composed send drops with the same
+   reason; the relay's state is not consulted.
+2. At time `arrival_at_R`, attempt to enqueue at the relay. If
+   `enqueued_bytes + byte_len > queue_depth_bytes`, the composed send
+   drops with reason `RelayQueueFull` and the relay emits a
+   `RelayDrop` record (§9.1).
+3. Otherwise, compute the ingress serialization end:
+   `max(arrival_at_R, ingress_queue_tail_ns) +
+   (byte_len * 1_000_000_000) / ingress_capacity_bps`.
+4. Compute the egress serialization start on the outbound link to
+   `to`: `max(ingress_end, egress_queue_tail_ns[to])`. If the relay
+   is `Booting`, add `cold_start_penalty_ns` and transition to
+   `Booted`. Compute `egress_end = egress_start + (byte_len *
+   1_000_000_000) / egress_capacity_bps_per_link`.
+5. Resolve the outbound edge `R → to` per §5.4 with `sent_at_ns =
+   egress_end`. Its arrival is the composed send's arrival.
+6. The relay emits a `RelayEnqueue` at `arrival_at_R` and a
+   `RelayDequeue` at `egress_end` (§9.1).
+
+The composed send returns one `Arrive(at_ns)` or one `Drop(reason)`;
+the relay's internal events are surfaced through the side channel
+that §3.2 already names for cache state changes.
+
+A relay's egress and ingress are independent: the ingress can be
+serializing a new message while the egress is still draining an old
+one. Head-of-line blocking arises only when two messages share an
+egress link (or the single ingress).
+
+### 5A.4 Determinism within the relay
+
+The relay draws no randomness in the MVP. Iteration over per-egress-
+link state inside a relay is by destination host ID in lexicographic
+order, per §7.3.
+
+### 5A.5 Behavioral tests
+
+The relay's tests assert that it has the properties below; how each
+is verified is the test author's call. (Tests live in
+`tests/relay_invariants.rs`.)
+
+- **Composition is transparent to hosts.** A send through a relayed
+  route returns one `SendOutcome` shaped identically to a direct
+  send's. The receiving host cannot distinguish a relayed delivery
+  from a direct one by the message it sees.
+- **HOL is observable and bounded.** Two messages sharing an egress
+  arrive in send order, separated by at least the first message's
+  egress serialization time.
+- **Ingress and egress are independent.** A message destined for peer
+  X does not delay a message destined for peer Y on the egress side.
+- **Queue overflow is exact.** A send that would push
+  `enqueued_bytes` strictly above `queue_depth_bytes` at its
+  arrival-at-relay time drops with `RelayQueueFull` and emits a
+  `RelayDrop` record. A send that exactly fills the queue is
+  accepted.
+- **Cold-start penalty is paid once per boot.** After a `RelayBoot`,
+  the first forwarded message includes the cold-start penalty; the
+  second does not.
+- **Mutation invalidation is exact.** A `RelayKill` returns exactly
+  the deliveries in-flight through the relay at the mutation's
+  virtual time and no others. A `RelayCapacityChange` invalidates no
+  deliveries.
+- **Ambiguous routes are rejected statically.** A scenario declaring
+  both a direct edge `A→B` and a relayed route `A→R→B`, or two
+  relayed routes for the same ordered host pair, is rejected by the
+  loader.
+- **No multi-hop in MVP.** A scenario declaring a route that
+  traverses two relays is rejected by the loader.
+- **Determinism.** Same topology, same seed, same query sequence ⇒
+  identical composed `SendOutcome` sequence and identical
+  `RelayEnqueue` / `RelayDequeue` / `RelayDrop` record streams.
 
 ---
 
@@ -675,6 +846,136 @@ Silent fallback is a test failure.
 
 ---
 
+## 6A. The pipeline-stage host kind
+
+The stage host wraps the production stage supervisor — the worker
+lifecycle implemented in `examples/pipeline-parallel-inference` and
+running today as `pp-gpu-node`. The wrap is structurally analogous
+to §6.2's SWIM host.
+
+The MVP stage host does not engage in inter-stage application traffic
+(activation forwarding, KV-cache updates). The failures Layer C
+exhibits are lifecycle failures, not application-protocol failures;
+inter-stage traffic is a strict superset and is out of scope for this
+extension.
+
+### 6A.2 Lifecycle
+
+The stage host moves through four states, each transition emitting
+exactly one diagnostic record:
+
+- `Cold` — initial state on `new_from_config`. No actions until the
+  first `tick`.
+- `Registering` — entered on the first `tick`. The host emits a
+  `register_name` event (§9.1) with the host's declared name and
+  address, then transitions to `Running`.
+- `Running` — steady state. The host emits no further state-
+  transition records on its own.
+- `Halted` — entered on receipt of a `WorkerExit { reason }` envelope
+  or after a `PeerKill` mutation. The host emits a `worker_exited`
+  event (§9.1) with the reason, then returns `Halt`.
+
+Transitions are linear: `Cold → Registering → Running → Halted`.
+There is no resurrection. A `PeerResurrect` mutation against a stage
+host produces a fresh instance from the scenario's peer declaration
+per §5.5; the resurrected instance starts in `Cold`.
+
+### 6A.3 Internal-cause exit
+
+A `WorkerExit { reason }` envelope arrives via the same recv path as
+`TimerFired` and `SendFailed`. The stage host's `recv` for that
+envelope returns exactly three actions, in order:
+
+1. `RecordEvent` carrying a `worker_exited` event whose payload
+   names the reason verbatim.
+2. `RecordEvent` carrying a `stage_lifecycle` event from the current
+   state to `Halted`.
+3. `Halt`.
+
+The order is normative: the event must reach the bundle writer
+before the engine acts on the halt.
+
+A `WorkerExit` mutation is dispatched **synchronously** — the
+engine calls the target host's `recv` and processes the returned
+actions inside the same `dispatch_mutation` call that records the
+mutation, before the main loop pops the next event. This is the
+only way to guarantee §6A.6's boundary case: a `WorkerExit` whose
+`at_ns` equals the scenario's `duration_ns` must still produce a
+`worker_exited` record. Routing the envelope through the queue
+(an enqueued `LocalRecv`) would race with the construction-time
+`Terminate` at the same virtual time and could silently lose the
+event — the exact failure mode the boundary clause forbids.
+
+The SWIM host kind has no `WorkerExit` semantics. A `WorkerExit`
+mutation targeting a SWIM-kind peer aborts the run with a structured
+error (`EngineAbort::WorkerExitOnWrongKind`). Silent acceptance is
+the failure mode this simulator exists to prevent.
+
+### 6A.4 Diagnostic surface
+
+The stage host emits three event kinds in addition to anything the
+production stage supervisor already emits:
+
+- `register_name { name, address, peer_node_id }` — emitted exactly
+  once per stage instance, at the transition `Registering → Running`.
+- `worker_exited { reason, status_code, signal }` — emitted exactly
+  once per stage instance, immediately before `Halt`.
+- `stage_lifecycle { from, to }` — emitted on every state transition
+  the §6A.2 lifecycle declares.
+
+Each kind's payload schema is named here for the production schema to
+follow. The deployment report's items C.1 and C.3 name
+`register_name` and `worker_exited` respectively; this spec fixes
+their shapes so the sim and production cannot drift.
+
+The stage host's `snapshot()` returns a JSON object with the fields:
+
+- `state` — one of the four §6A.2 lifecycle states.
+- `name_registry` — a map of `name → address` for every name this
+  host has registered. (The deployment report's item C.2 names the
+  absence of this field as a debugging gap; this spec requires it.)
+- `last_exit_reason` — present only when `state == Halted`.
+
+### 6A.5 Codec
+
+The stage host kind's codec exists for parity with §3.3. In the MVP
+its message-type is empty: the stage host produces no `Send` actions
+during its lifecycle. When inter-stage traffic enters scope in a
+later revision, the codec gains the production wire format.
+
+### 6A.6 Behavioral tests
+
+The stage host's tests assert that it has the properties below.
+(Tests live in `tests/stage_host_invariants.rs`.)
+
+- **Trait conformance.** `kind_tag()` returns `"stage"`, distinct
+  from every other registered kind's.
+- **Lifecycle linearity.** Every stage instance traverses the §6A.2
+  states in declared order, never revisits a state, and never skips
+  one. Each transition emits exactly one `stage_lifecycle` event.
+- **`register_name` exactly once.** Across the lifetime of one
+  instance, exactly one `register_name` event is emitted, at the
+  `Registering → Running` transition.
+- **`worker_exited` exactly once.** Across the lifetime of one
+  instance, exactly one `worker_exited` event is emitted,
+  immediately before the `Halt` action that ends the instance. The
+  event's `reason` field is byte-equal to the mutation's `reason`.
+- **Event-before-halt is observable.** A scenario whose
+  `duration_ns` is the same nanosecond as a `WorkerExit` mutation's
+  `at_ns` produces a bundle containing the `worker_exited` event.
+- **`WorkerExit` against SWIM aborts.** A `WorkerExit` mutation
+  targeting a SWIM-kind peer aborts the run with a structured error
+  (`EngineAbort::WorkerExitOnWrongKind`) naming the host's kind and
+  the mutation's index.
+- **Snapshot contains the registry.** A stage host's `snapshot()`
+  includes a `name_registry` field; every `register_name` event the
+  host has emitted appears in the map at every subsequent snapshot.
+- **Determinism.** Same `HostKindConfig`, same RNG seed, same
+  envelope sequence ⇒ identical action sequence and identical
+  emitted event stream.
+
+---
+
 ## 7. Determinism
 
 This section is normative. A violation is a ship-blocker.
@@ -769,15 +1070,32 @@ overrides under `[[links]]` may override any subset.
 A `[[peers]]` array, each entry:
 
 - `id: String`.
-- `kind: String` — selects the host kind.
+- `kind: String` — selects the host kind. The MVP recognises `"swim"`
+  and `"stage"`; the relay extension's `stage` kind_config is
+  `{ name: String, address: String }` (RELAY/STAGE §6A).
 - `kind_config: { ... }` — host-kind-specific opaque table.
-- `initial_state: String` — host-kind-specific.
+- `initial_state: String` — host-kind-specific. For `stage`, the only
+  legal value is `"cold"` (mirrors §6A.2's `Cold` initial state).
 - `tick_period_ns_override: u64` (optional).
+
+A `[[relays]]` array (relay extension), each entry:
+
+- `id: String` — unique across the union of peer ids and relay ids.
+- `ingress_capacity_bps: u64` — combined ingress bytes/sec.
+- `egress_capacity_bps_per_link: u64` — per-outbound-link bytes/sec.
+- `queue_depth_bytes: u64` — shared egress buffer bound.
+- `cold_start_penalty_ns: u64` (default `0`).
 
 A `[[links]]` array, each entry:
 
 - `from: String`.
 - `to: String`.
+- `via: String` (optional) — the ID of a relay through which this
+  edge is routed. When `via` is set, the edge's `from` and `to` must
+  both be host IDs; the loader synthesizes the `from → via` and
+  `via → to` inbound and outbound legs and registers a relayed
+  `HostRoute` for the host pair. Multiple `via` shorthands through
+  the same relay are allowed iff their leg policies agree.
 - Any subset of the §5.2 fields (overrides on top of `[default_link]`).
 
 A `[[mutations]]` array, each entry:
@@ -811,6 +1129,23 @@ The loader rejects:
   For the SWIM kind, this includes `probe_interval < suspicion_timeout`.
 - A `default_link` field that is non-integer, negative, or in a unit other
   than the §5.2 names (e.g., `latency_ms` is rejected; only `latency_ns`).
+
+Relay extension rules (added by RELAY/STAGE):
+
+- Duplicate IDs across the union of `[[peers]]` and `[[relays]]`.
+- A `via` reference to a peer ID rather than a relay ID.
+- A peer pair declared with both a direct edge and a relayed route
+  (the loader-level ambiguity check).
+- A `[[links]]` entry whose `from` or `to` is a relay and that also
+  carries a `via` field.
+- A multi-hop relayed route (any direct relay→relay edge, which would
+  make a chained route possible).
+- A `worker_exit` mutation whose target peer is not stage-kind.
+- A `relay_capacity_change` mutation with no fields set (the mutation
+  must change at least one of the three policy fields).
+- A `stage` peer whose `kind_config.name` is missing or whose
+  `kind_config.address` is missing or empty (delegated to
+  `StageHostKindValidator`).
 
 Validation failures produce a structured error with the file path, the
 offending field, and a one-line explanation.
@@ -903,6 +1238,18 @@ Event kinds the MVP emits:
 - Engine-synthesized cache state changes, dial start and outcome, drop on
   send, drop on delivery, send-failure errors.
 - Mutation records.
+- Stage host (RELAY/STAGE §6A.4): `register_name`, `worker_exited`,
+  `stage_lifecycle`. Each carries `kind_tag = "stage"` and the
+  emitting host's id.
+- Relay subsystem (RELAY/STAGE §5A.3): `RelayEnqueue`, `RelayDequeue`,
+  `RelayDrop`. Each carries `kind_tag = "relay"` and `host_id = null`
+  (the relay is not a host).
+
+The stage host's three kinds are introduced *ahead* of production on
+the basis of the deployment report's items C.1–C.3. The production
+stage supervisor must adopt the same schemas as part of landing this
+spec; otherwise the contract test against the production diagnostics
+emitter fails and the sim cannot reproduce Layer C without divergence.
 
 ### 9.3 Snapshots
 
@@ -992,6 +1339,25 @@ Each assertion kind has a name and a parameter shape. The MVP catalog:
   kind across the run.
 - `event_rate { kind, window_ns, max_per_window }` — bounds the rate of
   an event kind.
+- `relay_queue_depth_bounded { relay, max_bytes, window_start_ns?,
+  window_end_ns? }` (RELAY/STAGE) — across the window (defaults to
+  the whole run), the named relay's `enqueued_bytes` never exceeds
+  `max_bytes`. Fails on the first `RelayEnqueue` that pushes the
+  total above the bound.
+- `worker_alive_throughout { peer, window_start_ns, window_end_ns }`
+  (RELAY/STAGE) — the named peer's lifecycle state remains `Running`
+  throughout the window. Fails on any `stage_lifecycle` event into
+  `Halted` whose time falls in the window. The window is inclusive
+  on both ends: a halt at `window_end_ns` (or at `duration_ns` when
+  the window spans the whole run) fails the assertion, because the
+  §6A.3 synchronous dispatch rule guarantees the
+  `stage_lifecycle → Halted` event appears in the bundle even at
+  the boundary.
+- `name_resolves_within { name, observers, within_ns, from_ns }`
+  (RELAY/STAGE) — starting at `from_ns`, every observer in
+  `observers` produces a snapshot whose `name_registry` contains
+  `name` within `within_ns`. `Inconclusive` if no observer produces
+  a snapshot in the window.
 
 Adding a kind is a deliberate amendment to this section.
 
@@ -1083,7 +1449,25 @@ bundles.
 
 The MVP corpus is the three N3 vast.ai bundles described in the
 deployment report. Each pairs with a scenario in `scenarios/calibration/`
-that approximates the conditions under which the bundle was produced.
+that approximates the conditions under which the bundle was produced:
+
+- `vastai-N3-1` ↔ `n3_canary_relay_real_worker.toml`. Canary relay,
+  real worker. The relay's policy is set to the canary's measured
+  shape (low egress per link, large queue, multi-hundred-millisecond
+  cold start). Stage hosts carry the worker-exit timing observed in
+  the bundle.
+- `vastai-N3-2` ↔ `n3_own_relay_real_worker.toml`. Same topology
+  with the relay's policy widened to the own-relay's measured shape.
+  Stage hosts carry the same worker-exit timing.
+- `vastai-N3-stub` ↔ `n3_own_relay_stub.toml`. Same topology,
+  widened relay, stage hosts with no `WorkerExit` mutations (full-
+  run survival). Reproduces the gossip-flap pathology without stage
+  death.
+
+Each scenario carries a top-of-file prose comment naming the bundle
+it pairs with, the placeholder tolerances that the first calibration
+pass will replace with measured numbers, and any base scenario it
+extends.
 
 ### 11.2 The procedure
 
@@ -1104,6 +1488,20 @@ For each pair, the calibration tool:
 - Connection-cache hit count.
 - Dial-started count.
 - Per-peer fraction of run time in the Alive state.
+
+Relay extension metrics (RELAY/STAGE §10.2):
+
+- Relay queue-depth distribution over time (p50, p90, p99 of
+  `enqueued_bytes`).
+- Per-link HOL delay decomposition: each delivery's delay attributed
+  to base latency, edge-bandwidth serialization, jitter, cold-dial
+  penalty, relay ingress, relay egress, and active mutations.
+- Probe-success-vs-transition ratio: fraction of `Suspect`
+  transitions in which the observer's and the peer's bidirectional
+  probes were succeeding at the transition time.
+- Worker-exit reason distribution per peer.
+- Name-resolution latency per registered name (time from
+  `register_name` to first observer snapshot containing the name).
 
 Tolerances ship as placeholders informed by intuition; the first
 calibration pass against the N3 corpus sets the real numbers.
@@ -1131,12 +1529,20 @@ simulator does something useful and is testable.
 | 5 | Assertion evaluator | The gossip-flap reproduction scenario fails on current SWIM, passes after the fix. |
 | 6 | Bundle writer | A sim bundle renders through the production post-processor. |
 | 7 | Calibration tool | At least one N3 pair passes calibration. |
+| R1 | Relay vertex (§5A) without mutations | A direct send through a relay arrives later than the same send over a direct edge of equal policy by the relay's ingress + egress serialization time. |
+| R2 | Relay mutations (§5.5 additions) | A `RelayKill` followed by a `RelayBoot` produces a bundle in which the in-flight messages at kill-time appear in the invalidated-deliveries list and no others. |
+| R3 | Stage host kind (§6A) and `WorkerExit` mutation | A scenario with one stage host and one `WorkerExit` mutation produces a bundle containing exactly one `register_name`, one `worker_exited`, and three `stage_lifecycle` records, in §6A.2 order. |
+| R4 | Assertion catalog additions (§10.1 R-tail) | The N3-1 calibration scenario fails `relay_queue_depth_bounded` against the canary-relay policy and passes against the own-relay policy. |
+| R5 | Scenario loader additions (§8) and bundle additions (§9) | Every shipped calibration scenario parses; bundles render through the production post-processor with the new event kinds passed through unchanged. |
+| R6 | Calibration tool extensions (§11) | At least one of the three N3 pairs passes calibration on every declared metric. |
 
-MVP exit is the end of phase 7. Subsequent phases — proptest catalog
+MVP exit is the end of phase R6. Subsequent phases — proptest catalog
 expansion, scenario library growth — are post-MVP.
 
 Phases 1, 2, 6 are independently buildable by separate agents from this
-spec alone; phases 3 onwards require the prior phase as input.
+spec alone; phases 3 onwards require the prior phase as input. The
+relay phases R1–R3 are independently buildable from the §5A / §6A
+sections alone; R4–R6 require their predecessors.
 
 ---
 
@@ -1187,6 +1593,9 @@ must surface in code review.
 
 - `examples/pipeline-parallel-inference/N3_DEPLOYMENT_REPORT.md` —
   source of truth for the live failures the simulator must reproduce.
+  Items A, B2, C.1, C.2, and C.3 of that report map to §5A,
+  §11.3 (metrics), §6A.4 + §9.1 (`register_name`), §6A.4 (snapshot
+  registry), and §6A.4 (`worker_exited`) respectively.
 - `crates/simulation/NORTH_STAR.md` — the long-term simulator vision.
   This MVP is a strict subset and does not retract any of its claims.
 - `crates/simulation/BLOCKED.md` — the staged plan this MVP supersedes
@@ -1197,3 +1606,9 @@ must surface in code review.
   the SWIM host kind wraps.
 - `crates/distribution/src/diagnostics/` — the schema the bundle must
   match and the renderer it must render through.
+- `crates/distribution/src/bin/swactor-iroh-relay.rs` — the production
+  relay binary the §5A relay vertex models. The §9.2 parity contract
+  names this binary's emissions as the production side once it gains
+  matching schemas.
+- `examples/pipeline-parallel-inference/src/bin/pp_gpu_node.rs` —
+  the production stage supervisor the §6A host kind wraps.
