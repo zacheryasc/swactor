@@ -226,6 +226,8 @@ fn payload_to_json(p: &crate::bundle::EventPayload) -> serde_json::Value {
                 DropReason::NoRoute => "no_route",
                 DropReason::Partitioned => "partitioned",
                 DropReason::Lossy => "lossy",
+                DropReason::RelayQueueFull => "relay_queue_full",
+                DropReason::RelayDown => "relay_down",
             },
         }),
         EventPayload::DropOnDelivery { to, reason } => serde_json::json!({
@@ -258,6 +260,31 @@ fn payload_to_json(p: &crate::bundle::EventPayload) -> serde_json::Value {
             "to": to,
             "warm": warm,
         }),
+        EventPayload::RelayEnqueue { relay, from, to, byte_len } => serde_json::json!({
+            "kind": "relay_enqueue",
+            "relay": relay,
+            "from": from,
+            "to": to,
+            "byte_len": byte_len,
+        }),
+        EventPayload::RelayDequeue { relay, from, to, byte_len } => serde_json::json!({
+            "kind": "relay_dequeue",
+            "relay": relay,
+            "from": from,
+            "to": to,
+            "byte_len": byte_len,
+        }),
+        EventPayload::RelayDrop { relay, from, to, byte_len, reason } => serde_json::json!({
+            "kind": "relay_drop",
+            "relay": relay,
+            "from": from,
+            "to": to,
+            "byte_len": byte_len,
+            "reason": match reason {
+                crate::network::RelayDropReason::QueueFull => "queue_full",
+                crate::network::RelayDropReason::Down => "down",
+            },
+        }),
     }
 }
 
@@ -273,6 +300,10 @@ pub struct SnapshotEntry {
     pub seq: u32,
     pub members: BTreeMap<String, MemberView>,
     pub self_incarnation: u64,
+    /// RELAY_SPEC §5.4. Map of `name → address` for every name this
+    /// host has registered. Empty for hosts that do not register
+    /// names (e.g. the SWIM host kind).
+    pub name_registry: BTreeMap<String, String>,
 }
 
 impl SnapshotEntry {
@@ -285,13 +316,27 @@ impl SnapshotEntry {
             serde_json::from_slice(&rec.snapshot).unwrap_or(serde_json::Value::Null);
         let members = parse_members(&parsed["members"]);
         let self_incarnation = parsed["self_incarnation"].as_u64().unwrap_or(0);
+        let name_registry = parse_name_registry(&parsed["name_registry"]);
         Self {
             virtual_time_ns: rec.virtual_time_ns,
             seq,
             members,
             self_incarnation,
+            name_registry,
         }
     }
+}
+
+fn parse_name_registry(v: &serde_json::Value) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if let Some(obj) = v.as_object() {
+        for (name, addr) in obj {
+            if let Some(s) = addr.as_str() {
+                out.insert(name.clone(), s.to_string());
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -366,11 +411,13 @@ fn read_snapshots(root: &Path) -> std::io::Result<SnapshotIndex> {
             let snapshot = &outer["snapshot"];
             let members = parse_members(&snapshot["members"]);
             let self_incarnation = snapshot["self_incarnation"].as_u64().unwrap_or(0);
+            let name_registry = parse_name_registry(&snapshot["name_registry"]);
             list.push(SnapshotEntry {
                 virtual_time_ns,
                 seq,
                 members,
                 self_incarnation,
+                name_registry,
             });
         }
         list.sort_by_key(|e| e.virtual_time_ns);
@@ -469,6 +516,38 @@ fn evaluate_one(
         } => (
             "event_rate",
             eval_event_rate(event_kind, *window_ns, *max_per_window, events),
+        ),
+        AssertionKind::RelayQueueDepthBounded {
+            relay,
+            max_bytes,
+            window_start_ns,
+            window_end_ns,
+        } => (
+            "relay_queue_depth_bounded",
+            eval_relay_queue_depth_bounded(
+                relay,
+                *max_bytes,
+                *window_start_ns,
+                *window_end_ns,
+                events,
+            ),
+        ),
+        AssertionKind::WorkerAliveThroughout {
+            peer,
+            window_start_ns,
+            window_end_ns,
+        } => (
+            "worker_alive_throughout",
+            eval_worker_alive_throughout(peer, *window_start_ns, *window_end_ns, events),
+        ),
+        AssertionKind::NameResolvesWithin {
+            name,
+            observers,
+            within_ns,
+            from_ns,
+        } => (
+            "name_resolves_within",
+            eval_name_resolves_within(name, observers, *within_ns, *from_ns, snapshots),
         ),
     };
     Verdict {
@@ -876,6 +955,129 @@ fn eval_event_count(event_kind: &str, max: u64, events: &[EventLine]) -> Eval {
 }
 
 // ── event_rate ──────────────────────────────────────────────────────
+
+// ── relay_queue_depth_bounded (RELAY_SPEC §7.1, §7.2) ──────────────
+
+fn eval_relay_queue_depth_bounded(
+    relay: &str,
+    max_bytes: u64,
+    window_start_ns: Option<u64>,
+    window_end_ns: Option<u64>,
+    events: &[EventLine],
+) -> Eval {
+    let start = window_start_ns.unwrap_or(0);
+    let end = window_end_ns.unwrap_or(u64::MAX);
+    // Replay relay_enqueue / relay_dequeue events in time order to
+    // reconstruct `enqueued_bytes`. We sort by virtual_time_ns +
+    // line_idx so the timeline is stable.
+    let mut relevant: Vec<&EventLine> = events
+        .iter()
+        .filter(|e| {
+            e.kind_tag == "relay"
+                && e.event["relay"] == relay
+                && (e.event["kind"] == "relay_enqueue" || e.event["kind"] == "relay_dequeue")
+        })
+        .collect();
+    relevant.sort_by(|a, b| {
+        a.virtual_time_ns
+            .cmp(&b.virtual_time_ns)
+            .then(a.line_idx.cmp(&b.line_idx))
+    });
+    if relevant.is_empty() {
+        return inconclusive();
+    }
+    let mut depth: u64 = 0;
+    for e in &relevant {
+        let bl = e.event["byte_len"].as_u64().unwrap_or(0);
+        let in_window = e.virtual_time_ns >= start && e.virtual_time_ns <= end;
+        match e.event["kind"].as_str() {
+            Some("relay_enqueue") => {
+                depth = depth.saturating_add(bl);
+                if in_window && depth > max_bytes {
+                    return fail(vec![ev_event(e)]);
+                }
+            }
+            Some("relay_dequeue") => {
+                depth = depth.saturating_sub(bl);
+            }
+            _ => {}
+        }
+    }
+    pass()
+}
+
+// ── worker_alive_throughout (RELAY_SPEC §7.1, §7.2) ────────────────
+
+fn eval_worker_alive_throughout(
+    peer: &str,
+    start: u64,
+    end: u64,
+    events: &[EventLine],
+) -> Eval {
+    // Look for stage_lifecycle events into "Halted" for `peer` within
+    // the window. Any such event ⇒ Fail. Otherwise: Pass if any
+    // stage_lifecycle for `peer` appears at all (the host registered
+    // its life), else Inconclusive.
+    let mut any = false;
+    let mut evidence = Vec::new();
+    for e in events.iter().filter(|e| e.kind_tag == "stage") {
+        if e.event["kind"] == "stage_lifecycle" && e.host_id.as_deref() == Some(peer) {
+            any = true;
+            let to = e.event["to"].as_str().unwrap_or("");
+            if to == "Halted" && e.virtual_time_ns >= start && e.virtual_time_ns <= end {
+                evidence.push(ev_event(e));
+            }
+        }
+    }
+    if !any {
+        return inconclusive();
+    }
+    if evidence.is_empty() {
+        pass()
+    } else {
+        fail(evidence)
+    }
+}
+
+// ── name_resolves_within (RELAY_SPEC §7.1, §7.2) ────────────────────
+
+fn eval_name_resolves_within(
+    name: &str,
+    observers: &[String],
+    within_ns: u64,
+    from_ns: u64,
+    snapshots: &SnapshotIndex,
+) -> Eval {
+    let deadline = from_ns.saturating_add(within_ns);
+    let mut any_observer_snapshot = false;
+    let mut evidence_fail = Vec::new();
+    for obs in observers {
+        let Some(list) = snapshots.by_host.get(obs) else {
+            return inconclusive();
+        };
+        // First snapshot at-or-after from_ns.
+        let first = list.iter().find(|s| s.virtual_time_ns >= from_ns);
+        let Some(first) = first else {
+            return inconclusive();
+        };
+        any_observer_snapshot = true;
+        let resolved = list
+            .iter()
+            .filter(|s| s.virtual_time_ns >= from_ns && s.virtual_time_ns <= deadline)
+            .any(|s| s.name_registry.contains_key(name));
+        if !resolved {
+            evidence_fail.push(ev_snapshot(obs, first));
+        }
+    }
+    if !any_observer_snapshot {
+        return inconclusive();
+    }
+    if evidence_fail.is_empty() {
+        pass()
+    } else {
+        fail(evidence_fail)
+    }
+}
 
 fn eval_event_rate(
     event_kind: &str,

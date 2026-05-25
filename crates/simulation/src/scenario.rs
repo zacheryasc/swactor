@@ -36,6 +36,8 @@ pub struct Scenario {
     pub default_tick: DefaultTick,
     pub default_link: LinkPolicy,
     pub peers: Vec<Peer>,
+    #[serde(default)]
+    pub relays: Vec<Relay>,
     pub links: Vec<Link>,
     #[serde(default)]
     pub mutations: Vec<Mutation>,
@@ -43,6 +45,16 @@ pub struct Scenario {
     pub snapshots: Vec<Snapshot>,
     #[serde(default)]
     pub assertions: Vec<Assertion>,
+    /// Per-ordered-host-pair route resolution. Built by the loader
+    /// from `links` (and any `via` shorthands the loader expanded into
+    /// explicit relay legs). For a direct edge, the route names the
+    /// edge directly; for a relayed route, it names the inbound leg,
+    /// the relay, and the outbound leg. Networks consume this to
+    /// avoid re-deriving routes per send. Always skipped on serialize
+    /// — the loader re-derives it from `links` + `relays`, so
+    /// emitting it would duplicate the info and risk drift.
+    #[serde(default, skip_serializing)]
+    pub routes: Vec<HostRoute>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +94,49 @@ pub struct Link {
     pub policy: LinkPolicy,
 }
 
+/// A relay vertex (RELAY_SPEC §4). Not a host: it has no host trait,
+/// no tick, no recv. It is part of the network topology.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Relay {
+    pub id: String,
+    pub ingress_capacity_bps: u64,
+    pub egress_capacity_bps_per_link: u64,
+    pub queue_depth_bytes: u64,
+    #[serde(default)]
+    pub cold_start_penalty_ns: u64,
+}
+
+/// A resolved route between two hosts. Direct = one edge from host
+/// `from` to host `to`. Relayed = inbound edge `from→relay`, then the
+/// relay's queues, then outbound edge `relay→to`. Multi-hop relays
+/// are rejected by the loader (RELAY_SPEC §4.1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HostRoute {
+    Direct {
+        from: String,
+        to: String,
+    },
+    Relayed {
+        from: String,
+        relay: String,
+        to: String,
+    },
+}
+
+impl HostRoute {
+    pub fn from(&self) -> &str {
+        match self {
+            HostRoute::Direct { from, .. } | HostRoute::Relayed { from, .. } => from,
+        }
+    }
+    pub fn to(&self) -> &str {
+        match self {
+            HostRoute::Direct { to, .. } | HostRoute::Relayed { to, .. } => to,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Mutation {
     pub at_ns: u64,
@@ -119,6 +174,38 @@ pub enum MutationKind {
     PeerResurrect {
         peer: String,
         preserve_state: bool,
+    },
+    /// RELAY_SPEC §6.1. Delivers a `WorkerExit` envelope to the named
+    /// peer at the mutation's time. Targeting a host kind that does
+    /// not accept it aborts the run.
+    WorkerExit {
+        peer: String,
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status_code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+    },
+    /// RELAY_SPEC §4.5. Relay stops forwarding; queued messages
+    /// invalidate; later sends drop with `RelayDown`.
+    RelayKill {
+        relay: String,
+    },
+    /// RELAY_SPEC §4.5. Relay returns to service in `Booting` state.
+    /// The next forwarded message pays the cold-start penalty.
+    RelayBoot {
+        relay: String,
+    },
+    /// RELAY_SPEC §4.5. Replace any subset of the three policy fields
+    /// at the mutation's virtual time.
+    RelayCapacityChange {
+        relay: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ingress_capacity_bps: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        egress_capacity_bps_per_link: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        queue_depth_bytes: Option<u64>,
     },
 }
 
@@ -188,6 +275,34 @@ pub enum AssertionKind {
         window_ns: u64,
         max_per_window: u64,
     },
+    /// RELAY_SPEC §7.1. The named relay's `enqueued_bytes` never
+    /// exceeds `max_bytes` across the (defaults: whole-run) window.
+    RelayQueueDepthBounded {
+        relay: String,
+        max_bytes: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_start_ns: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_end_ns: Option<u64>,
+    },
+    /// RELAY_SPEC §7.1. The named peer's lifecycle state remains
+    /// `Running` throughout the window. Fails on any
+    /// `stage_lifecycle` event into `Halted` whose time falls in the
+    /// window.
+    WorkerAliveThroughout {
+        peer: String,
+        window_start_ns: u64,
+        window_end_ns: u64,
+    },
+    /// RELAY_SPEC §7.1. Starting at `from_ns`, every observer in
+    /// `observers` produces a snapshot whose `name_registry`
+    /// contains `name` within `within_ns`.
+    NameResolvesWithin {
+        name: String,
+        observers: Vec<String>,
+        within_ns: u64,
+        from_ns: u64,
+    },
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -222,6 +337,7 @@ impl HostKindRegistry {
     pub fn with_swim() -> Self {
         let mut reg = Self::default();
         reg.register(Box::new(SwimHostKindValidator));
+        reg.register(Box::new(StageHostKindValidator));
         reg
     }
 
@@ -270,6 +386,44 @@ impl HostKindValidator for SwimHostKindValidator {
             other => Err(format!(
                 "unknown SWIM initial_state {other:?}; expected one of \"alive\", \"joining\""
             )),
+        }
+    }
+}
+
+/// `stage` host kind validator (RELAY_SPEC §5, §8.1). Requires a
+/// `name` (the name the stage registers at `Registering → Running`)
+/// and an `address` (the address the stage registers under), both
+/// non-empty strings.
+pub struct StageHostKindValidator;
+
+impl HostKindValidator for StageHostKindValidator {
+    fn kind_tag(&self) -> &'static str {
+        "stage"
+    }
+    fn validate_config(&self, config: &toml::value::Table) -> Result<(), String> {
+        let name = config
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "required key missing: name".to_string())?;
+        if name.is_empty() {
+            return Err("name must not be empty".to_string());
+        }
+        let address = config
+            .get("address")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "required key missing: address".to_string())?;
+        if address.is_empty() {
+            return Err("address must not be empty".to_string());
+        }
+        Ok(())
+    }
+    fn validate_initial_state(&self, state: &str) -> Result<(), String> {
+        if state == "cold" {
+            Ok(())
+        } else {
+            Err(format!(
+                "unknown stage initial_state {state:?}; expected \"cold\""
+            ))
         }
     }
 }
@@ -379,6 +533,8 @@ struct RawScenario {
     #[serde(default)]
     peers: Vec<RawPeer>,
     #[serde(default)]
+    relays: Vec<Relay>,
+    #[serde(default)]
     links: Vec<RawLink>,
     #[serde(default)]
     mutations: Vec<toml::value::Table>,
@@ -433,6 +589,8 @@ struct RawPeer {
 struct RawLink {
     from: String,
     to: String,
+    #[serde(default)]
+    via: Option<String>,
     #[serde(flatten)]
     overrides: RawLinkPolicy,
 }
@@ -496,6 +654,7 @@ fn merge(parent: RawScenario, child: RawScenario) -> RawScenario {
             (Some(p), Some(c)) => Some(merge_policy(p, c)),
         },
         peers: append(parent.peers, child.peers),
+        relays: append(parent.relays, child.relays),
         links: append(parent.links, child.links),
         mutations: append(parent.mutations, child.mutations),
         snapshots: append(parent.snapshots, child.snapshots),
@@ -611,23 +770,74 @@ fn validate(
         return Err(err(path, "peers", "must declare at least one peer"));
     }
 
-    // Links — endpoints must be declared peers; no duplicate ordered pairs.
+    // Relays — IDs unique across (peers ∪ relays). RELAY_SPEC §4.1 /
+    // §8.2.
+    let mut relay_ids: BTreeSet<String> = BTreeSet::new();
+    let mut relays = Vec::with_capacity(raw.relays.len());
+    for (i, r) in raw.relays.iter().enumerate() {
+        let field = |s: &str| format!("relays[{i}].{s}");
+        if r.id.is_empty() {
+            return Err(err(path, field("id"), "must not be empty"));
+        }
+        if peer_ids.contains(&r.id) {
+            return Err(err(
+                path,
+                field("id"),
+                format!(
+                    "relay id {:?} collides with a declared peer id (peer and relay namespaces are shared)",
+                    r.id
+                ),
+            ));
+        }
+        if !relay_ids.insert(r.id.clone()) {
+            return Err(err(
+                path,
+                field("id"),
+                format!("duplicate relay id {:?}", r.id),
+            ));
+        }
+        if r.ingress_capacity_bps == 0 {
+            return Err(err(path, field("ingress_capacity_bps"), "must be > 0"));
+        }
+        if r.egress_capacity_bps_per_link == 0 {
+            return Err(err(
+                path,
+                field("egress_capacity_bps_per_link"),
+                "must be > 0",
+            ));
+        }
+        relays.push(r.clone());
+    }
+
+    // Nodes (the union of peers and relays). Edges may touch either.
+    let node_ids: BTreeSet<String> = peer_ids.union(&relay_ids).cloned().collect();
+
+    // Links — endpoints must be declared nodes; no duplicate ordered
+    // pairs. Optional `via` shorthand synthesises two relay legs.
+    // RELAY_SPEC §4.1 / §8.1 / §8.2.
     let mut links = Vec::with_capacity(raw.links.len());
     let mut seen_edges: BTreeSet<(String, String)> = BTreeSet::new();
+    // (from_host, to_host) → relay through which the host pair is routed.
+    // Only relayed routes from `via` shorthand land here; explicit
+    // host→relay or relay→host edges go through the standard path.
+    let mut via_routes: BTreeMap<(String, String), String> = BTreeMap::new();
+    // Validate first; deferred resolution into HostRoute happens once
+    // every link's policy is in hand.
+    let mut via_links: Vec<(String, String, String, LinkPolicy)> = Vec::new();
     for (i, l) in raw.links.iter().enumerate() {
         let field = |s: &str| format!("links[{i}].{s}");
-        if !peer_ids.contains(&l.from) {
+        if !node_ids.contains(&l.from) {
             return Err(err(
                 path,
                 field("from"),
-                format!("references undeclared peer {:?}", l.from),
+                format!("references undeclared peer or relay {:?}", l.from),
             ));
         }
-        if !peer_ids.contains(&l.to) {
+        if !node_ids.contains(&l.to) {
             return Err(err(
                 path,
                 field("to"),
-                format!("references undeclared peer {:?}", l.to),
+                format!("references undeclared peer or relay {:?}", l.to),
             ));
         }
         if l.from == l.to {
@@ -637,6 +847,50 @@ fn validate(
                 "self-loop links are not permitted",
             ));
         }
+        reject_unknown_fields(path, &format!("links[{i}]"), &l.overrides.extra)?;
+        let policy = resolve_policy(
+            path,
+            &format!("links[{i}]"),
+            &l.overrides,
+            Some(default_link),
+        )?;
+        if let Some(via) = &l.via {
+            // `via` shorthand. Both endpoints must be hosts; `via`
+            // must name a declared relay. The loader synthesizes the
+            // inbound and outbound legs with the same policy.
+            if relay_ids.contains(&l.from) || relay_ids.contains(&l.to) {
+                return Err(err(
+                    path,
+                    field("via"),
+                    format!(
+                        "a link with `via` must have host endpoints; {:?}->{:?} touches a relay",
+                        l.from, l.to
+                    ),
+                ));
+            }
+            if !relay_ids.contains(via) {
+                return Err(err(
+                    path,
+                    field("via"),
+                    format!("via must reference a declared relay, got {via:?}"),
+                ));
+            }
+            if via_routes
+                .insert((l.from.clone(), l.to.clone()), via.clone())
+                .is_some()
+            {
+                return Err(err(
+                    path,
+                    field("via"),
+                    format!(
+                        "duplicate relayed route {:?} -> via {:?} -> {:?}",
+                        l.from, via, l.to
+                    ),
+                ));
+            }
+            via_links.push((l.from.clone(), via.clone(), l.to.clone(), policy));
+            continue;
+        }
         let key = (l.from.clone(), l.to.clone());
         if !seen_edges.insert(key) {
             return Err(err(
@@ -645,24 +899,220 @@ fn validate(
                 format!("duplicate edge {:?} -> {:?}", l.from, l.to),
             ));
         }
-        reject_unknown_fields(path, &format!("links[{i}]"), &l.overrides.extra)?;
-        let policy = resolve_policy(
-            path,
-            &format!("links[{i}]"),
-            &l.overrides,
-            Some(default_link),
-        )?;
         links.push(Link {
             from: l.from.clone(),
             to: l.to.clone(),
             policy,
         });
     }
+    // Expand via shorthands. Reject conflicts with explicit edges;
+    // merge with existing synth edges when policies agree.
+    // `explicit_edges` is the set declared verbatim in `[[links]]`
+    // (without `via`); `synth_edges` is what the loader has so far
+    // synthesized from earlier via shorthands. Overlapping synth
+    // edges across multiple via routes through the same relay are
+    // allowed iff their policies match — otherwise we cannot pick a
+    // single legpolicy for the shared edge.
+    let explicit_edges = seen_edges.clone();
+    let mut synth_edges: BTreeSet<(String, String)> = BTreeSet::new();
+    for (from, via, to, policy) in &via_links {
+        let inbound = (from.clone(), via.clone());
+        let outbound = (via.clone(), to.clone());
+        if explicit_edges.contains(&inbound) {
+            return Err(err(
+                path,
+                format!("links via {via:?}"),
+                format!(
+                    "via shorthand conflicts with an explicit edge {from:?} -> {via:?}; declare one or the other"
+                ),
+            ));
+        }
+        if explicit_edges.contains(&outbound) {
+            return Err(err(
+                path,
+                format!("links via {via:?}"),
+                format!(
+                    "via shorthand conflicts with an explicit edge {via:?} -> {to:?}; declare one or the other"
+                ),
+            ));
+        }
+        if synth_edges.contains(&inbound) {
+            // Already added from another via through this relay; the
+            // policy must agree.
+            let existing = links
+                .iter()
+                .find(|l| l.from == inbound.0 && l.to == inbound.1)
+                .expect("synth_edges set ⇒ links entry");
+            if existing.policy != *policy {
+                return Err(err(
+                    path,
+                    format!("links via {via:?}"),
+                    format!(
+                        "multiple via shorthands through {via:?} from {from:?} disagree on the inbound leg policy"
+                    ),
+                ));
+            }
+        } else {
+            synth_edges.insert(inbound.clone());
+            seen_edges.insert(inbound.clone());
+            links.push(Link {
+                from: inbound.0.clone(),
+                to: inbound.1.clone(),
+                policy: *policy,
+            });
+        }
+        if synth_edges.contains(&outbound) {
+            let existing = links
+                .iter()
+                .find(|l| l.from == outbound.0 && l.to == outbound.1)
+                .expect("synth_edges set ⇒ links entry");
+            if existing.policy != *policy {
+                return Err(err(
+                    path,
+                    format!("links via {via:?}"),
+                    format!(
+                        "multiple via shorthands through {via:?} to {to:?} disagree on the outbound leg policy"
+                    ),
+                ));
+            }
+        } else {
+            synth_edges.insert(outbound.clone());
+            seen_edges.insert(outbound.clone());
+            links.push(Link {
+                from: outbound.0.clone(),
+                to: outbound.1.clone(),
+                policy: *policy,
+            });
+        }
+    }
+    // Build routes: every ordered host pair with an explicit direct
+    // edge or a `via` shorthand. Reject ambiguity (both kinds for the
+    // same pair). Multi-hop relays (which would require an edge from
+    // one relay to another) are rejected on edge construction below.
+    let mut routes: BTreeMap<(String, String), HostRoute> = BTreeMap::new();
+    for (key, via) in &via_routes {
+        routes.insert(
+            key.clone(),
+            HostRoute::Relayed {
+                from: key.0.clone(),
+                relay: via.clone(),
+                to: key.1.clone(),
+            },
+        );
+    }
+    for link in &links {
+        if !peer_ids.contains(&link.from) || !peer_ids.contains(&link.to) {
+            // Edges touching a relay are not by themselves a host
+            // route — they are legs of a route. Host-pair routes
+            // come from `via` shorthand or from direct host edges.
+            continue;
+        }
+        let key = (link.from.clone(), link.to.clone());
+        if routes.contains_key(&key) {
+            return Err(err(
+                path,
+                "links",
+                format!(
+                    "ambiguous route for {:?} -> {:?}: declared both directly and through a relay via shorthand",
+                    link.from, link.to
+                ),
+            ));
+        }
+        routes.insert(
+            key,
+            HostRoute::Direct {
+                from: link.from.clone(),
+                to: link.to.clone(),
+            },
+        );
+    }
+    // Infer relayed routes from explicit host↔relay edges. For any
+    // ordered host pair (a, b) without a route yet, look for a relay
+    // R such that explicit edges a→R and R→b both exist. Exactly one
+    // such R ⇒ relayed route; more than one ⇒ ambiguous (reject).
+    // This makes the loader robust against TOML round-trips that
+    // emit the synth legs explicitly: the loader recovers the same
+    // routing decision the original via shorthand made.
+    for a in &peer_ids {
+        for b in &peer_ids {
+            if a == b {
+                continue;
+            }
+            let key = (a.clone(), b.clone());
+            if routes.contains_key(&key) {
+                continue;
+            }
+            let candidates: Vec<&String> = relay_ids
+                .iter()
+                .filter(|r| {
+                    seen_edges.contains(&(a.clone(), (*r).clone()))
+                        && seen_edges.contains(&((*r).clone(), b.clone()))
+                })
+                .collect();
+            match candidates.len() {
+                0 => {}
+                1 => {
+                    routes.insert(
+                        key,
+                        HostRoute::Relayed {
+                            from: a.clone(),
+                            relay: candidates[0].clone(),
+                            to: b.clone(),
+                        },
+                    );
+                }
+                _ => {
+                    let names: Vec<String> =
+                        candidates.iter().map(|s| format!("{s:?}")).collect();
+                    return Err(err(
+                        path,
+                        "links",
+                        format!(
+                            "ambiguous route for {:?} -> {:?}: multiple relays ({}) carry both legs",
+                            a,
+                            b,
+                            names.join(", ")
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    // Reject multi-hop relay paths (relay-to-relay edges that would
+    // allow chaining). MVP rejects any direct relay→relay edge.
+    for link in &links {
+        if relay_ids.contains(&link.from) && relay_ids.contains(&link.to) {
+            return Err(err(
+                path,
+                "links",
+                format!(
+                    "multi-hop relay routes are not supported in the MVP: relay {:?} -> relay {:?}",
+                    link.from, link.to
+                ),
+            ));
+        }
+    }
+    let routes_vec: Vec<HostRoute> = routes.into_values().collect();
 
+    // Build a quick map peer_id → kind so worker_exit mutations can
+    // validate that the target is `stage`-kind. RELAY_SPEC §6.2 /
+    // §8.2.
+    let peer_kinds: BTreeMap<String, String> = peers
+        .iter()
+        .map(|p| (p.id.clone(), p.kind.clone()))
+        .collect();
     // Mutations: parse from raw table, validate references, validate at_ns.
     let mut mutations = Vec::with_capacity(raw.mutations.len());
     for (i, m) in raw.mutations.iter().enumerate() {
-        let parsed = parse_mutation(path, i, m, &peer_ids, &seen_edges)?;
+        let parsed = parse_mutation(
+            path,
+            i,
+            m,
+            &peer_ids,
+            &seen_edges,
+            &relay_ids,
+            &peer_kinds,
+        )?;
         if parsed.at_ns > duration_ns {
             return Err(err(
                 path,
@@ -692,7 +1142,7 @@ fn validate(
     // Assertions.
     let mut assertions = Vec::with_capacity(raw.assertions.len());
     for (i, a) in raw.assertions.iter().enumerate() {
-        let parsed = parse_assertion(path, i, a, &peer_ids, duration_ns)?;
+        let parsed = parse_assertion(path, i, a, &peer_ids, &relay_ids, duration_ns)?;
         assertions.push(parsed);
     }
 
@@ -706,10 +1156,12 @@ fn validate(
         default_tick,
         default_link,
         peers,
+        relays,
         links,
         mutations,
         snapshots,
         assertions,
+        routes: routes_vec,
     })
 }
 
@@ -831,6 +1283,8 @@ fn parse_mutation(
     table: &toml::value::Table,
     peers: &BTreeSet<String>,
     edges: &BTreeSet<(String, String)>,
+    relays: &BTreeSet<String>,
+    peer_kinds: &BTreeMap<String, String>,
 ) -> Result<Mutation, LoadError> {
     let field = |s: &str| format!("mutations[{i}].{s}");
     let at_ns = require_u64_field(path, &field("at_ns"), table.get("at_ns"))?;
@@ -888,6 +1342,112 @@ fn parse_mutation(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
         },
+        "worker_exit" => {
+            let peer = peer_field(path, &field("peer"), table.get("peer"), peers)?;
+            // RELAY_SPEC §8.2 — worker_exit must target a stage peer.
+            match peer_kinds.get(&peer).map(|s| s.as_str()) {
+                Some("stage") => {}
+                Some(other) => {
+                    return Err(err(
+                        path,
+                        field("peer"),
+                        format!(
+                            "worker_exit targets peer {peer:?} of kind {other:?}; only \"stage\" peers accept it"
+                        ),
+                    ));
+                }
+                None => {
+                    return Err(err(
+                        path,
+                        field("peer"),
+                        format!("references undeclared peer {peer:?}"),
+                    ));
+                }
+            }
+            let reason = table
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| err(path, field("reason"), "required string"))?
+                .to_string();
+            let status_code = match table.get("status_code") {
+                None => None,
+                Some(v) => Some(
+                    v.as_integer()
+                        .ok_or_else(|| {
+                            err(path, field("status_code"), "must be an integer")
+                        })?
+                        .try_into()
+                        .map_err(|_| {
+                            err(path, field("status_code"), "must fit in i32")
+                        })?,
+                ),
+            };
+            let signal = match table.get("signal") {
+                None => None,
+                Some(v) => Some(
+                    v.as_integer()
+                        .ok_or_else(|| err(path, field("signal"), "must be an integer"))?
+                        .try_into()
+                        .map_err(|_| err(path, field("signal"), "must fit in i32"))?,
+                ),
+            };
+            MutationKind::WorkerExit {
+                peer,
+                reason,
+                status_code,
+                signal,
+            }
+        }
+        "relay_kill" => MutationKind::RelayKill {
+            relay: relay_field(path, &field("relay"), table.get("relay"), relays)?,
+        },
+        "relay_boot" => MutationKind::RelayBoot {
+            relay: relay_field(path, &field("relay"), table.get("relay"), relays)?,
+        },
+        "relay_capacity_change" => {
+            let relay = relay_field(path, &field("relay"), table.get("relay"), relays)?;
+            let opt_u64 = |key: &str| -> Result<Option<u64>, LoadError> {
+                match table.get(key) {
+                    None => Ok(None),
+                    Some(v) => {
+                        let n = v.as_integer().ok_or_else(|| {
+                            err(path, format!("mutations[{i}].{key}"), "must be an integer")
+                        })?;
+                        if n < 0 {
+                            return Err(err(
+                                path,
+                                format!("mutations[{i}].{key}"),
+                                "must be non-negative",
+                            ));
+                        }
+                        if key != "queue_depth_bytes" && n == 0 {
+                            return Err(err(
+                                path,
+                                format!("mutations[{i}].{key}"),
+                                "must be > 0",
+                            ));
+                        }
+                        Ok(Some(n as u64))
+                    }
+                }
+            };
+            let ingress = opt_u64("ingress_capacity_bps")?;
+            let egress = opt_u64("egress_capacity_bps_per_link")?;
+            let depth = opt_u64("queue_depth_bytes")?;
+            if ingress.is_none() && egress.is_none() && depth.is_none() {
+                return Err(err(
+                    path,
+                    field("kind"),
+                    "relay_capacity_change must change at least one of ingress_capacity_bps / egress_capacity_bps_per_link / queue_depth_bytes",
+                ));
+            }
+            MutationKind::RelayCapacityChange {
+                relay,
+                ingress_capacity_bps: ingress,
+                egress_capacity_bps_per_link: egress,
+                queue_depth_bytes: depth,
+            }
+        }
         other => {
             return Err(err(
                 path,
@@ -983,6 +1543,22 @@ fn peer_field(
     Ok(s)
 }
 
+fn relay_field(
+    path: &Path,
+    field: &str,
+    v: Option<&toml::Value>,
+    relays: &BTreeSet<String>,
+) -> Result<String, LoadError> {
+    let s = v
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| err(path, field, "required string"))?
+        .to_string();
+    if !relays.contains(&s) {
+        return Err(err(path, field, format!("references undeclared relay {s:?}")));
+    }
+    Ok(s)
+}
+
 fn require_u64_field(path: &Path, field: &str, v: Option<&toml::Value>) -> Result<u64, LoadError> {
     let n = v
         .and_then(|x| x.as_integer())
@@ -1029,6 +1605,7 @@ fn parse_assertion(
     i: usize,
     table: &toml::value::Table,
     peers: &BTreeSet<String>,
+    relays: &BTreeSet<String>,
     duration_ns: u64,
 ) -> Result<Assertion, LoadError> {
     let field = |s: &str| format!("assertions[{i}].{s}");
@@ -1200,6 +1777,83 @@ fn parse_assertion(
                 table.get("max_per_window"),
             )?,
         },
+        "relay_queue_depth_bounded" => {
+            let relay = relay_field(path, &field("relay"), table.get("relay"), relays)?;
+            let max_bytes = require_u64_field(path, &field("max_bytes"), table.get("max_bytes"))?;
+            let window_start_ns = match table.get("window_start_ns") {
+                None => None,
+                Some(v) => Some(require_u64_field(path, &field("window_start_ns"), Some(v))?),
+            };
+            let window_end_ns = match table.get("window_end_ns") {
+                None => None,
+                Some(v) => Some(require_u64_field(path, &field("window_end_ns"), Some(v))?),
+            };
+            if let (Some(s), Some(e)) = (window_start_ns, window_end_ns) {
+                if s > e {
+                    return Err(err(
+                        path,
+                        field("window_start_ns"),
+                        "window_start_ns must be <= window_end_ns",
+                    ));
+                }
+            }
+            if let Some(e) = window_end_ns {
+                check_t(e, "window_end_ns")?;
+            }
+            AssertionKind::RelayQueueDepthBounded {
+                relay,
+                max_bytes,
+                window_start_ns,
+                window_end_ns,
+            }
+        }
+        "worker_alive_throughout" => {
+            let peer = peer_field(path, &field("peer"), table.get("peer"), peers)?;
+            let window_start_ns = require_u64_field(
+                path,
+                &field("window_start_ns"),
+                table.get("window_start_ns"),
+            )?;
+            let window_end_ns = require_u64_field(
+                path,
+                &field("window_end_ns"),
+                table.get("window_end_ns"),
+            )?;
+            check_t(window_end_ns, "window_end_ns")?;
+            if window_start_ns > window_end_ns {
+                return Err(err(
+                    path,
+                    field("window_start_ns"),
+                    "window_start_ns must be <= window_end_ns",
+                ));
+            }
+            AssertionKind::WorkerAliveThroughout {
+                peer,
+                window_start_ns,
+                window_end_ns,
+            }
+        }
+        "name_resolves_within" => {
+            let name = table
+                .get("name")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| err(path, field("name"), "required string"))?
+                .to_string();
+            if name.is_empty() {
+                return Err(err(path, field("name"), "must not be empty"));
+            }
+            let observers = string_list(path, &field("observers"), table.get("observers"))?;
+            check_peer_list(&observers, "observers")?;
+            let within_ns = require_u64_field(path, &field("within_ns"), table.get("within_ns"))?;
+            let from_ns = require_u64_field(path, &field("from_ns"), table.get("from_ns"))?;
+            check_t(from_ns.saturating_add(within_ns), "from_ns + within_ns")?;
+            AssertionKind::NameResolvesWithin {
+                name,
+                observers,
+                within_ns,
+                from_ns,
+            }
+        }
         other => {
             return Err(err(
                 path,

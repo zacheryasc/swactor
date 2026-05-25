@@ -260,10 +260,12 @@ fn generate_scenario(
         },
         default_link: link_policy,
         peers: peer_records,
+        relays: Vec::new(),
         links,
         mutations: Vec::new(),
         snapshots: Vec::new(),
         assertions,
+        routes: Vec::new(),
     };
     // Round-trip through the loader so we get the same validation
     // the on-disk path does.

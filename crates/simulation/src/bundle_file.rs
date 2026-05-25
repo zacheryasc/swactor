@@ -23,7 +23,7 @@ use crate::bundle::{
     BundleRecord, BundleWriter, DeliveryDropReason, EventPayload, EventRecord, MutationRecord,
     SnapshotRecord,
 };
-use crate::network::{CacheTransition, DropReason};
+use crate::network::{CacheTransition, DropReason, RelayDropReason};
 use crate::scenario::{Scenario, to_toml};
 
 /// The version string the manifest records under `simulator_version`.
@@ -211,6 +211,28 @@ fn render_event_payload(p: &EventPayload) -> serde_json::Value {
             "to": to,
             "warm": warm,
         }),
+        EventPayload::RelayEnqueue { relay, from, to, byte_len } => serde_json::json!({
+            "kind": "relay_enqueue",
+            "relay": relay,
+            "from": from,
+            "to": to,
+            "byte_len": byte_len,
+        }),
+        EventPayload::RelayDequeue { relay, from, to, byte_len } => serde_json::json!({
+            "kind": "relay_dequeue",
+            "relay": relay,
+            "from": from,
+            "to": to,
+            "byte_len": byte_len,
+        }),
+        EventPayload::RelayDrop { relay, from, to, byte_len, reason } => serde_json::json!({
+            "kind": "relay_drop",
+            "relay": relay,
+            "from": from,
+            "to": to,
+            "byte_len": byte_len,
+            "reason": relay_drop_reason_str(reason),
+        }),
     }
 }
 
@@ -276,6 +298,15 @@ fn drop_reason_str(r: &DropReason) -> &'static str {
         DropReason::NoRoute => "no_route",
         DropReason::Partitioned => "partitioned",
         DropReason::Lossy => "lossy",
+        DropReason::RelayQueueFull => "relay_queue_full",
+        DropReason::RelayDown => "relay_down",
+    }
+}
+
+fn relay_drop_reason_str(r: &RelayDropReason) -> &'static str {
+    match r {
+        RelayDropReason::QueueFull => "queue_full",
+        RelayDropReason::Down => "down",
     }
 }
 

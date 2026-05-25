@@ -380,6 +380,19 @@ impl Host for SwimHost {
                 let actions = self.node.report_send_failure(node_id);
                 self.collect_actions(actions)
             }
+            // RELAY_SPEC §5.3 — the SWIM host kind has no
+            // `WorkerExit` semantics. The engine guards this at
+            // `dispatch_mutation` (aborting before the envelope is
+            // even routed), so reaching this arm means the engine's
+            // gate is broken or the host has been reused outside the
+            // stage-host invariant. Panic loudly rather than silently
+            // dropping; silent fallback is the bug class the
+            // simulator exists to prevent.
+            HostMessage::WorkerExit { .. } => {
+                panic!(
+                    "SWIM host kind cannot receive WorkerExit; the engine's WorkerExitOnWrongKind gate is broken"
+                );
+            }
         }
     }
 

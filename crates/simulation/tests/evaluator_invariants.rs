@@ -147,6 +147,7 @@ fn snap(t: u64, seq: u32, members: &[(&str, &str, u64)], self_incarnation: u64) 
             })
             .collect(),
         self_incarnation,
+        name_registry: std::collections::BTreeMap::new(),
     }
 }
 

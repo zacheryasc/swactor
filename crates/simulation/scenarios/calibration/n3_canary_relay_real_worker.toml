@@ -1,0 +1,151 @@
+# Calibration scenario paired with bundle `vastai-N3-1`.
+# RELAY_SPEC §10.1.
+#
+# Topology: three SWIM/stage hosts (orchestrator + two pipeline stages)
+# routed through one relay. The relay's policy mimics the n0 canary
+# cluster as observed in run #1: very low egress per link, a large
+# shared queue, and a multi-hundred-millisecond cold-start. Stage hosts
+# carry the worker-exit timing observed in the bundle (51s / 75s / 191s
+# in run #1's siblings; this scenario uses the most aggressive 51s
+# value because it is the assertion that bites first).
+#
+# Expected verdict on the as-shipped relay policy: `relay_queue_depth_bounded`
+# Fails (the canary relay's queue grows past the bound at multi-kilobyte
+# gossip volumes — RELAY_SPEC §10.2 "calibration scenario"); the run's
+# stage worker_exits surface the C.3 finding deterministically.
+#
+# All numeric fields below are placeholders. The first calibration pass
+# (a follow-up commit per SIM_SPEC §11.3) replaces the placeholder
+# tolerances with measured numbers against the actual bundle. Until
+# then, these values exist so the scenario parses, runs, and surfaces
+# the right shape of failure to a human reader.
+
+name = "n3_canary_relay_real_worker"
+seed = 1
+duration_ns = 425_000_000_000  # 425 s — the live run's duration
+
+[default_tick]
+period_ns = 200_000_000  # 200 ms
+
+[default_link]
+latency_ns = 60_000_000           # 60 ms one-way, multi-region
+jitter_stddev_ns = 15_000_000     # 15 ms
+loss_prob_ppm = 0
+reorder_prob_ppm = 0
+bandwidth_bps = 25_000_000        # 25 Mb/s
+cold_dial_penalty_ns = 200_000_000
+cache_warm_after_ns = 200_000_000
+cache_invalidate_after_idle_ns = 30_000_000_000
+
+# Canary relay policy (placeholders pending first calibration pass).
+# Low egress per link + a generous queue is what reproduces the
+# 187-second buffering pathology observed at t=556598..743981 in
+# `vastai-N3-1`.
+[[relays]]
+id = "canary"
+ingress_capacity_bps = 100_000_000             # 100 Mb/s combined ingress
+egress_capacity_bps_per_link = 1_000_000       # 1 Mb/s per outbound link — the bottleneck
+queue_depth_bytes = 524_288                    # 512 KB shared egress buffer
+cold_start_penalty_ns = 500_000_000            # 500 ms first-message warmup
+
+[[peers]]
+id = "orchestrator"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+
+[[peers]]
+id = "stage_0"
+kind = "stage"
+initial_state = "cold"
+kind_config = { name = "pp-stage-0", address = "10.0.0.10:7700" }
+
+[[peers]]
+id = "stage_1"
+kind = "stage"
+initial_state = "cold"
+kind_config = { name = "pp-stage-1", address = "10.0.0.11:7700" }
+
+# Every host pair routes through the canary relay.
+[[links]]
+from = "orchestrator"
+to = "stage_0"
+via = "canary"
+[[links]]
+from = "stage_0"
+to = "orchestrator"
+via = "canary"
+[[links]]
+from = "orchestrator"
+to = "stage_1"
+via = "canary"
+[[links]]
+from = "stage_1"
+to = "orchestrator"
+via = "canary"
+[[links]]
+from = "stage_0"
+to = "stage_1"
+via = "canary"
+[[links]]
+from = "stage_1"
+to = "stage_0"
+via = "canary"
+
+# Stage worker_exits at the live timings (RELAY_SPEC §5.3 / C.3 of the
+# deployment report). Used by `worker_alive_throughout` below.
+[[mutations]]
+at_ns = 51_000_000_000   # 51 s — the earliest of the live worker exits
+kind = "worker_exit"
+peer = "stage_0"
+reason = "tinygrad worker crashed (placeholder)"
+status_code = 1
+
+[[mutations]]
+at_ns = 191_000_000_000  # 191 s — second stage exits later
+kind = "worker_exit"
+peer = "stage_1"
+reason = "tinygrad worker crashed (placeholder)"
+status_code = 1
+
+# Snapshots scattered so `name_resolves_within` can observe registry
+# convergence — or its absence.
+[[snapshots]]
+at_ns = 1_000_000_000
+[[snapshots]]
+at_ns = 10_000_000_000
+[[snapshots]]
+at_ns = 50_000_000_000
+[[snapshots]]
+at_ns = 200_000_000_000
+[[snapshots]]
+at_ns = 400_000_000_000
+
+# RELAY_SPEC §7.1 assertions over the calibration run.
+#
+# `relay_queue_depth_bounded` is the load-bearing assertion: under the
+# canary relay's policy, cumulative gossip pushes `enqueued_bytes`
+# past the bound, mirroring the 187-second buffering signature.
+[[assertions]]
+kind = "relay_queue_depth_bounded"
+relay = "canary"
+max_bytes = 65_536  # 64 KB — placeholder tolerance
+
+# `worker_alive_throughout` over the first minute fails on stage_0's
+# 51s exit, which the deployment report calls out as the canonical
+# Layer C symptom.
+[[assertions]]
+kind = "worker_alive_throughout"
+peer = "stage_0"
+window_start_ns = 0
+window_end_ns = 60_000_000_000
+
+# Name registry convergence: orchestrator should learn pp-stage-0
+# within the resolve deadline. Under the canary buffering this is the
+# observable that fails — `pp-entry never resolves` in the live run.
+[[assertions]]
+kind = "name_resolves_within"
+name = "pp-stage-0"
+observers = ["orchestrator"]
+within_ns = 30_000_000_000
+from_ns = 0

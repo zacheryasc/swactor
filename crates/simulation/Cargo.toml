@@ -76,3 +76,23 @@ path = "tests/swim_integration.rs"
 [[test]]
 name = "property_runner"
 path = "tests/property_runner.rs"
+
+[[test]]
+name = "relay_invariants"
+path = "tests/relay_invariants.rs"
+
+[[test]]
+name = "stage_host_invariants"
+path = "tests/stage_host_invariants.rs"
+
+[[test]]
+name = "relay_scenario_validation"
+path = "tests/relay_scenario_validation.rs"
+
+[[test]]
+name = "relay_assertion_invariants"
+path = "tests/relay_assertion_invariants.rs"
+
+[[test]]
+name = "adversarial_judge"
+path = "tests/adversarial_judge.rs"
