@@ -103,10 +103,13 @@ fn node_config() -> DistributedNodeConfig {
     DistributedNodeConfig {
         swim: SwimConfig {
             probe_interval: 10,
-            probe_timeout: 15,
             indirect_probes: 2,
-            suspicion_timeout: 60,
             dead_reprobe_interval: 100,
+            // probe_timeout / suspicion_timeout inherit the calibrated
+            // SwimConfig::default() (750 / 2250 ticks = 15 s / 45 s; see
+            // crates/simulation/SWIM_RETUNE_REPORT.md). Do NOT re-pin them:
+            // the old 15 / 60 pin = 300 ms probe budget on a 200-405 ms
+            // relay path, the 1779733878 flap cause.
             ..SwimConfig::default()
         },
         cache_capacity: 100,

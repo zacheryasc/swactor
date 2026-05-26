@@ -27,16 +27,18 @@
 //!    rented instances regardless of success or failure.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
-use iroh::{PublicKey, RelayMode};
+use iroh::{PublicKey, RelayMode, SecretKey};
 
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
 use swactor::transport::TransportRouter;
@@ -61,10 +63,13 @@ fn node_config() -> DistributedNodeConfig {
     DistributedNodeConfig {
         swim: SwimConfig {
             probe_interval: 10,
-            probe_timeout: 15,
             indirect_probes: 2,
-            suspicion_timeout: 60,
             dead_reprobe_interval: 100,
+            // probe_timeout / suspicion_timeout inherit the calibrated
+            // SwimConfig::default() (750 / 2250 ticks = 15 s / 45 s; see
+            // crates/simulation/SWIM_RETUNE_REPORT.md). Do NOT re-pin them:
+            // the old 15 / 60 pin = 300 ms probe budget on a 200-405 ms
+            // relay path, the 1779733878 flap cause.
             ..SwimConfig::default()
         },
         cache_capacity: 100,
@@ -77,9 +82,18 @@ fn node_config() -> DistributedNodeConfig {
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  pp-smoke-run --seed [--num-stages N] [--prompt <text>] [--max-tokens <n>] [--gpu-node <path>] [--worker <path>]");
-    eprintln!("  pp-smoke-run --vastai --api-key <key> [--num-stages N] [--gpu RTX_4090] [--image <name>] [--prompt <text>] [--max-tokens <n>]");
+    eprintln!("  pp-smoke-run --vastai --api-key <key> [--num-stages N] [--gpu \"RTX 3060\"] [--image <name>] [--prompt <text>] [--max-tokens <n>]");
+    eprintln!("Cluster lifecycle (--vastai):");
+    eprintln!("  (default)   lease N, drive one run, destroy.");
+    eprintln!("  --hold      lease N, drive, leave running; writes a cluster-handle file.");
+    eprintln!("  --redeploy  scp local binaries onto the held cluster, bounce + drive again.");
+    eprintln!("  --teardown  destroy the held cluster and delete the handle file.");
+    eprintln!("  --label <s> tag/select the cluster (default pp-<N>-<ts>).");
+    eprintln!("  --state <p> cluster-handle file path (default ./.pp-cluster.json).");
     eprintln!("Notes:");
     eprintln!("  --num-stages defaults to 2 and must be >= 2.");
+    eprintln!("  --hold/--redeploy need a stable orchestrator identity; it is generated");
+    eprintln!("  and stored in the handle file (override with PP_ORCH_SECRET=<64 hex>).");
 }
 
 #[derive(Debug)]
@@ -94,6 +108,22 @@ struct Args {
     max_tokens: u32,
     gpu_node_path: Option<PathBuf>,
     worker_path: Option<PathBuf>,
+    /// Cluster lifecycle mode for --vastai (mutually exclusive):
+    ///   default  → lease, drive one run, destroy (the original one-shot).
+    ///   hold     → lease, drive, leave the cluster running (no destroy).
+    ///   redeploy → skip leasing; scp the local binaries onto every held
+    ///              instance (found by --label), bounce them in place,
+    ///              drive again, leave running.
+    ///   teardown → destroy every instance carrying --label, then exit.
+    hold: bool,
+    redeploy: bool,
+    teardown: bool,
+    /// vast.ai instance label used to tag a cluster at lease time and to
+    /// rediscover its live SSH endpoints for redeploy/teardown.
+    label: Option<String>,
+    /// Path to the local cluster-handle file (the orchestrator secret +
+    /// the contracts we rented). Defaults to ./.pp-cluster.json.
+    state: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
@@ -103,18 +133,37 @@ fn parse_args() -> Args {
         vastai: false,
         num_stages: 2,
         api_key: None,
-        gpu_name: "RTX 4090".into(),
-        image: "swactor-pp-gpu:latest".into(),
+        // RTX 3060 (12GB) is our default deploy-test class: cheapest GPU class
+        // with deep, reliable supply on vast.ai (see fleet notes). Override with
+        // --gpu for capacity tests. NOT sized for real model weights.
+        gpu_name: "RTX 3060".into(),
+        image: "zacheryasc/swactor-pp-gpu:latest".into(),
         prompt: "Say hello".into(),
         max_tokens: 64,
         gpu_node_path: None,
         worker_path: None,
+        hold: false,
+        redeploy: false,
+        teardown: false,
+        label: None,
+        state: None,
     };
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
             "--seed" => a.seed = true,
             "--vastai" => a.vastai = true,
+            "--hold" => a.hold = true,
+            "--redeploy" => a.redeploy = true,
+            "--teardown" => a.teardown = true,
+            "--label" => {
+                i += 1;
+                a.label = Some(argv[i].clone());
+            }
+            "--state" => {
+                i += 1;
+                a.state = Some(PathBuf::from(&argv[i]));
+            }
             "--num-stages" => {
                 i += 1;
                 a.num_stages = argv[i].parse().unwrap_or_else(|_| {
@@ -184,6 +233,19 @@ fn main() {
     }
     if args.vastai && args.api_key.is_none() {
         eprintln!("--api-key required with --vastai");
+        std::process::exit(2);
+    }
+    if [args.hold, args.redeploy, args.teardown]
+        .iter()
+        .filter(|&&f| f)
+        .count()
+        > 1
+    {
+        eprintln!("at most one of --hold / --redeploy / --teardown may be set");
+        std::process::exit(2);
+    }
+    if (args.hold || args.redeploy || args.teardown) && !args.vastai {
+        eprintln!("--hold / --redeploy / --teardown require --vastai");
         std::process::exit(2);
     }
 
@@ -629,6 +691,310 @@ fn await_response(
 
 // ─── vast.ai mode ─────────────────────────────────────────────────────
 
+// ─── vast.ai cluster lifecycle (hold / redeploy / teardown) ───────────
+
+/// Local handle for a held cluster. The orchestrator secret is the one
+/// thing vast.ai cannot hand back: held stages seed to the orchestrator's
+/// node id (baked into their SEED_ADDR at create time), so re-attaching
+/// demands the same keypair. We persist it beside the set of contracts we
+/// rented. Volatile facts — live SSH endpoints and liveness — are re-fetched
+/// from the vast.ai API at redeploy/teardown, so this file never stores
+/// anything that can go stale underneath us.
+#[derive(Debug, Serialize, Deserialize)]
+struct ClusterState {
+    label: String,
+    /// 64 hex chars = the 32-byte iroh secret key.
+    orchestrator_secret: String,
+    num_stages: u32,
+    model: String,
+    image: String,
+    contracts: Vec<ContractRef>,
+    created_at: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContractRef {
+    id: u64,
+    stage: u32,
+}
+
+impl ClusterState {
+    fn load(path: &Path) -> Result<Self, String> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| format!("cannot read cluster state {}: {e}", path.display()))?;
+        serde_json::from_str(&raw)
+            .map_err(|e| format!("cannot parse cluster state {}: {e}", path.display()))
+    }
+    fn save(&self, path: &Path) -> Result<(), String> {
+        let raw = serde_json::to_string_pretty(self)
+            .map_err(|e| format!("cannot serialize cluster state: {e}"))?;
+        std::fs::write(path, raw)
+            .map_err(|e| format!("cannot write cluster state {}: {e}", path.display()))
+    }
+}
+
+fn default_state_path() -> PathBuf {
+    PathBuf::from(".pp-cluster.json")
+}
+
+fn default_label(num_stages: u32) -> String {
+    format!("pp-{num_stages}-{}", now_secs())
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+fn secret_from_hex(hex: &str) -> Result<[u8; 32], String> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        return Err(format!(
+            "orchestrator secret must be 64 hex chars, got {}",
+            hex.len()
+        ));
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .map_err(|_| "orchestrator secret is not valid hex".to_string())?;
+    }
+    Ok(out)
+}
+
+/// 32 bytes from the OS CSPRNG (Linux deploy host) to mint a fresh,
+/// persistable orchestrator identity for a held cluster.
+fn random_secret() -> Result<[u8; 32], String> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map_err(|e| format!("cannot read /dev/urandom: {e}"))?;
+    Ok(buf)
+}
+
+/// SSH private key vast.ai authenticates with (its public half is registered
+/// on the account). Override with PP_SSH_KEY.
+fn ssh_key_path() -> PathBuf {
+    if let Ok(p) = std::env::var("PP_SSH_KEY") {
+        return PathBuf::from(p);
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".ssh/id_ed25519")
+}
+
+/// Push the freshly-built binary + worker onto a held instance over SSH and
+/// bounce pp-gpu-node in place. The restart re-execs under PID 1's
+/// environment (where vast.ai injected the per-stage env at create time), so
+/// STAGE / NUM_STAGES / SEED_ADDR / SEED_RELAY / MODEL survive the bounce
+/// without us reconstructing them.
+fn redeploy_instance(
+    inst: &pipeline_parallel_inference::vastai::LabeledInstance,
+    gpu_node_bin: &Path,
+    worker_script: &Path,
+    ssh_key: &Path,
+) -> Result<(), String> {
+    let host = if !inst.ssh_host.is_empty() {
+        inst.ssh_host.as_str()
+    } else {
+        inst.public_ipaddr.as_str()
+    };
+    if host.is_empty() || inst.ssh_port == 0 {
+        return Err(format!(
+            "contract {} has no SSH endpoint yet (status {})",
+            inst.contract_id, inst.actual_status
+        ));
+    }
+    let port = inst.ssh_port.to_string();
+    let target = format!("root@{host}");
+
+    let scp = |local: &Path, remote: &str| -> Result<(), String> {
+        let out = Command::new("scp")
+            .args(["-P", &port])
+            .arg("-i")
+            .arg(ssh_key)
+            .args(["-o", "StrictHostKeyChecking=no"])
+            .args(["-o", "UserKnownHostsFile=/dev/null"])
+            .args(["-o", "ConnectTimeout=20"])
+            .arg(local)
+            .arg(format!("{target}:{remote}"))
+            .output()
+            .map_err(|e| format!("scp spawn failed: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "scp {} -> {remote} failed: {}",
+                local.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    };
+
+    scp(gpu_node_bin, "/usr/local/bin/pp-gpu-node")?;
+    scp(worker_script, "/usr/local/share/pp_tinygrad_worker.py")?;
+
+    // Kill the running stage (a child of vast.ai's PID 1, not PID 1 itself),
+    // then re-exec it detached under PID 1's env. Needs `pkill` (procps) and
+    // bash in the image.
+    let restart = "pkill -f /usr/local/bin/pp-gpu-node || true; sleep 1; chmod +x /usr/local/bin/pp-gpu-node; setsid bash -c 'while IFS= read -r -d \"\" kv; do export \"$kv\"; done < /proc/1/environ; exec /usr/local/bin/pp-gpu-node' >/var/log/pp-redeploy.log 2>&1 </dev/null &";
+    let out = Command::new("ssh")
+        .arg("-n")
+        .args(["-p", &port])
+        .arg("-i")
+        .arg(ssh_key)
+        .args(["-o", "StrictHostKeyChecking=no"])
+        .args(["-o", "UserKnownHostsFile=/dev/null"])
+        .args(["-o", "ConnectTimeout=20"])
+        .arg(&target)
+        .arg(restart)
+        .output()
+        .map_err(|e| format!("ssh spawn failed: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ssh restart failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+struct ResolvedCluster {
+    secret: [u8; 32],
+    label: String,
+    num_stages: u32,
+    model: String,
+}
+
+/// Resolve the orchestrator identity, label, and stage count for this run.
+/// Redeploy adopts them from the on-disk handle (so it re-presents the same
+/// node id the held stages seed to); hold/one-shot mint or read them.
+/// PP_ORCH_SECRET, when set, always wins.
+fn resolve_cluster(args: &Args, state_path: &Path) -> Result<ResolvedCluster, String> {
+    let env_secret = match std::env::var("PP_ORCH_SECRET") {
+        Ok(h) if !h.trim().is_empty() => Some(secret_from_hex(&h)?),
+        _ => None,
+    };
+    let model = std::env::var("MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| {
+            if std::env::var("PP_WORKER_STUB").is_ok() {
+                "stub".into()
+            } else {
+                "unset".into()
+            }
+        });
+
+    if args.redeploy {
+        let st = ClusterState::load(state_path)?;
+        let secret = match env_secret {
+            Some(s) => s,
+            None => secret_from_hex(&st.orchestrator_secret)?,
+        };
+        return Ok(ResolvedCluster {
+            secret,
+            label: st.label,
+            num_stages: st.num_stages,
+            model: st.model,
+        });
+    }
+
+    // hold or default one-shot: a one-shot's random secret is never
+    // persisted (it tears down in the same process), so it is harmless.
+    let label = args
+        .label
+        .clone()
+        .unwrap_or_else(|| default_label(args.num_stages));
+    let secret = match env_secret {
+        Some(s) => s,
+        None => random_secret()?,
+    };
+    Ok(ResolvedCluster {
+        secret,
+        label,
+        num_stages: args.num_stages,
+        model,
+    })
+}
+
+/// Destroy a held cluster and drop its handle. Authority for "is it really
+/// gone" is the vast.ai API, not the local file: we destroy by contract id,
+/// then re-query the label and only delete the handle once it reports zero.
+fn run_teardown(
+    tokio_rt: &tokio::runtime::Runtime,
+    http: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    state_path: &Path,
+) -> i32 {
+    use pipeline_parallel_inference::vastai;
+    let st = match ClusterState::load(state_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("pp-smoke-run: {e}");
+            eprintln!("  (nothing to tear down at that path)");
+            return 1;
+        }
+    };
+    let ids: Vec<u64> = st.contracts.iter().map(|c| c.id).collect();
+    eprintln!(
+        "pp-smoke-run: tearing down label={} contracts={ids:?}",
+        st.label
+    );
+    let results = tokio_rt.block_on(vastai::destroy_all_instances(http, base_url, api_key, &ids));
+    let mut ok = true;
+    for (id, r) in ids.iter().zip(results.iter()) {
+        if let Err(e) = r {
+            ok = false;
+            eprintln!("pp-smoke-run: destroy {id} failed: {e}");
+        }
+    }
+    match tokio_rt.block_on(vastai::list_instances_by_label(http, base_url, api_key, &st.label)) {
+        Ok(remaining) if remaining.is_empty() => {
+            eprintln!(
+                "pp-smoke-run: confirmed 0 instances under label {}",
+                st.label
+            );
+            if let Err(e) = std::fs::remove_file(state_path) {
+                eprintln!(
+                    "pp-smoke-run: note: could not remove {}: {e}",
+                    state_path.display()
+                );
+            }
+        }
+        Ok(remaining) => {
+            ok = false;
+            eprintln!(
+                "pp-smoke-run: WARNING {} instance(s) still under label {} — keeping handle file",
+                remaining.len(),
+                st.label
+            );
+            for r in &remaining {
+                eprintln!("  contract {} status={}", r.contract_id, r.actual_status);
+            }
+        }
+        Err(e) => {
+            ok = false;
+            eprintln!("pp-smoke-run: could not verify teardown via API: {e}");
+        }
+    }
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
 fn run_vastai(args: &Args) -> i32 {
     let api_key = args.api_key.clone().expect("--api-key checked earlier");
     let tokio_rt = match tokio::runtime::Runtime::new() {
@@ -638,9 +1004,29 @@ fn run_vastai(args: &Args) -> i32 {
             return 1;
         }
     };
+    let http = reqwest::Client::new();
+    let base_url = "https://cloud.vast.ai";
+    let state_path = args.state.clone().unwrap_or_else(default_state_path);
+
+    // Teardown is pure lifecycle — no orchestrator/driver needed.
+    if args.teardown {
+        return run_teardown(&tokio_rt, &http, base_url, &api_key, &state_path);
+    }
+
+    // Resolve identity + shape per mode (redeploy adopts the held cluster's
+    // secret/label/N from the handle; hold/one-shot mint or read them).
+    let cluster = match resolve_cluster(args, &state_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("pp-smoke-run: {e}");
+            return 1;
+        }
+    };
+    let num_stages = cluster.num_stages;
+    let label = cluster.label.clone();
 
     let mut driver = match IrohDriver::new(IrohDriverConfig {
-        secret_key: None,
+        secret_key: Some(SecretKey::from_bytes(&cluster.secret)),
         relay_mode: pipeline_parallel_inference::relay_config::relay_mode_from_env(),
         node: node_config(),
         peer_auth: None,
@@ -670,7 +1056,7 @@ fn run_vastai(args: &Args) -> i32 {
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
     eprintln!(
         "pp-smoke-run (--vastai --num-stages {n}): orchestrator node {my_hex}",
-        n = args.num_stages,
+        n = num_stages,
     );
     if diag_env_for_stages.is_enabled() {
         eprintln!(
@@ -712,48 +1098,124 @@ fn run_vastai(args: &Args) -> i32 {
         eprintln!("pp-smoke-run: no relay URL after 20s — vastai mode usually requires one");
     }
 
-    let base_url = "https://cloud.vast.ai";
-    let http = reqwest::Client::new();
-
-    // One call into the lease helper handles find-N-offers, create-N,
-    // wait-for-running, and rollback on any partial failure.
-    eprintln!(
-        "pp-smoke-run: leasing {} {} instances...",
-        args.num_stages, args.gpu_name,
-    );
-    let created = match tokio_rt.block_on(
-        pipeline_parallel_inference::vastai::lease_chain(
-            &http,
-            base_url,
-            &api_key,
-            &args.gpu_name,
-            args.num_stages,
-            &my_hex,
-            relay_url.as_deref(),
-            &args.image,
-            Duration::from_secs(10),
-            // Cap per-contract polling at 30 (5 min). A healthy 4090 host
-            // reaches `running` in ~30-90s; the only cases that take
-            // longer are hosts mid-failure (CDI errors, image pull
-            // stalls) which `wait_for_running` already surfaces as
-            // explicit errors. Keeping the cap tight makes the overall
-            // budget predictable.
-            30,
-            Some(&diag_env_for_stages),
-        ),
-    ) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("pp-smoke-run: lease_chain failed: {e}");
-            if let Some(handles) = diag {
-                handles.finalize("lease_chain_error");
-                handles.shutdown();
+    // ── Acquire the running cluster ──────────────────────────────────
+    // Redeploy skips leasing: it rediscovers the held cluster by label and
+    // pushes the freshly-built binaries onto each instance in place.
+    // Otherwise lease N fresh instances and (on --hold) persist the handle.
+    let contract_ids: Vec<u64> = if args.redeploy {
+        let insts = match tokio_rt.block_on(
+            pipeline_parallel_inference::vastai::list_instances_by_label(
+                &http, base_url, &api_key, &label,
+            ),
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("pp-smoke-run: cannot list cluster by label {label}: {e}");
+                if let Some(handles) = diag {
+                    handles.finalize("redeploy_list_error");
+                    handles.shutdown();
+                }
+                return 1;
             }
+        };
+        if insts.is_empty() {
+            eprintln!("pp-smoke-run: no live instances under label {label} — nothing to redeploy");
             return 1;
         }
+        if insts.len() != num_stages as usize {
+            eprintln!(
+                "pp-smoke-run: WARNING handle expects {num_stages} stages but label {label} has {} live",
+                insts.len(),
+            );
+        }
+        let gpu_bin = resolve_gpu_node_path(args);
+        let worker = resolve_worker_path(args);
+        let ssh_key = ssh_key_path();
+        eprintln!(
+            "pp-smoke-run: redeploying {} onto {} instance(s) (key {})",
+            gpu_bin.display(),
+            insts.len(),
+            ssh_key.display(),
+        );
+        for inst in &insts {
+            eprint!("  contract {} ... ", inst.contract_id);
+            match redeploy_instance(inst, &gpu_bin, &worker, &ssh_key) {
+                Ok(()) => eprintln!("pushed + bounced"),
+                Err(e) => {
+                    eprintln!("FAILED: {e}");
+                    eprintln!("pp-smoke-run: cluster left running; fix and re-run --redeploy");
+                    if let Some(handles) = diag {
+                        handles.finalize("redeploy_push_error");
+                        handles.shutdown();
+                    }
+                    return 1;
+                }
+            }
+        }
+        insts.iter().map(|i| i.contract_id).collect()
+    } else {
+        // One call into the lease helper handles find-N-offers, create-N,
+        // wait-for-running, and rollback on any partial failure.
+        eprintln!(
+            "pp-smoke-run: leasing {} {} instances (label {label})...",
+            num_stages, args.gpu_name,
+        );
+        let created = match tokio_rt.block_on(
+            pipeline_parallel_inference::vastai::lease_chain(
+                &http,
+                base_url,
+                &api_key,
+                &args.gpu_name,
+                num_stages,
+                &my_hex,
+                relay_url.as_deref(),
+                &args.image,
+                Some(label.as_str()),
+                Duration::from_secs(10),
+                // Cap per-contract polling at 30 (5 min). A healthy host
+                // reaches `running` in ~30-90s; longer means a host
+                // mid-failure, which `wait_for_running` already surfaces.
+                30,
+                Some(&diag_env_for_stages),
+            ),
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("pp-smoke-run: lease_chain failed: {e}");
+                if let Some(handles) = diag {
+                    handles.finalize("lease_chain_error");
+                    handles.shutdown();
+                }
+                return 1;
+            }
+        };
+        let ids: Vec<u64> = created.iter().map(|c| c.contract_id).collect();
+        // Persist the handle so --redeploy / --teardown can find this set.
+        if args.hold {
+            let st = ClusterState {
+                label: label.clone(),
+                orchestrator_secret: to_hex(&cluster.secret),
+                num_stages,
+                model: cluster.model.clone(),
+                image: args.image.clone(),
+                contracts: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &id)| ContractRef {
+                        id,
+                        stage: i as u32,
+                    })
+                    .collect(),
+                created_at: now_secs(),
+            };
+            match st.save(&state_path) {
+                Ok(()) => eprintln!("pp-smoke-run: wrote cluster handle {}", state_path.display()),
+                Err(e) => eprintln!("pp-smoke-run: WARNING could not write cluster handle: {e}"),
+            }
+        }
+        ids
     };
-    let contract_ids: Vec<u64> = created.iter().map(|c| c.contract_id).collect();
-    eprintln!("pp-smoke-run: rented contracts {contract_ids:?}");
+    eprintln!("pp-smoke-run: cluster contracts {contract_ids:?}");
 
     // Drive the run inside a labelled block returning `(code, reason)` so
     // every failure point can name the reason it bailed; the orchestrator's
@@ -780,10 +1242,10 @@ fn run_vastai(args: &Args) -> i32 {
         // dissemination budget is sized for the real cluster — see run_seed.
         eprintln!(
             "pp-smoke-run: waiting for SWIM convergence ({} alive peers)...",
-            args.num_stages,
+            num_stages,
         );
         let conv_res = await_convergence(
-            args.num_stages as usize,
+            num_stages as usize,
             Duration::from_secs(180),
             Duration::from_millis(200),
             || {

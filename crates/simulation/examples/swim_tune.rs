@@ -545,7 +545,14 @@ fn main() {
     );
     eprintln!("[meta] mode={mode:?} knobs={knobs:?}");
 
-    // The four scenarios we score.
+    // Scenarios scored by the sweep. The four named calibration
+    // scenarios match the on-disk corpus; `n3_1779733878_repro` is
+    // the deployment-mirror added by the SWIM retune
+    // (`SWIM_RETUNE_REPORT.md` §3); `gossip_flap_property` is the
+    // synthesised §10.3 library property the prior tune scored
+    // against (kept as a regression guard so the retune does not
+    // unwind the prior tune's order-of-magnitude collapse of
+    // `self_incarnation_peak`).
     let scenarios: Vec<(&str, Scenario)> = vec![
         (
             "gossip_flap_repro",
@@ -562,6 +569,10 @@ fn main() {
         (
             "n3_canary_relay_real_worker",
             load("scenarios/calibration/n3_canary_relay_real_worker.toml"),
+        ),
+        (
+            "n3_1779733878_repro",
+            load("scenarios/calibration/n3_1779733878_repro.toml"),
         ),
         (
             "gossip_flap_property",

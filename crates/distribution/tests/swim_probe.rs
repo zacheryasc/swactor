@@ -359,3 +359,77 @@ fn reprobe_does_nothing_when_no_dead_members() {
         }
     }
 }
+
+// ─── Lifeguard wiring §3.6 ──────────────────────────────────────────────────
+
+/// Drive a probe to declare the lone alive peer Suspect, then count
+/// how many ticks elapse before `DeclareDead` fires. Used by the
+/// Lifeguard wiring observation below.
+fn ticks_until_dead_after_suspect(config: SwimConfig) -> u64 {
+    use distribution::swim::probe::{SwimAction, SwimEvent, SwimProbe};
+    let mut probe = SwimProbe::new(config);
+    let mut members = MemberList::new(node(0));
+    members.apply(node(1), MemberState::Alive, 0);
+    // Probe + direct timeout + indirect timeout → Suspect.
+    tick_n(&mut probe, &mut members, 5);
+    tick_n(&mut probe, &mut members, 3);
+    let actions = tick_n(&mut probe, &mut members, 3);
+    for action in &actions {
+        if let SwimAction::Suspect(id) = action {
+            members.suspect(*id);
+        }
+    }
+    // Count ticks until DeclareDead. Cap at a generous budget so the
+    // test cannot hang under a misconfigured Lifeguard.
+    let mut ticks = 0u64;
+    let cap = 10_000u64;
+    loop {
+        ticks += 1;
+        let actions = probe.step(SwimEvent::Tick, &mut members);
+        if actions.iter().any(|a| matches!(a, SwimAction::DeclareDead(_))) {
+            return ticks;
+        }
+        if ticks >= cap {
+            return cap;
+        }
+    }
+}
+
+#[test]
+fn lifeguard_wiring_extends_suspect_to_dead_window_observably() {
+    use distribution::swim::lifeguard::LifeguardConfig;
+    // Wiring §3.6: when `SwimConfig::lifeguard` is `Some`, the
+    // suspect-to-dead window stretches per the adaptive band the
+    // config declares. This test fixes the same static
+    // `suspicion_timeout = 10` and the same probe shape on both
+    // sides; only the Lifeguard config differs. The adaptive side
+    // must take strictly more ticks to declare Dead than the static
+    // side — the dead-code condition the prior tune named (the
+    // §6.5 limit) is what this test rules out.
+    let base = SwimConfig {
+        probe_interval: 5,
+        probe_timeout: 3,
+        indirect_probes: 0,
+        suspicion_timeout: 10,
+        dead_reprobe_interval: 0,
+        ..SwimConfig::default()
+    };
+    let static_ticks = ticks_until_dead_after_suspect(SwimConfig {
+        lifeguard: None,
+        ..base.clone()
+    });
+    let adaptive_ticks = ticks_until_dead_after_suspect(SwimConfig {
+        lifeguard: Some(LifeguardConfig {
+            base_suspicion_timeout: 40,
+            min_suspicion_timeout: 40,
+            max_suspicion_timeout: 80,
+            ..LifeguardConfig::default()
+        }),
+        ..base
+    });
+    assert!(
+        adaptive_ticks > static_ticks,
+        "adaptive ({adaptive_ticks} ticks) must exceed static ({static_ticks}) — \
+         Lifeguard wiring is dead code if equal"
+    );
+}

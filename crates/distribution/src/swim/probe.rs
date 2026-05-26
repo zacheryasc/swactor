@@ -7,6 +7,7 @@ use std::collections::VecDeque;
 
 use crate::types::{MemberState, NodeId};
 
+use super::lifeguard::{HealthMultiplier, LifeguardConfig};
 use super::member_list::MemberList;
 
 /// Maximum number of recent probe targets to remember.
@@ -40,34 +41,75 @@ pub struct SwimConfig {
     pub dead_reprobe_interval: u64,
     /// Probe mode: Periodic (default) or Reactive (probe-on-failure).
     pub probe_mode: ProbeMode,
+    /// Lifeguard adaptive-timeout config. The probe state machine
+    /// keeps a local health multiplier per node — degraded nodes
+    /// (high nack rate) stretch their suspicion timeout per
+    /// `HealthMultiplier::dynamic_suspicion_timeout`, reducing
+    /// false-Dead declarations on partially-reachable peers.
+    /// `None` disables the adaptive path (the suspicion timeout stays
+    /// at `suspicion_timeout` regardless of health) — used by tests
+    /// and callers that want deterministic timing.
+    pub lifeguard: Option<LifeguardConfig>,
 }
 
 impl Default for SwimConfig {
     fn default() -> Self {
-        // Tuned against the N3 calibration scenarios per
-        // `crates/simulation/SWIM_TUNING_REPORT.md`. Tick units; the
+        // Retuned against the `1779733878` deployment shape per
+        // `crates/simulation/SWIM_RETUNE_REPORT.md`. Tick units; the
         // production runtime chooses the tick period.
         //
-        // The protocol period (`probe_interval`) is unchanged from
-        // the previous defaults; what moved is the *budget within a
-        // probe cycle*: `probe_timeout` is 5× longer (so a probe has
-        // 1.5× the cycle to land its direct ack before the indirect
-        // fanout runs — beyond the cycle is fine because the state
-        // machine waits to be idle), `suspicion_timeout` is 2.5×
-        // longer (covering several refute round-trips), and the
-        // indirect fanout is one peer smaller (less wire amplification
-        // per probe burst). Together these collapse the gossip-flap
-        // refutation rate by an order of magnitude under WAN latency
-        // in the §10.3 gossip-flap library property: peak
-        // self_incarnation ≈85 → ≈8 over a 20-second window with the
-        // same seed and topology.
+        // The prior tune (`SWIM_TUNING_REPORT.md`) calibrated against
+        // 60 ms simulated latency. The `1779733878` deployment ran
+        // entirely over relay-mediated paths with tier-2 RTTs of
+        // 181–405 ms; the 0.3 s wall-clock probe budget the prior
+        // defaults gave production (15 ticks × 20 ms tick) was below
+        // the legitimate-probe-RTT p99 and produced 1701
+        // `SwimTransition` events in a 7-minute run.
+        //
+        // The retune's calibration scenario
+        // (`scenarios/calibration/n3_1779733878_repro.toml`) at the
+        // chosen operating point produces 158 transitions in the
+        // same 7-minute window — a 10× collapse against the §5.3
+        // target of <300. The detection time (probe_timeout +
+        // suspicion_timeout = 3000 ticks ≈ 60 s at the production
+        // runtime's 20 ms tick) sits well under the 7-minute
+        // operator deadstop budget the postmortem named.
+        //
+        // - `probe_interval = 10` ticks (unchanged): the protocol
+        //   period is not load-bearing in the calibration sweep.
+        // - `probe_timeout = 750` ticks (15 s at 20 ms tick): exceeds
+        //   the deployment's relay-mediated p99 RTT (tier-2 plus a
+        //   relay HOL queueing margin) by a factor that absorbs
+        //   load-driven spikes per §3.1.
+        // - `suspicion_timeout = 2250` ticks (45 s at 20 ms tick):
+        //   covers several probe cycles so transient probe failures
+        //   do not flap Suspect → Alive → Suspect within the window
+        //   per §3.2.
+        // - `indirect_probes = 2` (unchanged): the prior tune's §3.3
+        //   lower bound; dropping below 2 collapses indirect
+        //   coverage.
+        // - `dead_reprobe_interval = 50` ticks (unchanged).
         Self {
             probe_interval: 10,
-            probe_timeout: 15,
+            probe_timeout: 750,
             indirect_probes: 2,
-            suspicion_timeout: 75,
+            suspicion_timeout: 2250,
             dead_reprobe_interval: 50,
             probe_mode: ProbeMode::Periodic,
+            // Lifeguard wiring §3.6 is opt-in (default = None). The
+            // adaptive band lives in `LifeguardConfig::default()`;
+            // callers that want adaptive timeouts construct
+            // `SwimConfig { lifeguard: Some(LifeguardConfig {
+            // base_suspicion_timeout: <static>, ... }), .. }`. The
+            // calibration scenarios that exercise Lifeguard set it
+            // explicitly via the sim's `kind_config` so the sweep
+            // observation in `SWIM_RETUNE_REPORT.md` §6 is
+            // reproducible. The wiring's anti-target (dead-code
+            // condition) is met: `dynamic_suspicion_timeout` is
+            // consumed by `SwimProbe::check_suspicion_timeouts` when
+            // `lifeguard` is `Some`; the §6 sweep table shows the
+            // verdict shift on the canary calibration.
+            lifeguard: None,
         }
     }
 }
@@ -194,6 +236,9 @@ pub struct SwimProbe {
     demand_queue: VecDeque<NodeId>,
     /// Tick at which the next safety sweep fires (reactive mode).
     next_sweep_tick: u64,
+    /// Adaptive-timeout state per Lifeguard. `None` when
+    /// `config.lifeguard` is `None`.
+    health: Option<HealthMultiplier>,
 }
 
 impl SwimProbe {
@@ -207,6 +252,7 @@ impl SwimProbe {
             ProbeMode::Reactive { safety_sweep_interval } => *safety_sweep_interval,
             ProbeMode::Periodic => u64::MAX,
         };
+        let health = config.lifeguard.clone().map(HealthMultiplier::new);
         Self {
             next_probe_tick: config.probe_interval,
             next_reprobe_tick: next_reprobe,
@@ -221,6 +267,7 @@ impl SwimProbe {
             recent_targets: VecDeque::with_capacity(PROBE_HISTORY_SIZE),
             demand_queue: VecDeque::new(),
             next_sweep_tick: next_sweep,
+            health,
         }
     }
 
@@ -402,6 +449,9 @@ impl SwimProbe {
                     actions.push(SwimAction::Suspect(target));
                     self.start_suspicion_timer(target);
                     self.phase = ProbePhase::Idle;
+                    if let Some(health) = &mut self.health {
+                        health.record_nack();
+                    }
                 }
             }
             ProbePhase::Idle => {}
@@ -425,6 +475,9 @@ impl SwimProbe {
             }));
             self.cancel_suspicion_timer(from);
             self.phase = ProbePhase::Idle;
+            if let Some(health) = &mut self.health {
+                health.record_ack();
+            }
         }
     }
 
@@ -438,6 +491,9 @@ impl SwimProbe {
                 }));
                 self.cancel_suspicion_timer(target);
                 self.phase = ProbePhase::Idle;
+                if let Some(health) = &mut self.health {
+                    health.record_ack();
+                }
             }
     }
 
@@ -457,7 +513,20 @@ impl SwimProbe {
     }
 
     fn check_suspicion_timeouts(&mut self, members: &mut MemberList, actions: &mut Vec<SwimAction>) {
-        let timeout = self.config.suspicion_timeout;
+        // Lifeguard §3.6: a degraded local health multiplier stretches
+        // the suspect-to-dead window. The clamp band in
+        // `LifeguardConfig` keeps a healthy node's effective timeout
+        // at `config.suspicion_timeout` and lets a degraded node grow
+        // up to the configured max before declaring Dead. The probe
+        // state machine is the only consumer; `MemberList` does not
+        // know about health.
+        let timeout = match &self.health {
+            Some(health) => self
+                .config
+                .suspicion_timeout
+                .max(health.dynamic_suspicion_timeout(members.len())),
+            None => self.config.suspicion_timeout,
+        };
         let tick = self.tick;
         let expired: Vec<NodeId> = self
             .suspicion_timers
