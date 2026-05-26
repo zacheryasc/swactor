@@ -224,7 +224,7 @@ impl SwimHost {
             .into_iter()
             .map(|ev| Action::RecordEvent {
                 kind_tag: "swim".into(),
-                event: diag_event_payload(&ev),
+                event: diag_event_payload(&ev, &self.peer_id_of),
             })
             .collect()
     }
@@ -416,7 +416,19 @@ impl Host for SwimHost {
 /// MVP evaluator doesn't have a schema for fall through to a
 /// `diag_event` envelope that carries the production `type` tag
 /// verbatim, so the bundle still records them.
-fn diag_event_payload(ev: &DiagEvent) -> Vec<u8> {
+fn diag_event_payload(ev: &DiagEvent, peer_id_of: &HashMap<NodeId, HostId>) -> Vec<u8> {
+    // Resolve a `NodeId` to the simulator's `HostId` string so the
+    // evaluator's host_id-keyed assertions can match. Falls back to
+    // hex when the NodeId is not in the cluster roster — production
+    // emits NodeId-hex natively, so this preserves the "honest about
+    // absence" pattern (the bundle reader sees a hex string instead
+    // of a name when the peer is unknown to the simulator).
+    let label = |id: &NodeId| -> String {
+        peer_id_of
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| hex_node_id(id))
+    };
     let v = match ev {
         DiagEvent::SwimTransition { peer, from, to, reason } => json!({
             "kind": "state_transition",
@@ -424,6 +436,39 @@ fn diag_event_payload(ev: &DiagEvent) -> Vec<u8> {
             "from": format!("{from:?}"),
             "to": format!("{to:?}"),
             "reason": reason,
+        }),
+        // Coverage 2.6: SWIM probe lifecycle. Dedicated `kind` strings
+        // so the bundle reader (and the evaluator's
+        // `no_flap_while_probes_ok` precondition) can match without
+        // unpacking the generic `diag_event` envelope.
+        //
+        // `target` is the probed peer's `HostId` string (looked up
+        // through `peer_id_of`), consistent with the simulator's
+        // `message_send` convention. Production emits `NodeId`-hex
+        // natively; the simulator translates at the boundary so the
+        // evaluator can compare against assertion `peer` strings that
+        // name peers by their scenario-declared host id. This is the
+        // same translation pattern `message_send` uses — schema
+        // parity per `SIM_SPEC.md §9.2` holds at the field-name level
+        // (`target`, `sequence`, `probe_kind`, `budget_ticks`).
+        DiagEvent::SwimProbeSent { target, sequence, kind } => json!({
+            "kind": "swim_probe_sent",
+            "target": label(target),
+            "sequence": sequence,
+            "probe_kind": kind,
+        }),
+        DiagEvent::SwimProbeAcked { target, sequence, kind } => json!({
+            "kind": "swim_probe_acked",
+            "target": label(target),
+            "sequence": sequence,
+            "probe_kind": kind,
+        }),
+        DiagEvent::SwimProbeTimedOut { target, sequence, kind, budget_ticks } => json!({
+            "kind": "swim_probe_timed_out",
+            "target": label(target),
+            "sequence": sequence,
+            "probe_kind": kind,
+            "budget_ticks": budget_ticks,
         }),
         // Every other production `Event` variant — iroh dial events,
         // metadata, message accounting, probes, errors, custom —
@@ -452,6 +497,7 @@ fn diag_event_payload(ev: &DiagEvent) -> Vec<u8> {
         | DiagEvent::MessageReceived { .. }
         | DiagEvent::ProbeSent { .. }
         | DiagEvent::ProbeReceived { .. }
+        | DiagEvent::InferenceResponseSent { .. }
         | DiagEvent::Error { .. }
         | DiagEvent::Custom { .. } => {
             let inner = serde_json::to_value(ev).unwrap_or(serde_json::Value::Null);

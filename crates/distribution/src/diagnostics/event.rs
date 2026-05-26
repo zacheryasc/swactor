@@ -213,6 +213,66 @@ pub enum Event {
         rtt_ms: Option<u64>,
         outcome: String,
     },
+    /// SWIM-protocol probe initiation (coverage 2.6). Distinct from the
+    /// host-level `ProbeSent` UDP-echo variant above: this one names a
+    /// peer `NodeId` (not a `host:port` string) and carries a SWIM
+    /// sequence number so the bundle reader can join (target, sequence)
+    /// across `SwimProbeSent` / `SwimProbeAcked` / `SwimProbeTimedOut`
+    /// to reconstruct per-probe RTT.
+    ///
+    /// `kind` is one of `"direct"` (the prober sent a `Ping` to the
+    /// target directly) or `"indirect"` (the prober sent a `PingReq`
+    /// through one or more relays after a direct-phase timeout).
+    SwimProbeSent {
+        target: NodeId,
+        sequence: u64,
+        kind: String,
+    },
+    /// SWIM probe completion — an `Ack` matched the in-flight probe
+    /// (coverage 2.6). RTT is *not* carried in the event payload; the
+    /// post-processor reconstructs it from the `(target, sequence)`
+    /// pair's `wall_ms` delta between `SwimProbeSent` and this event.
+    /// That keeps the emitter free of tick-period bookkeeping and
+    /// keeps schema parity with the sim, which stamps `wall_ms` from
+    /// virtual time (per `SIM_SPEC.md §7`).
+    SwimProbeAcked {
+        target: NodeId,
+        sequence: u64,
+        kind: String,
+    },
+    /// SWIM probe expiry — the configured budget elapsed without a
+    /// matching ack (coverage 2.6). `kind="direct"` means the direct
+    /// phase expired and the indirect fanout fires next; `kind="indirect"`
+    /// means the full probe failed and the target is now Suspect.
+    /// `budget_ticks` is the configured `probe_timeout` so a bundle
+    /// reader can see the budget alongside the (absent) RTT —
+    /// honesty-under-absence per the discriminator pattern.
+    SwimProbeTimedOut {
+        target: NodeId,
+        sequence: u64,
+        kind: String,
+        budget_ticks: u64,
+    },
+    /// Inference response-leg send outcome (`N3_COVERAGE_EXTENSION_SPEC.md §2.4`).
+    /// Emitted by the last stage on attempting to send an
+    /// `InferenceResponse` upstream to the orchestrator. The `1779733878`
+    /// postmortem's conclusion — "last stage could not deliver the
+    /// response" — was inferred from dial timeouts plus the absence of
+    /// an inbound `InferenceResponse`. This typed event makes the
+    /// attribution a one-line read rather than a triangulation.
+    ///
+    /// `send_outcome` is the iroh-level result discriminator the
+    /// transport returned: one of `"success"`, `"timeout"`,
+    /// `"connection_closed"`, `"refused"`, `"unresolved"`,
+    /// `"queued_unacked"`. The bundle reader can answer "did the
+    /// response send fail and how" without consulting an external
+    /// system.
+    InferenceResponseSent {
+        target_peer: NodeId,
+        request_id: String,
+        byte_size: u64,
+        send_outcome: String,
+    },
     Error {
         component: String,
         message: String,

@@ -5,7 +5,7 @@
 //! 1. Higher incarnation wins unconditionally.
 //! 2. Same incarnation: higher-priority state wins (Dead > Suspect > Alive).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::types::{MemberState, NodeId, NodeRecord};
 
@@ -28,13 +28,21 @@ impl MemberEntry {
 }
 
 /// The membership list — the core CRDT of the SWIM protocol.
+///
+/// Iteration order is by `NodeId` byte-ordering, not by insertion. This is
+/// deliberate: a `HashMap` here would randomise iteration per process and
+/// the dissemination layer's `pack_piggyback` order would vary run-to-run,
+/// which prevents byte-identical bundle replay across sim runs and adds a
+/// ±20 % run-to-run variance band to the gossip-flap property's
+/// `self_incarnation_peak` (see `crates/simulation/SWIM_TUNING_REPORT.md`
+/// §6.7 — the determinism prerequisite for evidence-driven retuning).
 pub struct MemberList {
     /// Our own node identity.
     self_id: NodeId,
     /// Our own incarnation number.
     self_incarnation: u64,
     /// All known members (excluding self).
-    members: HashMap<NodeId, MemberEntry>,
+    members: BTreeMap<NodeId, MemberEntry>,
 }
 
 impl MemberList {
@@ -42,7 +50,7 @@ impl MemberList {
         Self {
             self_id,
             self_incarnation: 0,
-            members: HashMap::new(),
+            members: BTreeMap::new(),
         }
     }
 

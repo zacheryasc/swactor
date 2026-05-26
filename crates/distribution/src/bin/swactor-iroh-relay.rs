@@ -97,6 +97,26 @@ async fn main() -> ExitCode {
         }
     };
 
+    // QUIC Address Discovery (QAD): lets clients learn their own public
+    // address so iroh can hole-punch direct paths instead of pinning every
+    // connection to this relay. QAD runs over QUIC, which mandates TLS; the
+    // cert is self-signed because this is an operator-controlled diagnostic
+    // relay behind a firewall, and clients are configured to trust a custom
+    // relay's cert (see `iroh_driver`'s `ca_roots_config` for
+    // `RelayMode::Custom`). With `quic: None` the relay can only forward bytes
+    // and the cluster never escapes relay-only operation — which is what
+    // produced the all-`conn_type=Relay`, no-direct-path runs.
+    let quic = {
+        let (_certs, server_config) =
+            iroh_relay::server::testing::self_signed_tls_certs_and_config();
+        let quic_bind =
+            SocketAddr::new(bind.ip(), iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT);
+        Some(iroh_relay::server::QuicConfig {
+            bind_addr: quic_bind,
+            server_config,
+        })
+    };
+
     let server = match iroh_relay::server::Server::spawn(
         iroh_relay::server::ServerConfig::<(), ()> {
             relay: Some(iroh_relay::server::RelayConfig {
@@ -106,7 +126,7 @@ async fn main() -> ExitCode {
                 key_cache_capacity: Some(1024),
                 access: iroh_relay::server::AccessConfig::Everyone,
             }),
-            quic: None,
+            quic,
             metrics_addr: None,
         },
     )
@@ -129,7 +149,11 @@ async fn main() -> ExitCode {
 
     let url_host = public_host.unwrap_or_else(|| addr.ip().to_string());
     let url = format!("http://{}:{}/", url_host, addr.port());
-    eprintln!("swactor-iroh-relay: listening on {bind} (advertised URL: {url})");
+    eprintln!(
+        "swactor-iroh-relay: listening on {bind} (advertised URL: {url}); \
+         QAD/QUIC on udp/{} (self-signed; open this port in the firewall)",
+        iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT,
+    );
 
     // Spec §1: when a collector is configured, this relay reports
     // into the same bundle as the cluster nodes under its own

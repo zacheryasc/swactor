@@ -1,16 +1,20 @@
 FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04
 
-# Runtime base — no CUDA dev headers, no nvcc. tinygrad's CUDA backend
-# compiles kernels via NVRTC which is part of the runtime image, so we
-# do not need the devel image (that base alone is ~5 GB and dominated
-# the 7.55 GB total of the previous build, blowing past the vastai
-# image-pull budget).
+# Runtime base, not devel: the devel base alone is ~5 GB and blew past the
+# vastai image-pull budget (the previous 7.55 GB build). NVRTC — the kernel
+# compiler tinygrad's CUDA backend uses — ships in the runtime image, but the
+# CUDA *toolkit headers* do not, and tinygrad's generated fp16 kernels
+# `#include <cuda_fp16.h>`. Pull in just the cudart dev headers (~7 MB) so
+# NVRTC's `-I/usr/local/cuda/include` resolves them — the minimal alternative
+# to the full devel base. Without this every real-model stage dies at
+# graph-realize with NVRTC_ERROR_COMPILATION ("cannot open cuda_fp16.h").
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         python3 \
         python3-venv \
         python3-pip \
-        ca-certificates && \
+        ca-certificates \
+        cuda-cudart-dev-12-6 && \
     rm -rf /var/lib/apt/lists/*
 
 # Install tinygrad and numpy

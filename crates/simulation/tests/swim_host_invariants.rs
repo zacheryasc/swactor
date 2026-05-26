@@ -167,6 +167,14 @@ fn every_recorded_event_has_a_known_kind_discriminator() {
         // RecordEvents the simulator synthesises.
         "state_transition",
         "message_send",
+        // Coverage 2.6: per-SWIM-probe lifecycle events. Each probe
+        // surfaces as one `swim_probe_sent` plus exactly one of
+        // `swim_probe_acked` / `swim_probe_timed_out` per phase. The
+        // bundle reader joins them on `(target, sequence)` to derive
+        // per-probe RTT.
+        "swim_probe_sent",
+        "swim_probe_acked",
+        "swim_probe_timed_out",
         // Any production `DiagEvent` variant we don't have an MVP
         // schema for surfaces under `diag_event` carrying the
         // production `type` tag verbatim. The mapping function is
@@ -179,6 +187,95 @@ fn every_recorded_event_has_a_known_kind_discriminator() {
         assert!(
             allowed.contains(&kind),
             "SWIM host emitted an unknown kind {kind:?}: {ev}"
+        );
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Coverage 2.6 — per-SWIM-probe RTT events (`N3_COVERAGE_EXTENSION_SPEC.md §2.6`)
+// ──────────────────────────────────────────────────────────────────────
+
+/// A SWIM host with no inbound traffic exercises the probe-timeout path.
+/// Verifies the lifecycle contract: every `swim_probe_sent` resolves
+/// into either `swim_probe_acked` or `swim_probe_timed_out` on the same
+/// `(target, sequence)`, never both, and timeouts carry the configured
+/// `budget_ticks` so a bundle reader can see the budget alongside the
+/// absent RTT (honesty-under-absence).
+#[test]
+fn coverage_2_6_unanswered_probes_resolve_to_typed_timed_out_events() {
+    let mut host = make_host("a", &["a", "b", "c"]);
+
+    // Drive enough ticks that a Periodic probe fires (probe_interval=2)
+    // and both phases (direct then indirect) exhaust their budget
+    // (probe_timeout=1 each). 30 ticks comfortably covers several
+    // complete probe cycles.
+    let mut events: Vec<serde_json::Value> = Vec::new();
+    for t in 0..30u64 {
+        for action in host.tick(t * 1000) {
+            if let Action::RecordEvent { event, .. } = action {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&event).expect("event payload is JSON");
+                events.push(v);
+            }
+        }
+    }
+
+    let sent: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "swim_probe_sent")
+        .collect();
+    let acked: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "swim_probe_acked")
+        .collect();
+    let timed_out: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "swim_probe_timed_out")
+        .collect();
+
+    // The host has no peer responding, so every probe must time out at
+    // both phases. Cover-2.6 contract: at least one probe lifecycle.
+    assert!(
+        !sent.is_empty(),
+        "no swim_probe_sent events emitted in 30 ticks (probe scheduler stuck?): {events:?}"
+    );
+    assert!(
+        acked.is_empty(),
+        "swim_probe_acked surfaced without any inbound traffic: {acked:?}"
+    );
+    assert!(
+        !timed_out.is_empty(),
+        "no swim_probe_timed_out events despite no inbound traffic: {events:?}"
+    );
+
+    // Honesty-under-absence: every timeout carries the configured
+    // budget so a bundle reader sees "probe missed a 1-tick budget"
+    // rather than a silent zero or null.
+    for to in &timed_out {
+        let budget = to["budget_ticks"].as_u64();
+        assert_eq!(
+            budget,
+            Some(1),
+            "swim_probe_timed_out missing or mismatched budget_ticks: {to}"
+        );
+        let probe_kind = to["probe_kind"].as_str().unwrap_or("");
+        assert!(
+            probe_kind == "direct" || probe_kind == "indirect",
+            "swim_probe_timed_out has unexpected probe_kind {probe_kind:?}: {to}"
+        );
+    }
+
+    // Schema parity contract (`SIM_SPEC.md §9.2`): every sent event
+    // carries `target` (hex node id) and a `sequence` u64. The bundle
+    // reader can join (target, sequence) with the corresponding
+    // resolution.
+    for s in &sent {
+        assert!(s["target"].is_string(), "swim_probe_sent.target absent: {s}");
+        assert!(s["sequence"].is_u64(), "swim_probe_sent.sequence absent: {s}");
+        let probe_kind = s["probe_kind"].as_str().unwrap_or("");
+        assert!(
+            probe_kind == "direct" || probe_kind == "indirect",
+            "swim_probe_sent has unexpected probe_kind {probe_kind:?}: {s}"
         );
     }
 }

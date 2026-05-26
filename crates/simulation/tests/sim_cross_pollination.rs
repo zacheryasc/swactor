@@ -21,10 +21,11 @@
 //!         (§2) holds even with no scenario config.
 
 use distribution::diagnostics::{Tier2RelaySession, Tier3SubprocessState};
+use distribution::types::NodeId;
 use serde_json::Value;
 
 use simulation::host::{Action, Host};
-use simulation::stage_host::{StageHost, SubprocessFakeSpec};
+use simulation::stage_host::{InferenceFakeSpec, StageHost, SubprocessFakeSpec};
 
 #[test]
 fn stage_host_snapshot_always_carries_tier2_relay_session_with_unknown_default() {
@@ -186,6 +187,94 @@ fn exit_after_ns_emits_typed_exited_with_correct_uptime() {
         serde_json::from_value(parsed["tier3_subprocess"].clone()).unwrap();
     assert_eq!(tier3.subprocesses[0].status, "exited");
     assert_eq!(tier3.subprocesses[0].exit_code, Some(0));
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Coverage 2.4 — inference response-leg send-outcome event
+// ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn inference_fake_emits_typed_response_sent_with_timeout_outcome() {
+    // Coverage 2.4 close-criterion shape: the last stage emits
+    // exactly one `InferenceResponseSent` carrying target / request /
+    // size / outcome when its outbound to the orchestrator fails.
+    // The `1779733878` failure attribution — "last stage could not
+    // deliver the response" — is now a single typed read, not a
+    // triangulation against dial timeouts.
+    let mut host = StageHost::new("stage-last", "pp-stage-last", "10.0.0.20:7700");
+    let orch_node_id = NodeId([0xAB; 32]);
+    host.set_inference_fake(InferenceFakeSpec {
+        fire_at_ns: 5_000_000,
+        target_peer_node_id: orch_node_id,
+        request_id: "req-7f3c".into(),
+        byte_size: 4_096,
+        send_outcome: "timeout".into(),
+    });
+    // Drive into Running.
+    let _ = host.tick(0);
+    // Past the fire time: the event lands.
+    let actions = host.tick(5_500_000);
+    let diag_events = collect_diag_events(&actions);
+    let sent = diag_events
+        .iter()
+        .find(|p| p.get("type").and_then(|v| v.as_str()) == Some("InferenceResponseSent"))
+        .expect("InferenceResponseSent must fire past fire_at_ns");
+    assert_eq!(sent["request_id"].as_str(), Some("req-7f3c"));
+    assert_eq!(sent["byte_size"].as_u64(), Some(4_096));
+    assert_eq!(sent["send_outcome"].as_str(), Some("timeout"));
+    // target_peer round-trips through the production NodeId schema.
+    let target: NodeId = serde_json::from_value(sent["target_peer"].clone())
+        .expect("target_peer must deserialize as NodeId");
+    assert_eq!(target, orch_node_id);
+}
+
+#[test]
+fn inference_fake_fires_at_most_once_across_many_ticks() {
+    // Spec §2.4 says "exactly one" event per response send. A stage
+    // host that re-emitted on every tick past `fire_at_ns` would
+    // produce double-counting in the bundle.
+    let mut host = StageHost::new("stage-once", "pp-stage-once", "10.0.0.21:7700");
+    host.set_inference_fake(InferenceFakeSpec {
+        fire_at_ns: 1_000_000,
+        target_peer_node_id: NodeId([0xCD; 32]),
+        request_id: "req-dedupe".into(),
+        byte_size: 128,
+        send_outcome: "success".into(),
+    });
+    let _ = host.tick(0);
+    let mut seen = 0usize;
+    for t in [1_000_000u64, 2_000_000, 3_000_000, 10_000_000] {
+        let actions = host.tick(t);
+        for p in collect_diag_events(&actions) {
+            if p.get("type").and_then(|v| v.as_str()) == Some("InferenceResponseSent") {
+                seen += 1;
+            }
+        }
+    }
+    assert_eq!(
+        seen, 1,
+        "InferenceResponseSent must fire exactly once across many ticks past fire_at_ns",
+    );
+}
+
+#[test]
+fn inference_fake_unset_emits_no_response_event() {
+    // Honesty-under-absence: a stage with no inference fake produces
+    // no InferenceResponseSent. The bundle reader sees the absence
+    // (the postproc renders the gap-2.4 absence-line); a silent
+    // synthesized event would break the discriminator contract.
+    let mut host = StageHost::new("stage-quiet", "pp-stage-quiet", "10.0.0.22:7700");
+    let _ = host.tick(0);
+    for t in [1_000_000u64, 5_000_000, 50_000_000] {
+        let actions = host.tick(t);
+        for p in collect_diag_events(&actions) {
+            assert_ne!(
+                p.get("type").and_then(|v| v.as_str()),
+                Some("InferenceResponseSent"),
+                "unsetting the inference fake must suppress InferenceResponseSent",
+            );
+        }
+    }
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────

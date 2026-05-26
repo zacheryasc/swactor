@@ -36,6 +36,15 @@ pub fn assemble(state: &CollectorState, run_id: &str) -> io::Result<PathBuf> {
     let bundle_path = state.bundle_path(run_id);
     let file = File::create(&bundle_path)?;
     assemble_into(state, run_id, file)?;
+    // Coverage 2.5: record the node-count snapshot at canonical-write
+    // time so the serve handler can detect staleness on a later GET
+    // (the canonical's node count vs. current staging's). Captured
+    // from the same in-memory `run_stats` the manifest was built from.
+    let canonical_node_count = state
+        .run_stats(run_id)
+        .map(|s| s.nodes.len())
+        .unwrap_or(0);
+    state.record_canonical_node_count(run_id, canonical_node_count);
     Ok(bundle_path)
 }
 

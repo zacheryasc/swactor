@@ -1,0 +1,118 @@
+# Family B central case — silent stage subprocess, `early_exit`
+# bucket (`N3_SIM_TEST_BATTERY_SPEC.md §3 family B`).
+#
+# Three peers: one orchestrator (swim kind), one stage-0, one
+# stage-2. Stage-2 receives a `WorkerExit` mutation at +1 s, mirroring
+# the "worker spawned but crashed before reaching ready" bucket from
+# the 2026-05-25 postmortem. The orchestrator can never resolve
+# `pp-stage-2` because the stage's worker is dead.
+#
+# Expected verdict on current source: `worker_alive_throughout` for
+# stage-2 over [0, 60s] Fails (the stage halts at +1 s).
+# `name_resolves_within` for pp-stage-2 also Fails (the orchestrator's
+# snapshot never contains the name).
+
+name = "n3_family_b_central_early_exit"
+seed = 2
+duration_ns = 60_000_000_000  # 60 s — beyond the name-resolution budget
+
+[default_tick]
+period_ns = 100_000_000  # 100 ms
+
+[default_link]
+latency_ns = 200_000_000
+jitter_stddev_ns = 50_000_000
+loss_prob_ppm = 0
+reorder_prob_ppm = 0
+bandwidth_bps = 25_000_000
+cold_dial_penalty_ns = 200_000_000
+cache_warm_after_ns = 200_000_000
+cache_invalidate_after_idle_ns = 30_000_000_000
+
+[[relays]]
+id = "R"
+ingress_capacity_bps = 1_000_000_000
+egress_capacity_bps_per_link = 100_000_000
+queue_depth_bytes = 65_536
+cold_start_penalty_ns = 0
+
+[[peers]]
+id = "orch"
+kind = "swim"
+initial_state = "alive"
+kind_config = { probe_interval_ns = 1_000_000_000, probe_timeout_ns = 1_500_000_000, suspicion_timeout_ns = 7_500_000_000, indirect_ping_fanout = 2 }
+
+[[peers]]
+id = "stage-0"
+kind = "stage"
+initial_state = "cold"
+kind_config = { name = "pp-stage-0", address = "10.0.0.10:7700" }
+
+[[peers]]
+id = "stage-2"
+kind = "stage"
+initial_state = "cold"
+kind_config = { name = "pp-stage-2", address = "10.0.0.12:7700" }
+
+[[links]]
+from = "orch"
+to = "stage-0"
+via = "R"
+[[links]]
+from = "stage-0"
+to = "orch"
+via = "R"
+[[links]]
+from = "orch"
+to = "stage-2"
+via = "R"
+[[links]]
+from = "stage-2"
+to = "orch"
+via = "R"
+[[links]]
+from = "stage-0"
+to = "stage-2"
+via = "R"
+[[links]]
+from = "stage-2"
+to = "stage-0"
+via = "R"
+
+# The fault: stage-2's worker exits at +1 s, before it can register
+# `pp-stage-2` with the orchestrator's name registry. `early_exit`
+# bucket per spec §3 family B axis 1.
+[[mutations]]
+at_ns = 1_000_000_000
+kind = "worker_exit"
+peer = "stage-2"
+reason = "tinygrad worker crashed before ready"
+status_code = 1
+
+[[snapshots]]
+at_ns = 500_000_000
+[[snapshots]]
+at_ns = 5_000_000_000
+[[snapshots]]
+at_ns = 30_000_000_000
+[[snapshots]]
+at_ns = 55_000_000_000
+
+# Required assertion: stage-2's lifecycle does not stay Running across
+# the window. Expected Fail — `WorkerExit` halts the stage at +1 s.
+[[assertions]]
+kind = "worker_alive_throughout"
+peer = "stage-2"
+window_start_ns = 0
+window_end_ns = 60_000_000_000
+
+# Required assertion: the orchestrator must resolve every stage name
+# in time. Expected Fail — `pp-stage-2` never appears in the
+# orchestrator's snapshot because the stage halted before
+# registering.
+[[assertions]]
+kind = "name_resolves_within"
+name = "pp-stage-2"
+observers = ["orch"]
+within_ns = 10_000_000_000
+from_ns = 0

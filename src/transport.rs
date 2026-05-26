@@ -22,7 +22,7 @@ use crate::Error;
 ///
 /// Typically the raw bytes of an ed25519 public key, but this type
 /// carries no cryptographic semantics.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NodeId(pub [u8; 32]);
 

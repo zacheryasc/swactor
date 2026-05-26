@@ -5,11 +5,16 @@ edition = "2024"
 
 [features]
 default = []
-iroh = ["dep:iroh", "dep:tokio", "dep:iroh-metrics"]
+# `dep:iroh-relay` is pulled in here (with only the empty `test-utils` feature)
+# so the client side can name `CaRootsConfig::insecure_skip_verify()` for a
+# custom relay's self-signed QAD cert. iroh already depends on iroh-relay
+# transitively, so this adds no real weight — it only flips the cfg gate.
+iroh = ["dep:iroh", "dep:tokio", "dep:iroh-metrics", "dep:iroh-relay"]
 relay = [
     "iroh",
     "collector",
-    "dep:iroh-relay",
+    # The standalone relay binary additionally needs the (heavy) server side.
+    "iroh-relay/server",
     "tokio/macros",
     "tokio/signal",
 ]
@@ -37,7 +42,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 iroh = { version = "0.98", optional = true }
-iroh-relay = { version = "0.98", features = ["server"], optional = true }
+# `test-utils` (an empty feature) exposes two cfg-gated APIs we rely on:
+#   - client: `CaRootsConfig::insecure_skip_verify()` (trust a custom relay's
+#     self-signed QAD cert) — needs only `test-utils`.
+#   - relay binary: `server::testing::self_signed_tls_certs_and_config()` for
+#     the QAD cert — needs `test-utils` + `server` (the latter via the `relay`
+#     feature). Using the helper keeps the `rustls::ServerConfig` version in
+#     lockstep with what `QuicConfig` expects.
+iroh-relay = { version = "0.98", features = ["test-utils"], optional = true }
 iroh-metrics = { version = "0.38", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 axum = { version = "0.8", optional = true }
