@@ -802,6 +802,7 @@ dependencies = [
  "flate2",
  "iroh",
  "iroh-metrics",
+ "iroh-relay",
  "libc",
  "serde",
  "serde_json",
@@ -2621,6 +2622,7 @@ dependencies = [
  "swactor",
  "swactor-process",
  "tokio",
+ "tracing-subscriber",
  "urlencoding",
  "wiremock",
 ]

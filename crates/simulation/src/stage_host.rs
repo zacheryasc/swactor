@@ -67,6 +67,40 @@ pub struct StageHost {
     /// emitting `SubprocessExited`.
     subprocess_fake_spec: Option<SubprocessFakeSpec>,
     subprocess_fake_state: Option<SubprocessFakeState>,
+    /// Coverage 2.4: scenario-driven inference response-leg fake. When
+    /// set, the stage host emits one production-shape
+    /// `InferenceResponseSent` event at `fire_at_ns`, carrying the
+    /// declared target / request / size / outcome discriminator. The
+    /// `send_outcome` mirrors the iroh-level result set production
+    /// emits: `success` / `timeout` / `connection_closed` / `refused`
+    /// / `unresolved` / `queued_unacked`.
+    inference_fake_spec: Option<InferenceFakeSpec>,
+    inference_fake_fired: bool,
+}
+
+/// Scenario-driven configuration for the coverage 2.4 inference
+/// response-leg fake. Drives the last stage's emission of the typed
+/// `InferenceResponseSent` event under a chosen outcome, so the
+/// bundle reader can match "the response did not arrive" against
+/// "stage-N tried to send and the transport returned X."
+///
+/// The scenario or test sets the spec; the stage host fires exactly
+/// one event at `fire_at_ns`. `target_peer_node_id_hex` is the
+/// orchestrator's `NodeId`-hex; absent the host renders the hex
+/// it received literally — honesty-under-absence.
+#[derive(Debug, Clone)]
+pub struct InferenceFakeSpec {
+    pub fire_at_ns: u64,
+    pub target_peer_node_id: distribution::types::NodeId,
+    pub request_id: String,
+    pub byte_size: u64,
+    /// One of `"success"`, `"timeout"`, `"connection_closed"`,
+    /// `"refused"`, `"unresolved"`, `"queued_unacked"`. The host
+    /// emits the value verbatim; the production stage actor's
+    /// emitter validates the discriminator before emit. Keeping the
+    /// sim permissive surfaces test-author typos as bundle-reader
+    /// confusion rather than silent acceptance.
+    pub send_outcome: String,
 }
 
 /// Scenario-driven configuration for the F1 subprocess fake. The
@@ -112,6 +146,8 @@ impl StageHost {
             relay_session: default_unknown_relay_session(),
             subprocess_fake_spec: None,
             subprocess_fake_state: None,
+            inference_fake_spec: None,
+            inference_fake_fired: false,
         }
     }
 
@@ -133,6 +169,15 @@ impl StageHost {
     /// spec's `never_ready` / `exit_after_ns` flags.
     pub fn set_subprocess_fake(&mut self, spec: SubprocessFakeSpec) {
         self.subprocess_fake_spec = Some(spec);
+    }
+
+    /// Coverage 2.4: scenario-driven inference response-leg fake. The
+    /// next `tick` whose `now_ns >= spec.fire_at_ns` emits exactly
+    /// one `InferenceResponseSent` event with the declared
+    /// discriminator. Subsequent ticks are no-ops for this surface.
+    pub fn set_inference_fake(&mut self, spec: InferenceFakeSpec) {
+        self.inference_fake_spec = Some(spec);
+        self.inference_fake_fired = false;
     }
 
     fn lifecycle_event(&self, from: StageState, to: StageState) -> Action {
@@ -263,6 +308,26 @@ impl Host for StageHost {
             }
             StageState::Running => {
                 let mut actions = Vec::new();
+                // Coverage 2.4: fire the inference response-leg event
+                // when its scheduled time has arrived. Exactly one
+                // emission per spec — `inference_fake_fired` guards
+                // against re-emit on later ticks.
+                if !self.inference_fake_fired {
+                    if let Some(spec) = self.inference_fake_spec.as_ref() {
+                        if now_ns >= spec.fire_at_ns {
+                            actions.push(emit_production_event(
+                                KIND_TAG,
+                                &distribution::diagnostics::Event::InferenceResponseSent {
+                                    target_peer: spec.target_peer_node_id,
+                                    request_id: spec.request_id.clone(),
+                                    byte_size: spec.byte_size,
+                                    send_outcome: spec.send_outcome.clone(),
+                                },
+                            ));
+                            self.inference_fake_fired = true;
+                        }
+                    }
+                }
                 if let Some(state) = self.subprocess_fake_state.as_mut() {
                     if state.exited_at_ns.is_none() {
                         if let Some(after_ns) = state.spec.exit_after_ns {

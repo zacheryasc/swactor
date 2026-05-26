@@ -142,10 +142,32 @@ async fn download_bundle(
     //      unfinalized bundles are by definition retrieved during
     //      incident response."
     //   3. neither tarball nor staging → 404 (truly unknown run).
+    //
+    // Coverage 2.5 — bundle serve hardening under run-id reuse: the
+    // canonical bytes on disk may be stale if staging has grown past
+    // the canonical's snapshot (the `1779733878` shape: phase-1
+    // finalize lands; phase-2 boot adds a new node to staging; a
+    // later GET should return the *richer* bundle, not the cached
+    // canonical). We use the node-count heuristic the spec names:
+    // compare current in-memory `nodes.len()` against the count
+    // recorded when the canonical was written. If staging is bigger,
+    // skip the cache and re-synthesize.
     let path = state.bundle_path(&run_id);
     let canonical = tokio::fs::read(&path).await;
     match canonical {
-        Ok(bytes) => return ok_response(&run_id, bytes),
+        Ok(bytes) => {
+            let current_count = state
+                .run_stats(&run_id)
+                .map(|s| s.nodes.len())
+                .unwrap_or(0);
+            let canonical_count = state.canonical_node_count(&run_id).unwrap_or(current_count);
+            if current_count > canonical_count {
+                // Stale: fall through to synthesis so the richer
+                // surface lands in the response.
+            } else {
+                return ok_response(&run_id, bytes);
+            }
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // Fall through to on-demand synthesis.
         }

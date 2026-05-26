@@ -507,9 +507,14 @@ fn evaluate_one(
             "dead_peer_resurrects_within",
             eval_dead_peer_resurrects(peer, *after_ns, *within_ns, events),
         ),
-        AssertionKind::EventCount { event_kind, max } => (
+        AssertionKind::EventCount {
+            event_kind,
+            min,
+            max,
+            peer,
+        } => (
             "event_count",
-            eval_event_count(event_kind, *max, events),
+            eval_event_count(event_kind, *min, *max, peer.as_deref(), events),
         ),
         AssertionKind::EventRate {
             event_kind,
@@ -814,8 +819,25 @@ fn eval_no_dead(peer: &str, start: u64, end: u64, events: &[EventLine]) -> Eval 
 }
 
 fn probes_ok_in_window(peer: &str, start: u64, end: u64, events: &[EventLine]) -> (bool, bool) {
-    // bidirectional: probes_sent_to_peer == probes_received_from_peer
-    // and no probe_timed_out for peer in the window.
+    // Probes-ok ⇔ every probe targeting `peer` resolved to an ack and
+    // no probe targeting `peer` timed out in the window. The
+    // bookkeeping recognises two event-kind families:
+    //
+    //   * legacy `probe_sent` / `probe_received` / `probe_timed_out`
+    //     (host-level UDP echo style — currently unused by the
+    //     simulator's SWIM host but kept for back-compat with any
+    //     other host kind that produces them);
+    //
+    //   * coverage 2.6 `swim_probe_sent` / `swim_probe_acked` /
+    //     `swim_probe_timed_out` (per-SWIM-probe lifecycle —
+    //     `N3_COVERAGE_EXTENSION_SPEC.md §2.6` lands these so this
+    //     precondition resolves to a definite verdict on every
+    //     scenario using a SWIM-host kind).
+    //
+    // Both families contribute to the same sent/received/timed_out
+    // tally. The legacy schema uses `from`/`to`; the SWIM schema
+    // uses `target` (the probed peer). Either way, "probes targeting
+    // `peer` in this window" is the bookkeeping unit.
     let mut any = false;
     let mut sent_to = 0u64;
     let mut received_from = 0u64;
@@ -825,6 +847,7 @@ fn probes_ok_in_window(peer: &str, start: u64, end: u64, events: &[EventLine]) -
         .filter(|e| e.virtual_time_ns >= start && e.virtual_time_ns <= end)
     {
         match e.event["kind"].as_str() {
+            // Legacy probe schema (UDP echo style).
             Some("probe_sent") if e.event["to"] == peer => {
                 sent_to += 1;
                 any = true;
@@ -834,6 +857,19 @@ fn probes_ok_in_window(peer: &str, start: u64, end: u64, events: &[EventLine]) -
                 any = true;
             }
             Some("probe_timed_out") if e.event["to"] == peer || e.event["from"] == peer => {
+                timed_out += 1;
+                any = true;
+            }
+            // Coverage 2.6 SWIM probe lifecycle.
+            Some("swim_probe_sent") if e.event["target"] == peer => {
+                sent_to += 1;
+                any = true;
+            }
+            Some("swim_probe_acked") if e.event["target"] == peer => {
+                received_from += 1;
+                any = true;
+            }
+            Some("swim_probe_timed_out") if e.event["target"] == peer => {
                 timed_out += 1;
                 any = true;
             }
@@ -939,19 +975,32 @@ fn eval_dead_peer_resurrects(peer: &str, after: u64, within: u64, events: &[Even
 
 // ── event_count ─────────────────────────────────────────────────────
 
-fn eval_event_count(event_kind: &str, max: u64, events: &[EventLine]) -> Eval {
-    let count: u64 = events
+fn eval_event_count(
+    event_kind: &str,
+    min: Option<u64>,
+    max: Option<u64>,
+    peer: Option<&str>,
+    events: &[EventLine],
+) -> Eval {
+    let matching: Vec<&EventLine> = events
         .iter()
         .filter(|e| e.event["kind"] == event_kind)
-        .count() as u64;
-    if count <= max {
+        .filter(|e| match peer {
+            None => true,
+            Some(p) => e.host_id.as_deref() == Some(p),
+        })
+        .collect();
+    let count = matching.len() as u64;
+    let lo = min.unwrap_or(0);
+    let hi = max.unwrap_or(u64::MAX);
+    if count >= lo && count <= hi {
         pass()
     } else {
-        let evidence: Vec<Evidence> = events
-            .iter()
-            .filter(|e| e.event["kind"] == event_kind)
-            .map(ev_event)
-            .collect();
+        // Cap evidence at 32 entries — large-count failures otherwise
+        // dump every match into verdicts.json. The bundle still has
+        // them; the assertion's evidence only needs to be
+        // representative.
+        let evidence: Vec<Evidence> = matching.into_iter().take(32).map(ev_event).collect();
         fail(evidence)
     }
 }

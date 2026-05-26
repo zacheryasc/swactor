@@ -34,11 +34,17 @@
 ## Probe outcomes
 - orchestrator: udp_echo/collector-udp-echo → ok (rtt=7ms, 3/3 ok)
 
+## Probe RTT distribution
+- No SWIM probe lifecycle events captured (gap 2.6 D/S layer not active for this run).
+
 ## Kernel network drops
 - No non-zero UDP/interface drop deltas observed.
 
 ## Gossip receipts (by node, by kind)
 - No GossipReceived events captured (no node ran a gossip-emitting source).
+
+## Inference responses
+- No InferenceResponseSent events captured (gap 2.4 D/S layer not active for this run).
 
 ## Per-peer dials
 - totals: started=3, succeeded=2, failed=1, in-flight=0

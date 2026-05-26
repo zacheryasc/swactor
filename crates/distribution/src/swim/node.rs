@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use swactor::transport::hex_encode;
 use crate::diagnostics::{noop_emitter, DynEmitter, Event as DiagEvent, EventEmitter, PeerState};
 use crate::diagnostics::swim_introspect::SwimIntrospect;
 use crate::diagnostics::snapshot::Tier2SwimConfig;
@@ -14,7 +13,7 @@ use crate::types::{MemberState, NodeId, NodeRecord};
 
 use super::dissemination::{membership_update, DisseminationQueue};
 use super::member_list::MemberList;
-use super::probe::{ProbeMode, SwimAction, SwimConfig, SwimEvent, SwimProbe};
+use super::probe::{ProbeMode, SwimAction, SwimConfig, SwimDiagEvent, SwimEvent, SwimProbe};
 
 /// Map SWIM's internal `MemberState` to the diagnostics wire type.
 fn to_peer_state(state: MemberState) -> PeerState {
@@ -449,7 +448,21 @@ impl SwimNode {
     fn apply_membership_update(&mut self, update: MembershipUpdate) -> Vec<NodeAction> {
         // Check if this is about us
         if update.node_id == self.members.self_id() {
-            if update.state == MemberState::Suspect || update.state == MemberState::Dead {
+            // Layer-B1 refute-on-stale-Suspect gate (per
+            // `crates/simulation/SWIM_TUNING_REPORT.md` §6.1): only
+            // refute when the incoming Suspect/Dead update is at our
+            // *current* incarnation. A gossip path that carries a
+            // stale Suspect/Dead record at incarnation N while our
+            // local incarnation has already advanced past N is news
+            // we have already refuted — refuting again creates a
+            // non-zero floor on `self_incarnation_peak` that no
+            // tuning can collapse. Under the relay-mediated path the
+            // `1779733878` deploy exposed, stale Suspects can sit in
+            // the dissemination queue for many probe cycles; gating
+            // on incarnation is what keeps the storm bounded.
+            if (update.state == MemberState::Suspect || update.state == MemberState::Dead)
+                && update.incarnation >= self.members.self_incarnation()
+            {
                 // Refute: bump incarnation and disseminate
                 let new_inc = self.members.refute();
                 if let Some(intro) = &self.introspect {
@@ -486,7 +499,6 @@ impl SwimNode {
                 "gossip",
             );
             if update.state == MemberState::Alive {
-                eprintln!("SWIM: alive {}", &hex_encode(&update.node_id.0)[..8]);
                 // In reactive mode, probe newly discovered alive peers so they
                 // don't decay to dead before we ever exchange a ping/ack.
                 self.probe.enqueue_demand_probe(update.node_id);
@@ -511,6 +523,15 @@ impl SwimNode {
         for pa in probe_actions {
             match pa {
                 SwimAction::SendPing { to, sequence } => {
+                    // Coverage 2.6: record the probe initiation. The
+                    // bundle reader joins (target, sequence) across
+                    // `SwimProbeSent` / `SwimProbeAcked` / `SwimProbeTimedOut`
+                    // to reconstruct per-probe RTT.
+                    self.diagnostics.emit_event(DiagEvent::SwimProbeSent {
+                        target: to,
+                        sequence,
+                        kind: "direct".to_string(),
+                    });
                     // If the target is suspect or dead, re-enqueue its state
                     // so it piggybacks on this message. This is the key mechanism
                     // for partition-heal recovery: the target learns it was
@@ -530,6 +551,12 @@ impl SwimNode {
                     });
                 }
                 SwimAction::SendPingReq { relay, target, sequence } => {
+                    // Coverage 2.6: indirect-phase probe initiation.
+                    self.diagnostics.emit_event(DiagEvent::SwimProbeSent {
+                        target,
+                        sequence,
+                        kind: "indirect".to_string(),
+                    });
                     let pb = self.dissemination.pack_piggyback(self.max_piggyback);
                     actions.push(NodeAction::SendPingReq {
                         relay,
@@ -539,7 +566,6 @@ impl SwimNode {
                     });
                 }
                 SwimAction::Suspect(node_id) => {
-                    eprintln!("SWIM: suspect {}", &hex_encode(&node_id.0)[..8]);
                     let prior = self
                         .members
                         .get(&node_id)
@@ -561,7 +587,6 @@ impl SwimNode {
                     }
                 }
                 SwimAction::DeclareDead(node_id) => {
-                    eprintln!("SWIM: dead {}", &hex_encode(&node_id.0)[..8]);
                     // The probe layer already flipped Suspect→Dead in
                     // `MemberList` before producing this action, so the
                     // current entry reads Dead. SWIM's lifecycle is
@@ -598,6 +623,23 @@ impl SwimNode {
                         self.cluster_size(),
                     );
                 }
+                SwimAction::Diag(diag) => match diag {
+                    SwimDiagEvent::ProbeAcked { target, sequence, kind } => {
+                        self.diagnostics.emit_event(DiagEvent::SwimProbeAcked {
+                            target,
+                            sequence,
+                            kind: kind.to_string(),
+                        });
+                    }
+                    SwimDiagEvent::ProbeTimedOut { target, sequence, kind, budget_ticks } => {
+                        self.diagnostics.emit_event(DiagEvent::SwimProbeTimedOut {
+                            target,
+                            sequence,
+                            kind: kind.to_string(),
+                            budget_ticks,
+                        });
+                    }
+                },
             }
         }
         actions

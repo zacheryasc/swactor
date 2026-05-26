@@ -419,7 +419,9 @@ fn dead_peer_resurrects_within_pass_fail_inconclusive() {
 fn event_count_pass_fail() {
     let scen = scenario_with(vec![AssertionKind::EventCount {
         event_kind: "probe_sent".into(),
-        max: 3,
+        min: None,
+        max: Some(3),
+        peer: None,
     }]);
     let probe = |t: u64, i: usize| {
         evt(
@@ -438,6 +440,125 @@ fn event_count_pass_fail() {
     // No events ⇒ count 0 ≤ max ⇒ Pass (per the catalog's literal wording
     // — "bounds the absolute count"; 0 is within bound).
     assert_eq!(evaluate(&scen, &[], &no_snaps)[0].outcome, Outcome::Pass);
+}
+
+#[test]
+fn event_count_min_floor_fails_when_count_below_floor() {
+    // `min: 1` asserts the kind must occur at least once. Used by
+    // battery family A to assert a `RelayPeerConnDown` cut produces
+    // at least one observable transition event (spec §3 family A's
+    // `event_count { kind: ..., min: 1 }` literal contract).
+    let scen = scenario_with(vec![AssertionKind::EventCount {
+        event_kind: "swim_probe_timed_out".into(),
+        min: Some(1),
+        max: None,
+        peer: None,
+    }]);
+    let no_snaps = SnapshotIndex::default();
+    // Zero matching events ⇒ count 0 < min 1 ⇒ Fail.
+    assert_eq!(
+        evaluate(&scen, &[], &no_snaps)[0].outcome,
+        Outcome::Fail,
+        "event_count with min=1 must Fail when zero matching events occur"
+    );
+    // One matching event ⇒ count 1 >= min 1 ⇒ Pass.
+    let one = vec![evt(
+        10,
+        None,
+        "swim",
+        serde_json::json!({"kind": "swim_probe_timed_out", "target": "b", "sequence": 1}),
+        0,
+    )];
+    assert_eq!(
+        evaluate(&scen, &one, &no_snaps)[0].outcome,
+        Outcome::Pass,
+        "event_count with min=1 must Pass when at least one matching event occurs"
+    );
+}
+
+#[test]
+fn event_count_min_and_max_together_define_a_range() {
+    // `min: 2, max: 5` asserts the count falls in [2, 5]. Below the
+    // floor or above the ceiling is Fail; in the range is Pass.
+    let scen = scenario_with(vec![AssertionKind::EventCount {
+        event_kind: "probe_sent".into(),
+        min: Some(2),
+        max: Some(5),
+        peer: None,
+    }]);
+    let probe = |t: u64, i: usize| {
+        evt(
+            t,
+            None,
+            "swim",
+            serde_json::json!({"kind": "probe_sent", "from": "a", "to": "b"}),
+            i,
+        )
+    };
+    let no_snaps = SnapshotIndex::default();
+    // 1 event ⇒ below min ⇒ Fail.
+    let one = vec![probe(0, 0)];
+    assert_eq!(evaluate(&scen, &one, &no_snaps)[0].outcome, Outcome::Fail);
+    // 3 events ⇒ in range ⇒ Pass.
+    let three = (0..3).map(|i| probe(i as u64 * 10, i)).collect::<Vec<_>>();
+    assert_eq!(evaluate(&scen, &three, &no_snaps)[0].outcome, Outcome::Pass);
+    // 7 events ⇒ above max ⇒ Fail.
+    let seven = (0..7).map(|i| probe(i as u64 * 10, i)).collect::<Vec<_>>();
+    assert_eq!(evaluate(&scen, &seven, &no_snaps)[0].outcome, Outcome::Fail);
+}
+
+#[test]
+fn event_count_peer_filter_only_counts_events_from_named_host() {
+    // Spec §3 family C: `event_count { peer: <observer>, ... }`
+    // requires counting events emitted by the named observer only.
+    // The catalog extension lets a scenario tighten its
+    // discriminator off the run-wide event-stream onto a single
+    // observer's stream.
+    let scen = scenario_with(vec![AssertionKind::EventCount {
+        event_kind: "gossip_received".into(),
+        min: Some(1),
+        max: None,
+        peer: Some("a".into()),
+    }]);
+    let no_snaps = SnapshotIndex::default();
+    // Three gossip_received events on host "b" (not "a") ⇒ filter
+    // out, count 0 ⇒ Fail.
+    let other_peer = (0..3)
+        .map(|i| {
+            evt(
+                10 + i as u64,
+                Some("b"),
+                "swim",
+                serde_json::json!({"kind": "gossip_received", "source_peer": "c"}),
+                i,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        evaluate(&scen, &other_peer, &no_snaps)[0].outcome,
+        Outcome::Fail,
+        "peer filter must exclude events from other hosts"
+    );
+    // Same kind on host "a" ⇒ Pass.
+    let target_peer = vec![evt(
+        50,
+        Some("a"),
+        "swim",
+        serde_json::json!({"kind": "gossip_received", "source_peer": "c"}),
+        4,
+    )];
+    assert_eq!(
+        evaluate(&scen, &target_peer, &no_snaps)[0].outcome,
+        Outcome::Pass,
+        "peer filter must Pass when matching events exist on the named host"
+    );
+    // Mixed: only host "a"'s events should count.
+    let mixed: Vec<_> = other_peer.into_iter().chain(target_peer.into_iter()).collect();
+    assert_eq!(
+        evaluate(&scen, &mixed, &no_snaps)[0].outcome,
+        Outcome::Pass,
+        "peer filter must reduce a mixed stream to the named host's events only"
+    );
 }
 
 #[test]
@@ -473,7 +594,9 @@ fn event_rate_pass_fail() {
 fn verdict_shape_includes_kind_parameters_outcome_and_evidence_on_fail() {
     let scen = scenario_with(vec![AssertionKind::EventCount {
         event_kind: "probe_sent".into(),
-        max: 0,
+        min: None,
+        max: Some(0),
+        peer: None,
     }]);
     let events = vec![evt(
         10,
@@ -498,9 +621,9 @@ fn verdict_shape_includes_kind_parameters_outcome_and_evidence_on_fail() {
 #[test]
 fn verdicts_listed_in_scenario_declaration_order() {
     let scen = scenario_with(vec![
-        AssertionKind::EventCount { event_kind: "alpha".into(), max: 0 },
-        AssertionKind::EventCount { event_kind: "beta".into(), max: 0 },
-        AssertionKind::EventCount { event_kind: "gamma".into(), max: 0 },
+        AssertionKind::EventCount { event_kind: "alpha".into(), min: None, max: Some(0), peer: None },
+        AssertionKind::EventCount { event_kind: "beta".into(), min: None, max: Some(0), peer: None },
+        AssertionKind::EventCount { event_kind: "gamma".into(), min: None, max: Some(0), peer: None },
     ]);
     let v = evaluate(&scen, &[], &SnapshotIndex::default());
     assert_eq!(v.len(), 3);
@@ -518,7 +641,9 @@ fn verdicts_listed_in_scenario_declaration_order() {
 fn streaming_resolves_to_same_verdict_as_post_run() {
     let scen = scenario_with(vec![AssertionKind::EventCount {
         event_kind: "probe_sent".into(),
-        max: 1,
+        min: None,
+        max: Some(1),
+        peer: None,
     }]);
     let events = vec![
         evt(10, None, "swim", serde_json::json!({"kind": "probe_sent", "from": "a", "to": "b"}), 0),
@@ -542,7 +667,9 @@ fn streaming_resolves_to_same_verdict_as_post_run() {
 fn streaming_resolves_event_count_fail_at_first_overshoot() {
     let scen = scenario_with(vec![AssertionKind::EventCount {
         event_kind: "probe_sent".into(),
-        max: 1,
+        min: None,
+        max: Some(1),
+        peer: None,
     }]);
     let mut stream = StreamingEvaluator::new(scen);
     stream.feed_event(evt(
@@ -576,8 +703,8 @@ fn streaming_resolves_event_count_fail_at_first_overshoot() {
 fn evaluate_bundle_writes_verdicts_json_with_one_entry_per_assertion() {
     let tmp = TempDir::new().unwrap();
     let scen = scenario_with(vec![
-        AssertionKind::EventCount { event_kind: "probe_sent".into(), max: 0 },
-        AssertionKind::EventCount { event_kind: "alpha".into(), max: 100 },
+        AssertionKind::EventCount { event_kind: "probe_sent".into(), min: None, max: Some(0), peer: None },
+        AssertionKind::EventCount { event_kind: "alpha".into(), min: None, max: Some(100), peer: None },
     ]);
     // Write a tiny bundle: one event of kind probe_sent (which makes
     // assertion 0 fail, assertion 1 pass since alpha has 0 events).

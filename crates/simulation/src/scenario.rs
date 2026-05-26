@@ -284,9 +284,26 @@ pub enum AssertionKind {
         after_ns: u64,
         within_ns: u64,
     },
+    /// `N3_SIM_TEST_BATTERY_SPEC.md §3` family A/C-shaped assertion.
+    /// Counts events of kind `event_kind` across the entire run. `min`
+    /// and `max` are both optional bounds (default 0 / u64::MAX); a
+    /// scenario can assert only the floor, only the ceiling, or
+    /// both. Pass iff `min <= observed <= max`.
+    ///
+    /// `peer` is an optional `host_id` filter — when set, only events
+    /// emitted by the named host are counted. Mutation-emitted events
+    /// (which carry no `host_id`) are filtered out under any non-`None`
+    /// `peer`. This lets family C tighten its "GossipReceived on
+    /// stage-2" discriminator against a per-peer counter rather than
+    /// a run-wide one (`N3_SIM_TEST_BATTERY_SPEC.md §3 family C`).
     EventCount {
         event_kind: String,
-        max: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        min: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
     },
     EventRate {
         event_kind: String,
@@ -1606,6 +1623,25 @@ fn require_u64_field(path: &Path, field: &str, v: Option<&toml::Value>) -> Resul
     Ok(n as u64)
 }
 
+fn optional_u64_field(
+    path: &Path,
+    field: &str,
+    v: Option<&toml::Value>,
+) -> Result<Option<u64>, LoadError> {
+    match v {
+        None => Ok(None),
+        Some(value) => {
+            let n = value
+                .as_integer()
+                .ok_or_else(|| err(path, field, "must be a non-negative integer when present"))?;
+            if n < 0 {
+                return Err(err(path, field, "must be non-negative"));
+            }
+            Ok(Some(n as u64))
+        }
+    }
+}
+
 fn require_u32_field(path: &Path, field: &str, v: Option<&toml::Value>) -> Result<u32, LoadError> {
     let n = require_u64_field(path, field, v)?;
     if n > u32::MAX as u64 {
@@ -1793,14 +1829,57 @@ fn parse_assertion(
                 within_ns,
             }
         }
-        "event_count" => AssertionKind::EventCount {
-            event_kind: table
+        "event_count" => {
+            let event_kind = table
                 .get("event_kind")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| err(path, field("event_kind"), "required string"))?
-                .to_string(),
-            max: require_u64_field(path, &field("max"), table.get("max"))?,
-        },
+                .to_string();
+            let min = optional_u64_field(path, &field("min"), table.get("min"))?;
+            let max = optional_u64_field(path, &field("max"), table.get("max"))?;
+            if min.is_none() && max.is_none() {
+                return Err(err(
+                    path,
+                    field("event_count"),
+                    "at least one of `min` or `max` must be set",
+                ));
+            }
+            if let (Some(lo), Some(hi)) = (min, max) {
+                if lo > hi {
+                    return Err(err(
+                        path,
+                        field("event_count"),
+                        format!("min ({lo}) must be <= max ({hi})"),
+                    ));
+                }
+            }
+            // Optional `peer:` host_id filter. Validated against the
+            // declared peer set so a typo like `peer = "stage-99"`
+            // fails at load time, not at evaluate time.
+            let peer = match table.get("peer") {
+                None => None,
+                Some(value) => {
+                    let s = value
+                        .as_str()
+                        .ok_or_else(|| err(path, field("peer"), "must be a string"))?
+                        .to_string();
+                    if !peers.contains(&s) {
+                        return Err(err(
+                            path,
+                            field("peer"),
+                            format!("references undeclared peer {s:?}"),
+                        ));
+                    }
+                    Some(s)
+                }
+            };
+            AssertionKind::EventCount {
+                event_kind,
+                min,
+                max,
+                peer,
+            }
+        }
         "event_rate" => AssertionKind::EventRate {
             event_kind: table
                 .get("event_kind")

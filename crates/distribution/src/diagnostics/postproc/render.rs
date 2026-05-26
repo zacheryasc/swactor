@@ -133,6 +133,26 @@ pub fn render_summary(bundle: &Bundle) -> String {
     }
     let _ = writeln!(out);
 
+    // -- SWIM per-probe RTT distribution (N3_COVERAGE_EXTENSION_SPEC §2.6).
+    // Joins `SwimProbeSent` to `SwimProbeAcked`/`SwimProbeTimedOut` by
+    // `(target, sequence, kind)` on the observer's event stream. Renders
+    // median/p95/p99 per (observer, target) pair plus per 5-second bucket
+    // so degradation over time is visible. Always emits the section
+    // header: absence is named, never silent.
+    let _ = writeln!(out, "## Probe RTT distribution");
+    let rtt_lines = swim_probe_rtt_lines(bundle);
+    if rtt_lines.is_empty() {
+        let _ = writeln!(
+            out,
+            "- No SWIM probe lifecycle events captured (gap 2.6 D/S layer not active for this run)."
+        );
+    } else {
+        for line in rtt_lines {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+    let _ = writeln!(out);
+
     // -- Kernel-level UDP / interface drops across the run window
     //    (spec §11). A line per (node, counter) only when the delta is
     //    non-zero; nothing rendered when every counter is clean.
@@ -159,6 +179,27 @@ pub fn render_summary(bundle: &Bundle) -> String {
         );
     } else {
         for line in gossip_lines {
+            let _ = writeln!(out, "- {line}");
+        }
+    }
+    let _ = writeln!(out);
+
+    // -- Inference responses (N3_COVERAGE_EXTENSION_SPEC §2.4).
+    // One line per `InferenceResponseSent` event: which stage tried to
+    // deliver which request to which observer, the byte size, and the
+    // send outcome discriminator. Always rendered: when no responses
+    // exist in the bundle, the section names the absence so the
+    // bundle reader is never left guessing whether the surface was
+    // wired or whether the run carried no inference traffic.
+    let _ = writeln!(out, "## Inference responses");
+    let inf_lines = inference_response_lines(bundle);
+    if inf_lines.is_empty() {
+        let _ = writeln!(
+            out,
+            "- No InferenceResponseSent events captured (gap 2.4 D/S layer not active for this run)."
+        );
+    } else {
+        for line in inf_lines {
             let _ = writeln!(out, "- {line}");
         }
     }
@@ -774,6 +815,225 @@ struct GossipTotals {
     items: u64,
 }
 
+/// Inference response-leg send-outcome lines
+/// (`N3_COVERAGE_EXTENSION_SPEC §2.4`).
+///
+/// One line per `InferenceResponseSent` event in any node's stream.
+/// Lines are sorted by (sender_label, wall_ms, request_id) so the
+/// bundle reader can read the response chain chronologically per
+/// sender. The send-outcome discriminator surfaces the iroh-level
+/// result (`success` / `timeout` / `connection_closed` / etc.) so
+/// "the response did not arrive, here is the typed reason" is a
+/// single read rather than a triangulation against dial timeouts.
+fn inference_response_lines(bundle: &Bundle) -> Vec<String> {
+    use crate::diagnostics::reachability::node_id_hex;
+    let mut out: Vec<String> = Vec::new();
+    for (sender_label, node) in &bundle.nodes {
+        for rec in &node.events {
+            if let Event::InferenceResponseSent {
+                target_peer,
+                request_id,
+                byte_size,
+                send_outcome,
+            } = &rec.event
+            {
+                let target_hex = node_id_hex(target_peer);
+                let target_label = bundle.label_for_hex(&target_hex);
+                out.push(format!(
+                    "{sender} -> {target}: request={request_id} bytes={byte_size} outcome={send_outcome} at={wall_ms}ms",
+                    sender = sender_label,
+                    target = target_label,
+                    wall_ms = rec.wall_ms,
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// SWIM per-probe RTT distribution lines (`N3_COVERAGE_EXTENSION_SPEC §2.6`).
+///
+/// For every observer in the bundle, joins `SwimProbeSent` events to
+/// matching `SwimProbeAcked` / `SwimProbeTimedOut` events by
+/// `(target, sequence, kind)` and reconstructs per-probe RTT from the
+/// `wall_ms` delta — RTT is *not* carried in the event payload to keep
+/// the production emitter free of tick-period bookkeeping and to
+/// preserve sim/prod parity (the simulator stamps `wall_ms` from
+/// virtual time per `SIM_SPEC.md §7`).
+///
+/// Output: one line per (observer, target) pair with the run-wide
+/// distribution, followed by per-five-second-bucket lines. A
+/// `SwimProbeTimedOut` outcome contributes to the timeout count and
+/// surfaces its `budget_ticks` budget — its RTT is absent (the budget
+/// elapsed without a response), per the honesty-under-absence
+/// discriminator pattern.
+fn swim_probe_rtt_lines(bundle: &Bundle) -> Vec<String> {
+    use crate::diagnostics::reachability::node_id_hex;
+
+    #[derive(Default)]
+    struct OutcomeStats {
+        acked_rtts_ms: Vec<u64>,
+        timeout_count: u64,
+        timeout_budget_ticks: Option<u64>,
+        pending: u64,
+    }
+
+    type Key = (String, String);
+    let mut by_pair: BTreeMap<Key, OutcomeStats> = BTreeMap::new();
+    let mut by_pair_and_bucket: BTreeMap<(Key, u64), OutcomeStats> = BTreeMap::new();
+
+    // First pass: for each observer's stream, index `SwimProbeSent`
+    // events by (target_hex, sequence, kind) and walk acks/timeouts to
+    // reconstruct per-probe outcomes.
+    for (observer_label, node) in &bundle.nodes {
+        let mut sent: BTreeMap<(String, u64, String), u64> = BTreeMap::new();
+        let mut resolved: BTreeSet<(String, u64, String)> = BTreeSet::new();
+        for rec in &node.events {
+            match &rec.event {
+                Event::SwimProbeSent { target, sequence, kind } => {
+                    sent.insert(
+                        (node_id_hex(target), *sequence, kind.clone()),
+                        rec.wall_ms,
+                    );
+                }
+                Event::SwimProbeAcked { target, sequence, kind } => {
+                    let key = (node_id_hex(target), *sequence, kind.clone());
+                    if let Some(send_ms) = sent.get(&key).copied() {
+                        let rtt_ms = rec.wall_ms.saturating_sub(send_ms);
+                        let target_label = bundle.label_for_hex(&key.0);
+                        let pair_key = (observer_label.clone(), target_label.clone());
+                        by_pair
+                            .entry(pair_key.clone())
+                            .or_default()
+                            .acked_rtts_ms
+                            .push(rtt_ms);
+                        let bucket = send_ms / 5_000;
+                        by_pair_and_bucket
+                            .entry((pair_key, bucket))
+                            .or_default()
+                            .acked_rtts_ms
+                            .push(rtt_ms);
+                        resolved.insert(key);
+                    }
+                }
+                Event::SwimProbeTimedOut {
+                    target,
+                    sequence,
+                    kind,
+                    budget_ticks,
+                } => {
+                    let key = (node_id_hex(target), *sequence, kind.clone());
+                    let target_label = bundle.label_for_hex(&key.0);
+                    let pair_key = (observer_label.clone(), target_label.clone());
+                    let send_ms = sent.get(&key).copied();
+                    let entry = by_pair.entry(pair_key.clone()).or_default();
+                    entry.timeout_count = entry.timeout_count.saturating_add(1);
+                    entry.timeout_budget_ticks =
+                        Some(entry.timeout_budget_ticks.unwrap_or(*budget_ticks));
+                    if let Some(send_ms) = send_ms {
+                        let bucket = send_ms / 5_000;
+                        let b_entry = by_pair_and_bucket
+                            .entry((pair_key, bucket))
+                            .or_default();
+                        b_entry.timeout_count = b_entry.timeout_count.saturating_add(1);
+                        b_entry.timeout_budget_ticks =
+                            Some(b_entry.timeout_budget_ticks.unwrap_or(*budget_ticks));
+                    }
+                    resolved.insert(key);
+                }
+                _ => {}
+            }
+        }
+        // Probes the observer sent but never resolved (no ack, no
+        // timeout in the bundle's window) count as `pending` —
+        // honesty-under-absence: surface them, do not silently drop.
+        for (key, send_ms) in &sent {
+            if resolved.contains(key) {
+                continue;
+            }
+            let target_label = bundle.label_for_hex(&key.0);
+            let pair_key = (observer_label.clone(), target_label);
+            let entry = by_pair.entry(pair_key.clone()).or_default();
+            entry.pending = entry.pending.saturating_add(1);
+            let bucket = send_ms / 5_000;
+            let b_entry = by_pair_and_bucket
+                .entry((pair_key, bucket))
+                .or_default();
+            b_entry.pending = b_entry.pending.saturating_add(1);
+        }
+    }
+
+    if by_pair.is_empty() {
+        return Vec::new();
+    }
+
+    fn percentile(sorted: &[u64], pct: f64) -> Option<u64> {
+        if sorted.is_empty() {
+            return None;
+        }
+        // Nearest-rank percentile on a sorted slice. Deterministic;
+        // independent of float arithmetic order beyond the rounding step.
+        let rank = ((pct / 100.0) * (sorted.len() as f64)).ceil() as usize;
+        let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+        Some(sorted[idx])
+    }
+
+    fn fmt_stats(stats: &OutcomeStats) -> String {
+        let mut rtts = stats.acked_rtts_ms.clone();
+        rtts.sort_unstable();
+        let median = percentile(&rtts, 50.0);
+        let p95 = percentile(&rtts, 95.0);
+        let p99 = percentile(&rtts, 99.0);
+        let acked = rtts.len() as u64;
+        let probes = acked + stats.timeout_count + stats.pending;
+        let rtt_block = if acked == 0 {
+            "rtt_ms=- (no acks)".to_string()
+        } else {
+            format!(
+                "rtt_ms median={} p95={} p99={}",
+                median.unwrap_or(0),
+                p95.unwrap_or(0),
+                p99.unwrap_or(0),
+            )
+        };
+        let budget_block = match stats.timeout_budget_ticks {
+            Some(b) => format!(" timeout_budget_ticks={b}"),
+            None => String::new(),
+        };
+        format!(
+            "probes={probes} acked={acked} timed_out={timed_out} pending={pending} {rtt_block}{budget_block}",
+            timed_out = stats.timeout_count,
+            pending = stats.pending,
+        )
+    }
+
+    let mut out: Vec<String> = Vec::new();
+    for (pair, stats) in &by_pair {
+        out.push(format!(
+            "- {observer} -> {target}: {body}",
+            observer = pair.0,
+            target = pair.1,
+            body = fmt_stats(stats),
+        ));
+        let mut bucket_rows: Vec<(u64, &OutcomeStats)> = by_pair_and_bucket
+            .iter()
+            .filter(|((k, _), _)| k == pair)
+            .map(|((_, b), s)| (*b, s))
+            .collect();
+        bucket_rows.sort_by_key(|(b, _)| *b);
+        for (bucket, b_stats) in bucket_rows {
+            let from_s = bucket * 5;
+            let to_s = from_s + 5;
+            out.push(format!(
+                "  bucket {from_s}-{to_s}s: {body}",
+                body = fmt_stats(b_stats),
+            ));
+        }
+    }
+    out
+}
+
 fn probe_summary_lines(bundle: &Bundle) -> Vec<String> {
     let mut out = Vec::new();
     for (label, node) in &bundle.nodes {
@@ -839,6 +1099,10 @@ fn event_kind(event: &Event) -> String {
         Event::MessageReceived { .. } => "MessageReceived".into(),
         Event::ProbeSent { .. } => "ProbeSent".into(),
         Event::ProbeReceived { .. } => "ProbeReceived".into(),
+        Event::SwimProbeSent { .. } => "SwimProbeSent".into(),
+        Event::SwimProbeAcked { .. } => "SwimProbeAcked".into(),
+        Event::SwimProbeTimedOut { .. } => "SwimProbeTimedOut".into(),
+        Event::InferenceResponseSent { .. } => "InferenceResponseSent".into(),
         Event::Error { .. } => "Error".into(),
         Event::Custom { kind, .. } => format!("Custom({kind})"),
     }

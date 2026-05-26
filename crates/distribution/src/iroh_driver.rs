@@ -238,12 +238,27 @@ impl IrohDriver {
         #[cfg(not(feature = "relay"))]
         let (relay_url, effective_relay_mode) = (None::<String>, config.relay_mode);
 
+        // A custom relay is operator-controlled (typically `swactor-iroh-relay`
+        // on a VPS, serving QUIC Address Discovery with a self-signed cert).
+        // We trust its cert below so QAD's TLS handshake succeeds — without
+        // that, address discovery fails and every connection stays
+        // `conn_type=Relay`, which defeats hole-punching and makes a NAT'd peer
+        // (e.g. a locally-run orchestrator) reachable only over the relay.
+        let custom_relay = matches!(effective_relay_mode, RelayMode::Custom(_));
+
         let endpoint = rt.block_on(async {
             let mut alpns = vec![ALPN.to_vec()];
             alpns.extend(config.additional_alpns.iter().cloned());
             let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .relay_mode(effective_relay_mode)
                 .alpns(alpns);
+
+            // Only relax relay-cert verification for a custom relay; Default /
+            // Staging relays keep full WebPKI verification.
+            if custom_relay {
+                builder =
+                    builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
+            }
 
             if let Some(key) = config.secret_key {
                 builder = builder.secret_key(key);

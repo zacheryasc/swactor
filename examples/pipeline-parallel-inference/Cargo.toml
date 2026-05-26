@@ -29,3 +29,4 @@ path = "src/bin/pp_smoke_run.rs"
 
 [dev-dependencies]
 wiremock = "0.6"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

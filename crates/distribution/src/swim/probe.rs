@@ -106,6 +106,39 @@ pub enum SwimAction {
     DeclareDead(NodeId),
     /// Our node was suspected — refute with bumped incarnation.
     Refute { new_incarnation: u64 },
+    /// Diagnostic-only signal — no protocol effect. The host adapter
+    /// translates these into typed `Event` records for coverage 2.6
+    /// (per-SWIM-probe RTT). Threading them as a `SwimAction` variant
+    /// keeps the probe state machine pure (no emitter handle) while
+    /// still letting the caller observe ack/timeout lifecycle without
+    /// reaching into private phase state.
+    Diag(SwimDiagEvent),
+}
+
+/// Diagnostic-only events produced by the probe state machine.
+///
+/// `kind` is `"direct"` for the direct-phase ack/timeout (i.e. a
+/// `SendPing` initiating the probe) and `"indirect"` for the
+/// indirect-phase ack/timeout (i.e. a `SendPingReq` fanout). The
+/// strings match the `kind` field on `Event::SwimProbeSent` /
+/// `SwimProbeAcked` / `SwimProbeTimedOut` so the host adapter is a
+/// 1:1 translation.
+#[derive(Debug, Clone)]
+pub enum SwimDiagEvent {
+    /// An ack matched the in-flight probe and the probe is complete.
+    ProbeAcked {
+        target: NodeId,
+        sequence: u64,
+        kind: &'static str,
+    },
+    /// The configured budget elapsed before the in-flight probe got
+    /// its ack. `budget_ticks` is the configured `probe_timeout`.
+    ProbeTimedOut {
+        target: NodeId,
+        sequence: u64,
+        kind: &'static str,
+        budget_ticks: u64,
+    },
 }
 
 // ─── Probe State ────────────────────────────────────────────────────────────
@@ -322,6 +355,16 @@ impl SwimProbe {
                 if self.tick - sent_at >= self.config.probe_timeout {
                     let target = *target;
                     let sequence = *sequence;
+                    let budget = self.config.probe_timeout;
+
+                    // The direct phase expired — signal coverage 2.6 first,
+                    // then fan out the indirect probes.
+                    actions.push(SwimAction::Diag(SwimDiagEvent::ProbeTimedOut {
+                        target,
+                        sequence,
+                        kind: "direct",
+                        budget_ticks: budget,
+                    }));
 
                     // Send indirect probes through relays
                     let relays = self.pick_relays(members, target);
@@ -340,9 +383,21 @@ impl SwimProbe {
                     };
                 }
             }
-            ProbePhase::WaitingIndirectAck { target, sequence: _, sent_at } => {
+            ProbePhase::WaitingIndirectAck { target, sequence, sent_at } => {
                 if self.tick - sent_at >= self.config.probe_timeout {
                     let target = *target;
+                    let sequence = *sequence;
+                    let budget = self.config.probe_timeout;
+
+                    // Indirect phase expired — coverage 2.6 signal first, then
+                    // declare suspect.
+                    actions.push(SwimAction::Diag(SwimDiagEvent::ProbeTimedOut {
+                        target,
+                        sequence,
+                        kind: "indirect",
+                        budget_ticks: budget,
+                    }));
+
                     // No ack received — suspect this node
                     actions.push(SwimAction::Suspect(target));
                     self.start_suspicion_timer(target);
@@ -353,27 +408,37 @@ impl SwimProbe {
         }
     }
 
-    fn handle_ack(&mut self, from: NodeId, sequence: u64, _members: &mut MemberList, _actions: &mut Vec<SwimAction>) {
-        match &self.phase {
+    fn handle_ack(&mut self, from: NodeId, sequence: u64, _members: &mut MemberList, actions: &mut Vec<SwimAction>) {
+        let kind = match &self.phase {
             ProbePhase::WaitingDirectAck { target, sequence: expected, .. }
-            | ProbePhase::WaitingIndirectAck { target, sequence: expected, .. } => {
-                if from == *target && sequence == *expected {
-                    // Successful ack — cancel any suspicion timer for this node
-                    self.cancel_suspicion_timer(from);
-                    self.phase = ProbePhase::Idle;
-                }
-            }
-            ProbePhase::Idle => {}
+                if from == *target && sequence == *expected => Some("direct"),
+            ProbePhase::WaitingIndirectAck { target, sequence: expected, .. }
+                if from == *target && sequence == *expected => Some("indirect"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            // Successful ack — coverage 2.6 signal, cancel suspicion, idle.
+            actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
+                target: from,
+                sequence,
+                kind,
+            }));
+            self.cancel_suspicion_timer(from);
+            self.phase = ProbePhase::Idle;
         }
     }
 
-    fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, _members: &mut MemberList, _actions: &mut Vec<SwimAction>) {
-        if let ProbePhase::WaitingIndirectAck { target: expected, sequence: expected_seq, .. } = &self.phase {
-            if target == *expected && sequence == *expected_seq {
+    fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, _members: &mut MemberList, actions: &mut Vec<SwimAction>) {
+        if let ProbePhase::WaitingIndirectAck { target: expected, sequence: expected_seq, .. } = &self.phase
+            && target == *expected && sequence == *expected_seq {
+                actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
+                    target,
+                    sequence,
+                    kind: "indirect",
+                }));
                 self.cancel_suspicion_timer(target);
                 self.phase = ProbePhase::Idle;
             }
-        }
     }
 
     fn start_suspicion_timer(&mut self, node_id: NodeId) {

@@ -315,7 +315,9 @@ fn expand_template(t: &AssertionTemplate, peers: &[String]) -> Vec<Assertion> {
         AssertionTemplate::EventCount { event_kind, max } => vec![Assertion {
             kind: AssertionKind::EventCount {
                 event_kind: event_kind.clone(),
-                max: *max,
+                min: None,
+                max: Some(*max),
+                peer: None,
             },
         }],
     }

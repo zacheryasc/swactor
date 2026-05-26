@@ -42,6 +42,15 @@ pub struct CollectorState {
     /// next POST. Cleared on read so each hint fires once. T1.4
     /// pull-trigger.
     pending_hints: Mutex<HashMap<HintKey, Hints>>,
+    /// Coverage 2.5 — bundle serve hardening under run-id reuse.
+    /// Records the in-memory node count captured each time the
+    /// canonical tarball is written by `bundle::assemble`. On serve,
+    /// `download_bundle` compares this against the current
+    /// `run_stats(run_id).nodes.len()`; if staging has grown past
+    /// the canonical's snapshot the canonical is stale and the
+    /// handler rebuilds from current staging. This is the
+    /// "node-count heuristic" the spec names.
+    canonical_node_counts: Mutex<HashMap<String, usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -85,7 +94,32 @@ impl CollectorState {
             seqs: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
             pending_hints: Mutex::new(HashMap::new()),
+            canonical_node_counts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Coverage 2.5: record the node-count snapshot captured when the
+    /// canonical tarball was last written for `run_id`. Called by
+    /// `bundle::assemble` right after the tarball lands on disk so
+    /// the serve handler can compare against current staging to
+    /// detect canonical staleness.
+    pub fn record_canonical_node_count(&self, run_id: &str, count: usize) {
+        let mut m = self
+            .canonical_node_counts
+            .lock()
+            .expect("canonical_node_counts mutex poisoned");
+        m.insert(run_id.to_string(), count);
+    }
+
+    /// Coverage 2.5: return the canonical's last-recorded node count
+    /// for `run_id`, or `None` if no canonical has been written yet
+    /// (or this collector process never wrote one).
+    pub fn canonical_node_count(&self, run_id: &str) -> Option<usize> {
+        self.canonical_node_counts
+            .lock()
+            .expect("canonical_node_counts mutex poisoned")
+            .get(run_id)
+            .copied()
     }
 
     /// Override the finalize wait window — tests use a millisecond
