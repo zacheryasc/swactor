@@ -569,6 +569,7 @@ fn main() {
         probe_mode: distribution::swim::probe::ProbeMode::Reactive {
             safety_sweep_interval: 3000, // 5 minutes at 100ms/tick
         },
+        lifeguard: None,
     };
     let node_config = DistributedNodeConfig {
         swim: swim_config,

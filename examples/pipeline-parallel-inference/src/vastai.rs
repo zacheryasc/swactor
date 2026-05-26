@@ -331,6 +331,7 @@ pub async fn create_instance(
     seed_addr: &str,
     seed_relay: Option<&str>,
     image: &str,
+    label: Option<&str>,
     diag_env: Option<&DiagEnv>,
 ) -> Result<InstanceInfo, String> {
     let url = format!("{base_url}/api/v0/asks/{offer_id}/");
@@ -372,12 +373,24 @@ pub async fn create_instance(
                 serde_json::Value::String(relay_url.to_string());
         }
     }
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "image": image,
         "env": env,
         "onstart": "exec /usr/local/bin/pp-gpu-node 2>&1",
-        "disk": 20,
+        // Every stage fetch()s the FULL gguf (whole file mmap'd by
+        // from_gguf), regardless of which layers it runs. qwen3:30b-a3b
+        // Q4_K_M is ~18 GB; with the ~4 GB CUDA-runtime image that
+        // overruns the old 20 GB allotment. 30 GB leaves headroom for
+        // the tinygrad kernel cache. Raising disk shrinks the offer pool
+        // slightly — acceptable at reliability2>=0.995.
+        "disk": 30,
     });
+    // A vast.ai-native label tags the whole cluster so it is discoverable
+    // later via `list_instances_by_label` (and `vastai show instances`)
+    // without us keeping any local state — vast.ai is the registry.
+    if let Some(l) = label {
+        body["label"] = serde_json::Value::String(l.to_string());
+    }
 
     let resp = client
         .put(&url)
@@ -467,6 +480,7 @@ pub async fn create_pipeline_instances(
             seed_addr,
             seed_relay,
             image,
+            None,
             diag_env,
         )
         .await
@@ -498,6 +512,80 @@ pub async fn destroy_all_instances(
         results.push(destroy_instance(client, base_url, api_key, id).await);
     }
     results
+}
+
+/// SSH endpoint + identity of a held instance, discovered by label.
+#[derive(Debug, Clone)]
+pub struct LabeledInstance {
+    pub contract_id: u64,
+    /// vast.ai SSH proxy host (e.g. `ssh5.vast.ai`); empty if not yet assigned.
+    pub ssh_host: String,
+    pub ssh_port: u16,
+    pub public_ipaddr: String,
+    pub actual_status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstanceListResponse {
+    instances: Vec<InstanceListEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstanceListEntry {
+    id: u64,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    actual_status: Option<String>,
+    #[serde(default)]
+    ssh_host: Option<String>,
+    #[serde(default)]
+    ssh_port: Option<u16>,
+    #[serde(default)]
+    public_ipaddr: Option<String>,
+}
+
+/// List every instance on the account tagged with `label`, sorted by
+/// contract id. vast.ai is the source of truth for "what's rented" — we
+/// keep no local cluster state, so attach/redeploy/teardown all rediscover
+/// the cluster through this call. Returns the SSH endpoint per instance so
+/// the caller can scp/ssh to redeploy in place.
+pub async fn list_instances_by_label(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    label: &str,
+) -> Result<Vec<LabeledInstance>, String> {
+    let url = format!("{base_url}/api/v0/instances/");
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {api_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("list_instances request failed: {e}"))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        return Err(format!("list_instances HTTP {status}: {body}"));
+    }
+    let body: InstanceListResponse = resp
+        .json()
+        .await
+        .map_err(|e| format!("list_instances parse failed: {e}"))?;
+    let mut out: Vec<LabeledInstance> = body
+        .instances
+        .into_iter()
+        .filter(|e| e.label.as_deref() == Some(label))
+        .map(|e| LabeledInstance {
+            contract_id: e.id,
+            ssh_host: e.ssh_host.unwrap_or_default(),
+            ssh_port: e.ssh_port.unwrap_or(0),
+            public_ipaddr: e.public_ipaddr.unwrap_or_default(),
+            actual_status: e.actual_status.unwrap_or_else(|| "unknown".to_string()),
+        })
+        .collect();
+    out.sort_by_key(|i| i.contract_id);
+    Ok(out)
 }
 
 /// Find `num_stages` distinct offers for the same GPU type. Each call to
@@ -549,6 +637,7 @@ pub async fn lease_chain(
     seed_addr: &str,
     seed_relay: Option<&str>,
     image: &str,
+    label: Option<&str>,
     poll_interval: Duration,
     max_polls: u32,
     diag_env: Option<&DiagEnv>,
@@ -592,6 +681,7 @@ pub async fn lease_chain(
                 seed_addr,
                 seed_relay,
                 image,
+                label,
                 diag_env,
             )
             .await

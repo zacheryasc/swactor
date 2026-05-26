@@ -31,6 +31,7 @@ fn make_host(host_id: &str, peer_ids: &[&str]) -> SwimHost {
         suspicion_timeout: 6,
         dead_reprobe_interval: 0,
         probe_mode: ProbeMode::Periodic,
+        lifeguard: None,
     };
     let peers: Vec<String> = peer_ids.iter().map(|s| (*s).to_string()).collect();
     SwimHost::new(host_id, &peers, cfg)

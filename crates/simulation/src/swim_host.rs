@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use distribution::diagnostics::sink::{DynEmitter, EventEmitter};
 use distribution::diagnostics::{Event as DiagEvent, SwimIntrospect};
+use distribution::swim::lifeguard::LifeguardConfig;
 use distribution::swim::node::{NodeAction, SwimNode};
 use distribution::swim::probe::{ProbeMode, SwimConfig};
 use distribution::types::{MemberState, NodeId};
@@ -204,13 +205,26 @@ impl SwimHost {
             .map(|n| n as u64)
             .unwrap_or(0);
         let unit = tick_period_ns.max(1);
+        // Lifeguard wiring (§3.6): inherit the production default's
+        // adaptive band, scaled to the scenario's tick units. The
+        // sim does not currently parse a per-host lifeguard
+        // kind_config — that would let battery scenarios sweep the
+        // multiplier; landed as a follow-up.
+        let suspicion_ticks = (suspicion_timeout_ns / unit).max(1);
+        let lifeguard = SwimConfig::default().lifeguard.map(|cfg| LifeguardConfig {
+            base_suspicion_timeout: suspicion_ticks,
+            min_suspicion_timeout: suspicion_ticks,
+            max_suspicion_timeout: suspicion_ticks.saturating_mul(6),
+            ..cfg
+        });
         SwimConfig {
             probe_interval: (probe_interval_ns / unit).max(1),
             probe_timeout: (probe_timeout_ns / unit).max(1),
             indirect_probes,
-            suspicion_timeout: (suspicion_timeout_ns / unit).max(1),
+            suspicion_timeout: suspicion_ticks,
             dead_reprobe_interval: dead_reprobe_interval_ns / unit,
             probe_mode: ProbeMode::Periodic,
+            lifeguard,
         }
     }
 

@@ -29,8 +29,10 @@ duration_ns = 412_000_000_000  # 412 s — the live run's duration
 period_ns = 200_000_000  # 200 ms
 
 [default_link]
-latency_ns = 60_000_000
-jitter_stddev_ns = 15_000_000
+# Retune calibration: same relay-mediated latency band as
+# `n3_own_relay_stub.toml` per `SWIM_RETUNE_REPORT.md` §3.
+latency_ns = 200_000_000           # 200 ms — relay-mediated one-way
+jitter_stddev_ns = 75_000_000      # 75 ms — relay HOL spread
 loss_prob_ppm = 0
 reorder_prob_ppm = 0
 bandwidth_bps = 25_000_000
@@ -51,10 +53,10 @@ cold_start_penalty_ns = 0
 id = "orchestrator"
 kind = "swim"
 initial_state = "alive"
-# Mirrors `SwimConfig::default()` at the scenario's 200 ms tick:
-# probe_interval = 10 ticks = 2 s, probe_timeout = 15 ticks = 3 s,
-# suspicion_timeout = 75 ticks = 15 s, indirect_ping_fanout = 2.
-kind_config = { probe_interval_ns = 2_000_000_000, probe_timeout_ns = 3_000_000_000, suspicion_timeout_ns = 15_000_000_000, indirect_ping_fanout = 2 }
+# Mirrors the retuned `SwimConfig::default()` wall-clock budget per
+# `SWIM_RETUNE_REPORT.md` §3: probe_interval 2 s, probe_timeout 15 s,
+# suspicion_timeout 45 s, indirect_ping_fanout 2.
+kind_config = { probe_interval_ns = 2_000_000_000, probe_timeout_ns = 15_000_000_000, suspicion_timeout_ns = 45_000_000_000, indirect_ping_fanout = 2 }
 
 [[peers]]
 id = "stage_0"
