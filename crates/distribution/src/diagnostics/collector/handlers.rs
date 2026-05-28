@@ -13,18 +13,25 @@
 //! pending hints from [`CollectorState::take_pending_hints`], and (for
 //! finalize) drive the T1.7 snapshot-then-tar sequence.
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Serialize;
 use serde_json::Value;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::protocol::{ClockEcho, Hints, PostAck, RecordKind};
-use super::state::{CollectorState, MAX_BODY_BYTES};
+use super::state::{CollectorState, MAX_BODY_BYTES, NodeStats, RunStats};
 use super::{bundle, wall_ms_now};
 
 /// Build the axum router. Wire this into `axum::serve` from the
@@ -33,7 +40,99 @@ pub fn router(state: Arc<CollectorState>) -> Router {
     Router::new()
         .route("/diag/{kind}", post(ingest))
         .route("/diag/bundle/{run_id}", get(download_bundle))
+        .route("/diag/runs", get(list_runs))
+        .route("/diag/stream/{run_id}", get(stream_run))
         .with_state(state)
+}
+
+/// SSE event for an in-memory record. The `event` field carries the
+/// `RecordKind` so clients can `addEventListener("snapshot", …)`.
+fn format_sse(event: &str, data: &str) -> Event {
+    Event::default().event(event).data(data)
+}
+
+/// Per-node accounting shape returned from `/diag/runs`. Mirrors
+/// `NodeStats` minus the cached `identity` blob (potentially large;
+/// belongs in the bundle, not a directory listing).
+#[derive(Serialize)]
+struct NodeSummary {
+    node_id: String,
+    boot_recorded: bool,
+    event_batches: u64,
+    snapshots: u64,
+    finalize_recorded: bool,
+}
+
+/// Per-run accounting shape returned from `/diag/runs`.
+#[derive(Serialize)]
+struct RunSummary {
+    run_id: String,
+    run_start_collector_ms: Option<u64>,
+    run_end_collector_ms: Option<u64>,
+    finalize_received: bool,
+    nodes: Vec<NodeSummary>,
+}
+
+impl RunSummary {
+    fn from_stats(run_id: String, stats: RunStats) -> Self {
+        let mut nodes: Vec<NodeSummary> = stats
+            .nodes
+            .into_iter()
+            .map(|(node_id, n): (String, NodeStats)| NodeSummary {
+                node_id,
+                boot_recorded: n.boot_recorded,
+                event_batches: n.event_batches,
+                snapshots: n.snapshots,
+                finalize_recorded: n.finalize_recorded,
+            })
+            .collect();
+        nodes.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        RunSummary {
+            run_id,
+            run_start_collector_ms: stats.run_start_collector_ms,
+            run_end_collector_ms: stats.run_end_collector_ms,
+            finalize_received: stats.finalize_received,
+            nodes,
+        }
+    }
+}
+
+async fn list_runs(State(state): State<Arc<CollectorState>>) -> Json<Vec<RunSummary>> {
+    let summaries = state
+        .run_summaries()
+        .into_iter()
+        .map(|(run_id, stats)| RunSummary::from_stats(run_id, stats))
+        .collect();
+    Json(summaries)
+}
+
+/// Subscribe to live persisted records for a single run as
+/// Server-Sent Events. Each event's name is the record `kind`
+/// (`boot`, `events`, `snapshot`, `finalize`); the data payload is
+/// the JSON-serialized `LiveRecord`.
+///
+/// Unknown `run_id`s are accepted — the connection stays open and
+/// the client will see records once they arrive. Slow subscribers
+/// that fall behind the broadcast capacity silently skip the gap
+/// (`/diag/bundle/{run_id}` is the catch-up path).
+async fn stream_run(
+    Path(run_id): Path<String>,
+    State(state): State<Arc<CollectorState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.subscribe();
+    let stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+        Ok(rec) if rec.run_id == run_id => {
+            let json = serde_json::to_string(&*rec).ok()?;
+            Some(Ok(format_sse(rec.kind.as_str(), &json)))
+        }
+        Ok(_) => None,
+        Err(BroadcastStreamRecvError::Lagged(_)) => None,
+    });
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("ping"),
+    )
 }
 
 async fn ingest(

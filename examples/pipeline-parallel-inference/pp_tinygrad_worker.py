@@ -70,14 +70,20 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import hashlib
+import io
 import json
 import os
 import re
 import signal
+import struct
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+from pathlib import Path
 from typing import Sequence
 
 # Stub-mode constants — small so test payloads stay tiny. Both values
@@ -111,6 +117,620 @@ def compute_layer_range(stage: int, num_stages: int, total_blocks: int) -> tuple
     start = stage * k
     end = (stage + 1) * k if stage < num_stages - 1 else total_blocks
     return start, end
+
+
+# ggml type tables for the sharded loader: quantized types map to
+# (elements_per_block, bytes_per_block); native types map to byte width. These
+# mirror tinygrad 0.12.0's ggml_data_to_tensor and let us size each tensor's raw
+# byte slice so only the kept weights are copied off disk.
+_GGML_QUANT_BLOCK = {2: (32, 18), 3: (32, 20), 8: (32, 34), 12: (256, 144), 14: (256, 210), 39: (32, 17)}
+_GGML_NATIVE_ITEMSIZE = {0: 4, 1: 2, 16: 1, 17: 2, 18: 4}
+
+
+def _ggml_tensor_nbytes(n_elements: int, ggml_type: int) -> int:
+    """Raw byte size of an ``n_elements`` ggml tensor of ``ggml_type``."""
+    if ggml_type in _GGML_NATIVE_ITEMSIZE:
+        return _GGML_NATIVE_ITEMSIZE[ggml_type] * n_elements
+    if ggml_type in _GGML_QUANT_BLOCK:
+        elems_per_block, bytes_per_block = _GGML_QUANT_BLOCK[ggml_type]
+        return (n_elements // elems_per_block) * bytes_per_block
+    raise ValueError(f"unsupported ggml type {ggml_type}")
+
+
+# ─── Sharded download (spec §4.1 / §4.2 / §4.7) ───────────────────────────
+#
+# The worker fetches only the byte ranges its stage actually needs
+# (§4.1), caches the partial GGUF idempotently (§4.2), and emits
+# `pp_download_progress` events with bounded latency while downloading
+# (§4.7). The cached file is a SPARSE file with the same apparent size
+# as the source — kept tensors live at their original byte offsets, so
+# `_load_sharded_transformer` opens it unchanged. Filesystem holes
+# absorb the non-kept regions so the actual disk usage is
+# O(per-stage shard size), not O(full model size).
+
+_PP_DOWNLOAD_READ_CHUNK = 256 * 1024
+_PP_HEADER_INITIAL = 1024 * 1024
+_PP_HEADER_MAX = 64 * 1024 * 1024
+
+
+def _pp_round_up(n: int, align: int) -> int:
+    if align <= 0:
+        return n
+    return ((n + align - 1) // align) * align
+
+
+class _PpHeaderTooShort(Exception):
+    """Raised mid-parse when the header buffer ran out — caller grows it."""
+
+
+def _pp_parse_gguf_header(buf: bytes) -> "tuple[list[tuple[str, tuple, int, int]], int, dict]":
+    """Parse a GGUF header from `buf`. Returns (t_infos, data_start, kv).
+
+    `t_infos` is a list of ``(name, dims, ggml_type, offset)`` tuples
+    matching what ``_load_sharded_transformer``'s in-file parser
+    produces. `data_start` is the absolute byte offset where tensor
+    data begins. Raises `_PpHeaderTooShort` if the header is larger
+    than `buf` — caller should re-fetch with a larger buffer.
+
+    Format reference: tinygrad 0.12.0's gguf reader. GGUF versions 2
+    and 3 share the parse shape; the file's u32 version is checked.
+    """
+    bio = io.BytesIO(buf)
+
+    def _need(n: int) -> bytes:
+        start = bio.tell()
+        out = bio.read(n)
+        if len(out) != n:
+            raise _PpHeaderTooShort(f"need {n} bytes at {start}, got {len(out)}")
+        return out
+
+    def _unpack(fmt: str, nbytes: int):
+        return struct.unpack(fmt, _need(nbytes))[0]
+
+    def _read_u32() -> int:
+        return _unpack("<I", 4)
+
+    def _read_i32() -> int:
+        return _unpack("<i", 4)
+
+    def _read_u64() -> int:
+        return _unpack("<Q", 8)
+
+    def _read_str() -> str:
+        length = _read_u64()
+        return _need(length).decode("utf-8")
+
+    def _read_arr():
+        elem_type = _read_i32()
+        count = _read_u64()
+        return [_readers[elem_type]() for _ in range(count)]
+
+    _readers = {
+        0: lambda: _unpack("<b", 1),
+        1: lambda: _unpack("<B", 1),
+        2: lambda: _unpack("<h", 2),
+        3: lambda: _unpack("<H", 2),
+        4: _read_u32,
+        5: _read_i32,
+        6: lambda: _unpack("<f", 4),
+        7: lambda: _unpack("<?", 1),
+        8: _read_str,
+        9: _read_arr,
+        10: _read_u64,
+        11: lambda: _unpack("<q", 8),
+        12: lambda: _unpack("<d", 8),
+    }
+
+    magic = _need(4)
+    if magic != b"GGUF":
+        raise ValueError(f"not a GGUF artifact (magic={magic!r})")
+    version = _read_i32()
+    if version not in (2, 3):
+        raise ValueError(f"unsupported GGUF version {version}")
+    n_tensors = _read_u64()
+    n_kv = _read_u64()
+
+    kv: "dict[str, object]" = {}
+    for _ in range(n_kv):
+        key = _read_str()
+        typ = _read_i32()
+        kv[key] = _readers[typ]()
+
+    t_infos: "list[tuple[str, tuple, int, int]]" = []
+    for _ in range(n_tensors):
+        name = _read_str()
+        n_dims = _read_u32()
+        dims = tuple(_read_u64() for _ in range(n_dims))
+        ggml_type = _read_i32()
+        offset = _read_u64()
+        t_infos.append((name, dims, ggml_type, offset))
+
+    alignment = int(kv.get("general.alignment", 32))
+    data_start = _pp_round_up(bio.tell(), alignment)
+    return t_infos, data_start, kv
+
+
+def _pp_kept_names(t_infos, stage: int, num_stages: int, kv: dict) -> "set[str]":
+    """Return the set of tensor names this stage requires. Matches the
+    `_kept` predicate inside `_load_sharded_transformer` — both code
+    paths must agree on the kept set or the loader would try to realize
+    a tensor whose bytes were not fetched."""
+    arch = str(kv["general.architecture"])
+    total_blocks = int(kv[f"{arch}.block_count"])
+    start, end = compute_layer_range(stage, num_stages, total_blocks)
+    is_last = stage == num_stages - 1
+    names = {info[0] for info in t_infos}
+    tied_output = "output.weight" not in names
+    kept: "set[str]" = set()
+    for info in t_infos:
+        name = info[0]
+        keep = False
+        for i in range(start, end):
+            if name.startswith(f"blk.{i}."):
+                keep = True
+                break
+        if not keep:
+            if name == "token_embd.weight" and (stage == 0 or (is_last and tied_output)):
+                keep = True
+            elif name == "output_norm.weight" and is_last:
+                keep = True
+            elif name == "output.weight" and is_last and not tied_output:
+                keep = True
+        if keep:
+            kept.add(name)
+    return kept
+
+
+def _pp_kept_byte_ranges(t_infos, data_start: int, kept_names: "set[str]") -> "list[tuple[int, int]]":
+    """Return the ``[(absolute_offset, nbytes)]`` byte ranges this stage
+    keeps, ordered by offset (so a streamed download writes ascending
+    offsets and the filesystem allocates fewer fragmented holes)."""
+    out: list[tuple[int, int]] = []
+    for name, dims, ggml_type, offset in t_infos:
+        if name not in kept_names:
+            continue
+        n_elements = 1
+        for d in dims:
+            n_elements *= int(d)
+        nbytes = _ggml_tensor_nbytes(n_elements, ggml_type)
+        out.append((data_start + int(offset), nbytes))
+    out.sort()
+    return out
+
+
+def _pp_cache_paths(url: str) -> "tuple[Path, Path, Path]":
+    """Return (cache_path, meta_path, partial_path) for ``url``.
+
+    Cache root defaults to ``$PP_MODEL_CACHE_DIR`` then ``~/.cache/pp-pipeline``.
+    The filename is ``<short-url-hash>-<basename>`` so two URLs that share a
+    basename cannot collide.
+    """
+    raw = os.environ.get("PP_MODEL_CACHE_DIR", "").strip()
+    cache_root = Path(raw).expanduser() if raw else Path.home() / ".cache" / "pp-pipeline"
+    cache_root.mkdir(parents=True, exist_ok=True)
+    url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+    basename = os.path.basename(urllib.parse.urlparse(url).path) or "model.gguf"
+    cache_path = cache_root / f"{url_hash}-{basename}"
+    meta_path = cache_path.with_name(cache_path.name + ".pp_meta")
+    partial_path = cache_path.with_name(cache_path.name + ".partial")
+    return cache_path, meta_path, partial_path
+
+
+def _pp_head(url: str) -> "tuple[int, str]":
+    """HEAD request; return (Content-Length, Accept-Ranges header lowercased)."""
+    req = urllib.request.Request(url, method="HEAD")
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        total = int(resp.headers.get("Content-Length", "0"))
+        accept = (resp.headers.get("Accept-Ranges") or "").lower()
+    return total, accept
+
+
+def _pp_range_get(url: str, start: int, end_inclusive: int) -> bytes:
+    """Issue a Range GET; return the body bytes."""
+    req = urllib.request.Request(
+        url, headers={"Range": f"bytes={start}-{end_inclusive}"}
+    )
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        return resp.read()
+
+
+def _pp_emit_progress(stage: int, bytes_done: int, bytes_total: int, started_at_mono: float) -> None:
+    """Emit one `pp_download_progress` event with the spec's field set
+    (§4.7). `started_at_mono` is `time.monotonic()` captured before the
+    first event so `elapsed_ms` is monotonic across the fetch."""
+    elapsed_ms = int((time.monotonic() - started_at_mono) * 1000)
+    mbps = round(((bytes_done * 8) / 1_000_000) / max(elapsed_ms / 1000, 1e-3), 1)
+    _emit_event(
+        "pp_download_progress",
+        stage_index=stage,
+        bytes_done=bytes_done,
+        bytes_total=bytes_total,
+        elapsed_ms=elapsed_ms,
+        mbps=mbps,
+    )
+
+
+def _pp_fingerprint(f, offset: int, nbytes: int) -> str:
+    """Hash the first 4KB + last 4KB of a kept tensor (or the whole
+    tensor if shorter). The §4.2 content-derived check: matches the
+    fingerprint recorded in the sidecar at download time."""
+    sample = 4096
+    f.seek(offset)
+    head = f.read(min(sample, nbytes))
+    if nbytes > sample:
+        f.seek(offset + nbytes - sample)
+        tail = f.read(sample)
+    else:
+        tail = b""
+    h = hashlib.sha256()
+    h.update(head)
+    h.update(tail)
+    h.update(nbytes.to_bytes(8, "little"))
+    return h.hexdigest()
+
+
+def _pp_write_meta(
+    meta_path: Path,
+    cache_path: Path,
+    stage: int,
+    num_stages: int,
+    url: str,
+    total_size: int,
+    kept_ranges: "list[tuple[int, int]]",
+) -> None:
+    fingerprints = []
+    with open(cache_path, "rb") as f:
+        for offset, nbytes in kept_ranges:
+            fingerprints.append({
+                "offset": offset,
+                "nbytes": nbytes,
+                "fingerprint": _pp_fingerprint(f, offset, nbytes),
+            })
+    meta_path.write_text(json.dumps({
+        "schema": 1,
+        "url": url,
+        "stage": stage,
+        "num_stages": num_stages,
+        "total_size": total_size,
+        "kept": fingerprints,
+    }))
+
+
+def _pp_verify_cache(
+    cache_path: Path,
+    meta_path: Path,
+    stage: int,
+    num_stages: int,
+) -> bool:
+    """Spec §4.2 integrity check: file present at the expected apparent
+    size AND every recorded fingerprint re-matches the cached bytes.
+    Returns False on any discrepancy (including missing files, missing
+    sidecar, mismatched stage / num_stages, size mismatch, or any
+    fingerprint mismatch). A passing cache is used as-is — no refetch."""
+    if not cache_path.exists() or not meta_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text())
+    except (OSError, ValueError):
+        return False
+    if meta.get("schema") != 1:
+        return False
+    if meta.get("stage") != stage or meta.get("num_stages") != num_stages:
+        return False
+    if cache_path.stat().st_size != meta.get("total_size"):
+        return False
+    kept = meta.get("kept") or []
+    if not kept:
+        return False
+    try:
+        with open(cache_path, "rb") as f:
+            for entry in kept:
+                offset = int(entry["offset"])
+                nbytes = int(entry["nbytes"])
+                expected = entry["fingerprint"]
+                if _pp_fingerprint(f, offset, nbytes) != expected:
+                    return False
+    except (OSError, KeyError, ValueError):
+        return False
+    return True
+
+
+def _pp_download_sharded(url: str, stage: int, num_stages: int) -> str:
+    """Spec §4.1 + §4.2 + §4.7: fetch only this stage's tensor bytes,
+    cache idempotently, emit progress events.
+
+    Returns the path to the on-disk file (sparse — apparent size matches
+    the source; only the kept ranges occupy disk blocks). On cache hit,
+    NO `pp_download_progress` events are emitted (spec §4.7).
+    """
+    cache_path, meta_path, partial_path = _pp_cache_paths(url)
+
+    # §4.2: orphan-cleanup any leftover .partial from a previous killed
+    # fetch BEFORE any new fetch is initiated. Emit an event so the
+    # bundle reader can see that a stale temp was reaped.
+    if partial_path.exists():
+        try:
+            partial_path.unlink()
+            _emit_event(
+                "pp_cache_orphan_cleaned",
+                stage_index=stage,
+                path=str(partial_path),
+            )
+        except OSError:
+            pass
+
+    # §4.2 cache hit — return the cached file as-is.
+    if _pp_verify_cache(cache_path, meta_path, stage, num_stages):
+        _emit_event(
+            "pp_cache_hit",
+            stage_index=stage,
+            path=str(cache_path),
+        )
+        return str(cache_path)
+
+    # §4.1 fail-fast on no-range support.
+    total_size, accept_ranges = _pp_head(url)
+    if "bytes" not in accept_ranges:
+        _emit_event(
+            "pp_download_failed",
+            stage_index=stage,
+            reason="no_byte_range_support",
+            url=url,
+            accept_ranges=accept_ranges,
+        )
+        _die(f"source does not support byte-range requests: {url}")
+    if total_size <= 0:
+        _emit_event(
+            "pp_download_failed",
+            stage_index=stage,
+            reason="no_content_length",
+            url=url,
+        )
+        _die(f"source did not advertise Content-Length: {url}")
+
+    # Fetch the header in growing increments until we can parse it.
+    header_size = min(_PP_HEADER_INITIAL, total_size)
+    while True:
+        try:
+            header_bytes = _pp_range_get(url, 0, header_size - 1)
+            t_infos, data_start, kv = _pp_parse_gguf_header(header_bytes)
+            if data_start <= len(header_bytes):
+                break
+            # Parser succeeded structurally but data_start sits past our
+            # buffer — re-fetch enough to include the tensor data start.
+            header_size = min(data_start + 1024, total_size)
+        except _PpHeaderTooShort:
+            new_size = min(header_size * 2, total_size)
+            if new_size == header_size or new_size > _PP_HEADER_MAX:
+                _emit_event(
+                    "pp_download_failed",
+                    stage_index=stage,
+                    reason="header_too_large",
+                    header_size=header_size,
+                )
+                _die(f"GGUF header exceeded {_PP_HEADER_MAX} bytes")
+            header_size = new_size
+
+    kept_names = _pp_kept_names(t_infos, stage, num_stages, kv)
+    kept_ranges = _pp_kept_byte_ranges(t_infos, data_start, kept_names)
+
+    # bytes_total is the bytes this stage will pull from the network:
+    # header + kept-tensor regions. Not the full file (spec §4.1 means
+    # we never fetch the rest).
+    header_keep_bytes = data_start
+    kept_bytes_total = sum(nb for _, nb in kept_ranges)
+    bytes_total = header_keep_bytes + kept_bytes_total
+
+    interval_s_raw = os.environ.get("PP_DOWNLOAD_PROGRESS_INTERVAL_SECS", "").strip()
+    try:
+        interval_s = float(interval_s_raw) if interval_s_raw else 10.0
+    except ValueError:
+        interval_s = 10.0
+    if interval_s <= 0:
+        interval_s = 10.0
+
+    # Write the sparse output to `.partial`; rename on success. Opening
+    # with "wb" then truncate(total_size) creates a sparse file on
+    # Linux: only blocks we actually `write()` allocate disk.
+    started_at = time.monotonic()
+    with open(partial_path, "wb") as f:
+        f.truncate(total_size)
+        f.seek(0)
+        f.write(header_bytes[:data_start])
+        bytes_done = data_start
+
+        # Spec §4.7: first event MUST be at start of fetch, AFTER we
+        # know bytes_total. We have that now.
+        _pp_emit_progress(stage, bytes_done, bytes_total, started_at)
+        last_emit = time.monotonic()
+
+        for offset, nbytes in kept_ranges:
+            req = urllib.request.Request(
+                url,
+                headers={"Range": f"bytes={offset}-{offset + nbytes - 1}"},
+            )
+            try:
+                resp = urllib.request.urlopen(req, timeout=300)
+            except Exception as e:
+                _emit_event(
+                    "pp_download_failed",
+                    stage_index=stage,
+                    reason="range_get_failed",
+                    offset=offset,
+                    nbytes=nbytes,
+                    error=str(e),
+                )
+                # Spec §4.7: final event MUST be emitted on fetch failure.
+                _pp_emit_progress(stage, bytes_done, bytes_total, started_at)
+                _die(f"range GET failed at offset {offset}: {e}")
+            try:
+                f.seek(offset)
+                while True:
+                    chunk = resp.read(_PP_DOWNLOAD_READ_CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    bytes_done += len(chunk)
+                    now = time.monotonic()
+                    if now - last_emit >= interval_s:
+                        _pp_emit_progress(stage, bytes_done, bytes_total, started_at)
+                        last_emit = now
+            finally:
+                resp.close()
+
+    # Spec §4.7: final event at completion.
+    _pp_emit_progress(stage, bytes_done, bytes_total, started_at)
+
+    # Sidecar before rename so a crash between rename + meta-write does
+    # not leave a "valid file, no sidecar" → would fail _pp_verify and
+    # refetch. Writing the sidecar first means a crash here leaves
+    # cache_path absent and partial_path present (which orphan-cleanup
+    # reaps on next boot).
+    _pp_write_meta(
+        meta_path, partial_path, stage, num_stages, url, total_size, kept_ranges
+    )
+    os.replace(partial_path, cache_path)
+    return str(cache_path)
+
+
+def _load_sharded_transformer(gguf_path, stage: int, num_stages: int, max_context: int = 512):
+    """Load only this stage's slice of the model onto the compute device.
+
+    Stock ``Transformer.from_gguf`` copies the *entire* GGUF onto the compute
+    device before any layer runs (it does ``gguf.to(None)``), so an 18 GB model
+    OOMs a 12 GB GPU no matter how the layers are split. Instead we parse the
+    GGUF header on the DISK device and copy only the tensors this stage needs —
+    ``blk[start:end]`` plus ``token_embd`` (stage 0) and ``output_norm`` /
+    ``output`` (last stage) — dequantizing each on the compute device. Returns
+    ``(model, kv, start, end)``. Vendored against tinygrad 0.12.0's gguf format.
+    """
+    import io
+    import struct
+    import functools
+
+    from tinygrad import Tensor, Device, nn
+    from tinygrad.helpers import prod, round_up, getenv
+    from tinygrad.nn.state import TensorIO, ggml_data_to_tensor
+    from tinygrad.apps.llm import Transformer
+
+    _t0 = time.monotonic()
+    gguf = Tensor(gguf_path)  # device is DISK:<path> — nothing is copied to the GPU yet
+
+    # --- parse the GGUF header (kv metadata + tensor directory) off disk ---
+    reader = io.BufferedReader(TensorIO(gguf), 1_000_000)
+
+    def _unpack(fmt, nbytes):
+        return struct.unpack(fmt, reader.read(nbytes))[0]
+
+    def _read_str():
+        return str(reader.read(_read_u64()), "utf-8")
+
+    def _read_arr():
+        elem_reader, count = _readers[_read_i32()], _read_u64()
+        return [elem_reader() for _ in range(count)]
+
+    _readers = {8: _read_str, 9: _read_arr, **{t: functools.partial(_unpack, "<" + f, nb) for t, f, nb in
+        [(0, "c", 1), (1, "b", 1), (2, "H", 2), (3, "h", 2), (4, "I", 4), (5, "i", 4),
+         (6, "f", 4), (7, "?", 1), (10, "Q", 8), (11, "q", 8), (12, "d", 8)]}}
+    _read_u32, _read_i32, _read_u64 = _readers[4], _readers[5], _readers[10]
+
+    magic, version = reader.read(4), _read_i32()
+    n_tensors, n_kv = _read_u64(), _read_u64()
+    if magic != b"GGUF" or version not in (2, 3):
+        raise ValueError(f"invalid GGUF (magic={magic!r} version={version})")
+    kv = {}
+    for _ in range(n_kv):
+        key, typ = _read_str(), _read_i32()
+        kv[key] = _readers[typ]()
+    t_infos = [(_read_str(), tuple(_read_u64() for _ in range(_read_u32())), _read_i32(), _read_u64())
+               for _ in range(n_tensors)]
+    data_start = round_up(reader.tell(), kv.get("general.alignment", 32))
+    _t_header = time.monotonic()
+
+    arch = kv["general.architecture"]
+    total_blocks = int(kv[f"{arch}.block_count"])
+    start, end = compute_layer_range(stage, num_stages, total_blocks)
+    is_last = stage == num_stages - 1
+    names = {info[0] for info in t_infos}
+    tied_output = "output.weight" not in names  # small models tie output to token_embd
+
+    def _kept(name: str) -> bool:
+        for i in range(start, end):
+            if name.startswith(f"blk.{i}."):
+                return True
+        if name == "token_embd.weight" and (stage == 0 or (is_last and tied_output)):
+            return True
+        if name == "output_norm.weight" and is_last:
+            return True
+        if name == "output.weight" and is_last and not tied_output:
+            return True
+        return False
+
+    half, device = getenv("HALF", 1), Device.DEFAULT
+    state_dict = {}
+    bytes_copied = 0
+    kept_count = 0
+    for name, dims, ggml_type, offset in t_infos:
+        n_elements = prod(dims)
+        if _kept(name):
+            nbytes = _ggml_tensor_nbytes(n_elements, ggml_type)
+            bytes_copied += nbytes
+            kept_count += 1
+            raw = gguf[data_start + offset: data_start + offset + nbytes].to(device)
+            tensor = ggml_data_to_tensor(raw, n_elements, ggml_type).reshape(*reversed(dims))
+            if arch == "llama":  # interleaved -> half-split RoPE layout (llama-style only)
+                n_heads, n_kv_heads = kv[f"{arch}.attention.head_count"], kv[f"{arch}.attention.head_count_kv"]
+                if "attn_q.weight" in name:
+                    tensor = tensor.rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
+                if "attn_k.weight" in name:
+                    tensor = tensor.rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
+            state_dict[name] = tensor.cast("float16") if half else tensor
+        else:
+            # DISK-rooted lazy tensor: only its .shape is read (model construction); never realized.
+            state_dict[name] = ggml_data_to_tensor(gguf[data_start + offset:], n_elements, ggml_type).reshape(*reversed(dims))
+    if tied_output and is_last:
+        state_dict["output.weight"] = state_dict["token_embd.weight"]
+    _t_statedict = time.monotonic()
+
+    n_heads = kv[f"{arch}.attention.head_count"]
+    model = Transformer(
+        num_blocks=total_blocks, dim=kv[f"{arch}.embedding_length"],
+        hidden_dim=kv.get(f"{arch}.expert_feed_forward_length", kv[f"{arch}.feed_forward_length"]),
+        n_heads=n_heads, n_kv_heads=kv[f"{arch}.attention.head_count_kv"],
+        norm_eps=kv[f"{arch}.attention.layer_norm_rms_epsilon"], vocab_size=len(kv["tokenizer.ggml.tokens"]),
+        head_dim=kv.get(f"{arch}.attention.key_length", kv[f"{arch}.embedding_length"] // n_heads),
+        rope_theta=kv[f"{arch}.rope.freq_base"], max_context=max_context,
+        qk_norm=int(state_dict["blk.0.attn_q_norm.weight"].shape[0]) if "blk.0.attn_q_norm.weight" in state_dict else 0,
+        num_experts=kv.get(f"{arch}.expert_count", 0), num_experts_per_tok=kv.get(f"{arch}.expert_used_count", 0))
+
+    _t_construct = time.monotonic()
+
+    # Provide only the kept weights; strict=False leaves the other blocks at their
+    # (lazy, never-run) init so they never touch the compute device.
+    kept = {name: tensor for name, tensor in state_dict.items()
+            if _kept(name) or (tied_output and is_last and name == "output.weight")}
+    # This is where the kept tensors are actually copied off disk and
+    # dequantized on the compute device — the dominant load cost.
+    nn.state.load_state_dict(model, kept, strict=False, verbose=False, consume=True, realize=True)
+    _t_realize = time.monotonic()
+
+    realize_ms = (_t_realize - _t_construct) * 1000
+    _emit_event(
+        "model_load_breakdown",
+        stage=stage,
+        resident_blocks=end - start,
+        total_blocks=total_blocks,
+        kept_tensors=kept_count,
+        bytes_copied=bytes_copied,
+        mb_copied=round(bytes_copied / 1_000_000, 1),
+        header_ms=round((_t_header - _t0) * 1000, 1),
+        statedict_build_ms=round((_t_statedict - _t_header) * 1000, 1),
+        construct_ms=round((_t_construct - _t_statedict) * 1000, 1),
+        realize_ms=round(realize_ms, 1),
+        realize_mb_per_s=round((bytes_copied / 1_000_000) / max(realize_ms / 1000, 1e-3), 1),
+        rss_mb=_rss_mb(),
+    )
+    return model, kv, start, end
 
 
 def argmax_sample(logits: Sequence[float]) -> int:
@@ -229,6 +849,14 @@ def _uptime_ms() -> int:
     return int((time.monotonic() - _WORKER_START_MONOTONIC) * 1000)
 
 
+def _wall_ms() -> int:
+    """Epoch milliseconds. Lets the bundle align worker events across nodes
+    and against the orchestrator's vast.ai create/lease timestamps — e.g.
+    (worker `starting`.wall_ms − instance create_ms) is the image-pull +
+    container-boot + worker-spawn cost the node can't see itself."""
+    return int(time.time() * 1000)
+
+
 def _rss_mb() -> "int | None":
     """Resident-set size in MB, read from /proc/self/status (Linux).
     Returns None on non-Linux or when the read fails — the field is
@@ -335,17 +963,27 @@ class _RealModelState:
         # the most likely crash site in real mode — emit lifecycle
         # events around the import so the bundle records exactly when
         # the worker started loading and how long it took.
-        _emit_event("importing_tinygrad", stage=stage)
+        _emit_event("importing_tinygrad", stage=stage, wall_ms=_wall_ms())
         _import_start = time.monotonic()
         import numpy as np
-        from tinygrad import Tensor
-        from tinygrad.helpers import fetch
-        from tinygrad.apps.llm import Transformer, SimpleTokenizer, models
+        from tinygrad import Tensor, Device
+        from tinygrad.helpers import fetch, getenv
+        from tinygrad.apps.llm import SimpleTokenizer, models
 
+        import_ms = int((time.monotonic() - _import_start) * 1000)
+        _emit_event("tinygrad_imported", stage=stage, elapsed_ms=import_ms)
+        # Device + precision context: which backend the shard lands on and the
+        # toggles (HALF/JIT/BEAM) that dominate load + inference cost. Correlate
+        # with model_load_breakdown / op events to attribute time to dequant vs
+        # kernel compile vs steady-state matmul.
         _emit_event(
-            "tinygrad_imported",
+            "device",
             stage=stage,
-            elapsed_ms=int((time.monotonic() - _import_start) * 1000),
+            default_device=str(Device.DEFAULT),
+            half=getenv("HALF", 1),
+            jit=getenv("JIT", 1),
+            beam=getenv("BEAM", 0),
+            cuda_visible=os.environ.get("CUDA_VISIBLE_DEVICES"),
         )
 
         if model_name not in models:
@@ -353,42 +991,90 @@ class _RealModelState:
             _die(f"unknown MODEL {model_name!r}; available: {available}")
 
         url = models[model_name]
-        _emit_event("fetching_model", stage=stage, model=model_name, url=url)
+        _emit_event("fetching_model", stage=stage, model=model_name, url=url, wall_ms=_wall_ms())
         print(
             f"pp_tinygrad_worker: stage={stage}/{num_stages} fetching {model_name}",
             file=sys.stderr,
             flush=True,
         )
         _fetch_start = time.monotonic()
-        gguf_path = fetch(url)
+        # Spec §4.1: download only this stage's tensor byte ranges.
+        # Spec §4.2: cache idempotently with an integrity check; a
+        # complete-and-valid cache MUST NOT trigger a network fetch.
+        # Spec §4.7: `pp_download_progress` events are emitted by
+        # `_pp_download_sharded` while the fetch is in progress and
+        # NEVER on a cache hit. The unused `fetch` import remains as
+        # documentation of the prior code path; the sharded fetcher
+        # replaces it.
+        _ = fetch  # silence the linter; kept for the diff reader
+        gguf_path = _pp_download_sharded(url, stage, num_stages)
+        fetch_ms = int((time.monotonic() - _fetch_start) * 1000)
+        # `gguf_bytes` is the file's apparent size (matches the source's
+        # total_size); actual on-disk usage is O(per-stage shard). Bundle
+        # readers reading `model_fetched.gguf_bytes` see the same value
+        # they did before the §4.1 change — the per-stage usage shows up
+        # in `pp_download_progress.bytes_total` (header + kept ranges).
+        try:
+            gguf_bytes = os.path.getsize(gguf_path)
+        except OSError:
+            gguf_bytes = 0
+        fetch_mb = gguf_bytes / 1_000_000
+        # A near-instant return with a non-zero apparent size means the
+        # sharded cache hit short-circuited the fetch. Distinguishable
+        # in the bundle from a real download via the presence (or not)
+        # of `pp_download_progress` events.
+        cache_hit = gguf_bytes > 0 and fetch_ms < 2000
+        download_mb_per_s = None if cache_hit else round(fetch_mb / max(fetch_ms / 1000, 1e-3), 1)
         _emit_event(
             "model_fetched",
             stage=stage,
-            elapsed_ms=int((time.monotonic() - _fetch_start) * 1000),
+            elapsed_ms=fetch_ms,
             gguf_path=str(gguf_path),
+            gguf_bytes=gguf_bytes,
+            gguf_mb=round(fetch_mb, 1),
+            download_mb_per_s=download_mb_per_s,
+            cache_hit=cache_hit,
         )
         print(
             f"pp_tinygrad_worker: stage={stage} loading model from {gguf_path}",
             file=sys.stderr,
             flush=True,
         )
-        _emit_event("loading_model", stage=stage, model=model_name)
+        _emit_event("loading_model", stage=stage, model=model_name, wall_ms=_wall_ms())
         _load_start = time.monotonic()
-        model, kv = Transformer.from_gguf(Tensor(gguf_path), max_context=512)
-        tokenizer = SimpleTokenizer.from_gguf_kv(kv)
-        _emit_event(
-            "model_loaded",
-            stage=stage,
-            elapsed_ms=int((time.monotonic() - _load_start) * 1000),
-            rss_mb=_rss_mb(),
+        # Shard at load time: only this stage's block range (+ embed/output on the
+        # end stages) is copied to the compute device, so an 18 GB model fits on a
+        # 12 GB GPU. See _load_sharded_transformer for why stock from_gguf can't.
+        # The loader emits its own `model_load_breakdown` (header/dequant/realize).
+        model, kv, start, end = _load_sharded_transformer(
+            gguf_path, stage, num_stages, max_context=512
         )
+        load_ms = int((time.monotonic() - _load_start) * 1000)
+        tokenizer = SimpleTokenizer.from_gguf_kv(kv)
 
         arch = kv["general.architecture"]
         hidden_dim = int(kv[f"{arch}.embedding_length"])
         total_blocks = int(kv[f"{arch}.block_count"])
         vocab_size = len(kv["tokenizer.ggml.tokens"])
 
-        start, end = compute_layer_range(stage, num_stages, total_blocks)
+        _emit_event(
+            "model_loaded",
+            stage=stage,
+            elapsed_ms=load_ms,
+            rss_mb=_rss_mb(),
+            blocks_resident=end - start,
+            total_blocks=total_blocks,
+        )
+        # Stash the cold-start breakdown so main() can emit one `boot_profile`
+        # summary once the worker is ready (import + fetch + load + total).
+        self.timing = {
+            "import_ms": import_ms,
+            "fetch_ms": fetch_ms,
+            "fetch_cache_hit": cache_hit,
+            "gguf_bytes": gguf_bytes,
+            "download_mb_per_s": download_mb_per_s,
+            "load_ms": load_ms,
+        }
 
         # Pin EOS token ids (best-effort) for callers that want to detect
         # end-of-text from the sampled stream. We don't enforce stop here
@@ -414,6 +1100,9 @@ class _RealModelState:
         self.start = start
         self.end = end
         self.eos_ids = eos_ids
+        # Per-op compute breakdown (deserialize / compute / host-copy ms), set by
+        # the forward ops and folded into the serve loop's `op` timing event.
+        self._last_compute: "dict | None" = None
 
         print(
             f"pp_tinygrad_worker: stage={stage} ready "
@@ -427,16 +1116,29 @@ class _RealModelState:
 
     def embed_and_forward(self, tokens: Sequence[int], position: int) -> tuple[bytes, int]:
         Tensor = self._Tensor
+        t0 = time.monotonic()
         t = Tensor([list(tokens)], dtype="int32")
         x = self.model.token_embd(t)
         for block in self.model.blk[self.start : self.end]:
             x = block(x, position)
         # Cast to half (2 bytes/elem) for the wire format, matching the
         # stub. The model's weights are float16; the op output may have
-        # promoted to float32, so an explicit cast normalises this.
+        # promoted to float32, so an explicit cast normalises this. tinygrad is
+        # lazy: embed + blocks + cast all *execute* at .realize() below (incl.
+        # JIT kernel compile on the first call), so compute_ms captures them.
+        t1 = time.monotonic()
         x = x.cast("half").realize()
+        t2 = time.monotonic()
         arr = x.numpy()  # shape (1, seq_len, hidden_dim), dtype float16
-        return arr.tobytes(), int(arr.shape[1])
+        out = arr.tobytes()
+        t3 = time.monotonic()
+        self._last_compute = {
+            "build_ms": round((t1 - t0) * 1000, 2),
+            "compute_ms": round((t2 - t1) * 1000, 2),
+            "host_copy_ms": round((t3 - t2) * 1000, 2),
+            "out_bytes": len(out),
+        }
+        return out, int(arr.shape[1])
 
     def forward_range(
         self, hidden_bytes: bytes, position: int, seq_len: int
@@ -456,17 +1158,29 @@ class _RealModelState:
                 f"seq_len*hidden_dim*2 ({seq_len}*{self.hidden_dim}*{BYTES_PER_ELEM} "
                 f"= {expected})"
             )
+        t0 = time.monotonic()
         arr = (
             np.frombuffer(hidden_bytes, dtype=np.float16)
             .reshape((1, seq_len, self.hidden_dim))
             .copy()
         )
         x = Tensor(arr)
+        t1 = time.monotonic()
         for block in self.model.blk[self.start : self.end]:
             x = block(x, position)
         x = x.cast("half").realize()
-        out = x.numpy()
-        return out.tobytes(), int(out.shape[1])
+        t2 = time.monotonic()
+        out_arr = x.numpy()
+        out = out_arr.tobytes()
+        t3 = time.monotonic()
+        self._last_compute = {
+            "deserialize_ms": round((t1 - t0) * 1000, 2),
+            "compute_ms": round((t2 - t1) * 1000, 2),
+            "host_copy_ms": round((t3 - t2) * 1000, 2),
+            "in_bytes": len(hidden_bytes),
+            "out_bytes": len(out),
+        }
+        return out, int(out_arr.shape[1])
 
     def forward_and_sample(
         self, hidden_bytes: bytes, position: int, seq_len: int
@@ -480,19 +1194,29 @@ class _RealModelState:
                 f"seq_len*hidden_dim*2 ({seq_len}*{self.hidden_dim}*{BYTES_PER_ELEM} "
                 f"= {expected})"
             )
+        t0 = time.monotonic()
         arr = (
             np.frombuffer(hidden_bytes, dtype=np.float16)
             .reshape((1, seq_len, self.hidden_dim))
             .copy()
         )
         x = Tensor(arr)
+        t1 = time.monotonic()
         for block in self.model.blk[self.start : self.end]:
             x = block(x, position)
         x = self.model.output_norm(x)
         logits = self.model.output(x)
         # Argmax on the last position's logits. Matches what
-        # ``Transformer.forward`` does at llm.py:178.
+        # ``Transformer.forward`` does at llm.py:178. The .item() forces the
+        # blocks + output projection (over the full vocab) to execute here.
         token_id = int(logits[0, -1, :].argmax().item())
+        t2 = time.monotonic()
+        self._last_compute = {
+            "deserialize_ms": round((t1 - t0) * 1000, 2),
+            "compute_ms": round((t2 - t1) * 1000, 2),
+            "in_bytes": len(hidden_bytes),
+            "token_id": token_id,
+        }
         return token_id
 
     def generate_full(self, prompt: str, max_tokens: int) -> list[int]:
@@ -510,6 +1234,12 @@ class _RealModelState:
         as positions are revisited, so the same worker can serve multiple
         independent prompts.
         """
+        if self.start != 0 or self.end != self.total_blocks:
+            raise RuntimeError(
+                "generate_full needs the whole model resident, but this stage only "
+                f"holds blk[{self.start}:{self.end}) of {self.total_blocks}. Use the "
+                "per-stage ops (embed_and_forward / forward_range / forward_and_sample)."
+            )
         Tensor = self._Tensor
         if max_tokens <= 0:
             return []
@@ -804,6 +1534,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         model=(args.model or os.environ.get("MODEL", "")).strip() or None,
         python_version=sys.version.split()[0],
         argv=list(sys.argv),
+        # wall_ms anchors this worker's boot against the orchestrator's vast.ai
+        # instance create/lease time — the only way to measure image-pull +
+        # container-boot latency, which the worker can't observe directly.
+        wall_ms=_wall_ms(),
+        host=os.uname().nodename,
     )
     _start_heartbeat()
 
@@ -845,19 +1580,35 @@ def main(argv: Sequence[str] | None = None) -> int:
         ready["layer_range"] = [real_state.start, real_state.end]
         ready["eos_token_ids"] = real_state.eos_ids
     _write(ready)
-    # Mirror ready as a structured event so the bundle records it under
-    # the same `worker_*` kind family as the rest of the lifecycle. The
-    # `status: "ready"` line above is kept for back-compat with the Rust
-    # `parse_status_line` helper that drives the actor's ready signal.
+    # Mirror ready as a structured event under the spec's event name
+    # (§4.6 / §6.9: per-stage filter on `pp_worker_ready`). The
+    # `pp_*` event kind is passed through unchanged by the Rust actor
+    # so the bundle records `Custom("pp_worker_ready")`, matching the
+    # name the orchestrator-side wired check filters on. The protocol
+    # `status: "ready"` line above is unchanged for the actor's ready
+    # signal.
     _emit_event(
-        "ready",
+        "pp_worker_ready",
         pid=os.getpid(),
-        stage=stage,
+        stage_index=stage,
         uptime_ms=_uptime_ms(),
         rss_mb=_rss_mb(),
     )
+    # One-stop cold-start breakdown so a single event answers "where did
+    # bring-up time go" per node: import + (fetch|cache) + load == time-to-ready.
+    if real_state is not None:
+        _emit_event(
+            "boot_profile",
+            stage=stage,
+            total_to_ready_ms=_uptime_ms(),
+            rss_mb=_rss_mb(),
+            blocks_resident=real_state.end - real_state.start,
+            **real_state.timing,
+        )
 
     global _REQUESTS_SERVED
+    seen_ops: set = set()
+    last_op_end = time.monotonic()
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -870,6 +1621,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         if not isinstance(req, dict):
             _write({"error": f"request must be a JSON object, got {type(req).__name__}"})
             continue
+        op = req.get("op")
+        if real_state is not None:
+            real_state._last_compute = None
+        t_start = time.monotonic()
+        # idle_ms_before is the pipeline bubble: how long this worker sat
+        # blocked on its upstream stage between finishing the last op and
+        # receiving this one. High idle => the bottleneck is elsewhere.
+        idle_ms = round((t_start - last_op_end) * 1000, 2)
         try:
             reply = _handle_request(req, stage, num_stages, real_state=real_state)
         except Exception as e:  # last-ditch safety net so the worker stays up
@@ -878,6 +1637,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(traceback.format_exc(), file=sys.stderr, flush=True)
             reply = {"request_id": req.get("request_id"), "error": f"internal: {e}"}
         _write(reply)
+        t_end = time.monotonic()
+        # Per-op trace — the granular signal for end-to-end latency. `first_call`
+        # flags the JIT-compile-bearing first invocation of each op (kernels are
+        # compiled once, then cached). `rid` (not `request_id`) keeps the Rust
+        # actor from ever mistaking this event line for an op reply.
+        is_first = op not in seen_ops
+        seen_ops.add(op)
+        _emit_event(
+            "op",
+            op=op,
+            rid=req.get("request_id"),
+            stage=stage,
+            duration_ms=round((t_end - t_start) * 1000, 2),
+            idle_ms_before=idle_ms,
+            first_call=is_first,
+            ok=isinstance(reply, dict) and "error" not in reply,
+            in_tokens=len(req["tokens"]) if isinstance(req.get("tokens"), list) else None,
+            in_seq_len=req.get("seq_len"),
+            out_seq_len=reply.get("seq_len") if isinstance(reply, dict) else None,
+            compute=(real_state._last_compute if real_state is not None else None),
+            uptime_ms=_uptime_ms(),
+        )
+        last_op_end = t_end
         _REQUESTS_SERVED += 1
 
     _emit_event(

@@ -1344,6 +1344,7 @@ dependencies = [
  "swactor-transport",
  "tar",
  "tokio",
+ "tokio-stream",
  "uuid",
 ]
 

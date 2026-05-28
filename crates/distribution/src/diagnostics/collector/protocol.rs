@@ -96,6 +96,23 @@ impl RecordKind {
     }
 }
 
+/// A persisted record, fanned out to live SSE subscribers via
+/// `GET /diag/stream/{run_id}`.
+///
+/// Ordering guarantee: per-(run_id, node_id, kind) monotonic by
+/// `seq`. Across kinds or nodes, ordering is best-effort — the
+/// broadcast preserves send order, but `Lagged` receivers see gaps
+/// and must reconcile via `GET /diag/bundle/{run_id}`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveRecord {
+    pub run_id: String,
+    pub node_id: String,
+    pub kind: RecordKind,
+    pub recv_ms: u64,
+    pub seq: u64,
+    pub body: serde_json::Value,
+}
+
 /// Per-node summary written into `MANIFEST.json` at the root of a
 /// finalized bundle.
 #[derive(Debug, Clone, Serialize, Deserialize)]

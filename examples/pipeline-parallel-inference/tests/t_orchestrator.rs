@@ -364,6 +364,7 @@ async fn lease_chain_finds_n_distinct_offers() {
         None,
         IMAGE,
         None,
+        None,
         Duration::from_millis(10),
         3,
         None,
@@ -371,14 +372,30 @@ async fn lease_chain_finds_n_distinct_offers() {
     .await
     .expect("lease_chain must succeed when N distinct offers exist");
 
+    // Contract: N pairwise-distinct instances, each drawn from the catalog.
+    // Which offer a given stage lands on is an implementation detail
+    // (find_offer takes the median-priced candidate, and a create that misses
+    // an unmounted offer falls back to another), so we assert distinctness +
+    // membership rather than a fixed id order.
     let ids: Vec<u64> = infos.iter().map(|i| i.contract_id).collect();
-    assert_eq!(ids, vec![9000, 9001, 9002, 9003]);
+    assert_eq!(ids.len(), 4, "must lease N=4 instances");
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 4, "the 4 leased contracts must be distinct");
+    assert!(
+        ids.iter().all(|c| (9000..=9003).contains(c)),
+        "every leased contract must come from the mounted catalog, got {ids:?}",
+    );
 }
 
 #[tokio::test]
 async fn lease_chain_creates_n_instances_with_distinct_stage_env() {
     let server = MockServer::start().await;
-    mount_offers(&server, 4).await;
+    // Exactly N offers, all creatable, so the median-priced selection never
+    // has to fall back to an unmounted offer — keeping the create count at one
+    // PUT per stage regardless of which offer each stage picks.
+    mount_offers(&server, 3).await;
     mount_creates_ok(&server, 3).await;
     mount_status_running(&server, &[9000, 9001, 9002]).await;
 
@@ -393,6 +410,7 @@ async fn lease_chain_creates_n_instances_with_distinct_stage_env() {
         None,
         IMAGE,
         None,
+        None,
         Duration::from_millis(10),
         3,
         None,
@@ -405,29 +423,32 @@ async fn lease_chain_creates_n_instances_with_distinct_stage_env() {
         .iter()
         .filter(|r| r.method.as_ref() == "PUT")
         .collect();
-    assert_eq!(puts.len(), 3, "exactly one PUT per stage");
+    assert_eq!(puts.len(), 3, "exactly one create (PUT) per stage");
 
-    // Pair each PUT body with its offer id so we can assert STAGE
-    // independently of the on-wire ordering of the requests.
-    let mut by_offer: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
-    for r in puts {
+    // Contract: the three creates collectively cover STAGE 0/1/2 exactly once
+    // each, and every one carries NUM_STAGES=3. We assert STAGE as a set
+    // rather than tying it to a specific offer id, since which offer hosts a
+    // given stage is up to the (median-priced) selector.
+    let mut stages: Vec<String> = Vec::new();
+    for r in &puts {
         let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
-        by_offer.insert(r.url.path().to_string(), body);
-    }
-    for i in 0..3u32 {
-        let path = format!("/api/v0/asks/{}/", 1000 + i);
-        let body = by_offer
-            .get(&path)
-            .unwrap_or_else(|| panic!("no PUT to offer {}", 1000 + i));
         assert_eq!(
-            body["env"]["STAGE"],
-            i.to_string(),
-            "offer {} must carry STAGE={i}",
-            1000 + i,
+            body["env"]["NUM_STAGES"], "3",
+            "every create must carry NUM_STAGES=3",
         );
-        assert_eq!(body["env"]["NUM_STAGES"], "3");
+        stages.push(
+            body["env"]["STAGE"]
+                .as_str()
+                .expect("STAGE env must be a string")
+                .to_string(),
+        );
     }
+    stages.sort();
+    assert_eq!(
+        stages,
+        vec!["0", "1", "2"],
+        "the creates must cover STAGE 0,1,2 exactly once each",
+    );
 }
 
 #[tokio::test]
@@ -477,6 +498,7 @@ async fn lease_chain_rolls_back_on_partial_creation() {
         None,
         IMAGE,
         None,
+        None,
         Duration::from_millis(10),
         3,
         None,
@@ -504,6 +526,7 @@ async fn lease_chain_waits_for_running_per_contract() {
         SEED_ADDR,
         None,
         IMAGE,
+        None,
         None,
         Duration::from_millis(10),
         3,
@@ -533,6 +556,86 @@ async fn lease_chain_waits_for_running_per_contract() {
             "wait_for_running must poll contract {id} at least once",
         );
     }
+}
+
+/// A host that loads the image then stops (never reaching `running`) must not
+/// sink the whole lease: the stage it was filling is destroyed and
+/// re-provisioned on a fresh offer, and `lease_chain` still returns N distinct
+/// running contracts — none of them the dead one. (This is the real failure
+/// that aborted a 12-node lease: one instance reported "stopped: Successfully
+/// loaded <image>".)
+#[tokio::test]
+async fn lease_chain_replaces_a_stage_that_stops_before_running() {
+    let server = MockServer::start().await;
+    // Four offers (1000..1003) at ascending price; find_offer takes the
+    // median, so stage 0 lands on offer 1002, stage 1 on 1001, and the
+    // replacement for stage 0 on 1003.
+    mount_offers(&server, 4).await;
+    for (offer, contract) in [(1002u32, 9002u64), (1001, 9001), (1003, 9003)] {
+        Mock::given(method("PUT"))
+            .and(path_regex(format!("^/api/v0/asks/{offer}/$").as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "new_contract": contract })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+    // 9002 stops after loading the image (the failure we are guarding against).
+    Mock::given(method("GET"))
+        .and(path_regex("^/api/v0/instances/9002/$"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "instances": {
+                "actual_status": "created",
+                "intended_status": "stopped",
+                "status_msg": "Successfully loaded zacheryasc/swactor-pp-gpu:latest",
+            }
+        })))
+        .mount(&server)
+        .await;
+    // The replacement (9003) and the healthy stage 1 (9001) both come up.
+    mount_status_running(&server, &[9003, 9001]).await;
+    // The dead instance must be torn down so it stops billing.
+    Mock::given(method("DELETE"))
+        .and(path_regex("^/api/v0/instances/9002/$"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "success": true })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let client = Client::new();
+    let infos = vastai::lease_chain(
+        &client,
+        &server.uri(),
+        API_KEY,
+        "RTX 4090",
+        2,
+        SEED_ADDR,
+        None,
+        IMAGE,
+        None,
+        None,
+        Duration::from_millis(10),
+        3,
+        None,
+    )
+    .await
+    .expect("lease_chain must recover by replacing the stopped stage");
+
+    let ids: Vec<u64> = infos.iter().map(|i| i.contract_id).collect();
+    assert_eq!(ids.len(), 2, "lease must still yield N=2 running instances");
+    assert!(
+        !ids.contains(&9002),
+        "the stopped instance must not appear in the lease, got {ids:?}",
+    );
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 2, "leased contracts must be distinct");
+    // The DELETE + create expectations are verified on server drop.
 }
 
 // ─── §9.3 convergence wait ────────────────────────────────────────────

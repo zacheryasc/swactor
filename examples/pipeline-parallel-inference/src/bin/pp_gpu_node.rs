@@ -39,7 +39,7 @@ use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
-use iroh::{PublicKey, RelayMode};
+use iroh::{PublicKey, RelayMode, SecretKey};
 
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Runtime, RuntimeConfig};
@@ -97,6 +97,36 @@ fn require_u32(name: &str) -> u32 {
         eprintln!("pp-gpu-node: env {name}={raw:?} must be a u32");
         std::process::exit(2);
     })
+}
+
+/// A held cluster's stages must keep a STABLE node id across a redeploy
+/// bounce, or the pipeline name registry (pp-entry / pp-stage-N) keeps
+/// routing to the dead pre-bounce id and the response never returns.
+/// `PP_STAGE_SECRET` (64 hex = 32 bytes) pins this stage's keypair; it is
+/// injected at instance-create time, so it is re-read from PID 1's env on
+/// every restart and the stage id is unchanged. Unset → random identity
+/// (fine for a one-shot localhost `--seed` run).
+fn stage_secret_from_env() -> Option<SecretKey> {
+    let hex = std::env::var("PP_STAGE_SECRET").ok()?;
+    let hex = hex.trim();
+    if hex.is_empty() {
+        return None;
+    }
+    if hex.len() != 64 {
+        eprintln!(
+            "pp-gpu-node: PP_STAGE_SECRET must be 64 hex chars, got {}",
+            hex.len()
+        );
+        std::process::exit(2);
+    }
+    let mut bytes = [0u8; 32];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
+            eprintln!("pp-gpu-node: PP_STAGE_SECRET is not valid hex");
+            std::process::exit(2);
+        });
+    }
+    Some(SecretKey::from_bytes(&bytes))
 }
 
 fn node_config() -> DistributedNodeConfig {
@@ -292,7 +322,133 @@ fn maybe_simulate_boot_delay(stage: u32) {
     }
 }
 
+// ─── PROTOTYPE_BINARY_SWAP (spec §5.1) ────────────────────────────────
+//
+// Out-of-band binary swap scaffolding. Disabled by default — a freshly
+// pulled image with no `PP_BINARY_SWAP_*` env vars boots using the
+// binary it shipped with (spec §5.1: "The worker's normal boot path
+// MUST NOT consult this URL"). When both env vars are set, the worker
+// fetches the URL, verifies the SHA-256 digest, atomically renames the
+// new binary over the running binary, and exits so the container's
+// restart policy spawns the new binary.
+//
+// All wiring tagged `PROTOTYPE_BINARY_SWAP` for spec §5.3
+// grep-discoverability. Removal criterion: when image build/push is no
+// longer a binding constraint on iteration speed, delete:
+//   - this function and its call site in `main()`
+//   - the `sha2` dep added to Cargo.toml under the same comment
+//   - the `PP_BINARY_SWAP_*` env vars from any deploy docs
+
+fn prototype_binary_swap_maybe_apply() {
+    let url = match std::env::var("PP_BINARY_SWAP_URL") {
+        Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
+        _ => return, // PROTOTYPE_BINARY_SWAP: gate off — normal boot.
+    };
+    let expected_digest = match std::env::var("PP_BINARY_SWAP_SHA256") {
+        Ok(d) if !d.trim().is_empty() => d.trim().to_lowercase(),
+        _ => {
+            eprintln!(
+                "pp-gpu-node: PROTOTYPE_BINARY_SWAP — PP_BINARY_SWAP_URL is set \
+                 but PP_BINARY_SWAP_SHA256 is missing; refusing to swap (spec §5.1 \
+                 requires both URL and digest)"
+            );
+            std::process::exit(2);
+        }
+    };
+    let our_path = std::env::current_exe()
+        .expect("PROTOTYPE_BINARY_SWAP: current_exe failed");
+    let mut new_os = our_path.clone().into_os_string();
+    new_os.push(".new");
+    let new_path = std::path::PathBuf::from(new_os);
+
+    eprintln!(
+        "pp-gpu-node: PROTOTYPE_BINARY_SWAP fetching {url} → {}",
+        new_path.display()
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("PROTOTYPE_BINARY_SWAP: tokio runtime");
+    let bytes = rt
+        .block_on(async {
+            let resp = reqwest::get(&url)
+                .await
+                .map_err(|e| format!("HTTP GET failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("HTTP {}", resp.status()));
+            }
+            resp.bytes().await.map_err(|e| format!("read body: {e}"))
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("pp-gpu-node: PROTOTYPE_BINARY_SWAP fetch failed: {e}");
+            std::process::exit(1);
+        });
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let actual_digest = format!("{:x}", hasher.finalize());
+    if actual_digest != expected_digest {
+        eprintln!(
+            "pp-gpu-node: PROTOTYPE_BINARY_SWAP digest mismatch: expected {expected_digest}, \
+             got {actual_digest} — refusing to install"
+        );
+        std::process::exit(1);
+    }
+
+    if let Err(e) = std::fs::write(&new_path, &bytes) {
+        eprintln!(
+            "pp-gpu-node: PROTOTYPE_BINARY_SWAP write {} failed: {e}",
+            new_path.display()
+        );
+        std::process::exit(1);
+    }
+    // Mark the staged binary executable (the URL host may serve it as
+    // a plain file with no +x bit).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(
+            &new_path,
+            std::fs::Permissions::from_mode(0o755),
+        ) {
+            eprintln!(
+                "pp-gpu-node: PROTOTYPE_BINARY_SWAP chmod {} failed: {e}",
+                new_path.display()
+            );
+            std::process::exit(1);
+        }
+    }
+    // Spec §5.1: "Atomically rename the new binary over the running
+    // binary." Linux rename() is atomic when both paths are on the
+    // same filesystem; renaming over a memory-mapped ELF unlinks the
+    // old inode but lets the running process continue (we exit
+    // immediately below, so this is harmless).
+    if let Err(e) = std::fs::rename(&new_path, &our_path) {
+        eprintln!(
+            "pp-gpu-node: PROTOTYPE_BINARY_SWAP rename {} → {} failed: {e}",
+            new_path.display(),
+            our_path.display()
+        );
+        std::process::exit(1);
+    }
+    eprintln!(
+        "pp-gpu-node: PROTOTYPE_BINARY_SWAP installed {} bytes; exiting for container restart",
+        bytes.len()
+    );
+    // Exit 0; the container's restart policy (typically `restart:
+    // always`) re-execs the new binary.
+    std::process::exit(0);
+}
+
 fn main() {
+    // PROTOTYPE_BINARY_SWAP (spec §5.1): inert when env vars unset.
+    // Run before any other boot work so the spec's "normal boot path
+    // MUST NOT consult this URL" holds — we either apply the swap and
+    // exit, or return immediately and let normal boot proceed.
+    prototype_binary_swap_maybe_apply();
+
     let stage = require_u32("STAGE");
     let num_stages = require_u32("NUM_STAGES");
     if num_stages < 2 || stage >= num_stages {
@@ -328,7 +484,7 @@ fn main() {
     };
 
     let mut driver = IrohDriver::new(IrohDriverConfig {
-        secret_key: None,
+        secret_key: stage_secret_from_env(),
         relay_mode,
         node: node_config(),
         peer_auth: None,
@@ -345,6 +501,26 @@ fn main() {
     let subprocess_introspect = _diag
         .as_ref()
         .map(|d| d.subprocess_introspect().clone());
+
+    // Stamp the bundle the moment this process announces itself, so a
+    // bundle reader can tell two pp-gpu-node incarnations of the same
+    // stage apart: a --redeploy bounce pkills the old process and
+    // setsid's a new one under the same PID-1 env, which means the same
+    // run_id + node_id, but the pid differs. The event carries that
+    // pid + wall clock as the slice point. No-op without diagnostics.
+    driver.emit(distribution::diagnostics::event::Event::Custom {
+        kind: "pp_stage_bounce".into(),
+        fields: serde_json::json!({
+            // Spec §4.8: stage worker events MUST carry stage_index
+            // top-level. The legacy `stage` alias is kept for back-compat
+            // with bundle consumers that filtered on it.
+            "stage_index": stage,
+            "stage": stage,
+            "num_stages": num_stages,
+            "pid": std::process::id(),
+            "boot_wall_ms": distribution::diagnostics::wall_ms_now(),
+        }),
+    });
 
     let my_id = driver.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
@@ -446,8 +622,25 @@ fn main() {
         driver.node_mut().set_relay_url(Some(home.to_string()));
     }
 
-    if !wait_for_cluster(&mut driver, Duration::from_secs(120)) {
-        eprintln!("pp-gpu-node: cluster did not converge in 120s");
+    // SWIM convergence gate. The old hardcoded 120s was fatal on vast.ai:
+    // every stage's only join target is the seed (the orchestrator), so a
+    // stage can only converge once the orchestrator is ticking SWIM and acking
+    // its pings. But the orchestrator is blocked in synchronous work for
+    // minutes at a time — the vast.ai lease (HTTP polling in lease_chain) and
+    // the redeploy scp/bounce loop — and never acks during those windows.
+    // Stages that booted early would hit 120s with no alive peer and exit(1)
+    // before the orchestrator ever became responsive (resolve loop), leaving
+    // "running" containers with dead processes. The window a stage must outlast
+    // is "however long the orchestrator stays busy", so the ceiling defaults
+    // high and is tunable via PP_CONVERGE_TIMEOUT_SECS. Convergence is
+    // near-instant once the orchestrator starts ticking, so a generous ceiling
+    // only costs wall-clock in the genuine no-connectivity case.
+    let converge_secs: u64 = std::env::var("PP_CONVERGE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1200);
+    if !wait_for_cluster(&mut driver, Duration::from_secs(converge_secs)) {
+        eprintln!("pp-gpu-node: cluster did not converge in {converge_secs}s");
         std::process::exit(1);
     }
     eprintln!("pp-gpu-node: cluster converged");
@@ -587,6 +780,23 @@ fn run_stage(
     };
     let stage_actor_addr = rt.spawn(actor).unwrap();
 
+    // Effective worker-ready and neighbor-resolve timeouts. §4.3 couples
+    // the neighbor resolve to worker-ready: a stage that has itself
+    // become ready MUST be willing to wait for its downstream neighbor
+    // for at least as long as it would wait for its own worker. With
+    // the per-index registration deferred to post-worker-ready (below),
+    // the neighbor's name is genuinely unavailable until the neighbor's
+    // worker boots; the resolve must outlast that boot.
+    let worker_ready_secs: u64 = std::env::var("PP_WORKER_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1800);
+    let neighbor_resolve_secs: u64 = std::env::var("PP_NEIGHBOR_RESOLVE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(worker_ready_secs);
+    let neighbor_resolve_timeout = Duration::from_secs(neighbor_resolve_secs);
+
     // Bridges are wired per role:
     //   First:        RequestBridge (entry) + NextTokenBridge (per-index).
     //   Middle, Last: ActivationBridge (per-index).
@@ -622,20 +832,35 @@ fn run_stage(
         None
     };
 
-    // Register pp-stage-{stage} IMMEDIATELY so neighbouring stages can
-    // resolve us. The per-index bridge is the role's *inbound-from-network*
-    // adapter:
+    // The per-index bridge is the role's *inbound-from-network* adapter:
     //   First:        receives NextTokens from Last  → NextTokenBridge.
     //   Middle, Last: receives StageActivations      → ActivationBridge.
+    //
+    // Registration is deferred to AFTER the worker is ready (below) so
+    // that the SWIM name `pp-stage-{stage}` is a real signal of stage
+    // readiness — the orchestrator polls every per-index name to know
+    // when to emit `pp_pipeline_wired` (spec §4.6). The per-index actor
+    // address itself remains the bridge target.
     let per_index_bridge_addr = match role {
         StageRole::First => next_token_bridge_addr.unwrap(),
         StageRole::Middle | StageRole::Last => activation_bridge_addr.unwrap(),
     };
-    register_name(&mut driver, &stage_name(stage), per_index_bridge_addr, stage);
 
     // Worker boot can take time even in stub mode (Python startup +
-    // tinygrad import on real mode). Generous timeout.
-    if !wait_for_worker_ready(&rt, &mut driver, &status_inbox, Duration::from_secs(600)) {
+    // tinygrad import on real mode). On a real run the worker also fetches
+    // and realizes its model slice: an ~18 GB MoE GGUF (qwen3:30b-a3b) on a
+    // cold node can spend many minutes downloading before it reports ready,
+    // and the old hardcoded 600s wall would exit(1) a still-loading stage
+    // before we ever learn whether the load succeeds. Default high and make
+    // it tunable via PP_WORKER_READY_TIMEOUT_SECS; a generous ceiling only
+    // costs wall-clock when a worker is genuinely wedged (which the
+    // ProcessExited branch below already short-circuits).
+    if !wait_for_worker_ready(
+        &rt,
+        &mut driver,
+        &status_inbox,
+        Duration::from_secs(worker_ready_secs),
+    ) {
         eprintln!("pp-gpu-node: stage-{stage} worker did not become ready");
         // The StageActor already emitted Custom("worker_exited") in
         // response to ProcessNotification::Exited. Give the HTTP-sink
@@ -648,15 +873,24 @@ fn run_stage(
         std::process::exit(1);
     }
 
+    // Now that this worker is ready, publish our per-index name. Spec
+    // §4.6: the orchestrator uses each `pp-stage-{K}`'s availability as
+    // a per-stage worker-ready signal when deciding to emit
+    // `pp_pipeline_wired`. Spec §4.3: neighbour resolves wait on this
+    // for as long as worker-ready takes.
+    register_name(&mut driver, &stage_name(stage), per_index_bridge_addr, stage);
+
     // Resolve neighbours and wire routes per role. Stage 3 keeps the
     // 2-stage resolution targets in place (Last looks up stage 0 as its
-    // NextToken sink, which happens to be First in N=2).
+    // NextToken sink, which happens to be First in N=2). Each neighbor
+    // resolution uses the §4.3 coupled timeout so a slow-to-boot neighbor
+    // cannot break a healthy chain.
     match role {
         StageRole::First => {
             let next_name = next_stage_name(stage, num_stages)
                 .expect("first stage has a next neighbour for N>=2");
             let (next_addr, next_hex) =
-                resolve_or_die(&mut driver, &next_name, Duration::from_secs(120));
+                resolve_or_die(&mut driver, &next_name, neighbor_resolve_timeout);
             eprintln!(
                 "pp-gpu-node: resolved {next_name} -> {next_addr:?} on {next_hex}"
             );
@@ -675,7 +909,7 @@ fn run_stage(
             let next_name = next_stage_name(stage, num_stages)
                 .expect("middle stage has a next neighbour");
             let (next_addr, next_hex) =
-                resolve_or_die(&mut driver, &next_name, Duration::from_secs(120));
+                resolve_or_die(&mut driver, &next_name, neighbor_resolve_timeout);
             eprintln!(
                 "pp-gpu-node: resolved {next_name} -> {next_addr:?} on {next_hex}"
             );
@@ -699,10 +933,10 @@ fn run_stage(
             let (feedback_addr, feedback_hex) = resolve_or_die(
                 &mut driver,
                 &feedback_name,
-                Duration::from_secs(120),
+                neighbor_resolve_timeout,
             );
             let (orch_addr, orch_hex) =
-                resolve_or_die(&mut driver, ORCHESTRATOR_NAME, Duration::from_secs(120));
+                resolve_or_die(&mut driver, ORCHESTRATOR_NAME, neighbor_resolve_timeout);
             eprintln!(
                 "pp-gpu-node: resolved {feedback_name}={feedback_addr:?} on \
                  {feedback_hex}, orch={orch_addr:?} on {orch_hex}"
