@@ -515,8 +515,12 @@ impl StageActor {
         let Some(emitter) = &self.diagnostics else {
             return;
         };
+        // Spec §4.8: every event emitted by a stage worker process MUST carry
+        // `stage_index` as a top-level field whenever the worker is past the
+        // point of knowing its index. The actor only ever has `stage_idx` set
+        // post-construction, so when present, inject it under the spec's name.
         if let Some(stage) = self.stage_idx {
-            fields["stage_idx"] = serde_json::json!(stage);
+            fields["stage_index"] = serde_json::json!(stage);
         }
         fields["role"] = serde_json::json!(self.role_str());
         emitter.emit_event(Event::Custom {
@@ -645,17 +649,26 @@ impl StageActor {
         }
 
         // Worker-side lifecycle event: any `{"event": "<kind>", ...}` line
-        // is re-emitted as `Custom("worker_<kind>")` and otherwise ignored
-        // (it carries no protocol payload). We stash the traceback off any
-        // `uncaught_exception` so the eventual `worker_exited` event can
-        // carry it even if the per-line event is truncated.
+        // is re-emitted into the diagnostic stream. Spec-defined event
+        // kinds — anything beginning with `pp_` — pass through verbatim
+        // so the bundle reader sees the same kind the spec names (e.g.
+        // `pp_download_progress`, spec §4.7). Generic worker events stay
+        // under the `worker_*` namespace so they cannot collide with
+        // orchestrator-emitted `pp_*` events. We stash the traceback off
+        // any `uncaught_exception` so the eventual `worker_exited` event
+        // can carry it even if the per-line event is truncated.
         if let Some(event_kind) = val.get("event").and_then(|v| v.as_str()) {
             if event_kind == "uncaught_exception" {
                 if let Some(tb) = val.get("traceback").and_then(|v| v.as_str()) {
                     self.last_python_traceback = Some(tb.to_string());
                 }
             }
-            self.emit_diag(&format!("worker_{event_kind}"), val.clone());
+            let kind = if event_kind.starts_with("pp_") {
+                event_kind.to_string()
+            } else {
+                format!("worker_{event_kind}")
+            };
+            self.emit_diag(&kind, val.clone());
             return;
         }
 

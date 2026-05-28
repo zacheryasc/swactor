@@ -18,6 +18,12 @@ iroh = "0.98"
 urlencoding = "2"
 base64 = "0.22"
 libc = "0.2"
+# PROTOTYPE_BINARY_SWAP (spec §5.1): pp-gpu-node verifies an
+# operator-supplied SHA-256 digest of the fetched replacement binary.
+# Already a transitive dep of the iroh stack; pinned here as a direct
+# dep so a future §5.1 removal can drop this line cleanly along with
+# the swap module.
+sha2 = "0.10"
 
 [[bin]]
 name = "pp-gpu-node"
@@ -30,3 +36,9 @@ path = "src/bin/pp_smoke_run.rs"
 [dev-dependencies]
 wiremock = "0.6"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# These binaries are shipped to rented GPU nodes — over the docker image on a
+# cold lease, and over scp through vast.ai's throttled SSH proxy on a redeploy.
+# Stripping debug symbols (~26MB -> ~18MB) trims both paths at no runtime cost.
+[profile.release]
+strip = true

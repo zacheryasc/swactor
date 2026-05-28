@@ -9,6 +9,11 @@
 //!   predecessor's announcement into the next child's environment.
 //! * [`await_convergence`] polls a closure that reports the current alive
 //!   peer count and returns when the target is met (or times out).
+//! * [`resolve_roster`] polls SWIM until every `pp-stage-K` resolves, then
+//!   returns the per-stage (node_id_hex, node_id_short) roster used by the
+//!   `pp_stage_roster` diagnostic event (spec §4.5).
+//! * [`stage_roster_event_fields`] builds the JSON fields for a
+//!   `pp_stage_roster` event from a resolved roster.
 //!
 //! Tests inject a fake command builder (e.g. `sh -c "echo PP_GPU_NODE_ADDR
 //! <hex> <direct>; sleep 60"`) so the chain can be exercised end-to-end
@@ -373,4 +378,133 @@ where
         }
         std::thread::sleep(poll_interval);
     }
+}
+
+// ─── Roster + pipeline-wired helpers (spec §4.5 / §4.6) ───────────────
+
+/// One entry in the resolved stage roster: stage_index → node id.
+///
+/// Built by [`resolve_roster`] once every per-stage SWIM name resolves.
+/// The orchestrator emits these as the `stages` field of the
+/// `pp_stage_roster` event (spec §4.5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageRosterEntry {
+    pub stage_index: u32,
+    pub node_id_hex: String,
+    pub node_id_short: String,
+}
+
+/// Why [`resolve_roster`] gave up.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RosterError {
+    /// At least one `pp-stage-K` did not resolve within the timeout. The
+    /// missing stage indices are reported in ascending order.
+    Timeout {
+        missing_stages: Vec<u32>,
+        timeout: Duration,
+    },
+}
+
+impl std::fmt::Display for RosterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RosterError::Timeout {
+                missing_stages,
+                timeout,
+            } => write!(
+                f,
+                "pipeline did not wire within {:.0}s: missing pp-stage-K for stages {:?}",
+                timeout.as_secs_f32(),
+                missing_stages,
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RosterError {}
+
+/// Poll until every `pp-stage-K` (K in `0..num_stages`) resolves, or
+/// `timeout` elapses. Returns the resolved roster ordered by
+/// `stage_index`. Each iteration calls `resolve_stage(K)` for any stage
+/// still missing — the callback returns `Some((actor_addr_unused,
+/// node_id_hex))` once SWIM has propagated the registration.
+///
+/// The callback's first tuple element is discarded by this helper; it
+/// exists because the orchestrator's per-name resolve returns
+/// `(ActorAddress, NodeId)` and most callers want the address too, so
+/// expressing the callback as "the resolve function" keeps adapter code
+/// short.
+pub fn resolve_roster<F>(
+    num_stages: u32,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut resolve_stage: F,
+) -> Result<Vec<StageRosterEntry>, RosterError>
+where
+    F: FnMut(u32) -> Option<String>,
+{
+    let deadline = Instant::now() + timeout;
+    let mut resolved: Vec<Option<String>> = vec![None; num_stages as usize];
+    loop {
+        for k in 0..num_stages {
+            if resolved[k as usize].is_some() {
+                continue;
+            }
+            if let Some(hex) = resolve_stage(k) {
+                resolved[k as usize] = Some(hex);
+            }
+        }
+        if resolved.iter().all(|o| o.is_some()) {
+            let out: Vec<StageRosterEntry> = resolved
+                .into_iter()
+                .enumerate()
+                .map(|(k, hex)| {
+                    let hex = hex.unwrap();
+                    let short = hex.chars().take(8).collect::<String>();
+                    StageRosterEntry {
+                        stage_index: k as u32,
+                        node_id_hex: hex,
+                        node_id_short: short,
+                    }
+                })
+                .collect();
+            return Ok(out);
+        }
+        if Instant::now() >= deadline {
+            let missing: Vec<u32> = resolved
+                .iter()
+                .enumerate()
+                .filter_map(|(k, o)| o.is_none().then_some(k as u32))
+                .collect();
+            return Err(RosterError::Timeout {
+                missing_stages: missing,
+                timeout,
+            });
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// Build the `fields` JSON for a `pp_stage_roster` diagnostic event from
+/// a resolved roster, attaching the given `drive_seq`. Spec §4.5: the
+/// event MUST list every stage, ordered by `stage_index`, with each
+/// entry carrying `stage_index`, `node_id_hex`, and `node_id_short`.
+pub fn stage_roster_event_fields(
+    drive_seq: u32,
+    roster: &[StageRosterEntry],
+) -> serde_json::Value {
+    let stages: Vec<serde_json::Value> = roster
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "stage_index": e.stage_index,
+                "node_id_hex": e.node_id_hex,
+                "node_id_short": e.node_id_short,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "drive_seq": drive_seq,
+        "stages": stages,
+    })
 }

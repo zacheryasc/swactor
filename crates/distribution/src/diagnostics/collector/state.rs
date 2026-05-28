@@ -7,12 +7,19 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::Value;
+use tokio::sync::broadcast;
 
-use super::protocol::{Hints, RecordKind};
+use super::protocol::{Hints, LiveRecord, RecordKind};
+
+/// Default fan-out capacity for the live SSE broadcast — overridable
+/// via `SWACTOR_DIAG_STREAM_CAPACITY`. 1024 is ~70s of buffer at the
+/// ~14 rec/s typical of an 11-stage cluster; slow subscribers see
+/// `Lagged` rather than backpressuring the ingest path.
+pub const DEFAULT_STREAM_CAPACITY: usize = 1024;
 
 /// How long `/diag/finalize` waits between marking nodes for
 /// snapshot_now and assembling the tarball, by default.
@@ -51,6 +58,11 @@ pub struct CollectorState {
     /// handler rebuilds from current staging. This is the
     /// "node-count heuristic" the spec names.
     canonical_node_counts: Mutex<HashMap<String, usize>>,
+    /// Fan-out of every persisted record to live SSE subscribers.
+    /// Lossy: when a subscriber falls behind the channel's capacity
+    /// it observes `Lagged` and resumes from the next send. The
+    /// catch-up path is `GET /diag/bundle/{run_id}`.
+    live_tx: broadcast::Sender<Arc<LiveRecord>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,6 +100,12 @@ pub struct NodeStats {
 
 impl CollectorState {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        let cap = std::env::var("SWACTOR_DIAG_STREAM_CAPACITY")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_STREAM_CAPACITY);
+        let (live_tx, _) = broadcast::channel(cap);
         Self {
             root: root.into(),
             finalize_wait: DEFAULT_FINALIZE_WAIT,
@@ -95,6 +113,7 @@ impl CollectorState {
             runs: Mutex::new(HashMap::new()),
             pending_hints: Mutex::new(HashMap::new()),
             canonical_node_counts: Mutex::new(HashMap::new()),
+            live_tx,
         }
     }
 
@@ -127,6 +146,17 @@ impl CollectorState {
     /// [`DEFAULT_FINALIZE_WAIT`].
     pub fn with_finalize_wait(mut self, d: Duration) -> Self {
         self.finalize_wait = d;
+        self
+    }
+
+    /// Override the live-broadcast capacity. Production reads
+    /// `SWACTOR_DIAG_STREAM_CAPACITY` in [`Self::new`]; tests use
+    /// this builder to exercise the lossy-lagged path without
+    /// racing other tests on a shared env var.
+    pub fn with_stream_capacity(mut self, cap: usize) -> Self {
+        let cap = cap.max(1);
+        let (tx, _) = broadcast::channel(cap);
+        self.live_tx = tx;
         self
     }
 
@@ -174,7 +204,35 @@ impl CollectorState {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(&path, bytes)?;
         self.update_stats(run_id, node_id, kind, recv_ms, body);
+        // Fan out to live SSE subscribers. SendError (zero receivers)
+        // is steady state; ignore.
+        let _ = self.live_tx.send(Arc::new(LiveRecord {
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            kind,
+            recv_ms,
+            seq,
+            body: body.clone(),
+        }));
         Ok(path)
+    }
+
+    /// Subscribe to the live fan-out of persisted records. Each
+    /// receiver gets every record sent after subscription; if the
+    /// receiver falls behind the channel capacity it observes
+    /// `RecvError::Lagged(n)` and continues from the next send.
+    pub fn subscribe(&self) -> broadcast::Receiver<Arc<LiveRecord>> {
+        self.live_tx.subscribe()
+    }
+
+    /// Snapshot of all known runs and their accounting, sorted by
+    /// `run_id`. Used by `GET /diag/runs`.
+    pub fn run_summaries(&self) -> Vec<(String, RunStats)> {
+        let runs = self.runs.lock().expect("collector runs mutex poisoned");
+        let mut out: Vec<(String, RunStats)> =
+            runs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     fn next_seq(&self, run_id: &str, node_id: &str, kind: RecordKind) -> u64 {

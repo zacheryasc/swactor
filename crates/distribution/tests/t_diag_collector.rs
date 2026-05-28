@@ -24,6 +24,7 @@
 
 #![cfg(feature = "collector")]
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -39,32 +40,49 @@ use tokio::net::TcpStream;
 struct Fixture {
     addr: SocketAddr,
     root: PathBuf,
+    state: Arc<CollectorState>,
     _tmpdir: TempDir,
     _server: tokio::task::JoinHandle<()>,
 }
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with(|s| s).await
+    }
+
+    /// Like `start`, but allows the caller to layer additional
+    /// builder calls onto the [`CollectorState`] before it's wrapped
+    /// in an `Arc` and handed to the server. Used by the stream
+    /// tests that need a smaller broadcast capacity to exercise the
+    /// lagged path.
+    async fn start_with(configure: impl FnOnce(CollectorState) -> CollectorState) -> Self {
         let tmpdir = TempDir::new();
         let root = tmpdir.path().to_path_buf();
         // Tests don't have aggregator clients chasing hints, so the
         // finalize wait would just stall every assertion. Collapse it.
-        let state = Arc::new(
+        let state = configure(
             CollectorState::new(&root).with_finalize_wait(Duration::from_millis(0)),
         );
+        let state = Arc::new(state);
         let listener = bind("127.0.0.1:0".parse().unwrap()).await.expect("bind");
         let addr = listener.local_addr().expect("local_addr");
+        let serve_state = Arc::clone(&state);
         let handle = tokio::spawn(async move {
-            let _ = serve(listener, state).await;
+            let _ = serve(listener, serve_state).await;
         });
         // Tiny pause so the spawned task gets to accept().
         tokio::time::sleep(Duration::from_millis(50)).await;
         Fixture {
             addr,
             root,
+            state,
             _tmpdir: tmpdir,
             _server: handle,
         }
+    }
+
+    fn state(&self) -> &Arc<CollectorState> {
+        &self.state
     }
 }
 
@@ -343,6 +361,335 @@ async fn header_values_are_sanitized_against_path_traversal() {
         !only.contains('/') && !only.contains('\\') && only != ".." && only != ".",
         "child dir must be a safe single component, got {only:?}"
     );
+}
+
+// ── Live stream / runs endpoint tests ────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_subscriber_sees_persisted_records_in_post_order() {
+    // A live subscriber receives every persisted record, in the order
+    // it was POSTed, with per-(run, node, kind) monotonic seq.
+    let fx = Fixture::start().await;
+    let mut rx = fx.state().subscribe();
+    let run_id = "run-live-1";
+    let node_id = "n".repeat(64);
+
+    for i in 0..3 {
+        let resp = post_json(
+            &fx,
+            "/diag/events",
+            run_id,
+            &node_id,
+            now_ms(),
+            &json!([{"i": i}]),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+    }
+
+    let mut got_seqs = Vec::new();
+    for _ in 0..3 {
+        let rec = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("recv within 1s")
+            .expect("recv ok");
+        assert_eq!(rec.run_id, run_id);
+        assert_eq!(rec.node_id, node_id);
+        // We POSTed only events — so every fan-out record is events.
+        // If a future change accidentally mis-tags records, this will
+        // catch it without echoing the persist() shape.
+        assert_eq!(
+            serde_json::to_string(&rec.kind).unwrap(),
+            "\"events\"",
+            "every record from /diag/events must be tagged kind=events"
+        );
+        got_seqs.push(rec.seq);
+    }
+    assert_eq!(got_seqs, vec![1, 2, 3], "events seq must be monotonic from 1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_subscriber_records_carry_origin_run_and_node_ids() {
+    // Two concurrent runs share one subscriber. Each fanned-out
+    // record carries the run_id and node_id it was POSTed under, so
+    // downstream filters (the SSE handler's run_id filter, or a
+    // future per-node consumer) can split the stream correctly.
+    let fx = Fixture::start().await;
+    let mut rx = fx.state().subscribe();
+    let run_a = "run-a";
+    let run_b = "run-b";
+    let node_a = "a".repeat(64);
+    let node_b = "b".repeat(64);
+
+    let resp = post_json(
+        &fx,
+        "/diag/boot",
+        run_a,
+        &node_a,
+        now_ms(),
+        &json!({"role": "stage"}),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let resp = post_json(
+        &fx,
+        "/diag/boot",
+        run_b,
+        &node_b,
+        now_ms(),
+        &json!({"role": "orchestrator"}),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for _ in 0..2 {
+        let rec = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("recv within 1s")
+            .expect("recv ok");
+        seen.insert(rec.run_id.clone(), rec.node_id.clone());
+    }
+    assert_eq!(seen.get(run_a), Some(&node_a));
+    assert_eq!(seen.get(run_b), Some(&node_b));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_subscriber_observes_lag_and_keeps_receiving() {
+    // Lossy-but-live contract: when the broadcast buffer overflows,
+    // the subscriber sees a Lagged error and the next live record
+    // still reaches it. The collector ingest path must not be
+    // backpressured by a slow subscriber.
+    use tokio::sync::broadcast::error::RecvError;
+
+    let fx = Fixture::start_with(|s| s.with_stream_capacity(4)).await;
+    let mut rx = fx.state().subscribe();
+    let run_id = "run-lag";
+    let node_id = "n".repeat(64);
+
+    // Fire 10 sends without draining — capacity is 4, so the receiver
+    // is at least 6 behind and is guaranteed to observe Lagged.
+    for i in 0..10 {
+        let resp = post_json(
+            &fx,
+            "/diag/events",
+            run_id,
+            &node_id,
+            now_ms(),
+            &json!([{"i": i}]),
+        )
+        .await;
+        assert_eq!(resp.status, 200);
+    }
+
+    let mut saw_lag = false;
+    let mut drained = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+            Ok(Ok(_)) => drained += 1,
+            Ok(Err(RecvError::Lagged(n))) => {
+                saw_lag = true;
+                assert!(n > 0, "Lagged must report a non-zero gap");
+            }
+            Ok(Err(other)) => panic!("unexpected recv error during drain: {other:?}"),
+            Err(_) => break, // drained
+        }
+    }
+    assert!(saw_lag, "lagged subscriber must observe Lagged at least once");
+    assert!(drained >= 1, "lagged subscriber must still get buffered records");
+
+    // After the gap, a fresh send still lands at this same receiver.
+    let resp = post_json(
+        &fx,
+        "/diag/events",
+        run_id,
+        &node_id,
+        now_ms(),
+        &json!([{"fresh": true}]),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let rec = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("recv within 1s after lag")
+        .expect("recv ok after lag");
+    assert_eq!(rec.run_id, run_id);
+    assert_eq!(rec.body, json!([{"fresh": true}]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runs_endpoint_lists_active_runs() {
+    // /diag/runs answers "what's there to stream?" — every run that
+    // has had at least one POST appears with its per-node accounting.
+    let fx = Fixture::start().await;
+    let run_a = "run-list-a";
+    let run_b = "run-list-b";
+    let node = "n".repeat(64);
+
+    let resp = post_json(
+        &fx,
+        "/diag/boot",
+        run_a,
+        &node,
+        now_ms(),
+        &json!({"role": "stage"}),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let resp = post_json(
+        &fx,
+        "/diag/boot",
+        run_b,
+        &node,
+        now_ms(),
+        &json!({"role": "orchestrator"}),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+
+    let resp = get(&fx, "/diag/runs").await;
+    assert_eq!(resp.status, 200, "body: {}", body_str(&resp));
+    let runs: Value = serde_json::from_slice(&resp.body).expect("runs json");
+    let arr = runs.as_array().expect("runs is array");
+    let ids: Vec<&str> = arr
+        .iter()
+        .filter_map(|v| v.get("run_id").and_then(|r| r.as_str()))
+        .collect();
+    assert!(ids.contains(&run_a), "ids={ids:?}");
+    assert!(ids.contains(&run_b), "ids={ids:?}");
+
+    // Boot landed but finalize did not; surface honestly.
+    for run_id in [run_a, run_b] {
+        let entry = arr
+            .iter()
+            .find(|v| v.get("run_id").and_then(|r| r.as_str()) == Some(run_id))
+            .expect("entry present");
+        assert_eq!(entry.get("finalize_received"), Some(&Value::Bool(false)));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sse_stream_delivers_a_record_over_http() {
+    // End-to-end SSE: subscribe via HTTP, POST a boot, parse the
+    // first SSE frame off the wire. Covers the HTTP/SSE framing
+    // path that the broadcast-level tests above intentionally skip.
+    let fx = Fixture::start().await;
+    let run_id = "run-sse-1";
+    let node_id = "c".repeat(64);
+
+    let mut stream = open_sse_stream(fx.addr, &format!("/diag/stream/{run_id}")).await;
+
+    // Now that the subscribe has happened (handler runs before the
+    // response head is flushed), drive one record into the channel.
+    let resp = post_json(
+        &fx,
+        "/diag/boot",
+        run_id,
+        &node_id,
+        now_ms(),
+        &json!({"role": "stage", "stage_index": 0}),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+
+    let chunk = tokio::time::timeout(Duration::from_secs(2), read_chunk(&mut stream))
+        .await
+        .expect("first chunk within 2s")
+        .expect("non-empty chunk");
+    let frame = std::str::from_utf8(&chunk).expect("chunk utf8");
+
+    let (event_name, data_json) = parse_sse_frame(frame).expect("well-formed SSE frame");
+    assert_eq!(event_name, "boot");
+    let body: Value = serde_json::from_str(&data_json).expect("data is json");
+    assert_eq!(body.get("run_id").and_then(|v| v.as_str()), Some(run_id));
+    assert_eq!(body.get("node_id").and_then(|v| v.as_str()), Some(node_id.as_str()));
+    assert_eq!(body.get("kind").and_then(|v| v.as_str()), Some("boot"));
+}
+
+// ── SSE / chunked-transfer test helpers ─────────────────────────────────
+
+/// Open a TCP stream, send a GET, consume HTTP headers. Returns the
+/// stream positioned at the first body byte (first chunk header).
+/// Verifies the response advertised chunked transfer-encoding so
+/// `read_chunk` can rely on the framing.
+async fn open_sse_stream(addr: SocketAddr, path: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nhost: 127.0.0.1\r\naccept: text/event-stream\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).await.expect("write");
+    stream.flush().await.ok();
+
+    // Read until end-of-headers.
+    let mut buf = Vec::with_capacity(1024);
+    let mut tmp = [0u8; 512];
+    loop {
+        let n = stream.read(&mut tmp).await.expect("read headers");
+        if n == 0 {
+            panic!("EOF before SSE headers");
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(idx) = find_double_crlf(&buf) {
+            assert_eq!(
+                &buf[idx + 4..],
+                b"",
+                "test reads must not span past the headers terminator"
+            );
+            break;
+        }
+    }
+    let head = std::str::from_utf8(&buf).expect("header utf8");
+    assert!(
+        head.to_ascii_lowercase().contains("transfer-encoding: chunked"),
+        "expected chunked SSE response, got:\n{head}"
+    );
+    stream
+}
+
+/// Read one HTTP/1.1 transfer-encoding chunk's payload. Returns
+/// `None` on the terminator chunk (size 0).
+async fn read_chunk(stream: &mut TcpStream) -> Option<Vec<u8>> {
+    let mut size_line = Vec::with_capacity(8);
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await.expect("read chunk size byte");
+        size_line.push(b[0]);
+        if size_line.ends_with(b"\r\n") {
+            break;
+        }
+    }
+    let s = std::str::from_utf8(&size_line[..size_line.len() - 2]).expect("size utf8");
+    let s = s.split(';').next().unwrap().trim();
+    let size = usize::from_str_radix(s, 16).expect("hex chunk size");
+    if size == 0 {
+        return None;
+    }
+    let mut data = vec![0u8; size];
+    stream.read_exact(&mut data).await.expect("read chunk data");
+    let mut trailer = [0u8; 2];
+    stream.read_exact(&mut trailer).await.expect("read chunk trailer");
+    assert_eq!(&trailer, b"\r\n", "chunk trailer must be CRLF");
+    Some(data)
+}
+
+/// Parse one SSE frame of the form `event: NAME\ndata: PAYLOAD\n\n`
+/// (or with a trailing single `\n`). Returns `(event_name, data)`.
+fn parse_sse_frame(frame: &str) -> Option<(String, String)> {
+    let trimmed = frame.trim_end_matches('\n');
+    let mut event = None;
+    let mut data: Option<String> = None;
+    for line in trimmed.split('\n') {
+        if let Some(rest) = line.strip_prefix("event: ") {
+            event = Some(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("data: ") {
+            // SSE allows multiple `data:` lines, joined by '\n'.
+            data = Some(match data {
+                Some(prev) => format!("{prev}\n{rest}"),
+                None => rest.to_string(),
+            });
+        }
+    }
+    Some((event?, data?))
 }
 
 // ---------- HTTP helpers ----------

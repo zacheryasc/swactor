@@ -105,13 +105,35 @@ impl DiagHandles {
 /// probe scheduler) run on the driver's tokio runtime and live until
 /// the process exits.
 pub fn install_from_env(driver: &mut IrohDriver, default_role: Role) -> Option<DiagHandles> {
+    install_with_overrides(driver, default_role, None)
+}
+
+/// Like [`install_from_env`] but lets the caller pin `run_id` explicitly
+/// rather than reading `SWACTOR_DIAG_RUN_ID` from the environment.
+///
+/// The orchestrator uses this to bind to the run_id persisted in the
+/// held-cluster handle — held stages baked their `SWACTOR_DIAG_RUN_ID`
+/// into PID-1's env at lease time and keep reusing it across bounces;
+/// the orchestrator (which runs in the operator's shell) cannot trust
+/// its own env to still match. Passing the handle's run_id here is the
+/// fix for that drift.
+///
+/// `run_id_override == None` falls back to `SWACTOR_DIAG_RUN_ID`.
+pub fn install_with_overrides(
+    driver: &mut IrohDriver,
+    default_role: Role,
+    run_id_override: Option<&str>,
+) -> Option<DiagHandles> {
     let url = std::env::var(ENV_COLLECTOR_URL).ok()?;
     let url = url.trim().to_string();
     if url.is_empty() {
         return None;
     }
 
-    let run_id = env_string(ENV_RUN_ID).unwrap_or_else(|| DEFAULT_RUN_ID.to_string());
+    let run_id = run_id_override
+        .map(|s| s.to_string())
+        .or_else(|| env_string(ENV_RUN_ID))
+        .unwrap_or_else(|| DEFAULT_RUN_ID.to_string());
     let role = match env_string(ENV_NODE_ROLE).as_deref() {
         Some("orchestrator") => Role::orchestrator(),
         Some("stage") => Role::stage(),
@@ -318,8 +340,12 @@ pub fn emit_register_name(
         "our_node_id_hex": hex_of_bytes(&driver.node_id().0),
         "wall_ms": wall_ms_now(),
     });
+    // Spec §4.8: events emitted by a stage worker process MUST carry
+    // `stage_index` top-level once the index is known. The orchestrator's
+    // own pp-orchestrator registration passes `None` here and so does not
+    // carry the field — it is not a stage worker.
     if let Some(s) = stage {
-        fields["stage"] = serde_json::json!(s);
+        fields["stage_index"] = serde_json::json!(s);
     }
     driver.emit(Event::Custom {
         kind: "register_name".into(),
