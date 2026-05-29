@@ -205,6 +205,33 @@ pub fn render_summary(bundle: &Bundle) -> String {
     }
     let _ = writeln!(out);
 
+    // -- Bandwidth: per-message byte volume, broken down by payload kind
+    //    and by peer. `MessageSent`/`MessageReceived` are emitted by both
+    //    the SWIM/control path (`IrohDriver`) and — for the
+    //    pipeline-parallel example — the actor transport carrying the heavy
+    //    `StageActivation` hidden states, so this rolls up both sources.
+    //    "How many bytes did stage-1 push to stage-2, and as what?" is meant
+    //    to be a single read.
+    let _ = writeln!(out, "## Bandwidth (by node, by kind and peer)");
+    let bw_by_kind = bandwidth_by_kind_lines(bundle);
+    let bw_by_peer = bandwidth_by_peer_lines(bundle);
+    if bw_by_kind.is_empty() && bw_by_peer.is_empty() {
+        let _ = writeln!(
+            out,
+            "- No MessageSent/MessageReceived events captured (no instrumented transport carried traffic)."
+        );
+    } else {
+        let _ = writeln!(out, "- by kind:");
+        for line in bw_by_kind {
+            let _ = writeln!(out, "  - {line}");
+        }
+        let _ = writeln!(out, "- by peer:");
+        for line in bw_by_peer {
+            let _ = writeln!(out, "  - {line}");
+        }
+    }
+    let _ = writeln!(out);
+
     // -- Per-peer dial rollup --
     let _ = writeln!(out, "## Per-peer dials");
     let rollups = per_peer_dial_rollup(bundle);
@@ -850,6 +877,83 @@ fn inference_response_lines(bundle: &Bundle) -> Vec<String> {
     }
     out.sort();
     out
+}
+
+#[derive(Debug, Default)]
+struct BandwidthTotals {
+    msgs: u64,
+    bytes: u64,
+}
+
+/// Per-node byte volume broken down by payload `kind` and direction. Lines
+/// look like `stage-1 sent pp::StageActivation × 42 (12345678 bytes)`. Joins
+/// `MessageSent` and `MessageReceived` from every observer; `size` is the
+/// payload-only byte count both the `IrohDriver` and the example transport
+/// record, accumulated as `u64` so multi-MB activations don't overflow.
+fn bandwidth_by_kind_lines(bundle: &Bundle) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut totals: BTreeMap<(String, &'static str, String), BandwidthTotals> = BTreeMap::new();
+    for (label, node) in &bundle.nodes {
+        for rec in &node.events {
+            let (dir, kind, size) = match &rec.event {
+                Event::MessageSent { kind, size, .. } => ("sent", kind, *size),
+                Event::MessageReceived { kind, size, .. } => ("recv", kind, *size),
+                _ => continue,
+            };
+            let entry = totals
+                .entry((label.clone(), dir, kind.clone()))
+                .or_default();
+            entry.msgs = entry.msgs.saturating_add(1);
+            entry.bytes = entry.bytes.saturating_add(size as u64);
+        }
+    }
+    totals
+        .into_iter()
+        .map(|((label, dir, kind), t)| {
+            format!(
+                "{label} {dir} {kind} × {msgs} ({bytes} bytes)",
+                msgs = t.msgs,
+                bytes = t.bytes,
+            )
+        })
+        .collect()
+}
+
+/// Per-node byte volume broken down by the peer on the other end. Lines look
+/// like `stage-1 -> stage-2 × 42 (12345678 bytes)` for sends and
+/// `stage-1 <- stage-0 × 42 (336 bytes)` for receipts; the arrow encodes
+/// direction. The peer `NodeId` is resolved to its run label exactly as
+/// [`inference_response_lines`] does, so an unlabeled peer still renders by
+/// hex rather than vanishing.
+fn bandwidth_by_peer_lines(bundle: &Bundle) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let mut totals: BTreeMap<(String, &'static str, String), BandwidthTotals> = BTreeMap::new();
+    for (label, node) in &bundle.nodes {
+        for rec in &node.events {
+            let (dir, peer, size) = match &rec.event {
+                Event::MessageSent { peer, size, .. } => ("sent", peer, *size),
+                Event::MessageReceived { peer, size, .. } => ("recv", peer, *size),
+                _ => continue,
+            };
+            let peer_label = bundle.label_for_hex(&node_id_hex(peer));
+            let entry = totals
+                .entry((label.clone(), dir, peer_label))
+                .or_default();
+            entry.msgs = entry.msgs.saturating_add(1);
+            entry.bytes = entry.bytes.saturating_add(size as u64);
+        }
+    }
+    totals
+        .into_iter()
+        .map(|((label, dir, peer), t)| {
+            let arrow = if dir == "sent" { "->" } else { "<-" };
+            format!(
+                "{label} {arrow} {peer} × {msgs} ({bytes} bytes)",
+                msgs = t.msgs,
+                bytes = t.bytes,
+            )
+        })
+        .collect()
 }
 
 /// SWIM per-probe RTT distribution lines (`N3_COVERAGE_EXTENSION_SPEC §2.6`).

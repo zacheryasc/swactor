@@ -26,7 +26,7 @@ fn next_token_codec() -> &'static dyn Codec<NextToken> {
 
 /// A non-trivial bf16-shaped payload. 8 positions × 16 lanes × 2 bytes = 256
 /// bytes of varied content. Not all-zeros, not monotonic, includes high
-/// bytes — survives JSON-array roundtrip and gives byte-flip / truncation
+/// bytes — survives a binary-codec roundtrip and gives byte-flip / truncation
 /// probes something real to corrupt.
 fn sample_hidden(len: usize) -> Vec<u8> {
     (0..len)
@@ -240,9 +240,9 @@ fn corrupted_bytes_produce_error_for_stage_activation() {
     let bytes = codec.encode(&original).unwrap();
     assert!(bytes.len() > 32, "test setup: encoded payload too small");
 
-    // Deterministic offsets spread across the payload — the start (structural
-    // JSON tokens), the middle (mostly inside the numeric `hidden` array),
-    // and near the end (closing brace / final fields).
+    // Deterministic offsets spread across the payload — the magic/version
+    // header bytes, the middle (inside the raw `hidden` bytes), and the
+    // trailing checksum word.
     let offsets = [
         0,
         1,
@@ -257,10 +257,11 @@ fn corrupted_bytes_produce_error_for_stage_activation() {
     let mut err_count = 0;
     for &off in &offsets {
         let mut corrupted = bytes.clone();
-        // 0xFF is never a valid JSON byte at any structural position and is
-        // never valid UTF-8 as a lone byte inside a string — guarantees a
-        // parser error whatever offset we land on.
-        corrupted[off] = 0xFF;
+        // XOR-flip (not `= 0xFF`): under the binary codec a raw `hidden` byte
+        // can already be 0xFF, so assignment could be a silent no-op. Flipping
+        // guarantees a real one-byte change, which the header checks (magic /
+        // version / length) or the trailing FNV-1a checksum must reject.
+        corrupted[off] ^= 0xFF;
         let result = codec.decode(&corrupted);
         assert!(
             result.is_err(),
@@ -271,8 +272,9 @@ fn corrupted_bytes_produce_error_for_stage_activation() {
     assert_eq!(err_count, offsets.len());
 }
 
-/// Cutting the encoded payload in half lands inside the `hidden` array — the
-/// JSON is no longer well-formed and decode must reject it.
+/// Any truncation short of the full encoding leaves the declared `hidden_len`
+/// (or the trailing checksum) inconsistent with the bytes present, so decode
+/// must reject it.
 #[test]
 fn truncated_stage_activation_produces_error() {
     let codec = activation_codec();

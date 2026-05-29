@@ -237,7 +237,7 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
 
     // One runtime per node (orchestrator + N stages).
     let mut runtimes: Vec<Runtime> = (0..=num_stages).map(|_| Runtime::new(RuntimeConfig::default())).collect();
-    let pumps: Vec<ActorMessagePump> = (0..=num_stages).map(|_| ActorMessagePump::new()).collect();
+    let pumps: Vec<ActorMessagePump> = (0..=num_stages).map(|_| ActorMessagePump::new(None)).collect();
 
     // Orchestrator-side inbox for the final response.
     let response_inbox = runtimes[0].new_inbox::<InferenceResponse>().unwrap();
@@ -359,6 +359,8 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
         drivers[0].endpoint().clone(),
         drivers[1].endpoint_addr(),
         drivers[0].tokio_handle(),
+        drivers[1].node_id(),
+        None,
     ));
     let router_orch = TransportRouter::new();
     router_orch.add_route(request_bridge_addr, orch_to_first);
@@ -373,6 +375,8 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
             drivers[rt_idx].endpoint().clone(),
             drivers[next_idx].endpoint_addr(),
             drivers[rt_idx].tokio_handle(),
+            drivers[next_idx].node_id(),
+            None,
         ));
         let router = TransportRouter::new();
         router.add_route(
@@ -390,11 +394,15 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
         drivers[last_idx].endpoint().clone(),
         drivers[1].endpoint_addr(),
         drivers[last_idx].tokio_handle(),
+        drivers[1].node_id(),
+        None,
     ));
     let last_to_orch = Arc::new(IrohActorTransport::new(
         drivers[last_idx].endpoint().clone(),
         drivers[0].endpoint_addr(),
         drivers[last_idx].tokio_handle(),
+        drivers[0].node_id(),
+        None,
     ));
     let router_last = TransportRouter::new();
     router_last.add_route(nt_bridge_addr, last_to_first);
@@ -990,7 +998,7 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
     let mut runtimes: Vec<Runtime> = (0..=num_stages)
         .map(|_| Runtime::new(RuntimeConfig::default()))
         .collect();
-    let pumps: Vec<ActorMessagePump> = (0..=num_stages).map(|_| ActorMessagePump::new()).collect();
+    let pumps: Vec<ActorMessagePump> = (0..=num_stages).map(|_| ActorMessagePump::new(None)).collect();
 
     let response_inbox = runtimes[0].new_inbox::<InferenceResponse>().unwrap();
     let inbox_addr = *response_inbox.addr();
@@ -1097,6 +1105,8 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
         drivers[0].endpoint().clone(),
         drivers[1].endpoint_addr(),
         drivers[0].tokio_handle(),
+        drivers[1].node_id(),
+        None,
     ));
     let router_orch = TransportRouter::new();
     router_orch.add_route(request_bridge_addr, orch_to_first);
@@ -1110,6 +1120,8 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
             drivers[rt_idx].endpoint().clone(),
             drivers[next_idx].endpoint_addr(),
             drivers[rt_idx].tokio_handle(),
+            drivers[next_idx].node_id(),
+            None,
         ));
         let router = TransportRouter::new();
         router.add_route(
@@ -1125,11 +1137,15 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
         drivers[last_idx].endpoint().clone(),
         drivers[1].endpoint_addr(),
         drivers[last_idx].tokio_handle(),
+        drivers[1].node_id(),
+        None,
     ));
     let last_to_orch = Arc::new(IrohActorTransport::new(
         drivers[last_idx].endpoint().clone(),
         drivers[0].endpoint_addr(),
         drivers[last_idx].tokio_handle(),
+        drivers[0].node_id(),
+        None,
     ));
     let router_last = TransportRouter::new();
     router_last.add_route(nt_bridge_addr, last_to_first);

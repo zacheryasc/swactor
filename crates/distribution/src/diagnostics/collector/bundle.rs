@@ -129,6 +129,11 @@ fn append_node_dir<W: Write>(
     let mut events: Vec<PathBuf> = Vec::new();
     let mut snapshots: Vec<PathBuf> = Vec::new();
     let mut finalizes: Vec<PathBuf> = Vec::new();
+    // Records from the independent vastai monitoring layer
+    // (vastai_instance-/vastai_sample-/vastai_logs-/vastai_lifecycle-)
+    // are bucketed together under `vastai/`, kept distinct from the
+    // swactor boot/events/snapshot/finalize layout above.
+    let mut vastai: Vec<PathBuf> = Vec::new();
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let path = entry.path();
@@ -139,7 +144,9 @@ fn append_node_dir<W: Write>(
             Some(n) => n,
             None => continue,
         };
-        if name.starts_with("boot-") {
+        if name.starts_with("vastai_") {
+            vastai.push(path);
+        } else if name.starts_with("boot-") {
             boots.push(path);
         } else if name.starts_with("events-") {
             events.push(path);
@@ -153,6 +160,7 @@ fn append_node_dir<W: Write>(
     events.sort();
     snapshots.sort();
     finalizes.sort();
+    vastai.sort();
 
     // Promote the latest boot/finalize to a single file at the node
     // root — the format in DIAGNOSTICS_PLAN.md expects exactly one of
@@ -186,6 +194,12 @@ fn append_node_dir<W: Write>(
         append_dir(tar, &format!("{dst_prefix}/finalize"))?;
         for p in &finalizes[..finalizes.len() - 1] {
             append_under(tar, p, &format!("{dst_prefix}/finalize"))?;
+        }
+    }
+    if !vastai.is_empty() {
+        append_dir(tar, &format!("{dst_prefix}/vastai"))?;
+        for p in &vastai {
+            append_under(tar, p, &format!("{dst_prefix}/vastai"))?;
         }
     }
     Ok(())
@@ -275,6 +289,11 @@ fn build_labels(stats: &Option<super::state::RunStats>) -> BTreeMap<String, Stri
 
 fn label_for(node_id: &str, identity: Option<&Value>) -> String {
     let short: String = node_id.chars().take(8).collect();
+    // vastai monitoring nodes carry no swactor boot/identity; their synthetic id
+    // (`vastai-external`, `vastai-stage-{i}`) is already a clean, stable label.
+    if identity.is_none() && node_id.starts_with("vastai-") {
+        return node_id.to_string();
+    }
     let Some(id) = identity else {
         return format!("node-{short}");
     };
@@ -336,6 +355,7 @@ fn build_manifest(
                 event_batches: node.event_batches,
                 snapshots: node.snapshots,
                 finalize_recorded: node.finalize_recorded,
+                vastai_records: node.vastai_records,
             }
         })
         .collect();

@@ -21,7 +21,7 @@ use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Serialize;
@@ -36,13 +36,68 @@ use super::{bundle, wall_ms_now};
 
 /// Build the axum router. Wire this into `axum::serve` from the
 /// binary, or into `tower::ServiceExt::oneshot` from tests.
-pub fn router(state: Arc<CollectorState>) -> Router {
+/// The data-plane routes (ingest, stream, bundle, runs) shared by both the
+/// standalone collector and the embeddable ingest router.
+fn diag_routes() -> Router<Arc<CollectorState>> {
     Router::new()
         .route("/diag/{kind}", post(ingest))
         .route("/diag/bundle/{run_id}", get(download_bundle))
         .route("/diag/runs", get(list_runs))
         .route("/diag/stream/{run_id}", get(stream_run))
+}
+
+pub fn router(state: Arc<CollectorState>) -> Router {
+    diag_routes()
+        .route("/", get(dashboard_index))
+        .route("/dashboard", get(dashboard_page))
+        .route("/dashboard.js", get(dashboard_js))
         .with_state(state)
+}
+
+/// Data-plane only (ingest + stream + bundle + runs), without the collector's
+/// built-in fleet UI. For embedding in another HTTP server (e.g. the dashboard)
+/// that brings its own landing page — merging the full [`router`] would collide
+/// on `GET /`, `/dashboard`, `/dashboard.js`.
+pub fn ingest_router(state: Arc<CollectorState>) -> Router {
+    diag_routes().with_state(state)
+}
+
+/// The live fleet dashboard, served same-origin with `/diag/stream` so the
+/// page's `EventSource` needs no CORS. Bundled into the binary so the
+/// collector is a single self-contained artifact.
+const DASHBOARD_HTML: &str = include_str!("assets/fleet_live.html");
+const DASHBOARD_JS: &str = include_str!("assets/fleet_model.js");
+
+/// `GET /` — bounce to the dashboard, pinned to the newest run we've seen so
+/// the page connects to the live stream immediately. With no runs yet, land on
+/// `/dashboard` bare; the page polls `/diag/runs` until one appears.
+async fn dashboard_index(State(state): State<Arc<CollectorState>>) -> Redirect {
+    match newest_run(&state) {
+        Some(run_id) => Redirect::to(&format!("/dashboard?run={run_id}")),
+        None => Redirect::to("/dashboard"),
+    }
+}
+
+async fn dashboard_page() -> Response {
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], DASHBOARD_HTML).into_response()
+}
+
+async fn dashboard_js() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        DASHBOARD_JS,
+    )
+        .into_response()
+}
+
+/// Newest run id by earliest-record timestamp — `run_summaries()` sorts by id,
+/// which isn't chronological, so pick the max `run_start_collector_ms`.
+fn newest_run(state: &CollectorState) -> Option<String> {
+    state
+        .run_summaries()
+        .into_iter()
+        .max_by_key(|(_, stats)| stats.run_start_collector_ms.unwrap_or(0))
+        .map(|(run_id, _)| run_id)
 }
 
 /// SSE event for an in-memory record. The `event` field carries the

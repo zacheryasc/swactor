@@ -92,6 +92,10 @@ pub struct NodeStats {
     pub event_batches: u64,
     pub snapshots: u64,
     pub finalize_recorded: bool,
+    /// Count of records from the independent vastai monitoring layer.
+    /// These nodes carry no swactor boot/identity, so the bundle
+    /// assembler names them from their synthetic node id.
+    pub vastai_records: u64,
     /// Cached identity payload (parsed from the most recent boot
     /// record) — lets the bundle assembler name the directory and
     /// fill in role/stage_index without re-reading boot.json.
@@ -282,6 +286,12 @@ impl CollectorState {
             RecordKind::Finalize => {
                 node.finalize_recorded = true;
                 run.finalize_received = true;
+            }
+            RecordKind::VastaiInstance
+            | RecordKind::VastaiSample
+            | RecordKind::VastaiLogs
+            | RecordKind::VastaiLifecycle => {
+                node.vastai_records += 1;
             }
         }
     }

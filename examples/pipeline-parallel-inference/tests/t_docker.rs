@@ -68,6 +68,32 @@ fn require_docker() -> bool {
     }
 }
 
+/// Skip a real-mode test unless a CUDA GPU is reachable through Docker.
+/// The slim runtime image has no host compiler, so tinygrad's CPU backend
+/// can't JIT — real inference needs a GPU attached via `docker run --gpus`.
+/// We probe the same way the run will: launch the CUDA base image with
+/// `--gpus all` and check `nvidia-smi` succeeds. Returns `true` to proceed.
+fn require_cuda_gpu() -> bool {
+    let out = Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--gpus",
+            "all",
+            "nvidia/cuda:12.6.3-base-ubuntu24.04",
+            "nvidia-smi",
+            "-L",
+        ])
+        .output();
+    match out {
+        Ok(o) if o.status.success() && !o.stdout.is_empty() => true,
+        _ => {
+            eprintln!("t_docker: skipping — no CUDA GPU reachable via `docker run --gpus all`");
+            false
+        }
+    }
+}
+
 fn remove_containers_with_prefix(prefix: &str) {
     let filter = format!("name=^{prefix}-[0-9]+$");
     let listing = Command::new("docker")
@@ -202,6 +228,15 @@ fn wait_for_running_containers(
 /// reliable as the manual `scripts/docker-e2e.sh` invocation — neither
 /// holds the pipe back.
 fn run_docker_e2e(num_stages: u32, prefix: &str, skip_image_build: bool) -> ScriptOutcome {
+    run_docker_e2e_env(num_stages, prefix, skip_image_build, &[])
+}
+
+fn run_docker_e2e_env(
+    num_stages: u32,
+    prefix: &str,
+    skip_image_build: bool,
+    extra_env: &[(&str, &str)],
+) -> ScriptOutcome {
     cargo_build_release_once();
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -221,6 +256,9 @@ fn run_docker_e2e(num_stages: u32, prefix: &str, skip_image_build: bool) -> Scri
         .stderr(Stdio::from(stderr_file));
     if skip_image_build {
         cmd.env("PP_SKIP_IMAGE_BUILD", "1");
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     let status = cmd.status().expect("run docker-e2e.sh");
     let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
@@ -327,6 +365,31 @@ fn cargo_build_release_once() {
             .status()
             .expect("invoke cargo build");
         assert!(status.success(), "cargo build --release failed");
+
+        // The unified code image bundles the diagnostics binaries too, so
+        // build them here for the Dockerfile COPY — the e2e script runs with
+        // PP_SKIP_BUILD=1 and won't build them itself.
+        let workspace = crate_dir()
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("workspace root")
+            .to_path_buf();
+        let status = Command::new("cargo")
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(workspace.join("Cargo.toml"))
+            .arg("--release")
+            .arg("-p")
+            .arg("distribution")
+            .arg("--features")
+            .arg("collector")
+            .arg("--bin")
+            .arg("swactor-diag-collector")
+            .arg("--bin")
+            .arg("swactor-diag-postproc")
+            .status()
+            .expect("invoke cargo build (diag binaries)");
+        assert!(status.success(), "cargo build --release (diag) failed");
     });
 }
 
@@ -410,6 +473,59 @@ fn docker_e2e_re_running_command_twice_both_pass() {
     assert_no_leftovers_eventually(prefix, Duration::from_secs(10));
 }
 
+// ─── §13b.3 real CUDA pipeline at 12 nodes ───────────────────────────
+//
+// The full pipeline, for real: 12 containers, each loading its own model
+// shard on a GPU via tinygrad/NVRTC, converging, and pushing a "hello
+// world" prompt all the way through to a non-empty completion. This is the
+// counterpart to the happy-path stub test — same orchestration, but real
+// weights and real inference at 12 nodes.
+//
+// Gated three ways: `#[ignore]` (like every test here), an explicit
+// `PP_REAL_E2E` opt-in, and a CUDA-GPU probe. Real workers fetch a model
+// shard and JIT CUDA kernels, so they reach `ready` far slower than the
+// stub — the wiring/response windows are widened via env. Run with:
+//
+// ```text
+// PP_REAL_E2E=1 cargo test -p pipeline-parallel-inference --test t_docker \
+//     -- --ignored real_e2e_twelve_stage
+// ```
+#[test]
+#[ignore]
+fn real_e2e_twelve_stage_pipeline_returns_response() {
+    let _serial = docker_serial_lock();
+    if std::env::var("PP_REAL_E2E").is_err() {
+        eprintln!("t_docker: skipping real 12-node e2e — set PP_REAL_E2E=1 to run");
+        return;
+    }
+    if !require_docker() || !require_cuda_gpu() {
+        return;
+    }
+    let prefix = "pp-e2e-real12";
+    let _cleanup = PrefixCleanup::new(prefix);
+
+    let outcome = run_docker_e2e_env(
+        12,
+        prefix,
+        false,
+        &[
+            ("PP_REAL", "1"),
+            ("PP_PROMPT", "hello world"),
+            ("PP_MAX_TOKENS", "8"),
+            ("PP_PIPELINE_WIRED_TIMEOUT_SECS", "900"),
+            ("PP_AWAIT_RESPONSE_TIMEOUT_SECS", "900"),
+        ],
+    );
+    outcome.require_success("real N=12");
+    let response = outcome.require_response();
+    assert!(
+        !response.trim().is_empty(),
+        "expected a non-empty completion from the 12-stage real pipeline"
+    );
+
+    assert_no_leftovers_eventually(prefix, Duration::from_secs(20));
+}
+
 // ─── §13b.2 failure path ─────────────────────────────────────────────
 
 #[test]
@@ -423,24 +539,36 @@ fn docker_e2e_premature_container_exit_fails_fast() {
     let _cleanup = PrefixCleanup::new(prefix);
     cargo_build_release_once();
 
-    // Build the stub image inline so the failure test does not depend
-    // on a prior happy-path run having already built it.
+    // Build the layered image inline (heavy base, then thin code layer) so
+    // the failure test does not depend on a prior happy-path run having
+    // built it. Stub mode is a runtime toggle (PP_WORKER_STUB=1 below).
     let workspace = crate_dir()
         .parent()
         .and_then(|p| p.parent())
         .expect("workspace root")
         .to_path_buf();
-    let image_tag = "pp-gpu-node-stub:t_docker-fail";
-    let dockerfile = crate_dir().join("Dockerfile.stub");
+    let base_tag = "swactor-pp-base:cuda12.6";
+    let base_build = Command::new("docker")
+        .args(["build", "-f"])
+        .arg(crate_dir().join("Dockerfile.base"))
+        .arg("-t")
+        .arg(base_tag)
+        .arg(&workspace)
+        .status()
+        .expect("docker build (base)");
+    assert!(base_build.success(), "docker build (base) failed");
+    let image_tag = "swactor-pp-gpu:t_docker-fail";
     let build = Command::new("docker")
         .args(["build", "-f"])
-        .arg(&dockerfile)
+        .arg(crate_dir().join("Dockerfile"))
+        .arg("--build-arg")
+        .arg(format!("BASE_IMAGE={base_tag}"))
         .arg("-t")
         .arg(image_tag)
         .arg(&workspace)
         .status()
-        .expect("docker build");
-    assert!(build.success(), "docker build failed");
+        .expect("docker build (code)");
+    assert!(build.success(), "docker build (code) failed");
 
     let smoke_bin = crate_dir().join("target/release/pp-smoke-run");
     let worker_py = crate_dir().join("pp_tinygrad_worker.py");

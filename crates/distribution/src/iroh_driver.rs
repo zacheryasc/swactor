@@ -7,7 +7,7 @@
 //! The driver owns a tokio runtime internally, exposing a synchronous API
 //! (`tick()`, `recv()`, `join()`) to match the existing main loop pattern.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -172,6 +172,11 @@ pub struct IrohDriver {
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     /// Collects connections from background join tasks.
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
+    /// Peers with a background dial in flight. A cache-miss send checks this
+    /// so it starts at most one dial per peer instead of blocking the SWIM
+    /// pump on a synchronous 30s dial (fatal to failure detection: a probe to
+    /// a dead peer would otherwise freeze the whole node for the dial budget).
+    dialing: Arc<Mutex<HashSet<NodeId>>>,
     /// Connections accepted by the background accept loop (SWIM ALPN).
     accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
     /// Connections accepted on non-SWIM ALPNs (streams, etc.).
@@ -337,6 +342,7 @@ impl IrohDriver {
             connections: HashMap::new(),
             peer_auth: config.peer_auth,
             pending_joins: Arc::new(Mutex::new(Vec::new())),
+            dialing: Arc::new(Mutex::new(HashSet::new())),
             accepted_conns,
             other_accepted_conns,
             peer_relay_urls: HashMap::new(),
@@ -952,7 +958,14 @@ impl IrohDriver {
         let target_key = PublicKey::from_bytes(&to.0)?;
         let payload_size = payload.len() as u32;
 
-        let conn = self.get_or_connect(*to, target_key)?;
+        let conn = match self.get_or_connect(*to, target_key) {
+            Ok(c) => c,
+            // No ready connection: a background dial was just started. Drop this
+            // best-effort SWIM/gossip send rather than blocking the pump to
+            // dial. SWIM re-sends over the cached connection on a later tick;
+            // a genuinely dead peer is still detected via its probe/Ack timeout.
+            Err(_) => return Ok(()),
+        };
 
         let result = self.rt.block_on(async {
             let mut send = conn.open_uni().await?;
@@ -962,7 +975,9 @@ impl IrohDriver {
         });
 
         if let Err(e) = result {
-            // Connection may be stale, remove and retry once
+            // Cached connection was stale. Invalidate it and kick a fresh
+            // background dial; drop this send (re-sent next tick). We do NOT
+            // synchronously re-dial here — that reintroduces the pump stall.
             self.connections.remove(to);
             let generation = self.connection_cache_tracker.generation_for(*to);
             let reason = format!("send-failed: {e}");
@@ -974,13 +989,8 @@ impl IrohDriver {
                     generation,
                     reason: "send-failed".into(),
                 });
-            let conn = self.get_or_connect(*to, target_key)?;
-            self.rt.block_on(async {
-                let mut send = conn.open_uni().await?;
-                write_message(&mut send, tag.as_bytes(), &payload).await?;
-                send.finish()?;
-                Ok::<_, Box<dyn std::error::Error>>(())
-            })?;
+            let _ = self.get_or_connect(*to, target_key);
+            return Ok(());
         }
 
         self.connection_cache_tracker
@@ -1070,133 +1080,118 @@ impl IrohDriver {
             });
         }
 
-        let endpoint = self.endpoint.clone();
-        // SWIM probes used a 2s connect-timeout with no in-call retry. On a
-        // WAN mesh where the home-relay path adds 100-500 ms latency and
-        // packets are occasionally dropped, that was too tight: a single
-        // slow handshake marked the peer suspect, then dead. Bumping the
-        // per-attempt budget and retrying inside the dial keeps SWIM
-        // convergence stable across the canary-relay endpoints that
-        // iroh 0.96 routes to by default.
-        const ATTEMPTS: u32 = 3;
-        let per_attempt_timeout = Duration::from_secs(10);
-        let addr_for_dial = relay.as_ref().map(|r| {
-            EndpointAddr::new(key).with_relay_url(r.clone())
-        });
-        let mut last_err: Option<Box<dyn std::error::Error>> = None;
-        let mut conn_opt: Option<Connection> = None;
-        let timeout_ms = per_attempt_timeout.as_millis() as u64;
-        let peer_hex = swactor::transport::hex_encode(&node_id.0);
-        for attempt in 1..=ATTEMPTS {
-            self.diagnostics.emit_event(DiagEvent::DialStarted {
-                peer: node_id,
-                attempt,
-                timeout_ms,
-            });
-            // Bare-key dial: iroh has only the public key and must
-            // run its discovery layer to find an address. Emit a
-            // `discovery_resolve_*` pair around the call so the
-            // bundle reader can distinguish "discovery never started"
-            // from "discovery started but never resolved" (T2.7).
-            let bare_key_dial = addr_for_dial.is_none();
-            if bare_key_dial {
-                self.diagnostics.emit_event(DiagEvent::Custom {
-                    kind: "discovery_resolve_started".into(),
-                    fields: serde_json::json!({
-                        "peer_node_id_hex": peer_hex,
-                        "attempt": attempt,
-                    }),
-                });
-            }
-            let attempt_start = Instant::now();
-            let addr_clone = addr_for_dial.clone();
-            let endpoint = endpoint.clone();
-            let dial: Result<Connection, Box<dyn std::error::Error>> =
-                self.rt.block_on(async move {
-                    let result = match addr_clone {
-                        Some(a) => {
-                            tokio::time::timeout(
-                                per_attempt_timeout,
-                                endpoint.connect(a, ALPN),
-                            )
-                            .await
-                        }
-                        None => {
-                            tokio::time::timeout(
-                                per_attempt_timeout,
-                                endpoint.connect(key, ALPN),
-                            )
-                            .await
-                        }
-                    };
-                    match result {
-                        Ok(r) => r.map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) }),
-                        Err(_) => Err("connect timeout".into()),
-                    }
-                });
-            let duration_ms = attempt_start.elapsed().as_millis() as u64;
-            if bare_key_dial {
-                let outcome_str = match &dial {
-                    Ok(_) => "resolved",
-                    Err(_) => "failed",
-                };
-                self.diagnostics.emit_event(DiagEvent::Custom {
-                    kind: "discovery_resolve_completed".into(),
-                    fields: serde_json::json!({
-                        "peer_node_id_hex": peer_hex,
-                        "attempt": attempt,
-                        "duration_ms": duration_ms,
-                        "outcome": outcome_str,
-                    }),
-                });
-            }
-            match dial {
-                Ok(c) => {
-                    self.diagnostics.emit_event(DiagEvent::DialOutcome {
-                        peer: node_id,
-                        attempt,
-                        outcome: DiagDialOutcome::Success,
-                        duration_ms,
-                    });
-                    conn_opt = Some(c);
-                    break;
-                }
-                Err(e) => {
-                    let outcome = classify_dial_error(&e);
-                    self.diagnostics.emit_event(DiagEvent::DialOutcome {
-                        peer: node_id,
-                        attempt,
-                        outcome,
-                        duration_ms,
-                    });
-                    if attempt < ATTEMPTS {
-                        eprintln!(
-                            "iroh driver: connect attempt {attempt}/{ATTEMPTS} to {} failed: {e}",
-                            swactor::transport::hex_encode(&node_id.0[..4]),
-                        );
-                    }
-                    last_err = Some(e);
-                    // Short backoff so a transient relay-side hiccup has
-                    // time to recover before the next attempt. Linear
-                    // 0/200/600 ms across 3 attempts.
-                    if attempt == 1 {
-                        std::thread::sleep(Duration::from_millis(200));
-                    } else if attempt == 2 {
-                        std::thread::sleep(Duration::from_millis(600));
-                    }
-                }
-            }
-        }
-        let conn = conn_opt.ok_or_else(|| {
-            last_err.unwrap_or_else(|| -> Box<dyn std::error::Error> {
-                "connect failed".into()
-            })
-        })?;
+        // Hand the dial to a background task instead of blocking the SWIM
+        // pump. A synchronous dial of up to ATTEMPTS × per-attempt-timeout
+        // (tens of seconds) to an unreachable peer would freeze the whole node
+        // — catastrophic for failure detection, which is exactly when peers go
+        // unreachable. The connection lands in `pending_joins` and is folded
+        // into the cache by the next `recv()`; this send is dropped
+        // best-effort and SWIM re-sends over the cached connection on a later
+        // tick (a genuinely dead peer is still detected via its probe/Ack
+        // timeout, no longer masked by a 30s blocking dial).
+        let dial_addr = match &relay {
+            Some(r) => EndpointAddr::new(key).with_relay_url(r.clone()),
+            None => EndpointAddr::new(key),
+        };
+        self.spawn_connect(node_id, dial_addr);
+        Err("connection not ready; background dial started".into())
+    }
 
-        self.connections.insert(node_id, conn.clone());
-        self.connection_cache_tracker
-            .note_dial_success(node_id, wall_ms_now());
-        Ok(conn)
+    /// Dial `node_id` in the background (never blocks the SWIM pump),
+    /// mirroring `spawn_join_request`'s retry/backoff and dial diagnostics but
+    /// without sending a join payload. At most one dial runs per peer at a
+    /// time (`dialing` guards re-entry); on success the connection is queued in
+    /// `pending_joins` for `recv()` to cache, and the in-flight flag is always
+    /// cleared when the task ends. The WAN-tuned 3 × 10s budget is preserved —
+    /// it just no longer stalls the caller.
+    fn spawn_connect(&self, node_id: NodeId, dial_addr: EndpointAddr) {
+        if !self.dialing.lock().unwrap().insert(node_id) {
+            return; // a dial is already in flight for this peer
+        }
+        let endpoint = self.endpoint.clone();
+        let pending = Arc::clone(&self.pending_joins);
+        let dialing = Arc::clone(&self.dialing);
+        let diagnostics = self.diagnostics.clone();
+        // Bare-key dial: no relay and no direct address → iroh must run its
+        // discovery layer. Emit the discovery_resolve_* pair as the
+        // synchronous path used to (T2.7).
+        let bare_key_dial =
+            dial_addr.relay_urls().next().is_none() && dial_addr.ip_addrs().next().is_none();
+        let peer_hex = swactor::transport::hex_encode(&node_id.0);
+        self.rt.spawn(async move {
+            const ATTEMPTS: u32 = 3;
+            let per_attempt_timeout = Duration::from_secs(10);
+            for attempt in 1..=ATTEMPTS {
+                diagnostics.emit_event(DiagEvent::DialStarted {
+                    peer: node_id,
+                    attempt,
+                    timeout_ms: per_attempt_timeout.as_millis() as u64,
+                });
+                if bare_key_dial {
+                    diagnostics.emit_event(DiagEvent::Custom {
+                        kind: "discovery_resolve_started".into(),
+                        fields: serde_json::json!({
+                            "peer_node_id_hex": peer_hex,
+                            "attempt": attempt,
+                        }),
+                    });
+                }
+                let attempt_start = Instant::now();
+                let result = tokio::time::timeout(
+                    per_attempt_timeout,
+                    endpoint.connect(dial_addr.clone(), ALPN),
+                )
+                .await;
+                let duration_ms = attempt_start.elapsed().as_millis() as u64;
+                if bare_key_dial {
+                    diagnostics.emit_event(DiagEvent::Custom {
+                        kind: "discovery_resolve_completed".into(),
+                        fields: serde_json::json!({
+                            "peer_node_id_hex": peer_hex,
+                            "attempt": attempt,
+                            "duration_ms": duration_ms,
+                            "outcome": match &result {
+                                Ok(Ok(_)) => "resolved",
+                                _ => "failed",
+                            },
+                        }),
+                    });
+                }
+                match result {
+                    Ok(Ok(conn)) => {
+                        diagnostics.emit_event(DiagEvent::DialOutcome {
+                            peer: node_id,
+                            attempt,
+                            outcome: DiagDialOutcome::Success,
+                            duration_ms,
+                        });
+                        pending.lock().unwrap().push(JoinResult { node_id, conn });
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        diagnostics.emit_event(DiagEvent::DialOutcome {
+                            peer: node_id,
+                            attempt,
+                            outcome: classify_dial_error_str(&e.to_string()),
+                            duration_ms,
+                        });
+                    }
+                    Err(_) => {
+                        diagnostics.emit_event(DiagEvent::DialOutcome {
+                            peer: node_id,
+                            attempt,
+                            outcome: DiagDialOutcome::Timeout,
+                            duration_ms,
+                        });
+                    }
+                }
+                if attempt < ATTEMPTS {
+                    let backoff = if attempt == 1 { 200 } else { 600 };
+                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                }
+            }
+            dialing.lock().unwrap().remove(&node_id);
+        });
     }
 
     // ─── Incoming: iroh → handler ────────────────────────────────────
@@ -1405,10 +1400,6 @@ async fn start_embedded_relay(
 /// Bucket a dial error into one of the diagnostic outcome categories.
 /// Falls back to `Error(msg)` for anything we can't classify so the
 /// post-processor still sees the original error text.
-fn classify_dial_error(err: &Box<dyn std::error::Error>) -> DiagDialOutcome {
-    classify_dial_error_str(&err.to_string())
-}
-
 fn classify_dial_error_str(msg: &str) -> DiagDialOutcome {
     let lower = msg.to_lowercase();
     if lower.contains("timeout") || lower.contains("timed out") {

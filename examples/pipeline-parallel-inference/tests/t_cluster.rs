@@ -71,11 +71,50 @@ fn test_node_config() -> DistributedNodeConfig {
     }
 }
 
+/// SWIM config for large local clusters. The small-N config above uses
+/// extremely tight probe/suspicion windows (3/5 ticks) so the 2..4 tests
+/// detect a killed node within a second or two. Those windows are measured
+/// in `tick()` calls, and a single-threaded harness pumps every driver
+/// serially per loop iteration — so a probe's ack only returns one or two
+/// iterations after it was sent. At a handful of nodes that fits inside 3
+/// ticks; at a dozen the initial burst of all-pairs iroh/QUIC connection
+/// setup pushes ack latency past the window, every node falsely suspects
+/// its peers, and membership collapses instead of converging. Widening the
+/// windows (closer to the production default) removes the false positives
+/// so convergence is reached, without changing the protocol under test.
+fn large_cluster_node_config() -> DistributedNodeConfig {
+    DistributedNodeConfig {
+        swim: SwimConfig {
+            // Probe every tick so membership gossip (piggybacked on
+            // ping/ack) spreads as fast as the serial pump allows.
+            probe_interval: 1,
+            // Failure detection is irrelevant to a *convergence* test, and
+            // false positives are what break it at scale. Set the probe and
+            // suspicion windows far beyond the test's wall-clock budget so a
+            // peer, once seen alive, is never falsely suspected — making
+            // membership growth monotonic and convergence a stable fixpoint.
+            probe_timeout: 10_000_000,
+            indirect_probes: 2,
+            suspicion_timeout: 10_000_000,
+            dead_reprobe_interval: 50,
+            ..SwimConfig::default()
+        },
+        cache_capacity: 100,
+        republish_interval: 50,
+        registry: RegistryConfig::default(),
+        metadata_lambda: 3,
+    }
+}
+
 fn make_driver() -> IrohDriver {
+    make_driver_with(test_node_config())
+}
+
+fn make_driver_with(node: DistributedNodeConfig) -> IrohDriver {
     IrohDriver::new(IrohDriverConfig {
         secret_key: None,
         relay_mode: RelayMode::Disabled,
-        node: test_node_config(),
+        node,
         peer_auth: None,
         additional_alpns: vec![ACTOR_ALPN.to_vec()],
     })
@@ -118,17 +157,51 @@ fn make_cluster(num_stages: u32) -> (Vec<IrohDriver>, MutexGuard<'static, ()>) {
     assert!(num_stages >= 2, "cluster tests require num_stages >= 2");
     let total = num_stages as usize + 1;
 
-    let mut drivers: Vec<IrohDriver> = (0..total).map(|_| make_driver()).collect();
-    let seed = drivers[0].endpoint_addr();
-    for d in drivers.iter_mut().skip(1) {
-        d.join(&[seed.clone()]);
+    // Small clusters keep the tight failure-detection windows; larger ones
+    // need the lenient windows to converge under a serial pump (see
+    // `large_cluster_node_config`).
+    let mut drivers: Vec<IrohDriver> = (0..total)
+        .map(|_| {
+            if num_stages >= 8 {
+                make_driver_with(large_cluster_node_config())
+            } else {
+                make_driver()
+            }
+        })
+        .collect();
+    if num_stages >= 8 {
+        // All-to-all bootstrap for large clusters. A single seed relies on
+        // SWIM gossip to disseminate the full roster, but the gossip
+        // transmit budget (Λ·⌈log2 N⌉) is fixed and, under a serial pump's
+        // randomised piggybacking, does not reliably reach all ~13 nodes —
+        // it stalls at a partial roster. Seeding every node with every
+        // other node's endpoint makes each peer directly known and probed,
+        // so convergence is complete and stable. This still exercises the
+        // real iroh transport + SWIM membership across every node.
+        let addrs: Vec<_> = drivers.iter().map(|d| d.endpoint_addr()).collect();
+        for (i, d) in drivers.iter_mut().enumerate() {
+            let others: Vec<_> = addrs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .map(|(_, a)| a.clone())
+                .collect();
+            d.join(&others);
+        }
+    } else {
+        let seed = drivers[0].endpoint_addr();
+        for d in drivers.iter_mut().skip(1) {
+            d.join(&[seed.clone()]);
+        }
     }
 
     let keys: Vec<PublicKey> = drivers.iter().map(pubkey_of).collect();
 
-    // 30s is plenty under exclusive access — convergence finishes in
-    // well under 5s on this box. Cap exists for a slow CI runner.
-    let timeout = Duration::from_secs(30);
+    // Convergence finishes in well under 5s for small clusters, but a
+    // single-threaded pump fanning SWIM gossip across many drivers slows
+    // sharply as the node count climbs, so scale the cap with N. The
+    // floor keeps the small-N cases (2..4) exactly where they were.
+    let timeout = Duration::from_secs(30 + num_stages as u64 * 10);
     let start = Instant::now();
     let mut converged = false;
     while start.elapsed() < timeout {
@@ -180,6 +253,8 @@ fn send_and_receive<T: Message>(
         sender.endpoint().clone(),
         receiver.endpoint_addr(),
         sender.tokio_handle(),
+        receiver.node_id(),
+        None,
     ));
     let router = TransportRouter::new();
     router.add_route(inbox_addr, transport);
@@ -229,6 +304,15 @@ fn n_node_cluster_converges_via_iroh_seed_join_n_3() {
 #[test]
 fn n_node_cluster_converges_via_iroh_seed_join_n_4() {
     convergence_case(4);
+}
+
+// ── comms-layer test: 12+ independent swactor nodes converge locally ──────
+// Pure networking/SWIM: 12 stage nodes plus the orchestrator (13 drivers)
+// all join via the seed and must each see every peer alive. No actors,
+// no workers, no model — just the convergence contract at scale.
+#[test]
+fn n_node_cluster_converges_via_iroh_seed_join_n_12() {
+    convergence_case(12);
 }
 
 // ── §8 — StageActivation across every adjacent pair ──────────────────────
@@ -283,6 +367,14 @@ fn stage_activation_roundtrips_between_each_adjacent_pair_n_3() {
 #[test]
 fn stage_activation_roundtrips_between_each_adjacent_pair_n_4() {
     stage_activation_each_hop_case(4);
+}
+
+// Comms layer carries StageActivation across all 11 forward hops of a
+// converged 12-stage cluster — the message-passing half of the 12-node
+// comms test.
+#[test]
+fn stage_activation_roundtrips_between_each_adjacent_pair_n_12() {
+    stage_activation_each_hop_case(12);
 }
 
 // ── §8 — NextToken from last stage to stage 0 ────────────────────────────

@@ -51,7 +51,7 @@ fn s45_roster_lists_every_stage_in_index_order_with_required_fields() {
 fn s45_drive_seq_changes_per_drive() {
     // Just confirm: the helper takes drive_seq as a parameter, so the
     // orchestrator can vary it per drive (spec §4.5: "emitted on every
-    // drive (including redeploys)").
+    // drive").
     let roster = vec![StageRosterEntry {
         stage_index: 0,
         node_id_hex: "00".repeat(32),
@@ -90,13 +90,11 @@ fn s46_resolve_roster_times_out_when_a_stage_never_registers() {
     }
 }
 
-// ─── §4.9 redeploy reachable-set semantics ──────────────────────────
+// ─── §4.9 spawn-chain partial-failure cleanup ───────────────────────
 //
-// The redeploy semantics live inline in pp_smoke_run::run_vastai (not
-// extractable from pipeline_parallel_inference::orchestrator), so the
-// contract is exercised here by a spawn_chain analogue: failures on one
-// stage MUST NOT prevent attempts on later stages, and the chain's
-// "did all succeed" predicate is what gates downstream drive.
+// spawn_chain treats each stage independently: a failure on one stage
+// MUST NOT leak the subprocesses already spawned for earlier stages, and
+// the chain's "did all succeed" predicate is what gates downstream drive.
 
 #[test]
 fn s49_independent_per_host_attempt_is_visible_in_chain_guard() {
@@ -129,7 +127,7 @@ fn s49_independent_per_host_attempt_is_visible_in_chain_guard() {
     }
 }
 
-// ─── §4.5 negative space: redeployable roster ───────────────────────
+// ─── §4.5 negative space: roster entry fields ───────────────────────
 
 #[test]
 fn s45_stages_list_carries_stage_index_node_id_hex_node_id_short() {
@@ -152,43 +150,11 @@ fn s45_stages_list_carries_stage_index_node_id_hex_node_id_short() {
     }
 }
 
-// ─── §5.1 binary swap default-off ───────────────────────────────────
+// ─── §5.2 distinct-host selection ───────────────────────────────────
 //
-// We can't exec pp-gpu-node from within a cargo test (and shouldn't —
-// it would attempt SWIM joins). But we can confirm the gate's surface:
-// `PP_BINARY_SWAP_URL` unset = inert. The function `prototype_binary_swap_maybe_apply`
-// is private to the binary; we observe its inertness indirectly by
-// confirming the worker binary boots its normal path when env unset.
-//
-// This is exercised in `s51_binary_swap_disabled_by_default` below by
-// invoking pp-gpu-node with no swap env and confirming it reaches the
-// normal STAGE-required check (exit 2), not a swap-related error.
-
-// ─── §5.2 PP_PREFLIGHT_HF default-off ───────────────────────────────
-
-#[test]
-fn s52_preflight_hf_off_by_default() {
-    use pipeline_parallel_inference::vastai::prototype_preflight_hf;
-    // SAFETY: this test runs single-threaded under cargo test's default
-    // (one #[test] at a time per process is not the default, but no
-    // other test reads this var concurrently).
-    unsafe {
-        std::env::remove_var("PP_PREFLIGHT_HF");
-    }
-    assert!(!prototype_preflight_hf::enabled(), "default MUST be off");
-    unsafe {
-        std::env::set_var("PP_PREFLIGHT_HF", "0");
-    }
-    assert!(!prototype_preflight_hf::enabled(), "PP_PREFLIGHT_HF=0 MUST be off");
-    unsafe {
-        std::env::set_var("PP_PREFLIGHT_HF", "false");
-    }
-    assert!(!prototype_preflight_hf::enabled(), "PP_PREFLIGHT_HF=false MUST be off");
-    unsafe {
-        std::env::set_var("PP_PREFLIGHT_HF", "1");
-    }
-    assert!(prototype_preflight_hf::enabled(), "PP_PREFLIGHT_HF=1 should turn it on");
-    unsafe {
-        std::env::remove_var("PP_PREFLIGHT_HF");
-    }
-}
+// The host-throughput preflight prototype (PP_PREFLIGHT_HF) was removed; its
+// only live behavior — never leasing two stages on the same physical host — is
+// now unconditional in the lease's distinct-host pick. That invariant is
+// covered by the `next_eligible_offer` scenario tests in
+// `src/vastai.rs` (no two draws share a host_id) and the orchestrator's
+// `lease_chain_finds_n_distinct_offers`.

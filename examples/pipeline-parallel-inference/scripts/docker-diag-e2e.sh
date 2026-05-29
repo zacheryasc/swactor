@@ -17,7 +17,8 @@
 #   examples/pipeline-parallel-inference/scripts/docker-diag-e2e.sh [N]
 #
 # Environment overrides:
-#   PP_DIAG_IMAGE         image tag (default: pp-diag:latest)
+#   PP_DIAG_IMAGE         code image tag (default: swactor-pp-gpu:latest)
+#   PP_BASE_IMAGE         base image tag (default: swactor-pp-base:cuda12.6)
 #   PP_DIAG_RUN_ID        run identifier (default: pp-diag-<timestamp>)
 #   PP_DIAG_BUNDLES_DIR   host path mounted into the collector
 #                         (default: a fresh tmpdir; printed on PASS)
@@ -27,17 +28,29 @@
 #   PP_SKIP_IMAGE_BUILD   skip docker image build (uses existing tag)
 #   PP_KEEP_BUNDLES_DIR   if set, don't rm the bundles dir on exit
 #                         (useful for inspecting the bundle by hand)
+#   PP_DIAG_NETWORK       docker network mode for the collector + stage
+#                         containers (default: host). Set to
+#                         `container:<id>` to make every container join an
+#                         existing container's network namespace instead of
+#                         the daemon's host namespace. This is what lets the
+#                         E2E run from inside a nested-container sandbox: the
+#                         orchestrator process and all containers then share
+#                         one loopback, so the hardcoded 127.0.0.1 wiring
+#                         meets. Non-host values force the direct `docker run`
+#                         collector path (compose's network_mode is fixed).
 #
 # Exits 0 iff every assertion in assert-bundle.sh passes.
 set -euo pipefail
 
 NUM_STAGES="${1:-3}"
-IMAGE="${PP_DIAG_IMAGE:-pp-diag:latest}"
+IMAGE="${PP_DIAG_IMAGE:-swactor-pp-gpu:latest}"
+BASE_IMAGE="${PP_BASE_IMAGE:-swactor-pp-base:cuda12.6}"
 RUN_ID="${PP_DIAG_RUN_ID:-pp-diag-$(date +%s%N)}"
 PROMPT="${PP_PROMPT:-Diag check}"
 MAX_TOKENS="${PP_MAX_TOKENS:-2}"
 CONTAINER_PREFIX="${PP_CONTAINER_PREFIX:-pp-diag-stage}"
 COLLECTOR_NAME="${PP_DIAG_COLLECTOR_NAME:-pp-diag-collector}"
+DIAG_NETWORK="${PP_DIAG_NETWORK:-host}"
 
 if ! [[ "$NUM_STAGES" =~ ^[0-9]+$ ]] || [ "$NUM_STAGES" -lt 2 ]; then
     echo "docker-diag-e2e: NUM_STAGES must be an integer >= 2, got '$NUM_STAGES'" >&2
@@ -59,7 +72,13 @@ fi
 # we fall back to a plain `docker run` of the same image / command —
 # this keeps the script runnable in stripped sandboxes that don't ship
 # compose, while still preferring the declarative path in production.
-if docker compose version >/dev/null 2>&1; then
+if [ "$DIAG_NETWORK" != "host" ]; then
+    # The compose file pins `network_mode: host`; a non-host override can
+    # only be expressed on the direct `docker run` path, so force it.
+    COMPOSE=()
+    USE_COMPOSE=0
+    echo "docker-diag-e2e: PP_DIAG_NETWORK=$DIAG_NETWORK -> using direct 'docker run' (bypassing compose)"
+elif docker compose version >/dev/null 2>&1; then
     COMPOSE=(docker compose)
     USE_COMPOSE=1
 elif command -v docker-compose >/dev/null 2>&1; then
@@ -97,12 +116,20 @@ for f in "$SMOKE_RUN_BIN" "$GPU_NODE_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPR
     [ -f "$f" ] || { echo "docker-diag-e2e: missing $f" >&2; exit 1; }
 done
 
-# Step 2: build the image. Build context is the workspace root because
-# the Dockerfile reaches into both target/release/ trees.
+# Step 2: build the layered image — heavy base then thin code layer.
+# Build context is the workspace root because the Dockerfiles reach into
+# both target/release/ trees. The diagnostics binaries ship in the default
+# code image, so this is the same image the GPU nodes run.
 if [ -z "${PP_SKIP_IMAGE_BUILD:-}" ]; then
-    echo "docker-diag-e2e: docker build $IMAGE"
+    echo "docker-diag-e2e: docker build $BASE_IMAGE (base)"
     docker build \
-        -f "$CRATE_DIR/Dockerfile.diag" \
+        -f "$CRATE_DIR/Dockerfile.base" \
+        -t "$BASE_IMAGE" \
+        "$WORKSPACE_DIR"
+    echo "docker-diag-e2e: docker build $IMAGE (code)"
+    docker build \
+        -f "$CRATE_DIR/Dockerfile" \
+        --build-arg "BASE_IMAGE=$BASE_IMAGE" \
         -t "$IMAGE" \
         "$WORKSPACE_DIR"
 fi
@@ -123,6 +150,7 @@ fi
 export PP_DIAG_BUNDLES_DIR="$BUNDLES_DIR"
 export PP_DIAG_IMAGE="$IMAGE"
 export PP_DIAG_COLLECTOR_NAME="$COLLECTOR_NAME"
+export PP_DIAG_NETWORK="$DIAG_NETWORK"
 
 cleanup_stages() {
     local ids
@@ -161,12 +189,14 @@ echo "docker-diag-e2e: starting collector (bundles -> $BUNDLES_DIR)"
 if [ "$USE_COMPOSE" = 1 ]; then
     "${COMPOSE[@]}" -f "$COMPOSE_FILE" up -d --remove-orphans collector
 else
+    # --entrypoint runs the collector directly; the default image entrypoint
+    # (pp_entrypoint.sh) would ignore these args and launch pp-gpu-node.
     docker run -d --rm \
         --name "$COLLECTOR_NAME" \
-        --network host \
+        --network "$DIAG_NETWORK" \
+        --entrypoint /usr/local/bin/swactor-diag-collector \
         -v "$BUNDLES_DIR":/var/lib/swactor-diag \
         "$IMAGE" \
-        swactor-diag-collector \
             --bind 127.0.0.1:9080 \
             --root /var/lib/swactor-diag \
             --udp 127.0.0.1:9081 \

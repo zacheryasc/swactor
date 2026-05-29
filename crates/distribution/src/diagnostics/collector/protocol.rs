@@ -63,9 +63,15 @@ pub struct PostAck<T = serde_json::Value> {
     pub body: Option<T>,
 }
 
-/// Record kind for the four POST endpoints. Used as the filename
+/// Record kind for the POST endpoints. Used as the filename
 /// prefix on disk (`{kind}-{seq}.json`) and as the path segment in
 /// the URL (`POST /diag/{kind}`).
+///
+/// The `Vastai*` kinds belong to the independent vastai monitoring layer
+/// (`crate::diagnostics::vastai`). The collector treats them like any
+/// other opaque record — persist + SSE fan-out work unchanged — but they are
+/// bucketed separately at bundle time and never participate in the swactor
+/// `Finalize` snapshot trigger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordKind {
@@ -73,6 +79,10 @@ pub enum RecordKind {
     Events,
     Snapshot,
     Finalize,
+    VastaiInstance,
+    VastaiSample,
+    VastaiLogs,
+    VastaiLifecycle,
 }
 
 impl RecordKind {
@@ -82,6 +92,10 @@ impl RecordKind {
             RecordKind::Events => "events",
             RecordKind::Snapshot => "snapshot",
             RecordKind::Finalize => "finalize",
+            RecordKind::VastaiInstance => "vastai_instance",
+            RecordKind::VastaiSample => "vastai_sample",
+            RecordKind::VastaiLogs => "vastai_logs",
+            RecordKind::VastaiLifecycle => "vastai_lifecycle",
         }
     }
 
@@ -91,8 +105,25 @@ impl RecordKind {
             "events" => Some(RecordKind::Events),
             "snapshot" => Some(RecordKind::Snapshot),
             "finalize" => Some(RecordKind::Finalize),
+            "vastai_instance" => Some(RecordKind::VastaiInstance),
+            "vastai_sample" => Some(RecordKind::VastaiSample),
+            "vastai_logs" => Some(RecordKind::VastaiLogs),
+            "vastai_lifecycle" => Some(RecordKind::VastaiLifecycle),
             _ => None,
         }
+    }
+
+    /// True for kinds produced by the vastai monitoring layer. Used by the
+    /// collector to bucket these records under a `vastai/` subdir at bundle
+    /// time and to keep them out of swactor-specific accounting.
+    pub fn is_vastai(self) -> bool {
+        matches!(
+            self,
+            RecordKind::VastaiInstance
+                | RecordKind::VastaiSample
+                | RecordKind::VastaiLogs
+                | RecordKind::VastaiLifecycle
+        )
     }
 }
 
@@ -130,6 +161,11 @@ pub struct ManifestNode {
     pub event_batches: u64,
     pub snapshots: u64,
     pub finalize_recorded: bool,
+    /// Count of records from the vastai monitoring layer (instance
+    /// observations, host samples, log batches, lifecycle markers).
+    /// Defaults to 0 for swactor-only nodes / older bundles.
+    #[serde(default)]
+    pub vastai_records: u64,
 }
 
 /// Top-level manifest written into the tarball root.
@@ -176,9 +212,35 @@ mod tests {
             RecordKind::Events,
             RecordKind::Snapshot,
             RecordKind::Finalize,
+            RecordKind::VastaiInstance,
+            RecordKind::VastaiSample,
+            RecordKind::VastaiLogs,
+            RecordKind::VastaiLifecycle,
         ] {
             assert_eq!(RecordKind::parse(k.as_str()), Some(k));
         }
         assert_eq!(RecordKind::parse("unknown"), None);
+    }
+
+    #[test]
+    fn vastai_kinds_are_classified_separately_from_swactor() {
+        // The bundle layer relies on this split to bucket vastai records
+        // under vastai/ rather than the swactor boot/events/snapshot dirs.
+        for k in [
+            RecordKind::VastaiInstance,
+            RecordKind::VastaiSample,
+            RecordKind::VastaiLogs,
+            RecordKind::VastaiLifecycle,
+        ] {
+            assert!(k.is_vastai());
+        }
+        for k in [
+            RecordKind::Boot,
+            RecordKind::Events,
+            RecordKind::Snapshot,
+            RecordKind::Finalize,
+        ] {
+            assert!(!k.is_vastai());
+        }
     }
 }

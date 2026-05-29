@@ -58,7 +58,10 @@ impl DiagEnv {
                 .filter(|s| !s.is_empty())
         }
         Self {
-            collector_url: nonempty("SWACTOR_DIAG_COLLECTOR_URL"),
+            // Default-on: fall back to the dashboard collector so a live deploy
+            // ships rented-stage telemetry by setting PP_DASHBOARD_URL alone.
+            collector_url: nonempty("SWACTOR_DIAG_COLLECTOR_URL")
+                .or_else(|| nonempty("PP_DASHBOARD_URL")),
             run_id: nonempty("SWACTOR_DIAG_RUN_ID"),
             udp_echo: nonempty("SWACTOR_DIAG_UDP_ECHO"),
             iroh_relay_url: nonempty(crate::relay_config::ENV_IROH_RELAY_URL),
@@ -84,7 +87,7 @@ impl DiagEnv {
     }
 }
 
-/// A vast.ai offer (GPU rental option) returned by [`find_offer`].
+/// A vast.ai offer (GPU rental option) returned by [`select_offer_pool`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct Offer {
     pub id: u64,
@@ -142,39 +145,121 @@ struct InstanceStatus {
     public_ipaddr: Option<String>,
     #[serde(default)]
     ssh_port: Option<u16>,
+    // Bytes pulled so far while an image loads. vast reports -1 before the
+    // container exists; once it does, this advances as the pull progresses, so
+    // it (alongside `status_msg`) is our only signal that a slow node is still
+    // making progress rather than stalled.
+    #[serde(default)]
+    disk_usage: Option<f64>,
 }
 
-/// Find the cheapest offer matching a GPU type, excluding specific offer IDs.
+/// Cost model for ranking offers on *true* lease cost rather than the $/hr
+/// figure vast.ai sorts on. vast.ai bills image-pull bandwidth separately from
+/// `dph_total`, so a host that is cheap-by-the-hour but gouges on download
+/// bandwidth can cost more once a fat image pull is priced in.
 ///
-/// Forked from `single-gpu-inference::vastai::find_offer` — same filters
-/// (rentable, reliability, CUDA version, direct ports, inet speed, geo).
-pub async fn find_offer(
+/// Composable on purpose: today it folds in the one-time image-pull cost
+/// (`image_GB * down_$/TB / 1000`). A future inter-stage / usage-bandwidth term
+/// keyed off run parameters slots into [`CostModel::effective_price`] without
+/// reworking selection.
+#[derive(Debug, Clone, Default)]
+pub struct CostModel {
+    /// Deploy-image size in GB; `None` → image pull is not priced in.
+    pub image_gb: Option<f64>,
+}
+
+impl CostModel {
+    /// Build from the environment (`PP_IMAGE_SIZE_GB`).
+    fn from_env() -> Self {
+        Self {
+            image_gb: env_image_size_gb(),
+        }
+    }
+
+    /// One-time cost of pulling the deploy image to this offer's host.
+    fn pull_cost(&self, o: &Offer) -> f64 {
+        self.image_gb
+            .map_or(0.0, |gb| gb * o.inet_down_cost_per_tb / 1000.0)
+    }
+
+    /// Effective hourly-equivalent price the selection ranks on: the listed
+    /// $/hr plus the priced-in image pull. With `image_gb` unset this is just
+    /// `dph_total`. (Extension slot: add an inter-stage bandwidth term here.)
+    fn effective_price(&self, o: &Offer) -> f64 {
+        o.dph_total + self.pull_cost(o)
+    }
+}
+
+/// Rank a set of offers into the survivor pool: drop the suspiciously-cheap
+/// tail *within each GPU model*, then merge and sort ascending by effective
+/// price. Cheap-for-its-model has correlated with reliability failures (CDI
+/// device-injection faults, hosts that load the image then stop) that the
+/// vast.ai reliability score does not capture, so the bottom slice of each
+/// model is trimmed.
+///
+/// The drop is `floor(drop_frac * group_len)` per model, so tiny groups (1–3
+/// offers) are kept intact rather than wiped — a model with a single offer
+/// keeps it.
+fn rank_survivors(offers: Vec<Offer>, cost: &CostModel, drop_frac: f64) -> Vec<Offer> {
+    let mut by_model: std::collections::HashMap<String, Vec<Offer>> =
+        std::collections::HashMap::new();
+    for o in offers {
+        by_model.entry(o.gpu_name.clone()).or_default().push(o);
+    }
+    let price = |o: &Offer| cost.effective_price(o);
+    let by_price = |a: &Offer, b: &Offer| {
+        price(a)
+            .partial_cmp(&price(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let mut survivors: Vec<Offer> = Vec::new();
+    for (_model, mut group) in by_model {
+        group.sort_by(&by_price);
+        let drop = (drop_frac * group.len() as f64).floor() as usize;
+        survivors.extend(group.into_iter().skip(drop));
+    }
+    survivors.sort_by(&by_price);
+    survivors
+}
+
+/// The next pool offer to lease: the cheapest survivor (the pool is pre-sorted
+/// ascending) that has not already been tried and whose physical host is not
+/// already claimed by this lease. `host_id == None` can't be deduped, so such
+/// offers are always eligible. Returns `None` once the pool is exhausted.
+fn next_eligible_offer<'a>(
+    pool: &'a [Offer],
+    tried_offer_ids: &[u64],
+    used_host_ids: &std::collections::HashSet<u64>,
+) -> Option<&'a Offer> {
+    pool.iter().find(|o| {
+        !tried_offer_ids.contains(&o.id)
+            && o.host_id.map_or(true, |h| !used_host_ids.contains(&h))
+    })
+}
+
+/// Build the ranked survivor pool for a heterogeneous PP lease in a single
+/// query. Replaces the old per-stage `find_offer` / `find_offer_chain`.
+///
+/// Policy: from all rentable offers at/above the VRAM threshold that are
+/// reachable and pass the quality gates, drop the cheapest `PP_DROP_CHEAP_FRAC`
+/// per GPU model, then return the full list ranked ascending by effective
+/// price. The caller leases the N cheapest survivors on distinct physical hosts
+/// (see [`next_eligible_offer`]); returning the whole pool lets the lease's
+/// resilience layer draw replacements without re-querying.
+pub async fn select_offer_pool(
     client: &Client,
     base_url: &str,
     api_key: &str,
     gpu_name: &str,
-    exclude_ids: &[u64],
-) -> Result<Offer, String> {
-    // Filter goals beyond "rentable, fast, verified":
-    //   - reliability2 >= 0.995 (>= 0.99 still surfaces hosts that recurrently
-    //     fail container init; tightening shrinks the candidate pool to
-    //     hosts with very few historical job failures).
-    //   - cuda_max_good >= 12.6 matches our CUDA-12.6 base image. Cheaper
-    //     offers without a modern host CUDA stack were the source of the
-    //     `unresolvable CDI devices` failures we saw earlier.
-    // The cheap-card selector is normally `gpu_name == <model>` (e.g. "RTX
-    // 3060"), which implicitly bounds cost because that model is cheap. When
-    // `PP_GPU_MIN_RAM_MB` is set we instead select by VRAM so the pipeline can
-    // span a *heterogeneous* set of cards: every PP stage is an independent
-    // process exchanging fp16 hidden state over the wire, so stages need not
-    // share a GPU model — only enough VRAM to hold their block slice. A VRAM
-    // filter alone would pull in datacenter GPUs (4090/A100/H100…) and wreck
-    // the median-cost pick, so `PP_GPU_MAX_DPH` caps $/hr to keep the pool in
-    // the same cheap band the single-model filter gave us, and `num_gpus == 1`
-    // keeps us from renting (and paying for) a multi-GPU rig per stage.
-    // Everything else — reliability, CUDA floor, verified, ports, inet, the
-    // non-CN geo filter, and the median-priced pick below — is identical to
-    // the single-model path.
+    num_stages: u32,
+) -> Result<Vec<Offer>, String> {
+    // Hard gates expressed server-side. reliability2 >= 0.995 and
+    // cuda_max_good >= 12.6 (our CUDA-12.6 base image) drop hosts that
+    // recurrently fail container init / CDI device injection; num_gpus == 1
+    // keeps us from renting a multi-GPU rig per stage. Network speed can't be
+    // probed before renting, so we trust vast.ai's measured inet figures and
+    // gate on a configurable minimum (PP_MIN_INET_DOWN_MBPS, default 100; the
+    // upload gate is off by default).
     let mut query = serde_json::json!({
         "rentable": {"eq": true},
         "rented": {"eq": false},
@@ -182,15 +267,22 @@ pub async fn find_offer(
         "cuda_max_good": {"gte": 12.6},
         "verified": {"eq": true},
         "direct_port_count": {"gte": 1},
-        "inet_down": {"gte": 100.0},
+        "num_gpus": {"eq": 1},
+        "inet_down": {"gte": env_min_inet_down_mbps()},
+        // Cap the response so one query covers N distinct hosts even after the
+        // per-model cheap drop, without paging.
+        "limit": 512,
     });
+    if let Some(up) = env_min_inet_up_mbps() {
+        query["inet_up"] = serde_json::json!({"gte": up});
+    }
+    // VRAM mode spans a heterogeneous card set (each PP stage is an independent
+    // process exchanging fp16 hidden state, so stages need not share a model —
+    // only enough VRAM for their block slice). Model-name mode is the historical
+    // default and implicitly bounds cost to that one cheap model.
     match env_min_gpu_ram_mb() {
         Some(min_ram) => {
             query["gpu_ram"] = serde_json::json!({"gte": min_ram});
-            query["num_gpus"] = serde_json::json!({"eq": 1});
-            if let Some(max_dph) = env_max_dph() {
-                query["dph_total"] = serde_json::json!({"lte": max_dph});
-            }
         }
         None => {
             query["gpu_name"] = serde_json::json!({"eq": gpu_name});
@@ -205,22 +297,24 @@ pub async fn find_offer(
         .header("Authorization", format!("Bearer {api_key}"))
         .send()
         .await
-        .map_err(|e| format!("find_offer request failed: {e}"))?;
+        .map_err(|e| format!("select_offer_pool request failed: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("find_offer HTTP {status}: {body}"));
+        return Err(format!("select_offer_pool HTTP {status}: {body}"));
     }
 
     let body: SearchResponse = resp
         .json()
         .await
-        .map_err(|e| format!("find_offer parse failed: {e}"))?;
+        .map_err(|e| format!("select_offer_pool parse failed: {e}"))?;
 
-    // Filter out hosts with unknown or Chinese geolocation — Docker Hub
-    // and iroh relays are unreachable from behind the Great Firewall.
-    let filtered: Vec<Offer> = body
+    // Post-filter in Rust: drop unknown/Chinese geolocations (Docker Hub and
+    // iroh relays are unreachable from behind the Great Firewall) and any
+    // blacklisted host (providers caught gouging on bandwidth).
+    let blacklist = blacklisted_host_ids();
+    let reachable: Vec<Offer> = body
         .offers
         .into_iter()
         .filter(|o| {
@@ -228,66 +322,30 @@ pub async fn find_offer(
                 .as_deref()
                 .map_or(false, |g| !g.to_uppercase().contains("CN"))
         })
-        .collect();
-
-    let blacklist = blacklisted_host_ids();
-    let mut candidates: Vec<Offer> = filtered
-        .into_iter()
-        .filter(|o| !exclude_ids.contains(&o.id))
         .filter(|o| o.host_id.map_or(true, |h| !blacklist.contains(&h)))
         .collect();
-    if candidates.is_empty() {
+
+    let cost = CostModel::from_env();
+    let drop_frac = env_drop_cheap_frac();
+    let pool = rank_survivors(reachable, &cost, drop_frac);
+
+    if pool.is_empty() {
         return Err(
-            "no offers available (after geo/host-blacklist/exclusion filter)".to_string(),
+            "no offers available (after quality/geo/host-blacklist filters and cheap-tail drop)"
+                .to_string(),
         );
     }
-
-    // Pick the median-priced offer rather than the cheapest. Cheap RTX 4090
-    // offers on vast.ai have been consistently failing CDI device injection
-    // at container start (per-instance dynamic CDI specs written too late
-    // or with mismatched shas — the reliability score does not reflect
-    // these container-runtime failures because they happen before the job
-    // starts running). The median strikes a balance: it skips the bottom
-    // tier of misconfigured hosts without paying for the most expensive
-    // ones in the candidate set.
-    // Effective price = $/hr plus the amortized-as-one-time image-pull cost
-    // (`image_GB * down_$/TB / 1000`) when PP_IMAGE_SIZE_GB is set. This makes
-    // the median pick rank on true cost: a host that is cheap per-hour but
-    // charges $40/TB sorts below a free-bandwidth host once a 20GB pull is
-    // priced in. With the flag unset, `pull_cost` is 0 and this is the old
-    // dph_total ordering.
-    let image_gb = env_image_size_gb();
-    let pull_cost = |o: &Offer| image_gb.map_or(0.0, |gb| gb * o.inet_down_cost_per_tb / 1000.0);
-    let effective = |o: &Offer| o.dph_total + pull_cost(o);
-    candidates.sort_by(|a, b| effective(a).partial_cmp(&effective(b)).unwrap());
-    let median_idx = candidates.len() / 2;
-    let n_candidates = candidates.len();
-    let picked = candidates.swap_remove(median_idx);
-    // One line per stage (N small) so a heterogeneous lease is auditable: which
-    // physical card each stage landed on and what it costs. Silent in the
-    // single-model path too — handy when a lease picks an unexpected host.
-    // When PP_IMAGE_SIZE_GB is set, append the priced-in one-time image pull so
-    // the chosen $/hr and the cost it was actually ranked on are both visible.
-    let pull_note = image_gb.map_or(String::new(), |gb| {
-        format!(" +${:.2} pull ({:.0}GB)", pull_cost(&picked), gb)
-    });
+    // One audit line: how big the survivor pool is and what the cheapest
+    // survivor costs once bandwidth is priced in. Per-stage picks are logged in
+    // provision_stage as they are leased.
     eprintln!(
-        "find_offer: selected offer {} — {} {} @ ${:.3}/hr [{}] \
-         bw ${:.2}/TB down ${:.2}/TB up{} (median of {} candidates)",
-        picked.id,
-        picked.gpu_name,
-        picked
-            .gpu_ram
-            .map(|r| format!("{:.0}MB", r))
-            .unwrap_or_else(|| "?MB".into()),
-        picked.dph_total,
-        picked.geolocation.as_deref().unwrap_or("?"),
-        picked.inet_down_cost_per_tb,
-        picked.inet_up_cost_per_tb,
-        pull_note,
-        n_candidates,
+        "select_offer_pool: {} survivor(s) for {num_stages} stage(s) after \
+         per-model {:.0}% cheap-drop (cheapest ${:.3}/hr eff)",
+        pool.len(),
+        drop_frac * 100.0,
+        cost.effective_price(&pool[0]),
     );
-    Ok(picked)
+    Ok(pool)
 }
 
 /// `PP_GPU_MIN_RAM_MB`: when set to a positive integer, the offer search
@@ -301,14 +359,75 @@ fn env_min_gpu_ram_mb() -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
-/// `PP_GPU_MAX_DPH`: optional $/hr cap, applied only in VRAM-filter mode, to
-/// keep the heterogeneous pool in the cheap band (otherwise datacenter GPUs
-/// dominate the median-cost pick). Unset → no cap.
-fn env_max_dph() -> Option<f64> {
-    std::env::var("PP_GPU_MAX_DPH")
+/// `PP_MIN_INET_DOWN_MBPS`: minimum vast.ai-reported download speed (Mbps) an
+/// offer must advertise. Network throughput can't be probed before renting, so
+/// the lease trusts vast's measured figure and gates on it. Default 100 (the
+/// historical hardcoded floor); 0 disables the gate.
+fn env_min_inet_down_mbps() -> f64 {
+    std::env::var("PP_MIN_INET_DOWN_MBPS")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|&v| v >= 0.0)
+        .unwrap_or(100.0)
+}
+
+/// `PP_MIN_INET_UP_MBPS`: optional minimum reported upload speed (Mbps).
+/// Default unset / 0 → no upload-speed gate.
+fn env_min_inet_up_mbps() -> Option<f64> {
+    std::env::var("PP_MIN_INET_UP_MBPS")
         .ok()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|&v| v > 0.0)
+}
+
+/// `PP_DROP_CHEAP_FRAC`: fraction of the cheapest offers to drop *within each
+/// GPU model* before leasing (cheap-for-its-model has correlated with
+/// reliability failures). Applied as a floor per model, so tiny groups survive.
+/// Default 0.30; clamped to [0, 0.99].
+fn env_drop_cheap_frac() -> f64 {
+    std::env::var("PP_DROP_CHEAP_FRAC")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.0, 0.99))
+        .unwrap_or(0.30)
+}
+
+/// `PP_LEASE_PACE_MS`: delay between successive stage provisions in
+/// [`lease_chain`] Phase 1, in milliseconds. Keeps the lease's request rate
+/// under the vast.ai endpoint throttle (~4.5 req/s). Default 600ms.
+fn lease_pace() -> Duration {
+    let ms = std::env::var("PP_LEASE_PACE_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(600);
+    Duration::from_millis(ms)
+}
+
+/// `PP_MAX_REPLACE_ATTEMPTS`: how many times [`lease_chain`] will destroy a
+/// stage that never reached `running` and re-lease a replacement before giving
+/// up. Default 3 (the historical hardcoded value). **0 disables replacement**:
+/// a stage that fails to come up is reported and the lease fails without
+/// re-leasing — the stand-down switch for a slow host where churning on
+/// replacements is worse than waiting (tune `max_polls`/poll interval instead).
+fn env_max_replace_attempts() -> u32 {
+    std::env::var("PP_MAX_REPLACE_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(3)
+}
+
+/// `PP_PULL_STALL_SECS`: how long an instance may sit in a loading state with
+/// **no** change to `status_msg` or `disk_usage` before [`wait_for_running`]
+/// declares it stalled and returns early. A node whose pull is still advancing
+/// rides out to the poll limit and is never killed for merely being slow.
+/// Default 180s; 0 disables stall detection (only the poll limit bounds the
+/// wait).
+fn env_pull_stall_secs() -> u64 {
+    std::env::var("PP_PULL_STALL_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(180)
 }
 
 /// Hosts blacklisted regardless of env: providers caught gouging on bandwidth.
@@ -349,6 +468,19 @@ pub async fn wait_for_running(
     max_polls: u32,
 ) -> Result<RunningInstance, String> {
     let url = format!("{base_url}/api/v0/instances/{contract_id}/");
+    let stall = Duration::from_secs(env_pull_stall_secs());
+    let stall_enabled = !stall.is_zero();
+
+    // Progress tracking: a slow-but-advancing node must ride out to the poll
+    // limit, never killed for merely being slow. We reset `progress_since`
+    // whenever status_msg or disk_usage changes; only when neither has moved
+    // for `stall` do we declare the node stalled. `state_since` is just for the
+    // elapsed-in-current-state figure in the log.
+    let mut state_since = std::time::Instant::now();
+    let mut progress_since = std::time::Instant::now();
+    let mut last_state: Option<String> = None;
+    let mut last_msg: Option<String> = None;
+    let mut last_disk: Option<f64> = None;
 
     for poll in 0..max_polls {
         let resp = match client
@@ -396,20 +528,48 @@ pub async fn wait_for_running(
 
         let actual = status.actual_status.as_deref().unwrap_or("unknown");
         let intended = status.intended_status.as_deref().unwrap_or("unknown");
+
+        // Did the node make any progress since the last poll? Either the
+        // status message advanced (e.g. "Pulling from ...") or bytes landed
+        // on disk.
+        let msg = status.status_msg.clone();
+        let disk = status.disk_usage;
+        if msg != last_msg || disk != last_disk {
+            progress_since = std::time::Instant::now();
+        }
+        if last_state.as_deref() != Some(actual) {
+            state_since = std::time::Instant::now();
+        }
+        last_state = Some(actual.to_string());
+        last_msg = msg.clone();
+        last_disk = disk;
+
+        let stalled = stall_enabled && progress_since.elapsed() >= stall;
+        let in_state = state_since.elapsed().as_secs();
+        let msg_disp = match msg.as_deref() {
+            Some(m) if !m.is_empty() => format!(" msg=\"{m}\""),
+            _ => String::new(),
+        };
+        let disk_disp = match disk {
+            Some(d) if d >= 0.0 => format!(" disk={d:.2}GB"),
+            _ => String::new(),
+        };
         eprintln!(
-            "  contract {contract_id} poll {}/{}: status={actual}",
+            "  contract {contract_id} poll {}/{max_polls}: status={actual} in-state={in_state}s {}{msg_disp}{disk_disp}",
             poll + 1,
-            max_polls
+            if stalled { "STALLED" } else { "progressing" },
         );
 
-        if let Some(msg) = &status.status_msg {
-            if msg.contains("Error") || msg.contains("failed") {
-                return Err(format!("instance {contract_id} error: {msg}"));
+        if let Some(m) = &msg {
+            if m.contains("Error") || m.contains("failed") {
+                return Err(format!("instance {contract_id} error: {m}"));
             }
         }
         if intended == "stopped" && actual != "running" {
-            let msg = status.status_msg.unwrap_or_default();
-            return Err(format!("instance {contract_id} stopped: {msg}"));
+            return Err(format!(
+                "instance {contract_id} stopped: {}",
+                msg.unwrap_or_default()
+            ));
         }
 
         match actual {
@@ -426,6 +586,15 @@ pub async fn wait_for_running(
                 ));
             }
             _ => {
+                // A genuinely hung load (no status_msg/disk_usage movement for
+                // `stall`) fails fast; a still-advancing one keeps waiting up
+                // to max_polls.
+                if stalled {
+                    return Err(format!(
+                        "instance {contract_id} stalled in '{actual}' for {}s with no status_msg/disk_usage progress",
+                        progress_since.elapsed().as_secs()
+                    ));
+                }
                 tokio::time::sleep(poll_interval).await;
             }
         }
@@ -505,9 +674,9 @@ pub async fn create_instance(
     if let Some(relay) = seed_relay {
         env["SEED_RELAY"] = serde_json::Value::String(relay.to_string());
     }
-    // Pin this stage's iroh identity so it survives an in-place redeploy
-    // bounce: re-read from PID 1's env on restart, the stage keeps the same
-    // node id and the pipeline name registry stays valid. See
+    // Pin this stage's iroh identity so it survives a restart: re-read from
+    // PID 1's env on restart, the stage keeps the same node id and the
+    // pipeline name registry stays valid. See
     // pp-gpu-node::stage_secret_from_env.
     if let Some(secret) = stage_secret {
         env["PP_STAGE_SECRET"] = serde_json::Value::String(secret.to_string());
@@ -545,7 +714,11 @@ pub async fn create_instance(
     let mut body = serde_json::json!({
         "image": image,
         "env": env,
-        "onstart": "exec /usr/local/bin/pp-gpu-node 2>&1",
+        // Run the PID-1 supervisor (not the worker directly): it brings up
+        // sshd deterministically and keeps the container — and the shell —
+        // alive if the worker crashes. No `exec` of the worker: the supervisor
+        // owns PID 1 and runs pp-gpu-node as a child.
+        "onstart": "/usr/local/bin/pp_entrypoint.sh 2>&1",
         // Every stage fetch()s the FULL gguf (whole file mmap'd by
         // from_gguf), regardless of which layers it runs. qwen3:30b-a3b
         // Q4_K_M is ~18 GB; with the ~4 GB CUDA-runtime image that
@@ -717,9 +890,9 @@ struct InstanceListEntry {
 
 /// List every instance on the account tagged with `label`, sorted by
 /// contract id. vast.ai is the source of truth for "what's rented" — we
-/// keep no local cluster state, so attach/redeploy/teardown all rediscover
-/// the cluster through this call. Returns the SSH endpoint per instance so
-/// the caller can scp/ssh to redeploy in place.
+/// keep no local cluster state, so teardown rediscovers the cluster through
+/// this call. Returns the SSH endpoint per instance so an operator can
+/// scp/ssh to a node for a manual binary/worker swap.
 pub async fn list_instances_by_label(
     client: &Client,
     base_url: &str,
@@ -756,37 +929,6 @@ pub async fn list_instances_by_label(
         .collect();
     out.sort_by_key(|i| i.contract_id);
     Ok(out)
-}
-
-/// Find `num_stages` distinct offers for the same GPU type. Each call to
-/// [`find_offer`] excludes every offer id returned by the previous calls,
-/// so the result is `num_stages` pairwise-distinct offers.
-///
-/// If fewer than `num_stages` matching offers exist, the call that runs
-/// out propagates the [`find_offer`] error to the caller (no rollback is
-/// needed — nothing was created).
-pub async fn find_offer_chain(
-    client: &Client,
-    base_url: &str,
-    api_key: &str,
-    gpu_name: &str,
-    num_stages: u32,
-) -> Result<Vec<Offer>, String> {
-    let mut chosen: Vec<Offer> = Vec::with_capacity(num_stages as usize);
-    for i in 0..num_stages {
-        let exclude: Vec<u64> = chosen.iter().map(|o| o.id).collect();
-        match find_offer(client, base_url, api_key, gpu_name, &exclude).await {
-            Ok(o) => chosen.push(o),
-            Err(e) => {
-                return Err(format!(
-                    "find_offer_chain: offer {}/{} for {gpu_name} not available: {e}",
-                    i + 1,
-                    num_stages,
-                ));
-            }
-        }
-    }
-    Ok(chosen)
 }
 
 /// Destroy one contract, retrying on transient failures (HTTP 429 rate-limit,
@@ -833,18 +975,21 @@ async fn rollback(client: &Client, base_url: &str, api_key: &str, created: &[Ins
     }
 }
 
-/// Find an offer for `stage` (excluding everything in `tried_offer_ids`, which
-/// it appends to) and create one instance, retrying with the next-best offer
-/// when a create is throttled (429) or the offer was snatched between select
-/// and create. Returns the created [`InstanceInfo`], or an error after
-/// `MAX_CREATE_ATTEMPTS`. Pulls this stage's pinned identity from
+/// Lease one instance for `stage` by drawing from the shared ranked `pool`:
+/// take the next survivor that is neither already tried (`tried_offer_ids`,
+/// which it appends to) nor on a host already claimed by this lease
+/// (`used_host_ids`, which it updates on a successful create), then create.
+/// Retries with the next eligible survivor when a create is throttled (429) or
+/// the offer was snatched between select and create. Returns the created
+/// [`InstanceInfo`], or an error once the pool is exhausted or
+/// `MAX_CREATE_ATTEMPTS` is hit. Pulls this stage's pinned identity from
 /// `stage_secrets[stage]` so a replacement keeps the same node id.
 #[allow(clippy::too_many_arguments)]
 async fn provision_stage(
     client: &Client,
     base_url: &str,
     api_key: &str,
-    gpu_name: &str,
+    pool: &[Offer],
     stage: u32,
     num_stages: u32,
     seed_addr: &str,
@@ -854,47 +999,46 @@ async fn provision_stage(
     stage_secrets: Option<&[String]>,
     diag_env: Option<&DiagEnv>,
     tried_offer_ids: &mut Vec<u64>,
-    // PROTOTYPE_PREFLIGHT_HF (spec §5.2): host ids already claimed by
-    // earlier stages in this chain. Used (and updated) only when the
-    // preflight gate is enabled.
+    // Host ids already leased by this chain. Distinct-host selection is
+    // unconditional: two offers on the same host_id share the same NAT'd public
+    // endpoint, so two stages must never land on one machine.
     used_host_ids: &mut std::collections::HashSet<u64>,
 ) -> Result<InstanceInfo, String> {
     const MAX_CREATE_ATTEMPTS: u32 = 5;
-    let preflight = prototype_preflight_hf::enabled();
+    let cost = CostModel::from_env();
     let mut last_err: Option<String> = None;
     for attempt in 1..=MAX_CREATE_ATTEMPTS {
-        let offer = match find_offer(client, base_url, api_key, gpu_name, tried_offer_ids).await {
-            Ok(o) => o,
-            Err(e) => {
-                last_err = Some(format!("find_offer for stage {stage}: {e}"));
+        let offer = match next_eligible_offer(pool, tried_offer_ids, used_host_ids) {
+            Some(o) => o.clone(),
+            None => {
+                // Genuine exhaustion (every survivor is tried or on a used
+                // host), not a rate signal — let the caller roll back.
+                last_err = Some(format!(
+                    "pool exhausted for stage {stage} (no untried offer on an unused host)"
+                ));
                 break;
             }
         };
         tried_offer_ids.push(offer.id);
-
-        // PROTOTYPE_PREFLIGHT_HF (spec §5.2): "Candidate chains MUST
-        // be filtered such that no two chain slots share the same
-        // public network endpoint (e.g. the offer's public IP)." The
-        // offer doesn't carry a resolved public IP yet, but `host_id`
-        // (the physical machine) is the public-endpoint proxy: two
-        // offers on the same host_id share the same NAT'd public IP.
-        // Gate is off by default → behavior unchanged.
-        if preflight {
-            if let Some(h) = offer.host_id {
-                if used_host_ids.contains(&h) {
-                    eprintln!(
-                        "PROTOTYPE_PREFLIGHT_HF: stage {stage} skipping offer {} \
-                         on host {h} (already used by an earlier chain slot)",
-                        offer.id,
-                    );
-                    last_err = Some(format!(
-                        "preflight rejected offer {} (host {h} already in chain)",
-                        offer.id,
-                    ));
-                    continue;
-                }
-            }
-        }
+        // One line per stage so a heterogeneous lease is auditable: which
+        // physical card the stage landed on, its $/hr, and the effective cost
+        // it was ranked on (with bandwidth priced in when PP_IMAGE_SIZE_GB set).
+        eprintln!(
+            "lease_chain: stage {stage} → offer {} — {} {} @ ${:.3}/hr [{}] host {} eff ${:.3}/hr",
+            offer.id,
+            offer.gpu_name,
+            offer
+                .gpu_ram
+                .map(|r| format!("{:.0}MB", r))
+                .unwrap_or_else(|| "?MB".into()),
+            offer.dph_total,
+            offer.geolocation.as_deref().unwrap_or("?"),
+            offer
+                .host_id
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "?".into()),
+            cost.effective_price(&offer),
+        );
 
         match create_instance(
             client,
@@ -915,10 +1059,8 @@ async fn provision_stage(
         .await
         {
             Ok(info) => {
-                if preflight {
-                    if let Some(h) = offer.host_id {
-                        used_host_ids.insert(h);
-                    }
+                if let Some(h) = offer.host_id {
+                    used_host_ids.insert(h);
                 }
                 return Ok(info);
             }
@@ -927,9 +1069,22 @@ async fn provision_stage(
                     "lease_chain: stage {stage} create on offer {} failed (attempt {attempt}/{MAX_CREATE_ATTEMPTS}): {e}",
                     offer.id,
                 );
+                // Back off before drawing the next survivor. A 429 means the
+                // endpoint is throttling (threshold ~4.5 req/s) and needs a
+                // longer pause; a snatched offer (no_such_ask) just needs the
+                // next candidate.
+                let is_429 = e.contains("429") || e.contains("Too Many Requests");
                 last_err = Some(e);
-                // Try the next-best offer; the loop excludes the already-tried
-                // id via `tried_offer_ids`.
+                if attempt < MAX_CREATE_ATTEMPTS {
+                    let backoff = if is_429 {
+                        Duration::from_millis(2000 * attempt as u64)
+                    } else {
+                        Duration::from_millis(400)
+                    };
+                    tokio::time::sleep(backoff).await;
+                }
+                // Next iteration draws the next eligible survivor; the tried id
+                // is already excluded.
             }
         }
     }
@@ -937,64 +1092,6 @@ async fn provision_stage(
         "stage {stage} could not be created after {MAX_CREATE_ATTEMPTS} attempts: {}",
         last_err.unwrap_or_default(),
     ))
-}
-
-// ─── PROTOTYPE_PREFLIGHT_HF (spec §5.2) ──────────────────────────────
-//
-// Pre-deploy host-throughput probe scaffolding. Disabled by default —
-// when `PP_PREFLIGHT_HF` is unset or "0", host selection behaves as it
-// does today (spec §5.2 gate clause).
-//
-// When enabled:
-//   - Candidate chains are filtered so that no two slots share the
-//     same `host_id` (public-network-endpoint proxy, spec §5.2).
-//   - The active per-host ranged-GET throughput probe is a MAY per
-//     spec §5.2 and is currently a no-op stub: we expose the
-//     threshold + sample-size knobs so future re-implementation has
-//     a stable surface area, but the orchestrator does NOT issue
-//     speculative leases just to probe. A future implementation
-//     would brief-lease a candidate, ssh-curl the model URL with
-//     `--range 0-PP_PREFLIGHT_HF_SAMPLE_MB`, and reject if measured
-//     throughput < `PP_PREFLIGHT_HF_MIN_MBPS`.
-//
-// Removal criterion (spec §5.2): when a per-host quality data layer
-// exists outside this code path, delete this module, the
-// `used_host_ids` argument on `provision_stage`, the local set
-// threaded through `lease_chain`, and the `PP_PREFLIGHT_HF*` env
-// vars from any deploy docs.
-pub mod prototype_preflight_hf {
-    /// Spec §5.2 gate. True when `PP_PREFLIGHT_HF` is set to anything
-    /// other than empty, `0`, or `false` (case-insensitive).
-    pub fn enabled() -> bool {
-        match std::env::var("PP_PREFLIGHT_HF") {
-            Ok(v) => {
-                let v = v.trim();
-                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-            }
-            Err(_) => false,
-        }
-    }
-
-    /// Minimum acceptable measured throughput in MB/s. Hosts whose
-    /// measured throughput is below this MUST be rejected (spec §5.2).
-    /// Default 50 MB/s.
-    pub fn min_mbps() -> f64 {
-        std::env::var("PP_PREFLIGHT_HF_MIN_MBPS")
-            .ok()
-            .and_then(|s| s.trim().parse::<f64>().ok())
-            .filter(|v| *v > 0.0)
-            .unwrap_or(50.0)
-    }
-
-    /// Per-host probe sample size in MB. Spec §5.2 says "default
-    /// sample size on the order of tens of MB". Default 20 MB.
-    pub fn sample_mb() -> u64 {
-        std::env::var("PP_PREFLIGHT_HF_SAMPLE_MB")
-            .ok()
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .filter(|v| *v > 0)
-            .unwrap_or(20)
-    }
 }
 
 /// Rent `num_stages` vast.ai instances and wait for each to reach `running`.
@@ -1024,22 +1121,35 @@ pub async fn lease_chain(
     poll_interval: Duration,
     max_polls: u32,
     diag_env: Option<&DiagEnv>,
+    // Optional external-monitoring hook. When present, each contract is
+    // registered as it is created (so the vastai poller observes it through the
+    // image-pull window) and unregistered when destroyed during replacement.
+    // `None` leaves lease behavior identical to before.
+    tracker: Option<&crate::vastai_mon::ContractTracker>,
 ) -> Result<Vec<InstanceInfo>, String> {
+    // One query builds the whole ranked survivor pool up front, instead of a
+    // search per stage — fewer requests (less 429 pressure) and one consistent
+    // candidate set that both provisioning phases draw from. Both phases share
+    // the cursor state below so replacements never reuse an offer or a host.
+    let pool = select_offer_pool(client, base_url, api_key, gpu_name, num_stages)
+        .await
+        .map_err(|e| format!("lease_chain: {e}"))?;
+
     let mut tried_offer_ids: Vec<u64> = Vec::new();
     let mut created: Vec<InstanceInfo> = Vec::with_capacity(num_stages as usize);
-    // PROTOTYPE_PREFLIGHT_HF (spec §5.2): host ids in use by this
-    // chain. Only consulted when the gate is on; the set is owned
-    // here so it survives across both provisioning phases.
+    // Host ids leased by this chain, owned here so it survives across both
+    // provisioning phases. Distinct-host selection is unconditional.
     let mut used_host_ids: std::collections::HashSet<u64> =
         std::collections::HashSet::new();
 
-    // Phase 1 — provision every stage (find + create, with per-stage retry).
+    // Phase 1 — provision every stage (draw from the pool + create, with
+    // per-stage retry on a snatched/throttled create).
     for stage in 0..num_stages {
         match provision_stage(
             client,
             base_url,
             api_key,
-            gpu_name,
+            &pool,
             stage,
             num_stages,
             seed_addr,
@@ -1053,19 +1163,34 @@ pub async fn lease_chain(
         )
         .await
         {
-            Ok(info) => created.push(info),
+            Ok(info) => {
+                if let Some(t) = tracker {
+                    t.track(info.contract_id, Some(stage), label.map(str::to_string));
+                }
+                created.push(info);
+            }
             Err(e) => {
                 rollback(client, base_url, api_key, &created).await;
                 return Err(format!("lease_chain: {e}"));
             }
+        }
+        // Pace successive stages. Each provision is a search + a create; firing
+        // 2*num_stages requests in a tight burst trips the endpoint's ~4.5 req/s
+        // throttle even when no individual create fails. Sleeping between stages
+        // keeps the happy-path lease under the threshold. Tunable via
+        // PP_LEASE_PACE_MS (default 600ms); the last stage needn't wait.
+        if stage + 1 < num_stages {
+            tokio::time::sleep(lease_pace()).await;
         }
     }
 
     // Phase 2 — wait for each instance to reach `running`. A host that stops
     // after loading the image must not abort the lease: destroy it and
     // re-provision the SAME stage slot (same stage index + pinned identity)
-    // on a fresh offer, up to MAX_REPLACE_ATTEMPTS, before giving up.
-    const MAX_REPLACE_ATTEMPTS: u32 = 3;
+    // on a fresh offer, up to PP_MAX_REPLACE_ATTEMPTS, before giving up.
+    // PP_MAX_REPLACE_ATTEMPTS=0 disables replacement entirely (a failed stage
+    // fails the lease without churning on a slow host).
+    let max_replace_attempts = env_max_replace_attempts();
     for stage in 0..num_stages {
         let idx = stage as usize;
         let mut replaced: u32 = 0;
@@ -1085,8 +1210,11 @@ pub async fn lease_chain(
                             "lease_chain: WARNING could not destroy dead contract {cid}: {de}"
                         );
                     }
+                    if let Some(t) = tracker {
+                        t.untrack(cid);
+                    }
                     replaced += 1;
-                    if replaced > MAX_REPLACE_ATTEMPTS {
+                    if replaced > max_replace_attempts {
                         // Give up on this stage; roll back the survivors (cid is
                         // already destroyed, so exclude it).
                         let survivors: Vec<InstanceInfo> = created
@@ -1098,17 +1226,17 @@ pub async fn lease_chain(
                         rollback(client, base_url, api_key, &survivors).await;
                         return Err(format!(
                             "lease_chain: stage {stage} never reached running after \
-                             {MAX_REPLACE_ATTEMPTS} replacements; last error: {e}"
+                             {max_replace_attempts} replacement(s); last error: {e}"
                         ));
                     }
                     eprintln!(
-                        "lease_chain: replacing stage {stage} (replacement {replaced}/{MAX_REPLACE_ATTEMPTS})"
+                        "lease_chain: replacing stage {stage} (replacement {replaced}/{max_replace_attempts})"
                     );
                     match provision_stage(
                         client,
                         base_url,
                         api_key,
-                        gpu_name,
+                        &pool,
                         stage,
                         num_stages,
                         seed_addr,
@@ -1123,7 +1251,16 @@ pub async fn lease_chain(
                     .await
                     {
                         // Loop re-waits on the replacement instance.
-                        Ok(info) => created[idx] = info,
+                        Ok(info) => {
+                            if let Some(t) = tracker {
+                                t.track(
+                                    info.contract_id,
+                                    Some(stage),
+                                    label.map(str::to_string),
+                                );
+                            }
+                            created[idx] = info;
+                        }
                         Err(pe) => {
                             let survivors: Vec<InstanceInfo> = created
                                 .iter()
@@ -1143,4 +1280,124 @@ pub async fn lease_chain(
     }
 
     Ok(created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn offer(id: u64, gpu: &str, dph: f64, host: u64) -> Offer {
+        Offer {
+            id,
+            gpu_name: gpu.to_string(),
+            dph_total: dph,
+            gpu_ram: Some(24576.0),
+            geolocation: Some("US".to_string()),
+            inet_down_cost_per_tb: 0.0,
+            inet_up_cost_per_tb: 0.0,
+            host_id: Some(host),
+        }
+    }
+
+    #[test]
+    fn cheap_tail_dropped_per_model_then_ranked_by_price() {
+        // Model A has 5 offers → drop floor(0.3*5)=1 cheapest. Model B has 3 →
+        // drop floor(0.3*3)=0, so the tiny group survives intact.
+        let mut offers = Vec::new();
+        for (i, p) in [0.10, 0.11, 0.12, 0.13, 0.14].iter().enumerate() {
+            offers.push(offer(100 + i as u64, "A", *p, 100 + i as u64));
+        }
+        for (i, p) in [0.20, 0.21, 0.22].iter().enumerate() {
+            offers.push(offer(200 + i as u64, "B", *p, 200 + i as u64));
+        }
+        let pool = rank_survivors(offers, &CostModel::default(), 0.30);
+
+        let ids: Vec<u64> = pool.iter().map(|o| o.id).collect();
+        assert_eq!(pool.len(), 7, "5 A (drop 1) + 3 B (drop 0) survivors");
+        assert!(!ids.contains(&100), "the single cheapest A offer is dropped");
+        assert!(
+            ids.contains(&200),
+            "model B's cheapest survives — its group is too small to drop any",
+        );
+        let prices: Vec<f64> = pool.iter().map(|o| o.dph_total).collect();
+        assert!(
+            prices.windows(2).all(|w| w[0] <= w[1]),
+            "merged pool must be sorted ascending by price: {prices:?}",
+        );
+    }
+
+    #[test]
+    fn bandwidth_cost_reorders_a_cheap_per_hour_but_gouging_host_below_a_free_one() {
+        // X is cheaper per hour but charges $40/TB download; Y is pricier per
+        // hour but has free bandwidth. A 20GB image pull (=$0.80) flips the order.
+        let x = Offer {
+            inet_down_cost_per_tb: 40.0,
+            ..offer(1, "Z", 0.10, 1)
+        };
+        let y = offer(2, "Z", 0.12, 2);
+        let priced = CostModel {
+            image_gb: Some(20.0),
+        };
+
+        let with_bw = rank_survivors(vec![x.clone(), y.clone()], &priced, 0.0);
+        assert_eq!(
+            with_bw[0].id, 2,
+            "free-bandwidth Y ranks first once the pull is priced in",
+        );
+
+        let without_bw = rank_survivors(vec![x, y], &CostModel::default(), 0.0);
+        assert_eq!(
+            without_bw[0].id, 1,
+            "on $/hr alone the cheaper-per-hour X ranks first",
+        );
+    }
+
+    #[test]
+    fn distinct_host_draw_never_repeats_a_host_and_skips_cheaper_same_host_offers() {
+        // Pool ascending by price; offers 1 and 2 share host 10. Simulate the
+        // lease's draw loop: pick, mark id tried + host used, repeat.
+        let pool = vec![
+            offer(1, "A", 0.10, 10),
+            offer(2, "A", 0.11, 10),
+            offer(3, "A", 0.12, 20),
+            offer(4, "A", 0.13, 30),
+        ];
+        let mut tried: Vec<u64> = Vec::new();
+        let mut used: HashSet<u64> = HashSet::new();
+        let mut leased_hosts: Vec<u64> = Vec::new();
+        for _ in 0..3 {
+            let o = next_eligible_offer(&pool, &tried, &used).expect("three distinct hosts exist");
+            tried.push(o.id);
+            used.insert(o.host_id.unwrap());
+            leased_hosts.push(o.host_id.unwrap());
+        }
+        let mut distinct = leased_hosts.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            3,
+            "the three leased hosts must be distinct, got {leased_hosts:?}",
+        );
+        assert!(
+            !tried.contains(&2),
+            "the cheaper second offer on already-used host 10 must never be leased",
+        );
+    }
+
+    #[test]
+    fn distinct_host_draw_exhausts_when_every_remaining_offer_shares_a_used_host() {
+        // Both offers sit on host 10, so only one distinct host is leasable.
+        let pool = vec![offer(1, "A", 0.10, 10), offer(2, "A", 0.11, 10)];
+        let mut tried: Vec<u64> = Vec::new();
+        let mut used: HashSet<u64> = HashSet::new();
+        let first = next_eligible_offer(&pool, &tried, &used).expect("first draw succeeds");
+        tried.push(first.id);
+        used.insert(first.host_id.unwrap());
+        assert!(
+            next_eligible_offer(&pool, &tried, &used).is_none(),
+            "no second distinct host is available",
+        );
+    }
 }

@@ -56,7 +56,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-pub use handlers::router;
+pub use handlers::{ingest_router, router};
 pub use protocol::{ClockEcho, Hints, Manifest, ManifestNode, PostAck, RecordKind};
 pub use state::CollectorState;
 pub use udp_echo::{UdpEchoHandle, spawn_udp_echo};

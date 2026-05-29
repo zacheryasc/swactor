@@ -7,3 +7,4 @@
 !examples/pipeline-parallel-inference/target/release/pp-gpu-node
 !examples/pipeline-parallel-inference/target/release/pp-smoke-run
 !examples/pipeline-parallel-inference/pp_tinygrad_worker.py
+!examples/pipeline-parallel-inference/pp_entrypoint.sh
