@@ -1,8 +1,13 @@
 pub mod diag;
+pub mod dist_broadcast;
+pub mod dist_plugin;
 pub mod messages;
+pub mod netmap_plugin;
+pub mod profile;
 pub mod stage_actor;
 pub mod topology;
 pub mod iroh_transport;
 pub mod orchestrator;
 pub mod relay_config;
 pub mod vastai;
+pub mod vastai_mon;

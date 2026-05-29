@@ -20,11 +20,14 @@
 
 services:
   collector:
-    image: ${PP_DIAG_IMAGE:-pp-diag:latest}
+    image: ${PP_DIAG_IMAGE:-swactor-pp-gpu:latest}
     container_name: ${PP_DIAG_COLLECTOR_NAME:-pp-diag-collector}
     network_mode: host
+    # Override the image's default entrypoint (pp_entrypoint.sh, which runs
+    # pp-gpu-node) so this container runs the collector instead. The
+    # diagnostics binaries ship in the same unified code image.
+    entrypoint: /usr/local/bin/swactor-diag-collector
     command:
-      - swactor-diag-collector
       - --bind
       - 127.0.0.1:9080
       - --root

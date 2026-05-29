@@ -12,6 +12,9 @@ pub mod topology;
 #[cfg(feature = "tui")]
 pub mod tui;
 
+#[cfg(feature = "live-collector")]
+pub mod live_collector;
+
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -111,6 +114,12 @@ pub struct DashboardHandle {
     port: u16,
     plugin_registry: Arc<PluginRegistry>,
     standalone_rt: Mutex<Option<tokio::runtime::Runtime>>,
+    /// Optional override for the `/` landing page (used by the live collector to
+    /// serve the unified fleet board instead of the runtime-less actor dashboard).
+    landing_html: Mutex<Option<Arc<str>>>,
+    /// Optional extra axum router merged into the live server — disjoint routes
+    /// such as the diagnostics collector's `/diag/*` ingest endpoints.
+    extra_router: Mutex<Option<axum::Router>>,
 }
 
 impl DashboardHandle {
@@ -142,6 +151,20 @@ impl DashboardHandle {
         self.plugin_registry.register(plugin);
     }
 
+    /// Override the `/` landing page with custom HTML. Used when the dashboard
+    /// runs without a swactor runtime (e.g. the live collector) so `/` shows the
+    /// unified fleet board rather than the empty actor dashboard.
+    pub fn set_landing_html(&self, html: impl Into<Arc<str>>) {
+        *self.landing_html.lock().unwrap() = Some(html.into());
+    }
+
+    /// Merge an extra axum router into the live HTTP server. The routes must be
+    /// disjoint from the dashboard's own (the collector's `/diag/*` are). Must be
+    /// called before `start_http`/`start_http_standalone`.
+    pub fn set_extra_router(&self, router: axum::Router) {
+        *self.extra_router.lock().unwrap() = Some(router);
+    }
+
     /// Access the time-series history store (for TUI sparklines, etc.).
     pub fn history(&self) -> &Arc<DashboardHistory> {
         &self.history
@@ -157,9 +180,10 @@ impl DashboardHandle {
     /// Use this when a tokio runtime already exists (e.g. IrohDriver's runtime).
     pub fn start_http(&self, handle: tokio::runtime::Handle) {
         let state = self.build_app_state();
+        let extra = self.extra_router.lock().unwrap().take();
         let port = self.port;
         handle.spawn(async move {
-            server::run_server(state, port).await;
+            server::run_server(state, port, extra).await;
         });
     }
 
@@ -186,6 +210,7 @@ impl DashboardHandle {
             history: Arc::clone(&self.history),
             cmd_router: Arc::new(crate::command::CommandRouter::with_builtins()),
             plugins: Arc::clone(&self.plugin_registry),
+            landing: self.landing_html.lock().unwrap().clone(),
         }
     }
 
@@ -275,6 +300,8 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         port,
         plugin_registry,
         standalone_rt: Mutex::new(None),
+        landing_html: Mutex::new(None),
+        extra_router: Mutex::new(None),
     }
 }
 

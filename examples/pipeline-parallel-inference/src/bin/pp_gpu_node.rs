@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -44,6 +45,9 @@ use iroh::{PublicKey, RelayMode, SecretKey};
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Runtime, RuntimeConfig};
 use swactor::transport::{CodecRegistry, TransportRouter};
+
+use dashboard::collector::StatsCollector;
+use dashboard::{start_dashboard, DashboardConfig};
 
 use distribution::diagnostics::Role as DiagRole;
 
@@ -99,9 +103,9 @@ fn require_u32(name: &str) -> u32 {
     })
 }
 
-/// A held cluster's stages must keep a STABLE node id across a redeploy
-/// bounce, or the pipeline name registry (pp-entry / pp-stage-N) keeps
-/// routing to the dead pre-bounce id and the response never returns.
+/// A held cluster's stages must keep a STABLE node id across a restart,
+/// or the pipeline name registry (pp-entry / pp-stage-N) keeps routing
+/// to the dead pre-restart id and the response never returns.
 /// `PP_STAGE_SECRET` (64 hex = 32 bytes) pins this stage's keypair; it is
 /// injected at instance-create time, so it is re-read from PID 1's env on
 /// every restart and the stage id is unchanged. Unset → random identity
@@ -135,11 +139,17 @@ fn node_config() -> DistributedNodeConfig {
             probe_interval: 10,
             indirect_probes: 2,
             dead_reprobe_interval: 100,
-            // probe_timeout / suspicion_timeout inherit the calibrated
-            // SwimConfig::default() (750 / 2250 ticks = 15 s / 45 s; see
-            // crates/simulation/SWIM_RETUNE_REPORT.md). Do NOT re-pin them:
-            // the old 15 / 60 pin = 300 ms probe budget on a 200-405 ms
-            // relay path, the 1779733878 flap cause.
+            // Raised above the calibrated SwimConfig::default() (750 / 2250
+            // ticks = 15 s / 45 s; see crates/simulation/SWIM_RETUNE_REPORT.md)
+            // because relay-mediated iroh paths were declaring peers Dead too
+            // eagerly. Doubled to give each probe phase more relay-recovery
+            // slack while preserving the calibrated 1:3 probe:suspicion ratio.
+            // Effective time-to-Dead = 2*probe_timeout + suspicion_timeout
+            // = 1500 + 1500 + 4500 = 7500 ticks ~= 150 s at the 20 ms tick.
+            // Do NOT shrink toward the old 15 / 60 pin (300 ms probe budget on
+            // a 200-405 ms relay path) — that was the 1779733878 flap cause.
+            probe_timeout: 1500,
+            suspicion_timeout: 4500,
             ..SwimConfig::default()
         },
         cache_capacity: 100,
@@ -248,6 +258,8 @@ fn build_route(
         driver.endpoint().clone(),
         addr,
         driver.tokio_handle(),
+        node_id,
+        Some(driver.diagnostics().clone()),
     )))
 }
 
@@ -307,6 +319,44 @@ fn install_parent_death_signal() {
 #[cfg(not(target_os = "linux"))]
 fn install_parent_death_signal() {}
 
+/// Set by the `SIGHUP` handler; polled by the pump loops to drive an
+/// in-place worker hot-reload (re-exec the on-disk worker script). An
+/// operator pushes a new `pp_tinygrad_worker.py` over the running one and
+/// `kill -HUP $(pidof pp-gpu-node)` to pick it up without re-leasing.
+static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+extern "C" fn handle_sighup(_sig: libc::c_int) {
+    // Async-signal-safe: the only work done here is a single atomic store.
+    RELOAD_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Install the `SIGHUP` handler that requests a worker reload. Mirrors
+/// `install_parent_death_signal`'s Linux-only pattern; the handler itself
+/// only touches an atomic, so it is safe to run in signal context.
+#[cfg(target_os = "linux")]
+fn install_sighup_handler() {
+    // SAFETY: registering a handler that performs only an async-signal-safe
+    // atomic store. `signal()` keeps the handler installed across deliveries
+    // under glibc (BSD semantics).
+    unsafe {
+        libc::signal(libc::SIGHUP, handle_sighup as *const () as libc::sighandler_t);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn install_sighup_handler() {}
+
+/// If a `SIGHUP` reload was requested, clear the flag and ask the stage
+/// actor to swap in a fresh worker. Shared by the startup hold and the main
+/// pump so both honour reloads with the same latency.
+fn drain_reload_request(rt: &Runtime, stage_actor_addr: ActorAddress) {
+    if RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
+        eprintln!("pp-gpu-node: SIGHUP — reloading worker");
+        let _ = rt.send_to(stage_actor_addr, StageMsg::ReloadWorker);
+    }
+}
+
 /// Honour the test-only `PP_BOOT_DELAY_STAGE` / `PP_BOOT_DELAY_SECS` pair:
 /// if our own stage matches, sleep before doing anything else. Used by the
 /// §13.3 boot-order tests to simulate a slow-starting node without needing
@@ -322,133 +372,8 @@ fn maybe_simulate_boot_delay(stage: u32) {
     }
 }
 
-// ─── PROTOTYPE_BINARY_SWAP (spec §5.1) ────────────────────────────────
-//
-// Out-of-band binary swap scaffolding. Disabled by default — a freshly
-// pulled image with no `PP_BINARY_SWAP_*` env vars boots using the
-// binary it shipped with (spec §5.1: "The worker's normal boot path
-// MUST NOT consult this URL"). When both env vars are set, the worker
-// fetches the URL, verifies the SHA-256 digest, atomically renames the
-// new binary over the running binary, and exits so the container's
-// restart policy spawns the new binary.
-//
-// All wiring tagged `PROTOTYPE_BINARY_SWAP` for spec §5.3
-// grep-discoverability. Removal criterion: when image build/push is no
-// longer a binding constraint on iteration speed, delete:
-//   - this function and its call site in `main()`
-//   - the `sha2` dep added to Cargo.toml under the same comment
-//   - the `PP_BINARY_SWAP_*` env vars from any deploy docs
-
-fn prototype_binary_swap_maybe_apply() {
-    let url = match std::env::var("PP_BINARY_SWAP_URL") {
-        Ok(u) if !u.trim().is_empty() => u.trim().to_string(),
-        _ => return, // PROTOTYPE_BINARY_SWAP: gate off — normal boot.
-    };
-    let expected_digest = match std::env::var("PP_BINARY_SWAP_SHA256") {
-        Ok(d) if !d.trim().is_empty() => d.trim().to_lowercase(),
-        _ => {
-            eprintln!(
-                "pp-gpu-node: PROTOTYPE_BINARY_SWAP — PP_BINARY_SWAP_URL is set \
-                 but PP_BINARY_SWAP_SHA256 is missing; refusing to swap (spec §5.1 \
-                 requires both URL and digest)"
-            );
-            std::process::exit(2);
-        }
-    };
-    let our_path = std::env::current_exe()
-        .expect("PROTOTYPE_BINARY_SWAP: current_exe failed");
-    let mut new_os = our_path.clone().into_os_string();
-    new_os.push(".new");
-    let new_path = std::path::PathBuf::from(new_os);
-
-    eprintln!(
-        "pp-gpu-node: PROTOTYPE_BINARY_SWAP fetching {url} → {}",
-        new_path.display()
-    );
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("PROTOTYPE_BINARY_SWAP: tokio runtime");
-    let bytes = rt
-        .block_on(async {
-            let resp = reqwest::get(&url)
-                .await
-                .map_err(|e| format!("HTTP GET failed: {e}"))?;
-            if !resp.status().is_success() {
-                return Err(format!("HTTP {}", resp.status()));
-            }
-            resp.bytes().await.map_err(|e| format!("read body: {e}"))
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("pp-gpu-node: PROTOTYPE_BINARY_SWAP fetch failed: {e}");
-            std::process::exit(1);
-        });
-
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let actual_digest = format!("{:x}", hasher.finalize());
-    if actual_digest != expected_digest {
-        eprintln!(
-            "pp-gpu-node: PROTOTYPE_BINARY_SWAP digest mismatch: expected {expected_digest}, \
-             got {actual_digest} — refusing to install"
-        );
-        std::process::exit(1);
-    }
-
-    if let Err(e) = std::fs::write(&new_path, &bytes) {
-        eprintln!(
-            "pp-gpu-node: PROTOTYPE_BINARY_SWAP write {} failed: {e}",
-            new_path.display()
-        );
-        std::process::exit(1);
-    }
-    // Mark the staged binary executable (the URL host may serve it as
-    // a plain file with no +x bit).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(
-            &new_path,
-            std::fs::Permissions::from_mode(0o755),
-        ) {
-            eprintln!(
-                "pp-gpu-node: PROTOTYPE_BINARY_SWAP chmod {} failed: {e}",
-                new_path.display()
-            );
-            std::process::exit(1);
-        }
-    }
-    // Spec §5.1: "Atomically rename the new binary over the running
-    // binary." Linux rename() is atomic when both paths are on the
-    // same filesystem; renaming over a memory-mapped ELF unlinks the
-    // old inode but lets the running process continue (we exit
-    // immediately below, so this is harmless).
-    if let Err(e) = std::fs::rename(&new_path, &our_path) {
-        eprintln!(
-            "pp-gpu-node: PROTOTYPE_BINARY_SWAP rename {} → {} failed: {e}",
-            new_path.display(),
-            our_path.display()
-        );
-        std::process::exit(1);
-    }
-    eprintln!(
-        "pp-gpu-node: PROTOTYPE_BINARY_SWAP installed {} bytes; exiting for container restart",
-        bytes.len()
-    );
-    // Exit 0; the container's restart policy (typically `restart:
-    // always`) re-execs the new binary.
-    std::process::exit(0);
-}
-
 fn main() {
-    // PROTOTYPE_BINARY_SWAP (spec §5.1): inert when env vars unset.
-    // Run before any other boot work so the spec's "normal boot path
-    // MUST NOT consult this URL" holds — we either apply the swap and
-    // exit, or return immediately and let normal boot proceed.
-    prototype_binary_swap_maybe_apply();
-
+    pipeline_parallel_inference::profile::load_profile();
     let stage = require_u32("STAGE");
     let num_stages = require_u32("NUM_STAGES");
     if num_stages < 2 || stage >= num_stages {
@@ -459,6 +384,7 @@ fn main() {
         std::process::exit(2);
     }
     install_parent_death_signal();
+    install_sighup_handler();
     maybe_simulate_boot_delay(stage);
     let role = StageRole::for_stage(stage, num_stages);
 
@@ -502,11 +428,23 @@ fn main() {
         .as_ref()
         .map(|d| d.subprocess_introspect().clone());
 
+    // Independent vastai monitoring layer (in-VM view): an OS/GPU metrics sampler
+    // plus live stdout/stderr log streaming, shipped to the collector under this
+    // container's synthetic node id. Spawned on the driver's tokio runtime and
+    // leaked like `_diag` — a stage runs until its parent kills it, and the
+    // background tasks keep streaming until then. Independent of swactor diag.
+    let _vastai_in_vm = {
+        let handle = driver.tokio_handle();
+        let _guard = handle.enter();
+        pipeline_parallel_inference::vastai_mon::install_in_vm_from_env()
+    };
+    let vastai_forwarder = _vastai_in_vm.as_ref().map(|m| m.forwarder());
+
     // Stamp the bundle the moment this process announces itself, so a
     // bundle reader can tell two pp-gpu-node incarnations of the same
-    // stage apart: a --redeploy bounce pkills the old process and
-    // setsid's a new one under the same PID-1 env, which means the same
-    // run_id + node_id, but the pid differs. The event carries that
+    // stage apart: a manual binary swap (the operator runbook) pkills the
+    // old process and setsid's a new one under the same PID-1 env, which
+    // means the same run_id + node_id, but the pid differs. The event carries that
     // pid + wall clock as the slice point. No-op without diagnostics.
     driver.emit(distribution::diagnostics::event::Event::Custom {
         kind: "pp_stage_bounce".into(),
@@ -626,8 +564,8 @@ fn main() {
     // every stage's only join target is the seed (the orchestrator), so a
     // stage can only converge once the orchestrator is ticking SWIM and acking
     // its pings. But the orchestrator is blocked in synchronous work for
-    // minutes at a time — the vast.ai lease (HTTP polling in lease_chain) and
-    // the redeploy scp/bounce loop — and never acks during those windows.
+    // minutes at a time — the vast.ai lease (HTTP polling in lease_chain) —
+    // and never acks during those windows.
     // Stages that booted early would hit 120s with no alive peer and exit(1)
     // before the orchestrator ever became responsive (resolve loop), leaving
     // "running" containers with dead processes. The window a stage must outlast
@@ -652,46 +590,99 @@ fn main() {
     rt.set_codec_registry(codecs.clone());
     rt.set_transport_router(router.clone());
 
+    // Optional per-stage live dashboard. When PP_STAGE_DASHBOARD is set, each
+    // stage serves the swactor dashboard on PP_STAGE_DASHBOARD_PORT_BASE +
+    // STAGE (default base 9100, so stage 0 → 9100, stage 1 → 9101, …). The
+    // stats hook must be installed before `rt` is shared into an Arc. Stages
+    // run with `--network host`, so these ports are reachable on the host.
+    let stage_dash = if std::env::var_os("PP_STAGE_DASHBOARD").is_some() {
+        let base: u16 = std::env::var("PP_STAGE_DASHBOARD_PORT_BASE")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(9100);
+        let port = base + stage as u16;
+        let collector = StatsCollector::new(RuntimeConfig::default().num_threads);
+        rt.set_stats_hook(collector.clone());
+        let handle = start_dashboard(DashboardConfig { port, ..Default::default() });
+        Some((handle, collector, port))
+    } else {
+        None
+    };
+
     let sender = rt.create_sender();
     let status_inbox = rt.new_inbox::<StageActorStatus>().unwrap();
 
+    let rt = Arc::new(rt);
+
+    if let Some((handle, collector, port)) = &stage_dash {
+        handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
+        handle.start_http(driver.tokio_handle());
+        eprintln!("pp-gpu-node: stage {stage} dashboard on http://localhost:{port}");
+    }
+
     run_stage(
         driver, rt, codecs, router, sender, status_inbox, role, stage, num_stages,
-        max_tokens, subprocess_introspect,
+        max_tokens, subprocess_introspect, vastai_forwarder,
     );
+    // Keep the dashboard handle alive for the whole stage lifetime.
+    drop(stage_dash);
 }
 
-fn wait_for_worker_ready(
+/// Pump the runtime + driver until the worker reports ready, honouring
+/// `SIGHUP`-driven reloads throughout.
+///
+/// Unlike a timeout-and-exit, this never gives up: if the worker crashes or
+/// stalls on startup, the node stays in SWIM (and sshd stays reachable) so an
+/// operator can push a fixed `pp_tinygrad_worker.py` and `kill -HUP` to
+/// reload in place, recovering the stage without a re-lease. `warn_after`
+/// only governs how often the still-waiting line is logged. Returns once a
+/// worker (original or reloaded) is ready.
+fn hold_until_worker_ready(
     rt: &Runtime,
     driver: &mut IrohDriver,
     status_inbox: &swactor::runtime::Inbox<StageActorStatus>,
-    timeout: Duration,
-) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
+    stage_actor_addr: ActorAddress,
+    stage: u32,
+    warn_after: Duration,
+) {
+    let mut last_warn = Instant::now();
+    loop {
         rt.tick();
         driver.recv();
         driver.tick();
+        drain_reload_request(rt, stage_actor_addr);
+
         if let Some(status) = status_inbox.try_recv() {
             match status {
                 StageActorStatus::WorkerReady { pid } => {
                     eprintln!("pp-gpu-node: worker ready (pid: {pid:?})");
-                    return true;
+                    return;
                 }
                 StageActorStatus::ProcessStarted => {
                     eprintln!("pp-gpu-node: worker process started");
                 }
                 StageActorStatus::ProcessExited { status } => {
                     eprintln!(
-                        "pp-gpu-node: worker exited during startup: {status:?}"
+                        "pp-gpu-node: stage-{stage} worker exited during startup: \
+                         {status:?}; holding (SWIM alive) — push a fixed worker.py \
+                         and `kill -HUP $(pidof pp-gpu-node)` to reload"
                     );
-                    return false;
+                    last_warn = Instant::now();
                 }
             }
         }
+
+        if last_warn.elapsed() >= warn_after {
+            eprintln!(
+                "pp-gpu-node: stage-{stage} worker still not ready after {}s; \
+                 holding — SIGHUP to reload the worker script",
+                warn_after.as_secs()
+            );
+            last_warn = Instant::now();
+        }
+
         std::thread::sleep(Duration::from_millis(50));
     }
-    false
 }
 
 fn pump(
@@ -717,7 +708,7 @@ fn pump(
 #[allow(clippy::too_many_arguments)]
 fn run_stage(
     mut driver: IrohDriver,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     codecs: Arc<CodecRegistry>,
     router: Arc<TransportRouter>,
     sender: swactor::runtime::ExternalSender,
@@ -727,6 +718,7 @@ fn run_stage(
     num_stages: u32,
     max_tokens: u32,
     subprocess_introspect: Option<Arc<distribution::diagnostics::subprocess_introspect::SubprocessIntrospect>>,
+    log_forwarder: Option<distribution::diagnostics::vastai::LogForwarder>,
 ) {
     // Construct the role-appropriate actor with placeholder routing
     // addresses. SetNeighbors overwrites them once SWIM resolution
@@ -740,6 +732,9 @@ fn run_stage(
     let attach_subprocess = |mut a: StageActor| {
         if let Some(intro) = subprocess_introspect.as_ref() {
             a = a.with_subprocess_introspect(intro.clone());
+        }
+        if let Some(fwd) = log_forwarder.as_ref() {
+            a = a.with_log_forwarder(fwd.clone());
         }
         a
     };
@@ -855,23 +850,17 @@ fn run_stage(
     // it tunable via PP_WORKER_READY_TIMEOUT_SECS; a generous ceiling only
     // costs wall-clock when a worker is genuinely wedged (which the
     // ProcessExited branch below already short-circuits).
-    if !wait_for_worker_ready(
+    // Worker readiness is non-fatal: hold here (keeping SWIM + sshd alive)
+    // until a worker — the original or one swapped in via SIGHUP — reports
+    // ready, then proceed to neighbour registration and wiring below.
+    hold_until_worker_ready(
         &rt,
         &mut driver,
         &status_inbox,
+        stage_actor_addr,
+        stage,
         Duration::from_secs(worker_ready_secs),
-    ) {
-        eprintln!("pp-gpu-node: stage-{stage} worker did not become ready");
-        // The StageActor already emitted Custom("worker_exited") in
-        // response to ProcessNotification::Exited. Give the HTTP-sink
-        // drainer enough time to flush it before we tear the process
-        // down — the bundle is otherwise the only place this signal
-        // lands, and on vast.ai the container is destroyed immediately
-        // after exit so stderr is unreachable. The sink's default
-        // batch interval is 1s, so we wait two batches' worth.
-        std::thread::sleep(Duration::from_millis(2_500));
-        std::process::exit(1);
-    }
+    );
 
     // Now that this worker is ready, publish our per-index name. Spec
     // §4.6: the orchestrator uses each `pp-stage-{K}`'s availability as
@@ -962,7 +951,7 @@ fn run_stage(
     }
 
     // Let SetNeighbors land before publishing entry / exit names.
-    let msg_pump = ActorMessagePump::new();
+    let msg_pump = ActorMessagePump::new(Some(diag_emitter.clone()));
     pump(&mut driver, &rt, &codecs, &msg_pump, Duration::from_millis(100));
 
     // Register pp-entry on First (the orchestrator can finally submit
@@ -977,16 +966,17 @@ fn run_stage(
         StageRole::Middle => {}
     }
 
-    main_pump(driver, rt, codecs, router, status_inbox, msg_pump);
+    main_pump(driver, rt, codecs, router, status_inbox, msg_pump, stage_actor_addr);
 }
 
 fn main_pump(
     mut driver: IrohDriver,
-    rt: Runtime,
+    rt: Arc<Runtime>,
     codecs: Arc<CodecRegistry>,
     _router: Arc<TransportRouter>,
     status_inbox: swactor::runtime::Inbox<StageActorStatus>,
     msg_pump: ActorMessagePump,
+    stage_actor_addr: ActorAddress,
 ) {
     eprintln!("pp-gpu-node: entering main pump loop");
     loop {
@@ -994,6 +984,7 @@ fn main_pump(
         driver.tick();
         msg_pump.pump(&driver, &codecs, &rt);
         rt.tick();
+        drain_reload_request(&rt, stage_actor_addr);
 
         if let Some(status) = status_inbox.try_recv() {
             match status {

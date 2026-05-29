@@ -79,12 +79,24 @@ if [ "${#missing[@]}" -gt 0 ]; then
 fi
 echo "assert-bundle: orchestrator + $EXPECTED_STAGES stages all present"
 
-# (2) Each node has at least one snapshot. The collector bundle layout
-# (see `collector::bundle::assemble`) groups records into per-kind
+# (2) Each ACTOR node has at least one snapshot. The collector bundle
+# layout (see `collector::bundle::assemble`) groups records into per-kind
 # subdirs under each node label: `<label>/snapshots/snapshot-*.json`,
-# `<label>/events/events-*.json`. Use `-path` so the check survives
-# future renames if anyone reshapes the layout deeper.
-for d in "${node_dirs[@]}"; do
+# `<label>/events/events-*.json`.
+#
+# The invariant is scoped to the orchestrator + stage actors that check
+# (1) requires — not to every directory in the bundle. Telemetry-only
+# nodes legitimately carry no snapshots: the vast.ai host sampler ships
+# `vastai/` sample+log records under its own `vastai-stage-N` label, and
+# those are host metrics, not actor-system state, so a snapshot is never
+# produced for them. Looping over the known actor set keeps the check
+# strict for the nodes that must have snapshots while tolerating these
+# sidecar streams.
+actor_nodes=(orchestrator)
+for ((i = 0; i < EXPECTED_STAGES; i++)); do
+    actor_nodes+=("stage-$i")
+done
+for d in "${actor_nodes[@]}"; do
     snap_count=$(find "$RUN_DIR/$d" -type f -name 'snapshot-*.json' | wc -l)
     if [ "$snap_count" -lt 1 ]; then
         echo "assert-bundle: $d has zero snapshots" >&2
@@ -94,7 +106,7 @@ for d in "${node_dirs[@]}"; do
         exit 1
     fi
 done
-echo "assert-bundle: every node has at least one snapshot"
+echo "assert-bundle: every actor node (orchestrator + $EXPECTED_STAGES stages) has at least one snapshot"
 
 # (3) Events span all three tiers. The collector persists batched events
 # as `events-*.json`; each file is a JSON array of EventRecords whose

@@ -608,28 +608,55 @@ async fn collect_peer_states(
     out
 }
 
-fn remote_info_to_wire(hex: String, info: iroh::endpoint::RemoteInfo) -> Tier2Peer {
-    let mut direct = Vec::new();
-    let mut relays = Vec::new();
+/// Derive the live iroh [`ConnType`] from a [`RemoteInfo`](iroh::endpoint::RemoteInfo)
+/// by inspecting which transport addresses iroh currently reports as `"active"`.
+///
+/// `Mixed` when both an IP and a relay address are active, `Direct`/`Relay` when
+/// only one kind is, and `None` when the peer is known but no address is in active
+/// use. Callers that need to distinguish "no info at all" should handle the
+/// `Option<RemoteInfo>` from `endpoint.remote_info(..)` before calling this.
+pub fn conn_type_of(info: &iroh::endpoint::RemoteInfo) -> ConnType {
     let mut active_direct = false;
     let mut active_relay = false;
     for addr_info in info.addrs() {
-        let usage = format!("{:?}", addr_info.usage()).to_lowercase();
-        let is_active = usage == "active";
+        let is_active = format!("{:?}", addr_info.usage()).to_lowercase() == "active";
         match addr_info.addr() {
-            iroh::TransportAddr::Ip(sa) => {
+            iroh::TransportAddr::Ip(_) => {
                 if is_active {
                     active_direct = true;
                 }
+            }
+            iroh::TransportAddr::Relay(_) => {
+                if is_active {
+                    active_relay = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    match (active_direct, active_relay) {
+        (true, true) => ConnType::Mixed,
+        (true, false) => ConnType::Direct,
+        (false, true) => ConnType::Relay,
+        // We've heard of the peer but no addr is in active use.
+        (false, false) => ConnType::None,
+    }
+}
+
+fn remote_info_to_wire(hex: String, info: iroh::endpoint::RemoteInfo) -> Tier2Peer {
+    let conn_type = Some(conn_type_of(&info));
+    let mut direct = Vec::new();
+    let mut relays = Vec::new();
+    for addr_info in info.addrs() {
+        let usage = format!("{:?}", addr_info.usage()).to_lowercase();
+        match addr_info.addr() {
+            iroh::TransportAddr::Ip(sa) => {
                 direct.push(TransportAddrWire {
                     addr: sa.to_string(),
                     usage: usage.clone(),
                 });
             }
             iroh::TransportAddr::Relay(url) => {
-                if is_active {
-                    active_relay = true;
-                }
                 relays.push(TransportAddrWire {
                     addr: url.to_string(),
                     usage: usage.clone(),
@@ -638,15 +665,6 @@ fn remote_info_to_wire(hex: String, info: iroh::endpoint::RemoteInfo) -> Tier2Pe
             _ => {}
         }
     }
-    let conn_type = match (active_direct, active_relay) {
-        (true, true) => Some(ConnType::Mixed),
-        (true, false) => Some(ConnType::Direct),
-        (false, true) => Some(ConnType::Relay),
-        (false, false) => {
-            // We've heard of the peer but no addr is in active use.
-            Some(ConnType::None)
-        }
-    };
     let conn_type_source = conn_type.map(|_| "derived".to_string());
     Tier2Peer {
         peer_node_id_hex: hex,

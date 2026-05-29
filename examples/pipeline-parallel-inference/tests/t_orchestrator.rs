@@ -277,7 +277,8 @@ const IMAGE: &str = "swactor-pp-gpu:latest";
 const API_KEY: &str = "lease-test-key";
 
 /// Build a JSON `offers` body with `count` synthetic offers, each cheaper
-/// than the next so the find-offer client's price-sort is deterministic.
+/// than the next (and on its own host) so the lease's price-sort and
+/// distinct-host pick are deterministic.
 fn offers_json(count: u32) -> serde_json::Value {
     let offers: Vec<_> = (0..count)
         .map(|i| {
@@ -286,15 +287,16 @@ fn offers_json(count: u32) -> serde_json::Value {
                 "gpu_name": "RTX 4090",
                 "dph_total": 0.10 + (i as f64) * 0.01,
                 "geolocation": "US",
+                "host_id": 1000 + i,
             })
         })
         .collect();
     serde_json::json!({ "offers": offers })
 }
 
-/// Mount the `/api/v0/bundles/?q=...` GET so every find_offer call gets
-/// the same fixed candidate list. The lease chain's client-side filter
-/// is what enforces distinctness via `exclude_ids`.
+/// Mount the `/api/v0/bundles/?q=...` GET so the lease's single
+/// `select_offer_pool` query gets the same fixed candidate list. The lease
+/// then picks the cheapest survivors on distinct hosts.
 async fn mount_offers(server: &MockServer, count: u32) {
     Mock::given(method("GET"))
         .and(path_regex(r"^/api/v0/bundles/"))
@@ -304,7 +306,9 @@ async fn mount_offers(server: &MockServer, count: u32) {
 }
 
 /// Mount per-offer create endpoints that succeed and return distinct
-/// contract ids `(1000 + offer_id_offset, …)`.
+/// contract ids `(9000 + offer_id_offset, …)`, expecting exactly one create
+/// per offer. Use for tests where the catalog size equals the stage count, so
+/// every offer is leased.
 async fn mount_creates_ok(server: &MockServer, num_stages: u32) {
     for i in 0..num_stages {
         let offer_id = 1000 + i;
@@ -318,6 +322,48 @@ async fn mount_creates_ok(server: &MockServer, num_stages: u32) {
                 })),
             )
             .expect(1)
+            .mount(server)
+            .await;
+    }
+}
+
+/// Mount creates for the whole `catalog` (offers 1000..1000+catalog → contracts
+/// 9000+i), without a per-offer call-count expectation: only the leased
+/// survivors are actually created, and which ones is up to the selection policy
+/// (cheapest survivor on an unused host after the per-model cheap-drop).
+async fn mount_creates_for_catalog(server: &MockServer, catalog: u32) {
+    for i in 0..catalog {
+        let offer_id = 1000 + i;
+        let contract_id = 9000 + i;
+        Mock::given(method("PUT"))
+            .and(path_regex(format!("^/api/v0/asks/{offer_id}/$").as_str()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "new_contract": contract_id,
+                })),
+            )
+            .mount(server)
+            .await;
+    }
+}
+
+/// Mount `running` status for every catalog contract (9000..9000+catalog),
+/// without a call-count expectation (only leased contracts are polled).
+async fn mount_status_running_for_catalog(server: &MockServer, catalog: u32) {
+    for i in 0..catalog {
+        let id = 9000 + i;
+        Mock::given(method("GET"))
+            .and(path_regex(format!("^/api/v0/instances/{id}/$").as_str()))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "instances": {
+                        "actual_status": "running",
+                        "intended_status": "running",
+                        "public_ipaddr": "203.0.113.10",
+                        "ssh_port": 22,
+                    }
+                })),
+            )
             .mount(server)
             .await;
     }
@@ -350,8 +396,8 @@ async fn mount_status_running(server: &MockServer, contract_ids: &[u64]) {
 async fn lease_chain_finds_n_distinct_offers() {
     let server = MockServer::start().await;
     mount_offers(&server, 6).await;
-    mount_creates_ok(&server, 4).await;
-    mount_status_running(&server, &[9000, 9001, 9002, 9003]).await;
+    mount_creates_for_catalog(&server, 6).await;
+    mount_status_running_for_catalog(&server, 6).await;
 
     let client = Client::new();
     let infos = vastai::lease_chain(
@@ -368,14 +414,14 @@ async fn lease_chain_finds_n_distinct_offers() {
         Duration::from_millis(10),
         3,
         None,
+        None,
     )
     .await
     .expect("lease_chain must succeed when N distinct offers exist");
 
     // Contract: N pairwise-distinct instances, each drawn from the catalog.
-    // Which offer a given stage lands on is an implementation detail
-    // (find_offer takes the median-priced candidate, and a create that misses
-    // an unmounted offer falls back to another), so we assert distinctness +
+    // Which offer a given stage lands on is policy (cheapest survivor on an
+    // unused host after the per-model cheap-drop), so we assert distinctness +
     // membership rather than a fixed id order.
     let ids: Vec<u64> = infos.iter().map(|i| i.contract_id).collect();
     assert_eq!(ids.len(), 4, "must lease N=4 instances");
@@ -384,7 +430,7 @@ async fn lease_chain_finds_n_distinct_offers() {
     unique.dedup();
     assert_eq!(unique.len(), 4, "the 4 leased contracts must be distinct");
     assert!(
-        ids.iter().all(|c| (9000..=9003).contains(c)),
+        ids.iter().all(|c| (9000..9006).contains(c)),
         "every leased contract must come from the mounted catalog, got {ids:?}",
     );
 }
@@ -413,6 +459,7 @@ async fn lease_chain_creates_n_instances_with_distinct_stage_env() {
         None,
         Duration::from_millis(10),
         3,
+        None,
         None,
     )
     .await
@@ -502,6 +549,7 @@ async fn lease_chain_rolls_back_on_partial_creation() {
         Duration::from_millis(10),
         3,
         None,
+        None,
     )
     .await;
 
@@ -513,11 +561,11 @@ async fn lease_chain_rolls_back_on_partial_creation() {
 async fn lease_chain_waits_for_running_per_contract() {
     let server = MockServer::start().await;
     mount_offers(&server, 4).await;
-    mount_creates_ok(&server, 3).await;
-    mount_status_running(&server, &[9000, 9001, 9002]).await;
+    mount_creates_for_catalog(&server, 4).await;
+    mount_status_running_for_catalog(&server, 4).await;
 
     let client = Client::new();
-    vastai::lease_chain(
+    let infos = vastai::lease_chain(
         &client,
         &server.uri(),
         API_KEY,
@@ -531,29 +579,27 @@ async fn lease_chain_waits_for_running_per_contract() {
         Duration::from_millis(10),
         3,
         None,
+        None,
     )
     .await
     .expect("lease_chain must succeed");
 
+    // wait_for_running must poll every leased contract at least once. Use the
+    // contracts actually returned rather than fixed ids, since which survivors
+    // get picked is up to the selection policy.
     let reqs = server.received_requests().await.unwrap();
-    let gets_per_contract: std::collections::HashMap<u64, usize> = {
-        let mut map = std::collections::HashMap::new();
-        for r in &reqs {
-            if r.method.as_ref() != "GET" {
-                continue;
-            }
-            for id in [9000u64, 9001, 9002] {
-                if r.url.path() == format!("/api/v0/instances/{id}/") {
-                    *map.entry(id).or_insert(0) += 1;
-                }
-            }
-        }
-        map
-    };
-    for id in [9000u64, 9001, 9002] {
+    for info in &infos {
+        let cid = info.contract_id;
+        let polls = reqs
+            .iter()
+            .filter(|r| {
+                r.method.as_ref() == "GET"
+                    && r.url.path() == format!("/api/v0/instances/{cid}/")
+            })
+            .count();
         assert!(
-            gets_per_contract.get(&id).copied().unwrap_or(0) >= 1,
-            "wait_for_running must poll contract {id} at least once",
+            polls >= 1,
+            "wait_for_running must poll leased contract {cid} at least once",
         );
     }
 }
@@ -567,9 +613,10 @@ async fn lease_chain_waits_for_running_per_contract() {
 #[tokio::test]
 async fn lease_chain_replaces_a_stage_that_stops_before_running() {
     let server = MockServer::start().await;
-    // Four offers (1000..1003) at ascending price; find_offer takes the
-    // median, so stage 0 lands on offer 1002, stage 1 on 1001, and the
-    // replacement for stage 0 on 1003.
+    // Four offers (1000..1003) at ascending price. The default 30% per-model
+    // drop removes the cheapest (1000); the lease then takes the cheapest
+    // survivors on distinct hosts — 1001 then 1002 — and the replacement for
+    // the stopped stage draws the next survivor, 1003.
     mount_offers(&server, 4).await;
     for (offer, contract) in [(1002u32, 9002u64), (1001, 9001), (1003, 9003)] {
         Mock::given(method("PUT"))
@@ -620,6 +667,7 @@ async fn lease_chain_replaces_a_stage_that_stops_before_running() {
         None,
         Duration::from_millis(10),
         3,
+        None,
         None,
     )
     .await

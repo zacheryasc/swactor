@@ -45,6 +45,8 @@ pub(crate) struct AppState {
     pub history: Arc<DashboardHistory>,
     pub cmd_router: Arc<CommandRouter>,
     pub plugins: Arc<PluginRegistry>,
+    /// Optional HTML served at `/` instead of the actor dashboard.
+    pub landing: Option<Arc<str>>,
 }
 
 // ── Router builders ─────────────────────────────────────────────────────
@@ -78,12 +80,18 @@ pub(crate) fn build_replay_router(state: ReplayState) -> Router {
 
 // ── Server startup ──────────────────────────────────────────────────────
 
-pub(crate) async fn run_server(state: AppState, port: u16) {
+pub(crate) async fn run_server(state: AppState, port: u16, extra: Option<Router>) {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .expect("failed to bind HTTP server");
     let shutdown = state.shutdown_notify.clone();
-    axum::serve(listener, build_live_router(state))
+    let mut app = build_live_router(state);
+    if let Some(extra) = extra {
+        // Disjoint route sets (dashboard UI/API vs collector `/diag/*`) compose
+        // cleanly onto one listener; both are `Router<()>` after `with_state`.
+        app = app.merge(extra);
+    }
+    axum::serve(listener, app)
         .with_graceful_shutdown(async move { shutdown.notified().await })
         .await
         .expect("HTTP server error");
@@ -105,7 +113,14 @@ fn html_response(template: &str, mode: &str) -> Response {
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], html).into_response()
 }
 
-async fn page_dashboard() -> Response {
+async fn page_dashboard(State(state): State<AppState>) -> Response {
+    if let Some(html) = &state.landing {
+        return (
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            html.to_string(),
+        )
+            .into_response();
+    }
     html_response(DASHBOARD_HTML, "live")
 }
 

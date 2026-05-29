@@ -8,9 +8,9 @@
 //! * `--vastai` — rents `N` GPU instances on vast.ai, deploys the
 //!   `pp-gpu-node` image to each, and drives the same orchestrator path
 //!   over WAN. The default one-shot destroys all rented instances before
-//!   exit; `--hold` / `--redeploy` leave the cluster running (tracked by a
-//!   local handle file) so it can be iterated on, and `--teardown` destroys
-//!   it. See the cluster-lifecycle usage block.
+//!   exit; `--hold` leaves the cluster running (tracked by a local handle
+//!   file) so it can be iterated on, and `--teardown` destroys it. See the
+//!   cluster-lifecycle usage block.
 //!
 //! Stage count is configurable via `--num-stages N` (default 2, any
 //! `N >= 2`). The chain logic is identical at every N; the binary's only
@@ -32,7 +32,8 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -46,9 +47,18 @@ use iroh::{PublicKey, RelayMode, SecretKey};
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
 use swactor::transport::TransportRouter;
 
+use dashboard::collector::StatsCollector;
+use dashboard::{start_dashboard, DashboardConfig};
+
+use distribution::diagnostics::sink::{noop_emitter, DynEmitter};
 use distribution::diagnostics::Role as DiagRole;
 
 use pipeline_parallel_inference::diag;
+use pipeline_parallel_inference::dist_broadcast;
+use pipeline_parallel_inference::dist_plugin::{
+    CountingEmitter, DistDashPlugin, MsgCounts, SharedSnapshot,
+};
+use pipeline_parallel_inference::netmap_plugin::{spawn_conn_poller, ConnTracker, NetmapPlugin};
 use pipeline_parallel_inference::iroh_transport::{
     ActorMessagePump, IrohActorTransport, ACTOR_ALPN,
 };
@@ -89,13 +99,12 @@ fn print_usage() {
     eprintln!("Cluster lifecycle (--vastai):");
     eprintln!("  (default)   lease N, drive one run, destroy.");
     eprintln!("  --hold      lease N, drive, leave running; writes a cluster-handle file.");
-    eprintln!("  --redeploy  scp local binaries onto the held cluster, bounce + drive again.");
     eprintln!("  --teardown  destroy the held cluster and delete the handle file.");
     eprintln!("  --label <s> tag/select the cluster (default pp-<N>-<ts>).");
     eprintln!("  --state <p> cluster-handle file path (default ./.pp-cluster.json).");
     eprintln!("Notes:");
     eprintln!("  --num-stages defaults to 2 and must be >= 2.");
-    eprintln!("  --hold/--redeploy need a stable orchestrator identity; it is generated");
+    eprintln!("  --hold needs a stable orchestrator identity; it is generated");
     eprintln!("  and stored in the handle file (override with PP_ORCH_SECRET=<64 hex>).");
 }
 
@@ -114,15 +123,11 @@ struct Args {
     /// Cluster lifecycle mode for --vastai (mutually exclusive):
     ///   default  → lease, drive one run, destroy (the original one-shot).
     ///   hold     → lease, drive, leave the cluster running (no destroy).
-    ///   redeploy → skip leasing; scp the local binaries onto every held
-    ///              instance (found by --label), bounce them in place,
-    ///              drive again, leave running.
     ///   teardown → destroy every instance carrying --label, then exit.
     hold: bool,
-    redeploy: bool,
     teardown: bool,
     /// vast.ai instance label used to tag a cluster at lease time and to
-    /// rediscover its live SSH endpoints for redeploy/teardown.
+    /// rediscover its live SSH endpoints for teardown.
     label: Option<String>,
     /// Path to the local cluster-handle file (the orchestrator secret +
     /// the contracts we rented). Defaults to ./.pp-cluster.json.
@@ -137,16 +142,26 @@ fn parse_args() -> Args {
         num_stages: 2,
         api_key: None,
         // RTX 3060 (12GB) is our default deploy-test class: cheapest GPU class
-        // with deep, reliable supply on vast.ai (see fleet notes). Override with
-        // --gpu for capacity tests. NOT sized for real model weights.
-        gpu_name: "RTX 3060".into(),
-        image: "zacheryasc/swactor-pp-gpu:latest".into(),
+        // with deep, reliable supply on vast.ai (see fleet notes). Settable via
+        // PP_GPU in a profile, or --gpu for capacity tests. NOT sized for real
+        // model weights.
+        gpu_name: std::env::var("PP_GPU")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "RTX 3060".into()),
+        // Image is not baked to a personal registry: it defaults from the
+        // PP_IMAGE env (the convention the run scripts already use, e.g.
+        // scripts/docker-e2e.sh), falling back to a registry-less tag. Set it
+        // in your profile (profiles/*.env) or override with --image.
+        image: std::env::var("PP_IMAGE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "swactor-pp-gpu:latest".into()),
         prompt: "Say hello".into(),
         max_tokens: 64,
         gpu_node_path: None,
         worker_path: None,
         hold: false,
-        redeploy: false,
         teardown: false,
         label: None,
         state: None,
@@ -157,7 +172,6 @@ fn parse_args() -> Args {
             "--seed" => a.seed = true,
             "--vastai" => a.vastai = true,
             "--hold" => a.hold = true,
-            "--redeploy" => a.redeploy = true,
             "--teardown" => a.teardown = true,
             "--label" => {
                 i += 1;
@@ -221,6 +235,7 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    pipeline_parallel_inference::profile::load_profile();
     let args = parse_args();
     if args.seed == args.vastai {
         eprintln!("exactly one of --seed or --vastai is required");
@@ -238,17 +253,12 @@ fn main() {
         eprintln!("--api-key required with --vastai");
         std::process::exit(2);
     }
-    if [args.hold, args.redeploy, args.teardown]
-        .iter()
-        .filter(|&&f| f)
-        .count()
-        > 1
-    {
-        eprintln!("at most one of --hold / --redeploy / --teardown may be set");
+    if args.hold && args.teardown {
+        eprintln!("at most one of --hold / --teardown may be set");
         std::process::exit(2);
     }
-    if (args.hold || args.redeploy || args.teardown) && !args.vastai {
-        eprintln!("--hold / --redeploy / --teardown require --vastai");
+    if (args.hold || args.teardown) && !args.vastai {
+        eprintln!("--hold / --teardown require --vastai");
         std::process::exit(2);
     }
 
@@ -314,12 +324,18 @@ fn build_gpu_node_command(
         "MODEL",
         "PYTHON",
         "CUDA",
+        // Per-stage live dashboard: each stage serves on base + STAGE.
+        "PP_STAGE_DASHBOARD",
+        "PP_STAGE_DASHBOARD_PORT_BASE",
         "PP_BOOT_DELAY_STAGE",
         "PP_BOOT_DELAY_SECS",
         "SWACTOR_DIAG_COLLECTOR_URL",
         "SWACTOR_DIAG_RUN_ID",
         "SWACTOR_DIAG_SPOOL_DIR",
         "SWACTOR_DIAG_UDP_ECHO",
+        // Default broadcast target: in-VM samplers/log-forwarders fall back to
+        // this when no dedicated collector URL is set.
+        "PP_DASHBOARD_URL",
     ] {
         if let Ok(v) = std::env::var(var) {
             cmd.env(var, v);
@@ -380,6 +396,27 @@ fn check_child_death(guard: &mut ChainGuard) -> Result<(), String> {
     Ok(())
 }
 
+/// The default-on distribution broadcast target: `PP_DASHBOARD_URL`, falling back
+/// to the diagnostics collector URL. Returns `None` (broadcast disabled) when both
+/// are unset or empty — preserving the prior no-dashboard behavior.
+fn resolve_broadcast_url() -> Option<String> {
+    std::env::var("PP_DASHBOARD_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("SWACTOR_DIAG_COLLECTOR_URL").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Diagnostics run-id for broadcast headers (matches the in-VM samplers' default).
+fn broadcast_run_id() -> String {
+    std::env::var("SWACTOR_DIAG_RUN_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "pp-run".to_string())
+}
+
 fn run_seed(args: &Args) -> i32 {
     let gpu_node_bin = resolve_gpu_node_path(args);
     if !gpu_node_bin.exists() {
@@ -414,6 +451,22 @@ fn run_seed(args: &Args) -> i32 {
 
     let diag = diag::install_from_env(&mut driver, DiagRole::orchestrator());
 
+    // Distribution view is wanted when the in-process dashboard (PP_DASHBOARD) is
+    // on, or a dashboard/collector URL resolves for the remote broadcast.
+    let broadcast_url = resolve_broadcast_url();
+    let want_dist = std::env::var_os("PP_DASHBOARD").is_some() || broadcast_url.is_some();
+
+    // Orchestrator dashboard message tallies. Decorate the driver's diagnostics
+    // emitter so every wire MessageSent/MessageReceived is counted for the
+    // distribution page; the decorator forwards to whatever emitter diag
+    // installed, so bundle shipping is unaffected. Created unconditionally (cheap)
+    // but only installed when the distribution view is wanted (local or remote).
+    let msg_counts = Arc::new(MsgCounts::default());
+    if want_dist {
+        let inner = driver.diagnostics().clone();
+        driver.set_diagnostics(Arc::new(CountingEmitter::new(inner, Arc::clone(&msg_counts))));
+    }
+
     let my_id = driver.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
     let direct: Vec<SocketAddr> = driver.direct_addresses().to_vec();
@@ -438,6 +491,77 @@ fn run_seed(args: &Args) -> i32 {
         let router = Arc::new(TransportRouter::new());
         rt.set_codec_registry(codecs.clone());
         rt.set_transport_router(router.clone());
+
+        // Optional live dashboard. When PP_DASHBOARD is set we install a stats
+        // hook on the orchestrator runtime (must happen before `rt` is shared)
+        // and serve the HTTP dashboard on the iroh driver's tokio runtime — no
+        // threads of our own; the SSE handler polls `rt.stats()` directly. The
+        // handle is held for the whole run so the server stays up.
+        let dashboard = if std::env::var_os("PP_DASHBOARD").is_some() {
+            let port: u16 = std::env::var("PP_DASHBOARD_PORT")
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(9090);
+            let collector = StatsCollector::new(RuntimeConfig::default().num_threads);
+            rt.set_stats_hook(collector.clone());
+            let handle = start_dashboard(DashboardConfig { port, ..Default::default() });
+            Some((handle, collector, port))
+        } else {
+            None
+        };
+
+        let rt = Arc::new(rt);
+
+        // Shared distribution snapshot cell, refreshed by the hold loop. The
+        // in-process plugins and the remote broadcaster both read this one cell, so
+        // it exists whenever the distribution view is wanted — even broadcast-only
+        // (no local dashboard). `None` when off so the hold loop skips the refresh.
+        let dist_cached: Option<SharedSnapshot> = if want_dist {
+            Some(Arc::new(Mutex::new(Some(driver.snapshot()))))
+        } else {
+            None
+        };
+
+        // When the in-process dashboard is on, register the distribution + net map
+        // plugins ("Distribution"/"Netmap" nav tabs) against the shared cell.
+        if let (Some((handle, collector, port)), Some(cached)) = (&dashboard, &dist_cached) {
+            handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
+            handle.register_plugin(Arc::new(DistDashPlugin::new(
+                Arc::clone(cached),
+                Arc::clone(&msg_counts),
+            )));
+            // Net map plugin: a live connection/bandwidth graph. Shares the
+            // cached snapshot and message tallies; a background poller keeps its
+            // transport map fresh by querying the iroh endpoint directly. The
+            // poller's stop flag rides the process lifetime (the driver's tokio
+            // runtime is torn down at end of run, aborting the task).
+            let conn_tracker = Arc::new(ConnTracker::default());
+            handle.register_plugin(Arc::new(NetmapPlugin::new(
+                Arc::clone(cached),
+                Arc::clone(&msg_counts),
+                Arc::clone(&conn_tracker),
+            )));
+            let poll_stop = Arc::new(AtomicBool::new(false));
+            spawn_conn_poller(&driver, Arc::clone(cached), conn_tracker, poll_stop);
+            handle.start_http(driver.tokio_handle());
+            eprintln!(
+                "pp-smoke-run: live dashboard on http://localhost:{port} \
+                 (overview / actors / topology / distribution / netmap)"
+            );
+        }
+
+        // Default-on remote broadcast: ship the distribution snapshot to the
+        // dashboard collector ~1/s so a remote dashboard renders the same view.
+        if let (Some(url), Some(cached)) = (broadcast_url.as_ref(), dist_cached.as_ref()) {
+            dist_broadcast::spawn_dist_broadcast(
+                driver.tokio_handle(),
+                Arc::clone(cached),
+                Arc::clone(&msg_counts),
+                url.clone(),
+                broadcast_run_id(),
+            );
+            eprintln!("pp-smoke-run: broadcasting distribution snapshot to {url}");
+        }
 
         let response_inbox = match rt.new_inbox::<InferenceResponse>() {
             Ok(i) => i,
@@ -599,10 +723,27 @@ fn run_seed(args: &Args) -> i32 {
                 break 'run (1, "stage0_key_error");
             }
         };
+        // The orchestrator's request/response legs are observed on the stage
+        // side too, so by default they're uninstrumented here to keep the
+        // diagnostics bundle from double-counting. When the distribution view is
+        // wanted (local or remote) we attach a *count-only* tap (counts into the
+        // shared `MsgCounts`, forwards to a no-op — never to the diagnostics
+        // sink), so the InferenceRequest / InferenceResponse show up by kind on
+        // the distribution page without touching bundle semantics.
+        let app_tap: Option<DynEmitter> = if want_dist {
+            Some(Arc::new(CountingEmitter::new(
+                noop_emitter(),
+                Arc::clone(&msg_counts),
+            )))
+        } else {
+            None
+        };
         let route = Arc::new(IrohActorTransport::new(
             driver.endpoint().clone(),
             iroh::EndpointAddr::from(key),
             driver.tokio_handle(),
+            stage0_node_id,
+            app_tap.clone(),
         ));
         router.add_route(stage0_addr, route);
 
@@ -643,6 +784,7 @@ fn run_seed(args: &Args) -> i32 {
             Some(&mut guard),
             &roster,
             drive_seq,
+            app_tap,
         );
         // Drive boundary marker; emitted even on failure so the bundle
         // reader can slice events into per-drive windows.
@@ -660,6 +802,16 @@ fn run_seed(args: &Args) -> i32 {
                 println!("=== pipeline-parallel Inference Response ===");
                 println!("{text}");
                 println!("============================================");
+                // The ChainGuard is still in scope here, so the stage
+                // containers stay up while we hold — letting the dashboard
+                // show a live, converged cluster rather than a torn-down one.
+                if dashboard.is_some() || std::env::var_os("PP_HOLD").is_some() {
+                    hold_open(
+                        &mut driver,
+                        dist_cached.as_ref(),
+                        dashboard.as_ref().map(|(_, _, p)| *p),
+                    );
+                }
                 (0, "ok")
             }
             Err(e) => {
@@ -791,6 +943,50 @@ impl AwaitError {
 ///   `dead`. When that happens, a `pp_drive_dead_member` diagnostic
 ///   event is emitted identifying the stage and the dead member's
 ///   `node_id_short` before returning [`AwaitError::ForwardPathDead`].
+/// Block the orchestrator after a successful drive so the live dashboard —
+/// and the stage containers, whose `ChainGuard` is still in scope — stay up
+/// for inspection. Returns when the operator presses Enter or closes stdin
+/// (Ctrl-D), at which point the run unwinds and tears the cluster down.
+/// Hold the cluster open after a successful drive. The `ChainGuard` is still
+/// in scope (containers stay up), and we keep ticking the driver so SWIM stays
+/// converged and — when the dashboard is on — refresh the distribution
+/// snapshot each tick so the membership graph and message tallies update live.
+/// Returns when the operator presses Enter or closes stdin (Ctrl-D).
+fn hold_open(
+    driver: &mut IrohDriver,
+    dist_cached: Option<&SharedSnapshot>,
+    port: Option<u16>,
+) {
+    match port {
+        Some(p) => eprintln!(
+            "pp-smoke-run: holding cluster open — orchestrator dashboard at \
+             http://localhost:{p}. Press Enter (or Ctrl-D) to tear down."
+        ),
+        None => eprintln!(
+            "pp-smoke-run: holding cluster open. Press Enter (or Ctrl-D) to tear down."
+        ),
+    }
+    // Read stdin on a side thread so the main thread can keep pumping the
+    // driver; a blocking read here would freeze SWIM and the live snapshot.
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
+    while !stop.load(Ordering::SeqCst) {
+        driver.recv();
+        driver.tick();
+        if let Some(cached) = dist_cached {
+            *cached.lock().unwrap() = Some(driver.snapshot());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn await_response(
     driver: &mut IrohDriver,
     rt: &Runtime,
@@ -800,8 +996,9 @@ fn await_response(
     children: Option<&mut ChainGuard>,
     forward_path: &[pipeline_parallel_inference::orchestrator::StageRosterEntry],
     drive_seq: u32,
+    app_tap: Option<DynEmitter>,
 ) -> Result<String, AwaitError> {
-    let msg_pump = ActorMessagePump::new();
+    let msg_pump = ActorMessagePump::new(app_tap);
     let start = Instant::now();
     let mut last_diag = Instant::now();
     let mut child_guard = children;
@@ -887,22 +1084,23 @@ fn await_response_timeout_secs(default_secs: u64) -> u64 {
 
 // ─── vast.ai mode ─────────────────────────────────────────────────────
 
-// ─── vast.ai cluster lifecycle (hold / redeploy / teardown) ───────────
+// ─── vast.ai cluster lifecycle (hold / teardown) ──────────────────────
 
 /// Local handle for a held cluster. The orchestrator secret is the one
 /// thing vast.ai cannot hand back: held stages seed to the orchestrator's
 /// node id (baked into their SEED_ADDR at create time), so re-attaching
 /// demands the same keypair. We persist it beside the set of contracts we
 /// rented. Volatile facts — live SSH endpoints and liveness — are re-fetched
-/// from the vast.ai API at redeploy/teardown, so this file never stores
-/// anything that can go stale underneath us.
+/// from the vast.ai API at teardown, so this file never stores anything that
+/// can go stale underneath us.
 #[derive(Debug, Serialize, Deserialize)]
 struct ClusterState {
     label: String,
     /// 64 hex chars = the 32-byte iroh secret key.
     orchestrator_secret: String,
     /// Per-stage pinned identities (64 hex each), indexed by stage. Injected
-    /// at create so a redeploy bounce keeps every stage's node id stable.
+    /// at create so the held cluster keeps stable, resolvable stage node ids
+    /// (pp-entry / pp-stage-N) for its whole lifetime.
     #[serde(default)]
     stage_secrets: Vec<String>,
     num_stages: u32,
@@ -912,10 +1110,9 @@ struct ClusterState {
     created_at: u64,
     /// Diagnostics run_id pinned for the held-cluster lifetime. Held
     /// stages bake their `SWACTOR_DIAG_RUN_ID` into PID-1 env at lease
-    /// time and re-read it across bounces; persisting it here lets
-    /// `--redeploy` and `--teardown` reattach to the same bundle
-    /// without drift from the operator's current shell env. `None` on
-    /// handles written before this field existed — callers fall back
+    /// time; persisting it here lets `--teardown` reattach to the same
+    /// bundle without drift from the operator's current shell env. `None`
+    /// on handles written before this field existed — callers fall back
     /// to env with a warning.
     #[serde(default)]
     run_id: Option<String>,
@@ -932,11 +1129,10 @@ struct ClusterState {
     /// iroh driver just to compute one public key).
     #[serde(default)]
     orchestrator_node_id_hex: Option<String>,
-    /// Monotonically incremented every invocation that drives an
-    /// inference request against the held cluster (initial `--hold` =
-    /// 1, each `--redeploy` += 1). Emitted on `pp_drive_start` /
+    /// Drive counter for the cluster, emitted on `pp_drive_start` /
     /// `pp_drive_end` events so the bundle reader can slice the
-    /// interleaved event stream back into per-drive windows.
+    /// interleaved event stream back into per-drive windows. Each
+    /// process drives once, so a `--hold` lease persists `1`.
     #[serde(default)]
     drive_sequence: u32,
 }
@@ -1012,174 +1208,15 @@ fn random_secret() -> Result<[u8; 32], String> {
     Ok(buf)
 }
 
-/// SSH private key vast.ai authenticates with (its public half is registered
-/// on the account). Override with PP_SSH_KEY.
-fn ssh_key_path() -> PathBuf {
-    if let Ok(p) = std::env::var("PP_SSH_KEY") {
-        return PathBuf::from(p);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".ssh/id_ed25519")
-}
-
-/// Push the freshly-built binary + worker onto a held instance over SSH and
-/// bounce pp-gpu-node in place. The restart re-execs under PID 1's
-/// environment (where vast.ai injected the per-stage env at create time), so
-/// STAGE / NUM_STAGES / SEED_ADDR / SEED_RELAY / MODEL survive the bounce
-/// without us reconstructing them.
-fn redeploy_instance(
-    inst: &pipeline_parallel_inference::vastai::LabeledInstance,
-    gpu_node_bin: &Path,
-    worker_script: &Path,
-    ssh_key: &Path,
-) -> Result<(), String> {
-    let host = if !inst.ssh_host.is_empty() {
-        inst.ssh_host.as_str()
-    } else {
-        inst.public_ipaddr.as_str()
-    };
-    if host.is_empty() || inst.ssh_port == 0 {
-        return Err(format!(
-            "contract {} has no SSH endpoint yet (status {})",
-            inst.contract_id, inst.actual_status
-        ));
-    }
-    let port = inst.ssh_port.to_string();
-    let target = format!("root@{host}");
-    let cid = inst.contract_id;
-
-    // Spec §4.9: surface per-host transfer/install progress (start,
-    // bytes/throughput where available, finish) so an in-progress
-    // multi-host redeploy is never misread as a hang. Emitted on stderr
-    // (the redeploy threads share the parent's stderr stream).
-    eprintln!(
-        "pp-redeploy: contract {cid} host {host}:{port} START (scp binary + scp worker + ssh restart)"
-    );
-    let host_t0 = Instant::now();
-
-    // The vast.ai SSH proxy throttles each connection to ~0.35 MB/s and
-    // occasionally drops a transfer mid-flight ("Connection closed"). Compress
-    // on the wire (-C) and retry transient failures so one dropped connection
-    // doesn't abort the redeploy. The big win is at the call site: every
-    // instance is redeployed concurrently, so the per-connection throttle is
-    // paid once in parallel (~40s for 12) instead of summed (~15 min).
-    let scp = |local: &Path, remote: &str| -> Result<(), String> {
-        // Spec §4.9: per-host transfer progress. Bytes come from the
-        // local file's size (the source-side measurement we have for
-        // sure); throughput is bytes / elapsed across all retries.
-        let local_bytes: u64 = std::fs::metadata(local).map(|m| m.len()).unwrap_or(0);
-        let local_mb = local_bytes as f64 / 1_000_000.0;
-        eprintln!(
-            "pp-redeploy: contract {cid} scp {} → {remote} start ({local_mb:.1} MB)",
-            local.display(),
-        );
-        let scp_t0 = Instant::now();
-        let mut last = String::new();
-        for attempt in 1..=3u32 {
-            let out = Command::new("scp")
-                .args(["-P", &port])
-                .arg("-i")
-                .arg(ssh_key)
-                .args(["-o", "StrictHostKeyChecking=no"])
-                .args(["-o", "UserKnownHostsFile=/dev/null"])
-                .args(["-o", "ConnectTimeout=20"])
-                .arg("-C")
-                .arg(local)
-                .arg(format!("{target}:{remote}"))
-                .output()
-                .map_err(|e| format!("scp spawn failed: {e}"))?;
-            if out.status.success() {
-                let elapsed_ms = scp_t0.elapsed().as_millis() as u64;
-                let mbps = if elapsed_ms > 0 {
-                    (local_mb * 1000.0) / elapsed_ms as f64
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "pp-redeploy: contract {cid} scp {} → {remote} done in {elapsed_ms}ms ({mbps:.1} MB/s, attempt {attempt}/3)",
-                    local.display(),
-                );
-                return Ok(());
-            }
-            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            eprintln!(
-                "pp-redeploy: contract {cid} scp {} → {remote} attempt {attempt}/3 failed: {last}",
-                local.display(),
-            );
-            std::thread::sleep(Duration::from_secs(2 * attempt as u64));
-        }
-        Err(format!(
-            "scp {} -> {remote} failed after 3 attempts: {last}",
-            local.display(),
-        ))
-    };
-
-    // Stage to .new paths first: the live ELF at /usr/local/bin/pp-gpu-node
-    // is memory-mapped by the running stage, so writing over it in place
-    // fails with ETXTBSY ("dest open ... Failure"). Swap the staged files in
-    // after the process is killed.
-    scp(gpu_node_bin, "/usr/local/bin/pp-gpu-node.new")?;
-    scp(worker_script, "/usr/local/share/pp_tinygrad_worker.py.new")?;
-
-    // Swap the staged files in (rename succeeds on a busy ELF — only
-    // open-for-write hits ETXTBSY), then kill the running stage + its python
-    // worker child and re-exec detached under PID 1's env. Kill by EXACT
-    // process name (`pkill -x`): a substring `pkill -f` would match the
-    // `bash -c '…'` shell running this very command (its argv contains the
-    // path) and cut our own connection. The new stage re-reads SEED_ADDR
-    // etc. from PID 1's env. Needs `pkill` (procps) + bash in the image.
-    let restart = "mv -f /usr/local/bin/pp-gpu-node.new /usr/local/bin/pp-gpu-node; mv -f /usr/local/share/pp_tinygrad_worker.py.new /usr/local/share/pp_tinygrad_worker.py; chmod +x /usr/local/bin/pp-gpu-node; pkill -x pp-gpu-node || true; pkill -x python3 || true; sleep 1; setsid bash -c 'while IFS= read -r -d \"\" kv; do export \"$kv\"; done < /proc/1/environ; exec /usr/local/bin/pp-gpu-node' >/var/log/pp-redeploy.log 2>&1 </dev/null &";
-    eprintln!("pp-redeploy: contract {cid} ssh restart start");
-    let ssh_t0 = Instant::now();
-    // Retry the restart too: the bounce is idempotent (mv -f of an
-    // already-swapped file is a harmless no-op; a second pkill+re-exec just
-    // bounces the fresh process again), so a dropped SSH connection is safe to
-    // re-issue.
-    let mut last = String::new();
-    for attempt in 1..=3u32 {
-        let out = Command::new("ssh")
-            .arg("-n")
-            .args(["-p", &port])
-            .arg("-i")
-            .arg(ssh_key)
-            .args(["-o", "StrictHostKeyChecking=no"])
-            .args(["-o", "UserKnownHostsFile=/dev/null"])
-            .args(["-o", "ConnectTimeout=20"])
-            .arg(&target)
-            .arg(restart)
-            .output()
-            .map_err(|e| format!("ssh spawn failed: {e}"))?;
-        if out.status.success() {
-            let elapsed_ms = ssh_t0.elapsed().as_millis() as u64;
-            let host_elapsed_ms = host_t0.elapsed().as_millis() as u64;
-            eprintln!(
-                "pp-redeploy: contract {cid} ssh restart done in {elapsed_ms}ms; total host time {host_elapsed_ms}ms"
-            );
-            return Ok(());
-        }
-        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        eprintln!(
-            "pp-redeploy: contract {cid} ssh restart attempt {attempt}/3 failed: {last}"
-        );
-        std::thread::sleep(Duration::from_secs(2 * attempt as u64));
-    }
-    Err(format!("ssh restart failed after 3 attempts: {last}"))
-}
-
 struct ResolvedCluster {
     secret: [u8; 32],
     label: String,
     num_stages: u32,
     model: String,
-    /// Pinned for the cluster's lifetime: orchestrator + every stage
-    /// must agree on this so events land in a single bundle. On
-    /// redeploy, sourced from the on-disk handle (the held stages
-    /// already use it); on hold/one-shot, env > generated default.
+    /// Pinned for the cluster's lifetime: orchestrator + every stage must
+    /// agree on this so events land in a single bundle. On hold/one-shot,
+    /// env > generated default.
     run_id: String,
-    /// `0` on one-shot and on legacy handles that pre-date drive
-    /// counting. `--hold` writes `1`; `--redeploy` reads-and-increments
-    /// before driving.
-    drive_sequence: u32,
 }
 
 fn resolve_run_id(label: &str) -> String {
@@ -1191,10 +1228,8 @@ fn resolve_run_id(label: &str) -> String {
 }
 
 /// Resolve the orchestrator identity, label, and stage count for this run.
-/// Redeploy adopts them from the on-disk handle (so it re-presents the same
-/// node id the held stages seed to); hold/one-shot mint or read them.
-/// PP_ORCH_SECRET, when set, always wins.
-fn resolve_cluster(args: &Args, state_path: &Path) -> Result<ResolvedCluster, String> {
+/// hold/one-shot mint or read them. PP_ORCH_SECRET, when set, always wins.
+fn resolve_cluster(args: &Args, _state_path: &Path) -> Result<ResolvedCluster, String> {
     let env_secret = match std::env::var("PP_ORCH_SECRET") {
         Ok(h) if !h.trim().is_empty() => Some(secret_from_hex(&h)?),
         _ => None,
@@ -1209,39 +1244,6 @@ fn resolve_cluster(args: &Args, state_path: &Path) -> Result<ResolvedCluster, St
                 "unset".into()
             }
         });
-
-    if args.redeploy {
-        let st = ClusterState::load(state_path)?;
-        let secret = match env_secret {
-            Some(s) => s,
-            None => secret_from_hex(&st.orchestrator_secret)?,
-        };
-        // run_id: prefer the value persisted at lease time so we land
-        // in the same bundle as the held stages. Legacy handles missing
-        // the field fall back to env / generated default, but warn —
-        // the stages' baked run_id is unknowable from this side, so we
-        // may silently split the bundle.
-        let run_id = match st.run_id.clone() {
-            Some(r) => r,
-            None => {
-                let derived = resolve_run_id(&st.label);
-                eprintln!(
-                    "pp-smoke-run: WARNING legacy cluster handle has no run_id; using {derived} \
-                     (set SWACTOR_DIAG_RUN_ID to whatever the held stages were leased with to avoid \
-                     a split bundle)"
-                );
-                derived
-            }
-        };
-        return Ok(ResolvedCluster {
-            secret,
-            label: st.label,
-            num_stages: st.num_stages,
-            model: st.model,
-            run_id,
-            drive_sequence: st.drive_sequence,
-        });
-    }
 
     // hold or default one-shot: a one-shot's random secret is never
     // persisted (it tears down in the same process), so it is harmless.
@@ -1260,15 +1262,14 @@ fn resolve_cluster(args: &Args, state_path: &Path) -> Result<ResolvedCluster, St
         num_stages: args.num_stages,
         model,
         run_id,
-        drive_sequence: 0,
     })
 }
 
 /// POST a single finalize record to the collector under the held
 /// cluster's run_id and the orchestrator's node id. This is the
 /// counterpart to the normal aggregator-driven finalize that the
-/// `--hold` and `--redeploy` paths now skip: with no orchestrator
-/// process running between drives, teardown is the one place that
+/// `--hold` path skips: with no orchestrator process running between
+/// drives, teardown is the one place that
 /// gets to seal the canonical bundle for the cluster's whole
 /// lifetime. The collector's bundle assembler triggers on this POST
 /// and tars `{run_id}/...` into `bundles/{run_id}.tar.gz`.
@@ -1429,8 +1430,7 @@ fn run_vastai(args: &Args) -> i32 {
         return run_teardown(&tokio_rt, &http, base_url, &api_key, &state_path);
     }
 
-    // Resolve identity + shape per mode (redeploy adopts the held cluster's
-    // secret/label/N from the handle; hold/one-shot mint or read them).
+    // Resolve identity + shape: hold/one-shot mint or read the secret/label/N.
     let cluster = match resolve_cluster(args, &state_path) {
         Ok(c) => c,
         Err(e) => {
@@ -1455,27 +1455,21 @@ fn run_vastai(args: &Args) -> i32 {
         }
     };
 
-    // Wire orchestrator-side diagnostics. The run_id override is what
-    // pins the orchestrator and the (already-running) stages into the
-    // same bundle: held stages baked their `SWACTOR_DIAG_RUN_ID` into
-    // PID-1 env at lease time, and `--redeploy` adopts that same value
-    // from the persisted handle. Without the override, a stale shell
-    // env on the orchestrator side could split events into two bundles.
+    // Wire orchestrator-side diagnostics. The run_id override pins the
+    // orchestrator and its stages into the same bundle: stages bake their
+    // `SWACTOR_DIAG_RUN_ID` into PID-1 env at lease time. Without the
+    // override, a stale shell env on the orchestrator side could split
+    // events into two bundles.
     let diag = diag::install_with_overrides(
         &mut driver,
         DiagRole::orchestrator(),
         Some(cluster.run_id.as_str()),
     );
 
-    // Bump the per-cluster drive counter once we're committed to driving
-    // a run. One-shot and the first --hold land at 1; every --redeploy
-    // increments. Emitted on pp_drive_start / pp_drive_end so the bundle
-    // reader can slice the interleaved event stream by attempt.
-    let drive_seq: u32 = if args.redeploy {
-        cluster.drive_sequence.saturating_add(1)
-    } else {
-        1
-    };
+    // Per-cluster drive counter, emitted on pp_drive_start / pp_drive_end so
+    // the bundle reader can slice the interleaved event stream by attempt.
+    // One-shot and --hold each drive exactly once per process, so this is 1.
+    let drive_seq: u32 = 1;
 
     // Rented stage containers learn the collector URL + run_id via env
     // vars injected into their vast.ai create_instance payload below.
@@ -1532,125 +1526,46 @@ fn run_vastai(args: &Args) -> i32 {
         eprintln!("pp-smoke-run: no relay URL after 20s — vastai mode usually requires one");
     }
 
-    // ── Acquire the running cluster ──────────────────────────────────
-    // Redeploy skips leasing: it rediscovers the held cluster by label and
-    // pushes the freshly-built binaries onto each instance in place.
-    // Otherwise lease N fresh instances and (on --hold) persist the handle.
-    let contract_ids: Vec<u64> = if args.redeploy {
-        let insts = match tokio_rt.block_on(
-            pipeline_parallel_inference::vastai::list_instances_by_label(
-                &http, base_url, &api_key, &label,
-            ),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("pp-smoke-run: cannot list cluster by label {label}: {e}");
-                // Skip finalize: this is the --redeploy path and the
-                // cluster is still alive. Finalizing here would tar a
-                // canonical bundle covering a window the cluster keeps
-                // extending past. shutdown() still drains any in-flight
-                // events the orchestrator emitted before bailing.
-                if let Some(handles) = diag {
-                    handles.shutdown();
-                }
-                return 1;
-            }
-        };
-        if insts.is_empty() {
-            eprintln!("pp-smoke-run: no live instances under label {label} — nothing to redeploy");
-            return 1;
-        }
-        if insts.len() != num_stages as usize {
-            eprintln!(
-                "pp-smoke-run: WARNING handle expects {num_stages} stages but label {label} has {} live",
-                insts.len(),
-            );
-        }
-        let gpu_bin = resolve_gpu_node_path(args);
-        let worker = resolve_worker_path(args);
-        let ssh_key = ssh_key_path();
-        eprintln!(
-            "pp-smoke-run: redeploying {} onto {} instance(s) (key {})",
-            gpu_bin.display(),
-            insts.len(),
-            ssh_key.display(),
-        );
-        // Push every instance concurrently. The vast.ai SSH proxy throttles
-        // each connection independently (~0.35 MB/s), so parallel transfers
-        // don't contend: a 12-node push finishes in roughly one transfer's
-        // time (~40s) instead of the sum (~15 min sequential). Scoped threads
-        // let the workers borrow insts/paths without cloning.
-        let results: Vec<(u64, Result<(), String>)> = std::thread::scope(|s| {
-            let handles: Vec<_> = insts
-                .iter()
-                .map(|inst| {
-                    let (gpu_bin, worker, ssh_key) = (&gpu_bin, &worker, &ssh_key);
-                    s.spawn(move || {
-                        (
-                            inst.contract_id,
-                            redeploy_instance(inst, gpu_bin, worker, ssh_key),
-                        )
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("redeploy worker thread panicked"))
-                .collect()
-        });
-        let failed: Vec<u64> = results
-            .into_iter()
-            .filter_map(|(id, r)| match r {
-                Ok(()) => {
-                    eprintln!("  contract {id} ... pushed + bounced");
-                    None
+    // ── Vastai monitoring (independent layer) ────────────────────────
+    // The external-view producer: an opt-in poller (VASTAI_MON_COLLECTOR_URL,
+    // falling back to SWACTOR_DIAG_COLLECTOR_URL) that polls the vast.ai API for
+    // every leased contract — through the image-pull window — and ships
+    // observations to the collector under its own synthetic node id. Decoupled
+    // from swactor diagnostics: it never touches the iroh driver or aggregator.
+    let vastai_poller = match pipeline_parallel_inference::vastai_mon::VastaiPollerConfig::from_env(
+        &cluster.run_id,
+        &api_key,
+        base_url,
+    ) {
+        Some(cfg) => {
+            // VastaiPoller::spawn calls tokio::spawn; enter the runtime so its
+            // background task lands on the multi-thread worker pool.
+            let _enter = tokio_rt.enter();
+            match pipeline_parallel_inference::vastai_mon::VastaiPoller::spawn(
+                cfg,
+                Some(num_stages),
+            ) {
+                Ok(p) => {
+                    eprintln!("pp-smoke-run: vastai monitoring enabled (external poller)");
+                    Some(p)
                 }
                 Err(e) => {
-                    eprintln!("  contract {id} ... FAILED: {e}");
-                    Some(id)
+                    eprintln!("pp-smoke-run: WARNING vastai monitoring disabled: {e}");
+                    None
                 }
-            })
-            .collect();
-        if !failed.is_empty() {
-            // A code-fix redeploy needs EVERY stage on the new binary, so any
-            // failure aborts. The cluster keeps running (don't seal a canonical
-            // bundle — let --teardown do it); fix and re-run --redeploy.
-            eprintln!(
-                "pp-smoke-run: {} stage(s) failed to redeploy ({:?}); cluster left running, fix and re-run --redeploy",
-                failed.len(),
-                failed,
-            );
-            if let Some(handles) = diag {
-                handles.shutdown();
-            }
-            return 1;
-        }
-        // Persist the bumped drive_sequence (and refresh run_id /
-        // collector_url in case a legacy handle had them missing) so the
-        // next --redeploy reads the right counter. We do this on the
-        // happy path only: a push failure above already returned, so
-        // any redeploy that gets here pushed every stage successfully.
-        // We re-load to avoid clobbering fields we don't know about.
-        if let Ok(mut st) = ClusterState::load(&state_path) {
-            st.drive_sequence = drive_seq;
-            if st.run_id.is_none() {
-                st.run_id = Some(cluster.run_id.clone());
-            }
-            if st.collector_url.is_none() {
-                st.collector_url = diag_env_for_stages.collector_url.clone();
-            }
-            if let Err(e) = st.save(&state_path) {
-                eprintln!(
-                    "pp-smoke-run: WARNING could not update cluster handle drive_seq={drive_seq}: {e}"
-                );
             }
         }
-        insts.iter().map(|i| i.contract_id).collect()
-    } else {
-        // Pin a stable identity per stage so an in-place redeploy bounce
-        // keeps each stage's node id — and thus the pipeline name registry
-        // (pp-entry / pp-stage-N) — valid. Only held clusters are
-        // redeployed, so a one-shot skips this and uses random ids.
+        None => None,
+    };
+    let vastai_tracker = vastai_poller.as_ref().map(|p| p.tracker());
+
+    // ── Acquire the running cluster ──────────────────────────────────
+    // Lease N fresh instances and (on --hold) persist the handle.
+    let contract_ids: Vec<u64> = {
+        // Pin a stable identity per stage so a held cluster keeps each
+        // stage's node id — and thus the pipeline name registry
+        // (pp-entry / pp-stage-N) — valid for its whole lifetime. A
+        // one-shot tears down immediately, so it uses random ids.
         let stage_secrets: Vec<String> = if args.hold {
             let mut v = Vec::with_capacity(num_stages as usize);
             for _ in 0..num_stages {
@@ -1672,8 +1587,8 @@ fn run_vastai(args: &Args) -> i32 {
         // by the hour can still bill $40/TB on every ~20GB pull. Default to
         // pricing the pull into the offer ranking so true cost drives the pick;
         // an explicit override wins, since set_var only fills an unset/blank
-        // var. Set here, before lease_chain spawns any work, so find_offer
-        // (which reads it from the env) sees it on every stage's pick.
+        // var. Set here, before lease_chain spawns any work, so select_offer_pool
+        // (which reads it from the env) sees it when ranking the pool.
         let var = "PP_IMAGE_SIZE_GB";
         if std::env::var(var).map_or(true, |v| v.trim().is_empty()) {
             // SAFETY: single-threaded here — no lease/diag worker threads have
@@ -1682,19 +1597,13 @@ fn run_vastai(args: &Args) -> i32 {
             eprintln!("pp-smoke-run: defaulting {var}=20 (price image pull into offer ranking)");
         }
 
-        // One call into the lease helper handles find-N-offers, create-N,
+        // One call into the lease helper handles select-the-pool, create-N,
         // wait-for-running, and rollback on any partial failure.
         // Describe the selector accurately: VRAM-filter mode (PP_GPU_MIN_RAM_MB)
         // spans a heterogeneous set of cards, so naming a single model would
-        // mislead. find_offer logs each stage's actual pick.
+        // mislead. lease_chain logs the survivor pool and each stage's pick.
         let selector = match std::env::var("PP_GPU_MIN_RAM_MB").ok().filter(|s| !s.trim().is_empty()) {
-            Some(mb) => {
-                let cap = std::env::var("PP_GPU_MAX_DPH").ok().filter(|s| !s.trim().is_empty());
-                match cap {
-                    Some(c) => format!("any 1-GPU offer with >={mb}MB VRAM, <=${c}/hr"),
-                    None => format!("any 1-GPU offer with >={mb}MB VRAM"),
-                }
-            }
+            Some(mb) => format!("any 1-GPU offer with >={mb}MB VRAM"),
             None => args.gpu_name.clone(),
         };
         eprintln!(
@@ -1723,6 +1632,7 @@ fn run_vastai(args: &Args) -> i32 {
                 // mid-failure, which `wait_for_running` already surfaces.
                 30,
                 Some(&diag_env_for_stages),
+                vastai_tracker.as_ref(),
             ),
         ) {
             Ok(c) => c,
@@ -1740,7 +1650,7 @@ fn run_vastai(args: &Args) -> i32 {
             }
         };
         let ids: Vec<u64> = created.iter().map(|c| c.contract_id).collect();
-        // Persist the handle so --redeploy / --teardown can find this set.
+        // Persist the handle so --teardown can find this set.
         if args.hold {
             let st = ClusterState {
                 label: label.clone(),
@@ -1924,12 +1834,14 @@ fn run_vastai(args: &Args) -> i32 {
             driver.endpoint().clone(),
             stage0_endpoint,
             driver.tokio_handle(),
+            stage0_node_id,
+            None,
         ));
         router.add_route(stage0_addr, route);
 
-        // Spec §4.5: emit one pp_stage_roster per drive (including
-        // redeploys), before any request injection event. The roster
-        // was built above by resolving every pp-stage-K.
+        // Spec §4.5: emit one pp_stage_roster per drive, before any
+        // request injection event. The roster was built above by
+        // resolving every pp-stage-K.
         driver.emit(distribution::diagnostics::event::Event::Custom {
             kind: "pp_stage_roster".into(),
             fields: stage_roster_event_fields(drive_seq, &roster),
@@ -1949,7 +1861,7 @@ fn run_vastai(args: &Args) -> i32 {
             max_tokens: args.max_tokens,
         };
         // Mark this drive's slice of the event stream so a bundle
-        // reader can split events across --redeploy iterations.
+        // reader can split events by drive.
         driver.emit(distribution::diagnostics::event::Event::Custom {
             kind: "pp_drive_start".into(),
             fields: serde_json::json!({
@@ -1975,6 +1887,7 @@ fn run_vastai(args: &Args) -> i32 {
             None,
             &roster,
             drive_seq,
+            None,
         );
 
         match result {
@@ -1993,7 +1906,7 @@ fn run_vastai(args: &Args) -> i32 {
 
     // Close out this drive's slice of the event stream — emitted
     // before finalize so the boundary marker lands in staging even
-    // when --hold/--redeploy intentionally skip finalize.
+    // when --hold intentionally skips finalize.
     driver.emit(distribution::diagnostics::event::Event::Custom {
         kind: "pp_drive_end".into(),
         fields: serde_json::json!({
@@ -2005,13 +1918,13 @@ fn run_vastai(args: &Args) -> i32 {
     });
 
     // Finalize policy: only one-shot runs seal a canonical bundle on
-    // exit. --hold and --redeploy leave the cluster running and the
-    // bundle window open; --teardown is the one place that finalizes a
-    // held cluster's bundle (it POSTs the finalize record over HTTP
-    // after destroying the instances). The collector's GET endpoint
-    // always synthesizes from staging on demand, so mid-flight reads
-    // still work between drives.
-    let is_held = args.hold || args.redeploy;
+    // exit. --hold leaves the cluster running and the bundle window
+    // open; --teardown is the one place that finalizes a held cluster's
+    // bundle (it POSTs the finalize record over HTTP after destroying
+    // the instances). The collector's GET endpoint always synthesizes
+    // from staging on demand, so mid-flight reads still work between
+    // drives.
+    let is_held = args.hold;
     if let Some(handles) = diag {
         if !is_held {
             handles.finalize(exit_reason);
@@ -2020,11 +1933,10 @@ fn run_vastai(args: &Args) -> i32 {
     }
     driver.shutdown();
 
-    // Teardown policy: --hold and --redeploy leave the cluster running so it
-    // can be iterated on; only the default one-shot tears down on exit.
+    // Teardown policy: --hold leaves the cluster running so it can be
+    // iterated on; only the default one-shot tears down on exit.
     if is_held {
         eprintln!("pp-smoke-run: HOLDING cluster (label={label}, contracts={contract_ids:?})");
-        eprintln!("  re-run after edits:  pp-smoke-run --vastai --api-key <k> --redeploy --state {}", state_path.display());
         eprintln!("  destroy when done:   pp-smoke-run --vastai --api-key <k> --teardown --state {}", state_path.display());
         eprintln!("  inspect:             vastai show instances   (label {label})");
     } else {
@@ -2043,6 +1955,19 @@ fn run_vastai(args: &Args) -> i32 {
                 eprintln!("pp-smoke-run: destroy {id} failed: {e}");
             }
         }
+    }
+
+    // Flush and stop the vastai monitoring poller (independent of swactor diag
+    // above). On a one-shot teardown, record a Teardown marker per contract so
+    // the timeline shows when each node was released; held clusters keep running
+    // but the in-process poller can't, so it shuts down either way.
+    if let Some(poller) = vastai_poller {
+        if !is_held {
+            for id in &contract_ids {
+                poller.note_teardown(*id, Some("one_shot_teardown".to_string()));
+            }
+        }
+        tokio_rt.block_on(poller.shutdown());
     }
     code
 }

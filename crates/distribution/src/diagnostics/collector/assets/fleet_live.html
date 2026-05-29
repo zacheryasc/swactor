@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>swactor · Live Fleet Board</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel2: #1c2330; --border: #2d3440;
+    --text: #e6edf3; --dim: #8b949e; --accent: #4a90e2;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 13px/1.45 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  header {
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 14px; margin: 0; letter-spacing: .5px; }
+  header h1 .badge { color: var(--accent); }
+  .stat { display: flex; flex-direction: column; line-height: 1.2; }
+  .stat .v { font-size: 16px; font-weight: 600; }
+  .stat .k { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  .controls { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+  .conn { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); }
+  .conn .dot { width: 8px; height: 8px; border-radius: 50%; background: #6b7280; }
+  .conn.live .dot { background: #4ade80; box-shadow: 0 0 6px #4ade80; }
+  .conn.down .dot { background: #f87171; }
+  .clock { font-size: 16px; font-variant-numeric: tabular-nums; }
+  .layout { display: grid; grid-template-columns: 1fr 360px; gap: 14px; padding: 14px 20px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; align-content: start; }
+  .empty { color: var(--dim); padding: 40px 4px; font-size: 13px; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; position: relative; overflow: hidden;
+  }
+  .card .topstrip { position: absolute; left: 0; top: 0; width: 4px; height: 100%; }
+  .card.dead { opacity: .82; }
+  .card-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 4px; }
+  .card-head .label { font-size: 14px; font-weight: 600; }
+  .card-head .gpu { color: var(--dim); font-size: 11px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 20px;
+    font-size: 11px; font-weight: 600; background: #0008;
+  }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .meta-row { display: flex; gap: 14px; color: var(--dim); font-size: 11px; margin: 6px 0 10px; flex-wrap: wrap; }
+  .gauge { margin: 9px 0; }
+  .gauge .glab { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 3px; }
+  .gauge .glab b { color: var(--text); font-weight: 600; }
+  .bar { height: 8px; border-radius: 4px; background: #0c0f15; overflow: hidden; }
+  .bar > span { display: block; height: 100%; border-radius: 4px; transition: width .2s linear, background .3s; }
+  .mini { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 14px; font-size: 11px; margin-top: 8px; color: var(--dim); }
+  .mini b { color: var(--text); font-weight: 600; }
+  .statusmsg { margin-top: 9px; font-size: 11px; color: #fbbf24; min-height: 14px; }
+  .statusmsg.err { color: #f87171; }
+
+  .logpane { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; display: flex; flex-direction: column; max-height: calc(100vh - 120px); position: sticky; top: 78px; }
+  .logpane h2 { font-size: 12px; margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--border); color: var(--dim); text-transform: uppercase; letter-spacing: .5px; }
+  .logs { overflow-y: auto; padding: 8px 12px; flex: 1; }
+  .logline { display: flex; gap: 8px; padding: 1px 0; font-size: 11.5px; white-space: pre-wrap; word-break: break-word; }
+  .logline .lt { color: var(--dim); flex-shrink: 0; }
+  .logline .ls { flex-shrink: 0; width: 64px; font-weight: 600; }
+  .logline.stderr .lx { color: #f87171; }
+  .legend { font-size: 10px; color: var(--dim); padding: 6px 20px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>swactor <span class="badge">·</span> Live Fleet Board</h1>
+  <div class="stat"><span class="v" id="s-run">—</span><span class="k">run</span></div>
+  <div class="stat"><span class="v" id="s-running">—</span><span class="k">running</span></div>
+  <div class="stat"><span class="v" id="s-gpu">—</span><span class="k">fleet gpu</span></div>
+  <div class="stat"><span class="v" id="s-recs">0</span><span class="k">records</span></div>
+  <div class="controls">
+    <span class="conn" id="conn"><span class="dot"></span><span id="conn-t">connecting…</span></span>
+    <span class="clock" id="clock">--:--:--</span>
+  </div>
+</header>
+<div class="legend">Server-aggregated snapshot model: each collector record folds into live fleet state; the browser renders the latest snapshot streamed over <code>/diag/stream/&lt;run&gt;</code>. Node health is inferred from host-sample freshness.</div>
+<div class="layout">
+  <div class="grid" id="grid"><div class="empty" id="empty">Waiting for the first record…</div></div>
+  <div class="logpane">
+    <h2>live log tail</h2>
+    <div class="logs" id="logs"></div>
+  </div>
+</div>
+
+<script src="/dashboard.js"></script>
+<script>
+const M = window.FleetModel;
+const STALE_MS = 15000;       // host-sample older than this => node considered offline
+const RENDER_MS = 250;        // throttle: coalesce bursts into one render
+
+const $ = (id) => document.getElementById(id);
+const records = [];           // bridged records: { at_ms, node, body }
+let runId = null;
+let dirty = false;
+
+function setConn(state, text) {
+  const el = $("conn");
+  el.className = "conn" + (state ? " " + state : "");
+  $("conn-t").textContent = text;
+}
+
+// Map a collector LiveRecord -> the shape FleetModel.buildModel folds.
+// LiveRecord.body is a VastaiRecord: { vastai_node, source, wall_ms, body:{t,...} }.
+function bridge(rec) {
+  const vr = rec.body || {};
+  const inner = vr.body;
+  if (!inner || !inner.t) return null;          // not a vastai record (e.g. swactor boot/events)
+  return { at_ms: vr.wall_ms ?? rec.recv_ms ?? Date.now(), node: vr.vastai_node || {}, body: inner };
+}
+
+function ingest(raw) {
+  let rec;
+  try { rec = JSON.parse(raw); } catch { return; }
+  const b = bridge(rec);
+  if (b) { records.push(b); dirty = true; }
+}
+
+function utilColor(p) {
+  if (p == null) return "#374151";
+  if (p < 25) return "#fbbf24";
+  if (p < 60) return "#4ade80";
+  return "#22c55e";
+}
+function tempColor(c) {
+  if (c == null) return "#374151";
+  if (c >= 85) return "#f87171";
+  if (c >= 75) return "#fbbf24";
+  return "#4dd0e1";
+}
+function gauge(label, valTxt, pct, color) {
+  return `<div class="gauge"><div class="glab"><span>${label}</span><b>${valTxt}</b></div>
+    <div class="bar"><span style="width:${Math.max(0, Math.min(100, pct || 0))}%;background:${color}"></span></div></div>`;
+}
+function escapeHtml(s) { return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
+
+function render() {
+  const now = Date.now();
+  $("clock").textContent = new Date(now).toLocaleTimeString();
+  $("s-recs").textContent = records.length;
+
+  const model = M.buildModel(records, { run_id: runId });
+  if (!model.stages.length) return;
+  $("empty") && $("empty").remove();
+
+  let runningCount = 0, gpuSum = 0, gpuN = 0;
+  const cards = model.stages.map((s) => {
+    const { inst, samp } = M.stageStateAt(s, now);
+    const si = M.liveStatus(s, now, STALE_MS);
+    if (si.kind === "running") runningCount++;
+
+    const util = samp ? samp.util : (inst ? inst.gpuUtil : null);
+    const temp = samp ? samp.temp : (inst ? inst.gpuTemp : null);
+    const vram = samp ? samp.vram : null;
+    const vramTot = samp ? samp.vramTotal : (inst && inst.gpuRam ? inst.gpuRam * 1024 : null);
+    const cpu = samp ? samp.cpu : (inst ? inst.cpuUtil : null);
+    if (si.kind === "running" && util != null) { gpuSum += util; gpuN++; }
+
+    const vramPct = vram != null && vramTot ? (vram / vramTot) * 100 : null;
+    const memPct = samp && samp.memUsedKb != null && samp.memTotalKb ? (samp.memUsedKb / samp.memTotalKb) * 100 : null;
+    const memTxt = samp && samp.memUsedKb != null && samp.memTotalKb
+      ? (samp.memUsedKb / 1048576).toFixed(1) + "/" + (samp.memTotalKb / 1048576).toFixed(0) + " GB" : "—";
+    const costTxt = s.totalCost ? `${M.fmtUSD(s.totalCost)}${s.dph ? " @ " + M.fmtUSD(s.dph) + "/h" : ""}` : "";
+    const msg = inst && inst.statusMsg ? inst.statusMsg : "";
+
+    return `<div class="card ${si.kind === "dead" ? "dead" : ""}">
+      <div class="topstrip" style="background:${s.color}"></div>
+      <div class="card-head">
+        <div><span class="label">${escapeHtml(s.label)}</span> <span class="gpu">${escapeHtml(s.gpuName || "")}</span></div>
+        <span class="pill"><span class="dot" style="background:${si.color}"></span>${si.label}</span>
+      </div>
+      <div class="meta-row">
+        ${s.geo ? `<span>${escapeHtml(s.geo)}</span>` : ""}
+        <span>stage ${s.idx}</span>
+        ${costTxt ? `<span>${costTxt}</span>` : ""}
+      </div>
+      ${gauge("GPU util", util != null ? util.toFixed(0) + "%" : "—", util, utilColor(util))}
+      ${vram != null ? gauge("VRAM", (vram / 1024).toFixed(1) + "/" + (vramTot ? (vramTot / 1024).toFixed(0) : "?") + " GB", vramPct, vramPct > 90 ? "#f87171" : "#a78bfa") : ""}
+      ${gauge("CPU", cpu != null ? cpu.toFixed(0) + "%" : "—", cpu, "#60a5fa")}
+      ${memPct != null ? gauge("MEM", memTxt, memPct, memPct > 90 ? "#f87171" : "#34d399") : ""}
+      <div class="mini">
+        <span>temp <b style="color:${tempColor(temp)}">${temp != null ? temp.toFixed(0) + "°C" : "—"}</b></span>
+        <span>power <b>${samp && samp.power != null ? samp.power.toFixed(0) + "W" : "—"}</b></span>
+        <span>net↓ <b>${samp ? M.fmtBytesRate(samp.netRx) : "—"}</b></span>
+        <span>net↑ <b>${samp ? M.fmtBytesRate(samp.netTx) : "—"}</b></span>
+        <span>disk↓ <b>${samp ? M.fmtBytesRate(samp.diskR) : "—"}</b></span>
+        <span>load <b>${samp && samp.load1 != null ? samp.load1.toFixed(1) : "—"}</b></span>
+      </div>
+      <div class="statusmsg ${si.kind === "dead" ? "err" : ""}">${escapeHtml(msg)}</div>
+    </div>`;
+  });
+  $("grid").innerHTML = cards.join("");
+  $("s-run").textContent = model.meta.run_id || "—";
+  $("s-running").textContent = `${runningCount}/${model.stages.length}`;
+  $("s-gpu").textContent = gpuN ? (gpuSum / gpuN).toFixed(0) + "%" : "—";
+
+  const tail = M.logsUpTo(model.allLogs, now, 80);
+  $("logs").innerHTML = tail.map((l) =>
+    `<div class="logline ${l.stream === "stderr" ? "stderr" : ""}">
+      <span class="lt">${M.fmtClock(now - l.at)} ago</span>
+      <span class="ls" style="color:${M.stageColor(l.stage)}">stage-${l.stage}</span>
+      <span class="lx">${escapeHtml(l.text != null ? l.text : (l.line ?? ""))}</span>
+    </div>`).join("");
+  const pane = $("logs"); pane.scrollTop = pane.scrollHeight;
+}
+
+function connect(id) {
+  runId = id;
+  $("s-run").textContent = id;
+  const es = new EventSource("/diag/stream/" + encodeURIComponent(id));
+  const KINDS = ["vastai_sample", "vastai_instance", "vastai_logs", "vastai_lifecycle"];
+  for (const k of KINDS) es.addEventListener(k, (e) => ingest(e.data));
+  es.onmessage = (e) => ingest(e.data); // tolerate unnamed events
+  es.onopen = () => setConn("live", "live · " + id);
+  es.onerror = () => setConn("down", "reconnecting…");
+}
+
+// Pick the run to stream: ?run= wins, else the newest run the collector knows.
+async function pickRun() {
+  const q = new URLSearchParams(location.search).get("run");
+  if (q) return q;
+  try {
+    const runs = await (await fetch("/diag/runs")).json();
+    if (Array.isArray(runs) && runs.length) {
+      runs.sort((a, b) => (b.run_start_collector_ms || 0) - (a.run_start_collector_ms || 0));
+      return runs[0].run_id;
+    }
+  } catch { /* fall through */ }
+  return null;
+}
+
+(async function main() {
+  setInterval(() => { if (dirty) { dirty = false; render(); } }, RENDER_MS);
+  setInterval(() => { $("clock").textContent = new Date().toLocaleTimeString(); }, 1000);
+  let id = await pickRun();
+  if (!id) {
+    // No run yet — poll until one appears, then connect.
+    setConn("", "waiting for a run…");
+    const t = setInterval(async () => {
+      const r = await pickRun();
+      if (r) { clearInterval(t); connect(r); }
+    }, 2000);
+    return;
+  }
+  connect(id);
+})();
+</script>
+</body>
+</html>

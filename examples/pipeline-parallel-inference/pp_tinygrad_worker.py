@@ -614,7 +614,7 @@ def _load_sharded_transformer(gguf_path, stage: int, num_stages: int, max_contex
     from tinygrad.apps.llm import Transformer
 
     _t0 = time.monotonic()
-    gguf = Tensor(gguf_path)  # device is DISK:<path> — nothing is copied to the GPU yet
+    gguf = Tensor(Path(gguf_path))  # device is DISK:<path> — nothing is copied to the GPU yet
 
     # --- parse the GGUF header (kv metadata + tensor directory) off disk ---
     reader = io.BufferedReader(TensorIO(gguf), 1_000_000)

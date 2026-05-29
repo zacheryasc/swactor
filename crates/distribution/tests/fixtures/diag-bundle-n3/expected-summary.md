@@ -46,6 +46,22 @@
 ## Inference responses
 - No InferenceResponseSent events captured (gap 2.4 D/S layer not active for this run).
 
+## Bandwidth (by node, by kind and peer)
+- by kind:
+  - orchestrator recv pong × 2 (32 bytes)
+  - orchestrator sent ping × 2 (64 bytes)
+  - stage-0 recv ping × 1 (32 bytes)
+  - stage-0 sent pong × 1 (16 bytes)
+  - stage-1 recv ping × 1 (32 bytes)
+- by peer:
+  - orchestrator <- stage-0 × 1 (16 bytes)
+  - orchestrator <- stage-1 × 1 (16 bytes)
+  - orchestrator -> stage-0 × 1 (32 bytes)
+  - orchestrator -> stage-1 × 1 (32 bytes)
+  - stage-0 <- orchestrator × 1 (32 bytes)
+  - stage-0 -> orchestrator × 1 (16 bytes)
+  - stage-1 <- orchestrator × 1 (32 bytes)
+
 ## Per-peer dials
 - totals: started=3, succeeded=2, failed=1, in-flight=0
 

@@ -140,6 +140,11 @@ pub enum StageMsg {
         reply_to: Option<ActorAddress>,
     },
     Reset,
+    /// Tear down the running worker subprocess and spawn a fresh one,
+    /// re-exec'ing the on-disk worker script so an edited
+    /// `pp_tinygrad_worker.py` is picked up without restarting the node.
+    /// Driven by a `SIGHUP` to `pp-gpu-node`.
+    ReloadWorker,
 }
 
 // ─── Bridges (one per inbound network message type) ───────────────────────
@@ -343,6 +348,10 @@ pub struct StageActor {
     /// `register`/`note_exited` into when the worker spawns/exits.
     /// `None` when not wired (tests).
     subprocess_introspect: Option<Arc<SubprocessIntrospect>>,
+    /// Live log forwarder for the independent vastai monitoring layer. When set,
+    /// each worker stdout/stderr line is streamed to the collector. `None` leaves
+    /// behavior identical (tests, monitoring off).
+    log_forwarder: Option<distribution::diagnostics::vastai::LogForwarder>,
 }
 
 impl StageActor {
@@ -380,7 +389,19 @@ impl StageActor {
             process_started_at: None,
             worker_pid: None,
             subprocess_introspect: None,
+            log_forwarder: None,
         }
+    }
+
+    /// Attach a vastai [`LogForwarder`](distribution::diagnostics::vastai::LogForwarder)
+    /// so the worker's stdout/stderr stream live to the collector. Independent of
+    /// the swactor `diagnostics` emitter above.
+    pub fn with_log_forwarder(
+        mut self,
+        forwarder: distribution::diagnostics::vastai::LogForwarder,
+    ) -> Self {
+        self.log_forwarder = Some(forwarder);
+        self
     }
 
     /// Build a first-stage (`StageRole::First`) actor. `next_stage_addr`
@@ -490,6 +511,15 @@ impl StageActor {
                 end -= 1;
             }
             line.truncate(end);
+        }
+        // Live-stream the line to the vastai monitoring layer (when wired). The
+        // bounded ring below stays the retrospective crash tail; the forwarder is
+        // the live, collected stream. No-op when monitoring is off.
+        if let Some(fwd) = &self.log_forwarder {
+            fwd.push(
+                distribution::diagnostics::vastai::record::LogStream::Stderr,
+                &line,
+            );
         }
         if self.stderr_tail.len() >= STDERR_TAIL_LINES {
             self.stderr_tail.pop_front();
@@ -987,13 +1017,10 @@ impl StageActor {
         self.accumulated.clear();
         self.finished = false;
     }
-}
 
-impl ActorInterface for StageActor {
-    type Incoming = StageMsg;
-    type Response = ();
-
-    fn on_start(&mut self, ctx: &Ctx) {
+    /// Spawn the worker subprocess and its notification bridge, recording
+    /// their addresses. Shared by `on_start` and `handle_reload_worker`.
+    fn spawn_worker(&mut self, ctx: &Ctx) {
         let proc_addr = spawn_local_process(ctx, &self.sender, self.spec.clone())
             .expect("failed to spawn stage worker process");
         let bridge = ProcessBridge {
@@ -1010,6 +1037,39 @@ impl ActorInterface for StageActor {
         );
         self.process_addr = Some(proc_addr);
         self.bridge_addr = Some(bridge_addr);
+    }
+
+    /// Hot-reload the worker: gracefully stop the running worker and start a
+    /// fresh one. Because the `ProcessSpec` re-execs `python3 <worker
+    /// script>`, the replacement picks up an edited on-disk worker file.
+    ///
+    /// The old process actor is *not* force-stopped — sending `Close` makes
+    /// it SIGTERM and reap the child before self-terminating, so the GPU is
+    /// freed before the replacement loads (force-stopping could orphan the
+    /// child). Any late notification from the old worker is ignored in
+    /// `handle`: each `ProcessNotification` carries its origin proc address,
+    /// which no longer matches `process_addr` after the swap.
+    fn handle_reload_worker(&mut self, ctx: &Ctx) {
+        if let Some(proc_addr) = self.process_addr.take() {
+            let _ = ctx.send(proc_addr, ProcessCommand::Close);
+        }
+        if let Some(bridge_addr) = self.bridge_addr.take() {
+            let _ = ctx.stop_actor(bridge_addr);
+        }
+        self.ready = false;
+        self.process_alive = false;
+        self.clear_pending_state();
+        self.output_buffer.clear();
+        self.spawn_worker(ctx);
+    }
+}
+
+impl ActorInterface for StageActor {
+    type Incoming = StageMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        self.spawn_worker(ctx);
     }
 
     fn handle(&mut self, ctx: &Ctx, msg: StageMsg) {
@@ -1033,6 +1093,7 @@ impl ActorInterface for StageActor {
                 }
             }
             StageMsg::Reset => self.handle_reset(),
+            StageMsg::ReloadWorker => self.handle_reload_worker(ctx),
             StageMsg::Process(notif) => match notif {
                 ProcessNotification::Started { pid, .. } => {
                     self.process_alive = true;
@@ -1090,11 +1151,23 @@ impl ActorInterface for StageActor {
                         while let Some(pos) = self.output_buffer.find('\n') {
                             let line = self.output_buffer[..pos].to_string();
                             self.output_buffer = self.output_buffer[pos + 1..].to_string();
+                            if let Some(fwd) = &self.log_forwarder {
+                                fwd.push(
+                                    distribution::diagnostics::vastai::record::LogStream::Stdout,
+                                    &line,
+                                );
+                            }
                             self.handle_worker_line(ctx, line.trim());
                         }
                     }
                 }
-                ProcessNotification::Exited { status, .. } => {
+                ProcessNotification::Exited { status, process } => {
+                    // Hot-reload guard: a late exit from a worker we already
+                    // replaced carries the old proc address; ignoring it
+                    // keeps the freshly spawned worker's state intact.
+                    if self.process_addr != Some(process) {
+                        return;
+                    }
                     self.process_alive = false;
                     self.ready = false;
                     self.clear_pending_state();
@@ -1106,6 +1179,25 @@ impl ActorInterface for StageActor {
                     };
                     let stderr_tail = self.drain_stderr_tail();
                     let traceback = self.last_python_traceback.take();
+
+                    // Mirror an abnormal worker exit to this process's own
+                    // stderr. The worker's stderr is otherwise consumed here and
+                    // only re-emitted on the `worker_exit_detail` diagnostics
+                    // event, which is invisible when no collector is configured
+                    // (the common bare-deploy case). pp-gpu-node's stderr is
+                    // captured by the container log, so this makes a crashed
+                    // worker self-diagnosing without a diagnostics backend.
+                    if !normal_exit {
+                        eprintln!(
+                            "pp-gpu-node: worker exited abnormally (code={exit_code:?} signal={signal:?}); stderr tail:"
+                        );
+                        for line in &stderr_tail {
+                            eprintln!("  worker| {line}");
+                        }
+                        if let Some(tb) = traceback.as_deref() {
+                            eprintln!("pp-gpu-node: worker python traceback:\n{tb}");
+                        }
+                    }
 
                     // Spec §4: typed SubprocessExited carries the
                     // generic per-process exit facts (label, PID,
@@ -1142,7 +1234,10 @@ impl ActorInterface for StageActor {
                         let _ = ctx.send(addr, StageActorStatus::ProcessExited { status });
                     }
                 }
-                ProcessNotification::Error { .. } => {
+                ProcessNotification::Error { process, .. } => {
+                    if self.process_addr != Some(process) {
+                        return;
+                    }
                     self.process_alive = false;
                     self.ready = false;
                 }

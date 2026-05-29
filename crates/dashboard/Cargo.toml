@@ -27,11 +27,21 @@ tui = ["dep:ratatui", "dep:crossterm"]
 # (tarball or spool dir) and serves a localhost web UI for scrubbing
 # through the event timeline.
 replay-viewer = ["dep:anyhow", "dep:distribution", "distribution/collector"]
+# Live collector + fleet dashboard: the dashboard process *is* the HTTP
+# diagnostics collector (receives broadcast POSTs) and serves a unified live
+# SSE UI folding the vast.ai fleet telemetry and the orchestrator's
+# distribution snapshot server-side.
+live-collector = ["dep:distribution", "distribution/collector"]
 
 [[bin]]
 name = "swactor-tui"
 path = "src/bin/tui.rs"
 required-features = ["tui"]
+
+[[bin]]
+name = "dashboard_collector"
+path = "src/bin/dashboard_collector.rs"
+required-features = ["live-collector"]
 
 [[example]]
 name = "replay_viewer"

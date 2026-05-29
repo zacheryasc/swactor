@@ -9,11 +9,23 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
+use distribution::diagnostics::event::Event;
+use distribution::diagnostics::sink::DynEmitter;
 use distribution::iroh_driver::IrohDriver;
+use distribution::types::NodeId;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor::transport::{CodecRegistry, Transport, WireEnvelope};
 use swactor::Error;
+
+/// Saturating cast of a payload length to the `u32` carried by the byte-metric
+/// events. Payloads here can exceed the SWIM-control sizes the existing
+/// `IrohDriver` events cap at, so we clamp rather than wrap — an
+/// over-`u32::MAX` activation reports as `u32::MAX` bytes instead of a tiny
+/// wrapped value. Downstream postproc accumulates these as `u64`.
+fn metric_size(len: usize) -> u32 {
+    len.min(u32::MAX as usize) as u32
+}
 
 /// ALPN protocol for actor-level messages (distinct from SWIM protocol).
 pub const ACTOR_ALPN: &[u8] = b"swactor/actor/1";
@@ -30,6 +42,12 @@ pub struct IrohActorTransport {
     target_addr: iroh::EndpointAddr,
     handle: tokio::runtime::Handle,
     conn: std::sync::Mutex<Option<iroh::endpoint::Connection>>,
+    /// The peer this transport dials — recorded on emitted byte-metric events
+    /// so postproc can attribute bandwidth per neighbour.
+    peer: NodeId,
+    /// Diagnostics emitter (the driver's, or `None` when unobserved). Each
+    /// successful send emits a [`Event::MessageSent`] through it.
+    diagnostics: Option<DynEmitter>,
 }
 
 impl IrohActorTransport {
@@ -37,18 +55,28 @@ impl IrohActorTransport {
         endpoint: iroh::Endpoint,
         target_addr: iroh::EndpointAddr,
         handle: tokio::runtime::Handle,
+        peer: NodeId,
+        diagnostics: Option<DynEmitter>,
     ) -> Self {
         Self {
             endpoint,
             target_addr,
             handle,
             conn: std::sync::Mutex::new(None),
+            peer,
+            diagnostics,
         }
     }
 }
 
 impl Transport for IrohActorTransport {
     fn send(&self, envelope: WireEnvelope) -> Result<(), Error> {
+        // Capture the metric inputs before `encode_wire` borrows the envelope
+        // and the block_on consumes the framed bytes. `size` is the payload
+        // only (matching the existing `IrohDriver` byte-metric semantics), not
+        // the 32B-dest + tag framing.
+        let kind = envelope.type_tag.clone();
+        let size = metric_size(envelope.payload.len());
         let data = encode_wire(&envelope);
         let ep = self.endpoint.clone();
         let target = self.target_addr.clone();
@@ -68,13 +96,20 @@ impl Transport for IrohActorTransport {
             }
             const ATTEMPTS: u32 = 3;
             const PER_ATTEMPT: Duration = Duration::from_secs(10);
+            // These per-attempt lines fire during normal WAN convergence and
+            // read like *the* failure even when a later retry succeeds. Keep
+            // them off by default; the real error is always returned via
+            // `last_err` regardless. Set PP_VERBOSE_TRANSPORT=1 to see them.
+            let verbose = std::env::var("PP_VERBOSE_TRANSPORT")
+                .map(|v| matches!(v.trim(), "1" | "true"))
+                .unwrap_or(false);
             let mut last_err: Option<Error> = None;
             for attempt in 1..=ATTEMPTS {
                 let target = target.clone();
                 match tokio::time::timeout(PER_ATTEMPT, ep.connect(target, ACTOR_ALPN)).await {
                     Ok(Ok(c)) => return Ok(c),
                     Ok(Err(e)) => {
-                        if attempt < ATTEMPTS {
+                        if verbose && attempt < ATTEMPTS {
                             eprintln!(
                                 "iroh actor transport: connect attempt {attempt}/{ATTEMPTS} failed: {e}"
                             );
@@ -82,7 +117,7 @@ impl Transport for IrohActorTransport {
                         last_err = Some(Error::from(format!("iroh connect: {e}")));
                     }
                     Err(_) => {
-                        if attempt < ATTEMPTS {
+                        if verbose && attempt < ATTEMPTS {
                             eprintln!(
                                 "iroh actor transport: connect attempt {attempt}/{ATTEMPTS} timed out"
                             );
@@ -101,7 +136,7 @@ impl Transport for IrohActorTransport {
 
         *self.conn.lock().unwrap() = Some(conn.clone());
 
-        self.handle.block_on(async move {
+        let result = self.handle.block_on(async move {
             let mut stream = conn
                 .open_uni()
                 .await
@@ -114,7 +149,20 @@ impl Transport for IrohActorTransport {
                 .finish()
                 .map_err(|e| Error::from(format!("iroh finish: {e}")))?;
             Ok(())
-        })
+        });
+
+        // Count only bytes that actually went out — a failed dial or write
+        // must not inflate the bandwidth totals.
+        if result.is_ok() {
+            if let Some(diag) = &self.diagnostics {
+                diag.emit_event(Event::MessageSent {
+                    peer: self.peer,
+                    kind,
+                    size,
+                });
+            }
+        }
+        result
     }
 }
 
@@ -175,6 +223,9 @@ pub fn drain_actor_messages(
         return;
     }
     let handle = driver.tokio_handle();
+    // Intentionally uninstrumented: this one-shot drain backs only short
+    // request/response tests, not the heavy pipeline path. Per-message byte
+    // metrics are emitted by [`ActorMessagePump`] (the long-lived flow).
     let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
 
     for (_node_id, conn) in conns {
@@ -216,14 +267,24 @@ pub fn drain_actor_messages(
 /// by the pump (never dropped between drains), so its background tasks can
 /// keep delivering streams as long as the underlying connection stays open.
 pub struct ActorMessagePump {
-    tx: mpsc::Sender<Vec<u8>>,
-    rx: mpsc::Receiver<Vec<u8>>,
+    // The per-connection background tasks tag each inbound stream with the
+    // `NodeId` of the connection it arrived on, so the drain loop can emit a
+    // peer-attributed [`Event::MessageReceived`] without re-deriving identity.
+    tx: mpsc::Sender<(NodeId, Vec<u8>)>,
+    rx: mpsc::Receiver<(NodeId, Vec<u8>)>,
+    /// Diagnostics emitter (the driver's, or `None` when unobserved). Each
+    /// received message emits a [`Event::MessageReceived`] through it.
+    diagnostics: Option<DynEmitter>,
 }
 
 impl ActorMessagePump {
-    pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        Self { tx, rx }
+    pub fn new(diagnostics: Option<DynEmitter>) -> Self {
+        let (tx, rx) = mpsc::channel::<(NodeId, Vec<u8>)>();
+        Self {
+            tx,
+            rx,
+            diagnostics,
+        }
     }
 
     /// Accept any newly-arrived ALPN connections from the driver and spawn a
@@ -233,14 +294,14 @@ impl ActorMessagePump {
         let conns = driver.drain_other_connections();
         if !conns.is_empty() {
             let handle = driver.tokio_handle();
-            for (_node_id, conn) in conns {
+            for (node_id, conn) in conns {
                 let tx = self.tx.clone();
                 handle.spawn(async move {
                     loop {
                         match conn.accept_uni().await {
                             Ok(mut recv) => match recv.read_to_end(256 * 1024).await {
                                 Ok(data) => {
-                                    if tx.send(data).is_err() {
+                                    if tx.send((node_id, data)).is_err() {
                                         break;
                                     }
                                 }
@@ -252,8 +313,19 @@ impl ActorMessagePump {
                 });
             }
         }
-        while let Ok(data) = self.rx.try_recv() {
+        while let Ok((node_id, data)) = self.rx.try_recv() {
             if let Some(envelope) = decode_wire(&data) {
+                // Emit before delivery — `receive` consumes the envelope and we
+                // want the byte metric regardless of whether a codec is
+                // registered for this tag. Size is payload-only, matching the
+                // send side and the existing `IrohDriver` semantics.
+                if let Some(diag) = &self.diagnostics {
+                    diag.emit_event(Event::MessageReceived {
+                        peer: node_id,
+                        kind: envelope.type_tag.clone(),
+                        size: metric_size(envelope.payload.len()),
+                    });
+                }
                 if let Ok((addr, msg)) = codecs.receive(envelope) {
                     let _ = rt.deliver_raw(addr, msg);
                 }
@@ -264,6 +336,6 @@ impl ActorMessagePump {
 
 impl Default for ActorMessagePump {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }

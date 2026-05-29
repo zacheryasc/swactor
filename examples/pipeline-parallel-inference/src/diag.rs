@@ -39,6 +39,9 @@ use distribution::iroh_driver::IrohDriver;
 use swactor::actor::ActorAddress;
 
 const ENV_COLLECTOR_URL: &str = "SWACTOR_DIAG_COLLECTOR_URL";
+/// Default broadcast target for a live deploy. When the dedicated diagnostics
+/// collector URL is unset, diagnostics ship to the dashboard collector instead.
+const ENV_DASHBOARD_URL: &str = "PP_DASHBOARD_URL";
 const ENV_RUN_ID: &str = "SWACTOR_DIAG_RUN_ID";
 const ENV_NODE_ROLE: &str = "SWACTOR_DIAG_NODE_ROLE";
 const ENV_STAGE_INDEX: &str = "SWACTOR_DIAG_STAGE_INDEX";
@@ -124,11 +127,13 @@ pub fn install_with_overrides(
     default_role: Role,
     run_id_override: Option<&str>,
 ) -> Option<DiagHandles> {
-    let url = std::env::var(ENV_COLLECTOR_URL).ok()?;
-    let url = url.trim().to_string();
-    if url.is_empty() {
-        return None;
-    }
+    // Prefer the dedicated collector URL; fall back to the dashboard collector so
+    // setting PP_DASHBOARD_URL alone is enough to ship diagnostics in a live deploy.
+    let url = env_string(ENV_COLLECTOR_URL)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| env_string(ENV_DASHBOARD_URL))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
 
     let run_id = run_id_override
         .map(|s| s.to_string())

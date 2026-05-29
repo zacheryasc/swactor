@@ -29,6 +29,7 @@ pub mod subprocess_introspect;
 pub mod snapshot;
 pub mod spool;
 pub mod swim_introspect;
+pub mod vastai;
 pub mod vastai_context;
 
 #[cfg(feature = "collector")]
@@ -71,8 +72,10 @@ pub use subprocess_introspect::SubprocessIntrospect;
 pub use registry_introspect::RegistryIntrospect;
 pub use swim_introspect::SwimIntrospect;
 pub use vastai_context::VastaiContext;
+#[cfg(feature = "collector")]
+pub use vastai::{VastaiShipper, VastaiShipperConfig, VastaiShipperHandle};
 #[cfg(feature = "iroh")]
-pub use iroh_introspect::{ConnectionCacheTracker, IrohIntrospect};
+pub use iroh_introspect::{ConnectionCacheTracker, IrohIntrospect, conn_type_of};
 
 /// Current wall clock in milliseconds since the UNIX epoch. One
 /// canonical helper so feature-gated and non-gated code paths agree.

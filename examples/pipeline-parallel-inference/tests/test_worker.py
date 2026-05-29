@@ -950,14 +950,16 @@ class TestLifecycleEvents:
         assert starting["stub"] is True
 
     def test_ready_event_carries_stage_and_uptime(self, stage0):
-        """A parallel `event=ready` line accompanies the back-compat
-        `status=ready` line so the bundle records readiness in the
-        same event-kind family as the rest of the lifecycle."""
+        """A parallel `event=pp_worker_ready` line accompanies the
+        back-compat `status=ready` line so the bundle records readiness
+        in the same event-kind family as the rest of the lifecycle
+        (§4.6). It carries `stage_index` per the event-hygiene rule of
+        §4.8, not the legacy `stage` field."""
         # Drain starting event first.
         _read_event(stage0, "starting")
-        ready = _read_event(stage0, "ready")
+        ready = _read_event(stage0, "pp_worker_ready")
         assert ready["pid"] == stage0.pid
-        assert ready["stage"] == 0
+        assert ready["stage_index"] == 0
         assert "uptime_ms" in ready
 
     def test_exiting_event_fires_on_eof(self, stage0):
@@ -1185,4 +1187,358 @@ class TestRealTinygradWorker:
         finally:
             _shutdown(stage0)
             _shutdown(stage1)
+
+    def test_real_middle_stage_loads_shard_and_forwards_synthetic_activation(self):
+        # "tinygrad works and the model shard loads" at the middle of a
+        # pipeline. Stage 1 of a 4-way split is a genuine Middle role: its
+        # shard is an interior block range that owns neither the embedding
+        # (stage 0) nor the output / output_norm (last stage). Two things
+        # must hold — the middle shard loads at all (tinygrad realizes only
+        # blk[start:end)), and a forward pass over it yields a hidden state
+        # of the right shape. The input activation is synthetic on purpose:
+        # forward_range accepts any buffer of the correct
+        # (seq_len, hidden_dim) shape, so the shard can be inferenced in
+        # isolation without standing up an upstream stage.
+        middle = _spawn_real(1, 4)
+        try:
+            ready = _read_reply(middle, timeout=REAL_LOAD_TIMEOUT)
+            assert ready["status"] == "ready", ready
+            assert ready["stage"] == 1
+            hidden_dim = ready["hidden_dim"]
+            total_blocks = ready["total_blocks"]
+            start, end = ready["layer_range"]
+            # Interior, non-empty slice: a real middle shard, not the whole
+            # model and not an end shard.
+            assert 0 < start < end < total_blocks, ready
+
+            seq_len = 4
+            nbytes = seq_len * hidden_dim * 2  # float16/bf16 on the wire
+            activation = bytes((i * 37 + 11) & 0xFF for i in range(nbytes))
+            _send(
+                middle,
+                {
+                    "op": "forward_range",
+                    "request_id": 1,
+                    "hidden_b64": base64.b64encode(activation).decode("ascii"),
+                    "position": 0,
+                    "seq_len": seq_len,
+                },
+            )
+            reply = _read_reply(middle, timeout=REAL_OP_TIMEOUT)
+            assert "error" not in reply, reply
+            assert reply["seq_len"] == seq_len
+            out = base64.b64decode(reply["hidden_b64"])
+            assert len(out) == seq_len * hidden_dim * 2
+            # A real forward over the shard produces a non-trivial hidden
+            # state; an all-zero return would pass the length check but mean
+            # nothing actually ran.
+            assert any(b != 0 for b in out)
+        finally:
+            _shutdown(middle)
+
+
+# ---------------------------------------------------------------------------
+# Sharded model-load over HTTP (spec §4.1 / §4.2 / §4.7).
+#
+# A middle stage must materialize *only* its own tensor slice by issuing
+# byte-range GETs against the source — never pulling the whole artifact,
+# and never pulling tensors that belong to stage 0 (embedding) or the
+# last stage (output / output_norm). These tests stub the op-messaging
+# layer out entirely: they drive `_pp_download_sharded` directly against
+# a local HTTP server that serves a synthetic GGUF with Range support,
+# and assert on observable behaviour — which bytes crossed the wire, what
+# landed on disk, and whether a warm cache short-circuits the next fetch.
+
+import contextlib
+import hashlib
+import http.server
+import io as _io
+import struct
+import threading
+
+
+def _tensor_payload(name: str, nbytes: int) -> bytes:
+    """Deterministic, content-addressed bytes for a tensor, so a shard
+    read back from the cache can be checked against the source."""
+    seed = hashlib.sha256(name.encode()).digest()
+    reps = (nbytes // len(seed)) + 1
+    return (seed * reps)[:nbytes]
+
+
+def _build_synthetic_gguf(num_blocks: int) -> "tuple[bytes, dict, int]":
+    """Build a minimal but well-formed GGUF (version 3, all-F32 tensors).
+
+    Returns ``(file_bytes, regions, full_size)`` where ``regions`` maps
+    each tensor name to its ``(absolute_offset, nbytes)`` in the file —
+    the test uses it to check which regions were fetched and to verify
+    shard integrity. Layout: a shared ``token_embd``, ``num_blocks``
+    blocks of two tensors each, and a trailing ``output_norm`` +
+    ``output`` (the presence of ``output.weight`` makes the embedding
+    untied, so a middle stage keeps neither embedding nor output).
+    """
+    GGML_F32 = 0
+    align = 32
+    # Sized so each stage's shard dwarfs the worker's fixed ~1 MB GGUF
+    # header probe (`_PP_HEADER_INITIAL`); otherwise the probe, not the
+    # shard, would dominate the bytes-fetched accounting on a toy file.
+    dim = 384
+
+    # (name, dims) — F32, so nbytes = 4 * prod(dims).
+    specs: list[tuple[str, tuple[int, ...]]] = [("token_embd.weight", (512, dim))]
+    for i in range(num_blocks):
+        specs.append((f"blk.{i}.attn_q.weight", (dim, dim)))
+        specs.append((f"blk.{i}.ffn_down.weight", (dim, 2 * dim)))
+    specs.append(("output_norm.weight", (dim,)))
+    specs.append(("output.weight", (512, dim)))
+
+    def _round_up(n: int, a: int) -> int:
+        return ((n + a - 1) // a) * a
+
+    # Assign each tensor a data-relative offset, aligned, in declaration order.
+    rel_offsets: dict[str, int] = {}
+    nbytes_by: dict[str, int] = {}
+    cursor = 0
+    for name, dims in specs:
+        n = 1
+        for d in dims:
+            n *= d
+        nb = 4 * n
+        off = _round_up(cursor, align)
+        rel_offsets[name] = off
+        nbytes_by[name] = nb
+        cursor = off + nb
+    data_region_size = _round_up(cursor, align)
+
+    # Serialize the header.
+    hdr = _io.BytesIO()
+    hdr.write(b"GGUF")
+    hdr.write(struct.pack("<i", 3))             # version
+    hdr.write(struct.pack("<Q", len(specs)))    # n_tensors
+    hdr.write(struct.pack("<Q", 3))             # n_kv
+
+    def _w_str(s: str) -> None:
+        b = s.encode("utf-8")
+        hdr.write(struct.pack("<Q", len(b)))
+        hdr.write(b)
+
+    # KV: general.architecture (str), llama.block_count (u32), general.alignment (u32)
+    _w_str("general.architecture"); hdr.write(struct.pack("<i", 8)); _w_str("llama")
+    _w_str("llama.block_count"); hdr.write(struct.pack("<i", 4)); hdr.write(struct.pack("<I", num_blocks))
+    _w_str("general.alignment"); hdr.write(struct.pack("<i", 4)); hdr.write(struct.pack("<I", align))
+
+    for name, dims in specs:
+        _w_str(name)
+        hdr.write(struct.pack("<I", len(dims)))
+        for d in dims:
+            hdr.write(struct.pack("<Q", d))
+        hdr.write(struct.pack("<i", GGML_F32))
+        hdr.write(struct.pack("<Q", rel_offsets[name]))
+
+    header_bytes = hdr.getvalue()
+    data_start = _round_up(len(header_bytes), align)
+
+    buf = bytearray(data_start + data_region_size)
+    buf[: len(header_bytes)] = header_bytes
+    regions: dict[str, tuple[int, int]] = {}
+    for name, _dims in specs:
+        abs_off = data_start + rel_offsets[name]
+        nb = nbytes_by[name]
+        buf[abs_off : abs_off + nb] = _tensor_payload(name, nb)
+        regions[name] = (abs_off, nb)
+
+    return bytes(buf), regions, len(buf)
+
+
+class _RangeHTTPServer:
+    """A localhost HTTP server that serves a fixed byte blob with HEAD +
+    Range GET support, recording every range that was requested."""
+
+    def __init__(self, blob: bytes):
+        self.blob = blob
+        self.ranges: list[tuple[int, int]] = []  # inclusive (start, end)
+        self.saw_full_get = False
+        blob_ref = blob
+        ranges_ref = self.ranges
+        server_self = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):  # silence
+                pass
+
+            def do_HEAD(self):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(blob_ref)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+
+            def do_GET(self):
+                rng = self.headers.get("Range")
+                if not rng:
+                    server_self.saw_full_get = True
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(blob_ref)))
+                    self.send_header("Accept-Ranges", "bytes")
+                    self.end_headers()
+                    self.wfile.write(blob_ref)
+                    return
+                spec = rng.split("=", 1)[1]
+                s_str, e_str = spec.split("-")
+                start = int(s_str)
+                end = int(e_str) if e_str else len(blob_ref) - 1
+                ranges_ref.append((start, end))
+                chunk = blob_ref[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(blob_ref)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self.wfile.write(chunk)
+
+        self._httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+
+    @property
+    def url(self) -> str:
+        host, port = self._httpd.server_address
+        return f"http://{host}:{port}/model.gguf"
+
+    def fetched_bytes(self) -> int:
+        return sum(e - s + 1 for s, e in self.ranges)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *a):
+        self._httpd.shutdown()
+        self._httpd.server_close()
+
+
+def _capture_events(fn):
+    """Run ``fn`` while capturing the worker's stdout event stream;
+    return ``(result, events)`` where events are the parsed JSON lines."""
+    cap = _io.StringIO()
+    with contextlib.redirect_stdout(cap):
+        result = fn()
+    events = []
+    for line in cap.getvalue().splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            try:
+                events.append(json.loads(line))
+            except ValueError:
+                pass
+    return result, events
+
+
+class TestMiddleStageShardLoad:
+    NUM_BLOCKS = 8
+    NUM_STAGES = 4
+    STAGE = 1  # a middle stage: keeps neither embedding nor output
+
+    def _kept_block_names(self) -> set[str]:
+        start, end = worker.compute_layer_range(self.STAGE, self.NUM_STAGES, self.NUM_BLOCKS)
+        names = set()
+        for i in range(start, end):
+            names.add(f"blk.{i}.attn_q.weight")
+            names.add(f"blk.{i}.ffn_down.weight")
+        return names
+
+    def test_middle_stage_fetches_only_its_shard(self, tmp_path, monkeypatch):
+        # §4.1 / §6.1: the middle stage pulls its block tensors (plus the
+        # GGUF header) and nothing else — not the whole file, not the
+        # embedding, not the output.
+        monkeypatch.setenv("PP_MODEL_CACHE_DIR", str(tmp_path))
+        blob, regions, full_size = _build_synthetic_gguf(self.NUM_BLOCKS)
+
+        with _RangeHTTPServer(blob) as srv:
+            (cache_path, _events) = _capture_events(
+                lambda: worker._pp_download_sharded(srv.url, self.STAGE, self.NUM_STAGES)
+            )
+
+            assert not srv.saw_full_get, "stage issued a whole-file GET"
+
+            # The bytes that crossed the wire must be a small fraction of
+            # the full artifact — header + this stage's two blocks only.
+            kept = self._kept_block_names()
+            shard_bytes = sum(regions[n][1] for n in kept)
+            assert srv.fetched_bytes() < full_size // 2, (
+                f"fetched {srv.fetched_bytes()} of {full_size}; expected ~shard "
+                f"({shard_bytes}) + header"
+            )
+
+        # §4.1 shard integrity: every kept block tensor in the cache file
+        # equals the source bytes; this is what `_load_sharded_transformer`
+        # would mmap. Read back at the tensor's absolute offset.
+        with open(cache_path, "rb") as f:
+            for name in kept:
+                off, nb = regions[name]
+                f.seek(off)
+                got = f.read(nb)
+                assert got == _tensor_payload(name, nb), f"shard byte mismatch for {name}"
+
+            # Tensors owned by other stages — the embedding and the output —
+            # must NOT be materialized: their byte ranges are sparse holes
+            # (all-zero), not the source payload. (The worker's header probe
+            # may read the file's start over the wire, but only the kept
+            # ranges and the parsed header prefix are ever written to disk.)
+            for name in ("token_embd.weight", "output.weight"):
+                off, nb = regions[name]
+                f.seek(off)
+                got = f.read(nb)
+                assert got == b"\x00" * nb, f"forbidden tensor {name} was materialized"
+                assert got != _tensor_payload(name, nb)
+
+        # The cached file is sparse: apparent size matches the source,
+        # but the blocks actually allocated on disk are far fewer than a
+        # full copy would need.
+        st = os.stat(cache_path)
+        assert st.st_size == full_size
+        if hasattr(st, "st_blocks"):
+            assert st.st_blocks * 512 < full_size, (
+                f"cache not sparse: {st.st_blocks * 512} disk bytes vs {full_size}"
+            )
+
+    def test_middle_stage_emits_bounded_download_progress(self, tmp_path, monkeypatch):
+        # §4.7 / §6.8: a stage that fetches emits a first progress event
+        # mid-fetch (bytes_done < bytes_total) and a final one at
+        # completion (bytes_done == bytes_total), all tagged stage_index.
+        monkeypatch.setenv("PP_MODEL_CACHE_DIR", str(tmp_path))
+        monkeypatch.setenv("PP_DOWNLOAD_PROGRESS_INTERVAL_SECS", "0.0001")
+        blob, _regions, _full = _build_synthetic_gguf(self.NUM_BLOCKS)
+
+        with _RangeHTTPServer(blob) as srv:
+            _path, events = _capture_events(
+                lambda: worker._pp_download_sharded(srv.url, self.STAGE, self.NUM_STAGES)
+            )
+
+        progress = [e for e in events if e.get("event") == "pp_download_progress"]
+        assert progress, "no pp_download_progress events emitted during a fetch"
+        for e in progress:
+            assert e["stage_index"] == self.STAGE
+        total = progress[-1]["bytes_total"]
+        assert any(e["bytes_done"] < total for e in progress), "no mid-fetch event"
+        assert progress[-1]["bytes_done"] == total, "final event not at completion"
+
+    def test_warm_cache_is_a_hit_with_no_refetch(self, tmp_path, monkeypatch):
+        # §4.2 / §6.2: a second load against an intact cache performs no
+        # network fetch and emits no download-progress events — only a
+        # cache-hit. This is the stage-bounce scenario.
+        monkeypatch.setenv("PP_MODEL_CACHE_DIR", str(tmp_path))
+        blob, _regions, _full = _build_synthetic_gguf(self.NUM_BLOCKS)
+
+        with _RangeHTTPServer(blob) as srv:
+            worker._pp_download_sharded(srv.url, self.STAGE, self.NUM_STAGES)
+            ranges_after_first = len(srv.ranges)
+            assert ranges_after_first > 0
+
+            _path, events = _capture_events(
+                lambda: worker._pp_download_sharded(srv.url, self.STAGE, self.NUM_STAGES)
+            )
+
+            assert len(srv.ranges) == ranges_after_first, "warm cache triggered a refetch"
+
+        kinds = [e.get("event") for e in events]
+        assert "pp_cache_hit" in kinds, kinds
+        assert "pp_download_progress" not in kinds, "cache hit must not emit progress"
 

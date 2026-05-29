@@ -10,7 +10,8 @@
 #   examples/pipeline-parallel-inference/scripts/docker-e2e.sh [N]
 #
 # Environment overrides:
-#   PP_IMAGE            container image tag (default: pp-gpu-node-stub:latest)
+#   PP_IMAGE            code image tag (default: swactor-pp-gpu:latest)
+#   PP_BASE_IMAGE       base image tag (default: swactor-pp-base:cuda12.6)
 #   PP_CONTAINER_PREFIX container name prefix (default: pp-stage)
 #   PP_MAX_TOKENS       max decode tokens (default: 4)
 #   PP_PROMPT           inference prompt (default: "Say hello")
@@ -22,10 +23,26 @@
 set -euo pipefail
 
 NUM_STAGES="${1:-3}"
-IMAGE="${PP_IMAGE:-pp-gpu-node-stub:latest}"
 PREFIX="${PP_CONTAINER_PREFIX:-pp-stage}"
 MAX_TOKENS="${PP_MAX_TOKENS:-4}"
 PROMPT="${PP_PROMPT:-Say hello}"
+
+# Real vs stub mode — a runtime toggle on ONE image, not two images. Stub
+# (default) runs the Python worker in PP_WORKER_STUB mode — no tinygrad, no
+# GPU, no GGUF — so the harness exercises orchestration/convergence/teardown
+# on any host (the CUDA base is inert under the stub). PP_REAL runs real
+# tinygrad inference on a GPU: each stage loads its own model shard via
+# NVRTC, and requires a CUDA GPU reachable through `docker run --gpus`.
+IMAGE="${PP_IMAGE:-swactor-pp-gpu:latest}"
+BASE_IMAGE="${PP_BASE_IMAGE:-swactor-pp-base:cuda12.6}"
+if [ -n "${PP_REAL:-}" ]; then
+    MODEL="${MODEL:-llama3.2:1b}"
+    # Root of the GGUF shard cache. The shim gives each stage its own
+    # subdir under here (the worker keys cache files by URL, not stage, so
+    # stages must not share one dir) — letting each stage reuse its own
+    # downloaded shard across runs.
+    PP_MODEL_CACHE_DIR="${PP_MODEL_CACHE_DIR:-$HOME/.cache/pp-pipeline}"
+fi
 
 if ! [[ "$NUM_STAGES" =~ ^[0-9]+$ ]] || [ "$NUM_STAGES" -lt 2 ]; then
     echo "docker-e2e: NUM_STAGES must be an integer >= 2, got '$NUM_STAGES'" >&2
@@ -49,23 +66,42 @@ WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
 SMOKE_RUN_BIN="$CRATE_DIR/target/release/pp-smoke-run"
 GPU_NODE_BIN="$CRATE_DIR/target/release/pp-gpu-node"
 WORKER_PY="$CRATE_DIR/pp_tinygrad_worker.py"
+COLLECTOR_BIN="$WORKSPACE_DIR/target/release/swactor-diag-collector"
+POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
 
-# Step 1: build release artifacts the docker image will package.
+# Step 1: build release artifacts the docker image will package. The
+# unified code image bundles the diagnostics binaries too (inert unless
+# SWACTOR_DIAG_COLLECTOR_URL is set), so the Dockerfile's COPY needs them
+# present even for this stub run. The pp binaries live in this crate's
+# workspace; the diagnostics binaries live at the repo root.
 if [ -z "${PP_SKIP_BUILD:-}" ]; then
     echo "docker-e2e: building pp-gpu-node + pp-smoke-run (release)"
     cargo build --manifest-path "$CRATE_DIR/Cargo.toml" --release \
         --bin pp-gpu-node --bin pp-smoke-run
+    echo "docker-e2e: building swactor-diag-{collector,postproc} (release, --features collector)"
+    cargo build --manifest-path "$WORKSPACE_DIR/Cargo.toml" --release \
+        -p distribution --features collector \
+        --bin swactor-diag-collector --bin swactor-diag-postproc
 fi
-for f in "$SMOKE_RUN_BIN" "$GPU_NODE_BIN" "$WORKER_PY"; do
+for f in "$SMOKE_RUN_BIN" "$GPU_NODE_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
     [ -f "$f" ] || { echo "docker-e2e: missing $f" >&2; exit 1; }
 done
 
-# Step 2: build the stub-mode image. Build context is the workspace
-# root because the Dockerfile copies from `examples/...`.
+# Step 2: build the layered image — the heavy base (CUDA + tinygrad + sshd)
+# then the thin code layer on top. Build context is the workspace root
+# because the Dockerfiles copy from `examples/...` and `target/...`. Stub
+# mode is a runtime toggle (PP_WORKER_STUB=1 below), so the same CUDA image
+# serves both stub (no GPU) and real runs.
 if [ -z "${PP_SKIP_IMAGE_BUILD:-}" ]; then
-    echo "docker-e2e: building $IMAGE"
+    echo "docker-e2e: building $BASE_IMAGE (base)"
     docker build \
-        -f "$CRATE_DIR/Dockerfile.stub" \
+        -f "$CRATE_DIR/Dockerfile.base" \
+        -t "$BASE_IMAGE" \
+        "$WORKSPACE_DIR"
+    echo "docker-e2e: building $IMAGE (code)"
+    docker build \
+        -f "$CRATE_DIR/Dockerfile" \
+        --build-arg "BASE_IMAGE=$BASE_IMAGE" \
         -t "$IMAGE" \
         "$WORKSPACE_DIR"
 fi
@@ -89,18 +125,38 @@ STDERR_LOG="$OUTPUT_DIR/stderr.log"
 trap 'rm -rf "$OUTPUT_DIR"' EXIT
 
 set +e
-PP_WORKER_STUB=1 \
-PP_IMAGE="$IMAGE" \
-PP_CONTAINER_PREFIX="$PREFIX" \
-PP_DEV=CPU \
-"$SMOKE_RUN_BIN" \
-    --seed \
-    --num-stages "$NUM_STAGES" \
-    --gpu-node "$SCRIPT_DIR/docker-gpu-node.sh" \
-    --worker "$WORKER_PY" \
-    --prompt "$PROMPT" \
-    --max-tokens "$MAX_TOKENS" \
-    >"$STDOUT_LOG" 2>"$STDERR_LOG"
+if [ -n "${PP_REAL:-}" ]; then
+    # Real CUDA inference: no stub, attach a GPU, point the worker at the
+    # model and the shared shard cache. PP_DEV=CUDA selects tinygrad's CUDA
+    # backend (the slim image has no host compiler for the CPU backend).
+    MODEL="$MODEL" \
+    PP_IMAGE="$IMAGE" \
+    PP_CONTAINER_PREFIX="$PREFIX" \
+    PP_DEV=CUDA \
+    PP_GPUS="${PP_GPUS:-all}" \
+    PP_MODEL_CACHE_DIR="$PP_MODEL_CACHE_DIR" \
+    "$SMOKE_RUN_BIN" \
+        --seed \
+        --num-stages "$NUM_STAGES" \
+        --gpu-node "$SCRIPT_DIR/docker-gpu-node.sh" \
+        --worker "$WORKER_PY" \
+        --prompt "$PROMPT" \
+        --max-tokens "$MAX_TOKENS" \
+        >"$STDOUT_LOG" 2>"$STDERR_LOG"
+else
+    PP_WORKER_STUB=1 \
+    PP_IMAGE="$IMAGE" \
+    PP_CONTAINER_PREFIX="$PREFIX" \
+    PP_DEV=CPU \
+    "$SMOKE_RUN_BIN" \
+        --seed \
+        --num-stages "$NUM_STAGES" \
+        --gpu-node "$SCRIPT_DIR/docker-gpu-node.sh" \
+        --worker "$WORKER_PY" \
+        --prompt "$PROMPT" \
+        --max-tokens "$MAX_TOKENS" \
+        >"$STDOUT_LOG" 2>"$STDERR_LOG"
+fi
 SMOKE_STATUS=$?
 set -e
 
