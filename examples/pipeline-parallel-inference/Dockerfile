@@ -23,8 +23,8 @@ FROM ${BASE_IMAGE}
 # Pipeline binaries (this crate's target/) + diagnostics binaries (the
 # workspace-root target/). All are statically linked enough that the base
 # stage's libc is all they need; the worker is pure Python.
-COPY examples/pipeline-parallel-inference/target/release/pp-gpu-node  /usr/local/bin/pp-gpu-node
-COPY examples/pipeline-parallel-inference/target/release/pp-smoke-run /usr/local/bin/pp-smoke-run
+COPY examples/pipeline-parallel-inference/target/release/pp-worker  /usr/local/bin/pp-worker
+COPY examples/pipeline-parallel-inference/target/release/pp-orchestrator /usr/local/bin/pp-orchestrator
 COPY target/release/swactor-diag-collector /usr/local/bin/swactor-diag-collector
 COPY target/release/swactor-diag-postproc  /usr/local/bin/swactor-diag-postproc
 COPY examples/pipeline-parallel-inference/pp_tinygrad_worker.py /usr/local/share/pp_tinygrad_worker.py

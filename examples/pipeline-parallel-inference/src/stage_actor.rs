@@ -121,7 +121,7 @@ pub enum StageActorStatus {
 /// this enum by the bridge actors; `Process` is adapted from the worker
 /// subprocess; `SetNeighbors` and `Reset` are control messages.
 ///
-/// `SetNeighbors` is a one-shot setup message used by the `pp-gpu-node`
+/// `SetNeighbors` is a one-shot setup message used by the `pp-worker`
 /// binary to inject the resolved addresses of neighbouring stages and the
 /// orchestrator after SWIM gossip has propagated them. Each field is
 /// optional; only the fields relevant to the actor's role need to be set.
@@ -143,7 +143,7 @@ pub enum StageMsg {
     /// Tear down the running worker subprocess and spawn a fresh one,
     /// re-exec'ing the on-disk worker script so an edited
     /// `pp_tinygrad_worker.py` is picked up without restarting the node.
-    /// Driven by a `SIGHUP` to `pp-gpu-node`.
+    /// Driven by a `SIGHUP` to `pp-worker`.
     ReloadWorker,
 }
 
@@ -1184,18 +1184,18 @@ impl ActorInterface for StageActor {
                     // stderr. The worker's stderr is otherwise consumed here and
                     // only re-emitted on the `worker_exit_detail` diagnostics
                     // event, which is invisible when no collector is configured
-                    // (the common bare-deploy case). pp-gpu-node's stderr is
+                    // (the common bare-deploy case). pp-worker's stderr is
                     // captured by the container log, so this makes a crashed
                     // worker self-diagnosing without a diagnostics backend.
                     if !normal_exit {
                         eprintln!(
-                            "pp-gpu-node: worker exited abnormally (code={exit_code:?} signal={signal:?}); stderr tail:"
+                            "pp-worker: worker exited abnormally (code={exit_code:?} signal={signal:?}); stderr tail:"
                         );
                         for line in &stderr_tail {
                             eprintln!("  worker| {line}");
                         }
                         if let Some(tb) = traceback.as_deref() {
-                            eprintln!("pp-gpu-node: worker python traceback:\n{tb}");
+                            eprintln!("pp-worker: worker python traceback:\n{tb}");
                         }
                     }
 

@@ -3,7 +3,7 @@
 #
 # Brings up:
 #   - `swactor-diag-collector` in a container (HTTP 9080 + UDP 9081)
-#   - `pp-smoke-run` on the host, in seed mode with N stub-mode stage
+#   - `pp-orchestrator` on the host, in seed mode with N stub-mode stage
 #     children spawned via `docker-gpu-node.sh` (each its own
 #     container on `--network host`)
 #
@@ -95,8 +95,8 @@ CRATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
 COMPOSE_FILE="$CRATE_DIR/docker-compose.diag.yml"
 
-SMOKE_RUN_BIN="$CRATE_DIR/target/release/pp-smoke-run"
-GPU_NODE_BIN="$CRATE_DIR/target/release/pp-gpu-node"
+ORCHESTRATOR_BIN="$CRATE_DIR/target/release/pp-orchestrator"
+WORKER_BIN="$CRATE_DIR/target/release/pp-worker"
 WORKER_PY="$CRATE_DIR/pp_tinygrad_worker.py"
 COLLECTOR_BIN="$WORKSPACE_DIR/target/release/swactor-diag-collector"
 POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
@@ -104,15 +104,15 @@ POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
 # Step 1: build release artifacts the image will package. The pp binaries
 # live in their own workspace; the distribution binaries live at the top.
 if [ -z "${PP_SKIP_BUILD:-}" ]; then
-    echo "docker-diag-e2e: cargo build pp-smoke-run + pp-gpu-node (release)"
+    echo "docker-diag-e2e: cargo build pp-orchestrator + pp-worker (release)"
     cargo build --manifest-path "$CRATE_DIR/Cargo.toml" --release \
-        --bin pp-gpu-node --bin pp-smoke-run
+        --bin pp-worker --bin pp-orchestrator
     echo "docker-diag-e2e: cargo build swactor-diag-{collector,postproc} (release, --features collector)"
     cargo build --manifest-path "$WORKSPACE_DIR/Cargo.toml" --release \
         -p distribution --features collector \
         --bin swactor-diag-collector --bin swactor-diag-postproc
 fi
-for f in "$SMOKE_RUN_BIN" "$GPU_NODE_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
+for f in "$ORCHESTRATOR_BIN" "$WORKER_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
     [ -f "$f" ] || { echo "docker-diag-e2e: missing $f" >&2; exit 1; }
 done
 
@@ -190,7 +190,7 @@ if [ "$USE_COMPOSE" = 1 ]; then
     "${COMPOSE[@]}" -f "$COMPOSE_FILE" up -d --remove-orphans collector
 else
     # --entrypoint runs the collector directly; the default image entrypoint
-    # (pp_entrypoint.sh) would ignore these args and launch pp-gpu-node.
+    # (pp_entrypoint.sh) would ignore these args and launch pp-worker.
     docker run -d --rm \
         --name "$COLLECTOR_NAME" \
         --network "$DIAG_NETWORK" \
@@ -223,7 +223,7 @@ until (echo > /dev/tcp/127.0.0.1/9080) >/dev/null 2>&1; do
 done
 echo "docker-diag-e2e: collector ready"
 
-# Step 5: drive pp-smoke-run with diagnostics env vars set. Stage children
+# Step 5: drive pp-orchestrator with diagnostics env vars set. Stage children
 # pick up the same vars via docker-gpu-node.sh's `-e` forwarders.
 OUTPUT_DIR="$(mktemp -d)"
 STDOUT_LOG="$OUTPUT_DIR/stdout.log"
@@ -244,7 +244,7 @@ SWACTOR_DIAG_COLLECTOR_URL="http://127.0.0.1:9080" \
 SWACTOR_DIAG_RUN_ID="$RUN_ID" \
 SWACTOR_DIAG_SPOOL_DIR="$OUTPUT_DIR/spool" \
 SWACTOR_DIAG_UDP_ECHO="127.0.0.1:9081" \
-"$SMOKE_RUN_BIN" \
+"$ORCHESTRATOR_BIN" \
     --seed \
     --num-stages "$NUM_STAGES" \
     --gpu-node "$SCRIPT_DIR/docker-gpu-node.sh" \
@@ -252,20 +252,20 @@ SWACTOR_DIAG_UDP_ECHO="127.0.0.1:9081" \
     --prompt "$PROMPT" \
     --max-tokens "$MAX_TOKENS" \
     >"$STDOUT_LOG" 2>"$STDERR_LOG"
-SMOKE_STATUS=$?
+ORCH_STATUS=$?
 set -e
 
-if [ "$SMOKE_STATUS" -ne 0 ]; then
-    echo "docker-diag-e2e: pp-smoke-run exited $SMOKE_STATUS" >&2
+if [ "$ORCH_STATUS" -ne 0 ]; then
+    echo "docker-diag-e2e: pp-orchestrator exited $ORCH_STATUS" >&2
     echo "----- stdout -----" >&2
     cat "$STDOUT_LOG" >&2
     echo "----- stderr (last 60) -----" >&2
     tail -n 60 "$STDERR_LOG" >&2
     exit 1
 fi
-echo "docker-diag-e2e: pp-smoke-run exited 0"
+echo "docker-diag-e2e: pp-orchestrator exited 0"
 if [ -n "${PP_DIAG_VERBOSE:-}" ]; then
-    echo "----- pp-smoke-run stderr (last 30) -----"
+    echo "----- pp-orchestrator stderr (last 30) -----"
     tail -n 30 "$STDERR_LOG"
 fi
 
@@ -295,7 +295,7 @@ while true; do
         else
             docker logs "$COLLECTOR_NAME" 2>&1 | tail -n 50 >&2 || true
         fi
-        echo "----- pp-smoke-run stderr (last 60) -----" >&2
+        echo "----- pp-orchestrator stderr (last 60) -----" >&2
         tail -n 60 "$STDERR_LOG" >&2 || true
         exit 1
     fi

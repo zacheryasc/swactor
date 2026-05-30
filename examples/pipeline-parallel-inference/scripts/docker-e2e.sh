@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # docker-e2e.sh — the Stage 11 pre-deploy gate.
 #
-# Brings up `N` stub-mode `pp-gpu-node` containers on localhost, drives
-# one InferenceRequest through them via `pp-smoke-run --seed`, and tears
+# Brings up `N` stub-mode `pp-worker` containers on localhost, drives
+# one InferenceRequest through them via `pp-orchestrator --seed`, and tears
 # everything down. The image is built locally from the workspace's
 # release artifacts; no GPU, no tinygrad, no GGUF required.
 #
@@ -63,8 +63,8 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
-SMOKE_RUN_BIN="$CRATE_DIR/target/release/pp-smoke-run"
-GPU_NODE_BIN="$CRATE_DIR/target/release/pp-gpu-node"
+ORCHESTRATOR_BIN="$CRATE_DIR/target/release/pp-orchestrator"
+WORKER_BIN="$CRATE_DIR/target/release/pp-worker"
 WORKER_PY="$CRATE_DIR/pp_tinygrad_worker.py"
 COLLECTOR_BIN="$WORKSPACE_DIR/target/release/swactor-diag-collector"
 POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
@@ -75,15 +75,15 @@ POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
 # present even for this stub run. The pp binaries live in this crate's
 # workspace; the diagnostics binaries live at the repo root.
 if [ -z "${PP_SKIP_BUILD:-}" ]; then
-    echo "docker-e2e: building pp-gpu-node + pp-smoke-run (release)"
+    echo "docker-e2e: building pp-worker + pp-orchestrator (release)"
     cargo build --manifest-path "$CRATE_DIR/Cargo.toml" --release \
-        --bin pp-gpu-node --bin pp-smoke-run
+        --bin pp-worker --bin pp-orchestrator
     echo "docker-e2e: building swactor-diag-{collector,postproc} (release, --features collector)"
     cargo build --manifest-path "$WORKSPACE_DIR/Cargo.toml" --release \
         -p distribution --features collector \
         --bin swactor-diag-collector --bin swactor-diag-postproc
 fi
-for f in "$SMOKE_RUN_BIN" "$GPU_NODE_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
+for f in "$ORCHESTRATOR_BIN" "$WORKER_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
     [ -f "$f" ] || { echo "docker-e2e: missing $f" >&2; exit 1; }
 done
 
@@ -117,7 +117,7 @@ cleanup_containers() {
 }
 cleanup_containers
 
-# Step 4: drive pp-smoke-run with the docker shim as its --gpu-node.
+# Step 4: drive pp-orchestrator with the docker shim as its --gpu-node.
 # The shim consults PP_IMAGE / PP_CONTAINER_PREFIX / PP_DEV from its env.
 OUTPUT_DIR="$(mktemp -d)"
 STDOUT_LOG="$OUTPUT_DIR/stdout.log"
@@ -135,7 +135,7 @@ if [ -n "${PP_REAL:-}" ]; then
     PP_DEV=CUDA \
     PP_GPUS="${PP_GPUS:-all}" \
     PP_MODEL_CACHE_DIR="$PP_MODEL_CACHE_DIR" \
-    "$SMOKE_RUN_BIN" \
+    "$ORCHESTRATOR_BIN" \
         --seed \
         --num-stages "$NUM_STAGES" \
         --gpu-node "$SCRIPT_DIR/docker-gpu-node.sh" \
@@ -148,7 +148,7 @@ else
     PP_IMAGE="$IMAGE" \
     PP_CONTAINER_PREFIX="$PREFIX" \
     PP_DEV=CPU \
-    "$SMOKE_RUN_BIN" \
+    "$ORCHESTRATOR_BIN" \
         --seed \
         --num-stages "$NUM_STAGES" \
         --gpu-node "$SCRIPT_DIR/docker-gpu-node.sh" \
@@ -157,11 +157,11 @@ else
         --max-tokens "$MAX_TOKENS" \
         >"$STDOUT_LOG" 2>"$STDERR_LOG"
 fi
-SMOKE_STATUS=$?
+ORCH_STATUS=$?
 set -e
 
-if [ $SMOKE_STATUS -ne 0 ]; then
-    echo "docker-e2e: pp-smoke-run exited $SMOKE_STATUS" >&2
+if [ $ORCH_STATUS -ne 0 ]; then
+    echo "docker-e2e: pp-orchestrator exited $ORCH_STATUS" >&2
     echo "----- stdout -----" >&2
     cat "$STDOUT_LOG" >&2
     echo "----- stderr (last 60) -----" >&2

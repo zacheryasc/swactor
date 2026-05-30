@@ -3,7 +3,7 @@
 //! and verify clean teardown.
 //!
 //! TEST_SPEC §13b. Mirrors §13's happy path and at least one failure
-//! scenario, but with each `pp-gpu-node` running inside its own
+//! scenario, but with each `pp-worker` running inside its own
 //! container instead of as a host process.
 //!
 //! Every test in this file is `#[ignore]`d and requires a working
@@ -144,7 +144,7 @@ fn wait_until_prefix_drains(prefix: &str, timeout: Duration) {
 }
 
 /// Poll for "no leftover stage containers" with a short grace window.
-/// A clean `pp-smoke-run` exit triggers `docker run --rm` teardown on
+/// A clean `pp-orchestrator` exit triggers `docker run --rm` teardown on
 /// each shim, but the daemon-side delete is not synchronous with the
 /// CLI's exit, so we give the daemon a moment to catch up before we
 /// call the run dirty.
@@ -359,9 +359,9 @@ fn cargo_build_release_once() {
             .arg(crate_dir().join("Cargo.toml"))
             .arg("--release")
             .arg("--bin")
-            .arg("pp-gpu-node")
+            .arg("pp-worker")
             .arg("--bin")
-            .arg("pp-smoke-run")
+            .arg("pp-orchestrator")
             .status()
             .expect("invoke cargo build");
         assert!(status.success(), "cargo build --release failed");
@@ -570,7 +570,7 @@ fn docker_e2e_premature_container_exit_fails_fast() {
         .expect("docker build (code)");
     assert!(build.success(), "docker build (code) failed");
 
-    let smoke_bin = crate_dir().join("target/release/pp-smoke-run");
+    let smoke_bin = crate_dir().join("target/release/pp-orchestrator");
     let worker_py = crate_dir().join("pp_tinygrad_worker.py");
     assert!(smoke_bin.exists() && worker_py.exists());
 
@@ -593,10 +593,10 @@ fn docker_e2e_premature_container_exit_fails_fast() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn pp-smoke-run with docker shim");
+        .expect("spawn pp-orchestrator with docker shim");
 
     // Drain the child's stderr (and stdout) into in-memory buffers via
-    // background reader threads. Without this any pp-smoke-run / shim
+    // background reader threads. Without this any pp-orchestrator / shim
     // diagnostic message is swallowed and the test gives the reader
     // nothing actionable on failure.
     let stderr_buf = spawn_stream_collector(child.stderr.take().expect("child stderr piped"));
@@ -610,8 +610,8 @@ fn docker_e2e_premature_container_exit_fails_fast() {
             let _ = child.wait();
             panic!(
                 "3 stage containers did not start within 180s\n\
-                 --- pp-smoke-run stderr (tail) ---\n{}\n\
-                 --- pp-smoke-run stdout (tail) ---\n{}",
+                 --- pp-orchestrator stderr (tail) ---\n{}\n\
+                 --- pp-orchestrator stdout (tail) ---\n{}",
                 tail_lines(&stderr_buf.snapshot(), 80),
                 tail_lines(&stdout_buf.snapshot(), 40),
             );
@@ -634,15 +634,15 @@ fn docker_e2e_premature_container_exit_fails_fast() {
     // the docker-shim child exit promptly).
     let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
-        match child.try_wait().expect("try_wait pp-smoke-run") {
+        match child.try_wait().expect("try_wait pp-orchestrator") {
             Some(s) => break s,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
                 panic!(
-                    "pp-smoke-run did not exit within 60s of killing a container\n\
-                     --- pp-smoke-run stderr (tail) ---\n{}\n\
-                     --- pp-smoke-run stdout (tail) ---\n{}",
+                    "pp-orchestrator did not exit within 60s of killing a container\n\
+                     --- pp-orchestrator stderr (tail) ---\n{}\n\
+                     --- pp-orchestrator stdout (tail) ---\n{}",
                     tail_lines(&stderr_buf.snapshot(), 80),
                     tail_lines(&stdout_buf.snapshot(), 40),
                 );
@@ -653,7 +653,7 @@ fn docker_e2e_premature_container_exit_fails_fast() {
     assert!(
         !status.success(),
         "expected non-zero exit after container kill, got {status:?}\n\
-         --- pp-smoke-run stderr (tail) ---\n{}",
+         --- pp-orchestrator stderr (tail) ---\n{}",
         tail_lines(&stderr_buf.snapshot(), 80),
     );
 

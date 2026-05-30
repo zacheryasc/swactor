@@ -1,4 +1,4 @@
-//! Orchestrator helpers for `pp-smoke-run`.
+//! Orchestrator helpers for `pp-orchestrator`.
 //!
 //! Extracted from the binary so the spawn-chain and convergence-wait logic
 //! can be unit-tested without provisioning child processes or driving a
@@ -17,7 +17,7 @@
 //!
 //! Tests inject a fake command builder (e.g. `sh -c "echo PP_GPU_NODE_ADDR
 //! <hex> <direct>; sleep 60"`) so the chain can be exercised end-to-end
-//! without `pp-gpu-node` on disk.
+//! without `pp-worker` on disk.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -118,7 +118,7 @@ impl Drop for ChainGuard {
         // to the container's PID 1 and only then does the container exit
         // and `--rm` clean up. A bare SIGKILL bypasses that proxy and
         // orphans the container. For the no-wrapper host case the cost is
-        // ~tens of ms — pp-gpu-node has no SIGTERM handler so it exits
+        // ~tens of ms — pp-worker has no SIGTERM handler so it exits
         // immediately on receipt.
         //
         // The budget is *per stage*, not shared across the whole chain.
@@ -148,7 +148,7 @@ impl Drop for ChainGuard {
             // child already exited (we ignore the error either way).
             let _ = stage.child.kill();
             let _ = stage.child.wait();
-            eprintln!("pp-smoke-run: stopped stage {} child pid {pid}", stage.stage);
+            eprintln!("pp-orchestrator: stopped stage {} child pid {pid}", stage.stage);
         }
     }
 }
@@ -307,7 +307,7 @@ fn read_stage_address(
     });
     rx.recv_timeout(timeout).map_err(|_| {
         eprintln!(
-            "pp-smoke-run: stage {stage} did not announce PP_GPU_NODE_ADDR within {:.0}s",
+            "pp-orchestrator: stage {stage} did not announce PP_GPU_NODE_ADDR within {:.0}s",
             timeout.as_secs_f32()
         );
     })

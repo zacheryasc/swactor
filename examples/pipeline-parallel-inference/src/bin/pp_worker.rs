@@ -1,4 +1,4 @@
-//! pp-gpu-node — pipeline-parallel GPU inference node.
+//! pp-worker — pipeline-parallel GPU inference node.
 //!
 //! Boots one stage of a pipeline-parallel inference run. Reads its
 //! configuration from the environment (set at instance-create time on
@@ -68,7 +68,7 @@ use swactor_process::{ProcessMode, ProcessSpec};
 /// SWIM name the orchestrator uses to publish the address of its
 /// `InferenceResponse` inbox. The last stage resolves this name to learn
 /// where to send the final response. Defined here (and re-declared in
-/// `pp-smoke-run`) so the topology module stays test-shaped; the binary
+/// `pp-orchestrator`) so the topology module stays test-shaped; the binary
 /// is the only place that cares about this name.
 const ORCHESTRATOR_NAME: &str = "pp-orchestrator";
 
@@ -88,7 +88,7 @@ fn parse_hex_node_id(s: &str) -> [u8; 32] {
 fn require_env(name: &str) -> String {
     std::env::var(name)
         .unwrap_or_else(|_| {
-            eprintln!("pp-gpu-node: env {name} is required");
+            eprintln!("pp-worker: env {name} is required");
             std::process::exit(2);
         })
         .trim()
@@ -98,7 +98,7 @@ fn require_env(name: &str) -> String {
 fn require_u32(name: &str) -> u32 {
     let raw = require_env(name);
     raw.parse::<u32>().unwrap_or_else(|_| {
-        eprintln!("pp-gpu-node: env {name}={raw:?} must be a u32");
+        eprintln!("pp-worker: env {name}={raw:?} must be a u32");
         std::process::exit(2);
     })
 }
@@ -118,7 +118,7 @@ fn stage_secret_from_env() -> Option<SecretKey> {
     }
     if hex.len() != 64 {
         eprintln!(
-            "pp-gpu-node: PP_STAGE_SECRET must be 64 hex chars, got {}",
+            "pp-worker: PP_STAGE_SECRET must be 64 hex chars, got {}",
             hex.len()
         );
         std::process::exit(2);
@@ -126,7 +126,7 @@ fn stage_secret_from_env() -> Option<SecretKey> {
     let mut bytes = [0u8; 32];
     for (i, b) in bytes.iter_mut().enumerate() {
         *b = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap_or_else(|_| {
-            eprintln!("pp-gpu-node: PP_STAGE_SECRET is not valid hex");
+            eprintln!("pp-worker: PP_STAGE_SECRET is not valid hex");
             std::process::exit(2);
         });
     }
@@ -266,7 +266,7 @@ fn build_route(
 fn register_name(driver: &mut IrohDriver, name: &str, addr: ActorAddress, stage: u32) {
     driver.node_mut().register_name(name.into(), addr);
     diag::emit_register_name(driver, name, addr, Some(stage));
-    eprintln!("pp-gpu-node: registered {name} -> {addr:?}");
+    eprintln!("pp-worker: registered {name} -> {addr:?}");
 }
 
 fn resolve_or_die(
@@ -274,10 +274,10 @@ fn resolve_or_die(
     name: &str,
     timeout: Duration,
 ) -> (ActorAddress, String) {
-    eprintln!("pp-gpu-node: resolving {name}...");
+    eprintln!("pp-worker: resolving {name}...");
     resolve_name(driver, name, timeout).unwrap_or_else(|| {
         eprintln!(
-            "pp-gpu-node: failed to resolve {name} in {:.0}s",
+            "pp-worker: failed to resolve {name} in {:.0}s",
             timeout.as_secs_f32()
         );
         std::process::exit(1);
@@ -294,16 +294,16 @@ fn add_route_or_die(
     match build_route(driver, node_hex) {
         Ok(t) => router.add_route(addr, t),
         Err(e) => {
-            eprintln!("pp-gpu-node: route to {label} failed: {e}");
+            eprintln!("pp-worker: route to {label} failed: {e}");
             std::process::exit(1);
         }
     }
 }
 
 /// Ask the kernel to deliver `SIGTERM` to this process when its parent dies.
-/// Without this, a `SIGKILL` to `pp-smoke-run` would orphan its children to
+/// Without this, a `SIGKILL` to `pp-orchestrator` would orphan its children to
 /// pid 1 and leave them running — the orchestrator's `ChainGuard::drop` runs
-/// only on graceful exit. With it, each `pp-gpu-node` dies seconds after its
+/// only on graceful exit. With it, each `pp-worker` dies seconds after its
 /// orchestrator does, which is the `binary_e2e_orchestrator_sigkilled_*`
 /// contract from TEST_SPEC §13.2. Linux-only; other platforms are no-ops.
 #[cfg(target_os = "linux")]
@@ -322,7 +322,7 @@ fn install_parent_death_signal() {}
 /// Set by the `SIGHUP` handler; polled by the pump loops to drive an
 /// in-place worker hot-reload (re-exec the on-disk worker script). An
 /// operator pushes a new `pp_tinygrad_worker.py` over the running one and
-/// `kill -HUP $(pidof pp-gpu-node)` to pick it up without re-leasing.
+/// `kill -HUP $(pidof pp-worker)` to pick it up without re-leasing.
 static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "linux")]
@@ -352,7 +352,7 @@ fn install_sighup_handler() {}
 /// pump so both honour reloads with the same latency.
 fn drain_reload_request(rt: &Runtime, stage_actor_addr: ActorAddress) {
     if RELOAD_REQUESTED.swap(false, Ordering::SeqCst) {
-        eprintln!("pp-gpu-node: SIGHUP — reloading worker");
+        eprintln!("pp-worker: SIGHUP — reloading worker");
         let _ = rt.send_to(stage_actor_addr, StageMsg::ReloadWorker);
     }
 }
@@ -366,7 +366,7 @@ fn maybe_simulate_boot_delay(stage: u32) {
     let secs = std::env::var("PP_BOOT_DELAY_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok());
     if let (Some(target), Some(secs)) = (target, secs) {
         if target == stage && secs > 0 {
-            eprintln!("pp-gpu-node: simulated boot delay of {secs}s on stage {stage}");
+            eprintln!("pp-worker: simulated boot delay of {secs}s on stage {stage}");
             std::thread::sleep(Duration::from_secs(secs));
         }
     }
@@ -378,7 +378,7 @@ fn main() {
     let num_stages = require_u32("NUM_STAGES");
     if num_stages < 2 || stage >= num_stages {
         eprintln!(
-            "pp-gpu-node: invalid STAGE={stage} for NUM_STAGES={num_stages} \
+            "pp-worker: invalid STAGE={stage} for NUM_STAGES={num_stages} \
              (need NUM_STAGES >= 2 and STAGE < NUM_STAGES; N=1 is not supported)"
         );
         std::process::exit(2);
@@ -441,7 +441,7 @@ fn main() {
     let vastai_forwarder = _vastai_in_vm.as_ref().map(|m| m.forwarder());
 
     // Stamp the bundle the moment this process announces itself, so a
-    // bundle reader can tell two pp-gpu-node incarnations of the same
+    // bundle reader can tell two pp-worker incarnations of the same
     // stage apart: a manual binary swap (the operator runbook) pkills the
     // old process and setsid's a new one under the same PID-1 env, which
     // means the same run_id + node_id, but the pid differs. The event carries that
@@ -468,7 +468,7 @@ fn main() {
         .map(|sa| sa.to_string())
         .collect();
     eprintln!(
-        "pp-gpu-node: stage {stage}/{num_stages} ({role:?}) started (node_id: {my_hex})"
+        "pp-worker: stage {stage}/{num_stages} ({role:?}) started (node_id: {my_hex})"
     );
     // PP_GPU_NODE_ADDR is printed to stdout (flushed) so a parent process
     // capturing this child's stdout can extract our addressing. The orchestrator
@@ -485,7 +485,7 @@ fn main() {
     let mut seed_addr = iroh::EndpointAddr::from(seed_key);
     if let Some(relay) = seed_relay_env.as_deref() {
         if let Ok(relay_url) = relay.trim().parse::<iroh::RelayUrl>() {
-            eprintln!("pp-gpu-node: using seed relay {relay}");
+            eprintln!("pp-worker: using seed relay {relay}");
             seed_addr = seed_addr.with_relay_url(relay_url);
         }
     }
@@ -525,7 +525,7 @@ fn main() {
                     peer_addr = peer_addr.with_ip_addr(sa);
                 }
             }
-            eprintln!("pp-gpu-node: also joining {label} {peer_hex}");
+            eprintln!("pp-worker: also joining {label} {peer_hex}");
             targets.push(peer_addr);
         }
     };
@@ -545,7 +545,7 @@ fn main() {
         "first-stage peer",
     );
 
-    eprintln!("pp-gpu-node: joining seed {seed_hex}");
+    eprintln!("pp-worker: joining seed {seed_hex}");
     driver.join(&join_targets);
 
     // If we ended up with a relay (vast.ai / WAN), publish it via SWIM
@@ -556,7 +556,7 @@ fn main() {
     // the autoregressive feedback edge (last → first) because SWIM has
     // not yet probed that specific pair.
     if let Some(home) = driver.home_relay_url() {
-        eprintln!("pp-gpu-node: publishing home relay {home} to SWIM gossip");
+        eprintln!("pp-worker: publishing home relay {home} to SWIM gossip");
         driver.node_mut().set_relay_url(Some(home.to_string()));
     }
 
@@ -578,10 +578,10 @@ fn main() {
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(1200);
     if !wait_for_cluster(&mut driver, Duration::from_secs(converge_secs)) {
-        eprintln!("pp-gpu-node: cluster did not converge in {converge_secs}s");
+        eprintln!("pp-worker: cluster did not converge in {converge_secs}s");
         std::process::exit(1);
     }
-    eprintln!("pp-gpu-node: cluster converged");
+    eprintln!("pp-worker: cluster converged");
 
     // Create the actor runtime, codec registry, and transport router.
     let mut rt = Runtime::new(RuntimeConfig::default());
@@ -617,7 +617,7 @@ fn main() {
     if let Some((handle, collector, port)) = &stage_dash {
         handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
         handle.start_http(driver.tokio_handle());
-        eprintln!("pp-gpu-node: stage {stage} dashboard on http://localhost:{port}");
+        eprintln!("pp-worker: stage {stage} dashboard on http://localhost:{port}");
     }
 
     run_stage(
@@ -655,17 +655,17 @@ fn hold_until_worker_ready(
         if let Some(status) = status_inbox.try_recv() {
             match status {
                 StageActorStatus::WorkerReady { pid } => {
-                    eprintln!("pp-gpu-node: worker ready (pid: {pid:?})");
+                    eprintln!("pp-worker: worker ready (pid: {pid:?})");
                     return;
                 }
                 StageActorStatus::ProcessStarted => {
-                    eprintln!("pp-gpu-node: worker process started");
+                    eprintln!("pp-worker: worker process started");
                 }
                 StageActorStatus::ProcessExited { status } => {
                     eprintln!(
-                        "pp-gpu-node: stage-{stage} worker exited during startup: \
+                        "pp-worker: stage-{stage} worker exited during startup: \
                          {status:?}; holding (SWIM alive) — push a fixed worker.py \
-                         and `kill -HUP $(pidof pp-gpu-node)` to reload"
+                         and `kill -HUP $(pidof pp-worker)` to reload"
                     );
                     last_warn = Instant::now();
                 }
@@ -674,7 +674,7 @@ fn hold_until_worker_ready(
 
         if last_warn.elapsed() >= warn_after {
             eprintln!(
-                "pp-gpu-node: stage-{stage} worker still not ready after {}s; \
+                "pp-worker: stage-{stage} worker still not ready after {}s; \
                  holding — SIGHUP to reload the worker script",
                 warn_after.as_secs()
             );
@@ -881,7 +881,7 @@ fn run_stage(
             let (next_addr, next_hex) =
                 resolve_or_die(&mut driver, &next_name, neighbor_resolve_timeout);
             eprintln!(
-                "pp-gpu-node: resolved {next_name} -> {next_addr:?} on {next_hex}"
+                "pp-worker: resolved {next_name} -> {next_addr:?} on {next_hex}"
             );
             add_route_or_die(&driver, &router, next_addr, &next_hex, &next_name);
             rt.send_to(
@@ -900,7 +900,7 @@ fn run_stage(
             let (next_addr, next_hex) =
                 resolve_or_die(&mut driver, &next_name, neighbor_resolve_timeout);
             eprintln!(
-                "pp-gpu-node: resolved {next_name} -> {next_addr:?} on {next_hex}"
+                "pp-worker: resolved {next_name} -> {next_addr:?} on {next_hex}"
             );
             add_route_or_die(&driver, &router, next_addr, &next_hex, &next_name);
             rt.send_to(
@@ -927,7 +927,7 @@ fn run_stage(
             let (orch_addr, orch_hex) =
                 resolve_or_die(&mut driver, ORCHESTRATOR_NAME, neighbor_resolve_timeout);
             eprintln!(
-                "pp-gpu-node: resolved {feedback_name}={feedback_addr:?} on \
+                "pp-worker: resolved {feedback_name}={feedback_addr:?} on \
                  {feedback_hex}, orch={orch_addr:?} on {orch_hex}"
             );
             add_route_or_die(
@@ -978,7 +978,7 @@ fn main_pump(
     msg_pump: ActorMessagePump,
     stage_actor_addr: ActorAddress,
 ) {
-    eprintln!("pp-gpu-node: entering main pump loop");
+    eprintln!("pp-worker: entering main pump loop");
     loop {
         driver.recv();
         driver.tick();
@@ -989,10 +989,10 @@ fn main_pump(
         if let Some(status) = status_inbox.try_recv() {
             match status {
                 StageActorStatus::ProcessExited { status } => {
-                    eprintln!("pp-gpu-node: worker exited: {status:?}");
-                    eprintln!("pp-gpu-node: keeping SWIM alive for diagnostics");
+                    eprintln!("pp-worker: worker exited: {status:?}");
+                    eprintln!("pp-worker: keeping SWIM alive for diagnostics");
                 }
-                other => eprintln!("pp-gpu-node: status: {other:?}"),
+                other => eprintln!("pp-worker: status: {other:?}"),
             }
         }
         std::thread::sleep(Duration::from_millis(20));
