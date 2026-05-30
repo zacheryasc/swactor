@@ -125,6 +125,7 @@ pub const ACTOR_DETAIL_HTML: &str = r##"<!DOCTYPE html>
       <a href="/actors" class="nav-link">Actors</a>
       <a href="/plugin/distribution" class="nav-link">Distribution</a>
       <a href="/plugin/datastore" class="nav-link">Datastore</a>
+      <a href="/plugin/vastai" class="nav-link">Fleet</a>
     </nav>
   </div>
 </div>
@@ -569,6 +570,7 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
       <a href="/actors" class="nav-link active">Actors</a>
       <a href="/plugin/distribution" class="nav-link">Distribution</a>
       <a href="/plugin/datastore" class="nav-link">Datastore</a>
+      <a href="/plugin/vastai" class="nav-link">Fleet</a>
     </nav>
   </div>
   <div class="header-right">
@@ -1377,6 +1379,7 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
       <a href="/actors" class="nav-link">Actors</a>
       <a href="/plugin/distribution" class="nav-link">Distribution</a>
       <a href="/plugin/datastore" class="nav-link">Datastore</a>
+      <a href="/plugin/vastai" class="nav-link">Fleet</a>
     </nav>
   </div>
   <div class="header-right">
@@ -1934,6 +1937,7 @@ pub const TOPOLOGY_HTML: &str = r##"<!DOCTYPE html>
       <a href="/topology" class="nav-link active">Topology</a>
       <a href="/plugin/distribution" class="nav-link">Distribution</a>
       <a href="/plugin/datastore" class="nav-link">Datastore</a>
+      <a href="/plugin/vastai" class="nav-link">Fleet</a>
     </nav>
   </div>
 </div>

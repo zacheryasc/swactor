@@ -10,7 +10,7 @@
 //! to stage 0, and so on until EOS or `max_tokens`. The last stage emits the
 //! final `InferenceResponse` back to the orchestrator.
 //!
-//! The same shape the binary uses (see `pp_smoke_run.rs`), minus the child
+//! The same shape the binary uses (see `pp_orchestrator.rs`), minus the child
 //! subprocesses — actors live in this test process and addresses are wired up
 //! directly without SWIM resolution.
 

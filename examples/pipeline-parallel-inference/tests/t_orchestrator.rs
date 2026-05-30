@@ -2,7 +2,7 @@
 //! lease chain (mocked HTTP), and the convergence-wait helper.
 //!
 //! None of these tests touch real iroh, real vast.ai, or the
-//! `pp-gpu-node` binary. The spawn chain is exercised with a `sh -c`
+//! `pp-worker` binary. The spawn chain is exercised with a `sh -c`
 //! "fake child" that prints `PP_GPU_NODE_ADDR ...` and then sleeps; the
 //! vast.ai chain uses `wiremock`; the convergence-wait helper is a
 //! pure function fed a closure.
@@ -151,7 +151,7 @@ fn spawn_chain_propagates_each_stage_peer_direct_to_successor() {
 }
 
 #[test]
-fn spawn_chain_reads_pp_gpu_node_addr_in_order() {
+fn spawn_chain_reads_addr_announcement_in_order() {
     let tmp = TempDir::new("reads-in-order");
     let pids_file = tmp.child("pids");
 

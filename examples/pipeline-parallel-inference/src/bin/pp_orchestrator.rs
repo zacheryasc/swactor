@@ -1,12 +1,12 @@
-//! pp-smoke-run — orchestrator for the pipeline-parallel smoke test.
+//! pp-orchestrator — orchestrator for the pipeline-parallel smoke test.
 //!
 //! Two modes:
 //!
-//! * `--seed`   — fully local. Spawns `N` `pp-gpu-node` child processes
+//! * `--seed`   — fully local. Spawns `N` `pp-worker` child processes
 //!   (`STAGE=0..N-1`) talking to a local iroh seed. Uses
 //!   `RelayMode::Disabled` since direct addresses suffice on localhost.
 //! * `--vastai` — rents `N` GPU instances on vast.ai, deploys the
-//!   `pp-gpu-node` image to each, and drives the same orchestrator path
+//!   `pp-worker` image to each, and drives the same orchestrator path
 //!   over WAN. The default one-shot destroys all rented instances before
 //!   exit; `--hold` leaves the cluster running (tracked by a local handle
 //!   file) so it can be iterated on, and `--teardown` destroys it. See the
@@ -55,6 +55,7 @@ use distribution::diagnostics::Role as DiagRole;
 
 use pipeline_parallel_inference::diag;
 use pipeline_parallel_inference::dist_broadcast;
+use pipeline_parallel_inference::fleet_plugin::RemoteVastaiPlugin;
 use pipeline_parallel_inference::dist_plugin::{
     CountingEmitter, DistDashPlugin, MsgCounts, SharedSnapshot,
 };
@@ -94,8 +95,8 @@ fn node_config() -> DistributedNodeConfig {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  pp-smoke-run --seed [--num-stages N] [--prompt <text>] [--max-tokens <n>] [--gpu-node <path>] [--worker <path>]");
-    eprintln!("  pp-smoke-run --vastai --api-key <key> [--num-stages N] [--gpu \"RTX 3060\"] [--image <name>] [--prompt <text>] [--max-tokens <n>]");
+    eprintln!("  pp-orchestrator --seed [--num-stages N] [--prompt <text>] [--max-tokens <n>] [--gpu-node <path>] [--worker <path>]");
+    eprintln!("  pp-orchestrator --vastai --api-key <key> [--num-stages N] [--gpu \"RTX 3060\"] [--image <name>] [--prompt <text>] [--max-tokens <n>]");
     eprintln!("Cluster lifecycle (--vastai):");
     eprintln!("  (default)   lease N, drive one run, destroy.");
     eprintln!("  --hold      lease N, drive, leave running; writes a cluster-handle file.");
@@ -141,14 +142,14 @@ fn parse_args() -> Args {
         vastai: false,
         num_stages: 2,
         api_key: None,
-        // RTX 3060 (12GB) is our default deploy-test class: cheapest GPU class
-        // with deep, reliable supply on vast.ai (see fleet notes). Settable via
-        // PP_GPU in a profile, or --gpu for capacity tests. NOT sized for real
-        // model weights.
+        // GPU model pin: off by default (empty = no model filter). Set PP_GPU in
+        // a profile, or --gpu for capacity tests, to restrict to one model. Pair
+        // or replace with PP_GPU_MIN_RAM_MB to select by VRAM instead.
         gpu_name: std::env::var("PP_GPU")
             .ok()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| "RTX 3060".into()),
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default(),
         // Image is not baked to a personal registry: it defaults from the
         // PP_IMAGE env (the convention the run scripts already use, e.g.
         // scripts/docker-e2e.sh), falling back to a registry-less tag. Set it
@@ -272,7 +273,7 @@ fn main() {
 
 // ─── Seed (localhost) mode ────────────────────────────────────────────
 
-/// Resolve the `pp-gpu-node` binary path. Defaults to a sibling of the
+/// Resolve the `pp-worker` binary path. Defaults to a sibling of the
 /// current executable.
 fn resolve_gpu_node_path(args: &Args) -> PathBuf {
     if let Some(p) = &args.gpu_node_path {
@@ -280,7 +281,7 @@ fn resolve_gpu_node_path(args: &Args) -> PathBuf {
     }
     let exe = std::env::current_exe().expect("current_exe failed");
     let parent = exe.parent().expect("current exe has no parent");
-    parent.join("pp-gpu-node")
+    parent.join("pp-worker")
 }
 
 /// Resolve the worker script path. Defaults to `pp_tinygrad_worker.py`
@@ -292,7 +293,7 @@ fn resolve_worker_path(args: &Args) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("pp_tinygrad_worker.py")
 }
 
-/// Build a `Command` for a single `pp-gpu-node` child. Captures all the
+/// Build a `Command` for a single `pp-worker` child. Captures all the
 /// env-var bookkeeping in one place so the spawn-chain closure is short.
 fn build_gpu_node_command(
     gpu_node_bin: &PathBuf,
@@ -303,7 +304,7 @@ fn build_gpu_node_command(
     ctx: &StageSpawnCtx,
 ) -> Command {
     eprintln!(
-        "pp-smoke-run: spawning {} STAGE={} NUM_STAGES={}",
+        "pp-orchestrator: spawning {} STAGE={} NUM_STAGES={}",
         gpu_node_bin.display(),
         ctx.stage,
         ctx.num_stages,
@@ -421,7 +422,7 @@ fn run_seed(args: &Args) -> i32 {
     let gpu_node_bin = resolve_gpu_node_path(args);
     if !gpu_node_bin.exists() {
         eprintln!(
-            "pp-smoke-run: pp-gpu-node binary not found at {} (use --gpu-node to override)",
+            "pp-orchestrator: pp-worker binary not found at {} (use --gpu-node to override)",
             gpu_node_bin.display()
         );
         return 1;
@@ -429,7 +430,7 @@ fn run_seed(args: &Args) -> i32 {
     let worker_script = resolve_worker_path(args);
     if !worker_script.exists() {
         eprintln!(
-            "pp-smoke-run: worker script not found at {} (use --worker to override)",
+            "pp-orchestrator: worker script not found at {} (use --worker to override)",
             worker_script.display()
         );
         return 1;
@@ -444,7 +445,7 @@ fn run_seed(args: &Args) -> i32 {
     }) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("pp-smoke-run: failed to create iroh driver: {e}");
+            eprintln!("pp-orchestrator: failed to create iroh driver: {e}");
             return 1;
         }
     };
@@ -476,7 +477,7 @@ fn run_seed(args: &Args) -> i32 {
         .collect::<Vec<_>>()
         .join(",");
     eprintln!(
-        "pp-smoke-run (--seed --num-stages {n}): orchestrator node {my_hex}, direct={direct:?}",
+        "pp-orchestrator (--seed --num-stages {n}): orchestrator node {my_hex}, direct={direct:?}",
         n = args.num_stages,
     );
 
@@ -543,10 +544,22 @@ fn run_seed(args: &Args) -> i32 {
             )));
             let poll_stop = Arc::new(AtomicBool::new(false));
             spawn_conn_poller(&driver, Arc::clone(cached), conn_tracker, poll_stop);
+            // Fleet plugin ("Fleet" nav tab): the vast.ai/host-metric fleet view.
+            // In production the collector lives on a VPS; this plugin *pulls* the
+            // collector's already-folded fleet model ~1/s and re-serves it locally,
+            // so the full dashboard shows the fleet beside the live actor views.
+            // Registered unconditionally so the tab exists; the poller only runs
+            // when a collector URL is known (the same one the dist snapshot is
+            // pushed to). Idle URL => the tab just waits for records.
+            let fleet = Arc::new(RemoteVastaiPlugin::new());
+            if let Some(url) = broadcast_url.as_ref() {
+                fleet.spawn_stream(&driver.tokio_handle(), url.clone(), broadcast_run_id());
+            }
+            handle.register_plugin(fleet);
             handle.start_http(driver.tokio_handle());
             eprintln!(
-                "pp-smoke-run: live dashboard on http://localhost:{port} \
-                 (overview / actors / topology / distribution / netmap)"
+                "pp-orchestrator: live dashboard on http://localhost:{port} \
+                 (overview / actors / topology / distribution / netmap / fleet)"
             );
         }
 
@@ -560,13 +573,13 @@ fn run_seed(args: &Args) -> i32 {
                 url.clone(),
                 broadcast_run_id(),
             );
-            eprintln!("pp-smoke-run: broadcasting distribution snapshot to {url}");
+            eprintln!("pp-orchestrator: broadcasting distribution snapshot to {url}");
         }
 
         let response_inbox = match rt.new_inbox::<InferenceResponse>() {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("pp-smoke-run: new_inbox failed: {e}");
+                eprintln!("pp-orchestrator: new_inbox failed: {e}");
                 break 'run (1, "new_inbox_error");
             }
         };
@@ -589,18 +602,18 @@ fn run_seed(args: &Args) -> i32 {
         }) {
             Ok(g) => g,
             Err(e) => {
-                eprintln!("pp-smoke-run: {e}");
+                eprintln!("pp-orchestrator: {e}");
                 break 'run (1, "spawn_chain_error");
             }
         };
-        eprintln!("pp-smoke-run: spawned {} stage children", guard.len());
+        eprintln!("pp-orchestrator: spawned {} stage children", guard.len());
         // The chain spawner read the announcement line from each child's
         // stdout and kept the pipe draining in a background thread. No
         // further stdout pumping needed here.
 
         // Wait for the cluster (orchestrator + N stages) to converge.
         eprintln!(
-            "pp-smoke-run: waiting for cluster convergence ({} alive peers)...",
+            "pp-orchestrator: waiting for cluster convergence ({} alive peers)...",
             args.num_stages,
         );
         let conv_res = await_convergence_or_child_death(
@@ -620,17 +633,17 @@ fn run_seed(args: &Args) -> i32 {
             .node_mut()
             .register_name(ORCHESTRATOR_NAME.into(), inbox_addr);
         diag::emit_register_name(&driver, ORCHESTRATOR_NAME, inbox_addr, None);
-        eprintln!("pp-smoke-run: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
+        eprintln!("pp-orchestrator: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
         if let Err(e) = conv_res {
-            eprintln!("pp-smoke-run: {e}");
+            eprintln!("pp-orchestrator: {e}");
             break 'run (1, "convergence_error");
         }
-        eprintln!("pp-smoke-run: cluster converged");
+        eprintln!("pp-orchestrator: cluster converged");
 
         // Spec §4.6 + §4.5: gate the request injection on (a) every
         // pp-stage-K resolvable and (b) pp-entry resolvable. The
         // per-index name is published by each stage only after its
-        // worker is ready (pp-gpu-node.rs), so resolution of every
+        // worker is ready (pp-worker.rs), so resolution of every
         // pp-stage-K is a faithful "all workers ready" signal. The
         // resolve loop polls children too so a stage that dies during
         // wiring fails fast instead of waiting out the timeout.
@@ -638,7 +651,7 @@ fn run_seed(args: &Args) -> i32 {
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(1800);
-        eprintln!("pp-smoke-run: waiting for pipeline-wired (all pp-stage-K + {ENTRY_NAME})...");
+        eprintln!("pp-orchestrator: waiting for pipeline-wired (all pp-stage-K + {ENTRY_NAME})...");
         let wire_deadline = Instant::now() + Duration::from_secs(roster_deadline_secs);
         let mut roster_hex: Vec<Option<String>> = vec![None; args.num_stages as usize];
         let (stage0_addr, stage0_node_id) = loop {
@@ -660,7 +673,7 @@ fn run_seed(args: &Args) -> i32 {
                 break entry.unwrap();
             }
             if let Err(e) = check_child_death(&mut guard) {
-                eprintln!("pp-smoke-run: {e}");
+                eprintln!("pp-orchestrator: {e}");
                 break 'run (1, "stage_died_pre_resolve");
             }
             if Instant::now() >= wire_deadline {
@@ -670,7 +683,7 @@ fn run_seed(args: &Args) -> i32 {
                     .filter_map(|(k, o)| o.is_none().then_some(k as u32))
                     .collect();
                 eprintln!(
-                    "pp-smoke-run: pipeline did not wire within {roster_deadline_secs}s; \
+                    "pp-orchestrator: pipeline did not wire within {roster_deadline_secs}s; \
                      missing pp-stage-K for {missing:?} (entry resolved: {})",
                     entry.is_some(),
                 );
@@ -697,7 +710,7 @@ fn run_seed(args: &Args) -> i32 {
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        eprintln!("pp-smoke-run: {ENTRY_NAME} -> {stage0_addr:?} on {stage0_hex}");
+        eprintln!("pp-orchestrator: {ENTRY_NAME} -> {stage0_addr:?} on {stage0_hex}");
 
         // Spec §4.5: emit one pp_stage_roster per drive, before request
         // injection, listing every stage. Seed mode runs a single drive
@@ -719,7 +732,7 @@ fn run_seed(args: &Args) -> i32 {
         let key = match PublicKey::from_bytes(&stage0_node_id.0) {
             Ok(k) => k,
             Err(e) => {
-                eprintln!("pp-smoke-run: invalid stage-0 node key: {e}");
+                eprintln!("pp-orchestrator: invalid stage-0 node key: {e}");
                 break 'run (1, "stage0_key_error");
             }
         };
@@ -766,11 +779,11 @@ fn run_seed(args: &Args) -> i32 {
             }),
         });
         eprintln!(
-            "pp-smoke-run: sending InferenceRequest (prompt={:?}, max_tokens={})",
+            "pp-orchestrator: sending InferenceRequest (prompt={:?}, max_tokens={})",
             request.prompt, request.max_tokens
         );
         if let Err(e) = rt.send_to(stage0_addr, request) {
-            eprintln!("pp-smoke-run: send_to failed: {e}");
+            eprintln!("pp-orchestrator: send_to failed: {e}");
             break 'run (1, "send_to_error");
         }
 
@@ -815,7 +828,7 @@ fn run_seed(args: &Args) -> i32 {
                 (0, "ok")
             }
             Err(e) => {
-                eprintln!("pp-smoke-run: {e}");
+                eprintln!("pp-orchestrator: {e}");
                 (1, e.exit_reason())
             }
         }
@@ -884,7 +897,10 @@ enum AwaitError {
     Timeout(Duration),
     /// `InferenceResponse` arrived with an empty `text` field.
     EmptyResponse,
-    /// Some `pp-gpu-node` child exited locally (seed-mode child guard).
+    /// `send_to(stage0, request)` failed before the request left the
+    /// orchestrator, so the drive never started.
+    SendFailed(String),
+    /// Some `pp-worker` child exited locally (seed-mode child guard).
     ChildDied(String),
     /// Spec §4.4: a SWIM member on the forward path (orchestrator +
     /// every stage in the resolved roster) transitioned to `dead` while
@@ -906,6 +922,7 @@ impl std::fmt::Display for AwaitError {
                 d.as_secs_f32()
             ),
             AwaitError::EmptyResponse => write!(f, "received empty InferenceResponse"),
+            AwaitError::SendFailed(s) => write!(f, "send_to failed: {s}"),
             AwaitError::ChildDied(s) => write!(f, "{s}"),
             AwaitError::ForwardPathDead {
                 stage_index,
@@ -928,6 +945,7 @@ impl AwaitError {
         match self {
             AwaitError::Timeout(_) => "response_timeout",
             AwaitError::EmptyResponse => "response_empty",
+            AwaitError::SendFailed(_) => "send_to_error",
             AwaitError::ChildDied(_) => "stage_died_mid_drive",
             AwaitError::ForwardPathDead { .. } => "forward_path_dead",
         }
@@ -959,11 +977,11 @@ fn hold_open(
 ) {
     match port {
         Some(p) => eprintln!(
-            "pp-smoke-run: holding cluster open — orchestrator dashboard at \
+            "pp-orchestrator: holding cluster open — orchestrator dashboard at \
              http://localhost:{p}. Press Enter (or Ctrl-D) to tear down."
         ),
         None => eprintln!(
-            "pp-smoke-run: holding cluster open. Press Enter (or Ctrl-D) to tear down."
+            "pp-orchestrator: holding cluster open. Press Enter (or Ctrl-D) to tear down."
         ),
     }
     // Read stdin on a side thread so the main thread can keep pumping the
@@ -1060,7 +1078,7 @@ fn await_response(
                 .map(|m| format!("{}={}", &m.node_id[..8.min(m.node_id.len())], m.state))
                 .collect();
             eprintln!(
-                "pp-smoke-run: waiting for response ({:.0}s elapsed, members: {:?})",
+                "pp-orchestrator: waiting for response ({:.0}s elapsed, members: {:?})",
                 start.elapsed().as_secs_f32(),
                 members
             );
@@ -1080,6 +1098,196 @@ fn await_response_timeout_secs(default_secs: u64) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(default_secs)
+}
+
+/// Drive a single inference request through the already-wired pipeline and
+/// await its response (vast.ai mode). Self-contained per drive: emits this
+/// drive's spec §4.5 `pp_stage_roster` + §4.6 `pp_pipeline_wired` markers and
+/// the `pp_drive_start` / `pp_drive_end` boundaries, sends one
+/// `InferenceRequest` to stage 0, waits for the response, and prints it on
+/// success. The roster and the stage-0 route are resolved once by the caller
+/// and reused across drives; the roster is re-emitted each drive so the bundle
+/// reader can slice the interleaved event stream per `drive_seq`. Returns the
+/// drive's result so the caller can derive an exit code.
+#[allow(clippy::too_many_arguments)]
+fn drive_once(
+    driver: &mut IrohDriver,
+    rt: &Runtime,
+    codecs: &Arc<swactor::transport::CodecRegistry>,
+    response_inbox: &Inbox<InferenceResponse>,
+    stage0_addr: swactor::actor::ActorAddress,
+    roster: &[pipeline_parallel_inference::orchestrator::StageRosterEntry],
+    num_stages: u32,
+    label: &str,
+    prompt: &str,
+    max_tokens: u32,
+    drive_seq: u32,
+) -> Result<String, AwaitError> {
+    let drive_start = Instant::now();
+    let inbox_addr = *response_inbox.addr();
+
+    // Spec §4.5: emit one pp_stage_roster per drive, before any request
+    // injection event.
+    driver.emit(distribution::diagnostics::event::Event::Custom {
+        kind: "pp_stage_roster".into(),
+        fields: stage_roster_event_fields(drive_seq, roster),
+    });
+    // Spec §4.6: emit exactly one pp_pipeline_wired per drive (every stage
+    // ready, every neighbour wired — proxied by pp-stage-K registration being
+    // post-ready — and pp-entry resolved).
+    driver.emit(distribution::diagnostics::event::Event::Custom {
+        kind: "pp_pipeline_wired".into(),
+        fields: serde_json::json!({ "drive_seq": drive_seq }),
+    });
+
+    let request = InferenceRequest {
+        reply_to: inbox_addr,
+        prompt: prompt.to_string(),
+        max_tokens,
+    };
+    // Mark this drive's slice of the event stream so a bundle reader can split
+    // events by drive.
+    driver.emit(distribution::diagnostics::event::Event::Custom {
+        kind: "pp_drive_start".into(),
+        fields: serde_json::json!({
+            "drive_seq": drive_seq,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "num_stages": num_stages,
+            "label": label,
+        }),
+    });
+
+    let result = match rt.send_to(stage0_addr, request) {
+        Err(e) => Err(AwaitError::SendFailed(e.to_string())),
+        Ok(()) => {
+            let await_secs = await_response_timeout_secs(600);
+            await_response(
+                driver,
+                rt,
+                codecs,
+                response_inbox,
+                Duration::from_secs(await_secs),
+                None,
+                roster,
+                drive_seq,
+                None,
+            )
+        }
+    };
+
+    let (code, reason): (i32, &'static str) = match &result {
+        Ok(_) => (0, "ok"),
+        Err(e) => (1, e.exit_reason()),
+    };
+    // Close out this drive's slice of the event stream — emitted even on
+    // failure so the bundle reader can window events per drive.
+    driver.emit(distribution::diagnostics::event::Event::Custom {
+        kind: "pp_drive_end".into(),
+        fields: serde_json::json!({
+            "drive_seq": drive_seq,
+            "exit_reason": reason,
+            "elapsed_ms": drive_start.elapsed().as_millis() as u64,
+            "code": code,
+        }),
+    });
+
+    match &result {
+        Ok(text) => {
+            println!("=== pipeline-parallel Inference Response ===");
+            println!("{text}");
+            println!("============================================");
+        }
+        Err(e) => eprintln!("pp-orchestrator: drive {drive_seq} failed: {e}"),
+    }
+    result
+}
+
+/// Live multi-prompt loop for vast.ai mode (dashboard or `--hold`). Keeps the
+/// cluster converged and the dashboard SSE fed while the operator drives more
+/// prompts. A stdin-reader side thread feeds prompt lines so the main thread
+/// can keep pumping the driver; each non-empty line drives one more inference at
+/// the next `drive_seq`. A blank line, `quit`, or EOF (Ctrl-D) ends the loop,
+/// after which the caller's finalize + teardown tail runs.
+#[allow(clippy::too_many_arguments)]
+fn prompt_loop(
+    driver: &mut IrohDriver,
+    rt: &Runtime,
+    codecs: &Arc<swactor::transport::CodecRegistry>,
+    response_inbox: &Inbox<InferenceResponse>,
+    stage0_addr: swactor::actor::ActorAddress,
+    roster: &[pipeline_parallel_inference::orchestrator::StageRosterEntry],
+    num_stages: u32,
+    label: &str,
+    max_tokens: u32,
+    first_drive_seq: u32,
+    dist_cached: Option<&SharedSnapshot>,
+    port: Option<u16>,
+) {
+    match port {
+        Some(p) => eprintln!(
+            "pp-orchestrator: cluster live — dashboard at http://localhost:{p}. \
+             Type a prompt + Enter to drive again; blank line / Ctrl-D / `quit` to tear down."
+        ),
+        None => eprintln!(
+            "pp-orchestrator: cluster live. Type a prompt + Enter to drive again; \
+             blank line / Ctrl-D / `quit` to tear down."
+        ),
+    }
+
+    // Read prompts on a side thread so the main thread keeps pumping the driver;
+    // a blocking stdin read here would freeze SWIM and the live snapshot. The
+    // thread forwards each prompt line over a channel and flips `stop` on a
+    // blank line, `quit`, or EOF.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { break };
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("quit") {
+                    break;
+                }
+                if tx.send(trimmed.to_string()).is_err() {
+                    break;
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
+
+    let mut drive_seq = first_drive_seq;
+    while !stop.load(Ordering::SeqCst) {
+        driver.recv();
+        driver.tick();
+        if let Some(cached) = dist_cached {
+            *cached.lock().unwrap() = Some(driver.snapshot());
+        }
+        // Drive any prompts that arrived since the last tick. drive_once pumps
+        // the driver itself while awaiting each response.
+        while let Ok(prompt) = rx.try_recv() {
+            drive_seq += 1;
+            eprintln!("pp-orchestrator: driving prompt #{drive_seq}: {prompt:?}");
+            let _ = drive_once(
+                driver,
+                rt,
+                codecs,
+                response_inbox,
+                stage0_addr,
+                roster,
+                num_stages,
+                label,
+                &prompt,
+                max_tokens,
+                drive_seq,
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 // ─── vast.ai mode ─────────────────────────────────────────────────────
@@ -1336,14 +1544,14 @@ fn run_teardown(
     let st = match ClusterState::load(state_path) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("pp-smoke-run: {e}");
+            eprintln!("pp-orchestrator: {e}");
             eprintln!("  (nothing to tear down at that path)");
             return 1;
         }
     };
     let ids: Vec<u64> = st.contracts.iter().map(|c| c.id).collect();
     eprintln!(
-        "pp-smoke-run: tearing down label={} contracts={ids:?}",
+        "pp-orchestrator: tearing down label={} contracts={ids:?}",
         st.label
     );
     let results = tokio_rt.block_on(vastai::destroy_all_instances(http, base_url, api_key, &ids));
@@ -1351,13 +1559,13 @@ fn run_teardown(
     for (id, r) in ids.iter().zip(results.iter()) {
         if let Err(e) = r {
             ok = false;
-            eprintln!("pp-smoke-run: destroy {id} failed: {e}");
+            eprintln!("pp-orchestrator: destroy {id} failed: {e}");
         }
     }
     match tokio_rt.block_on(vastai::list_instances_by_label(http, base_url, api_key, &st.label)) {
         Ok(remaining) if remaining.is_empty() => {
             eprintln!(
-                "pp-smoke-run: confirmed 0 instances under label {}",
+                "pp-orchestrator: confirmed 0 instances under label {}",
                 st.label
             );
             // Seal the bundle now that the cluster is provably gone:
@@ -1368,13 +1576,13 @@ fn run_teardown(
             match tokio_rt.block_on(post_teardown_finalize(http, &st)) {
                 Ok(()) if st.collector_url.is_some() => {
                     eprintln!(
-                        "pp-smoke-run: posted finalize to collector for run_id={}",
+                        "pp-orchestrator: posted finalize to collector for run_id={}",
                         st.run_id.as_deref().unwrap_or("<unset>"),
                     );
                 }
                 Ok(()) => {} // no collector pinned — nothing to do
                 Err(e) => {
-                    eprintln!("pp-smoke-run: WARNING teardown finalize failed: {e}");
+                    eprintln!("pp-orchestrator: WARNING teardown finalize failed: {e}");
                     eprintln!(
                         "  (the bundle is still retrievable via GET {}/diag/bundle/{} — staging is intact)",
                         st.collector_url.as_deref().unwrap_or("<collector>"),
@@ -1384,7 +1592,7 @@ fn run_teardown(
             }
             if let Err(e) = std::fs::remove_file(state_path) {
                 eprintln!(
-                    "pp-smoke-run: note: could not remove {}: {e}",
+                    "pp-orchestrator: note: could not remove {}: {e}",
                     state_path.display()
                 );
             }
@@ -1392,7 +1600,7 @@ fn run_teardown(
         Ok(remaining) => {
             ok = false;
             eprintln!(
-                "pp-smoke-run: WARNING {} instance(s) still under label {} — keeping handle file",
+                "pp-orchestrator: WARNING {} instance(s) still under label {} — keeping handle file",
                 remaining.len(),
                 st.label
             );
@@ -1402,7 +1610,7 @@ fn run_teardown(
         }
         Err(e) => {
             ok = false;
-            eprintln!("pp-smoke-run: could not verify teardown via API: {e}");
+            eprintln!("pp-orchestrator: could not verify teardown via API: {e}");
         }
     }
     if ok {
@@ -1417,7 +1625,7 @@ fn run_vastai(args: &Args) -> i32 {
     let tokio_rt = match tokio::runtime::Runtime::new() {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("pp-smoke-run: tokio runtime failed: {e}");
+            eprintln!("pp-orchestrator: tokio runtime failed: {e}");
             return 1;
         }
     };
@@ -1434,7 +1642,7 @@ fn run_vastai(args: &Args) -> i32 {
     let cluster = match resolve_cluster(args, &state_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("pp-smoke-run: {e}");
+            eprintln!("pp-orchestrator: {e}");
             return 1;
         }
     };
@@ -1450,7 +1658,7 @@ fn run_vastai(args: &Args) -> i32 {
     }) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("pp-smoke-run: failed to create iroh driver: {e}");
+            eprintln!("pp-orchestrator: failed to create iroh driver: {e}");
             return 1;
         }
     };
@@ -1465,6 +1673,23 @@ fn run_vastai(args: &Args) -> i32 {
         DiagRole::orchestrator(),
         Some(cluster.run_id.as_str()),
     );
+
+    // Distribution view is wanted when the in-process dashboard (PP_DASHBOARD) is
+    // on, or a dashboard/collector URL resolves for the remote broadcast. Same
+    // gating as run_seed.
+    let broadcast_url = resolve_broadcast_url();
+    let want_dist = std::env::var_os("PP_DASHBOARD").is_some() || broadcast_url.is_some();
+
+    // Orchestrator dashboard message tallies. Decorate the driver's diagnostics
+    // emitter so every wire MessageSent/MessageReceived is counted for the
+    // distribution page; the decorator forwards to whatever emitter diag
+    // installed, so bundle shipping is unaffected. Installed only when the
+    // distribution view is wanted (local or remote).
+    let msg_counts = Arc::new(MsgCounts::default());
+    if want_dist {
+        let inner = driver.diagnostics().clone();
+        driver.set_diagnostics(Arc::new(CountingEmitter::new(inner, Arc::clone(&msg_counts))));
+    }
 
     // Per-cluster drive counter, emitted on pp_drive_start / pp_drive_end so
     // the bundle reader can slice the interleaved event stream by attempt.
@@ -1483,12 +1708,12 @@ fn run_vastai(args: &Args) -> i32 {
     let my_id = driver.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
     eprintln!(
-        "pp-smoke-run (--vastai --num-stages {n}): orchestrator node {my_hex}",
+        "pp-orchestrator (--vastai --num-stages {n}): orchestrator node {my_hex}",
         n = num_stages,
     );
     if diag_env_for_stages.is_enabled() {
         eprintln!(
-            "pp-smoke-run: forwarding diagnostics to rented stages (collector={})",
+            "pp-orchestrator: forwarding diagnostics to rented stages (collector={})",
             diag_env_for_stages
                 .collector_url
                 .as_deref()
@@ -1512,10 +1737,10 @@ fn run_vastai(args: &Args) -> i32 {
         url
     };
     if let Some(ref u) = relay_url {
-        eprintln!("pp-smoke-run: home relay {u}");
+        eprintln!("pp-orchestrator: home relay {u}");
         // Gossip our own home relay through SWIM metadata so the rented
         // stages learn it without having to dial us back first. Mirrors
-        // what pp-gpu-node does on its side; together they ensure every
+        // what pp-worker does on its side; together they ensure every
         // pair of nodes can resolve each other's relay URL through
         // metadata gossip alone — the route enrichment in build_route()
         // depends on this.
@@ -1523,7 +1748,7 @@ fn run_vastai(args: &Args) -> i32 {
             .node_mut()
             .set_relay_url(Some(u.clone()));
     } else {
-        eprintln!("pp-smoke-run: no relay URL after 20s — vastai mode usually requires one");
+        eprintln!("pp-orchestrator: no relay URL after 20s — vastai mode usually requires one");
     }
 
     // ── Vastai monitoring (independent layer) ────────────────────────
@@ -1546,11 +1771,11 @@ fn run_vastai(args: &Args) -> i32 {
                 Some(num_stages),
             ) {
                 Ok(p) => {
-                    eprintln!("pp-smoke-run: vastai monitoring enabled (external poller)");
+                    eprintln!("pp-orchestrator: vastai monitoring enabled (external poller)");
                     Some(p)
                 }
                 Err(e) => {
-                    eprintln!("pp-smoke-run: WARNING vastai monitoring disabled: {e}");
+                    eprintln!("pp-orchestrator: WARNING vastai monitoring disabled: {e}");
                     None
                 }
             }
@@ -1558,6 +1783,105 @@ fn run_vastai(args: &Args) -> i32 {
         None => None,
     };
     let vastai_tracker = vastai_poller.as_ref().map(|p| p.tracker());
+
+    // ── Live dashboard + runtime — started BEFORE the lease ──────────────
+    // The lease + image-load phase is the slow, failure-prone part the operator
+    // most needs to watch, so the HTTP server binds here (start_http) rather
+    // than after convergence. Plugins populate as the cluster comes up. Setup
+    // depends only on the driver + msg_counts created above, never on the lease.
+    let mut rt = Runtime::new(RuntimeConfig::default());
+    let codecs = Arc::new(inference_codec_registry());
+    let router = Arc::new(TransportRouter::new());
+    rt.set_codec_registry(codecs.clone());
+    rt.set_transport_router(router.clone());
+
+    // When PP_DASHBOARD is set we install a stats hook on the orchestrator
+    // runtime (must happen before `rt` is shared) and serve the HTTP dashboard
+    // on the iroh driver's tokio runtime. The handle is held for the whole run
+    // so the server stays up through the lease, drive, and multi-prompt loop.
+    let dashboard = if std::env::var_os("PP_DASHBOARD").is_some() {
+        let port: u16 = std::env::var("PP_DASHBOARD_PORT")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(9090);
+        let collector = StatsCollector::new(RuntimeConfig::default().num_threads);
+        rt.set_stats_hook(collector.clone());
+        let handle = start_dashboard(DashboardConfig { port, ..Default::default() });
+        Some((handle, collector, port))
+    } else {
+        None
+    };
+
+    let rt = Arc::new(rt);
+
+    // Shared distribution snapshot cell, refreshed by the multi-prompt loop.
+    // The in-process plugins and the remote broadcaster both read this one
+    // cell, so it exists whenever the distribution view is wanted — even
+    // broadcast-only (no local dashboard). `None` when off so the loop skips
+    // the refresh.
+    let dist_cached: Option<SharedSnapshot> = if want_dist {
+        Some(Arc::new(Mutex::new(Some(driver.snapshot()))))
+    } else {
+        None
+    };
+
+    // When the in-process dashboard is on, register the distribution + net map
+    // plugins ("Distribution"/"Netmap" nav tabs) against the shared cell.
+    if let (Some((handle, collector, port)), Some(cached)) = (&dashboard, &dist_cached) {
+        handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
+        handle.register_plugin(Arc::new(DistDashPlugin::new(
+            Arc::clone(cached),
+            Arc::clone(&msg_counts),
+        )));
+        // Net map plugin: a live connection/bandwidth graph. Shares the
+        // cached snapshot and message tallies; a background poller keeps its
+        // transport map fresh by querying the iroh endpoint directly. The
+        // poller's stop flag rides the process lifetime (the driver's tokio
+        // runtime is torn down at end of run, aborting the task).
+        let conn_tracker = Arc::new(ConnTracker::default());
+        handle.register_plugin(Arc::new(NetmapPlugin::new(
+            Arc::clone(cached),
+            Arc::clone(&msg_counts),
+            Arc::clone(&conn_tracker),
+        )));
+        let poll_stop = Arc::new(AtomicBool::new(false));
+        spawn_conn_poller(&driver, Arc::clone(cached), conn_tracker, poll_stop);
+        // Fleet plugin ("Fleet" nav tab): the vast.ai/host-metric fleet view.
+        // The collector lives on the VPS; this plugin *pulls* the collector's
+        // already-folded fleet model (the collector→orchestrator vast.ai
+        // stream) and re-serves it locally, so the full dashboard shows the
+        // fleet beside the live actor views. Registered unconditionally so the
+        // tab exists; the stream only runs when a collector URL is known.
+        let fleet = Arc::new(RemoteVastaiPlugin::new());
+        if let Some(url) = broadcast_url.as_ref() {
+            // Subscribe under the SAME run_id the stages + vast.ai poller ship
+            // under (cluster.run_id), NOT broadcast_run_id() — otherwise the
+            // Fleet tab listens on the wrong slug and shows nothing while the
+            // poller publishes fine. cluster.run_id already honors
+            // SWACTOR_DIAG_RUN_ID, then falls back to pp-{label}.
+            fleet.spawn_stream(&driver.tokio_handle(), url.clone(), cluster.run_id.clone());
+        }
+        handle.register_plugin(fleet);
+        handle.start_http(driver.tokio_handle());
+        eprintln!(
+            "pp-orchestrator: live dashboard on http://localhost:{port} \
+             (overview / actors / topology / distribution / netmap / fleet)"
+        );
+    }
+
+    // Default-on remote broadcast: ship the distribution snapshot to the
+    // dashboard collector ~1/s so a remote dashboard renders the same view.
+    // Use cluster.run_id so every stream for this run lands under one slug.
+    if let (Some(url), Some(cached)) = (broadcast_url.as_ref(), dist_cached.as_ref()) {
+        dist_broadcast::spawn_dist_broadcast(
+            driver.tokio_handle(),
+            Arc::clone(cached),
+            Arc::clone(&msg_counts),
+            url.clone(),
+            cluster.run_id.clone(),
+        );
+        eprintln!("pp-orchestrator: broadcasting distribution snapshot to {url}");
+    }
 
     // ── Acquire the running cluster ──────────────────────────────────
     // Lease N fresh instances and (on --hold) persist the handle.
@@ -1572,7 +1896,7 @@ fn run_vastai(args: &Args) -> i32 {
                 match random_secret() {
                     Ok(b) => v.push(to_hex(&b)),
                     Err(e) => {
-                        eprintln!("pp-smoke-run: {e}");
+                        eprintln!("pp-orchestrator: {e}");
                         return 1;
                     }
                 }
@@ -1594,7 +1918,7 @@ fn run_vastai(args: &Args) -> i32 {
             // SAFETY: single-threaded here — no lease/diag worker threads have
             // been spawned yet, so there is no concurrent env access.
             unsafe { std::env::set_var(var, "20") };
-            eprintln!("pp-smoke-run: defaulting {var}=20 (price image pull into offer ranking)");
+            eprintln!("pp-orchestrator: defaulting {var}=20 (price image pull into offer ranking)");
         }
 
         // One call into the lease helper handles select-the-pool, create-N,
@@ -1602,16 +1926,28 @@ fn run_vastai(args: &Args) -> i32 {
         // Describe the selector accurately: VRAM-filter mode (PP_GPU_MIN_RAM_MB)
         // spans a heterogeneous set of cards, so naming a single model would
         // mislead. lease_chain logs the survivor pool and each stage's pick.
-        let selector = match std::env::var("PP_GPU_MIN_RAM_MB").ok().filter(|s| !s.trim().is_empty()) {
-            Some(mb) => format!("any 1-GPU offer with >={mb}MB VRAM"),
-            None => args.gpu_name.clone(),
+        let vram = std::env::var("PP_GPU_MIN_RAM_MB")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let selector = match (&vram, args.gpu_name.is_empty()) {
+            (Some(mb), true) => format!("any 1-GPU offer with >={mb}MB VRAM"),
+            (Some(mb), false) => format!("{} with >={mb}MB VRAM", args.gpu_name),
+            (None, false) => args.gpu_name.clone(),
+            (None, true) => "any 1-GPU offer".to_string(),
         };
         eprintln!(
-            "pp-smoke-run: leasing {} instances [{selector}] (label {label})...",
+            "pp-orchestrator: leasing {} instances [{selector}] (label {label})...",
             num_stages,
         );
-        let created = match tokio_rt.block_on(
-            pipeline_parallel_inference::vastai::lease_chain(
+        // Run the lease in 200ms slices instead of one blocking call, so the
+        // main thread can pump SWIM and refresh the dashboard snapshot while
+        // instances come up. Otherwise the membership/topology/net-map panels
+        // freeze at the empty startup snapshot for the entire (multi-minute,
+        // CDI-retrying) lease — even though stages are already joining SWIM —
+        // which defeats the point of binding the dashboard before the lease.
+        let lease_result = {
+            let mut lease_fut = Box::pin(pipeline_parallel_inference::vastai::lease_chain(
                 &http,
                 base_url,
                 &api_key,
@@ -1633,11 +1969,26 @@ fn run_vastai(args: &Args) -> i32 {
                 30,
                 Some(&diag_env_for_stages),
                 vastai_tracker.as_ref(),
-            ),
-        ) {
+            ));
+            loop {
+                match tokio_rt.block_on(async {
+                    tokio::time::timeout(Duration::from_millis(200), &mut lease_fut).await
+                }) {
+                    Ok(res) => break res,
+                    Err(_elapsed) => {
+                        driver.recv();
+                        driver.tick();
+                        if let Some(cached) = dist_cached.as_ref() {
+                            *cached.lock().unwrap() = Some(driver.snapshot());
+                        }
+                    }
+                }
+            }
+        };
+        let created = match lease_result {
             Ok(c) => c,
             Err(e) => {
-                eprintln!("pp-smoke-run: lease_chain failed: {e}");
+                eprintln!("pp-orchestrator: lease_chain failed: {e}");
                 // One-shot lease failure (a --hold lease failure also
                 // lands here) finalizes — there is no cluster left to
                 // extend the window, so sealing the canonical bundle is
@@ -1678,30 +2029,23 @@ fn run_vastai(args: &Args) -> i32 {
                 orchestrator_node_id_hex: Some(my_hex.clone()),
             };
             match st.save(&state_path) {
-                Ok(()) => eprintln!("pp-smoke-run: wrote cluster handle {}", state_path.display()),
-                Err(e) => eprintln!("pp-smoke-run: WARNING could not write cluster handle: {e}"),
+                Ok(()) => eprintln!("pp-orchestrator: wrote cluster handle {}", state_path.display()),
+                Err(e) => eprintln!("pp-orchestrator: WARNING could not write cluster handle: {e}"),
             }
         }
         ids
     };
-    eprintln!("pp-smoke-run: cluster contracts {contract_ids:?}");
+    eprintln!("pp-orchestrator: cluster contracts {contract_ids:?}");
 
     // Drive the run inside a labelled block returning `(code, reason)` so
     // every failure point can name the reason it bailed; the orchestrator's
     // diagnostics finalize record then carries that reason into the bundle.
     // Mirrors the run_seed pattern.
-    let drive_start_instant = Instant::now();
     let (code, exit_reason): (i32, &'static str) = 'run: {
-        // Set up runtime + inbox + orchestrator name, same as seed mode.
-        let mut rt = Runtime::new(RuntimeConfig::default());
-        let codecs = Arc::new(inference_codec_registry());
-        let router = Arc::new(TransportRouter::new());
-        rt.set_codec_registry(codecs.clone());
-        rt.set_transport_router(router.clone());
         let response_inbox = match rt.new_inbox::<InferenceResponse>() {
             Ok(i) => i,
             Err(e) => {
-                eprintln!("pp-smoke-run: new_inbox failed: {e}");
+                eprintln!("pp-orchestrator: new_inbox failed: {e}");
                 break 'run (1, "new_inbox_error");
             }
         };
@@ -1720,7 +2064,7 @@ fn run_vastai(args: &Args) -> i32 {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(180);
         eprintln!(
-            "pp-smoke-run: waiting for SWIM convergence ({} alive peers, {}s budget)...",
+            "pp-orchestrator: waiting for SWIM convergence ({} alive peers, {}s budget)...",
             num_stages, orch_converge_secs,
         );
         let conv_res = await_convergence(
@@ -1730,16 +2074,17 @@ fn run_vastai(args: &Args) -> i32 {
             || {
                 driver.recv();
                 driver.tick();
-                driver
-                    .snapshot()
-                    .members
-                    .iter()
-                    .filter(|m| m.state == "alive")
-                    .count()
+                let snap = driver.snapshot();
+                // Keep the dashboard membership/topology panels live as peers
+                // join during convergence.
+                if let Some(cached) = dist_cached.as_ref() {
+                    *cached.lock().unwrap() = Some(snap.clone());
+                }
+                snap.members.iter().filter(|m| m.state == "alive").count()
             },
         );
         if let Err(e) = conv_res {
-            eprintln!("pp-smoke-run: {e}");
+            eprintln!("pp-orchestrator: {e}");
             break 'run (1, "convergence_error");
         }
 
@@ -1747,12 +2092,12 @@ fn run_vastai(args: &Args) -> i32 {
             .node_mut()
             .register_name(ORCHESTRATOR_NAME.into(), inbox_addr);
         diag::emit_register_name(&driver, ORCHESTRATOR_NAME, inbox_addr, None);
-        eprintln!("pp-smoke-run: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
+        eprintln!("pp-orchestrator: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
 
         // Spec §4.5 + §4.6: gate the drive on (a) every pp-stage-K
         // resolvable and (b) pp-entry resolvable. Both are proxies for
         // "all stage workers ready and pipeline wired" because the
-        // per-index name is published post-worker-ready by pp-gpu-node.
+        // per-index name is published post-worker-ready by pp-worker.
         // 1200s covers an ~18 GB MoE GGUF (e.g. qwen3:30b-a3b)
         // downloading in parallel on N nodes even when some have slow
         // links; smaller models resolve in a fraction of this.
@@ -1766,6 +2111,10 @@ fn run_vastai(args: &Args) -> i32 {
         let (stage0_addr, stage0_node_id) = loop {
             driver.recv();
             driver.tick();
+            // Keep the dashboard panels live while the pipeline wires up.
+            if let Some(cached) = dist_cached.as_ref() {
+                *cached.lock().unwrap() = Some(driver.snapshot());
+            }
             for k in 0..num_stages {
                 if roster_hex[k as usize].is_some() {
                     continue;
@@ -1788,7 +2137,7 @@ fn run_vastai(args: &Args) -> i32 {
                     .filter_map(|(k, o)| o.is_none().then_some(k as u32))
                     .collect();
                 eprintln!(
-                    "pp-smoke-run: pipeline did not wire within {resolve_secs}s; \
+                    "pp-orchestrator: pipeline did not wire within {resolve_secs}s; \
                      missing pp-stage-K for {missing:?} (entry resolved: {})",
                     entry.is_some(),
                 );
@@ -1813,14 +2162,14 @@ fn run_vastai(args: &Args) -> i32 {
         let key = match PublicKey::from_bytes(&stage0_node_id.0) {
             Ok(k) => k,
             Err(e) => {
-                eprintln!("pp-smoke-run: invalid stage-0 node key: {e}");
+                eprintln!("pp-orchestrator: invalid stage-0 node key: {e}");
                 break 'run (1, "stage0_key_error");
             }
         };
         // Enrich the EndpointAddr with stage 0's relay URL (from SWIM
         // metadata gossip) or our own home relay as a fallback, so iroh has
         // routing info even if it has never dialed stage 0 directly. See
-        // pp-gpu-node::build_route for the same rationale on the worker side.
+        // pp-worker::build_route for the same rationale on the worker side.
         let mut stage0_endpoint = iroh::EndpointAddr::from(key);
         if let Some(url) = driver
             .node()
@@ -1839,83 +2188,54 @@ fn run_vastai(args: &Args) -> i32 {
         ));
         router.add_route(stage0_addr, route);
 
-        // Spec §4.5: emit one pp_stage_roster per drive, before any
-        // request injection event. The roster was built above by
-        // resolving every pp-stage-K.
-        driver.emit(distribution::diagnostics::event::Event::Custom {
-            kind: "pp_stage_roster".into(),
-            fields: stage_roster_event_fields(drive_seq, &roster),
-        });
-        // Spec §4.6: emit exactly one pp_pipeline_wired per drive once
-        // every stage is ready, every neighbour is wired (proxied by
-        // pp-stage-K registration being post-ready), and pp-entry is
-        // resolved.
-        driver.emit(distribution::diagnostics::event::Event::Custom {
-            kind: "pp_pipeline_wired".into(),
-            fields: serde_json::json!({ "drive_seq": drive_seq }),
-        });
-
-        let request = InferenceRequest {
-            reply_to: inbox_addr,
-            prompt: args.prompt.clone(),
-            max_tokens: args.max_tokens,
-        };
-        // Mark this drive's slice of the event stream so a bundle
-        // reader can split events by drive.
-        driver.emit(distribution::diagnostics::event::Event::Custom {
-            kind: "pp_drive_start".into(),
-            fields: serde_json::json!({
-                "drive_seq": drive_seq,
-                "prompt": args.prompt,
-                "max_tokens": args.max_tokens,
-                "num_stages": num_stages,
-                "label": label,
-            }),
-        });
-        if let Err(e) = rt.send_to(stage0_addr, request) {
-            eprintln!("pp-smoke-run: send_to failed: {e}");
-            break 'run (1, "send_to_error");
-        }
-
-        let await_secs = await_response_timeout_secs(600);
-        let result = await_response(
+        // First (canonical) drive: args.prompt at drive_seq 1. drive_once emits
+        // this drive's pp_stage_roster / pp_pipeline_wired / pp_drive_start /
+        // pp_drive_end markers, sends the request to stage 0, and prints the
+        // response. The roster + stage-0 route were resolved once above and are
+        // reused for every drive.
+        let (code, reason) = match drive_once(
             &mut driver,
             &rt,
             &codecs,
             &response_inbox,
-            Duration::from_secs(await_secs),
-            None,
+            stage0_addr,
             &roster,
+            num_stages,
+            &label,
+            &args.prompt,
+            args.max_tokens,
             drive_seq,
-            None,
-        );
+        ) {
+            Ok(_) => (0, "ok"),
+            Err(e) => (1, e.exit_reason()),
+        };
 
-        match result {
-            Ok(text) => {
-                println!("=== pipeline-parallel Inference Response ===");
-                println!("{text}");
-                println!("============================================");
-                (0, "ok")
-            }
-            Err(e) => {
-                eprintln!("pp-smoke-run: {e}");
-                (1, e.exit_reason())
-            }
+        // Live multi-prompt loop, gated on the dashboard or --hold. A plain
+        // one-shot (neither set) keeps today's single-drive-then-exit behaviour.
+        // Modeled on hold_open: a stdin-reader side thread feeds prompt lines
+        // while the main thread pumps the driver (~200 ms) and refreshes the
+        // distribution snapshot so SWIM + the dashboard SSE stay live between
+        // prompts. EOF / blank line / `quit` leaves the loop, after which the
+        // existing finalize + teardown tail runs.
+        if std::env::var_os("PP_DASHBOARD").is_some() || args.hold {
+            prompt_loop(
+                &mut driver,
+                &rt,
+                &codecs,
+                &response_inbox,
+                stage0_addr,
+                &roster,
+                num_stages,
+                &label,
+                args.max_tokens,
+                drive_seq,
+                dist_cached.as_ref(),
+                dashboard.as_ref().map(|(_, _, p)| *p),
+            );
         }
-    };
 
-    // Close out this drive's slice of the event stream — emitted
-    // before finalize so the boundary marker lands in staging even
-    // when --hold intentionally skips finalize.
-    driver.emit(distribution::diagnostics::event::Event::Custom {
-        kind: "pp_drive_end".into(),
-        fields: serde_json::json!({
-            "drive_seq": drive_seq,
-            "exit_reason": exit_reason,
-            "elapsed_ms": drive_start_instant.elapsed().as_millis() as u64,
-            "code": code,
-        }),
-    });
+        (code, reason)
+    };
 
     // Finalize policy: only one-shot runs seal a canonical bundle on
     // exit. --hold leaves the cluster running and the bundle window
@@ -1936,12 +2256,12 @@ fn run_vastai(args: &Args) -> i32 {
     // Teardown policy: --hold leaves the cluster running so it can be
     // iterated on; only the default one-shot tears down on exit.
     if is_held {
-        eprintln!("pp-smoke-run: HOLDING cluster (label={label}, contracts={contract_ids:?})");
-        eprintln!("  destroy when done:   pp-smoke-run --vastai --api-key <k> --teardown --state {}", state_path.display());
+        eprintln!("pp-orchestrator: HOLDING cluster (label={label}, contracts={contract_ids:?})");
+        eprintln!("  destroy when done:   pp-orchestrator --vastai --api-key <k> --teardown --state {}", state_path.display());
         eprintln!("  inspect:             vastai show instances   (label {label})");
     } else {
         // Default one-shot: always destroy rented instances, even on failure.
-        eprintln!("pp-smoke-run: destroying instances {contract_ids:?}");
+        eprintln!("pp-orchestrator: destroying instances {contract_ids:?}");
         let results = tokio_rt.block_on(
             pipeline_parallel_inference::vastai::destroy_all_instances(
                 &http,
@@ -1952,7 +2272,7 @@ fn run_vastai(args: &Args) -> i32 {
         );
         for (id, r) in contract_ids.iter().zip(results.iter()) {
             if let Err(e) = r {
-                eprintln!("pp-smoke-run: destroy {id} failed: {e}");
+                eprintln!("pp-orchestrator: destroy {id} failed: {e}");
             }
         }
     }

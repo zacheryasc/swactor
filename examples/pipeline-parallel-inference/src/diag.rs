@@ -1,5 +1,5 @@
-//! Wire `crates/distribution` diagnostics into `pp-smoke-run` and
-//! `pp-gpu-node` from environment variables.
+//! Wire `crates/distribution` diagnostics into `pp-orchestrator` and
+//! `pp-worker` from environment variables.
 //!
 //! Reading `SWACTOR_DIAG_COLLECTOR_URL` is the opt-in switch. When it is
 //! unset (or empty) `install_from_env` returns `None` and the binary

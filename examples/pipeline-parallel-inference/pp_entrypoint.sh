@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PID-1 supervisor for the pipeline-parallel runtime container.
 #
-# The worker used to run as PID 1 (`exec pp-gpu-node`), so SSH depended on
+# The worker used to run as PID 1 (`exec pp-worker`), so SSH depended on
 # vast's host-side helper winning a race against our exec, and a worker crash
 # killed the whole container — no shell left to read the traceback. This script
 # instead owns PID 1: it brings up sshd deterministically, runs the worker as a
@@ -41,9 +41,9 @@ echo "pp-entrypoint: sshd up on :22" >&2
 
 # ── Worker: run as a child, tee output to a file readable over SSH ───────────
 WORKER_LOG=/var/log/pp-worker.log
-echo "pp-entrypoint: launching pp-gpu-node (log -> $WORKER_LOG)" >&2
+echo "pp-entrypoint: launching pp-worker (log -> $WORKER_LOG)" >&2
 set -o pipefail
-/usr/local/bin/pp-gpu-node 2>&1 | tee "$WORKER_LOG"
+/usr/local/bin/pp-worker 2>&1 | tee "$WORKER_LOG"
 code=${PIPESTATUS[0]}
 
 # ── Operator runbooks (manual, over SSH) ─────────────────────────────────────
@@ -51,23 +51,23 @@ code=${PIPESTATUS[0]}
 #
 #   Worker hot-reload (no restart) — edit the Python in place, then SIGHUP:
 #     scp -P <port> pp_tinygrad_worker.py root@<host>:/usr/local/share/pp_tinygrad_worker.py
-#     ssh <host> 'kill -HUP $(pidof pp-gpu-node)'
-#   pp-gpu-node tears down its worker and re-execs the on-disk script; the
+#     ssh <host> 'kill -HUP $(pidof pp-worker)'
+#   pp-worker tears down its worker and re-execs the on-disk script; the
 #   swactor process (and SWIM membership) stays up across the swap.
 #
 #   Swactor-binary swap — stop the binary, stage the new one, re-exec under
 #   PID 1's env (preserves STAGE/SEED_ADDR/PP_STAGE_SECRET so the node id is
 #   unchanged). `.new` staging avoids ETXTBSY on the mapped ELF:
-#     ssh <host> 'pkill -x pp-gpu-node'                    # drops to the hold below
-#     scp -P <port> pp-gpu-node root@<host>:/usr/local/bin/pp-gpu-node.new
-#     ssh <host> 'mv -f /usr/local/bin/pp-gpu-node.new /usr/local/bin/pp-gpu-node && \
-#       chmod +x /usr/local/bin/pp-gpu-node && \
+#     ssh <host> 'pkill -x pp-worker'                    # drops to the hold below
+#     scp -P <port> pp-worker root@<host>:/usr/local/bin/pp-worker.new
+#     ssh <host> 'mv -f /usr/local/bin/pp-worker.new /usr/local/bin/pp-worker && \
+#       chmod +x /usr/local/bin/pp-worker && \
 #       setsid bash -c "while IFS= read -r -d \"\" kv; do export \"\$kv\"; done \
-#         < /proc/1/environ; exec /usr/local/bin/pp-gpu-node" \
+#         < /proc/1/environ; exec /usr/local/bin/pp-worker" \
 #       >/var/log/pp-restart.log 2>&1 </dev/null &'
 #
 # ── Crash policy: do NOT restart. Keep PID 1 / sshd alive for postmortem. ────
-echo "pp-entrypoint: pp-gpu-node exited with code $code; NOT restarting (node held for postmortem)" >&2
+echo "pp-entrypoint: pp-worker exited with code $code; NOT restarting (node held for postmortem)" >&2
 echo "pp-entrypoint: --- last 40 lines of $WORKER_LOG ---" >&2
 tail -n 40 "$WORKER_LOG" >&2 || true
 exec sleep infinity

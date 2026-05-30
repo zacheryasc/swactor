@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# docker-gpu-node.sh — shim that pp-smoke-run can spawn instead of the
-# pp-gpu-node binary directly. Boots one pp-gpu-node container per stage
+# docker-gpu-node.sh — shim that pp-orchestrator can spawn instead of the
+# pp-worker binary directly. Boots one pp-worker container per stage
 # on the host network so iroh can dial without NAT.
 #
-# Required env (forwarded by pp-smoke-run):
+# Required env (forwarded by pp-orchestrator):
 #   STAGE, NUM_STAGES, SEED_ADDR, SEED_DIRECT, MAX_TOKENS
 # Optional env (forwarded if present):
 #   MODEL, PP_WORKER_STUB, WORKER_CMD,
@@ -80,10 +80,10 @@ mkdir -p "$CACHE_DIR"
 #
 # --entrypoint runs the binary directly, bypassing the image's default
 # pp_entrypoint.sh (sshd + postmortem hold). That supervisor is for remote
-# vast.ai nodes; a local docker stage should exit cleanly when pp-gpu-node
+# vast.ai nodes; a local docker stage should exit cleanly when pp-worker
 # does so --rm reaps it and the E2E's no-leftover-container check holds.
 exec docker run --rm --init \
-    --entrypoint /usr/local/bin/pp-gpu-node \
+    --entrypoint /usr/local/bin/pp-worker \
     --name "$NAME" \
     --network "${PP_DIAG_NETWORK:-host}" \
     "${GPU_ARGS[@]}" \

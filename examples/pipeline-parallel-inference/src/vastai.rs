@@ -15,6 +15,7 @@
 //!
 //! All functions accept a `base_url` so tests can point at a wiremock server.
 
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use reqwest::Client;
@@ -28,7 +29,7 @@ pub struct InstanceInfo {
 
 /// Diagnostics env-var bundle forwarded to rented stage containers.
 ///
-/// `pp-gpu-node::diag::install_from_env` reads `SWACTOR_DIAG_*` on boot
+/// `pp-worker::diag::install_from_env` reads `SWACTOR_DIAG_*` on boot
 /// inside each container to decide whether to enable the aggregator and
 /// where to ship to. The orchestrator-side caller of [`lease_chain`]
 /// builds this from its own process env (typically the same vars the
@@ -111,6 +112,12 @@ pub struct Offer {
     /// that gouge on bandwidth, since bandwidth price is a per-host policy.
     #[serde(default)]
     pub host_id: Option<u64>,
+    /// vast.ai host verification state: `"verified"`, `"unverified"` (never
+    /// tested), or `"deverified"` (was verified, then failed vast's checks).
+    /// Deverified hosts recurrently fail CDI GPU-device injection at container
+    /// start despite a high `reliability2`, so they are dropped by default.
+    #[serde(default)]
+    pub verification: Option<String>,
 }
 
 /// Connection details for a running instance.
@@ -237,6 +244,118 @@ fn next_eligible_offer<'a>(
     })
 }
 
+/// The offers [`lease_chain`] would rent on the happy path: the cheapest
+/// `num_stages` on distinct hosts, in stage order (stage 0 = cheapest). Mirrors
+/// the distinct-host draw in [`next_eligible_offer`] (a `None` host id is never
+/// deduped, matching that helper). Actual picks can differ only if a create
+/// fails and the chain falls through to the next survivor — so the confirmed
+/// cost is the floor, not a ceiling.
+fn plan_picks(pool: &[Offer], num_stages: u32) -> Vec<&Offer> {
+    let mut picks: Vec<&Offer> = Vec::with_capacity(num_stages as usize);
+    let mut used: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for o in pool {
+        if picks.len() == num_stages as usize {
+            break;
+        }
+        if let Some(h) = o.host_id {
+            if !used.insert(h) {
+                continue; // host already claimed by an earlier pick
+            }
+        }
+        picks.push(o);
+    }
+    picks
+}
+
+/// `PP_ASSUME_YES`: skip the interactive lease confirmation (for scripted / CI
+/// runs that intend to rent without a human at the keyboard). Truthy = any
+/// non-empty value other than `0` / `false` / `no`.
+fn assume_yes() -> bool {
+    std::env::var("PP_ASSUME_YES")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            !v.is_empty() && v != "0" && v != "false" && v != "no"
+        })
+        .unwrap_or(false)
+}
+
+/// Print the planned lease + its hourly cost and, when running interactively,
+/// require an explicit `y`/`N` before any instance is created.
+///
+/// This is the cost guardrail: the offer search can legitimately land on an
+/// expensive card when the cheap pool is thin, and an unconfirmed lease once put
+/// a 3-stage run onto an A100. The prompt is the last gate before money is spent.
+///
+/// To keep scripted runs and the (HTTP-mocked) test suite unaffected, the
+/// confirmation is *skipped* (the lease proceeds) when `PP_ASSUME_YES` is set or
+/// when stdin is not a TTY — there is no human to answer in those cases. The cost
+/// summary is always logged regardless.
+fn confirm_lease(pool: &[Offer], num_stages: u32, cost: &CostModel) -> Result<(), String> {
+    let picks = plan_picks(pool, num_stages);
+    let total_dph: f64 = picks.iter().map(|o| o.dph_total).sum();
+    let total_eff: f64 = picks.iter().map(|o| cost.effective_price(o)).sum();
+
+    eprintln!(
+        "pp-orchestrator: lease plan — {num_stages} stage(s), cheapest on distinct hosts:"
+    );
+    for (i, o) in picks.iter().enumerate() {
+        eprintln!(
+            "  stage {i}  {:<14} {:>8}  ${:.3}/hr  [{}]  host {}",
+            o.gpu_name,
+            o.gpu_ram
+                .map(|r| format!("{:.0}MB", r))
+                .unwrap_or_else(|| "?MB".into()),
+            o.dph_total,
+            o.geolocation.as_deref().unwrap_or("?"),
+            o.host_id
+                .map(|h| h.to_string())
+                .unwrap_or_else(|| "?".into()),
+        );
+    }
+    if picks.len() < num_stages as usize {
+        eprintln!(
+            "  WARNING: only {} distinct-host offer(s) available for {num_stages} stage(s) — \
+             the lease will likely fail to fill the chain.",
+            picks.len(),
+        );
+    }
+    let eff_note = if (total_eff - total_dph).abs() > 1e-6 {
+        format!("   (image-pull priced in: ${total_eff:.3}/hr eff)")
+    } else {
+        String::new()
+    };
+    eprintln!(
+        "  TOTAL  ${total_dph:.3}/hr  (~${:.2}/day){eff_note}",
+        total_dph * 24.0,
+    );
+
+    if assume_yes() {
+        eprintln!("pp-orchestrator: PP_ASSUME_YES set — proceeding without confirmation");
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "pp-orchestrator: stdin is not a TTY — proceeding without interactive confirmation \
+             (set PP_ASSUME_YES=1 to silence this)"
+        );
+        return Ok(());
+    }
+
+    eprint!("Proceed with renting these {num_stages} instance(s)? [y/N]: ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("failed to read lease confirmation: {e}"))?;
+    let ans = line.trim().to_ascii_lowercase();
+    if ans == "y" || ans == "yes" {
+        Ok(())
+    } else {
+        Err("operator declined the lease (cost not confirmed); no instances were created".into())
+    }
+}
+
 /// Build the ranked survivor pool for a heterogeneous PP lease in a single
 /// query. Replaces the old per-stage `find_offer` / `find_offer_chain`.
 ///
@@ -253,40 +372,55 @@ pub async fn select_offer_pool(
     gpu_name: &str,
     num_stages: u32,
 ) -> Result<Vec<Offer>, String> {
-    // Hard gates expressed server-side. reliability2 >= 0.995 and
-    // cuda_max_good >= 12.6 (our CUDA-12.6 base image) drop hosts that
-    // recurrently fail container init / CDI device injection; num_gpus == 1
-    // keeps us from renting a multi-GPU rig per stage. Network speed can't be
-    // probed before renting, so we trust vast.ai's measured inet figures and
-    // gate on a configurable minimum (PP_MIN_INET_DOWN_MBPS, default 100; the
-    // upload gate is off by default).
+    // Hard gates expressed server-side. reliability2 (PP_MIN_RELIABILITY,
+    // default 0.95 — "semi-reliable", NOT near-perfect) and cuda_max_good >=
+    // 12.6 (our CUDA-12.6 base image) drop hosts that recurrently fail
+    // container init / CDI device injection; num_gpus == 1 keeps us from
+    // renting a multi-GPU rig per stage. Network speed can't be probed before
+    // renting, so we trust vast.ai's measured inet figures and gate on a
+    // configurable minimum (PP_MIN_INET_DOWN_MBPS, default 100; the upload
+    // gate is off by default).
     let mut query = serde_json::json!({
         "rentable": {"eq": true},
         "rented": {"eq": false},
-        "reliability2": {"gte": 0.995},
+        "reliability2": {"gte": env_min_reliability()},
         "cuda_max_good": {"gte": 12.6},
-        "verified": {"eq": true},
         "direct_port_count": {"gte": 1},
         "num_gpus": {"eq": 1},
         "inet_down": {"gte": env_min_inet_down_mbps()},
-        // Cap the response so one query covers N distinct hosts even after the
-        // per-model cheap drop, without paging.
-        "limit": 512,
+        // vast.ai treats `limit` as a SCAN BUDGET (machines examined in the
+        // engine's default high-perf-first order), NOT a result cap: a small
+        // limit returns *fewer* matches because it never reaches the cheap
+        // commodity hosts that rank low. Empirically `limit:512` returned ~184
+        // ram>=8000 offers while `limit:5000` returned ~1639 — the missing
+        // ~1450 included the cheap 3090/3060 supply, so a small limit alone
+        // skews the pool toward datacenter cards. Set high so the survivor pool
+        // reflects the whole market.
+        "limit": 5000,
     });
     if let Some(up) = env_min_inet_up_mbps() {
         query["inet_up"] = serde_json::json!({"gte": up});
     }
-    // VRAM mode spans a heterogeneous card set (each PP stage is an independent
-    // process exchanging fp16 hidden state, so stages need not share a model —
-    // only enough VRAM for their block slice). Model-name mode is the historical
-    // default and implicitly bounds cost to that one cheap model.
-    match env_min_gpu_ram_mb() {
-        Some(min_ram) => {
-            query["gpu_ram"] = serde_json::json!({"gte": min_ram});
-        }
-        None => {
-            query["gpu_name"] = serde_json::json!({"eq": gpu_name});
-        }
+    // vast.ai's `verified` flag means the host passed vast's own datacenter
+    // vetting. AND'd with the other gates it discarded ~90% of supply — almost
+    // every cheap consumer 3090/3060 is unverified — so it is OFF by default and
+    // reliability2 (above) carries the quality floor. Opt back in with
+    // PP_REQUIRE_VERIFIED=1 for a vetted-hosts-only pool.
+    if env_require_verified() {
+        query["verified"] = serde_json::json!({"eq": true});
+    }
+    // GPU selection is two independent, optional filters — neither is required.
+    // A VRAM floor (PP_GPU_MIN_RAM_MB) spans a heterogeneous card set (each PP
+    // stage is an independent process exchanging fp16 hidden state, so stages
+    // need not share a model — only enough VRAM for their block slice). A model
+    // pin (PP_GPU / `gpu_name`) restricts to one model. Unset both → the GPU
+    // itself isn't filtered and the quality gates above + cost ranking pick the
+    // host.
+    if let Some(min_ram) = env_min_gpu_ram_mb() {
+        query["gpu_ram"] = serde_json::json!({"gte": min_ram});
+    }
+    if !gpu_name.is_empty() {
+        query["gpu_name"] = serde_json::json!({"eq": gpu_name});
     }
     let url = format!(
         "{base_url}/api/v0/bundles/?q={}",
@@ -311,8 +445,16 @@ pub async fn select_offer_pool(
         .map_err(|e| format!("select_offer_pool parse failed: {e}"))?;
 
     // Post-filter in Rust: drop unknown/Chinese geolocations (Docker Hub and
-    // iroh relays are unreachable from behind the Great Firewall) and any
-    // blacklisted host (providers caught gouging on bandwidth).
+    // iroh relays are unreachable from behind the Great Firewall), any
+    // blacklisted host (providers caught gouging on bandwidth), and — by
+    // default — `deverified` hosts. vast.ai deverifies a host after it fails
+    // vast's own checks; in practice these recurrently fail CDI GPU-device
+    // injection at container start ("unresolvable CDI devices …/gpu=0") even
+    // though their `reliability2` stays ~0.99, which is why the reliability
+    // gate alone does not catch them. `unverified` (never-tested) hosts are
+    // kept — they hold the cheap consumer-GPU supply and usually start fine.
+    // PP_REQUIRE_VERIFIED already restricts the query to verified-only, in
+    // which case this filter is a no-op.
     let blacklist = blacklisted_host_ids();
     let reachable: Vec<Offer> = body
         .offers
@@ -323,6 +465,7 @@ pub async fn select_offer_pool(
                 .map_or(false, |g| !g.to_uppercase().contains("CN"))
         })
         .filter(|o| o.host_id.map_or(true, |h| !blacklist.contains(&h)))
+        .filter(|o| o.verification.as_deref() != Some("deverified"))
         .collect();
 
     let cost = CostModel::from_env();
@@ -348,10 +491,10 @@ pub async fn select_offer_pool(
     Ok(pool)
 }
 
-/// `PP_GPU_MIN_RAM_MB`: when set to a positive integer, the offer search
-/// selects cards by VRAM (`gpu_ram >= N` MB) instead of by exact GPU model,
-/// enabling a heterogeneous cluster. Unset / blank / zero → model-name mode
-/// (the historical default, unchanged).
+/// `PP_GPU_MIN_RAM_MB`: when set to a positive integer, adds a VRAM floor
+/// (`gpu_ram >= N` MB) to the offer search, enabling a heterogeneous cluster.
+/// Independent of the optional `PP_GPU` model pin; unset / blank / zero → no
+/// VRAM filter.
 fn env_min_gpu_ram_mb() -> Option<u64> {
     std::env::var("PP_GPU_MIN_RAM_MB")
         .ok()
@@ -369,6 +512,31 @@ fn env_min_inet_down_mbps() -> f64 {
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|&v| v >= 0.0)
         .unwrap_or(100.0)
+}
+
+/// `PP_MIN_RELIABILITY`: minimum vast.ai `reliability2` an offer must carry.
+/// The old hardcoded 0.995, combined with the `verified` gate, admitted almost
+/// only datacenter rigs (A100/H100) — every cheap consumer 3090/3060 sits at
+/// 0.95–0.99 and/or is unverified, so the two gates AND'd together left zero
+/// cheap cards and the lease was forced onto an expensive datacenter card.
+/// Default 0.95 ("semi-reliable"); clamped to [0, 1]; 0 disables the gate.
+fn env_min_reliability() -> f64 {
+    std::env::var("PP_MIN_RELIABILITY")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|&v| (0.0..=1.0).contains(&v))
+        .unwrap_or(0.95)
+}
+
+/// `PP_REQUIRE_VERIFIED`: when truthy (`1`/`true`/`yes`, case-insensitive),
+/// restrict the search to vast.ai-verified hosts. Default off — the verified
+/// flag AND'd with the other gates excluded nearly all cheap consumer GPUs, so
+/// reliability2 carries the quality floor and unvetted hosts are admitted.
+fn env_require_verified() -> bool {
+    std::env::var("PP_REQUIRE_VERIFIED")
+        .ok()
+        .map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
 }
 
 /// `PP_MIN_INET_UP_MBPS`: optional minimum reported upload speed (Mbps).
@@ -677,7 +845,7 @@ pub async fn create_instance(
     // Pin this stage's iroh identity so it survives a restart: re-read from
     // PID 1's env on restart, the stage keeps the same node id and the
     // pipeline name registry stays valid. See
-    // pp-gpu-node::stage_secret_from_env.
+    // pp-worker::stage_secret_from_env.
     if let Some(secret) = stage_secret {
         env["PP_STAGE_SECRET"] = serde_json::Value::String(secret.to_string());
     }
@@ -717,7 +885,7 @@ pub async fn create_instance(
         // Run the PID-1 supervisor (not the worker directly): it brings up
         // sshd deterministically and keeps the container — and the shell —
         // alive if the worker crashes. No `exec` of the worker: the supervisor
-        // owns PID 1 and runs pp-gpu-node as a child.
+        // owns PID 1 and runs pp-worker as a child.
         "onstart": "/usr/local/bin/pp_entrypoint.sh 2>&1",
         // Every stage fetch()s the FULL gguf (whole file mmap'd by
         // from_gguf), regardless of which layers it runs. qwen3:30b-a3b
@@ -1135,6 +1303,11 @@ pub async fn lease_chain(
         .await
         .map_err(|e| format!("lease_chain: {e}"))?;
 
+    // Cost guardrail: show what we're about to rent and (interactively) require
+    // a y/N before spending money. Runs before any create_instance, so a decline
+    // is a clean abort with nothing leased. Skipped for non-TTY / PP_ASSUME_YES.
+    confirm_lease(&pool, num_stages, &CostModel::from_env())?;
+
     let mut tried_offer_ids: Vec<u64> = Vec::new();
     let mut created: Vec<InstanceInfo> = Vec::with_capacity(num_stages as usize);
     // Host ids leased by this chain, owned here so it survives across both
@@ -1297,6 +1470,7 @@ mod tests {
             inet_down_cost_per_tb: 0.0,
             inet_up_cost_per_tb: 0.0,
             host_id: Some(host),
+            verification: Some("verified".to_string()),
         }
     }
 

@@ -2,7 +2,7 @@
 # docker-dashboard-e2e.sh — the docker-e2e run, held open under the live
 # swactor dashboard, one dashboard PER STAGE.
 #
-# Brings up `N` stub-mode `pp-gpu-node` containers on localhost and drives
+# Brings up `N` stub-mode `pp-worker` containers on localhost and drives
 # one InferenceRequest through them, exactly like `docker-e2e.sh` — but each
 # stage serves the live swactor dashboard (PP_STAGE_DASHBOARD) and the
 # orchestrator HOLDS after the drive (PP_HOLD). The stage containers run on
@@ -78,8 +78,8 @@ done
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CRATE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
-SMOKE_RUN_BIN="$CRATE_DIR/target/release/pp-smoke-run"
-GPU_NODE_BIN="$CRATE_DIR/target/release/pp-gpu-node"
+ORCHESTRATOR_BIN="$CRATE_DIR/target/release/pp-orchestrator"
+WORKER_BIN="$CRATE_DIR/target/release/pp-worker"
 WORKER_PY="$CRATE_DIR/pp_tinygrad_worker.py"
 COLLECTOR_BIN="$WORKSPACE_DIR/target/release/swactor-diag-collector"
 POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
@@ -87,20 +87,20 @@ POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
 # Step 1: build the release artifacts the docker image packages (same set
 # docker-e2e.sh builds — the image's COPY needs the diag binaries present).
 if [ -z "${PP_SKIP_BUILD:-}" ]; then
-    echo "docker-dashboard-e2e: building pp-gpu-node + pp-smoke-run (release)"
+    echo "docker-dashboard-e2e: building pp-worker + pp-orchestrator (release)"
     cargo build --manifest-path "$CRATE_DIR/Cargo.toml" --release \
-        --bin pp-gpu-node --bin pp-smoke-run
+        --bin pp-worker --bin pp-orchestrator
     echo "docker-dashboard-e2e: building swactor-diag-{collector,postproc} (release)"
     cargo build --manifest-path "$WORKSPACE_DIR/Cargo.toml" --release \
         -p distribution --features collector \
         --bin swactor-diag-collector --bin swactor-diag-postproc
 fi
-for f in "$SMOKE_RUN_BIN" "$GPU_NODE_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
+for f in "$ORCHESTRATOR_BIN" "$WORKER_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
     [ -f "$f" ] || { echo "docker-dashboard-e2e: missing $f" >&2; exit 1; }
 done
 
 # Step 2: build the layered image (heavy CUDA base, then thin code layer).
-# The stage dashboard lives in the pp-gpu-node binary baked into this image,
+# The stage dashboard lives in the pp-worker binary baked into this image,
 # so a stale image without it will show nothing — rebuild unless you know the
 # current image already carries the dashboard-enabled binary.
 if [ -z "${PP_SKIP_IMAGE_BUILD:-}" ]; then
@@ -131,7 +131,7 @@ for ((k = 0; k < NUM_STAGES; k++)); do
     echo "    stage ${k}:      http://localhost:$((PORT_BASE + k))"
 done
 
-# Step 4: drive pp-smoke-run with the docker shim. The orchestrator serves its
+# Step 4: drive pp-orchestrator with the docker shim. The orchestrator serves its
 # own dashboard (PP_DASHBOARD) — including the live SWIM distribution graph and
 # message tallies — and each stage serves its own (PP_STAGE_DASHBOARD). PP_HOLD
 # makes the orchestrator block at the end, ticking the driver so the
@@ -146,7 +146,7 @@ PP_DASHBOARD=1 \
 PP_DASHBOARD_PORT="$ORCH_PORT" \
 PP_STAGE_DASHBOARD=1 \
 PP_STAGE_DASHBOARD_PORT_BASE="$PORT_BASE" \
-"$SMOKE_RUN_BIN" \
+"$ORCHESTRATOR_BIN" \
     --seed \
     --num-stages "$NUM_STAGES" \
     --gpu-node "$SCRIPT_DIR/docker-gpu-node.sh" \

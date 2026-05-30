@@ -1,6 +1,6 @@
 //! Picks the iroh `RelayMode` from process environment.
 //!
-//! `SWACTOR_IROH_RELAY_URL` — when set, both pp-smoke-run and pp-gpu-node
+//! `SWACTOR_IROH_RELAY_URL` — when set, both pp-orchestrator and pp-worker
 //! use `RelayMode::Custom(<url>)` instead of the canary default. The
 //! orchestrator's [`DiagEnv`](crate::vastai::DiagEnv) propagates the same
 //! var into every rented container so the whole cluster homes onto one

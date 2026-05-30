@@ -1,6 +1,7 @@
 pub mod diag;
 pub mod dist_broadcast;
 pub mod dist_plugin;
+pub mod fleet_plugin;
 pub mod messages;
 pub mod netmap_plugin;
 pub mod profile;

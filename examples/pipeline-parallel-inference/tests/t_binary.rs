@@ -1,4 +1,4 @@
-//! T-binary: drive the actual `pp-smoke-run --seed` and `pp-gpu-node`
+//! T-binary: drive the actual `pp-orchestrator --seed` and `pp-worker`
 //! binaries as child processes. TEST_SPEC §13 (stub workers) and §14
 //! (real tinygrad workers, `#[ignore]`).
 //!
@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SMOKE_RUN_BIN: &str = env!("CARGO_BIN_EXE_pp-smoke-run");
-const GPU_NODE_BIN: &str = env!("CARGO_BIN_EXE_pp-gpu-node");
+const ORCHESTRATOR_BIN: &str = env!("CARGO_BIN_EXE_pp-orchestrator");
+const WORKER_BIN: &str = env!("CARGO_BIN_EXE_pp-worker");
 
 /// Default per-test budget for an N=5 stub-mode happy path: cluster build +
 /// SWIM convergence + sequential worker boots + a short decode loop. Tests
@@ -156,7 +156,7 @@ fn wait_for_n_children(parent_pid: u32, expected: usize, timeout: Duration) -> O
     }
 }
 
-/// Extract the response text from `pp-smoke-run`'s stdout. The orchestrator
+/// Extract the response text from `pp-orchestrator`'s stdout. The orchestrator
 /// prints the response between two banner lines:
 ///
 /// ```text
@@ -194,14 +194,14 @@ struct SmokeRunOpts {
     boot_delay_secs: Option<u32>,
 }
 
-/// Spawn `pp-smoke-run --seed` with the given options. Returns the spawned
+/// Spawn `pp-orchestrator --seed` with the given options. Returns the spawned
 /// process plus a shared log buffer that captures every stdout / stderr
-/// line from `pp-smoke-run` AND every `pp-gpu-node` child (children inherit
+/// line from `pp-orchestrator` AND every `pp-worker` child (children inherit
 /// the orchestrator's stderr fd, so their messages land in the same buffer).
 fn spawn_smoke_run(opts: &SmokeRunOpts) -> (Child, LogBuffer, LogBuffer) {
     assert!(opts.num_stages >= 2);
     let worker = worker_script();
-    let mut cmd = Command::new(SMOKE_RUN_BIN);
+    let mut cmd = Command::new(ORCHESTRATOR_BIN);
     cmd.arg("--seed")
         .arg("--num-stages")
         .arg(opts.num_stages.to_string())
@@ -210,7 +210,7 @@ fn spawn_smoke_run(opts: &SmokeRunOpts) -> (Child, LogBuffer, LogBuffer) {
         .arg("--max-tokens")
         .arg(opts.max_tokens.to_string())
         .arg("--gpu-node")
-        .arg(GPU_NODE_BIN)
+        .arg(WORKER_BIN)
         .arg("--worker")
         .arg(&worker)
         .stdout(Stdio::piped())
@@ -228,13 +228,13 @@ fn spawn_smoke_run(opts: &SmokeRunOpts) -> (Child, LogBuffer, LogBuffer) {
         cmd.env_remove("PP_BOOT_DELAY_SECS");
     }
 
-    let mut child = cmd.spawn().expect("spawn pp-smoke-run");
+    let mut child = cmd.spawn().expect("spawn pp-orchestrator");
     let stdout = child.stdout.take().expect("piped stdout");
     let stderr = child.stderr.take().expect("piped stderr");
     let stdout_buf = LogBuffer::default();
     let stderr_buf = LogBuffer::default();
-    drain_stdout(stdout, "pp-smoke-run", stdout_buf.clone());
-    drain_stderr(stderr, "pp-smoke-run", stderr_buf.clone());
+    drain_stdout(stdout, "pp-orchestrator", stdout_buf.clone());
+    drain_stderr(stderr, "pp-orchestrator", stderr_buf.clone());
     (child, stdout_buf, stderr_buf)
 }
 
@@ -251,13 +251,13 @@ fn run_to_completion(opts: &SmokeRunOpts) -> RunOutcome {
         .unwrap_or_else(|| {
             let _ = smoke.kill();
             let _ = smoke.wait();
-            panic!("pp-smoke-run did not spawn {n} pp-gpu-node children within 60s")
+            panic!("pp-orchestrator did not spawn {n} pp-worker children within 60s")
         });
 
     let status = wait_with_timeout(&mut smoke, HAPPY_PATH_TIMEOUT).unwrap_or_else(|| {
         let _ = smoke.kill();
         let _ = smoke.wait();
-        panic!("pp-smoke-run did not exit within {:?}", HAPPY_PATH_TIMEOUT);
+        panic!("pp-orchestrator did not exit within {:?}", HAPPY_PATH_TIMEOUT);
     });
     RunOutcome {
         status,
@@ -278,7 +278,7 @@ impl RunOutcome {
     fn require_success(&self) {
         assert!(
             self.status.success(),
-            "pp-smoke-run exited with {:?}\n--- stdout ---\n{}\n--- stderr (last 40 lines) ---\n{}",
+            "pp-orchestrator exited with {:?}\n--- stdout ---\n{}\n--- stderr (last 40 lines) ---\n{}",
             self.status,
             self.stdout.join("\n"),
             self.stderr
@@ -295,7 +295,7 @@ impl RunOutcome {
     fn require_response_non_empty(&self) -> String {
         let response = extract_response(&self.stdout).unwrap_or_else(|| {
             panic!(
-                "pp-smoke-run stdout missing response banner; got:\n{}",
+                "pp-orchestrator stdout missing response banner; got:\n{}",
                 self.stdout.join("\n")
             )
         });
@@ -310,7 +310,7 @@ impl RunOutcome {
         for pid in &self.pre_exit_pids {
             assert!(
                 !pid_alive(*pid),
-                "pp-gpu-node child pid {pid} still alive after pp-smoke-run exit"
+                "pp-worker child pid {pid} still alive after pp-orchestrator exit"
             );
         }
     }
@@ -436,7 +436,7 @@ fn binary_e2e_all_stages_register_pp_stage_index_names() {
 // §13.2 — Failure / cleanup paths
 // ───────────────────────────────────────────────────────────────────────
 
-/// Spawn `pp-smoke-run` at `num_stages`, wait until every stage child is
+/// Spawn `pp-orchestrator` at `num_stages`, wait until every stage child is
 /// visible, kill `stage_to_kill`, and assert the orchestrator exits
 /// non-zero with no surviving stage children.
 fn kill_stage_and_expect_failure(num_stages: u32, stage_to_kill: u32) {
@@ -448,7 +448,7 @@ fn kill_stage_and_expect_failure(num_stages: u32, stage_to_kill: u32) {
         .unwrap_or_else(|| {
             let _ = smoke.kill();
             let _ = smoke.wait();
-            panic!("pp-smoke-run did not spawn {num_stages} children within 60s");
+            panic!("pp-orchestrator did not spawn {num_stages} children within 60s");
         });
     let victim = pids[stage_to_kill as usize];
 
@@ -457,16 +457,16 @@ fn kill_stage_and_expect_failure(num_stages: u32, stage_to_kill: u32) {
     let exit = wait_with_timeout(&mut smoke, Duration::from_secs(120)).unwrap_or_else(|| {
         let _ = smoke.kill();
         let _ = smoke.wait();
-        panic!("pp-smoke-run did not exit within 120s after killing stage {stage_to_kill}");
+        panic!("pp-orchestrator did not exit within 120s after killing stage {stage_to_kill}");
     });
     assert!(
         !exit.success(),
-        "pp-smoke-run should fail when stage {stage_to_kill} (pid {victim}) is killed, got {exit:?}"
+        "pp-orchestrator should fail when stage {stage_to_kill} (pid {victim}) is killed, got {exit:?}"
     );
     for pid in &pids {
         assert!(
             !pid_alive(*pid),
-            "stage child pid {pid} still alive after pp-smoke-run exit"
+            "stage child pid {pid} still alive after pp-orchestrator exit"
         );
     }
 }
@@ -532,9 +532,9 @@ fn binary_e2e_no_orphaned_processes_after_failed_exit_3() {
 #[test]
 #[ignore]
 fn binary_e2e_orchestrator_sigkilled_children_die_within_timeout() {
-    // SIGKILL `pp-smoke-run` itself once its children are up. The kernel
-    // delivers `SIGTERM` to each pp-gpu-node (via PR_SET_PDEATHSIG, set in
-    // pp-gpu-node's main), and each pp-gpu-node then dies — which also
+    // SIGKILL `pp-orchestrator` itself once its children are up. The kernel
+    // delivers `SIGTERM` to each pp-worker (via PR_SET_PDEATHSIG, set in
+    // pp-worker's main), and each pp-worker then dies — which also
     // closes its Python worker's stdin, making the worker exit on EOF.
     let opts = stub_opts(3);
     let (mut smoke, _stdout, _stderr) = spawn_smoke_run(&opts);
@@ -543,7 +543,7 @@ fn binary_e2e_orchestrator_sigkilled_children_die_within_timeout() {
         .unwrap_or_else(|| {
             let _ = smoke.kill();
             let _ = smoke.wait();
-            panic!("pp-smoke-run did not spawn 3 children within 60s");
+            panic!("pp-orchestrator did not spawn 3 children within 60s");
         });
 
     sigkill(smoke_pid);
@@ -554,7 +554,7 @@ fn binary_e2e_orchestrator_sigkilled_children_die_within_timeout() {
     });
     assert!(
         cleaned_up,
-        "pp-gpu-node children {pids:?} still alive 10s after pp-smoke-run SIGKILL; \
+        "pp-worker children {pids:?} still alive 10s after pp-orchestrator SIGKILL; \
          per-pid alive states: {:?}",
         pids.iter().map(|p| (p, pid_alive(*p))).collect::<Vec<_>>()
     );
@@ -595,7 +595,7 @@ fn binary_e2e_orchestrator_can_resolve_pp_entry_after_n_stages_register() {
 
 #[test]
 #[ignore]
-fn binary_e2e_pp_smoke_run_handles_slow_middle_stage_boot() {
+fn binary_e2e_pp_orchestrator_handles_slow_middle_stage_boot() {
     let opts = SmokeRunOpts {
         num_stages: 4,
         prompt: "Say hello".into(),
@@ -612,7 +612,7 @@ fn binary_e2e_pp_smoke_run_handles_slow_middle_stage_boot() {
 
 #[test]
 #[ignore]
-fn binary_e2e_pp_smoke_run_handles_slow_last_stage_boot() {
+fn binary_e2e_pp_orchestrator_handles_slow_last_stage_boot() {
     let opts = SmokeRunOpts {
         num_stages: 4,
         prompt: "Say hello".into(),
@@ -675,18 +675,18 @@ fn real_tinygrad_at(num_stages: u32) {
             .unwrap_or_else(|| {
                 let _ = smoke.kill();
                 let _ = smoke.wait();
-                panic!("pp-smoke-run did not spawn {num_stages} children within 120s");
+                panic!("pp-orchestrator did not spawn {num_stages} children within 120s");
             });
     let status = wait_with_timeout(&mut smoke, Duration::from_secs(1200)).unwrap_or_else(|| {
         let _ = smoke.kill();
         let _ = smoke.wait();
-        panic!("pp-smoke-run did not finish within 20m");
+        panic!("pp-orchestrator did not finish within 20m");
     });
     let stdout_lines = stdout.lines();
     let stderr_joined = stderr.joined();
     assert!(
         status.success(),
-        "pp-smoke-run exited {status:?}\n--- stdout ---\n{}\n--- stderr (tail) ---\n{}",
+        "pp-orchestrator exited {status:?}\n--- stdout ---\n{}\n--- stderr (tail) ---\n{}",
         stdout_lines.join("\n"),
         stderr_joined
             .lines()
@@ -708,7 +708,7 @@ fn real_tinygrad_at(num_stages: u32) {
     for pid in pre_exit_pids {
         assert!(
             !pid_alive(pid),
-            "pp-gpu-node child pid {pid} still alive after pp-smoke-run exit"
+            "pp-worker child pid {pid} still alive after pp-orchestrator exit"
         );
     }
 }
@@ -764,9 +764,9 @@ fn binary_e2e_real_tinygrad_response_matches_single_node_for_say_hello() {
     let status = wait_with_timeout(&mut smoke, Duration::from_secs(1200)).unwrap_or_else(|| {
         let _ = smoke.kill();
         let _ = smoke.wait();
-        panic!("pp-smoke-run did not finish within 20m");
+        panic!("pp-orchestrator did not finish within 20m");
     });
-    assert!(status.success(), "pp-smoke-run exited {status:?}");
+    assert!(status.success(), "pp-orchestrator exited {status:?}");
     let response = extract_response(&stdout.lines()).expect("missing response banner");
     assert_eq!(
         response.trim(),

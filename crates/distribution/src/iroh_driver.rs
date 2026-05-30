@@ -229,13 +229,9 @@ impl IrohDriver {
                 match rt.block_on(start_embedded_relay(bind_addr, config.relay_public_ip)) {
                     Ok((server, url)) => {
                         let url_str = url.to_string();
-                        eprintln!("Relay: embedded relay started at {url}");
                         (Some(server), Some(url_str), RelayMode::Custom(url.into()))
                     }
-                    Err(e) => {
-                        eprintln!("Relay: failed to start embedded relay: {e}, falling back");
-                        (None, None, config.relay_mode)
-                    }
+                    Err(_) => (None, None, config.relay_mode),
                 }
             }
             None => (None, None, config.relay_mode),
@@ -301,33 +297,18 @@ impl IrohDriver {
                                     Some(auth) => auth.lock().unwrap().is_allowed(&node_id),
                                 };
                                 if !allowed {
-                                    eprintln!(
-                                        "iroh driver: rejected connection from unauthorized peer {}",
-                                        swactor::transport::hex_encode(&node_id.0[..4])
-                                    );
                                     conn.close(0u32.into(), b"unauthorized");
                                     continue;
                                 }
                                 // Route by negotiated ALPN
                                 let negotiated_alpn = conn.alpn();
                                 if negotiated_alpn == ALPN {
-                                    eprintln!(
-                                        "iroh driver: accepted SWIM connection from {}",
-                                        swactor::transport::hex_encode(&node_id.0[..4])
-                                    );
                                     swim_buf.lock().unwrap().push((node_id, conn));
                                 } else {
-                                    eprintln!(
-                                        "iroh driver: accepted non-SWIM connection from {} (ALPN: {})",
-                                        swactor::transport::hex_encode(&node_id.0[..4]),
-                                        String::from_utf8_lossy(negotiated_alpn),
-                                    );
                                     other_buf.lock().unwrap().push((node_id, conn));
                                 }
                             }
-                            Err(e) => {
-                                eprintln!("iroh driver: incoming connection error: {e}");
-                            }
+                            Err(_) => {}
                         },
                         None => break, // endpoint closed
                     }
@@ -659,7 +640,6 @@ impl IrohDriver {
                     });
                 }
 
-                eprintln!("iroh driver: join attempt {attempt}/{max_attempts} connecting to {}...", seed_addr.id);
                 diagnostics.emit_event(DiagEvent::DialStarted {
                     peer: seed_node_id,
                     attempt,
@@ -726,7 +706,6 @@ impl IrohDriver {
                             });
                         }
 
-                        eprintln!("iroh driver: join attempt {attempt}/{max_attempts} connected to {}, sending...", seed_addr.id);
                         let send_result: Result<(), String> = async {
                             let mut send = conn.open_uni().await.map_err(|e| e.to_string())?;
                             let tag_len = (tag.len() as u32).to_be_bytes();
@@ -740,7 +719,6 @@ impl IrohDriver {
 
                         match send_result {
                             Ok(()) => {
-                                eprintln!("iroh driver: join attempt {attempt}/{max_attempts} sent to {}", seed_addr.id);
                                 diagnostics.emit_event(DiagEvent::MessageSent {
                                     peer: seed_node_id,
                                     kind: tag.to_string(),
@@ -764,10 +742,6 @@ impl IrohDriver {
                                 return;
                             }
                             Err(e) => {
-                                eprintln!(
-                                    "iroh driver: join attempt {attempt}/{max_attempts} send error to {}: {e}",
-                                    seed_addr.id
-                                );
                                 diagnostics.emit_event(DiagEvent::Error {
                                     component: "iroh_driver".into(),
                                     message: format!("join send error: {e}"),
@@ -778,10 +752,6 @@ impl IrohDriver {
                         }
                     }
                     Ok(Err(e)) => {
-                        eprintln!(
-                            "iroh driver: join attempt {attempt}/{max_attempts} connect error to {}: {e}",
-                            seed_addr.id
-                        );
                         let outcome = classify_dial_error_str(&e.to_string());
                         diagnostics.emit_event(DiagEvent::DialOutcome {
                             peer: seed_node_id,
@@ -792,10 +762,6 @@ impl IrohDriver {
                         continue;
                     }
                     Err(_) => {
-                        eprintln!(
-                            "iroh driver: join attempt {attempt}/{max_attempts} connect timeout to {}",
-                            seed_addr.id
-                        );
                         diagnostics.emit_event(DiagEvent::DialOutcome {
                             peer: seed_node_id,
                             attempt,
@@ -817,7 +783,6 @@ impl IrohDriver {
                     updated_at: Instant::now(),
                 });
             }
-            eprintln!("iroh driver: join failed after {max_attempts} attempts to {}", seed_addr.id);
         });
     }
 
@@ -832,9 +797,6 @@ impl IrohDriver {
         // Collect completed background join connections
         {
             let mut pending = self.pending_joins.lock().unwrap();
-            if !pending.is_empty() {
-                eprintln!("iroh driver: collecting {} pending join connection(s)", pending.len());
-            }
             for result in pending.drain(..) {
                 self.connection_cache_tracker
                     .note_dial_success(result.node_id, wall_ms_now());
@@ -864,7 +826,6 @@ impl IrohDriver {
         let mut failure_targets: Vec<NodeId> = Vec::new();
         for action in actions {
             if let Err(e) = self.send_action(action) {
-                eprintln!("iroh driver: send error: {e}");
                 let target = action_target(action);
                 self.diagnostics.emit_event(DiagEvent::Error {
                     component: "iroh_driver".into(),
@@ -882,9 +843,7 @@ impl IrohDriver {
             let probe_actions = self.node.report_send_failure(target);
             // Best-effort send of probe actions — no recursion on failure
             for action in &probe_actions {
-                if let Err(e) = self.send_action(action) {
-                    eprintln!("iroh driver: probe send error: {e}");
-                }
+                let _ = self.send_action(action);
             }
         }
     }
@@ -1230,10 +1189,6 @@ impl IrohDriver {
             self.read_streams(&conn, remote_id, &mut messages).await;
         }
 
-        if !messages.is_empty() {
-            eprintln!("iroh driver: received {} message(s)", messages.len());
-        }
-
         (messages, new_connections)
     }
 
@@ -1250,8 +1205,7 @@ impl IrohDriver {
                         Ok((tag, payload)) => {
                             messages.push((tag, payload, remote_id));
                         }
-                        Err(e) => {
-                            eprintln!("iroh driver: read error: {e}");
+                        Err(_) => {
                             break;
                         }
                     }
@@ -1276,18 +1230,12 @@ impl IrohDriver {
         match tag {
             "swactor_dist::Ping" => match serde_json::from_slice::<Ping>(payload) {
                 Ok(msg) => self.node.handle_ping(msg.from, msg.sequence, &msg.piggyback),
-                Err(e) => {
-                    eprintln!("iroh driver: decode Ping: {e}");
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             },
 
             "swactor_dist::Ack" => match serde_json::from_slice::<Ack>(payload) {
                 Ok(msg) => self.node.handle_ack(msg.from, msg.sequence, &msg.piggyback),
-                Err(e) => {
-                    eprintln!("iroh driver: decode Ack: {e}");
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             },
 
             "swactor_dist::PingReq" => match serde_json::from_slice::<PingReq>(payload) {
@@ -1295,44 +1243,29 @@ impl IrohDriver {
                     self.node
                         .handle_ping_req(msg.from, msg.target, msg.sequence, &msg.piggyback)
                 }
-                Err(e) => {
-                    eprintln!("iroh driver: decode PingReq: {e}");
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             },
 
             "swactor_dist::JoinRequest" => {
                 match serde_json::from_slice::<JoinRequest>(payload) {
                     Ok(msg) => self.node.handle_join_request(msg.from),
-                    Err(e) => {
-                        eprintln!("iroh driver: decode JoinRequest: {e}");
-                        Vec::new()
-                    }
+                    Err(_) => Vec::new(),
                 }
             }
 
             "swactor_dist::JoinResponse" => {
                 match serde_json::from_slice::<JoinResponse>(payload) {
                     Ok(msg) => self.node.handle_join_response(msg.members),
-                    Err(e) => {
-                        eprintln!("iroh driver: decode JoinResponse: {e}");
-                        Vec::new()
-                    }
+                    Err(_) => Vec::new(),
                 }
             }
 
             "swactor_dist::IndirectAck" => match serde_json::from_slice::<IndirectAck>(payload) {
                 Ok(msg) => self.node.handle_indirect_ack(msg.target, msg.sequence, &msg.piggyback),
-                Err(e) => {
-                    eprintln!("iroh driver: decode IndirectAck: {e}");
-                    Vec::new()
-                }
+                Err(_) => Vec::new(),
             },
 
-            other => {
-                eprintln!("iroh driver: unknown message type: {other}");
-                Vec::new()
-            }
+            _ => Vec::new(),
         }
     }
 

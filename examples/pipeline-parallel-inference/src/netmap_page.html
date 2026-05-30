@@ -7,10 +7,14 @@
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: 'Menlo','Consolas','Monaco',monospace; background:#0f1117; color:#e0e0e0; font-size:13px; }
-  .header { display:flex; align-items:center; gap:16px; padding:10px 16px; background:#161922; border-bottom:1px solid #262b38; }
-  .header h1 { font-size:15px; font-weight:600; color:#7aa2f7; }
-  .nav a { color:#9aa5b1; text-decoration:none; margin-right:14px; }
-  .nav a:hover, .nav a.active { color:#7aa2f7; }
+  .header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; background:#161822; border-bottom:1px solid #2a2d3e; }
+  .header h1 { font-size:16px; font-weight:600; color:#fff; }
+  .header-left { display:flex; align-items:center; }
+  .nav-links { display:flex; gap:4px; margin-left:20px; }
+  .nav-link { color:#888; text-decoration:none; font-size:12px; padding:4px 10px; border-radius:3px; transition:color 0.2s; }
+  .nav-link:hover { color:#e0e0e0; }
+  .nav-link.active { color:#fff; background:#2a2d3e; }
+  .header-right { display:flex; align-items:center; gap:12px; }
   .wrap { padding:16px; display:grid; grid-template-columns: 1fr; gap:16px; }
   .card { background:#161922; border:1px solid #262b38; border-radius:6px; padding:12px; }
   .card h2 { font-size:13px; color:#c0caf5; margin-bottom:10px; border-bottom:1px solid #262b38; padding-bottom:6px; }
@@ -33,14 +37,18 @@
 </head>
 <body>
   <div class="header">
-    <h1>Orchestrator · Net map</h1>
-    <div class="nav">
-      <a href="/">Overview</a>
-      <a href="/actors">Actors</a>
-      <a href="/plugin/distribution">Distribution</a>
-      <a href="/plugin/netmap" class="active">Net map</a>
+    <div class="header-left">
+      <h1>Swactor Runtime Dashboard</h1>
+      <nav class="nav-links">
+        <a href="/" class="nav-link">Overview</a>
+        <a href="/actors" class="nav-link">Actors</a>
+        <a href="/topology" class="nav-link">Topology</a>
+        <a href="/plugin/distribution" class="nav-link">Distribution</a>
+        <a href="/plugin/netmap" class="nav-link active">Net map</a>
+        <a href="/plugin/vastai" class="nav-link">Fleet</a>
+      </nav>
     </div>
-    <span id="node" class="mono" style="margin-left:auto"></span>
+    <div class="header-right"><span id="node" class="mono"></span></div>
   </div>
 
   <div class="wrap">
