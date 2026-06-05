@@ -1,0 +1,10 @@
+# Build context for the multi-stage datastream demo image. Unlike the root
+# .dockerignore (which excludes everything for the prebuilt-binary scratch
+# image), this build compiles from source inside Docker, so it needs the source
+# tree — just not the heavy build artifacts or VCS metadata.
+target
+**/target
+.git
+identity
+auth
+*.log

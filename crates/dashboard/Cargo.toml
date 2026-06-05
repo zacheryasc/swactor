@@ -32,6 +32,11 @@ replay-viewer = ["dep:anyhow", "dep:distribution", "distribution/collector"]
 # SSE UI folding the vast.ai fleet telemetry and the orchestrator's
 # distribution snapshot server-side.
 live-collector = ["dep:distribution", "distribution/collector"]
+# Datastream-backed dashboard: bind the demo's UDP telemetry sink, demux the
+# per-node frames, and drive the live HTTP dashboard. Only needs the
+# `distribution::datastream` module (not feature-gated there), so it stays free
+# of the heavier collector/iroh stack.
+datastream = ["dep:distribution"]
 
 [[bin]]
 name = "swactor-tui"
@@ -42,6 +47,11 @@ required-features = ["tui"]
 name = "dashboard_collector"
 path = "src/bin/dashboard_collector.rs"
 required-features = ["live-collector"]
+
+[[bin]]
+name = "swactor-datastream-dashboard"
+path = "src/bin/datastream_dashboard.rs"
+required-features = ["datastream"]
 
 [[example]]
 name = "replay_viewer"

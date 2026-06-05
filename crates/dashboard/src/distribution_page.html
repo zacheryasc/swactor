@@ -873,7 +873,9 @@
   function setToken(t) { dashToken = t; }
 
   function fetchPeers() {
-    fetch('/api/plugin/peers')
+    // The plugin API route requires a non-empty sub-path ('' 404s), and the
+    // peers plugin answers GET .../list — so query that, not the bare name.
+    fetch('/api/plugin/peers/list')
       .then(function(r) { return r.json(); })
       .then(function(d) { renderPeers(d); })
       .catch(function() {});
