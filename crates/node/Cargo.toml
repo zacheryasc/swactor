@@ -29,3 +29,7 @@ relay = ["iroh", "distribution/relay"]
 [[bin]]
 name = "swactor"
 path = "src/main.rs"
+
+[[bin]]
+name = "swactor-datastream-collector"
+path = "src/bin/swactor-datastream-collector.rs"

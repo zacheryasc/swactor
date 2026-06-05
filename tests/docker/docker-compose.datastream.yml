@@ -1,0 +1,113 @@
+# Datastream demo cluster.
+#
+# A relay, a UDP collector, a seed swactor node, and two workers — every node
+# drives a dummy child process and ships its telemetry datastream to the
+# collector, whose stdout is the live, frame-by-frame raw stream.
+#
+# Run it (from the repo root), foreground so the collector's stream is visible:
+#
+#   cargo build --release -p node -p distribution \
+#       --bin swactor --bin swactor-datastream-collector --bin swactor-iroh-relay
+#   docker compose -f tests/docker/docker-compose.datastream.yml build
+#   docker compose -f tests/docker/docker-compose.datastream.yml up
+#
+# Watch the `collector-1 | ...` lines. Ctrl-C then `down` to clean up.
+#
+# Nodes converge over the standalone relay (10.0.3.2): each node runs with the
+# embedded relay off (--no-relay) and points --relay-hosts at the relay so iroh
+# selects RelayMode::Custom. The seed's node id below is baked from the
+# committed identity in ./identities/seed/node.key.json.
+
+x-node-build: &node-build
+  build:
+    context: ../..
+    dockerfile: tests/docker/Dockerfile.datastream
+
+services:
+  collector:
+    <<: *node-build
+    entrypoint: ["swactor-datastream-collector"]
+    command: ["--bind", "0.0.0.0:7700"]
+    networks:
+      datastream:
+        ipv4_address: 10.0.3.5
+
+  relay:
+    <<: *node-build
+    entrypoint: ["swactor-iroh-relay"]
+    command: ["--bind", "0.0.0.0:7843", "--public-host", "10.0.3.2"]
+    networks:
+      datastream:
+        ipv4_address: 10.0.3.2
+
+  seed:
+    <<: *node-build
+    command:
+      - "--config=/etc/swactor/node.toml"
+      - "--identity-dir=/seed-identity"
+      - "--no-relay"
+      - "--relay-port=7843"
+      - "--relay-hosts=10.0.3.2"
+      - "--datastream"
+      - "--datastream-collector=collector:7700"
+      - "--datastream-region=seed"
+      - "--actors=2"
+    networks:
+      datastream:
+        ipv4_address: 10.0.3.10
+    ports:
+      - "9091:9090"
+    depends_on:
+      - collector
+      - relay
+
+  node-2:
+    <<: *node-build
+    command:
+      - "--config=/etc/swactor/node.toml"
+      - "--seed-node-id=G2hRm2rWTFCqyeVnStJg72ysBiTvE19NTTPjdSEXhFK6"
+      - "--no-relay"
+      - "--relay-port=7843"
+      - "--relay-hosts=10.0.3.2"
+      - "--datastream"
+      - "--datastream-collector=collector:7700"
+      - "--datastream-region=worker"
+      - "--actors=3"
+    networks:
+      datastream:
+        ipv4_address: 10.0.3.11
+    ports:
+      - "9092:9090"
+    depends_on:
+      - collector
+      - relay
+      - seed
+
+  node-3:
+    <<: *node-build
+    command:
+      - "--config=/etc/swactor/node.toml"
+      - "--seed-node-id=G2hRm2rWTFCqyeVnStJg72ysBiTvE19NTTPjdSEXhFK6"
+      - "--no-relay"
+      - "--relay-port=7843"
+      - "--relay-hosts=10.0.3.2"
+      - "--datastream"
+      - "--datastream-collector=collector:7700"
+      - "--datastream-region=worker"
+      - "--actors=2"
+    networks:
+      datastream:
+        ipv4_address: 10.0.3.12
+    ports:
+      - "9093:9090"
+    depends_on:
+      - collector
+      - relay
+      - seed
+
+networks:
+  datastream:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.3.0/24

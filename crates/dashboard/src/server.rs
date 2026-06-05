@@ -40,6 +40,8 @@ pub(crate) struct AppState {
     pub store: Arc<EventStore>,
     pub runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
     pub collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
+    /// Externally pushed stats, served when no live `Runtime` is attached.
+    pub pushed_stats: Arc<Mutex<Option<swactor::stats::RuntimeStats>>>,
     pub shutdown: Arc<AtomicBool>,
     pub shutdown_notify: Arc<tokio::sync::Notify>,
     pub history: Arc<DashboardHistory>,
@@ -163,6 +165,7 @@ async fn handle_live_sse(
             // Send stats if runtime is available
             {
                 let maybe_rt = state.runtime.lock().unwrap().clone();
+                let maybe_pushed = state.pushed_stats.lock().unwrap().clone();
                 if let Some(rt) = maybe_rt {
                     let mut stats = rt.stats();
                     if let Some(col) = state.collector.lock().unwrap().as_ref() {
@@ -185,6 +188,32 @@ async fn handle_live_sse(
                     }
 
                     // Send topology every 5th tick (~1/sec)
+                    tick_count += 1;
+                    if tick_count.is_multiple_of(5) {
+                        let topo = topology::worker_topology(&stats);
+                        if let Ok(tjson) = serde_json::to_string(&topo)
+                            && tx.send(format_sse("topology", &tjson)).await.is_err() {
+                                return;
+                            }
+                    }
+                } else if let Some(stats) = maybe_pushed {
+                    // No live runtime: serve externally pushed stats (e.g. a
+                    // datastream source). These already carry full actor_details,
+                    // so no collector/name enrichment is needed.
+                    state.history.record(&stats);
+
+                    let warnings = warning_detector.check(&stats);
+                    if !warnings.is_empty()
+                        && let Ok(wjson) = serde_json::to_string(&warnings)
+                            && tx.send(format_sse("warnings", &wjson)).await.is_err() {
+                                return;
+                            }
+
+                    let json = serde_json::to_string(&stats).unwrap();
+                    if tx.send(format_sse("stats", &json)).await.is_err() {
+                        return;
+                    }
+
                     tick_count += 1;
                     if tick_count.is_multiple_of(5) {
                         let topo = topology::worker_topology(&stats);

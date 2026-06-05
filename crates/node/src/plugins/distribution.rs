@@ -10,8 +10,9 @@ use dashboard::plugin::{DashboardPlugin, PluginResponse};
 use dashboard::JoinPeerInfo;
 use distribution::snapshot::DistributionNodeSnapshot;
 
-/// HTML page for the distribution plugin.
-const DISTRIBUTION_HTML: &str = include_str!("distribution_page.html");
+/// HTML page for the distribution plugin. Owned by the `dashboard` crate so the
+/// live node and the datastream dashboard serve the identical page.
+const DISTRIBUTION_HTML: &str = dashboard::DISTRIBUTION_PAGE_HTML;
 
 /// Dashboard plugin that exposes distribution node snapshots.
 pub struct DistributionPlugin {

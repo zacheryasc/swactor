@@ -1,0 +1,25 @@
+# Dashboard overlay for the datastream demo.
+#
+# Use *together* with the base compose file so the same relay/seed/worker nodes
+# (and their telemetry) are the data source — only the sink changes. The base
+# `collector` service (which prints frames to stdout) is replaced by
+# `swactor-datastream-dashboard`, which binds the same UDP port (7700), demuxes
+# the per-node frames, and serves the live browser dashboard on :9090.
+#
+#   docker compose \
+#     -f tests/docker/docker-compose.datastream.yml \
+#     -f tests/docker/docker-compose.datastream.dashboard.yml up
+#
+# Then open http://localhost:18080. (Or just run ./tests/docker/datastream-dashboard-demo.sh)
+# Override the host port with DASH_PORT=<port> if 18080 is taken too.
+
+services:
+  collector:
+    entrypoint: ["swactor-datastream-dashboard"]
+    # Bind the same UDP sink the nodes ship to, serve the dashboard on :9090,
+    # and show the seed node. Drop --node to display the first node seen instead.
+    command: ["--bind", "0.0.0.0:7700", "--port", "9090", "--node", "seed"]
+    # Host port is overridable (DASH_PORT); defaults to 18080 since 9090 is a
+    # commonly-occupied port. Container port is always the dashboard's 9090.
+    ports:
+      - "${DASH_PORT:-18080}:9090"

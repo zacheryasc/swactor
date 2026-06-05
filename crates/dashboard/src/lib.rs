@@ -15,6 +15,15 @@ pub mod tui;
 #[cfg(feature = "live-collector")]
 pub mod live_collector;
 
+#[cfg(feature = "datastream")]
+pub mod datastream_source;
+
+/// The canonical Distribution page (the SWIM connection-graph view). Owned by
+/// the dashboard crate so every front-end that serves it — a live node's
+/// `DistributionPlugin` and the datastream dashboard — renders the exact same
+/// page and chrome, fed by a [`distribution::snapshot::DistributionNodeSnapshot`].
+pub const DISTRIBUTION_PAGE_HTML: &str = include_str!("distribution_page.html");
+
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -106,6 +115,9 @@ pub struct DashboardHandle {
     store: Arc<EventStore>,
     runtime: Arc<Mutex<Option<Arc<Runtime>>>>,
     collector: Arc<Mutex<Option<Arc<StatsCollector>>>>,
+    /// Externally pushed stats, used when no live `Runtime` is attached (e.g. a
+    /// datastream-backed source synthesizes `RuntimeStats` and pushes them here).
+    pushed_stats: Arc<Mutex<Option<RuntimeStats>>>,
     shutdown: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     stats_timeline: Arc<ArrayQueue<TimestampedStats>>,
@@ -139,6 +151,13 @@ impl DashboardHandle {
     pub fn set_runtime(&self, runtime: Arc<Runtime>, collector: Arc<StatsCollector>) {
         *self.runtime.lock().unwrap() = Some(runtime);
         *self.collector.lock().unwrap() = Some(collector);
+    }
+
+    /// Push a stats snapshot from an external source (latest wins). When no live
+    /// `Runtime` is attached, the SSE loop serves these to the dashboard exactly
+    /// as if they came from a runtime. Used by the datastream source.
+    pub fn set_stats(&self, stats: RuntimeStats) {
+        *self.pushed_stats.lock().unwrap() = Some(stats);
     }
 
     /// Whether trace recording is enabled.
@@ -205,6 +224,7 @@ impl DashboardHandle {
             store: Arc::clone(&self.store),
             runtime: Arc::clone(&self.runtime),
             collector: Arc::clone(&self.collector),
+            pushed_stats: Arc::clone(&self.pushed_stats),
             shutdown: Arc::clone(&self.shutdown),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
             history: Arc::clone(&self.history),
@@ -252,6 +272,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     ));
     let runtime: Arc<Mutex<Option<Arc<Runtime>>>> = Arc::new(Mutex::new(None));
     let collector: Arc<Mutex<Option<Arc<StatsCollector>>>> = Arc::new(Mutex::new(None));
+    let pushed_stats: Arc<Mutex<Option<RuntimeStats>>> = Arc::new(Mutex::new(None));
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_notify = Arc::new(tokio::sync::Notify::new());
     let stats_timeline = Arc::new(ArrayQueue::new(config.record_stats_capacity.max(1)));
@@ -292,6 +313,7 @@ pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
         store,
         runtime,
         collector,
+        pushed_stats,
         shutdown,
         shutdown_notify,
         stats_timeline,
