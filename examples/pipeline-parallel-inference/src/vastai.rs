@@ -27,30 +27,23 @@ pub struct InstanceInfo {
     pub contract_id: u64,
 }
 
-/// Diagnostics env-var bundle forwarded to rented stage containers.
+/// Cluster env forwarded to rented stage containers at create time.
 ///
-/// `pp-worker::diag::install_from_env` reads `SWACTOR_DIAG_*` on boot
-/// inside each container to decide whether to enable the aggregator and
-/// where to ship to. The orchestrator-side caller of [`lease_chain`]
-/// builds this from its own process env (typically the same vars the
-/// orchestrator itself read), and `create_instance` injects them — plus
-/// the per-stage `STAGE_INDEX` / `STAGE_COUNT` / `NODE_ROLE=stage` — into
-/// each container's env on creation. Leaving `collector_url` `None`
-/// disables the whole forwarding path; rented containers then start with
-/// no `SWACTOR_DIAG_*` vars and run as if diagnostics were off.
+/// The orchestrator-side caller of [`lease_chain`] builds this from its own
+/// process env and `create_instance` injects it — plus the per-stage
+/// `STAGE_INDEX` / `STAGE_COUNT` / `NODE_ROLE=stage` — into each container's env.
+/// Currently this carries only the custom iroh relay URL: when the orchestrator
+/// runs behind a custom relay, every stage must use the same one to reach the
+/// SWIM cluster across the internet. Leaving `iroh_relay_url` `None` skips the
+/// injection (the local/default-relay case).
 #[derive(Debug, Clone, Default)]
-pub struct DiagEnv {
-    pub collector_url: Option<String>,
-    pub run_id: Option<String>,
-    pub udp_echo: Option<String>,
+pub struct StageEnv {
     pub iroh_relay_url: Option<String>,
 }
 
-impl DiagEnv {
-    /// Read the standard `SWACTOR_DIAG_*` vars from the current process
-    /// env. Returns an instance with all fields `None` when nothing is
-    /// set — callers can still pass it and `create_instance` will skip
-    /// the injection.
+impl StageEnv {
+    /// Read the cluster env from the current process. `iroh_relay_url` comes
+    /// from `ENV_IROH_RELAY_URL`; all-`None` when nothing is set.
     pub fn from_process_env() -> Self {
         fn nonempty(v: &str) -> Option<String> {
             std::env::var(v)
@@ -59,32 +52,13 @@ impl DiagEnv {
                 .filter(|s| !s.is_empty())
         }
         Self {
-            // Default-on: fall back to the dashboard collector so a live deploy
-            // ships rented-stage telemetry by setting PP_DASHBOARD_URL alone.
-            collector_url: nonempty("SWACTOR_DIAG_COLLECTOR_URL")
-                .or_else(|| nonempty("PP_DASHBOARD_URL")),
-            run_id: nonempty("SWACTOR_DIAG_RUN_ID"),
-            udp_echo: nonempty("SWACTOR_DIAG_UDP_ECHO"),
             iroh_relay_url: nonempty(crate::relay_config::ENV_IROH_RELAY_URL),
         }
     }
 
-    /// `true` when there is anything worth propagating into stage container
-    /// env. A custom iroh relay alone (no collector URL) is enough — that
-    /// path is what makes the cluster come up; collector-only is the
-    /// observability path.
+    /// `true` when there is anything worth propagating into stage container env.
     pub fn is_enabled(&self) -> bool {
-        self.collector_url.is_some() || self.iroh_relay_url.is_some()
-    }
-
-    /// Override the run_id that will be injected into every rented
-    /// stage's `SWACTOR_DIAG_RUN_ID`. Used by the orchestrator's
-    /// `--hold` path to pin the held cluster's run_id to whatever ends
-    /// up in the on-disk cluster handle (rather than whatever happens
-    /// to be in the operator's shell env at lease time).
-    pub fn with_run_id(mut self, run_id: String) -> Self {
-        self.run_id = Some(run_id);
-        self
+        self.iroh_relay_url.is_some()
     }
 }
 
@@ -815,10 +789,9 @@ pub async fn fetch_logs(client: &Client, log_url: &str) -> Result<String, String
 ///
 /// `stage` and `num_stages` are forwarded as `STAGE` / `NUM_STAGES` so the
 /// worker can compute its layer range on boot. `seed_addr` is forwarded so
-/// the new node knows where to join the SWIM cluster. When `diag_env` is
-/// `Some(..)` with a collector URL set, the corresponding `SWACTOR_DIAG_*`
-/// vars are also added so the rented container reports into the same
-/// diagnostics bundle as the orchestrator — see [`DiagEnv`].
+/// the new node knows where to join the SWIM cluster. When `stage_env` carries
+/// a custom iroh relay URL, it is injected too so the rented container reaches
+/// the cluster across the internet — see [`StageEnv`].
 pub async fn create_instance(
     client: &Client,
     base_url: &str,
@@ -831,7 +804,7 @@ pub async fn create_instance(
     image: &str,
     label: Option<&str>,
     stage_secret: Option<&str>,
-    diag_env: Option<&DiagEnv>,
+    stage_env: Option<&StageEnv>,
 ) -> Result<InstanceInfo, String> {
     let url = format!("{base_url}/api/v0/asks/{offer_id}/");
     let mut env = serde_json::json!({
@@ -860,21 +833,8 @@ pub async fn create_instance(
             }
         }
     }
-    if let Some(diag) = diag_env {
-        if let Some(url) = diag.collector_url.as_deref() {
-            env["SWACTOR_DIAG_COLLECTOR_URL"] = serde_json::Value::String(url.to_string());
-            env["SWACTOR_DIAG_NODE_ROLE"] = serde_json::Value::String("stage".to_string());
-            env["SWACTOR_DIAG_STAGE_INDEX"] = serde_json::Value::String(stage.to_string());
-            env["SWACTOR_DIAG_STAGE_COUNT"] =
-                serde_json::Value::String(num_stages.to_string());
-            if let Some(run_id) = diag.run_id.as_deref() {
-                env["SWACTOR_DIAG_RUN_ID"] = serde_json::Value::String(run_id.to_string());
-            }
-            if let Some(echo) = diag.udp_echo.as_deref() {
-                env["SWACTOR_DIAG_UDP_ECHO"] = serde_json::Value::String(echo.to_string());
-            }
-        }
-        if let Some(relay_url) = diag.iroh_relay_url.as_deref() {
+    if let Some(stage_env) = stage_env {
+        if let Some(relay_url) = stage_env.iroh_relay_url.as_deref() {
             env[crate::relay_config::ENV_IROH_RELAY_URL] =
                 serde_json::Value::String(relay_url.to_string());
         }
@@ -973,7 +933,7 @@ pub async fn create_pipeline_instances(
     seed_addr: &str,
     seed_relay: Option<&str>,
     image: &str,
-    diag_env: Option<&DiagEnv>,
+    stage_env: Option<&StageEnv>,
 ) -> Result<Vec<InstanceInfo>, String> {
     let num_stages = offer_ids.len() as u32;
     let mut created: Vec<InstanceInfo> = Vec::with_capacity(offer_ids.len());
@@ -992,7 +952,7 @@ pub async fn create_pipeline_instances(
             image,
             None,
             None,
-            diag_env,
+            stage_env,
         )
         .await
         {
@@ -1165,7 +1125,7 @@ async fn provision_stage(
     image: &str,
     label: Option<&str>,
     stage_secrets: Option<&[String]>,
-    diag_env: Option<&DiagEnv>,
+    stage_env: Option<&StageEnv>,
     tried_offer_ids: &mut Vec<u64>,
     // Host ids already leased by this chain. Distinct-host selection is
     // unconditional: two offers on the same host_id share the same NAT'd public
@@ -1222,7 +1182,7 @@ async fn provision_stage(
             stage_secrets
                 .and_then(|ss| ss.get(stage as usize))
                 .map(|s| s.as_str()),
-            diag_env,
+            stage_env,
         )
         .await
         {
@@ -1288,12 +1248,7 @@ pub async fn lease_chain(
     stage_secrets: Option<&[String]>,
     poll_interval: Duration,
     max_polls: u32,
-    diag_env: Option<&DiagEnv>,
-    // Optional external-monitoring hook. When present, each contract is
-    // registered as it is created (so the vastai poller observes it through the
-    // image-pull window) and unregistered when destroyed during replacement.
-    // `None` leaves lease behavior identical to before.
-    tracker: Option<&crate::vastai_mon::ContractTracker>,
+    stage_env: Option<&StageEnv>,
 ) -> Result<Vec<InstanceInfo>, String> {
     // One query builds the whole ranked survivor pool up front, instead of a
     // search per stage — fewer requests (less 429 pressure) and one consistent
@@ -1330,16 +1285,13 @@ pub async fn lease_chain(
             image,
             label,
             stage_secrets,
-            diag_env,
+            stage_env,
             &mut tried_offer_ids,
             &mut used_host_ids,
         )
         .await
         {
             Ok(info) => {
-                if let Some(t) = tracker {
-                    t.track(info.contract_id, Some(stage), label.map(str::to_string));
-                }
                 created.push(info);
             }
             Err(e) => {
@@ -1383,9 +1335,6 @@ pub async fn lease_chain(
                             "lease_chain: WARNING could not destroy dead contract {cid}: {de}"
                         );
                     }
-                    if let Some(t) = tracker {
-                        t.untrack(cid);
-                    }
                     replaced += 1;
                     if replaced > max_replace_attempts {
                         // Give up on this stage; roll back the survivors (cid is
@@ -1417,7 +1366,7 @@ pub async fn lease_chain(
                         image,
                         label,
                         stage_secrets,
-                        diag_env,
+                        stage_env,
                         &mut tried_offer_ids,
                         &mut used_host_ids,
                     )
@@ -1425,13 +1374,6 @@ pub async fn lease_chain(
                     {
                         // Loop re-waits on the replacement instance.
                         Ok(info) => {
-                            if let Some(t) = tracker {
-                                t.track(
-                                    info.contract_id,
-                                    Some(stage),
-                                    label.map(str::to_string),
-                                );
-                            }
                             created[idx] = info;
                         }
                         Err(pe) => {

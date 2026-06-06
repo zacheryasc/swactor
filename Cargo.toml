@@ -8,7 +8,6 @@ members = [
     "crates/process",
     "crates/transport",
     "crates/distribution",
-    "crates/vastai-synth",
     "crates/datastore",
     "crates/node",
     "tests/docker",

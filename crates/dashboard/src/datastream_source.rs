@@ -29,6 +29,7 @@ use distribution::datastream::catalog::{
     self, IdentityRecord, LifecycleCost, MembershipTransition, Record, ResourceSample,
     RuntimeStats as DsRuntimeStats, TransportInternals,
 };
+use distribution::datastream::frame::{Frame, StreamId};
 use distribution::datastream::wire::decode_delivery;
 use distribution::snapshot::{DistributionNodeSnapshot, MemberInfo};
 
@@ -142,15 +143,11 @@ impl DatastreamModel {
             .unwrap_or(false)
     }
 
-    /// A friendly label for this node: `region · short-id` once its identity is
-    /// known, else just the short id.
+    /// A friendly label for this node. The stream carries only the node id
+    /// (a node is generic; its job is resolved orchestrator-side), so the label
+    /// is its short id.
     fn label(&self, node_id: &str) -> String {
-        match &self.identity {
-            Some(idr) if !idr.region.is_empty() => {
-                format!("{} · {}", idr.region, short_id(node_id))
-            }
-            _ => short_id(node_id),
-        }
+        short_id(node_id)
     }
 
     /// Total process-output lines seen across all labels.
@@ -291,18 +288,10 @@ impl DatastreamModel {
         }
     }
 
-    /// Does this node match the optional selection filter? Matches against the
-    /// node id and (once known) the identity region/role.
+    /// Does this node match the optional selection filter? The stream carries
+    /// only the node id, so the filter matches against that.
     fn matches(&self, node_id: &str, filter: &str) -> bool {
-        if node_id.contains(filter) {
-            return true;
-        }
-        match &self.identity {
-            Some(id) => {
-                id.region == filter || format!("{:?}", id.role).eq_ignore_ascii_case(filter)
-            }
-            None => false,
-        }
+        node_id.contains(filter)
     }
 
     /// Rebuild a [`DistributionNodeSnapshot`] for this node from the demuxed
@@ -389,7 +378,6 @@ impl DatastreamModel {
         let r = self.resource.as_ref();
         let t = self.transport.as_ref();
         let rt = self.runtime.as_ref();
-        let id = self.identity.as_ref();
         let last_proc = self
             .procs
             .values()
@@ -400,8 +388,10 @@ impl DatastreamModel {
         serde_json::json!({
             "id": node_id,
             "short": short_id(node_id),
-            "region": id.map(|i| i.region.clone()).unwrap_or_default(),
-            "role": id.map(|i| format!("{:?}", i.role).to_lowercase()).unwrap_or_default(),
+            // A node is generic on the stream; the orchestrator attaches
+            // role/region as lease metadata (Phase 2). Blank until then.
+            "region": "",
+            "role": "",
             "selected": selected,
             "cpu_pct": r.map(|r| r.cpu_pct.round() as u32).unwrap_or(0),
             "mem_used_mb": r.map(|r| r.mem_used_mb).unwrap_or(0),
@@ -465,6 +455,130 @@ fn fleet_json(
         "nodes": nodes,
     })
     .to_string()
+}
+
+/// What one folded frame produced: the refreshed Fleet table JSON, the selected
+/// node's Distribution snapshot, its synthesized `RuntimeStats` (only when the
+/// frame was for the selected node), and any activity-log lines.
+pub struct FleetUpdate {
+    /// Fleet-table JSON for every live node — write into the `vastai` cache.
+    pub fleet_json: String,
+    /// The selected node's Distribution snapshot JSON, if a node is selected.
+    pub dist_json: Option<String>,
+    /// Synthesized single-node stats, present only when this frame was for the
+    /// selected node. A UDP demo pushes it via `set_stats`; an orchestrator with
+    /// its own live runtime ignores it.
+    pub stats: Option<RuntimeStats>,
+    /// `(is_warn, message)` activity-log lines for the selected node.
+    pub logs: Vec<(bool, String)>,
+}
+
+/// The fleet aggregate: per-node demuxed [`DatastreamModel`]s, the selected
+/// node, and an optional selection filter. One [`ingest`](Self::ingest) call
+/// folds a delivered frame and yields a [`FleetUpdate`]. Transport-agnostic —
+/// fed from UDP (the raw demo) or the cluster `datastream-sink` (the
+/// orchestrator) alike.
+pub struct FleetView {
+    models: HashMap<String, DatastreamModel>,
+    selected: Option<String>,
+    node_filter: Option<String>,
+}
+
+impl FleetView {
+    /// A fresh fleet view. `node_filter` selects which node drives the
+    /// single-node Overview/Distribution panes (the first node whose id contains
+    /// the filter); `None` selects the first node seen.
+    pub fn new(node_filter: Option<String>) -> Self {
+        Self {
+            models: HashMap::new(),
+            selected: None,
+            node_filter,
+        }
+    }
+
+    /// The live datastream telemetry for `node_id` as a JSON object (the same
+    /// per-node fields the Fleet table shows), or `None` if no frame has been
+    /// folded for it yet. The orchestrator's `FleetLifecycle` calls this to
+    /// merge a launched node's live telemetry onto its launch entry once the
+    /// node has joined and started streaming.
+    pub fn node_metrics(&self, node_id: &str) -> Option<serde_json::Value> {
+        let now = Instant::now();
+        let live = live_set(&self.models, now);
+        let expected_peers = live.len().saturating_sub(1);
+        self.models
+            .get(node_id)
+            .map(|m| m.node_summary(node_id, expected_peers, false, &live))
+    }
+
+    /// Has `node_id` streamed a frame within the liveness window?
+    pub fn is_live(&self, node_id: &str) -> bool {
+        self.models
+            .get(node_id)
+            .map(|m| m.is_live(Instant::now()))
+            .unwrap_or(false)
+    }
+
+    /// Fold one delivered `(stream, frame)` into the fleet and recompute the
+    /// views. See [`FleetUpdate`] for what is returned.
+    pub fn ingest(&mut self, stream: &StreamId, frame: &Frame) -> FleetUpdate {
+        let node = stream.node.as_str().to_string();
+        let model = self.models.entry(node.clone()).or_default();
+        let events = model.update(frame.channel.as_str(), &frame.payload);
+
+        // Pick the display node: first matching the filter, else first seen.
+        if self.selected.is_none() {
+            let qualifies = match self.node_filter.as_deref() {
+                Some(f) => model.matches(&node, f),
+                None => true,
+            };
+            if qualifies {
+                self.selected = Some(node.clone());
+            }
+        }
+        let is_selected = self.selected.as_deref() == Some(node.as_str());
+
+        // Activity log + single-node stats only for the selected node.
+        let logs = if is_selected {
+            events
+                .into_iter()
+                .map(|e| match e {
+                    LogEvent::Info(m) => (false, m),
+                    LogEvent::Warn(m) => (true, m),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let now = Instant::now();
+        let live = live_set(&self.models, now);
+        let labels = build_labels(&self.models);
+        let fleet_json = fleet_json(&self.models, self.selected.as_deref(), &live);
+        let stats = if is_selected {
+            self.models.get(&node).map(|m| m.to_runtime_stats())
+        } else {
+            None
+        };
+        let dist_json = self.selected.as_deref().and_then(|sel| {
+            self.models
+                .get(sel)
+                .and_then(|m| serde_json::to_string(&m.dist_snapshot(sel, &labels, &live)).ok())
+        });
+
+        FleetUpdate {
+            fleet_json,
+            dist_json,
+            stats,
+            logs,
+        }
+    }
+}
+
+/// A ready-to-register Fleet (`vastai`) plugin backed by `cache`: serves the
+/// Fleet page and the `vastai` SSE/JSON model. The orchestrator registers this
+/// and feeds `cache` from its `datastream-sink`.
+pub fn fleet_cache_plugin(cache: Arc<Mutex<Option<String>>>) -> Arc<dyn DashboardPlugin> {
+    Arc::new(CachePlugin::new("vastai", FLEET_HTML, cache))
 }
 
 /// Plugin backed by a shared cache string: serves a fixed HTML page, emits its
@@ -639,8 +753,7 @@ pub fn run_datastream_ingest(
     )) as Arc<dyn DashboardPlugin>);
     handle.register_plugin(Arc::new(PeersStub) as Arc<dyn DashboardPlugin>);
 
-    let mut models: HashMap<String, DatastreamModel> = HashMap::new();
-    let mut selected: Option<String> = None;
+    let mut view = FleetView::new(node_filter.map(str::to_string));
     // 64 KiB comfortably exceeds a UDP datagram; a frame never spans datagrams.
     let mut buf = vec![0u8; 64 * 1024];
 
@@ -660,45 +773,20 @@ pub fn run_datastream_ingest(
             }
         };
 
-        let node = stream.node.as_str().to_string();
-        let model = models.entry(node.clone()).or_default();
-        let events = model.update(frame.channel.as_str(), &frame.payload);
-
-        // Pick the display node: first matching the filter, else first seen.
-        if selected.is_none() {
-            let qualifies = match node_filter {
-                Some(f) => model.matches(&node, f),
-                None => true,
-            };
-            if qualifies {
-                eprintln!("datastream dashboard: displaying node {}", short_id(&node));
-                selected = Some(node.clone());
+        let update = view.ingest(&stream, &frame);
+        for (is_warn, m) in update.logs {
+            if is_warn {
+                tracing::warn!(target: "datastream", "{m}");
+            } else {
+                tracing::info!(target: "datastream", "{m}");
             }
         }
-
-        if selected.as_deref() == Some(node.as_str()) {
-            // Surface process output / membership through the activity log.
-            for ev in events {
-                match ev {
-                    LogEvent::Info(m) => tracing::info!(target: "datastream", "{m}"),
-                    LogEvent::Warn(m) => tracing::warn!(target: "datastream", "{m}"),
-                }
-            }
-            handle.set_stats(model.to_runtime_stats());
+        if let Some(stats) = update.stats {
+            handle.set_stats(stats);
         }
-
-        // Refresh both views from the current live nodes on each frame.
-        let now = Instant::now();
-        let live = live_set(&models, now);
-        let labels = build_labels(&models);
-        *fleet_cache.lock().unwrap() = Some(fleet_json(&models, selected.as_deref(), &live));
-        if let Some(sel) = selected.as_deref() {
-            if let Some(m) = models.get(sel) {
-                let snap = m.dist_snapshot(sel, &labels, &live);
-                if let Ok(json) = serde_json::to_string(&snap) {
-                    *dist_cache.lock().unwrap() = Some(json);
-                }
-            }
+        *fleet_cache.lock().unwrap() = Some(update.fleet_json);
+        if let Some(json) = update.dist_json {
+            *dist_cache.lock().unwrap() = Some(json);
         }
     }
 }
@@ -749,6 +837,10 @@ const FLEET_HTML: &str = r#"<!doctype html>
   .bar > i.hi { background: #fbbf24; } .bar > i.crit { background: #f87171; }
   .st { padding: 1px 6px; border-radius: 4px; font-weight: 600; font-size: 11px; }
   .st.suspect { background: #3a2d12; color: #fbbf24; } .st.dead { background: #3a1518; color: #f87171; }
+  .state { padding: 1px 8px; border-radius: 4px; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .3px; }
+  .state.bootstrapping { background: #2a2433; color: #c4b5fd; }
+  .state.live { background: #14361f; color: #4ade80; }
+  .state.failed { background: #3a1518; color: #f87171; }
   .muted { color: #666; }
   .last { max-width: 380px; overflow: hidden; text-overflow: ellipsis; color: #999; }
 </style>
@@ -772,7 +864,7 @@ const FLEET_HTML: &str = r#"<!doctype html>
 <div class="content">
   <table>
     <thead><tr>
-      <th>node</th><th>region</th><th>role</th><th>CPU</th><th>mem</th>
+      <th>node</th><th>state</th><th>region</th><th>role</th><th>CPU</th><th>mem</th>
       <th class="num">actors</th><th class="num">mbox</th><th>transport</th>
       <th class="num">peers</th><th class="num">proc</th><th>last line</th>
     </tr></thead>
@@ -790,14 +882,17 @@ const FLEET_HTML: &str = r#"<!doctype html>
 
   function render(){
     var conv = document.getElementById("conv");
+    var live = (state.live_count==null) ? state.node_count : state.live_count;
     if (state.node_count > 1 && state.converged){ conv.className="pill ok"; conv.textContent="SWIM: converged ("+state.node_count+" nodes)"; }
-    else { conv.className="pill warn"; conv.textContent="SWIM: converging ("+state.node_count+" nodes)"; }
+    else { conv.className="pill warn"; conv.textContent="SWIM: converging ("+live+"/"+state.node_count+" live)"; }
 
     var rows = state.nodes.map(function(n){
       var peers = n.alive + (n.suspect?(' <span class="st suspect">'+n.suspect+'</span>'):'')
                 + (n.dead?(' <span class="st dead">'+n.dead+'</span>'):'');
+      var st = n.state || "live";
       return '<tr class="'+(n.selected?"sel":"")+'">'
         + '<td>'+esc(n.short)+(n.selected?' <span class="muted">(shown)</span>':'')+'</td>'
+        + '<td><span class="state '+esc(st)+'">'+esc(st)+'</span></td>'
         + '<td>'+esc(n.region)+'</td>'
         + '<td><span class="tag '+esc(n.role)+'">'+esc(n.role||"?")+'</span></td>'
         + '<td>'+bar(n.cpu_pct)+'</td>'

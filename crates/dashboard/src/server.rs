@@ -65,7 +65,10 @@ pub(crate) fn build_live_router(state: AppState) -> Router {
         .route("/api/investigate", get(handle_investigate_api))
         .route("/api/logs", get(handle_logs_api))
         .route("/actor/{hex}", get(handle_actor_detail))
-        // Plugin routes
+        // Plugin routes. The bare form must be registered separately: a
+        // `{*rest}` wildcard never matches an empty remainder, and plugins
+        // answer their model snapshot on the bare path.
+        .route("/api/plugin/{name}", get(handle_plugin_get_bare).post(handle_plugin_post_bare))
         .route("/api/plugin/{name}/{*rest}", get(handle_plugin_get).post(handle_plugin_post))
         .route("/plugin/{name}", get(handle_plugin_page));
 
@@ -361,17 +364,23 @@ async fn handle_history_api(State(state): State<AppState>) -> Response {
 
 // ── Plugin handlers ─────────────────────────────────────────────────────
 
-async fn handle_plugin_get(
-    State(state): State<AppState>,
-    Path((name, rest)): Path<(String, String)>,
-    Query(params): Query<HashMap<String, String>>,
+/// Dispatch one plugin API request and convert its [`PluginResponse`] to HTTP.
+/// `rest` is the path after `/api/plugin/{name}/` — empty for the bare
+/// `/api/plugin/{name}` form.
+fn dispatch_plugin(
+    state: &AppState,
+    method: &str,
+    name: &str,
+    rest: &str,
+    params: &HashMap<String, String>,
+    body: &[u8],
 ) -> Response {
     let plugins = state.plugins.snapshot();
     let plugin = match plugins.iter().find(|p| p.name() == name) {
         Some(p) => p,
         None => return json_error(StatusCode::NOT_FOUND, &format!("plugin '{name}' not found")),
     };
-    match plugin.handle_request("GET", &rest, &params, &[]) {
+    match plugin.handle_request(method, rest, params, body) {
         crate::plugin::PluginResponse::Json(json) => json_response(json),
         crate::plugin::PluginResponse::Binary { content_type, data } => {
             ([(header::CONTENT_TYPE, content_type)], data).into_response()
@@ -386,30 +395,41 @@ async fn handle_plugin_get(
     }
 }
 
+async fn handle_plugin_get(
+    State(state): State<AppState>,
+    Path((name, rest)): Path<(String, String)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    dispatch_plugin(&state, "GET", &name, &rest, &params, &[])
+}
+
 async fn handle_plugin_post(
     State(state): State<AppState>,
     Path((name, rest)): Path<(String, String)>,
     Query(params): Query<HashMap<String, String>>,
     body: Bytes,
 ) -> Response {
-    let plugins = state.plugins.snapshot();
-    let plugin = match plugins.iter().find(|p| p.name() == name) {
-        Some(p) => p,
-        None => return json_error(StatusCode::NOT_FOUND, &format!("plugin '{name}' not found")),
-    };
-    match plugin.handle_request("POST", &rest, &params, &body) {
-        crate::plugin::PluginResponse::Json(json) => json_response(json),
-        crate::plugin::PluginResponse::Binary { content_type, data } => {
-            ([(header::CONTENT_TYPE, content_type)], data).into_response()
-        }
-        crate::plugin::PluginResponse::Error { status, message } => {
-            let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            json_error(code, &message)
-        }
-        crate::plugin::PluginResponse::NotFound => {
-            json_error(StatusCode::NOT_FOUND, "not found")
-        }
-    }
+    dispatch_plugin(&state, "POST", &name, &rest, &params, &body)
+}
+
+/// `/api/plugin/{name}` with no trailing path. The `{*rest}` route cannot
+/// match an empty remainder, so without this route the bare form — what the
+/// distribution/netmap pages fetch for their first paint — would 404.
+async fn handle_plugin_get_bare(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    dispatch_plugin(&state, "GET", &name, "", &params, &[])
+}
+
+async fn handle_plugin_post_bare(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+    body: Bytes,
+) -> Response {
+    dispatch_plugin(&state, "POST", &name, "", &params, &body)
 }
 
 async fn handle_plugin_page(

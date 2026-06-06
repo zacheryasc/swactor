@@ -1,6 +1,9 @@
 pub mod actor;
 pub mod extension;
+pub mod process_observer;
 pub mod worker;
+
+pub use process_observer::ProcessOutputObserver;
 
 // Re-export well-known environment key types for convenient access.
 pub use actor::{SpawnTimestamp, LogicalName, ServiceBinding, ExitValue, CapabilitySet};

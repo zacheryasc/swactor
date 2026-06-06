@@ -81,21 +81,15 @@ WORKSPACE_DIR="$(cd "$CRATE_DIR/../.." && pwd)"
 ORCHESTRATOR_BIN="$CRATE_DIR/target/release/pp-orchestrator"
 WORKER_BIN="$CRATE_DIR/target/release/pp-worker"
 WORKER_PY="$CRATE_DIR/pp_tinygrad_worker.py"
-COLLECTOR_BIN="$WORKSPACE_DIR/target/release/swactor-diag-collector"
-POSTPROC_BIN="$WORKSPACE_DIR/target/release/swactor-diag-postproc"
 
 # Step 1: build the release artifacts the docker image packages (same set
-# docker-e2e.sh builds — the image's COPY needs the diag binaries present).
+# docker-e2e.sh builds).
 if [ -z "${PP_SKIP_BUILD:-}" ]; then
     echo "docker-dashboard-e2e: building pp-worker + pp-orchestrator (release)"
     cargo build --manifest-path "$CRATE_DIR/Cargo.toml" --release \
         --bin pp-worker --bin pp-orchestrator
-    echo "docker-dashboard-e2e: building swactor-diag-{collector,postproc} (release)"
-    cargo build --manifest-path "$WORKSPACE_DIR/Cargo.toml" --release \
-        -p distribution --features collector \
-        --bin swactor-diag-collector --bin swactor-diag-postproc
 fi
-for f in "$ORCHESTRATOR_BIN" "$WORKER_BIN" "$WORKER_PY" "$COLLECTOR_BIN" "$POSTPROC_BIN"; do
+for f in "$ORCHESTRATOR_BIN" "$WORKER_BIN" "$WORKER_PY"; do
     [ -f "$f" ] || { echo "docker-dashboard-e2e: missing $f" >&2; exit 1; }
 done
 

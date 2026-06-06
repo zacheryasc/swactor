@@ -59,6 +59,17 @@ pub fn spawn_ssh_process(
     spawn_process_inner(ctx, sender, spec, driver, waker_slot)
 }
 
+/// The basename of a command path, used as the process's telemetry label.
+/// `/usr/bin/python3` → `python3`, `python` → `python`. Falls back to the whole
+/// string when there is no path separator or trailing component.
+fn command_basename(command: &str) -> String {
+    command
+        .rsplit(['/', '\\'])
+        .find(|s| !s.is_empty())
+        .unwrap_or(command)
+        .to_string()
+}
+
 fn spawn_process_inner<D: ProcessDriver + 'static>(
     ctx: &Ctx,
     sender: &ExternalSender,
@@ -66,8 +77,19 @@ fn spawn_process_inner<D: ProcessDriver + 'static>(
     driver: D,
     waker_slot: Arc<OnceLock<ProcessWaker>>,
 ) -> Result<ActorAddress, Error> {
+    // Label this process's output by its command basename so the node's
+    // per-runtime observer (if any) taps it onto `proc.<label>.*` automatically.
+    let label = command_basename(&spec.command);
+    let observer = ctx.process_output_observer();
     let (session, initial_actions) = ProcessSession::new(spec);
-    let actor = ProcessActor::new(session, driver, initial_actions, waker_slot.clone());
+    let actor = ProcessActor::new(
+        session,
+        driver,
+        initial_actions,
+        waker_slot.clone(),
+        observer,
+        label,
+    );
     let addr = ctx.spawn(actor)?;
 
     // Now that we have the address, fill the waker

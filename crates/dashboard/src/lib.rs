@@ -12,10 +12,6 @@ pub mod topology;
 #[cfg(feature = "tui")]
 pub mod tui;
 
-#[cfg(feature = "live-collector")]
-pub mod live_collector;
-
-#[cfg(feature = "datastream")]
 pub mod datastream_source;
 
 /// The canonical Distribution page (the SWIM connection-graph view). Owned by
@@ -126,11 +122,11 @@ pub struct DashboardHandle {
     port: u16,
     plugin_registry: Arc<PluginRegistry>,
     standalone_rt: Mutex<Option<tokio::runtime::Runtime>>,
-    /// Optional override for the `/` landing page (used by the live collector to
-    /// serve the unified fleet board instead of the runtime-less actor dashboard).
+    /// Optional override for the `/` landing page (e.g. a host serving a fleet
+    /// board instead of the runtime-less actor dashboard).
     landing_html: Mutex<Option<Arc<str>>>,
-    /// Optional extra axum router merged into the live server — disjoint routes
-    /// such as the diagnostics collector's `/diag/*` ingest endpoints.
+    /// Optional extra axum router merged into the live server, for hosts that
+    /// add disjoint routes of their own.
     extra_router: Mutex<Option<axum::Router>>,
 }
 

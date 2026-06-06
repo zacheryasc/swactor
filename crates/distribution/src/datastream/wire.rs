@@ -19,6 +19,10 @@
 //!   pay_len:  u32 | payload: bytes[pay_len]
 //! ```
 
+use serde::{Deserialize, Serialize};
+use swactor::transport::{Codec, CodecRegistry, NetworkMessage};
+use swactor::Error;
+
 use super::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 
 /// Why a buffer could not be decoded as an envelope. A carrier that
@@ -79,6 +83,49 @@ pub fn decode_delivery(buf: &[u8]) -> Result<(StreamId, Frame), WireError> {
     let stream = StreamId::new(NodeId::new(node), life);
     let frame = Frame::new(ChannelId::new(channel), position, payload);
     Ok((stream, frame))
+}
+
+// ── Cluster transport message ──────────────────────────────────────────────
+//
+// When the datastream rides the swactor cluster (rather than a raw UDP socket),
+// each ordered delivery travels as one `DatastreamFrame` actor message to the
+// orchestrator's `datastream-sink`. The payload is exactly the bytes
+// [`encode_delivery`] already produces, so this is a thin envelope — the codec
+// is the identity, never re-encoding the frame.
+
+/// One datastream delivery, addressed to the cluster `datastream-sink` actor.
+/// `payload` is `encode_delivery(&stream_id, &frame)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DatastreamFrame {
+    pub payload: Vec<u8>,
+}
+
+impl NetworkMessage for DatastreamFrame {
+    fn type_tag() -> &'static str {
+        "swactor::DatastreamFrame"
+    }
+}
+
+/// Identity codec for [`DatastreamFrame`]: the payload is already a compact
+/// self-describing envelope, so the wire bytes are the payload verbatim (no
+/// JSON inflation of the byte vector).
+pub struct DatastreamFrameCodec;
+
+impl Codec<DatastreamFrame> for DatastreamFrameCodec {
+    fn encode(&self, msg: &DatastreamFrame) -> Result<Vec<u8>, Error> {
+        Ok(msg.payload.clone())
+    }
+    fn decode(&self, bytes: &[u8]) -> Result<DatastreamFrame, Error> {
+        Ok(DatastreamFrame {
+            payload: bytes.to_vec(),
+        })
+    }
+}
+
+/// Register the [`DatastreamFrame`] codec on a cluster's `CodecRegistry` so the
+/// orchestrator can receive worker telemetry over `ACTOR_ALPN`.
+pub fn register_datastream_codec(cr: &mut CodecRegistry) {
+    cr.register::<DatastreamFrame, _>(DatastreamFrameCodec);
 }
 
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {

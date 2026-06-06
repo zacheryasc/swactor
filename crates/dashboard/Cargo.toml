@@ -17,26 +17,11 @@ ratatui = { version = "0.29", optional = true, default-features = false, feature
 crossterm = { version = "0.28", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = "3"
-anyhow = { version = "1", optional = true }
-distribution = { path = "../distribution", optional = true }
+distribution = { path = "../distribution" }
 
 [features]
 default = []
 tui = ["dep:ratatui", "dep:crossterm"]
-# Offline replay viewer example: loads a finalized diagnostics bundle
-# (tarball or spool dir) and serves a localhost web UI for scrubbing
-# through the event timeline.
-replay-viewer = ["dep:anyhow", "dep:distribution", "distribution/collector"]
-# Live collector + fleet dashboard: the dashboard process *is* the HTTP
-# diagnostics collector (receives broadcast POSTs) and serves a unified live
-# SSE UI folding the vast.ai fleet telemetry and the orchestrator's
-# distribution snapshot server-side.
-live-collector = ["dep:distribution", "distribution/collector"]
-# Datastream-backed dashboard: bind the demo's UDP telemetry sink, demux the
-# per-node frames, and drive the live HTTP dashboard. Only needs the
-# `distribution::datastream` module (not feature-gated there), so it stays free
-# of the heavier collector/iroh stack.
-datastream = ["dep:distribution"]
 
 [[bin]]
 name = "swactor-tui"
@@ -44,16 +29,5 @@ path = "src/bin/tui.rs"
 required-features = ["tui"]
 
 [[bin]]
-name = "dashboard_collector"
-path = "src/bin/dashboard_collector.rs"
-required-features = ["live-collector"]
-
-[[bin]]
 name = "swactor-datastream-dashboard"
 path = "src/bin/datastream_dashboard.rs"
-required-features = ["datastream"]
-
-[[example]]
-name = "replay_viewer"
-path = "examples/replay_viewer.rs"
-required-features = ["replay-viewer"]

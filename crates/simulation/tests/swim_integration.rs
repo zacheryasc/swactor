@@ -91,7 +91,7 @@ fn swim_integration_smoke_writes_a_bundle_with_swim_events_and_passes_assertions
     let alpha_snap = fs::read_to_string(out.join("snapshots/alpha/0.json")).unwrap();
     let snap_v: serde_json::Value = serde_json::from_str(&alpha_snap).unwrap();
     assert!(snap_v["snapshot"]["members"].is_object());
-    assert!(snap_v["snapshot"]["tier2"].is_object());
+    assert!(snap_v["snapshot"]["self_incarnation"].is_u64());
 
     // Run the assertion evaluator on the bundle. Both declared
     // assertions are generous bounds; they should pass.

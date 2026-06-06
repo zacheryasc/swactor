@@ -33,9 +33,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use distribution::datastream::catalog;
+use distribution::datastream::emit::{
+    ClusterFrameSink, DatastreamEmitter, EmitterConfig, TickInput,
+};
 use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
@@ -49,9 +53,6 @@ use swactor::transport::{CodecRegistry, TransportRouter};
 use dashboard::collector::StatsCollector;
 use dashboard::{start_dashboard, DashboardConfig};
 
-use distribution::diagnostics::Role as DiagRole;
-
-use pipeline_parallel_inference::diag;
 use pipeline_parallel_inference::iroh_transport::{
     ActorMessagePump, IrohActorTransport, ACTOR_ALPN,
 };
@@ -61,7 +62,7 @@ use pipeline_parallel_inference::stage_actor::{
     StageMsg, StageRole,
 };
 use pipeline_parallel_inference::topology::{
-    next_stage_name, stage_name, ENTRY_NAME, EXIT_NAME,
+    next_stage_name, stage_name, DATASTREAM_SINK_NAME, ENTRY_NAME, EXIT_NAME,
 };
 use swactor_process::{ProcessMode, ProcessSpec};
 
@@ -259,13 +260,13 @@ fn build_route(
         addr,
         driver.tokio_handle(),
         node_id,
-        Some(driver.diagnostics().clone()),
+        // Workers host no dashboard, so no message tallies.
+        None,
     )))
 }
 
-fn register_name(driver: &mut IrohDriver, name: &str, addr: ActorAddress, stage: u32) {
+fn register_name(driver: &mut IrohDriver, name: &str, addr: ActorAddress, _stage: u32) {
     driver.node_mut().register_name(name.into(), addr);
-    diag::emit_register_name(driver, name, addr, Some(stage));
     eprintln!("pp-worker: registered {name} -> {addr:?}");
 }
 
@@ -417,48 +418,6 @@ fn main() {
         additional_alpns: vec![ACTOR_ALPN.to_vec()],
     })
     .expect("failed to create iroh driver");
-
-    // Install diagnostics from SWACTOR_DIAG_* env vars if the collector
-    // URL is set. The returned handle is intentionally leaked: a stage
-    // process runs until its parent kills it, and finalizing per-stage
-    // would race the orchestrator's authoritative finalize record. The
-    // background drainer keeps streaming events until SIGKILL.
-    let _diag = diag::install_from_env(&mut driver, DiagRole::stage());
-    let subprocess_introspect = _diag
-        .as_ref()
-        .map(|d| d.subprocess_introspect().clone());
-
-    // Independent vastai monitoring layer (in-VM view): an OS/GPU metrics sampler
-    // plus live stdout/stderr log streaming, shipped to the collector under this
-    // container's synthetic node id. Spawned on the driver's tokio runtime and
-    // leaked like `_diag` — a stage runs until its parent kills it, and the
-    // background tasks keep streaming until then. Independent of swactor diag.
-    let _vastai_in_vm = {
-        let handle = driver.tokio_handle();
-        let _guard = handle.enter();
-        pipeline_parallel_inference::vastai_mon::install_in_vm_from_env()
-    };
-    let vastai_forwarder = _vastai_in_vm.as_ref().map(|m| m.forwarder());
-
-    // Stamp the bundle the moment this process announces itself, so a
-    // bundle reader can tell two pp-worker incarnations of the same
-    // stage apart: a manual binary swap (the operator runbook) pkills the
-    // old process and setsid's a new one under the same PID-1 env, which
-    // means the same run_id + node_id, but the pid differs. The event carries that
-    // pid + wall clock as the slice point. No-op without diagnostics.
-    driver.emit(distribution::diagnostics::event::Event::Custom {
-        kind: "pp_stage_bounce".into(),
-        fields: serde_json::json!({
-            // Spec §4.8: stage worker events MUST carry stage_index
-            // top-level. The legacy `stage` alias is kept for back-compat
-            // with bundle consumers that filtered on it.
-            "stage_index": stage,
-            "stage": stage,
-            "num_stages": num_stages,
-            "pid": std::process::id(),
-            "boot_wall_ms": distribution::diagnostics::wall_ms_now(),
-        }),
-    });
 
     let my_id = driver.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
@@ -622,7 +581,7 @@ fn main() {
 
     run_stage(
         driver, rt, codecs, router, sender, status_inbox, role, stage, num_stages,
-        max_tokens, subprocess_introspect, vastai_forwarder,
+        max_tokens,
     );
     // Keep the dashboard handle alive for the whole stage lifetime.
     drop(stage_dash);
@@ -717,9 +676,34 @@ fn run_stage(
     stage: u32,
     num_stages: u32,
     max_tokens: u32,
-    subprocess_introspect: Option<Arc<distribution::diagnostics::subprocess_introspect::SubprocessIntrospect>>,
-    log_forwarder: Option<distribution::diagnostics::vastai::LogForwarder>,
 ) {
+    // Per-node telemetry datastream, default-on. Build the emitter and install
+    // its process-output observer BEFORE spawning the StageActor (which spawns
+    // the python worker), so the worker's stdout/stderr is captured into
+    // `proc.python.*` automatically with zero StageActor changes. The cluster
+    // sink is late-bound: it resolves `datastream-sink` in the main pump once
+    // the orchestrator has joined and published it; until then the mux's bounded
+    // buffer absorbs frames.
+    let node_hex: String = driver
+        .node_id()
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let datastream_sink_slot: Arc<OnceLock<ActorAddress>> = Arc::new(OnceLock::new());
+    let emitter = DatastreamEmitter::new(
+        EmitterConfig {
+            node_hex,
+            life: 0,
+            mux_capacity: 4096,
+        },
+        Box::new(ClusterFrameSink::new(
+            Arc::clone(&rt),
+            Arc::clone(&datastream_sink_slot),
+        )),
+    );
+    rt.set_process_output_observer(emitter.process_observer());
+
     // Construct the role-appropriate actor with placeholder routing
     // addresses. SetNeighbors overwrites them once SWIM resolution
     // succeeds.
@@ -728,34 +712,18 @@ fn run_stage(
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
 
-    let diag_emitter = driver.diagnostics().clone();
-    let attach_subprocess = |mut a: StageActor| {
-        if let Some(intro) = subprocess_introspect.as_ref() {
-            a = a.with_subprocess_introspect(intro.clone());
-        }
-        if let Some(fwd) = log_forwarder.as_ref() {
-            a = a.with_log_forwarder(fwd.clone());
-        }
-        a
-    };
     let actor = match role {
         StageRole::First => {
             let mut a =
                 StageActor::first(worker_spec(stage, num_stages), sender, placeholder)
-                    .with_status_addr(*status_inbox.addr())
-                    .with_diagnostics(diag_emitter.clone())
-                    .with_stage_idx(stage);
+                    .with_status_addr(*status_inbox.addr());
             if !stub_mode {
                 a = a.with_real_tokenization();
             }
-            attach_subprocess(a)
+            a
         }
-        StageRole::Middle => attach_subprocess(
-            StageActor::middle(worker_spec(stage, num_stages), sender, placeholder)
-                .with_status_addr(*status_inbox.addr())
-                .with_diagnostics(diag_emitter.clone())
-                .with_stage_idx(stage),
-        ),
+        StageRole::Middle => StageActor::middle(worker_spec(stage, num_stages), sender, placeholder)
+            .with_status_addr(*status_inbox.addr()),
         StageRole::Last => {
             let mut a = StageActor::last(
                 worker_spec(stage, num_stages),
@@ -764,13 +732,11 @@ fn run_stage(
                 placeholder,
                 max_tokens,
             )
-            .with_status_addr(*status_inbox.addr())
-            .with_diagnostics(diag_emitter.clone())
-            .with_stage_idx(stage);
+            .with_status_addr(*status_inbox.addr());
             if !stub_mode {
                 a = a.with_real_detokenization();
             }
-            attach_subprocess(a)
+            a
         }
     };
     let stage_actor_addr = rt.spawn(actor).unwrap();
@@ -951,7 +917,7 @@ fn run_stage(
     }
 
     // Let SetNeighbors land before publishing entry / exit names.
-    let msg_pump = ActorMessagePump::new(Some(diag_emitter.clone()));
+    let msg_pump = ActorMessagePump::new(None);
     pump(&mut driver, &rt, &codecs, &msg_pump, Duration::from_millis(100));
 
     // Register pp-entry on First (the orchestrator can finally submit
@@ -966,19 +932,33 @@ fn run_stage(
         StageRole::Middle => {}
     }
 
-    main_pump(driver, rt, codecs, router, status_inbox, msg_pump, stage_actor_addr);
+    main_pump(
+        driver,
+        rt,
+        codecs,
+        router,
+        status_inbox,
+        msg_pump,
+        stage_actor_addr,
+        emitter,
+        datastream_sink_slot,
+    );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn main_pump(
     mut driver: IrohDriver,
     rt: Arc<Runtime>,
     codecs: Arc<CodecRegistry>,
-    _router: Arc<TransportRouter>,
+    router: Arc<TransportRouter>,
     status_inbox: swactor::runtime::Inbox<StageActorStatus>,
     msg_pump: ActorMessagePump,
     stage_actor_addr: ActorAddress,
+    mut emitter: DatastreamEmitter,
+    datastream_sink_slot: Arc<OnceLock<ActorAddress>>,
 ) {
     eprintln!("pp-worker: entering main pump loop");
+    let mut round: u64 = 0;
     loop {
         driver.recv();
         driver.tick();
@@ -986,15 +966,57 @@ fn main_pump(
         rt.tick();
         drain_reload_request(&rt, stage_actor_addr);
 
+        // Lazily resolve + route the telemetry sink once the orchestrator has
+        // published it (it joins and registers `datastream-sink` only
+        // post-convergence). Frames before this are dropped by the sink and
+        // absorbed by the mux's bounded buffer.
+        if datastream_sink_slot.get().is_none() && round % 50 == 0 {
+            if let Some((addr, node_id)) = driver.node().resolve_name(DATASTREAM_SINK_NAME) {
+                let hex: String = node_id.0.iter().map(|b| format!("{b:02x}")).collect();
+                match build_route(&driver, &hex) {
+                    Ok(t) => {
+                        router.add_route(addr, t);
+                        let _ = datastream_sink_slot.set(addr);
+                        eprintln!("pp-worker: {DATASTREAM_SINK_NAME} resolved -> {addr:?}");
+                    }
+                    Err(e) => eprintln!("pp-worker: route to {DATASTREAM_SINK_NAME} failed: {e}"),
+                }
+            }
+        }
+
+        // Emit this node's telemetry. The loop sleeps 20 ms, so `round % 50`
+        // samples host/runtime/transport ~1/s; membership diffs every iteration.
+        let snap = driver.snapshot();
+        let rs = rt.stats();
+        let members: Vec<(String, String)> = snap
+            .members
+            .iter()
+            .map(|m| (m.node_id.clone(), m.state.clone()))
+            .collect();
+        emitter.tick(
+            TickInput {
+                members: &members,
+                runtime: catalog::RuntimeStats {
+                    actors_live: rs.actors.len() as u32,
+                    mailbox_depth: rs.workers.iter().map(|w| w.mailbox_depth as u32).sum(),
+                    scheduled_tasks: rs.workers.iter().map(|w| w.num_actors as u32).sum(),
+                },
+                relay_connected: driver.home_relay_url().is_some(),
+                relay_peers: snap.members.iter().filter(|m| m.relay_url.is_some()).count() as u32,
+            },
+            round % 50 == 0,
+        );
+
         if let Some(status) = status_inbox.try_recv() {
             match status {
                 StageActorStatus::ProcessExited { status } => {
                     eprintln!("pp-worker: worker exited: {status:?}");
-                    eprintln!("pp-worker: keeping SWIM alive for diagnostics");
+                    eprintln!("pp-worker: keeping SWIM alive so the cluster sees the exit");
                 }
                 other => eprintln!("pp-worker: status: {other:?}"),
             }
         }
+        round = round.wrapping_add(1);
         std::thread::sleep(Duration::from_millis(20));
     }
 }

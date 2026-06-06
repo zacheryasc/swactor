@@ -232,16 +232,11 @@ async fn destroy_continues_when_one_delete_fails() {
     );
 }
 
-/// When a DiagEnv with a collector URL is supplied, every create_instance
-/// PUT must carry the orchestrator-side SWACTOR_DIAG_* vars plus the
-/// auto-derived per-stage NODE_ROLE/STAGE_INDEX/STAGE_COUNT. This is the
-/// guarantee the --vastai path relies on to make rented containers ship
-/// into the same diagnostics bundle as the orchestrator. Without it the
-/// collector only sees the orchestrator's events and the post-processor's
-/// "first peer to go dead" answer is unanchored — exactly the situation
-/// VASTAI_STATUS.md describes for the failing N>=3 runs.
+/// A custom iroh relay URL in the [`StageEnv`] is injected into every rented
+/// stage's container env, so all stages reach the SWIM cluster through the same
+/// relay across the internet.
 #[tokio::test]
-async fn create_instances_forward_diag_env_to_each_stage_container() {
+async fn create_instances_forward_iroh_relay_to_each_stage_container() {
     let server = MockServer::start().await;
 
     for i in 0..3u64 {
@@ -258,11 +253,8 @@ async fn create_instances_forward_diag_env_to_each_stage_container() {
     }
 
     let client = Client::new();
-    let diag = vastai::DiagEnv {
-        collector_url: Some("https://collector.example:9080".into()),
-        run_id: Some("vastai-run-42".into()),
-        udp_echo: Some("collector.example:9081".into()),
-        iroh_relay_url: None,
+    let stage_env = vastai::StageEnv {
+        iroh_relay_url: Some("https://relay.example:4443".into()),
     };
     vastai::create_pipeline_instances(
         &client,
@@ -272,87 +264,22 @@ async fn create_instances_forward_diag_env_to_each_stage_container() {
         SEED_ADDR,
         None,
         IMAGE,
-        Some(&diag),
+        Some(&stage_env),
     )
     .await
     .expect("create_pipeline_instances must succeed");
 
-    let mut envs_by_stage: std::collections::HashMap<String, serde_json::Value> =
-        std::collections::HashMap::new();
+    let relay_key = pipeline_parallel_inference::relay_config::ENV_IROH_RELAY_URL;
+    let mut stages_seen = 0;
     for req in server.received_requests().await.unwrap() {
         if req.method.as_ref() != "PUT" {
             continue;
         }
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-        let stage = body["env"]["STAGE"].as_str().unwrap().to_string();
-        envs_by_stage.insert(stage, body["env"].clone());
+        assert_eq!(body["env"][relay_key], "https://relay.example:4443");
+        stages_seen += 1;
     }
-
-    assert_eq!(envs_by_stage.len(), 3);
-    for i in 0..3u32 {
-        let env = envs_by_stage
-            .get(&i.to_string())
-            .unwrap_or_else(|| panic!("missing stage {i}"));
-        assert_eq!(env["SWACTOR_DIAG_COLLECTOR_URL"], "https://collector.example:9080");
-        assert_eq!(env["SWACTOR_DIAG_RUN_ID"], "vastai-run-42");
-        assert_eq!(env["SWACTOR_DIAG_UDP_ECHO"], "collector.example:9081");
-        assert_eq!(env["SWACTOR_DIAG_NODE_ROLE"], "stage");
-        assert_eq!(env["SWACTOR_DIAG_STAGE_INDEX"], i.to_string());
-        assert_eq!(env["SWACTOR_DIAG_STAGE_COUNT"], "3");
-    }
-}
-
-/// Conversely: without a DiagEnv (None), no SWACTOR_DIAG_* keys appear in
-/// the create_instance payload — confirming the forwarding is fully opt-in
-/// and doesn't leak the orchestrator's local diagnostics setup into runs
-/// that didn't ask for it.
-#[tokio::test]
-async fn create_instances_omit_diag_env_when_not_supplied() {
-    let server = MockServer::start().await;
-
-    Mock::given(method("PUT"))
-        .and(path_regex("^/api/v0/asks/(550|551)/$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "new_contract": 9700
-        })))
-        .expect(2)
-        .mount(&server)
-        .await;
-
-    let client = Client::new();
-    vastai::create_pipeline_instances(
-        &client,
-        &server.uri(),
-        API_KEY,
-        &[550, 551],
-        SEED_ADDR,
-        None,
-        IMAGE,
-        None,
-    )
-    .await
-    .expect("create_pipeline_instances must succeed");
-
-    for req in server.received_requests().await.unwrap() {
-        if req.method.as_ref() != "PUT" {
-            continue;
-        }
-        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-        for key in [
-            "SWACTOR_DIAG_COLLECTOR_URL",
-            "SWACTOR_DIAG_RUN_ID",
-            "SWACTOR_DIAG_UDP_ECHO",
-            "SWACTOR_DIAG_NODE_ROLE",
-            "SWACTOR_DIAG_STAGE_INDEX",
-            "SWACTOR_DIAG_STAGE_COUNT",
-        ] {
-            assert!(
-                body["env"].get(key).is_none(),
-                "env must not carry {key} when no DiagEnv supplied; got {:?}",
-                body["env"],
-            );
-        }
-    }
+    assert_eq!(stages_seen, 3);
 }
 
 // ─── §10 N-stage parameterised tests (N ∈ {3, 5}) ─────────────────────
@@ -793,7 +720,6 @@ async fn lease_chain_does_not_replace_when_max_replace_attempts_is_zero() {
         None,
         std::time::Duration::from_millis(10),
         2,
-        None,
         None,
     )
     .await;

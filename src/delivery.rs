@@ -240,6 +240,8 @@ pub(crate) struct TickContext<'a> {
     pub(crate) inbox_registry: &'a InboxRegistry,
     pub(crate) config: &'a RuntimeConfig,
     pub(crate) extension: Option<&'a dyn crate::extension::RuntimeExtension>,
+    pub(crate) process_output_observer:
+        Option<&'a Arc<dyn crate::process_observer::ProcessOutputObserver>>,
     pub(crate) stats_hook: Option<&'a dyn crate::stats::StatsHook>,
     /// Thread handles for waking parked workers on cross-worker sends.
     pub(crate) worker_threads: &'a [OnceLock<Thread>],

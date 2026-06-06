@@ -32,6 +32,7 @@
 //! the pipe is verified.
 
 pub mod catalog;
+pub mod emit;
 pub mod frame;
 pub mod ingest;
 pub mod mux;

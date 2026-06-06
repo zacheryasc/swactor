@@ -148,25 +148,27 @@ pub enum SwimAction {
     DeclareDead(NodeId),
     /// Our node was suspected — refute with bumped incarnation.
     Refute { new_incarnation: u64 },
-    /// Diagnostic-only signal — no protocol effect. The host adapter
-    /// translates these into typed `Event` records for coverage 2.6
-    /// (per-SWIM-probe RTT). Threading them as a `SwimAction` variant
-    /// keeps the probe state machine pure (no emitter handle) while
-    /// still letting the caller observe ack/timeout lifecycle without
-    /// reaching into private phase state.
-    Diag(SwimDiagEvent),
+    /// Observation-only signal — no protocol effect. `SwimNode`
+    /// surfaces these through its [`SwimObserver`] hook (per-SWIM-probe
+    /// RTT). Threading them as a `SwimAction` variant keeps the probe
+    /// state machine pure (no observer handle) while still letting the
+    /// caller observe ack/timeout lifecycle without reaching into
+    /// private phase state.
+    ///
+    /// [`SwimObserver`]: super::node::SwimObserver
+    Observe(SwimProbeObservation),
 }
 
-/// Diagnostic-only events produced by the probe state machine.
+/// Observation-only events produced by the probe state machine.
 ///
 /// `kind` is `"direct"` for the direct-phase ack/timeout (i.e. a
 /// `SendPing` initiating the probe) and `"indirect"` for the
 /// indirect-phase ack/timeout (i.e. a `SendPingReq` fanout). The
-/// strings match the `kind` field on `Event::SwimProbeSent` /
-/// `SwimProbeAcked` / `SwimProbeTimedOut` so the host adapter is a
-/// 1:1 translation.
+/// strings match the `kind` field on
+/// [`SwimObservation`](super::node::SwimObservation)'s `ProbeSent` /
+/// `ProbeAcked` / `ProbeTimedOut`, so the node's translation is 1:1.
 #[derive(Debug, Clone)]
-pub enum SwimDiagEvent {
+pub enum SwimProbeObservation {
     /// An ack matched the in-flight probe and the probe is complete.
     ProbeAcked {
         target: NodeId,
@@ -406,7 +408,7 @@ impl SwimProbe {
 
                     // The direct phase expired — signal coverage 2.6 first,
                     // then fan out the indirect probes.
-                    actions.push(SwimAction::Diag(SwimDiagEvent::ProbeTimedOut {
+                    actions.push(SwimAction::Observe(SwimProbeObservation::ProbeTimedOut {
                         target,
                         sequence,
                         kind: "direct",
@@ -438,7 +440,7 @@ impl SwimProbe {
 
                     // Indirect phase expired — coverage 2.6 signal first, then
                     // declare suspect.
-                    actions.push(SwimAction::Diag(SwimDiagEvent::ProbeTimedOut {
+                    actions.push(SwimAction::Observe(SwimProbeObservation::ProbeTimedOut {
                         target,
                         sequence,
                         kind: "indirect",
@@ -468,7 +470,7 @@ impl SwimProbe {
         };
         if let Some(kind) = kind {
             // Successful ack — coverage 2.6 signal, cancel suspicion, idle.
-            actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
+            actions.push(SwimAction::Observe(SwimProbeObservation::ProbeAcked {
                 target: from,
                 sequence,
                 kind,
@@ -484,7 +486,7 @@ impl SwimProbe {
     fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, _members: &mut MemberList, actions: &mut Vec<SwimAction>) {
         if let ProbePhase::WaitingIndirectAck { target: expected, sequence: expected_seq, .. } = &self.phase
             && target == *expected && sequence == *expected_seq {
-                actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
+                actions.push(SwimAction::Observe(SwimProbeObservation::ProbeAcked {
                     target,
                     sequence,
                     kind: "indirect",

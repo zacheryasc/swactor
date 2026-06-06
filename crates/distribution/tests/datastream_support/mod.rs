@@ -19,7 +19,7 @@
 
 use distribution::datastream::catalog::{
     self, IdentityRecord, LifecycleCost, MembershipTransition, ProcStream, Record, ResourceSample,
-    Role, RuntimeStats, TransportInternals,
+    RuntimeStats, TransportInternals,
 };
 use distribution::datastream::frame::{ChannelId, Frame, Position, StreamId};
 use distribution::datastream::mux::Mux;
@@ -79,8 +79,6 @@ pub mod payloads {
     pub fn identity(node: &str, life: u64) -> IdentityRecord {
         IdentityRecord {
             node: node.to_string(),
-            role: Role::Worker,
-            region: "us-east-1".to_string(),
             life,
         }
     }

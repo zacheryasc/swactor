@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::host::{
@@ -23,6 +24,103 @@ use crate::host::{
 };
 
 const KIND_TAG: KindTag = "stage";
+
+// ──────────────────────────────────────────────────────────────────────
+// Datastream-style channel records
+// ──────────────────────────────────────────────────────────────────────
+//
+// The datastream's `ChannelId` is open/string-based: a producer may
+// emit typed records on channels the catalog has never heard of, and
+// consumers retain unknown channels whole (spec §6.3). The sim host
+// leans on exactly that extensibility — its subprocess / inference /
+// relay facts are sim-defined records on sim-defined channels, framed
+// in the bundle as `{kind: "channel_record", channel, record}` so a
+// bundle reader dispatches on the channel name the same way the
+// dashboard's `FleetView` dispatches on frame channels.
+
+/// Channel carrying [`SubprocessLifecycle`] records.
+pub const SUBPROCESS_LIFECYCLE_CHANNEL: &str = "subprocess.lifecycle";
+/// Channel carrying [`InferenceResponse`] records.
+pub const INFERENCE_RESPONSE_CHANNEL: &str = "inference.response";
+
+/// One subprocess lifecycle fact: spawned / ready / exited.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubprocessLifecycle {
+    /// `"spawned"`, `"ready"`, or `"exited"`.
+    pub phase: String,
+    pub label: String,
+    pub pid: u32,
+    #[serde(default)]
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_signal: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uptime_ms: Option<u64>,
+}
+
+/// The response-leg send outcome for one inference request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InferenceResponse {
+    pub target_peer: distribution::types::NodeId,
+    pub request_id: String,
+    pub byte_size: u64,
+    /// One of `"success"`, `"timeout"`, `"connection_closed"`,
+    /// `"refused"`, `"unresolved"`, `"queued_unacked"`.
+    pub send_outcome: String,
+}
+
+/// Per-snapshot tunnel-state block. Sim-defined (the old production
+/// `Tier2RelaySession` shape died with the diagnostics subsystem);
+/// defaults to `unknown / derived` per spec §2 honesty-under-absence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelaySession {
+    pub relay_url: Option<String>,
+    pub status: String,
+    pub status_source: String,
+    #[serde(default)]
+    pub status_changed_at_ms: Option<u64>,
+    #[serde(default)]
+    pub status_entered_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_send_at_ms: Option<u64>,
+    #[serde(default)]
+    pub last_recv_at_ms: Option<u64>,
+    #[serde(default)]
+    pub tx_bytes_total: Option<u64>,
+    #[serde(default)]
+    pub rx_bytes_total: Option<u64>,
+}
+
+/// Per-snapshot subprocess block built from the scenario-configured
+/// subprocess fake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubprocessState {
+    pub subprocesses: Vec<Subprocess>,
+    /// Virtual-time stamp (§7.1: never the host wall clock).
+    pub scraped_at_ms: u64,
+}
+
+/// One subprocess row in [`SubprocessState`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Subprocess {
+    pub label: String,
+    pub pid: u32,
+    #[serde(default)]
+    pub parent_pid: Option<u32>,
+    pub status: String,
+    #[serde(default)]
+    pub spawn_at_ms: Option<u64>,
+    #[serde(default)]
+    pub exit_at_ms: Option<u64>,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub exit_signal: Option<i32>,
+    #[serde(default)]
+    pub cmdline: Option<String>,
+}
 
 /// RELAY_SPEC §5.2 lifecycle states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,28 +150,26 @@ pub struct StageHost {
     name_registry: BTreeMap<String, String>,
     last_exit_reason: Option<String>,
     /// Sim cross-pollination F2: per-snapshot tunnel-state field a
-    /// scenario can configure. When set, the stage host renders the
-    /// production-shape [`distribution::diagnostics::Tier2RelaySession`]
-    /// in its snapshot under the `tier2_relay_session` key so a
-    /// simulated bundle is shape-compatible with a real one. Defaults
-    /// to `unknown / derived` per spec §2 honesty-under-absence.
-    relay_session: distribution::diagnostics::Tier2RelaySession,
+    /// scenario can configure. When set, the stage host renders a
+    /// [`RelaySession`] in its snapshot under the `relay_session` key.
+    /// Defaults to `unknown / derived` per spec §2 honesty-under-absence.
+    relay_session: RelaySession,
     /// Sim cross-pollination F1: per-snapshot subprocess block driven
     /// by the scenario's `subprocess_fake` config. Populated lazily
-    /// from `subprocess_fake_spec` on the first tick — emitting
-    /// `SubprocessSpawned` then either staying in `running` (when
-    /// `never_ready=true`, the "spawned-stayed-alive-no-output"
-    /// bucket from spec §4) or transitioning to `exited` and
-    /// emitting `SubprocessExited`.
+    /// from `subprocess_fake_spec` on the first tick — emitting a
+    /// `spawned` [`SubprocessLifecycle`] record then either staying in
+    /// `running` (when `never_ready=true`, the
+    /// "spawned-stayed-alive-no-output" bucket from spec §4) or
+    /// transitioning to `exited` and emitting an `exited` record.
     subprocess_fake_spec: Option<SubprocessFakeSpec>,
     subprocess_fake_state: Option<SubprocessFakeState>,
     /// Coverage 2.4: scenario-driven inference response-leg fake. When
-    /// set, the stage host emits one production-shape
-    /// `InferenceResponseSent` event at `fire_at_ns`, carrying the
-    /// declared target / request / size / outcome discriminator. The
-    /// `send_outcome` mirrors the iroh-level result set production
-    /// emits: `success` / `timeout` / `connection_closed` / `refused`
-    /// / `unresolved` / `queued_unacked`.
+    /// set, the stage host emits one [`InferenceResponse`] record at
+    /// `fire_at_ns`, carrying the declared target / request / size /
+    /// outcome discriminator. The `send_outcome` mirrors the
+    /// iroh-level result set: `success` / `timeout` /
+    /// `connection_closed` / `refused` / `unresolved` /
+    /// `queued_unacked`.
     inference_fake_spec: Option<InferenceFakeSpec>,
     inference_fake_fired: bool,
 }
@@ -105,8 +201,8 @@ pub struct InferenceFakeSpec {
 
 /// Scenario-driven configuration for the F1 subprocess fake. The
 /// engine knows nothing about subprocesses; this drives the stage
-/// host's emission of the §4 lifecycle events and the per-snapshot
-/// `tier3_subprocess` block.
+/// host's emission of the §4 lifecycle records and the per-snapshot
+/// `subprocess` block.
 #[derive(Debug, Clone)]
 pub struct SubprocessFakeSpec {
     pub label: String,
@@ -153,27 +249,23 @@ impl StageHost {
 
     /// F2: scenario-driven override of the per-snapshot tunnel
     /// state. Use to model "tunnel up" / "tunnel down" /
-    /// "tunnel unknown" for a simulated node — same shape as
-    /// production's [`distribution::diagnostics::Tier2RelaySession`].
-    pub fn set_relay_session(
-        &mut self,
-        session: distribution::diagnostics::Tier2RelaySession,
-    ) {
+    /// "tunnel unknown" for a simulated node.
+    pub fn set_relay_session(&mut self, session: RelaySession) {
         self.relay_session = session;
     }
 
     /// F1: scenario-driven subprocess fake. After this is set, the
-    /// host's next `tick` emits `Event::SubprocessSpawned` through
-    /// the diag-event envelope and populates the per-snapshot
-    /// subprocess block. Behaviour after that is driven by the
-    /// spec's `never_ready` / `exit_after_ns` flags.
+    /// host's next `tick` emits a `spawned` [`SubprocessLifecycle`]
+    /// record on the `subprocess.lifecycle` channel and populates the
+    /// per-snapshot subprocess block. Behaviour after that is driven
+    /// by the spec's `never_ready` / `exit_after_ns` flags.
     pub fn set_subprocess_fake(&mut self, spec: SubprocessFakeSpec) {
         self.subprocess_fake_spec = Some(spec);
     }
 
     /// Coverage 2.4: scenario-driven inference response-leg fake. The
     /// next `tick` whose `now_ns >= spec.fire_at_ns` emits exactly
-    /// one `InferenceResponseSent` event with the declared
+    /// one [`InferenceResponse`] record with the declared
     /// discriminator. Subsequent ticks are no-ops for this surface.
     pub fn set_inference_fake(&mut self, spec: InferenceFakeSpec) {
         self.inference_fake_spec = Some(spec);
@@ -198,10 +290,9 @@ fn encode(v: &serde_json::Value) -> EventBytes {
 
 /// Spec §2 honesty-under-absence default: a simulated stage with no
 /// scenario-configured tunnel state emits `unknown / derived` rather
-/// than fabricating a `connected` or `disconnected` claim. Matches
-/// what the iroh introspector pre-seeds in production.
-fn default_unknown_relay_session() -> distribution::diagnostics::Tier2RelaySession {
-    distribution::diagnostics::Tier2RelaySession {
+/// than fabricating a `connected` or `disconnected` claim.
+fn default_unknown_relay_session() -> RelaySession {
+    RelaySession {
         relay_url: None,
         status: "unknown".to_string(),
         status_source: "derived".to_string(),
@@ -214,15 +305,13 @@ fn default_unknown_relay_session() -> distribution::diagnostics::Tier2RelaySessi
     }
 }
 
-/// Emit a sim Event wrapping a production diagnostics `Event`. Reuses
-/// the same `diag_event` envelope SwimHost uses so a bundle reader
-/// dispatches both kinds identically.
-fn emit_production_event(
-    kind_tag: &str,
-    ev: &distribution::diagnostics::Event,
-) -> Action {
-    let inner = serde_json::to_value(ev).unwrap_or(serde_json::Value::Null);
-    let payload = json!({ "kind": "diag_event", "payload": inner });
+/// Emit a sim Event carrying a typed record on a named channel —
+/// the datastream frame idiom (`channel` tags the lane, the record is
+/// the payload). A bundle reader dispatches on the channel name the
+/// same way the dashboard's `FleetView` dispatches on frame channels.
+fn emit_channel_record<R: Serialize>(kind_tag: &str, channel: &str, record: &R) -> Action {
+    let inner = serde_json::to_value(record).unwrap_or(serde_json::Value::Null);
+    let payload = json!({ "kind": "channel_record", "channel": channel, "record": inner });
     Action::RecordEvent {
         kind_tag: kind_tag.to_string(),
         event: encode(&payload),
@@ -267,36 +356,42 @@ impl Host for StageHost {
                     .insert(self.name.clone(), self.address.clone());
                 actions.push(self.lifecycle_event(StageState::Registering, StageState::Running));
                 self.state = StageState::Running;
-                // Sim cross-pollination F1: spec §4 lifecycle event
-                // for the configured subprocess fake. Mirrors the
-                // wiring contract in `examples/.../stage_actor.rs`:
-                // on spawn, emit the typed `SubprocessSpawned`. If
-                // the spec opts into `never_ready=false`, the
-                // companion `Custom("worker_ready")` is emitted too
-                // — distinguishing "spawned and running, worker
-                // reported ready" from "spawned and running, never
-                // produced protocol output."
+                // Sim cross-pollination F1: spec §4 lifecycle record
+                // for the configured subprocess fake. On spawn, emit a
+                // `spawned` record on the subprocess channel. If the
+                // spec opts into `never_ready=false`, the companion
+                // `ready` record is emitted too — distinguishing
+                // "spawned and running, worker reported ready" from
+                // "spawned and running, never produced protocol
+                // output."
                 if let Some(spec) = self.subprocess_fake_spec.take() {
-                    actions.push(emit_production_event(
+                    actions.push(emit_channel_record(
                         KIND_TAG,
-                        &distribution::diagnostics::Event::SubprocessSpawned {
+                        SUBPROCESS_LIFECYCLE_CHANNEL,
+                        &SubprocessLifecycle {
+                            phase: "spawned".to_string(),
                             label: spec.label.clone(),
                             pid: spec.pid,
                             command: spec.command.clone(),
+                            exit_code: None,
+                            exit_signal: None,
+                            uptime_ms: None,
                         },
                     ));
                     if !spec.never_ready {
-                        actions.push(Action::RecordEvent {
-                            kind_tag: KIND_TAG.to_string(),
-                            event: encode(&json!({
-                                "kind": "diag_event",
-                                "payload": {
-                                    "type": "Custom",
-                                    "kind": "worker_ready",
-                                    "fields": { "pid": spec.pid },
-                                },
-                            })),
-                        });
+                        actions.push(emit_channel_record(
+                            KIND_TAG,
+                            SUBPROCESS_LIFECYCLE_CHANNEL,
+                            &SubprocessLifecycle {
+                                phase: "ready".to_string(),
+                                label: spec.label.clone(),
+                                pid: spec.pid,
+                                command: spec.command.clone(),
+                                exit_code: None,
+                                exit_signal: None,
+                                uptime_ms: None,
+                            },
+                        ));
                     }
                     self.subprocess_fake_state = Some(SubprocessFakeState {
                         spec,
@@ -315,9 +410,10 @@ impl Host for StageHost {
                 if !self.inference_fake_fired {
                     if let Some(spec) = self.inference_fake_spec.as_ref() {
                         if now_ns >= spec.fire_at_ns {
-                            actions.push(emit_production_event(
+                            actions.push(emit_channel_record(
                                 KIND_TAG,
-                                &distribution::diagnostics::Event::InferenceResponseSent {
+                                INFERENCE_RESPONSE_CHANNEL,
+                                &InferenceResponse {
                                     target_peer: spec.target_peer_node_id,
                                     request_id: spec.request_id.clone(),
                                     byte_size: spec.byte_size,
@@ -333,9 +429,11 @@ impl Host for StageHost {
                         if let Some(after_ns) = state.spec.exit_after_ns {
                             if now_ns >= state.spawn_at_ns.saturating_add(after_ns) {
                                 let uptime_ns = now_ns.saturating_sub(state.spawn_at_ns);
-                                actions.push(emit_production_event(
+                                actions.push(emit_channel_record(
                                     KIND_TAG,
-                                    &distribution::diagnostics::Event::SubprocessExited {
+                                    SUBPROCESS_LIFECYCLE_CHANNEL,
+                                    &SubprocessLifecycle {
+                                        phase: "exited".to_string(),
                                         label: state.spec.label.clone(),
                                         pid: state.spec.pid,
                                         command: state.spec.command.clone(),
@@ -405,23 +503,22 @@ impl Host for StageHost {
         // RELAY_SPEC §5.4. Stage snapshot is opaque to the §9 bundle
         // schema for SWIM; the evaluator picks `name_registry` and
         // optionally `last_exit_reason` from it. Sim cross-pollination
-        // adds two production-shape nested blocks so a bundle reader
-        // cannot tell from the data shape alone whether this snapshot
-        // came from a real deployment or the sim (per spec §"Sim
-        // cross-pollination"):
-        //   - `tier2_relay_session`: matches `Tier2RelaySession`
-        //   - `tier3_subprocess`:    matches `Tier3SubprocessState`
+        // adds two typed nested blocks so a bundle reader can decode
+        // the same facts a real node's datastream carries (per spec
+        // §"Sim cross-pollination"):
+        //   - `relay_session`: a [`RelaySession`]
+        //   - `subprocess`:    a [`SubprocessState`]
         let mut payload = json!({
             "state": self.state.as_str(),
             "name_registry": self.name_registry,
             "members": {},
             "self_incarnation": 0,
-            "tier2_relay_session": serde_json::to_value(&self.relay_session)
-                .expect("Tier2RelaySession serialises by construction"),
+            "relay_session": serde_json::to_value(&self.relay_session)
+                .expect("RelaySession serialises by construction"),
         });
-        if let Some(tier3) = self.subprocess_snapshot() {
-            payload["tier3_subprocess"] = serde_json::to_value(&tier3)
-                .expect("Tier3SubprocessState serialises by construction");
+        if let Some(subprocess) = self.subprocess_snapshot() {
+            payload["subprocess"] = serde_json::to_value(&subprocess)
+                .expect("SubprocessState serialises by construction");
         }
         if self.state == StageState::Halted {
             if let Some(reason) = &self.last_exit_reason {
@@ -433,14 +530,10 @@ impl Host for StageHost {
 }
 
 impl StageHost {
-    /// Build the production-shape `Tier3SubprocessState` from the
-    /// scenario-configured subprocess fake. `None` when no fake is
-    /// configured, in which case the snapshot omits the block (mirrors
-    /// the production aggregator's behaviour when no introspector is
-    /// installed).
-    fn subprocess_snapshot(
-        &self,
-    ) -> Option<distribution::diagnostics::Tier3SubprocessState> {
+    /// Build the [`SubprocessState`] block from the scenario-configured
+    /// subprocess fake. `None` when no fake is configured, in which
+    /// case the snapshot omits the block (honesty-under-absence).
+    fn subprocess_snapshot(&self) -> Option<SubprocessState> {
         let state = self.subprocess_fake_state.as_ref()?;
         let (status, exit_code, exit_signal, exit_at_ms) = match state.exited_at_ns {
             Some(ns) => (
@@ -451,8 +544,8 @@ impl StageHost {
             ),
             None => ("running".to_string(), None, None, None),
         };
-        Some(distribution::diagnostics::Tier3SubprocessState {
-            subprocesses: vec![distribution::diagnostics::Tier3Subprocess {
+        Some(SubprocessState {
+            subprocesses: vec![Subprocess {
                 label: state.spec.label.clone(),
                 pid: state.spec.pid,
                 parent_pid: None,
@@ -461,10 +554,6 @@ impl StageHost {
                 exit_at_ms,
                 exit_code,
                 exit_signal,
-                rss_bytes: None,
-                vm_size_bytes: None,
-                open_fd_count: None,
-                cpu_ms: None,
                 cmdline: Some(state.spec.command.clone()),
             }],
             // §7.1: never read the host wall clock — use virtual time

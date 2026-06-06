@@ -3,25 +3,53 @@
 //! This is the top-level SWIM state machine that a `DistributedNode` will drive.
 //! It produces `SwimAction`s that the caller translates into real network I/O.
 
-use std::sync::Arc;
-
-use crate::diagnostics::{noop_emitter, DynEmitter, Event as DiagEvent, EventEmitter, PeerState};
-use crate::diagnostics::swim_introspect::SwimIntrospect;
-use crate::diagnostics::snapshot::Tier2SwimConfig;
 use crate::messages::MembershipUpdate;
 use crate::types::{MemberState, NodeId, NodeRecord};
 
 use super::dissemination::{membership_update, DisseminationQueue};
 use super::member_list::MemberList;
-use super::probe::{ProbeMode, SwimAction, SwimConfig, SwimDiagEvent, SwimEvent, SwimProbe};
+use super::probe::{SwimAction, SwimConfig, SwimEvent, SwimProbe, SwimProbeObservation};
 
-/// Map SWIM's internal `MemberState` to the diagnostics wire type.
-fn to_peer_state(state: MemberState) -> PeerState {
-    match state {
-        MemberState::Alive => PeerState::Alive,
-        MemberState::Suspect => PeerState::Suspect,
-        MemberState::Dead => PeerState::Dead,
-    }
+// ─── Observation seam ────────────────────────────────────────────────────────
+
+/// What the SWIM node can report about itself, for a caller that wants to
+/// record it (e.g. the deterministic simulator). Purely observational — no
+/// protocol effect. Production installs no observer and pays nothing.
+#[derive(Debug, Clone)]
+pub enum SwimObservation {
+    /// A peer's membership state changed. `from` is `None` when the peer
+    /// was previously unknown to this node.
+    Transition {
+        peer: NodeId,
+        from: Option<MemberState>,
+        to: MemberState,
+        reason: &'static str,
+    },
+    /// A probe was initiated (`kind` is `"direct"` or `"indirect"`).
+    ProbeSent {
+        target: NodeId,
+        sequence: u64,
+        kind: &'static str,
+    },
+    /// An in-flight probe was answered.
+    ProbeAcked {
+        target: NodeId,
+        sequence: u64,
+        kind: &'static str,
+    },
+    /// An in-flight probe ran out its budget. `budget_ticks` is the
+    /// configured `probe_timeout`.
+    ProbeTimedOut {
+        target: NodeId,
+        sequence: u64,
+        kind: &'static str,
+        budget_ticks: u64,
+    },
+}
+
+/// Receiver for [`SwimObservation`]s. Installed via [`SwimNode::set_observer`].
+pub trait SwimObserver: Send {
+    fn observe(&self, observation: SwimObservation);
 }
 
 // ─── SwimNode Actions (superset of probe actions) ───────────────────────────
@@ -59,19 +87,10 @@ pub struct SwimNode {
     /// PingReqs we forwarded: (requester, target, sequence).
     /// When we receive an ack matching (target, sequence), forward it to requester.
     pending_relays: Vec<(NodeId, NodeId, u64)>,
-    /// Diagnostics sink. Defaults to a no-op so untouched call sites
-    /// stay free of observability overhead. Production wires this with
-    /// [`crate::diagnostics::Aggregator`] via [`Self::set_diagnostics`].
-    diagnostics: DynEmitter,
-    /// Optional tier-2 introspector. Populated by
-    /// [`Self::install_introspect`] and updated from every state-
-    /// changing entry point. None until installed so library tests
-    /// that do not opt in stay free of the bookkeeping.
-    introspect: Option<Arc<SwimIntrospect>>,
-    /// Λ multiplier used by the dissemination queue — captured here
-    /// so the introspector can report it without leaking into the
-    /// dissemination layer's API.
-    gossip_lambda: usize,
+    /// Observation hook. `None` by default so untouched call sites stay
+    /// free of observability overhead; the simulator installs one via
+    /// [`Self::set_observer`].
+    observer: Option<Box<dyn SwimObserver>>,
 }
 
 impl SwimNode {
@@ -90,88 +109,36 @@ impl SwimNode {
             dissemination: DisseminationQueue::new(GOSSIP_LAMBDA),
             max_piggyback: MAX_PIGGYBACK,
             pending_relays: Vec::new(),
-            diagnostics: noop_emitter(),
-            introspect: None,
-            gossip_lambda: GOSSIP_LAMBDA,
+            observer: None,
         }
     }
 
-    /// Install a tier-2 SWIM introspector and return the
-    /// `Arc<SwimIntrospect>` so the caller can register it with the
-    /// diagnostics aggregator. The introspector is initialized from
-    /// this node's protocol configuration and current member set.
-    /// Subsequent state changes flow through the same Arc.
-    ///
-    /// Calling this a second time replaces the previous introspector.
-    pub fn install_introspect(&mut self) -> Arc<SwimIntrospect> {
-        let config = self.tier2_config();
-        let introspect = Arc::new(SwimIntrospect::new(config, self.members.self_id()));
-        introspect.note_self_incarnation(self.members.self_incarnation());
-        for entry in self.members.all_members() {
-            introspect.note_peer_state(entry.node_id, to_peer_state(entry.state), entry.incarnation);
-        }
-        self.introspect = Some(Arc::clone(&introspect));
-        introspect
+    /// Install an observation hook so membership transitions and probe
+    /// lifecycle surface as [`SwimObservation`]s. Safe to call at any
+    /// time; observations before the call are dropped.
+    pub fn set_observer(&mut self, observer: Box<dyn SwimObserver>) {
+        self.observer = Some(observer);
     }
 
-    /// Snapshot of the protocol parameters this node was built with,
-    /// in the wire-shape the diagnostics layer expects.
-    fn tier2_config(&self) -> Tier2SwimConfig {
-        let cfg = self.probe.config();
-        let probe_mode = match &cfg.probe_mode {
-            ProbeMode::Periodic => "periodic".to_string(),
-            ProbeMode::Reactive {
-                safety_sweep_interval,
-            } => format!("reactive({safety_sweep_interval})"),
-        };
-        Tier2SwimConfig {
-            probe_interval_ticks: cfg.probe_interval,
-            probe_timeout_ticks: cfg.probe_timeout,
-            suspicion_timeout_ticks: cfg.suspicion_timeout,
-            indirect_probes_k: cfg.indirect_probes as u32,
-            dead_reprobe_interval_ticks: cfg.dead_reprobe_interval,
-            gossip_fanout_lambda: self.gossip_lambda as u32,
-            max_piggyback: self.max_piggyback as u32,
-            probe_mode,
+    fn observe(&self, observation: SwimObservation) {
+        if let Some(obs) = &self.observer {
+            obs.observe(observation);
         }
     }
 
-    /// Borrow the installed introspector (read-only). Returns `None`
-    /// until [`Self::install_introspect`] has been called.
-    pub fn introspect(&self) -> Option<&Arc<SwimIntrospect>> {
-        self.introspect.as_ref()
-    }
-
-    /// Install a diagnostics emitter so SWIM transitions surface as
-    /// structured [`DiagEvent`]s. Safe to call at any time; events
-    /// before the call are dropped.
-    pub fn set_diagnostics(&mut self, emitter: DynEmitter) {
-        self.diagnostics = emitter;
-    }
-
-    /// Borrow the current diagnostics emitter (read-only).
-    pub fn diagnostics(&self) -> &DynEmitter {
-        &self.diagnostics
-    }
-
-    fn emit_transition(&self, peer: NodeId, from: PeerState, to: PeerState, reason: &str) {
-        self.diagnostics.emit_event(DiagEvent::SwimTransition {
+    fn observe_transition(
+        &self,
+        peer: NodeId,
+        from: Option<MemberState>,
+        to: MemberState,
+        reason: &'static str,
+    ) {
+        self.observe(SwimObservation::Transition {
             peer,
             from,
             to,
-            reason: reason.to_string(),
+            reason,
         });
-        if let Some(intro) = &self.introspect {
-            let incarnation = self
-                .members
-                .get(&peer)
-                .map(|e| e.incarnation)
-                .unwrap_or(0);
-            intro.note_peer_state(peer, to, incarnation);
-            if to == PeerState::Suspect {
-                intro.note_suspect_started(peer);
-            }
-        }
     }
 
     pub fn self_id(&self) -> NodeId {
@@ -193,9 +160,6 @@ impl SwimNode {
             if entry.state == MemberState::Dead {
                 self.members.remove(&node_id);
                 self.dissemination.purge_node(&node_id);
-                if let Some(intro) = &self.introspect {
-                    intro.drop_peer(node_id);
-                }
             }
         }
     }
@@ -213,19 +177,12 @@ impl SwimNode {
 
     /// Handle a received ping.
     pub fn handle_ping(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        if let Some(intro) = &self.introspect {
-            intro.note_ping_received(from, sequence);
-        }
         let mut actions = self.apply_piggyback(from, piggyback);
 
         // Ensure the sender is in our member list
-        let prior = self
-            .members
-            .get(&from)
-            .map(|e| to_peer_state(e.state))
-            .unwrap_or(PeerState::Unknown);
+        let prior = self.members.get(&from).map(|e| e.state);
         if self.members.apply(from, MemberState::Alive, 0) {
-            self.emit_transition(from, prior, PeerState::Alive, "ping-received");
+            self.observe_transition(from, prior, MemberState::Alive, "ping-received");
         }
 
         // Reply with ack
@@ -240,9 +197,6 @@ impl SwimNode {
 
     /// Handle a received ack.
     pub fn handle_ack(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        if let Some(intro) = &self.introspect {
-            intro.note_ack_received(from, sequence);
-        }
         let mut actions = self.apply_piggyback(from, piggyback);
         let probe_actions = self.probe.step(
             SwimEvent::AckReceived { from, sequence },
@@ -270,9 +224,6 @@ impl SwimNode {
         sequence: u64,
         piggyback: &[u8],
     ) -> Vec<NodeAction> {
-        if let Some(intro) = &self.introspect {
-            intro.note_ping_req_received(from, target, sequence);
-        }
         let mut actions = self.apply_piggyback(from, piggyback);
 
         // Record the pending relay so we can forward the ack back
@@ -302,9 +253,6 @@ impl SwimNode {
 
     /// Handle a received indirect ack (forwarded by a relay node).
     pub fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
-        if let Some(intro) = &self.introspect {
-            intro.note_indirect_ack_received(target, sequence);
-        }
         // `target` is the indirectly-probed peer; the membership data
         // ultimately came from there even though a relay forwarded it.
         // Crediting `target` as the gossip source matches the bundle
@@ -320,20 +268,13 @@ impl SwimNode {
 
     /// Handle a join request from a new node.
     pub fn handle_join_request(&mut self, from: NodeId) -> Vec<NodeAction> {
-        if let Some(intro) = &self.introspect {
-            intro.note_join_request_received(from);
-        }
         // Add the new node to our member list
-        let prior = self
-            .members
-            .get(&from)
-            .map(|e| to_peer_state(e.state))
-            .unwrap_or(PeerState::Unknown);
+        let prior = self.members.get(&from).map(|e| e.state);
         let changed = self.members.apply(from, MemberState::Alive, 0);
         let mut actions = Vec::new();
 
         if changed {
-            self.emit_transition(from, prior, PeerState::Alive, "join-request");
+            self.observe_transition(from, prior, MemberState::Alive, "join-request");
             // Enqueue the join for dissemination
             self.dissemination.enqueue(
                 membership_update(from, MemberState::Alive, 0),
@@ -363,33 +304,19 @@ impl SwimNode {
 
     /// Handle a join response (we received the member list from a seed).
     pub fn handle_join_response(&mut self, members: Vec<NodeRecord>) -> Vec<NodeAction> {
-        if let Some(intro) = &self.introspect {
-            // The first record in a join response is conventionally
-            // the responding peer; fall back to self-id if the list is
-            // somehow empty so the message still surfaces.
-            let from = members
-                .first()
-                .map(|r| r.node_id)
-                .unwrap_or(self.members.self_id());
-            intro.note_join_response_received(from, members.len());
-        }
         let mut actions = Vec::new();
         for record in members {
-            let prior = self
-                .members
-                .get(&record.node_id)
-                .map(|e| to_peer_state(e.state))
-                .unwrap_or(PeerState::Unknown);
+            let prior = self.members.get(&record.node_id).map(|e| e.state);
             let changed = self.members.apply(
                 record.node_id,
                 record.state,
                 record.incarnation,
             );
             if changed {
-                self.emit_transition(
+                self.observe_transition(
                     record.node_id,
                     prior,
-                    to_peer_state(record.state),
+                    record.state,
                     "join-response",
                 );
                 actions.push(NodeAction::MembershipChanged {
@@ -424,20 +351,8 @@ impl SwimNode {
         self.members.alive_count() + 1 // +1 for self
     }
 
-    fn apply_piggyback(&mut self, from: NodeId, bytes: &[u8]) -> Vec<NodeAction> {
+    fn apply_piggyback(&mut self, _from: NodeId, bytes: &[u8]) -> Vec<NodeAction> {
         let updates = DisseminationQueue::unpack_piggyback(bytes);
-        // Spec §10 (gap 10): typed receipt event per piggyback. Fires
-        // for every payload-bearing receipt so a bundle reader can
-        // reconstruct gossip propagation per (source, kind) without
-        // grepping the SWIM internals.
-        if !bytes.is_empty() {
-            self.diagnostics.emit_event(DiagEvent::GossipReceived {
-                source_peer: from,
-                payload_kind: "swim_piggyback".to_string(),
-                payload_bytes: bytes.len().min(u32::MAX as usize) as u32,
-                item_count: updates.len().min(u32::MAX as usize) as u32,
-            });
-        }
         let mut actions = Vec::new();
         for update in updates {
             actions.extend(self.apply_membership_update(update));
@@ -465,9 +380,6 @@ impl SwimNode {
             {
                 // Refute: bump incarnation and disseminate
                 let new_inc = self.members.refute();
-                if let Some(intro) = &self.introspect {
-                    intro.note_self_incarnation(new_inc);
-                }
                 self.dissemination.enqueue(
                     membership_update(
                         self.members.self_id(),
@@ -480,11 +392,7 @@ impl SwimNode {
             return Vec::new();
         }
 
-        let prior = self
-            .members
-            .get(&update.node_id)
-            .map(|e| to_peer_state(e.state))
-            .unwrap_or(PeerState::Unknown);
+        let prior = self.members.get(&update.node_id).map(|e| e.state);
 
         let changed = self.members.apply(
             update.node_id,
@@ -492,12 +400,7 @@ impl SwimNode {
             update.incarnation,
         );
         if changed {
-            self.emit_transition(
-                update.node_id,
-                prior,
-                to_peer_state(update.state),
-                "gossip",
-            );
+            self.observe_transition(update.node_id, prior, update.state, "gossip");
             if update.state == MemberState::Alive {
                 // In reactive mode, probe newly discovered alive peers so they
                 // don't decay to dead before we ever exchange a ping/ack.
@@ -523,14 +426,13 @@ impl SwimNode {
         for pa in probe_actions {
             match pa {
                 SwimAction::SendPing { to, sequence } => {
-                    // Coverage 2.6: record the probe initiation. The
-                    // bundle reader joins (target, sequence) across
-                    // `SwimProbeSent` / `SwimProbeAcked` / `SwimProbeTimedOut`
-                    // to reconstruct per-probe RTT.
-                    self.diagnostics.emit_event(DiagEvent::SwimProbeSent {
+                    // Record the probe initiation. An observer joins
+                    // (target, sequence) across `ProbeSent` / `ProbeAcked` /
+                    // `ProbeTimedOut` to reconstruct per-probe RTT.
+                    self.observe(SwimObservation::ProbeSent {
                         target: to,
                         sequence,
-                        kind: "direct".to_string(),
+                        kind: "direct",
                     });
                     // If the target is suspect or dead, re-enqueue its state
                     // so it piggybacks on this message. This is the key mechanism
@@ -551,11 +453,11 @@ impl SwimNode {
                     });
                 }
                 SwimAction::SendPingReq { relay, target, sequence } => {
-                    // Coverage 2.6: indirect-phase probe initiation.
-                    self.diagnostics.emit_event(DiagEvent::SwimProbeSent {
+                    // Indirect-phase probe initiation.
+                    self.observe(SwimObservation::ProbeSent {
                         target,
                         sequence,
-                        kind: "indirect".to_string(),
+                        kind: "indirect",
                     });
                     let pb = self.dissemination.pack_piggyback(self.max_piggyback);
                     actions.push(NodeAction::SendPingReq {
@@ -566,13 +468,14 @@ impl SwimNode {
                     });
                 }
                 SwimAction::Suspect(node_id) => {
-                    let prior = self
-                        .members
-                        .get(&node_id)
-                        .map(|e| to_peer_state(e.state))
-                        .unwrap_or(PeerState::Unknown);
+                    let prior = self.members.get(&node_id).map(|e| e.state);
                     if self.members.suspect(node_id) {
-                        self.emit_transition(node_id, prior, PeerState::Suspect, "probe-timeout");
+                        self.observe_transition(
+                            node_id,
+                            prior,
+                            MemberState::Suspect,
+                            "probe-timeout",
+                        );
                         if let Some(entry) = self.members.get(&node_id) {
                             self.dissemination.enqueue(
                                 membership_update(node_id, MemberState::Suspect, entry.incarnation),
@@ -597,10 +500,10 @@ impl SwimNode {
                             membership_update(node_id, MemberState::Dead, inc),
                             self.cluster_size(),
                         );
-                        self.emit_transition(
+                        self.observe_transition(
                             node_id,
-                            PeerState::Suspect,
-                            PeerState::Dead,
+                            Some(MemberState::Suspect),
+                            MemberState::Dead,
                             "suspicion-timeout",
                         );
                         actions.push(NodeAction::MembershipChanged {
@@ -611,9 +514,6 @@ impl SwimNode {
                     }
                 }
                 SwimAction::Refute { new_incarnation } => {
-                    if let Some(intro) = &self.introspect {
-                        intro.note_self_incarnation(new_incarnation);
-                    }
                     self.dissemination.enqueue(
                         membership_update(
                             self.members.self_id(),
@@ -623,19 +523,19 @@ impl SwimNode {
                         self.cluster_size(),
                     );
                 }
-                SwimAction::Diag(diag) => match diag {
-                    SwimDiagEvent::ProbeAcked { target, sequence, kind } => {
-                        self.diagnostics.emit_event(DiagEvent::SwimProbeAcked {
+                SwimAction::Observe(obs) => match obs {
+                    SwimProbeObservation::ProbeAcked { target, sequence, kind } => {
+                        self.observe(SwimObservation::ProbeAcked {
                             target,
                             sequence,
-                            kind: kind.to_string(),
+                            kind,
                         });
                     }
-                    SwimDiagEvent::ProbeTimedOut { target, sequence, kind, budget_ticks } => {
-                        self.diagnostics.emit_event(DiagEvent::SwimProbeTimedOut {
+                    SwimProbeObservation::ProbeTimedOut { target, sequence, kind, budget_ticks } => {
+                        self.observe(SwimObservation::ProbeTimedOut {
                             target,
                             sequence,
-                            kind: kind.to_string(),
+                            kind,
                             budget_ticks,
                         });
                     }

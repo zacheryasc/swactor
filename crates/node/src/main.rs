@@ -22,13 +22,10 @@ use distribution::peer_auth::PeerAllowList;
 use distribution::snapshot::DistributionNodeSnapshot;
 use distribution::swim::probe::SwimConfig;
 
-use distribution::datastream::catalog::{
-    self, ProcStream, Record, Role, RuntimeStats as DsRuntimeStats, TransportInternals,
+use distribution::datastream::catalog::RuntimeStats as DsRuntimeStats;
+use distribution::datastream::emit::{
+    DatastreamEmitter, EmitterConfig, FrameSink, NoopSink, TickInput, UdpFrameSink,
 };
-use distribution::datastream::frame::{Lifetime, NodeId as DsNodeId, StreamId};
-use distribution::datastream::mux::Mux;
-use distribution::datastream::source::{self, CpuSampler, MembershipTracker};
-use distribution::datastream::wire::encode_delivery;
 
 use dashboard::collector::StatsCollector;
 use dashboard::{start_dashboard, DashboardConfig};
@@ -64,19 +61,6 @@ enum Subcmd {
     Join {
         /// Invite code (base58-encoded node ID)
         code: String,
-    },
-    /// Internal: a dummy child workload that prints lines forever.
-    ///
-    /// The node spawns itself with this subcommand as the "real process" each
-    /// node drives; its stdout/stderr are captured into the datastream's
-    /// `proc.<label>.{stdout,stderr}` channels. It runs until killed.
-    DummyWorkload {
-        /// Milliseconds between output lines
-        #[arg(long, default_value = "1000")]
-        interval_ms: u64,
-        /// Label used to name the process-output channels
-        #[arg(long, default_value = "workload")]
-        label: String,
     },
 }
 
@@ -161,36 +145,6 @@ struct Args {
     /// Relay host(s) for cluster discovery (repeatable). Overrides config.
     #[arg(long)]
     relay_hosts: Vec<String>,
-
-    /// Enable per-node telemetry datastream emission
-    #[arg(long)]
-    datastream: bool,
-
-    /// Ship datastream frames to this UDP collector (host:port). Implies --datastream.
-    #[arg(long)]
-    datastream_collector: Option<String>,
-
-    /// Region label reported in the datastream identity record
-    #[arg(long, default_value = "local")]
-    datastream_region: String,
-
-    /// Do not spawn the dummy child workload (whose output feeds proc.* channels)
-    #[arg(long)]
-    no_datastream_child: bool,
-
-    /// Label for the dummy child workload process
-    #[arg(long, default_value = "workload")]
-    datastream_child_label: String,
-}
-
-/// Datastream emission configuration, resolved from flags/env in `main`.
-struct DatastreamOpts {
-    enabled: bool,
-    collector: Option<String>,
-    region: String,
-    child: bool,
-    child_label: String,
-    life: u64,
 }
 
 // ── Dummy actor ──────────────────────────────────────────────────────────
@@ -315,10 +269,6 @@ fn main() {
                 install::uninstall();
                 return;
             }
-            Subcmd::DummyWorkload { interval_ms, label } => {
-                run_dummy_workload(*interval_ms, label);
-                return;
-            }
             Subcmd::Name { .. } | Subcmd::Invite | Subcmd::Join { .. } => {
                 /* handled after config/identity is loaded */
             }
@@ -413,25 +363,6 @@ fn main() {
         args.relay_hosts.clone()
     } else {
         cfg.relay_hosts.unwrap_or_default()
-    };
-
-    // Datastream telemetry options (all inert unless --datastream / --datastream-collector)
-    let datastream_enabled = args.datastream || args.datastream_collector.is_some();
-    let ds_opts = DatastreamOpts {
-        enabled: datastream_enabled,
-        collector: args.datastream_collector.clone(),
-        region: args.datastream_region.clone(),
-        child: datastream_enabled && !args.no_datastream_child,
-        child_label: args.datastream_child_label.clone(),
-        life: std::env::var("SWACTOR_LIFETIME")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0)
-            }),
     };
 
     // Signal handler — second Ctrl+C forces immediate exit
@@ -693,7 +624,6 @@ fn main() {
         relay_port,
         relay_hosts,
         node_hex.clone(),
-        ds_opts,
     );
 
     #[cfg(not(feature = "iroh"))]
@@ -730,14 +660,11 @@ fn run_iroh(
     relay_port: u16,
     relay_hosts: Vec<String>,
     node_hex: String,
-    ds_opts: DatastreamOpts,
 ) {
     use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
     use iroh::{RelayMode, SecretKey};
     use swactor::std::RuntimeNaming;
 
-    // A node that was given no seed to join is the cluster's coordinator/seed.
-    let is_seed = seed_node_id.is_none();
 
     // Evaluate relay candidacy and determine embedded relay bind address
     #[cfg(feature = "relay")]
@@ -882,19 +809,50 @@ fn run_iroh(
     dash.start_http(driver.tokio_handle());
     eprintln!("Dashboard at http://0.0.0.0:{dashboard_port}");
 
-    // Datastream telemetry: create the per-node mux, emit identity, spawn the
-    // dummy child workload, and prepare the UDP shipping socket.
-    let mut ds_rt = if ds_opts.enabled {
-        eprintln!(
-            "Datastream: enabled (collector: {}, region: {}, child: {})",
-            ds_opts.collector.as_deref().unwrap_or("<none>"),
-            ds_opts.region,
-            ds_opts.child,
-        );
-        Some(setup_datastream(&ds_opts, &node_hex, is_seed))
-    } else {
-        None
+    // Per-node telemetry datastream, default-on: build the shared emitter (it
+    // emits the identity frame and owns the mux + samplers) and install its
+    // process-output observer so every process this node spawns is captured into
+    // `proc.<label>.*` automatically. When `SWACTOR_DATASTREAM_COLLECTOR` names
+    // a UDP collector (e.g. `swactor-datastream-collector` or the dashboard's
+    // datastream ingest), frames ship there one-datagram-per-frame; otherwise
+    // the mux drains to a no-op sink — the node's own dashboard already renders
+    // its live runtime directly, and the proc tap stays on either way.
+    let life = std::env::var("SWACTOR_LIFETIME")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let sink: Box<dyn FrameSink> = match std::env::var("SWACTOR_DATASTREAM_COLLECTOR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
+        Some(target) => match target
+            .parse()
+            .map_err(|e| format!("{e}"))
+            .and_then(|addr| UdpFrameSink::new(addr).map_err(|e| format!("{e}")))
+        {
+            Ok(s) => {
+                eprintln!("Datastream: shipping frames to {target}");
+                Box::new(s)
+            }
+            Err(e) => {
+                eprintln!("Datastream: SWACTOR_DATASTREAM_COLLECTOR={target} unusable ({e}); telemetry off");
+                Box::new(NoopSink)
+            }
+        },
+        None => Box::new(NoopSink),
     };
+    let mut emitter = DatastreamEmitter::new(
+        EmitterConfig {
+            node_hex: node_hex.clone(),
+            life,
+            mux_capacity: 4096,
+        },
+        sink,
+    );
+    handle
+        .runtime
+        .set_process_output_observer(emitter.process_observer());
 
     // Main loop
     let mut round: u64 = 0;
@@ -978,60 +936,32 @@ fn run_iroh(
         let mut snap = driver.snapshot();
         snap.node_name = Some(node_name.clone());
 
-        // Datastream emission: periodic samples (~1s), event-driven membership,
-        // then drain and ship every frame to the collector (one per datagram).
-        if let Some(ds) = ds_rt.as_mut() {
-            if round % 10 == 0 {
-                ds.mux.submit(
-                    catalog::HOST_RESOURCE,
-                    source::read_host_resource(&mut ds.cpu).encode(),
-                );
-
-                let rs = handle.runtime.stats();
-                let runtime_rec = DsRuntimeStats {
-                    actors_live: rs.actors.len() as u32,
-                    mailbox_depth: rs.workers.iter().map(|w| w.mailbox_depth as u32).sum(),
-                    scheduled_tasks: rs.workers.iter().map(|w| w.num_actors as u32).sum(),
-                };
-                ds.mux.submit(catalog::RUNTIME_STATS, runtime_rec.encode());
-
-                let transport = TransportInternals {
-                    relay_connected: driver.home_relay_url().is_some(),
-                    direct_peers: snap.members.iter().filter(|m| m.state == "alive").count() as u32,
-                    relay_peers: snap.members.iter().filter(|m| m.relay_url.is_some()).count() as u32,
-                    rtt_ms_p50: 0,
-                };
-                ds.mux.submit(catalog::TRANSPORT_INTERNALS, transport.encode());
-            }
-
-            // Key the membership view by the stable node id, not the friendly
-            // name: a peer's `node_name` resolves only after its metadata
-            // arrives, so keying on it would emit the same peer twice (once by
-            // id before the name is known, once by name after) and double-count
-            // it downstream. The id never changes; the consumer maps it to a
-            // friendly label for display.
+        // Datastream emission: periodic host/runtime/transport samples (~1s),
+        // event-driven membership transitions, drained through the shared
+        // emitter each iteration. Members are keyed by the stable node id (a
+        // peer's friendly name resolves only after its metadata arrives, so
+        // keying on it would double-count the peer downstream).
+        {
+            let rs = handle.runtime.stats();
             let members: Vec<(String, String)> = snap
                 .members
                 .iter()
                 .map(|m| (m.node_id.clone(), m.state.clone()))
                 .collect();
-            for transition in ds.membership.diff(&members) {
-                ds.mux.submit(catalog::MEMBERSHIP, transition.encode());
-            }
-
-            // Drain unconditionally to bound the buffer; ship when we have a
-            // resolved collector address (re-resolve lazily if it was down).
-            let frames = ds.mux.drain();
-            if let Some(sock) = ds.udp.as_ref() {
-                if ds.collector_addr.is_none() && round % 10 == 0 {
-                    ds.collector_addr = ds.collector_spec.as_deref().and_then(resolve_addr);
-                }
-                if let Some(addr) = ds.collector_addr {
-                    for frame in &frames {
-                        let _ = sock.send_to(&encode_delivery(&ds.stream_id, frame), addr);
-                    }
-                }
-            }
+            emitter.tick(
+                TickInput {
+                    members: &members,
+                    runtime: DsRuntimeStats {
+                        actors_live: rs.actors.len() as u32,
+                        mailbox_depth: rs.workers.iter().map(|w| w.mailbox_depth as u32).sum(),
+                        scheduled_tasks: rs.workers.iter().map(|w| w.num_actors as u32).sum(),
+                    },
+                    relay_connected: driver.home_relay_url().is_some(),
+                    relay_peers: snap.members.iter().filter(|m| m.relay_url.is_some()).count()
+                        as u32,
+                },
+                round % 10 == 0,
+            );
         }
 
         // Build rich invite code: <base58>#<addr1>,<addr2>@<relay_url>
@@ -1120,141 +1050,8 @@ fn run_iroh(
         thread::sleep(Duration::from_millis(100));
     }
 
-    // Stop the dummy child workload, if any.
-    if let Some(ds) = ds_rt.as_mut() {
-        if let Some(child) = ds.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-
     // Driver shutdown handles embedded relay cleanup automatically
     driver.shutdown();
-}
-
-// ── Datastream telemetry ───────────────────────────────────────────────────
-
-/// Live state a node carries to emit and ship its telemetry datastream.
-struct DatastreamRuntime {
-    stream_id: StreamId,
-    mux: Arc<Mux>,
-    udp: Option<std::net::UdpSocket>,
-    collector_addr: Option<std::net::SocketAddr>,
-    collector_spec: Option<String>,
-    cpu: CpuSampler,
-    membership: MembershipTracker,
-    child: Option<std::process::Child>,
-}
-
-/// Build the per-node datastream runtime: a mux keyed by this node's stream id,
-/// an immediate identity frame, the outgoing UDP socket, and the dummy child.
-fn setup_datastream(opts: &DatastreamOpts, node_hex: &str, is_seed: bool) -> DatastreamRuntime {
-    let stream_id = StreamId::new(DsNodeId::new(node_hex), Lifetime(opts.life));
-    let mux = Arc::new(Mux::new(stream_id.clone(), 4096));
-
-    // Identity is emitted first so the consumer can attribute the stream.
-    let role = if is_seed { Role::Coordinator } else { Role::Worker };
-    mux.submit(
-        catalog::IDENTITY,
-        source::identity_record(node_hex, role, &opts.region, opts.life).encode(),
-    );
-
-    let udp = if opts.collector.is_some() {
-        match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(s) => Some(s),
-            Err(e) => {
-                eprintln!("Datastream: failed to bind UDP socket: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let collector_addr = opts.collector.as_deref().and_then(resolve_addr);
-
-    let child = if opts.child {
-        spawn_workload_child(&mux, &opts.child_label)
-    } else {
-        None
-    };
-
-    DatastreamRuntime {
-        stream_id,
-        mux,
-        udp,
-        collector_addr,
-        collector_spec: opts.collector.clone(),
-        cpu: CpuSampler::new(),
-        membership: MembershipTracker::new(),
-        child,
-    }
-}
-
-/// Spawn the node binary as its own dummy child workload and pump the child's
-/// stdout/stderr into the mux as `proc.<label>.{stdout,stderr}` text frames.
-fn spawn_workload_child(mux: &Arc<Mux>, label: &str) -> Option<std::process::Child> {
-    use std::io::BufRead;
-    use std::process::{Command, Stdio};
-
-    let exe = std::env::current_exe().ok()?;
-    let mut child = Command::new(exe)
-        .arg("dummy-workload")
-        .arg("--label")
-        .arg(label)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| eprintln!("Datastream: failed to spawn child workload: {e}"))
-        .ok()?;
-
-    if let Some(out) = child.stdout.take() {
-        let mux = Arc::clone(mux);
-        let channel = catalog::process_output(label, ProcStream::Stdout);
-        thread::spawn(move || {
-            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                mux.submit(channel.clone(), line.into_bytes());
-            }
-        });
-    }
-    if let Some(err) = child.stderr.take() {
-        let mux = Arc::clone(mux);
-        let channel = catalog::process_output(label, ProcStream::Stderr);
-        thread::spawn(move || {
-            for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-                mux.submit(channel.clone(), line.into_bytes());
-            }
-        });
-    }
-    Some(child)
-}
-
-/// Resolve a `host:port` collector spec to a single socket address.
-fn resolve_addr(spec: &str) -> Option<std::net::SocketAddr> {
-    use std::net::ToSocketAddrs;
-    spec.to_socket_addrs().ok()?.next()
-}
-
-/// The dummy child workload: print a line to stdout every `interval_ms`, and an
-/// occasional stderr line, until killed. This is the real OS process each node
-/// drives; its output is what flows on the datastream's `proc.*` channels.
-fn run_dummy_workload(interval_ms: u64, label: &str) {
-    use std::io::Write;
-    let interval = Duration::from_millis(interval_ms.max(1));
-    let mut n: u64 = 0;
-    loop {
-        n += 1;
-        {
-            let mut out = std::io::stdout().lock();
-            let _ = writeln!(out, "tick {n} — {label} working");
-            let _ = out.flush();
-        }
-        if n % 5 == 0 {
-            let mut err = std::io::stderr().lock();
-            let _ = writeln!(err, "warn: {label} synthetic backpressure at tick {n}");
-            let _ = err.flush();
-        }
-        thread::sleep(interval);
-    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────

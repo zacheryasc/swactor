@@ -9,31 +9,14 @@ default = []
 # so the client side can name `CaRootsConfig::insecure_skip_verify()` for a
 # custom relay's self-signed QAD cert. iroh already depends on iroh-relay
 # transitively, so this adds no real weight — it only flips the cfg gate.
-iroh = ["dep:iroh", "dep:tokio", "dep:iroh-metrics", "dep:iroh-relay"]
+iroh = ["dep:iroh", "dep:tokio", "dep:iroh-metrics", "dep:iroh-relay", "tokio/time"]
 relay = [
     "iroh",
-    "collector",
     # The standalone relay binary additionally needs the (heavy) server side.
     "iroh-relay/server",
     "tokio/macros",
     "tokio/signal",
-]
-# Standalone HTTP collector binary plus the post-processor for
-# finalized bundles. Pulls axum + the file/tar/flate2 stack; library
-# consumers that do not enable this feature stay free of those deps.
-collector = [
-    "dep:axum",
-    "dep:tokio",
-    "dep:tokio-stream",
-    "tokio/macros",
-    "tokio/net",
-    "tokio/sync",
     "tokio/time",
-    "tokio/fs",
-    "tokio/io-util",
-    "tokio/signal",
-    "dep:tar",
-    "dep:flate2",
 ]
 
 [dependencies]
@@ -53,10 +36,6 @@ iroh = { version = "0.98", optional = true }
 iroh-relay = { version = "0.98", features = ["test-utils"], optional = true }
 iroh-metrics = { version = "0.38", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
-axum = { version = "0.8", optional = true }
-tokio-stream = { version = "0.1", features = ["sync"], optional = true }
-tar = { version = "0.4", optional = true }
-flate2 = { version = "1", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
@@ -65,16 +44,6 @@ libc = "0.2"
 serde_json = "1"
 iroh-relay = { version = "0.98", features = ["server", "test-utils"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
-
-[[bin]]
-name = "swactor-diag-collector"
-path = "src/bin/swactor-diag-collector.rs"
-required-features = ["collector"]
-
-[[bin]]
-name = "swactor-diag-postproc"
-path = "src/bin/swactor-diag-postproc.rs"
-required-features = ["collector"]
 
 [[bin]]
 name = "swactor-iroh-relay"

@@ -1,17 +1,19 @@
 # Datastream demo cluster.
 #
 # A relay, a UDP collector, a seed swactor node, and two workers — every node
-# drives a dummy child process and ships its telemetry datastream to the
+# (the relay included) ships its telemetry datastream as UDP frames to the
 # collector, whose stdout is the live, frame-by-frame raw stream.
 #
 # Run it (from the repo root), foreground so the collector's stream is visible:
 #
-#   cargo build --release -p node -p distribution \
-#       --bin swactor --bin swactor-datastream-collector --bin swactor-iroh-relay
 #   docker compose -f tests/docker/docker-compose.datastream.yml build
 #   docker compose -f tests/docker/docker-compose.datastream.yml up
 #
 # Watch the `collector-1 | ...` lines. Ctrl-C then `down` to clean up.
+#
+# The datastream emitter is default-on in every node; pointing
+# SWACTOR_DATASTREAM_COLLECTOR at the collector's UDP address swaps the
+# node's no-op sink for the UDP frame sink (one delivery per datagram).
 #
 # Nodes converge over the standalone relay (10.0.3.2): each node runs with the
 # embedded relay off (--no-relay) and points --relay-hosts at the relay so iroh
@@ -36,9 +38,13 @@ services:
     <<: *node-build
     entrypoint: ["swactor-iroh-relay"]
     command: ["--bind", "0.0.0.0:7843", "--public-host", "10.0.3.2"]
+    environment:
+      SWACTOR_DATASTREAM_COLLECTOR: "10.0.3.5:7700"
     networks:
       datastream:
         ipv4_address: 10.0.3.2
+    depends_on:
+      - collector
 
   seed:
     <<: *node-build
@@ -48,10 +54,9 @@ services:
       - "--no-relay"
       - "--relay-port=7843"
       - "--relay-hosts=10.0.3.2"
-      - "--datastream"
-      - "--datastream-collector=collector:7700"
-      - "--datastream-region=seed"
       - "--actors=2"
+    environment:
+      SWACTOR_DATASTREAM_COLLECTOR: "10.0.3.5:7700"
     networks:
       datastream:
         ipv4_address: 10.0.3.10
@@ -69,10 +74,9 @@ services:
       - "--no-relay"
       - "--relay-port=7843"
       - "--relay-hosts=10.0.3.2"
-      - "--datastream"
-      - "--datastream-collector=collector:7700"
-      - "--datastream-region=worker"
       - "--actors=3"
+    environment:
+      SWACTOR_DATASTREAM_COLLECTOR: "10.0.3.5:7700"
     networks:
       datastream:
         ipv4_address: 10.0.3.11
@@ -91,10 +95,9 @@ services:
       - "--no-relay"
       - "--relay-port=7843"
       - "--relay-hosts=10.0.3.2"
-      - "--datastream"
-      - "--datastream-collector=collector:7700"
-      - "--datastream-region=worker"
       - "--actors=2"
+    environment:
+      SWACTOR_DATASTREAM_COLLECTOR: "10.0.3.5:7700"
     networks:
       datastream:
         ipv4_address: 10.0.3.12

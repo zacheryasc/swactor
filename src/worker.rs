@@ -404,6 +404,12 @@ impl ContextInner for WorkerContext<'_> {
         self.tc.extension
     }
 
+    fn process_output_observer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::process_observer::ProcessOutputObserver>> {
+        self.tc.process_output_observer.cloned()
+    }
+
     fn system_info(&self) -> SystemInfo {
         let num_workers = self.tc.config.num_threads.max(1);
         let total_actors: usize = self.tc.worker_stats.iter()

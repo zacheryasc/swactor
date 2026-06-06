@@ -26,4 +26,4 @@
 
 ## Family closes when
 
-Every scenario produces a parseable bundle whose `summary.md` renders cleanly through `swactor-diag-postproc`. The central scenario's test driver verifies the bundle-shape contracts named above.
+Every scenario produces a parseable bundle. The central scenario's test driver verifies the bundle-shape contracts named above.

@@ -11,14 +11,12 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use super::catalog::{IdentityRecord, MembershipTransition, ResourceSample, Role};
+use super::catalog::{IdentityRecord, MembershipTransition, ResourceSample};
 
 /// Build the identity record a node emits first on its stream (spec §6.1).
-pub fn identity_record(node: &str, role: Role, region: &str, life: u64) -> IdentityRecord {
+pub fn identity_record(node: &str, life: u64) -> IdentityRecord {
     IdentityRecord {
         node: node.to_string(),
-        role,
-        region: region.to_string(),
         life,
     }
 }
@@ -35,9 +33,9 @@ impl CpuSampler {
         Self::default()
     }
 
-    /// CPU busy percent since the previous call, in `[0, 100*ncpu]` clamped to
-    /// `[0, 100]`. Returns 0 on the first call (no baseline yet) and on any
-    /// platform where `/proc/stat` is unavailable.
+    /// Host-average CPU busy percent since the previous call, in `[0, 100]`.
+    /// Returns 0 on the first call (no baseline yet) and on any platform
+    /// where `/proc/stat` is unavailable.
     pub fn sample(&mut self) -> f32 {
         let now = Instant::now();
         let busy = match read_proc_stat_busy_jiffies() {
@@ -50,11 +48,13 @@ impl CpuSampler {
                 if elapsed <= 0.0 {
                     0.0
                 } else {
-                    // Jiffies are USER_HZ (typically 100/s) per CPU. Normalize by
-                    // wall time and the tick rate to get a busy fraction.
+                    // Jiffies are USER_HZ (typically 100/s) per CPU, and the
+                    // aggregate `cpu` line sums every CPU — normalize by wall
+                    // time, the tick rate, AND the CPU count, or any host
+                    // with one busy core reads as a flat 100%.
                     let delta = busy.saturating_sub(prev_busy) as f64;
                     let hz = clock_ticks_per_sec();
-                    let frac = delta / (hz * elapsed);
+                    let frac = delta / (hz * elapsed * num_cpus().max(1) as f64);
                     (frac * 100.0).clamp(0.0, 100.0) as f32
                 }
             }
@@ -137,6 +137,31 @@ fn clock_ticks_per_sec() -> f64 {
         }
     }
     100.0
+}
+
+/// CPU count for normalizing the aggregate busy-jiffies line. Counted from
+/// the per-CPU `cpuN` lines of `/proc/stat` itself — the exact set the
+/// aggregate line sums — NOT `available_parallelism()`, which reflects
+/// cgroup quotas inside a container while `/proc/stat` still reports the
+/// whole host. Falls back to `available_parallelism()` off-Linux.
+fn num_cpus() -> u64 {
+    let from_proc = std::fs::read_to_string("/proc/stat")
+        .map(|text| {
+            text.lines()
+                .filter(|l| {
+                    l.strip_prefix("cpu")
+                        .and_then(|r| r.chars().next())
+                        .is_some_and(|c| c.is_ascii_digit())
+                })
+                .count() as u64
+        })
+        .unwrap_or(0);
+    if from_proc > 0 {
+        return from_proc;
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get() as u64)
+        .unwrap_or(1)
 }
 
 /// Total non-idle jiffies from the aggregate `cpu` line of `/proc/stat`.

@@ -193,8 +193,9 @@ function onFleetModel(m){
 }
 
 // ── Data source ──────────────────────────────────────────────────────────────
-// The orchestrator's RemoteVastaiPlugin re-serves the collector's folded fleet
-// model. Seed from the one-shot API, then stream live updates over SSE (`vastai`).
+// The orchestrator's fleet plugin serves the FleetLifecycle model folded from
+// datastream frames. Seed from the one-shot API, then stream live updates over
+// SSE (`vastai`).
 fetch('/api/plugin/vastai/model').then(r=>r.json()).then(function(m){ if(m) onFleetModel(m); }).catch(function(){});
 
 var es=new EventSource('/events');

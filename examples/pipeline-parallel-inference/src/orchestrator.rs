@@ -10,10 +10,7 @@
 //! * [`await_convergence`] polls a closure that reports the current alive
 //!   peer count and returns when the target is met (or times out).
 //! * [`resolve_roster`] polls SWIM until every `pp-stage-K` resolves, then
-//!   returns the per-stage (node_id_hex, node_id_short) roster used by the
-//!   `pp_stage_roster` diagnostic event (spec §4.5).
-//! * [`stage_roster_event_fields`] builds the JSON fields for a
-//!   `pp_stage_roster` event from a resolved roster.
+//!   returns the per-stage (node_id_hex, node_id_short) roster.
 //!
 //! Tests inject a fake command builder (e.g. `sh -c "echo PP_GPU_NODE_ADDR
 //! <hex> <direct>; sleep 60"`) so the chain can be exercised end-to-end
@@ -22,8 +19,16 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// A per-stage bootstrap-output observer: every line a launched child writes to
+/// stdout (the `docker run` / boot logs, before the node joins and ships live
+/// telemetry) is handed here, tagged with its stage index. The `FleetLifecycle`
+/// uses this to populate a launching node's `proc.bootstrap.*` before it has a
+/// swactor identity. `(stage, line)` — `line` excludes the trailing newline.
+pub type BootstrapObserver = Arc<dyn Fn(u32, &str) + Send + Sync>;
 
 /// Address announcement parsed from a stage child's stdout.
 #[derive(Debug, Clone)]
@@ -210,6 +215,22 @@ impl std::error::Error for SpawnChainError {}
 pub fn spawn_chain<F>(
     num_stages: u32,
     addr_timeout: Duration,
+    build_cmd: F,
+) -> Result<ChainGuard, SpawnChainError>
+where
+    F: FnMut(StageSpawnCtx) -> Command,
+{
+    spawn_chain_observed(num_stages, addr_timeout, None, build_cmd)
+}
+
+/// Like [`spawn_chain`], but every line a stage child writes to stdout is also
+/// handed to `on_line` (if any) tagged with its stage index — the bootstrap-log
+/// tee the orchestrator's `FleetLifecycle` uses to show a node *loading* before
+/// it joins. Behaviour is otherwise identical to [`spawn_chain`].
+pub fn spawn_chain_observed<F>(
+    num_stages: u32,
+    addr_timeout: Duration,
+    on_line: Option<BootstrapObserver>,
     mut build_cmd: F,
 ) -> Result<ChainGuard, SpawnChainError>
 where
@@ -241,7 +262,7 @@ where
             .take()
             .expect("stdout forced to piped before spawn");
 
-        let addr = match read_stage_address(stdout, stage, addr_timeout) {
+        let addr = match read_stage_address(stdout, stage, addr_timeout, on_line.clone()) {
             Ok(a) => a,
             Err(()) => {
                 guard.push(SpawnedStage {
@@ -277,6 +298,7 @@ fn read_stage_address(
     stdout: ChildStdout,
     stage: u32,
     timeout: Duration,
+    on_line: Option<BootstrapObserver>,
 ) -> Result<StageAddr, ()> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
@@ -289,6 +311,11 @@ fn read_stage_address(
                 Ok(0) => break,
                 Ok(_) => {
                     print!("{line}");
+                    // Tee the boot output into the fleet lifecycle (bootstrap
+                    // logs) before — and after — the node announces/joins.
+                    if let Some(obs) = &on_line {
+                        obs(stage, line.trim_end_matches('\n'));
+                    }
                     if !announced {
                         if let Some(rest) = line.trim().strip_prefix("PP_GPU_NODE_ADDR ") {
                             if let Some((hex, direct)) = rest.split_once(' ') {
@@ -385,8 +412,8 @@ where
 /// One entry in the resolved stage roster: stage_index → node id.
 ///
 /// Built by [`resolve_roster`] once every per-stage SWIM name resolves.
-/// The orchestrator emits these as the `stages` field of the
-/// `pp_stage_roster` event (spec §4.5).
+/// The orchestrator uses these to watch the forward path's membership
+/// while awaiting a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageRosterEntry {
     pub stage_index: u32,
@@ -483,28 +510,4 @@ where
         }
         std::thread::sleep(poll_interval);
     }
-}
-
-/// Build the `fields` JSON for a `pp_stage_roster` diagnostic event from
-/// a resolved roster, attaching the given `drive_seq`. Spec §4.5: the
-/// event MUST list every stage, ordered by `stage_index`, with each
-/// entry carrying `stage_index`, `node_id_hex`, and `node_id_short`.
-pub fn stage_roster_event_fields(
-    drive_seq: u32,
-    roster: &[StageRosterEntry],
-) -> serde_json::Value {
-    let stages: Vec<serde_json::Value> = roster
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "stage_index": e.stage_index,
-                "node_id_hex": e.node_id_hex,
-                "node_id_short": e.node_id_short,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "drive_seq": drive_seq,
-        "stages": stages,
-    })
 }
