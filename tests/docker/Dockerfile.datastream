@@ -12,9 +12,11 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release -p node -p distribution \
-    --bin swactor --bin swactor-datastream-collector --bin swactor-iroh-relay \
-    && cargo build --release -p dashboard --features datastream \
+RUN cargo build --release -p node \
+    --bin swactor --bin swactor-datastream-collector \
+    && cargo build --release -p distribution --features relay \
+    --bin swactor-iroh-relay \
+    && cargo build --release -p dashboard \
     --bin swactor-datastream-dashboard
 
 FROM debian:bookworm-slim

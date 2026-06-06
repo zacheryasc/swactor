@@ -414,7 +414,6 @@ async fn lease_chain_finds_n_distinct_offers() {
         Duration::from_millis(10),
         3,
         None,
-        None,
     )
     .await
     .expect("lease_chain must succeed when N distinct offers exist");
@@ -459,7 +458,6 @@ async fn lease_chain_creates_n_instances_with_distinct_stage_env() {
         None,
         Duration::from_millis(10),
         3,
-        None,
         None,
     )
     .await
@@ -549,7 +547,6 @@ async fn lease_chain_rolls_back_on_partial_creation() {
         Duration::from_millis(10),
         3,
         None,
-        None,
     )
     .await;
 
@@ -578,7 +575,6 @@ async fn lease_chain_waits_for_running_per_contract() {
         None,
         Duration::from_millis(10),
         3,
-        None,
         None,
     )
     .await
@@ -667,7 +663,6 @@ async fn lease_chain_replaces_a_stage_that_stops_before_running() {
         None,
         Duration::from_millis(10),
         3,
-        None,
         None,
     )
     .await

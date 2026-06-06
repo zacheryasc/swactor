@@ -154,6 +154,69 @@ fn echo_hello_full_lifecycle() {
     );
 }
 
+/// The per-node process-output observer is the mechanism a telemetry node uses
+/// to tap *every* managed process with no per-spawn wiring: it installs one
+/// observer on its runtime, and any process spawned through the facility hands
+/// its output there, labeled by command basename. This is the contract a node's
+/// `proc.<label>.*` capture relies on, so it must hold for a real spawn driven
+/// only through the public Runtime + `spawn_local_process` API.
+#[test]
+fn runtime_observer_taps_managed_process_output_by_basename() {
+    use std::sync::{Arc, Mutex};
+    use swactor::process_observer::ProcessOutputObserver;
+
+    #[derive(Default)]
+    struct Recorder {
+        // (label, is_stderr, text) for each chunk observed.
+        seen: Mutex<Vec<(String, bool, String)>>,
+    }
+    impl ProcessOutputObserver for Recorder {
+        fn on_output(&self, label: &str, is_stderr: bool, data: &[u8]) {
+            self.seen.lock().unwrap().push((
+                label.to_string(),
+                is_stderr,
+                String::from_utf8_lossy(data).into_owned(),
+            ));
+        }
+    }
+
+    let rt = Runtime::new(RuntimeConfig::default());
+    let recorder = Arc::new(Recorder::default());
+    // Install the observer before the first managed process is spawned.
+    rt.set_process_output_observer(recorder.clone());
+
+    let sender = rt.create_sender();
+    let notif_inbox = rt.new_inbox::<ProcessNotification>().unwrap();
+    let spawner_addr = rt.spawn(E2eSpawnerActor).unwrap();
+    let reply_inbox = rt.new_inbox::<E2eSpawned>().unwrap();
+    rt.tick();
+
+    // A path command so the basename (`echo`) is what labels the output, not the
+    // full path — the node keys `proc.<label>.*` on the basename.
+    rt.send_to(
+        spawner_addr,
+        E2eSpawnRequest {
+            spec: automated_spec("/bin/echo", &["telemetry-line"]),
+            subscriber: *notif_inbox.addr(),
+            reply_to: *reply_inbox.addr(),
+            sender: sender.clone(),
+        },
+    )
+    .unwrap();
+
+    // Drive until the process has produced output (also drains the inbox).
+    let _ = tick_collect(&rt, &notif_inbox, 3, 200);
+
+    let seen = recorder.seen.lock().unwrap().clone();
+    let captured = seen
+        .iter()
+        .any(|(label, is_stderr, text)| label == "echo" && !*is_stderr && text.contains("telemetry-line"));
+    assert!(
+        captured,
+        "observer should capture stdout of the managed process under its command basename, got: {seen:?}"
+    );
+}
+
 #[test]
 fn bad_command_reports_error_e2e() {
     let rt = Runtime::new(RuntimeConfig::default());

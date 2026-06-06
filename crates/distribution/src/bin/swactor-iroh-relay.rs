@@ -6,48 +6,38 @@
 //! it by setting `SWACTOR_IROH_RELAY_URL=http://<host>:<port>/` and we then
 //! select `RelayMode::Custom(url)` instead of the canary default.
 //!
-//! Defaults to plain HTTP on `0.0.0.0:7843`. No TLS — meant for diagnostic
-//! / experimental deployments behind a firewall the operator controls.
+//! Defaults to plain HTTP on `0.0.0.0:7843`. No TLS — meant for
+//! experimental deployments behind a firewall the operator controls.
 //!
-//! ## Observability (spec §1, gap 1)
+//! ## Telemetry
 //!
-//! When `SWACTOR_DIAG_COLLECTOR_URL` is set this binary boots its own
-//! diagnostics aggregator with `Role::custom("relay")` and installs a
-//! [`distribution::diagnostics::RelayObservability`] helper on it. The
-//! aggregator reports into the same collector / bundle as the cluster's
-//! nodes, so the post-processor's `## Relay sessions` section can
-//! correlate relay-reported close reasons against node-side
-//! `connection_cache[peer].last_failure_reason`. Per-session lifecycle
-//! events are emitted via [`RelayObservability::note_session_opened`]
-//! / `note_session_closed` — wired today as a skeleton (iroh-relay's
-//! native server does not expose session hooks); when the upstream
-//! relay grows them, the call sites slot in here and the bundle
-//! starts answering "who closed and why" automatically.
+//! When a datastream collector address is configured (`--collector` or
+//! `SWACTOR_DATASTREAM_COLLECTOR`), the relay runs the same
+//! [`DatastreamEmitter`] every node runs and ships its frames as UDP
+//! datagrams via [`UdpFrameSink`] — one identity frame at boot, then live
+//! host-resource samples each second. That is enough for the fleet view to
+//! show the relay VPS alongside the worker nodes. Session-level telemetry
+//! (opens/closes, bytes) waits on iroh-relay exposing session hooks; when it
+//! grows them, the counts slot into [`TickInput`] here.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::time::Duration;
 
-use distribution::diagnostics::aggregator::{spawn_periodic_snapshots, PeriodicConfig};
-use distribution::diagnostics::{
-    wall_ms_now, Aggregator, HttpSink, Identity, RelayObservability, RelayServerIntrospector,
-    Role, SinkConfig, SnapshotSignal, GIT_SHA, IROH_VERSION,
+use distribution::datastream::catalog::RuntimeStats;
+use distribution::datastream::emit::{
+    DatastreamEmitter, EmitterConfig, FrameSink, NoopSink, TickInput, UdpFrameSink,
 };
-use distribution::diagnostics::sink::{DynEmitter, EventEmitter};
 use distribution::types::NodeId;
 
 const DEFAULT_BIND: &str = "0.0.0.0:7843";
-const ENV_COLLECTOR_URL: &str = "SWACTOR_DIAG_COLLECTOR_URL";
-const ENV_RUN_ID: &str = "SWACTOR_DIAG_RUN_ID";
-const ENV_SPOOL_DIR: &str = "SWACTOR_DIAG_SPOOL_DIR";
-const ENV_RELAY_LABEL: &str = "SWACTOR_DIAG_RELAY_LABEL";
-const DEFAULT_RUN_ID: &str = "pp-run";
-const DEFAULT_SPOOL_DIR: &str = "/tmp/swactor-diag-relay";
+const ENV_COLLECTOR: &str = "SWACTOR_DATASTREAM_COLLECTOR";
+const ENV_LIFETIME: &str = "SWACTOR_LIFETIME";
 
 fn print_help() {
     eprintln!(
         "Usage:\n  \
-         swactor-iroh-relay [--bind ADDR] [--public-host HOST]\n\n\
+         swactor-iroh-relay [--bind ADDR] [--public-host HOST] [--collector ADDR]\n\n\
          Options:\n  \
          --bind ADDR          HTTP bind address (default {DEFAULT_BIND})\n  \
                               or via SWACTOR_IROH_RELAY_BIND\n  \
@@ -55,14 +45,18 @@ fn print_help() {
                               Defaults to the bind IP — set this to the\n  \
                               VPS's public IP when --bind uses 0.0.0.0.\n  \
                               or via SWACTOR_IROH_RELAY_PUBLIC_HOST\n  \
+         --collector ADDR     UDP address of a datastream collector to ship\n  \
+                              this relay's telemetry frames to.\n  \
+                              or via {ENV_COLLECTOR}\n  \
          -h, --help           Show this help"
     );
 }
 
-fn parse_args() -> Result<(SocketAddr, Option<String>), String> {
+fn parse_args() -> Result<(SocketAddr, Option<String>, Option<SocketAddr>), String> {
     let mut bind: Option<String> = std::env::var("SWACTOR_IROH_RELAY_BIND").ok();
     let mut public_host: Option<String> =
         std::env::var("SWACTOR_IROH_RELAY_PUBLIC_HOST").ok();
+    let mut collector: Option<String> = env_string(ENV_COLLECTOR);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -71,6 +65,9 @@ fn parse_args() -> Result<(SocketAddr, Option<String>), String> {
             }
             "--public-host" => {
                 public_host = Some(args.next().ok_or("--public-host needs HOST")?);
+            }
+            "--collector" => {
+                collector = Some(args.next().ok_or("--collector needs ADDR")?);
             }
             "-h" | "--help" => {
                 print_help();
@@ -83,12 +80,19 @@ fn parse_args() -> Result<(SocketAddr, Option<String>), String> {
     let bind: SocketAddr = bind_str
         .parse()
         .map_err(|e| format!("invalid bind addr {bind_str:?}: {e}"))?;
-    Ok((bind, public_host))
+    let collector: Option<SocketAddr> = match collector {
+        Some(s) => Some(
+            s.parse()
+                .map_err(|e| format!("invalid collector addr {s:?}: {e}"))?,
+        ),
+        None => None,
+    };
+    Ok((bind, public_host, collector))
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    let (bind, public_host) = match parse_args() {
+    let (bind, public_host, collector) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("swactor-iroh-relay: {e}");
@@ -100,8 +104,8 @@ async fn main() -> ExitCode {
     // QUIC Address Discovery (QAD): lets clients learn their own public
     // address so iroh can hole-punch direct paths instead of pinning every
     // connection to this relay. QAD runs over QUIC, which mandates TLS; the
-    // cert is self-signed because this is an operator-controlled diagnostic
-    // relay behind a firewall, and clients are configured to trust a custom
+    // cert is self-signed because this is an operator-controlled relay
+    // behind a firewall, and clients are configured to trust a custom
     // relay's cert (see `iroh_driver`'s `ca_roots_config` for
     // `RelayMode::Custom`). With `quic: None` the relay can only forward bytes
     // and the cluster never escapes relay-only operation — which is what
@@ -155,101 +159,75 @@ async fn main() -> ExitCode {
         iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT,
     );
 
-    // Spec §1: when a collector is configured, this relay reports
-    // into the same bundle as the cluster nodes under its own
-    // identity. Holding `_diag` keeps the aggregator + spawned tasks
-    // alive for the lifetime of the binary; dropping it at shutdown
-    // flushes the sink.
-    let _diag = install_relay_diagnostics(&url);
+    // Datastream telemetry: the same per-node emitter every node runs,
+    // shipping over UDP when a collector is configured and draining into
+    // a no-op otherwise (so the mux stays bounded either way).
+    let mut emitter = build_emitter(&url, collector);
 
-    if let Err(e) = tokio::signal::ctrl_c().await {
-        eprintln!("swactor-iroh-relay: signal listen failed: {e}");
-        return ExitCode::from(1);
+    let mut ticker = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        tokio::select! {
+            res = tokio::signal::ctrl_c() => {
+                if let Err(e) = res {
+                    eprintln!("swactor-iroh-relay: signal listen failed: {e}");
+                    return ExitCode::from(1);
+                }
+                break;
+            }
+            _ = ticker.tick() => {
+                emitter.tick(
+                    TickInput {
+                        // The relay is not a SWIM member and iroh-relay's
+                        // native server exposes no session hooks yet, so
+                        // membership and peer counts are honestly empty.
+                        members: &[],
+                        runtime: RuntimeStats::default(),
+                        relay_connected: true,
+                        relay_peers: 0,
+                    },
+                    true,
+                );
+            }
+        }
     }
     eprintln!("swactor-iroh-relay: shutdown signal received");
     ExitCode::SUCCESS
 }
 
-/// Holder for the relay's diagnostics state. `RelayObservability` is
-/// exposed so a future call site that hooks iroh-relay's session
-/// lifecycle can record opens/closes through it.
-struct RelayDiag {
-    _agg: Arc<Aggregator<HttpSink>>,
-    _observability: Arc<RelayObservability>,
-}
-
-fn install_relay_diagnostics(advertised_url: &str) -> Option<RelayDiag> {
-    let collector_url = std::env::var(ENV_COLLECTOR_URL).ok()?;
-    let collector_url = collector_url.trim().to_string();
-    if collector_url.is_empty() {
-        return None;
-    }
-    let run_id = env_string(ENV_RUN_ID).unwrap_or_else(|| DEFAULT_RUN_ID.to_string());
-    let spool_dir = std::path::PathBuf::from(
-        env_string(ENV_SPOOL_DIR).unwrap_or_else(|| DEFAULT_SPOOL_DIR.to_string()),
-    );
-
-    // The relay has no `iroh::Endpoint` and therefore no `NodeId`. We
-    // synthesize a deterministic-per-process id from the advertised
-    // URL so the bundle's manifest keeps a stable handle on this
-    // relay across reboots within a run.
+/// Build the relay's datastream emitter. Identity is synthesized from the
+/// advertised URL (stable across restarts); the lifetime discriminator comes
+/// from `SWACTOR_LIFETIME` like the generic node.
+fn build_emitter(advertised_url: &str, collector: Option<SocketAddr>) -> DatastreamEmitter {
     let node_id = synthesize_node_id(advertised_url);
-    let node_id_hex: String = node_id.0.iter().map(|b| format!("{:02x}", b)).collect();
+    let node_hex: String = node_id.0.iter().map(|b| format!("{:02x}", b)).collect();
+    let life = env_string(ENV_LIFETIME)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
 
-    let mut identity = Identity::new(node_id, Role::custom("relay"), run_id.clone())
-        .with_process_start(wall_ms_now());
-    identity = identity.with_host_context(
-        distribution::diagnostics::HostContext::from_env()
-            .with_iroh_version(IROH_VERSION)
-            .with_git_sha(GIT_SHA.map(|s| s.to_string()))
-            .with_binary_version(option_env!("CARGO_PKG_VERSION").map(|s| s.to_string()))
-            .with_home_relay_url(Some(advertised_url.to_string())),
-    );
-    if let Some(label) = env_string(ENV_RELAY_LABEL) {
-        // Caller can override the friendly hostname carried in the
-        // host context so the bundle reader recognises the relay by
-        // its operational name rather than just its synthetic node id.
-        identity.hostname = Some(label);
-    }
-
-    let signal = SnapshotSignal::new();
-    let sink_config = SinkConfig::new(
-        collector_url.clone(),
-        run_id.clone(),
-        node_id_hex,
-        spool_dir,
-    )
-    .with_snapshot_signal(signal.clone());
-    let sink = match HttpSink::new(sink_config) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!(
-                "swactor-iroh-relay: HttpSink::new failed ({e}); continuing without diagnostics"
-            );
-            return None;
-        }
+    let sink: Box<dyn FrameSink> = match collector {
+        Some(target) => match UdpFrameSink::new(target) {
+            Ok(s) => {
+                eprintln!("swactor-iroh-relay: shipping datastream frames to {target}");
+                Box::new(s)
+            }
+            Err(e) => {
+                eprintln!(
+                    "swactor-iroh-relay: UdpFrameSink bind failed ({e}); telemetry off"
+                );
+                Box::new(NoopSink)
+            }
+        },
+        None => Box::new(NoopSink),
     };
-    let aggregator = Arc::new(Aggregator::new(identity, sink));
 
-    let observability = Arc::new(RelayObservability::new());
-    let emitter: DynEmitter = aggregator.clone() as Arc<dyn EventEmitter + Send + Sync + 'static>;
-    observability.set_emitter(emitter);
-    aggregator.set_relay_server_introspector(
-        observability.clone() as Arc<dyn RelayServerIntrospector>,
-    );
-
-    // Periodic snapshots: same cadence as nodes so the bundle reader
-    // can line snapshots up by wall_ms.
-    let _ = spawn_periodic_snapshots(aggregator.clone(), PeriodicConfig::default(), signal);
-
-    eprintln!(
-        "swactor-iroh-relay: diagnostics installed (collector={collector_url} run_id={run_id} \
-         role=relay url={advertised_url})"
-    );
-    Some(RelayDiag {
-        _agg: aggregator,
-        _observability: observability,
-    })
+    DatastreamEmitter::new(
+        EmitterConfig {
+            node_hex,
+            life,
+            mux_capacity: 4096,
+        },
+        sink,
+    )
 }
 
 fn env_string(var: &str) -> Option<String> {

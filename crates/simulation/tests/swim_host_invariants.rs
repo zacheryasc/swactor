@@ -5,8 +5,10 @@
 //!
 //! - Trait conformance: kind_tag is the production tag string,
 //!   non-empty and unique.
-//! - SWIM snapshot parity: `snapshot()` is the production tier-2
-//!   `Tier2SwimState` shape under JSON serialisation.
+//! - SWIM snapshot parity: `snapshot()` carries the evaluator schema
+//!   (`members`, `self_incarnation`) built from the production node's
+//!   public membership state — the same state the datastream emitter
+//!   polls in production.
 //! - SWIM unknown-output is loud: an unrecognised inbound payload
 //!   panics (no silent fallback).
 //! - SWIM emits no novel kinds: every event the host records has a
@@ -61,15 +63,15 @@ fn host_id_round_trips_through_the_id_accessor() {
 #[test]
 fn snapshot_bytes_carry_no_host_wall_clock_values_per_7_1() {
     // §7.1 forbids reading the host wall clock anywhere in the
-    // simulator's bundle path. The production `SwimIntrospect`
-    // stamps `wall_ms_now()` values into `Tier2SwimState`'s
-    // `scraped_at_ms` / `last_*_at_ms` / `recent_messages[*].at_ms`
-    // fields. The adapter scrubs all of those before serialising.
+    // simulator's bundle path. The snapshot is built from the SWIM
+    // node's public membership state, which carries no timestamps at
+    // all — so this holds by construction; the recursive scan below
+    // keeps it pinned if the snapshot ever grows time-typed fields.
     //
-    // We assert no surviving `at_ms` value plausibly originates from
-    // the host wall clock: an unscrubbed `wall_ms_now()` is on the
-    // order of 1.7e12 ms (year 2024+). Virtual time stays bounded
-    // by the engine's tick range — for an un-driven host, zero.
+    // We assert no `at_ms` value plausibly originates from the host
+    // wall clock: a wall-clock read is on the order of 1.7e12 ms
+    // (year 2024+). Virtual time stays bounded by the engine's tick
+    // range — for an un-driven host, zero.
     let host = make_host("a", &["a", "b", "c"]);
     let bytes = host.snapshot();
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -105,30 +107,40 @@ fn snapshot_bytes_carry_no_host_wall_clock_values_per_7_1() {
 }
 
 #[test]
-fn snapshot_bytes_carry_the_production_tier2_swim_state_shape() {
-    // §6.4 "SWIM snapshot parity with production." We don't peek at
-    // private production state; instead we deserialise the snapshot
-    // bytes back into a `Tier2SwimState` and assert non-default
-    // fields match the host's configured values.
-    use distribution::diagnostics::snapshot::Tier2SwimState;
+fn snapshot_bytes_carry_the_public_membership_state() {
+    // §6.4 "SWIM snapshot parity with production." The snapshot is
+    // built from the production node's *public* membership state —
+    // the same surface the datastream emitter polls each tick to
+    // derive its `MembershipTransition` records — so we assert the
+    // bootstrap roster shows up exactly as configured.
+    use simulation::swim_host::node_id_for;
 
     let host = make_host("a", &["a", "b", "c"]);
     let bytes = host.snapshot();
     let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("snapshot is JSON");
-    // We embed the full tier-2 state under "tier2" so the
-    // evaluator's MVP-shape projection coexists with the production
-    // shape.
-    let tier2_blob = parsed
-        .get("tier2")
-        .expect("snapshot must include the production tier-2 blob");
-    let tier2: Tier2SwimState =
-        serde_json::from_value(tier2_blob.clone()).expect("tier2 deserialises");
-    assert_eq!(tier2.config.probe_interval_ticks, 2);
-    assert_eq!(tier2.config.suspicion_timeout_ticks, 6);
-    assert_eq!(tier2.config.indirect_probes_k, 2);
-    // MVP-shape fields the §10 evaluator needs are also present.
-    assert!(parsed["members"].is_object());
+
+    // MVP-shape fields the §10 evaluator needs.
+    let members = parsed["members"]
+        .as_object()
+        .expect("snapshot carries a members object");
     assert!(parsed["self_incarnation"].is_u64());
+    assert_eq!(parsed["self_id"].as_str(), Some("a"));
+
+    // The constructor bootstraps every *other* declared peer as Alive
+    // at incarnation 0; keys are the peers' node-id hex.
+    assert_eq!(members.len(), 2, "two bootstrap peers expected: {members:?}");
+    for peer in ["b", "c"] {
+        let hex: String = node_id_for(peer)
+            .0
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let entry = members
+            .get(&hex)
+            .unwrap_or_else(|| panic!("peer {peer} ({hex}) missing from members"));
+        assert_eq!(entry["state"].as_str(), Some("Alive"));
+        assert_eq!(entry["incarnation"].as_u64(), Some(0));
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -176,12 +188,10 @@ fn every_recorded_event_has_a_known_kind_discriminator() {
         "swim_probe_sent",
         "swim_probe_acked",
         "swim_probe_timed_out",
-        // Any production `DiagEvent` variant we don't have an MVP
-        // schema for surfaces under `diag_event` carrying the
-        // production `type` tag verbatim. The mapping function is
-        // exhaustive on the production enum, so a new variant is a
-        // compile-time failure rather than a silent allow-list drift.
-        "diag_event",
+        // The mapping function (`observation_payload`) is exhaustive
+        // on the production `SwimObservation` enum, so a new variant
+        // is a compile-time failure rather than a silent allow-list
+        // drift — there is no generic fallthrough kind.
     ];
     for ev in &record_events {
         let kind = ev["kind"].as_str().unwrap_or("(missing)");

@@ -7,10 +7,9 @@
 //! envelopes into a swactor `Runtime` via its codec registry.
 
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
 
-use distribution::diagnostics::event::Event;
-use distribution::diagnostics::sink::DynEmitter;
 use distribution::iroh_driver::IrohDriver;
 use distribution::types::NodeId;
 use swactor::actor::ActorAddress;
@@ -18,11 +17,12 @@ use swactor::runtime::Runtime;
 use swactor::transport::{CodecRegistry, Transport, WireEnvelope};
 use swactor::Error;
 
-/// Saturating cast of a payload length to the `u32` carried by the byte-metric
-/// events. Payloads here can exceed the SWIM-control sizes the existing
-/// `IrohDriver` events cap at, so we clamp rather than wrap — an
-/// over-`u32::MAX` activation reports as `u32::MAX` bytes instead of a tiny
-/// wrapped value. Downstream postproc accumulates these as `u64`.
+use crate::dist_plugin::{hex32, MsgCounts};
+
+/// Saturating cast of a payload length to the `u32` carried by the byte
+/// metrics. Payloads here can exceed SWIM-control sizes, so we clamp rather
+/// than wrap — an over-`u32::MAX` activation reports as `u32::MAX` bytes
+/// instead of a tiny wrapped value. `MsgCounts` accumulates these as `u64`.
 fn metric_size(len: usize) -> u32 {
     len.min(u32::MAX as usize) as u32
 }
@@ -42,12 +42,13 @@ pub struct IrohActorTransport {
     target_addr: iroh::EndpointAddr,
     handle: tokio::runtime::Handle,
     conn: std::sync::Mutex<Option<iroh::endpoint::Connection>>,
-    /// The peer this transport dials — recorded on emitted byte-metric events
-    /// so postproc can attribute bandwidth per neighbour.
+    /// The peer this transport dials — recorded on the message tallies so
+    /// the dashboard can attribute bandwidth per neighbour.
     peer: NodeId,
-    /// Diagnostics emitter (the driver's, or `None` when unobserved). Each
-    /// successful send emits a [`Event::MessageSent`] through it.
-    diagnostics: Option<DynEmitter>,
+    /// Message tallies (the orchestrator dashboard's, or `None` when
+    /// uncounted). Each successful send is tallied via
+    /// [`MsgCounts::note_sent`].
+    counts: Option<Arc<MsgCounts>>,
 }
 
 impl IrohActorTransport {
@@ -56,7 +57,7 @@ impl IrohActorTransport {
         target_addr: iroh::EndpointAddr,
         handle: tokio::runtime::Handle,
         peer: NodeId,
-        diagnostics: Option<DynEmitter>,
+        counts: Option<Arc<MsgCounts>>,
     ) -> Self {
         Self {
             endpoint,
@@ -64,7 +65,7 @@ impl IrohActorTransport {
             handle,
             conn: std::sync::Mutex::new(None),
             peer,
-            diagnostics,
+            counts,
         }
     }
 }
@@ -154,12 +155,8 @@ impl Transport for IrohActorTransport {
         // Count only bytes that actually went out — a failed dial or write
         // must not inflate the bandwidth totals.
         if result.is_ok() {
-            if let Some(diag) = &self.diagnostics {
-                diag.emit_event(Event::MessageSent {
-                    peer: self.peer,
-                    kind,
-                    size,
-                });
+            if let Some(counts) = &self.counts {
+                counts.note_sent(&hex32(&self.peer.0), &kind, size as u64);
             }
         }
         result
@@ -268,23 +265,20 @@ pub fn drain_actor_messages(
 /// keep delivering streams as long as the underlying connection stays open.
 pub struct ActorMessagePump {
     // The per-connection background tasks tag each inbound stream with the
-    // `NodeId` of the connection it arrived on, so the drain loop can emit a
-    // peer-attributed [`Event::MessageReceived`] without re-deriving identity.
+    // `NodeId` of the connection it arrived on, so the drain loop can tally a
+    // peer-attributed receive without re-deriving identity.
     tx: mpsc::Sender<(NodeId, Vec<u8>)>,
     rx: mpsc::Receiver<(NodeId, Vec<u8>)>,
-    /// Diagnostics emitter (the driver's, or `None` when unobserved). Each
-    /// received message emits a [`Event::MessageReceived`] through it.
-    diagnostics: Option<DynEmitter>,
+    /// Message tallies (the orchestrator dashboard's, or `None` when
+    /// uncounted). Each received message is tallied via
+    /// [`MsgCounts::note_recv`].
+    counts: Option<Arc<MsgCounts>>,
 }
 
 impl ActorMessagePump {
-    pub fn new(diagnostics: Option<DynEmitter>) -> Self {
+    pub fn new(counts: Option<Arc<MsgCounts>>) -> Self {
         let (tx, rx) = mpsc::channel::<(NodeId, Vec<u8>)>();
-        Self {
-            tx,
-            rx,
-            diagnostics,
-        }
+        Self { tx, rx, counts }
     }
 
     /// Accept any newly-arrived ALPN connections from the driver and spawn a
@@ -315,16 +309,16 @@ impl ActorMessagePump {
         }
         while let Ok((node_id, data)) = self.rx.try_recv() {
             if let Some(envelope) = decode_wire(&data) {
-                // Emit before delivery — `receive` consumes the envelope and we
-                // want the byte metric regardless of whether a codec is
+                // Tally before delivery — `receive` consumes the envelope and
+                // we want the byte metric regardless of whether a codec is
                 // registered for this tag. Size is payload-only, matching the
-                // send side and the existing `IrohDriver` semantics.
-                if let Some(diag) = &self.diagnostics {
-                    diag.emit_event(Event::MessageReceived {
-                        peer: node_id,
-                        kind: envelope.type_tag.clone(),
-                        size: metric_size(envelope.payload.len()),
-                    });
+                // send side.
+                if let Some(counts) = &self.counts {
+                    counts.note_recv(
+                        &hex32(&node_id.0),
+                        &envelope.type_tag,
+                        metric_size(envelope.payload.len()) as u64,
+                    );
                 }
                 if let Ok((addr, msg)) = codecs.receive(envelope) {
                     let _ = rt.deliver_raw(addr, msg);

@@ -365,31 +365,6 @@ fn cargo_build_release_once() {
             .status()
             .expect("invoke cargo build");
         assert!(status.success(), "cargo build --release failed");
-
-        // The unified code image bundles the diagnostics binaries too, so
-        // build them here for the Dockerfile COPY — the e2e script runs with
-        // PP_SKIP_BUILD=1 and won't build them itself.
-        let workspace = crate_dir()
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("workspace root")
-            .to_path_buf();
-        let status = Command::new("cargo")
-            .arg("build")
-            .arg("--manifest-path")
-            .arg(workspace.join("Cargo.toml"))
-            .arg("--release")
-            .arg("-p")
-            .arg("distribution")
-            .arg("--features")
-            .arg("collector")
-            .arg("--bin")
-            .arg("swactor-diag-collector")
-            .arg("--bin")
-            .arg("swactor-diag-postproc")
-            .status()
-            .expect("invoke cargo build (diag binaries)");
-        assert!(status.success(), "cargo build --release (diag) failed");
     });
 }
 

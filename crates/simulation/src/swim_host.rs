@@ -2,23 +2,22 @@
 //!
 //! Wraps `distribution::swim::SwimNode` and presents the simulator's
 //! `Host` trait. Constructs the production state machine from the
-//! scenario's `kind_config`, installs a diagnostics emitter shim that
-//! turns production `Event`s into `RecordEvent` actions, installs the
-//! tier-2 `SwimIntrospect`, and translates the production `NodeAction`
+//! scenario's `kind_config`, installs the production observation hook
+//! ([`SwimObserver`]) that turns [`SwimObservation`]s into
+//! `RecordEvent` actions, and translates the production `NodeAction`
 //! enum into the simulator's `Action` enum.
 //!
 //! The adapter does *not* substitute for any production logic. Every
-//! state change, message decode, and snapshot capture goes through the
-//! production code; the adapter is pure translation.
+//! state change and message decode goes through the production code;
+//! snapshots are built from the node's public membership state (the
+//! same source the production datastream emitter polls); the adapter
+//! is pure translation.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use distribution::diagnostics::sink::{DynEmitter, EventEmitter};
-use distribution::diagnostics::{Event as DiagEvent, SwimIntrospect};
 use distribution::swim::lifeguard::LifeguardConfig;
-use distribution::swim::node::{NodeAction, SwimNode};
+use distribution::swim::node::{NodeAction, SwimNode, SwimObservation, SwimObserver};
 use distribution::swim::probe::{ProbeMode, SwimConfig};
 use distribution::types::{MemberState, NodeId};
 use serde_json::json;
@@ -72,25 +71,29 @@ pub fn node_id_for(host_id: &str) -> NodeId {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Diagnostics emitter shim
+// Observation shim
 // ──────────────────────────────────────────────────────────────────────
 
-/// Buffers `Event`s into a shared `Vec` so the adapter can drain them
-/// into `Action::RecordEvent` after each `tick` / `recv` call.
+/// Buffers [`SwimObservation`]s into a shared `Vec` so the adapter can
+/// drain them into `Action::RecordEvent` after each `tick` / `recv` call.
 #[derive(Default)]
-struct BufferingEmitter {
-    buf: Mutex<Vec<DiagEvent>>,
+struct BufferingObserver {
+    buf: Mutex<Vec<SwimObservation>>,
 }
 
-impl EventEmitter for BufferingEmitter {
-    fn emit_event(&self, event: DiagEvent) {
-        self.buf.lock().unwrap().push(event);
+impl BufferingObserver {
+    fn drain(&self) -> Vec<SwimObservation> {
+        std::mem::take(&mut *self.buf.lock().unwrap())
     }
 }
 
-impl BufferingEmitter {
-    fn drain(&self) -> Vec<DiagEvent> {
-        std::mem::take(&mut *self.buf.lock().unwrap())
+/// The handle installed on the SWIM node; the host keeps the shared
+/// buffer end to drain after each call into production code.
+struct ObserverHandle(Arc<BufferingObserver>);
+
+impl SwimObserver for ObserverHandle {
+    fn observe(&self, observation: SwimObservation) {
+        self.0.buf.lock().unwrap().push(observation);
     }
 }
 
@@ -102,19 +105,11 @@ pub struct SwimHost {
     host_id: String,
     node_id: NodeId,
     node: SwimNode,
-    introspect: Arc<SwimIntrospect>,
-    emitter: Arc<BufferingEmitter>,
+    observer: Arc<BufferingObserver>,
     /// HostId lookup for `NodeId` peers the SWIM node emits to. Built
     /// from the cluster roster at construction. `NodeId` only
     /// implements `Hash` / `Eq` upstream, so we key by it directly.
     peer_id_of: HashMap<NodeId, HostId>,
-    /// Latest virtual time the host has seen (updated on every
-    /// tick/recv). `snapshot()` is `&self` so we need interior
-    /// mutability; `AtomicU64` is the simplest `Send`-safe option.
-    /// Used to scrub wall-clock fields the production `SwimIntrospect`
-    /// stamps into `Tier2SwimState` — §7.1 forbids the simulator's
-    /// bundle from carrying the host wall clock.
-    last_virtual_ns: AtomicU64,
 }
 
 impl SwimHost {
@@ -133,10 +128,8 @@ impl SwimHost {
         let host_id = host_id.into();
         let node_id = node_id_for(&host_id);
         let mut node = SwimNode::new(node_id, config);
-        let introspect = node.install_introspect();
-        let emitter: Arc<BufferingEmitter> = Arc::new(BufferingEmitter::default());
-        let dyn_emitter: DynEmitter = emitter.clone();
-        node.set_diagnostics(dyn_emitter);
+        let observer: Arc<BufferingObserver> = Arc::new(BufferingObserver::default());
+        node.set_observer(Box::new(ObserverHandle(observer.clone())));
         let mut peer_id_of = HashMap::new();
         for p in peer_ids {
             peer_id_of.insert(node_id_for(p), p.clone());
@@ -157,17 +150,14 @@ impl SwimHost {
             let _ = node.handle_join_response(bootstrap_members);
         }
         // Drain anything the bootstrap may have queued into the
-        // diagnostics emitter; the first real tick starts with a
-        // clean slate.
-        let _ = emitter.drain();
+        // observer; the first real tick starts with a clean slate.
+        let _ = observer.drain();
         Self {
             host_id,
             node_id,
             node,
-            introspect,
-            emitter,
+            observer,
             peer_id_of,
-            last_virtual_ns: AtomicU64::new(0),
         }
     }
 
@@ -228,17 +218,13 @@ impl SwimHost {
         }
     }
 
-    pub fn introspect(&self) -> &Arc<SwimIntrospect> {
-        &self.introspect
-    }
-
-    fn drain_emitter(&self) -> Vec<Action> {
-        self.emitter
+    fn drain_observer(&self) -> Vec<Action> {
+        self.observer
             .drain()
             .into_iter()
-            .map(|ev| Action::RecordEvent {
+            .map(|obs| Action::RecordEvent {
                 kind_tag: "swim".into(),
-                event: diag_event_payload(&ev, &self.peer_id_of),
+                event: observation_payload(&obs, &self.peer_id_of),
             })
             .collect()
     }
@@ -296,18 +282,16 @@ impl SwimHost {
                 // Per SIM_SPEC §1, §6.4, and §9.2 the simulator may not
                 // emit event kinds production does not. `NodeAction::
                 // MembershipChanged` is a state-machine *output* (used
-                // by production to wire SWIM into Kademlia), not a
-                // diagnostic event — production emits no
-                // `MembershipChanged` `Event` variant. The diagnostics
-                // emitter already publishes a `SwimTransition` for
-                // every state change, which `drain_emitter` records
-                // as a `state_transition` event in the bundle. So
-                // we deliberately emit no `Action` here: the
-                // membership signal is preserved via production's own
-                // diagnostic. The arm is matched (rather than `_`-ed)
-                // so a future `NodeAction` variant is a compile-time
-                // failure here — the §6.4 "unknown-output is loud"
-                // property.
+                // by production to wire SWIM into Kademlia), not an
+                // observation. The production observation hook already
+                // publishes a `Transition` for every state change,
+                // which `drain_observer` records as a
+                // `state_transition` event in the bundle. So we
+                // deliberately emit no `Action` here: the membership
+                // signal is preserved via production's own observation.
+                // The arm is matched (rather than `_`-ed) so a future
+                // `NodeAction` variant is a compile-time failure here —
+                // the §6.4 "unknown-output is loud" property.
                 Vec::new()
             }
         }
@@ -348,7 +332,7 @@ impl SwimHost {
         for na in node_actions {
             out.extend(self.translate(na));
         }
-        out.extend(self.drain_emitter());
+        out.extend(self.drain_observer());
         out
     }
 }
@@ -361,14 +345,12 @@ impl Host for SwimHost {
         "swim"
     }
 
-    fn tick(&mut self, now_ns: u64) -> Vec<Action> {
-        self.last_virtual_ns.store(now_ns, Ordering::Relaxed);
+    fn tick(&mut self, _now_ns: u64) -> Vec<Action> {
         let actions = self.node.tick();
         self.collect_actions(actions)
     }
 
-    fn recv(&mut self, message: HostMessage, now_ns: u64) -> Vec<Action> {
-        self.last_virtual_ns.store(now_ns, Ordering::Relaxed);
+    fn recv(&mut self, message: HostMessage, _now_ns: u64) -> Vec<Action> {
         match message {
             HostMessage::App(bytes) => {
                 // The engine doesn't know the SWIM message kind; we
@@ -382,14 +364,14 @@ impl Host for SwimHost {
             }
             HostMessage::TimerFired { .. } => {
                 // SwimNode is tick-driven, not timer-driven. Drain any
-                // pending diagnostics anyway.
-                self.drain_emitter()
+                // pending observations anyway.
+                self.drain_observer()
             }
             HostMessage::SendFailed { to, .. } => {
                 let Some(node_id) = self.peer_id_of.iter().find_map(|(nid, h)| {
                     if h == &to { Some(*nid) } else { None }
                 }) else {
-                    return self.drain_emitter();
+                    return self.drain_observer();
                 };
                 let actions = self.node.report_send_failure(node_id);
                 self.collect_actions(actions)
@@ -411,11 +393,8 @@ impl Host for SwimHost {
     }
 
     fn snapshot(&self) -> SnapshotBytes {
-        use distribution::diagnostics::snapshot::SwimIntrospector;
-        let tier2 = self.introspect.capture();
-        let virtual_ns = self.last_virtual_ns.load(Ordering::Relaxed);
-        serde_json::to_vec(&snapshot_payload(&tier2, &self.host_id, virtual_ns))
-            .expect("Tier2SwimState serialises to JSON by construction")
+        serde_json::to_vec(&snapshot_payload(&self.node, &self.host_id))
+            .expect("snapshot serialises to JSON by construction")
     }
 }
 
@@ -423,14 +402,15 @@ impl Host for SwimHost {
 // Helpers
 // ──────────────────────────────────────────────────────────────────────
 
-/// Project a production `Event` into the MVP evaluator schema. The
-/// match is exhaustive over `DiagEvent`: a future production variant
-/// is a compile-time failure here, which is the §6.4 "SWIM emits no
-/// novel kinds" property — structural, not positional. Variants the
-/// MVP evaluator doesn't have a schema for fall through to a
-/// `diag_event` envelope that carries the production `type` tag
-/// verbatim, so the bundle still records them.
-fn diag_event_payload(ev: &DiagEvent, peer_id_of: &HashMap<NodeId, HostId>) -> Vec<u8> {
+/// Project a production [`SwimObservation`] into the MVP evaluator
+/// schema. The match is exhaustive over `SwimObservation`: a future
+/// production variant is a compile-time failure here, which is the
+/// §6.4 "SWIM emits no novel kinds" property — structural, not
+/// positional.
+fn observation_payload(
+    obs: &SwimObservation,
+    peer_id_of: &HashMap<NodeId, HostId>,
+) -> Vec<u8> {
     // Resolve a `NodeId` to the simulator's `HostId` string so the
     // evaluator's host_id-keyed assertions can match. Falls back to
     // hex when the NodeId is not in the cluster roster — production
@@ -443,18 +423,22 @@ fn diag_event_payload(ev: &DiagEvent, peer_id_of: &HashMap<NodeId, HostId>) -> V
             .cloned()
             .unwrap_or_else(|| hex_node_id(id))
     };
-    let v = match ev {
-        DiagEvent::SwimTransition { peer, from, to, reason } => json!({
+    let v = match obs {
+        SwimObservation::Transition { peer, from, to, reason } => json!({
             "kind": "state_transition",
             "peer": hex_node_id(peer),
-            "from": format!("{from:?}"),
+            // `from` is `None` when the peer was previously unknown to
+            // this node — rendered as "Unknown", the same string the
+            // old diagnostics `PeerState::Unknown` produced.
+            "from": from
+                .map(|s| format!("{s:?}"))
+                .unwrap_or_else(|| "Unknown".to_string()),
             "to": format!("{to:?}"),
             "reason": reason,
         }),
-        // Coverage 2.6: SWIM probe lifecycle. Dedicated `kind` strings
-        // so the bundle reader (and the evaluator's
-        // `no_flap_while_probes_ok` precondition) can match without
-        // unpacking the generic `diag_event` envelope.
+        // SWIM probe lifecycle. Dedicated `kind` strings so the bundle
+        // reader (and the evaluator's `no_flap_while_probes_ok`
+        // precondition) can match without unpacking a generic envelope.
         //
         // `target` is the probed peer's `HostId` string (looked up
         // through `peer_id_of`), consistent with the simulator's
@@ -465,58 +449,25 @@ fn diag_event_payload(ev: &DiagEvent, peer_id_of: &HashMap<NodeId, HostId>) -> V
         // same translation pattern `message_send` uses — schema
         // parity per `SIM_SPEC.md §9.2` holds at the field-name level
         // (`target`, `sequence`, `probe_kind`, `budget_ticks`).
-        DiagEvent::SwimProbeSent { target, sequence, kind } => json!({
+        SwimObservation::ProbeSent { target, sequence, kind } => json!({
             "kind": "swim_probe_sent",
             "target": label(target),
             "sequence": sequence,
             "probe_kind": kind,
         }),
-        DiagEvent::SwimProbeAcked { target, sequence, kind } => json!({
+        SwimObservation::ProbeAcked { target, sequence, kind } => json!({
             "kind": "swim_probe_acked",
             "target": label(target),
             "sequence": sequence,
             "probe_kind": kind,
         }),
-        DiagEvent::SwimProbeTimedOut { target, sequence, kind, budget_ticks } => json!({
+        SwimObservation::ProbeTimedOut { target, sequence, kind, budget_ticks } => json!({
             "kind": "swim_probe_timed_out",
             "target": label(target),
             "sequence": sequence,
             "probe_kind": kind,
             "budget_ticks": budget_ticks,
         }),
-        // Every other production `Event` variant — iroh dial events,
-        // metadata, message accounting, probes, errors, custom —
-        // surfaces under one `diag_event` kind, carrying production's
-        // own `type` discriminator inside the payload. The arms are
-        // listed individually so a new production variant fails to
-        // compile here rather than silently routing through a default
-        // arm.
-        DiagEvent::DialStarted { .. }
-        | DiagEvent::DialOutcome { .. }
-        | DiagEvent::IrohConnTypeChanged { .. }
-        | DiagEvent::RelayChanged { .. }
-        | DiagEvent::RelaySessionStateChanged { .. }
-        | DiagEvent::RelaySessionOpened { .. }
-        | DiagEvent::RelaySessionClosed { .. }
-        | DiagEvent::SubprocessSpawned { .. }
-        | DiagEvent::SubprocessExited { .. }
-        | DiagEvent::GossipReceived { .. }
-        | DiagEvent::SwimMetadataSent { .. }
-        | DiagEvent::SwimMetadataReceived { .. }
-        | DiagEvent::ConnectionCacheHit { .. }
-        | DiagEvent::ConnectionCacheMiss { .. }
-        | DiagEvent::ConnectionCacheInvalidated { .. }
-        | DiagEvent::NodeMapUpdate { .. }
-        | DiagEvent::MessageSent { .. }
-        | DiagEvent::MessageReceived { .. }
-        | DiagEvent::ProbeSent { .. }
-        | DiagEvent::ProbeReceived { .. }
-        | DiagEvent::InferenceResponseSent { .. }
-        | DiagEvent::Error { .. }
-        | DiagEvent::Custom { .. } => {
-            let inner = serde_json::to_value(ev).unwrap_or(serde_json::Value::Null);
-            json!({ "kind": "diag_event", "payload": inner })
-        }
     };
     serde_json::to_vec(&v).unwrap()
 }
@@ -569,76 +520,30 @@ fn dispatch_swim_recv(
     );
 }
 
-/// Map a captured `Tier2SwimState` into the MVP evaluator schema
-/// (`members: {peer_id: {state, incarnation}}, self_incarnation`)
-/// while keeping production's tier-2 fields available under a nested
-/// key. The full production payload is the source of truth; the MVP
-/// schema is a projection the §10 evaluator already understands.
-///
-/// §7.1 compliance: `Tier2SwimState` is stamped by the production
-/// `SwimIntrospect` with `wall_ms_now()` values
-/// (`crates/distribution/src/diagnostics/swim_introspect.rs`). §7.1
-/// forbids any read of the host wall clock from the simulator's
-/// bundle path, so every wall-clock-typed field is overwritten with
-/// a virtual-time value (or `null` for optional fields) before the
-/// payload is serialised. The production *schema* is preserved
-/// verbatim — only the polluted timestamps are replaced.
-fn snapshot_payload(
-    tier2: &distribution::diagnostics::snapshot::Tier2SwimState,
-    self_id: &str,
-    virtual_ns: u64,
-) -> serde_json::Value {
+/// Build the MVP evaluator snapshot schema
+/// (`members: {peer_hex: {state, incarnation}}, self_incarnation`)
+/// from the SWIM node's *public* membership state — the same source
+/// the production datastream emitter polls each tick to derive its
+/// `MembershipTransition` records. No wall clock is read anywhere on
+/// this path, so §7.1 (no host wall clock in the simulator's bundle)
+/// holds by construction.
+fn snapshot_payload(node: &SwimNode, self_id: &str) -> serde_json::Value {
+    let member_list = node.members();
     let mut members = serde_json::Map::new();
-    for peer in &tier2.peers {
+    for entry in member_list.all_members() {
         members.insert(
-            peer.peer_node_id_hex.clone(),
+            hex_node_id(&entry.node_id),
             json!({
-                "state": format!("{:?}", peer.state),
-                "incarnation": peer.incarnation,
+                "state": format!("{:?}", entry.state),
+                "incarnation": entry.incarnation,
             }),
         );
     }
-    let virtual_ms = virtual_ns / 1_000_000;
-    // Render the production tier-2 blob and then replace the
-    // wall-clock-tainted fields. Doing it on the rendered Value
-    // keeps the schema (key names, key order, nesting) identical to
-    // production while letting us swap values.
-    let mut tier2_value =
-        serde_json::to_value(tier2).expect("Tier2SwimState serialises by construction");
-    if let Some(obj) = tier2_value.as_object_mut() {
-        obj.insert("scraped_at_ms".into(), serde_json::Value::from(virtual_ms));
-        if let Some(peers) = obj.get_mut("peers").and_then(|v| v.as_array_mut()) {
-            for p in peers {
-                if let Some(p_obj) = p.as_object_mut() {
-                    for field in [
-                        "last_ping_sent_at_ms",
-                        "last_ack_received_at_ms",
-                        "last_ping_received_at_ms",
-                        "suspect_started_at_ms",
-                    ] {
-                        if p_obj.contains_key(field) {
-                            p_obj.insert(field.into(), serde_json::Value::Null);
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(msgs) = obj.get_mut("recent_messages").and_then(|v| v.as_array_mut()) {
-            for m in msgs {
-                if let Some(m_obj) = m.as_object_mut() {
-                    if m_obj.contains_key("at_ms") {
-                        m_obj.insert("at_ms".into(), serde_json::Value::from(virtual_ms));
-                    }
-                }
-            }
-        }
-    }
     json!({
         "self_id": self_id,
-        "self_node_id_hex": tier2.self_node_id_hex,
+        "self_node_id_hex": hex_node_id(&node.self_id()),
         "members": members,
-        "self_incarnation": tier2.self_incarnation,
-        "tier2": tier2_value,
+        "self_incarnation": member_list.self_incarnation(),
     })
 }
 

@@ -1,8 +1,9 @@
 # Datastream demo cluster
 
-Spins up a small cluster of real `swactor` nodes in Docker, each driving a dummy
-child process, all shipping their per-node telemetry **datastream** to a single
-collector that prints the raw stream — live, frame-by-frame — to stdout.
+Spins up a small cluster of real `swactor` nodes in Docker, all shipping their
+per-node telemetry **datastream** to a single collector that prints the raw
+stream — live, frame-by-frame — to stdout. The standalone relay ships its own
+stream too, so the whole fleet (relay included) is visible on one wire.
 
 This is the "see the new metrics scheme working" demo. No dashboard; just the
 raw stream.
@@ -19,16 +20,19 @@ manual breakdown of what that script does.)
 
 ## What runs
 
-| Service     | Role                                                              |
-|-------------|-------------------------------------------------------------------|
-| `collector` | Binds UDP `:7700`, decodes each delivery, prints it on arrival    |
-| `relay`     | `swactor-iroh-relay` so nodes can find each other over the bridge |
-| `seed`      | Coordinator node (fixed identity), drives a dummy workload        |
-| `node-2/3`  | Worker nodes that join the seed, each drives a dummy workload      |
+| Service     | Role                                                                  |
+|-------------|-----------------------------------------------------------------------|
+| `collector` | Binds UDP `:7700`, decodes each delivery, prints it on arrival        |
+| `relay`     | `swactor-iroh-relay`; also ships its own datastream to the collector  |
+| `seed`      | Coordinator node (fixed identity)                                     |
+| `node-2/3`  | Worker nodes that join the seed                                       |
 
-Each node emits `identity` once, then `host.resource` / `runtime.stats` /
-`transport.internals` every ~1s, `membership` transitions as peers come and go,
-and its dummy child's stdout/stderr as `proc.workload.{stdout,stderr}`.
+The emitter is default-on in every node; setting
+`SWACTOR_DATASTREAM_COLLECTOR=<ip:port>` (as the compose file does) swaps the
+default no-op sink for the UDP frame sink. Each node emits `identity` once,
+then `host.resource` / `runtime.stats` / `transport.internals` every ~1s,
+`membership` transitions as peers come and go, and any managed process's
+stdout/stderr as `proc.<label>.{stdout,stderr}`.
 
 ## Run it
 
@@ -49,12 +53,11 @@ docker compose -f tests/docker/docker-compose.datastream.yml down
 Watch the `collector-1 | ...` lines. Each is one frame:
 
 ```
-collector-1  | e8d77206#1780337699 #0     [identity] {"node":"e8d7...","region":"seed","role":"coordinator",...}
-collector-1  | e8d77206#1780337699 #1     [proc.workload.stdout] tick 1 — workload working
-collector-1  | e8d77206#1780337699 #2     [host.resource] {"cpu_pct":3.5,"mem_total_mb":31741,"mem_used_mb":4019,...}
-collector-1  | e8d77206#1780337699 #3     [runtime.stats] {"actors_live":7,"mailbox_depth":0,"scheduled_tasks":7}
-collector-1  | e8d77206#1780337699 #4     [transport.internals] {"direct_peers":2,"relay_connected":true,...}
-collector-1  | e98b5ff5#1780337699 #7     [membership] {"from":"unknown","peer":"...","to":"alive"}
+collector-1  | e8d77206#0 #0     [identity] {"node":"e8d7...","life":0}
+collector-1  | e8d77206#0 #1     [host.resource] {"cpu_pct":3.5,"mem_total_mb":31741,"mem_used_mb":4019,...}
+collector-1  | e8d77206#0 #2     [runtime.stats] {"actors_live":7,"mailbox_depth":0,"scheduled_tasks":7}
+collector-1  | e8d77206#0 #3     [transport.internals] {"direct_peers":2,"relay_connected":true,...}
+collector-1  | e98b5ff5#0 #7     [membership] {"from":"unknown","peer":"...","to":"alive"}
 ```
 
 The prefix is `<node-id-prefix>#<lifetime>`; `#N` is the position within that
@@ -72,25 +75,22 @@ cargo build -p node --bin swactor --bin swactor-datastream-collector
 
 ./target/debug/swactor-datastream-collector --bind 127.0.0.1:7700 &
 
-./target/debug/swactor --identity-dir /tmp/dsA --dashboard-port 9101 --no-relay \
-    --datastream --datastream-collector 127.0.0.1:7700 --datastream-region A --actors 2 &
-./target/debug/swactor --identity-dir /tmp/dsB --dashboard-port 9102 --no-relay \
-    --datastream --datastream-collector 127.0.0.1:7700 --datastream-region B --actors 3 &
+SWACTOR_DATASTREAM_COLLECTOR=127.0.0.1:7700 \
+    ./target/debug/swactor --identity-dir /tmp/dsA --dashboard-port 9101 --no-relay --actors 2 &
+SWACTOR_DATASTREAM_COLLECTOR=127.0.0.1:7700 \
+    ./target/debug/swactor --identity-dir /tmp/dsB --dashboard-port 9102 --no-relay --actors 3 &
 ```
 
 (Two standalone nodes with `--no-relay` and no seed won't discover each other,
 so `membership` stays quiet — that's expected. Every other channel streams.)
 
-## Flags
+## Configuration
 
-| Flag                          | Meaning                                                  |
-|-------------------------------|----------------------------------------------------------|
-| `--datastream`                | Enable telemetry emission (off by default)               |
-| `--datastream-collector H:P`  | UDP collector address; implies `--datastream`            |
-| `--datastream-region R`       | Region label in the `identity` record                    |
-| `--no-datastream-child`       | Don't spawn the dummy child workload                     |
-| `--datastream-child-label L`  | Name for the `proc.<L>.*` channels (default `workload`)  |
+| Env var                          | Meaning                                                       |
+|----------------------------------|---------------------------------------------------------------|
+| `SWACTOR_DATASTREAM_COLLECTOR`   | UDP collector address (`ip:port`); unset = no-op sink         |
+| `SWACTOR_LIFETIME`               | Lifetime discriminator (default `0`)                          |
 
-The lifetime discriminator is taken from `$SWACTOR_LIFETIME` if set, else the
-current UNIX seconds — bump it across restarts so a re-incarnated node starts a
-fresh stream.
+Telemetry emission itself is default-on — the env var only chooses where the
+ordered frames ship. Bump `SWACTOR_LIFETIME` across restarts so a re-incarnated
+node starts a fresh stream instead of colliding with its prior life.

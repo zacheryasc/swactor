@@ -8,16 +8,13 @@
 //! by live bandwidth** (bytes/sec, derived client-side from the delta of the
 //! cumulative per-peer byte counters between successive snapshots).
 //!
-//! Two pieces feed it, both **shared** with the existing distribution plugin so
-//! we don't install a second diagnostics tap:
+//! Two pieces feed it, both **shared** with the existing distribution plugin:
 //!
 //!   * [`SharedSnapshot`] + [`MsgCounts`](crate::dist_plugin::MsgCounts) — the
 //!     cached cluster snapshot (members, names) and the per-peer message/byte
-//!     tallies the `CountingEmitter` already accumulates.
+//!     tallies the actor transport accumulates.
 //!   * [`ConnTracker`] — a per-peer transport map kept fresh by
-//!     [`spawn_conn_poller`], which queries `endpoint.remote_info` directly. It
-//!     is independent of the diagnostics aggregator (which is only installed
-//!     under `SWACTOR_DIAG_*`), so the map works even with diagnostics off.
+//!     [`spawn_conn_poller`], which queries `endpoint.remote_info` directly.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,11 +22,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dashboard::plugin::{DashboardPlugin, PluginResponse};
-use distribution::diagnostics::{ConnType, conn_type_of};
-use distribution::iroh_driver::IrohDriver;
+use distribution::iroh_driver::{conn_type_of, ConnType, IrohDriver};
 use iroh::PublicKey;
 
 use crate::dist_plugin::{MsgCounts, SharedSnapshot};
+
+/// Current wall clock in milliseconds since the UNIX epoch — the time base the
+/// frontend uses to derive bytes/sec between successive snapshots.
+fn wall_ms_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// Parse a 64-char lowercase-hex node id back into raw key bytes. Inverse of the
 /// `node_id_hex` / `hex32` formatting used across the snapshot and tally maps.
@@ -107,10 +113,7 @@ impl NetmapPlugin {
         if let serde_json::Value::Object(ref mut m) = v {
             m.insert("msg_counts".to_string(), self.counts.to_json());
             m.insert("conn".to_string(), self.conn.to_json());
-            m.insert(
-                "conn_ts_ms".to_string(),
-                serde_json::json!(distribution::diagnostics::wall_ms_now()),
-            );
+            m.insert("conn_ts_ms".to_string(), serde_json::json!(wall_ms_now()));
         }
         serde_json::to_string(&v).ok()
     }
@@ -146,7 +149,7 @@ impl DashboardPlugin for NetmapPlugin {
 /// Spawn the transport poller on the driver's tokio runtime. Every ~1s it reads
 /// the current member set from `cached`, asks the iroh endpoint for each peer's
 /// `remote_info`, derives the [`ConnType`], and updates `conn`. Runs until `stop`
-/// is set. Independent of the diagnostics aggregator.
+/// is set.
 pub fn spawn_conn_poller(
     driver: &IrohDriver,
     cached: SharedSnapshot,

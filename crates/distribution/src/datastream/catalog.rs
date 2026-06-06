@@ -121,21 +121,12 @@ pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
     }
 }
 
-/// The node's coarse role in the fleet.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Worker,
-    Coordinator,
-    Relay,
-}
-
-/// Identity / boot record (spec §6.1).
+/// Identity / boot record (spec §6.1). A node is generic — its job is resolved
+/// orchestrator-side by SWIM name, so the stream carries only the node id and
+/// the lifetime it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IdentityRecord {
     pub node: String,
-    pub role: Role,
-    pub region: String,
     /// The lifetime this stream belongs to (spec §8.4), echoed in-band so a
     /// view can confirm attribution.
     #[serde(default)]
@@ -186,7 +177,7 @@ pub struct MembershipTransition {
 }
 
 /// Runtime-stats record (spec §6.1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeStats {
     #[serde(default)]
     pub actors_live: u32,

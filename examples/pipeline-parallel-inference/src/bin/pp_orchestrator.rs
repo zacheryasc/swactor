@@ -44,21 +44,19 @@ use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
 use iroh::{PublicKey, RelayMode, SecretKey};
 
+use swactor::actor::{ActorInterface, Ctx};
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
 use swactor::transport::TransportRouter;
 
 use dashboard::collector::StatsCollector;
+use dashboard::datastream_source::{fleet_cache_plugin, FleetView};
 use dashboard::{start_dashboard, DashboardConfig};
 
-use distribution::diagnostics::sink::{noop_emitter, DynEmitter};
-use distribution::diagnostics::Role as DiagRole;
+use distribution::datastream::wire::{decode_delivery, DatastreamFrame};
 
-use pipeline_parallel_inference::diag;
-use pipeline_parallel_inference::dist_broadcast;
-use pipeline_parallel_inference::fleet_plugin::RemoteVastaiPlugin;
-use pipeline_parallel_inference::dist_plugin::{
-    CountingEmitter, DistDashPlugin, MsgCounts, SharedSnapshot,
-};
+use pipeline_parallel_inference::fleet_lifecycle::FleetLifecycle;
+
+use pipeline_parallel_inference::dist_plugin::{DistDashPlugin, MsgCounts, SharedSnapshot};
 use pipeline_parallel_inference::netmap_plugin::{spawn_conn_poller, ConnTracker, NetmapPlugin};
 use pipeline_parallel_inference::iroh_transport::{
     ActorMessagePump, IrohActorTransport, ACTOR_ALPN,
@@ -67,11 +65,32 @@ use pipeline_parallel_inference::messages::{
     inference_codec_registry, InferenceRequest, InferenceResponse,
 };
 use pipeline_parallel_inference::orchestrator::{
-    await_convergence, spawn_chain, stage_roster_event_fields, ChainGuard, StageSpawnCtx,
+    await_convergence, spawn_chain_observed, ChainGuard, StageSpawnCtx,
 };
-use pipeline_parallel_inference::topology::{stage_name, ENTRY_NAME};
+use pipeline_parallel_inference::topology::{stage_name, DATASTREAM_SINK_NAME, ENTRY_NAME};
 
 const ORCHESTRATOR_NAME: &str = "pp-orchestrator";
+
+/// Cluster sink for worker telemetry. Each `DatastreamFrame` a worker ships to
+/// the registered `datastream-sink` is decoded back into its `(stream, frame)`
+/// delivery and folded into the [`FleetLifecycle`], which merges it with the
+/// node's launch state + bootstrap logs + lease metadata and refreshes the
+/// Fleet dashboard cache. The orchestrator's `ActorMessagePump` already decodes
+/// and delivers these — this actor is the only receive code.
+struct DatastreamSink {
+    lifecycle: Arc<FleetLifecycle>,
+}
+
+impl ActorInterface for DatastreamSink {
+    type Incoming = DatastreamFrame;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, f: DatastreamFrame) {
+        if let Ok((stream, frame)) = decode_delivery(&f.payload) {
+            self.lifecycle.ingest(&stream, &frame);
+        }
+    }
+}
 
 fn node_config() -> DistributedNodeConfig {
     DistributedNodeConfig {
@@ -330,24 +349,11 @@ fn build_gpu_node_command(
         "PP_STAGE_DASHBOARD_PORT_BASE",
         "PP_BOOT_DELAY_STAGE",
         "PP_BOOT_DELAY_SECS",
-        "SWACTOR_DIAG_COLLECTOR_URL",
-        "SWACTOR_DIAG_RUN_ID",
-        "SWACTOR_DIAG_SPOOL_DIR",
-        "SWACTOR_DIAG_UDP_ECHO",
-        // Default broadcast target: in-VM samplers/log-forwarders fall back to
-        // this when no dedicated collector URL is set.
-        "PP_DASHBOARD_URL",
     ] {
         if let Ok(v) = std::env::var(var) {
             cmd.env(var, v);
         }
     }
-    // The orchestrator knows each child's diagnostic identity. Override
-    // the role/index/count rather than letting the child guess from its
-    // own env — keeps the bundle's identity blocks authoritative.
-    cmd.env("SWACTOR_DIAG_NODE_ROLE", "stage")
-        .env("SWACTOR_DIAG_STAGE_INDEX", ctx.stage.to_string())
-        .env("SWACTOR_DIAG_STAGE_COUNT", ctx.num_stages.to_string());
     let worker_cmd = std::env::var("WORKER_CMD").unwrap_or_else(|_| "python3".into());
     cmd.env("WORKER_CMD", worker_cmd);
     if let Some(peer) = &ctx.peer {
@@ -397,27 +403,6 @@ fn check_child_death(guard: &mut ChainGuard) -> Result<(), String> {
     Ok(())
 }
 
-/// The default-on distribution broadcast target: `PP_DASHBOARD_URL`, falling back
-/// to the diagnostics collector URL. Returns `None` (broadcast disabled) when both
-/// are unset or empty — preserving the prior no-dashboard behavior.
-fn resolve_broadcast_url() -> Option<String> {
-    std::env::var("PP_DASHBOARD_URL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| std::env::var("SWACTOR_DIAG_COLLECTOR_URL").ok())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-/// Diagnostics run-id for broadcast headers (matches the in-VM samplers' default).
-fn broadcast_run_id() -> String {
-    std::env::var("SWACTOR_DIAG_RUN_ID")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "pp-run".to_string())
-}
-
 fn run_seed(args: &Args) -> i32 {
     let gpu_node_bin = resolve_gpu_node_path(args);
     if !gpu_node_bin.exists() {
@@ -450,23 +435,12 @@ fn run_seed(args: &Args) -> i32 {
         }
     };
 
-    let diag = diag::install_from_env(&mut driver, DiagRole::orchestrator());
-
     // Distribution view is wanted when the in-process dashboard (PP_DASHBOARD) is
-    // on, or a dashboard/collector URL resolves for the remote broadcast.
-    let broadcast_url = resolve_broadcast_url();
-    let want_dist = std::env::var_os("PP_DASHBOARD").is_some() || broadcast_url.is_some();
-
-    // Orchestrator dashboard message tallies. Decorate the driver's diagnostics
-    // emitter so every wire MessageSent/MessageReceived is counted for the
-    // distribution page; the decorator forwards to whatever emitter diag
-    // installed, so bundle shipping is unaffected. Created unconditionally (cheap)
-    // but only installed when the distribution view is wanted (local or remote).
+    // on. The message tallies are fed directly by the actor transport
+    // (`iroh_transport`), so no driver-level tap is needed; created
+    // unconditionally (cheap), wired into the transport only when wanted.
+    let want_dist = std::env::var_os("PP_DASHBOARD").is_some();
     let msg_counts = Arc::new(MsgCounts::default());
-    if want_dist {
-        let inner = driver.diagnostics().clone();
-        driver.set_diagnostics(Arc::new(CountingEmitter::new(inner, Arc::clone(&msg_counts))));
-    }
 
     let my_id = driver.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
@@ -482,9 +456,7 @@ fn run_seed(args: &Args) -> i32 {
     );
 
     // Run inside a labelled block so every failure point can `break`
-    // with both an exit code and a stable exit-reason string; the
-    // diagnostics finalize record then carries that reason into the
-    // bundle.
+    // with both an exit code and a stable exit-reason string.
     let (code, exit_reason): (i32, &'static str) = 'run: {
         // Runtime + inbox + transport bookkeeping.
         let mut rt = Runtime::new(RuntimeConfig::default());
@@ -513,10 +485,30 @@ fn run_seed(args: &Args) -> i32 {
 
         let rt = Arc::new(rt);
 
+        // Datastream telemetry sink: workers ship their per-node streams here
+        // over the cluster, and the fold drives the Fleet dashboard. Spawn it now
+        // (alive before any worker resolves it); publish its name post-convergence
+        // below, alongside ORCHESTRATOR_NAME, so the registry budget is sized for
+        // the real cluster.
+        let fleet_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let fleet_view = Arc::new(Mutex::new(FleetView::new(None)));
+        // One Fleet entry per launched stage, created bootstrapping; the sink
+        // folds live telemetry in and the launch path flips entries to live /
+        // failed and tees their bootstrap logs.
+        let lifecycle = Arc::new(FleetLifecycle::new(
+            Arc::clone(&fleet_view),
+            Arc::clone(&fleet_cache),
+            args.num_stages,
+        ));
+        let datastream_sink_addr = rt
+            .spawn(DatastreamSink {
+                lifecycle: Arc::clone(&lifecycle),
+            })
+            .expect("spawn datastream-sink");
+
         // Shared distribution snapshot cell, refreshed by the hold loop. The
-        // in-process plugins and the remote broadcaster both read this one cell, so
-        // it exists whenever the distribution view is wanted — even broadcast-only
-        // (no local dashboard). `None` when off so the hold loop skips the refresh.
+        // in-process plugins read this one cell; `None` when the distribution
+        // view is off so the hold loop skips the refresh.
         let dist_cached: Option<SharedSnapshot> = if want_dist {
             Some(Arc::new(Mutex::new(Some(driver.snapshot()))))
         } else {
@@ -544,36 +536,15 @@ fn run_seed(args: &Args) -> i32 {
             )));
             let poll_stop = Arc::new(AtomicBool::new(false));
             spawn_conn_poller(&driver, Arc::clone(cached), conn_tracker, poll_stop);
-            // Fleet plugin ("Fleet" nav tab): the vast.ai/host-metric fleet view.
-            // In production the collector lives on a VPS; this plugin *pulls* the
-            // collector's already-folded fleet model ~1/s and re-serves it locally,
-            // so the full dashboard shows the fleet beside the live actor views.
-            // Registered unconditionally so the tab exists; the poller only runs
-            // when a collector URL is known (the same one the dist snapshot is
-            // pushed to). Idle URL => the tab just waits for records.
-            let fleet = Arc::new(RemoteVastaiPlugin::new());
-            if let Some(url) = broadcast_url.as_ref() {
-                fleet.spawn_stream(&driver.tokio_handle(), url.clone(), broadcast_run_id());
-            }
-            handle.register_plugin(fleet);
+            // Fleet plugin ("Fleet" nav tab): the cross-node telemetry table,
+            // fed by the datastream sink the workers ship to over the cluster.
+            // The cache is refreshed by `DatastreamSink::handle` as frames arrive.
+            handle.register_plugin(fleet_cache_plugin(Arc::clone(&fleet_cache)));
             handle.start_http(driver.tokio_handle());
             eprintln!(
                 "pp-orchestrator: live dashboard on http://localhost:{port} \
                  (overview / actors / topology / distribution / netmap / fleet)"
             );
-        }
-
-        // Default-on remote broadcast: ship the distribution snapshot to the
-        // dashboard collector ~1/s so a remote dashboard renders the same view.
-        if let (Some(url), Some(cached)) = (broadcast_url.as_ref(), dist_cached.as_ref()) {
-            dist_broadcast::spawn_dist_broadcast(
-                driver.tokio_handle(),
-                Arc::clone(cached),
-                Arc::clone(&msg_counts),
-                url.clone(),
-                broadcast_run_id(),
-            );
-            eprintln!("pp-orchestrator: broadcasting distribution snapshot to {url}");
         }
 
         let response_inbox = match rt.new_inbox::<InferenceResponse>() {
@@ -585,24 +556,59 @@ fn run_seed(args: &Args) -> i32 {
         };
         let inbox_addr = *response_inbox.addr();
 
+        // When the distribution view is wanted, tally the orchestrator's
+        // request/response legs into the shared `MsgCounts` so the
+        // InferenceRequest / InferenceResponse show up by kind on the
+        // distribution page.
+        let app_tap: Option<Arc<MsgCounts>> = if want_dist {
+            Some(Arc::clone(&msg_counts))
+        } else {
+            None
+        };
+        // ONE message pump for the whole run. The pump owns the channel its
+        // per-connection reader tasks deliver into; dropping it severs every
+        // accepted worker connection (readers exit on the closed channel and
+        // the conn closes with them), so it must outlive every phase that
+        // receives actor messages — the roster wait, the drive, and the hold.
+        // Workers dial in and ship datastream frames from the moment the sink
+        // name resolves, so every wait loop below must pump + rt.tick() or
+        // the workers exhaust the connection's uni-stream credit and their
+        // send path stalls.
+        let msg_pump = ActorMessagePump::new(app_tap.clone());
+
         // Spawn N stage children sequentially. Each non-first child receives
         // its predecessor's announced addressing in `PEER_DIRECT` so the
         // outbound dial populates each peer's NodeMap — SWIM gossip alone
         // propagates membership but not addressing.
         let max_tokens = args.max_tokens;
-        let mut guard = match spawn_chain(args.num_stages, Duration::from_secs(60), |ctx| {
-            build_gpu_node_command(
-                &gpu_node_bin,
-                &worker_script,
-                &my_hex,
-                &direct_csv,
-                max_tokens,
-                &ctx,
-            )
-        }) {
+        // Tee each launcher child's stdout into its Fleet entry as bootstrap
+        // logs (proc.bootstrap.*) so the dashboard shows the node *loading*
+        // before it joins and starts shipping live telemetry.
+        let boot_observer: pipeline_parallel_inference::orchestrator::BootstrapObserver = {
+            let lifecycle = Arc::clone(&lifecycle);
+            Arc::new(move |stage, line| lifecycle.record_bootstrap(stage, false, line))
+        };
+        let mut guard = match spawn_chain_observed(
+            args.num_stages,
+            Duration::from_secs(60),
+            Some(boot_observer),
+            |ctx| {
+                build_gpu_node_command(
+                    &gpu_node_bin,
+                    &worker_script,
+                    &my_hex,
+                    &direct_csv,
+                    max_tokens,
+                    &ctx,
+                )
+            },
+        ) {
             Ok(g) => g,
             Err(e) => {
                 eprintln!("pp-orchestrator: {e}");
+                // The chain failed to come up; mark every entry failed so the
+                // Fleet view shows what loaded before the failure.
+                lifecycle.fail_remaining_bootstrapping();
                 break 'run (1, "spawn_chain_error");
             }
         };
@@ -632,10 +638,15 @@ fn run_seed(args: &Args) -> i32 {
         driver
             .node_mut()
             .register_name(ORCHESTRATOR_NAME.into(), inbox_addr);
-        diag::emit_register_name(&driver, ORCHESTRATOR_NAME, inbox_addr, None);
         eprintln!("pp-orchestrator: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
+        // Publish the telemetry sink so workers resolve and ship to it.
+        driver
+            .node_mut()
+            .register_name(DATASTREAM_SINK_NAME.into(), datastream_sink_addr);
+        eprintln!("pp-orchestrator: registered {DATASTREAM_SINK_NAME} -> {datastream_sink_addr:?}");
         if let Err(e) = conv_res {
             eprintln!("pp-orchestrator: {e}");
+            lifecycle.fail_remaining_bootstrapping();
             break 'run (1, "convergence_error");
         }
         eprintln!("pp-orchestrator: cluster converged");
@@ -657,6 +668,12 @@ fn run_seed(args: &Args) -> i32 {
         let (stage0_addr, stage0_node_id) = loop {
             driver.recv();
             driver.tick();
+            // Workers resolve the datastream sink and start shipping as soon
+            // as they join — in real mode this loop spans the whole model
+            // download, so the telemetry must be drained here, not just
+            // during the drive.
+            msg_pump.pump(&driver, &codecs, &rt);
+            rt.tick();
             for k in 0..args.num_stages {
                 if roster_hex[k as usize].is_some() {
                     continue;
@@ -665,6 +682,9 @@ fn run_seed(args: &Args) -> i32 {
                 if let Some((_, nid)) = driver.node().resolve_name(&nm) {
                     let hex: String =
                         nid.0.iter().map(|b| format!("{:02x}", b)).collect();
+                    // The seam: stage K's swactor id is now known, so flip its
+                    // Fleet entry bootstrapping → live and bind its datastream.
+                    lifecycle.bind_live(k, &hex);
                     roster_hex[k as usize] = Some(hex);
                 }
             }
@@ -674,6 +694,7 @@ fn run_seed(args: &Args) -> i32 {
             }
             if let Err(e) = check_child_death(&mut guard) {
                 eprintln!("pp-orchestrator: {e}");
+                lifecycle.fail_remaining_bootstrapping();
                 break 'run (1, "stage_died_pre_resolve");
             }
             if Instant::now() >= wire_deadline {
@@ -687,6 +708,9 @@ fn run_seed(args: &Args) -> i32 {
                      missing pp-stage-K for {missing:?} (entry resolved: {})",
                     entry.is_some(),
                 );
+                // The nodes that never resolved their pp-stage-K stay bootstrapping
+                // — flip them to failed and keep their last logs as evidence.
+                lifecycle.fail_remaining_bootstrapping();
                 break 'run (1, "pipeline_wired_timeout");
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -712,44 +736,12 @@ fn run_seed(args: &Args) -> i32 {
             .collect();
         eprintln!("pp-orchestrator: {ENTRY_NAME} -> {stage0_addr:?} on {stage0_hex}");
 
-        // Spec §4.5: emit one pp_stage_roster per drive, before request
-        // injection, listing every stage. Seed mode runs a single drive
-        // so drive_seq is pinned to 1.
-        let drive_seq: u32 = 1;
-        driver.emit(distribution::diagnostics::event::Event::Custom {
-            kind: "pp_stage_roster".into(),
-            fields: stage_roster_event_fields(drive_seq, &roster),
-        });
-        // Spec §4.6: emit exactly one pp_pipeline_wired per drive once
-        // every stage is ready, every neighbour is wired (proxied by
-        // pp-stage-K registration being post-ready), and the
-        // orchestrator has resolved pp-entry.
-        driver.emit(distribution::diagnostics::event::Event::Custom {
-            kind: "pp_pipeline_wired".into(),
-            fields: serde_json::json!({ "drive_seq": drive_seq }),
-        });
-
         let key = match PublicKey::from_bytes(&stage0_node_id.0) {
             Ok(k) => k,
             Err(e) => {
                 eprintln!("pp-orchestrator: invalid stage-0 node key: {e}");
                 break 'run (1, "stage0_key_error");
             }
-        };
-        // The orchestrator's request/response legs are observed on the stage
-        // side too, so by default they're uninstrumented here to keep the
-        // diagnostics bundle from double-counting. When the distribution view is
-        // wanted (local or remote) we attach a *count-only* tap (counts into the
-        // shared `MsgCounts`, forwards to a no-op — never to the diagnostics
-        // sink), so the InferenceRequest / InferenceResponse show up by kind on
-        // the distribution page without touching bundle semantics.
-        let app_tap: Option<DynEmitter> = if want_dist {
-            Some(Arc::new(CountingEmitter::new(
-                noop_emitter(),
-                Arc::clone(&msg_counts),
-            )))
-        } else {
-            None
         };
         let route = Arc::new(IrohActorTransport::new(
             driver.endpoint().clone(),
@@ -766,18 +758,6 @@ fn run_seed(args: &Args) -> i32 {
             prompt: args.prompt.clone(),
             max_tokens: args.max_tokens,
         };
-        // Mark this drive's slice of the event stream — seed mode
-        // matches the vastai mode emissions so per-drive event slicing
-        // applies uniformly.
-        driver.emit(distribution::diagnostics::event::Event::Custom {
-            kind: "pp_drive_start".into(),
-            fields: serde_json::json!({
-                "drive_seq": drive_seq,
-                "prompt": args.prompt,
-                "max_tokens": args.max_tokens,
-                "num_stages": args.num_stages,
-            }),
-        });
         eprintln!(
             "pp-orchestrator: sending InferenceRequest (prompt={:?}, max_tokens={})",
             request.prompt, request.max_tokens
@@ -796,19 +776,8 @@ fn run_seed(args: &Args) -> i32 {
             Duration::from_secs(await_secs),
             Some(&mut guard),
             &roster,
-            drive_seq,
-            app_tap,
+            &msg_pump,
         );
-        // Drive boundary marker; emitted even on failure so the bundle
-        // reader can slice events into per-drive windows.
-        let drive_code = if result.is_ok() { 0 } else { 1 };
-        driver.emit(distribution::diagnostics::event::Event::Custom {
-            kind: "pp_drive_end".into(),
-            fields: serde_json::json!({
-                "drive_seq": drive_seq,
-                "code": drive_code,
-            }),
-        });
 
         match result {
             Ok(text) => {
@@ -821,6 +790,9 @@ fn run_seed(args: &Args) -> i32 {
                 if dashboard.is_some() || std::env::var_os("PP_HOLD").is_some() {
                     hold_open(
                         &mut driver,
+                        &rt,
+                        &codecs,
+                        &msg_pump,
                         dist_cached.as_ref(),
                         dashboard.as_ref().map(|(_, _, p)| *p),
                     );
@@ -834,10 +806,7 @@ fn run_seed(args: &Args) -> i32 {
         }
     };
 
-    if let Some(handles) = diag {
-        handles.finalize(exit_reason);
-        handles.shutdown();
-    }
+    let _ = exit_reason;
     driver.shutdown();
     code
     // guard drops here, killing all stage children
@@ -969,9 +938,16 @@ impl AwaitError {
 /// in scope (containers stay up), and we keep ticking the driver so SWIM stays
 /// converged and — when the dashboard is on — refresh the distribution
 /// snapshot each tick so the membership graph and message tallies update live.
+/// The caller's `ActorMessagePump` is pumped each tick (and the runtime
+/// ticked) so the workers' datastream frames keep reaching the fleet sink —
+/// the Fleet tab animates for the whole hold instead of freezing at the last
+/// drive, and the workers' uni-stream credit keeps being replenished.
 /// Returns when the operator presses Enter or closes stdin (Ctrl-D).
 fn hold_open(
     driver: &mut IrohDriver,
+    rt: &Runtime,
+    codecs: &Arc<swactor::transport::CodecRegistry>,
+    msg_pump: &ActorMessagePump,
     dist_cached: Option<&SharedSnapshot>,
     port: Option<u16>,
 ) {
@@ -998,6 +974,8 @@ fn hold_open(
     while !stop.load(Ordering::SeqCst) {
         driver.recv();
         driver.tick();
+        msg_pump.pump(driver, codecs, rt);
+        rt.tick();
         if let Some(cached) = dist_cached {
             *cached.lock().unwrap() = Some(driver.snapshot());
         }
@@ -1013,10 +991,8 @@ fn await_response(
     timeout: Duration,
     children: Option<&mut ChainGuard>,
     forward_path: &[pipeline_parallel_inference::orchestrator::StageRosterEntry],
-    drive_seq: u32,
-    app_tap: Option<DynEmitter>,
+    msg_pump: &ActorMessagePump,
 ) -> Result<String, AwaitError> {
-    let msg_pump = ActorMessagePump::new(app_tap);
     let start = Instant::now();
     let mut last_diag = Instant::now();
     let mut child_guard = children;
@@ -1055,15 +1031,6 @@ fn await_response(
                 .iter()
                 .find(|e| e.node_id_hex == m.node_id)
             {
-                driver.emit(distribution::diagnostics::event::Event::Custom {
-                    kind: "pp_drive_dead_member".into(),
-                    fields: serde_json::json!({
-                        "drive_seq": drive_seq,
-                        "stage_index": entry.stage_index,
-                        "node_id_hex": entry.node_id_hex,
-                        "node_id_short": entry.node_id_short,
-                    }),
-                });
                 return Err(AwaitError::ForwardPathDead {
                     stage_index: entry.stage_index,
                     node_id_short: entry.node_id_short.clone(),
@@ -1101,14 +1068,10 @@ fn await_response_timeout_secs(default_secs: u64) -> u64 {
 }
 
 /// Drive a single inference request through the already-wired pipeline and
-/// await its response (vast.ai mode). Self-contained per drive: emits this
-/// drive's spec §4.5 `pp_stage_roster` + §4.6 `pp_pipeline_wired` markers and
-/// the `pp_drive_start` / `pp_drive_end` boundaries, sends one
-/// `InferenceRequest` to stage 0, waits for the response, and prints it on
-/// success. The roster and the stage-0 route are resolved once by the caller
-/// and reused across drives; the roster is re-emitted each drive so the bundle
-/// reader can slice the interleaved event stream per `drive_seq`. Returns the
-/// drive's result so the caller can derive an exit code.
+/// await its response (vast.ai mode). Sends one `InferenceRequest` to
+/// stage 0, waits for the response, and prints it on success. The roster and
+/// the stage-0 route are resolved once by the caller and reused across
+/// drives. Returns the drive's result so the caller can derive an exit code.
 #[allow(clippy::too_many_arguments)]
 fn drive_once(
     driver: &mut IrohDriver,
@@ -1117,46 +1080,20 @@ fn drive_once(
     response_inbox: &Inbox<InferenceResponse>,
     stage0_addr: swactor::actor::ActorAddress,
     roster: &[pipeline_parallel_inference::orchestrator::StageRosterEntry],
-    num_stages: u32,
-    label: &str,
+    _num_stages: u32,
+    _label: &str,
     prompt: &str,
     max_tokens: u32,
     drive_seq: u32,
+    msg_pump: &ActorMessagePump,
 ) -> Result<String, AwaitError> {
-    let drive_start = Instant::now();
     let inbox_addr = *response_inbox.addr();
-
-    // Spec §4.5: emit one pp_stage_roster per drive, before any request
-    // injection event.
-    driver.emit(distribution::diagnostics::event::Event::Custom {
-        kind: "pp_stage_roster".into(),
-        fields: stage_roster_event_fields(drive_seq, roster),
-    });
-    // Spec §4.6: emit exactly one pp_pipeline_wired per drive (every stage
-    // ready, every neighbour wired — proxied by pp-stage-K registration being
-    // post-ready — and pp-entry resolved).
-    driver.emit(distribution::diagnostics::event::Event::Custom {
-        kind: "pp_pipeline_wired".into(),
-        fields: serde_json::json!({ "drive_seq": drive_seq }),
-    });
 
     let request = InferenceRequest {
         reply_to: inbox_addr,
         prompt: prompt.to_string(),
         max_tokens,
     };
-    // Mark this drive's slice of the event stream so a bundle reader can split
-    // events by drive.
-    driver.emit(distribution::diagnostics::event::Event::Custom {
-        kind: "pp_drive_start".into(),
-        fields: serde_json::json!({
-            "drive_seq": drive_seq,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "num_stages": num_stages,
-            "label": label,
-        }),
-    });
 
     let result = match rt.send_to(stage0_addr, request) {
         Err(e) => Err(AwaitError::SendFailed(e.to_string())),
@@ -1170,27 +1107,10 @@ fn drive_once(
                 Duration::from_secs(await_secs),
                 None,
                 roster,
-                drive_seq,
-                None,
+                msg_pump,
             )
         }
     };
-
-    let (code, reason): (i32, &'static str) = match &result {
-        Ok(_) => (0, "ok"),
-        Err(e) => (1, e.exit_reason()),
-    };
-    // Close out this drive's slice of the event stream — emitted even on
-    // failure so the bundle reader can window events per drive.
-    driver.emit(distribution::diagnostics::event::Event::Custom {
-        kind: "pp_drive_end".into(),
-        fields: serde_json::json!({
-            "drive_seq": drive_seq,
-            "exit_reason": reason,
-            "elapsed_ms": drive_start.elapsed().as_millis() as u64,
-            "code": code,
-        }),
-    });
 
     match &result {
         Ok(text) => {
@@ -1223,6 +1143,7 @@ fn prompt_loop(
     first_drive_seq: u32,
     dist_cached: Option<&SharedSnapshot>,
     port: Option<u16>,
+    msg_pump: &ActorMessagePump,
 ) {
     match port {
         Some(p) => eprintln!(
@@ -1264,6 +1185,10 @@ fn prompt_loop(
     while !stop.load(Ordering::SeqCst) {
         driver.recv();
         driver.tick();
+        // Keep draining worker datastream frames between drives so the Fleet
+        // tab stays live and the workers' uni-stream credit replenishes.
+        msg_pump.pump(driver, codecs, rt);
+        rt.tick();
         if let Some(cached) = dist_cached {
             *cached.lock().unwrap() = Some(driver.snapshot());
         }
@@ -1284,6 +1209,7 @@ fn prompt_loop(
                 &prompt,
                 max_tokens,
                 drive_seq,
+                msg_pump,
             );
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -1316,33 +1242,6 @@ struct ClusterState {
     image: String,
     contracts: Vec<ContractRef>,
     created_at: u64,
-    /// Diagnostics run_id pinned for the held-cluster lifetime. Held
-    /// stages bake their `SWACTOR_DIAG_RUN_ID` into PID-1 env at lease
-    /// time; persisting it here lets `--teardown` reattach to the same
-    /// bundle without drift from the operator's current shell env. `None`
-    /// on handles written before this field existed — callers fall back
-    /// to env with a warning.
-    #[serde(default)]
-    run_id: Option<String>,
-    /// Collector base URL pinned at lease time. Same rationale as
-    /// `run_id`: the shell env may have moved on by teardown, but the
-    /// bundle still belongs at the same collector. `None` skips the
-    /// teardown finalize POST silently.
-    #[serde(default)]
-    collector_url: Option<String>,
-    /// Orchestrator's hex node id, snapshotted at lease time. Lets
-    /// `--teardown` post a finalize record under the same `x-node-id`
-    /// the orchestrator used during the run — without re-deriving it
-    /// from `orchestrator_secret` (which would mean spinning a full
-    /// iroh driver just to compute one public key).
-    #[serde(default)]
-    orchestrator_node_id_hex: Option<String>,
-    /// Drive counter for the cluster, emitted on `pp_drive_start` /
-    /// `pp_drive_end` events so the bundle reader can slice the
-    /// interleaved event stream back into per-drive windows. Each
-    /// process drives once, so a `--hold` lease persists `1`.
-    #[serde(default)]
-    drive_sequence: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1421,18 +1320,6 @@ struct ResolvedCluster {
     label: String,
     num_stages: u32,
     model: String,
-    /// Pinned for the cluster's lifetime: orchestrator + every stage must
-    /// agree on this so events land in a single bundle. On hold/one-shot,
-    /// env > generated default.
-    run_id: String,
-}
-
-fn resolve_run_id(label: &str) -> String {
-    std::env::var("SWACTOR_DIAG_RUN_ID")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| format!("pp-{label}"))
 }
 
 /// Resolve the orchestrator identity, label, and stage count for this run.
@@ -1459,7 +1346,6 @@ fn resolve_cluster(args: &Args, _state_path: &Path) -> Result<ResolvedCluster, S
         .label
         .clone()
         .unwrap_or_else(|| default_label(args.num_stages));
-    let run_id = resolve_run_id(&label);
     let secret = match env_secret {
         Some(s) => s,
         None => random_secret()?,
@@ -1469,65 +1355,7 @@ fn resolve_cluster(args: &Args, _state_path: &Path) -> Result<ResolvedCluster, S
         label,
         num_stages: args.num_stages,
         model,
-        run_id,
     })
-}
-
-/// POST a single finalize record to the collector under the held
-/// cluster's run_id and the orchestrator's node id. This is the
-/// counterpart to the normal aggregator-driven finalize that the
-/// `--hold` path skips: with no orchestrator process running between
-/// drives, teardown is the one place that
-/// gets to seal the canonical bundle for the cluster's whole
-/// lifetime. The collector's bundle assembler triggers on this POST
-/// and tars `{run_id}/...` into `bundles/{run_id}.tar.gz`.
-///
-/// Silently returns `Ok` when the handle does not carry the
-/// collector URL or the orchestrator node id (legacy handle or
-/// diagnostics-off run) — there is nothing to seal.
-async fn post_teardown_finalize(
-    http: &reqwest::Client,
-    st: &ClusterState,
-) -> Result<(), String> {
-    let collector = match st.collector_url.as_deref() {
-        Some(u) if !u.trim().is_empty() => u.trim(),
-        _ => return Ok(()),
-    };
-    let node_id_hex = match st.orchestrator_node_id_hex.as_deref() {
-        Some(h) if !h.trim().is_empty() => h.trim(),
-        _ => return Ok(()),
-    };
-    let run_id = match st.run_id.as_deref() {
-        Some(r) if !r.trim().is_empty() => r.trim(),
-        _ => return Ok(()),
-    };
-
-    let send_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let body = serde_json::json!({
-        "exit_reason": "teardown",
-        "label": st.label,
-        "contracts": st.contracts.iter().map(|c| c.id).collect::<Vec<_>>(),
-        "drive_sequence_last": st.drive_sequence,
-    });
-    let url = format!("{}/diag/finalize", collector.trim_end_matches('/'));
-    let resp = http
-        .post(&url)
-        .header("x-run-id", run_id)
-        .header("x-node-id", node_id_hex)
-        .header("x-node-send-ms", send_ms.to_string())
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("finalize POST failed: {e}"))?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("finalize POST HTTP {status}: {text}"));
-    }
-    Ok(())
 }
 
 /// Destroy a held cluster and drop its handle. Authority for "is it really
@@ -1568,28 +1396,6 @@ fn run_teardown(
                 "pp-orchestrator: confirmed 0 instances under label {}",
                 st.label
             );
-            // Seal the bundle now that the cluster is provably gone:
-            // POST a finalize record under the run_id and orchestrator
-            // node id we pinned at lease time. Best-effort — the
-            // staging dir on the collector survives a failed seal, and
-            // `GET /diag/bundle/<run>` synthesizes from staging anyway.
-            match tokio_rt.block_on(post_teardown_finalize(http, &st)) {
-                Ok(()) if st.collector_url.is_some() => {
-                    eprintln!(
-                        "pp-orchestrator: posted finalize to collector for run_id={}",
-                        st.run_id.as_deref().unwrap_or("<unset>"),
-                    );
-                }
-                Ok(()) => {} // no collector pinned — nothing to do
-                Err(e) => {
-                    eprintln!("pp-orchestrator: WARNING teardown finalize failed: {e}");
-                    eprintln!(
-                        "  (the bundle is still retrievable via GET {}/diag/bundle/{} — staging is intact)",
-                        st.collector_url.as_deref().unwrap_or("<collector>"),
-                        st.run_id.as_deref().unwrap_or("<run_id>"),
-                    );
-                }
-            }
             if let Err(e) = std::fs::remove_file(state_path) {
                 eprintln!(
                     "pp-orchestrator: note: could not remove {}: {e}",
@@ -1663,47 +1469,16 @@ fn run_vastai(args: &Args) -> i32 {
         }
     };
 
-    // Wire orchestrator-side diagnostics. The run_id override pins the
-    // orchestrator and its stages into the same bundle: stages bake their
-    // `SWACTOR_DIAG_RUN_ID` into PID-1 env at lease time. Without the
-    // override, a stale shell env on the orchestrator side could split
-    // events into two bundles.
-    let diag = diag::install_with_overrides(
-        &mut driver,
-        DiagRole::orchestrator(),
-        Some(cluster.run_id.as_str()),
-    );
-
-    // Distribution view is wanted when the in-process dashboard (PP_DASHBOARD) is
-    // on, or a dashboard/collector URL resolves for the remote broadcast. Same
-    // gating as run_seed.
-    let broadcast_url = resolve_broadcast_url();
-    let want_dist = std::env::var_os("PP_DASHBOARD").is_some() || broadcast_url.is_some();
-
-    // Orchestrator dashboard message tallies. Decorate the driver's diagnostics
-    // emitter so every wire MessageSent/MessageReceived is counted for the
-    // distribution page; the decorator forwards to whatever emitter diag
-    // installed, so bundle shipping is unaffected. Installed only when the
-    // distribution view is wanted (local or remote).
+    // Distribution view is wanted when the in-process dashboard (PP_DASHBOARD)
+    // is on. Same gating as run_seed: the message tallies are fed directly by
+    // the actor transport, so no driver-level tap is needed.
+    let want_dist = std::env::var_os("PP_DASHBOARD").is_some();
     let msg_counts = Arc::new(MsgCounts::default());
-    if want_dist {
-        let inner = driver.diagnostics().clone();
-        driver.set_diagnostics(Arc::new(CountingEmitter::new(inner, Arc::clone(&msg_counts))));
-    }
 
     // Per-cluster drive counter, emitted on pp_drive_start / pp_drive_end so
-    // the bundle reader can slice the interleaved event stream by attempt.
-    // One-shot and --hold each drive exactly once per process, so this is 1.
+    // a reader can slice the interleaved event stream by attempt. One-shot and
+    // --hold each drive exactly once per process, so this is 1.
     let drive_seq: u32 = 1;
-
-    // Rented stage containers learn the collector URL + run_id via env
-    // vars injected into their vast.ai create_instance payload below.
-    // Reading the values here (rather than from the DiagHandles) means
-    // the forwarding works even when the orchestrator's own diagnostics
-    // are off. The run_id is pinned from `cluster.run_id` (same source
-    // of truth as the orchestrator-side install above).
-    let diag_env_for_stages = pipeline_parallel_inference::vastai::DiagEnv::from_process_env()
-        .with_run_id(cluster.run_id.clone());
 
     let my_id = driver.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
@@ -1711,15 +1486,11 @@ fn run_vastai(args: &Args) -> i32 {
         "pp-orchestrator (--vastai --num-stages {n}): orchestrator node {my_hex}",
         n = num_stages,
     );
-    if diag_env_for_stages.is_enabled() {
-        eprintln!(
-            "pp-orchestrator: forwarding diagnostics to rented stages (collector={})",
-            diag_env_for_stages
-                .collector_url
-                .as_deref()
-                .unwrap_or(""),
-        );
-    }
+
+    // Cluster env forwarded into each rented stage container: the custom iroh
+    // relay URL (when set) so every stage reaches the SWIM cluster across the
+    // internet. Read from this process's env at lease time.
+    let stage_env_for_stages = pipeline_parallel_inference::vastai::StageEnv::from_process_env();
 
     // Wait for a relay URL so remote nodes can find us across the internet.
     let relay_url = {
@@ -1751,38 +1522,6 @@ fn run_vastai(args: &Args) -> i32 {
         eprintln!("pp-orchestrator: no relay URL after 20s — vastai mode usually requires one");
     }
 
-    // ── Vastai monitoring (independent layer) ────────────────────────
-    // The external-view producer: an opt-in poller (VASTAI_MON_COLLECTOR_URL,
-    // falling back to SWACTOR_DIAG_COLLECTOR_URL) that polls the vast.ai API for
-    // every leased contract — through the image-pull window — and ships
-    // observations to the collector under its own synthetic node id. Decoupled
-    // from swactor diagnostics: it never touches the iroh driver or aggregator.
-    let vastai_poller = match pipeline_parallel_inference::vastai_mon::VastaiPollerConfig::from_env(
-        &cluster.run_id,
-        &api_key,
-        base_url,
-    ) {
-        Some(cfg) => {
-            // VastaiPoller::spawn calls tokio::spawn; enter the runtime so its
-            // background task lands on the multi-thread worker pool.
-            let _enter = tokio_rt.enter();
-            match pipeline_parallel_inference::vastai_mon::VastaiPoller::spawn(
-                cfg,
-                Some(num_stages),
-            ) {
-                Ok(p) => {
-                    eprintln!("pp-orchestrator: vastai monitoring enabled (external poller)");
-                    Some(p)
-                }
-                Err(e) => {
-                    eprintln!("pp-orchestrator: WARNING vastai monitoring disabled: {e}");
-                    None
-                }
-            }
-        }
-        None => None,
-    };
-    let vastai_tracker = vastai_poller.as_ref().map(|p| p.tracker());
 
     // ── Live dashboard + runtime — started BEFORE the lease ──────────────
     // The lease + image-load phase is the slow, failure-prone part the operator
@@ -1813,6 +1552,22 @@ fn run_vastai(args: &Args) -> i32 {
     };
 
     let rt = Arc::new(rt);
+
+    // Datastream telemetry sink (same as the local path): workers ship their
+    // per-node streams here over the cluster; the fold drives the Fleet
+    // dashboard. Its name is published post-convergence below.
+    let fleet_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let fleet_view = Arc::new(Mutex::new(FleetView::new(None)));
+    let lifecycle = Arc::new(FleetLifecycle::new(
+        Arc::clone(&fleet_view),
+        Arc::clone(&fleet_cache),
+        num_stages,
+    ));
+    let datastream_sink_addr = rt
+        .spawn(DatastreamSink {
+            lifecycle: Arc::clone(&lifecycle),
+        })
+        .expect("spawn datastream-sink");
 
     // Shared distribution snapshot cell, refreshed by the multi-prompt loop.
     // The in-process plugins and the remote broadcaster both read this one
@@ -1846,41 +1601,15 @@ fn run_vastai(args: &Args) -> i32 {
         )));
         let poll_stop = Arc::new(AtomicBool::new(false));
         spawn_conn_poller(&driver, Arc::clone(cached), conn_tracker, poll_stop);
-        // Fleet plugin ("Fleet" nav tab): the vast.ai/host-metric fleet view.
-        // The collector lives on the VPS; this plugin *pulls* the collector's
-        // already-folded fleet model (the collector→orchestrator vast.ai
-        // stream) and re-serves it locally, so the full dashboard shows the
-        // fleet beside the live actor views. Registered unconditionally so the
-        // tab exists; the stream only runs when a collector URL is known.
-        let fleet = Arc::new(RemoteVastaiPlugin::new());
-        if let Some(url) = broadcast_url.as_ref() {
-            // Subscribe under the SAME run_id the stages + vast.ai poller ship
-            // under (cluster.run_id), NOT broadcast_run_id() — otherwise the
-            // Fleet tab listens on the wrong slug and shows nothing while the
-            // poller publishes fine. cluster.run_id already honors
-            // SWACTOR_DIAG_RUN_ID, then falls back to pp-{label}.
-            fleet.spawn_stream(&driver.tokio_handle(), url.clone(), cluster.run_id.clone());
-        }
-        handle.register_plugin(fleet);
+        // Fleet plugin ("Fleet" nav tab): the cross-node telemetry table, fed by
+        // the datastream sink the workers ship to over the cluster. The cache is
+        // refreshed by `DatastreamSink::handle` as frames arrive.
+        handle.register_plugin(fleet_cache_plugin(Arc::clone(&fleet_cache)));
         handle.start_http(driver.tokio_handle());
         eprintln!(
             "pp-orchestrator: live dashboard on http://localhost:{port} \
              (overview / actors / topology / distribution / netmap / fleet)"
         );
-    }
-
-    // Default-on remote broadcast: ship the distribution snapshot to the
-    // dashboard collector ~1/s so a remote dashboard renders the same view.
-    // Use cluster.run_id so every stream for this run lands under one slug.
-    if let (Some(url), Some(cached)) = (broadcast_url.as_ref(), dist_cached.as_ref()) {
-        dist_broadcast::spawn_dist_broadcast(
-            driver.tokio_handle(),
-            Arc::clone(cached),
-            Arc::clone(&msg_counts),
-            url.clone(),
-            cluster.run_id.clone(),
-        );
-        eprintln!("pp-orchestrator: broadcasting distribution snapshot to {url}");
     }
 
     // ── Acquire the running cluster ──────────────────────────────────
@@ -1967,8 +1696,7 @@ fn run_vastai(args: &Args) -> i32 {
                 // reaches `running` in ~30-90s; longer means a host
                 // mid-failure, which `wait_for_running` already surfaces.
                 30,
-                Some(&diag_env_for_stages),
-                vastai_tracker.as_ref(),
+                Some(&stage_env_for_stages),
             ));
             loop {
                 match tokio_rt.block_on(async {
@@ -1989,14 +1717,6 @@ fn run_vastai(args: &Args) -> i32 {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("pp-orchestrator: lease_chain failed: {e}");
-                // One-shot lease failure (a --hold lease failure also
-                // lands here) finalizes — there is no cluster left to
-                // extend the window, so sealing the canonical bundle is
-                // safe and useful.
-                if let Some(handles) = diag {
-                    handles.finalize("lease_chain_error");
-                    handles.shutdown();
-                }
                 return 1;
             }
         };
@@ -2019,14 +1739,6 @@ fn run_vastai(args: &Args) -> i32 {
                     })
                     .collect(),
                 created_at: now_secs(),
-                run_id: Some(cluster.run_id.clone()),
-                // Persist the collector URL so --teardown can post a
-                // finalize record from a shell that no longer has
-                // SWACTOR_DIAG_COLLECTOR_URL set. None when diagnostics
-                // were off at lease time.
-                collector_url: diag_env_for_stages.collector_url.clone(),
-                drive_sequence: drive_seq,
-                orchestrator_node_id_hex: Some(my_hex.clone()),
             };
             match st.save(&state_path) {
                 Ok(()) => eprintln!("pp-orchestrator: wrote cluster handle {}", state_path.display()),
@@ -2037,10 +1749,67 @@ fn run_vastai(args: &Args) -> i32 {
     };
     eprintln!("pp-orchestrator: cluster contracts {contract_ids:?}");
 
+    // Attach the orchestrator-held lease metadata to each Fleet entry. The
+    // GPU/cost/contract facts are orchestrator-side knowledge (from leasing),
+    // not node telemetry — they ride the row directly, keyed positionally by
+    // stage (lease_chain creates instances in stage order).
+    for (stage, contract_id) in contract_ids.iter().enumerate() {
+        lifecycle.set_lease(
+            stage as u32,
+            pipeline_parallel_inference::fleet_lifecycle::LeaseMeta {
+                contract_id: *contract_id,
+                status: "leased".to_string(),
+                ..Default::default()
+            },
+        );
+    }
+
+    // Vast.ai bootstrap source (post-running): the instances are already
+    // `running` (lease_chain waited), but the swactor node inside is still
+    // loading and has not joined. Pull each container's log tail and feed it
+    // into the Fleet entry as bootstrap output, so the dashboard shows the node
+    // loading until its own datastream takes over (the entry flips to live).
+    // Best-effort: any API hiccup just retries; the poller stops per stage once
+    // that stage joins.
+    for (stage, contract_id) in contract_ids.iter().enumerate() {
+        let stage = stage as u32;
+        let contract_id = *contract_id;
+        let http = http.clone();
+        let base_url = base_url.to_string();
+        let api_key = api_key.clone();
+        let lifecycle = Arc::clone(&lifecycle);
+        driver.tokio_handle().spawn(async move {
+            let mut last_len = 0usize;
+            while !lifecycle.stage_is_live(stage) {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                if lifecycle.stage_is_live(stage) {
+                    break;
+                }
+                let url = match pipeline_parallel_inference::vastai::request_logs(
+                    &http, &base_url, &api_key, contract_id,
+                )
+                .await
+                {
+                    Ok(u) => u,
+                    Err(_) => continue,
+                };
+                let text =
+                    match pipeline_parallel_inference::vastai::fetch_logs(&http, &url).await {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                let lines: Vec<&str> = text.lines().collect();
+                for line in lines.iter().skip(last_len) {
+                    lifecycle.record_bootstrap(stage, false, line);
+                }
+                last_len = lines.len();
+            }
+        });
+    }
+
     // Drive the run inside a labelled block returning `(code, reason)` so
-    // every failure point can name the reason it bailed; the orchestrator's
-    // diagnostics finalize record then carries that reason into the bundle.
-    // Mirrors the run_seed pattern.
+    // every failure point can name the reason it bailed. Mirrors the
+    // run_seed pattern.
     let (code, exit_reason): (i32, &'static str) = 'run: {
         let response_inbox = match rt.new_inbox::<InferenceResponse>() {
             Ok(i) => i,
@@ -2050,6 +1819,13 @@ fn run_vastai(args: &Args) -> i32 {
             }
         };
         let inbox_addr = *response_inbox.addr();
+
+        // ONE message pump for the whole run (see run_seed): it owns the
+        // channel its per-connection reader tasks deliver into, so it must
+        // outlive every phase that receives actor messages — the resolve
+        // wait (where real-mode workers spend the whole model download
+        // shipping datastream frames), each drive, and the prompt loop.
+        let msg_pump = ActorMessagePump::new(None);
 
         // Wait for cluster convergence (all rented nodes join via the relay).
         // Registering pp-orchestrator must happen *after* convergence so the
@@ -2085,14 +1861,19 @@ fn run_vastai(args: &Args) -> i32 {
         );
         if let Err(e) = conv_res {
             eprintln!("pp-orchestrator: {e}");
+            lifecycle.fail_remaining_bootstrapping();
             break 'run (1, "convergence_error");
         }
 
         driver
             .node_mut()
             .register_name(ORCHESTRATOR_NAME.into(), inbox_addr);
-        diag::emit_register_name(&driver, ORCHESTRATOR_NAME, inbox_addr, None);
         eprintln!("pp-orchestrator: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
+        // Publish the telemetry sink so workers resolve and ship to it.
+        driver
+            .node_mut()
+            .register_name(DATASTREAM_SINK_NAME.into(), datastream_sink_addr);
+        eprintln!("pp-orchestrator: registered {DATASTREAM_SINK_NAME} -> {datastream_sink_addr:?}");
 
         // Spec §4.5 + §4.6: gate the drive on (a) every pp-stage-K
         // resolvable and (b) pp-entry resolvable. Both are proxies for
@@ -2111,6 +1892,12 @@ fn run_vastai(args: &Args) -> i32 {
         let (stage0_addr, stage0_node_id) = loop {
             driver.recv();
             driver.tick();
+            // Workers resolve the datastream sink and start shipping as soon
+            // as they join — this loop spans the whole model download, so
+            // drain their frames here or their uni-stream credit exhausts
+            // and the send path stalls their main loop (SWIM flap).
+            msg_pump.pump(&driver, &codecs, &rt);
+            rt.tick();
             // Keep the dashboard panels live while the pipeline wires up.
             if let Some(cached) = dist_cached.as_ref() {
                 *cached.lock().unwrap() = Some(driver.snapshot());
@@ -2123,6 +1910,8 @@ fn run_vastai(args: &Args) -> i32 {
                 if let Some((_, nid)) = driver.node().resolve_name(&nm) {
                     let hex: String =
                         nid.0.iter().map(|b| format!("{:02x}", b)).collect();
+                    // The seam: stage K joined, flip its Fleet entry to live.
+                    lifecycle.bind_live(k, &hex);
                     roster_hex[k as usize] = Some(hex);
                 }
             }
@@ -2141,6 +1930,7 @@ fn run_vastai(args: &Args) -> i32 {
                      missing pp-stage-K for {missing:?} (entry resolved: {})",
                     entry.is_some(),
                 );
+                lifecycle.fail_remaining_bootstrapping();
                 break 'run (1, "resolve_timeout");
             }
             std::thread::sleep(Duration::from_millis(200));
@@ -2205,6 +1995,7 @@ fn run_vastai(args: &Args) -> i32 {
             &args.prompt,
             args.max_tokens,
             drive_seq,
+            &msg_pump,
         ) {
             Ok(_) => (0, "ok"),
             Err(e) => (1, e.exit_reason()),
@@ -2231,6 +2022,7 @@ fn run_vastai(args: &Args) -> i32 {
                 drive_seq,
                 dist_cached.as_ref(),
                 dashboard.as_ref().map(|(_, _, p)| *p),
+                &msg_pump,
             );
         }
 
@@ -2245,12 +2037,7 @@ fn run_vastai(args: &Args) -> i32 {
     // from staging on demand, so mid-flight reads still work between
     // drives.
     let is_held = args.hold;
-    if let Some(handles) = diag {
-        if !is_held {
-            handles.finalize(exit_reason);
-        }
-        handles.shutdown();
-    }
+    let _ = exit_reason;
     driver.shutdown();
 
     // Teardown policy: --hold leaves the cluster running so it can be
@@ -2277,17 +2064,5 @@ fn run_vastai(args: &Args) -> i32 {
         }
     }
 
-    // Flush and stop the vastai monitoring poller (independent of swactor diag
-    // above). On a one-shot teardown, record a Teardown marker per contract so
-    // the timeline shows when each node was released; held clusters keep running
-    // but the in-process poller can't, so it shuts down either way.
-    if let Some(poller) = vastai_poller {
-        if !is_held {
-            for id in &contract_ids {
-                poller.note_teardown(*id, Some("one_shot_teardown".to_string()));
-            }
-        }
-        tokio_rt.block_on(poller.shutdown());
-    }
     code
 }

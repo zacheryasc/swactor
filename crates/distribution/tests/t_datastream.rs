@@ -13,7 +13,7 @@ mod support;
 use std::sync::Arc;
 
 use distribution::datastream::catalog::{
-    self, ChannelKind, IdentityRecord, LifecycleCost, ProcStream, Record, ResourceSample, Role,
+    self, ChannelKind, IdentityRecord, LifecycleCost, ProcStream, Record, ResourceSample,
 };
 use distribution::datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use distribution::datastream::ingest::Consumer;
@@ -216,10 +216,9 @@ fn records_name_their_own_typed_channel() {
     assert_eq!(IdentityRecord::channel().as_str(), catalog::IDENTITY);
     assert_eq!(ResourceSample::channel().as_str(), catalog::HOST_RESOURCE);
     assert_eq!(catalog::classify(&IdentityRecord::channel()), ChannelKind::Typed);
-    // Role enum encodes in snake_case as the wire expects.
-    let r = IdentityRecord { node: "n".into(), role: Role::Coordinator, region: "r".into(), life: 0 };
-    let json = String::from_utf8(r.encode()).unwrap();
-    assert!(json.contains("\"coordinator\""), "role serializes snake_case: {json}");
+    // An identity record round-trips through its typed codec (spec §6.1).
+    let r = IdentityRecord { node: "n".into(), life: 7 };
+    assert_eq!(IdentityRecord::decode(&r.encode()).unwrap(), r);
 }
 
 // ── The mux: position authority (spec §5) ──────────────────────────────

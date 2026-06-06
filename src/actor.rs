@@ -552,6 +552,12 @@ pub trait ContextInner {
     fn post_worker_request(&self, request: Box<dyn Any + Send>);
     /// Access the runtime extension (if installed).
     fn extension(&self) -> Option<&dyn crate::extension::RuntimeExtension>;
+    /// Access the per-runtime process-output observer (if installed).
+    fn process_output_observer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::process_observer::ProcessOutputObserver>> {
+        None
+    }
     /// Return system-level information (worker count, actor count, uptime).
     fn system_info(&self) -> SystemInfo;
 }
@@ -610,6 +616,15 @@ impl<'a> Ctx<'a> {
     /// Access the runtime extension (if installed).
     pub fn extension(&self) -> Option<&dyn crate::extension::RuntimeExtension> {
         self.inner.extension()
+    }
+
+    /// Access the per-runtime process-output observer (if installed). The
+    /// process facility reads this when spawning so every managed process's
+    /// output is taped automatically.
+    pub fn process_output_observer(
+        &self,
+    ) -> Option<std::sync::Arc<dyn crate::process_observer::ProcessOutputObserver>> {
+        self.inner.process_output_observer()
     }
 
     /// Return system-level information (worker count, actor count, uptime).

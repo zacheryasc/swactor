@@ -107,6 +107,7 @@ pub struct Runtime {
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
     stats_hook: Option<Arc<dyn StatsHook>>,
+    process_output_observer: OnceLock<Arc<dyn crate::process_observer::ProcessOutputObserver>>,
     /// Workers available for tick(). run() drains this and moves workers to threads.
     tick_workers: RefCell<Vec<Worker>>,
     /// Thread handles for waking parked workers. Set by workers on startup via OnceLock.
@@ -248,6 +249,7 @@ impl Runtime {
             is_running: AtomicBool::new(false),
             worker_stats,
             stats_hook: None,
+            process_output_observer: OnceLock::new(),
             tick_workers: RefCell::new(workers),
             worker_threads,
             created_at: Instant::now(),
@@ -390,6 +392,7 @@ impl Runtime {
             inbox_registry: &self.inbox_registry,
             config: &self.config,
             extension: self.extension.as_deref(),
+            process_output_observer: self.process_output_observer.get(),
             stats_hook: self.stats_hook.as_deref(),
             worker_threads: &self.worker_threads,
             worker_stats: &self.worker_stats,
@@ -516,6 +519,18 @@ impl Runtime {
         self.stats_hook = Some(hook);
     }
 
+    /// Install the per-node process-output observer. Every process spawned
+    /// through the process facility on this runtime hands its stdout/stderr to
+    /// `obs`, labeled by command basename. Takes `&self` (the slot is a
+    /// `OnceLock`) so it can be installed on an already-shared `Arc<Runtime>`,
+    /// before the first managed process is spawned. Subsequent calls are no-ops.
+    pub fn set_process_output_observer(
+        &self,
+        obs: Arc<dyn crate::process_observer::ProcessOutputObserver>,
+    ) {
+        let _ = self.process_output_observer.set(obs);
+    }
+
     /// Set the codec registry for remote transport.
     #[cfg(feature = "transport")]
     pub fn set_codec_registry(&mut self, registry: Arc<crate::transport::CodecRegistry>) {
@@ -618,6 +633,12 @@ impl ContextInner for Runtime {
 
     fn extension(&self) -> Option<&dyn RuntimeExtension> {
         self.extension.as_deref()
+    }
+
+    fn process_output_observer(
+        &self,
+    ) -> Option<Arc<dyn crate::process_observer::ProcessOutputObserver>> {
+        self.process_output_observer.get().cloned()
     }
 
     fn system_info(&self) -> SystemInfo {

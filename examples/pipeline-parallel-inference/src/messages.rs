@@ -194,12 +194,15 @@ impl Codec<StageActivation> for InferenceCodec {
 // ─── Registry ──────────────────────────────────────────────────────────────
 
 /// Build a `CodecRegistry` with all pipeline-parallel message types
-/// registered for the actor transport.
+/// registered for the actor transport. Includes the datastream telemetry
+/// envelope so worker telemetry can ride the cluster to the orchestrator's
+/// `datastream-sink`.
 pub fn inference_codec_registry() -> CodecRegistry {
     let mut cr = CodecRegistry::new();
     cr.register::<InferenceRequest, _>(InferenceCodec);
     cr.register::<InferenceResponse, _>(InferenceCodec);
     cr.register::<StageActivation, _>(InferenceCodec);
     cr.register::<NextToken, _>(InferenceCodec);
+    distribution::datastream::wire::register_datastream_codec(&mut cr);
     cr
 }

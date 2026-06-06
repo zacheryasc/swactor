@@ -1,8 +1,9 @@
 use std::sync::{Arc, OnceLock};
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
+use swactor::process_observer::ProcessOutputObserver;
 
-use crate::action::ProcessAction;
+use crate::action::{OutputStream, ProcessAction};
 use crate::event::ProcessEvent;
 use crate::message::{ProcessCommand, ProcessNotification};
 use crate::session::ProcessSession;
@@ -20,6 +21,12 @@ pub struct ProcessActor<D: ProcessDriver> {
     deferred_actions: Option<Vec<ProcessAction>>,
     /// Shared slot for the waker — filled after the actor address is known.
     pub waker_slot: Arc<OnceLock<ProcessWaker>>,
+    /// Per-node observer that taps this process's output (command-basename
+    /// `label`) onto the node's telemetry stream. `None` when the runtime has
+    /// no observer installed.
+    output_observer: Option<Arc<dyn ProcessOutputObserver>>,
+    /// Command basename used to label this process's output to the observer.
+    label: String,
 }
 
 impl<D: ProcessDriver> ProcessActor<D> {
@@ -28,6 +35,8 @@ impl<D: ProcessDriver> ProcessActor<D> {
         driver: D,
         initial_actions: Vec<ProcessAction>,
         waker_slot: Arc<OnceLock<ProcessWaker>>,
+        output_observer: Option<Arc<dyn ProcessOutputObserver>>,
+        label: String,
     ) -> Self {
         Self {
             session,
@@ -35,6 +44,8 @@ impl<D: ProcessDriver> ProcessActor<D> {
             self_addr: None,
             deferred_actions: Some(initial_actions),
             waker_slot,
+            output_observer,
+            label,
         }
     }
 
@@ -78,6 +89,11 @@ impl<D: ProcessDriver> ProcessActor<D> {
                     data,
                     stream,
                 } => {
+                    // Tap the node's telemetry observer before the data is moved
+                    // into the subscriber notification. Per-node, auto-attached.
+                    if let Some(obs) = &self.output_observer {
+                        obs.on_output(&self.label, matches!(stream, OutputStream::Stderr), &data);
+                    }
                     let notif = ProcessNotification::Output {
                         process: self_addr,
                         data,

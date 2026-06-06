@@ -7,11 +7,7 @@ use swactor::actor::ActorAddress;
 
 use crate::cache::LocationCache;
 use crate::crypto::{Keypair, KeypairExt};
-use std::sync::Arc;
 
-use crate::diagnostics::DynEmitter;
-use crate::diagnostics::registry_introspect::RegistryIntrospect;
-use crate::diagnostics::swim_introspect::SwimIntrospect;
 use crate::kademlia::directory::{actor_addr_as_node_id, DirectoryShard};
 use crate::kademlia::repair::{RepairQueue, RepublishTracker};
 use crate::kademlia::routing_table::RoutingTable;
@@ -62,7 +58,6 @@ pub struct DistributedNode {
     registry: ClusterRegistry,
     metadata: NodeMetadataDisseminator,
     tick_count: u64,
-    registry_introspect: Option<Arc<RegistryIntrospect>>,
 }
 
 impl DistributedNode {
@@ -85,7 +80,6 @@ impl DistributedNode {
             registry: ClusterRegistry::new(config.registry),
             metadata: NodeMetadataDisseminator::new(config.metadata_lambda),
             tick_count: 0,
-            registry_introspect: None,
             keypair,
         }
     }
@@ -100,44 +94,11 @@ impl DistributedNode {
         &self.keypair
     }
 
-    /// Install a diagnostics emitter. Forwards to the underlying SWIM
-    /// node so membership transitions surface as structured events.
-    pub fn set_diagnostics(&mut self, emitter: DynEmitter) {
-        self.swim.set_diagnostics(emitter);
-    }
-
-    /// Install the tier-2 SWIM introspector and return its `Arc`. The
-    /// caller is expected to register the same `Arc` with the
-    /// diagnostics aggregator via
-    /// [`crate::diagnostics::Aggregator::set_swim_introspector`].
-    ///
-    /// Also primes the introspector with the disseminator's current
-    /// local metadata generation so the first snapshot reports a
-    /// non-zero version when this node already set its relay URL
-    /// before diagnostics were wired up.
-    pub fn install_swim_introspect(&mut self) -> Arc<SwimIntrospect> {
-        let introspect = self.swim.install_introspect();
-        introspect.note_metadata_local_version(self.metadata.local_version());
-        introspect
-    }
-
-    /// Install the registry introspector and return its `Arc`. The
-    /// caller is expected to register the same `Arc` with the
-    /// diagnostics aggregator via
-    /// [`crate::diagnostics::Aggregator::set_registry_introspector`].
-    /// Primes the introspector with the current registry contents so
-    /// the first snapshot reflects any names already registered.
-    pub fn install_registry_introspect(&mut self) -> Arc<RegistryIntrospect> {
-        let introspect = Arc::new(RegistryIntrospect::new());
-        introspect.capture_now(&self.registry);
-        self.registry_introspect = Some(introspect.clone());
-        introspect
-    }
-
-    fn refresh_registry_introspect(&self) {
-        if let Some(intro) = &self.registry_introspect {
-            intro.capture_now(&self.registry);
-        }
+    /// Install an observation hook on the underlying SWIM node so
+    /// membership transitions and probe lifecycle surface as
+    /// [`SwimObservation`](crate::swim::node::SwimObservation)s.
+    pub fn set_swim_observer(&mut self, observer: Box<dyn crate::swim::node::SwimObserver>) {
+        self.swim.set_observer(observer);
     }
 
     // ─── Cluster operations ─────────────────────────────────────────────
@@ -190,11 +151,6 @@ impl DistributedNode {
 
         // Registry GC
         self.registry.gc_tick();
-        // Refresh the introspect view once per tick so peer-learned
-        // entries (via gossip merge) and tombstones from dead-node
-        // sweeps land in the next snapshot even when the call paths
-        // bypass register_name / unregister_name.
-        self.refresh_registry_introspect();
 
         // Wrap outgoing piggyback with registry + metadata entries
         self.inject_piggyback(actions)
@@ -324,13 +280,11 @@ impl DistributedNode {
     /// Register a human-readable name for an actor on this node.
     pub fn register_name(&mut self, name: String, actor_addr: ActorAddress) {
         self.registry.register(name, actor_addr, self.node_id(), self.cluster_size());
-        self.refresh_registry_introspect();
     }
 
     /// Unregister a name (creates a tombstone).
     pub fn unregister_name(&mut self, name: &str) {
         self.registry.unregister(name, self.node_id(), self.cluster_size());
-        self.refresh_registry_introspect();
     }
 
     /// Resolve a name to its current (ActorAddress, NodeId).
@@ -355,7 +309,6 @@ impl DistributedNode {
         let name = self.metadata.node_name(&self.node_id()).map(String::from);
         self.metadata
             .set_local(self.node_id(), url, name, self.cluster_size());
-        self.publish_metadata_version_to_introspect();
     }
 
     /// Set this node's human-readable name and begin gossiping it to the cluster.
@@ -363,14 +316,8 @@ impl DistributedNode {
         let relay_url = self.metadata.relay_url(&self.node_id()).map(String::from);
         self.metadata
             .set_local(self.node_id(), relay_url, Some(name), self.cluster_size());
-        self.publish_metadata_version_to_introspect();
     }
 
-    fn publish_metadata_version_to_introspect(&self) {
-        if let Some(intro) = self.swim.introspect() {
-            intro.note_metadata_local_version(self.metadata.local_version());
-        }
-    }
 
     /// Look up a node's relay URL.
     pub fn relay_url(&self, node_id: &NodeId) -> Option<&str> {
@@ -493,7 +440,6 @@ impl DistributedNode {
     fn merge_registry_entries(&mut self, entries: Vec<RegistryEntry>) {
         if !entries.is_empty() {
             self.registry.merge_batch(entries, self.cluster_size());
-            self.refresh_registry_introspect();
         }
     }
 
@@ -502,17 +448,7 @@ impl DistributedNode {
         if entries.is_empty() {
             return;
         }
-        let intro = self.swim.introspect().cloned();
         self.metadata.apply_incoming(entries, self.cluster_size());
-        if let Some(intro) = intro {
-            let self_id = self.node_id();
-            for (node_id, version) in self.metadata.all_versions() {
-                if node_id == self_id {
-                    continue;
-                }
-                intro.note_peer_metadata_version(node_id, version);
-            }
-        }
     }
 }
 

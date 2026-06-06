@@ -25,6 +25,10 @@ pub const ENTRY_NAME: &str = "pp-entry";
 /// the response sink if it ever needs to.
 pub const EXIT_NAME: &str = "pp-exit";
 
+/// SWIM name the orchestrator registers for its telemetry datastream sink.
+/// Workers resolve this to ship their per-node datastream over the cluster.
+pub const DATASTREAM_SINK_NAME: &str = "datastream-sink";
+
 /// The per-index name for a stage, e.g. `pp-stage-0`.
 pub fn stage_name(stage: u32) -> String {
     format!("pp-stage-{stage}")

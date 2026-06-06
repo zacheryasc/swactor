@@ -296,31 +296,6 @@ impl ClusterRegistry {
         self.entries.values()
     }
 
-    /// Capture the current registry state as a snapshot-ready
-    /// [`Tier2Registry`]. Entries are sorted by name for stable
-    /// diffing across snapshots.
-    pub fn capture(&self) -> crate::diagnostics::Tier2Registry {
-        let mut entries: Vec<crate::diagnostics::Tier2RegistryEntry> = self
-            .entries
-            .values()
-            .map(|e| crate::diagnostics::Tier2RegistryEntry {
-                name: e.name.clone(),
-                actor_addr_hex: hex_of_bytes(&e.actor_addr.0),
-                owner_node_id_hex: hex_of_bytes(&e.node_id.0),
-                generation: e.generation,
-                logical_timestamp: e.timestamp,
-                is_tombstone: e.tombstone,
-            })
-            .collect();
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        crate::diagnostics::Tier2Registry {
-            entries,
-            tombstone_count: self.tombstone_count() as u64,
-            clock: self.clock,
-            scraped_at_ms: crate::diagnostics::wall_ms_now(),
-        }
-    }
-
     // ─── Internal ───────────────────────────────────────────────────────
 
     fn next_generation(&self, name: &str) -> u64 {
@@ -391,18 +366,6 @@ fn lww_wins(incoming: &RegistryEntry, existing: &RegistryEntry) -> bool {
         return incoming.generation > existing.generation;
     }
     incoming.node_id.0 > existing.node_id.0
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-fn hex_of_bytes(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(HEX[(*b >> 4) as usize] as char);
-        s.push(HEX[(*b & 0xf) as usize] as char);
-    }
-    s
 }
 
 // ─── Piggyback pack/unpack ──────────────────────────────────────────────────
