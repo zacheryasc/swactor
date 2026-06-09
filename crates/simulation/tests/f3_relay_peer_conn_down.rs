@@ -1,5 +1,5 @@
 //! Stage F3 — sim "tunnel up, peer-via-tunnel down" failure mode
-//! (`examples/pipeline-parallel-inference/N3_OBSERVABILITY_UPGRADE_SPEC.md`
+//! (`apps/pipeline-parallel-inference/N3_OBSERVABILITY_UPGRADE_SPEC.md`
 //! §"Sim cross-pollination" bullet 3).
 //!
 //! Spec literal: "The sim's network failure model must allow 'tunnel

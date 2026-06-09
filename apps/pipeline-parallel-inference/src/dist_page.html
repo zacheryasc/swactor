@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Orchestrator — Distribution</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Menlo','Consolas','Monaco',monospace; background:#0f1117; color:#e0e0e0; font-size:13px; }
+  .header { display:flex; align-items:center; justify-content:space-between; padding:12px 20px; background:#161822; border-bottom:1px solid #2a2d3e; }
+  .header h1 { font-size:16px; font-weight:600; color:#fff; }
+  .header-left { display:flex; align-items:center; }
+  .nav-links { display:flex; gap:4px; margin-left:20px; }
+  .nav-link { color:#888; text-decoration:none; font-size:12px; padding:4px 10px; border-radius:3px; transition:color 0.2s; }
+  .nav-link:hover { color:#e0e0e0; }
+  .nav-link.active { color:#fff; background:#2a2d3e; }
+  .header-right { display:flex; align-items:center; gap:12px; }
+  .wrap { padding:16px; display:grid; grid-template-columns: 1fr 1fr; gap:16px; }
+  .card { background:#161922; border:1px solid #262b38; border-radius:6px; padding:12px; }
+  .card h2 { font-size:13px; color:#c0caf5; margin-bottom:10px; border-bottom:1px solid #262b38; padding-bottom:6px; }
+  .full { grid-column: 1 / -1; }
+  .stats { display:flex; gap:18px; flex-wrap:wrap; }
+  .stat { display:flex; flex-direction:column; }
+  .stat .v { font-size:20px; font-weight:700; }
+  .stat .l { font-size:10px; color:#7f8694; text-transform:uppercase; letter-spacing:.5px; }
+  .alive { color:#9ece6a; } .suspect { color:#e0af68; } .dead { color:#f7768e; }
+  .sent { color:#7aa2f7; } .recv { color:#bb9af7; }
+  table { width:100%; border-collapse:collapse; }
+  th, td { text-align:left; padding:4px 8px; border-bottom:1px solid #1f2430; font-size:12px; }
+  th { color:#7f8694; font-weight:600; text-transform:uppercase; font-size:10px; }
+  td.num { text-align:right; font-variant-numeric: tabular-nums; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
+  .mono { color:#9aa5b1; }
+  canvas { width:100%; height:340px; display:block; background:#0d0f15; border-radius:4px; }
+  .muted { color:#5c6370; font-style:italic; }
+</style>
+</head>
+<body>
+  <div class="header">
+    <div class="header-left">
+      <h1>Swactor Runtime Dashboard</h1>
+      <nav class="nav-links">
+        <a href="/" class="nav-link">Overview</a>
+        <a href="/actors" class="nav-link">Actors</a>
+        <a href="/topology" class="nav-link">Topology</a>
+        <a href="/plugin/distribution" class="nav-link active">Distribution</a>
+        <a href="/plugin/netmap" class="nav-link">Net map</a>
+        <a href="/plugin/vastai" class="nav-link">Fleet</a>
+      </nav>
+    </div>
+    <div class="header-right"><span id="node" class="mono"></span></div>
+  </div>
+
+  <div class="wrap">
+    <div class="card">
+      <h2>Cluster (SWIM)</h2>
+      <div class="stats">
+        <div class="stat"><span id="c-alive" class="v alive">0</span><span class="l">Alive</span></div>
+        <div class="stat"><span id="c-suspect" class="v suspect">0</span><span class="l">Suspect</span></div>
+        <div class="stat"><span id="c-dead" class="v dead">0</span><span class="l">Dead</span></div>
+        <div class="stat"><span id="c-routing" class="v">0</span><span class="l">Directory</span></div>
+        <div class="stat"><span id="c-cache" class="v">0</span><span class="l">Cache</span></div>
+        <div class="stat"><span id="c-registry" class="v">0</span><span class="l">Names</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Messages (this node, wire)</h2>
+      <div class="stats">
+        <div class="stat"><span id="m-sent" class="v sent">0</span><span class="l">Sent</span></div>
+        <div class="stat"><span id="m-recv" class="v recv">0</span><span class="l">Received</span></div>
+        <div class="stat"><span id="m-sentb" class="v sent">0</span><span class="l">Sent bytes</span></div>
+        <div class="stat"><span id="m-recvb" class="v recv">0</span><span class="l">Recv bytes</span></div>
+      </div>
+    </div>
+
+    <div class="card full">
+      <h2>SWIM membership graph</h2>
+      <canvas id="graph"></canvas>
+      <div class="muted" style="margin-top:6px">Orchestrator at center; peers placed around it, colored by SWIM state. Labels use the registered name when known.</div>
+    </div>
+
+    <div class="card">
+      <h2>Members</h2>
+      <table>
+        <thead><tr><th>State</th><th>Name / Node</th><th>Addr</th><th class="num">Inc</th></tr></thead>
+        <tbody id="members"><tr><td colspan="4" class="muted">waiting for snapshot…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h2>Messages by kind</h2>
+      <table>
+        <thead><tr><th>Kind</th><th class="num">Sent</th><th class="num">Recv</th></tr></thead>
+        <tbody id="bykind"><tr><td colspan="3" class="muted">no traffic yet</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="card full">
+      <h2>Messages by peer</h2>
+      <table>
+        <thead><tr><th>Peer</th><th>Name</th><th class="num">Sent</th><th class="num">Recv</th></tr></thead>
+        <tbody id="bypeer"><tr><td colspan="4" class="muted">no traffic yet</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+  var canvas = document.getElementById('graph');
+  var ctx = canvas.getContext('2d');
+  var last = null;
+
+  function short(id) { return id ? id.slice(0, 8) : '?'; }
+  function nameMap(d) {
+    // node_id hex -> [names] from the registry (skip tombstones)
+    var m = {};
+    (d.registry_entries || []).forEach(function(e) {
+      if (e.tombstone) return;
+      (m[e.node_id] = m[e.node_id] || []).push(e.name);
+    });
+    return m;
+  }
+  function stateClass(s) { s = (s||'').toLowerCase(); return s.indexOf('alive')>=0?'alive':s.indexOf('susp')>=0?'suspect':'dead'; }
+  function stateColor(s) { var c=stateClass(s); return c==='alive'?'#9ece6a':c==='suspect'?'#e0af68':'#f7768e'; }
+
+  function resize() {
+    var r = canvas.getBoundingClientRect();
+    canvas.width = r.width * devicePixelRatio;
+    canvas.height = r.height * devicePixelRatio;
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  }
+
+  function drawGraph(d) {
+    resize();
+    var r = canvas.getBoundingClientRect();
+    var W = r.width, H = r.height, cx = W/2, cy = H/2;
+    ctx.clearRect(0, 0, W, H);
+    var names = nameMap(d);
+    var members = d.members || [];
+    var R = Math.min(W, H) * 0.36;
+
+    // edges first
+    ctx.strokeStyle = '#2a3142'; ctx.lineWidth = 1;
+    members.forEach(function(mem, i) {
+      var a = (i / Math.max(members.length,1)) * Math.PI * 2 - Math.PI/2;
+      var x = cx + Math.cos(a)*R, y = cy + Math.sin(a)*R;
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x, y); ctx.stroke();
+    });
+
+    // member nodes
+    ctx.font = '11px Menlo, monospace';
+    members.forEach(function(mem, i) {
+      var a = (i / Math.max(members.length,1)) * Math.PI * 2 - Math.PI/2;
+      var x = cx + Math.cos(a)*R, y = cy + Math.sin(a)*R;
+      ctx.fillStyle = stateColor(mem.state);
+      ctx.beginPath(); ctx.arc(x, y, 9, 0, Math.PI*2); ctx.fill();
+      var lbl = (names[mem.node_id] && names[mem.node_id][0]) || mem.node_name || mem.label || short(mem.node_id);
+      ctx.fillStyle = '#c0caf5'; ctx.textAlign = 'center';
+      ctx.fillText(lbl, x, y - 14);
+    });
+
+    // center = orchestrator
+    ctx.fillStyle = '#7aa2f7';
+    ctx.beginPath(); ctx.arc(cx, cy, 13, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#0d0f15'; ctx.textAlign = 'center'; ctx.font = 'bold 11px Menlo, monospace';
+    ctx.fillText('orch', cx, cy + 4);
+  }
+
+  function render(d) {
+    last = d;
+    document.getElementById('node').textContent = 'node ' + short(d.node_id);
+    document.getElementById('c-alive').textContent = d.alive_count || 0;
+    document.getElementById('c-suspect').textContent = d.suspect_count || 0;
+    document.getElementById('c-dead').textContent = d.dead_count || 0;
+    document.getElementById('c-routing').textContent = d.directory_route_count || 0;
+    document.getElementById('c-cache').textContent = d.cache_size || 0;
+    document.getElementById('c-registry').textContent = d.registry_size || 0;
+
+    var names = nameMap(d);
+
+    // members table
+    var mb = (d.members || []).map(function(m) {
+      var nm = (names[m.node_id] && names[m.node_id].join(', ')) || m.node_name || m.label || '';
+      return '<tr><td><span class="dot" style="background:'+stateColor(m.state)+'"></span>'+m.state+'</td>'
+        + '<td>'+(nm? nm+' <span class="mono">'+short(m.node_id)+'</span>' : '<span class="mono">'+short(m.node_id)+'</span>')+'</td>'
+        + '<td class="mono">'+(m.addr||'—')+'</td>'
+        + '<td class="num">'+m.incarnation+'</td></tr>';
+    }).join('');
+    document.getElementById('members').innerHTML = mb || '<tr><td colspan="4" class="muted">no members</td></tr>';
+
+    // messages
+    var mc = d.msg_counts || {};
+    document.getElementById('m-sent').textContent = mc.sent_total || 0;
+    document.getElementById('m-recv').textContent = mc.recv_total || 0;
+    document.getElementById('m-sentb').textContent = (mc.sent_bytes || 0).toLocaleString();
+    document.getElementById('m-recvb').textContent = (mc.recv_bytes || 0).toLocaleString();
+
+    // by kind (union of sent+recv kinds)
+    var ks = mc.by_kind_sent || {}, kr = mc.by_kind_recv || {};
+    var kinds = Object.keys(ks).concat(Object.keys(kr)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort();
+    var kt = kinds.map(function(k){
+      return '<tr><td class="mono">'+k+'</td><td class="num sent">'+(ks[k]||0)+'</td><td class="num recv">'+(kr[k]||0)+'</td></tr>';
+    }).join('');
+    document.getElementById('bykind').innerHTML = kt || '<tr><td colspan="3" class="muted">no traffic yet</td></tr>';
+
+    // by peer
+    var bp = mc.by_peer || {};
+    var pt = Object.keys(bp).sort().map(function(p){
+      var nm = (names[p] && names[p].join(', ')) || '';
+      return '<tr><td class="mono">'+short(p)+'</td><td>'+nm+'</td><td class="num sent">'+(bp[p].sent||0)+'</td><td class="num recv">'+(bp[p].recv||0)+'</td></tr>';
+    }).join('');
+    document.getElementById('bypeer').innerHTML = pt || '<tr><td colspan="4" class="muted">no traffic yet</td></tr>';
+
+    drawGraph(d);
+  }
+
+  // Seed from the one-shot API, then stream live updates over SSE.
+  fetch('/api/plugin/distribution').then(function(r){return r.json();}).then(render).catch(function(){});
+  var es = new EventSource('/events');
+  es.addEventListener('distribution', function(e) {
+    try { render(JSON.parse(e.data)); } catch (err) {}
+  });
+  es.addEventListener('done', function() { es.close(); });
+  window.addEventListener('beforeunload', function() { es.close(); });
+  window.addEventListener('resize', function() { if (last) drawGraph(last); });
+</script>
+</body>
+</html>

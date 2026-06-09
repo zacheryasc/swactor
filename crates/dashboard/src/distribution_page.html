@@ -212,9 +212,7 @@
         <div class="stat-card"><div class="value" id="statSuspect">0</div><div class="label">Suspect</div></div>
         <div class="stat-card"><div class="value" id="statDead">0</div><div class="label">Dead</div></div>
         <div class="stat-card"><div class="value" id="statCache">0</div><div class="label">Cache</div></div>
-        <div class="stat-card"><div class="value" id="statRT">0</div><div class="label">RT Size</div></div>
         <div class="stat-card"><div class="value" id="statDir">0</div><div class="label">Directory</div></div>
-        <div class="stat-card"><div class="value" id="statRepair">0</div><div class="label">Repair Q</div></div>
         <div class="stat-card"><div class="value" id="statProbes">0</div><div class="label">Probes</div></div>
       </div>
     </div>
@@ -255,10 +253,6 @@
       </div>
     </div>
     <div class="bottom-section">
-      <h2>Routing Buckets</h2>
-      <canvas id="bucketChart"></canvas>
-    </div>
-    <div class="bottom-section">
       <h2>Trusted Peers <span id="peerAuthMode" style="color:#555;font-weight:400;"></span></h2>
       <div class="scroll-wrap" id="peersPanel">
         <div id="peersList"></div>
@@ -297,9 +291,6 @@
   var vx = 0, vy = 0, vs = 1;
   var isDragging = false, dragX = 0, dragY = 0, dragVx = 0, dragVy = 0;
   var clickStartX = 0, clickStartY = 0;
-
-  // Routing neighbor set (for ego highlight)
-  var routingSet = {};
 
   // ── Quadtree (Barnes-Hut) ──────────────────────────────────────
   var QF = 11;
@@ -568,15 +559,9 @@
     // Draw edges (self → each member)
     for (var i = 1; i < N; i++) {
       var alpha = 1;
-      var dash = false;
       if (highlighted) {
         if (!highlighted[i]) { alpha = 0.08; }
-        else {
-          // Check if this node is a routing neighbor
-          var nid = nodeIds[i];
-          if (routingSet[nid]) { dash = true; alpha = 0.7; }
-          else { alpha = 0.5; }
-        }
+        else { alpha = 0.5; }
       } else {
         alpha = 0.2;
       }
@@ -586,8 +571,7 @@
       ctx.lineTo(posX[i], posY[i]);
       ctx.strokeStyle = 'rgba(99,102,241,' + alpha + ')';
       ctx.lineWidth = 1 / vs;
-      if (dash) { ctx.setLineDash([4/vs, 4/vs]); }
-      else { ctx.setLineDash([]); }
+      ctx.setLineDash([]);
       ctx.stroke();
     }
     ctx.setLineDash([]);
@@ -666,12 +650,6 @@
       newAddrs.push(d.members[i].addr);
     }
 
-    // Build routing neighbor set
-    routingSet = {};
-    for (var i = 0; i < d.routing_neighbors.length; i++) {
-      routingSet[d.routing_neighbors[i].node_id] = true;
-    }
-
     selfNodeId = d.node_id;
 
     // Check if topology changed
@@ -714,9 +692,7 @@
     document.getElementById('statSuspect').textContent = d.suspect_count;
     document.getElementById('statDead').textContent = d.dead_count;
     document.getElementById('statCache').textContent = d.cache_size;
-    document.getElementById('statRT').textContent = d.routing_table_size;
-    document.getElementById('statDir').textContent = d.directory_entry_count;
-    document.getElementById('statRepair').textContent = d.repair_queue_size;
+    document.getElementById('statDir').textContent = d.directory_route_count;
     document.getElementById('statProbes').textContent = d.recent_probe_targets.length;
 
     // Color alive/suspect/dead
@@ -790,57 +766,6 @@
         '<td style="font-size:10px;">' + addr + '</td>';
       probesBody.appendChild(tr);
     }
-
-    // Routing bucket histogram
-    drawBucketChart(d.routing_buckets);
-  }
-
-  // ── Bucket histogram ───────────────────────────────────────────
-  function drawBucketChart(buckets) {
-    var cv = document.getElementById('bucketChart');
-    var bctx = cv.getContext('2d');
-    var dpr = devicePixelRatio || 1;
-    var rect = cv.parentElement.getBoundingClientRect();
-    var rw = rect.width, rh = cv.parentElement.clientHeight - 20;
-    cv.width = rw * dpr;
-    cv.height = rh * dpr;
-    cv.style.width = rw + 'px';
-    cv.style.height = rh + 'px';
-    bctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    bctx.clearRect(0, 0, rw, rh);
-
-    if (!buckets || buckets.length === 0) {
-      bctx.fillStyle = '#555';
-      bctx.font = '11px monospace';
-      bctx.textAlign = 'center';
-      bctx.fillText('No buckets', rw / 2, rh / 2);
-      return;
-    }
-
-    var maxCount = 1;
-    for (var i = 0; i < buckets.length; i++) {
-      if (buckets[i][1] > maxCount) maxCount = buckets[i][1];
-    }
-
-    var barW = Math.max(4, Math.floor((rw - 20) / buckets.length) - 2);
-    var chartH = rh - 20;
-
-    for (var i = 0; i < buckets.length; i++) {
-      var x = 10 + i * (barW + 2);
-      var h = (buckets[i][1] / maxCount) * (chartH - 4);
-      bctx.fillStyle = '#6366f1';
-      bctx.globalAlpha = 0.8;
-      bctx.fillRect(x, chartH - h, barW, h);
-
-      if (buckets.length <= 30) {
-        bctx.globalAlpha = 1;
-        bctx.fillStyle = '#888';
-        bctx.font = '8px monospace';
-        bctx.textAlign = 'center';
-        bctx.fillText(buckets[i][0], x + barW / 2, rh - 2);
-      }
-    }
-    bctx.globalAlpha = 1;
   }
 
   // ── SSE connection ─────────────────────────────────────────────

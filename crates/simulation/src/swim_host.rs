@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use distribution::swim::lifeguard::LifeguardConfig;
 use distribution::swim::node::{NodeAction, SwimNode, SwimObservation, SwimObserver};
@@ -110,6 +111,12 @@ pub struct SwimHost {
     /// from the cluster roster at construction. `NodeId` only
     /// implements `Hash` / `Eq` upstream, so we key by it directly.
     peer_id_of: HashMap<NodeId, HostId>,
+    /// Anchor for synthesizing an `Instant` from the simulator's virtual
+    /// nanoseconds. SWIM is wall-clock-driven (`SwimProbe::step` takes an
+    /// `Instant`); the simulator advances time by passing `base + now_ns`, so
+    /// the pure state machine still sees a monotonic, fully-deterministic clock
+    /// (`base` cancels out of every deadline comparison).
+    base: Instant,
 }
 
 impl SwimHost {
@@ -127,7 +134,11 @@ impl SwimHost {
     pub fn new(host_id: impl Into<String>, peer_ids: &[String], config: SwimConfig) -> Self {
         let host_id = host_id.into();
         let node_id = node_id_for(&host_id);
-        let mut node = SwimNode::new(node_id, config);
+        // Anchor SWIM's wall clock at this host's virtual-time base so the
+        // simulation stays fully deterministic (`base` cancels out of every
+        // deadline comparison: `base + now_ns >= base + interval`).
+        let base = Instant::now();
+        let mut node = SwimNode::new(node_id, config, base);
         let observer: Arc<BufferingObserver> = Arc::new(BufferingObserver::default());
         node.set_observer(Box::new(ObserverHandle(observer.clone())));
         let mut peer_id_of = HashMap::new();
@@ -158,7 +169,13 @@ impl SwimHost {
             node,
             observer,
             peer_id_of,
+            base,
         }
+    }
+
+    /// Synthesize the virtual `Instant` for a given engine timestamp.
+    fn virtual_now(&self, now_ns: u64) -> Instant {
+        self.base + Duration::from_nanos(now_ns)
     }
 
     /// Default SwimConfig matching the scenario `kind_config` shape.
@@ -194,25 +211,25 @@ impl SwimHost {
             .and_then(|v| v.as_integer())
             .map(|n| n as u64)
             .unwrap_or(0);
-        let unit = tick_period_ns.max(1);
-        // Lifeguard wiring (§3.6): inherit the production default's
-        // adaptive band, scaled to the scenario's tick units. The
-        // sim does not currently parse a per-host lifeguard
-        // kind_config — that would let battery scenarios sweep the
-        // multiplier; landed as a follow-up.
-        let suspicion_ticks = (suspicion_timeout_ns / unit).max(1);
+        // SWIM is wall-clock now: scenario nanoseconds map straight to
+        // `Duration`s (no tick-period quantization). `tick_period_ns` is still
+        // the probe-interval default above.
+        // Lifeguard wiring (§3.6): inherit the production default's adaptive
+        // band, anchored at the scenario's suspicion timeout. The sim does not
+        // currently parse a per-host lifeguard kind_config — follow-up.
+        let suspicion = Duration::from_nanos(suspicion_timeout_ns.max(1));
         let lifeguard = SwimConfig::default().lifeguard.map(|cfg| LifeguardConfig {
-            base_suspicion_timeout: suspicion_ticks,
-            min_suspicion_timeout: suspicion_ticks,
-            max_suspicion_timeout: suspicion_ticks.saturating_mul(6),
+            base_suspicion_timeout: suspicion,
+            min_suspicion_timeout: suspicion,
+            max_suspicion_timeout: suspicion.saturating_mul(6),
             ..cfg
         });
         SwimConfig {
-            probe_interval: (probe_interval_ns / unit).max(1),
-            probe_timeout: (probe_timeout_ns / unit).max(1),
+            probe_interval: Duration::from_nanos(probe_interval_ns.max(1)),
+            probe_timeout: Duration::from_nanos(probe_timeout_ns.max(1)),
             indirect_probes,
-            suspicion_timeout: suspicion_ticks,
-            dead_reprobe_interval: dead_reprobe_interval_ns / unit,
+            suspicion_timeout: suspicion,
+            dead_reprobe_interval: Duration::from_nanos(dead_reprobe_interval_ns),
             probe_mode: ProbeMode::Periodic,
             lifeguard,
         }
@@ -282,10 +299,10 @@ impl SwimHost {
                 // Per SIM_SPEC §1, §6.4, and §9.2 the simulator may not
                 // emit event kinds production does not. `NodeAction::
                 // MembershipChanged` is a state-machine *output* (used
-                // by production to wire SWIM into Kademlia), not an
-                // observation. The production observation hook already
-                // publishes a `Transition` for every state change,
-                // which `drain_observer` records as a
+                // by production to wire SWIM into the directory actor),
+                // not an observation. The production observation hook
+                // already publishes a `Transition` for every state
+                // change, which `drain_observer` records as a
                 // `state_transition` event in the bundle. So we
                 // deliberately emit no `Action` here: the membership
                 // signal is preserved via production's own observation.
@@ -345,8 +362,8 @@ impl Host for SwimHost {
         "swim"
     }
 
-    fn tick(&mut self, _now_ns: u64) -> Vec<Action> {
-        let actions = self.node.tick();
+    fn tick(&mut self, now_ns: u64) -> Vec<Action> {
+        let actions = self.node.tick(self.virtual_now(now_ns));
         self.collect_actions(actions)
     }
 
@@ -393,7 +410,7 @@ impl Host for SwimHost {
     }
 
     fn snapshot(&self) -> SnapshotBytes {
-        serde_json::to_vec(&snapshot_payload(&self.node, &self.host_id))
+        serde_json::to_vec(&snapshot_payload(&self.node, &self.host_id, &self.peer_id_of))
             .expect("snapshot serialises to JSON by construction")
     }
 }
@@ -426,7 +443,14 @@ fn observation_payload(
     let v = match obs {
         SwimObservation::Transition { peer, from, to, reason } => json!({
             "kind": "state_transition",
-            "peer": hex_node_id(peer),
+            // Translate NodeId → scenario HostId (the same `label`
+            // boundary the probe events below, `message_send`, and the
+            // snapshot `members` view use) so the evaluator's
+            // host_id-keyed assertions (`dead_peer_resurrects_within`,
+            // `peer_detected_dead_within`, `no_flap_while_probes_ok`, …)
+            // can match. Falls back to hex for a peer not in the roster
+            // — the "honest about absence" pattern.
+            "peer": label(peer),
             // `from` is `None` when the peer was previously unknown to
             // this node — rendered as "Unknown", the same string the
             // old diagnostics `PeerState::Unknown` produced.
@@ -436,9 +460,10 @@ fn observation_payload(
             "to": format!("{to:?}"),
             "reason": reason,
         }),
-        // SWIM probe lifecycle. Dedicated `kind` strings so the bundle
-        // reader (and the evaluator's `no_flap_while_probes_ok`
-        // precondition) can match without unpacking a generic envelope.
+        // Coverage 2.6: SWIM probe lifecycle. Dedicated `kind` strings
+        // so the bundle reader (and the evaluator's
+        // `no_flap_while_probes_ok` precondition) can match without
+        // unpacking a generic envelope.
         //
         // `target` is the probed peer's `HostId` string (looked up
         // through `peer_id_of`), consistent with the simulator's
@@ -521,18 +546,39 @@ fn dispatch_swim_recv(
 }
 
 /// Build the MVP evaluator snapshot schema
-/// (`members: {peer_hex: {state, incarnation}}, self_incarnation`)
+/// (`members: {host_id: {state, incarnation}}, self_incarnation`)
 /// from the SWIM node's *public* membership state — the same source
 /// the production datastream emitter polls each tick to derive its
 /// `MembershipTransition` records. No wall clock is read anywhere on
 /// this path, so §7.1 (no host wall clock in the simulator's bundle)
 /// holds by construction.
-fn snapshot_payload(node: &SwimNode, self_id: &str) -> serde_json::Value {
+///
+/// Members are keyed by the scenario `HostId` (translated from the
+/// peer's `NodeId` through `peer_id_of`, falling back to hex for a
+/// peer not in the roster) so the §10 evaluator's host_id-named
+/// membership assertions (`all_alive_at`, `peer_detected_dead_within`,
+/// `convergence_after`, …) can look members up — the same boundary
+/// translation `state_transition` / `message_send` apply.
+///
+/// The old `Tier2SwimState` snapshot (with per-peer `*_at_ms`
+/// timestamps and a `recent_messages` ring) had no replacement once
+/// the diagnostics introspection subsystem was removed; this
+/// member-derived projection carries exactly the fields the §10
+/// evaluator consumes (`members`, `self_incarnation`).
+fn snapshot_payload(
+    node: &SwimNode,
+    self_id: &str,
+    peer_id_of: &HashMap<NodeId, HostId>,
+) -> serde_json::Value {
     let member_list = node.members();
     let mut members = serde_json::Map::new();
     for entry in member_list.all_members() {
+        let key = peer_id_of
+            .get(&entry.node_id)
+            .cloned()
+            .unwrap_or_else(|| hex_node_id(&entry.node_id));
         members.insert(
-            hex_node_id(&entry.node_id),
+            key,
             json!({
                 "state": format!("{:?}", entry.state),
                 "incarnation": entry.incarnation,

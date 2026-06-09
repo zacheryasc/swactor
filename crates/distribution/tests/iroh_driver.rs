@@ -31,21 +31,12 @@ fn iroh_driver_creates_with_unique_identity() {
 }
 
 #[test]
-fn iroh_driver_snapshot_contains_node_id() {
+fn iroh_driver_reports_listen_addr_and_no_routes() {
+    // A freshly created driver knows where it listens and, having learned no
+    // peers, has converged on an empty directory route view.
     let mut driver = make_driver();
-    let snap = driver.snapshot();
-    assert!(!snap.node_id.is_empty());
-    assert_eq!(snap.members.len(), 0);
-    driver.shutdown();
-}
-
-#[test]
-fn iroh_driver_identity_matches_iroh_endpoint() {
-    let mut driver = make_driver();
-    let node_id = driver.node_id();
-    let snap = driver.snapshot();
-    let expected_hex: String = node_id.0.iter().map(|b| format!("{:02x}", b)).collect();
-    assert_eq!(snap.node_id, expected_hex);
+    assert!(!driver.listen_addr().is_empty());
+    assert_eq!(driver.directory_route_count(), 0);
     driver.shutdown();
 }
 
@@ -71,8 +62,8 @@ fn two_nodes_form_cluster_via_join() {
     );
 
     assert!(converged, "nodes did not converge within timeout");
-    assert_eq!(node_a.snapshot().alive_count, 1, "node_a should see 1 alive peer");
-    assert_eq!(node_b.snapshot().alive_count, 1, "node_b should see 1 alive peer");
+    assert_eq!(node_a.alive_count(), 1, "node_a should see 1 alive peer");
+    assert_eq!(node_b.alive_count(), 1, "node_b should see 1 alive peer");
 
     node_a.shutdown();
     node_b.shutdown();
@@ -101,8 +92,8 @@ fn two_nodes_form_cluster_via_mutual_join() {
     );
 
     assert!(converged, "nodes did not converge within timeout (mutual join)");
-    assert_eq!(node_a.snapshot().alive_count, 1);
-    assert_eq!(node_b.snapshot().alive_count, 1);
+    assert_eq!(node_a.alive_count(), 1);
+    assert_eq!(node_b.alive_count(), 1);
 
     node_a.shutdown();
     node_b.shutdown();
@@ -138,8 +129,8 @@ fn two_nodes_form_cluster_with_peer_auth() {
     );
 
     assert!(converged, "nodes with peer auth did not converge within timeout");
-    assert_eq!(node_a.snapshot().alive_count, 1);
-    assert_eq!(node_b.snapshot().alive_count, 1);
+    assert_eq!(node_a.alive_count(), 1);
+    assert_eq!(node_b.alive_count(), 1);
 
     node_a.shutdown();
     node_b.shutdown();
@@ -162,11 +153,11 @@ fn peer_auth_prevents_unauthorized_join() {
         &mut node_a,
         &mut node_b,
         Duration::from_secs(3),
-        |_a, b| b.snapshot().alive_count > 0,
+        |_a, b| b.alive_count() > 0,
     );
 
     assert!(!converged, "unauthorized peer should NOT have joined");
-    assert_eq!(node_b.snapshot().alive_count, 0, "node_b should have no alive peers");
+    assert_eq!(node_b.alive_count(), 0, "node_b should have no alive peers");
 
     node_a.shutdown();
     node_b.shutdown();
@@ -178,10 +169,42 @@ fn peer_auth_prevents_unauthorized_join() {
 fn three_nodes_converge_via_star_join() {
     let mut cluster = IrohTestCluster::star(3);
 
-    let converged = cluster.pump_until(Duration::from_secs(10), |drivers| {
-        drivers.iter().all(|d| d.snapshot().alive_count == 2)
+    let converged = cluster.pump_until(Duration::from_secs(10), |nodes| {
+        nodes.iter().all(|d| d.alive_count() == 2)
     });
 
     assert!(converged, "3-node star did not converge");
     cluster.shutdown();
+}
+
+// ─── Goal 2 (real-QUIC) — genuine death is detected ──────────────────────
+
+#[test]
+fn goal2_shutdown_node_is_detected_dead_by_survivors() {
+    // BEHAVIORAL_TEST_SPEC Goal 2 over real QUIC: shut one node down for real and
+    // poll until the survivors converge on it being Dead — a genuine probe
+    // timeout, not an injected death. Observed only through the membership view.
+    let mut cluster = IrohTestCluster::star(3);
+    let converged = cluster.pump_until(Duration::from_secs(10), |nodes| {
+        nodes.iter().all(|d| d.alive_count() == 2)
+    });
+    assert!(converged, "precondition: 3-node star must converge");
+
+    let dead = 2usize;
+    let dead_key = cluster.key(dead);
+    cluster.shutdown_one(dead);
+
+    // The survivors' probes to the dead node now truly fail; drive them until
+    // both converge on it being Dead.
+    let detected = cluster.pump_until_excluding(&[dead], Duration::from_secs(30), |drivers| {
+        drivers
+            .iter()
+            .enumerate()
+            .all(|(i, d)| i == dead || sees_dead(d, &dead_key))
+    });
+    assert!(detected, "survivors must detect the shut-down node as Dead");
+
+    // Tear down the two survivors (the third is already shut down).
+    cluster[0].shutdown();
+    cluster[1].shutdown();
 }

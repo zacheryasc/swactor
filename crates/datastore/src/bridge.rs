@@ -10,7 +10,7 @@ use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor::std::RuntimeNaming;
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 use crate::actors::{BlobStoreActor, DatastoreNode, GatewayActor, MetadataActor};
 use crate::auth::{AccessControlList, AuthzEngine};

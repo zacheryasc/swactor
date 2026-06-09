@@ -1105,7 +1105,7 @@ dependencies = [
  "crossbeam-queue",
  "crossterm",
  "ctrlc",
- "distribution",
+ "datastream",
  "ratatui",
  "serde",
  "serde_json",
@@ -1154,6 +1154,17 @@ checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
  "syn",
+]
+
+[[package]]
+name = "datastream"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "swactor",
+ "swactor-transport",
 ]
 
 [[package]]
@@ -1331,10 +1342,12 @@ dependencies = [
 name = "distribution"
 version = "0.1.0"
 dependencies = [
+ "datastream",
  "iroh",
  "iroh-metrics",
  "iroh-relay",
  "libc",
+ "proptest",
  "serde",
  "serde_json",
  "swactor",
@@ -2382,6 +2395,7 @@ dependencies = [
  "serde_json",
  "swactor",
  "swactor-datastore",
+ "tokio",
  "ureq",
 ]
 
@@ -3119,6 +3133,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "dashboard",
+ "datastream",
  "distribution",
  "iroh",
  "libc",
@@ -3127,7 +3142,9 @@ dependencies = [
  "swactor",
  "swactor-datastore",
  "swactor-transport",
+ "tokio",
  "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]

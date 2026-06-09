@@ -45,10 +45,8 @@ fn deploy_lifecycle_simulation() {
         let snap = poll_distribution(port).unwrap();
         assert!(snap.alive_count >= 4,
             "port {port}: expected alive_count >= 4, got {}", snap.alive_count);
-        assert!(snap.routing_table_size >= 3,
-            "port {port}: expected routing_table_size >= 3, got {}", snap.routing_table_size);
-        assert!(snap.directory_entry_count >= 2,
-            "port {port}: expected directory_entry_count >= 2, got {}", snap.directory_entry_count);
+        assert!(snap.directory_route_count >= 2,
+            "port {port}: expected directory_route_count >= 2, got {}", snap.directory_route_count);
     }
 
     cluster.stop();

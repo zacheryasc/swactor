@@ -16,11 +16,16 @@ use crate::plugins::datastore::bridge_ops::BridgeOps;
 /// HTML page for the datastore plugin.
 const DATASTORE_HTML: &str = include_str!("datastore_page.html");
 
-/// Dashboard plugin that exposes datastore metrics, CRUD operations, and
-/// lifecycle management through the generic plugin interface.
+/// Dashboard plugin that exposes datastore CRUD operations and lifecycle
+/// management. Datastore *telemetry* (object/byte/op counts, recent events,
+/// transfers) now arrives over the datastream and is folded into `telemetry` by
+/// the node's in-process consumer — this plugin no longer polls metrics directly.
 pub struct DatastorePlugin {
     /// The bridge operations handle — either a live bridge or a factory-only state.
     state: Mutex<DatastoreState>,
+    /// Datastream-reconstructed datastore JSON (`{is_running, snapshot}`), fed by
+    /// the node's frame consumer. `None` until the first datastore-state frame.
+    telemetry: Arc<Mutex<Option<String>>>,
 }
 
 enum DatastoreState {
@@ -32,24 +37,37 @@ enum DatastoreState {
 }
 
 impl DatastorePlugin {
-    /// Create a plugin wrapping an already-running datastore group.
-    pub fn from_group(group: &DatastoreGroup, runtime: Arc<Runtime>, default_chunk_size: u32) -> Self {
+    /// Create a plugin wrapping an already-running datastore group. `telemetry`
+    /// is the shared cache the node's frame consumer writes the reconstructed
+    /// datastore JSON into.
+    pub fn from_group(
+        group: &DatastoreGroup,
+        runtime: Arc<Runtime>,
+        default_chunk_size: u32,
+        telemetry: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         Self {
             state: Mutex::new(DatastoreState::Running(BridgeOps::from_group(
                 group,
                 runtime,
                 default_chunk_size,
             ))),
+            telemetry,
         }
     }
 
     /// Create a plugin with no running datastore (factory-only mode).
-    pub fn stopped(runtime: Arc<Runtime>, default_chunk_size: u32) -> Self {
+    pub fn stopped(
+        runtime: Arc<Runtime>,
+        default_chunk_size: u32,
+        telemetry: Arc<Mutex<Option<String>>>,
+    ) -> Self {
         Self {
             state: Mutex::new(DatastoreState::Stopped {
                 runtime,
                 default_chunk_size,
             }),
+            telemetry,
         }
     }
 }
@@ -60,19 +78,14 @@ impl DashboardPlugin for DatastorePlugin {
     }
 
     fn snapshot_json(&self) -> Option<String> {
-        let state = self.state.lock().unwrap();
-        match &*state {
-            DatastoreState::Running(ops) => {
-                let snap_json = ops.snapshot_json().unwrap_or_else(|| "null".into());
-                Some(format!(
-                    r#"{{"is_running":true,"snapshot":{}}}"#,
-                    snap_json
-                ))
-            }
-            DatastoreState::Stopped { .. } => {
-                Some(r#"{"is_running":false,"snapshot":null}"#.to_string())
-            }
+        // Telemetry is reconstructed from the datastream by the node's frame
+        // consumer (already wrapped as `{is_running, snapshot}`); serve it as-is.
+        if let Some(json) = self.telemetry.lock().unwrap().clone() {
+            return Some(json);
         }
+        // No datastore-state frame folded yet: report liveness with an empty snapshot.
+        let running = matches!(&*self.state.lock().unwrap(), DatastoreState::Running(_));
+        Some(format!(r#"{{"is_running":{running},"snapshot":null}}"#))
     }
 
     fn handle_request(
@@ -231,7 +244,7 @@ fn start_datastore_group(
     chunk_size: u32,
     storage_path: Option<String>,
 ) -> Result<BridgeOps, String> {
-    use swactor::transport::NodeId;
+    use swactor_transport::NodeId;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     // Generate a unique node ID
@@ -356,7 +369,9 @@ mod bridge_ops {
         ) -> Self {
             let datastore_addr = group.datastore_addr();
             let metadata_addr = group.metadata_addr();
-            let metrics = Arc::new(DatastoreMetrics::new());
+            // Share the group's metrics so this plugin's CRUD and the node's
+            // datastream emitter observe one accumulator (a single source).
+            let metrics = Arc::clone(group.metrics());
 
             Self {
                 metrics,
@@ -365,11 +380,6 @@ mod bridge_ops {
                 metadata_addr,
                 default_chunk_size,
             }
-        }
-
-        pub fn snapshot_json(&self) -> Option<String> {
-            let snap = self.metrics.snapshot();
-            serde_json::to_string(&snap).ok()
         }
 
         pub fn list_objects(

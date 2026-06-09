@@ -1,43 +1,8 @@
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 
-pub use swactor::transport::NodeId;
+pub use swactor_transport::NodeId;
 pub use crate::crypto::Signature;
-
-// ─── NodeId extensions (Kademlia-specific) ─────────────────────────────────
-
-/// Kademlia XOR distance operations on NodeId.
-pub trait NodeIdDistance {
-    /// XOR distance between two node IDs (Kademlia metric).
-    fn xor_distance(&self, other: &NodeId) -> [u8; 32];
-    /// Number of leading zero bits in the XOR distance to `other`.
-    /// Returns 0..=256. Used to select the k-bucket index.
-    fn xor_leading_zeros(&self, other: &NodeId) -> u32;
-}
-
-impl NodeIdDistance for NodeId {
-    fn xor_distance(&self, other: &NodeId) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        for i in 0..32 {
-            out[i] = self.0[i] ^ other.0[i];
-        }
-        out
-    }
-
-    fn xor_leading_zeros(&self, other: &NodeId) -> u32 {
-        let dist = self.xor_distance(other);
-        let mut zeros = 0u32;
-        for byte in dist {
-            if byte == 0 {
-                zeros += 8;
-            } else {
-                zeros += byte.leading_zeros();
-                break;
-            }
-        }
-        zeros
-    }
-}
 
 // ─── MemberState ────────────────────────────────────────────────────────────
 
@@ -90,8 +55,9 @@ pub struct NodeRecord {
 
 /// Signed binding of an actor address to a node.
 ///
-/// Stored in the Kademlia directory. The spawning node signs the entry
-/// to prove it owns the actor.
+/// Disseminated through the gossip directory (see `docs/DIRECTORY.md` and
+/// [`crate::directory_actor`]). The spawning node signs the entry over
+/// `(actor, host, generation)` to prove it owns the actor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectoryEntry {
     pub actor_addr: ActorAddress,

@@ -20,18 +20,23 @@
 //! deterministic stub hosts. Asserting it against a freshly
 //! constructed `SwimHost` would be testing wrapped-dependency entropy.
 
+use std::time::Duration;
+
 use distribution::swim::probe::{ProbeMode, SwimConfig};
 
 use simulation::host::{Action, Host, HostMessage};
 use simulation::swim_host::SwimHost;
 
 fn make_host(host_id: &str, peer_ids: &[&str]) -> SwimHost {
+    // SWIM is wall-clock now; the tick loops below drive virtual time in 1ms
+    // steps, so these millisecond durations keep the same probe cadence the old
+    // tick-count config had (and the tier-2 `_ticks` fields now report ms: 2/6).
     let cfg = SwimConfig {
-        probe_interval: 2,
-        probe_timeout: 1,
+        probe_interval: Duration::from_millis(2),
+        probe_timeout: Duration::from_millis(1),
         indirect_probes: 2,
-        suspicion_timeout: 6,
-        dead_reprobe_interval: 0,
+        suspicion_timeout: Duration::from_millis(6),
+        dead_reprobe_interval: Duration::ZERO,
         probe_mode: ProbeMode::Periodic,
         lifeguard: None,
     };
@@ -113,8 +118,6 @@ fn snapshot_bytes_carry_the_public_membership_state() {
     // the same surface the datastream emitter polls each tick to
     // derive its `MembershipTransition` records — so we assert the
     // bootstrap roster shows up exactly as configured.
-    use simulation::swim_host::node_id_for;
-
     let host = make_host("a", &["a", "b", "c"]);
     let bytes = host.snapshot();
     let parsed: serde_json::Value = serde_json::from_slice(&bytes).expect("snapshot is JSON");
@@ -127,17 +130,15 @@ fn snapshot_bytes_carry_the_public_membership_state() {
     assert_eq!(parsed["self_id"].as_str(), Some("a"));
 
     // The constructor bootstraps every *other* declared peer as Alive
-    // at incarnation 0; keys are the peers' node-id hex.
+    // at incarnation 0. Members are keyed by the scenario HostId (the
+    // same NodeId → HostId boundary translation `state_transition` /
+    // `message_send` apply) so the §10 evaluator's host_id-named
+    // membership assertions can look them up.
     assert_eq!(members.len(), 2, "two bootstrap peers expected: {members:?}");
     for peer in ["b", "c"] {
-        let hex: String = node_id_for(peer)
-            .0
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
         let entry = members
-            .get(&hex)
-            .unwrap_or_else(|| panic!("peer {peer} ({hex}) missing from members"));
+            .get(peer)
+            .unwrap_or_else(|| panic!("peer {peer} missing from members"));
         assert_eq!(entry["state"].as_str(), Some("Alive"));
         assert_eq!(entry["incarnation"].as_u64(), Some(0));
     }
@@ -168,7 +169,7 @@ fn every_recorded_event_has_a_known_kind_discriminator() {
     let mut host = make_host("a", &["a", "b", "c"]);
     let mut record_events: Vec<serde_json::Value> = Vec::new();
     for t in 0..30 {
-        for action in host.tick(t * 1000) {
+        for action in host.tick(t * 1_000_000) {
             if let Action::RecordEvent { event, .. } = action {
                 let v: serde_json::Value =
                     serde_json::from_slice(&event).expect("event payload is JSON");
@@ -222,7 +223,7 @@ fn coverage_2_6_unanswered_probes_resolve_to_typed_timed_out_events() {
     // complete probe cycles.
     let mut events: Vec<serde_json::Value> = Vec::new();
     for t in 0..30u64 {
-        for action in host.tick(t * 1000) {
+        for action in host.tick(t * 1_000_000) {
             if let Action::RecordEvent { event, .. } = action {
                 let v: serde_json::Value =
                     serde_json::from_slice(&event).expect("event payload is JSON");

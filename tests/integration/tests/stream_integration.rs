@@ -13,8 +13,19 @@ use swactor_datastore::bridge::{DatastoreGroup, DatastoreGroupConfig};
 use swactor_datastore::messages::{DatastoreNodeMsg, DatastoreResponse};
 use swactor::std::RuntimeNaming;
 
+/// Process-wide tokio runtime backing the test drivers (they no longer own one).
+/// Kept alive for the whole test process; drivers are driven from the test's own
+/// thread, so their internal `block_on` is a legal sync→async bridge.
+fn test_tokio_handle() -> tokio::runtime::Handle {
+    use std::sync::OnceLock;
+    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RT.get_or_init(|| tokio::runtime::Runtime::new().expect("build test tokio runtime"))
+        .handle()
+        .clone()
+}
+
 fn make_driver_with_streams() -> IrohDriver {
-    IrohDriver::new(IrohDriverConfig {
+    IrohDriver::with_handle(test_tokio_handle(), IrohDriverConfig {
         secret_key: None,
         relay_mode: RelayMode::Disabled,
         node: DistributedNodeConfig::default(),
@@ -94,11 +105,12 @@ fn pump_until_response(
     let tokio_handle = driver_a.tokio_handle();
 
     loop {
-        // SWIM protocol ticks
-        driver_a.recv();
-        driver_a.tick();
-        driver_b.recv();
-        driver_b.tick();
+        // Fold any newly-established iroh connections into each driver. The
+        // actor-bridge pump runs `fold_connections` even with no bridge
+        // installed, which is all this transport-only test needs; stream
+        // connections are routed below.
+        driver_a.pump_inbound_to_actors();
+        driver_b.pump_inbound_to_actors();
 
         // Route incoming stream connections on node A
         for (node_id, conn) in driver_a.drain_other_connections() {
@@ -154,22 +166,13 @@ fn small_blob_transfers_between_two_nodes_via_stream() {
     driver_a.join(&[addr_b]);
     driver_b.join(&[addr_a]);
 
-    // Pump until SWIM membership converges
-    let swim_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        driver_a.recv();
-        driver_a.tick();
-        driver_b.recv();
-        driver_b.tick();
-
-        let snap_a = driver_a.snapshot();
-        let snap_b = driver_b.snapshot();
-        if snap_a.alive_count >= 1 && snap_b.alive_count >= 1 {
-            break;
-        }
-        if Instant::now() >= swim_deadline {
-            panic!("SWIM convergence timed out");
-        }
+    // Warm up iroh connectivity: fold the join connections so each endpoint has
+    // learned the other's address before the transfer. SWIM membership is no
+    // longer the readiness signal (this is a transport/stream test, not a
+    // membership test); the download loop below drives the actual connection.
+    for _ in 0..10 {
+        driver_a.pump_inbound_to_actors();
+        driver_b.pump_inbound_to_actors();
         std::thread::sleep(Duration::from_millis(50));
     }
 
@@ -297,21 +300,11 @@ fn multi_chunk_blob_transfers_between_two_nodes_via_stream() {
     driver_a.join(&[addr_b]);
     driver_b.join(&[addr_a]);
 
-    let swim_deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        driver_a.recv();
-        driver_a.tick();
-        driver_b.recv();
-        driver_b.tick();
-
-        let snap_a = driver_a.snapshot();
-        let snap_b = driver_b.snapshot();
-        if snap_a.alive_count >= 1 && snap_b.alive_count >= 1 {
-            break;
-        }
-        if Instant::now() >= swim_deadline {
-            panic!("SWIM convergence timed out");
-        }
+    // Warm up iroh connectivity (see the note in the first test): SWIM membership
+    // is no longer the readiness signal; the download loop drives the connection.
+    for _ in 0..10 {
+        driver_a.pump_inbound_to_actors();
+        driver_b.pump_inbound_to_actors();
         std::thread::sleep(Duration::from_millis(50));
     }
 

@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 use crate::messages::{DatastoreResponse, TransferMsg};
 use crate::types::{ContentHash, ObjectManifest, TransferStatus};

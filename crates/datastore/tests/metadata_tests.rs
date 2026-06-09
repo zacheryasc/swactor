@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashSet};
 use swactor_datastore::messages::{DatastoreResponse, MetadataMsg};
 use swactor_datastore::types::{ContentHash, ObjectEntry};
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 use common::{
     make_entry, make_manifest, spawn_metadata, test_node_id, test_runtime, tick_n, tick_until_recv,

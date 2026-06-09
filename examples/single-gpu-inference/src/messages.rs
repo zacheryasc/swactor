@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
-use swactor::transport::{Codec, CodecRegistry, NetworkMessage};
+use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 use swactor::Error;
 
 // ─── Message Types ─────────────────────────────────────────────────────────
@@ -59,8 +59,12 @@ impl Codec<InferenceResponse> for InferenceCodec {
 // ─── Registry ──────────────────────────────────────────────────────────────
 
 /// Build a `CodecRegistry` with inference message types registered.
+///
+/// Composes the distribution protocol's actor codecs (SWIM / registry /
+/// metadata / directory wire tags) so the `ClusterNode` actor bridge can
+/// decode inbound protocol frames, then adds the inference app types on top.
 pub fn inference_codec_registry() -> CodecRegistry {
-    let mut cr = CodecRegistry::new();
+    let mut cr = distribution::messages::actor_codec_registry();
     cr.register::<InferenceRequest, _>(InferenceCodec);
     cr.register::<InferenceResponse, _>(InferenceCodec);
     cr

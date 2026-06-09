@@ -11,7 +11,7 @@ use swactor_datastore::messages::{MetadataMsg, TransferMsg};
 use swactor_datastore::types::ContentHash;
 use swactor_datastore::TransferActor;
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Phase 3: Metadata dissemination tests

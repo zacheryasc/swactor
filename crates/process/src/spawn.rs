@@ -24,7 +24,7 @@ pub fn spawn_local_process(
     let waker_slot = Arc::new(OnceLock::new());
     let queue = EventQueue::new();
     let driver = LocalDriver::new(queue, waker_slot.clone());
-    spawn_process_inner(ctx, sender, spec, driver, waker_slot)
+    spawn_process_inner(ctx, sender, spec, driver, waker_slot, None)
 }
 
 /// Spawn a process actor with a custom driver.
@@ -38,13 +38,19 @@ pub fn spawn_process<D: ProcessDriver + 'static>(
     driver: D,
     waker_slot: Arc<OnceLock<ProcessWaker>>,
 ) -> Result<ActorAddress, Error> {
-    spawn_process_inner(ctx, sender, spec, driver, waker_slot)
+    spawn_process_inner(ctx, sender, spec, driver, waker_slot, None)
 }
 
 /// Spawn a process actor using the `SshDriver` (remote host via SSH).
 ///
 /// Requires a tokio runtime handle (e.g. from `IrohDriver::tokio_handle()`)
 /// and SSH connection config.
+///
+/// `telemetry_label`, when `Some`, overrides the command-basename label the
+/// node's process-output observer taps output onto (`proc.<label>.*`). A caller
+/// that spawns several remote shells running the same command (e.g. one
+/// `pp-worker` per stage) sets a distinct label per child so their boot output
+/// is attributable.
 #[cfg(feature = "ssh")]
 pub fn spawn_ssh_process(
     ctx: &Ctx,
@@ -52,11 +58,12 @@ pub fn spawn_ssh_process(
     spec: ProcessSpec,
     tokio_handle: tokio::runtime::Handle,
     ssh_config: crate::ssh::SshConfig,
+    telemetry_label: Option<String>,
 ) -> Result<ActorAddress, Error> {
     let waker_slot = Arc::new(OnceLock::new());
     let queue = EventQueue::new();
     let driver = crate::ssh::SshDriver::new(queue, waker_slot.clone(), tokio_handle, ssh_config);
-    spawn_process_inner(ctx, sender, spec, driver, waker_slot)
+    spawn_process_inner(ctx, sender, spec, driver, waker_slot, telemetry_label)
 }
 
 /// The basename of a command path, used as the process's telemetry label.
@@ -76,10 +83,13 @@ fn spawn_process_inner<D: ProcessDriver + 'static>(
     spec: ProcessSpec,
     driver: D,
     waker_slot: Arc<OnceLock<ProcessWaker>>,
+    label_override: Option<String>,
 ) -> Result<ActorAddress, Error> {
-    // Label this process's output by its command basename so the node's
-    // per-runtime observer (if any) taps it onto `proc.<label>.*` automatically.
-    let label = command_basename(&spec.command);
+    // Label this process's output so the node's per-runtime observer (if any)
+    // taps it onto `proc.<label>.*` automatically. Default to the command
+    // basename; a caller can override (e.g. to keep several remote shells
+    // running the same command distinguishable).
+    let label = label_override.unwrap_or_else(|| command_basename(&spec.command));
     let observer = ctx.process_output_observer();
     let (session, initial_actions) = ProcessSession::new(spec);
     let actor = ProcessActor::new(

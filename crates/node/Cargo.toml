@@ -9,12 +9,15 @@ dashboard = { path = "../dashboard" }
 swactor-datastore = { path = "../datastore" }
 swactor-transport = { path = "../transport" }
 distribution = { path = "../distribution" }
+datastream = { path = "../datastream" }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 iroh = { version = "0.98", optional = true }
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tracing = "0.1"
 libc = "0.2"
 
 [lib]

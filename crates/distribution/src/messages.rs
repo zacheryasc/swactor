@@ -1,10 +1,12 @@
-//! Protocol messages for SWIM membership and Kademlia directory, plus JSON codec.
+//! Protocol messages for SWIM membership and the standalone gossip frames
+//! (registry, node metadata, directory), plus their JSON codec.
 
 use serde::{Deserialize, Serialize};
-use swactor::actor::ActorAddress;
-use swactor::transport::{Codec, CodecRegistry, NetworkMessage};
+use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 use swactor::Error;
 
+use crate::node_metadata::NodeMetadataEntry;
+use crate::registry::RegistryEntry;
 use crate::types::{DirectoryEntry, MemberState, NodeId, NodeRecord};
 
 // ─── SWIM Protocol Messages ────────────────────────────────────────────────
@@ -114,70 +116,51 @@ pub struct MembershipUpdate {
     pub incarnation: u64,
 }
 
-// ─── Kademlia Protocol Messages ─────────────────────────────────────────────
+// ─── Standalone gossip (decoupled from the SWIM piggyback) ───────────────────
 
-/// Kademlia FIND_NODE request — "who are the k closest nodes to this target?"
+/// Cluster-registry gossip — a batch of name→actor CRDT entries disseminated
+/// independently of SWIM membership.
+///
+/// Replaces the old combined SWIM piggyback (registry entries packed onto
+/// Ping/Ack): once SWIM is membership-only, the registry owns its own wire
+/// frame and its own dissemination cadence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FindNodeRequest {
-    pub from: NodeId,
-    pub target: NodeId,
+pub struct RegistryGossip {
+    pub entries: Vec<RegistryEntry>,
 }
 
-impl NetworkMessage for FindNodeRequest {
+impl NetworkMessage for RegistryGossip {
     fn type_tag() -> &'static str {
-        "swactor_dist::FindNodeRequest"
+        "swactor_dist::RegistryGossip"
     }
 }
 
-/// Kademlia FIND_NODE response — closest known nodes.
+/// Node-metadata gossip — a batch of per-node metadata entries (relay URL,
+/// node name) disseminated independently of SWIM membership.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FindNodeResponse {
-    pub closest: Vec<NodeId>,
+pub struct MetadataGossip {
+    pub entries: Vec<NodeMetadataEntry>,
 }
 
-impl NetworkMessage for FindNodeResponse {
+impl NetworkMessage for MetadataGossip {
     fn type_tag() -> &'static str {
-        "swactor_dist::FindNodeResponse"
+        "swactor_dist::MetadataGossip"
     }
 }
 
-/// Kademlia STORE — "store this directory entry"
+/// Directory gossip — a batch of signed actor→host claims (`DIRECTORY.md` §3),
+/// disseminated independently of SWIM membership exactly like `RegistryGossip` /
+/// `MetadataGossip`. Each `DirectoryEntry` is the spec's `Claim`: it carries its
+/// own `generation` and signature, so merge is self-describing and a forged claim
+/// is rejected on receipt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoreRequest {
-    pub entry: DirectoryEntry,
+pub struct DirectoryGossip {
+    pub claims: Vec<DirectoryEntry>,
 }
 
-impl NetworkMessage for StoreRequest {
+impl NetworkMessage for DirectoryGossip {
     fn type_tag() -> &'static str {
-        "swactor_dist::StoreRequest"
-    }
-}
-
-/// Kademlia FIND_VALUE request — "where is this actor?"
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FindValueRequest {
-    pub from: NodeId,
-    pub actor_addr: ActorAddress,
-}
-
-impl NetworkMessage for FindValueRequest {
-    fn type_tag() -> &'static str {
-        "swactor_dist::FindValueRequest"
-    }
-}
-
-/// Kademlia FIND_VALUE response — either the entry or closer nodes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum FindValueResponse {
-    /// Found the actor — here's the directory entry.
-    Found(DirectoryEntry),
-    /// Don't have it — here are closer nodes to ask.
-    Closer(Vec<NodeId>),
-}
-
-impl NetworkMessage for FindValueResponse {
-    fn type_tag() -> &'static str {
-        "swactor_dist::FindValueResponse"
+        "swactor_dist::DirectoryGossip"
     }
 }
 
@@ -205,13 +188,12 @@ macro_rules! impl_json_codec {
 impl_json_codec!(Ping);
 impl_json_codec!(Ack);
 impl_json_codec!(PingReq);
+impl_json_codec!(IndirectAck);
 impl_json_codec!(JoinRequest);
 impl_json_codec!(JoinResponse);
-impl_json_codec!(FindNodeRequest);
-impl_json_codec!(FindNodeResponse);
-impl_json_codec!(StoreRequest);
-impl_json_codec!(FindValueRequest);
-impl_json_codec!(FindValueResponse);
+impl_json_codec!(RegistryGossip);
+impl_json_codec!(MetadataGossip);
+impl_json_codec!(DirectoryGossip);
 
 /// Build a `CodecRegistry` with all distribution protocol messages registered.
 pub fn distribution_codec_registry() -> CodecRegistry {
@@ -219,12 +201,108 @@ pub fn distribution_codec_registry() -> CodecRegistry {
     cr.register::<Ping, _>(JsonCodec);
     cr.register::<Ack, _>(JsonCodec);
     cr.register::<PingReq, _>(JsonCodec);
+    // §6.1 / §14.5: `IndirectAck` is folded into the shared registry so all six
+    // SWIM message types decode through one uniform path (the iroh driver no
+    // longer needs to hand-dispatch it by tag).
+    cr.register::<IndirectAck, _>(JsonCodec);
     cr.register::<JoinRequest, _>(JsonCodec);
     cr.register::<JoinResponse, _>(JsonCodec);
-    cr.register::<FindNodeRequest, _>(JsonCodec);
-    cr.register::<FindNodeResponse, _>(JsonCodec);
-    cr.register::<StoreRequest, _>(JsonCodec);
-    cr.register::<FindValueRequest, _>(JsonCodec);
-    cr.register::<FindValueResponse, _>(JsonCodec);
+    cr.register::<RegistryGossip, _>(JsonCodec);
+    cr.register::<MetadataGossip, _>(JsonCodec);
+    cr.register::<DirectoryGossip, _>(JsonCodec);
+    cr
+}
+
+/// Build the `CodecRegistry` for the **actor transport**.
+///
+/// Distinct from [`distribution_codec_registry`] in one key way: here every wire
+/// `type_tag` decodes directly into the matching actor `Incoming` *enum variant*
+/// (e.g. `"swactor_dist::Ping"` → [`SwimIn::Ping`]), so a decoded frame can be
+/// handed straight to the target actor's mailbox via `Runtime::deliver_raw`.
+/// Symmetrically, each actor `Incoming` enum registers a variant-multiplexing
+/// encoder (one Rust type → several wire tags). Local-only control variants
+/// (`Tick`, `Subscribe`, …) deliberately fail to encode — they never cross the
+/// wire.
+///
+/// Mixing these decoders into [`distribution_codec_registry`] would clobber its
+/// `type_tag → concrete-type` decoders, so the actor transport keeps its own.
+///
+/// Grows one actor at a time as the migration lands; today it covers SWIM.
+pub fn actor_codec_registry() -> CodecRegistry {
+    use crate::swim::actor::SwimIn;
+
+    let mut cr = CodecRegistry::new();
+
+    // ── SWIM: SwimIn ⇄ the six network type_tags ──
+    cr.register_encoder::<SwimIn>(|msg| {
+        let json = |r: Result<Vec<u8>, serde_json::Error>| {
+            r.map_err(|e| Error::from(format!("encode: {e}")))
+        };
+        let (tag, bytes) = match msg {
+            SwimIn::Ping(p) => ("swactor_dist::Ping", json(serde_json::to_vec(p))?),
+            SwimIn::Ack(a) => ("swactor_dist::Ack", json(serde_json::to_vec(a))?),
+            SwimIn::PingReq(pr) => ("swactor_dist::PingReq", json(serde_json::to_vec(pr))?),
+            SwimIn::IndirectAck(ia) => ("swactor_dist::IndirectAck", json(serde_json::to_vec(ia))?),
+            SwimIn::JoinRequest(jr) => ("swactor_dist::JoinRequest", json(serde_json::to_vec(jr))?),
+            SwimIn::JoinResponse(jr) => ("swactor_dist::JoinResponse", json(serde_json::to_vec(jr))?),
+            // Local-control variants (§6.2) never leave the node.
+            SwimIn::Tick { .. }
+            | SwimIn::SendFailed { .. }
+            | SwimIn::Join { .. }
+            | SwimIn::Leave
+            | SwimIn::Subscribe { .. } => {
+                return Err(Error::from(
+                    "SwimIn: local-only control variant is not network-encodable",
+                ));
+            }
+        };
+        Ok((tag.to_string(), bytes))
+    });
+
+    // A generic free fn (not a closure — closures are monomorphic and we decode
+    // into six different inner types).
+    fn d<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, Error> {
+        serde_json::from_slice(bytes).map_err(|e| Error::from(format!("decode: {e}")))
+    }
+    cr.register_decoder::<SwimIn>("swactor_dist::Ping", |b| Ok(SwimIn::Ping(d(b)?)));
+    cr.register_decoder::<SwimIn>("swactor_dist::Ack", |b| Ok(SwimIn::Ack(d(b)?)));
+    cr.register_decoder::<SwimIn>("swactor_dist::PingReq", |b| Ok(SwimIn::PingReq(d(b)?)));
+    cr.register_decoder::<SwimIn>("swactor_dist::IndirectAck", |b| Ok(SwimIn::IndirectAck(d(b)?)));
+    cr.register_decoder::<SwimIn>("swactor_dist::JoinRequest", |b| Ok(SwimIn::JoinRequest(d(b)?)));
+    cr.register_decoder::<SwimIn>("swactor_dist::JoinResponse", |b| Ok(SwimIn::JoinResponse(d(b)?)));
+
+    // ── Registry: RegistryIn::Gossip ⇄ RegistryGossip frame ──
+    use crate::registry_actor::RegistryIn;
+    cr.register_encoder::<RegistryIn>(|msg| match msg {
+        RegistryIn::Gossip(g) => Ok((
+            RegistryGossip::type_tag().to_string(),
+            serde_json::to_vec(g).map_err(|e| Error::from(format!("encode: {e}")))?,
+        )),
+        _ => Err(Error::from("RegistryIn: only Gossip is network-encodable")),
+    });
+    cr.register_decoder::<RegistryIn>(RegistryGossip::type_tag(), |b| Ok(RegistryIn::Gossip(d(b)?)));
+
+    // ── Metadata: MetadataIn::Gossip ⇄ MetadataGossip frame ──
+    use crate::node_metadata_actor::MetadataIn;
+    cr.register_encoder::<MetadataIn>(|msg| match msg {
+        MetadataIn::Gossip(g) => Ok((
+            MetadataGossip::type_tag().to_string(),
+            serde_json::to_vec(g).map_err(|e| Error::from(format!("encode: {e}")))?,
+        )),
+        _ => Err(Error::from("MetadataIn: only Gossip is network-encodable")),
+    });
+    cr.register_decoder::<MetadataIn>(MetadataGossip::type_tag(), |b| Ok(MetadataIn::Gossip(d(b)?)));
+
+    // ── Directory: DirectoryIn::Gossip ⇄ DirectoryGossip frame ──
+    use crate::directory_actor::DirectoryIn;
+    cr.register_encoder::<DirectoryIn>(|msg| match msg {
+        DirectoryIn::Gossip(g) => Ok((
+            DirectoryGossip::type_tag().to_string(),
+            serde_json::to_vec(g).map_err(|e| Error::from(format!("encode: {e}")))?,
+        )),
+        _ => Err(Error::from("DirectoryIn: only Gossip is network-encodable")),
+    });
+    cr.register_decoder::<DirectoryIn>(DirectoryGossip::type_tag(), |b| Ok(DirectoryIn::Gossip(d(b)?)));
+
     cr
 }

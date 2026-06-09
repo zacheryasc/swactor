@@ -14,9 +14,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
-use swactor::transport::NetworkMessage;
+use swactor_transport::NetworkMessage;
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 use crate::streams::types::StreamId;
 
 use crate::auth::{AccessRequestInfo, AuthorizedKeyInfo, DeniedReason, SignedRequest};

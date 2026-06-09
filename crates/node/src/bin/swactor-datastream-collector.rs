@@ -4,7 +4,7 @@
 //! This is the "raw stream to stdout" end of the per-node telemetry datastream
 //! (see `distribution/DATASTREAM_SPEC.md`). It is deliberately the dumbest
 //! possible consumer: one datagram carries one frame
-//! ([`encode_delivery`](distribution::datastream::wire::encode_delivery)), so
+//! ([`encode_delivery`](datastream::wire::encode_delivery)), so
 //! we decode and print in arrival order — loss and reorder show up as they
 //! happen on the wire, which is exactly what you want when watching a live
 //! cluster. No store, no views, no dashboard.
@@ -15,8 +15,8 @@
 use std::io::Write;
 use std::net::UdpSocket;
 
-use distribution::datastream::views::decode_body;
-use distribution::datastream::wire::decode_delivery;
+use datastream::views::decode_body;
+use datastream::wire::decode_delivery;
 
 fn main() {
     let bind = resolve_bind();

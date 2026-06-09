@@ -21,9 +21,6 @@ pub mod stats;
 
 pub mod runtime;
 
-#[cfg(feature = "transport")]
-pub mod transport;
-
 #[cfg(feature = "std")]
 pub mod std;
 

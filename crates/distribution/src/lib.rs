@@ -3,12 +3,14 @@ pub mod crypto;
 pub mod peer_auth;
 pub mod messages;
 pub mod swim;
-pub mod kademlia;
 pub mod cache;
 pub mod node;
 pub mod registry;
+pub mod registry_actor;
 pub mod node_metadata;
+pub mod node_metadata_actor;
+pub mod directory_actor;
+pub mod transport_bridge;
 pub mod snapshot;
-pub mod datastream;
 #[cfg(feature = "iroh")]
 pub mod iroh_driver;

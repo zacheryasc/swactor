@@ -114,14 +114,23 @@ pub struct Runtime {
     worker_threads: Arc<Vec<OnceLock<Thread>>>,
     created_at: Instant,
     #[cfg(feature = "transport")]
-    codec_registry: Option<Arc<crate::transport::CodecRegistry>>,
-    #[cfg(feature = "transport")]
-    transport_router: Option<Arc<crate::transport::TransportRouter>>,
+    remote_sink: Option<Arc<dyn RemoteSink>>,
 }
 
 // Safety: RefCell<Vec<Worker>> is only accessed from the owning thread via tick().
 // After run() the RefCell is empty and not accessed by worker threads.
 unsafe impl Sync for Runtime {}
+
+/// Core's only hook for delivering a message to a **non-local** address.
+///
+/// Implemented outside core (e.g. `swactor-transport`'s `CodecRemoteSink`),
+/// which owns all codec/transport concerns. Core stays codec-free: it hands the
+/// sink a type-erased message and an address, and nothing more. `Send + Sync`
+/// because the sink is stored in an `Arc` and shared across worker threads.
+#[cfg(feature = "transport")]
+pub trait RemoteSink: Send + Sync {
+    fn send(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
+}
 
 /// Globally unique identity of a swactor runtime instance.
 /// Pure identity — no networking info. A runtime can exist on any device,
@@ -254,9 +263,7 @@ impl Runtime {
             worker_threads,
             created_at: Instant::now(),
             #[cfg(feature = "transport")]
-            codec_registry: None,
-            #[cfg(feature = "transport")]
-            transport_router: None,
+            remote_sink: None,
         };
 
         #[cfg(feature = "tracing")]
@@ -398,9 +405,7 @@ impl Runtime {
             worker_stats: &self.worker_stats,
             created_at: self.created_at,
             #[cfg(feature = "transport")]
-            codec_registry: self.codec_registry.as_deref(),
-            #[cfg(feature = "transport")]
-            transport_router: self.transport_router.as_deref(),
+            remote_sink: self.remote_sink.as_deref(),
         }
     }
 
@@ -531,22 +536,19 @@ impl Runtime {
         let _ = self.process_output_observer.set(obs);
     }
 
-    /// Set the codec registry for remote transport.
+    /// Set the sink for non-local (remote) message delivery.
+    ///
+    /// The sink owns all codec/transport concerns; core only knows how to hand
+    /// it a type-erased message destined for a non-local address.
     #[cfg(feature = "transport")]
-    pub fn set_codec_registry(&mut self, registry: Arc<crate::transport::CodecRegistry>) {
-        self.codec_registry = Some(registry);
-    }
-
-    /// Set the transport router for remote message delivery.
-    #[cfg(feature = "transport")]
-    pub fn set_transport_router(&mut self, router: Arc<crate::transport::TransportRouter>) {
-        self.transport_router = Some(router);
+    pub fn set_remote_sink(&mut self, sink: Arc<dyn RemoteSink>) {
+        self.remote_sink = Some(sink);
     }
 
     /// Deliver a raw deserialized message into the runtime.
     ///
-    /// Used by [`CodecRegistry::receive`](crate::transport::CodecRegistry::receive)
-    /// to inject incoming messages from remote runtimes.
+    /// Whoever owns the socket decodes the wire bytes outside core and calls
+    /// this to inject the resulting message for a local actor or inbox.
     #[cfg(feature = "transport")]
     pub fn deliver_raw(
         &self,

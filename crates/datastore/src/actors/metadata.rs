@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 use crate::messages::{BlobStoreMsg, DatastoreResponse, MetadataMsg};
 use crate::types::{ContentHash, DatastoreConfig, ObjectEntry, ObjectManifest};

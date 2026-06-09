@@ -15,7 +15,7 @@ use swactor_datastore::storage::InMemoryBackend;
 use swactor_datastore::types::{ChunkRef, ContentHash, DatastoreConfig, ObjectEntry, ObjectManifest};
 use swactor_datastore::{BlobStoreActor, DatastoreNode, MetadataActor, TransferActor};
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 /// Create a single-threaded runtime with StdExtension.
 pub fn test_runtime() -> Runtime {

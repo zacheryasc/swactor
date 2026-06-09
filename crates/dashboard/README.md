@@ -8,7 +8,7 @@ runtime investigation.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `distribution` | yes | `/distribution` page with SWIM membership, Kademlia routing, and location cache |
+| `distribution` | yes | `/distribution` page with SWIM membership, gossip directory routes, and location cache |
 | `tui` | no | Terminal UI with overview, worker detail, and distribution views |
 
 ## HTTP Dashboard
@@ -22,7 +22,7 @@ cargo run -p dashboard --example dashboard_demo
 Pages:
 - `http://localhost:9090` — live overview (workers, actors, message rates)
 - `http://localhost:9090/actors` — actor table
-- `http://localhost:9090/distribution` — SWIM membership, Kademlia routing, cache entries
+- `http://localhost:9090/distribution` — SWIM membership, gossip directory routes, cache entries
 
 The demo creates a 4-worker runtime with ping-pong and counter actors, plus a
 9-node distribution cluster (1 main node + 8 peers) with simulated SWIM
@@ -41,7 +41,7 @@ cargo run -p dashboard --features tui --bin swactor-tui -- http://localhost:9090
 Views (cycle with Tab):
 - **Overview** — htop-style worker bars, summary line, sortable actor table
 - **Worker Detail** — focused view of a single worker's actors and phase breakdown
-- **Distribution** — cluster summary, scrollable members table, cache entries, routing bucket histogram
+- **Distribution** — cluster summary, scrollable members table, cache entries, gossip directory route count
 
 Key bindings: `q` quit, `Tab` cycle views, `s` sort column, `r` reverse sort,
 arrow keys/`j`/`k` scroll, `Enter` drill into worker, `Esc` back to overview.

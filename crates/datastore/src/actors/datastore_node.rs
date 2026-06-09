@@ -11,7 +11,7 @@ use std::sync::Arc;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::Runtime;
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 use crate::actors::stream_downloader::StreamDownloader;
 use crate::actors::stream_server::StreamServer;

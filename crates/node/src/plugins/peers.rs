@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use dashboard::plugin::{DashboardPlugin, PluginResponse};
 use dashboard::JoinPeerInfo;
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 use swactor_transport::identity::{base58_decode, hex_decode};
 use distribution::peer_auth::PeerAllowList;
 

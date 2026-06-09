@@ -90,7 +90,7 @@ while true; do
         for url in "${ALL_DASHBOARDS[@]}"; do
             echo -n "  $url: "
             curl -sf "$url/api/distribution" 2>/dev/null \
-                | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'alive={d[\"alive_count\"]}, routing={d[\"routing_table_size\"]}, dir={d[\"directory_entry_count\"]}, cache={d[\"cache_size\"]}')" \
+                | python3 -c "import json,sys; d=json.load(sys.stdin); print(f'alive={d[\"alive_count\"]}, dir={d[\"directory_route_count\"]}, cache={d[\"cache_size\"]}')" \
                 2>/dev/null || echo "unreachable"
         done
         echo ""
@@ -120,13 +120,13 @@ done
 # ── Report ───────────────────────────────────────────────────────────────────
 echo ""
 echo "=== Cluster Status ==="
-printf "%-35s %6s %8s %5s %6s\n" "ENDPOINT" "ALIVE" "ROUTING" "DIR" "CACHE"
+printf "%-35s %6s %5s %6s\n" "ENDPOINT" "ALIVE" "DIR" "CACHE"
 for url in "${ALL_DASHBOARDS[@]}"; do
     data=$(curl -sf "$url/api/distribution" 2>/dev/null) || { echo "$url: unreachable"; continue; }
     echo "$data" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-print(f'  {\"$url\":<33} {d[\"alive_count\"]:>6} {d[\"routing_table_size\"]:>8} {d[\"directory_entry_count\"]:>5} {d[\"cache_size\"]:>6}')
+print(f'  {\"$url\":<33} {d[\"alive_count\"]:>6} {d[\"directory_route_count\"]:>5} {d[\"cache_size\"]:>6}')
 "
 done
 
@@ -138,11 +138,9 @@ pass=true
 for url in "${ALL_DASHBOARDS[@]}"; do
     data=$(curl -sf "$url/api/distribution" 2>/dev/null) || { echo "FAIL: $url unreachable"; pass=false; continue; }
     alive=$(echo "$data" | python3 -c "import json,sys; print(json.load(sys.stdin)['alive_count'])")
-    routing=$(echo "$data" | python3 -c "import json,sys; print(json.load(sys.stdin)['routing_table_size'])")
-    dir=$(echo "$data" | python3 -c "import json,sys; print(json.load(sys.stdin)['directory_entry_count'])")
+    dir=$(echo "$data" | python3 -c "import json,sys; print(json.load(sys.stdin)['directory_route_count'])")
 
     if [ "$alive" -lt 4 ]; then echo "FAIL: $url alive=$alive (expected >= 4)"; pass=false; fi
-    if [ "$routing" -lt 3 ]; then echo "FAIL: $url routing=$routing (expected >= 3)"; pass=false; fi
     if [ "$dir" -lt 2 ]; then echo "FAIL: $url dir=$dir (expected >= 2)"; pass=false; fi
 done
 

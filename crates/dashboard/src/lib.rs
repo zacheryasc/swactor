@@ -17,7 +17,8 @@ pub mod datastream_source;
 /// The canonical Distribution page (the SWIM connection-graph view). Owned by
 /// the dashboard crate so every front-end that serves it — a live node's
 /// `DistributionPlugin` and the datastream dashboard — renders the exact same
-/// page and chrome, fed by a [`distribution::snapshot::DistributionNodeSnapshot`].
+/// page and chrome, fed by the distribution-page JSON the datastream consumer
+/// reconstructs (see [`crate::datastream_source`]).
 pub const DISTRIBUTION_PAGE_HTML: &str = include_str!("distribution_page.html");
 
 use std::io;

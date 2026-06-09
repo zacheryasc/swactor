@@ -13,7 +13,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto;
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 use crate::crypto::Signature;
 use crate::content_hash::ContentHash;
 

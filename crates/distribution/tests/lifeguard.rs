@@ -5,7 +5,15 @@
 //! 2. Dynamic suspect timeout — scales with cluster size
 //! 3. Protocol period scaling — probe intervals stretch under load
 
+use std::time::Duration;
+
 use distribution::swim::lifeguard::{HealthMultiplier, LifeguardConfig};
+
+/// Suspicion timeouts are wall-clock now; express the old integer tick-counts
+/// as milliseconds so the relative assertions carry over unchanged.
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
 
 // ─── Local Health Multiplier ─────────────────────────────────────────────────
 
@@ -132,11 +140,11 @@ fn degraded_node_stretches_probe_timeout() {
 
 #[test]
 fn suspect_timeout_scales_with_cluster_size() {
-    // Given: a healthy node with base_suspicion_timeout = 30
+    // Given: a healthy node with base_suspicion_timeout = 30ms
     let config = LifeguardConfig {
-        base_suspicion_timeout: 30,
-        min_suspicion_timeout: 10,
-        max_suspicion_timeout: 500,
+        base_suspicion_timeout: ms(30),
+        min_suspicion_timeout: ms(10),
+        max_suspicion_timeout: ms(500),
         ..LifeguardConfig::default()
     };
     let hm = HealthMultiplier::new(config);
@@ -149,41 +157,41 @@ fn suspect_timeout_scales_with_cluster_size() {
     // Then: larger clusters get longer timeouts (log2 scaling)
     assert!(
         timeout_2 < timeout_8,
-        "8-node cluster should have longer timeout than 2-node: {} vs {}",
+        "8-node cluster should have longer timeout than 2-node: {:?} vs {:?}",
         timeout_2, timeout_8
     );
     assert!(
         timeout_8 < timeout_100,
-        "100-node cluster should have longer timeout than 8-node: {} vs {}",
+        "100-node cluster should have longer timeout than 8-node: {:?} vs {:?}",
         timeout_8, timeout_100
     );
 }
 
 #[test]
 fn suspect_timeout_is_clamped_to_min() {
-    // Given: a config with min_suspicion_timeout = 50 and a tiny cluster
+    // Given: a config with min_suspicion_timeout = 50ms and a tiny cluster
     let config = LifeguardConfig {
-        base_suspicion_timeout: 1,
-        min_suspicion_timeout: 50,
-        max_suspicion_timeout: 500,
+        base_suspicion_timeout: ms(1),
+        min_suspicion_timeout: ms(50),
+        max_suspicion_timeout: ms(500),
         ..LifeguardConfig::default()
     };
     let hm = HealthMultiplier::new(config);
 
-    // When: computing for a 2-node cluster (log2(3) ≈ 2, so base*2*1 = 2)
+    // When: computing for a 2-node cluster (log2(3) ≈ 2, so base*2*1 = 2ms)
     let timeout = hm.dynamic_suspicion_timeout(2);
 
     // Then: clamped to minimum
-    assert_eq!(timeout, 50);
+    assert_eq!(timeout, ms(50));
 }
 
 #[test]
 fn suspect_timeout_is_clamped_to_max() {
-    // Given: a config with max_suspicion_timeout = 100 and a huge cluster
+    // Given: a config with max_suspicion_timeout = 100ms and a huge cluster
     let config = LifeguardConfig {
-        base_suspicion_timeout: 30,
-        min_suspicion_timeout: 10,
-        max_suspicion_timeout: 100,
+        base_suspicion_timeout: ms(30),
+        min_suspicion_timeout: ms(10),
+        max_suspicion_timeout: ms(100),
         ..LifeguardConfig::default()
     };
     let hm = HealthMultiplier::new(config);
@@ -192,16 +200,16 @@ fn suspect_timeout_is_clamped_to_max() {
     let timeout = hm.dynamic_suspicion_timeout(10000);
 
     // Then: clamped to maximum
-    assert_eq!(timeout, 100);
+    assert_eq!(timeout, ms(100));
 }
 
 #[test]
 fn degraded_health_further_increases_suspect_timeout() {
     // Given: a config and two nodes — one healthy, one degraded
     let config = LifeguardConfig {
-        base_suspicion_timeout: 30,
-        min_suspicion_timeout: 10,
-        max_suspicion_timeout: 5000,
+        base_suspicion_timeout: ms(30),
+        min_suspicion_timeout: ms(10),
+        max_suspicion_timeout: ms(5000),
         ..LifeguardConfig::default()
     };
     let healthy = HealthMultiplier::new(config.clone());
@@ -216,7 +224,7 @@ fn degraded_health_further_increases_suspect_timeout() {
     // Then: degraded node gives itself even more time
     assert!(
         degraded_timeout > healthy_timeout,
-        "degraded node ({}) should have longer suspect timeout than healthy ({})",
+        "degraded node ({:?}) should have longer suspect timeout than healthy ({:?})",
         degraded_timeout, healthy_timeout
     );
     // Specifically: healthy = 30 * log2(17) * 1, degraded = 30 * log2(17) * 3
@@ -275,9 +283,9 @@ fn mixed_ack_nack_stream_settles_to_moderate_health() {
 fn solo_node_gets_minimal_suspect_timeout() {
     // Given: a healthy node in a cluster of size 1
     let config = LifeguardConfig {
-        base_suspicion_timeout: 30,
-        min_suspicion_timeout: 15,
-        max_suspicion_timeout: 500,
+        base_suspicion_timeout: ms(30),
+        min_suspicion_timeout: ms(15),
+        max_suspicion_timeout: ms(500),
         ..LifeguardConfig::default()
     };
     let hm = HealthMultiplier::new(config);
@@ -286,21 +294,21 @@ fn solo_node_gets_minimal_suspect_timeout() {
     let timeout = hm.dynamic_suspicion_timeout(1);
 
     // Then: log2(2) = 1, so 30*1*1 = 30 (above min)
-    assert_eq!(timeout, 30);
+    assert_eq!(timeout, ms(30));
 }
 
 #[test]
 fn empty_cluster_still_returns_valid_timeout() {
     // Given: edge case — cluster size 0
     let config = LifeguardConfig {
-        base_suspicion_timeout: 30,
-        min_suspicion_timeout: 15,
-        max_suspicion_timeout: 500,
+        base_suspicion_timeout: ms(30),
+        min_suspicion_timeout: ms(15),
+        max_suspicion_timeout: ms(500),
         ..LifeguardConfig::default()
     };
     let hm = HealthMultiplier::new(config);
 
     // When/Then: doesn't panic and returns clamped value
     let timeout = hm.dynamic_suspicion_timeout(0);
-    assert!(timeout >= 15);
+    assert!(timeout >= ms(15));
 }

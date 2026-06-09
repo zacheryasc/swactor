@@ -10,5 +10,6 @@ distribution = { path = "../../crates/distribution", features = ["iroh", "relay"
 dashboard = { path = "../../crates/dashboard" }
 swactor = { path = "../..", features = ["serde", "transport"] }
 iroh = "0.98"
+tokio = { version = "1", features = ["rt-multi-thread"] }
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"

@@ -4,12 +4,12 @@ use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use swactor::transport::NodeId;
+use crate::NodeId;
 
 /// Ed25519 signing keypair.
 ///
 /// Wraps `ed25519_dalek::SigningKey`. The public key half is exposed as a
-/// `swactor::transport::NodeId` so peer identity is uniform across the
+/// `swactor_transport::NodeId` so peer identity is uniform across the
 /// distribution stack.
 #[derive(Clone)]
 pub struct Keypair {

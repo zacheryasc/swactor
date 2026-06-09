@@ -1,6 +1,6 @@
 use swactor::actor::ActorAddress;
 use distribution::crypto::{self, Keypair, KeypairExt};
-use distribution::types::{DirectoryEntry, MemberState, NodeId, NodeIdDistance, NodeRecord, Signature};
+use distribution::types::{DirectoryEntry, MemberState, NodeId, NodeRecord, Signature};
 
 // ─── Keypair generation and identity ────────────────────────────────────────
 
@@ -138,46 +138,6 @@ fn node_record_serde_roundtrip() {
     let back: NodeRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(record.node_id, back.node_id);
     assert_eq!(record.incarnation, back.incarnation);
-}
-
-// ─── XOR distance ───────────────────────────────────────────────────────────
-
-#[test]
-fn xor_distance_to_self_is_zero() {
-    let kp = Keypair::generate();
-    let id = kp.node_id();
-    let dist = id.xor_distance(&id);
-    assert_eq!(dist, [0u8; 32]);
-}
-
-#[test]
-fn xor_distance_is_symmetric() {
-    let a = Keypair::generate().node_id();
-    let b = Keypair::generate().node_id();
-    assert_eq!(a.xor_distance(&b), b.xor_distance(&a));
-}
-
-#[test]
-fn xor_leading_zeros_self_is_256() {
-    let id = Keypair::generate().node_id();
-    assert_eq!(id.xor_leading_zeros(&id), 256);
-}
-
-#[test]
-fn xor_leading_zeros_opposite_is_zero() {
-    let a = NodeId([0x00; 32]);
-    let b = NodeId([0xff; 32]);
-    assert_eq!(a.xor_leading_zeros(&b), 0);
-}
-
-#[test]
-fn xor_leading_zeros_one_bit_difference() {
-    let a = NodeId([0x00; 32]);
-    let mut b_bytes = [0x00u8; 32];
-    b_bytes[0] = 0x01; // differs only in bit 7 of first byte
-    let b = NodeId(b_bytes);
-    // XOR = 0x01 0x00 ... → leading zeros = 7
-    assert_eq!(a.xor_leading_zeros(&b), 7);
 }
 
 // ─── MemberState ordering ───────────────────────────────────────────────────
