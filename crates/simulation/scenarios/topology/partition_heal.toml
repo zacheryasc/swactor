@@ -1,5 +1,9 @@
-# Partition the cluster into {a} | {b, c} for 5s, then heal. Asserts the
-# cluster converges back to all-Alive within a bounded window.
+# Partition the cluster into {a} | {b, c}, then heal. Asserts the cluster
+# converges back to all-Alive within a bounded window AND that the isolated
+# node's death is *resolved* — the Dead→Alive resurrection arc (Goal 3, "death
+# is provisional"), not just the post-heal endpoint. `dead_reprobe_interval_ns`
+# is non-zero so the partition-heal detector (SWIM_ACTOR_SPEC §9.8) actually
+# re-probes the isolated node and lets it refute back to Alive.
 # Expected verdict: pass-now.
 
 name = "partition_heal"
@@ -23,17 +27,17 @@ cache_invalidate_after_idle_ns = 30_000_000_000
 id = "a"
 kind = "swim"
 initial_state = "alive"
-kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000, dead_reprobe_interval_ns = 1_000_000_000 }
 [[peers]]
 id = "b"
 kind = "swim"
 initial_state = "alive"
-kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000, dead_reprobe_interval_ns = 1_000_000_000 }
 [[peers]]
 id = "c"
 kind = "swim"
 initial_state = "alive"
-kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000 }
+kind_config = { probe_interval_ns = 1_000_000_000, suspicion_timeout_ns = 5_000_000_000, dead_reprobe_interval_ns = 1_000_000_000 }
 
 [[links]]
 from = "a"
@@ -64,8 +68,25 @@ peers_b = ["b", "c"]
 kind = "heal"
 at_ns = 30_000_000_000
 
+# Snapshots spanning the post-heal convergence window so `convergence_after`
+# has data to evaluate (snapshots are only emitted at these declared times).
+[[snapshots]]
+at_ns = 45_000_000_000
+[[snapshots]]
+at_ns = 55_000_000_000
+[[snapshots]]
+at_ns = 60_000_000_000
+
 [[assertions]]
 kind = "convergence_after"
 after_ns = 30_000_000_000
 within_ns = 30_000_000_000
 peers = ["a", "b", "c"]
+
+# Goal 3 — death is provisional: the isolated node "a" is detected Dead during
+# the partition, then resurrected to Alive after the heal (within the window).
+[[assertions]]
+kind = "dead_peer_resurrects_within"
+peer = "a"
+after_ns = 10_000_000_000
+within_ns = 60_000_000_000

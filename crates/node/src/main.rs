@@ -6,35 +6,57 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
 use swactor::actor::{ActorInterface, Ctx};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::Runtime;
-use swactor::transport::NodeId;
+use swactor::stats::StatsHook;
+use swactor_transport::NodeId;
 use swactor_transport::crypto::Keypair;
 use swactor_transport::identity::{base58_encode, base58_decode, hex_encode, load_or_generate_keypair};
 use distribution::node::DistributedNodeConfig;
 use distribution::peer_auth::PeerAllowList;
-use distribution::snapshot::DistributionNodeSnapshot;
 use distribution::swim::probe::SwimConfig;
 
-use distribution::datastream::catalog::RuntimeStats as DsRuntimeStats;
-use distribution::datastream::emit::{
-    DatastreamEmitter, EmitterConfig, FrameSink, NoopSink, TickInput, UdpFrameSink,
+use datastream::catalog::{
+    self, ActorRec, ActorRuntimeDetail, DatastoreState, DistributionState, IdentityRecord,
+    RuntimeStats as DsRuntimeStats,
 };
+use datastream::emit::{
+    DatastreamEmitter, DatastreamEventSink, EmitterConfig, FrameSink, TickInput,
+};
+use datastream::frame::{Frame, StreamId};
 
 use dashboard::collector::StatsCollector;
+use dashboard::datastream_source::FleetView;
 use dashboard::{start_dashboard, DashboardConfig};
 
+use swactor_datastore::metrics::{DatastoreEventObserver, DatastoreMetrics};
 use swactor_datastore::{DatastoreAuthConfig, DatastoreGroup, DatastoreGroupConfig};
 
 use swactor_node::{config, install, names, plugins};
 #[cfg(feature = "relay")]
 use swactor_node::relay;
+
+/// Extra swactor ticks run after `stop` so in-flight messages and stopping
+/// actors drain before teardown.
+const DRAIN_TICKS: usize = 100;
+
+/// How often the unified driver loop rebuilds the dashboard snapshot. This is a
+/// UI-refresh throttle (the snapshot read/serialize is comparatively expensive),
+/// not a protocol cadence — SWIM and the actors advance every loop iteration.
+const SNAPSHOT_REFRESH: Duration = Duration::from_millis(200);
+
+/// tokio worker-thread count. One worker is permanently consumed by the
+/// busy-spinning swactor driver loop (the mailbox has no waker, by design), so
+/// reserve it and leave the rest for iroh I/O + the dashboard; floor at 2 so a
+/// small box still makes progress.
+fn worker_count(cpus: usize) -> usize {
+    cpus.saturating_sub(1).max(2)
+}
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
@@ -141,10 +163,6 @@ struct Args {
     /// Bind address for embedded relay server
     #[arg(long, default_value = "0.0.0.0")]
     relay_bind: String,
-
-    /// Relay host(s) for cluster discovery (repeatable). Overrides config.
-    #[arg(long)]
-    relay_hosts: Vec<String>,
 }
 
 // ── Dummy actor ──────────────────────────────────────────────────────────
@@ -159,6 +177,147 @@ impl ActorInterface for HeartbeatActor {
     type Response = ();
 
     fn handle(&mut self, _ctx: &Ctx, _msg: Heartbeat) {}
+}
+
+// ── Membership fanout ──────────────────────────────────────────────────────
+// Adapts the SwimActor's `MembershipChanged` stream (its sole observable) into
+// the registry/metadata actors' `Membership` control messages, and folds it into
+// a mirror the dashboard snapshot reads. This is the seam by which the directory,
+// registry, and metadata layers "live beside" SWIM yet react to its membership.
+struct MembershipFanout {
+    registry: swactor::actor::ActorAddress,
+    metadata: swactor::actor::ActorAddress,
+    directory: swactor::actor::ActorAddress,
+    mirror: Arc<Mutex<distribution::swim::member_list::MemberList>>,
+}
+
+impl ActorInterface for MembershipFanout {
+    type Incoming = distribution::swim::actor::MembershipChanged;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, m: Self::Incoming) {
+        self.mirror
+            .lock()
+            .unwrap()
+            .apply(m.node_id, m.state, m.incarnation);
+        let _ = ctx.send(
+            self.registry,
+            distribution::registry_actor::RegistryIn::Membership(m.clone()),
+        );
+        let _ = ctx.send(
+            self.metadata,
+            distribution::node_metadata_actor::MetadataIn::Membership(m.clone()),
+        );
+        let _ = ctx.send(
+            self.directory,
+            distribution::directory_actor::DirectoryIn::Membership(m),
+        );
+    }
+}
+
+// ── In-process datastream consumer (node-local dashboard) ───────────────────
+// Single source: the node's emitter ships frames here. We fold them through the
+// SAME `FleetView` the fleet dashboard uses and render the node-local dashboard
+// from the result, so the node renders its own telemetry exactly as a remote
+// observer would. (Cross-node export rides the cluster transport via a
+// `ClusterFrameSink`, not a dedicated UDP channel.)
+struct LocalRenderSink {
+    view: FleetView,
+    dist_cache: Arc<Mutex<Option<String>>>,
+    datastore_cache: Arc<Mutex<Option<String>>>,
+    fleet_cache: Arc<Mutex<Option<String>>>,
+    stats_slot: Arc<Mutex<Option<swactor::stats::RuntimeStats>>>,
+    /// Node-local overlays the datastream view does not carry directly: the
+    /// interactive invite code / join statuses, and the node's authoritative
+    /// SWIM membership (`{members, *_count}`) for its own single-node view.
+    invite_code: Arc<Mutex<Option<String>>>,
+    join_statuses: Arc<Mutex<Option<String>>>,
+    members: Arc<Mutex<Option<String>>>,
+}
+
+impl FrameSink for LocalRenderSink {
+    fn ship(&mut self, stream: &StreamId, frame: &Frame) {
+        let update = self.view.ingest(stream, frame);
+        for (is_warn, m) in update.logs {
+            if is_warn {
+                tracing::warn!(target: "datastream", "{m}");
+            } else {
+                tracing::info!(target: "datastream", "{m}");
+            }
+        }
+        if let Some(stats) = update.stats {
+            *self.stats_slot.lock().unwrap() = Some(stats);
+        }
+        *self.fleet_cache.lock().unwrap() = Some(update.fleet_json);
+        if let Some(dist_json) = update.dist_json {
+            *self.dist_cache.lock().unwrap() = Some(overlay_dist(
+                dist_json,
+                &self.invite_code,
+                &self.join_statuses,
+                &self.members,
+            ));
+        }
+        if let Some(ds_json) = update.datastore_json {
+            *self.datastore_cache.lock().unwrap() =
+                Some(format!(r#"{{"is_running":true,"snapshot":{ds_json}}}"#));
+        }
+    }
+}
+
+/// Overlay node-local state onto the reconstructed distribution JSON before the
+/// node-local distribution page serves it: the authoritative SWIM membership
+/// (`{members, *_count}`), the interactive invite code, and the real-time join
+/// statuses — all things the single-node datastream view cannot supply itself.
+fn overlay_dist(
+    dist_json: String,
+    invite_code: &Arc<Mutex<Option<String>>>,
+    join_statuses: &Arc<Mutex<Option<String>>>,
+    members: &Arc<Mutex<Option<String>>>,
+) -> String {
+    let mut v: serde_json::Value = match serde_json::from_str(&dist_json) {
+        Ok(v) => v,
+        Err(_) => return dist_json,
+    };
+    if let Some(obj) = v.as_object_mut() {
+        // Authoritative membership: merge `members` + the alive/suspect/dead counts.
+        if let Some(m) = members.lock().unwrap().clone() {
+            if let Ok(serde_json::Value::Object(mo)) = serde_json::from_str(&m) {
+                for (k, val) in mo {
+                    obj.insert(k, val);
+                }
+            }
+        }
+        if let Some(code) = invite_code.lock().unwrap().clone() {
+            obj.insert("invite_code".into(), serde_json::Value::String(code));
+        }
+        if let Some(js) = join_statuses.lock().unwrap().clone() {
+            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&js) {
+                obj.insert("join_statuses".into(), arr);
+            }
+        }
+    }
+    v.to_string()
+}
+
+/// Bridges datastore operation events onto the node's datastream. The datastore
+/// defines the observer trait (it owns the events); this node-side adapter holds
+/// the emitter's thread-safe event sink and frames each op as it fires.
+struct NodeDatastoreObserver {
+    sink: DatastreamEventSink,
+}
+
+impl DatastoreEventObserver for NodeDatastoreObserver {
+    fn on_event(
+        &self,
+        timestamp_ms: u64,
+        kind: &str,
+        hash: &str,
+        name: Option<&str>,
+        size_bytes: u64,
+    ) {
+        self.sink
+            .datastore_event(timestamp_ms, kind, hash, name, size_bytes);
+    }
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────
@@ -359,12 +518,7 @@ fn main() {
     } else {
         cfg.relay_bind.unwrap_or_else(|| args.relay_bind.clone())
     };
-    let relay_hosts = if !args.relay_hosts.is_empty() {
-        args.relay_hosts.clone()
-    } else {
-        cfg.relay_hosts.unwrap_or_default()
-    };
-
+    let relay_hosts = cfg.relay_hosts.unwrap_or_default();
     // Signal handler — second Ctrl+C forces immediate exit
     {
         let stop = Arc::clone(&stop);
@@ -517,25 +671,53 @@ fn main() {
     });
     dash.install_tracing();
 
-    // Create actor runtime
-    let num_threads = 2;
-    let collector = StatsCollector::new(num_threads);
-    let mut rt = Runtime::new(RuntimeConfig {
-        num_threads,
+    // The node's one tokio pool and one swactor runtime. iroh I/O, the SWIM
+    // state machine, dashboard HTTP, and the actor runtime all live on this one
+    // pool; a single driver loop ticks the lone swactor runtime (Arc-shared).
+    // No second engine, no per-core islands.
+    let cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let tokio = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_count(cpus))
+        .enable_all()
+        .build()
+        .expect("failed to build tokio runtime");
+    let collector = StatsCollector::new(1);
+    let mut swactor_rt = Runtime::new(RuntimeConfig {
+        num_threads: 1,
         max_actors: 1024,
         channel_buffer_size: 2000,
         ..Default::default()
     })
     .with_extension(Arc::new(swactor::std::StdExtension::new()));
-    rt.set_stats_hook(collector.clone());
+    swactor_rt.set_stats_hook(collector.clone() as Arc<dyn StatsHook>);
+    // Actor transport: install the actor codec registry (wire `type_tag` ⇄ actor
+    // `Incoming` variant) and a transport router so the protocol actors can reach
+    // remote peers with a plain `ctx.send` (→ iroh egress). Must be installed
+    // before the runtime is shared behind an `Arc`.
+    let actor_codec = Arc::new(distribution::messages::actor_codec_registry());
+    let transport_router = Arc::new(swactor_transport::TransportRouter::new());
+    swactor_rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
+        Arc::clone(&actor_codec),
+        Arc::clone(&transport_router),
+    )));
+    let rt: Arc<Runtime> = Arc::new(swactor_rt);
+    // Single source: the node-local dashboard renders from the node's OWN
+    // datastream frames. Runtime stats are pushed via `set_stats` from the
+    // in-process frame consumer (built in `run_iroh`), not read from a live
+    // runtime handle — so we do NOT call `dash.set_runtime`. The `collector`
+    // stays as the per-actor stats *producer* feeding the `runtime.actors`
+    // record, and is handed to `run_iroh`.
 
-    let handle = rt.run().expect("failed to start runtime");
-    dash.set_runtime(handle.runtime.clone(), collector);
+    // Datastream-reconstructed datastore telemetry JSON, shared between the
+    // node's frame consumer (writer) and the datastore plugin (reader).
+    let datastore_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Datastore setup
     let ds_group = if !no_datastore {
         let group = DatastoreGroup::spawn(
-            handle.runtime.clone(),
+            Arc::clone(&rt),
             DatastoreGroupConfig {
                 node_id,
                 node_id_hex: node_hex.clone(),
@@ -556,8 +738,9 @@ fn main() {
         // Register datastore plugin
         let ds_plugin = plugins::datastore::DatastorePlugin::from_group(
             &group,
-            Arc::clone(&handle.runtime),
+            Arc::clone(&rt),
             chunk_size,
+            Arc::clone(&datastore_cache),
         );
         dash.register_plugin(Arc::new(ds_plugin));
         Some(group)
@@ -565,30 +748,34 @@ fn main() {
         eprintln!("Datastore: disabled");
         // Register stopped datastore plugin (allows starting from dashboard)
         let ds_plugin = plugins::datastore::DatastorePlugin::stopped(
-            Arc::clone(&handle.runtime),
+            Arc::clone(&rt),
             chunk_size,
+            Arc::clone(&datastore_cache),
         );
         dash.register_plugin(Arc::new(ds_plugin));
         None
     };
+    // The datastore's metrics accumulator (the single source the plugin's CRUD
+    // records to) — cloned out before `ds_group` moves into `run_iroh`, so the
+    // emitter can frame its readout and stream its op events.
+    let ds_metrics = ds_group.as_ref().map(|g| Arc::clone(g.metrics()));
 
     // Distribution config
     eprintln!("Distribution: SWIM (transport: iroh, mode: reactive)");
     let swim_config = SwimConfig {
-        probe_interval: 10,       // unused in Reactive mode, kept for compat
-        probe_timeout: 15,        // 1.5s — generous for relay roundtrips
+        probe_interval: Duration::from_secs(1), // unused in Reactive mode, kept for compat
+        probe_timeout: Duration::from_millis(1500), // generous for relay roundtrips
         indirect_probes: 2,
-        suspicion_timeout: 80,    // 8s — gives refutation time to gossip back
-        dead_reprobe_interval: 100,
+        suspicion_timeout: Duration::from_secs(8), // gives refutation time to gossip back
+        dead_reprobe_interval: Duration::from_secs(10),
         probe_mode: distribution::swim::probe::ProbeMode::Reactive {
-            safety_sweep_interval: 3000, // 5 minutes at 100ms/tick
+            safety_sweep_interval: Duration::from_secs(300), // 5 minutes
         },
         lifeguard: None,
     };
     let node_config = DistributedNodeConfig {
         swim: swim_config,
         cache_capacity: 1000,
-        republish_interval: 500,
         ..Default::default()
     };
 
@@ -611,10 +798,11 @@ fn main() {
         node_config,
         keypair,
         Arc::clone(&peer_auth),
-        &handle,
+        &tokio,
+        rt,
         &dash,
         &stop,
-        &ds_group,
+        ds_group,
         node_name,
         invite_code,
         join_rx,
@@ -623,18 +811,22 @@ fn main() {
         &relay_bind,
         relay_port,
         relay_hosts,
-        node_hex.clone(),
+        actor_codec,
+        transport_router,
+        collector,
+        ds_metrics,
+        datastore_cache,
     );
 
     #[cfg(not(feature = "iroh"))]
     {
+        let _ = (collector, ds_metrics, datastore_cache);
         eprintln!("iroh feature is required but not enabled");
         std::process::exit(1);
     }
 
-    handle.shutdown();
+    tokio.shutdown_timeout(Duration::from_secs(5));
     dash.shutdown();
-    handle.join();
 }
 
 // ── iroh transport ───────────────────────────────────────────────────────
@@ -647,10 +839,11 @@ fn run_iroh(
     node_config: DistributedNodeConfig,
     keypair: Keypair,
     peer_auth: Arc<Mutex<PeerAllowList>>,
-    handle: &swactor::runtime::RuntimeHandle,
+    tokio: &tokio::runtime::Runtime,
+    rt: Arc<Runtime>,
     dash: &dashboard::DashboardHandle,
     stop: &Arc<AtomicBool>,
-    ds_group: &Option<DatastoreGroup>,
+    ds_group: Option<DatastoreGroup>,
     node_name: String,
     invite_code: String,
     join_rx: std::sync::mpsc::Receiver<dashboard::JoinPeerInfo>,
@@ -659,12 +852,15 @@ fn run_iroh(
     relay_bind: &str,
     relay_port: u16,
     relay_hosts: Vec<String>,
-    node_hex: String,
+    actor_codec: Arc<swactor_transport::CodecRegistry>,
+    transport_router: Arc<swactor_transport::TransportRouter>,
+    collector: Arc<StatsCollector>,
+    ds_metrics: Option<Arc<DatastoreMetrics>>,
+    datastore_cache: Arc<Mutex<Option<String>>>,
 ) {
     use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
     use iroh::{RelayMode, SecretKey};
     use swactor::std::RuntimeNaming;
-
 
     // Evaluate relay candidacy and determine embedded relay bind address
     #[cfg(feature = "relay")]
@@ -727,6 +923,12 @@ fn run_iroh(
         }
     };
 
+    // Pull the protocol-actor configs out before `node_config` moves into the
+    // (now transport-only) driver.
+    let swim_config = node_config.swim.clone();
+    let registry_config = node_config.registry.clone();
+    let metadata_lambda = node_config.metadata_lambda;
+
     let iroh_config = IrohDriverConfig {
         secret_key: Some(SecretKey::from_bytes(&keypair.secret_bytes())),
         relay_mode,
@@ -738,25 +940,133 @@ fn run_iroh(
         #[cfg(feature = "relay")]
         relay_public_ip,
     };
-    let mut driver = IrohDriver::new(iroh_config).expect("failed to create iroh driver");
+    // Build the driver on the node's one tokio pool. Construction and the
+    // synchronous setup below run on the main thread, so the driver's
+    // constructor block_on is a legal sync→async bridge. The driver loop that
+    // follows is async and uses only the pure-sync recv()/tick().
+    let mut driver = IrohDriver::with_handle(tokio.handle().clone(), iroh_config)
+        .expect("failed to create iroh driver");
 
-    // Spawn StreamManager actor
+    // ── Actorized distribution protocol ──
+    // SWIM membership, the cluster name registry, and node-metadata dissemination
+    // now run as actors on the swactor runtime; the driver is reduced to a
+    // transport bridge (decode inbound → actor mailbox; actor outbound → iroh).
+    use distribution::directory_actor::{DirectoryActor, DirectoryIn};
+    use distribution::node_metadata_actor::{MetadataActor, MetadataIn};
+    use distribution::registry_actor::{RegistryActor, RegistryIn};
+    use distribution::swim::actor::{SwimActor, SwimIn};
+    use distribution::transport_bridge::{
+        IrohPeerDirectory, IrohRouteBinder, Outbox, RelayMirror, RouteView, RouteViewTransport,
+    };
+
+    let node_id = driver.node_id();
+    let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+    let relay_mirror: RelayMirror =
+        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let route_view: RouteView =
+        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let peer_directory = Arc::new(IrohPeerDirectory::new(
+        Arc::clone(&transport_router),
+        Arc::clone(&outbox),
+    ));
+
+    let swim_addr = rt
+        .spawn(SwimActor::new(
+            node_id,
+            swim_config,
+            Instant::now(),
+            peer_directory.clone(),
+        ))
+        .expect("spawn SwimActor");
+    let registry_addr = rt
+        .spawn(RegistryActor::new(
+            node_id,
+            registry_config,
+            peer_directory.clone(),
+        ))
+        .expect("spawn RegistryActor");
+    let metadata_addr = rt
+        .spawn(MetadataActor::new(
+            node_id,
+            metadata_lambda,
+            peer_directory.clone(),
+            Arc::clone(&relay_mirror),
+        ))
+        .expect("spawn MetadataActor");
+    // §5 egress: a shared transport that resolves an actor's host from the route
+    // view at send time, plus the binder the DirectoryActor uses to register a
+    // route for each actor it learns lives on a peer.
+    let route_view_transport = Arc::new(RouteViewTransport::new(
+        Arc::clone(&route_view),
+        Arc::clone(&outbox),
+    ));
+    let route_binder = Arc::new(IrohRouteBinder::new(
+        Arc::clone(&transport_router),
+        Arc::clone(&route_view_transport),
+    ));
+    let directory_addr = rt
+        .spawn(DirectoryActor::new(
+            node_id,
+            peer_directory.clone(),
+            Arc::clone(&route_view),
+            route_binder,
+        ))
+        .expect("spawn DirectoryActor");
+
+    // Fan SWIM's MembershipChanged stream out to the registry + metadata actors
+    // and into a mirror the dashboard snapshot reads. The sentinel self-id means
+    // every real node is stored in the mirror (a MemberList never stores self).
+    let membership_mirror = Arc::new(Mutex::new(
+        distribution::swim::member_list::MemberList::new(distribution::types::NodeId([0xFF; 32])),
+    ));
+    let fanout_addr = rt
+        .spawn(MembershipFanout {
+            registry: registry_addr,
+            metadata: metadata_addr,
+            directory: directory_addr,
+            mirror: Arc::clone(&membership_mirror),
+        })
+        .expect("spawn MembershipFanout");
+    rt.send_to(swim_addr, SwimIn::Subscribe { observer: fanout_addr })
+        .expect("subscribe membership fanout");
+
+    // Ingress routing table: which local actor owns each inbound wire tag.
+    let mut routes: std::collections::HashMap<String, swactor::actor::ActorAddress> =
+        std::collections::HashMap::new();
+    for tag in [
+        "swactor_dist::Ping",
+        "swactor_dist::Ack",
+        "swactor_dist::PingReq",
+        "swactor_dist::IndirectAck",
+        "swactor_dist::JoinRequest",
+        "swactor_dist::JoinResponse",
+    ] {
+        routes.insert(tag.to_string(), swim_addr);
+    }
+    routes.insert("swactor_dist::RegistryGossip".to_string(), registry_addr);
+    routes.insert("swactor_dist::MetadataGossip".to_string(), metadata_addr);
+    routes.insert("swactor_dist::DirectoryGossip".to_string(), directory_addr);
+    driver.enable_actor_bridge(
+        Arc::clone(&rt),
+        Arc::clone(&actor_codec),
+        routes,
+        swim_addr,
+        Arc::clone(&relay_mirror),
+        Arc::clone(&route_view),
+    );
+
+    // Spawn StreamManager actor on the swactor runtime
     let stream_mgr = swactor_datastore::streams::StreamManager::new(
         driver.endpoint().clone(),
         driver.tokio_handle(),
-        Arc::clone(&handle.runtime),
+        Arc::clone(&rt),
     );
-    let stream_mgr_addr = handle
-        .runtime
-        .spawn(stream_mgr)
-        .expect("spawn StreamManager");
-    handle
-        .runtime
-        .register_name(swactor_datastore::streams::STREAM_MANAGER_NAME, stream_mgr_addr)
+    let stream_mgr_addr = rt.spawn(stream_mgr).expect("spawn StreamManager");
+    rt.register_name(swactor_datastore::streams::STREAM_MANAGER_NAME, stream_mgr_addr)
         .expect("register StreamManager");
 
     // Wire streams into the datastore
-    if let Some(group) = ds_group {
+    if let Some(group) = &ds_group {
         group.configure_streams(stream_mgr_addr, driver.tokio_handle());
     }
 
@@ -780,26 +1090,38 @@ fn run_iroh(
     }
 
     // Spawn and register actors
-    let actor_addrs = spawn_actors(actors, handle, driver.node_mut());
+    let actor_addrs = spawn_actors(actors, &rt, directory_addr, &driver);
 
-    // Announce node name and relay URL to cluster gossip
-    driver.node_mut().set_node_name(node_name.clone());
-    let mut home_relay_set = if let Some(url) = driver.relay_url().map(|u| u.to_string()) {
-        driver.node_mut().set_relay_url(Some(url));
+    // Announce node name and relay URL to cluster gossip (via the MetadataActor).
+    rt.send_to(metadata_addr, MetadataIn::SetNodeName { name: node_name.clone() })
+        .ok();
+    let home_relay_set = if let Some(url) = driver.relay_url().map(|u| u.to_string()) {
+        rt.send_to(metadata_addr, MetadataIn::SetRelayUrl { url: Some(url) })
+            .ok();
         true
     } else {
         false
     };
 
-    // Wire distribution snapshot to dashboard via plugin
-    let mut snap = driver.snapshot();
-    snap.node_name = Some(node_name.clone());
-    snap.invite_code = Some(invite_code.clone());
-    snap.version = Some(VERSION.to_string());
-    let cached_snapshot: Arc<Mutex<Option<DistributionNodeSnapshot>>> =
-        Arc::new(Mutex::new(Some(snap)));
+    // Single-source dashboard wiring: the node-local dashboard renders from the
+    // node's OWN datastream frames, folded by an in-process `FleetView`. These
+    // shared slots carry the reconstructed views from the frame consumer (the
+    // writer, in the emitter's sink) to the plugins / `set_stats` (the readers).
+    let dist_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let fleet_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let stats_slot: Arc<Mutex<Option<swactor::stats::RuntimeStats>>> = Arc::new(Mutex::new(None));
+    // Live node-interactive overlays the node-local distribution page layers
+    // onto the reconstructed JSON: the rich invite code and real-time join
+    // statuses (interactive, not collection telemetry), plus the node's own
+    // authoritative SWIM membership — the node ran SWIM, so its membership
+    // mirror is the source of truth for its single-node view (the fleet
+    // consumer's cross-node liveness filter would otherwise hide every peer).
+    let invite_overlay: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let join_overlay: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let members_overlay: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
     let dist_plugin = plugins::distribution::DistributionPlugin::new(
-        Arc::clone(&cached_snapshot),
+        Arc::clone(&dist_cache),
         Some(join_tx_dist),
     );
     let dismissed_statuses = dist_plugin.dismissed_statuses();
@@ -809,38 +1131,84 @@ fn run_iroh(
     dash.start_http(driver.tokio_handle());
     eprintln!("Dashboard at http://0.0.0.0:{dashboard_port}");
 
-    // Per-node telemetry datastream, default-on: build the shared emitter (it
-    // emits the identity frame and owns the mux + samplers) and install its
-    // process-output observer so every process this node spawns is captured into
-    // `proc.<label>.*` automatically. When `SWACTOR_DATASTREAM_COLLECTOR` names
-    // a UDP collector (e.g. `swactor-datastream-collector` or the dashboard's
-    // datastream ingest), frames ship there one-datagram-per-frame; otherwise
-    // the mux drains to a no-op sink — the node's own dashboard already renders
-    // its live runtime directly, and the proc tap stays on either way.
+    // ── Periodic side-work: ordinary async tasks on tokio::time::interval ──
+    // (NOT a thread::sleep pump). The datastore keeps its round-based cadence —
+    // one interval tick == one round — preserving the old 100ms/round semantics
+    // with zero datastore-crate change.
+    if let Some(group) = ds_group {
+        let stop = Arc::clone(stop);
+        tokio.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            let mut round: u64 = 0;
+            while !stop.load(Ordering::Relaxed) {
+                interval.tick().await;
+                round += 1;
+                group.tick(round);
+            }
+        });
+    }
+
+    // Demo heartbeat: route a Heartbeat to each demo actor on a fixed cadence.
+    {
+        let rt = Arc::clone(&rt);
+        let stop = Arc::clone(stop);
+        let addrs = actor_addrs;
+        tokio.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            while !stop.load(Ordering::Relaxed) {
+                interval.tick().await;
+                for addr in &addrs {
+                    let _ = rt.send_to(*addr, Heartbeat);
+                }
+            }
+        });
+    }
+
+    // ── SWIM / gossip clock ──
+    // An external interval restamps wall-clock `now` each fire (swactor's
+    // tick-counted timer can't) and injects `Tick` into each protocol actor.
+    // 100 ms ≪ the probe/suspicion timeouts, so detection resolution is ample.
+    {
+        let rt = Arc::clone(&rt);
+        let stop = Arc::clone(stop);
+        tokio.spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(100));
+            while !stop.load(Ordering::Relaxed) {
+                interval.tick().await;
+                let _ = rt.send_to(swim_addr, SwimIn::Tick { now: Instant::now() });
+                let _ = rt.send_to(registry_addr, RegistryIn::Tick);
+                let _ = rt.send_to(metadata_addr, MetadataIn::Tick);
+                let _ = rt.send_to(directory_addr, DirectoryIn::Tick);
+            }
+        });
+    }
+
+    // ── THE unified driver loop ──
+    // One task ticks the lone swactor runtime AND the SWIM state machine (now
+    // wall-clock, so it advances every iteration) and drains iroh I/O — all
+    // pure-sync, no block_on. It runs as the block_on future on the main thread
+    // (so `driver`, which is !Sync, needs no Send bound) and busy-spins one
+    // worker (the mailbox has no waker, by design).
+    let stop_loop = Arc::clone(stop);
+    // Per-node telemetry datastream (single source, always-on): build the shared
+    // emitter and install its process-output observer so every process this node
+    // spawns is captured as `proc.<label>.*`. The emitter ships frames to an
+    // in-process consumer that renders the node-local dashboard. There is no
+    // dedicated UDP collector — cross-node telemetry rides the cluster transport.
+    let node_hex = hex_encode(&driver.node_id().0);
     let life = std::env::var("SWACTOR_LIFETIME")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
-    let sink: Box<dyn FrameSink> = match std::env::var("SWACTOR_DATASTREAM_COLLECTOR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-    {
-        Some(target) => match target
-            .parse()
-            .map_err(|e| format!("{e}"))
-            .and_then(|addr| UdpFrameSink::new(addr).map_err(|e| format!("{e}")))
-        {
-            Ok(s) => {
-                eprintln!("Datastream: shipping frames to {target}");
-                Box::new(s)
-            }
-            Err(e) => {
-                eprintln!("Datastream: SWACTOR_DATASTREAM_COLLECTOR={target} unusable ({e}); telemetry off");
-                Box::new(NoopSink)
-            }
-        },
-        None => Box::new(NoopSink),
+    let sink = LocalRenderSink {
+        view: FleetView::new(Some(node_hex.clone())),
+        dist_cache: Arc::clone(&dist_cache),
+        datastore_cache: Arc::clone(&datastore_cache),
+        fleet_cache: Arc::clone(&fleet_cache),
+        stats_slot: Arc::clone(&stats_slot),
+        invite_code: Arc::clone(&invite_overlay),
+        join_statuses: Arc::clone(&join_overlay),
+        members: Arc::clone(&members_overlay),
     };
     let mut emitter = DatastreamEmitter::new(
         EmitterConfig {
@@ -848,224 +1216,373 @@ fn run_iroh(
             life,
             mux_capacity: 4096,
         },
-        sink,
+        Box::new(sink),
     );
-    handle
-        .runtime
-        .set_process_output_observer(emitter.process_observer());
-
-    // Main loop
-    let mut round: u64 = 0;
-    while !stop.load(Ordering::Relaxed) {
-        round += 1;
-
-        driver.recv();
-        driver.tick();
-
-        // Forward incoming stream connections to StreamManager
-        for (node_id, conn) in driver.drain_other_connections() {
-            let rt_clone = Arc::clone(&handle.runtime);
-            let mgr_addr = stream_mgr_addr;
-            let node_bytes = node_id.0;
-            driver.tokio_handle().spawn(async move {
-                match swactor_datastore::streams::accept::handle_incoming(
-                    node_bytes, conn, &rt_clone, mgr_addr,
-                )
-                .await
-                {
-                    Ok(()) => {}
-                    Err(e) => {
-                        eprintln!("stream accept: failed to handle incoming: {e}");
-                    }
-                }
-            });
-        }
-
-        // Drain discovered peers (dashboard "Add Peer") and auto-join them
-        {
-            let mut new_peers: Vec<dashboard::JoinPeerInfo> = Vec::new();
-            while let Ok(info) = join_rx.try_recv() {
-                new_peers.push(info);
-            }
-            if !new_peers.is_empty() {
-                let own_id = driver.node_id().0;
-                let addrs: Vec<iroh::EndpointAddr> = new_peers
-                    .iter()
-                    .filter(|info| info.node_id != own_id)
-                    .filter_map(|info| {
-                        iroh::PublicKey::from_bytes(&info.node_id).ok().map(|k| {
-                            let mut addr = iroh::EndpointAddr::from(k);
-                            if let Some(url_str) = &info.relay_url {
-                                match url_str.parse::<iroh::RelayUrl>() {
-                                    Ok(url) => {
-                                        eprintln!("Auto-joining peer {} via relay {}", base58_encode(&info.node_id), url);
-                                        addr = addr.with_relay_url(url);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Auto-joining peer {} (bad relay URL {}: {e})", base58_encode(&info.node_id), url_str);
-                                    }
-                                }
-                            } else {
-                                eprintln!("Auto-joining peer {} (no relay URL)", base58_encode(&info.node_id));
-                            }
-                            for sa in &info.direct_addrs {
-                                addr = addr.with_ip_addr(*sa);
-                            }
-                            addr
-                        })
-                    })
-                    .collect();
-                if !addrs.is_empty() {
-                    driver.join(&addrs);
-                }
-            }
-        }
-
-        // Lazily pick up home relay URL once the endpoint connects
-        if !home_relay_set
-            && let Some(url) = driver.home_relay_url() {
-                eprintln!("Relay URL (home): {url}");
-                driver.node_mut().set_relay_url(Some(url.to_string()));
-                home_relay_set = true;
-            }
-
-        for addr in &actor_addrs {
-            let _ = handle.runtime.send_to(*addr, Heartbeat);
-        }
-
-        let mut snap = driver.snapshot();
-        snap.node_name = Some(node_name.clone());
-
-        // Datastream emission: periodic host/runtime/transport samples (~1s),
-        // event-driven membership transitions, drained through the shared
-        // emitter each iteration. Members are keyed by the stable node id (a
-        // peer's friendly name resolves only after its metadata arrives, so
-        // keying on it would double-count the peer downstream).
-        {
-            let rs = handle.runtime.stats();
-            let members: Vec<(String, String)> = snap
-                .members
-                .iter()
-                .map(|m| (m.node_id.clone(), m.state.clone()))
-                .collect();
-            emitter.tick(
-                TickInput {
-                    members: &members,
-                    runtime: DsRuntimeStats {
-                        actors_live: rs.actors.len() as u32,
-                        mailbox_depth: rs.workers.iter().map(|w| w.mailbox_depth as u32).sum(),
-                        scheduled_tasks: rs.workers.iter().map(|w| w.num_actors as u32).sum(),
-                    },
-                    relay_connected: driver.home_relay_url().is_some(),
-                    relay_peers: snap.members.iter().filter(|m| m.relay_url.is_some()).count()
-                        as u32,
-                },
-                round % 10 == 0,
-            );
-        }
-
-        // Build rich invite code: <base58>#<addr1>,<addr2>@<relay_url>
-        {
-            let direct_addrs = driver.direct_addresses();
-            let addrs_part = if direct_addrs.is_empty() {
-                String::new()
-            } else {
-                let addrs_str: Vec<String> = direct_addrs.iter().map(|a| a.to_string()).collect();
-                format!("#{}", addrs_str.join(","))
-            };
-            let relay_part = match &snap.relay_url {
-                Some(relay) => format!("@{}", relay),
-                None => String::new(),
-            };
-            snap.invite_code = Some(format!("{}{}{}", invite_code, addrs_part, relay_part));
-        }
-
-        // Drain dismissed join statuses from the dashboard
-        {
-            let mut dismissed = dismissed_statuses.lock().unwrap();
-            for bytes in dismissed.drain(..) {
-                driver.clear_join_status(&swactor::transport::NodeId(bytes));
-            }
-        }
-
-        // Populate join statuses, auto-clearing alive peers
-        {
-            use distribution::iroh_driver::JoinPhase;
-            use distribution::snapshot::JoinStatusInfo;
-
-            let statuses = driver.join_statuses();
-            let alive_node_ids: Vec<swactor::transport::NodeId> = snap.members.iter()
-                .filter(|m| m.state == "alive")
-                .filter_map(|m| {
-                    let mut bytes = [0u8; 32];
-                    if m.node_id.len() == 64 {
-                        for i in 0..32 {
-                            bytes[i] = u8::from_str_radix(&m.node_id[i*2..i*2+2], 16).unwrap_or(0);
-                        }
-                        Some(swactor::transport::NodeId(bytes))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Clear statuses for alive peers
-            if !alive_node_ids.is_empty() {
-                driver.clear_join_statuses(&alive_node_ids);
-            }
-
-            // Convert remaining statuses to snapshot format
-            snap.join_statuses = statuses.iter()
-                .filter(|(nid, _)| !alive_node_ids.contains(nid))
-                .map(|(nid, status)| {
-                    let node_id_hex: String = nid.0.iter().map(|b| format!("{:02x}", b)).collect();
-                    let (phase_str, detail) = match &status.phase {
-                        JoinPhase::Connecting { attempt, max_attempts } =>
-                            ("connecting".into(), Some(format!("{}/{}", attempt, max_attempts))),
-                        JoinPhase::Sending { attempt, max_attempts } =>
-                            ("sending".into(), Some(format!("{}/{}", attempt, max_attempts))),
-                        JoinPhase::Sent => ("sent".into(), None),
-                        JoinPhase::Failed { error } => ("failed".into(), Some(error.clone())),
-                    };
-                    JoinStatusInfo {
-                        node_id: node_id_hex,
-                        phase: phase_str,
-                        detail,
-                        has_relay: status.has_relay,
-                        has_direct: status.has_direct,
-                        direct_addr_count: status.direct_addr_count,
-                    }
-                })
-                .collect();
-        }
-
-        snap.version = Some(VERSION.to_string());
-        *cached_snapshot.lock().unwrap() = Some(snap);
-
-        // Datastore ticks
-        if let Some(group) = ds_group {
-            group.tick(round);
-        }
-
-        thread::sleep(Duration::from_millis(100));
+    rt.set_process_output_observer(emitter.process_observer());
+    // Stream datastore op events onto the node's own datastream.
+    if let Some(metrics) = &ds_metrics {
+        metrics.set_event_observer(Arc::new(NodeDatastoreObserver {
+            sink: emitter.event_sink(),
+        }));
     }
+    // Seed identity with the descriptive fields known at startup; the relay URL
+    // and listen addr are learned lazily and re-emitted from the loop below.
+    emitter.update_identity(&IdentityRecord {
+        node: node_hex.clone(),
+        life,
+        node_name: node_name.clone(),
+        listen_addr: driver.listen_addr(),
+        relay_url: driver.relay_url().map(|u| u.to_string()).unwrap_or_default(),
+        version: VERSION.to_string(),
+    });
 
-    // Driver shutdown handles embedded relay cleanup automatically
-    driver.shutdown();
+    tokio.block_on(async move {
+        let mut home_relay_set = home_relay_set;
+        let mut last_snapshot = Instant::now();
+        while !stop_loop.load(Ordering::Relaxed) {
+            tokio::task::yield_now().await; // run iroh reader/writer/accept/dial tasks + reactor
+            driver.pump_inbound_to_actors(); // decode received frames → actor mailboxes
+            rt.tick(); // advance the actors: consume inbound + Tick, enqueue outbound
+            driver.drain_outbox(&outbox); // actor-produced frames → iroh writes
+
+            // Forward incoming stream connections to StreamManager.
+            for (node_id, conn) in driver.drain_other_connections() {
+                let rt_clone = Arc::clone(&rt);
+                let mgr_addr = stream_mgr_addr;
+                let node_bytes = node_id.0;
+                driver.tokio_handle().spawn(async move {
+                    match swactor_datastore::streams::accept::handle_incoming(
+                        node_bytes, conn, &rt_clone, mgr_addr,
+                    )
+                    .await
+                    {
+                        Ok(()) => {}
+                        Err(e) => {
+                            eprintln!("stream accept: failed to handle incoming: {e}");
+                        }
+                    }
+                });
+            }
+
+            // Drain discovered peers (dashboard "Add Peer") and auto-join them.
+            {
+                let mut new_peers: Vec<dashboard::JoinPeerInfo> = Vec::new();
+                while let Ok(info) = join_rx.try_recv() {
+                    new_peers.push(info);
+                }
+                if !new_peers.is_empty() {
+                    let own_id = driver.node_id().0;
+                    let addrs: Vec<iroh::EndpointAddr> = new_peers
+                        .iter()
+                        .filter(|info| info.node_id != own_id)
+                        .filter_map(|info| {
+                            iroh::PublicKey::from_bytes(&info.node_id).ok().map(|k| {
+                                let mut addr = iroh::EndpointAddr::from(k);
+                                if let Some(url_str) = &info.relay_url {
+                                    match url_str.parse::<iroh::RelayUrl>() {
+                                        Ok(url) => {
+                                            eprintln!("Auto-joining peer {} via relay {}", base58_encode(&info.node_id), url);
+                                            addr = addr.with_relay_url(url);
+                                        }
+                                        Err(e) => {
+                                            eprintln!("Auto-joining peer {} (bad relay URL {}: {e})", base58_encode(&info.node_id), url_str);
+                                        }
+                                    }
+                                } else {
+                                    eprintln!("Auto-joining peer {} (no relay URL)", base58_encode(&info.node_id));
+                                }
+                                for sa in &info.direct_addrs {
+                                    addr = addr.with_ip_addr(*sa);
+                                }
+                                addr
+                            })
+                        })
+                        .collect();
+                    if !addrs.is_empty() {
+                        driver.join(&addrs);
+                    }
+                }
+            }
+
+            // Lazily pick up home relay URL once the endpoint connects.
+            if !home_relay_set
+                && let Some(url) = driver.home_relay_url() {
+                    eprintln!("Relay URL (home): {url}");
+                    rt.send_to(metadata_addr, MetadataIn::SetRelayUrl { url: Some(url.to_string()) })
+                        .ok();
+                    home_relay_set = true;
+                }
+
+            // Dashboard snapshot — throttled (UI refresh, not protocol cadence:
+            // SWIM and the actors advance every iteration above).
+            if last_snapshot.elapsed() >= SNAPSHOT_REFRESH {
+                last_snapshot = Instant::now();
+                // Members and relay-peer count from the MembershipChanged-fed
+                // mirror (SWIM runs in the actor now) and the metadata relay
+                // mirror. We also stage the authoritative member list + counts as
+                // the node-local overlay (the node's own SWIM view drives its
+                // single-node distribution graph).
+                let (members, relay_peers) = {
+                    use distribution::types::MemberState;
+                    let ml = membership_mirror.lock().unwrap();
+                    let relay = relay_mirror.read().unwrap();
+                    let mut members: Vec<(String, String)> = Vec::new();
+                    let mut members_json: Vec<serde_json::Value> = Vec::new();
+                    let mut relay_peers = 0u32;
+                    let (mut alive, mut suspect, mut dead) = (0usize, 0usize, 0usize);
+                    for e in ml.all_members() {
+                        let id: String =
+                            e.node_id.0.iter().map(|b| format!("{:02x}", b)).collect();
+                        let state = match e.state {
+                            MemberState::Alive => {
+                                alive += 1;
+                                "alive"
+                            }
+                            MemberState::Suspect => {
+                                suspect += 1;
+                                "suspect"
+                            }
+                            MemberState::Dead => {
+                                dead += 1;
+                                "dead"
+                            }
+                        }
+                        .to_string();
+                        let r = relay.get(&e.node_id).cloned();
+                        if r.is_some() {
+                            relay_peers += 1;
+                        }
+                        members_json.push(serde_json::json!({
+                            "node_id": id.clone(),
+                            "addr": serde_json::Value::Null,
+                            "state": state.clone(),
+                            "incarnation": e.incarnation,
+                            "relay_url": r,
+                        }));
+                        members.push((id, state));
+                    }
+                    *members_overlay.lock().unwrap() = Some(
+                        serde_json::json!({
+                            "members": members_json,
+                            "alive_count": alive,
+                            "suspect_count": suspect,
+                            "dead_count": dead,
+                        })
+                        .to_string(),
+                    );
+                    (members, relay_peers)
+                };
+
+                // Consolidated distribution-subsystem state. Directory route count
+                // and peer-auth are live; cache / registry / probe targets live in
+                // the actors and would be surfaced via read-mirrors — currently
+                // empty, exactly as the pre-datastream snapshot reported them.
+                {
+                    let (mode, count) = {
+                        let pa = peer_auth.lock().unwrap();
+                        if pa.is_open() {
+                            ("open".to_string(), 0)
+                        } else {
+                            ("allow-list".to_string(), pa.list_peers().len() as u32)
+                        }
+                    };
+                    emitter.submit_dist_state(&DistributionState {
+                        directory_route_count: driver.directory_route_count() as u32,
+                        peer_auth_mode: mode,
+                        authorized_peer_count: count,
+                        ..Default::default()
+                    });
+                }
+
+                // Consolidated datastore steady metrics from the shared accumulator.
+                if let Some(metrics) = &ds_metrics {
+                    let r = metrics.readout();
+                    emitter.submit_datastore_state(&DatastoreState {
+                        object_count: r.object_count,
+                        total_bytes: r.total_bytes,
+                        put_ops: r.put_ops,
+                        get_ops: r.get_ops,
+                        delete_ops: r.delete_ops,
+                        objects: r
+                            .objects
+                            .iter()
+                            .map(|o| catalog::ObjectRec {
+                                hash: o.hash.clone(),
+                                name: o.name.clone(),
+                                size_bytes: o.size_bytes,
+                            })
+                            .collect(),
+                        active_transfers: r
+                            .active_transfers
+                            .iter()
+                            .map(|t| catalog::TransferRec {
+                                hash: t.hash.clone(),
+                                chunks_received: t.chunks_received as u64,
+                                chunks_total: t.chunks_total as u64,
+                            })
+                            .collect(),
+                    });
+                }
+
+                // Per-actor runtime detail (the real actor table).
+                {
+                    let mut rs = rt.stats();
+                    collector.enrich(&mut rs);
+                    dashboard::collector::enrich_names(&mut rs, &rt);
+                    let actors = rs
+                        .actor_details
+                        .iter()
+                        .map(|a| ActorRec {
+                            address: a.address.0.iter().map(|b| format!("{:02x}", b)).collect(),
+                            name: a.name.clone().unwrap_or_default(),
+                            mailbox_depth: a.mailbox_depth as u32,
+                            messages_processed: a.messages_processed,
+                            last_msg_type: a.last_msg_type.clone().unwrap_or_default(),
+                            poisoned: a.poisoned,
+                            message_type_counts: a.message_type_counts.clone(),
+                        })
+                        .collect();
+                    emitter.submit_actor_detail(&ActorRuntimeDetail { actors });
+                }
+
+                // Periodic host/runtime/transport samples + event-driven membership
+                // transitions, then drain — the sink renders the node-local dashboard.
+                {
+                    let rs = rt.stats();
+                    emitter.tick(
+                        TickInput {
+                            members: &members,
+                            runtime: DsRuntimeStats {
+                                actors_live: rs.actors.len() as u32,
+                                mailbox_depth: rs.workers.iter().map(|w| w.mailbox_depth as u32).sum(),
+                                scheduled_tasks: rs.workers.iter().map(|w| w.num_actors as u32).sum(),
+                            },
+                            relay_connected: driver.home_relay_url().is_some(),
+                            relay_peers,
+                        },
+                        true,
+                    );
+                }
+
+                // Push the synthesized runtime stats to the Overview/Actors page.
+                if let Some(stats) = stats_slot.lock().unwrap().take() {
+                    dash.set_stats(stats);
+                }
+
+                // ── Interactive overlays (node-local only; not collection
+                // telemetry, so not on the datastream). The node-local
+                // distribution page overlays these onto the reconstructed JSON.
+                // Rich invite code: <base58>#<addr1>,<addr2>@<relay_url>.
+                {
+                    let self_relay = relay_mirror.read().unwrap().get(&node_id).cloned();
+                    let direct_addrs = driver.direct_addresses();
+                    let addrs_part = if direct_addrs.is_empty() {
+                        String::new()
+                    } else {
+                        let addrs_str: Vec<String> =
+                            direct_addrs.iter().map(|a| a.to_string()).collect();
+                        format!("#{}", addrs_str.join(","))
+                    };
+                    let relay_part = match self_relay {
+                        Some(relay) => format!("@{relay}"),
+                        None => String::new(),
+                    };
+                    *invite_overlay.lock().unwrap() =
+                        Some(format!("{invite_code}{addrs_part}{relay_part}"));
+                }
+
+                // Drain dismissed join statuses from the dashboard.
+                {
+                    let mut dismissed = dismissed_statuses.lock().unwrap();
+                    for bytes in dismissed.drain(..) {
+                        driver.clear_join_status(&swactor_transport::NodeId(bytes));
+                    }
+                }
+
+                // Real-time join statuses, auto-clearing alive peers.
+                {
+                    use distribution::iroh_driver::JoinPhase;
+                    let statuses = driver.join_statuses();
+                    let alive_node_ids: Vec<swactor_transport::NodeId> = members
+                        .iter()
+                        .filter(|(_, s)| s == "alive")
+                        .filter_map(|(id, _)| {
+                            if id.len() == 64 {
+                                let mut bytes = [0u8; 32];
+                                for i in 0..32 {
+                                    bytes[i] =
+                                        u8::from_str_radix(&id[i * 2..i * 2 + 2], 16).unwrap_or(0);
+                                }
+                                Some(swactor_transport::NodeId(bytes))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    if !alive_node_ids.is_empty() {
+                        driver.clear_join_statuses(&alive_node_ids);
+                    }
+                    let js: Vec<serde_json::Value> = statuses
+                        .iter()
+                        .filter(|(nid, _)| !alive_node_ids.contains(nid))
+                        .map(|(nid, status)| {
+                            let node_id_hex: String =
+                                nid.0.iter().map(|b| format!("{:02x}", b)).collect();
+                            let (phase, detail) = match &status.phase {
+                                JoinPhase::Connecting { attempt, max_attempts } => {
+                                    ("connecting", Some(format!("{attempt}/{max_attempts}")))
+                                }
+                                JoinPhase::Sending { attempt, max_attempts } => {
+                                    ("sending", Some(format!("{attempt}/{max_attempts}")))
+                                }
+                                JoinPhase::Sent => ("sent", None),
+                                JoinPhase::Failed { error } => ("failed", Some(error.clone())),
+                            };
+                            serde_json::json!({
+                                "node_id": node_id_hex,
+                                "phase": phase,
+                                "detail": detail,
+                                "has_relay": status.has_relay,
+                                "has_direct": status.has_direct,
+                                "direct_addr_count": status.direct_addr_count,
+                            })
+                        })
+                        .collect();
+                    *join_overlay.lock().unwrap() = Some(serde_json::Value::Array(js).to_string());
+                }
+            }
+        }
+
+        // Graceful drain: stop the swactor runtime, close iroh (awaited, not
+        // block_on — we're on a worker), then tick a bounded number of times so
+        // stopping actors and in-flight messages clean up.
+        rt.shutdown();
+        driver.close().await;
+        for _ in 0..DRAIN_TICKS {
+            rt.tick();
+        }
+    });
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
+#[cfg(feature = "iroh")]
 fn spawn_actors(
     count: usize,
-    handle: &swactor::runtime::RuntimeHandle,
-    node: &mut distribution::node::DistributedNode,
+    rt: &Arc<Runtime>,
+    directory_addr: swactor::actor::ActorAddress,
+    driver: &distribution::iroh_driver::IrohDriver,
 ) -> Vec<swactor::actor::ActorAddress> {
+    use distribution::directory_actor::DirectoryIn;
     let mut addrs = Vec::new();
     for _ in 0..count {
-        match handle.runtime.spawn(HeartbeatActor) {
+        // All application actors live on the one swactor runtime.
+        match rt.spawn(HeartbeatActor) {
             Ok(addr) => {
-                node.register_actor(addr, 1);
+                // Sign a host claim for the actor and hand it to the DirectoryActor
+                // to disseminate, so peers learn where to route this actor.
+                let entry = driver.register_actor(addr, 1);
+                let _ = rt.send_to(directory_addr, DirectoryIn::Register(entry));
                 addrs.push(addr);
             }
             Err(e) => eprintln!("failed to spawn actor: {e}"),

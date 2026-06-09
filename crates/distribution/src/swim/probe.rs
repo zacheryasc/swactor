@@ -4,6 +4,7 @@
 //! No I/O, no timers — the caller drives the clock.
 
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::types::{MemberState, NodeId};
 
@@ -21,24 +22,27 @@ pub enum ProbeMode {
     /// Classic SWIM: probe one random member every `probe_interval` ticks.
     Periodic,
     /// No periodic probing. Probes triggered externally via `SendFailed`.
-    /// Safety sweep probes one random member every `safety_sweep_interval` ticks.
-    Reactive { safety_sweep_interval: u64 },
+    /// Safety sweep probes one random member every `safety_sweep_interval`.
+    Reactive { safety_sweep_interval: Duration },
 }
 
 /// SWIM protocol configuration.
+///
+/// All durations are wall-clock: the state machine is driven by an `Instant`
+/// passed into [`SwimProbe::step`], not a logical tick counter.
 #[derive(Debug, Clone)]
 pub struct SwimConfig {
-    /// Ticks between probe cycles (used in Periodic mode).
-    pub probe_interval: u64,
-    /// Ticks to wait for a direct ack before sending indirect probes.
-    pub probe_timeout: u64,
+    /// Time between probe cycles (used in Periodic mode).
+    pub probe_interval: Duration,
+    /// Time to wait for a direct ack before sending indirect probes.
+    pub probe_timeout: Duration,
     /// Number of indirect probe relays (k in the SWIM paper).
     pub indirect_probes: usize,
-    /// Ticks a node stays in Suspect before being declared Dead.
-    pub suspicion_timeout: u64,
-    /// Ticks between dead-node reprobe attempts. 0 = disabled.
+    /// How long a node stays in Suspect before being declared Dead.
+    pub suspicion_timeout: Duration,
+    /// Time between dead-node reprobe attempts. Zero = disabled.
     /// When enabled, periodically pings dead nodes to detect partition heals.
-    pub dead_reprobe_interval: u64,
+    pub dead_reprobe_interval: Duration,
     /// Probe mode: Periodic (default) or Reactive (probe-on-failure).
     pub probe_mode: ProbeMode,
     /// Lifeguard adaptive-timeout config. The probe state machine
@@ -89,12 +93,15 @@ impl Default for SwimConfig {
         //   lower bound; dropping below 2 collapses indirect
         //   coverage.
         // - `dead_reprobe_interval = 50` ticks (unchanged).
+        // Wall-clock equivalents of the retuned tick values at the
+        // production runtime's 20 ms tick period (see the tick math above):
+        // 10 / 750 / 2250 / 50 ticks → 200 ms / 15 s / 45 s / 1 s.
         Self {
-            probe_interval: 10,
-            probe_timeout: 750,
+            probe_interval: Duration::from_millis(200),
+            probe_timeout: Duration::from_secs(15),
             indirect_probes: 2,
-            suspicion_timeout: 2250,
-            dead_reprobe_interval: 50,
+            suspicion_timeout: Duration::from_secs(45),
+            dead_reprobe_interval: Duration::from_secs(1),
             probe_mode: ProbeMode::Periodic,
             // Lifeguard wiring §3.6 is opt-in (default = None). The
             // adaptive band lives in `LifeguardConfig::default()`;
@@ -146,29 +153,28 @@ pub enum SwimAction {
     Suspect(NodeId),
     /// A node is declared dead.
     DeclareDead(NodeId),
-    /// Our node was suspected — refute with bumped incarnation.
-    Refute { new_incarnation: u64 },
-    /// Observation-only signal — no protocol effect. `SwimNode`
-    /// surfaces these through its [`SwimObserver`] hook (per-SWIM-probe
-    /// RTT). Threading them as a `SwimAction` variant keeps the probe
-    /// state machine pure (no observer handle) while still letting the
-    /// caller observe ack/timeout lifecycle without reaching into
-    /// private phase state.
-    ///
-    /// [`SwimObserver`]: super::node::SwimObserver
-    Observe(SwimProbeObservation),
+    // (No `Refute` action: refutation is NOT a probe action — it lives solely in
+    // the §7.1 self-refute gate, `node.rs::apply_membership_update`. The probe
+    // engine never refutes; a node never probes or suspects itself, §1 inv. 3.)
+    /// Diagnostic-only signal — no protocol effect. The host adapter
+    /// translates these into typed `Event` records for coverage 2.6
+    /// (per-SWIM-probe RTT). Threading them as a `SwimAction` variant
+    /// keeps the probe state machine pure (no emitter handle) while
+    /// still letting the caller observe ack/timeout lifecycle without
+    /// reaching into private phase state.
+    Diag(SwimDiagEvent),
 }
 
-/// Observation-only events produced by the probe state machine.
+/// Diagnostic-only events produced by the probe state machine.
 ///
 /// `kind` is `"direct"` for the direct-phase ack/timeout (i.e. a
 /// `SendPing` initiating the probe) and `"indirect"` for the
 /// indirect-phase ack/timeout (i.e. a `SendPingReq` fanout). The
-/// strings match the `kind` field on
-/// [`SwimObservation`](super::node::SwimObservation)'s `ProbeSent` /
-/// `ProbeAcked` / `ProbeTimedOut`, so the node's translation is 1:1.
+/// strings match the `kind` field on `Event::SwimProbeSent` /
+/// `SwimProbeAcked` / `SwimProbeTimedOut` so the host adapter is a
+/// 1:1 translation.
 #[derive(Debug, Clone)]
-pub enum SwimProbeObservation {
+pub enum SwimDiagEvent {
     /// An ack matched the in-flight probe and the probe is complete.
     ProbeAcked {
         target: NodeId,
@@ -176,7 +182,10 @@ pub enum SwimProbeObservation {
         kind: &'static str,
     },
     /// The configured budget elapsed before the in-flight probe got
-    /// its ack. `budget_ticks` is the configured `probe_timeout`.
+    /// its ack. `budget_ticks` is the configured `probe_timeout`, now
+    /// reported in **milliseconds** (the protocol clock is wall-clock,
+    /// not ticks); the field name is retained for diagnostics wire
+    /// compatibility.
     ProbeTimedOut {
         target: NodeId,
         sequence: u64,
@@ -195,13 +204,13 @@ enum ProbePhase {
     WaitingDirectAck {
         target: NodeId,
         sequence: u64,
-        sent_at: u64,
+        sent_at: Instant,
     },
     /// Indirect probes sent, waiting for any ack.
     WaitingIndirectAck {
         target: NodeId,
         sequence: u64,
-        sent_at: u64,
+        sent_at: Instant,
     },
 }
 
@@ -209,7 +218,7 @@ enum ProbePhase {
 #[derive(Debug)]
 struct SuspicionTimer {
     node_id: NodeId,
-    started_at: u64,
+    started_at: Instant,
 }
 
 /// Maximum demand queue size to prevent unbounded growth.
@@ -218,8 +227,15 @@ const MAX_DEMAND_QUEUE: usize = 32;
 /// The SWIM probe state machine.
 pub struct SwimProbe {
     config: SwimConfig,
-    tick: u64,
-    next_probe_tick: u64,
+    /// Current wall-clock time, refreshed at the top of every `step`. The
+    /// state machine stays pure — the caller supplies the clock.
+    now: Instant,
+    /// Monotonic step counter, used only as a deterministic PRNG seed for
+    /// probe-target shuffling and relay rotation (decoupled from the clock).
+    step_counter: u64,
+    /// When the next probe cycle may fire (Periodic mode). `None` until the
+    /// first tick initializes it to `now + probe_interval`.
+    next_probe_at: Option<Instant>,
     sequence: u64,
     phase: ProbePhase,
     /// Round-robin index into the member list for probe target selection.
@@ -230,37 +246,44 @@ pub struct SwimProbe {
     suspicion_timers: Vec<SuspicionTimer>,
     /// Ring buffer of recent probe targets (most recent at back).
     recent_targets: VecDeque<NodeId>,
-    /// Tick at which the next dead-node reprobe should fire.
-    next_reprobe_tick: u64,
+    /// When the next dead-node reprobe should fire. `None` until initialized
+    /// (also stays `None`-driven when `dead_reprobe_interval` is zero).
+    next_reprobe_at: Option<Instant>,
     /// Round-robin index into the dead member list for reprobe target selection.
     reprobe_index: usize,
     /// Peers needing probes due to send failures (reactive mode).
     demand_queue: VecDeque<NodeId>,
-    /// Tick at which the next safety sweep fires (reactive mode).
-    next_sweep_tick: u64,
+    /// When the next safety sweep fires (reactive mode). `None` until initialized.
+    next_sweep_at: Option<Instant>,
     /// Adaptive-timeout state per Lifeguard. `None` when
     /// `config.lifeguard` is `None`.
     health: Option<HealthMultiplier>,
 }
 
 impl SwimProbe {
-    pub fn new(config: SwimConfig) -> Self {
-        let next_reprobe = if config.dead_reprobe_interval > 0 {
-            config.dead_reprobe_interval
+    /// Create a probe anchored at wall-clock `now` (the moment the caller
+    /// considers "start"). Deadlines are computed relative to `now`, mirroring
+    /// the old tick-counter init that anchored at tick 0.
+    pub fn new(config: SwimConfig, now: Instant) -> Self {
+        let next_reprobe_at = if config.dead_reprobe_interval > Duration::ZERO {
+            Some(now + config.dead_reprobe_interval)
         } else {
-            u64::MAX
+            None
         };
-        let next_sweep = match &config.probe_mode {
-            ProbeMode::Reactive { safety_sweep_interval } => *safety_sweep_interval,
-            ProbeMode::Periodic => u64::MAX,
+        let next_sweep_at = match &config.probe_mode {
+            ProbeMode::Reactive { safety_sweep_interval } => Some(now + *safety_sweep_interval),
+            ProbeMode::Periodic => None,
         };
+        let next_probe_at = Some(now + config.probe_interval);
         let health = config.lifeguard.clone().map(HealthMultiplier::new);
         Self {
-            next_probe_tick: config.probe_interval,
-            next_reprobe_tick: next_reprobe,
+            now,
+            step_counter: 0,
+            next_probe_at,
+            next_reprobe_at,
+            next_sweep_at,
             reprobe_index: 0,
             config,
-            tick: 0,
             sequence: 0,
             phase: ProbePhase::Idle,
             probe_index: 0,
@@ -268,18 +291,18 @@ impl SwimProbe {
             suspicion_timers: Vec::new(),
             recent_targets: VecDeque::with_capacity(PROBE_HISTORY_SIZE),
             demand_queue: VecDeque::new(),
-            next_sweep_tick: next_sweep,
             health,
         }
     }
 
     /// Process an event and produce zero or more actions.
-    pub fn step(&mut self, event: SwimEvent, members: &mut MemberList) -> Vec<SwimAction> {
+    pub fn step(&mut self, now: Instant, event: SwimEvent, members: &mut MemberList) -> Vec<SwimAction> {
+        self.now = now;
         let mut actions = Vec::new();
 
         match event {
             SwimEvent::Tick => {
-                self.tick += 1;
+                self.step_counter = self.step_counter.wrapping_add(1);
                 self.check_probe_timeout(members, &mut actions);
                 self.check_suspicion_timeouts(members, &mut actions);
                 match &self.config.probe_mode {
@@ -337,7 +360,7 @@ impl SwimProbe {
             // Simple shuffle using XOR of tick and index
             let n = self.probe_order.len();
             for i in (1..n).rev() {
-                let j = ((self.tick as usize).wrapping_mul(31).wrapping_add(i)) % (i + 1);
+                let j = ((self.step_counter as usize).wrapping_mul(31).wrapping_add(i)) % (i + 1);
                 self.probe_order.swap(i, j);
             }
             self.probe_index = 0;
@@ -359,7 +382,7 @@ impl SwimProbe {
 
         let k = self.config.indirect_probes.min(alive.len());
         // Simple selection: take first k after a rotation based on tick
-        let start = if alive.is_empty() { 0 } else { self.tick as usize % alive.len() };
+        let start = if alive.is_empty() { 0 } else { self.step_counter as usize % alive.len() };
         let mut relays = Vec::with_capacity(k);
         for i in 0..k {
             let idx = (start + i) % alive.len();
@@ -369,14 +392,16 @@ impl SwimProbe {
     }
 
     fn maybe_start_probe(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
-        if self.tick < self.next_probe_tick {
-            return;
+        if let Some(at) = self.next_probe_at {
+            if self.now < at {
+                return;
+            }
         }
         if !matches!(self.phase, ProbePhase::Idle) {
             return;
         }
 
-        self.next_probe_tick = self.tick + self.config.probe_interval;
+        self.next_probe_at = Some(self.now + self.config.probe_interval);
 
         if let Some(target) = self.pick_probe_target(&MemberList::clone_shallow(members)) {
             // Record this probe target in history
@@ -393,7 +418,7 @@ impl SwimProbe {
             self.phase = ProbePhase::WaitingDirectAck {
                 target,
                 sequence: seq,
-                sent_at: self.tick,
+                sent_at: self.now,
             };
         }
     }
@@ -401,18 +426,18 @@ impl SwimProbe {
     fn check_probe_timeout(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
         match &self.phase {
             ProbePhase::WaitingDirectAck { target, sequence, sent_at } => {
-                if self.tick - sent_at >= self.config.probe_timeout {
+                if self.now.saturating_duration_since(*sent_at) >= self.config.probe_timeout {
                     let target = *target;
                     let sequence = *sequence;
                     let budget = self.config.probe_timeout;
 
                     // The direct phase expired — signal coverage 2.6 first,
                     // then fan out the indirect probes.
-                    actions.push(SwimAction::Observe(SwimProbeObservation::ProbeTimedOut {
+                    actions.push(SwimAction::Diag(SwimDiagEvent::ProbeTimedOut {
                         target,
                         sequence,
                         kind: "direct",
-                        budget_ticks: budget,
+                        budget_ticks: budget.as_millis() as u64,
                     }));
 
                     // Send indirect probes through relays
@@ -428,23 +453,23 @@ impl SwimProbe {
                     self.phase = ProbePhase::WaitingIndirectAck {
                         target,
                         sequence,
-                        sent_at: self.tick,
+                        sent_at: self.now,
                     };
                 }
             }
             ProbePhase::WaitingIndirectAck { target, sequence, sent_at } => {
-                if self.tick - sent_at >= self.config.probe_timeout {
+                if self.now.saturating_duration_since(*sent_at) >= self.config.probe_timeout {
                     let target = *target;
                     let sequence = *sequence;
                     let budget = self.config.probe_timeout;
 
                     // Indirect phase expired — coverage 2.6 signal first, then
                     // declare suspect.
-                    actions.push(SwimAction::Observe(SwimProbeObservation::ProbeTimedOut {
+                    actions.push(SwimAction::Diag(SwimDiagEvent::ProbeTimedOut {
                         target,
                         sequence,
                         kind: "indirect",
-                        budget_ticks: budget,
+                        budget_ticks: budget.as_millis() as u64,
                     }));
 
                     // No ack received — suspect this node
@@ -470,7 +495,7 @@ impl SwimProbe {
         };
         if let Some(kind) = kind {
             // Successful ack — coverage 2.6 signal, cancel suspicion, idle.
-            actions.push(SwimAction::Observe(SwimProbeObservation::ProbeAcked {
+            actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
                 target: from,
                 sequence,
                 kind,
@@ -486,7 +511,7 @@ impl SwimProbe {
     fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, _members: &mut MemberList, actions: &mut Vec<SwimAction>) {
         if let ProbePhase::WaitingIndirectAck { target: expected, sequence: expected_seq, .. } = &self.phase
             && target == *expected && sequence == *expected_seq {
-                actions.push(SwimAction::Observe(SwimProbeObservation::ProbeAcked {
+                actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
                     target,
                     sequence,
                     kind: "indirect",
@@ -506,7 +531,7 @@ impl SwimProbe {
         }
         self.suspicion_timers.push(SuspicionTimer {
             node_id,
-            started_at: self.tick,
+            started_at: self.now,
         });
     }
 
@@ -529,11 +554,11 @@ impl SwimProbe {
                 .max(health.dynamic_suspicion_timeout(members.len())),
             None => self.config.suspicion_timeout,
         };
-        let tick = self.tick;
+        let now = self.now;
         let expired: Vec<NodeId> = self
             .suspicion_timers
             .iter()
-            .filter(|t| tick - t.started_at >= timeout)
+            .filter(|t| now.saturating_duration_since(t.started_at) >= timeout)
             .map(|t| t.node_id)
             .collect();
 
@@ -565,14 +590,16 @@ impl SwimProbe {
 
     /// Periodically ping a dead node to detect partition heals.
     fn maybe_reprobe_dead(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
-        if self.config.dead_reprobe_interval == 0 {
+        if self.config.dead_reprobe_interval == Duration::ZERO {
             return;
         }
-        if self.tick < self.next_reprobe_tick {
-            return;
+        if let Some(at) = self.next_reprobe_at {
+            if self.now < at {
+                return;
+            }
         }
 
-        self.next_reprobe_tick = self.tick + self.config.dead_reprobe_interval;
+        self.next_reprobe_at = Some(self.now + self.config.dead_reprobe_interval);
 
         let dead = members.dead_members();
         if dead.is_empty() {
@@ -656,7 +683,7 @@ impl SwimProbe {
         self.phase = ProbePhase::WaitingDirectAck {
             target,
             sequence: seq,
-            sent_at: self.tick,
+            sent_at: self.now,
         };
     }
 
@@ -672,14 +699,16 @@ impl SwimProbe {
 
     /// At safety_sweep_interval, probe one random alive member.
     fn maybe_safety_sweep(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
-        if self.tick < self.next_sweep_tick {
-            return;
+        if let Some(at) = self.next_sweep_at {
+            if self.now < at {
+                return;
+            }
         }
         let interval = match &self.config.probe_mode {
             ProbeMode::Reactive { safety_sweep_interval } => *safety_sweep_interval,
             ProbeMode::Periodic => return,
         };
-        self.next_sweep_tick = self.tick + interval;
+        self.next_sweep_at = Some(self.now + interval);
 
         if !matches!(self.phase, ProbePhase::Idle) {
             return;

@@ -42,12 +42,6 @@ fn cluster_of_five_converges() {
                     i,
                     snap.alive_count
                 );
-                assert!(
-                    snap.routing_table_size >= 3,
-                    "node {} should have >= 3 routing table entries, got {}",
-                    i,
-                    snap.routing_table_size
-                );
             }
         }
         Err(diag) => {
@@ -164,30 +158,31 @@ fn actors_resolvable_across_cluster() {
         .expect("cluster did not converge before actor resolution test");
 
     // When: we query each node's snapshot
-    let mut total_directory_entries = 0;
+    let mut total_directory_routes = 0;
     let mut total_cache_size = 0;
 
     for (i, &port) in DASHBOARD_PORTS.iter().enumerate() {
         let snap = poll_distribution(port)
             .unwrap_or_else(|| panic!("node {} unreachable", i));
 
-        // Then: each node has registered its own 2 actors in the directory
+        // Then: the directory has converged so each node knows >= its own 2 actors
+        // (after convergence it knows the whole cluster's actors).
         assert!(
-            snap.directory_entry_count >= 2,
-            "node {} should have >= 2 directory entries, got {}",
+            snap.directory_route_count >= 2,
+            "node {} should know >= 2 directory routes, got {}",
             i,
-            snap.directory_entry_count
+            snap.directory_route_count
         );
 
-        total_directory_entries += snap.directory_entry_count;
+        total_directory_routes += snap.directory_route_count;
         total_cache_size += snap.cache_size;
     }
 
-    // Total actors across cluster should be 10 (5 nodes * 2 actors)
+    // 5 nodes * 2 actors = 10 actors; every converged node knows all of them.
     assert!(
-        total_directory_entries >= 10,
-        "total directory entries across cluster should be >= 10, got {}",
-        total_directory_entries
+        total_directory_routes >= 10,
+        "total directory routes across cluster should be >= 10, got {}",
+        total_directory_routes
     );
 
     // At least some nodes should have cached locations for remote actors

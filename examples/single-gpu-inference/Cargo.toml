@@ -8,13 +8,14 @@ publish = false
 
 [dependencies]
 swactor = { path = "../..", features = ["transport", "serde", "std"] }
+swactor-transport = { path = "../../crates/transport" }
 swactor-process = { path = "../../crates/process" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 distribution = { path = "../../crates/distribution", features = ["iroh"] }
-iroh = "0.96"
+iroh = "0.98"
 urlencoding = "2"
 
 [[bin]]

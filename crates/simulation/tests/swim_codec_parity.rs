@@ -19,7 +19,7 @@ use simulation::swim_codec::{CodecError, SwimMessage};
 
 /// Production's `JsonCodec` is `serde_json::to_vec` under the hood
 /// (`crates/distribution/src/messages.rs:184`). Calling
-/// `JsonCodec.encode(&m)` would require pulling the `swactor::transport::Codec`
+/// `JsonCodec.encode(&m)` would require pulling the `swactor_transport::Codec`
 /// trait into scope, which the simulation crate doesn't depend on; the
 /// equivalent direct call is shorter and equally definitive — they
 /// both reduce to `serde_json::to_vec(&m).unwrap()`.

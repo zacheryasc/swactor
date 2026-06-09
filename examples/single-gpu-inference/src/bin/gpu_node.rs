@@ -24,9 +24,10 @@ use distribution::swim::probe::SwimConfig;
 use iroh::RelayMode;
 
 use swactor::actor::ActorAddress;
-use swactor::runtime::{Runtime, RuntimeConfig};
-use swactor::transport::{CodecRegistry, TransportRouter};
+use swactor::runtime::Runtime;
+use swactor_transport::CodecRegistry;
 
+use single_gpu_inference::cluster::ClusterNode;
 use single_gpu_inference::inference_actor::{InferenceActor, InferenceActorStatus, RequestBridge};
 use single_gpu_inference::iroh_transport::{decode_wire, IrohActorTransport, ACTOR_ALPN};
 use single_gpu_inference::messages::{inference_codec_registry, InferenceRequest};
@@ -48,15 +49,19 @@ fn parse_hex_node_id(s: &str) -> [u8; 32] {
 fn node_config() -> DistributedNodeConfig {
     DistributedNodeConfig {
         swim: SwimConfig {
-            probe_interval: 10,
-            probe_timeout: 15,
+            // Probe one peer every ~200 ms (old config: 10 ticks at the
+            // implicit ~20 ms tick).
+            probe_interval: Duration::from_millis(200),
+            // Wait for a direct ack before indirect probes (old: 15 ticks).
+            probe_timeout: Duration::from_millis(300),
             indirect_probes: 2,
-            suspicion_timeout: 60,
-            dead_reprobe_interval: 100,
+            // How long a node stays Suspect before Dead (old: 60 ticks).
+            suspicion_timeout: Duration::from_secs(2),
+            // Periodically reprobe dead peers (old: 100 ticks).
+            dead_reprobe_interval: Duration::from_secs(2),
             ..SwimConfig::default()
         },
         cache_capacity: 100,
-        republish_interval: 50,
         registry: RegistryConfig::default(),
         metadata_lambda: 3,
     }
@@ -139,20 +144,30 @@ fn drain_and_collect_reply_addrs(
 }
 
 fn main() {
-    // Create iroh driver
-    let mut driver = IrohDriver::new(IrohDriverConfig {
-        secret_key: None,
-        relay_mode: RelayMode::Default,
-        node: node_config(),
-        peer_auth: None,
-        additional_alpns: vec![ACTOR_ALPN.to_vec()],
-    })
-    .expect("failed to create iroh driver");
+    // Build the actorized cluster node: an IrohDriver transport bridge plus the
+    // SWIM / registry / metadata / directory protocol actors hosted on one
+    // swactor runtime. App actors (inference + bridge) live on the same runtime.
+    // The codec registry must carry both the distribution protocol wire tags and
+    // the inference app types — `inference_codec_registry` composes both.
+    let mut cluster = ClusterNode::new(
+        IrohDriverConfig {
+            secret_key: None,
+            relay_mode: RelayMode::Default,
+            node: node_config(),
+            peer_auth: None,
+            additional_alpns: vec![ACTOR_ALPN.to_vec()],
+        },
+        node_config(),
+        inference_codec_registry(),
+        |_rt| {},
+    )
+    .expect("failed to create cluster node");
 
     // Print node address info so tests/orchestrators can discover us
-    let my_id = driver.node_id();
+    let my_id = cluster.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
-    let direct_addrs: Vec<String> = driver
+    let direct_addrs: Vec<String> = cluster
+        .driver
         .direct_addresses()
         .iter()
         .map(|sa| sa.to_string())
@@ -187,43 +202,37 @@ fn main() {
         }
 
         eprintln!("joining seed: {seed_hex}");
-        driver.join(&[seed_addr]);
+        cluster.join(&[seed_addr]);
     } else {
         eprintln!("no SEED_ADDR set — listening for incoming connections");
     }
 
-    // Create actor runtime
-    let mut rt = Runtime::new(RuntimeConfig::default());
-    let codecs = Arc::new(inference_codec_registry());
-
-    // Spawn InferenceActor + RequestBridge
-    let status_inbox = rt.new_inbox::<InferenceActorStatus>().unwrap();
-    let sender = rt.create_sender();
+    // Spawn InferenceActor + RequestBridge on the cluster runtime.
+    let status_inbox = cluster.rt.new_inbox::<InferenceActorStatus>().unwrap();
+    let sender = cluster.rt.create_sender();
     let actor =
         InferenceActor::new(worker_spec(), sender).with_status_addr(*status_inbox.addr());
-    let inference_addr = rt.spawn(actor).unwrap();
+    let inference_addr = cluster.rt.spawn(actor).unwrap();
 
     let bridge = RequestBridge { target: inference_addr };
-    let bridge_addr = rt.spawn(bridge).unwrap();
+    let bridge_addr = cluster.rt.spawn(bridge).unwrap();
 
-    // Register "inference" name in the cluster
-    driver
-        .node_mut()
-        .register_name("inference".into(), bridge_addr);
+    // Register "inference" name in the cluster (gossiped to peers).
+    cluster.register_name("inference", bridge_addr);
     eprintln!("registered name 'inference' -> bridge {:?}", bridge_addr);
 
-    // Install codecs on the runtime
-    rt.set_codec_registry(codecs.clone());
-
-    // Transport router — routes are added dynamically as requests arrive
-    let router = Arc::new(TransportRouter::new());
-    rt.set_transport_router(router.clone());
+    // App-level return routes for `reply_to` addresses are registered
+    // dynamically (as requests arrive) on the cluster's shared transport
+    // router — the same one the distribution protocol actors use. Per-actor
+    // routes here are the InferenceResponse return path; they don't collide
+    // with the protocol's route-view egress.
+    let router = Arc::clone(&cluster.transport_router);
 
     // Wait for worker to be ready (model download + load can take minutes)
     let start = Instant::now();
     let mut worker_ready = false;
     while start.elapsed() < Duration::from_secs(600) {
-        rt.tick();
+        cluster.pump_once();
         if let Some(status) = status_inbox.try_recv() {
             match status {
                 InferenceActorStatus::WorkerReady { pid } => {
@@ -240,8 +249,6 @@ fn main() {
                 }
             }
         }
-        driver.recv();
-        driver.tick();
         std::thread::sleep(Duration::from_millis(50));
     }
     if !worker_ready {
@@ -252,12 +259,15 @@ fn main() {
     // Main loop
     eprintln!("entering main loop");
     loop {
-        driver.recv();
-        driver.tick();
+        cluster.pump_once();
 
         // Drain incoming actor messages and collect reply_to addresses
-        let reply_addrs =
-            drain_and_collect_reply_addrs(&driver, &codecs, &rt, Duration::from_millis(50));
+        let reply_addrs = drain_and_collect_reply_addrs(
+            &cluster.driver,
+            &cluster.codecs,
+            &cluster.rt,
+            Duration::from_millis(50),
+        );
 
         // Dynamically register transport routes for reply_to addresses.
         // These addresses live on the remote orchestrator node — we need a
@@ -265,16 +275,16 @@ fn main() {
         for reply_addr in reply_addrs {
             // Find the peer to route back to. With a single orchestrator peer,
             // we route all reply addresses to the only alive member.
-            let snap = driver.snapshot();
+            let snap = cluster.snapshot();
             for member in &snap.members {
                 if member.state == "alive" && member.node_id.len() == 64 {
                     let peer_bytes = parse_hex_node_id(&member.node_id);
                     if let Ok(peer_key) = iroh::PublicKey::from_bytes(&peer_bytes) {
                         let peer_addr = iroh::EndpointAddr::from(peer_key);
                         let transport = Arc::new(IrohActorTransport::new(
-                            driver.endpoint().clone(),
+                            cluster.driver.endpoint().clone(),
                             peer_addr,
-                            driver.tokio_handle(),
+                            cluster.driver.tokio_handle(),
                         ));
                         router.add_route(reply_addr, transport);
                         eprintln!("added return route for {:?}", reply_addr);
@@ -283,7 +293,9 @@ fn main() {
             }
         }
 
-        rt.tick();
+        // Re-tick so the InferenceActor's outbound responses (routed via the
+        // shared transport router) get delivered.
+        cluster.rt.tick();
 
         // Check worker health — log but don't exit, so SWIM stays alive
         // for diagnostics when the worker crashes
@@ -301,10 +313,4 @@ fn main() {
 
         std::thread::sleep(Duration::from_millis(10));
     }
-
-    // Cleanup
-    let _ = rt.stop_actor(inference_addr);
-    rt.tick();
-    driver.shutdown();
-    eprintln!("gpu-node shut down");
 }

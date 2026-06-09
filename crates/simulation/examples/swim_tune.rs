@@ -536,7 +536,7 @@ fn main() {
     // sees what "baseline" actually means in tick-units.
     let defaults = SwimConfig::default();
     eprintln!(
-        "[meta] SwimConfig::default = {{ probe_interval: {}, probe_timeout: {}, suspicion_timeout: {}, indirect_probes: {}, dead_reprobe_interval: {} }}",
+        "[meta] SwimConfig::default = {{ probe_interval: {:?}, probe_timeout: {:?}, suspicion_timeout: {:?}, indirect_probes: {}, dead_reprobe_interval: {:?} }}",
         defaults.probe_interval,
         defaults.probe_timeout,
         defaults.suspicion_timeout,

@@ -14,6 +14,8 @@
 //! All three mechanisms are combined through a single `LifeguardConfig` that can
 //! be applied to `SwimConfig` dynamically.
 
+use std::time::Duration;
+
 /// Lifeguard configuration parameters.
 #[derive(Debug, Clone)]
 pub struct LifeguardConfig {
@@ -24,22 +26,24 @@ pub struct LifeguardConfig {
     /// How much each successful ack decreases the health score.
     pub ack_reward: u32,
     /// Base suspicion timeout (before log(n) scaling).
-    pub base_suspicion_timeout: u64,
+    pub base_suspicion_timeout: Duration,
     /// Minimum suspect timeout regardless of cluster size.
-    pub min_suspicion_timeout: u64,
+    pub min_suspicion_timeout: Duration,
     /// Maximum suspect timeout regardless of cluster size.
-    pub max_suspicion_timeout: u64,
+    pub max_suspicion_timeout: Duration,
 }
 
 impl Default for LifeguardConfig {
     fn default() -> Self {
+        // Wall-clock equivalents of the prior tick defaults (30 / 15 / 120
+        // ticks) at the production 20 ms tick period.
         Self {
             max_health_score: 8,
             nack_penalty: 1,
             ack_reward: 1,
-            base_suspicion_timeout: 30,
-            min_suspicion_timeout: 15,
-            max_suspicion_timeout: 120,
+            base_suspicion_timeout: Duration::from_millis(600),
+            min_suspicion_timeout: Duration::from_millis(300),
+            max_suspicion_timeout: Duration::from_millis(2400),
         }
     }
 }
@@ -91,9 +95,10 @@ impl HealthMultiplier {
     /// Compute the dynamic suspect timeout based on cluster size and health.
     ///
     /// Formula: `clamp(base * ceil(log2(n+1)) * multiplier, min, max)`
-    pub fn dynamic_suspicion_timeout(&self, cluster_size: usize) -> u64 {
+    pub fn dynamic_suspicion_timeout(&self, cluster_size: usize) -> Duration {
         let log_n = log2_ceil(cluster_size.saturating_add(1) as u64).max(1);
-        let timeout = self.config.base_suspicion_timeout * log_n * self.multiplier();
+        let scale = (log_n * self.multiplier()).min(u32::MAX as u64) as u32;
+        let timeout = self.config.base_suspicion_timeout * scale;
         timeout.clamp(
             self.config.min_suspicion_timeout,
             self.config.max_suspicion_timeout,

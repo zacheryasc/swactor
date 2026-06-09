@@ -9,7 +9,7 @@ use std::time::Duration;
 use distribution::iroh_driver::IrohDriver;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
-use swactor::transport::{CodecRegistry, Transport, WireEnvelope};
+use swactor_transport::{CodecRegistry, Transport, WireEnvelope};
 use swactor::Error;
 
 /// ALPN protocol for actor-level messages (distinct from SWIM protocol).

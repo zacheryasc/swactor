@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 pub use crate::content_hash::ContentHash;
 

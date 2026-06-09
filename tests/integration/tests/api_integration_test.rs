@@ -14,7 +14,7 @@ use swactor_datastore::metrics::DatastoreMetrics;
 use swactor_datastore::storage::InMemoryBackend;
 use swactor_datastore::DatastoreConfig;
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 fn find_free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -174,16 +174,13 @@ fn run_crud_scenario(base: &str, metrics: &Arc<DatastoreMetrics>) {
         Ok(_) => panic!("expected 404, got 200"),
     }
 
-    // 9. Verify metrics snapshot reflects the full lifecycle
-    let snap = metrics.snapshot();
+    // 9. Verify the metrics readout reflects the full lifecycle. (The op-event
+    // stream the datastream carries is covered by the datastore's own
+    // `t_datastore_state` event-stream contract test.)
+    let snap = metrics.readout();
     assert_eq!(snap.put_ops, 1, "one put recorded");
     // handle_get + handle_data = 2 get operations
     assert_eq!(snap.get_ops, 2, "metadata-get + data-get recorded");
     assert_eq!(snap.delete_ops, 1, "one delete recorded");
     assert!(snap.objects.is_empty(), "no objects after delete");
-    assert!(
-        snap.recent_events.len() >= 4,
-        "at least 4 events (put + get + get + delete), got {}",
-        snap.recent_events.len()
-    );
 }

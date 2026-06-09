@@ -3,3 +3,4 @@ pub mod probe;
 pub mod dissemination;
 pub mod node;
 pub mod lifeguard;
+pub mod actor;

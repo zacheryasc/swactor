@@ -1,5 +1,5 @@
 //! Sim cross-pollination — spec §"Sim cross-pollination" in
-//! `examples/pipeline-parallel-inference/N3_OBSERVABILITY_UPGRADE_SPEC.md`.
+//! `apps/pipeline-parallel-inference/N3_OBSERVABILITY_UPGRADE_SPEC.md`.
 //!
 //! A simulated node's snapshots and events must conform to the same
 //! shape a bundle reader decodes for a real node: typed records on

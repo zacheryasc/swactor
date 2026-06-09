@@ -11,33 +11,30 @@
 //!
 //! ## Telemetry
 //!
-//! When a datastream collector address is configured (`--collector` or
-//! `SWACTOR_DATASTREAM_COLLECTOR`), the relay runs the same
-//! [`DatastreamEmitter`] every node runs and ships its frames as UDP
-//! datagrams via [`UdpFrameSink`] — one identity frame at boot, then live
-//! host-resource samples each second. That is enough for the fleet view to
-//! show the relay VPS alongside the worker nodes. Session-level telemetry
-//! (opens/closes, bytes) waits on iroh-relay exposing session hooks; when it
-//! grows them, the counts slot into [`TickInput`] here.
+//! The relay is not a swactor cluster member (it has no runtime/SWIM), so it
+//! cannot ship telemetry over the cluster transport the way nodes do — and the
+//! dedicated UDP datastream channel has been removed. It therefore runs the
+//! shared [`DatastreamEmitter`] draining into a [`NoopSink`] (keeping the mux
+//! bounded) and does not appear in the fleet view. If the relay ever needs to
+//! be observable, it should join the cluster and use a `ClusterFrameSink`.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use distribution::datastream::catalog::RuntimeStats;
-use distribution::datastream::emit::{
-    DatastreamEmitter, EmitterConfig, FrameSink, NoopSink, TickInput, UdpFrameSink,
+use datastream::catalog::RuntimeStats;
+use datastream::emit::{
+    DatastreamEmitter, EmitterConfig, NoopSink, TickInput,
 };
 use distribution::types::NodeId;
 
 const DEFAULT_BIND: &str = "0.0.0.0:7843";
-const ENV_COLLECTOR: &str = "SWACTOR_DATASTREAM_COLLECTOR";
 const ENV_LIFETIME: &str = "SWACTOR_LIFETIME";
 
 fn print_help() {
     eprintln!(
         "Usage:\n  \
-         swactor-iroh-relay [--bind ADDR] [--public-host HOST] [--collector ADDR]\n\n\
+         swactor-iroh-relay [--bind ADDR] [--public-host HOST]\n\n\
          Options:\n  \
          --bind ADDR          HTTP bind address (default {DEFAULT_BIND})\n  \
                               or via SWACTOR_IROH_RELAY_BIND\n  \
@@ -45,18 +42,14 @@ fn print_help() {
                               Defaults to the bind IP — set this to the\n  \
                               VPS's public IP when --bind uses 0.0.0.0.\n  \
                               or via SWACTOR_IROH_RELAY_PUBLIC_HOST\n  \
-         --collector ADDR     UDP address of a datastream collector to ship\n  \
-                              this relay's telemetry frames to.\n  \
-                              or via {ENV_COLLECTOR}\n  \
          -h, --help           Show this help"
     );
 }
 
-fn parse_args() -> Result<(SocketAddr, Option<String>, Option<SocketAddr>), String> {
+fn parse_args() -> Result<(SocketAddr, Option<String>), String> {
     let mut bind: Option<String> = std::env::var("SWACTOR_IROH_RELAY_BIND").ok();
     let mut public_host: Option<String> =
         std::env::var("SWACTOR_IROH_RELAY_PUBLIC_HOST").ok();
-    let mut collector: Option<String> = env_string(ENV_COLLECTOR);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -65,9 +58,6 @@ fn parse_args() -> Result<(SocketAddr, Option<String>, Option<SocketAddr>), Stri
             }
             "--public-host" => {
                 public_host = Some(args.next().ok_or("--public-host needs HOST")?);
-            }
-            "--collector" => {
-                collector = Some(args.next().ok_or("--collector needs ADDR")?);
             }
             "-h" | "--help" => {
                 print_help();
@@ -80,19 +70,12 @@ fn parse_args() -> Result<(SocketAddr, Option<String>, Option<SocketAddr>), Stri
     let bind: SocketAddr = bind_str
         .parse()
         .map_err(|e| format!("invalid bind addr {bind_str:?}: {e}"))?;
-    let collector: Option<SocketAddr> = match collector {
-        Some(s) => Some(
-            s.parse()
-                .map_err(|e| format!("invalid collector addr {s:?}: {e}"))?,
-        ),
-        None => None,
-    };
-    Ok((bind, public_host, collector))
+    Ok((bind, public_host))
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> ExitCode {
-    let (bind, public_host, collector) = match parse_args() {
+    let (bind, public_host) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("swactor-iroh-relay: {e}");
@@ -159,10 +142,9 @@ async fn main() -> ExitCode {
         iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT,
     );
 
-    // Datastream telemetry: the same per-node emitter every node runs,
-    // shipping over UDP when a collector is configured and draining into
-    // a no-op otherwise (so the mux stays bounded either way).
-    let mut emitter = build_emitter(&url, collector);
+    // Datastream telemetry: the same per-node emitter every node runs, draining
+    // into a no-op (the relay is not a cluster member; see the module docs).
+    let mut emitter = build_emitter(&url);
 
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
     loop {
@@ -196,29 +178,14 @@ async fn main() -> ExitCode {
 
 /// Build the relay's datastream emitter. Identity is synthesized from the
 /// advertised URL (stable across restarts); the lifetime discriminator comes
-/// from `SWACTOR_LIFETIME` like the generic node.
-fn build_emitter(advertised_url: &str, collector: Option<SocketAddr>) -> DatastreamEmitter {
+/// from `SWACTOR_LIFETIME` like the generic node. The sink is a [`NoopSink`]:
+/// the relay is not a cluster member and the dedicated UDP channel is gone.
+fn build_emitter(advertised_url: &str) -> DatastreamEmitter {
     let node_id = synthesize_node_id(advertised_url);
     let node_hex: String = node_id.0.iter().map(|b| format!("{:02x}", b)).collect();
     let life = env_string(ENV_LIFETIME)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-
-    let sink: Box<dyn FrameSink> = match collector {
-        Some(target) => match UdpFrameSink::new(target) {
-            Ok(s) => {
-                eprintln!("swactor-iroh-relay: shipping datastream frames to {target}");
-                Box::new(s)
-            }
-            Err(e) => {
-                eprintln!(
-                    "swactor-iroh-relay: UdpFrameSink bind failed ({e}); telemetry off"
-                );
-                Box::new(NoopSink)
-            }
-        },
-        None => Box::new(NoopSink),
-    };
 
     DatastreamEmitter::new(
         EmitterConfig {
@@ -226,7 +193,7 @@ fn build_emitter(advertised_url: &str, collector: Option<SocketAddr>) -> Datastr
             life,
             mux_capacity: 4096,
         },
-        sink,
+        Box::new(NoopSink),
     )
 }
 

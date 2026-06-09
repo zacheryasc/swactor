@@ -250,9 +250,7 @@ pub(crate) struct TickContext<'a> {
     /// Runtime creation time for computing uptime_ms.
     pub(crate) created_at: crate::Instant,
     #[cfg(feature = "transport")]
-    pub(crate) codec_registry: Option<&'a crate::transport::CodecRegistry>,
-    #[cfg(feature = "transport")]
-    pub(crate) transport_router: Option<&'a crate::transport::TransportRouter>,
+    pub(crate) remote_sink: Option<&'a dyn crate::runtime::RemoteSink>,
 }
 
 impl<'a> TickContext<'a> {
@@ -268,8 +266,8 @@ impl<'a> TickContext<'a> {
             if self.inbox_registry.contains(&addr) {
                 return self.inbox_registry.try_deliver(addr, msg);
             }
-            if let (Some(cr), Some(tr)) = (self.codec_registry, self.transport_router) {
-                return crate::transport::send_via_transport(addr, msg, cr, tr);
+            if let Some(sink) = self.remote_sink {
+                return sink.send(addr, msg);
             }
         }
         self.inbox_registry.try_deliver(addr, msg)

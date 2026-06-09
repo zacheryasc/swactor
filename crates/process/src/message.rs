@@ -32,11 +32,8 @@ pub enum ProcessNotification {
     ///
     /// `pid` is `Some(u32)` when the underlying driver knows the OS
     /// pid (real `LocalDriver`) and `None` when it doesn't
-    /// (mock drivers, future SSH-tunnel-style drivers). Observability
-    /// hooks read this to register the subprocess with the
-    /// `SubprocessIntrospector` from
-    /// `distribution::diagnostics`
-    /// (`N3_OBSERVABILITY_UPGRADE_SPEC.md` §4).
+    /// (mock drivers, future SSH-tunnel-style drivers). Telemetry hooks
+    /// can read this to attribute the subprocess in a per-node datastream.
     Started {
         process: ActorAddress,
         #[doc(hidden)]

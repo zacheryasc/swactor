@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use swactor::transport::{hex_decode, hex_encode};
+use swactor_transport::{hex_decode, hex_encode};
 use crate::types::NodeId;
 
 /// A single trusted peer entry.

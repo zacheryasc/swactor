@@ -9,7 +9,7 @@ use swactor_datastore::types::{
     ChunkRef, ContentHash, DatastoreConfig, ObjectEntry, ObjectManifest,
 };
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Scenario: Content-addressing round-trip

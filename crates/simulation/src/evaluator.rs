@@ -507,6 +507,14 @@ fn evaluate_one(
             "dead_peer_resurrects_within",
             eval_dead_peer_resurrects(peer, *after_ns, *within_ns, events),
         ),
+        AssertionKind::PeerDetectedDeadWithin {
+            peer,
+            after_ns,
+            within_ns,
+        } => (
+            "peer_detected_dead_within",
+            eval_peer_detected_dead(peer, *after_ns, *within_ns, snapshots),
+        ),
         AssertionKind::EventCount {
             event_kind,
             min,
@@ -971,6 +979,72 @@ fn eval_dead_peer_resurrects(peer: &str, after: u64, within: u64, events: &[Even
         }
     }
     fail(vec![ev_event(dead_e)])
+}
+
+// ── peer_detected_dead_within ───────────────────────────────────────
+
+fn eval_peer_detected_dead(peer: &str, after: u64, within: u64, snapshots: &SnapshotIndex) -> Eval {
+    // The mirror of dead_peer_resurrects, in the detection direction
+    // (BEHAVIORAL_TEST_SPEC Goal 2). After `peer` is silenced at `after`, EVERY
+    // surviving observer must converge on it being Dead within `within`.
+    // Snapshot-based like convergence_after: a killed peer stops producing
+    // snapshots, so the observers are all the *other* snapshot-producing hosts.
+    let deadline = after.saturating_add(within);
+    let observers: Vec<&String> = snapshots.by_host.keys().filter(|h| h.as_str() != peer).collect();
+    if observers.is_empty() {
+        return inconclusive();
+    }
+    // Candidate convergence times: every observer snapshot in (after, deadline].
+    let mut times: BTreeSet<u64> = BTreeSet::new();
+    for observer in &observers {
+        if let Some(list) = snapshots.by_host.get(*observer) {
+            for s in list {
+                if s.virtual_time_ns > after && s.virtual_time_ns <= deadline {
+                    times.insert(s.virtual_time_ns);
+                }
+            }
+        }
+    }
+    if times.is_empty() {
+        return inconclusive();
+    }
+    // Pass iff at some t in the window, every observer's latest snapshot ≤ t
+    // already names `peer` as Dead — i.e. detection has reached all survivors.
+    for t in &times {
+        let mut all_present = true;
+        let mut all_dead = true;
+        for observer in &observers {
+            let snap = snapshots
+                .by_host
+                .get(*observer)
+                .and_then(|list| list.iter().filter(|s| s.virtual_time_ns <= *t).next_back());
+            let Some(snap) = snap else {
+                all_present = false;
+                break;
+            };
+            match snap.members.get(peer) {
+                Some(mv) if mv.state == "Dead" => {}
+                _ => {
+                    all_dead = false;
+                    break;
+                }
+            }
+        }
+        if all_present && all_dead {
+            return pass();
+        }
+    }
+    // No window time where every observer saw `peer` Dead ⇒ Fail, with each
+    // observer's last in-window snapshot as evidence.
+    let mut evidence = Vec::new();
+    for observer in &observers {
+        if let Some(list) = snapshots.by_host.get(*observer) {
+            if let Some(last) = list.iter().filter(|s| s.virtual_time_ns <= deadline).next_back() {
+                evidence.push(ev_snapshot(observer, last));
+            }
+        }
+    }
+    fail(evidence)
 }
 
 // ── event_count ─────────────────────────────────────────────────────

@@ -8,7 +8,7 @@ use single_gpu_inference::messages::{
     inference_codec_registry, InferenceCodec, InferenceRequest, InferenceResponse,
 };
 use swactor::actor::ActorAddress;
-use swactor::transport::Codec;
+use swactor_transport::Codec;
 
 fn request_codec() -> &'static dyn Codec<InferenceRequest> {
     &InferenceCodec

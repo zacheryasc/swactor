@@ -284,6 +284,18 @@ pub enum AssertionKind {
         after_ns: u64,
         within_ns: u64,
     },
+    /// The mirror of `DeadPeerResurrectsWithin`, in the *detection*
+    /// direction (BEHAVIORAL_TEST_SPEC.md Goal 2 — "real detection", the
+    /// central gap). After `peer` is genuinely silenced at/around
+    /// `after_ns`, EVERY surviving observer must converge on `peer` =
+    /// Dead within `within_ns`. Snapshot/`state_transition`-based: the
+    /// killed peer stops being snapshotted, so the observers are all the
+    /// other hosts, and they must agree it is Dead.
+    PeerDetectedDeadWithin {
+        peer: String,
+        after_ns: u64,
+        within_ns: u64,
+    },
     /// `N3_SIM_TEST_BATTERY_SPEC.md §3` family A/C-shaped assertion.
     /// Counts events of kind `event_kind` across the entire run. `min`
     /// and `max` are both optional bounds (default 0 / u64::MAX); a
@@ -1824,6 +1836,19 @@ fn parse_assertion(
                 require_u64_field(path, &field("within_ns"), table.get("within_ns"))?;
             check_t(after_ns.saturating_add(within_ns), "after_ns + within_ns")?;
             AssertionKind::DeadPeerResurrectsWithin {
+                peer,
+                after_ns,
+                within_ns,
+            }
+        }
+        "peer_detected_dead_within" => {
+            let peer = peer_field(path, &field("peer"), table.get("peer"), peers)?;
+            let after_ns =
+                require_u64_field(path, &field("after_ns"), table.get("after_ns"))?;
+            let within_ns =
+                require_u64_field(path, &field("within_ns"), table.get("within_ns"))?;
+            check_t(after_ns.saturating_add(within_ns), "after_ns + within_ns")?;
+            AssertionKind::PeerDetectedDeadWithin {
                 peer,
                 after_ns,
                 within_ns,

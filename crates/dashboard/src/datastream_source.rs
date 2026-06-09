@@ -8,8 +8,8 @@
 //!     [`RuntimeStats`] (each datastream channel becomes one synthetic actor row);
 //!   * the canonical **Distribution** connection-graph page
 //!     (`/plugin/distribution`, [`crate::DISTRIBUTION_PAGE_HTML`]) via a
-//!     [`DistributionNodeSnapshot`] rebuilt from the selected node's membership —
-//!     so it renders the exact SWIM graph a live node shows;
+//!     distribution-page JSON rebuilt from the selected node's membership and
+//!     `dist.state` — so it renders the exact SWIM graph a live node shows;
 //!   * a cross-node **Fleet** table (`/plugin/vastai`) served in the same
 //!     dashboard chrome (nav bar + palette), not a separate app.
 //!
@@ -20,24 +20,25 @@
 //! [`NODE_TTL`]); a node that stops streaming drops out of every view, so a
 //! restarted/departed node leaves no ghost in the graph or the fleet table.
 
-use std::collections::{HashMap, HashSet};
-use std::net::UdpSocket;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use distribution::datastream::catalog::{
-    self, IdentityRecord, LifecycleCost, MembershipTransition, Record, ResourceSample,
-    RuntimeStats as DsRuntimeStats, TransportInternals,
+use datastream::catalog::{
+    self, ActorRuntimeDetail, DatastoreState, DistributionState, IdentityRecord, LifecycleCost,
+    MembershipTransition, Record, ResourceSample, RuntimeStats as DsRuntimeStats,
+    TransportInternals,
 };
-use distribution::datastream::frame::{Frame, StreamId};
-use distribution::datastream::wire::decode_delivery;
-use distribution::snapshot::{DistributionNodeSnapshot, MemberInfo};
+use datastream::frame::{Frame, StreamId};
 
 use swactor::actor::ActorAddress;
 use swactor::stats::{ActorInfo, RuntimeStats, TickTiming, WorkerInfo};
 
+/// How many recent datastore operation events to retain per node for the
+/// reconstructed timeline (the streaming successor of the old fixed event ring).
+const DATASTORE_EVENT_CAP: usize = 200;
+
 use crate::plugin::{DashboardPlugin, PluginResponse};
-use crate::{DashboardHandle, DISTRIBUTION_PAGE_HTML};
 
 /// A node counts as live — shown in the graph and fleet table — if it has
 /// streamed a frame within this window. Nodes ship resource/runtime/transport
@@ -54,6 +55,14 @@ struct DatastreamModel {
     runtime: Option<DsRuntimeStats>,
     transport: Option<TransportInternals>,
     lifecycle: Option<LifecycleCost>,
+    /// Consolidated distribution-subsystem state (cache/registry/directory/...).
+    dist_state: Option<DistributionState>,
+    /// Datastore steady metrics.
+    datastore_state: Option<DatastoreState>,
+    /// Per-actor runtime detail (the real actor table).
+    actor_detail: Option<ActorRuntimeDetail>,
+    /// Recent datastore op events (newest last), capped at [`DATASTORE_EVENT_CAP`].
+    datastore_events: VecDeque<serde_json::Value>,
     /// peer node-id → latest liveness state.
     membership: HashMap<String, String>,
     /// last membership transition, formatted for display.
@@ -103,6 +112,34 @@ impl DatastreamModel {
             catalog::LIFECYCLE_COST => {
                 if let Ok(r) = LifecycleCost::decode(payload) {
                     self.lifecycle = Some(r);
+                }
+            }
+            catalog::DIST_STATE => {
+                if let Ok(r) = DistributionState::decode(payload) {
+                    self.dist_state = Some(r);
+                }
+            }
+            catalog::DATASTORE_STATE => {
+                if let Ok(r) = DatastoreState::decode(payload) {
+                    self.datastore_state = Some(r);
+                }
+            }
+            catalog::RUNTIME_ACTORS => {
+                if let Ok(r) = ActorRuntimeDetail::decode(payload) {
+                    self.actor_detail = Some(r);
+                }
+            }
+            // Datastore op events: structured text lines, tailed into a capped
+            // ring so the datastore page can show a recent-operations timeline.
+            catalog::DATASTORE_EVENTS => {
+                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
+                    let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("?");
+                    let hash = v.get("hash").and_then(|x| x.as_str()).unwrap_or("");
+                    events.push(LogEvent::Info(format!("datastore {kind} {}", short_id(hash))));
+                    if self.datastore_events.len() >= DATASTORE_EVENT_CAP {
+                        self.datastore_events.pop_front();
+                    }
+                    self.datastore_events.push_back(v);
                 }
             }
             catalog::MEMBERSHIP => {
@@ -165,6 +202,85 @@ impl DatastreamModel {
             .collect()
     }
 
+    /// The per-actor rows for the Actors/Overview table. Prefers the real actor
+    /// detail the node ships on `runtime.actors`; falls back to one synthetic row
+    /// per datastream channel when only the aggregate runtime stats are present
+    /// (an older producer), so the page degrades rather than going blank.
+    fn actor_rows(&self) -> Vec<ActorInfo> {
+        if let Some(detail) = &self.actor_detail {
+            if !detail.actors.is_empty() {
+                return detail.actors.iter().map(real_actor_row).collect();
+            }
+        }
+
+        let mut rows: Vec<ActorInfo> = Vec::new();
+        if let Some(r) = &self.resource {
+            rows.push(synth_actor(
+                "host.resource",
+                Some(format!(
+                    "cpu {:.0}% mem {}/{}MB",
+                    r.cpu_pct, r.mem_used_mb, r.mem_total_mb
+                )),
+                self.total_proc_lines(),
+                vec![
+                    ("cpu_pct".to_string(), r.cpu_pct.round() as u64),
+                    ("mem_used_mb".to_string(), r.mem_used_mb as u64),
+                    ("mem_total_mb".to_string(), r.mem_total_mb as u64),
+                    ("gpu_pct".to_string(), r.gpu_pct.round() as u64),
+                    ("disk_used_gb".to_string(), r.disk_used_gb as u64),
+                    ("net_rx_kbps".to_string(), r.net_rx_kbps as u64),
+                    ("net_tx_kbps".to_string(), r.net_tx_kbps as u64),
+                ],
+            ));
+        }
+        if let Some(t) = &self.transport {
+            rows.push(synth_actor(
+                "transport.internals",
+                Some(format!(
+                    "relay {} · {} direct · {} relayed",
+                    if t.relay_connected { "up" } else { "down" },
+                    t.direct_peers,
+                    t.relay_peers
+                )),
+                0,
+                vec![
+                    ("relay_connected".to_string(), t.relay_connected as u64),
+                    ("direct_peers".to_string(), t.direct_peers as u64),
+                    ("relay_peers".to_string(), t.relay_peers as u64),
+                    ("rtt_ms_p50".to_string(), t.rtt_ms_p50 as u64),
+                ],
+            ));
+        }
+        if !self.membership.is_empty() || self.last_transition.is_some() {
+            let mut counts: HashMap<&str, u64> = HashMap::new();
+            for state in self.membership.values() {
+                *counts.entry(state.as_str()).or_default() += 1;
+            }
+            let breakdown = counts
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect();
+            rows.push(synth_actor(
+                "membership",
+                self.last_transition.clone(),
+                self.membership.len() as u64,
+                breakdown,
+            ));
+        }
+        // One row per process label, newest line as "last message".
+        let mut procs: Vec<(&String, &(u64, String))> = self.procs.iter().collect();
+        procs.sort_by(|a, b| a.0.cmp(b.0));
+        for (label, (count, last)) in procs {
+            rows.push(synth_actor(
+                &format!("proc.{label}"),
+                Some(last.clone()),
+                *count,
+                vec![("lines".to_string(), *count)],
+            ));
+        }
+        rows
+    }
+
     /// Synthesize the dashboard's native stats from the accumulated datastream.
     fn to_runtime_stats(&self) -> RuntimeStats {
         let ds_rt = self.runtime.clone().unwrap_or(DsRuntimeStats {
@@ -189,77 +305,7 @@ impl DatastreamModel {
             stops: 0,
         };
 
-        // Each datastream channel becomes one synthetic actor row, with columns
-        // and the per-actor breakdown chart repurposed to show its values.
-        let mut actor_details: Vec<ActorInfo> = Vec::new();
-
-        if let Some(r) = &self.resource {
-            actor_details.push(synth_actor(
-                "host.resource",
-                Some(format!(
-                    "cpu {:.0}% mem {}/{}MB",
-                    r.cpu_pct, r.mem_used_mb, r.mem_total_mb
-                )),
-                self.total_proc_lines(),
-                vec![
-                    ("cpu_pct".to_string(), r.cpu_pct.round() as u64),
-                    ("mem_used_mb".to_string(), r.mem_used_mb as u64),
-                    ("mem_total_mb".to_string(), r.mem_total_mb as u64),
-                    ("gpu_pct".to_string(), r.gpu_pct.round() as u64),
-                    ("disk_used_gb".to_string(), r.disk_used_gb as u64),
-                    ("net_rx_kbps".to_string(), r.net_rx_kbps as u64),
-                    ("net_tx_kbps".to_string(), r.net_tx_kbps as u64),
-                ],
-            ));
-        }
-
-        if let Some(t) = &self.transport {
-            actor_details.push(synth_actor(
-                "transport.internals",
-                Some(format!(
-                    "relay {} · {} direct · {} relayed",
-                    if t.relay_connected { "up" } else { "down" },
-                    t.direct_peers,
-                    t.relay_peers
-                )),
-                0,
-                vec![
-                    ("relay_connected".to_string(), t.relay_connected as u64),
-                    ("direct_peers".to_string(), t.direct_peers as u64),
-                    ("relay_peers".to_string(), t.relay_peers as u64),
-                    ("rtt_ms_p50".to_string(), t.rtt_ms_p50 as u64),
-                ],
-            ));
-        }
-
-        if !self.membership.is_empty() || self.last_transition.is_some() {
-            let mut counts: HashMap<&str, u64> = HashMap::new();
-            for state in self.membership.values() {
-                *counts.entry(state.as_str()).or_default() += 1;
-            }
-            let breakdown = counts
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect();
-            actor_details.push(synth_actor(
-                "membership",
-                self.last_transition.clone(),
-                self.membership.len() as u64,
-                breakdown,
-            ));
-        }
-
-        // One row per process label, newest line as "last message".
-        let mut procs: Vec<(&String, &(u64, String))> = self.procs.iter().collect();
-        procs.sort_by(|a, b| a.0.cmp(b.0));
-        for (label, (count, last)) in procs {
-            actor_details.push(synth_actor(
-                &format!("proc.{label}"),
-                Some(last.clone()),
-                *count,
-                vec![("lines".to_string(), *count)],
-            ));
-        }
+        let actor_details = self.actor_rows();
 
         let actors = actor_details
             .iter()
@@ -294,69 +340,149 @@ impl DatastreamModel {
         node_id.contains(filter)
     }
 
-    /// Rebuild a [`DistributionNodeSnapshot`] for this node from the demuxed
-    /// stream, so the canonical Distribution page renders its SWIM connection
-    /// graph exactly as it would for a live node. Only live peers are included
-    /// (`peer_labels`/`live` are the fleet-wide label map and live set).
+    /// Rebuild the distribution-page JSON for this node from the demuxed stream,
+    /// so the canonical Distribution page renders its SWIM graph and panels
+    /// exactly as it would for a live node. Members (and their liveness) come
+    /// from the `membership` channel; cache / registry / directory / probe /
+    /// peer-auth from the `dist.state` record; name / listen addr / relay /
+    /// version from `identity`. Only live peers are included.
     ///
-    /// Fields the datastream does not carry (routing table, cache, directory,
-    /// registry) are honest zeros — the graph and membership panel, which is all
-    /// this view exists to show, are driven entirely by `members`.
+    /// `invite_code` and `join_statuses` are node-interactive state the
+    /// datastream does not carry; a node overlays its own live values, and the
+    /// fleet view leaves them null/empty.
     fn dist_snapshot(
         &self,
         node_id: &str,
         peer_labels: &HashMap<String, String>,
         live: &HashSet<String>,
-    ) -> DistributionNodeSnapshot {
-        let mut members: Vec<MemberInfo> = self
+    ) -> serde_json::Value {
+        let mut members: Vec<(String, String)> = self
             .live_peers(live)
             .into_iter()
-            .map(|(peer, state)| MemberInfo {
-                node_id: peer.clone(),
-                addr: None,
-                state: state.clone(),
-                incarnation: 0,
-                is_authorized: None,
-                label: None,
-                relay_url: None,
-                node_name: Some(peer_labels.get(peer).cloned().unwrap_or_else(|| short_id(peer))),
-            })
+            .map(|(peer, state)| (peer.clone(), state.clone()))
             .collect();
-        members.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        members.sort_by(|a, b| a.0.cmp(&b.0));
 
-        let count = |want: &str| members.iter().filter(|m| m.state == want).count();
+        let count = |want: &str| members.iter().filter(|(_, s)| s == want).count();
         let (alive_count, suspect_count, dead_count) =
             (count("alive"), count("suspect"), count("dead"));
+        let members_json: Vec<serde_json::Value> = members
+            .iter()
+            .map(|(peer, state)| {
+                serde_json::json!({
+                    "node_id": peer,
+                    "addr": serde_json::Value::Null,
+                    "state": state,
+                    "incarnation": 0,
+                    "node_name": peer_labels.get(peer).cloned().unwrap_or_else(|| short_id(peer)),
+                })
+            })
+            .collect();
 
-        DistributionNodeSnapshot {
-            node_id: node_id.to_string(),
-            listen_addr: None,
-            members,
-            alive_count,
-            suspect_count,
-            dead_count,
-            routing_table_size: 0,
-            routing_buckets: Vec::new(),
-            routing_neighbors: Vec::new(),
-            cache_size: 0,
-            cache_entries: Vec::new(),
-            directory_entry_count: 0,
-            repair_queue_size: 0,
-            registry_size: 0,
-            registry_tombstones: 0,
-            registry_entries: Vec::new(),
-            recent_probe_targets: Vec::new(),
-            peer_auth_mode: "open".into(),
-            authorized_peer_count: None,
-            node_name: Some(peer_labels.get(node_id).cloned().unwrap_or_else(|| short_id(node_id))),
-            invite_code: None,
-            // `relay_url` means "this node runs an embedded relay server" (it
-            // draws a teal ring in the graph) — not "is connected to a relay".
-            // The datastream doesn't carry that, so leave it unset.
-            relay_url: None,
-            version: None,
-            join_statuses: Vec::new(),
-        }
+        let ds = self.dist_state.as_ref();
+        let id = self.identity.as_ref();
+        let nonempty = |s: &String| !s.is_empty();
+
+        let cache_entries: Vec<serde_json::Value> = ds
+            .map(|d| {
+                d.cache_entries
+                    .iter()
+                    .map(|e| serde_json::json!({ "actor_addr": e.actor_addr, "node_id": e.node_id }))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let registry_entries: Vec<serde_json::Value> = ds
+            .map(|d| {
+                d.registry_entries
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "name": e.name,
+                            "actor_addr": e.actor_addr,
+                            "node_id": e.node_id,
+                            "tombstone": e.tombstone,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let peer_auth_mode = ds
+            .map(|d| d.peer_auth_mode.clone())
+            .filter(nonempty)
+            .unwrap_or_else(|| "open".into());
+        // The old snapshot reported `None` in open mode; preserve that.
+        let authorized_peer_count = match ds {
+            Some(d) if peer_auth_mode != "open" => serde_json::json!(d.authorized_peer_count),
+            _ => serde_json::Value::Null,
+        };
+
+        let node_name = id
+            .map(|i| i.node_name.clone())
+            .filter(nonempty)
+            .or_else(|| peer_labels.get(node_id).cloned())
+            .unwrap_or_else(|| short_id(node_id));
+
+        serde_json::json!({
+            "node_id": node_id,
+            "listen_addr": id.map(|i| i.listen_addr.clone()).filter(nonempty),
+            "members": members_json,
+            "alive_count": alive_count,
+            "suspect_count": suspect_count,
+            "dead_count": dead_count,
+            "cache_size": ds.map(|d| d.cache_size).unwrap_or(0),
+            "cache_entries": cache_entries,
+            "directory_route_count": ds.map(|d| d.directory_route_count).unwrap_or(0),
+            "registry_size": ds.map(|d| d.registry_size).unwrap_or(0),
+            "registry_tombstones": ds.map(|d| d.registry_tombstones).unwrap_or(0),
+            "registry_entries": registry_entries,
+            "recent_probe_targets": ds.map(|d| d.recent_probe_targets.clone()).unwrap_or_default(),
+            "peer_auth_mode": peer_auth_mode,
+            "authorized_peer_count": authorized_peer_count,
+            "node_name": node_name,
+            "invite_code": serde_json::Value::Null,
+            // "this node runs an embedded relay" — carried on identity now.
+            "relay_url": id.map(|i| i.relay_url.clone()).filter(nonempty),
+            "version": id.map(|i| i.version.clone()).filter(nonempty),
+            "join_statuses": Vec::<serde_json::Value>::new(),
+        })
+    }
+
+    /// Reconstruct the datastore snapshot JSON (the inner object the datastore
+    /// page renders) from the `datastore.state` record and the recent-events
+    /// ring. `None` until a datastore-state frame has been folded for this node.
+    fn datastore_json(&self, node_id: &str) -> Option<serde_json::Value> {
+        let ds = self.datastore_state.as_ref()?;
+        let objects: Vec<serde_json::Value> = ds
+            .objects
+            .iter()
+            .map(|o| {
+                serde_json::json!({ "hash": o.hash, "name": o.name, "size_bytes": o.size_bytes })
+            })
+            .collect();
+        let active_transfers: Vec<serde_json::Value> = ds
+            .active_transfers
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "hash": t.hash,
+                    "chunks_received": t.chunks_received,
+                    "chunks_total": t.chunks_total,
+                })
+            })
+            .collect();
+        let recent_events: Vec<serde_json::Value> = self.datastore_events.iter().cloned().collect();
+        Some(serde_json::json!({
+            "node_id": node_id,
+            "object_count": ds.object_count,
+            "total_bytes": ds.total_bytes,
+            "put_ops": ds.put_ops,
+            "get_ops": ds.get_ops,
+            "delete_ops": ds.delete_ops,
+            "objects": objects,
+            "recent_events": recent_events,
+            "active_transfers": active_transfers,
+        }))
     }
 
     /// A compact per-node summary row for the fleet table.
@@ -465,6 +591,9 @@ pub struct FleetUpdate {
     pub fleet_json: String,
     /// The selected node's Distribution snapshot JSON, if a node is selected.
     pub dist_json: Option<String>,
+    /// The selected node's datastore snapshot JSON (the inner object the
+    /// datastore page renders), if a node is selected and ships datastore state.
+    pub datastore_json: Option<String>,
     /// Synthesized single-node stats, present only when this frame was for the
     /// selected node. A UDP demo pushes it via `set_stats`; an orchestrator with
     /// its own live runtime ignores it.
@@ -564,10 +693,17 @@ impl FleetView {
                 .get(sel)
                 .and_then(|m| serde_json::to_string(&m.dist_snapshot(sel, &labels, &live)).ok())
         });
+        let datastore_json = self.selected.as_deref().and_then(|sel| {
+            self.models
+                .get(sel)
+                .and_then(|m| m.datastore_json(sel))
+                .and_then(|v| serde_json::to_string(&v).ok())
+        });
 
         FleetUpdate {
             fleet_json,
             dist_json,
+            datastore_json,
             stats,
             logs,
         }
@@ -584,7 +720,8 @@ pub fn fleet_cache_plugin(cache: Arc<Mutex<Option<String>>>) -> Arc<dyn Dashboar
 /// Plugin backed by a shared cache string: serves a fixed HTML page, emits its
 /// cache on the SSE stream under `name`, and answers `GET /api/plugin/{name}`.
 /// Used for both the Fleet table (`vastai`) and the Distribution graph
-/// (`distribution`); each is fed by [`run_datastream_ingest`].
+/// (`distribution`); the orchestrator's `datastream-sink` actor folds frames
+/// into a `FleetView` and writes the JSON the Fleet plugin serves.
 struct CachePlugin {
     name: &'static str,
     page: &'static str,
@@ -629,32 +766,6 @@ impl DashboardPlugin for CachePlugin {
     }
 }
 
-/// Minimal `peers` plugin so the Distribution page's `fetch('/api/plugin/peers')`
-/// resolves cleanly (open auth, no managed peer list) instead of 404ing. Silent
-/// on the SSE stream.
-struct PeersStub;
-
-impl DashboardPlugin for PeersStub {
-    fn name(&self) -> &str {
-        "peers"
-    }
-    fn snapshot_json(&self) -> Option<String> {
-        None
-    }
-    fn handle_request(
-        &self,
-        method: &str,
-        path: &str,
-        _query: &HashMap<String, String>,
-        _body: &[u8],
-    ) -> PluginResponse {
-        match (method, path) {
-            ("GET", "" | "list") => PluginResponse::json(r#"{"mode":"open","peers":[]}"#.into()),
-            _ => PluginResponse::not_found(),
-        }
-    }
-}
-
 /// Build one synthetic actor row with a deterministic address from its name.
 ///
 /// `mailbox_depth` is always 0: a datastream channel is not a real mailbox, and
@@ -696,6 +807,33 @@ fn addr_from(name: &str) -> ActorAddress {
     ActorAddress(bytes)
 }
 
+/// Map a wire [`ActorRec`](catalog::ActorRec) into a dashboard [`ActorInfo`] row.
+fn real_actor_row(a: &catalog::ActorRec) -> ActorInfo {
+    ActorInfo {
+        address: parse_addr_hex(&a.address).unwrap_or_else(|| addr_from(&a.name)),
+        worker_id: 0,
+        mailbox_depth: a.mailbox_depth as usize,
+        last_msg_type: (!a.last_msg_type.is_empty()).then(|| a.last_msg_type.clone()),
+        messages_processed: a.messages_processed,
+        poisoned: a.poisoned,
+        name: (!a.name.is_empty()).then(|| a.name.clone()),
+        message_type_counts: a.message_type_counts.clone(),
+    }
+}
+
+/// Parse a 64-char hex actor address back into an [`ActorAddress`]; `None` if it
+/// is not exactly 32 hex-encoded bytes.
+fn parse_addr_hex(hex: &str) -> Option<ActorAddress> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        bytes[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(ActorAddress(bytes))
+}
+
 /// Split `proc.<label>.stdout` / `proc.<label>.stderr` into `(label, is_stderr)`.
 fn parse_proc_channel(channel: &str) -> Option<(&str, bool)> {
     let rest = channel.strip_prefix("proc.")?;
@@ -711,85 +849,6 @@ fn short_id(id: &str) -> String {
     id[..id.len().min(8)].to_string()
 }
 
-/// Bind the UDP datastream sink, demux frames, and drive the dashboard's views.
-/// Blocks forever, like the dumb collector's `main`.
-///
-/// Registers three plugins fed off the demuxed stream:
-///   * `distribution` — the canonical SWIM connection-graph page, snapshotting
-///     the selected node;
-///   * `vastai` (the nav's "Fleet") — the cross-node telemetry table;
-///   * `peers` — an open-auth stub so the graph page's peer fetch resolves.
-///
-/// The single-node Overview/Actors page is driven via `handle.set_stats`.
-pub fn run_datastream_ingest(
-    bind: &str,
-    node_filter: Option<&str>,
-    handle: &DashboardHandle,
-) -> std::io::Result<()> {
-    let sock = UdpSocket::bind(bind)?;
-    eprintln!("datastream dashboard: listening on {bind} (one frame per datagram)");
-
-    // Distribution graph (selected node) and Fleet table (all live nodes), each
-    // a shared cache the ingest loop refreshes and the SSE loop fans out.
-    let dist_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let fleet_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    handle.register_plugin(Arc::new(CachePlugin::new(
-        "distribution",
-        DISTRIBUTION_PAGE_HTML,
-        Arc::clone(&dist_cache),
-    )) as Arc<dyn DashboardPlugin>);
-    handle.register_plugin(Arc::new(CachePlugin::new(
-        "vastai",
-        FLEET_HTML,
-        Arc::clone(&fleet_cache),
-    )) as Arc<dyn DashboardPlugin>);
-    // The base dashboard nav has a Datastore link; the datastream carries no
-    // datastore, so serve an honest "not available" page in-chrome rather than
-    // 404ing. Empty cache → silent on the SSE stream.
-    handle.register_plugin(Arc::new(CachePlugin::new(
-        "datastore",
-        DATASTORE_HTML,
-        Arc::new(Mutex::new(None)),
-    )) as Arc<dyn DashboardPlugin>);
-    handle.register_plugin(Arc::new(PeersStub) as Arc<dyn DashboardPlugin>);
-
-    let mut view = FleetView::new(node_filter.map(str::to_string));
-    // 64 KiB comfortably exceeds a UDP datagram; a frame never spans datagrams.
-    let mut buf = vec![0u8; 64 * 1024];
-
-    loop {
-        let (n, _src) = match sock.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("datastream dashboard: recv error: {e}");
-                continue;
-            }
-        };
-        let (stream, frame) = match decode_delivery(&buf[..n]) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("datastream dashboard: dropped malformed datagram ({n} B): {e:?}");
-                continue;
-            }
-        };
-
-        let update = view.ingest(&stream, &frame);
-        for (is_warn, m) in update.logs {
-            if is_warn {
-                tracing::warn!(target: "datastream", "{m}");
-            } else {
-                tracing::info!(target: "datastream", "{m}");
-            }
-        }
-        if let Some(stats) = update.stats {
-            handle.set_stats(stats);
-        }
-        *fleet_cache.lock().unwrap() = Some(update.fleet_json);
-        if let Some(json) = update.dist_json {
-            *dist_cache.lock().unwrap() = Some(json);
-        }
-    }
-}
 
 /// Cross-node **Fleet** table, served in the dashboard's own chrome (the same
 /// header / nav bar / palette as the Overview and Distribution pages, so it is a
@@ -921,46 +980,5 @@ const FLEET_HTML: &str = r#"<!doctype html>
   window.addEventListener("beforeunload", function(){ es.close(); });
 })();
 </script>
-</body>
-</html>"#;
-
-/// Honest in-chrome placeholder for the Datastore nav link: the datastream demo
-/// ships no datastore telemetry, so rather than 404 the link, explain that.
-const DATASTORE_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Swactor Runtime – Datastore</title>
-<style>
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Menlo', 'Consolas', 'Monaco', monospace; background: #0f1117; color: #e0e0e0; font-size: 13px; }
-  .header { display: flex; align-items: center; padding: 12px 20px; background: #161822; border-bottom: 1px solid #2a2d3e; }
-  .header h1 { font-size: 16px; font-weight: 600; color: #fff; }
-  .nav-links { display: flex; gap: 4px; margin-left: 20px; }
-  .nav-link { color: #888; text-decoration: none; font-size: 12px; padding: 4px 10px; border-radius: 3px; }
-  .nav-link:hover { color: #e0e0e0; }
-  .nav-link.active { color: #fff; background: #2a2d3e; }
-  .note { margin: 80px auto; max-width: 520px; text-align: center; color: #888; line-height: 1.6; }
-  .note b { color: #cbd5e1; }
-</style>
-</head>
-<body>
-<div class="header">
-  <h1>Swactor Runtime Dashboard</h1>
-  <nav class="nav-links">
-    <a href="/" class="nav-link">Overview</a>
-    <a href="/actors" class="nav-link">Actors</a>
-    <a href="/plugin/distribution" class="nav-link">Distribution</a>
-    <a href="/plugin/datastore" class="nav-link active">Datastore</a>
-    <a href="/plugin/vastai" class="nav-link">Fleet</a>
-  </nav>
-</div>
-<div class="note">
-  <p><b>No datastore in this view.</b></p>
-  <p>This dashboard is fed by the per-node telemetry <b>datastream</b>, which does not
-     carry datastore contents. See <a href="/plugin/distribution" class="nav-link">Distribution</a>
-     for the cluster connection graph or <a href="/plugin/vastai" class="nav-link">Fleet</a> for per-node telemetry.</p>
-</div>
 </body>
 </html>"#;

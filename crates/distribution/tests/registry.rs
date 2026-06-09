@@ -1,69 +1,15 @@
-//! Behavioral tests for the cluster registry.
+//! Behavioral tests for the cluster registry CRDT.
 //!
-//! Tests gossip-propagated naming via LWW-Register CRDT, using the shared
-//! `TestCluster` harness from `common`.
-
-mod common;
+//! These pin the `ClusterRegistry` LWW-Register merge semantics and tombstone
+//! GC directly on the pure type. The actor-path registry convergence (gossip
+//! propagation, tombstone dissemination, death-driven tombstoning across a
+//! cluster) is covered by `gossip_actors_transport.rs` and `registry_actor.rs`.
 
 use swactor::actor::ActorAddress;
-use common::{test_config, TestCluster};
-use distribution::node::DistributedNode;
-use distribution::registry::{ClusterRegistry, RegistryConfig, RegistryEntry, RegistryEvent};
+use distribution::registry::{ClusterRegistry, RegistryConfig, RegistryEntry};
 use distribution::types::NodeId;
 
-// ─── Test 1: register and resolve ───────────────────────────────────────────
-
-#[test]
-fn register_and_resolve() {
-    let mut node = DistributedNode::new(test_config());
-    let actor = ActorAddress::new_random();
-    let node_id = node.node_id();
-
-    node.register_name("my-actor".into(), actor);
-
-    let result = node.resolve_name("my-actor");
-    assert_eq!(result, Some((actor, node_id)));
-}
-
-// ─── Test 2: unregistered name returns None ─────────────────────────────────
-
-#[test]
-fn unregistered_name_returns_none() {
-    let node = DistributedNode::new(test_config());
-    assert_eq!(node.resolve_name("nonexistent"), None);
-}
-
-// ─── Test 3: unregister tombstones name ─────────────────────────────────────
-
-#[test]
-fn unregister_tombstones_name() {
-    let mut node = DistributedNode::new(test_config());
-    let actor = ActorAddress::new_random();
-
-    node.register_name("service".into(), actor);
-    assert!(node.resolve_name("service").is_some());
-
-    node.unregister_name("service");
-    assert_eq!(node.resolve_name("service"), None);
-}
-
-// ─── Test 4: re-registration updates binding ────────────────────────────────
-
-#[test]
-fn re_registration_updates_binding() {
-    let mut node = DistributedNode::new(test_config());
-    let actor_a = ActorAddress::new_random();
-    let actor_b = ActorAddress::new_random();
-    let node_id = node.node_id();
-
-    node.register_name("foo".into(), actor_a);
-    assert_eq!(node.resolve_name("foo"), Some((actor_a, node_id)));
-
-    node.register_name("foo".into(), actor_b);
-    assert_eq!(node.resolve_name("foo"), Some((actor_b, node_id)));
-}
-
-// ─── Test 5: LWW conflict — higher timestamp wins ──────────────────────────
+// ─── LWW conflict — higher timestamp wins ──────────────────────────────────
 
 #[test]
 fn lww_conflict_higher_timestamp_wins() {
@@ -96,7 +42,7 @@ fn lww_conflict_higher_timestamp_wins() {
     assert_eq!(reg.resolve("svc"), Some((addr_new, node_id)));
 }
 
-// ─── Test 6: LWW tiebreak — generation then node_id ────────────────────────
+// ─── LWW tiebreak — generation then node_id ────────────────────────────────
 
 #[test]
 fn lww_tiebreak_generation_then_node_id() {
@@ -154,117 +100,7 @@ fn lww_tiebreak_generation_then_node_id() {
     assert_eq!(reg2.resolve("y"), Some((addr_b, node_low)));
 }
 
-// ─── Test 7: gossip propagates registration ─────────────────────────────────
-
-#[test]
-fn gossip_propagates_registration() {
-    let mut cluster = TestCluster::new(2);
-
-    let actor = ActorAddress::new_random();
-    cluster[0].register_name("greeter".into(), actor);
-
-    // B doesn't know about "greeter" yet.
-    assert_eq!(cluster[1].resolve_name("greeter"), None);
-
-    // Run gossip rounds — registry entries piggyback on SWIM messages.
-    cluster.gossip_rounds(5);
-
-    // Now B should resolve "greeter" to A's actor.
-    let a_id = cluster.node_id(0);
-    assert_eq!(cluster[1].resolve_name("greeter"), Some((actor, a_id)));
-}
-
-// ─── Test 8: tombstone propagation via gossip ───────────────────────────────
-
-#[test]
-fn tombstone_propagation_via_gossip() {
-    let mut cluster = TestCluster::new(2);
-
-    let actor = ActorAddress::new_random();
-    cluster[0].register_name("ephemeral".into(), actor);
-
-    // Propagate the registration.
-    cluster.gossip_rounds(5);
-    let a_id = cluster.node_id(0);
-    assert_eq!(cluster[1].resolve_name("ephemeral"), Some((actor, a_id)));
-
-    // Now unregister on A.
-    cluster[0].unregister_name("ephemeral");
-
-    // Propagate the tombstone.
-    cluster.gossip_rounds(5);
-
-    assert_eq!(cluster[1].resolve_name("ephemeral"), None);
-}
-
-// ─── Test 9: node death tombstones entries ──────────────────────────────────
-
-#[test]
-fn node_death_tombstones_entries() {
-    // Set up a 3-node cluster: A(0), B(1), C(2)
-    let mut cluster = TestCluster::new(3);
-
-    let b_id = cluster.node_id(1);
-
-    // B registers a name.
-    let actor = ActorAddress::new_random();
-    cluster[1].register_name("b-service".into(), actor);
-
-    // Propagate B's registration to A and C via mesh gossip.
-    cluster.gossip_rounds(5);
-
-    assert_eq!(cluster[0].resolve_name("b-service"), Some((actor, b_id)));
-    assert_eq!(cluster[2].resolve_name("b-service"), Some((actor, b_id)));
-
-    // B dies — SWIM detects via timeout. We simulate by running rounds
-    // without B participating, until suspicion_timeout expires.
-    cluster.gossip_rounds_excluding(&[1], 20);
-
-    // After enough ticks, A should declare B dead, which tombstones "b-service".
-    assert_eq!(
-        cluster[0].resolve_name("b-service"),
-        None,
-        "A must tombstone b-service after declaring B dead"
-    );
-
-    // Propagate tombstone from A to C.
-    cluster.gossip_rounds_excluding(&[1], 5);
-    assert_eq!(
-        cluster[2].resolve_name("b-service"),
-        None,
-        "C should see tombstone after B's death propagates"
-    );
-}
-
-// ─── Test 10: registry events emitted on change ─────────────────────────────
-
-#[test]
-fn registry_events_emitted_on_change() {
-    let mut node = DistributedNode::new(test_config());
-    let actor = ActorAddress::new_random();
-    let node_id = node.node_id();
-
-    node.register_name("evt-test".into(), actor);
-    node.unregister_name("evt-test");
-
-    let events = node.registry_events();
-    assert_eq!(events.len(), 2);
-    assert_eq!(
-        events[0],
-        RegistryEvent::Registered {
-            name: "evt-test".into(),
-            actor_addr: actor,
-            node_id,
-        }
-    );
-    assert!(matches!(
-        &events[1],
-        RegistryEvent::Unregistered { name, previous_addr }
-        if name == "evt-test" && *previous_addr == actor
-    ));
-}
-
-// ─── Test 11: tombstone GC removes old tombstones ──────────────────────────
+// ─── Tombstone GC removes old tombstones ───────────────────────────────────
 
 #[test]
 fn tombstone_gc_removes_old_tombstones() {
@@ -300,32 +136,4 @@ fn tombstone_gc_removes_old_tombstones() {
 
     // The tombstone should be gone.
     assert_eq!(reg.tombstone_count(), 0, "tombstone should be GC'd after TTL");
-}
-
-// ─── Test 12: gossip convergence with five nodes ────────────────────────────
-
-#[test]
-fn gossip_convergence_five_nodes() {
-    let mut cluster = TestCluster::new(5);
-
-    // Each node registers a unique name.
-    let actors: Vec<ActorAddress> = (0..5).map(|_| ActorAddress::new_random()).collect();
-    for i in 0..5 {
-        cluster[i].register_name(format!("service-{i}"), actors[i]);
-    }
-
-    // Run many gossip rounds.
-    cluster.gossip_rounds(15);
-
-    // All 5 names should be resolvable on all 5 nodes.
-    for i in 0..5 {
-        for j in 0..5 {
-            let result = cluster[i].resolve_name(&format!("service-{j}"));
-            assert_eq!(
-                result,
-                Some((actors[j], cluster.node_id(j))),
-                "node {i} should resolve service-{j}"
-            );
-        }
-    }
 }

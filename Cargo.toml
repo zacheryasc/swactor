@@ -8,13 +8,14 @@ members = [
     "crates/process",
     "crates/transport",
     "crates/distribution",
+    "crates/datastream",
     "crates/datastore",
     "crates/node",
     "tests/docker",
     "tests/integration",
     "xtask",
 ]
-exclude = ["crates/bindings/wasm-crypto", "examples"]
+exclude = ["crates/bindings/wasm-crypto", "examples", "apps"]
 
 [package]
 name = "swactor"

@@ -1,22 +1,25 @@
 //! Distribution plugin adapter for the dashboard plugin system.
 //!
-//! Wraps a cached `DistributionNodeSnapshot` into a `DashboardPlugin` that the
-//! dashboard can poll for snapshots and serve the distribution page.
+//! Serves the distribution page from a cache of datastream-reconstructed JSON
+//! (written by the node's in-process frame consumer) and keeps the interactive
+//! Re-peer / dismiss actions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use dashboard::plugin::{DashboardPlugin, PluginResponse};
 use dashboard::JoinPeerInfo;
-use distribution::snapshot::DistributionNodeSnapshot;
 
 /// HTML page for the distribution plugin. Owned by the `dashboard` crate so the
 /// live node and the datastream dashboard serve the identical page.
 const DISTRIBUTION_HTML: &str = dashboard::DISTRIBUTION_PAGE_HTML;
 
-/// Dashboard plugin that exposes distribution node snapshots.
+/// Dashboard plugin that exposes the distribution page. The telemetry JSON is
+/// reconstructed from the datastream by the node's in-process consumer and fed
+/// into `cached`; this plugin serves it and keeps the interactive Re-peer /
+/// dismiss actions.
 pub struct DistributionPlugin {
-    cached: Arc<Mutex<Option<DistributionNodeSnapshot>>>,
+    cached: Arc<Mutex<Option<String>>>,
     join_sender: Option<std::sync::mpsc::Sender<JoinPeerInfo>>,
     /// Node IDs whose join status has been dismissed by the user.
     /// The main loop drains these and calls `clear_join_status` on the driver.
@@ -25,7 +28,7 @@ pub struct DistributionPlugin {
 
 impl DistributionPlugin {
     pub fn new(
-        cached: Arc<Mutex<Option<DistributionNodeSnapshot>>>,
+        cached: Arc<Mutex<Option<String>>>,
         join_sender: Option<std::sync::mpsc::Sender<JoinPeerInfo>>,
     ) -> Self {
         Self {
@@ -47,9 +50,7 @@ impl DashboardPlugin for DistributionPlugin {
     }
 
     fn snapshot_json(&self) -> Option<String> {
-        let guard = self.cached.lock().unwrap();
-        let snapshot = guard.as_ref()?;
-        serde_json::to_string(snapshot).ok()
+        self.cached.lock().unwrap().clone()
     }
 
     fn handle_request(
@@ -61,14 +62,13 @@ impl DashboardPlugin for DistributionPlugin {
     ) -> PluginResponse {
         match (method, path) {
             ("GET", "") => {
-                let guard = self.cached.lock().unwrap();
-                match guard.as_ref() {
-                    Some(snapshot) => match serde_json::to_string(snapshot) {
-                        Ok(json) => PluginResponse::json(json),
-                        Err(_) => PluginResponse::json("{}".into()),
-                    },
-                    None => PluginResponse::json("{}".into()),
-                }
+                let json = self
+                    .cached
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "{}".into());
+                PluginResponse::json(json)
             }
             ("POST", "rejoin") => self.handle_rejoin(body),
             ("POST", "clear_status") => self.handle_clear_status(body),
@@ -104,15 +104,19 @@ impl DistributionPlugin {
             None => return PluginResponse::json(r#"{"error":"invalid node_id hex"}"#.into()),
         };
 
-        // Look up relay_url from cached snapshot
-        let relay_url = {
-            let guard = self.cached.lock().unwrap();
-            guard.as_ref().and_then(|snap| {
-                snap.members.iter()
-                    .find(|m| m.node_id == node_id_hex)
-                    .and_then(|m| m.relay_url.clone())
+        // Look up relay_url from the cached distribution JSON.
+        let relay_url = self.cached.lock().unwrap().as_ref().and_then(|json| {
+            let v: serde_json::Value = serde_json::from_str(json).ok()?;
+            let members = v.get("members")?.as_array()?;
+            members.iter().find_map(|m| {
+                let nid = m.get("node_id")?.as_str()?;
+                if nid == node_id_hex {
+                    m.get("relay_url")?.as_str().map(|s| s.to_string())
+                } else {
+                    None
+                }
             })
-        };
+        });
 
         match tx.send(JoinPeerInfo { node_id: bytes, relay_url, direct_addrs: vec![] }) {
             Ok(()) => PluginResponse::json(r#"{"ok":true}"#.into()),

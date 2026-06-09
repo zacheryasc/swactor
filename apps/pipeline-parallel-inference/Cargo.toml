@@ -1,0 +1,46 @@
+[workspace]
+
+[package]
+name = "pipeline-parallel-inference"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+swactor = { path = "../..", features = ["transport", "serde", "std"] }
+swactor-transport = { path = "../../crates/transport" }
+# `ssh` enables the orchestrator's boot-phase telemetry: it SSHes into each
+# rented node and streams the worker boot log onto its datastream.
+swactor-process = { path = "../../crates/process", features = ["ssh"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+tokio = { version = "1", features = ["full"] }
+distribution = { path = "../../crates/distribution", features = ["iroh"] }
+datastream = { path = "../../crates/datastream" }
+# Live runtime dashboard (HTTP overview/actors/topology pages, served on
+# localhost when PP_DASHBOARD is set).
+dashboard = { path = "../../crates/dashboard" }
+iroh = "0.98"
+urlencoding = "2"
+base64 = "0.22"
+libc = "0.2"
+
+[[bin]]
+name = "pp-worker"
+path = "src/bin/pp_worker.rs"
+
+[[bin]]
+name = "pp-orchestrator"
+path = "src/bin/pp_orchestrator.rs"
+
+[dev-dependencies]
+wiremock = "0.6"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# These binaries are shipped to rented GPU nodes over the docker image on a
+# cold lease, and over scp through vast.ai's throttled SSH proxy for manual
+# swaps. Stripping debug symbols (~26MB -> ~18MB) trims both at no runtime cost.
+[profile.release]
+strip = true

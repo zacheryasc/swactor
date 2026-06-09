@@ -14,7 +14,7 @@ use swactor_datastore::types::ContentHash;
 use swactor_datastore::messages::{DatastoreResponse, GetChunkRequest};
 use swactor_datastore::{reassemble_blob, verify_integrity};
 
-use swactor::transport::NodeId;
+use swactor_transport::NodeId;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Put & Retrieve

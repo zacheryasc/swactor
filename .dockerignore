@@ -5,7 +5,7 @@
 !target/release/swactor-diag-postproc
 !examples/single-gpu-inference/target/release/gpu-node
 !examples/single-gpu-inference/tinygrad_worker.py
-!examples/pipeline-parallel-inference/target/release/pp-worker
-!examples/pipeline-parallel-inference/target/release/pp-orchestrator
-!examples/pipeline-parallel-inference/pp_tinygrad_worker.py
-!examples/pipeline-parallel-inference/pp_entrypoint.sh
+!apps/pipeline-parallel-inference/target/release/pp-worker
+!apps/pipeline-parallel-inference/target/release/pp-orchestrator
+!apps/pipeline-parallel-inference/pp_tinygrad_worker.py
+!apps/pipeline-parallel-inference/pp_entrypoint.sh

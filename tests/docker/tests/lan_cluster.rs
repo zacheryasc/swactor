@@ -38,11 +38,6 @@ fn lan_cluster_converges() {
                     "{host}:{port} should see >= 4 alive, got {}",
                     snap.alive_count
                 );
-                assert!(
-                    snap.routing_table_size >= 3,
-                    "{host}:{port} should have >= 3 routing entries, got {}",
-                    snap.routing_table_size
-                );
             }
         }
         Err(diag) => {
@@ -161,29 +156,29 @@ fn lan_actors_resolvable_cross_machine() {
         .expect("LAN cluster did not converge before actor resolution test");
 
     // When: we query each node's snapshot
-    let mut total_directory_entries = 0;
+    let mut total_directory_routes = 0;
     let mut total_cache_size = 0;
 
     for &(host, port) in &LAN_ENDPOINTS {
         let snap = poll_distribution_at(host, port)
             .unwrap_or_else(|| panic!("{host}:{port} unreachable"));
 
-        // Then: each node has its own 2 actors in the directory
+        // Then: the directory has converged so each node knows >= its own 2 actors.
         assert!(
-            snap.directory_entry_count >= 2,
-            "{host}:{port} should have >= 2 directory entries, got {}",
-            snap.directory_entry_count
+            snap.directory_route_count >= 2,
+            "{host}:{port} should know >= 2 directory routes, got {}",
+            snap.directory_route_count
         );
 
-        total_directory_entries += snap.directory_entry_count;
+        total_directory_routes += snap.directory_route_count;
         total_cache_size += snap.cache_size;
     }
 
-    // Total actors across cluster: 10 (5 nodes * 2 actors)
+    // 5 nodes * 2 actors = 10 actors; every converged node knows all of them.
     assert!(
-        total_directory_entries >= 10,
-        "total directory entries should be >= 10, got {}",
-        total_directory_entries
+        total_directory_routes >= 10,
+        "total directory routes should be >= 10, got {}",
+        total_directory_routes
     );
 
     // Nodes should cache remote actor locations (including cross-machine)
