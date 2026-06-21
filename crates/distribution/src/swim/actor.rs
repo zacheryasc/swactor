@@ -24,7 +24,7 @@ use crate::crypto::verify_directory_entry;
 use crate::messages::{Ack, IndirectAck, JoinRequest, JoinResponse, Ping, PingReq};
 use crate::types::{DirectoryEntry, MemberState, NodeId};
 
-use super::node::{NodeAction, SwimNode};
+use super::node::{NodeAction, SwimNode, SwimObserver};
 use super::probe::SwimConfig;
 
 // ─── The Binding (§3.2) ───────────────────────────────────────────────────────
@@ -177,6 +177,15 @@ impl SwimActor {
             subscribers: Vec::new(),
             peer_directory,
         }
+    }
+
+    /// Install a [`SwimObserver`] on the wrapped engine, so probe RTT and
+    /// membership transitions (with their cause) surface to a telemetry sink.
+    /// Non-breaking builder over [`new`](Self::new); callers that don't observe
+    /// SWIM leave it off (production previously always did).
+    pub fn with_observer(mut self, observer: Box<dyn SwimObserver>) -> Self {
+        self.node.set_observer(observer);
+        self
     }
 
     /// Resolve `to` through the Binding and send `msg`; on a binding miss or a

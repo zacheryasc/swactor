@@ -1,4 +1,5 @@
-# swactor-datastore
+# swactor-datastore **CURRENTLY OBSELETE**
+
 
 Distributed content-addressed datastore built on [swactor](../../README.md). Objects are split into fixed-size chunks, identified by their blake3 hash, and replicated across a peer-to-peer network via epidemic gossip.
 

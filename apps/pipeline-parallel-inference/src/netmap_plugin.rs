@@ -8,12 +8,10 @@
 //! by live bandwidth** (bytes/sec, derived client-side from the delta of the
 //! cumulative per-peer byte counters between successive snapshots).
 //!
-//! Two pieces feed it, both **shared** with the distribution plugin:
+//! Two pieces feed it:
 //!
-//!   * [`SharedSnapshot`] + [`MsgCounts`](crate::dist_plugin::MsgCounts) — the
-//!     cached cluster snapshot (members, names) and the per-peer message/byte
-//!     tallies. The engine no longer carries a message-counting emitter, so the
-//!     tallies stay at zero; the graph still renders the live transport mesh.
+//!   * [`SharedSnapshot`] — the cached cluster snapshot (members, names),
+//!     **shared** with the distribution plugin.
 //!   * [`ConnTracker`] — a per-peer transport map kept fresh by
 //!     [`spawn_conn_poller`], which queries `endpoint.remote_info` directly —
 //!     a self-contained poll, independent of any telemetry pipeline.
@@ -27,7 +25,7 @@ use dashboard::plugin::{DashboardPlugin, PluginResponse};
 use distribution::iroh_driver::{conn_type_of, ConnType, IrohDriver};
 use iroh::PublicKey;
 
-use crate::dist_plugin::{MsgCounts, SharedSnapshot};
+use crate::dist_plugin::SharedSnapshot;
 
 /// Milliseconds since the Unix epoch.
 fn wall_ms_now() -> u64 {
@@ -91,27 +89,21 @@ const NETMAP_HTML: &str = include_str!("netmap_page.html");
 /// Read-only dashboard plugin backing `/plugin/netmap`.
 pub struct NetmapPlugin {
     cached: SharedSnapshot,
-    counts: Arc<MsgCounts>,
     conn: Arc<ConnTracker>,
 }
 
 impl NetmapPlugin {
-    pub fn new(cached: SharedSnapshot, counts: Arc<MsgCounts>, conn: Arc<ConnTracker>) -> Self {
-        Self {
-            cached,
-            counts,
-            conn,
-        }
+    pub fn new(cached: SharedSnapshot, conn: Arc<ConnTracker>) -> Self {
+        Self { cached, conn }
     }
 
-    /// Serialize the cached snapshot with message tallies, the transport map, and
-    /// a server timestamp the frontend uses as the time base for bytes/sec.
+    /// Serialize the cached snapshot with the transport map and a server
+    /// timestamp the frontend uses as the time base for bytes/sec.
     fn rendered_json(&self) -> Option<String> {
         let guard = self.cached.lock().unwrap();
         let snap = guard.as_ref()?;
         let mut v = serde_json::to_value(snap).ok()?;
         if let serde_json::Value::Object(ref mut m) = v {
-            m.insert("msg_counts".to_string(), self.counts.to_json());
             m.insert("conn".to_string(), self.conn.to_json());
             m.insert(
                 "conn_ts_ms".to_string(),

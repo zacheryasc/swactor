@@ -18,6 +18,27 @@ Once connected, **SWIM protocol** handles cluster membership: protocol probes ev
 
 **Peer auth** operates in two modes: open (no `peers_file`) or allow-list (`peers.json`). In allow-list mode, SWIM messages from unknown nodes are dropped at the transport layer. New peers can be added via `swactor join` or the dashboard UI, both of which hot-update the allow-list.
 
+> **Note (deferred, not urgent): gossip opens a fresh QUIC stream per message.**
+> The iroh driver reuses the per-peer *connection* but opens and finishes a new
+> uni-stream for every gossip/SWIM message (`iroh_driver.rs` `send_wire` →
+> `open_uni`/`finish` per send; reader does `accept_uni` + `read_to_end` per
+> message). The stream-per-message shape exists only because the wire frame has
+> no payload-length field and relies on stream-EOF to delimit. No per-message RTT
+> is paid (uni-streams are unilateral), but each send costs a tokio task spawn, a
+> fresh read-side allocation, and a slot against `max_concurrent_uni_streams`.
+>
+> Two cheaper shapes, when it's worth doing:
+> - **QUIC datagrams** for the small probe traffic (Ping/Ack/PingReq). One
+>   datagram = one self-delimiting message, no stream state at all, and
+>   best-effort delivery *matches* SWIM's own loss-tolerance instead of fighting
+>   it with redundant QUIC retransmits. Capped at ~path-MTU, so it doesn't cover
+>   large gossip (e.g. a `JoinResponse` with a big member list).
+> - **One persistent length-prefixed stream per connection** for the larger /
+>   must-arrive messages — the same persistent-stream discipline used for blob
+>   edges.
+>
+> Low priority; tracked here so it isn't lost.
+
 ### Relay
 
 Nodes with a public IP auto-promote to embedded relay servers (port 3340). Candidacy is evaluated at startup: the node checks its outbound IP is non-RFC1918 and the relay port is bindable. Relay URLs are announced via SWIM gossip so other nodes discover them automatically. Nodes behind NAT use relays for indirect connectivity — this is why the probe timeout is 600ms instead of the typical 300ms.

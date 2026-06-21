@@ -54,7 +54,7 @@ use dashboard::collector::StatsCollector;
 use dashboard::datastream_source::{fleet_cache_plugin, FleetView};
 use dashboard::{start_dashboard, DashboardConfig};
 
-use pipeline_parallel_inference::dist_plugin::{DistDashPlugin, MsgCounts, SharedSnapshot};
+use pipeline_parallel_inference::dist_plugin::{DistDashPlugin, SharedSnapshot};
 use pipeline_parallel_inference::netmap_plugin::{spawn_conn_poller, ConnTracker, NetmapPlugin};
 use pipeline_parallel_inference::iroh_transport::{
     ActorMessagePump, IrohActorTransport, ACTOR_ALPN,
@@ -500,12 +500,6 @@ fn run_seed(args: &Args) -> i32 {
     // its snapshot cell exists whenever the in-process dashboard is on.
     let want_dist = std::env::var_os("PP_DASHBOARD").is_some();
 
-    // Orchestrator dashboard message tallies. The per-message wire tally used
-    // to decorate the driver's diagnostics emitter; that emitter was removed
-    // from the engine, so the counts stay empty (the distribution page still
-    // renders membership/routing, just without live message counters).
-    let msg_counts = Arc::new(MsgCounts::default());
-
     let my_id = cluster.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
     let direct: Vec<SocketAddr> = cluster.driver.direct_addresses().to_vec();
@@ -545,19 +539,15 @@ fn run_seed(args: &Args) -> i32 {
         // plugins ("Distribution"/"Netmap" nav tabs) against the shared cell.
         if let (Some((handle, collector, port)), Some(cached)) = (&dashboard, &dist_cached) {
             handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
-            handle.register_plugin(Arc::new(DistDashPlugin::new(
-                Arc::clone(cached),
-                Arc::clone(&msg_counts),
-            )));
+            handle.register_plugin(Arc::new(DistDashPlugin::new(Arc::clone(cached))));
             // Net map plugin: a live connection/bandwidth graph. Shares the
-            // cached snapshot and message tallies; a background poller keeps its
-            // transport map fresh by querying the iroh endpoint directly. The
-            // poller's stop flag rides the process lifetime (the driver's tokio
-            // runtime is torn down at end of run, aborting the task).
+            // cached snapshot; a background poller keeps its transport map fresh
+            // by querying the iroh endpoint directly. The poller's stop flag
+            // rides the process lifetime (the driver's tokio runtime is torn
+            // down at end of run, aborting the task).
             let conn_tracker = Arc::new(ConnTracker::default());
             handle.register_plugin(Arc::new(NetmapPlugin::new(
                 Arc::clone(cached),
-                Arc::clone(&msg_counts),
                 Arc::clone(&conn_tracker),
             )));
             let poll_stop = Arc::new(AtomicBool::new(false));
@@ -1499,12 +1489,6 @@ fn run_vastai(args: &Args) -> i32 {
     // snapshot cell exists whenever the in-process dashboard is on.
     let want_dist = std::env::var_os("PP_DASHBOARD").is_some();
 
-    // Orchestrator dashboard message tallies. The per-message wire tally used
-    // to decorate the driver's diagnostics emitter; that emitter was removed
-    // from the engine, so the counts stay empty (the distribution page still
-    // renders membership/routing, just without live message counters).
-    let msg_counts = Arc::new(MsgCounts::default());
-
     // Per-cluster drive counter, emitted on pp_drive_start / pp_drive_end so
     // the bundle reader can slice the interleaved event stream by attempt.
     // One-shot and --hold each drive exactly once per process, so this is 1.
@@ -1581,19 +1565,15 @@ fn run_vastai(args: &Args) -> i32 {
     // plugins ("Distribution"/"Netmap" nav tabs) against the shared cell.
     if let (Some((handle, collector, port)), Some(cached)) = (&dashboard, &dist_cached) {
         handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
-        handle.register_plugin(Arc::new(DistDashPlugin::new(
-            Arc::clone(cached),
-            Arc::clone(&msg_counts),
-        )));
-        // Net map plugin: a live connection/bandwidth graph. Shares the
-        // cached snapshot and message tallies; a background poller keeps its
-        // transport map fresh by querying the iroh endpoint directly. The
-        // poller's stop flag rides the process lifetime (the driver's tokio
-        // runtime is torn down at end of run, aborting the task).
+        handle.register_plugin(Arc::new(DistDashPlugin::new(Arc::clone(cached))));
+        // Net map plugin: a live connection/bandwidth graph. Shares the cached
+        // snapshot; a background poller keeps its transport map fresh by querying
+        // the iroh endpoint directly. The poller's stop flag rides the process
+        // lifetime (the driver's tokio runtime is torn down at end of run,
+        // aborting the task).
         let conn_tracker = Arc::new(ConnTracker::default());
         handle.register_plugin(Arc::new(NetmapPlugin::new(
             Arc::clone(cached),
-            Arc::clone(&msg_counts),
             Arc::clone(&conn_tracker),
         )));
         let poll_stop = Arc::new(AtomicBool::new(false));

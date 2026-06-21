@@ -39,10 +39,14 @@ use distribution::directory_actor::{DirectoryActor, DirectoryIn};
 use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
 use distribution::node::DistributedNodeConfig;
 use distribution::node_metadata_actor::{MetadataActor, MetadataIn, RelayInfo};
-use distribution::registry_actor::{NameResolved, RegistryActor, RegistryIn};
-use distribution::snapshot::{DistributionNodeSnapshot, MemberInfo};
+use distribution::registry::RegistrySnapshot;
+use distribution::registry_actor::{NameResolved, RegistryActor, RegistryIn, RegistryView};
+use distribution::snapshot::{
+    CacheEntryInfo, DistributionNodeSnapshot, MemberInfo, RegistryEntryInfo,
+};
 use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
+use distribution::swim::telemetry::{ObservedTransition, SwimTelemetry};
 use distribution::transport_bridge::{
     IrohPeerDirectory, IrohRouteBinder, Outbox, RelayMirror, RouteView, RouteViewTransport,
 };
@@ -89,6 +93,11 @@ pub struct ClusterNode {
     membership_mirror: Arc<Mutex<MemberList>>,
     relay_mirror: RelayMirror,
     _route_view: RouteView,
+    /// Read-mirror of the cluster registry, for the `dist.state` telemetry.
+    registry_view: RegistryView,
+    /// Production SWIM observer: probe RTT, recent probe targets, and membership
+    /// transitions (with cause), for `transport.internals` / `membership` / `dist.state`.
+    swim_telemetry: Arc<SwimTelemetry>,
     /// Reused per `resolve_name` call to avoid leaking inbox addresses in the
     /// runtime's inbox registry.
     resolve_inbox: Inbox<NameResolved>,
@@ -168,21 +177,24 @@ impl ClusterNode {
             Arc::clone(&outbox),
         ));
 
+        // Telemetry mirrors observed by the fleet emitter (same wiring as the
+        // standalone node): the SWIM observer (probe RTT, recent targets,
+        // transitions-with-cause) and the registry read-mirror.
+        let swim_telemetry = SwimTelemetry::new();
+        let registry_view: RegistryView = Arc::new(RwLock::new(RegistrySnapshot::default()));
+
         // The four protocol actors.
         let swim_addr = rt
-            .spawn(SwimActor::new(
-                node_id,
-                swim_config,
-                Instant::now(),
-                peer_directory.clone(),
-            ))
+            .spawn(
+                SwimActor::new(node_id, swim_config, Instant::now(), peer_directory.clone())
+                    .with_observer(Box::new(Arc::clone(&swim_telemetry))),
+            )
             .expect("spawn SwimActor");
         let registry_addr = rt
-            .spawn(RegistryActor::new(
-                node_id,
-                registry_config,
-                peer_directory.clone(),
-            ))
+            .spawn(
+                RegistryActor::new(node_id, registry_config, peer_directory.clone())
+                    .with_view(Arc::clone(&registry_view)),
+            )
             .expect("spawn RegistryActor");
         let metadata_addr = rt
             .spawn(MetadataActor::new(
@@ -266,9 +278,57 @@ impl ClusterNode {
             membership_mirror,
             relay_mirror,
             _route_view: route_view,
+            registry_view,
+            swim_telemetry,
             resolve_inbox,
             relay_inbox,
         }
+    }
+
+    // ── Telemetry accessors (for the fleet emitter) ─────────────────────────
+
+    /// A consistent snapshot of the cluster registry (size / tombstones / entries).
+    pub fn registry_snapshot(&self) -> RegistrySnapshot {
+        self.registry_view.read().expect("registry view poisoned").clone()
+    }
+
+    /// Median SWIM probe round-trip time (ms); `0` until a probe completes.
+    pub fn swim_rtt_p50(&self) -> u32 {
+        self.swim_telemetry.rtt_ms_p50()
+    }
+
+    /// Recent SWIM probe targets (most recent last).
+    pub fn swim_recent_targets(&self) -> Vec<NodeId> {
+        self.swim_telemetry.recent_targets()
+    }
+
+    /// Drain the membership transitions captured since the last call (each carries
+    /// a real cause string).
+    pub fn drain_swim_transitions(&self) -> Vec<ObservedTransition> {
+        self.swim_telemetry.drain_transitions()
+    }
+
+    /// This node's location cache: the remote `(actor, host)` pairs it knows, from
+    /// the directory route-view **and** the registry's live bindings (the demo
+    /// resolves neighbours by name, so the registry is its location directory).
+    /// Self-hosted and tombstoned entries are excluded; deduplicated by address.
+    pub fn location_cache_entries(&self) -> Vec<(ActorAddress, NodeId)> {
+        let self_id = self.driver.node_id();
+        let mut seen = std::collections::HashSet::new();
+        let mut out: Vec<(ActorAddress, NodeId)> = Vec::new();
+        for (addr, host) in self.driver.location_cache_entries() {
+            if seen.insert(addr) {
+                out.push((addr, host));
+            }
+        }
+        let registry = self.registry_view.read().expect("registry view poisoned");
+        for e in &registry.entries {
+            if !e.tombstone && e.node_id != self_id && seen.insert(e.actor_addr) {
+                out.push((e.actor_addr, e.node_id));
+            }
+        }
+        out.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+        out
     }
 
     // ── Driver passthroughs ─────────────────────────────────────────────────
@@ -449,9 +509,12 @@ impl ClusterNode {
     pub fn snapshot(&self) -> DistributionNodeSnapshot {
         let mut snap = self.driver.snapshot();
 
-        // Members + counts from the SWIM mirror.
+        // Members + counts from the SWIM mirror, each labelled with the cause of
+        // its most recent liveness transition from the production SWIM observer
+        // (a non-draining read — the fleet emitter still owns the drain).
         let mirror = self.membership_mirror.lock().unwrap();
         let relays = self.relay_mirror.read().ok();
+        let reasons = self.swim_telemetry.last_reasons();
         let mut members: Vec<MemberInfo> = Vec::with_capacity(mirror.len());
         let (mut alive, mut suspect, mut dead) = (0usize, 0usize, 0usize);
         for entry in mirror.all_members() {
@@ -482,6 +545,7 @@ impl ClusterNode {
                 label: None,
                 relay_url,
                 node_name: None,
+                reason: reasons.get(&entry.node_id).map(|r| r.to_string()),
             });
         }
         snap.members = members;
@@ -498,6 +562,39 @@ impl ClusterNode {
                 snap.relay_url = Some(r.to_string());
             }
         }
+
+        // Registry (name directory), location cache, and recent probe targets,
+        // from this node's telemetry mirrors — the `dist.state` fields the
+        // Distribution page renders. (`driver.snapshot()` fills only the
+        // directory route count.)
+        let hex = |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+        let registry = self.registry_snapshot();
+        snap.registry_size = registry.size;
+        snap.registry_tombstones = registry.tombstones;
+        snap.registry_entries = registry
+            .entries
+            .iter()
+            .map(|e| RegistryEntryInfo {
+                name: e.name.clone(),
+                actor_addr: hex(&e.actor_addr.0),
+                node_id: hex(&e.node_id.0),
+                tombstone: e.tombstone,
+            })
+            .collect();
+        let cache = self.location_cache_entries();
+        snap.cache_size = cache.len();
+        snap.cache_entries = cache
+            .iter()
+            .map(|(addr, host)| CacheEntryInfo {
+                actor_addr: hex(&addr.0),
+                node_id: hex(&host.0),
+            })
+            .collect();
+        snap.recent_probe_targets = self
+            .swim_recent_targets()
+            .iter()
+            .map(|t| hex(&t.0))
+            .collect();
 
         snap
     }

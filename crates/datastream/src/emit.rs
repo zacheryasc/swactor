@@ -20,12 +20,12 @@ use swactor::process_observer::ProcessOutputObserver;
 use swactor::runtime::Runtime;
 
 use super::catalog::{
-    self, ActorRuntimeDetail, DatastoreState, DistributionState, IdentityRecord, ProcStream,
-    Record, RuntimeStats, TransportInternals,
+    self, ActorRuntimeDetail, DatastoreState, DatastreamHealth, DistributionState, IdentityRecord,
+    MembershipTransition, ProcStream, Record, RuntimeStats, TransportInternals, WorkerCounters,
 };
 use super::frame::{Frame, Lifetime, NodeId, StreamId};
 use super::mux::Mux;
-use super::source::{self, CpuSampler, MembershipTracker};
+use super::source::{self, HostSampler, MembershipTracker};
 use super::wire::{encode_delivery, DatastreamFrame};
 
 /// Where assembled frames go once the mux has ordered them. A sink is the only
@@ -51,6 +51,9 @@ pub struct TickInput<'a> {
     pub runtime: RuntimeStats,
     pub relay_connected: bool,
     pub relay_peers: u32,
+    /// Median SWIM probe round-trip time (ms) this tick; `0` when no probe has
+    /// completed (e.g. a lone node, or before a real SWIM observer is installed).
+    pub rtt_ms_p50: u32,
 }
 
 /// Forwards managed-process output into a node's mux as `proc.<label>.*` text
@@ -77,9 +80,14 @@ impl ProcessOutputObserver for MuxProcObserver {
 pub struct DatastreamEmitter {
     stream_id: StreamId,
     mux: Arc<Mux>,
-    cpu: CpuSampler,
+    host: HostSampler,
     membership: MembershipTracker,
     sink: Box<dyn FrameSink>,
+    /// When set, [`tick`](Self::tick) does **not** synthesize membership from the
+    /// member-list diff (M4) — the caller drives `membership` from a real event
+    /// source via [`submit_membership`](Self::submit_membership), so the diff
+    /// would only duplicate it with empty reasons.
+    external_membership: bool,
 }
 
 impl DatastreamEmitter {
@@ -95,10 +103,18 @@ impl DatastreamEmitter {
         Self {
             stream_id,
             mux,
-            cpu: CpuSampler::new(),
+            host: HostSampler::new(),
             membership: MembershipTracker::new(),
             sink,
+            external_membership: false,
         }
+    }
+
+    /// Switch `membership` to an external event source: [`tick`](Self::tick) stops
+    /// diffing the member list (M4), and the caller emits transitions via
+    /// [`submit_membership`](Self::submit_membership) with a real `reason`.
+    pub fn use_external_membership(&mut self) {
+        self.external_membership = true;
     }
 
     /// The node's mux, for producers (e.g. a raw demo) that submit directly.
@@ -121,7 +137,7 @@ impl DatastreamEmitter {
         if sample_periodic {
             self.mux.submit(
                 catalog::HOST_RESOURCE,
-                source::read_host_resource(&mut self.cpu).encode(),
+                source::read_host_resource(&mut self.host).encode(),
             );
             self.mux.submit(catalog::RUNTIME_STATS, input.runtime.encode());
             let transport = TransportInternals {
@@ -132,14 +148,39 @@ impl DatastreamEmitter {
                     .filter(|(_, s)| s == "alive")
                     .count() as u32,
                 relay_peers: input.relay_peers,
-                rtt_ms_p50: 0,
+                rtt_ms_p50: input.rtt_ms_p50,
             };
             self.mux
                 .submit(catalog::TRANSPORT_INTERNALS, transport.encode());
+
+            // The pipe reporting on its own integrity: positions assigned vs.
+            // frames dropped on mux overflow. Read before submitting this frame,
+            // so the figures exclude the health frame itself. Rides every tick, so
+            // it ships on any node that ticks (the demo's FleetEmitter included).
+            let assigned = self.mux.assigned();
+            let dropped = self.mux.dropped();
+            let loss_rate_ppm = if assigned > 0 {
+                ((dropped as u128 * 1_000_000) / assigned as u128).min(u32::MAX as u128) as u32
+            } else {
+                0
+            };
+            self.mux.submit(
+                catalog::DATASTREAM_HEALTH,
+                DatastreamHealth {
+                    assigned,
+                    dropped,
+                    loss_rate_ppm,
+                }
+                .encode(),
+            );
         }
 
-        for transition in self.membership.diff(input.members) {
-            self.mux.submit(catalog::MEMBERSHIP, transition.encode());
+        // M4 fallback: synthesize membership from the member-list diff, unless the
+        // caller drives it from a real event source (`use_external_membership`).
+        if !self.external_membership {
+            for transition in self.membership.diff(input.members) {
+                self.mux.submit(catalog::MEMBERSHIP, transition.encode());
+            }
         }
 
         for frame in self.mux.drain() {
@@ -162,6 +203,21 @@ impl DatastreamEmitter {
     /// Submit the per-actor runtime detail table. Periodic.
     pub fn submit_actor_detail(&self, detail: &ActorRuntimeDetail) {
         self.mux.submit(catalog::RUNTIME_ACTORS, detail.encode());
+    }
+
+    /// Submit the aggregated worker-runtime counters (routing/error tallies +
+    /// tick timing) onto the pipe — the deep slice the thin `runtime.stats`
+    /// heartbeat omits. Periodic.
+    pub fn submit_worker_counters(&self, counters: &WorkerCounters) {
+        self.mux.submit(catalog::RUNTIME_WORKERS, counters.encode());
+    }
+
+    /// Submit one membership transition from a real event source (the SWIM
+    /// observer), carrying a non-empty `reason`. Event-driven; pairs with
+    /// [`use_external_membership`](Self::use_external_membership), which turns off
+    /// the M4 diff so this is the sole `membership` source.
+    pub fn submit_membership(&self, transition: &MembershipTransition) {
+        self.mux.submit(catalog::MEMBERSHIP, transition.encode());
     }
 
     /// Re-emit the identity record once late-bound fields (name, listen addr,

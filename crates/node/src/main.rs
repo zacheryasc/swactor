@@ -953,7 +953,7 @@ fn run_iroh(
     // transport bridge (decode inbound → actor mailbox; actor outbound → iroh).
     use distribution::directory_actor::{DirectoryActor, DirectoryIn};
     use distribution::node_metadata_actor::{MetadataActor, MetadataIn};
-    use distribution::registry_actor::{RegistryActor, RegistryIn};
+    use distribution::registry_actor::{RegistryActor, RegistryIn, RegistryView};
     use distribution::swim::actor::{SwimActor, SwimIn};
     use distribution::transport_bridge::{
         IrohPeerDirectory, IrohRouteBinder, Outbox, RelayMirror, RouteView, RouteViewTransport,
@@ -965,25 +965,28 @@ fn run_iroh(
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     let route_view: RouteView =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    // Read-mirror of the cluster registry the telemetry tick reads to fill the
+    // `dist.state` registry fields (size / tombstones / entries).
+    let registry_view: RegistryView = Arc::new(std::sync::RwLock::new(Default::default()));
+    // Production SWIM observer: reconstructs probe RTT, recent probe targets, and
+    // membership transitions (with cause) from the SWIM observation stream.
+    let swim_telemetry = distribution::swim::telemetry::SwimTelemetry::new();
     let peer_directory = Arc::new(IrohPeerDirectory::new(
         Arc::clone(&transport_router),
         Arc::clone(&outbox),
     ));
 
     let swim_addr = rt
-        .spawn(SwimActor::new(
-            node_id,
-            swim_config,
-            Instant::now(),
-            peer_directory.clone(),
-        ))
+        .spawn(
+            SwimActor::new(node_id, swim_config, Instant::now(), peer_directory.clone())
+                .with_observer(Box::new(Arc::clone(&swim_telemetry))),
+        )
         .expect("spawn SwimActor");
     let registry_addr = rt
-        .spawn(RegistryActor::new(
-            node_id,
-            registry_config,
-            peer_directory.clone(),
-        ))
+        .spawn(
+            RegistryActor::new(node_id, registry_config, peer_directory.clone())
+                .with_view(Arc::clone(&registry_view)),
+        )
         .expect("spawn RegistryActor");
     let metadata_addr = rt
         .spawn(MetadataActor::new(
@@ -1218,6 +1221,10 @@ fn run_iroh(
         },
         Box::new(sink),
     );
+    // The node drives `membership` from the SWIM observer (real transitions with a
+    // cause), so turn off the emitter's member-list diff to avoid duplicate,
+    // reason-less transitions.
+    emitter.use_external_membership();
     rt.set_process_output_observer(emitter.process_observer());
     // Stream datastore op events onto the node's own datastream.
     if let Some(metrics) = &ds_metrics {
@@ -1373,10 +1380,11 @@ fn run_iroh(
                     (members, relay_peers)
                 };
 
-                // Consolidated distribution-subsystem state. Directory route count
-                // and peer-auth are live; cache / registry / probe targets live in
-                // the actors and would be surfaced via read-mirrors — currently
-                // empty, exactly as the pre-datastream snapshot reported them.
+                // Consolidated distribution-subsystem state. Directory route count,
+                // peer-auth, the cluster registry (via `registry_view`), and the
+                // location cache (remote routes off the directory's RouteView) are
+                // live; probe targets still come from the actors and remain empty
+                // until the SWIM observer mirror lands.
                 {
                     let (mode, count) = {
                         let pa = peer_auth.lock().unwrap();
@@ -1386,10 +1394,40 @@ fn run_iroh(
                             ("allow-list".to_string(), pa.list_peers().len() as u32)
                         }
                     };
+                    let registry = registry_view.read().unwrap();
+                    let registry_entries = registry
+                        .entries
+                        .iter()
+                        .map(|e| catalog::RegistryEntryRec {
+                            name: e.name.clone(),
+                            actor_addr: hex(&e.actor_addr.0),
+                            node_id: hex(&e.node_id.0),
+                            tombstone: e.tombstone,
+                        })
+                        .collect();
+                    let cache = driver.location_cache_entries();
+                    let cache_entries = cache
+                        .iter()
+                        .map(|(addr, host)| catalog::CacheEntryRec {
+                            actor_addr: hex(&addr.0),
+                            node_id: hex(&host.0),
+                        })
+                        .collect();
+                    let recent_probe_targets = swim_telemetry
+                        .recent_targets()
+                        .iter()
+                        .map(|t| hex(&t.0))
+                        .collect();
                     emitter.submit_dist_state(&DistributionState {
                         directory_route_count: driver.directory_route_count() as u32,
                         peer_auth_mode: mode,
                         authorized_peer_count: count,
+                        registry_size: registry.size as u32,
+                        registry_tombstones: registry.tombstones as u32,
+                        registry_entries,
+                        cache_size: cache.len() as u32,
+                        cache_entries,
+                        recent_probe_targets,
                         ..Default::default()
                     });
                 }
@@ -1443,10 +1481,53 @@ fn run_iroh(
                         })
                         .collect();
                     emitter.submit_actor_detail(&ActorRuntimeDetail { actors });
+
+                    // Worker-runtime counters (W7): the routing/error tallies and
+                    // tick timing the runtime keeps per worker — live in-process but
+                    // never on the pipe until now. Aggregated across workers from the
+                    // same snapshot.
+                    let mut wc = catalog::WorkerCounters {
+                        num_workers: rs.workers.len() as u32,
+                        ..Default::default()
+                    };
+                    for w in &rs.workers {
+                        wc.scheduled_tasks += w.num_actors as u32;
+                        wc.local_sends += w.local_sends;
+                        wc.cross_sends += w.cross_sends;
+                        wc.inbox_sends += w.inbox_sends;
+                        wc.type_mismatches += w.type_mismatches;
+                        wc.panics += w.panics;
+                        wc.messages_dropped += w.messages_dropped;
+                        wc.restarts += w.restarts;
+                        wc.stops += w.stops;
+                        wc.messages_processed += w.messages_processed;
+                    }
+                    let mut tick_us: Vec<u64> = rs
+                        .tick_timings
+                        .iter()
+                        .flatten()
+                        .map(|t| t.phase_us.iter().sum())
+                        .collect();
+                    tick_us.sort_unstable();
+                    wc.tick_p50_us = tick_us.get(tick_us.len() / 2).copied().unwrap_or(0);
+                    emitter.submit_worker_counters(&wc);
                 }
 
-                // Periodic host/runtime/transport samples + event-driven membership
-                // transitions, then drain — the sink renders the node-local dashboard.
+                // Real membership transitions (with cause) from the SWIM observer,
+                // submitted before the tick so they drain on this iteration. Replaces
+                // the emitter's reason-less member-list diff (`use_external_membership`).
+                for t in swim_telemetry.drain_transitions() {
+                    emitter.submit_membership(&datastream::catalog::MembershipTransition {
+                        peer: hex(&t.peer.0),
+                        from: t.from.map(member_state_str).unwrap_or("unknown").to_string(),
+                        to: member_state_str(t.to).to_string(),
+                        reason: t.reason.to_string(),
+                    });
+                }
+
+                // Periodic host/runtime/transport samples, then drain — the sink
+                // renders the node-local dashboard. `rtt_ms_p50` is the SWIM
+                // observer's real probe round-trip median (0 until a probe completes).
                 {
                     let rs = rt.stats();
                     emitter.tick(
@@ -1459,6 +1540,7 @@ fn run_iroh(
                             },
                             relay_connected: driver.home_relay_url().is_some(),
                             relay_peers,
+                            rtt_ms_p50: swim_telemetry.rtt_ms_p50(),
                         },
                         true,
                     );
@@ -1592,6 +1674,17 @@ fn spawn_actors(
         eprintln!("Registered {} actors", addrs.len());
     }
     addrs
+}
+
+/// The `membership` channel's state strings, matching the member-list diff's
+/// convention so the consumer renders observer-driven and diffed transitions alike.
+fn member_state_str(state: distribution::types::MemberState) -> &'static str {
+    use distribution::types::MemberState;
+    match state {
+        MemberState::Alive => "alive",
+        MemberState::Suspect => "suspect",
+        MemberState::Dead => "dead",
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {

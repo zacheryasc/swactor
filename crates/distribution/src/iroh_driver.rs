@@ -582,6 +582,32 @@ impl IrohDriver {
             .unwrap_or(0)
     }
 
+    /// This node's location cache: every directory route whose host is a *remote*
+    /// peer — the `(actor, host)` locations the node has learned in order to route
+    /// across the network. Read off the same directory `RouteView` mirror as
+    /// [`directory_route_count`](Self::directory_route_count), but filtered to
+    /// peer-hosted actors: a node never needs to "cache" the location of an actor
+    /// it hosts itself, so self-hosted routes are excluded. This is the honest
+    /// `dist.state.cache_*` source, distinct from the all-routes count above.
+    pub fn location_cache_entries(&self) -> Vec<(ActorAddress, NodeId)> {
+        let self_id = self.node_id();
+        self.actor_bridge
+            .as_ref()
+            .and_then(|b| {
+                b.route_view.read().ok().map(|view| {
+                    let mut entries: Vec<(ActorAddress, NodeId)> = view
+                        .iter()
+                        .filter(|(_, host)| **host != self_id)
+                        .map(|(actor, host)| (*actor, *host))
+                        .collect();
+                    // Stable order so the dashboard table doesn't reshuffle each tick.
+                    entries.sort_by(|a, b| a.0.0.cmp(&b.0.0));
+                    entries
+                })
+            })
+            .unwrap_or_default()
+    }
+
     /// Get a snapshot of all join statuses.
     pub fn join_statuses(&self) -> HashMap<NodeId, JoinStatus> {
         self.join_statuses.lock().unwrap().clone()

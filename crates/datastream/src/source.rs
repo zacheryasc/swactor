@@ -70,21 +70,90 @@ impl CpuSampler {
     }
 }
 
-/// Read a host-resource sample: CPU busy percent (via `sampler`) and memory
-/// from `/proc/meminfo`. Fields we have no source for stay at their default
-/// (honest zeros), and on a non-Linux host the whole sample is the default.
-pub fn read_host_resource(sampler: &mut CpuSampler) -> ResourceSample {
-    let cpu_pct = sampler.sample();
+/// Samples host network throughput across calls. Like [`CpuSampler`], the rate
+/// needs two observations: the first call seeds the byte baseline and reports 0.
+#[derive(Default)]
+pub struct NetSampler {
+    /// `(rx_bytes_total, tx_bytes_total, observed_at)` from the previous call.
+    prev: Option<(u64, u64, Instant)>,
+}
+
+impl NetSampler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `(rx_kbps, tx_kbps)` since the previous call — **kilobits per second**
+    /// summed across every non-loopback interface. Returns `(0, 0)` on the first
+    /// call (no baseline) and on any platform without `/proc/net/dev`.
+    pub fn sample(&mut self) -> (u32, u32) {
+        let now = Instant::now();
+        let (rx, tx) = match read_net_bytes() {
+            Some(v) => v,
+            None => return (0, 0),
+        };
+        let out = match self.prev {
+            Some((prev_rx, prev_tx, prev_at)) => {
+                let elapsed = now.duration_since(prev_at).as_secs_f64();
+                if elapsed <= 0.0 {
+                    (0, 0)
+                } else {
+                    let to_kbps = |delta: u64| {
+                        ((delta as f64) * 8.0 / 1000.0 / elapsed).clamp(0.0, u32::MAX as f64) as u32
+                    };
+                    (
+                        to_kbps(rx.saturating_sub(prev_rx)),
+                        to_kbps(tx.saturating_sub(prev_tx)),
+                    )
+                }
+            }
+            None => (0, 0),
+        };
+        self.prev = Some((rx, tx, now));
+        out
+    }
+}
+
+/// All the host-resource sampler state a node carries between ticks: the CPU
+/// rate baseline and the network byte baseline. Disk and GPU are point reads, so
+/// they need no state.
+pub struct HostSampler {
+    cpu: CpuSampler,
+    net: NetSampler,
+}
+
+impl HostSampler {
+    pub fn new() -> Self {
+        Self {
+            cpu: CpuSampler::new(),
+            net: NetSampler::new(),
+        }
+    }
+}
+
+impl Default for HostSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read a host-resource sample: CPU busy percent and network throughput (rates,
+/// via `sampler`'s baselines), memory from `/proc/meminfo`, disk usage from
+/// `statvfs`, and GPU utilization best-effort (NVML/`nvidia-smi`). Every field
+/// has a real host source; on a CPU-only box `gpu_pct` is an honest `0` (no GPU
+/// present — never a fabricated load), and off-Linux the whole sample defaults.
+pub fn read_host_resource(sampler: &mut HostSampler) -> ResourceSample {
+    let cpu_pct = sampler.cpu.sample();
     let (mem_total_mb, mem_used_mb) = read_meminfo_mb().unwrap_or((0, 0));
-    // Fields we have no host source for stay at honest zeros.
+    let (net_rx_kbps, net_tx_kbps) = sampler.net.sample();
     ResourceSample {
         cpu_pct,
         mem_used_mb,
         mem_total_mb,
-        gpu_pct: 0.0,
-        disk_used_gb: 0,
-        net_rx_kbps: 0,
-        net_tx_kbps: 0,
+        gpu_pct: read_gpu_pct(),
+        disk_used_gb: read_disk_used_gb(),
+        net_rx_kbps,
+        net_tx_kbps,
     }
 }
 
@@ -187,6 +256,100 @@ fn read_proc_stat_busy_jiffies() -> Option<u64> {
     Some(total.saturating_sub(idle))
 }
 
+/// Used disk space in whole gigabytes (base-10) of the root filesystem, via
+/// `statvfs("/")`. In a container the root overlay reports its backing store, so
+/// this is a real reading. `0` on failure or off-Linux.
+fn read_disk_used_gb() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: `statvfs` only reads into the zeroed-out struct we provide, and
+        // `"/"` is always a valid, NUL-terminated C path.
+        unsafe {
+            let mut stat: libc::statvfs = std::mem::zeroed();
+            if libc::statvfs(b"/\0".as_ptr().cast(), &mut stat) == 0 {
+                let frsize = stat.f_frsize as u64;
+                let used_blocks = (stat.f_blocks as u64).saturating_sub(stat.f_bfree as u64);
+                let used_bytes = used_blocks.saturating_mul(frsize);
+                return (used_bytes / 1_000_000_000) as u32;
+            }
+        }
+    }
+    0
+}
+
+/// `(rx_bytes_total, tx_bytes_total)` summed across every interface except
+/// loopback, from `/proc/net/dev`. `None` off-Linux or if the file is unreadable.
+fn read_net_bytes() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/proc/net/dev") {
+            let mut rx_total = 0u64;
+            let mut tx_total = 0u64;
+            // Two header lines, then one `iface: rx_bytes ... tx_bytes ...` per nic.
+            for line in text.lines().skip(2) {
+                let Some((iface, stats)) = line.split_once(':') else {
+                    continue;
+                };
+                if iface.trim() == "lo" {
+                    continue; // loopback is local traffic, not network throughput
+                }
+                let cols: Vec<u64> = stats
+                    .split_whitespace()
+                    .filter_map(|c| c.parse::<u64>().ok())
+                    .collect();
+                // Receive bytes is column 0; transmit bytes is column 8.
+                if cols.len() >= 9 {
+                    rx_total = rx_total.saturating_add(cols[0]);
+                    tx_total = tx_total.saturating_add(cols[8]);
+                }
+            }
+            return Some((rx_total, tx_total));
+        }
+    }
+    None
+}
+
+/// GPU utilization percent, best-effort. Only probes when an NVIDIA GPU is
+/// actually present (the driver dir is populated); on a CPU-only host — the demo
+/// default — this returns an honest `0`, never a fabricated load. Averaged across
+/// GPUs when several are present.
+fn read_gpu_pct() -> f32 {
+    #[cfg(target_os = "linux")]
+    {
+        let present = std::fs::read_dir("/proc/driver/nvidia/gpus")
+            .map(|mut entries| entries.next().is_some())
+            .unwrap_or(false);
+        if present
+            && let Some(pct) = query_nvidia_smi_util()
+        {
+            return pct;
+        }
+    }
+    0.0
+}
+
+/// Average `utilization.gpu` across GPUs via `nvidia-smi`. Only called once a GPU
+/// is known present, so this never runs on the CPU-only demo. `None` on any error.
+#[cfg(target_os = "linux")]
+fn query_nvidia_smi_util() -> Option<f32> {
+    let out = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let samples: Vec<f32> = text
+        .lines()
+        .filter_map(|l| l.trim().parse::<f32>().ok())
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    Some(samples.iter().sum::<f32>() / samples.len() as f32)
+}
+
 /// `(MemTotal, MemTotal - MemAvailable)` in MiB from `/proc/meminfo`.
 fn read_meminfo_mb() -> Option<(u32, u32)> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
@@ -214,13 +377,15 @@ mod tests {
     fn host_resource_reports_real_memory_on_linux() {
         // On a real Linux host the machine has some memory; a sample that
         // reported zero total would mean we never read the host at all.
-        let mut sampler = CpuSampler::new();
+        let mut sampler = HostSampler::new();
         let sample = read_host_resource(&mut sampler);
         assert!(sample.mem_total_mb > 0, "expected to read MemTotal from the host");
         assert!(
             sample.mem_used_mb <= sample.mem_total_mb,
             "used memory cannot exceed total"
         );
+        // The root filesystem always has some space in use on a real host.
+        assert!(sample.disk_used_gb > 0, "expected statvfs to report used disk");
     }
 
     #[test]

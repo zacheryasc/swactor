@@ -64,16 +64,6 @@
       </div>
     </div>
 
-    <div class="card">
-      <h2>Messages (this node, wire)</h2>
-      <div class="stats">
-        <div class="stat"><span id="m-sent" class="v sent">0</span><span class="l">Sent</span></div>
-        <div class="stat"><span id="m-recv" class="v recv">0</span><span class="l">Received</span></div>
-        <div class="stat"><span id="m-sentb" class="v sent">0</span><span class="l">Sent bytes</span></div>
-        <div class="stat"><span id="m-recvb" class="v recv">0</span><span class="l">Recv bytes</span></div>
-      </div>
-    </div>
-
     <div class="card full">
       <h2>SWIM membership graph</h2>
       <canvas id="graph"></canvas>
@@ -83,26 +73,11 @@
     <div class="card">
       <h2>Members</h2>
       <table>
-        <thead><tr><th>State</th><th>Name / Node</th><th>Addr</th><th class="num">Inc</th></tr></thead>
-        <tbody id="members"><tr><td colspan="4" class="muted">waiting for snapshot…</td></tr></tbody>
+        <thead><tr><th>State</th><th>Name / Node</th><th>Addr</th><th class="num">Inc</th><th>Reason</th></tr></thead>
+        <tbody id="members"><tr><td colspan="5" class="muted">waiting for snapshot…</td></tr></tbody>
       </table>
     </div>
 
-    <div class="card">
-      <h2>Messages by kind</h2>
-      <table>
-        <thead><tr><th>Kind</th><th class="num">Sent</th><th class="num">Recv</th></tr></thead>
-        <tbody id="bykind"><tr><td colspan="3" class="muted">no traffic yet</td></tr></tbody>
-      </table>
-    </div>
-
-    <div class="card full">
-      <h2>Messages by peer</h2>
-      <table>
-        <thead><tr><th>Peer</th><th>Name</th><th class="num">Sent</th><th class="num">Recv</th></tr></thead>
-        <tbody id="bypeer"><tr><td colspan="4" class="muted">no traffic yet</td></tr></tbody>
-      </table>
-    </div>
   </div>
 
 <script>
@@ -184,32 +159,10 @@
       return '<tr><td><span class="dot" style="background:'+stateColor(m.state)+'"></span>'+m.state+'</td>'
         + '<td>'+(nm? nm+' <span class="mono">'+short(m.node_id)+'</span>' : '<span class="mono">'+short(m.node_id)+'</span>')+'</td>'
         + '<td class="mono">'+(m.addr||'—')+'</td>'
-        + '<td class="num">'+m.incarnation+'</td></tr>';
+        + '<td class="num">'+m.incarnation+'</td>'
+        + '<td class="muted">'+(m.reason||'—')+'</td></tr>';
     }).join('');
-    document.getElementById('members').innerHTML = mb || '<tr><td colspan="4" class="muted">no members</td></tr>';
-
-    // messages
-    var mc = d.msg_counts || {};
-    document.getElementById('m-sent').textContent = mc.sent_total || 0;
-    document.getElementById('m-recv').textContent = mc.recv_total || 0;
-    document.getElementById('m-sentb').textContent = (mc.sent_bytes || 0).toLocaleString();
-    document.getElementById('m-recvb').textContent = (mc.recv_bytes || 0).toLocaleString();
-
-    // by kind (union of sent+recv kinds)
-    var ks = mc.by_kind_sent || {}, kr = mc.by_kind_recv || {};
-    var kinds = Object.keys(ks).concat(Object.keys(kr)).filter(function(v,i,a){return a.indexOf(v)===i;}).sort();
-    var kt = kinds.map(function(k){
-      return '<tr><td class="mono">'+k+'</td><td class="num sent">'+(ks[k]||0)+'</td><td class="num recv">'+(kr[k]||0)+'</td></tr>';
-    }).join('');
-    document.getElementById('bykind').innerHTML = kt || '<tr><td colspan="3" class="muted">no traffic yet</td></tr>';
-
-    // by peer
-    var bp = mc.by_peer || {};
-    var pt = Object.keys(bp).sort().map(function(p){
-      var nm = (names[p] && names[p].join(', ')) || '';
-      return '<tr><td class="mono">'+short(p)+'</td><td>'+nm+'</td><td class="num sent">'+(bp[p].sent||0)+'</td><td class="num recv">'+(bp[p].recv||0)+'</td></tr>';
-    }).join('');
-    document.getElementById('bypeer').innerHTML = pt || '<tr><td colspan="4" class="muted">no traffic yet</td></tr>';
+    document.getElementById('members').innerHTML = mb || '<tr><td colspan="5" class="muted">no members</td></tr>';
 
     drawGraph(d);
   }

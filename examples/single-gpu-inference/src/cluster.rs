@@ -482,6 +482,8 @@ impl ClusterNode {
                 label: None,
                 relay_url,
                 node_name: None,
+                // No SWIM observer wired in this single-node example.
+                reason: None,
             });
         }
         snap.members = members;
