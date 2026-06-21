@@ -205,7 +205,7 @@
   }
 
   function computeRates(d) {
-    var bp = (d.msg_counts && d.msg_counts.by_peer) || {};
+    var bp = {};
     var now = d.conn_ts_ms || Date.now();
     var rates = {};
     Object.keys(bp).forEach(function(p) {
@@ -229,7 +229,7 @@
     document.getElementById('node').textContent = 'node ' + short(d.node_id);
 
     var conn = d.conn || {};
-    var bp = (d.msg_counts && d.msg_counts.by_peer) || {};
+    var bp = {};
     var members = d.members || [];
     var rows = members.map(function(m) {
       var hex = m.node_id, c = conn[hex] || {}, rt = lastRates[hex] || {}, t = bp[hex] || {};
@@ -257,7 +257,7 @@
     var hit = nodeHits.find(function(h) { return Math.hypot(mx - h.x, my - h.y) <= h.r + 4; });
     if (!hit) { tip.style.display = 'none'; return; }
     var d = last, c = (d.conn || {})[hit.hex] || {}, rt = lastRates[hit.hex] || {};
-    var t = ((d.msg_counts && d.msg_counts.by_peer) || {})[hit.hex] || {};
+    var t = ({})[hit.hex] || {};
     tip.innerHTML = '<b>' + labelFor(d, hit.hex, hit.mem) + '</b> <span class="mono">' + short(hit.hex) + '</span><br>'
       + 'transport: <b>' + (c.type || 'None') + '</b>'
       + (c.relay_url ? '<br>relay: <span class="mono">' + c.relay_url + '</span>' : '')

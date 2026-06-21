@@ -53,6 +53,30 @@ pub struct RegistryEntry {
     pub tombstone: bool,
 }
 
+// ─── Observability snapshot ──────────────────────────────────────────────────
+
+/// A point-in-time, read-only projection of the registry, decoupled from the
+/// CRDT internals so a consumer (the node's telemetry tick) can read live
+/// registry figures off a shared mirror without touching the actor.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistrySnapshot {
+    /// Total entries, including tombstones.
+    pub size: usize,
+    /// How many of those entries are tombstones.
+    pub tombstones: usize,
+    /// Every entry, sorted by name for stable rendering.
+    pub entries: Vec<RegistryEntrySnapshot>,
+}
+
+/// One entry in a [`RegistrySnapshot`] — a named actor location, possibly a tombstone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryEntrySnapshot {
+    pub name: String,
+    pub actor_addr: ActorAddress,
+    pub node_id: NodeId,
+    pub tombstone: bool,
+}
+
 // ─── Events ─────────────────────────────────────────────────────────────────
 
 /// Events emitted when the registry changes.
@@ -281,6 +305,32 @@ impl ClusterRegistry {
     /// Iterate all entries (for snapshot).
     pub fn entries(&self) -> impl Iterator<Item = &RegistryEntry> {
         self.entries.values()
+    }
+
+    /// A read-only projection of the whole registry for observability — the
+    /// size, tombstone count, and every entry in one consistent pass. The node
+    /// publishes this to a [`RegistryView`](crate::registry_actor::RegistryView)
+    /// mirror so telemetry can read live registry figures without `ask`-ing the
+    /// actor on its hot path.
+    pub fn snapshot(&self) -> RegistrySnapshot {
+        let mut entries: Vec<RegistryEntrySnapshot> = self
+            .entries
+            .values()
+            .map(|e| RegistryEntrySnapshot {
+                name: e.name.clone(),
+                actor_addr: e.actor_addr,
+                node_id: e.node_id,
+                tombstone: e.tombstone,
+            })
+            .collect();
+        // Stable order so the dashboard table doesn't reshuffle each tick.
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let tombstones = entries.iter().filter(|e| e.tombstone).count();
+        RegistrySnapshot {
+            size: entries.len(),
+            tombstones,
+            entries,
+        }
     }
 
     // ─── Internal ───────────────────────────────────────────────────────

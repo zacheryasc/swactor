@@ -28,6 +28,12 @@ pub struct MemberInfo {
     pub relay_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub node_name: Option<String>,
+    /// Cause of this member's most recent SWIM liveness transition (the
+    /// production observer's reason string, e.g. "ping-received",
+    /// "probe-timeout"). `None` until a transition has been observed; the
+    /// old state-diff path could never carry this.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub reason: Option<String>,
 }
 
 /// Snapshot of a single LRU cache entry.

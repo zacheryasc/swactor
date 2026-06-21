@@ -25,9 +25,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use datastream::catalog::{
-    self, ActorRuntimeDetail, DatastoreState, DistributionState, IdentityRecord, LifecycleCost,
+    self, ActorRuntimeDetail, DatastoreState, DatastreamHealth, DistributionState, IdentityRecord,
     MembershipTransition, Record, ResourceSample, RuntimeStats as DsRuntimeStats,
-    TransportInternals,
+    TransportInternals, WorkerCounters,
 };
 use datastream::frame::{Frame, StreamId};
 
@@ -54,18 +54,24 @@ struct DatastreamModel {
     resource: Option<ResourceSample>,
     runtime: Option<DsRuntimeStats>,
     transport: Option<TransportInternals>,
-    lifecycle: Option<LifecycleCost>,
     /// Consolidated distribution-subsystem state (cache/registry/directory/...).
     dist_state: Option<DistributionState>,
     /// Datastore steady metrics.
     datastore_state: Option<DatastoreState>,
     /// Per-actor runtime detail (the real actor table).
     actor_detail: Option<ActorRuntimeDetail>,
+    /// Aggregated worker-runtime counters (routing/error tallies + tick timing).
+    worker_counters: Option<WorkerCounters>,
+    /// Datastream self-health (mux assigned/dropped + loss rate).
+    datastream_health: Option<DatastreamHealth>,
     /// Recent datastore op events (newest last), capped at [`DATASTORE_EVENT_CAP`].
     datastore_events: VecDeque<serde_json::Value>,
     /// peer node-id → latest liveness state.
     membership: HashMap<String, String>,
-    /// last membership transition, formatted for display.
+    /// peer node-id → cause of its most recent liveness transition (the SWIM
+    /// observer's reason string; the value-add of W3/W4 over the state-diff).
+    membership_reason: HashMap<String, String>,
+    /// last membership transition, formatted for display (with its cause).
     last_transition: Option<String>,
     /// proc label → (line count, last line).
     procs: HashMap<String, (u64, String)>,
@@ -109,11 +115,6 @@ impl DatastreamModel {
                     self.transport = Some(r);
                 }
             }
-            catalog::LIFECYCLE_COST => {
-                if let Ok(r) = LifecycleCost::decode(payload) {
-                    self.lifecycle = Some(r);
-                }
-            }
             catalog::DIST_STATE => {
                 if let Ok(r) = DistributionState::decode(payload) {
                     self.dist_state = Some(r);
@@ -127,6 +128,16 @@ impl DatastreamModel {
             catalog::RUNTIME_ACTORS => {
                 if let Ok(r) = ActorRuntimeDetail::decode(payload) {
                     self.actor_detail = Some(r);
+                }
+            }
+            catalog::RUNTIME_WORKERS => {
+                if let Ok(r) = WorkerCounters::decode(payload) {
+                    self.worker_counters = Some(r);
+                }
+            }
+            catalog::DATASTREAM_HEALTH => {
+                if let Ok(r) = DatastreamHealth::decode(payload) {
+                    self.datastream_health = Some(r);
                 }
             }
             // Datastore op events: structured text lines, tailed into a capped
@@ -145,9 +156,19 @@ impl DatastreamModel {
             catalog::MEMBERSHIP => {
                 if let Ok(t) = MembershipTransition::decode(payload) {
                     // Display the short id; key the membership map by the full
-                    // id so the views can resolve it to a friendly label.
-                    let line = format!("{}: {} → {}", short_id(&t.peer), t.from, t.to);
+                    // id so the views can resolve it to a friendly label. Carry
+                    // the observer's cause string through to the display — it is
+                    // the whole value-add of the production observer over the old
+                    // state-diff (which only ever knew *that* a peer changed).
+                    let line = if t.reason.is_empty() {
+                        format!("{}: {} → {}", short_id(&t.peer), t.from, t.to)
+                    } else {
+                        format!("{}: {} → {} ({})", short_id(&t.peer), t.from, t.to, t.reason)
+                    };
                     self.membership.insert(t.peer.clone(), t.to.clone());
+                    if !t.reason.is_empty() {
+                        self.membership_reason.insert(t.peer.clone(), t.reason.clone());
+                    }
                     self.last_transition = Some(line.clone());
                     events.push(LogEvent::Info(format!("membership {line}")));
                 }
@@ -289,20 +310,27 @@ impl DatastreamModel {
             scheduled_tasks: 0,
         });
 
-        // One synthetic worker = this node.
+        // One synthetic worker = this node. Routing/error counters come from the
+        // `runtime.workers` channel (the deep slice behind the thin runtime.stats);
+        // they stay 0 only until that channel has been folded.
+        let wc = self.worker_counters.clone().unwrap_or_default();
         let worker = WorkerInfo {
             id: 0,
             num_actors: ds_rt.actors_live as usize,
             mailbox_depth: ds_rt.mailbox_depth as usize,
-            messages_processed: self.total_proc_lines(),
-            local_sends: 0,
-            cross_sends: 0,
-            inbox_sends: 0,
-            type_mismatches: 0,
-            panics: 0,
-            messages_dropped: 0,
-            restarts: 0,
-            stops: 0,
+            messages_processed: if wc.messages_processed > 0 {
+                wc.messages_processed
+            } else {
+                self.total_proc_lines()
+            },
+            local_sends: wc.local_sends,
+            cross_sends: wc.cross_sends,
+            inbox_sends: wc.inbox_sends,
+            type_mismatches: wc.type_mismatches,
+            panics: wc.panics,
+            messages_dropped: wc.messages_dropped,
+            restarts: wc.restarts,
+            stops: wc.stops,
         };
 
         let actor_details = self.actor_rows();
@@ -312,15 +340,12 @@ impl DatastreamModel {
             .map(|a| (a.address, a.worker_id))
             .collect();
 
+        // Uptime since this node's first frame was folded (the legacy
+        // provider.lifecycle uptime had no producer and was removed).
         let uptime_ms = self
-            .lifecycle
-            .as_ref()
-            .map(|l| l.uptime_s * 1000)
-            .unwrap_or_else(|| {
-                self.first_seen
-                    .map(|t| t.elapsed().as_millis() as u64)
-                    .unwrap_or(0)
-            });
+            .first_seen
+            .map(|t| t.elapsed().as_millis() as u64)
+            .unwrap_or(0);
 
         RuntimeStats {
             num_workers: 1,
@@ -375,6 +400,9 @@ impl DatastreamModel {
                     "state": state,
                     "incarnation": 0,
                     "node_name": peer_labels.get(peer).cloned().unwrap_or_else(|| short_id(peer)),
+                    // Cause of this peer's last transition (observer reason),
+                    // null until one has been seen.
+                    "reason": self.membership_reason.get(peer).cloned(),
                 })
             })
             .collect();
@@ -504,6 +532,8 @@ impl DatastreamModel {
         let r = self.resource.as_ref();
         let t = self.transport.as_ref();
         let rt = self.runtime.as_ref();
+        let wc = self.worker_counters.as_ref();
+        let dh = self.datastream_health.as_ref();
         let last_proc = self
             .procs
             .values()
@@ -523,8 +553,28 @@ impl DatastreamModel {
             "mem_used_mb": r.map(|r| r.mem_used_mb).unwrap_or(0),
             "mem_total_mb": r.map(|r| r.mem_total_mb).unwrap_or(0),
             "gpu_pct": r.map(|r| r.gpu_pct.round() as u32).unwrap_or(0),
+            "disk_used_gb": r.map(|r| r.disk_used_gb).unwrap_or(0),
+            "net_rx_kbps": r.map(|r| r.net_rx_kbps).unwrap_or(0),
+            "net_tx_kbps": r.map(|r| r.net_tx_kbps).unwrap_or(0),
             "actors_live": rt.map(|r| r.actors_live).unwrap_or(0),
             "mailbox_depth": rt.map(|r| r.mailbox_depth).unwrap_or(0),
+            // Real polled value (was a hardcoded 0 in the consumer).
+            "scheduled_tasks": rt.map(|r| r.scheduled_tasks).unwrap_or(0),
+            // Worker-runtime counters (runtime.workers channel): routing/error
+            // tallies + tick timing, the deep slice behind runtime.stats.
+            "worker_counters": {
+                "num_workers": wc.map(|w| w.num_workers).unwrap_or(0),
+                "local_sends": wc.map(|w| w.local_sends).unwrap_or(0),
+                "cross_sends": wc.map(|w| w.cross_sends).unwrap_or(0),
+                "inbox_sends": wc.map(|w| w.inbox_sends).unwrap_or(0),
+                "type_mismatches": wc.map(|w| w.type_mismatches).unwrap_or(0),
+                "panics": wc.map(|w| w.panics).unwrap_or(0),
+                "messages_dropped": wc.map(|w| w.messages_dropped).unwrap_or(0),
+                "restarts": wc.map(|w| w.restarts).unwrap_or(0),
+                "stops": wc.map(|w| w.stops).unwrap_or(0),
+                "messages_processed": wc.map(|w| w.messages_processed).unwrap_or(0),
+                "tick_p50_us": wc.map(|w| w.tick_p50_us).unwrap_or(0),
+            },
             "relay_connected": t.map(|t| t.relay_connected).unwrap_or(false),
             "direct_peers": t.map(|t| t.direct_peers).unwrap_or(0),
             "relay_peers": t.map(|t| t.relay_peers).unwrap_or(0),
@@ -533,6 +583,18 @@ impl DatastreamModel {
             "suspect": suspect,
             "dead": dead,
             "converged": converged,
+            // Most recent SWIM liveness transition this node observed, carrying
+            // the observer's cause string (the `reason` was always "" before the
+            // migration installed the production observer). `null` until a
+            // transition has been folded.
+            "last_transition": self.last_transition.clone(),
+            // Datastream self-health (datastream.health channel): the pipe
+            // reporting its own integrity. loss_rate_ppm = dropped/assigned × 1e6.
+            "datastream": {
+                "assigned": dh.map(|d| d.assigned).unwrap_or(0),
+                "dropped": dh.map(|d| d.dropped).unwrap_or(0),
+                "loss_rate_ppm": dh.map(|d| d.loss_rate_ppm).unwrap_or(0),
+            },
             "proc_lines": self.total_proc_lines(),
             "last_proc": last_proc,
         })
@@ -924,8 +986,9 @@ const FLEET_HTML: &str = r#"<!doctype html>
   <table>
     <thead><tr>
       <th>node</th><th>state</th><th>region</th><th>role</th><th>CPU</th><th>mem</th>
+      <th class="num">disk</th><th class="num">net ↓/↑</th>
       <th class="num">actors</th><th class="num">mbox</th><th>transport</th>
-      <th class="num">peers</th><th class="num">proc</th><th>last line</th>
+      <th class="num">peers</th><th class="num">proc</th><th class="num">pipe</th><th>last line</th>
     </tr></thead>
     <tbody id="rows"></tbody>
   </table>
@@ -956,11 +1019,17 @@ const FLEET_HTML: &str = r#"<!doctype html>
         + '<td><span class="tag '+esc(n.role)+'">'+esc(n.role||"?")+'</span></td>'
         + '<td>'+bar(n.cpu_pct)+'</td>'
         + '<td>'+n.mem_used_mb+'/'+n.mem_total_mb+'MB</td>'
+        + '<td class="num">'+(n.disk_used_gb||0)+'G</td>'
+        + '<td class="num">'+(n.net_rx_kbps||0)+'/'+(n.net_tx_kbps||0)+'</td>'
         + '<td class="num">'+n.actors_live+'</td>'
         + '<td class="num">'+n.mailbox_depth+'</td>'
         + '<td>'+(n.relay_connected?'relay ':'')+n.direct_peers+'d/'+n.relay_peers+'r</td>'
         + '<td class="num">'+peers+'</td>'
         + '<td class="num">'+n.proc_lines+'</td>'
+        + '<td class="num" title="frames assigned / dropped">'
+          +((n.datastream&&n.datastream.assigned)||0)
+          +((n.datastream&&n.datastream.dropped)?(' <span class="st dead">-'+n.datastream.dropped+'</span>'):'')
+          +'</td>'
         + '<td class="last">'+esc(n.last_proc)+'</td>'
         + '</tr>';
     }).join("");

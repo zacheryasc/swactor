@@ -10,15 +10,22 @@
 //! node returns.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 
 use crate::messages::RegistryGossip;
-use crate::registry::{ClusterRegistry, RegistryConfig};
+use crate::registry::{ClusterRegistry, RegistryConfig, RegistrySnapshot};
 use crate::swim::actor::{MembershipChanged, PeerDirectory};
 use crate::types::{MemberState, NodeId};
+
+/// A single-writer read-mirror of the registry's observable state, published by
+/// the [`RegistryActor`] after each change and read by the node's telemetry tick
+/// (the same discipline as the directory's
+/// [`RouteView`](crate::transport_bridge::RouteView)). Installed via
+/// [`RegistryActor::with_view`]; absent in tests/examples that don't observe it.
+pub type RegistryView = Arc<RwLock<RegistrySnapshot>>;
 
 /// Everything the `RegistryActor` receives, as one enum (only `Gossip` crosses
 /// the wire; the rest are local control — see [`crate::messages::actor_codec_registry`]).
@@ -55,6 +62,9 @@ pub struct RegistryActor {
     /// Round-robins the gossip target across alive peers, one per `Tick` — the
     /// standalone analog of "piggyback on the next probe".
     fanout_cursor: usize,
+    /// Optional read-mirror the node's telemetry tick observes. Republished
+    /// after each registry change. `None` when no one is observing.
+    view: Option<RegistryView>,
 }
 
 impl RegistryActor {
@@ -69,6 +79,23 @@ impl RegistryActor {
             peer_directory,
             alive: BTreeSet::new(),
             fanout_cursor: 0,
+            view: None,
+        }
+    }
+
+    /// Install a read-mirror that this actor republishes after each change, so a
+    /// telemetry consumer can read live registry figures without `ask`-ing it.
+    /// Seeds the mirror with the current (empty) snapshot immediately.
+    pub fn with_view(mut self, view: RegistryView) -> Self {
+        *view.write().expect("registry view poisoned") = self.registry.snapshot();
+        self.view = Some(view);
+        self
+    }
+
+    /// Republish the registry snapshot to the read-mirror, if one is installed.
+    fn publish(&self) {
+        if let Some(view) = &self.view {
+            *view.write().expect("registry view poisoned") = self.registry.snapshot();
         }
     }
 
@@ -116,16 +143,19 @@ impl ActorInterface for RegistryActor {
                     self.alive.remove(&m.node_id);
                     let size = self.cluster_size();
                     self.registry.tombstone_node(m.node_id, size);
+                    self.publish();
                 }
                 MemberState::Suspect => {}
             },
             RegistryIn::RegisterName { name, actor_addr } => {
                 let size = self.cluster_size();
                 self.registry.register(name, actor_addr, self.self_id, size);
+                self.publish();
             }
             RegistryIn::UnregisterName { name } => {
                 let size = self.cluster_size();
                 self.registry.unregister(&name, self.self_id, size);
+                self.publish();
             }
             RegistryIn::ResolveName { name, reply } => {
                 let binding = self.registry.resolve(&name);
@@ -134,10 +164,13 @@ impl ActorInterface for RegistryActor {
             RegistryIn::Gossip(g) => {
                 let size = self.cluster_size();
                 self.registry.merge_batch(g.entries, size);
+                self.publish();
             }
             RegistryIn::Tick => {
                 self.registry.gc_tick();
                 self.disseminate(ctx);
+                // GC may have reaped tombstones; keep the mirror current.
+                self.publish();
             }
         }
     }

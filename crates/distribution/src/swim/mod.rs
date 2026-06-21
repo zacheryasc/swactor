@@ -4,3 +4,4 @@ pub mod dissemination;
 pub mod node;
 pub mod lifeguard;
 pub mod actor;
+pub mod telemetry;

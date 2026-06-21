@@ -13,8 +13,8 @@ mod support;
 use std::sync::Arc;
 
 use datastream::catalog::{
-    self, ActorRuntimeDetail, ChannelKind, DatastoreState, DistributionState, IdentityRecord,
-    LifecycleCost, ProcStream, Record, ResourceSample,
+    self, ActorRuntimeDetail, ChannelKind, DatastoreState, DatastreamHealth, DistributionState,
+    IdentityRecord, ProcStream, Record, ResourceSample,
 };
 use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use datastream::ingest::Consumer;
@@ -36,7 +36,7 @@ fn surviving(sent: &[Frame], dropped: &[u64]) -> Vec<Frame> {
 
 /// A node that has emitted a realistic spread of channels: identity, two
 /// resource samples, a transport snapshot, a membership transition, runtime
-/// stats, two lines of process output, and a lifecycle record.
+/// stats, two lines of process output, and a worker-counters record.
 fn busy_node(stream: &StreamId) -> Vec<Frame> {
     let node = Node::new(stream.clone());
     node.emit(&payloads::identity(stream.node.as_str(), stream.life.0)); // 0
@@ -47,7 +47,7 @@ fn busy_node(stream: &StreamId) -> Vec<Frame> {
     node.emit(&payloads::resource(1)); // 5
     node.emit(&payloads::runtime(2)); // 6
     node.emit_text("trainer", ProcStream::Stderr, "WARN cuda oom, retrying"); // 7
-    node.emit(&payloads::lifecycle("running", 1800)); // 8
+    node.emit(&payloads::worker_counters(8)); // 8
     node.emit(&payloads::resource(2)); // 9
     node.sent()
 }
@@ -95,10 +95,11 @@ fn codec_round_trips_every_typed_channel() {
     assert_round_trip(&payloads::transport(4));
     assert_round_trip(&payloads::membership("node-beta", "alive", "suspect"));
     assert_round_trip(&payloads::runtime(5));
-    assert_round_trip(&payloads::lifecycle("running", 3600));
     assert_round_trip(&payloads::dist_state(6));
     assert_round_trip(&payloads::datastore_state(7));
     assert_round_trip(&payloads::actor_detail(8));
+    assert_round_trip(&payloads::worker_counters(9));
+    assert_round_trip(&payloads::datastream_health(10));
 }
 
 fn assert_round_trip<R: Record + PartialEq + std::fmt::Debug>(record: &R) {
@@ -970,7 +971,9 @@ fn kind_iv_deployment_simulation() {
         at_tick(&mut a_ticks, t, a.emit(&payloads::resource(t)));
     }
     at_tick(&mut a_ticks, 7, a.emit(&payloads::resource(7))); // resumes after the outage
-    at_tick(&mut a_ticks, 8, a.emit(&payloads::lifecycle("finalized", 7200))); // finalize
+    // Finalize frame: a datastream.health record whose `assigned` carries the seed,
+    // so the surviving last frame is identifiable by value below.
+    at_tick(&mut a_ticks, 8, a.emit(&payloads::datastream_health(7200))); // finalize
     let sent_a = a.sent();
 
     // ── Node B: lives, and also emits membership transitions ───────────
@@ -1053,8 +1056,8 @@ fn kind_iv_deployment_simulation() {
     assert_eq!(a_stored.gap_spans(), vec![GapSpan { start: 3, end: 5 }], "A: one surfaced gap");
     let finalize = a_stored.frames().last().unwrap();
     assert_eq!(
-        LifecycleCost::decode(&finalize.payload).unwrap().phase,
-        "finalized",
+        DatastreamHealth::decode(&finalize.payload).unwrap().assigned,
+        7200,
         "A's run ends with the finalize frame, delivered after the outage"
     );
 

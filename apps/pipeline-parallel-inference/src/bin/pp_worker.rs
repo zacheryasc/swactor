@@ -992,7 +992,26 @@ fn main_pump(
             let members = fleet::members_to_pairs(&cluster.members_raw());
             let runtime = fleet::runtime_stats(&cluster.rt);
             let relay_connected = cluster.driver.home_relay_url().is_some();
-            fleet.tick(&members, runtime, relay_connected, 0);
+
+            // Real membership transitions (with cause) from the SWIM observer —
+            // submitted before tick() so they drain this cycle (replaces the
+            // emitter's reason-less member-list diff).
+            for t in cluster.drain_swim_transitions() {
+                fleet.submit_membership(&fleet::membership_transition(&t));
+            }
+            // Consolidated distribution state: registry + location cache + recent
+            // probe targets + directory route count.
+            let dist = fleet::build_dist_state(
+                &cluster.registry_snapshot(),
+                &cluster.location_cache_entries(),
+                &cluster.swim_recent_targets(),
+                cluster.driver.directory_route_count() as u32,
+            );
+            fleet.submit_dist_state(&dist);
+            // Worker-runtime counters (the deep slice behind runtime.stats).
+            fleet.submit_worker_counters(&fleet::worker_counters(&cluster.rt));
+
+            fleet.tick(&members, runtime, relay_connected, 0, cluster.swim_rtt_p50());
         }
 
         if let Some(status) = status_inbox.try_recv() {

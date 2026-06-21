@@ -18,9 +18,9 @@
 #![allow(dead_code)]
 
 use datastream::catalog::{
-    self, ActorRec, ActorRuntimeDetail, CacheEntryRec, DatastoreState, DistributionState,
-    IdentityRecord, LifecycleCost, MembershipTransition, ObjectRec, ProcStream, Record,
-    RegistryEntryRec, ResourceSample, RuntimeStats, TransferRec, TransportInternals,
+    self, ActorRec, ActorRuntimeDetail, CacheEntryRec, DatastoreState, DatastreamHealth,
+    DistributionState, IdentityRecord, MembershipTransition, ObjectRec, ProcStream, Record,
+    RegistryEntryRec, ResourceSample, RuntimeStats, TransferRec, TransportInternals, WorkerCounters,
 };
 use datastream::frame::{ChannelId, Frame, Position, StreamId};
 use datastream::mux::Mux;
@@ -221,9 +221,28 @@ pub mod payloads {
         }
     }
 
-    /// A provider/lifecycle/cost record.
-    pub fn lifecycle(phase: &str, uptime_s: u64) -> LifecycleCost {
-        LifecycleCost { phase: phase.to_string(), cost_usd_per_hr: 1.27, uptime_s }
+    /// Aggregated worker-runtime counters (the `runtime.workers` channel).
+    pub fn worker_counters(tick: u64) -> WorkerCounters {
+        WorkerCounters {
+            num_workers: 4,
+            scheduled_tasks: 4 + (tick % 3) as u32,
+            local_sends: 100 + tick,
+            cross_sends: 20 + tick,
+            inbox_sends: tick,
+            messages_processed: 1000 + tick * 7,
+            tick_p50_us: 50 + tick,
+            ..Default::default()
+        }
+    }
+
+    /// Datastream self-health (the `datastream.health` channel). `assigned`
+    /// tracks the seed directly so a scenario can pick a frame out by its value.
+    pub fn datastream_health(tick: u64) -> DatastreamHealth {
+        DatastreamHealth {
+            assigned: tick,
+            dropped: tick % 4,
+            loss_rate_ppm: (tick % 4) as u32,
+        }
     }
 
     /// A realistic line of process output (without trailing newline).

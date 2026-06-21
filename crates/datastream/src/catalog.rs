@@ -35,9 +35,6 @@ pub const TRANSPORT_INTERNALS: &str = "transport.internals";
 pub const MEMBERSHIP: &str = "membership";
 /// Runtime stats — the node's own actor-runtime metrics. Periodic.
 pub const RUNTIME_STATS: &str = "runtime.stats";
-/// Provider / lifecycle / cost — coarse lifecycle and cost facts about the
-/// node as a rented resource.
-pub const LIFECYCLE_COST: &str = "provider.lifecycle";
 /// Distribution-subsystem state — location cache, directory, registry, gossip
 /// probes, and peer-auth. Periodic, consolidated; the parts of a node's
 /// distribution view the `membership`/`identity` channels do not already carry.
@@ -48,6 +45,14 @@ pub const DATASTORE_STATE: &str = "datastore.state";
 /// Per-actor runtime detail — one row per live actor, behind the aggregate
 /// [`RUNTIME_STATS`]. Periodic.
 pub const RUNTIME_ACTORS: &str = "runtime.actors";
+/// Worker-runtime counters — the routing/error tallies and tick timing the
+/// runtime keeps per worker, aggregated. The deep slice behind the thin
+/// [`RUNTIME_STATS`] heartbeat. Periodic.
+pub const RUNTIME_WORKERS: &str = "runtime.workers";
+/// Datastream self-health — the pipe reporting on its own integrity: positions
+/// assigned vs. frames dropped on mux overflow, and the resulting loss rate.
+/// Periodic.
+pub const DATASTREAM_HEALTH: &str = "datastream.health";
 /// Datastore operation events — a raw-text channel carrying one line per
 /// recorded op (`<kind> <hash> <size>`), the `proc.*` model applied to ops.
 pub const DATASTORE_EVENTS: &str = "datastore.events";
@@ -102,7 +107,8 @@ pub fn classify(channel: &ChannelId) -> ChannelKind {
     let id = channel.as_str();
     match id {
         IDENTITY | HOST_RESOURCE | TRANSPORT_INTERNALS | MEMBERSHIP | RUNTIME_STATS
-        | LIFECYCLE_COST | DIST_STATE | DATASTORE_STATE | RUNTIME_ACTORS => ChannelKind::Typed,
+        | DIST_STATE | DATASTORE_STATE | RUNTIME_ACTORS | RUNTIME_WORKERS
+        | DATASTREAM_HEALTH => ChannelKind::Typed,
         DATASTORE_EVENTS => ChannelKind::Text,
         _ if id.starts_with("proc.") => ChannelKind::Text,
         _ => ChannelKind::Opaque,
@@ -220,16 +226,6 @@ pub struct RuntimeStats {
     pub scheduled_tasks: u32,
 }
 
-/// Provider / lifecycle / cost record (spec §6.1).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LifecycleCost {
-    pub phase: String,
-    #[serde(default)]
-    pub cost_usd_per_hr: f32,
-    #[serde(default)]
-    pub uptime_s: u64,
-}
-
 /// Distribution-subsystem state record. A periodic, consolidated view of the
 /// cache / directory / registry / gossip / peer-auth state a node observes.
 /// Members and their liveness ride the `membership` channel and node identity
@@ -323,6 +319,59 @@ pub struct TransferRec {
     pub chunks_total: u64,
 }
 
+/// Worker-runtime counters — the routing/error tallies the runtime keeps per
+/// worker on its hot path, aggregated across workers, plus a tick-timing summary.
+/// These are live in-process (the dashboard's `WorkerStats`) but the thin
+/// [`RuntimeStats`] heartbeat carries none of them; this record puts them on the
+/// pipe. All-integer so it derives `Eq`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerCounters {
+    /// Number of runtime workers folded into these totals.
+    #[serde(default)]
+    pub num_workers: u32,
+    /// Scheduled actors across all workers (the deep value behind
+    /// [`RuntimeStats::scheduled_tasks`]).
+    #[serde(default)]
+    pub scheduled_tasks: u32,
+    #[serde(default)]
+    pub local_sends: u64,
+    #[serde(default)]
+    pub cross_sends: u64,
+    #[serde(default)]
+    pub inbox_sends: u64,
+    #[serde(default)]
+    pub type_mismatches: u64,
+    #[serde(default)]
+    pub panics: u64,
+    #[serde(default)]
+    pub messages_dropped: u64,
+    #[serde(default)]
+    pub restarts: u64,
+    #[serde(default)]
+    pub stops: u64,
+    /// Total messages processed across all workers.
+    #[serde(default)]
+    pub messages_processed: u64,
+    /// Median recent per-tick duration (sum of the 6 phase timings), microseconds.
+    #[serde(default)]
+    pub tick_p50_us: u64,
+}
+
+/// Datastream self-health — the mux's own integrity counters. `assigned` is the
+/// gap-free high-water mark (every position handed out); `dropped` is the frames
+/// lost to mux overflow. A consumer computes the loss rate as `dropped/assigned`;
+/// `loss_rate_ppm` carries it pre-computed (parts-per-million) for convenience.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatastreamHealth {
+    #[serde(default)]
+    pub assigned: u64,
+    #[serde(default)]
+    pub dropped: u64,
+    /// `dropped / assigned × 1_000_000`; `0` when nothing has been assigned yet.
+    #[serde(default)]
+    pub loss_rate_ppm: u32,
+}
+
 /// Per-actor runtime detail — the rows behind the aggregate [`RuntimeStats`].
 /// Periodic, on its own channel so a consumer that only wants the summary never
 /// pays to decode the full table.
@@ -366,9 +415,6 @@ impl Record for MembershipTransition {
 impl Record for RuntimeStats {
     const CHANNEL: &'static str = RUNTIME_STATS;
 }
-impl Record for LifecycleCost {
-    const CHANNEL: &'static str = LIFECYCLE_COST;
-}
 impl Record for DistributionState {
     const CHANNEL: &'static str = DIST_STATE;
 }
@@ -377,4 +423,10 @@ impl Record for DatastoreState {
 }
 impl Record for ActorRuntimeDetail {
     const CHANNEL: &'static str = RUNTIME_ACTORS;
+}
+impl Record for WorkerCounters {
+    const CHANNEL: &'static str = RUNTIME_WORKERS;
+}
+impl Record for DatastreamHealth {
+    const CHANNEL: &'static str = DATASTREAM_HEALTH;
 }

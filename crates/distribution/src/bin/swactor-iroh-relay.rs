@@ -166,6 +166,8 @@ async fn main() -> ExitCode {
                         runtime: RuntimeStats::default(),
                         relay_connected: true,
                         relay_peers: 0,
+                        // The relay runs no SWIM probe loop, so no real RTT.
+                        rtt_ms_p50: 0,
                     },
                     true,
                 );
