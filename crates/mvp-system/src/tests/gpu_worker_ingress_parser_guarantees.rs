@@ -163,10 +163,7 @@ fn payload_loading_is_exact_extent_and_release_after_copy_completion() {
         object_id: ingress::ObjectId(9000),
         byte_count: 8,
     });
-    assert_eq!(
-        harness.device_copy_log().last().unwrap().byte_count,
-        8
-    );
+    assert_eq!(harness.device_copy_log().last().unwrap().byte_count, 8);
     assert!(harness.consume_cursor(ingress::RingId(8001)) > before_copy_complete);
 
     // EOF mid-object faults the object.
@@ -208,9 +205,12 @@ fn object_loaded_requires_complete_valid_object_and_current_handle() {
 
     // No ObjectLoaded may appear before device copy completion and handle
     // creation.
-    assert!(!harness.events().iter().any(|event| {
-        matches!(event, ingress::WorkerIngressOut::ObjectLoaded { .. })
-    }));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, ingress::WorkerIngressOut::ObjectLoaded { .. }) })
+    );
 
     // Complete device work.
     harness.observe(ingress::WorkerIngressEvent::DeviceCopyCompleted {

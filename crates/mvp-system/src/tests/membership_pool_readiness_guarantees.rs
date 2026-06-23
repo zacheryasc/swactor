@@ -34,10 +34,7 @@ fn readiness_config() -> membership::ReadinessConfig {
 // This helper provides every required public fact for one node. Tests use it to
 // build complete and deliberately incomplete pool views without observing any
 // private readiness bookkeeping.
-fn report_node_ready(
-    gate: &mut membership::ReadinessGateHarness,
-    node_id: membership::NodeId,
-) {
+fn report_node_ready(gate: &mut membership::ReadinessGateHarness, node_id: membership::NodeId) {
     gate.observe(membership::Observation::NodeKnown { node_id });
     gate.observe(membership::Observation::SwimLive { node_id });
     gate.observe(membership::Observation::NodeAvailable { node_id });
@@ -88,8 +85,14 @@ fn pool_ready_requires_complete_stable_candidate_pool() {
         .expect("complete stable pool must emit PoolReady");
 
     // Compare as sets so ordering is not part of the behavioral contract.
-    let observed = ready.iter().copied().collect::<std::collections::BTreeSet<_>>();
-    let expected = pool.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    let observed = ready
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    let expected = pool
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(observed, expected);
 }
 
@@ -142,9 +145,11 @@ fn planning_starts_only_after_pool_ready_and_stops_if_readiness_is_lost() {
     gate.request_run_planning(membership::RunRequest::new(membership::RunId(7)));
 
     // With no PoolReady event, there must be no planning command.
-    assert!(!gate.commands().iter().any(|command| {
-        matches!(command, membership::ReadinessCommand::StartPlanning { .. })
-    }));
+    assert!(
+        !gate.commands().iter().any(|command| {
+            matches!(command, membership::ReadinessCommand::StartPlanning { .. })
+        })
+    );
 
     // Satisfy readiness, then immediately lose a required node before plan
     // commit. The policy may wait or abort, but it must not commit placement.
@@ -155,9 +160,11 @@ fn planning_starts_only_after_pool_ready_and_stops_if_readiness_is_lost() {
     gate.observe(membership::Observation::SwimLost { node_id: pool[1] });
 
     // No plan commitment command may be emitted from an unstable pool view.
-    assert!(!gate.commands().iter().any(|command| {
-        matches!(command, membership::ReadinessCommand::CommitRunPlan { .. })
-    }));
+    assert!(
+        !gate.commands().iter().any(|command| {
+            matches!(command, membership::ReadinessCommand::CommitRunPlan { .. })
+        })
+    );
 }
 
 // This proves membership loss after provisioning is a run fault, not active
@@ -180,16 +187,20 @@ fn required_node_loss_after_provisioning_faults_without_replacement() {
     gate.observe(membership::Observation::SwimLost { node_id: pool[1] });
 
     // The run must fault with a membership reason.
-    assert!(gate.events().contains(&membership::ReadinessEvent::RunFaulted {
-        run_id: membership::RunId(7),
-        reason: membership::RunFaultReason::RequiredNodeLost {
-            node_id: pool[1],
-        },
-    }));
+    assert!(
+        gate.events()
+            .contains(&membership::ReadinessEvent::RunFaulted {
+                run_id: membership::RunId(7),
+                reason: membership::RunFaultReason::RequiredNodeLost { node_id: pool[1] },
+            })
+    );
 
     // Re-placement would violate the committed-plan authority boundary.
     assert!(!gate.commands().iter().any(|command| {
-        matches!(command, membership::ReadinessCommand::RecomputePlacement { .. })
+        matches!(
+            command,
+            membership::ReadinessCommand::RecomputePlacement { .. }
+        )
     }));
 }
 
@@ -212,7 +223,9 @@ fn swim_observations_do_not_create_graph_assignments() {
             | membership::ReadinessCommand::StartPlanning { .. }
             | membership::ReadinessCommand::WaitForStability { .. }
             | membership::ReadinessCommand::AbortPendingRun { .. } => {}
-            membership::ReadinessCommand::AssignStage { .. }
+            membership::ReadinessCommand::CommitRunPlan { .. }
+            | membership::ReadinessCommand::RecomputePlacement { .. }
+            | membership::ReadinessCommand::AssignStage { .. }
             | membership::ReadinessCommand::AssignEdge { .. }
             | membership::ReadinessCommand::AssignLayerRange { .. }
             | membership::ReadinessCommand::AssignObjectSpec { .. } => {

@@ -77,13 +77,22 @@ fn driver_owns_endpoint_connection_demux_and_pump_tasks() {
 
     // Pump tasks are driver-owned.
     assert!(harness.commands().iter().any(|command| {
-        matches!(command, driver::DriverCommand::SpawnSendPump { edge_id: driver::EdgeId(7001), .. })
+        matches!(
+            command,
+            driver::DriverCommand::SpawnSendPump {
+                edge_id: driver::EdgeId(7001),
+                ..
+            }
+        )
     }));
 
     // Actor commands must not expose stream polling.
-    assert!(!harness.actor_messages().iter().any(|message| {
-        matches!(message, driver::ActorMessage::PollStreamFuture { .. })
-    }));
+    assert!(
+        !harness
+            .actor_messages()
+            .iter()
+            .any(|message| { matches!(message, driver::ActorMessage::PollStreamFuture { .. }) })
+    );
 }
 
 // This proves each edge uses one persistent uni-stream, writes an edge-id
@@ -131,15 +140,24 @@ fn recv_rendezvous_starts_pump_only_after_spec_and_stream_exist() {
     // Spec first, stream second.
     let mut spec_first = new_driver();
     spec_first.observe(driver::DriverEvent::EstablishRecv(recv_spec()));
-    assert!(!spec_first.commands().iter().any(|command| {
-        matches!(command, driver::DriverCommand::SpawnRecvPump { .. })
-    }));
+    assert!(
+        !spec_first
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, driver::DriverCommand::SpawnRecvPump { .. }) })
+    );
     spec_first.observe(driver::DriverEvent::IncomingUniStream {
         edge_id: driver::EdgeId(7001),
         stream_id: driver::StreamId(1),
     });
     assert!(spec_first.commands().iter().any(|command| {
-        matches!(command, driver::DriverCommand::SpawnRecvPump { edge_id: driver::EdgeId(7001), .. })
+        matches!(
+            command,
+            driver::DriverCommand::SpawnRecvPump {
+                edge_id: driver::EdgeId(7001),
+                ..
+            }
+        )
     }));
 
     // Stream first, spec second.
@@ -172,12 +190,20 @@ fn recv_pump_copies_bytes_without_parsing_and_respects_backpressure() {
         edge_id: driver::EdgeId(7001),
         bytes: driver::fake_object_header_bytes(),
     });
-    assert!(!harness.events().iter().any(|event| {
-        matches!(event, driver::DriverEventOut::ObjectHeaderParsed { .. })
-    }));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, driver::DriverEventOut::ObjectHeaderParsed { .. }) })
+    );
     assert!(harness.ring_commit(driver::EdgeId(7001)) > 0);
     assert!(harness.wake_hints().iter().any(|wake| {
-        matches!(wake, driver::WakeHint::RingReadable { edge_id: driver::EdgeId(7001) })
+        matches!(
+            wake,
+            driver::WakeHint::RingReadable {
+                edge_id: driver::EdgeId(7001)
+            }
+        )
     }));
 
     // With no ring space, the pump stops reading and waits for RingWritable.
@@ -217,7 +243,12 @@ fn send_pump_advances_consume_only_after_write_acceptance() {
     });
     assert_eq!(harness.ring_consume(driver::EdgeId(7001)), 7);
     assert!(harness.wake_hints().iter().any(|wake| {
-        matches!(wake, driver::WakeHint::RingWritable { edge_id: driver::EdgeId(7001) })
+        matches!(
+            wake,
+            driver::WakeHint::RingWritable {
+                edge_id: driver::EdgeId(7001)
+            }
+        )
     }));
 }
 
@@ -236,7 +267,13 @@ fn driver_faults_and_stop_emit_stream_fault_or_pump_stopped() {
         edge_id: driver::EdgeId(7001),
     });
     assert!(recv.events().iter().any(|event| {
-        matches!(event, driver::DriverEventOut::StreamFault { edge_id: driver::EdgeId(7001), .. })
+        matches!(
+            event,
+            driver::DriverEventOut::StreamFault {
+                edge_id: driver::EdgeId(7001),
+                ..
+            }
+        )
     }));
 
     // Write error faults the send edge.
@@ -246,7 +283,13 @@ fn driver_faults_and_stop_emit_stream_fault_or_pump_stopped() {
         edge_id: driver::EdgeId(7001),
     });
     assert!(send.events().iter().any(|event| {
-        matches!(event, driver::DriverEventOut::StreamFault { edge_id: driver::EdgeId(7001), .. })
+        matches!(
+            event,
+            driver::DriverEventOut::StreamFault {
+                edge_id: driver::EdgeId(7001),
+                ..
+            }
+        )
     }));
 
     // StopEdge stops the corresponding pump.
@@ -254,6 +297,12 @@ fn driver_faults_and_stop_emit_stream_fault_or_pump_stopped() {
         edge_id: driver::EdgeId(7001),
     });
     assert!(send.events().iter().any(|event| {
-        matches!(event, driver::DriverEventOut::PumpStopped { edge_id: driver::EdgeId(7001), .. })
+        matches!(
+            event,
+            driver::DriverEventOut::PumpStopped {
+                edge_id: driver::EdgeId(7001),
+                ..
+            }
+        )
     }));
 }

@@ -109,7 +109,12 @@ fn header_is_written_and_committed_before_payload() {
     // Payload bytes are not committed before the payload copy is valid.
     assert_eq!(harness.committed_payload_bytes(egress::RingId(8002)), 0);
     assert!(harness.wake_hints().iter().any(|wake| {
-        matches!(wake, egress::WakeHint::RingReadable { ring_id: egress::RingId(8002) })
+        matches!(
+            wake,
+            egress::WakeHint::RingReadable {
+                ring_id: egress::RingId(8002)
+            }
+        )
     }));
 }
 
@@ -156,29 +161,37 @@ fn payload_copy_is_exact_extent_and_respects_backpressure() {
 fn object_produced_precedes_step_completed_after_all_outputs() {
     // Execute a step with two outputs.
     let mut harness = installed_producer();
-    harness.observe(egress::WorkerEgressEvent::InstallRing(egress::InstallRing {
-        ring_id: egress::RingId(8003),
-        edge_id: egress::EdgeId(7003),
-        port_id: egress::PortId("out2".into()),
-        ..egress_ring()
-    }));
+    harness.observe(egress::WorkerEgressEvent::InstallRing(
+        egress::InstallRing {
+            ring_id: egress::RingId(8003),
+            edge_id: egress::EdgeId(7003),
+            port_id: egress::PortId("out2".into()),
+            ..egress_ring()
+        },
+    ));
     harness.observe(egress::WorkerEgressEvent::ExecuteStep {
         step_id: egress::StepId(77),
-        outputs: vec![output_binding(0, 8), egress::OutputBinding {
-            ring_id: egress::RingId(8003),
-            object_id: egress::ObjectId(9100),
-            sequence: 0,
-            extent: 8,
-            flags: egress::ObjectFlags::default(),
-            device_source: egress::DeviceHandle::new(egress::WorkerGeneration(1), 55),
-        }],
+        outputs: vec![
+            output_binding(0, 8),
+            egress::OutputBinding {
+                ring_id: egress::RingId(8003),
+                object_id: egress::ObjectId(9100),
+                sequence: 0,
+                extent: 8,
+                flags: egress::ObjectFlags::default(),
+                device_source: egress::DeviceHandle::new(egress::WorkerGeneration(1), 55),
+            },
+        ],
     });
 
     // Produce only the first output and prove StepCompleted is still absent.
     harness.complete_output(egress::ObjectId(9000));
-    assert!(!harness.events().iter().any(|event| {
-        matches!(event, egress::WorkerEgressOut::StepCompleted { .. })
-    }));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, egress::WorkerEgressOut::StepCompleted { .. }) })
+    );
 
     // Produce the second output and complete role state update.
     harness.complete_output(egress::ObjectId(9100));
@@ -190,17 +203,41 @@ fn object_produced_precedes_step_completed_after_all_outputs() {
     let first_object_pos = harness
         .events()
         .iter()
-        .position(|event| matches!(event, egress::WorkerEgressOut::ObjectProduced { object_id: egress::ObjectId(9000), .. }))
+        .position(|event| {
+            matches!(
+                event,
+                egress::WorkerEgressOut::ObjectProduced {
+                    object_id: egress::ObjectId(9000),
+                    ..
+                }
+            )
+        })
         .expect("first object produced");
     let second_object_pos = harness
         .events()
         .iter()
-        .position(|event| matches!(event, egress::WorkerEgressOut::ObjectProduced { object_id: egress::ObjectId(9100), .. }))
+        .position(|event| {
+            matches!(
+                event,
+                egress::WorkerEgressOut::ObjectProduced {
+                    object_id: egress::ObjectId(9100),
+                    ..
+                }
+            )
+        })
         .expect("second object produced");
     let completed_pos = harness
         .events()
         .iter()
-        .position(|event| matches!(event, egress::WorkerEgressOut::StepCompleted { step_id: egress::StepId(77), .. }))
+        .position(|event| {
+            matches!(
+                event,
+                egress::WorkerEgressOut::StepCompleted {
+                    step_id: egress::StepId(77),
+                    ..
+                }
+            )
+        })
         .expect("step completed");
     assert!(first_object_pos < completed_pos);
     assert!(second_object_pos < completed_pos);
@@ -220,7 +257,13 @@ fn egress_faults_are_visible_and_suppress_success_events() {
         }],
     });
     assert!(invalid_ring.events().iter().any(|event| {
-        matches!(event, egress::WorkerEgressOut::StepFailed { reason: egress::StepFailureReason::InvalidOutputRing, .. })
+        matches!(
+            event,
+            egress::WorkerEgressOut::StepFailed {
+                reason: egress::StepFailureReason::InvalidOutputRing,
+                ..
+            }
+        )
     }));
 
     // Extent violation fails the step.
@@ -230,7 +273,13 @@ fn egress_faults_are_visible_and_suppress_success_events() {
         outputs: vec![output_binding(0, 32)],
     });
     assert!(bad_extent.events().iter().any(|event| {
-        matches!(event, egress::WorkerEgressOut::StepFailed { reason: egress::StepFailureReason::OutputExtentViolation, .. })
+        matches!(
+            event,
+            egress::WorkerEgressOut::StepFailed {
+                reason: egress::StepFailureReason::OutputExtentViolation,
+                ..
+            }
+        )
     }));
 
     // Copy failure faults the ring or fails the step, but must not emit
@@ -247,7 +296,10 @@ fn egress_faults_are_visible_and_suppress_success_events() {
         matches!(event, egress::WorkerEgressOut::StepFailed { .. })
             || matches!(event, egress::WorkerEgressOut::RingFault { .. })
     }));
-    assert!(!copy_failed.events().iter().any(|event| {
-        matches!(event, egress::WorkerEgressOut::ObjectProduced { .. })
-    }));
+    assert!(
+        !copy_failed
+            .events()
+            .iter()
+            .any(|event| { matches!(event, egress::WorkerEgressOut::ObjectProduced { .. }) })
+    );
 }

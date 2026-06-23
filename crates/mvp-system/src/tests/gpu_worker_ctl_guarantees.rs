@@ -70,24 +70,35 @@ fn worker_lifecycle_runs_start_initialize_ready_and_fault_paths() {
     // Start the worker process.
     let mut harness = new_controller();
     harness.observe(ctl::WorkerCtlEvent::StartWorker);
-    assert!(harness.commands().iter().any(|command| {
-        matches!(command, ctl::WorkerCtlCommand::SpawnProcessActor { .. })
-    }));
+    assert!(
+        harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, ctl::WorkerCtlCommand::SpawnProcessActor { .. }) })
+    );
 
     // Process start triggers InitializeWorker.
     harness.observe(ctl::WorkerCtlEvent::ProcessStarted {
         pid: ctl::ProcessId(1234),
     });
-    assert!(harness.serialized_worker_commands().iter().any(|command| {
-        matches!(command, ctl::WorkerCommand::InitializeWorker { .. })
-    }));
+    assert!(
+        harness
+            .serialized_worker_commands()
+            .iter()
+            .any(|command| { matches!(command, ctl::WorkerCommand::InitializeWorker { .. }) })
+    );
 
     // WorkerReady emits a running lifecycle event.
     harness.observe(ctl::WorkerCtlEvent::WorkerReady {
         generation: ctl::WorkerGeneration(1),
     });
     assert!(harness.events().iter().any(|event| {
-        matches!(event, ctl::WorkerCtlOut::WorkerRunning { generation: ctl::WorkerGeneration(1) })
+        matches!(
+            event,
+            ctl::WorkerCtlOut::WorkerRunning {
+                generation: ctl::WorkerGeneration(1)
+            }
+        )
     }));
 
     // Initialization timeout in a fresh controller is terminal failure.
@@ -95,7 +106,13 @@ fn worker_lifecycle_runs_start_initialize_ready_and_fault_paths() {
     timed_out.observe(ctl::WorkerCtlEvent::StartWorker);
     timed_out.advance_time_ms(1_001);
     assert!(timed_out.events().iter().any(|event| {
-        matches!(event, ctl::WorkerCtlOut::WorkerFailed { reason: ctl::WorkerFailure::InitializationTimeout, .. })
+        matches!(
+            event,
+            ctl::WorkerCtlOut::WorkerFailed {
+                reason: ctl::WorkerFailure::InitializationTimeout,
+                ..
+            }
+        )
     }));
 }
 
@@ -112,7 +129,10 @@ fn command_routing_requires_running_current_generation_and_is_payload_free() {
     }
 
     // All valid commands are serialized to the worker.
-    assert_eq!(harness.serialized_worker_commands().len(), current_generation_commands().len() + 1);
+    assert_eq!(
+        harness.serialized_worker_commands().len(),
+        current_generation_commands().len() + 1
+    );
 
     // Serialized commands must not contain payload bytes.
     for command in harness.serialized_worker_commands() {
@@ -136,13 +156,21 @@ fn command_routing_requires_running_current_generation_and_is_payload_free() {
     harness.observe(ctl::WorkerCtlEvent::WorkerReady {
         generation: ctl::WorkerGeneration(2),
     });
-    harness.observe(ctl::WorkerCtlEvent::ActorCommand(ctl::ActorCommand::ExecuteStep {
-        generation: ctl::WorkerGeneration(1),
-        step_id: ctl::StepId(9002),
-        input: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
-    }));
+    harness.observe(ctl::WorkerCtlEvent::ActorCommand(
+        ctl::ActorCommand::ExecuteStep {
+            generation: ctl::WorkerGeneration(1),
+            step_id: ctl::StepId(9002),
+            input: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
+        },
+    ));
     assert!(harness.events().iter().any(|event| {
-        matches!(event, ctl::WorkerCtlOut::CommandRejected { reason: ctl::CommandRejection::OldGenerationHandle, .. })
+        matches!(
+            event,
+            ctl::WorkerCtlOut::CommandRejected {
+                reason: ctl::CommandRejection::OldGenerationHandle,
+                ..
+            }
+        )
     }));
 }
 
@@ -154,31 +182,66 @@ fn parsed_worker_events_route_to_their_control_owners() {
     let mut harness = running_controller();
 
     // Deliver each worker event family through stdout parsing.
-    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(ctl::WorkerEvent::RingInstalled {
-        ring_id: ctl::RingId(8001),
-    }));
-    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(ctl::WorkerEvent::ObjectLoaded {
-        object_id: ctl::ObjectId(9000),
-        sequence: 0,
-    }));
-    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(ctl::WorkerEvent::ObjectProduced {
-        object_id: ctl::ObjectId(9001),
-        sequence: 0,
-    }));
-    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(ctl::WorkerEvent::StepCompleted {
-        step_id: ctl::StepId(77),
-    }));
-    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(ctl::WorkerEvent::RingReadable {
-        ring_id: ctl::RingId(8001),
-    }));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::RingInstalled {
+            ring_id: ctl::RingId(8001),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::ObjectLoaded {
+            object_id: ctl::ObjectId(9000),
+            sequence: 0,
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::ObjectProduced {
+            object_id: ctl::ObjectId(9001),
+            sequence: 0,
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::StepCompleted {
+            step_id: ctl::StepId(77),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::RingReadable {
+            ring_id: ctl::RingId(8001),
+        },
+    ));
 
     // Routing is proven by destination commands/events, not private dispatch
     // tables.
-    assert!(harness.routed().iter().any(|route| matches!(route, ctl::RoutedEvent::ToEdgeEstablisher(_))));
-    assert!(harness.routed().iter().any(|route| matches!(route, ctl::RoutedEvent::ToRxOrRole(_))));
-    assert!(harness.routed().iter().any(|route| matches!(route, ctl::RoutedEvent::ToTxOrRole(_))));
-    assert!(harness.routed().iter().any(|route| matches!(route, ctl::RoutedEvent::ToStageController(_))));
-    assert!(harness.routed().iter().any(|route| matches!(route, ctl::RoutedEvent::ToDriverOrWorkerSide(_))));
+    assert!(
+        harness
+            .routed()
+            .iter()
+            .any(|route| matches!(route, ctl::RoutedEvent::ToEdgeEstablisher(_)))
+    );
+    assert!(
+        harness
+            .routed()
+            .iter()
+            .any(|route| matches!(route, ctl::RoutedEvent::ToRxOrRole(_)))
+    );
+    assert!(
+        harness
+            .routed()
+            .iter()
+            .any(|route| matches!(route, ctl::RoutedEvent::ToTxOrRole(_)))
+    );
+    assert!(
+        harness
+            .routed()
+            .iter()
+            .any(|route| matches!(route, ctl::RoutedEvent::ToStageController(_)))
+    );
+    assert!(
+        harness
+            .routed()
+            .iter()
+            .any(|route| matches!(route, ctl::RoutedEvent::ToDriverOrWorkerSide(_)))
+    );
 }
 
 // This proves worker crash invalidates old handles, roles, rings, in-flight
@@ -188,15 +251,19 @@ fn parsed_worker_events_route_to_their_control_owners() {
 fn crash_invalidates_generation_state_and_fans_out_faults() {
     // Install one ring and start one step in generation 1.
     let mut harness = running_controller();
-    harness.observe(ctl::WorkerCtlEvent::ActorCommand(ctl::ActorCommand::InstallRing {
-        generation: ctl::WorkerGeneration(1),
-        ring_id: ctl::RingId(8001),
-    }));
-    harness.observe(ctl::WorkerCtlEvent::ActorCommand(ctl::ActorCommand::ExecuteStep {
-        generation: ctl::WorkerGeneration(1),
-        step_id: ctl::StepId(9001),
-        input: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
-    }));
+    harness.observe(ctl::WorkerCtlEvent::ActorCommand(
+        ctl::ActorCommand::InstallRing {
+            generation: ctl::WorkerGeneration(1),
+            ring_id: ctl::RingId(8001),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::ActorCommand(
+        ctl::ActorCommand::ExecuteStep {
+            generation: ctl::WorkerGeneration(1),
+            step_id: ctl::StepId(9001),
+            input: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
+        },
+    ));
 
     // Crash the worker process.
     harness.observe(ctl::WorkerCtlEvent::ProcessExited {
@@ -205,10 +272,22 @@ fn crash_invalidates_generation_state_and_fans_out_faults() {
 
     // Installed rings fault and affected pumps are stopped.
     assert!(harness.events().iter().any(|event| {
-        matches!(event, ctl::WorkerCtlOut::RingFaulted { ring_id: ctl::RingId(8001), .. })
+        matches!(
+            event,
+            ctl::WorkerCtlOut::RingFaulted {
+                ring_id: ctl::RingId(8001),
+                ..
+            }
+        )
     }));
     assert!(harness.commands().iter().any(|command| {
-        matches!(command, ctl::WorkerCtlCommand::StopDriverPump { ring_id: ctl::RingId(8001), .. })
+        matches!(
+            command,
+            ctl::WorkerCtlCommand::StopDriverPump {
+                ring_id: ctl::RingId(8001),
+                ..
+            }
+        )
     }));
 
     // Restart increments worker generation.
@@ -229,16 +308,21 @@ fn crash_invalidates_generation_state_and_fans_out_faults() {
 fn graceful_shutdown_sends_worker_shutdown_and_reaches_terminal_stopped() {
     // Start from a running worker with an installed ring.
     let mut harness = running_controller();
-    harness.observe(ctl::WorkerCtlEvent::ActorCommand(ctl::ActorCommand::InstallRing {
-        generation: ctl::WorkerGeneration(1),
-        ring_id: ctl::RingId(8001),
-    }));
+    harness.observe(ctl::WorkerCtlEvent::ActorCommand(
+        ctl::ActorCommand::InstallRing {
+            generation: ctl::WorkerGeneration(1),
+            ring_id: ctl::RingId(8001),
+        },
+    ));
 
     // Request graceful shutdown.
     harness.observe(ctl::WorkerCtlEvent::ShutdownRequested);
-    assert!(harness.serialized_worker_commands().iter().any(|command| {
-        matches!(command, ctl::WorkerCommand::ShutdownWorker { .. })
-    }));
+    assert!(
+        harness
+            .serialized_worker_commands()
+            .iter()
+            .any(|command| { matches!(command, ctl::WorkerCommand::ShutdownWorker { .. }) })
+    );
 
     // WorkerStopped must precede terminal stopped.
     harness.observe(ctl::WorkerCtlEvent::WorkerStopped {
@@ -261,6 +345,12 @@ fn graceful_shutdown_sends_worker_shutdown_and_reaches_terminal_stopped() {
 
     // Rings are marked quiesced on graceful stop.
     assert!(harness.events().iter().any(|event| {
-        matches!(event, ctl::WorkerCtlOut::RingQuiesced { ring_id: ctl::RingId(8001), .. })
+        matches!(
+            event,
+            ctl::WorkerCtlOut::RingQuiesced {
+                ring_id: ctl::RingId(8001),
+                ..
+            }
+        )
     }));
 }

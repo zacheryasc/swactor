@@ -20,7 +20,7 @@ type EdgeKind = plan::EdgeKind;
 type EdgePlan = plan::EdgePlan;
 type InboundEdgeProvision = plan::InboundEdgeProvision;
 type ModelFacts = plan::ModelFacts;
-type NodeId = plan::NodeId;
+use plan::NodeId;
 type ObjectKind = plan::ObjectKind;
 type OutboundEdgeProvision = plan::OutboundEdgeProvision;
 type PlacementInput = plan::PlacementInput;
@@ -283,7 +283,10 @@ fn edge_graph_is_exactly_the_linear_pipeline() {
         .filter(|edge| edge.kind == EdgeKind::TokenOut)
         .collect::<Vec<_>>();
     assert_eq!(token_out.len(), 1);
-    assert_eq!(edge_stage_index(&token_out[0].producer), Some(stage_count - 1));
+    assert_eq!(
+        edge_stage_index(&token_out[0].producer),
+        Some(stage_count - 1)
+    );
     assert!(matches!(
         token_out[0].consumer,
         EdgeEndpoint::Orchestrator { node_id } if node_id == node(99)

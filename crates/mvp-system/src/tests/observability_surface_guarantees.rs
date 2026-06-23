@@ -54,7 +54,10 @@ fn fault_trace() -> Vec<obs::Event> {
             obs::FaultReason::WorkerCrashed,
             obs::Component::StageController,
         )
-        .run_faulted(obs::FaultReason::WorkerCrashed, obs::Component::StageController)
+        .run_faulted(
+            obs::FaultReason::WorkerCrashed,
+            obs::Component::StageController,
+        )
         .stop_run_sent(obs::StageIndex(0))
         .stage_stopped(obs::StageIndex(0))
         .run_torn_down()
@@ -94,13 +97,19 @@ fn assert_required_identity(event: &obs::Event) {
             sequence,
             ..
         } => {
-            assert!([obs::ObjectId(9000), obs::ObjectId(9001), obs::ObjectId(9002)].contains(object_id));
+            assert!(
+                [
+                    obs::ObjectId(9000),
+                    obs::ObjectId(9001),
+                    obs::ObjectId(9002)
+                ]
+                .contains(object_id)
+            );
             assert_eq!(*sequence, obs::Sequence(0));
         }
         obs::Event::StepScoped { step_id, .. } => assert_eq!(*step_id, obs::StepId(77)),
         obs::Event::WorkerScoped {
-            worker_generation,
-            ..
+            worker_generation, ..
         } => assert_eq!(*worker_generation, obs::WorkerGeneration(1)),
     }
 }
@@ -166,7 +175,10 @@ fn lifecycle_events_cover_successful_run_milestones() {
         obs::EventKind::RunTornDown,
     ];
     for kind in required {
-        assert!(observed.contains(&kind), "missing lifecycle event: {kind:?}");
+        assert!(
+            observed.contains(&kind),
+            "missing lifecycle event: {kind:?}"
+        );
     }
 }
 
@@ -242,7 +254,10 @@ fn event_ordering_reflects_component_contracts_and_one_terminal_outcome() {
     let terminal_count = events
         .iter()
         .filter(|event| {
-            matches!(event.kind(), obs::EventKind::RunCompleted | obs::EventKind::RunFaulted)
+            matches!(
+                event.kind(),
+                obs::EventKind::RunCompleted | obs::EventKind::RunFaulted
+            )
         })
         .count();
     assert_eq!(terminal_count, 1);
@@ -253,8 +268,10 @@ fn event_ordering_reflects_component_contracts_and_one_terminal_outcome() {
 #[test]
 fn event_contract_survives_transport_storage_and_batching_policy() {
     // Build the same logical events under two batching policies.
-    let unbatched = obs::EventSubscriberHarness::collect(successful_run_trace(), obs::Batching::None);
-    let batched = obs::EventSubscriberHarness::collect(successful_run_trace(), obs::Batching::Fixed(8));
+    let unbatched =
+        obs::EventSubscriberHarness::collect(successful_run_trace(), obs::Batching::None);
+    let batched =
+        obs::EventSubscriberHarness::collect(successful_run_trace(), obs::Batching::Fixed(8));
 
     // Flattened public event facts must match as an ordered stream.
     let unbatched_kinds = unbatched

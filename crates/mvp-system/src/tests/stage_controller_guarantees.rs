@@ -101,9 +101,12 @@ fn provisioning_validates_authority_and_assigned_shape_before_setup() {
 
     // The controller must not emit any command that replaces the provisioned
     // edge ids with a locally chosen edge.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, stage::StageCommand::RewireEdge { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, stage::StageCommand::RewireEdge { .. }) })
+    );
 
     // An unauthorized provision attempt must fault before setup can begin.
     let mut unauthorized = new_controller();
@@ -120,9 +123,12 @@ fn provisioning_validates_authority_and_assigned_shape_before_setup() {
             }
         )
     }));
-    assert!(!unauthorized.commands().iter().any(|command| {
-        matches!(command, stage::StageCommand::ConfigureWorkerRole { .. })
-    }));
+    assert!(
+        !unauthorized
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, stage::StageCommand::ConfigureWorkerRole { .. }) })
+    );
 }
 
 // This proves StageReady is emitted only after worker readiness, weight
@@ -143,9 +149,12 @@ fn stage_ready_waits_for_worker_weights_and_both_edges() {
     let final_event = events.pop().expect("fixture has final setup event");
     for event in events {
         harness.observe(event);
-        assert!(!harness.events().iter().any(|event| {
-            matches!(event, stage::StageLifecycleEvent::StageReady { .. })
-        }));
+        assert!(
+            !harness
+                .events()
+                .iter()
+                .any(|event| { matches!(event, stage::StageLifecycleEvent::StageReady { .. }) })
+        );
     }
 
     // The final prerequisite crosses the barrier.
@@ -220,11 +229,7 @@ fn accepted_inbound_object_creates_one_same_sequence_execute_step() {
 #[test]
 fn duplicate_skipped_and_out_of_order_sequences_fault() {
     // Each invalid trace starts from a freshly readied stage.
-    let invalid_traces = vec![
-        vec![0, 0],
-        vec![0, 2],
-        vec![0, 1, 0],
-    ];
+    let invalid_traces = vec![vec![0, 0], vec![0, 2], vec![0, 1, 0]];
 
     for trace in invalid_traces {
         // Accept the first object and complete its step when needed so the next
@@ -272,7 +277,10 @@ fn step_completed_releases_input_and_admits_next_object() {
 
     // Before worker completion, no compute-complete lifecycle event is allowed.
     assert!(!harness.events().iter().any(|event| {
-        matches!(event, stage::StageLifecycleEvent::StepAccepted { sequence: 1, .. })
+        matches!(
+            event,
+            stage::StageLifecycleEvent::StepAccepted { sequence: 1, .. }
+        )
     }));
 
     // Worker StepCompleted is the public completion signal.
@@ -348,13 +356,21 @@ fn stage_fault_rejects_new_work_until_stopped() {
     harness.observe(stage::StageEvent::StopRun {
         run_id: stage::RunId(7),
     });
-    assert!(harness.commands().iter().any(|command| {
-        matches!(command, stage::StageCommand::StopLocalEdges { .. })
-    }));
-    assert!(harness.commands().iter().any(|command| {
-        matches!(command, stage::StageCommand::ReleaseRunDeviceObjects { .. })
-    }));
-    assert!(harness.events().iter().any(|event| {
-        matches!(event, stage::StageLifecycleEvent::StageStopped { .. })
-    }));
+    assert!(
+        harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, stage::StageCommand::StopLocalEdges { .. }) })
+    );
+    assert!(
+        harness.commands().iter().any(|command| {
+            matches!(command, stage::StageCommand::ReleaseRunDeviceObjects { .. })
+        })
+    );
+    assert!(
+        harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, stage::StageLifecycleEvent::StageStopped { .. }) })
+    );
 }

@@ -75,9 +75,13 @@ fn node_available_waits_for_all_required_readiness_facts() {
     let final_fact = facts.pop().expect("fixture has a final fact");
     for fact in facts {
         harness.observe(fact);
-        assert!(!harness.events().contains(&boot::LifecycleEvent::NodeAvailable {
-            node_id: boot::NodeId(10),
-        }));
+        assert!(
+            !harness
+                .events()
+                .contains(&boot::LifecycleEvent::NodeAvailable {
+                    node_id: boot::NodeId(10),
+                })
+        );
     }
 
     // Once the final required fact arrives, availability becomes observable.
@@ -160,15 +164,22 @@ fn boot_resource_failure_faults_without_node_availability() {
 
         // The emitted fault must carry the stable reason enum for operators and
         // tests; logs are not part of the contract.
-        assert!(harness.events().contains(&boot::LifecycleEvent::NodeFaulted {
-            node_id: boot::NodeId(10),
-            kind: expected_kind,
-        }));
+        assert!(
+            harness
+                .events()
+                .contains(&boot::LifecycleEvent::NodeFaulted {
+                    node_id: boot::NodeId(10),
+                    kind: expected_kind,
+                })
+        );
 
         // A faulted boot attempt must not also become available.
-        assert!(!harness.events().iter().any(|event| {
-            matches!(event, boot::LifecycleEvent::NodeAvailable { .. })
-        }));
+        assert!(
+            !harness
+                .events()
+                .iter()
+                .any(|event| { matches!(event, boot::LifecycleEvent::NodeAvailable { .. }) })
+        );
 
         // The orchestrator-facing eligibility check must agree with the
         // lifecycle transcript.
@@ -193,7 +204,10 @@ fn boot_never_self_assigns_run_topology() {
             boot::BootCommand::AdvertiseLifecycle { .. }
             | boot::BootCommand::JoinMembership { .. }
             | boot::BootCommand::OpenProvisioningInbox { .. } => {}
-            boot::BootCommand::AssignStage { .. }
+            boot::BootCommand::LoadWeights { .. }
+            | boot::BootCommand::ConfigureRole { .. }
+            | boot::BootCommand::EstablishEdge { .. }
+            | boot::BootCommand::AssignStage { .. }
             | boot::BootCommand::AssignLayerRange { .. }
             | boot::BootCommand::AssignEdge { .. }
             | boot::BootCommand::AssignObjectSpec { .. } => {

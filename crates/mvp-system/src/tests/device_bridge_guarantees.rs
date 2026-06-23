@@ -77,11 +77,17 @@ fn allocation_creates_current_generation_handle_or_typed_failure() {
 fn host_to_device_copies_exact_range_and_defers_release_until_safe() {
     // Allocate a device object and request an asynchronous copy.
     let (mut harness, handle) = allocated_bridge();
-    let copy = harness.host_to_device(
-        device::HostRange { offset: 4, len: 8 },
-        device::DeviceRange { handle, offset: 0, len: 8 },
-        device::CopyMode::Async,
-    ).expect("copy request must be accepted");
+    let copy = harness
+        .host_to_device(
+            device::HostRange { offset: 4, len: 8 },
+            device::DeviceRange {
+                handle,
+                offset: 0,
+                len: 8,
+            },
+            device::CopyMode::Async,
+        )
+        .expect("copy request must be accepted");
 
     // The backend sees the exact ranges.
     assert!(harness.backend_calls().iter().any(|call| {
@@ -89,7 +95,11 @@ fn host_to_device_copies_exact_range_and_defers_release_until_safe() {
             call,
             device::BackendCall::HostToDevice {
                 host: device::HostRange { offset: 4, len: 8 },
-                device: device::DeviceRange { offset: 0, len: 8, .. },
+                device: device::DeviceRange {
+                    offset: 0,
+                    len: 8,
+                    ..
+                },
                 ..
             }
         )
@@ -110,18 +120,28 @@ fn host_to_device_copies_exact_range_and_defers_release_until_safe() {
 fn device_to_host_copies_exact_range_and_defers_host_validity_until_safe() {
     // Allocate a device object and request an asynchronous device-to-host copy.
     let (mut harness, handle) = allocated_bridge();
-    let copy = harness.device_to_host(
-        device::DeviceRange { handle, offset: 0, len: 8 },
-        device::HostRange { offset: 12, len: 8 },
-        device::CopyMode::Async,
-    ).expect("copy request must be accepted");
+    let copy = harness
+        .device_to_host(
+            device::DeviceRange {
+                handle,
+                offset: 0,
+                len: 8,
+            },
+            device::HostRange { offset: 12, len: 8 },
+            device::CopyMode::Async,
+        )
+        .expect("copy request must be accepted");
 
     // The backend sees the exact ranges.
     assert!(harness.backend_calls().iter().any(|call| {
         matches!(
             call,
             device::BackendCall::DeviceToHost {
-                device: device::DeviceRange { offset: 0, len: 8, .. },
+                device: device::DeviceRange {
+                    offset: 0,
+                    len: 8,
+                    ..
+                },
                 host: device::HostRange { offset: 12, len: 8 },
                 ..
             }
@@ -176,11 +196,17 @@ fn lifetime_blocks_free_until_dependencies_clear_and_rejects_old_generation() {
         handle,
         step_id: device::StepId(77),
     });
-    let copy = harness.host_to_device(
-        device::HostRange { offset: 0, len: 8 },
-        device::DeviceRange { handle, offset: 0, len: 8 },
-        device::CopyMode::Async,
-    ).expect("copy request must be accepted");
+    let copy = harness
+        .host_to_device(
+            device::HostRange { offset: 0, len: 8 },
+            device::DeviceRange {
+                handle,
+                offset: 0,
+                len: 8,
+            },
+            device::CopyMode::Async,
+        )
+        .expect("copy request must be accepted");
 
     // Free is blocked while compute/copy depends on the allocation.
     assert_eq!(
@@ -195,9 +221,11 @@ fn lifetime_blocks_free_until_dependencies_clear_and_rejects_old_generation() {
     });
     harness.observe(device::DeviceEvent::CopyCompleted { copy });
     assert_eq!(harness.free_device(handle), Ok(()));
-    assert!(harness.backend_calls().iter().any(|call| {
-        matches!(call, device::BackendCall::Free { freed } if *freed == handle)
-    }));
+    assert!(
+        harness.backend_calls().iter().any(|call| {
+            matches!(call, device::BackendCall::Free { freed } if *freed == handle)
+        })
+    );
 
     // Restart invalidates prior handles.
     harness.observe(device::DeviceEvent::WorkerRestarted {
@@ -219,7 +247,11 @@ fn backend_copy_and_view_failures_are_typed() {
     let copy_failure = harness
         .host_to_device(
             device::HostRange { offset: 0, len: 8 },
-            device::DeviceRange { handle, offset: 0, len: 8 },
+            device::DeviceRange {
+                handle,
+                offset: 0,
+                len: 8,
+            },
             device::CopyMode::Sync,
         )
         .expect_err("copy failure must surface");

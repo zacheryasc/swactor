@@ -89,7 +89,10 @@ fn provisioning_creates_local_edge_records_without_remote_actor_addresses() {
     assert!(rx.local_record(edge::EdgeId(7001)).is_some());
 
     // Data-flow provisioning must not require remote actor addresses.
-    for record in [tx.local_record(edge::EdgeId(7001)).unwrap(), rx.local_record(edge::EdgeId(7001)).unwrap()] {
+    for record in [
+        tx.local_record(edge::EdgeId(7001)).unwrap(),
+        rx.local_record(edge::EdgeId(7001)).unwrap(),
+    ] {
         assert!(record.remote_actor_address.is_none());
     }
 }
@@ -109,9 +112,12 @@ fn lease_flow_matches_records_and_suppresses_stale_or_cancelled_leases() {
     });
 
     // Mismatched lease must not install worker or pump state.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::InstallWorkerRing { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::InstallWorkerRing { .. }) })
+    );
 
     // A matching rejection faults the record.
     harness.observe(edge::EdgeEvent::RingLeaseRejected {
@@ -164,9 +170,12 @@ fn worker_ring_install_precedes_driver_establishment_and_uses_provision_specs() 
     });
 
     // Before ring installation, no driver command may be issued.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::EstablishSend { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::EstablishSend { .. }) })
+    );
 
     // Matching ring installation advances establishment.
     harness.observe(edge::EdgeEvent::RingInstalled {
@@ -188,7 +197,13 @@ fn worker_ring_install_precedes_driver_establishment_and_uses_provision_specs() 
 
     // Now the driver may be established.
     assert!(harness.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::EstablishSend { edge_id: edge::EdgeId(7001), .. })
+        matches!(
+            command,
+            edge::EdgeCommand::EstablishSend {
+                edge_id: edge::EdgeId(7001),
+                ..
+            }
+        )
     }));
 }
 
@@ -212,9 +227,11 @@ fn driver_ready_marks_local_edge_actor_ready() {
     }));
 
     // The edge is not ready until DriverEdgeReady arrives.
-    assert!(!tx.events().iter().any(|event| {
-        matches!(event, edge::EdgeLifecycleEvent::EdgeReady { .. })
-    }));
+    assert!(
+        !tx.events()
+            .iter()
+            .any(|event| { matches!(event, edge::EdgeLifecycleEvent::EdgeReady { .. }) })
+    );
     tx.observe(edge::EdgeEvent::DriverEdgeReady {
         edge_id: edge::EdgeId(7001),
     });
@@ -230,9 +247,11 @@ fn driver_ready_marks_local_edge_actor_ready() {
 
     // After readiness, stream and pump behavior belongs to the driver; the
     // establisher should not emit hot-path byte commands.
-    assert!(!tx.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::CopyHotPathBytes { .. })
-    }));
+    assert!(
+        !tx.commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::CopyHotPathBytes { .. }) })
+    );
 }
 
 // This proves StopEdge cancels queued leases, stops pumps, uninstalls worker
@@ -251,20 +270,32 @@ fn stop_edge_tears_down_local_state_and_terminal_stopped_ignores_late_events() {
     });
 
     // Stop commands must cover queued lease, pump, and worker ring cleanup.
-    assert!(harness.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::CancelQueuedLease { .. })
-    }));
-    assert!(harness.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::StopPump { .. })
-    }));
-    assert!(harness.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::UninstallWorkerRing { .. })
-    }));
+    assert!(
+        harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::CancelQueuedLease { .. }) })
+    );
+    assert!(
+        harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::StopPump { .. }) })
+    );
+    assert!(
+        harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::UninstallWorkerRing { .. }) })
+    );
 
     // Arena release is withheld until quiescence proof arrives.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }) })
+    );
     harness.observe(edge::EdgeEvent::QuiescenceProven {
         ring_id: edge::RingId(8001),
     });

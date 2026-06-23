@@ -91,7 +91,10 @@ fn inventory_entries_are_known_before_planning_and_not_negotiated_by_nodes() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(after_nodes, before_nodes);
     assert!(!harness.commands().iter().any(|command| {
-        matches!(command, inventory::InventoryCommand::AcceptPlacementNegotiation { .. })
+        matches!(
+            command,
+            inventory::InventoryCommand::AcceptPlacementNegotiation { .. }
+        )
     }));
 }
 
@@ -224,7 +227,8 @@ fn planning_preserves_candidate_pool_and_emits_no_hidden_nodes() {
 #[test]
 fn provisioned_stages_do_not_reinterpret_inventory() {
     // Commit a plan and provision its stages.
-    let plan = inventory::plan_from_inventory(planning_request()).expect("valid inventory must plan");
+    let plan =
+        inventory::plan_from_inventory(planning_request()).expect("valid inventory must plan");
     let mut harness = inventory::InventoryHarness::new(inventory_entries());
     harness.commit_plan(plan.clone());
     harness.provision_stages();
@@ -238,7 +242,10 @@ fn provisioned_stages_do_not_reinterpret_inventory() {
 
     // No provisioned stage may be asked to reinterpret its assignment.
     assert!(!harness.commands().iter().any(|command| {
-        matches!(command, inventory::InventoryCommand::RewriteStagePlacement { .. })
+        matches!(
+            command,
+            inventory::InventoryCommand::RewriteStagePlacement { .. }
+        )
     }));
 
     // The committed plan remains the only graph-visible placement fact.
