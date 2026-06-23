@@ -26,7 +26,7 @@ use swactor::std::StdExtension;
 use distribution::swim::actor::{
     MembershipChanged, PeerDirectory, SharedPeerDirectory, SwimActor, SwimIn,
 };
-use distribution::swim::dissemination::{membership_update, DisseminationQueue};
+use distribution::swim::dissemination::{DisseminationQueue, membership_update};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::node::SwimNode;
 use distribution::swim::probe::{ProbeMode, SwimConfig};
@@ -77,12 +77,22 @@ impl Cluster {
         let mut inboxes = Vec::new();
         for &nid in &ids {
             let addr = rt
-                .spawn(SwimActor::new(nid, config.clone(), now, Arc::new(dir.clone())))
+                .spawn(SwimActor::new(
+                    nid,
+                    config.clone(),
+                    now,
+                    Arc::new(dir.clone()),
+                ))
                 .expect("spawn SwimActor");
             dir.bind(nid, addr, 0);
             let inbox = rt.new_inbox::<MembershipChanged>().expect("inbox");
-            rt.send_to(addr, SwimIn::Subscribe { observer: *inbox.addr() })
-                .unwrap();
+            rt.send_to(
+                addr,
+                SwimIn::Subscribe {
+                    observer: *inbox.addr(),
+                },
+            )
+            .unwrap();
             addrs.push(addr);
             inboxes.push(inbox);
         }
@@ -99,7 +109,8 @@ impl Cluster {
         let seed = c.ids[0];
         for i in 1..n {
             let addr = c.addrs[i];
-            c.rt.send_to(addr, SwimIn::Join { seeds: vec![seed] }).unwrap();
+            c.rt.send_to(addr, SwimIn::Join { seeds: vec![seed] })
+                .unwrap();
         }
         c.pump(8);
         c.drain();
@@ -190,7 +201,10 @@ fn a_silenced_node_that_returns_is_resurrected_dead_then_alive() {
     let detected = c.run_until(2000, |c| {
         (0..4).all(|o| o == victim || c.sees(o, vid, MemberState::Dead))
     });
-    assert!(detected, "survivors must first detect the silenced node as Dead");
+    assert!(
+        detected,
+        "survivors must first detect the silenced node as Dead"
+    );
 
     // The node returns: rebind at a higher generation, ticking resumes.
     c.dir.bind(vid, c.addrs[victim], 1);
@@ -213,7 +227,10 @@ fn a_single_observed_death_infects_a_non_probing_witness() {
     // on Dead, which is only reachable by multi-hop piggyback infection (§11),
     // not direct observation.
     let mut c = Cluster::new(5, reprobe_config());
-    assert!(c.run_until(400, |c| c.all_converged_alive()), "precondition: converge");
+    assert!(
+        c.run_until(400, |c| c.all_converged_alive()),
+        "precondition: converge"
+    );
 
     let victim = 4usize;
     let vid = id(victim as u8);

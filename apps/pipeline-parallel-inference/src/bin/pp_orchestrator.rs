@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use datastream::{DatastreamSink, DATASTREAM_SINK_NAME};
+use datastream::{DATASTREAM_SINK_NAME, DatastreamSink};
 use distribution::iroh_driver::IrohDriverConfig;
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
@@ -51,21 +51,21 @@ use swactor::runtime::{Inbox, RuntimeConfig};
 use pipeline_parallel_inference::cluster::ClusterNode;
 
 use dashboard::collector::StatsCollector;
-use dashboard::datastream_source::{fleet_cache_plugin, FleetView};
-use dashboard::{start_dashboard, DashboardConfig};
+use dashboard::datastream_source::{FleetView, fleet_cache_plugin};
+use dashboard::{DashboardConfig, start_dashboard};
 
 use pipeline_parallel_inference::dist_plugin::{DistDashPlugin, SharedSnapshot};
-use pipeline_parallel_inference::netmap_plugin::{spawn_conn_poller, ConnTracker, NetmapPlugin};
 use pipeline_parallel_inference::iroh_transport::{
-    ActorMessagePump, IrohActorTransport, ACTOR_ALPN,
+    ACTOR_ALPN, ActorMessagePump, IrohActorTransport,
 };
 use pipeline_parallel_inference::messages::{
-    inference_codec_registry, InferenceRequest, InferenceResponse,
+    InferenceRequest, InferenceResponse, inference_codec_registry,
 };
+use pipeline_parallel_inference::netmap_plugin::{ConnTracker, NetmapPlugin, spawn_conn_poller};
 use pipeline_parallel_inference::orchestrator::{
-    await_convergence, spawn_chain, ChainGuard, StageSpawnCtx,
+    ChainGuard, StageSpawnCtx, await_convergence, spawn_chain,
 };
-use pipeline_parallel_inference::topology::{stage_name, ENTRY_NAME};
+use pipeline_parallel_inference::topology::{ENTRY_NAME, stage_name};
 
 const ORCHESTRATOR_NAME: &str = "pp-orchestrator";
 
@@ -77,11 +77,10 @@ fn node_config() -> DistributedNodeConfig {
             indirect_probes: 2,
             // Periodically reprobe dead peers every ~2 s (old: 100 ticks).
             dead_reprobe_interval: Duration::from_secs(2),
-            // probe_timeout / suspicion_timeout inherit the calibrated
-            // SwimConfig::default() (15 s / 45 s; see
-            // crates/simulation/SWIM_RETUNE_REPORT.md). Do NOT re-pin them:
-            // the old 15 / 60 pin = 300 ms probe budget on a 200-405 ms
-            // relay path, the 1779733878 flap cause.
+            // probe_timeout / suspicion_timeout inherit SwimConfig::default()
+            // (15 s / 45 s). Do NOT re-pin them: the old 15 / 60 pin =
+            // 300 ms probe budget on a 200-405 ms relay path, the
+            // 1779733878 flap cause.
             ..SwimConfig::default()
         },
         cache_capacity: 100,
@@ -92,8 +91,12 @@ fn node_config() -> DistributedNodeConfig {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  pp-orchestrator --seed [--num-stages N] [--prompt <text>] [--max-tokens <n>] [--gpu-node <path>] [--worker <path>]");
-    eprintln!("  pp-orchestrator --vastai --api-key <key> [--num-stages N] [--gpu \"RTX 3060\"] [--image <name>] [--prompt <text>] [--max-tokens <n>]");
+    eprintln!(
+        "  pp-orchestrator --seed [--num-stages N] [--prompt <text>] [--max-tokens <n>] [--gpu-node <path>] [--worker <path>]"
+    );
+    eprintln!(
+        "  pp-orchestrator --vastai --api-key <key> [--num-stages N] [--gpu \"RTX 3060\"] [--image <name>] [--prompt <text>] [--max-tokens <n>]"
+    );
     eprintln!("Cluster lifecycle (--vastai):");
     eprintln!("  (default)   lease N, drive one run, destroy.");
     eprintln!("  --hold      lease N, drive, leave running; writes a cluster-handle file.");
@@ -466,7 +469,10 @@ fn run_seed(args: &Args) -> i32 {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(9090);
         let collector = StatsCollector::new(RuntimeConfig::default().num_threads);
-        let handle = start_dashboard(DashboardConfig { port, ..Default::default() });
+        let handle = start_dashboard(DashboardConfig {
+            port,
+            ..Default::default()
+        });
         Some((handle, collector, port))
     } else {
         None
@@ -651,8 +657,7 @@ fn run_seed(args: &Args) -> i32 {
                 }
                 let nm = stage_name(k);
                 if let Some((_, nid)) = cluster.resolve_name(&nm) {
-                    let hex: String =
-                        nid.0.iter().map(|b| format!("{:02x}", b)).collect();
+                    let hex: String = nid.0.iter().map(|b| format!("{:02x}", b)).collect();
                     roster_hex[k as usize] = Some(hex);
                 }
             }
@@ -679,20 +684,19 @@ fn run_seed(args: &Args) -> i32 {
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        let roster: Vec<pipeline_parallel_inference::orchestrator::StageRosterEntry> =
-            roster_hex
-                .into_iter()
-                .enumerate()
-                .map(|(k, hex)| {
-                    let hex = hex.unwrap();
-                    let short = hex.chars().take(8).collect::<String>();
-                    pipeline_parallel_inference::orchestrator::StageRosterEntry {
-                        stage_index: k as u32,
-                        node_id_hex: hex,
-                        node_id_short: short,
-                    }
-                })
-                .collect();
+        let roster: Vec<pipeline_parallel_inference::orchestrator::StageRosterEntry> = roster_hex
+            .into_iter()
+            .enumerate()
+            .map(|(k, hex)| {
+                let hex = hex.unwrap();
+                let short = hex.chars().take(8).collect::<String>();
+                pipeline_parallel_inference::orchestrator::StageRosterEntry {
+                    stage_index: k as u32,
+                    node_id_hex: hex,
+                    node_id_short: short,
+                }
+            })
+            .collect();
         let stage0_hex: String = stage0_node_id
             .0
             .iter()
@@ -856,11 +860,9 @@ enum AwaitError {
 impl std::fmt::Display for AwaitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            AwaitError::Timeout(d) => write!(
-                f,
-                "no InferenceResponse within {:.0}s",
-                d.as_secs_f32()
-            ),
+            AwaitError::Timeout(d) => {
+                write!(f, "no InferenceResponse within {:.0}s", d.as_secs_f32())
+            }
             AwaitError::EmptyResponse => write!(f, "received empty InferenceResponse"),
             AwaitError::SendFailed(s) => write!(f, "send_to failed: {s}"),
             AwaitError::ChildDied(s) => write!(f, "{s}"),
@@ -910,11 +912,7 @@ impl AwaitError {
 /// converged and — when the dashboard is on — refresh the distribution
 /// snapshot each tick so the membership graph and message tallies update live.
 /// Returns when the operator presses Enter or closes stdin (Ctrl-D).
-fn hold_open(
-    cluster: &mut ClusterNode,
-    dist_cached: Option<&SharedSnapshot>,
-    port: Option<u16>,
-) {
+fn hold_open(cluster: &mut ClusterNode, dist_cached: Option<&SharedSnapshot>, port: Option<u16>) {
     match port {
         Some(p) => eprintln!(
             "pp-orchestrator: holding cluster open — orchestrator dashboard at \
@@ -990,10 +988,7 @@ fn await_response(
         // SWIM does not declare self `dead`.
         let snap = cluster.snapshot();
         for m in snap.members.iter().filter(|m| m.state == "dead") {
-            if let Some(entry) = forward_path
-                .iter()
-                .find(|e| e.node_id_hex == m.node_id)
-            {
+            if let Some(entry) = forward_path.iter().find(|e| e.node_id_hex == m.node_id) {
                 // (Diagnostics emission removed: was a driver.emit(Event::Custom {...}).)
                 return Err(AwaitError::ForwardPathDead {
                     stage_index: entry.stage_index,
@@ -1382,7 +1377,9 @@ fn run_teardown(
             eprintln!("pp-orchestrator: destroy {id} failed: {e}");
         }
     }
-    match tokio_rt.block_on(vastai::list_instances_by_label(http, base_url, api_key, &st.label)) {
+    match tokio_rt.block_on(vastai::list_instances_by_label(
+        http, base_url, api_key, &st.label,
+    )) {
         Ok(remaining) if remaining.is_empty() => {
             eprintln!(
                 "pp-orchestrator: confirmed 0 instances under label {}",
@@ -1411,11 +1408,7 @@ fn run_teardown(
             eprintln!("pp-orchestrator: could not verify teardown via API: {e}");
         }
     }
-    if ok {
-        0
-    } else {
-        1
-    }
+    if ok { 0 } else { 1 }
 }
 
 fn run_vastai(args: &Args) -> i32 {
@@ -1455,7 +1448,10 @@ fn run_vastai(args: &Args) -> i32 {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(9090);
         let collector = StatsCollector::new(RuntimeConfig::default().num_threads);
-        let handle = start_dashboard(DashboardConfig { port, ..Default::default() });
+        let handle = start_dashboard(DashboardConfig {
+            port,
+            ..Default::default()
+        });
         Some((handle, collector, port))
     } else {
         None
@@ -1577,7 +1573,12 @@ fn run_vastai(args: &Args) -> i32 {
             Arc::clone(&conn_tracker),
         )));
         let poll_stop = Arc::new(AtomicBool::new(false));
-        spawn_conn_poller(&cluster_node.driver, Arc::clone(cached), conn_tracker, poll_stop);
+        spawn_conn_poller(
+            &cluster_node.driver,
+            Arc::clone(cached),
+            conn_tracker,
+            poll_stop,
+        );
         // Fleet tab: the orchestrator-hosted datastream consumer. Each rented
         // stage resolves the `datastream-sink` actor and ships its telemetry
         // over the swactor transport; the actor folds them into a live FleetView
@@ -1721,7 +1722,10 @@ fn run_vastai(args: &Args) -> i32 {
                 run_id: Some(cluster.run_id.clone()),
             };
             match st.save(&state_path) {
-                Ok(()) => eprintln!("pp-orchestrator: wrote cluster handle {}", state_path.display()),
+                Ok(()) => eprintln!(
+                    "pp-orchestrator: wrote cluster handle {}",
+                    state_path.display()
+                ),
                 Err(e) => eprintln!("pp-orchestrator: WARNING could not write cluster handle: {e}"),
             }
         }
@@ -1874,8 +1878,7 @@ fn run_vastai(args: &Args) -> i32 {
                 }
                 let nm = stage_name(k);
                 if let Some((_, nid)) = cluster_node.resolve_name(&nm) {
-                    let hex: String =
-                        nid.0.iter().map(|b| format!("{:02x}", b)).collect();
+                    let hex: String = nid.0.iter().map(|b| format!("{:02x}", b)).collect();
                     roster_hex[k as usize] = Some(hex);
                 }
             }
@@ -1898,20 +1901,19 @@ fn run_vastai(args: &Args) -> i32 {
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        let roster: Vec<pipeline_parallel_inference::orchestrator::StageRosterEntry> =
-            roster_hex
-                .into_iter()
-                .enumerate()
-                .map(|(k, hex)| {
-                    let hex = hex.unwrap();
-                    let short = hex.chars().take(8).collect::<String>();
-                    pipeline_parallel_inference::orchestrator::StageRosterEntry {
-                        stage_index: k as u32,
-                        node_id_hex: hex,
-                        node_id_short: short,
-                    }
-                })
-                .collect();
+        let roster: Vec<pipeline_parallel_inference::orchestrator::StageRosterEntry> = roster_hex
+            .into_iter()
+            .enumerate()
+            .map(|(k, hex)| {
+                let hex = hex.unwrap();
+                let short = hex.chars().take(8).collect::<String>();
+                pipeline_parallel_inference::orchestrator::StageRosterEntry {
+                    stage_index: k as u32,
+                    node_id_hex: hex,
+                    node_id_short: short,
+                }
+            })
+            .collect();
         let key = match PublicKey::from_bytes(&stage0_node_id.0) {
             Ok(k) => k,
             Err(e) => {
@@ -1991,19 +1993,21 @@ fn run_vastai(args: &Args) -> i32 {
     // iterated on; only the default one-shot tears down on exit.
     if is_held {
         eprintln!("pp-orchestrator: HOLDING cluster (label={label}, contracts={contract_ids:?})");
-        eprintln!("  destroy when done:   pp-orchestrator --vastai --api-key <k> --teardown --state {}", state_path.display());
+        eprintln!(
+            "  destroy when done:   pp-orchestrator --vastai --api-key <k> --teardown --state {}",
+            state_path.display()
+        );
         eprintln!("  inspect:             vastai show instances   (label {label})");
     } else {
         // Default one-shot: always destroy rented instances, even on failure.
         eprintln!("pp-orchestrator: destroying instances {contract_ids:?}");
-        let results = tokio_rt.block_on(
-            pipeline_parallel_inference::vastai::destroy_all_instances(
+        let results =
+            tokio_rt.block_on(pipeline_parallel_inference::vastai::destroy_all_instances(
                 &http,
                 base_url,
                 &api_key,
                 &contract_ids,
-            ),
-        );
+            ));
         for (id, r) in contract_ids.iter().zip(results.iter()) {
             if let Err(e) = r {
                 eprintln!("pp-orchestrator: destroy {id} failed: {e}");

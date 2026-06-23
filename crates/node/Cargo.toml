@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 swactor = { path = "../..", features = ["serde", "tracing", "transport"] }
 dashboard = { path = "../dashboard" }
-swactor-datastore = { path = "../datastore" }
 swactor-transport = { path = "../transport" }
 distribution = { path = "../distribution" }
 datastream = { path = "../datastream" }

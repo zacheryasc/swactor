@@ -1,13 +1,14 @@
 pub mod collector;
 pub mod command;
 pub mod history;
+mod html;
 pub mod investigate;
 pub mod layer;
 pub mod plugin;
-pub mod warnings;
-mod html;
 mod server;
+pub mod telemetry;
 pub mod topology;
+pub mod warnings;
 
 #[cfg(feature = "tui")]
 pub mod tui;
@@ -38,7 +39,7 @@ use swactor::stats::RuntimeStats;
 
 use crate::collector::StatsCollector;
 use crate::history::{DashboardHistory, HistoryConfig};
-use crate::layer::{now_ms, DashboardEvent, DashboardLayer, EventStore};
+use crate::layer::{DashboardEvent, DashboardLayer, EventStore, now_ms};
 use crate::plugin::PluginRegistry;
 
 // ─── Trace Types ────────────────────────────────────────────────────────────
@@ -237,9 +238,7 @@ impl DashboardHandle {
     /// This drains the recording buffers — each call consumes the buffered data.
     pub fn save_trace(&self, path: &str) -> io::Result<()> {
         let events = self.store.all_events().ok_or_else(|| {
-            io::Error::other(
-                "recording not enabled (set DashboardConfig::record = true)",
-            )
+            io::Error::other("recording not enabled (set DashboardConfig::record = true)")
         })?;
         let mut stats_timeline = Vec::new();
         while let Some(ts) = self.stats_timeline.pop() {
@@ -249,8 +248,7 @@ impl DashboardHandle {
             events,
             stats_timeline,
         };
-        let json = serde_json::to_string(&trace)
-            .map_err(|e| io::Error::other(e))?;
+        let json = serde_json::to_string(&trace).map_err(|e| io::Error::other(e))?;
         std::fs::write(path, json)
     }
 }
@@ -335,7 +333,11 @@ pub fn run_with_dashboard(
     dash.install_tracing();
     dash.start_http_standalone();
 
-    let num_workers = if rt_config.num_threads < 2 { 1 } else { rt_config.num_threads };
+    let num_workers = if rt_config.num_threads < 2 {
+        1
+    } else {
+        rt_config.num_threads
+    };
     let collector = StatsCollector::new(num_workers);
 
     let mut rt = Runtime::new(rt_config);
@@ -349,8 +351,8 @@ pub fn run_with_dashboard(
 /// Load a trace file and serve a replay dashboard. Blocks indefinitely.
 pub fn serve_replay(path: &str, config: ReplayConfig) -> io::Result<()> {
     let data = std::fs::read_to_string(path)?;
-    let trace: RuntimeTrace = serde_json::from_str(&data)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let trace: RuntimeTrace =
+        serde_json::from_str(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)

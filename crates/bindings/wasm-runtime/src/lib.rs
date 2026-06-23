@@ -4,7 +4,7 @@ use wasm_bindgen::prelude::*;
 
 use swactor::actor::{ActorAddress, ActorExited, ActorInterface};
 use swactor::runtime::{Ctx, Inbox, Runtime, RuntimeConfig};
-use swactor::std::{CtxGroups, CtxWatching, RuntimeNaming, RuntimeGroups, StdExtension};
+use swactor::std::{CtxGroups, CtxWatching, RuntimeGroups, RuntimeNaming, StdExtension};
 
 // ─── Core JS-facing types ───────────────────────────────────────────────────
 
@@ -215,12 +215,22 @@ impl WasmRuntime {
 
     /// Total messages processed across all workers.
     pub fn total_messages(&self) -> f64 {
-        self.rt.stats().workers.iter().map(|w| w.messages_processed).sum::<u64>() as f64
+        self.rt
+            .stats()
+            .workers
+            .iter()
+            .map(|w| w.messages_processed)
+            .sum::<u64>() as f64
     }
 
     /// Total panics across all workers.
     pub fn total_panics(&self) -> f64 {
-        self.rt.stats().workers.iter().map(|w| w.panics).sum::<u64>() as f64
+        self.rt
+            .stats()
+            .workers
+            .iter()
+            .map(|w| w.panics)
+            .sum::<u64>() as f64
     }
 }
 
@@ -337,7 +347,11 @@ pub fn spawn_relay(rt: &WasmRuntime, target: &WasmAddr) -> WasmAddr {
 /// Spawn a sentinel that watches a target actor and reports its death
 /// to the given string inbox.
 #[wasm_bindgen]
-pub fn spawn_sentinel(rt: &WasmRuntime, target: &WasmAddr, report_to: &WasmInboxString) -> WasmAddr {
+pub fn spawn_sentinel(
+    rt: &WasmRuntime,
+    target: &WasmAddr,
+    report_to: &WasmInboxString,
+) -> WasmAddr {
     let addr = rt
         .rt
         .spawn(Sentinel {

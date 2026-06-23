@@ -16,7 +16,7 @@ use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;
 
 use super::frame::{Frame, StreamId};
-use super::wire::{decode_delivery, DatastreamFrame};
+use super::wire::{DatastreamFrame, decode_delivery};
 
 /// Receives [`DatastreamFrame`] cluster messages and folds each decoded delivery
 /// through `on_frame`. Spawn it, then publish its address under

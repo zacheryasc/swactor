@@ -1,8 +1,8 @@
 use std::sync::{Arc, OnceLock};
 
+use swactor::Error;
 use swactor::actor::{ActorAddress, Ctx};
 use swactor::runtime::ExternalSender;
-use swactor::Error;
 
 use crate::actor::ProcessActor;
 use crate::local::LocalDriver;

@@ -130,7 +130,13 @@ impl ClusterRegistry {
     }
 
     /// Register a name → actor binding from the local node.
-    pub fn register(&mut self, name: String, actor_addr: ActorAddress, node_id: NodeId, cluster_size: usize) {
+    pub fn register(
+        &mut self,
+        name: String,
+        actor_addr: ActorAddress,
+        node_id: NodeId,
+        cluster_size: usize,
+    ) {
         self.clock += 1;
         let generation = self.next_generation(&name);
         let entry = RegistryEntry {
@@ -149,7 +155,8 @@ impl ClusterRegistry {
         self.clock += 1;
         let generation = self.next_generation(name);
         // Use the existing actor_addr if present, otherwise a zero address.
-        let actor_addr = self.entries
+        let actor_addr = self
+            .entries
             .get(name)
             .map(|e| e.actor_addr)
             .unwrap_or(ActorAddress([0; 32]));
@@ -179,9 +186,10 @@ impl ClusterRegistry {
     /// Merge a single remote entry. Returns true if state changed.
     pub fn merge(&mut self, remote: RegistryEntry) -> bool {
         if let Some(existing) = self.entries.get(&remote.name)
-            && !lww_wins(&remote, existing) {
-                return false;
-            }
+            && !lww_wins(&remote, existing)
+        {
+            return false;
+        }
 
         let changed = match self.entries.get(&remote.name) {
             Some(existing) => existing != &remote,
@@ -228,7 +236,8 @@ impl ClusterRegistry {
 
     /// Tombstone all entries owned by a dead node.
     pub fn tombstone_node(&mut self, dead_node_id: NodeId, cluster_size: usize) {
-        let owned: Vec<String> = self.entries
+        let owned: Vec<String> = self
+            .entries
             .iter()
             .filter(|(_, e)| e.node_id == dead_node_id && !e.tombstone)
             .map(|(name, _)| name.clone())
@@ -271,7 +280,8 @@ impl ClusterRegistry {
         let ttl = self.config.tombstone_ttl;
         let clock = self.clock;
         // Names still being disseminated — don't GC those.
-        let pending_names: std::collections::HashSet<String> = self.dissemination
+        let pending_names: std::collections::HashSet<String> = self
+            .dissemination
             .iter()
             .map(|e| e.entry.name.clone())
             .collect();
@@ -352,7 +362,11 @@ impl ClusterRegistry {
         let budget = self.transmit_budget(cluster_size);
 
         // Replace existing entry for same name if present.
-        if let Some(existing) = self.dissemination.iter_mut().find(|e| e.entry.name == entry.name) {
+        if let Some(existing) = self
+            .dissemination
+            .iter_mut()
+            .find(|e| e.entry.name == entry.name)
+        {
             existing.entry = entry;
             existing.remaining = budget;
             return;

@@ -59,14 +59,20 @@ pub enum Signal {
 /// Errors produced by the process session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessError {
-    SpawnFailed { reason: String },
-    ConnectionLost { reason: String },
-    InvalidState { attempted: &'static str, current_state: &'static str },
+    SpawnFailed {
+        reason: String,
+    },
+    ConnectionLost {
+        reason: String,
+    },
+    InvalidState {
+        attempted: &'static str,
+        current_state: &'static str,
+    },
 }
 
 /// Passive tracking of stdin backpressure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FlowControl {
     pub pending_stdin_bytes: usize,
 }
@@ -165,4 +171,3 @@ impl Default for EventQueue {
         Self::new()
     }
 }
-

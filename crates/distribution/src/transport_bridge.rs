@@ -20,9 +20,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
 
+use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor_transport::{Transport, TransportRouter, WireEnvelope};
-use swactor::Error;
 
 use crate::swim::actor::PeerDirectory;
 use crate::types::NodeId;
@@ -199,7 +199,11 @@ pub struct IrohRouteBinder {
 
 impl IrohRouteBinder {
     pub fn new(router: Arc<TransportRouter>, transport: Arc<RouteViewTransport>) -> Self {
-        Self { router, transport, bound: Mutex::new(HashSet::new()) }
+        Self {
+            router,
+            transport,
+            bound: Mutex::new(HashSet::new()),
+        }
     }
 }
 

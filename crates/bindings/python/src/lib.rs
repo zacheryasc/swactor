@@ -4,7 +4,9 @@ use std::cell::RefCell;
 use pyo3::prelude::*;
 use pyo3::types::PyModule;
 
-use ::swactor::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest};
+use ::swactor::actor::{
+    Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest,
+};
 use ::swactor::config::RuntimeConfig;
 use ::swactor::runtime::{Inbox, Runtime, RuntimeHandle};
 
@@ -52,11 +54,7 @@ pub struct PyActorAddress {
 #[pymethods]
 impl PyActorAddress {
     fn hex(&self) -> String {
-        self.inner
-            .0
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        self.inner.0.iter().map(|b| format!("{b:02x}")).collect()
     }
 
     fn to_bytes(&self) -> Vec<u8> {
@@ -134,10 +132,9 @@ impl PyCtx {
 
     fn spawn(&self, handler: PyObject) -> PyActorAddress {
         let addr = ActorAddress::new_random();
-        self.effects.borrow_mut().push(Effect::Spawn {
-            addr,
-            handler,
-        });
+        self.effects
+            .borrow_mut()
+            .push(Effect::Spawn { addr, handler });
         PyActorAddress::from(addr)
     }
 }
@@ -163,8 +160,7 @@ impl ActorInterface for PyActor {
 
         let call_result = Python::with_gil(|py| {
             let ctx_bound = Bound::new(py, py_ctx)?;
-            self.handler
-                .call1(py, (&ctx_bound, msg.into_inner()))?;
+            self.handler.call1(py, (&ctx_bound, msg.into_inner()))?;
             let ctx_ref = ctx_bound.borrow();
             Ok::<Vec<Effect>, PyErr>(ctx_ref.take_effects())
         });
@@ -174,10 +170,9 @@ impl ActorInterface for PyActor {
                 for effect in effects {
                     match effect {
                         Effect::Send { addr, msg } => {
-                            let _ = ctx.raw_inner().send_any(
-                                addr,
-                                Box::new(PyMsg(msg)) as Box<dyn Any + Send>,
-                            );
+                            let _ = ctx
+                                .raw_inner()
+                                .send_any(addr, Box::new(PyMsg(msg)) as Box<dyn Any + Send>);
                         }
                         Effect::Spawn { addr, handler } => {
                             let actor = PyActor::new(handler);
@@ -242,11 +237,7 @@ impl PyRuntimeConfig {
         max_actors = 1_000,
         channel_buffer_size = 1_000,
     ))]
-    fn new(
-        num_threads: usize,
-        max_actors: usize,
-        channel_buffer_size: usize,
-    ) -> Self {
+    fn new(num_threads: usize, max_actors: usize, channel_buffer_size: usize) -> Self {
         Self {
             num_threads,
             max_actors,
@@ -288,46 +279,41 @@ impl PyRuntime {
     }
 
     fn spawn(&self, handler: PyObject) -> PyResult<PyActorAddress> {
-        let rt = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        let rt = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+        })?;
         let actor = PyActor::new(handler);
         let addr = rt.spawn(actor).map_err(to_py_err)?;
         Ok(PyActorAddress::from(addr))
     }
 
     fn send(&self, addr: &PyActorAddress, msg: PyObject) -> PyResult<()> {
-        let rt = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        let rt = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+        })?;
         rt.send_to(addr.inner, PyMsg(msg)).map_err(to_py_err)
     }
 
     fn inbox(&self) -> PyResult<PyInbox> {
-        let rt = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        let rt = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+        })?;
         let inbox: Inbox<PyMsg> = rt.new_inbox().map_err(to_py_err)?;
         Ok(PyInbox { inner: inbox })
     }
 
     fn tick(&self) -> PyResult<()> {
-        let rt = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        let rt = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+        })?;
         rt.tick();
         Ok(())
     }
 
     fn run(&mut self, py: Python<'_>) -> PyResult<PyRuntimeHandle> {
-        let rt = self
-            .inner
-            .take()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        let rt = self.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+        })?;
         let handle = py.allow_threads(|| rt.run().map_err(to_py_err))?;
         Ok(PyRuntimeHandle {
             inner: Some(handle),
@@ -335,18 +321,16 @@ impl PyRuntime {
     }
 
     fn stats(&self) -> PyResult<PyRuntimeStats> {
-        let rt = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        let rt = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+        })?;
         Ok(build_stats(rt))
     }
 
     fn shutdown(&self) -> PyResult<()> {
-        let rt = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()"))?;
+        let rt = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+        })?;
         rt.shutdown();
         Ok(())
     }
@@ -362,24 +346,18 @@ pub struct PyRuntimeHandle {
 #[pymethods]
 impl PyRuntimeHandle {
     fn spawn(&self, handler: PyObject) -> PyResult<PyActorAddress> {
-        let handle = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-            })?;
+        let handle = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
+        })?;
         let actor = PyActor::new(handler);
         let addr = handle.runtime.spawn(actor).map_err(to_py_err)?;
         Ok(PyActorAddress::from(addr))
     }
 
     fn send(&self, addr: &PyActorAddress, msg: PyObject) -> PyResult<()> {
-        let handle = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-            })?;
+        let handle = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
+        })?;
         handle
             .runtime
             .send_to(addr.inner, PyMsg(msg))
@@ -387,44 +365,32 @@ impl PyRuntimeHandle {
     }
 
     fn inbox(&self) -> PyResult<PyInbox> {
-        let handle = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-            })?;
+        let handle = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
+        })?;
         let inbox: Inbox<PyMsg> = handle.runtime.new_inbox().map_err(to_py_err)?;
         Ok(PyInbox { inner: inbox })
     }
 
     fn stats(&self) -> PyResult<PyRuntimeStats> {
-        let handle = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-            })?;
+        let handle = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
+        })?;
         Ok(build_stats(&handle.runtime))
     }
 
     fn shutdown(&self) -> PyResult<()> {
-        let handle = self
-            .inner
-            .as_ref()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-            })?;
+        let handle = self.inner.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
+        })?;
         handle.shutdown();
         Ok(())
     }
 
     fn join(&mut self, py: Python<'_>) -> PyResult<()> {
-        let handle = self
-            .inner
-            .take()
-            .ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-            })?;
+        let handle = self.inner.take().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
+        })?;
         py.allow_threads(|| handle.join());
         Ok(())
     }

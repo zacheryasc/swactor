@@ -50,16 +50,11 @@ fn two_nodes_form_cluster_via_join() {
     let b_addr = node_b.endpoint_addr();
     node_a.join(&[b_addr]);
 
-    let converged = pump_until_pair(
-        &mut node_a,
-        &mut node_b,
-        Duration::from_secs(5),
-        |a, b| {
-            let a_key = PublicKey::from_bytes(&a.node_id().0).unwrap();
-            let b_key = PublicKey::from_bytes(&b.node_id().0).unwrap();
-            sees_alive(a, &b_key) && sees_alive(b, &a_key)
-        },
-    );
+    let converged = pump_until_pair(&mut node_a, &mut node_b, Duration::from_secs(5), |a, b| {
+        let a_key = PublicKey::from_bytes(&a.node_id().0).unwrap();
+        let b_key = PublicKey::from_bytes(&b.node_id().0).unwrap();
+        sees_alive(a, &b_key) && sees_alive(b, &a_key)
+    });
 
     assert!(converged, "nodes did not converge within timeout");
     assert_eq!(node_a.alive_count(), 1, "node_a should see 1 alive peer");
@@ -80,18 +75,16 @@ fn two_nodes_form_cluster_via_mutual_join() {
     node_a.join(&[b_addr]);
     node_b.join(&[a_addr]);
 
-    let converged = pump_until_pair(
-        &mut node_a,
-        &mut node_b,
-        Duration::from_secs(5),
-        |a, b| {
-            let a_key = PublicKey::from_bytes(&a.node_id().0).unwrap();
-            let b_key = PublicKey::from_bytes(&b.node_id().0).unwrap();
-            sees_alive(a, &b_key) && sees_alive(b, &a_key)
-        },
-    );
+    let converged = pump_until_pair(&mut node_a, &mut node_b, Duration::from_secs(5), |a, b| {
+        let a_key = PublicKey::from_bytes(&a.node_id().0).unwrap();
+        let b_key = PublicKey::from_bytes(&b.node_id().0).unwrap();
+        sees_alive(a, &b_key) && sees_alive(b, &a_key)
+    });
 
-    assert!(converged, "nodes did not converge within timeout (mutual join)");
+    assert!(
+        converged,
+        "nodes did not converge within timeout (mutual join)"
+    );
     assert_eq!(node_a.alive_count(), 1);
     assert_eq!(node_b.alive_count(), 1);
 
@@ -117,18 +110,16 @@ fn two_nodes_form_cluster_with_peer_auth() {
 
     node_a.join(&[b_addr]);
 
-    let converged = pump_until_pair(
-        &mut node_a,
-        &mut node_b,
-        Duration::from_secs(5),
-        |a, b| {
-            let a_key = PublicKey::from_bytes(&a.node_id().0).unwrap();
-            let b_key = PublicKey::from_bytes(&b.node_id().0).unwrap();
-            sees_alive(a, &b_key) && sees_alive(b, &a_key)
-        },
-    );
+    let converged = pump_until_pair(&mut node_a, &mut node_b, Duration::from_secs(5), |a, b| {
+        let a_key = PublicKey::from_bytes(&a.node_id().0).unwrap();
+        let b_key = PublicKey::from_bytes(&b.node_id().0).unwrap();
+        sees_alive(a, &b_key) && sees_alive(b, &a_key)
+    });
 
-    assert!(converged, "nodes with peer auth did not converge within timeout");
+    assert!(
+        converged,
+        "nodes with peer auth did not converge within timeout"
+    );
     assert_eq!(node_a.alive_count(), 1);
     assert_eq!(node_b.alive_count(), 1);
 
@@ -149,12 +140,9 @@ fn peer_auth_prevents_unauthorized_join() {
     let b_addr = node_b.endpoint_addr();
     node_a.join(&[b_addr]);
 
-    let converged = pump_until_pair(
-        &mut node_a,
-        &mut node_b,
-        Duration::from_secs(3),
-        |_a, b| b.alive_count() > 0,
-    );
+    let converged = pump_until_pair(&mut node_a, &mut node_b, Duration::from_secs(3), |_a, b| {
+        b.alive_count() > 0
+    });
 
     assert!(!converged, "unauthorized peer should NOT have joined");
     assert_eq!(node_b.alive_count(), 0, "node_b should have no alive peers");

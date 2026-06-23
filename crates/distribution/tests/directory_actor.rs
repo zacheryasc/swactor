@@ -16,17 +16,17 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
+use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
 use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
-use swactor::Error;
 
 use distribution::crypto::{Keypair, KeypairExt};
 use distribution::directory_actor::{DirectoryActor, DirectoryIn, Located};
 use distribution::messages::actor_codec_registry;
 use distribution::swim::actor::{MembershipChanged, SharedPeerDirectory};
-use distribution::transport_bridge::{peer_addr, NoopRouteBinder, RouteView};
+use distribution::transport_bridge::{NoopRouteBinder, RouteView, peer_addr};
 use distribution::types::{DirectoryEntry, MemberState, NodeId};
 
 const DIRECTORY_TAG: &str = "swactor_dist::DirectoryGossip";
@@ -100,7 +100,13 @@ impl DirectoryCluster {
                 ))
                 .expect("spawn DirectoryActor");
 
-            nodes.push(Node { rt, directory, dir, router, route_view });
+            nodes.push(Node {
+                rt,
+                directory,
+                dir,
+                router,
+                route_view,
+            });
         }
 
         // Mesh: bind every peer's NodeId to its synthetic address, route that
@@ -116,7 +122,12 @@ impl DirectoryCluster {
             }
         }
 
-        let c = DirectoryCluster { nodes, keys, ids, frames };
+        let c = DirectoryCluster {
+            nodes,
+            keys,
+            ids,
+            frames,
+        };
         c.pump(4); // settle membership
         c
     }
@@ -150,7 +161,11 @@ impl DirectoryCluster {
         node.rt
             .send_to(
                 node.directory,
-                DirectoryIn::Membership(MembershipChanged { node_id: who, state, incarnation }),
+                DirectoryIn::Membership(MembershipChanged {
+                    node_id: who,
+                    state,
+                    incarnation,
+                }),
             )
             .unwrap();
     }
@@ -201,7 +216,12 @@ impl DirectoryCluster {
     /// The host `observer` currently routes `actor` to, read straight from its
     /// published `RouteView` (the load-bearing observable).
     fn host_in_view(&self, observer: usize, actor: ActorAddress) -> Option<NodeId> {
-        self.nodes[observer].route_view.read().unwrap().get(&actor).copied()
+        self.nodes[observer]
+            .route_view
+            .read()
+            .unwrap()
+            .get(&actor)
+            .copied()
     }
 
     /// The host `observer` resolves `actor` to via the diagnostic `Resolve` reply
@@ -212,7 +232,10 @@ impl DirectoryCluster {
             .rt
             .send_to(
                 self.nodes[observer].directory,
-                DirectoryIn::Resolve { actor, reply: *inbox.addr() },
+                DirectoryIn::Resolve {
+                    actor,
+                    reply: *inbox.addr(),
+                },
             )
             .unwrap();
         self.nodes[observer].rt.tick();
@@ -238,7 +261,10 @@ fn a_claim_converges_to_every_peer() {
     let converged = c.run_until(200, |c| {
         (0..c.ids.len()).all(|o| c.host_in_view(o, actor) == Some(c.ids[0]))
     });
-    assert!(converged, "claim did not converge to every peer's RouteView");
+    assert!(
+        converged,
+        "claim did not converge to every peer's RouteView"
+    );
 
     // The diagnostic Resolve reply agrees with the route view.
     assert_eq!(c.resolve(2, actor), Some(c.ids[0]));
@@ -251,7 +277,8 @@ fn a_higher_generation_supersedes_a_move() {
     let actor = an_actor();
     c.register(0, c.claim(0, actor, 1));
     assert!(
-        c.run_until(200, |c| (0..3).all(|o| c.host_in_view(o, actor) == Some(c.ids[0]))),
+        c.run_until(200, |c| (0..3)
+            .all(|o| c.host_in_view(o, actor) == Some(c.ids[0]))),
         "precondition: claim must first converge to node 0"
     );
 
@@ -260,7 +287,10 @@ fn a_higher_generation_supersedes_a_move() {
     let moved = c.run_until(200, |c| {
         (0..c.ids.len()).all(|o| c.host_in_view(o, actor) == Some(c.ids[1]))
     });
-    assert!(moved, "the higher-generation move did not supersede everywhere");
+    assert!(
+        moved,
+        "the higher-generation move did not supersede everywhere"
+    );
 }
 
 #[test]
@@ -279,12 +309,18 @@ fn merge_is_order_and_duplication_immune() {
 
     // Node 0 merges in one order; node 1 in another, with a duplicate.
     feed_gossip(&c.nodes[0], vec![c1.clone(), c2.clone(), c3.clone()]);
-    feed_gossip(&c.nodes[1], vec![c3.clone(), c1.clone(), c2.clone(), c3.clone()]);
+    feed_gossip(
+        &c.nodes[1],
+        vec![c3.clone(), c1.clone(), c2.clone(), c3.clone()],
+    );
     c.pump(4);
 
     let view0 = c.nodes[0].route_view.read().unwrap().clone();
     let view1 = c.nodes[1].route_view.read().unwrap().clone();
-    assert_eq!(view0, view1, "merge order / duplication changed the converged view");
+    assert_eq!(
+        view0, view1,
+        "merge order / duplication changed the converged view"
+    );
     // And it is the expected map, not merely equal-but-empty.
     assert_eq!(view0.get(&a1), Some(&c.ids[0]));
     assert_eq!(view0.get(&a2), Some(&c.ids[1]));
@@ -299,7 +335,8 @@ fn a_settled_cluster_goes_quiet() {
     let actor = an_actor();
     c.register(0, c.claim(0, actor, 1));
     assert!(
-        c.run_until(200, |c| (0..3).all(|o| c.host_in_view(o, actor) == Some(c.ids[0]))),
+        c.run_until(200, |c| (0..3)
+            .all(|o| c.host_in_view(o, actor) == Some(c.ids[0]))),
         "precondition: must converge before measuring quiescence"
     );
 
@@ -311,7 +348,11 @@ fn a_settled_cluster_goes_quiet() {
     for _ in 0..20 {
         c.round();
     }
-    assert_eq!(c.frames(), settled, "a settled cluster kept emitting directory gossip");
+    assert_eq!(
+        c.frames(),
+        settled,
+        "a settled cluster kept emitting directory gossip"
+    );
 }
 
 #[test]
@@ -347,7 +388,10 @@ fn a_rejoining_peer_is_caught_up() {
     DirectoryCluster::announce(&c.nodes[0], MemberState::Alive, c.ids[2], 3);
     DirectoryCluster::announce(&c.nodes[1], MemberState::Alive, c.ids[2], 3);
     let caught_up = c.run_until(200, |c| c.host_in_view(2, late) == Some(c.ids[0]));
-    assert!(caught_up, "a rejoining peer was not caught up on missed claims");
+    assert!(
+        caught_up,
+        "a rejoining peer was not caught up on missed claims"
+    );
 }
 
 #[test]
@@ -358,7 +402,8 @@ fn a_dead_host_drops_out_of_routing() {
     let actor = an_actor();
     c.register(0, c.claim(0, actor, 1));
     assert!(
-        c.run_until(200, |c| (1..3).all(|o| c.host_in_view(o, actor) == Some(c.ids[0]))),
+        c.run_until(200, |c| (1..3)
+            .all(|o| c.host_in_view(o, actor) == Some(c.ids[0]))),
         "precondition: peers must first route the actor to its host"
     );
 
@@ -367,8 +412,16 @@ fn a_dead_host_drops_out_of_routing() {
     DirectoryCluster::announce(&c.nodes[2], MemberState::Dead, c.ids[0], 2);
     c.pump(4);
 
-    assert_eq!(c.host_in_view(1, actor), None, "a dead host must drop out of routing");
-    assert_eq!(c.host_in_view(2, actor), None, "a dead host must drop out of routing");
+    assert_eq!(
+        c.host_in_view(1, actor),
+        None,
+        "a dead host must drop out of routing"
+    );
+    assert_eq!(
+        c.host_in_view(2, actor),
+        None,
+        "a dead host must drop out of routing"
+    );
 }
 
 #[test]
@@ -384,17 +437,26 @@ fn an_empty_cluster_loses_nothing() {
     c.register(0, c.claim(0, actor, 1));
     let before = c.frames();
     for _ in 0..20 {
-        let _ = c.nodes[0].rt.send_to(c.nodes[0].directory, DirectoryIn::Tick);
+        let _ = c.nodes[0]
+            .rt
+            .send_to(c.nodes[0].directory, DirectoryIn::Tick);
         c.pump(2);
     }
-    assert_eq!(c.frames(), before, "a node with no alive peer must emit nothing");
+    assert_eq!(
+        c.frames(),
+        before,
+        "a node with no alive peer must emit nothing"
+    );
     // The claim survived locally (node 0 still routes its own actor).
     assert_eq!(c.host_in_view(0, actor), Some(c.ids[0]));
 
     // A peer appears; the held claim converges to it.
     DirectoryCluster::announce(&c.nodes[0], MemberState::Alive, c.ids[1], 6);
     let converged = c.run_until(200, |c| c.host_in_view(1, actor) == Some(c.ids[0]));
-    assert!(converged, "the held claim did not converge once a peer appeared");
+    assert!(
+        converged,
+        "the held claim did not converge once a peer appeared"
+    );
 }
 
 #[test]
@@ -415,8 +477,9 @@ fn a_forged_claim_is_rejected() {
     feed_gossip(&c.nodes[1], vec![forged]);
     c.register(0, c.claim(0, honest_actor, 1));
 
-    let honest_converged =
-        c.run_until(200, |c| (0..3).all(|o| c.host_in_view(o, honest_actor) == Some(c.ids[0])));
+    let honest_converged = c.run_until(200, |c| {
+        (0..3).all(|o| c.host_in_view(o, honest_actor) == Some(c.ids[0]))
+    });
     assert!(honest_converged, "the genuine claim should still converge");
 
     // The forged claim is nowhere — no node ever routed it.
@@ -450,7 +513,11 @@ fn gc_reclaims_a_long_dead_hosts_claims() {
     for _ in 0..5 {
         c.round(); // a few gc ticks, well under GC_GRACE_TICKS
     }
-    assert_eq!(c.host_in_view(1, actor), None, "a dead host is hidden from routing");
+    assert_eq!(
+        c.host_in_view(1, actor),
+        None,
+        "a dead host is hidden from routing"
+    );
     DirectoryCluster::announce(&c.nodes[1], MemberState::Alive, c.ids[0], 3);
     c.pump(4);
     assert_eq!(
@@ -473,7 +540,11 @@ fn gc_reclaims_a_long_dead_hosts_claims() {
         None,
         "a host gone past the GC grace window is reclaimed, not resurrected on return"
     );
-    assert_eq!(c.resolve(1, actor), None, "the reclaimed claim is gone from the map too");
+    assert_eq!(
+        c.resolve(1, actor),
+        None,
+        "the reclaimed claim is gone from the map too"
+    );
 }
 
 #[test]
@@ -487,7 +558,11 @@ fn equal_generation_ties_break_deterministically() {
     let from_2 = c.claim(2, actor, 5); // host = ids[2]
     let from_3 = c.claim(3, actor, 5); // host = ids[3], SAME generation
     // The deterministic winner is the larger node_id.
-    let winner = if c.ids[2] > c.ids[3] { c.ids[2] } else { c.ids[3] };
+    let winner = if c.ids[2] > c.ids[3] {
+        c.ids[2]
+    } else {
+        c.ids[3]
+    };
 
     // Two observers merge the rival claims in opposite orders.
     feed_gossip(&c.nodes[0], vec![from_2.clone(), from_3.clone()]);
@@ -508,6 +583,9 @@ fn equal_generation_ties_break_deterministically() {
 fn feed_gossip(node: &Node, claims: Vec<DirectoryEntry>) {
     use distribution::messages::DirectoryGossip;
     node.rt
-        .send_to(node.directory, DirectoryIn::Gossip(DirectoryGossip { claims }))
+        .send_to(
+            node.directory,
+            DirectoryIn::Gossip(DirectoryGossip { claims }),
+        )
         .unwrap();
 }

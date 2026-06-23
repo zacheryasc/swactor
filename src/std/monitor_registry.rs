@@ -1,6 +1,6 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::actor::{ActorAddress, MonitorRef};
 use crate::{AddrBuildHasher, AddrMap};
@@ -35,7 +35,9 @@ impl MonitorRegistry {
     pub fn register(&self, watcher: ActorAddress, target: ActorAddress) -> MonitorRef {
         let id = self.next_ref.fetch_add(1, Ordering::Relaxed);
         let mref = MonitorRef::from_raw(id);
-        self.monitors.write().unwrap()
+        self.monitors
+            .write()
+            .unwrap()
             .entry(target)
             .or_default()
             .push((mref, watcher));
@@ -58,7 +60,12 @@ impl MonitorRegistry {
 
     /// Remove and return all monitors for a dead actor.
     pub fn take_monitors(&self, target: &ActorAddress) -> Vec<(MonitorRef, ActorAddress)> {
-        let watchers = self.monitors.write().unwrap().remove(target).unwrap_or_default();
+        let watchers = self
+            .monitors
+            .write()
+            .unwrap()
+            .remove(target)
+            .unwrap_or_default();
         let mut ref_map = self.ref_to_target.write().unwrap();
         for (mref, _) in &watchers {
             ref_map.remove(mref);

@@ -62,7 +62,10 @@ pub enum DirectoryIn {
     /// Local diagnostic read (`DIRECTORY.md` §5): resolve `actor`'s host from the
     /// converged map; the answer is sent to `reply`. Off the hot path — the
     /// load-bearing read is the [`RouteView`], read directly by the egress.
-    Resolve { actor: ActorAddress, reply: ActorAddress },
+    Resolve {
+        actor: ActorAddress,
+        reply: ActorAddress,
+    },
     /// Clock: disseminate one batch to one peer, then run GC.
     Tick,
 }

@@ -1,19 +1,21 @@
+use crate::Instant;
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use crate::Instant;
 
-use crate::actor::{ActorAddress, AnyActor, ContextInner, Ctx, Environment, ExitValue, ResumeSignal, SpawnRequest, StopReason, StopSignal, StopWithSignal, SystemInfo};
+use crate::Error;
+use crate::actor::{
+    ActorAddress, AnyActor, ContextInner, Ctx, Environment, ExitValue, ResumeSignal, SpawnRequest,
+    StopReason, StopSignal, StopWithSignal, SystemInfo,
+};
 use crate::channel::Receiver;
 use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
 use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
-use crate::Error;
 
 use crate::extension::WorkerExtension;
-
 
 // Extracted pure functions for use in kani to prove guarantees
 
@@ -107,16 +109,27 @@ impl Worker {
         let mut spawn_count: usize = 0;
         while let Some(mut req) = self.spawn_rx.try_recv() {
             if let Some(ext) = tc.extension {
-                req.env = ext.on_spawn(req.addr, req.parent, req.env, tc.created_at.elapsed().as_millis() as u64);
+                req.env = ext.on_spawn(
+                    req.addr,
+                    req.parent,
+                    req.env,
+                    tc.created_at.elapsed().as_millis() as u64,
+                );
             }
             self.pool.insert(req);
             #[cfg(feature = "tracing")]
-            { spawn_count += 1; }
+            {
+                spawn_count += 1;
+            }
             did_work = true;
         }
         #[cfg(feature = "tracing")]
         if spawn_count > 0 {
-            tracing::debug!(worker_id = self.id.0, count = spawn_count, "worker.spawns_drained");
+            tracing::debug!(
+                worker_id = self.id.0,
+                count = spawn_count,
+                "worker.spawns_drained"
+            );
         }
         did_work
     }
@@ -158,7 +171,9 @@ impl Worker {
                 }
             }
 
-            self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
+            self.stats
+                .num_actors
+                .store(self.pool.len(), Ordering::Relaxed);
         }
 
         // Deliver any messages sent during on_stop callbacks
@@ -184,7 +199,10 @@ impl Worker {
         if !self.has_backlog
             && self.spawn_rx.is_empty()
             && self.transfer_rx.is_empty()
-            && !self.worker_ext.as_ref().map_or(false, |e| e.has_pending_work())
+            && !self
+                .worker_ext
+                .as_ref()
+                .map_or(false, |e| e.has_pending_work())
         {
             return false;
         }
@@ -206,7 +224,9 @@ impl Worker {
         let t2 = Instant::now();
 
         // 2.5. Fire per-worker extension (e.g., timers) → deliver before tick_all
-        let ext_msgs: Vec<_> = self.worker_ext.as_mut()
+        let ext_msgs: Vec<_> = self
+            .worker_ext
+            .as_mut()
             .map(|ext| ext.on_tick())
             .unwrap_or_default();
         for (dest, msg) in ext_msgs {
@@ -234,7 +254,14 @@ impl Worker {
                 worker_requests: &worker_requests,
                 stats: &self.stats,
             };
-            processed = self.pool.tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget, &stop_requests, &stop_with_values, &suspend_requests);
+            processed = self.pool.tick_all(
+                &worker_ctx,
+                &self.stats,
+                tc.config.actor_message_budget,
+                &stop_requests,
+                &stop_with_values,
+                &suspend_requests,
+            );
             if processed > 0 {
                 did_work = true;
             }
@@ -275,9 +302,15 @@ impl Worker {
 
         // 6. Publish stats (skip entirely when idle to avoid allocation + mutex)
         if did_work {
-            self.stats.num_actors.store(self.pool.len(), Ordering::Relaxed);
-            self.stats.total_mailbox_depth.store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
-            self.stats.messages_processed.fetch_add(processed as u64, Ordering::Relaxed);
+            self.stats
+                .num_actors
+                .store(self.pool.len(), Ordering::Relaxed);
+            self.stats
+                .total_mailbox_depth
+                .store(self.pool.total_mailbox_depth(), Ordering::Relaxed);
+            self.stats
+                .messages_processed
+                .fetch_add(processed as u64, Ordering::Relaxed);
 
             if let Some(hook) = tc.stats_hook {
                 self.pool.mailbox_depths_into(&mut self.snapshot_buf);
@@ -373,8 +406,7 @@ impl ContextInner for WorkerContext<'_> {
     fn spawn_any(&self, request: SpawnRequest) {
         let worker_id = self.tc.placement.next_worker();
         self.tc.address_map.insert(request.addr, worker_id);
-        self.tc.spawn_txs[worker_id.as_usize()]
-            .send(request);
+        self.tc.spawn_txs[worker_id.as_usize()].send(request);
         crate::runtime::notify_worker(self.tc.worker_threads, worker_id.as_usize());
     }
 
@@ -393,7 +425,9 @@ impl ContextInner for WorkerContext<'_> {
     fn request_resume(&self, addr: ActorAddress) {
         // Same-worker: buffer as pending_local ResumeSignal
         // Cross-worker: would go through transfer queue (handled by Runtime impl)
-        self.pending_local.borrow_mut().push((addr, Box::new(ResumeSignal)));
+        self.pending_local
+            .borrow_mut()
+            .push((addr, Box::new(ResumeSignal)));
     }
 
     fn post_worker_request(&self, request: Box<dyn Any + Send>) {
@@ -412,7 +446,10 @@ impl ContextInner for WorkerContext<'_> {
 
     fn system_info(&self) -> SystemInfo {
         let num_workers = self.tc.config.num_threads.max(1);
-        let total_actors: usize = self.tc.worker_stats.iter()
+        let total_actors: usize = self
+            .tc
+            .worker_stats
+            .iter()
             .map(|ws| ws.num_actors.load(Ordering::Relaxed))
             .sum();
         SystemInfo {
@@ -459,20 +496,23 @@ impl ActorPool {
     }
 
     pub fn insert(&mut self, req: SpawnRequest) {
-        self.actors.insert(req.addr, ActorSlot {
-            mailbox: VecDeque::with_capacity(16),
-            actor: req.actor,
-            poisoned: false,
-            stopping: false,
-            started: false,
-            suspended: false,
-            last_msg_type: None,
-            messages_processed: 0,
-            msg_type_counts: HashMap::new(),
-            parent_addr: req.parent,
-            env: req.env,
-            exit_value: None,
-        });
+        self.actors.insert(
+            req.addr,
+            ActorSlot {
+                mailbox: VecDeque::with_capacity(16),
+                actor: req.actor,
+                poisoned: false,
+                stopping: false,
+                started: false,
+                suspended: false,
+                last_msg_type: None,
+                messages_processed: 0,
+                msg_type_counts: HashMap::new(),
+                parent_addr: req.parent,
+                env: req.env,
+                exit_value: None,
+            },
+        );
     }
 
     /// Deliver a type-erased message to the actor at `addr`.
@@ -545,7 +585,15 @@ impl ActorPool {
                 slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
             snap_type_counts.sort_by(|a, b| b.1.cmp(&a.1));
 
-            let ctx = Ctx::new(inner, addr, slot.parent_addr, slot.env.clone(), snap_processed, snap_depth, snap_type_counts);
+            let ctx = Ctx::new(
+                inner,
+                addr,
+                slot.parent_addr,
+                slot.env.clone(),
+                snap_processed,
+                snap_depth,
+                snap_type_counts,
+            );
 
             // Call on_start once, before first message
             if !slot.started {
@@ -635,7 +683,9 @@ impl ActorPool {
                     Err(_) => {
                         stats.panics.fetch_add(1, Ordering::Relaxed);
                         slot.mailbox.clear();
-                        eprintln!("swactor: actor {addr} panicked — poisoned, future messages will be discarded");
+                        eprintln!(
+                            "swactor: actor {addr} panicked — poisoned, future messages will be discarded"
+                        );
                         #[cfg(feature = "tracing")]
                         tracing::error!(actor_addr = %addr, "actor.panicked");
                         slot.poisoned = true;
@@ -646,7 +696,9 @@ impl ActorPool {
                         slot.last_msg_type = Some(type_name);
                         slot.messages_processed += 1;
                         // Track per-type counts (bounded to 32 distinct types)
-                        if slot.msg_type_counts.len() < 32 || slot.msg_type_counts.contains_key(type_name) {
+                        if slot.msg_type_counts.len() < 32
+                            || slot.msg_type_counts.contains_key(type_name)
+                        {
                             *slot.msg_type_counts.entry(type_name).or_insert(0) += 1;
                         }
                     }
@@ -713,7 +765,10 @@ impl ActorPool {
     ///
     /// For stopping actors: calls `on_stop()` before removal (wrapped in catch_unwind).
     /// For poisoned actors: `on_stop()` is NOT called (state may be corrupt).
-    pub fn cleanup_dead(&mut self, inner: &dyn ContextInner) -> Vec<(ActorAddress, StopReason, Option<ExitValue>)> {
+    pub fn cleanup_dead(
+        &mut self,
+        inner: &dyn ContextInner,
+    ) -> Vec<(ActorAddress, StopReason, Option<ExitValue>)> {
         let dead_addrs: Vec<ActorAddress> = self
             .actors
             .iter()
@@ -734,7 +789,10 @@ impl ActorPool {
                         slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
                     type_counts.sort_by(|a, b| b.1.cmp(&a.1));
                     let ctx = Ctx::new(
-                        inner, addr, slot.parent_addr, slot.env.clone(),
+                        inner,
+                        addr,
+                        slot.parent_addr,
+                        slot.env.clone(),
                         slot.messages_processed,
                         slot.mailbox.len(),
                         type_counts,

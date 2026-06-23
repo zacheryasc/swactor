@@ -20,23 +20,25 @@
 //! [`NODE_TTL`]); a node that stops streaming drops out of every view, so a
 //! restarted/departed node leaves no ghost in the graph or the fleet table.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use datastream::catalog::{
-    self, ActorRuntimeDetail, DatastoreState, DatastreamHealth, DistributionState, IdentityRecord,
-    MembershipTransition, Record, ResourceSample, RuntimeStats as DsRuntimeStats,
-    TransportInternals, WorkerCounters,
-};
+use datastream::Record;
 use datastream::frame::{Frame, StreamId};
+use datastream::health::{DATASTREAM_HEALTH, DatastreamHealth};
+use distribution::telemetry::{
+    DIST_STATE, DistributionState, MEMBERSHIP, MembershipTransition, TRANSPORT_INTERNALS,
+    TransportInternals,
+};
+
+use crate::telemetry::{
+    ActorRec, ActorRuntimeDetail, HOST_RESOURCE, IDENTITY, IdentityRecord, RUNTIME_ACTORS,
+    RUNTIME_STATS, RUNTIME_WORKERS, ResourceSample, RuntimeStats as DsRuntimeStats, WorkerCounters,
+};
 
 use swactor::actor::ActorAddress;
 use swactor::stats::{ActorInfo, RuntimeStats, TickTiming, WorkerInfo};
-
-/// How many recent datastore operation events to retain per node for the
-/// reconstructed timeline (the streaming successor of the old fixed event ring).
-const DATASTORE_EVENT_CAP: usize = 200;
 
 use crate::plugin::{DashboardPlugin, PluginResponse};
 
@@ -56,16 +58,12 @@ struct DatastreamModel {
     transport: Option<TransportInternals>,
     /// Consolidated distribution-subsystem state (cache/registry/directory/...).
     dist_state: Option<DistributionState>,
-    /// Datastore steady metrics.
-    datastore_state: Option<DatastoreState>,
     /// Per-actor runtime detail (the real actor table).
     actor_detail: Option<ActorRuntimeDetail>,
     /// Aggregated worker-runtime counters (routing/error tallies + tick timing).
     worker_counters: Option<WorkerCounters>,
     /// Datastream self-health (mux assigned/dropped + loss rate).
     datastream_health: Option<DatastreamHealth>,
-    /// Recent datastore op events (newest last), capped at [`DATASTORE_EVENT_CAP`].
-    datastore_events: VecDeque<serde_json::Value>,
     /// peer node-id → latest liveness state.
     membership: HashMap<String, String>,
     /// peer node-id → cause of its most recent liveness transition (the SWIM
@@ -95,65 +93,47 @@ impl DatastreamModel {
         let mut events = Vec::new();
 
         match channel {
-            catalog::IDENTITY => {
+            IDENTITY => {
                 if let Ok(r) = IdentityRecord::decode(payload) {
                     self.identity = Some(r);
                 }
             }
-            catalog::HOST_RESOURCE => {
+            HOST_RESOURCE => {
                 if let Ok(r) = ResourceSample::decode(payload) {
                     self.resource = Some(r);
                 }
             }
-            catalog::RUNTIME_STATS => {
+            RUNTIME_STATS => {
                 if let Ok(r) = DsRuntimeStats::decode(payload) {
                     self.runtime = Some(r);
                 }
             }
-            catalog::TRANSPORT_INTERNALS => {
+            TRANSPORT_INTERNALS => {
                 if let Ok(r) = TransportInternals::decode(payload) {
                     self.transport = Some(r);
                 }
             }
-            catalog::DIST_STATE => {
+            DIST_STATE => {
                 if let Ok(r) = DistributionState::decode(payload) {
                     self.dist_state = Some(r);
                 }
             }
-            catalog::DATASTORE_STATE => {
-                if let Ok(r) = DatastoreState::decode(payload) {
-                    self.datastore_state = Some(r);
-                }
-            }
-            catalog::RUNTIME_ACTORS => {
+            RUNTIME_ACTORS => {
                 if let Ok(r) = ActorRuntimeDetail::decode(payload) {
                     self.actor_detail = Some(r);
                 }
             }
-            catalog::RUNTIME_WORKERS => {
+            RUNTIME_WORKERS => {
                 if let Ok(r) = WorkerCounters::decode(payload) {
                     self.worker_counters = Some(r);
                 }
             }
-            catalog::DATASTREAM_HEALTH => {
+            DATASTREAM_HEALTH => {
                 if let Ok(r) = DatastreamHealth::decode(payload) {
                     self.datastream_health = Some(r);
                 }
             }
-            // Datastore op events: structured text lines, tailed into a capped
-            // ring so the datastore page can show a recent-operations timeline.
-            catalog::DATASTORE_EVENTS => {
-                if let Ok(v) = serde_json::from_slice::<serde_json::Value>(payload) {
-                    let kind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("?");
-                    let hash = v.get("hash").and_then(|x| x.as_str()).unwrap_or("");
-                    events.push(LogEvent::Info(format!("datastore {kind} {}", short_id(hash))));
-                    if self.datastore_events.len() >= DATASTORE_EVENT_CAP {
-                        self.datastore_events.pop_front();
-                    }
-                    self.datastore_events.push_back(v);
-                }
-            }
-            catalog::MEMBERSHIP => {
+            MEMBERSHIP => {
                 if let Ok(t) = MembershipTransition::decode(payload) {
                     // Display the short id; key the membership map by the full
                     // id so the views can resolve it to a friendly label. Carry
@@ -163,11 +143,18 @@ impl DatastreamModel {
                     let line = if t.reason.is_empty() {
                         format!("{}: {} → {}", short_id(&t.peer), t.from, t.to)
                     } else {
-                        format!("{}: {} → {} ({})", short_id(&t.peer), t.from, t.to, t.reason)
+                        format!(
+                            "{}: {} → {} ({})",
+                            short_id(&t.peer),
+                            t.from,
+                            t.to,
+                            t.reason
+                        )
                     };
                     self.membership.insert(t.peer.clone(), t.to.clone());
                     if !t.reason.is_empty() {
-                        self.membership_reason.insert(t.peer.clone(), t.reason.clone());
+                        self.membership_reason
+                            .insert(t.peer.clone(), t.reason.clone());
                     }
                     self.last_transition = Some(line.clone());
                     events.push(LogEvent::Info(format!("membership {line}")));
@@ -415,7 +402,9 @@ impl DatastreamModel {
             .map(|d| {
                 d.cache_entries
                     .iter()
-                    .map(|e| serde_json::json!({ "actor_addr": e.actor_addr, "node_id": e.node_id }))
+                    .map(
+                        |e| serde_json::json!({ "actor_addr": e.actor_addr, "node_id": e.node_id }),
+                    )
                     .collect()
             })
             .unwrap_or_default();
@@ -474,43 +463,6 @@ impl DatastreamModel {
             "version": id.map(|i| i.version.clone()).filter(nonempty),
             "join_statuses": Vec::<serde_json::Value>::new(),
         })
-    }
-
-    /// Reconstruct the datastore snapshot JSON (the inner object the datastore
-    /// page renders) from the `datastore.state` record and the recent-events
-    /// ring. `None` until a datastore-state frame has been folded for this node.
-    fn datastore_json(&self, node_id: &str) -> Option<serde_json::Value> {
-        let ds = self.datastore_state.as_ref()?;
-        let objects: Vec<serde_json::Value> = ds
-            .objects
-            .iter()
-            .map(|o| {
-                serde_json::json!({ "hash": o.hash, "name": o.name, "size_bytes": o.size_bytes })
-            })
-            .collect();
-        let active_transfers: Vec<serde_json::Value> = ds
-            .active_transfers
-            .iter()
-            .map(|t| {
-                serde_json::json!({
-                    "hash": t.hash,
-                    "chunks_received": t.chunks_received,
-                    "chunks_total": t.chunks_total,
-                })
-            })
-            .collect();
-        let recent_events: Vec<serde_json::Value> = self.datastore_events.iter().cloned().collect();
-        Some(serde_json::json!({
-            "node_id": node_id,
-            "object_count": ds.object_count,
-            "total_bytes": ds.total_bytes,
-            "put_ops": ds.put_ops,
-            "get_ops": ds.get_ops,
-            "delete_ops": ds.delete_ops,
-            "objects": objects,
-            "recent_events": recent_events,
-            "active_transfers": active_transfers,
-        }))
     }
 
     /// A compact per-node summary row for the fleet table.
@@ -603,7 +555,10 @@ impl DatastreamModel {
 
 /// `node-id → "region · short-id"` for every demuxed node.
 fn build_labels(models: &HashMap<String, DatastreamModel>) -> HashMap<String, String> {
-    models.iter().map(|(id, m)| (id.clone(), m.label(id))).collect()
+    models
+        .iter()
+        .map(|(id, m)| (id.clone(), m.label(id)))
+        .collect()
 }
 
 /// The set of node ids currently live (streamed within [`NODE_TTL`]).
@@ -634,8 +589,7 @@ fn fleet_json(
             .cmp(&(b["region"].as_str(), b["short"].as_str()))
     });
     // Whole fleet converged once every node has converged and there's >1 node.
-    let converged =
-        node_count > 1 && nodes.iter().all(|n| n["converged"].as_bool() == Some(true));
+    let converged = node_count > 1 && nodes.iter().all(|n| n["converged"].as_bool() == Some(true));
 
     serde_json::json!({
         "node_count": node_count,
@@ -653,9 +607,6 @@ pub struct FleetUpdate {
     pub fleet_json: String,
     /// The selected node's Distribution snapshot JSON, if a node is selected.
     pub dist_json: Option<String>,
-    /// The selected node's datastore snapshot JSON (the inner object the
-    /// datastore page renders), if a node is selected and ships datastore state.
-    pub datastore_json: Option<String>,
     /// Synthesized single-node stats, present only when this frame was for the
     /// selected node. A UDP demo pushes it via `set_stats`; an orchestrator with
     /// its own live runtime ignores it.
@@ -755,17 +706,10 @@ impl FleetView {
                 .get(sel)
                 .and_then(|m| serde_json::to_string(&m.dist_snapshot(sel, &labels, &live)).ok())
         });
-        let datastore_json = self.selected.as_deref().and_then(|sel| {
-            self.models
-                .get(sel)
-                .and_then(|m| m.datastore_json(sel))
-                .and_then(|v| serde_json::to_string(&v).ok())
-        });
 
         FleetUpdate {
             fleet_json,
             dist_json,
-            datastore_json,
             stats,
             logs,
         }
@@ -813,9 +757,13 @@ impl DashboardPlugin for CachePlugin {
         _body: &[u8],
     ) -> PluginResponse {
         match (method, path) {
-            ("GET", "" | "model" | "snapshot") => {
-                PluginResponse::json(self.cache.lock().unwrap().clone().unwrap_or_else(|| "{}".into()))
-            }
+            ("GET", "" | "model" | "snapshot") => PluginResponse::json(
+                self.cache
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "{}".into()),
+            ),
             // The Distribution page has Re-peer / dismiss buttons; in this
             // read-only datastream view they are inert (acknowledged, no-op).
             ("POST", "rejoin" | "clear_status") => PluginResponse::json(r#"{"ok":true}"#.into()),
@@ -869,8 +817,8 @@ fn addr_from(name: &str) -> ActorAddress {
     ActorAddress(bytes)
 }
 
-/// Map a wire [`ActorRec`](catalog::ActorRec) into a dashboard [`ActorInfo`] row.
-fn real_actor_row(a: &catalog::ActorRec) -> ActorInfo {
+/// Map a wire [`ActorRec`] into a dashboard [`ActorInfo`] row.
+fn real_actor_row(a: &ActorRec) -> ActorInfo {
     ActorInfo {
         address: parse_addr_hex(&a.address).unwrap_or_else(|| addr_from(&a.name)),
         worker_id: 0,
@@ -910,7 +858,6 @@ fn parse_proc_channel(channel: &str) -> Option<(&str, bool)> {
 fn short_id(id: &str) -> String {
     id[..id.len().min(8)].to_string()
 }
-
 
 /// Cross-node **Fleet** table, served in the dashboard's own chrome (the same
 /// header / nav bar / palette as the Overview and Distribution pages, so it is a
@@ -974,7 +921,6 @@ const FLEET_HTML: &str = r#"<!doctype html>
       <a href="/" class="nav-link">Overview</a>
       <a href="/actors" class="nav-link">Actors</a>
       <a href="/plugin/distribution" class="nav-link">Distribution</a>
-      <a href="/plugin/datastore" class="nav-link">Datastore</a>
       <a href="/plugin/vastai" class="nav-link active">Fleet</a>
     </nav>
   </div>

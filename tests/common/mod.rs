@@ -2,13 +2,13 @@
 
 #![allow(dead_code, unused_imports)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use swactor::actor::{
-    ActorAddress, ActorExited, ActorInterface, CapabilitySet, Down, Environment, EnvironmentBuilder,
-    ExitReason, ExitValue, LogicalName, MonitorRef, ServiceBinding, SpawnBuilder, SpawnTimestamp,
-    StopReason,
+    ActorAddress, ActorExited, ActorInterface, CapabilitySet, Down, Environment,
+    EnvironmentBuilder, ExitReason, ExitValue, LogicalName, MonitorRef, ServiceBinding,
+    SpawnBuilder, SpawnTimestamp, StopReason,
 };
 pub use swactor::runtime::{Ctx, Inbox, Runtime, RuntimeConfig};
 pub use swactor::std::{
@@ -118,7 +118,13 @@ impl ActorInterface for DelegatorActor {
     type Response = ();
     fn handle(&mut self, ctx: &Ctx, msg: Forward) {
         let child = ctx.spawn(DoubleActor).unwrap();
-        let _ = ctx.send(child, Forward { value: msg.value, reply_to: msg.reply_to });
+        let _ = ctx.send(
+            child,
+            Forward {
+                value: msg.value,
+                reply_to: msg.reply_to,
+            },
+        );
     }
 }
 
@@ -155,7 +161,13 @@ impl ActorInterface for FanOutActor {
     fn handle(&mut self, ctx: &Ctx, msg: FanOut) {
         for i in 1..=msg.count {
             let child = ctx.spawn(DoubleActor).unwrap();
-            let _ = ctx.send(child, Forward { value: i, reply_to: msg.reply_to });
+            let _ = ctx.send(
+                child,
+                Forward {
+                    value: i,
+                    reply_to: msg.reply_to,
+                },
+            );
         }
     }
 }

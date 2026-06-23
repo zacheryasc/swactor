@@ -7,8 +7,8 @@
 mod common;
 use common::*;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Local actors ────────────────────────────────────────────────────────────
 
@@ -96,7 +96,13 @@ impl ActorInterface for SpawnThenPanicActor {
     type Response = ();
     fn handle(&mut self, ctx: &Ctx, msg: Forward) {
         let child = ctx.spawn(DoubleActor).unwrap();
-        let _ = ctx.send(child, Forward { value: msg.value, reply_to: msg.reply_to });
+        let _ = ctx.send(
+            child,
+            Forward {
+                value: msg.value,
+                reply_to: msg.reply_to,
+            },
+        );
         panic!("intentional panic after spawn+send");
     }
 }
@@ -200,7 +206,11 @@ fn new_exit_watcher() -> (ExitWatcher, WatcherState) {
         last_reason: last_reason.clone(),
     };
     (
-        ExitWatcher { exit_count, last_reason, last_addr },
+        ExitWatcher {
+            exit_count,
+            last_reason,
+            last_addr,
+        },
         state,
     )
 }
@@ -269,32 +279,49 @@ fn actor_from_birth_to_first_message() {
     let inbox = rt.new_inbox::<Pong>().unwrap();
 
     // Spawn one tracked actor + 4 more sharing the same counters
-    let addr = rt.spawn(LifecycleActor {
-        started: started.clone(),
-        stopped: stopped.clone(),
-        handled: handled.clone(),
-    }).unwrap();
+    let addr = rt
+        .spawn(LifecycleActor {
+            started: started.clone(),
+            stopped: stopped.clone(),
+            handled: handled.clone(),
+        })
+        .unwrap();
     for _ in 0..4 {
         rt.spawn(LifecycleActor {
             started: started.clone(),
             stopped: stopped.clone(),
             handled: handled.clone(),
-        }).unwrap();
+        })
+        .unwrap();
     }
 
     // First tick: all 5 on_start fire, no messages processed yet
     rt.tick();
     assert_eq!(started.load(Ordering::Relaxed), 5, "on_start per instance");
-    assert_eq!(handled.load(Ordering::Relaxed), 0, "no messages before first send");
+    assert_eq!(
+        handled.load(Ordering::Relaxed),
+        0,
+        "no messages before first send"
+    );
 
     // Send 3 Increments to a CounterActor to verify state accumulation
     let counter_addr = rt.spawn(CounterActor { count: 0 }).unwrap();
     let count_inbox = rt.new_inbox::<Count>().unwrap();
     for _ in 0..3 {
-        rt.send_to(counter_addr, Increment { reply_to: *count_inbox.addr() }).unwrap();
+        rt.send_to(
+            counter_addr,
+            Increment {
+                reply_to: *count_inbox.addr(),
+            },
+        )
+        .unwrap();
     }
     let replies = tick_and_drain(&rt, &count_inbox, 10);
-    assert_eq!(replies, vec![Count(1), Count(2), Count(3)], "state accumulates");
+    assert_eq!(
+        replies,
+        vec![Count(1), Count(2), Count(3)],
+        "state accumulates"
+    );
 
     // on_start must not fire again on subsequent ticks
     rt.tick();
@@ -302,7 +329,13 @@ fn actor_from_birth_to_first_message() {
     assert_eq!(started.load(Ordering::Relaxed), 5, "on_start not repeated");
 
     // Verify the first actor still responds normally
-    rt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        addr,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     let reply = tick_until_recv(&rt, &inbox, 10);
     assert!(reply.is_some(), "actor handles messages after on_start");
 }
@@ -319,19 +352,41 @@ fn parent_child_delegation_and_spawn_chains() {
     // Act 1: DelegatorActor spawns child, forwards value 7 → Done(14)
     let delegator = rt.spawn(DelegatorActor).unwrap();
     let inbox = rt.new_inbox::<Done>().unwrap();
-    rt.send_to(delegator, Forward { value: 7, reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        delegator,
+        Forward {
+            value: 7,
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     let reply = tick_until_recv(&rt, &inbox, 20);
     assert_eq!(reply, Some(Done(14)), "delegator child doubles value");
 
     // Act 2: Chain of depth 20
     let chain = rt.spawn(ChainActor).unwrap();
-    rt.send_to(chain, ChainMsg { remaining: 20, depth: 0, reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        chain,
+        ChainMsg {
+            remaining: 20,
+            depth: 0,
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     let reply = tick_until_recv(&rt, &inbox, 200);
     assert_eq!(reply, Some(Done(20)), "chain reaches depth 20");
 
     // Act 3: Fan-out to 20 children
     let fan = rt.spawn(FanOutActor).unwrap();
-    rt.send_to(fan, FanOut { count: 20, reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        fan,
+        FanOut {
+            count: 20,
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     let replies = tick_and_drain(&rt, &inbox, 50);
     assert_eq!(replies.len(), 20, "all 20 fan-out children reply");
 }
@@ -345,14 +400,22 @@ fn graceful_stop_lifecycle() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Done>().unwrap();
 
-    let addr = rt.spawn(SelfStopActor {
-        count: 0,
-        stop_after: 3,
-        stopped: stopped.clone(),
-    }).unwrap();
+    let addr = rt
+        .spawn(SelfStopActor {
+            count: 0,
+            stop_after: 3,
+            stopped: stopped.clone(),
+        })
+        .unwrap();
 
     for i in 0..5 {
-        let _ = rt.send_to(addr, Forward { value: i, reply_to: *inbox.addr() });
+        let _ = rt.send_to(
+            addr,
+            Forward {
+                value: i,
+                reply_to: *inbox.addr(),
+            },
+        );
     }
     tick_n(&rt, 10);
 
@@ -360,54 +423,101 @@ fn graceful_stop_lifecycle() {
     while let Some(Done(v)) = inbox.try_recv() {
         replies.push(v);
     }
-    assert_eq!(replies.len(), 3, "only 3 messages processed before self-stop");
+    assert_eq!(
+        replies.len(),
+        3,
+        "only 3 messages processed before self-stop"
+    );
     assert_eq!(stopped.load(Ordering::Relaxed), 1, "on_stop fired");
-    assert!(rt.send_to(addr, Forward { value: 99, reply_to: *inbox.addr() }).is_err(),
-        "send to stopped actor fails");
+    assert!(
+        rt.send_to(
+            addr,
+            Forward {
+                value: 99,
+                reply_to: *inbox.addr()
+            }
+        )
+        .is_err(),
+        "send to stopped actor fails"
+    );
 
     // --- Part B: FarewellActor sends farewell in on_stop ---
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    let addr = rt.spawn(FarewellActor { farewell_to: *inbox.addr() }).unwrap();
+    let addr = rt
+        .spawn(FarewellActor {
+            farewell_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
     rt.stop_actor(addr).unwrap();
     tick_n(&rt, 5);
-    assert_eq!(inbox.try_recv(), Some(Pong), "farewell message delivered from on_stop");
+    assert_eq!(
+        inbox.try_recv(),
+        Some(Pong),
+        "farewell message delivered from on_stop"
+    );
 
     // --- Part C: External stop after pending messages ---
     let stopped = Arc::new(AtomicUsize::new(0));
     let handled = Arc::new(AtomicUsize::new(0));
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    let addr = rt.spawn(LifecycleActor {
-        started: Arc::new(AtomicUsize::new(0)),
-        stopped: stopped.clone(),
-        handled: handled.clone(),
-    }).unwrap();
+    let addr = rt
+        .spawn(LifecycleActor {
+            started: Arc::new(AtomicUsize::new(0)),
+            stopped: stopped.clone(),
+            handled: handled.clone(),
+        })
+        .unwrap();
     for _ in 0..10 {
-        let _ = rt.send_to(addr, Ping { reply_to: *inbox.addr() });
+        let _ = rt.send_to(
+            addr,
+            Ping {
+                reply_to: *inbox.addr(),
+            },
+        );
     }
     rt.stop_actor(addr).unwrap();
     tick_n(&rt, 10);
-    assert_eq!(handled.load(Ordering::Relaxed), 10, "all pending messages processed before stop");
-    assert_eq!(stopped.load(Ordering::Relaxed), 1, "on_stop fires after messages");
+    assert_eq!(
+        handled.load(Ordering::Relaxed),
+        10,
+        "all pending messages processed before stop"
+    );
+    assert_eq!(
+        stopped.load(Ordering::Relaxed),
+        1,
+        "on_stop fires after messages"
+    );
 
     // --- Part D: External stop before messages → 0 processed ---
     let handled = Arc::new(AtomicUsize::new(0));
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    let addr = rt.spawn(LifecycleActor {
-        started: Arc::new(AtomicUsize::new(0)),
-        stopped: Arc::new(AtomicUsize::new(0)),
-        handled: handled.clone(),
-    }).unwrap();
+    let addr = rt
+        .spawn(LifecycleActor {
+            started: Arc::new(AtomicUsize::new(0)),
+            stopped: Arc::new(AtomicUsize::new(0)),
+            handled: handled.clone(),
+        })
+        .unwrap();
     rt.tick(); // on_start
     rt.stop_actor(addr).unwrap();
     for _ in 0..5 {
-        let _ = rt.send_to(addr, Ping { reply_to: *inbox.addr() });
+        let _ = rt.send_to(
+            addr,
+            Ping {
+                reply_to: *inbox.addr(),
+            },
+        );
     }
     tick_n(&rt, 10);
-    assert_eq!(handled.load(Ordering::Relaxed), 0, "stop before messages prevents processing");
+    assert_eq!(
+        handled.load(Ordering::Relaxed),
+        0,
+        "stop before messages prevents processing"
+    );
 
     // --- Part E: Mid-mailbox stop trigger ---
     let processed = Arc::new(AtomicUsize::new(0));
@@ -420,8 +530,11 @@ fn graceful_stop_lifecycle() {
     rt.send_to(addr, Trigger(false)).unwrap();
     rt.send_to(addr, Trigger(false)).unwrap();
     tick_n(&rt, 5);
-    assert_eq!(processed.load(Ordering::Relaxed), 3,
-        "only messages up to and including stop trigger processed");
+    assert_eq!(
+        processed.load(Ordering::Relaxed),
+        3,
+        "only messages up to and including stop trigger processed"
+    );
     assert!(rt.send_to(addr, Trigger(false)).is_err());
 }
 
@@ -439,44 +552,101 @@ fn panic_isolation_and_cleanup() {
     let good = rt.spawn(CounterActor { count: 0 }).unwrap();
     let bad = rt.spawn(PanicActor).unwrap();
     let bad_start_handled = Arc::new(AtomicUsize::new(0));
-    let bad_start = rt.spawn(PanicOnStartActor { handled: bad_start_handled.clone() }).unwrap();
+    let bad_start = rt
+        .spawn(PanicOnStartActor {
+            handled: bad_start_handled.clone(),
+        })
+        .unwrap();
 
     // Trigger panics
     rt.send_to(bad, PanicMsg).unwrap();
-    let _ = rt.send_to(bad_start, Ping { reply_to: *inbox.addr() });
+    let _ = rt.send_to(
+        bad_start,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    );
     tick_n(&rt, 10);
 
     // Healthy actor still works
-    rt.send_to(good, Increment { reply_to: *count_inbox.addr() }).unwrap();
-    rt.send_to(good, Increment { reply_to: *count_inbox.addr() }).unwrap();
+    rt.send_to(
+        good,
+        Increment {
+            reply_to: *count_inbox.addr(),
+        },
+    )
+    .unwrap();
+    rt.send_to(
+        good,
+        Increment {
+            reply_to: *count_inbox.addr(),
+        },
+    )
+    .unwrap();
     let replies = tick_and_drain(&rt, &count_inbox, 10);
-    assert_eq!(replies, vec![Count(1), Count(2)], "healthy actor unaffected by peer panics");
+    assert_eq!(
+        replies,
+        vec![Count(1), Count(2)],
+        "healthy actor unaffected by peer panics"
+    );
 
     // Poisoned actors are cleaned from address map
-    assert!(rt.send_to(bad, PanicMsg).is_err(), "send to cleaned-up actor fails");
-    assert_eq!(bad_start_handled.load(Ordering::Relaxed), 0, "on_start panic prevents messages");
+    assert!(
+        rt.send_to(bad, PanicMsg).is_err(),
+        "send to cleaned-up actor fails"
+    );
+    assert_eq!(
+        bad_start_handled.load(Ordering::Relaxed),
+        0,
+        "on_start panic prevents messages"
+    );
 
     // Stats track panics vs stops separately
     let stats = rt.stats();
     let panics: u64 = stats.workers.iter().map(|w| w.panics).sum();
-    assert!(panics >= 2, "at least 2 panics recorded (PanicActor + PanicOnStartActor)");
+    assert!(
+        panics >= 2,
+        "at least 2 panics recorded (PanicActor + PanicOnStartActor)"
+    );
 
     // --- Mid-batch panic discards remaining ---
     let counter = Arc::new(AtomicUsize::new(0));
     let rt = std_runtime(RuntimeConfig::default());
     let dummy = rt.new_inbox::<Pong>().unwrap();
-    let addr = rt.spawn(PanicAfterNActor { remaining_good: 2, counter: counter.clone() }).unwrap();
+    let addr = rt
+        .spawn(PanicAfterNActor {
+            remaining_good: 2,
+            counter: counter.clone(),
+        })
+        .unwrap();
     for _ in 0..5 {
-        rt.send_to(addr, Ping { reply_to: *dummy.addr() }).unwrap();
+        rt.send_to(
+            addr,
+            Ping {
+                reply_to: *dummy.addr(),
+            },
+        )
+        .unwrap();
     }
     tick_n(&rt, 20);
-    assert_eq!(counter.load(Ordering::SeqCst), 2, "only messages before panic processed");
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "only messages before panic processed"
+    );
 
     // --- Child spawned before parent panic survives ---
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Done>().unwrap();
     let parent = rt.spawn(SpawnThenPanicActor).unwrap();
-    rt.send_to(parent, Forward { value: 5, reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        parent,
+        Forward {
+            value: 5,
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     let reply = tick_until_recv(&rt, &inbox, 30);
     assert_eq!(reply, Some(Done(10)), "child survives parent panic");
 
@@ -484,7 +654,13 @@ fn panic_isolation_and_cleanup() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let addr = rt.spawn(SendThenPanicActor).unwrap();
-    rt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        addr,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     let reply = tick_until_recv(&rt, &inbox, 20);
     assert!(reply.is_some(), "message sent before panic still delivered");
 
@@ -499,7 +675,10 @@ fn panic_isolation_and_cleanup() {
     }
     tick_n(&rt, 10);
     let stats = rt.stats();
-    assert_eq!(stats.workers[0].num_actors, 0, "all poisoned actors cleaned up");
+    assert_eq!(
+        stats.workers[0].num_actors, 0,
+        "all poisoned actors cleaned up"
+    );
 }
 
 /// Watch API contract: watchers are notified on death, unwatch cancels,
@@ -533,7 +712,8 @@ fn watch_notification_contract() {
     tick_n(&rt, 3);
 
     // w4 unwatches
-    rt.send_to(w4_addr, WatcherCmd::UnwatchThis(target)).unwrap();
+    rt.send_to(w4_addr, WatcherCmd::UnwatchThis(target))
+        .unwrap();
     tick_n(&rt, 3);
 
     // Kill target
@@ -608,12 +788,20 @@ fn watch_edge_cases() {
     }
 
     let target = rt.spawn(PanicActor).unwrap();
-    let sup = rt.spawn(SupervisorWatcher { spawned_count: spawned.clone() }).unwrap();
+    let sup = rt
+        .spawn(SupervisorWatcher {
+            spawned_count: spawned.clone(),
+        })
+        .unwrap();
     rt.send_to(sup, SupCmd::WatchThis(target)).unwrap();
     tick_n(&rt, 3);
     rt.send_to(target, PanicMsg).unwrap();
     tick_n(&rt, 5);
-    assert_eq!(spawned.load(Ordering::SeqCst), 1, "watcher spawned replacement");
+    assert_eq!(
+        spawned.load(Ordering::SeqCst),
+        1,
+        "watcher spawned replacement"
+    );
 }
 
 /// Monitor API contract: Down on stop (Normal) and panic (Panicked), multiple
@@ -630,7 +818,8 @@ fn monitor_death_notification_contract() {
         watch_target: target,
         reply_to: *inbox.addr(),
         mref: None,
-    }).unwrap();
+    })
+    .unwrap();
     rt.tick();
     rt.stop_actor(target).unwrap();
     tick_n(&rt, 3);
@@ -646,7 +835,8 @@ fn monitor_death_notification_contract() {
         watch_target: target,
         reply_to: *inbox.addr(),
         mref: None,
-    }).unwrap();
+    })
+    .unwrap();
     rt.tick();
     rt.send_to(target, PanicMsg).unwrap();
     tick_n(&rt, 3);
@@ -659,11 +849,17 @@ fn monitor_death_notification_contract() {
     let inbox2 = rt.new_inbox::<Down>().unwrap();
     let target = rt.spawn(PingPongActor).unwrap();
     rt.spawn(MonitorWatcherActor {
-        watch_target: target, reply_to: *inbox1.addr(), mref: None,
-    }).unwrap();
+        watch_target: target,
+        reply_to: *inbox1.addr(),
+        mref: None,
+    })
+    .unwrap();
     rt.spawn(MonitorWatcherActor {
-        watch_target: target, reply_to: *inbox2.addr(), mref: None,
-    }).unwrap();
+        watch_target: target,
+        reply_to: *inbox2.addr(),
+        mref: None,
+    })
+    .unwrap();
     rt.tick();
     rt.stop_actor(target).unwrap();
     tick_n(&rt, 3);
@@ -674,22 +870,38 @@ fn monitor_death_notification_contract() {
     let rt = std_runtime(RuntimeConfig::default());
     let down_inbox = rt.new_inbox::<Down>().unwrap();
     let target = rt.spawn(PingPongActor).unwrap();
-    let watcher = rt.spawn(DemonitorActor { watch_target: target, mref: None }).unwrap();
+    let watcher = rt
+        .spawn(DemonitorActor {
+            watch_target: target,
+            mref: None,
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(watcher, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        watcher,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     rt.tick(); // demonitor
     rt.stop_actor(target).unwrap();
     tick_n(&rt, 3);
-    assert!(down_inbox.try_recv().is_none(), "demonitored: no Down delivered");
+    assert!(
+        down_inbox.try_recv().is_none(),
+        "demonitored: no Down delivered"
+    );
 
     // --- Dead watcher cleaned up ---
     let rt = std_runtime(RuntimeConfig::default());
     let target = rt.spawn(PingPongActor).unwrap();
-    let watcher = rt.spawn(MonitorWatcherActor {
-        watch_target: target,
-        reply_to: ActorAddress::default(),
-        mref: None,
-    }).unwrap();
+    let watcher = rt
+        .spawn(MonitorWatcherActor {
+            watch_target: target,
+            reply_to: ActorAddress::default(),
+            mref: None,
+        })
+        .unwrap();
     rt.tick();
     rt.stop_actor(watcher).unwrap();
     rt.tick(); // watcher dies
@@ -716,12 +928,22 @@ fn monitor_death_notification_contract() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Down>().unwrap();
     let target = rt.spawn(PingPongActor).unwrap();
-    rt.spawn(DoubleMonitor { target, reply_to: *inbox.addr() }).unwrap();
+    rt.spawn(DoubleMonitor {
+        target,
+        reply_to: *inbox.addr(),
+    })
+    .unwrap();
     rt.tick();
     rt.stop_actor(target).unwrap();
     tick_n(&rt, 3);
-    assert!(inbox.try_recv().is_some(), "first Down from stacked monitor");
-    assert!(inbox.try_recv().is_some(), "second Down from stacked monitor");
+    assert!(
+        inbox.try_recv().is_some(),
+        "first Down from stacked monitor"
+    );
+    assert!(
+        inbox.try_recv().is_some(),
+        "second Down from stacked monitor"
+    );
     assert!(inbox.try_recv().is_none(), "no more");
 
     // --- handle_down dispatch ---
@@ -747,17 +969,29 @@ fn monitor_death_notification_contract() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Count>().unwrap();
     let target = rt.spawn(PanicActor).unwrap();
-    let tracker = rt.spawn(MonitoringTracker {
-        target,
-        downs: vec![],
-        inbox: *inbox.addr(),
-    }).unwrap();
+    let tracker = rt
+        .spawn(MonitoringTracker {
+            target,
+            downs: vec![],
+            inbox: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
     rt.send_to(target, PanicMsg).unwrap();
     tick_n(&rt, 3);
-    rt.send_to(tracker, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        tracker,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     rt.tick();
-    assert_eq!(inbox.try_recv(), Some(Count(1)), "handle_down received exactly one Down");
+    assert_eq!(
+        inbox.try_recv(),
+        Some(Count(1)),
+        "handle_down received exactly one Down"
+    );
 
     // --- When Incoming=Down, handle_down is NOT called ---
     struct DownAsIncoming {
@@ -781,10 +1015,16 @@ fn monitor_death_notification_contract() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Down>().unwrap();
     let target = rt.spawn(PanicActor).unwrap();
-    rt.spawn(DownAsIncoming { target, inbox: *inbox.addr() }).unwrap();
+    rt.spawn(DownAsIncoming {
+        target,
+        inbox: *inbox.addr(),
+    })
+    .unwrap();
     rt.tick();
     rt.send_to(target, PanicMsg).unwrap();
     tick_n(&rt, 3);
-    let received = inbox.try_recv().expect("Down delivered via handle(), not handle_down");
+    let received = inbox
+        .try_recv()
+        .expect("Down delivered via handle(), not handle_down");
     assert_eq!(received.reason, StopReason::Panicked);
 }

@@ -4,11 +4,11 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use crate::action::ProcessAction;
-use crate::types::ProcessDriver;
 use crate::event::ProcessEvent;
 use crate::types::EventQueue;
-use crate::types::{ExitStatus, ProcessSpec, Signal};
+use crate::types::ProcessDriver;
 use crate::types::ProcessWaker;
+use crate::types::{ExitStatus, ProcessSpec, Signal};
 
 // ─── Signal ────────────────────────────────────────────────────────────────
 

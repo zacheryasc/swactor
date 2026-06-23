@@ -5,11 +5,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 use std::thread::Thread;
 
+use crate::Error;
 use crate::actor::{ActorAddress, Message, SpawnRequest};
 use crate::channel::Sender;
 use crate::config::RuntimeConfig;
 use crate::stats::WorkerStats;
-use crate::Error;
 
 // ─── Identity Hasher for ActorAddress ───────────────────────────────────────
 
@@ -145,7 +145,9 @@ impl Placement {
         for offset in 0..n {
             let i = (rr + offset) % n;
             let actors = self.worker_stats[i].num_actors.load(Ordering::Relaxed);
-            let depth = self.worker_stats[i].total_mailbox_depth.load(Ordering::Relaxed);
+            let depth = self.worker_stats[i]
+                .total_mailbox_depth
+                .load(Ordering::Relaxed);
             let score = actors + depth;
             if score < best_score {
                 best_score = score;
@@ -216,11 +218,7 @@ impl InboxRegistry {
         self.senders.read().unwrap().contains_key(addr)
     }
 
-    pub fn try_deliver(
-        &self,
-        addr: ActorAddress,
-        msg: Box<dyn Any + Send>,
-    ) -> Result<(), Error> {
+    pub fn try_deliver(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
         let senders = self.senders.read().unwrap();
         if let Some(sender) = senders.get(&addr) {
             sender.try_send_any(msg);

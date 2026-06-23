@@ -38,10 +38,18 @@ fn arb_event() -> impl Strategy<Value = ProcessEvent> {
         Just(ProcessEvent::Started),
         Just(ProcessEvent::KillTimeout),
         ".*".prop_map(|reason| ProcessEvent::SpawnFailed { reason }),
-        proptest::collection::vec(any::<u8>(), 0..64)
-            .prop_map(|data| ProcessEvent::OutputReceived { data, is_stderr: false }),
-        proptest::collection::vec(any::<u8>(), 0..64)
-            .prop_map(|data| ProcessEvent::OutputReceived { data, is_stderr: true }),
+        proptest::collection::vec(any::<u8>(), 0..64).prop_map(|data| {
+            ProcessEvent::OutputReceived {
+                data,
+                is_stderr: false,
+            }
+        }),
+        proptest::collection::vec(any::<u8>(), 0..64).prop_map(|data| {
+            ProcessEvent::OutputReceived {
+                data,
+                is_stderr: true,
+            }
+        }),
         prop_oneof![
             any::<i32>().prop_map(ExitStatus::Code),
             any::<i32>().prop_map(ExitStatus::Signal),

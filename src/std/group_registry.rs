@@ -31,11 +31,15 @@ impl GroupRegistry {
 
     /// Add an actor to a named group. Group is created if it doesn't exist.
     pub fn join(&self, group: String, addr: ActorAddress) {
-        self.groups.write().unwrap()
+        self.groups
+            .write()
+            .unwrap()
             .entry(group.clone())
             .or_insert_with(|| HashSet::with_hasher(AddrBuildHasher))
             .insert(addr);
-        self.memberships.write().unwrap()
+        self.memberships
+            .write()
+            .unwrap()
             .entry(addr)
             .or_default()
             .insert(group);
@@ -58,7 +62,9 @@ impl GroupRegistry {
 
     /// Return all members of a group.
     pub fn members(&self, group: &str) -> Vec<ActorAddress> {
-        self.groups.read().unwrap()
+        self.groups
+            .read()
+            .unwrap()
             .get(group)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()

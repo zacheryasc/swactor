@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use proptest::prelude::*;
-use proptest_state_machine::{prop_state_machine, ReferenceStateMachine, StateMachineTest};
+use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 
 use std::sync::Arc;
 
@@ -320,11 +320,7 @@ impl ReferenceStateMachine for SwactorModel {
                     .collect();
                 if !alive_ids.is_empty() {
                     let id = alive_ids[*actor_idx % alive_ids.len()];
-                    state
-                        .sent_messages
-                        .entry(id)
-                        .or_default()
-                        .push(*value);
+                    state.sent_messages.entry(id).or_default().push(*value);
                 }
             }
             Transition::Tick => {

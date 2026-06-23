@@ -76,7 +76,11 @@ impl Mux {
         // Assign first, unconditionally: numbering is independent of
         // whether the frame survives the buffer (spec §5.2).
         let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
-        let frame = Frame { channel: channel.into(), position, payload };
+        let frame = Frame {
+            channel: channel.into(),
+            position,
+            payload,
+        };
 
         let mut buffer = self.buffer.lock().expect("mux buffer poisoned");
         if buffer.len() < self.capacity {

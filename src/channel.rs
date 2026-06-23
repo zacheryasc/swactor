@@ -76,4 +76,3 @@ impl<T> Sender<T> {
         self.queue.push(value)
     }
 }
-

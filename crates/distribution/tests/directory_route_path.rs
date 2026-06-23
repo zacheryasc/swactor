@@ -19,18 +19,18 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
+use swactor::Error;
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, Runtime, RuntimeConfig};
 use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, NetworkMessage, TransportRouter};
-use swactor::Error;
 
 use distribution::crypto::{Keypair, KeypairExt};
 use distribution::directory_actor::{DirectoryActor, DirectoryIn};
 use distribution::messages::actor_codec_registry;
 use distribution::swim::actor::MembershipChanged;
 use distribution::transport_bridge::{
-    peer_addr, IrohPeerDirectory, IrohRouteBinder, OutFrame, Outbox, RouteView, RouteViewTransport,
+    IrohPeerDirectory, IrohRouteBinder, OutFrame, Outbox, RouteView, RouteViewTransport, peer_addr,
 };
 use distribution::types::{MemberState, NodeId};
 
@@ -134,8 +134,10 @@ impl RouteCluster {
             let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
             // Gossip egress (directory → peer) and app egress (RouteView → host)
             // both feed the one outbox, just like the live driver.
-            let peer_directory =
-                Arc::new(IrohPeerDirectory::new(Arc::clone(&router), Arc::clone(&outbox)));
+            let peer_directory = Arc::new(IrohPeerDirectory::new(
+                Arc::clone(&router),
+                Arc::clone(&outbox),
+            ));
             let route_view_transport = Arc::new(RouteViewTransport::new(
                 Arc::clone(&route_view),
                 Arc::clone(&outbox),
@@ -153,7 +155,13 @@ impl RouteCluster {
                 ))
                 .expect("spawn DirectoryActor");
 
-            nodes.push(RouteNode { rt, outbox, route_view, directory, node_id: nid });
+            nodes.push(RouteNode {
+                rt,
+                outbox,
+                route_view,
+                directory,
+                node_id: nid,
+            });
         }
 
         // Every node considers the others alive.
@@ -175,7 +183,12 @@ impl RouteCluster {
             }
         }
 
-        let c = RouteCluster { nodes, keys, ids, codec };
+        let c = RouteCluster {
+            nodes,
+            keys,
+            ids,
+            codec,
+        };
         c.settle(4);
         c
     }
@@ -241,13 +254,18 @@ impl RouteCluster {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let addr = self.nodes[node]
             .rt
-            .spawn(AppReceiver { seen: Arc::clone(&seen) })
+            .spawn(AppReceiver {
+                seen: Arc::clone(&seen),
+            })
             .expect("spawn AppReceiver");
         (addr, seen)
     }
 
     fn spawn_sender(&self, node: usize) -> ActorAddress {
-        self.nodes[node].rt.spawn(AppSender).expect("spawn AppSender")
+        self.nodes[node]
+            .rt
+            .spawn(AppSender)
+            .expect("spawn AppSender")
     }
 
     /// Author a host claim for `actor` on `host` and begin disseminating it.
@@ -272,13 +290,22 @@ impl RouteCluster {
             .rt
             .send_to(
                 self.nodes[node].directory,
-                DirectoryIn::Membership(MembershipChanged { node_id: who, state, incarnation: 2 }),
+                DirectoryIn::Membership(MembershipChanged {
+                    node_id: who,
+                    state,
+                    incarnation: 2,
+                }),
             )
             .unwrap();
     }
 
     fn host_in_view(&self, observer: usize, actor: ActorAddress) -> Option<NodeId> {
-        self.nodes[observer].route_view.read().unwrap().get(&actor).copied()
+        self.nodes[observer]
+            .route_view
+            .read()
+            .unwrap()
+            .get(&actor)
+            .copied()
     }
 }
 
@@ -303,7 +330,11 @@ fn a_message_routes_to_an_actor_by_address_alone() {
 
     c.send_hello(0, sender, target, 42);
     c.settle(10);
-    assert_eq!(nonces(&seen), vec![42], "the message did not reach the target by address alone");
+    assert_eq!(
+        nonces(&seen),
+        vec![42],
+        "the message did not reach the target by address alone"
+    );
 }
 
 #[test]
@@ -320,11 +351,18 @@ fn a_send_to_an_unknown_actor_is_silently_dropped() {
     for _ in 0..20 {
         c.round();
     }
-    assert_eq!(c.host_in_view(0, unknown), None, "an unregistered actor must be unknown");
+    assert_eq!(
+        c.host_in_view(0, unknown),
+        None,
+        "an unregistered actor must be unknown"
+    );
 
     c.send_hello(0, sender, unknown, 7);
     c.settle(10);
-    assert!(nonces(&seen).is_empty(), "a send to an unknown actor must not be delivered");
+    assert!(
+        nonces(&seen).is_empty(),
+        "a send to an unknown actor must not be delivered"
+    );
 }
 
 #[test]
@@ -343,7 +381,11 @@ fn routing_follows_a_supersede() {
     // Pre-move: the message lands on the B-hosted actor.
     c.send_hello(0, sender, target, 1);
     c.settle(10);
-    assert_eq!(nonces(&on_b), vec![1], "pre-supersede send should reach the original host");
+    assert_eq!(
+        nonces(&on_b),
+        vec![1],
+        "pre-supersede send should reach the original host"
+    );
 
     // A strictly-newer claim, signed by C, moves the actor's route to C.
     c.register_claim(2, target, 2);
@@ -356,7 +398,11 @@ fn routing_follows_a_supersede() {
     // longer reaches the B-hosted actor.
     c.send_hello(0, sender, target, 2);
     c.settle(10);
-    assert_eq!(nonces(&on_b), vec![1], "a superseded route must stop landing on the old host");
+    assert_eq!(
+        nonces(&on_b),
+        vec![1],
+        "a superseded route must stop landing on the old host"
+    );
 }
 
 #[test]
@@ -374,12 +420,20 @@ fn a_send_to_a_dead_host_drops() {
     );
     c.send_hello(0, sender, target, 1);
     c.settle(10);
-    assert_eq!(nonces(&seen), vec![1], "precondition: the live-host send should arrive");
+    assert_eq!(
+        nonces(&seen),
+        vec![1],
+        "precondition: the live-host send should arrive"
+    );
 
     // The host dies (from A's perspective); the target leaves A's route view.
     c.announce(0, MemberState::Dead, c.ids[1]);
     c.settle(4);
-    assert_eq!(c.host_in_view(0, target), None, "a dead host's actor must leave the route view");
+    assert_eq!(
+        c.host_in_view(0, target),
+        None,
+        "a dead host's actor must leave the route view"
+    );
 
     c.send_hello(0, sender, target, 2);
     c.settle(10);

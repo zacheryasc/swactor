@@ -128,7 +128,9 @@ impl ProcessSession {
         // KillTimeout — handled in all states before per-state dispatch
         if matches!(event, ProcessEvent::KillTimeout) {
             return if self.state == ProcessState::Stopping {
-                vec![ProcessAction::SendSignal { signal: Signal::Kill }]
+                vec![ProcessAction::SendSignal {
+                    signal: Signal::Kill,
+                }]
             } else {
                 vec![]
             };
@@ -196,9 +198,7 @@ impl ProcessSession {
                     stream,
                 }]
             }
-            ProcessEvent::Exited { status } => {
-                self.enter_exited(status)
-            }
+            ProcessEvent::Exited { status } => self.enter_exited(status),
             ProcessEvent::ConnectionLost { reason } => {
                 self.state = ProcessState::Exited;
                 self.exit_status = Some(ExitStatus::Unknown);
@@ -220,11 +220,12 @@ impl ProcessSession {
                 }
                 // Backpressure: buffer if over limit
                 if let Some(limit) = self.spec.stdin_buffer_limit
-                    && self.flow.pending_stdin_bytes >= limit {
-                        self.stdin_buffer_bytes += data.len();
-                        self.stdin_buffer.push_back(data);
-                        return vec![];
-                    }
+                    && self.flow.pending_stdin_bytes >= limit
+                {
+                    self.stdin_buffer_bytes += data.len();
+                    self.stdin_buffer.push_back(data);
+                    return vec![];
+                }
                 self.flow.pending_stdin_bytes += data.len();
                 vec![ProcessAction::WriteStdin { data }]
             }
@@ -271,9 +272,7 @@ impl ProcessSession {
                     stream,
                 }]
             }
-            ProcessEvent::Exited { status } => {
-                self.enter_exited(status)
-            }
+            ProcessEvent::Exited { status } => self.enter_exited(status),
             ProcessEvent::ConnectionLost { reason } => {
                 self.state = ProcessState::Exited;
                 self.exit_status = Some(ExitStatus::Unknown);

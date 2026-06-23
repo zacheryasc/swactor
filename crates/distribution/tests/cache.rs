@@ -1,6 +1,6 @@
-use swactor::actor::ActorAddress;
 use distribution::cache::LocationCache;
 use distribution::types::NodeId;
+use swactor::actor::ActorAddress;
 
 fn node(byte: u8) -> NodeId {
     NodeId([byte; 32])
@@ -62,7 +62,11 @@ fn get_refreshes_lru_order() {
     // Insert a3 — should evict a2 (LRU), not a1
     cache.insert(a3, node(3));
 
-    assert_eq!(cache.get(&a1), Some(node(1)), "a1 should survive (recently accessed)");
+    assert_eq!(
+        cache.get(&a1),
+        Some(node(1)),
+        "a1 should survive (recently accessed)"
+    );
     assert_eq!(cache.get(&a2), None, "a2 should have been evicted");
 }
 

@@ -3,18 +3,16 @@
 //! Feeds the real `FleetView` consumer a scripted set of one node's frames and
 //! checks the `FleetUpdate` it produces carries the migrated metrics: the
 //! distribution panels show real cache / registry / directory / peer-auth
-//! values, the Actors table shows the real per-actor rows, and the datastore
-//! view shows the real counters and recent events. Every expectation is derived
-//! from the input records, never read back from the consumer, and the test
-//! asserts on the reconstructed JSON / stats — not on rendered HTML — so it
+//! values, and the Actors table shows the real per-actor rows. Every expectation
+//! is derived from the input records, never read back from the consumer, and the
+//! test asserts on reconstructed JSON / stats — not on rendered HTML — so it
 //! survives a UI refactor.
 
 use dashboard::datastream_source::{FleetUpdate, FleetView};
-use datastream::catalog::{
-    self, ActorRec, ActorRuntimeDetail, DatastoreState, DistributionState, IdentityRecord, ObjectRec,
-    Record,
-};
+use dashboard::telemetry::{ActorRec, ActorRuntimeDetail, IdentityRecord};
+use datastream::Record;
 use datastream::frame::{Frame, Lifetime, NodeId, Position, StreamId};
+use distribution::telemetry::DistributionState;
 
 fn node_stream() -> StreamId {
     StreamId::new(NodeId::new(&"ab".repeat(32)), Lifetime(1))
@@ -64,9 +62,13 @@ fn distribution_panels_render_real_state_from_frames() {
     ];
     let update = ingest_all(&mut view, &stream, &frames);
 
-    let dj: serde_json::Value =
-        serde_json::from_str(update.dist_json.as_ref().expect("dist json for selected node"))
-            .unwrap();
+    let dj: serde_json::Value = serde_json::from_str(
+        update
+            .dist_json
+            .as_ref()
+            .expect("dist json for selected node"),
+    )
+    .unwrap();
     // The migrated distribution metrics arrive as real values (not the zeros the
     // pre-datastream reconstruction used to fill).
     assert_eq!(dj["cache_size"], 4);
@@ -132,45 +134,22 @@ fn actors_table_renders_real_per_actor_rows() {
 }
 
 #[test]
-fn datastore_view_renders_counters_and_recent_events() {
+fn dashboard_ignores_unknown_plugin_channel_without_corrupting_stream_state() {
     let stream = node_stream();
     let mut view = FleetView::new(None);
-
-    let ds = DatastoreState {
-        object_count: 3,
-        total_bytes: 4096,
-        put_ops: 5,
-        get_ops: 9,
-        delete_ops: 1,
-        objects: vec![ObjectRec {
-            hash: "h1".into(),
-            name: Some("a.bin".into()),
-            size_bytes: 1024,
-        }],
-        active_transfers: vec![],
-    };
-    let event = serde_json::json!({
-        "timestamp_ms": 1u64, "kind": "put", "hash": "h1", "name": "a.bin", "size_bytes": 1024
-    })
-    .to_string();
     let frames = vec![
         frame(&identity(&stream, "node"), 0),
-        frame(&ds, 1),
-        Frame::new(catalog::datastore_event(), Position(2), event.into_bytes()),
+        Frame::new(
+            "external.plugin.sample",
+            Position(1),
+            br#"{"value":42}"#.to_vec(),
+        ),
     ];
-    let update = ingest_all(&mut view, &stream, &frames);
 
-    let dj: serde_json::Value =
-        serde_json::from_str(update.datastore_json.as_ref().expect("datastore json"))
-            .unwrap();
-    assert_eq!(dj["object_count"], 3);
-    assert_eq!(dj["total_bytes"], 4096);
-    assert_eq!(dj["put_ops"], 5);
-    assert_eq!(dj["get_ops"], 9);
-    assert_eq!(dj["objects"][0]["hash"], "h1");
-    // The op event streamed on the text channel is rebuilt into the timeline.
-    let events = dj["recent_events"].as_array().expect("recent events array");
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["kind"], "put");
-    assert_eq!(events[0]["hash"], "h1");
+    let update = ingest_all(&mut view, &stream, &frames);
+    let fleet: serde_json::Value = serde_json::from_str(&update.fleet_json).unwrap();
+    let rows = fleet["nodes"].as_array().expect("fleet rows");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], stream.node.as_str());
 }

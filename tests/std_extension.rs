@@ -6,8 +6,8 @@
 mod common;
 use common::*;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Local actors ────────────────────────────────────────────────────────────
 
@@ -86,7 +86,13 @@ fn naming_registry_lifecycle() {
     // Register "alice", lookup, send Ping → Pong
     let alice = rt.spawn_named("alice", PingPongActor).unwrap();
     assert_eq!(rt.where_is("alice"), Some(alice));
-    rt.send_to(alice, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        alice,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     assert!(inbox.try_recv().is_some(), "named actor processes messages");
 
@@ -131,9 +137,18 @@ fn naming_registry_lifecycle() {
     let removed = rt.unregister("charlie");
     assert_eq!(removed, Some(charlie));
     assert_eq!(rt.where_is("charlie"), None, "name freed by unregister");
-    rt.send_to(charlie, Ping { reply_to: *charlie_inbox.addr() }).unwrap();
+    rt.send_to(
+        charlie,
+        Ping {
+            reply_to: *charlie_inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
-    assert!(charlie_inbox.try_recv().is_some(), "actor still alive after name unregistered");
+    assert!(
+        charlie_inbox.try_recv().is_some(),
+        "actor still alive after name unregistered"
+    );
 }
 
 /// Actors resolve and register names from handlers using ctx.
@@ -144,22 +159,48 @@ fn naming_from_actor_handlers() {
 
     // ctx.where_is from handler
     let target = rt.spawn_named("target", PingPongActor).unwrap();
-    let looker = rt.spawn(NameLookupActor {
-        target_name: "target",
-        reply_to: *inbox.addr(),
-    }).unwrap();
+    let looker = rt
+        .spawn(NameLookupActor {
+            target_name: "target",
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(looker, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        looker,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
-    assert_eq!(inbox.try_recv(), Some(MyAddr(target)), "ctx.where_is resolves");
+    assert_eq!(
+        inbox.try_recv(),
+        Some(MyAddr(target)),
+        "ctx.where_is resolves"
+    );
 
     // ctx.spawn_named from handler
-    let spawner = rt.spawn(NamedSpawnerActor { reply_to: *inbox.addr() }).unwrap();
+    let spawner = rt
+        .spawn(NamedSpawnerActor {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(spawner, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        spawner,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let child_addr = inbox.try_recv().expect("child address returned");
-    assert_eq!(rt.where_is("child"), Some(child_addr.0), "name registered from handler");
+    assert_eq!(
+        rt.where_is("child"),
+        Some(child_addr.0),
+        "name registered from handler"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -183,26 +224,45 @@ fn groups_pub_sub_lifecycle() {
     rt.join_group(c, "workers");
     rt.tick();
 
-    let count = rt.publish_to("workers", Ping { reply_to: *inbox.addr() });
+    let count = rt.publish_to(
+        "workers",
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    );
     assert_eq!(count, 3, "3 members, 3 messages sent");
     rt.tick();
     let mut pongs = 0;
-    while inbox.try_recv().is_some() { pongs += 1; }
+    while inbox.try_recv().is_some() {
+        pongs += 1;
+    }
     assert_eq!(pongs, 3, "all 3 received");
 
     // Leave stops delivery
     rt.leave_group(c, "workers");
-    let count = rt.publish_to("workers", Ping { reply_to: *inbox.addr() });
+    let count = rt.publish_to(
+        "workers",
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    );
     assert_eq!(count, 2, "2 after leave");
     rt.tick();
     let mut pongs = 0;
-    while inbox.try_recv().is_some() { pongs += 1; }
+    while inbox.try_recv().is_some() {
+        pongs += 1;
+    }
     assert_eq!(pongs, 2);
 
     // Dead actor auto-removed
     rt.stop_actor(b).unwrap();
     rt.tick();
-    let count = rt.publish_to("workers", Ping { reply_to: *inbox.addr() });
+    let count = rt.publish_to(
+        "workers",
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    );
     assert_eq!(count, 1, "dead actor removed");
 
     // Multi-group cleanup: actor in alpha/beta/gamma dies → all cleaned
@@ -224,7 +284,10 @@ fn groups_pub_sub_lifecycle() {
     rt.join_group(actor, "temp");
     assert!(rt.groups().contains(&"temp".to_string()));
     rt.leave_group(actor, "temp");
-    assert!(!rt.groups().contains(&"temp".to_string()), "empty group removed");
+    assert!(
+        !rt.groups().contains(&"temp".to_string()),
+        "empty group removed"
+    );
 
     // Empty group query
     let rt = std_runtime(RuntimeConfig::default());
@@ -252,7 +315,9 @@ fn groups_pub_sub_lifecycle() {
 
     // ctx.publish from handler
     #[derive(Clone)]
-    struct BroadcastCmd { reply_to: ActorAddress }
+    struct BroadcastCmd {
+        reply_to: ActorAddress,
+    }
 
     struct Broadcaster;
     impl ActorInterface for Broadcaster {
@@ -262,7 +327,12 @@ fn groups_pub_sub_lifecycle() {
             ctx.join_group("bcast");
         }
         fn handle(&mut self, ctx: &Ctx, msg: BroadcastCmd) {
-            ctx.publish("bcast", Ping { reply_to: msg.reply_to });
+            ctx.publish(
+                "bcast",
+                Ping {
+                    reply_to: msg.reply_to,
+                },
+            );
         }
     }
 
@@ -274,11 +344,22 @@ fn groups_pub_sub_lifecycle() {
     rt.join_group(p2, "bcast");
     let broadcaster = rt.spawn(Broadcaster).unwrap();
     rt.tick();
-    rt.send_to(broadcaster, BroadcastCmd { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        broadcaster,
+        BroadcastCmd {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let mut pongs = 0;
-    while inbox.try_recv().is_some() { pongs += 1; }
-    assert!(pongs >= 2, "at least 2 PingPong members replied, got {pongs}");
+    while inbox.try_recv().is_some() {
+        pongs += 1;
+    }
+    assert!(
+        pongs >= 2,
+        "at least 2 PingPong members replied, got {pongs}"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -294,26 +375,40 @@ fn ask_pattern() {
     // Basic ask
     let actor = rt.spawn(PingPongActor).unwrap();
     rt.tick();
-    let pong: Pong = rt.ask(actor, |reply_to| Ping { reply_to })
-        .unwrap().recv_ticking(&rt, 10).unwrap();
+    let pong: Pong = rt
+        .ask(actor, |reply_to| Ping { reply_to })
+        .unwrap()
+        .recv_ticking(&rt, 10)
+        .unwrap();
     assert_eq!(pong, Pong);
 
     // Repeated asks track state
     let counter = rt.spawn(CounterActor { count: 0 }).unwrap();
     rt.tick();
-    let c1: Count = rt.ask(counter, |reply_to| Increment { reply_to })
-        .unwrap().recv_ticking(&rt, 10).unwrap();
-    let c2: Count = rt.ask(counter, |reply_to| Increment { reply_to })
-        .unwrap().recv_ticking(&rt, 10).unwrap();
-    let c3: Count = rt.ask(counter, |reply_to| Increment { reply_to })
-        .unwrap().recv_ticking(&rt, 10).unwrap();
+    let c1: Count = rt
+        .ask(counter, |reply_to| Increment { reply_to })
+        .unwrap()
+        .recv_ticking(&rt, 10)
+        .unwrap();
+    let c2: Count = rt
+        .ask(counter, |reply_to| Increment { reply_to })
+        .unwrap()
+        .recv_ticking(&rt, 10)
+        .unwrap();
+    let c3: Count = rt
+        .ask(counter, |reply_to| Increment { reply_to })
+        .unwrap()
+        .recv_ticking(&rt, 10)
+        .unwrap();
     assert_eq!((c1, c2, c3), (Count(1), Count(2), Count(3)));
 
     // try_recv: None before tick, Some after
     let rt = std_runtime(RuntimeConfig::default());
     let actor = rt.spawn(PingPongActor).unwrap();
     rt.tick();
-    let ask = rt.ask::<Ping, Pong>(actor, |reply_to| Ping { reply_to }).unwrap();
+    let ask = rt
+        .ask::<Ping, Pong>(actor, |reply_to| Ping { reply_to })
+        .unwrap();
     assert!(ask.try_recv().is_none(), "no response before tick");
     rt.tick();
     assert_eq!(ask.try_recv(), Some(Pong));
@@ -343,94 +438,189 @@ fn supervision_restart_policies() {
     let counter_c = counter.clone();
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
-        vec![ChildSpec::new("worker", RestartPolicy::Permanent, move |ctx| {
-            ctx.spawn(PanicAfterN { trigger: 2, count: 0, counter: counter_c.clone() })
-        })],
+        SupervisorStrategy::OneForOne,
+        5,
+        vec![ChildSpec::new(
+            "worker",
+            RestartPolicy::Permanent,
+            move |ctx| {
+                ctx.spawn(PanicAfterN {
+                    trigger: 2,
+                    count: 0,
+                    counter: counter_c.clone(),
+                })
+            },
+        )],
     );
     let sup_addr = rt.spawn(sup).unwrap();
     tick_n(&rt, 2);
-    let child = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup_addr).map(|(a, _)| *a).unwrap();
-    rt.send_to(child, Ping { reply_to: *inbox.addr() }).unwrap();
+    let child = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup_addr)
+        .map(|(a, _)| *a)
+        .unwrap();
+    rt.send_to(
+        child,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     assert_eq!(counter.load(Ordering::SeqCst), 1);
-    rt.send_to(child, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        child,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5); // panics, supervisor restarts
-    assert_eq!(rt.stats().workers[0].num_actors, 2, "supervisor + restarted child");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        2,
+        "supervisor + restarted child"
+    );
 
     // Transient stops normally → NOT restarted
     let rt = std_runtime(RuntimeConfig::default());
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
+        SupervisorStrategy::OneForOne,
+        5,
         vec![ChildSpec::new("worker", RestartPolicy::Transient, |ctx| {
             ctx.spawn(StopsAfterFirst)
         })],
     );
     let sup_addr = rt.spawn(sup).unwrap();
     tick_n(&rt, 2);
-    let child = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup_addr).map(|(a, _)| *a).unwrap();
-    rt.send_to(child, Ping { reply_to: ActorAddress::default() }).unwrap();
+    let child = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup_addr)
+        .map(|(a, _)| *a)
+        .unwrap();
+    rt.send_to(
+        child,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 4);
-    assert_eq!(rt.stats().workers[0].num_actors, 1, "transient+normal → no restart");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        1,
+        "transient+normal → no restart"
+    );
 
     // Transient panics → restarted
     let rt = std_runtime(RuntimeConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let counter_c = counter.clone();
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
-        vec![ChildSpec::new("worker", RestartPolicy::Transient, move |ctx| {
-            ctx.spawn(PanicAfterN { trigger: 1, count: 0, counter: counter_c.clone() })
-        })],
+        SupervisorStrategy::OneForOne,
+        5,
+        vec![ChildSpec::new(
+            "worker",
+            RestartPolicy::Transient,
+            move |ctx| {
+                ctx.spawn(PanicAfterN {
+                    trigger: 1,
+                    count: 0,
+                    counter: counter_c.clone(),
+                })
+            },
+        )],
     );
     let sup_addr = rt.spawn(sup).unwrap();
     tick_n(&rt, 2);
-    let child = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup_addr).map(|(a, _)| *a).unwrap();
+    let child = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup_addr)
+        .map(|(a, _)| *a)
+        .unwrap();
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    rt.send_to(child, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        child,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
-    assert_eq!(rt.stats().workers[0].num_actors, 2, "transient+panic → restarted");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        2,
+        "transient+panic → restarted"
+    );
 
     // Temporary never restarts
     let rt = std_runtime(RuntimeConfig::default());
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
-        vec![ChildSpec::new("worker", RestartPolicy::Temporary, |ctx| ctx.spawn(PanicActor))],
+        SupervisorStrategy::OneForOne,
+        5,
+        vec![ChildSpec::new("worker", RestartPolicy::Temporary, |ctx| {
+            ctx.spawn(PanicActor)
+        })],
     );
     let sup_addr = rt.spawn(sup).unwrap();
     tick_n(&rt, 2);
-    let child = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup_addr).map(|(a, _)| *a).unwrap();
+    let child = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup_addr)
+        .map(|(a, _)| *a)
+        .unwrap();
     rt.send_to(child, PanicMsg).unwrap();
     tick_n(&rt, 4);
-    assert_eq!(rt.stats().workers[0].num_actors, 1, "temporary → no restart");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        1,
+        "temporary → no restart"
+    );
 
     // Meltdown: max_restarts=2, crash 3 times → supervisor stops
     let rt = std_runtime(RuntimeConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 2,
+        SupervisorStrategy::OneForOne,
+        2,
         vec![ChildSpec::new("crasher", RestartPolicy::Permanent, {
             let c = counter.clone();
-            move |ctx| ctx.spawn(PanicAfterN { trigger: 1, count: 0, counter: c.clone() })
+            move |ctx| {
+                ctx.spawn(PanicAfterN {
+                    trigger: 1,
+                    count: 0,
+                    counter: c.clone(),
+                })
+            }
         })],
     );
     let sup_addr = rt.spawn(sup).unwrap();
     tick_n(&rt, 2);
     for _ in 0..3 {
-        if let Some((child, _)) = rt.stats().actors.iter()
-            .find(|(a, _)| *a != sup_addr)
-        {
+        if let Some((child, _)) = rt.stats().actors.iter().find(|(a, _)| *a != sup_addr) {
             let inbox = rt.new_inbox::<Pong>().unwrap();
-            let _ = rt.send_to(*child, Ping { reply_to: *inbox.addr() });
+            let _ = rt.send_to(
+                *child,
+                Ping {
+                    reply_to: *inbox.addr(),
+                },
+            );
             tick_n(&rt, 5);
         }
     }
     let sup_alive = rt.stats().actors.iter().any(|(a, _)| *a == sup_addr);
-    assert!(!sup_alive, "supervisor stopped after exceeding max_restarts");
+    assert!(
+        !sup_alive,
+        "supervisor stopped after exceeding max_restarts"
+    );
 }
 
 /// Strategies: OneForOne, OneForAll, RestForOne. Stopping supervisor kills children.
@@ -441,13 +631,21 @@ fn supervision_strategies() {
     let counter_a = Arc::new(AtomicUsize::new(0));
     let counter_b = Arc::new(AtomicUsize::new(0));
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
+        SupervisorStrategy::OneForOne,
+        5,
         vec![
             ChildSpec::new("crasher", RestartPolicy::Permanent, {
                 let c = counter_a.clone();
-                move |ctx| ctx.spawn_named("ofo_a", PanicAfterN {
-                    trigger: 1, count: 0, counter: c.clone(),
-                })
+                move |ctx| {
+                    ctx.spawn_named(
+                        "ofo_a",
+                        PanicAfterN {
+                            trigger: 1,
+                            count: 0,
+                            counter: c.clone(),
+                        },
+                    )
+                }
             }),
             ChildSpec::new("stable", RestartPolicy::Permanent, {
                 let c = counter_b.clone();
@@ -460,24 +658,47 @@ fn supervision_strategies() {
     let child_a = rt.where_is("ofo_a").unwrap();
     let child_b = rt.where_is("ofo_b").unwrap();
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    rt.send_to(child_a, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        child_a,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let child_b_after = rt.where_is("ofo_b").unwrap();
     assert_eq!(child_b, child_b_after, "child_b unchanged in OneForOne");
-    rt.send_to(child_b, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        child_b,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
-    assert!(counter_b.load(Ordering::SeqCst) >= 1, "child_b still processing");
+    assert!(
+        counter_b.load(Ordering::SeqCst) >= 1,
+        "child_b still processing"
+    );
 
     // OneForAll: all children restarted
     let rt = std_runtime(RuntimeConfig::default());
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForAll, 5,
+        SupervisorStrategy::OneForAll,
+        5,
         vec![
             ChildSpec::new("a", RestartPolicy::Permanent, {
                 let c = Arc::new(AtomicUsize::new(0));
-                move |ctx| ctx.spawn_named("ofa_a", PanicAfterN {
-                    trigger: 1, count: 0, counter: c.clone(),
-                })
+                move |ctx| {
+                    ctx.spawn_named(
+                        "ofa_a",
+                        PanicAfterN {
+                            trigger: 1,
+                            count: 0,
+                            counter: c.clone(),
+                        },
+                    )
+                }
             }),
             ChildSpec::new("b", RestartPolicy::Permanent, {
                 let c = Arc::new(AtomicUsize::new(0));
@@ -490,7 +711,13 @@ fn supervision_strategies() {
     let old_b = rt.where_is("ofa_b").unwrap();
     let child_a = rt.where_is("ofa_a").unwrap();
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    rt.send_to(child_a, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        child_a,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 8);
     let new_b = rt.where_is("ofa_b").expect("ofa_b re-registered");
     assert_ne!(old_b, new_b, "child_b restarted in OneForAll");
@@ -498,7 +725,8 @@ fn supervision_strategies() {
     // RestForOne: failed child + later children restarted, earlier unaffected
     let rt = std_runtime(RuntimeConfig::default());
     let sup = Supervisor::new(
-        SupervisorStrategy::RestForOne, 5,
+        SupervisorStrategy::RestForOne,
+        5,
         vec![
             ChildSpec::new("a", RestartPolicy::Permanent, {
                 let c = Arc::new(AtomicUsize::new(0));
@@ -506,9 +734,16 @@ fn supervision_strategies() {
             }),
             ChildSpec::new("b", RestartPolicy::Permanent, {
                 let c = Arc::new(AtomicUsize::new(0));
-                move |ctx| ctx.spawn_named("rfo_b", PanicAfterN {
-                    trigger: 1, count: 0, counter: c.clone(),
-                })
+                move |ctx| {
+                    ctx.spawn_named(
+                        "rfo_b",
+                        PanicAfterN {
+                            trigger: 1,
+                            count: 0,
+                            counter: c.clone(),
+                        },
+                    )
+                }
             }),
             ChildSpec::new("c", RestartPolicy::Permanent, {
                 let c = Arc::new(AtomicUsize::new(0));
@@ -522,7 +757,13 @@ fn supervision_strategies() {
     let old_c = rt.where_is("rfo_c").unwrap();
     let child_b = rt.where_is("rfo_b").unwrap();
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    rt.send_to(child_b, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        child_b,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 8);
     let new_a = rt.where_is("rfo_a").unwrap();
     let new_c = rt.where_is("rfo_c").expect("rfo_c re-registered");
@@ -532,10 +773,15 @@ fn supervision_strategies() {
     // Stopping supervisor kills children
     let rt = std_runtime(RuntimeConfig::default());
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
+        SupervisorStrategy::OneForOne,
+        5,
         vec![
-            ChildSpec::new("a", RestartPolicy::Permanent, |ctx| ctx.spawn(PingPongActor)),
-            ChildSpec::new("b", RestartPolicy::Permanent, |ctx| ctx.spawn(PingPongActor)),
+            ChildSpec::new("a", RestartPolicy::Permanent, |ctx| {
+                ctx.spawn(PingPongActor)
+            }),
+            ChildSpec::new("b", RestartPolicy::Permanent, |ctx| {
+                ctx.spawn(PingPongActor)
+            }),
         ],
     );
     let sup_addr = rt.spawn(sup).unwrap();
@@ -543,7 +789,11 @@ fn supervision_strategies() {
     assert_eq!(rt.stats().workers[0].num_actors, 3);
     rt.stop_actor(sup_addr).unwrap();
     tick_n(&rt, 5);
-    assert_eq!(rt.stats().workers[0].num_actors, 0, "stopping supervisor kills children");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        0,
+        "stopping supervisor kills children"
+    );
 }
 
 /// handle_down dispatch and ctx.stop_actor from handler.
@@ -551,7 +801,9 @@ fn supervision_strategies() {
 fn handle_down_dispatch() {
     // ctx.stop_actor from handler stops target
     #[derive(Clone)]
-    struct StopCmd { target: ActorAddress }
+    struct StopCmd {
+        target: ActorAddress,
+    }
     struct Stopper;
     impl ActorInterface for Stopper {
         type Incoming = StopCmd;
@@ -567,9 +819,20 @@ fn handle_down_dispatch() {
     rt.tick();
     rt.send_to(stopper, StopCmd { target }).unwrap();
     tick_n(&rt, 4);
-    assert!(rt.send_to(target, Ping { reply_to: ActorAddress::default() }).is_err(),
-        "target stopped by ctx.stop_actor");
-    assert!(rt.send_to(stopper, StopCmd { target }).is_ok(), "stopper still alive");
+    assert!(
+        rt.send_to(
+            target,
+            Ping {
+                reply_to: ActorAddress::default()
+            }
+        )
+        .is_err(),
+        "target stopped by ctx.stop_actor"
+    );
+    assert!(
+        rt.send_to(stopper, StopCmd { target }).is_ok(),
+        "stopper still alive"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -597,8 +860,10 @@ fn router_work_distribution() {
 
     let c = collected.clone();
     let router = Router::<Work>::new(
-        RoutingStrategy::RoundRobin, 3,
-        move |ctx| ctx.spawn(Collector(c.clone())), 10,
+        RoutingStrategy::RoundRobin,
+        3,
+        move |ctx| ctx.spawn(Collector(c.clone())),
+        10,
     );
     let router_addr = rt.spawn(router).unwrap();
     rt.tick();
@@ -632,8 +897,10 @@ fn router_work_distribution() {
     }
     let t = total.clone();
     let router = Router::<BPing>::new(
-        RoutingStrategy::Broadcast, 3,
-        move |ctx| ctx.spawn(BCounter(t.clone())), 10,
+        RoutingStrategy::Broadcast,
+        3,
+        move |ctx| ctx.spawn(BCounter(t.clone())),
+        10,
     );
     let router_addr = rt.spawn(router).unwrap();
     rt.tick();
@@ -641,7 +908,11 @@ fn router_work_distribution() {
         rt.send_to(router_addr, BPing).unwrap();
     }
     tick_n(&rt, 3);
-    assert_eq!(total.load(Ordering::Relaxed), 15, "5 broadcasts × 3 workers = 15");
+    assert_eq!(
+        total.load(Ordering::Relaxed),
+        15,
+        "5 broadcasts × 3 workers = 15"
+    );
 
     // Random: 30 msgs → at least 2 workers used
     let rt = std_runtime(RuntimeConfig::default());
@@ -658,8 +929,10 @@ fn router_work_distribution() {
     }
     let c = rcollected.clone();
     let router = Router::<RWork>::new(
-        RoutingStrategy::Random, 3,
-        move |ctx| ctx.spawn(RCollector(c.clone())), 10,
+        RoutingStrategy::Random,
+        3,
+        move |ctx| ctx.spawn(RCollector(c.clone())),
+        10,
     );
     let router_addr = rt.spawn(router).unwrap();
     rt.tick();
@@ -674,27 +947,41 @@ fn router_work_distribution() {
     // Dead worker replaced
     let rt = std_runtime(RuntimeConfig::default());
     let spawn_count = Arc::new(AtomicUsize::new(0));
-    struct PanicOnFirst { first: bool }
+    struct PanicOnFirst {
+        first: bool,
+    }
     #[derive(Clone)]
     struct DWork;
     impl ActorInterface for PanicOnFirst {
         type Incoming = DWork;
         type Response = ();
         fn handle(&mut self, _ctx: &Ctx, _msg: DWork) {
-            if self.first { self.first = false; panic!("first message panic"); }
+            if self.first {
+                self.first = false;
+                panic!("first message panic");
+            }
         }
     }
     let sc = spawn_count.clone();
     let router = Router::<DWork>::new(
-        RoutingStrategy::RoundRobin, 3,
-        move |ctx| { sc.fetch_add(1, Ordering::Relaxed); ctx.spawn(PanicOnFirst { first: sc.load(Ordering::Relaxed) == 1 }) },
+        RoutingStrategy::RoundRobin,
+        3,
+        move |ctx| {
+            sc.fetch_add(1, Ordering::Relaxed);
+            ctx.spawn(PanicOnFirst {
+                first: sc.load(Ordering::Relaxed) == 1,
+            })
+        },
         10,
     );
     let router_addr = rt.spawn(router).unwrap();
     rt.tick();
     rt.send_to(router_addr, DWork).unwrap();
     tick_n(&rt, 5);
-    assert!(spawn_count.load(Ordering::Relaxed) >= 4, "replacement spawned");
+    assert!(
+        spawn_count.load(Ordering::Relaxed) >= 4,
+        "replacement spawned"
+    );
 
     // Meltdown: max_restarts=2
     let rt = std_runtime(RuntimeConfig::default());
@@ -704,11 +991,15 @@ fn router_work_distribution() {
     impl ActorInterface for AlwaysPanics {
         type Incoming = MWork;
         type Response = ();
-        fn handle(&mut self, _ctx: &Ctx, _msg: MWork) { panic!("always"); }
+        fn handle(&mut self, _ctx: &Ctx, _msg: MWork) {
+            panic!("always");
+        }
     }
     let router = Router::<MWork>::new(
-        RoutingStrategy::RoundRobin, 1,
-        |ctx| ctx.spawn(AlwaysPanics), 2,
+        RoutingStrategy::RoundRobin,
+        1,
+        |ctx| ctx.spawn(AlwaysPanics),
+        2,
     );
     let router_addr = rt.spawn(router).unwrap();
     rt.tick();
@@ -729,16 +1020,17 @@ fn router_work_distribution() {
         type Response = ();
         fn handle(&mut self, _ctx: &Ctx, _msg: SWork) {}
     }
-    let router = Router::<SWork>::new(
-        RoutingStrategy::RoundRobin, 3,
-        |ctx| ctx.spawn(Dummy), 10,
-    );
+    let router = Router::<SWork>::new(RoutingStrategy::RoundRobin, 3, |ctx| ctx.spawn(Dummy), 10);
     let router_addr = rt.spawn(router).unwrap();
     rt.tick();
     assert_eq!(rt.stats().workers[0].num_actors, 4);
     rt.stop_actor(router_addr).unwrap();
     tick_n(&rt, 5);
-    assert_eq!(rt.stats().workers[0].num_actors, 0, "stop router kills workers");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        0,
+        "stop router kills workers"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -773,7 +1065,8 @@ fn actor_sees_own_stats_after_processing() {
                 StatsMsg::Report { reply_to } => {
                     let report = StatsReport {
                         processed: ctx.messages_processed(),
-                        type_counts: ctx.message_type_counts()
+                        type_counts: ctx
+                            .message_type_counts()
                             .iter()
                             .map(|(k, v)| (k.to_string(), *v))
                             .collect(),
@@ -796,15 +1089,30 @@ fn actor_sees_own_stats_after_processing() {
     rt.tick();
 
     // Now ask for a report — the actor should see 5 processed messages
-    rt.send_to(actor, StatsMsg::Report { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        StatsMsg::Report {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
 
     let report = inbox.try_recv().expect("should receive stats report");
-    assert_eq!(report.processed, 5, "actor should see 5 previously processed messages");
-    assert!(!report.type_counts.is_empty(), "type counts should be populated");
+    assert_eq!(
+        report.processed, 5,
+        "actor should see 5 previously processed messages"
+    );
+    assert!(
+        !report.type_counts.is_empty(),
+        "type counts should be populated"
+    );
     // The type name should contain "StatsMsg"
     assert!(
-        report.type_counts.iter().any(|(name, count)| name.contains("StatsMsg") && *count >= 5),
+        report
+            .type_counts
+            .iter()
+            .any(|(name, count)| name.contains("StatsMsg") && *count >= 5),
         "type counts should include StatsMsg entries with count >= 5, got {:?}",
         report.type_counts,
     );
@@ -814,7 +1122,9 @@ fn actor_sees_own_stats_after_processing() {
 #[test]
 fn actor_sees_system_info() {
     #[derive(Clone)]
-    struct GetSysInfo { reply_to: ActorAddress }
+    struct GetSysInfo {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug)]
     struct SysInfoReport {
@@ -828,10 +1138,13 @@ fn actor_sees_system_info() {
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, msg: GetSysInfo) {
             let info = ctx.system_info();
-            let _ = ctx.send(msg.reply_to, SysInfoReport {
-                num_workers: info.num_workers,
-                total_actors: info.total_actors,
-            });
+            let _ = ctx.send(
+                msg.reply_to,
+                SysInfoReport {
+                    num_workers: info.num_workers,
+                    total_actors: info.total_actors,
+                },
+            );
         }
     }
 
@@ -844,12 +1157,22 @@ fn actor_sees_system_info() {
     let _extra2 = rt.spawn(PingPongActor).unwrap();
     rt.tick(); // on_start + stats update
 
-    rt.send_to(reporter, GetSysInfo { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        reporter,
+        GetSysInfo {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
 
     let report = inbox.try_recv().expect("should receive system info");
     assert_eq!(report.num_workers, 1, "default config has 1 worker");
-    assert!(report.total_actors >= 3, "should see at least 3 actors, got {}", report.total_actors);
+    assert!(
+        report.total_actors >= 3,
+        "should see at least 3 actors, got {}",
+        report.total_actors
+    );
 }
 
 /// Mailbox depth reflects queued messages before dequeuing.
@@ -859,7 +1182,9 @@ fn actor_sees_system_info() {
 #[test]
 fn mailbox_depth_reflects_queued_messages() {
     #[derive(Clone)]
-    struct DepthProbe { reply_to: ActorAddress }
+    struct DepthProbe {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct DepthReport(usize);
@@ -884,7 +1209,13 @@ fn mailbox_depth_reflects_queued_messages() {
 
     // Enqueue 5 messages
     for _ in 0..5 {
-        rt.send_to(actor, DepthProbe { reply_to: *inbox.addr() }).unwrap();
+        rt.send_to(
+            actor,
+            DepthProbe {
+                reply_to: *inbox.addr(),
+            },
+        )
+        .unwrap();
     }
 
     // Tick once — budget=1, so only the first message is processed
@@ -892,7 +1223,10 @@ fn mailbox_depth_reflects_queued_messages() {
 
     let report = inbox.try_recv().expect("should receive depth report");
     // The snapshot is taken before any dequeuing in this tick, so depth == 5
-    assert_eq!(report.0, 5, "mailbox depth should be 5 (snapshot before dequeue)");
+    assert_eq!(
+        report.0, 5,
+        "mailbox depth should be 5 (snapshot before dequeue)"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -903,7 +1237,9 @@ fn mailbox_depth_reflects_queued_messages() {
 #[test]
 fn child_knows_its_parent() {
     #[derive(Clone)]
-    struct ReportParent { reply_to: ActorAddress }
+    struct ReportParent {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ParentReport(Option<ActorAddress>);
@@ -917,21 +1253,38 @@ fn child_knows_its_parent() {
         }
     }
 
-    struct ParentActor { reply_to: ActorAddress }
+    struct ParentActor {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for ParentActor {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let child = ctx.spawn(ChildReporter).unwrap();
-            let _ = ctx.send(child, ReportParent { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                ReportParent {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ParentReport>().unwrap();
-    let parent = rt.spawn(ParentActor { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn(ParentActor {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick(); // on_start
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let report = inbox.try_recv().expect("child should report parent");
     assert_eq!(report, ParentReport(Some(parent)));
@@ -941,7 +1294,9 @@ fn child_knows_its_parent() {
 #[test]
 fn runtime_spawned_has_no_parent() {
     #[derive(Clone)]
-    struct ReportParent { reply_to: ActorAddress }
+    struct ReportParent {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ParentReport(Option<ActorAddress>);
@@ -959,7 +1314,13 @@ fn runtime_spawned_has_no_parent() {
     let inbox = rt.new_inbox::<ParentReport>().unwrap();
     let actor = rt.spawn(Reporter).unwrap();
     rt.tick(); // on_start
-    rt.send_to(actor, ReportParent { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        ReportParent {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("actor should report parent");
     assert_eq!(report, ParentReport(None));
@@ -969,7 +1330,9 @@ fn runtime_spawned_has_no_parent() {
 #[test]
 fn grandchild_reports_immediate_parent() {
     #[derive(Clone)]
-    struct ReportParent { reply_to: ActorAddress }
+    struct ReportParent {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ParentReport(Option<ActorAddress>);
@@ -983,36 +1346,68 @@ fn grandchild_reports_immediate_parent() {
         }
     }
 
-    struct Middle { reply_to: ActorAddress }
+    struct Middle {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Middle {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let child = ctx.spawn(Leaf).unwrap();
-            let _ = ctx.send(child, ReportParent { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                ReportParent {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
-    struct Root { reply_to: ActorAddress }
+    struct Root {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Root {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-            let mid = ctx.spawn(Middle { reply_to: self.reply_to }).unwrap();
-            let _ = ctx.send(mid, Ping { reply_to: ActorAddress::default() });
+            let mid = ctx
+                .spawn(Middle {
+                    reply_to: self.reply_to,
+                })
+                .unwrap();
+            let _ = ctx.send(
+                mid,
+                Ping {
+                    reply_to: ActorAddress::default(),
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ParentReport>().unwrap();
-    let root = rt.spawn(Root { reply_to: *inbox.addr() }).unwrap();
+    let root = rt
+        .spawn(Root {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick(); // on_start
-    rt.send_to(root, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        root,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
     let report = inbox.try_recv().expect("grandchild should report parent");
     // C's parent should be B (some address), not A (root) and not None
     assert!(report.0.is_some(), "grandchild has a parent");
-    assert_ne!(report.0.unwrap(), root, "grandchild's parent is the middle actor, not root");
+    assert_ne!(
+        report.0.unwrap(),
+        root,
+        "grandchild's parent is the middle actor, not root"
+    );
 }
 
 /// Parent address is available during on_stop.
@@ -1021,7 +1416,9 @@ fn parent_visible_in_on_stop() {
     #[derive(Clone, Debug, PartialEq)]
     struct ParentReport(Option<ActorAddress>);
 
-    struct OnStopReporter { reply_to: ActorAddress }
+    struct OnStopReporter {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for OnStopReporter {
         type Incoming = Ping;
         type Response = ();
@@ -1031,21 +1428,37 @@ fn parent_visible_in_on_stop() {
         }
     }
 
-    struct Spawner { reply_to: ActorAddress }
+    struct Spawner {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Spawner {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-            let child = ctx.spawn(OnStopReporter { reply_to: self.reply_to }).unwrap();
+            let child = ctx
+                .spawn(OnStopReporter {
+                    reply_to: self.reply_to,
+                })
+                .unwrap();
             let _ = ctx.stop_actor(child);
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ParentReport>().unwrap();
-    let spawner = rt.spawn(Spawner { reply_to: *inbox.addr() }).unwrap();
+    let spawner = rt
+        .spawn(Spawner {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick(); // on_start
-    rt.send_to(spawner, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        spawner,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
     let report = inbox.try_recv().expect("on_stop should report parent");
     assert_eq!(report, ParentReport(Some(spawner)));
@@ -1063,7 +1476,9 @@ fn env_child_inherits_parent_environment() {
     struct DbAddr(String);
 
     #[derive(Clone)]
-    struct ReportEnv { reply_to: ActorAddress }
+    struct ReportEnv {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct EnvReport(Option<String>);
@@ -1078,7 +1493,9 @@ fn env_child_inherits_parent_environment() {
         }
     }
 
-    struct EnvParent { reply_to: ActorAddress }
+    struct EnvParent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for EnvParent {
         type Incoming = Ping;
         type Response = ();
@@ -1088,15 +1505,30 @@ fn env_child_inherits_parent_environment() {
                 .env(DbAddr("postgres://localhost".into()))
                 .finish()
                 .unwrap();
-            let _ = ctx.send(child, ReportEnv { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                ReportEnv {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<EnvReport>().unwrap();
-    let parent = rt.spawn(EnvParent { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn(EnvParent {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let report = inbox.try_recv().expect("child should report env");
     assert_eq!(report, EnvReport(Some("postgres://localhost".into())));
@@ -1109,7 +1541,9 @@ fn env_runtime_spawned_has_empty_environment() {
     struct Tag(String);
 
     #[derive(Clone)]
-    struct ReportEnv { reply_to: ActorAddress }
+    struct ReportEnv {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct EnvReport(bool);
@@ -1128,10 +1562,20 @@ fn env_runtime_spawned_has_empty_environment() {
     let inbox = rt.new_inbox::<EnvReport>().unwrap();
     let actor = rt.spawn(EnvReporter).unwrap();
     rt.tick();
-    rt.send_to(actor, ReportEnv { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        ReportEnv {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("actor should report env");
-    assert_eq!(report, EnvReport(false), "runtime-spawned actor has no env values");
+    assert_eq!(
+        report,
+        EnvReport(false),
+        "runtime-spawned actor has no env values"
+    );
 }
 
 /// Environment flows through a grandchild chain: A sets env, spawns B, B
@@ -1142,7 +1586,9 @@ fn env_flows_through_grandchild_chain() {
     struct Secret(u64);
 
     #[derive(Clone)]
-    struct ReportEnv { reply_to: ActorAddress }
+    struct ReportEnv {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct EnvReport(Option<u64>);
@@ -1157,39 +1603,69 @@ fn env_flows_through_grandchild_chain() {
         }
     }
 
-    struct Middle { reply_to: ActorAddress }
+    struct Middle {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Middle {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             // ctx.spawn inherits parent env automatically
             let child = ctx.spawn(Leaf).unwrap();
-            let _ = ctx.send(child, ReportEnv { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                ReportEnv {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
-    struct Root { reply_to: ActorAddress }
+    struct Root {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Root {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let mid = ctx
-                .spawn_builder(Middle { reply_to: self.reply_to })
+                .spawn_builder(Middle {
+                    reply_to: self.reply_to,
+                })
                 .env(Secret(42))
                 .finish()
                 .unwrap();
-            let _ = ctx.send(mid, Ping { reply_to: ActorAddress::default() });
+            let _ = ctx.send(
+                mid,
+                Ping {
+                    reply_to: ActorAddress::default(),
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<EnvReport>().unwrap();
-    let root = rt.spawn(Root { reply_to: *inbox.addr() }).unwrap();
+    let root = rt
+        .spawn(Root {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(root, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        root,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
     let report = inbox.try_recv().expect("grandchild should report env");
-    assert_eq!(report, EnvReport(Some(42)), "env value from root flows to grandchild");
+    assert_eq!(
+        report,
+        EnvReport(Some(42)),
+        "env value from root flows to grandchild"
+    );
 }
 
 /// Spawn builder overrides one key while inheriting others: parent has Key1 +
@@ -1202,24 +1678,34 @@ fn env_spawn_builder_overrides_one_key_inherits_others() {
     struct Key2(String);
 
     #[derive(Clone)]
-    struct ReportEnv { reply_to: ActorAddress }
+    struct ReportEnv {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
-    struct EnvReport { key1: Option<String>, key2: Option<String> }
+    struct EnvReport {
+        key1: Option<String>,
+        key2: Option<String>,
+    }
 
     struct EnvChild;
     impl ActorInterface for EnvChild {
         type Incoming = ReportEnv;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, msg: ReportEnv) {
-            let _ = ctx.send(msg.reply_to, EnvReport {
-                key1: ctx.env::<Key1>().map(|k| k.0.clone()),
-                key2: ctx.env::<Key2>().map(|k| k.0.clone()),
-            });
+            let _ = ctx.send(
+                msg.reply_to,
+                EnvReport {
+                    key1: ctx.env::<Key1>().map(|k| k.0.clone()),
+                    key2: ctx.env::<Key2>().map(|k| k.0.clone()),
+                },
+            );
         }
     }
 
-    struct EnvParent { reply_to: ActorAddress }
+    struct EnvParent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for EnvParent {
         type Incoming = Ping;
         type Response = ();
@@ -1230,7 +1716,12 @@ fn env_spawn_builder_overrides_one_key_inherits_others() {
                 .env(Key2("overridden".into()))
                 .finish()
                 .unwrap();
-            let _ = ctx.send(child, ReportEnv { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                ReportEnv {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
@@ -1241,33 +1732,58 @@ fn env_spawn_builder_overrides_one_key_inherits_others() {
         .build();
 
     // Spawn the parent with the built env using a "bootstrap" actor
-    struct Bootstrap { reply_to: ActorAddress }
+    struct Bootstrap {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Bootstrap {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let parent = ctx
-                .spawn_builder(EnvParent { reply_to: self.reply_to })
+                .spawn_builder(EnvParent {
+                    reply_to: self.reply_to,
+                })
                 .env(Key1("original".into()))
                 .env(Key2("original".into()))
                 .finish()
                 .unwrap();
-            let _ = ctx.send(parent, Ping { reply_to: ActorAddress::default() });
+            let _ = ctx.send(
+                parent,
+                Ping {
+                    reply_to: ActorAddress::default(),
+                },
+            );
         }
     }
 
     let _ = parent_env; // verify it builds (used above for documentation)
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<EnvReport>().unwrap();
-    let bootstrap = rt.spawn(Bootstrap {
-        reply_to: *inbox.addr(),
-    }).unwrap();
+    let bootstrap = rt
+        .spawn(Bootstrap {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(bootstrap, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        bootstrap,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
     let report = inbox.try_recv().expect("child should report env");
-    assert_eq!(report.key1, Some("original".into()), "Key1 inherited from parent");
-    assert_eq!(report.key2, Some("overridden".into()), "Key2 overridden by spawn_builder");
+    assert_eq!(
+        report.key1,
+        Some("original".into()),
+        "Key1 inherited from parent"
+    );
+    assert_eq!(
+        report.key2,
+        Some("overridden".into()),
+        "Key2 overridden by spawn_builder"
+    );
 }
 
 /// Environment is readable during on_stop callback.
@@ -1279,7 +1795,9 @@ fn env_readable_in_on_stop() {
     #[derive(Clone, Debug, PartialEq)]
     struct EnvReport(Option<String>);
 
-    struct OnStopEnvReporter { reply_to: ActorAddress }
+    struct OnStopEnvReporter {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for OnStopEnvReporter {
         type Incoming = Ping;
         type Response = ();
@@ -1290,13 +1808,17 @@ fn env_readable_in_on_stop() {
         }
     }
 
-    struct Spawner { reply_to: ActorAddress }
+    struct Spawner {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Spawner {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let child = ctx
-                .spawn_builder(OnStopEnvReporter { reply_to: self.reply_to })
+                .spawn_builder(OnStopEnvReporter {
+                    reply_to: self.reply_to,
+                })
                 .env(Config("production".into()))
                 .finish()
                 .unwrap();
@@ -1306,9 +1828,19 @@ fn env_readable_in_on_stop() {
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<EnvReport>().unwrap();
-    let spawner = rt.spawn(Spawner { reply_to: *inbox.addr() }).unwrap();
+    let spawner = rt
+        .spawn(Spawner {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(spawner, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        spawner,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
     let report = inbox.try_recv().expect("on_stop should report env");
     assert_eq!(report, EnvReport(Some("production".into())));
@@ -1322,7 +1854,9 @@ fn env_sibling_overrides_are_independent() {
     struct Version(u32);
 
     #[derive(Clone)]
-    struct ReportEnv { reply_to: ActorAddress }
+    struct ReportEnv {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct EnvReport(Option<u32>);
@@ -1337,23 +1871,53 @@ fn env_sibling_overrides_are_independent() {
         }
     }
 
-    struct Parent { reply_to: ActorAddress }
+    struct Parent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Parent {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-            let a = ctx.spawn_builder(VersionReporter).env(Version(1)).finish().unwrap();
-            let b = ctx.spawn_builder(VersionReporter).env(Version(2)).finish().unwrap();
-            let _ = ctx.send(a, ReportEnv { reply_to: self.reply_to });
-            let _ = ctx.send(b, ReportEnv { reply_to: self.reply_to });
+            let a = ctx
+                .spawn_builder(VersionReporter)
+                .env(Version(1))
+                .finish()
+                .unwrap();
+            let b = ctx
+                .spawn_builder(VersionReporter)
+                .env(Version(2))
+                .finish()
+                .unwrap();
+            let _ = ctx.send(
+                a,
+                ReportEnv {
+                    reply_to: self.reply_to,
+                },
+            );
+            let _ = ctx.send(
+                b,
+                ReportEnv {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<EnvReport>().unwrap();
-    let parent = rt.spawn(Parent { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn(Parent {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
     let mut reports: Vec<EnvReport> = std::iter::from_fn(|| inbox.try_recv()).collect();
@@ -1371,7 +1935,9 @@ fn env_sibling_overrides_are_independent() {
 #[test]
 fn spawn_timestamp_present_with_std_extension() {
     #[derive(Clone)]
-    struct ReportTs { reply_to: ActorAddress }
+    struct ReportTs {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct TsReport(Option<u64>);
@@ -1390,10 +1956,19 @@ fn spawn_timestamp_present_with_std_extension() {
     let inbox = rt.new_inbox::<TsReport>().unwrap();
     let actor = rt.spawn(TsActor).unwrap();
     rt.tick();
-    rt.send_to(actor, ReportTs { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        ReportTs {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("should receive timestamp report");
-    assert!(report.0.is_some(), "SpawnTimestamp should be present with StdExtension");
+    assert!(
+        report.0.is_some(),
+        "SpawnTimestamp should be present with StdExtension"
+    );
 }
 
 /// Parent and child spawned at different times have different timestamps,
@@ -1401,43 +1976,70 @@ fn spawn_timestamp_present_with_std_extension() {
 #[test]
 fn spawn_timestamp_parent_child_ordering() {
     #[derive(Clone, Debug)]
-    struct TsPair { parent_ts: u64, child_ts: u64 }
+    struct TsPair {
+        parent_ts: u64,
+        child_ts: u64,
+    }
 
-    struct TsChild { reply_to: ActorAddress, parent_ts: u64 }
+    struct TsChild {
+        reply_to: ActorAddress,
+        parent_ts: u64,
+    }
     impl ActorInterface for TsChild {
         type Incoming = ();
         type Response = ();
         fn on_start(&mut self, ctx: &Ctx) {
             let child_ts = ctx.env::<SpawnTimestamp>().unwrap().0;
-            let _ = ctx.send(self.reply_to, TsPair {
-                parent_ts: self.parent_ts,
-                child_ts,
-            });
+            let _ = ctx.send(
+                self.reply_to,
+                TsPair {
+                    parent_ts: self.parent_ts,
+                    child_ts,
+                },
+            );
         }
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
     }
 
-    struct TsParent { reply_to: ActorAddress }
+    struct TsParent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for TsParent {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let my_ts = ctx.env::<SpawnTimestamp>().unwrap().0;
-            let _ = ctx.spawn(TsChild { reply_to: self.reply_to, parent_ts: my_ts });
+            let _ = ctx.spawn(TsChild {
+                reply_to: self.reply_to,
+                parent_ts: my_ts,
+            });
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<TsPair>().unwrap();
-    let parent = rt.spawn(TsParent { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn(TsParent {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     // Tick a few times so some uptime accumulates before the child spawn
     tick_n(&rt, 3);
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let report = inbox.try_recv().expect("should receive timestamp pair");
-    assert!(report.child_ts >= report.parent_ts,
+    assert!(
+        report.child_ts >= report.parent_ts,
         "child timestamp ({}) should be >= parent timestamp ({})",
-        report.child_ts, report.parent_ts);
+        report.child_ts,
+        report.parent_ts
+    );
 }
 
 /// SpawnTimestamp is available during on_stop callback.
@@ -1446,7 +2048,9 @@ fn spawn_timestamp_available_in_on_stop() {
     #[derive(Clone, Debug, PartialEq)]
     struct TsReport(Option<u64>);
 
-    struct OnStopTsReporter { reply_to: ActorAddress }
+    struct OnStopTsReporter {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for OnStopTsReporter {
         type Incoming = ();
         type Response = ();
@@ -1459,12 +2063,19 @@ fn spawn_timestamp_available_in_on_stop() {
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<TsReport>().unwrap();
-    let actor = rt.spawn(OnStopTsReporter { reply_to: *inbox.addr() }).unwrap();
+    let actor = rt
+        .spawn(OnStopTsReporter {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
     rt.stop_actor(actor).unwrap();
     tick_n(&rt, 3);
     let report = inbox.try_recv().expect("on_stop should report timestamp");
-    assert!(report.0.is_some(), "SpawnTimestamp should be available in on_stop");
+    assert!(
+        report.0.is_some(),
+        "SpawnTimestamp should be available in on_stop"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1475,7 +2086,9 @@ fn spawn_timestamp_available_in_on_stop() {
 #[test]
 fn logical_name_present_for_named_actor() {
     #[derive(Clone)]
-    struct ReportName { reply_to: ActorAddress }
+    struct ReportName {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct NameReport(Option<String>);
@@ -1494,7 +2107,13 @@ fn logical_name_present_for_named_actor() {
     let inbox = rt.new_inbox::<NameReport>().unwrap();
     let addr = rt.spawn_named("my-service", NameActor).unwrap();
     rt.tick();
-    rt.send_to(addr, ReportName { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        addr,
+        ReportName {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("should receive name report");
     assert_eq!(report, NameReport(Some("my-service".to_string())));
@@ -1504,7 +2123,9 @@ fn logical_name_present_for_named_actor() {
 #[test]
 fn logical_name_absent_for_unnamed_actor() {
     #[derive(Clone)]
-    struct ReportName { reply_to: ActorAddress }
+    struct ReportName {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct NameReport(Option<String>);
@@ -1523,7 +2144,13 @@ fn logical_name_absent_for_unnamed_actor() {
     let inbox = rt.new_inbox::<NameReport>().unwrap();
     let addr = rt.spawn(NameActor).unwrap();
     rt.tick();
-    rt.send_to(addr, ReportName { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        addr,
+        ReportName {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("should receive name report");
     assert_eq!(report, NameReport(None));
@@ -1533,7 +2160,9 @@ fn logical_name_absent_for_unnamed_actor() {
 #[test]
 fn logical_name_via_runtime_spawn_named() {
     #[derive(Clone)]
-    struct ReportName { reply_to: ActorAddress }
+    struct ReportName {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct NameReport(Option<String>);
@@ -1552,7 +2181,13 @@ fn logical_name_via_runtime_spawn_named() {
     let inbox = rt.new_inbox::<NameReport>().unwrap();
     let addr = rt.spawn_named("svc", NameActor).unwrap();
     rt.tick();
-    rt.send_to(addr, ReportName { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        addr,
+        ReportName {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("should receive name report");
     assert_eq!(report, NameReport(Some("svc".to_string())));
@@ -1562,7 +2197,9 @@ fn logical_name_via_runtime_spawn_named() {
 #[test]
 fn logical_name_inherited_by_child() {
     #[derive(Clone)]
-    struct ReportName { reply_to: ActorAddress }
+    struct ReportName {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct NameReport(Option<String>);
@@ -1577,24 +2214,46 @@ fn logical_name_inherited_by_child() {
         }
     }
 
-    struct NamedParent { reply_to: ActorAddress }
+    struct NamedParent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for NamedParent {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             // ctx.spawn inherits parent env, which includes LogicalName
             let child = ctx.spawn(ChildReporter).unwrap();
-            let _ = ctx.send(child, ReportName { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                ReportName {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<NameReport>().unwrap();
-    let parent = rt.spawn_named("parent-svc", NamedParent { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn_named(
+            "parent-svc",
+            NamedParent {
+                reply_to: *inbox.addr(),
+            },
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
-    let report = inbox.try_recv().expect("child should report inherited name");
+    let report = inbox
+        .try_recv()
+        .expect("child should report inherited name");
     assert_eq!(report, NameReport(Some("parent-svc".to_string())));
 }
 
@@ -1606,7 +2265,9 @@ fn logical_name_inherited_by_child() {
 #[test]
 fn supervised_child_knows_supervisor() {
     #[derive(Clone)]
-    struct ReportSupervisor { reply_to: ActorAddress }
+    struct ReportSupervisor {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct SupervisorReport(Option<ActorAddress>);
@@ -1625,17 +2286,25 @@ fn supervised_child_knows_supervisor() {
     let inbox = rt.new_inbox::<SupervisorReport>().unwrap();
     let reply_to = *inbox.addr();
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
-        vec![ChildSpec::new("child", RestartPolicy::Permanent, move |ctx| {
-            ctx.spawn(SupervisedChild)
-        })],
+        SupervisorStrategy::OneForOne,
+        5,
+        vec![ChildSpec::new(
+            "child",
+            RestartPolicy::Permanent,
+            move |ctx| ctx.spawn(SupervisedChild),
+        )],
     );
     let sup_addr = rt.spawn(sup).unwrap();
     tick_n(&rt, 2);
 
     // Find the child address
-    let child = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup_addr).map(|(a, _)| *a).unwrap();
+    let child = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup_addr)
+        .map(|(a, _)| *a)
+        .unwrap();
     rt.send_to(child, ReportSupervisor { reply_to }).unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("child should report supervisor");
@@ -1646,7 +2315,9 @@ fn supervised_child_knows_supervisor() {
 #[test]
 fn unsupervised_actor_has_no_supervisor() {
     #[derive(Clone)]
-    struct ReportSupervisor { reply_to: ActorAddress }
+    struct ReportSupervisor {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct SupervisorReport(Option<ActorAddress>);
@@ -1665,7 +2336,13 @@ fn unsupervised_actor_has_no_supervisor() {
     let inbox = rt.new_inbox::<SupervisorReport>().unwrap();
     let actor = rt.spawn(PlainActor).unwrap();
     rt.tick();
-    rt.send_to(actor, ReportSupervisor { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        ReportSupervisor {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("actor should report supervisor");
     assert_eq!(report, SupervisorReport(None));
@@ -1676,7 +2353,9 @@ fn unsupervised_actor_has_no_supervisor() {
 #[test]
 fn supervisor_survives_child_restart() {
     #[derive(Clone)]
-    struct ReportSupervisor { reply_to: ActorAddress }
+    struct ReportSupervisor {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct SupervisorReport(Option<ActorAddress>);
@@ -1702,28 +2381,50 @@ fn supervisor_survives_child_restart() {
     let crash_counter = Arc::new(AtomicUsize::new(0));
     let cc = crash_counter.clone();
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
-        vec![ChildSpec::new("crasher", RestartPolicy::Permanent, move |ctx| {
-            ctx.spawn(CrashOnce { crash_counter: cc.clone() })
-        })],
+        SupervisorStrategy::OneForOne,
+        5,
+        vec![ChildSpec::new(
+            "crasher",
+            RestartPolicy::Permanent,
+            move |ctx| {
+                ctx.spawn(CrashOnce {
+                    crash_counter: cc.clone(),
+                })
+            },
+        )],
     );
     let sup_addr = rt.spawn(sup).unwrap();
     tick_n(&rt, 2);
 
     // First: find child and make it crash
-    let child_v1 = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup_addr).map(|(a, _)| *a).unwrap();
+    let child_v1 = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup_addr)
+        .map(|(a, _)| *a)
+        .unwrap();
     rt.send_to(child_v1, ReportSupervisor { reply_to }).unwrap();
     tick_n(&rt, 5); // panics, supervisor restarts
 
     // Find the new child (different address)
-    let child_v2 = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup_addr).map(|(a, _)| *a).unwrap();
-    assert_ne!(child_v1, child_v2, "child should have a new address after restart");
+    let child_v2 = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup_addr)
+        .map(|(a, _)| *a)
+        .unwrap();
+    assert_ne!(
+        child_v1, child_v2,
+        "child should have a new address after restart"
+    );
 
     rt.send_to(child_v2, ReportSupervisor { reply_to }).unwrap();
     rt.tick();
-    let report = inbox.try_recv().expect("restarted child should report supervisor");
+    let report = inbox
+        .try_recv()
+        .expect("restarted child should report supervisor");
     assert_eq!(report, SupervisorReport(Some(sup_addr)));
 }
 
@@ -1732,37 +2433,55 @@ fn supervisor_survives_child_restart() {
 #[test]
 fn grandchild_not_supervised_child_is() {
     #[derive(Clone)]
-    struct ReportSupervisor { reply_to: ActorAddress }
+    struct ReportSupervisor {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
-    struct SupervisorReport { addr: ActorAddress, supervisor: Option<ActorAddress> }
+    struct SupervisorReport {
+        addr: ActorAddress,
+        supervisor: Option<ActorAddress>,
+    }
 
     struct GrandChild;
     impl ActorInterface for GrandChild {
         type Incoming = ReportSupervisor;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, msg: ReportSupervisor) {
-            let _ = ctx.send(msg.reply_to, SupervisorReport {
-                addr: ctx.self_addr(),
-                supervisor: ctx.supervisor(),
-            });
+            let _ = ctx.send(
+                msg.reply_to,
+                SupervisorReport {
+                    addr: ctx.self_addr(),
+                    supervisor: ctx.supervisor(),
+                },
+            );
         }
     }
 
-    struct ChildA { reply_to: ActorAddress }
+    struct ChildA {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for ChildA {
         type Incoming = ReportSupervisor;
         type Response = ();
         fn on_start(&mut self, ctx: &Ctx) {
             // Spawn a grandchild (not supervised)
             let gc = ctx.spawn(GrandChild).unwrap();
-            let _ = ctx.send(gc, ReportSupervisor { reply_to: self.reply_to });
+            let _ = ctx.send(
+                gc,
+                ReportSupervisor {
+                    reply_to: self.reply_to,
+                },
+            );
         }
         fn handle(&mut self, ctx: &Ctx, msg: ReportSupervisor) {
-            let _ = ctx.send(msg.reply_to, SupervisorReport {
-                addr: ctx.self_addr(),
-                supervisor: ctx.supervisor(),
-            });
+            let _ = ctx.send(
+                msg.reply_to,
+                SupervisorReport {
+                    addr: ctx.self_addr(),
+                    supervisor: ctx.supervisor(),
+                },
+            );
         }
     }
 
@@ -1770,7 +2489,8 @@ fn grandchild_not_supervised_child_is() {
     let inbox = rt.new_inbox::<SupervisorReport>().unwrap();
     let reply_to = *inbox.addr();
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForOne, 5,
+        SupervisorStrategy::OneForOne,
+        5,
         vec![ChildSpec::new("a", RestartPolicy::Permanent, move |ctx| {
             ctx.spawn(ChildA { reply_to })
         })],
@@ -1783,13 +2503,21 @@ fn grandchild_not_supervised_child_is() {
     assert_eq!(gc_report.supervisor, None, "grandchild is not supervised");
 
     // Now ask child A to report
-    let child_a = rt.stats().actors.iter()
+    let child_a = rt
+        .stats()
+        .actors
+        .iter()
         .find(|(a, _)| *a != sup_addr && *a != gc_report.addr)
-        .map(|(a, _)| *a).unwrap();
+        .map(|(a, _)| *a)
+        .unwrap();
     rt.send_to(child_a, ReportSupervisor { reply_to }).unwrap();
     rt.tick();
     let a_report = inbox.try_recv().expect("child A should report");
-    assert_eq!(a_report.supervisor, Some(sup_addr), "child A's supervisor is the supervisor");
+    assert_eq!(
+        a_report.supervisor,
+        Some(sup_addr),
+        "child A's supervisor is the supervisor"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1799,10 +2527,12 @@ fn grandchild_not_supervised_child_is() {
 /// Actor discovers a registered service by marker type.
 #[test]
 fn service_discovery_by_marker_type() {
-    struct Datastore;
+    struct PrimaryService;
 
     #[derive(Clone)]
-    struct LookupService { reply_to: ActorAddress }
+    struct LookupService {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ServiceReport(Option<ActorAddress>);
@@ -1812,22 +2542,28 @@ fn service_discovery_by_marker_type() {
         type Incoming = LookupService;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, msg: LookupService) {
-            let addr = ctx.resource::<Datastore>();
+            let addr = ctx.resource::<PrimaryService>();
             let _ = ctx.send(msg.reply_to, ServiceReport(addr));
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
-    let fake_ds_addr = ActorAddress::new_random();
-    rt.register_service::<Datastore>(fake_ds_addr);
+    let service_addr = ActorAddress::new_random();
+    rt.register_service::<PrimaryService>(service_addr);
 
     let inbox = rt.new_inbox::<ServiceReport>().unwrap();
     let consumer = rt.spawn(ServiceConsumer).unwrap();
     rt.tick();
-    rt.send_to(consumer, LookupService { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        consumer,
+        LookupService {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("should receive service report");
-    assert_eq!(report, ServiceReport(Some(fake_ds_addr)));
+    assert_eq!(report, ServiceReport(Some(service_addr)));
 }
 
 /// Child inherits service binding from parent's environment.
@@ -1836,7 +2572,9 @@ fn service_binding_inherited_by_child() {
     struct AuthService;
 
     #[derive(Clone)]
-    struct LookupService { reply_to: ActorAddress }
+    struct LookupService {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ServiceReport(Option<ActorAddress>);
@@ -1851,13 +2589,20 @@ fn service_binding_inherited_by_child() {
         }
     }
 
-    struct Parent { reply_to: ActorAddress }
+    struct Parent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Parent {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let child = ctx.spawn(Leaf).unwrap();
-            let _ = ctx.send(child, LookupService { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                LookupService {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
@@ -1866,9 +2611,19 @@ fn service_binding_inherited_by_child() {
     rt.register_service::<AuthService>(auth_addr);
 
     let inbox = rt.new_inbox::<ServiceReport>().unwrap();
-    let parent = rt.spawn(Parent { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn(Parent {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let report = inbox.try_recv().expect("child should report service");
     assert_eq!(report, ServiceReport(Some(auth_addr)));
@@ -1877,16 +2632,18 @@ fn service_binding_inherited_by_child() {
 /// Multiple services registered, each accessible by its own marker type.
 #[test]
 fn multiple_services_each_accessible_by_marker() {
-    struct Datastore;
+    struct PrimaryService;
     struct Cache;
     struct Logger;
 
     #[derive(Clone)]
-    struct LookupAll { reply_to: ActorAddress }
+    struct LookupAll {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct AllServicesReport {
-        ds: Option<ActorAddress>,
+        primary: Option<ActorAddress>,
         cache: Option<ActorAddress>,
         logger: Option<ActorAddress>,
     }
@@ -1896,29 +2653,40 @@ fn multiple_services_each_accessible_by_marker() {
         type Incoming = LookupAll;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, msg: LookupAll) {
-            let _ = ctx.send(msg.reply_to, AllServicesReport {
-                ds: ctx.resource::<Datastore>(),
-                cache: ctx.resource::<Cache>(),
-                logger: ctx.resource::<Logger>(),
-            });
+            let _ = ctx.send(
+                msg.reply_to,
+                AllServicesReport {
+                    primary: ctx.resource::<PrimaryService>(),
+                    cache: ctx.resource::<Cache>(),
+                    logger: ctx.resource::<Logger>(),
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
-    let ds_addr = ActorAddress::new_random();
+    let primary_addr = ActorAddress::new_random();
     let cache_addr = ActorAddress::new_random();
     let logger_addr = ActorAddress::new_random();
-    rt.register_service::<Datastore>(ds_addr);
+    rt.register_service::<PrimaryService>(primary_addr);
     rt.register_service::<Cache>(cache_addr);
     rt.register_service::<Logger>(logger_addr);
 
     let inbox = rt.new_inbox::<AllServicesReport>().unwrap();
     let actor = rt.spawn(MultiConsumer).unwrap();
     rt.tick();
-    rt.send_to(actor, LookupAll { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        LookupAll {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
-    let report = inbox.try_recv().expect("should receive all services report");
-    assert_eq!(report.ds, Some(ds_addr));
+    let report = inbox
+        .try_recv()
+        .expect("should receive all services report");
+    assert_eq!(report.primary, Some(primary_addr));
     assert_eq!(report.cache, Some(cache_addr));
     assert_eq!(report.logger, Some(logger_addr));
 }
@@ -1929,7 +2697,9 @@ fn unregistered_service_returns_none() {
     struct Nonexistent;
 
     #[derive(Clone)]
-    struct LookupService { reply_to: ActorAddress }
+    struct LookupService {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ServiceReport(Option<ActorAddress>);
@@ -1949,7 +2719,13 @@ fn unregistered_service_returns_none() {
     let inbox = rt.new_inbox::<ServiceReport>().unwrap();
     let actor = rt.spawn(Consumer).unwrap();
     rt.tick();
-    rt.send_to(actor, LookupService { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        LookupService {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("should receive service report");
     assert_eq!(report, ServiceReport(None));
@@ -1958,10 +2734,12 @@ fn unregistered_service_returns_none() {
 /// Service binding overridable via spawn_builder — per-subtree customization.
 #[test]
 fn service_binding_overridable_via_spawn_builder() {
-    struct Datastore;
+    struct PrimaryService;
 
     #[derive(Clone)]
-    struct LookupService { reply_to: ActorAddress }
+    struct LookupService {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct ServiceReport(Option<ActorAddress>);
@@ -1971,50 +2749,81 @@ fn service_binding_overridable_via_spawn_builder() {
         type Incoming = LookupService;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, msg: LookupService) {
-            let addr = ctx.resource::<Datastore>();
+            let addr = ctx.resource::<PrimaryService>();
             let _ = ctx.send(msg.reply_to, ServiceReport(addr));
         }
     }
 
-    struct Spawner { reply_to: ActorAddress, override_addr: ActorAddress }
+    struct Spawner {
+        reply_to: ActorAddress,
+        override_addr: ActorAddress,
+    }
     impl ActorInterface for Spawner {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-            // Override the Datastore binding for this subtree
-            let child = ctx.spawn_builder(Consumer)
-                .env(ServiceBinding::<Datastore>::new(self.override_addr))
+            // Override the primary service binding for this subtree
+            let child = ctx
+                .spawn_builder(Consumer)
+                .env(ServiceBinding::<PrimaryService>::new(self.override_addr))
                 .finish()
                 .unwrap();
-            let _ = ctx.send(child, LookupService { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                LookupService {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
-    let global_ds = ActorAddress::new_random();
-    let override_ds = ActorAddress::new_random();
-    rt.register_service::<Datastore>(global_ds);
+    let global_service = ActorAddress::new_random();
+    let override_service = ActorAddress::new_random();
+    rt.register_service::<PrimaryService>(global_service);
 
     let inbox = rt.new_inbox::<ServiceReport>().unwrap();
 
     // Spawn a plain consumer — should see the global binding
     let plain = rt.spawn(Consumer).unwrap();
     rt.tick();
-    rt.send_to(plain, LookupService { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        plain,
+        LookupService {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("plain consumer should report");
-    assert_eq!(report, ServiceReport(Some(global_ds)), "plain consumer sees global service");
+    assert_eq!(
+        report,
+        ServiceReport(Some(global_service)),
+        "plain consumer sees global service"
+    );
 
     // Spawn via spawn_builder override — should see the override
-    let spawner = rt.spawn(Spawner {
-        reply_to: *inbox.addr(),
-        override_addr: override_ds,
-    }).unwrap();
+    let spawner = rt
+        .spawn(Spawner {
+            reply_to: *inbox.addr(),
+            override_addr: override_service,
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(spawner, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        spawner,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let report = inbox.try_recv().expect("overridden consumer should report");
-    assert_eq!(report, ServiceReport(Some(override_ds)), "overridden consumer sees custom service");
+    assert_eq!(
+        report,
+        ServiceReport(Some(override_service)),
+        "overridden consumer sees custom service"
+    );
 }
 
 /// Service is accessible in on_start and on_stop lifecycle hooks.
@@ -2043,10 +2852,13 @@ fn service_accessible_in_lifecycle_hooks() {
         }
         fn on_stop(&mut self, ctx: &Ctx) {
             let on_stop_addr = ctx.resource::<MetricsService>();
-            let _ = ctx.send(self.reply_to, LifecycleReport {
-                on_start_addr: self.on_start_addr,
-                on_stop_addr,
-            });
+            let _ = ctx.send(
+                self.reply_to,
+                LifecycleReport {
+                    on_start_addr: self.on_start_addr,
+                    on_stop_addr,
+                },
+            );
         }
     }
 
@@ -2055,18 +2867,29 @@ fn service_accessible_in_lifecycle_hooks() {
     rt.register_service::<MetricsService>(metrics_addr);
 
     let inbox = rt.new_inbox::<LifecycleReport>().unwrap();
-    let actor = rt.spawn(LifecycleActor {
-        reply_to: *inbox.addr(),
-        on_start_addr: None,
-    }).unwrap();
+    let actor = rt
+        .spawn(LifecycleActor {
+            reply_to: *inbox.addr(),
+            on_start_addr: None,
+        })
+        .unwrap();
     rt.tick(); // on_start
-    rt.send_to(actor, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        actor,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5); // handle → stop_self → on_stop
     let report = inbox.try_recv().expect("should receive lifecycle report");
-    assert_eq!(report, LifecycleReport {
-        on_start_addr: Some(metrics_addr),
-        on_stop_addr: Some(metrics_addr),
-    });
+    assert_eq!(
+        report,
+        LifecycleReport {
+            on_start_addr: Some(metrics_addr),
+            on_stop_addr: Some(metrics_addr),
+        }
+    );
 }
 
 /// OneForAll restart re-registers all children: crash one child, after restart
@@ -2074,7 +2897,9 @@ fn service_accessible_in_lifecycle_hooks() {
 #[test]
 fn one_for_all_restart_re_registers_children() {
     #[derive(Clone)]
-    struct ReportSupervisor { reply_to: ActorAddress }
+    struct ReportSupervisor {
+        reply_to: ActorAddress,
+    }
 
     #[derive(Clone, Debug, PartialEq)]
     struct SupervisorReport(Option<ActorAddress>);
@@ -2102,10 +2927,15 @@ fn one_for_all_restart_re_registers_children() {
     let inbox = rt.new_inbox::<SupervisorReport>().unwrap();
     let reply_to = *inbox.addr();
     let sup = Supervisor::new(
-        SupervisorStrategy::OneForAll, 5,
+        SupervisorStrategy::OneForAll,
+        5,
         vec![
-            ChildSpec::new("crasher", RestartPolicy::Permanent, |ctx| ctx.spawn(CrashChild)),
-            ChildSpec::new("stable", RestartPolicy::Permanent, |ctx| ctx.spawn(StableChild)),
+            ChildSpec::new("crasher", RestartPolicy::Permanent, |ctx| {
+                ctx.spawn(CrashChild)
+            }),
+            ChildSpec::new("stable", RestartPolicy::Permanent, |ctx| {
+                ctx.spawn(StableChild)
+            }),
         ],
     );
     let sup_addr = rt.spawn(sup).unwrap();
@@ -2114,7 +2944,10 @@ fn one_for_all_restart_re_registers_children() {
     // Find the crasher and make it crash
     // We need to identify which is which. The CrashChild accepts Ping,
     // and we know there are exactly 2 non-supervisor actors.
-    let children: Vec<ActorAddress> = rt.stats().actors.iter()
+    let children: Vec<ActorAddress> = rt
+        .stats()
+        .actors
+        .iter()
         .filter(|(a, _)| *a != sup_addr)
         .map(|(a, _)| *a)
         .collect();
@@ -2123,12 +2956,20 @@ fn one_for_all_restart_re_registers_children() {
     // Send Ping to the crasher (it will be one of them). We'll try both —
     // the StableChild doesn't handle Ping so it'll be a type mismatch, not a crash.
     for &child in &children {
-        let _ = rt.send_to(child, Ping { reply_to: ActorAddress::default() });
+        let _ = rt.send_to(
+            child,
+            Ping {
+                reply_to: ActorAddress::default(),
+            },
+        );
     }
     tick_n(&rt, 8); // crash + OneForAll restart
 
     // After restart, all children should report the supervisor
-    let new_children: Vec<ActorAddress> = rt.stats().actors.iter()
+    let new_children: Vec<ActorAddress> = rt
+        .stats()
+        .actors
+        .iter()
         .filter(|(a, _)| *a != sup_addr)
         .map(|(a, _)| *a)
         .collect();
@@ -2140,10 +2981,16 @@ fn one_for_all_restart_re_registers_children() {
 
     // At least the stable child should report
     let reports: Vec<SupervisorReport> = std::iter::from_fn(|| inbox.try_recv()).collect();
-    assert!(!reports.is_empty(), "at least one child should report after OneForAll restart");
+    assert!(
+        !reports.is_empty(),
+        "at least one child should report after OneForAll restart"
+    );
     for report in &reports {
-        assert_eq!(report.0, Some(sup_addr),
-            "all children should report the supervisor after OneForAll restart");
+        assert_eq!(
+            report.0,
+            Some(sup_addr),
+            "all children should report the supervisor after OneForAll restart"
+        );
     }
 }
 
@@ -2164,19 +3011,33 @@ fn handle_wraps_service_and_sends_ergonomically() {
     impl ResourceHandle for CounterHandle {
         type Service = CounterService;
         fn from_parts(service_addr: ActorAddress, self_addr: ActorAddress) -> Self {
-            Self { service: service_addr, self_addr }
+            Self {
+                service: service_addr,
+                self_addr,
+            }
         }
-        fn service_addr(&self) -> ActorAddress { self.service }
-        fn self_addr(&self) -> ActorAddress { self.self_addr }
+        fn service_addr(&self) -> ActorAddress {
+            self.service
+        }
+        fn self_addr(&self) -> ActorAddress {
+            self.self_addr
+        }
     }
 
     impl CounterHandle {
         fn increment(&self, ctx: &Ctx) -> Result<(), swactor::Error> {
-            ctx.send(self.service_addr(), Increment { reply_to: self.self_addr() })
+            ctx.send(
+                self.service_addr(),
+                Increment {
+                    reply_to: self.self_addr(),
+                },
+            )
         }
     }
 
-    struct HandleUser { _inbox: ActorAddress }
+    struct HandleUser {
+        _inbox: ActorAddress,
+    }
     impl ActorInterface for HandleUser {
         type Incoming = Ping;
         type Response = ();
@@ -2196,17 +3057,33 @@ fn handle_wraps_service_and_sends_ergonomically() {
 
     let inbox = rt.new_inbox::<Count>().unwrap();
     // Use spawn_with_env so we can set reply_to
-    let user = rt.spawn(HandleUser { _inbox: *inbox.addr() }).unwrap();
+    let user = rt
+        .spawn(HandleUser {
+            _inbox: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick(); // on_start
 
     // Instead of the handle's reply_to, we directly test: send Ping to user,
     // which uses the handle to increment. The counter replies to user's addr.
     // We observe the counter got incremented via ask.
-    rt.send_to(user, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        user,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
     // Verify: ask counter for its count
-    rt.send_to(counter_addr, Increment { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        counter_addr,
+        Increment {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 2);
     let count = inbox.try_recv().expect("counter should reply");
     assert_eq!(count, Count(2), "handle increment + direct increment = 2");
@@ -2224,10 +3101,17 @@ fn handle_returns_none_when_service_not_registered() {
     impl ResourceHandle for DummyHandle {
         type Service = Nonexistent;
         fn from_parts(service_addr: ActorAddress, self_addr: ActorAddress) -> Self {
-            Self { _service: service_addr, _self_addr: self_addr }
+            Self {
+                _service: service_addr,
+                _self_addr: self_addr,
+            }
         }
-        fn service_addr(&self) -> ActorAddress { self._service }
-        fn self_addr(&self) -> ActorAddress { self._self_addr }
+        fn service_addr(&self) -> ActorAddress {
+            self._service
+        }
+        fn self_addr(&self) -> ActorAddress {
+            self._self_addr
+        }
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -2247,10 +3131,20 @@ fn handle_returns_none_when_service_not_registered() {
     let inbox = rt.new_inbox::<HandleReport>().unwrap();
     let actor = rt.spawn(Reporter).unwrap();
     rt.tick();
-    rt.send_to(actor, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     let report = inbox.try_recv().expect("should receive handle report");
-    assert_eq!(report, HandleReport(false), "handle returns None without registration");
+    assert_eq!(
+        report,
+        HandleReport(false),
+        "handle returns None without registration"
+    );
 }
 
 /// Handle inherits service binding from parent.
@@ -2264,9 +3158,18 @@ fn handle_inherits_service_binding_from_parent() {
     }
     impl ResourceHandle for SvcHandle {
         type Service = MyService;
-        fn from_parts(s: ActorAddress, a: ActorAddress) -> Self { Self { service: s, self_addr: a } }
-        fn service_addr(&self) -> ActorAddress { self.service }
-        fn self_addr(&self) -> ActorAddress { self.self_addr }
+        fn from_parts(s: ActorAddress, a: ActorAddress) -> Self {
+            Self {
+                service: s,
+                self_addr: a,
+            }
+        }
+        fn service_addr(&self) -> ActorAddress {
+            self.service
+        }
+        fn self_addr(&self) -> ActorAddress {
+            self.self_addr
+        }
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -2282,13 +3185,20 @@ fn handle_inherits_service_binding_from_parent() {
         }
     }
 
-    struct Parent { reply_to: ActorAddress }
+    struct Parent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Parent {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             let child = ctx.spawn(Child).unwrap();
-            let _ = ctx.send(child, Ping { reply_to: self.reply_to });
+            let _ = ctx.send(
+                child,
+                Ping {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
@@ -2297,12 +3207,26 @@ fn handle_inherits_service_binding_from_parent() {
     rt.register_service::<MyService>(svc_addr);
 
     let inbox = rt.new_inbox::<HandleReport>().unwrap();
-    let parent = rt.spawn(Parent { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn(Parent {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let report = inbox.try_recv().expect("child should report handle");
-    assert_eq!(report, HandleReport(Some(svc_addr)), "child inherits service binding");
+    assert_eq!(
+        report,
+        HandleReport(Some(svc_addr)),
+        "child inherits service binding"
+    );
 }
 
 /// Handle constructible in on_start.
@@ -2316,15 +3240,26 @@ fn handle_constructible_in_on_start() {
     }
     impl ResourceHandle for MyHandle {
         type Service = MySvc;
-        fn from_parts(s: ActorAddress, a: ActorAddress) -> Self { Self { service: s, self_addr: a } }
-        fn service_addr(&self) -> ActorAddress { self.service }
-        fn self_addr(&self) -> ActorAddress { self.self_addr }
+        fn from_parts(s: ActorAddress, a: ActorAddress) -> Self {
+            Self {
+                service: s,
+                self_addr: a,
+            }
+        }
+        fn service_addr(&self) -> ActorAddress {
+            self.service
+        }
+        fn self_addr(&self) -> ActorAddress {
+            self.self_addr
+        }
     }
 
     #[derive(Clone, Debug, PartialEq)]
     struct HandleReport(bool);
 
-    struct OnStartChecker { reply_to: ActorAddress }
+    struct OnStartChecker {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for OnStartChecker {
         type Incoming = ();
         type Response = ();
@@ -2340,9 +3275,15 @@ fn handle_constructible_in_on_start() {
     rt.register_service::<MySvc>(svc_addr);
 
     let inbox = rt.new_inbox::<HandleReport>().unwrap();
-    let _ = rt.spawn(OnStartChecker { reply_to: *inbox.addr() }).unwrap();
+    let _ = rt
+        .spawn(OnStartChecker {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 3);
-    let report = inbox.try_recv().expect("should receive on_start handle report");
+    let report = inbox
+        .try_recv()
+        .expect("should receive on_start handle report");
     assert_eq!(report, HandleReport(true), "handle available in on_start");
 }
 
@@ -2357,9 +3298,18 @@ fn two_actors_same_handle_own_addresses() {
     }
     impl ResourceHandle for MyHandle {
         type Service = MySvc;
-        fn from_parts(s: ActorAddress, a: ActorAddress) -> Self { Self { service: s, self_addr: a } }
-        fn service_addr(&self) -> ActorAddress { self.service }
-        fn self_addr(&self) -> ActorAddress { self.self_addr }
+        fn from_parts(s: ActorAddress, a: ActorAddress) -> Self {
+            Self {
+                service: s,
+                self_addr: a,
+            }
+        }
+        fn service_addr(&self) -> ActorAddress {
+            self.service
+        }
+        fn self_addr(&self) -> ActorAddress {
+            self.self_addr
+        }
     }
 
     #[derive(Clone, Debug, PartialEq)]
@@ -2384,14 +3334,29 @@ fn two_actors_same_handle_own_addresses() {
     let a = rt.spawn(Reporter).unwrap();
     let b = rt.spawn(Reporter).unwrap();
     rt.tick();
-    rt.send_to(a, Ping { reply_to: *inbox.addr() }).unwrap();
-    rt.send_to(b, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        a,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
+    rt.send_to(
+        b,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
 
     let mut reports: Vec<SelfAddrReport> = std::iter::from_fn(|| inbox.try_recv()).collect();
     assert_eq!(reports.len(), 2, "both actors report");
-    reports.sort_by_key(|r| r.0 .0);
-    assert_ne!(reports[0].0, reports[1].0, "each actor has its own self_addr in the handle");
+    reports.sort_by_key(|r| r.0.0);
+    assert_ne!(
+        reports[0].0, reports[1].0,
+        "each actor has its own self_addr in the handle"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2411,27 +3376,51 @@ fn stop_with_value_monitor_receives_in_down() {
     }
 
     #[derive(Clone, Debug)]
-    struct DownReport { reason: StopReason, value: Option<u64> }
+    struct DownReport {
+        reason: StopReason,
+        value: Option<u64>,
+    }
 
-    struct Watcher { reply_to: ActorAddress }
+    struct Watcher {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Watcher {
         type Incoming = ();
         type Response = ();
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
         fn handle_down(&mut self, ctx: &Ctx, down: Down) {
-            let val = down.exit_value.as_ref().and_then(|v| v.downcast_ref::<u64>().copied());
-            let _ = ctx.send(self.reply_to, DownReport { reason: down.reason, value: val });
+            let val = down
+                .exit_value
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<u64>().copied());
+            let _ = ctx.send(
+                self.reply_to,
+                DownReport {
+                    reason: down.reason,
+                    value: val,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<DownReport>().unwrap();
     let target = rt.spawn(Completer).unwrap();
-    let _watcher = rt.spawn(Watcher { reply_to: *inbox.addr() }).unwrap();
+    let _watcher = rt
+        .spawn(Watcher {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
 
     // Watcher monitors target
-    rt.send_to(target, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        target,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
 
     // We need to set up the monitor — use a helper actor
     // Actually, let's use the runtime watch API which delivers ActorExited.
@@ -2441,7 +3430,10 @@ fn stop_with_value_monitor_receives_in_down() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<DownReport>().unwrap();
 
-    struct MonitorWatcher { target: ActorAddress, reply_to: ActorAddress }
+    struct MonitorWatcher {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for MonitorWatcher {
         type Incoming = ();
         type Response = ();
@@ -2450,16 +3442,36 @@ fn stop_with_value_monitor_receives_in_down() {
         }
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
         fn handle_down(&mut self, ctx: &Ctx, down: Down) {
-            let val = down.exit_value.as_ref().and_then(|v| v.downcast_ref::<u64>().copied());
-            let _ = ctx.send(self.reply_to, DownReport { reason: down.reason, value: val });
+            let val = down
+                .exit_value
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<u64>().copied());
+            let _ = ctx.send(
+                self.reply_to,
+                DownReport {
+                    reason: down.reason,
+                    value: val,
+                },
+            );
         }
     }
 
     let target = rt.spawn(Completer).unwrap();
-    let _watcher = rt.spawn(MonitorWatcher { target, reply_to: *inbox.addr() }).unwrap();
+    let _watcher = rt
+        .spawn(MonitorWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 2); // on_start for both
 
-    rt.send_to(target, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        target,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
     let report = inbox.try_recv().expect("watcher should receive Down");
@@ -2480,9 +3492,15 @@ fn stop_with_value_watcher_receives_in_actor_exited() {
     }
 
     #[derive(Clone, Debug)]
-    struct ExitReport { reason: ExitReason, value: Option<String> }
+    struct ExitReport {
+        reason: ExitReason,
+        value: Option<String>,
+    }
 
-    struct ExitWatcher { target: ActorAddress, reply_to: ActorAddress }
+    struct ExitWatcher {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for ExitWatcher {
         type Incoming = ();
         type Response = ();
@@ -2491,21 +3509,43 @@ fn stop_with_value_watcher_receives_in_actor_exited() {
         }
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
         fn on_actor_exit(&mut self, ctx: &Ctx, exited: ActorExited) {
-            let val = exited.exit_value.as_ref().and_then(|v| v.downcast_ref::<String>().cloned());
-            let _ = ctx.send(self.reply_to, ExitReport { reason: exited.reason, value: val });
+            let val = exited
+                .exit_value
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<String>().cloned());
+            let _ = ctx.send(
+                self.reply_to,
+                ExitReport {
+                    reason: exited.reason,
+                    value: val,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ExitReport>().unwrap();
     let target = rt.spawn(Completer).unwrap();
-    let _watcher = rt.spawn(ExitWatcher { target, reply_to: *inbox.addr() }).unwrap();
+    let _watcher = rt
+        .spawn(ExitWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 2);
 
-    rt.send_to(target, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        target,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
-    let report = inbox.try_recv().expect("watcher should receive ActorExited");
+    let report = inbox
+        .try_recv()
+        .expect("watcher should receive ActorExited");
     assert_eq!(report.reason, ExitReason::Completed);
     assert_eq!(report.value, Some("done".to_string()));
 }
@@ -2514,26 +3554,51 @@ fn stop_with_value_watcher_receives_in_actor_exited() {
 #[test]
 fn normal_stop_has_none_exit_value() {
     #[derive(Clone, Debug)]
-    struct DownReport { reason: StopReason, has_value: bool }
+    struct DownReport {
+        reason: StopReason,
+        has_value: bool,
+    }
 
-    struct MonitorWatcher { target: ActorAddress, reply_to: ActorAddress }
+    struct MonitorWatcher {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for MonitorWatcher {
         type Incoming = ();
         type Response = ();
-        fn on_start(&mut self, ctx: &Ctx) { ctx.monitor(self.target).unwrap(); }
+        fn on_start(&mut self, ctx: &Ctx) {
+            ctx.monitor(self.target).unwrap();
+        }
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
         fn handle_down(&mut self, ctx: &Ctx, down: Down) {
-            let _ = ctx.send(self.reply_to, DownReport { reason: down.reason, has_value: down.exit_value.is_some() });
+            let _ = ctx.send(
+                self.reply_to,
+                DownReport {
+                    reason: down.reason,
+                    has_value: down.exit_value.is_some(),
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<DownReport>().unwrap();
     let target = rt.spawn(StopsAfterFirst).unwrap();
-    let _watcher = rt.spawn(MonitorWatcher { target, reply_to: *inbox.addr() }).unwrap();
+    let _watcher = rt
+        .spawn(MonitorWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 2);
 
-    rt.send_to(target, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        target,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
     let report = inbox.try_recv().expect("should receive Down");
@@ -2545,23 +3610,42 @@ fn normal_stop_has_none_exit_value() {
 #[test]
 fn panic_has_none_exit_value() {
     #[derive(Clone, Debug)]
-    struct DownReport { reason: StopReason, has_value: bool }
+    struct DownReport {
+        reason: StopReason,
+        has_value: bool,
+    }
 
-    struct MonitorWatcher { target: ActorAddress, reply_to: ActorAddress }
+    struct MonitorWatcher {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for MonitorWatcher {
         type Incoming = ();
         type Response = ();
-        fn on_start(&mut self, ctx: &Ctx) { ctx.monitor(self.target).unwrap(); }
+        fn on_start(&mut self, ctx: &Ctx) {
+            ctx.monitor(self.target).unwrap();
+        }
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
         fn handle_down(&mut self, ctx: &Ctx, down: Down) {
-            let _ = ctx.send(self.reply_to, DownReport { reason: down.reason, has_value: down.exit_value.is_some() });
+            let _ = ctx.send(
+                self.reply_to,
+                DownReport {
+                    reason: down.reason,
+                    has_value: down.exit_value.is_some(),
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<DownReport>().unwrap();
     let target = rt.spawn(PanicActor).unwrap();
-    let _watcher = rt.spawn(MonitorWatcher { target, reply_to: *inbox.addr() }).unwrap();
+    let _watcher = rt
+        .spawn(MonitorWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 2);
 
     rt.send_to(target, PanicMsg).unwrap();
@@ -2587,14 +3671,22 @@ fn multiple_monitors_receive_cloned_exit_value() {
     #[derive(Clone, Debug)]
     struct DownReport(Option<u32>);
 
-    struct MonitorWatcher { target: ActorAddress, reply_to: ActorAddress }
+    struct MonitorWatcher {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for MonitorWatcher {
         type Incoming = ();
         type Response = ();
-        fn on_start(&mut self, ctx: &Ctx) { ctx.monitor(self.target).unwrap(); }
+        fn on_start(&mut self, ctx: &Ctx) {
+            ctx.monitor(self.target).unwrap();
+        }
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
         fn handle_down(&mut self, ctx: &Ctx, down: Down) {
-            let val = down.exit_value.as_ref().and_then(|v| v.downcast_ref::<u32>().copied());
+            let val = down
+                .exit_value
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<u32>().copied());
             let _ = ctx.send(self.reply_to, DownReport(val));
         }
     }
@@ -2602,12 +3694,33 @@ fn multiple_monitors_receive_cloned_exit_value() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<DownReport>().unwrap();
     let target = rt.spawn(Completer).unwrap();
-    let _w1 = rt.spawn(MonitorWatcher { target, reply_to: *inbox.addr() }).unwrap();
-    let _w2 = rt.spawn(MonitorWatcher { target, reply_to: *inbox.addr() }).unwrap();
-    let _w3 = rt.spawn(MonitorWatcher { target, reply_to: *inbox.addr() }).unwrap();
+    let _w1 = rt
+        .spawn(MonitorWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
+    let _w2 = rt
+        .spawn(MonitorWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
+    let _w3 = rt
+        .spawn(MonitorWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 2);
 
-    rt.send_to(target, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        target,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
     let reports: Vec<DownReport> = std::iter::from_fn(|| inbox.try_recv()).collect();
@@ -2620,7 +3733,9 @@ fn multiple_monitors_receive_cloned_exit_value() {
 /// stop_with from on_start works.
 #[test]
 fn stop_with_from_on_start() {
-    struct StartCompleter { _reply_to: ActorAddress }
+    struct StartCompleter {
+        _reply_to: ActorAddress,
+    }
     impl ActorInterface for StartCompleter {
         type Incoming = ();
         type Response = ();
@@ -2631,28 +3746,56 @@ fn stop_with_from_on_start() {
     }
 
     #[derive(Clone, Debug)]
-    struct DownReport { reason: StopReason, value: Option<u8> }
+    struct DownReport {
+        reason: StopReason,
+        value: Option<u8>,
+    }
 
-    struct MonitorWatcher { target: ActorAddress, reply_to: ActorAddress }
+    struct MonitorWatcher {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for MonitorWatcher {
         type Incoming = ();
         type Response = ();
-        fn on_start(&mut self, ctx: &Ctx) { ctx.monitor(self.target).unwrap(); }
+        fn on_start(&mut self, ctx: &Ctx) {
+            ctx.monitor(self.target).unwrap();
+        }
         fn handle(&mut self, _ctx: &Ctx, _msg: ()) {}
         fn handle_down(&mut self, ctx: &Ctx, down: Down) {
-            let val = down.exit_value.as_ref().and_then(|v| v.downcast_ref::<u8>().copied());
-            let _ = ctx.send(self.reply_to, DownReport { reason: down.reason, value: val });
+            let val = down
+                .exit_value
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<u8>().copied());
+            let _ = ctx.send(
+                self.reply_to,
+                DownReport {
+                    reason: down.reason,
+                    value: val,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<DownReport>().unwrap();
     // Spawn target first so we know its address for the watcher
-    let target = rt.spawn(StartCompleter { _reply_to: ActorAddress::default() }).unwrap();
-    let _watcher = rt.spawn(MonitorWatcher { target, reply_to: *inbox.addr() }).unwrap();
+    let target = rt
+        .spawn(StartCompleter {
+            _reply_to: ActorAddress::default(),
+        })
+        .unwrap();
+    let _watcher = rt
+        .spawn(MonitorWatcher {
+            target,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 10);
 
-    let report = inbox.try_recv().expect("should receive Down from on_start stop_with");
+    let report = inbox
+        .try_recv()
+        .expect("should receive Down from on_start stop_with");
     assert_eq!(report.reason, StopReason::Completed);
     assert_eq!(report.value, Some(7));
 }
@@ -2672,7 +3815,10 @@ fn supervisor_receives_rich_exit_in_handle_down() {
     #[derive(Clone, Debug)]
     struct ValueReport(Option<Vec<u8>>);
 
-    struct ManualSupervisor { reply_to: ActorAddress, child: Option<ActorAddress> }
+    struct ManualSupervisor {
+        reply_to: ActorAddress,
+        child: Option<ActorAddress>,
+    }
     impl ActorInterface for ManualSupervisor {
         type Incoming = Ping;
         type Response = ();
@@ -2683,24 +3829,45 @@ fn supervisor_receives_rich_exit_in_handle_down() {
         }
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             if let Some(child) = self.child {
-                let _ = ctx.send(child, Ping { reply_to: ActorAddress::default() });
+                let _ = ctx.send(
+                    child,
+                    Ping {
+                        reply_to: ActorAddress::default(),
+                    },
+                );
             }
         }
         fn handle_down(&mut self, ctx: &Ctx, down: Down) {
-            let val = down.exit_value.as_ref().and_then(|v| v.downcast_ref::<Vec<u8>>().cloned());
+            let val = down
+                .exit_value
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<Vec<u8>>().cloned());
             let _ = ctx.send(self.reply_to, ValueReport(val));
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ValueReport>().unwrap();
-    let sup = rt.spawn(ManualSupervisor { reply_to: *inbox.addr(), child: None }).unwrap();
+    let sup = rt
+        .spawn(ManualSupervisor {
+            reply_to: *inbox.addr(),
+            child: None,
+        })
+        .unwrap();
     tick_n(&rt, 2);
 
-    rt.send_to(sup, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        sup,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
 
-    let report = inbox.try_recv().expect("supervisor should receive exit value");
+    let report = inbox
+        .try_recv()
+        .expect("supervisor should receive exit value");
     assert_eq!(report.0, Some(vec![1, 2, 3]));
 }
 
@@ -2711,7 +3878,9 @@ fn supervisor_receives_rich_exit_in_handle_down() {
 /// Parent dies → unsupervised children killed.
 #[test]
 fn orphan_unsupervised_children_killed_when_parent_dies() {
-    struct SpawnChildren { reply_to: ActorAddress }
+    struct SpawnChildren {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for SpawnChildren {
         type Incoming = Ping;
         type Response = ();
@@ -2730,18 +3899,32 @@ fn orphan_unsupervised_children_killed_when_parent_dies() {
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Count>().unwrap();
-    let parent = rt.spawn(SpawnChildren { reply_to: *inbox.addr() }).unwrap();
+    let parent = rt
+        .spawn(SpawnChildren {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 3);
     let _ = inbox.try_recv().expect("children spawned");
     // parent + 3 children = 4 actors
     assert_eq!(rt.stats().workers[0].num_actors, 4);
 
     // Kill parent
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
 
     // All should be dead (parent stopped, children orphaned and killed)
-    assert_eq!(rt.stats().workers[0].num_actors, 0, "all actors should be dead");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        0,
+        "all actors should be dead"
+    );
 }
 
 /// Parent dies → supervised children NOT killed.
@@ -2754,7 +3937,8 @@ fn orphan_supervised_children_not_killed() {
         fn on_start(&mut self, ctx: &Ctx) {
             // Spawn a supervisor as a child
             let sup = Supervisor::new(
-                SupervisorStrategy::OneForOne, 5,
+                SupervisorStrategy::OneForOne,
+                5,
                 vec![ChildSpec::new("worker", RestartPolicy::Permanent, |ctx| {
                     ctx.spawn(PingPongActor)
                 })],
@@ -2771,10 +3955,20 @@ fn orphan_supervised_children_not_killed() {
     tick_n(&rt, 5);
     // parent + supervisor + supervised child = 3
     let actors_before = rt.stats().workers[0].num_actors;
-    assert!(actors_before >= 3, "should have parent + supervisor + child, got {}", actors_before);
+    assert!(
+        actors_before >= 3,
+        "should have parent + supervisor + child, got {}",
+        actors_before
+    );
 
     // Kill parent
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 10);
 
     // Supervisor and its child should still be alive (supervisor is a child of parent,
@@ -2807,17 +4001,22 @@ fn orphan_supervised_children_not_killed() {
     // Parent dies. child_b is killed (orphan). child_a survives (supervised).
     let rt = std_runtime(RuntimeConfig::default());
 
-    struct GrandParent { _reply_to: ActorAddress }
+    struct GrandParent {
+        _reply_to: ActorAddress,
+    }
     impl ActorInterface for GrandParent {
         type Incoming = Ping;
         type Response = ();
         fn on_start(&mut self, ctx: &Ctx) {
             // Spawn a supervisor for one child
             let sup = Supervisor::new(
-                SupervisorStrategy::OneForOne, 5,
-                vec![ChildSpec::new("supervised", RestartPolicy::Permanent, |ctx| {
-                    ctx.spawn(PingPongActor)
-                })],
+                SupervisorStrategy::OneForOne,
+                5,
+                vec![ChildSpec::new(
+                    "supervised",
+                    RestartPolicy::Permanent,
+                    |ctx| ctx.spawn(PingPongActor),
+                )],
             );
             let _sup_addr = ctx.spawn(sup).unwrap();
             // Also spawn an unsupervised child directly
@@ -2828,12 +4027,26 @@ fn orphan_supervised_children_not_killed() {
         }
     }
 
-    let parent = rt.spawn(GrandParent { _reply_to: ActorAddress::default() }).unwrap();
+    let parent = rt
+        .spawn(GrandParent {
+            _reply_to: ActorAddress::default(),
+        })
+        .unwrap();
     tick_n(&rt, 5);
     let before = rt.stats().workers[0].num_actors;
-    assert!(before >= 4, "should have parent + supervisor + supervised child + unsupervised, got {}", before);
+    assert!(
+        before >= 4,
+        "should have parent + supervisor + supervised child + unsupervised, got {}",
+        before
+    );
 
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 15);
 
     // After cascade: parent dies, supervisor+unsupervised get orphaned.
@@ -2847,7 +4060,9 @@ fn orphan_supervised_children_not_killed() {
 /// Cascading orphan cleanup: A→B→C, A dies, B then C killed.
 #[test]
 fn orphan_cascading_cleanup() {
-    struct SpawnChild { reply_to: ActorAddress }
+    struct SpawnChild {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for SpawnChild {
         type Incoming = Ping;
         type Response = ();
@@ -2860,13 +4075,19 @@ fn orphan_cascading_cleanup() {
         }
     }
 
-    struct Root { reply_to: ActorAddress }
+    struct Root {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Root {
         type Incoming = Ping;
         type Response = ();
         fn on_start(&mut self, ctx: &Ctx) {
             // Spawn middle, which spawns leaf
-            let _ = ctx.spawn(SpawnChild { reply_to: self.reply_to }).unwrap();
+            let _ = ctx
+                .spawn(SpawnChild {
+                    reply_to: self.reply_to,
+                })
+                .unwrap();
         }
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             ctx.stop_self();
@@ -2875,7 +4096,11 @@ fn orphan_cascading_cleanup() {
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    let root = rt.spawn(Root { reply_to: *inbox.addr() }).unwrap();
+    let root = rt
+        .spawn(Root {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 5);
     let _ = inbox.try_recv(); // middle spawned its child
 
@@ -2884,7 +4109,13 @@ fn orphan_cascading_cleanup() {
     assert_eq!(before, 3, "should have root + middle + leaf");
 
     // Kill root → middle orphaned → leaf orphaned
-    rt.send_to(root, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        root,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 15); // multiple ticks for cascade
 
     assert_eq!(rt.stats().workers[0].num_actors, 0, "cascade killed all");
@@ -2902,7 +4133,11 @@ fn orphan_runtime_spawned_unaffected() {
     // Stop one — the other should not be affected
     rt.stop_actor(a).unwrap();
     tick_n(&rt, 5);
-    assert_eq!(rt.stats().workers[0].num_actors, 1, "only stopped actor removed");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        1,
+        "only stopped actor removed"
+    );
 
     rt.stop_actor(b).unwrap();
     tick_n(&rt, 5);
@@ -2916,7 +4151,9 @@ fn orphan_runtime_spawned_unaffected() {
 /// Suspended actor queues but doesn't process; resume restores processing.
 #[test]
 fn suspended_actor_queues_then_resume_processes() {
-    struct SuspendOnFirst { suspended: bool }
+    struct SuspendOnFirst {
+        suspended: bool,
+    }
     impl ActorInterface for SuspendOnFirst {
         type Incoming = Increment;
         type Response = Count;
@@ -2938,12 +4175,24 @@ fn suspended_actor_queues_then_resume_processes() {
     rt.tick(); // on_start
 
     // First message: processed, then actor suspends itself
-    rt.send_to(actor, Increment { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        Increment {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     assert_eq!(inbox.try_recv(), Some(Count(1)), "first message processed");
 
     // Second message: queued but not processed (actor suspended)
-    rt.send_to(actor, Increment { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        actor,
+        Increment {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     assert!(inbox.try_recv().is_none(), "no reply while suspended");
 
@@ -2951,7 +4200,9 @@ fn suspended_actor_queues_then_resume_processes() {
     // We need to use the ContextInner::request_resume. From test, use send ResumeSignal.
     // Actually, the simplest way: use another actor that resumes it.
 
-    struct Resumer { target: ActorAddress }
+    struct Resumer {
+        target: ActorAddress,
+    }
     impl ActorInterface for Resumer {
         type Incoming = Ping;
         type Response = ();
@@ -2963,10 +4214,20 @@ fn suspended_actor_queues_then_resume_processes() {
 
     let resumer = rt.spawn(Resumer { target: actor }).unwrap();
     rt.tick();
-    rt.send_to(resumer, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        resumer,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
-    assert_eq!(inbox.try_recv(), Some(Count(99)), "queued message processed after resume");
+    assert_eq!(
+        inbox.try_recv(),
+        Some(Count(99)),
+        "queued message processed after resume"
+    );
 }
 
 /// Supervisor can resume suspended child.
@@ -2975,7 +4236,9 @@ fn supervisor_can_resume_suspended_child() {
     #[derive(Clone)]
     struct Suspend;
     #[derive(Clone)]
-    struct Resume { target: ActorAddress }
+    struct Resume {
+        target: ActorAddress,
+    }
     #[derive(Clone, Debug, PartialEq)]
     struct Ack;
 
@@ -2991,7 +4254,10 @@ fn supervisor_can_resume_suspended_child() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Ack>().unwrap();
 
-    struct MySup { child: Option<ActorAddress>, reply_to: ActorAddress }
+    struct MySup {
+        child: Option<ActorAddress>,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for MySup {
         type Incoming = Resume;
         type Response = ();
@@ -2999,7 +4265,12 @@ fn supervisor_can_resume_suspended_child() {
             let child = ctx.spawn(SuspendableChild).unwrap();
             ctx.monitor(child).unwrap();
             // Register as supervisor via public API
-            let ext = ctx.extension().unwrap().as_any().downcast_ref::<StdExtension>().unwrap();
+            let ext = ctx
+                .extension()
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StdExtension>()
+                .unwrap();
             ext.register_supervisor(ctx.self_addr(), child);
             self.child = Some(child);
         }
@@ -3010,11 +4281,21 @@ fn supervisor_can_resume_suspended_child() {
         }
     }
 
-    let sup = rt.spawn(MySup { child: None, reply_to: *inbox.addr() }).unwrap();
+    let sup = rt
+        .spawn(MySup {
+            child: None,
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     tick_n(&rt, 3);
 
-    let child = rt.stats().actors.iter()
-        .find(|(a, _)| *a != sup).map(|(a, _)| *a).unwrap();
+    let child = rt
+        .stats()
+        .actors
+        .iter()
+        .find(|(a, _)| *a != sup)
+        .map(|(a, _)| *a)
+        .unwrap();
 
     // Suspend child
     rt.send_to(child, Suspend).unwrap();
@@ -3024,7 +4305,9 @@ fn supervisor_can_resume_suspended_child() {
     rt.send_to(sup, Resume { target: child }).unwrap();
     tick_n(&rt, 3);
 
-    let ack = inbox.try_recv().expect("supervisor should be able to resume");
+    let ack = inbox
+        .try_recv()
+        .expect("supervisor should be able to resume");
     assert_eq!(ack, Ack);
 }
 
@@ -3032,11 +4315,15 @@ fn supervisor_can_resume_suspended_child() {
 #[test]
 fn non_supervisor_cannot_resume() {
     #[derive(Clone)]
-    struct TryResume { target: ActorAddress }
+    struct TryResume {
+        target: ActorAddress,
+    }
     #[derive(Clone, Debug, PartialEq)]
     struct ResumeResult(bool);
 
-    struct NonSup { reply_to: ActorAddress }
+    struct NonSup {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for NonSup {
         type Incoming = TryResume;
         type Response = ();
@@ -3049,14 +4336,22 @@ fn non_supervisor_cannot_resume() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ResumeResult>().unwrap();
     let target = rt.spawn(PingPongActor).unwrap();
-    let non_sup = rt.spawn(NonSup { reply_to: *inbox.addr() }).unwrap();
+    let non_sup = rt
+        .spawn(NonSup {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
 
     rt.send_to(non_sup, TryResume { target }).unwrap();
     rt.tick();
 
     let result = inbox.try_recv().expect("should get resume result");
-    assert_eq!(result, ResumeResult(false), "non-supervisor should be denied");
+    assert_eq!(
+        result,
+        ResumeResult(false),
+        "non-supervisor should be denied"
+    );
 }
 
 /// Suspended actor can be stopped.
@@ -3081,12 +4376,20 @@ fn suspended_actor_can_be_stopped() {
     // Suspend
     rt.send_to(actor, SuspendCmd).unwrap();
     tick_n(&rt, 3);
-    assert_eq!(rt.stats().workers[0].num_actors, 1, "actor still alive while suspended");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        1,
+        "actor still alive while suspended"
+    );
 
     // Stop the suspended actor
     rt.stop_actor(actor).unwrap();
     tick_n(&rt, 5);
-    assert_eq!(rt.stats().workers[0].num_actors, 0, "suspended actor stopped");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        0,
+        "suspended actor stopped"
+    );
 }
 
 /// Cross-worker resume works (single-threaded test via transfer queue).
@@ -3119,7 +4422,9 @@ fn cross_worker_resume_via_runtime() {
     tick_n(&rt, 2);
 
     // Resume via an actor using raw_inner (simulates cross-worker)
-    struct Resumer { target: ActorAddress }
+    struct Resumer {
+        target: ActorAddress,
+    }
     impl ActorInterface for Resumer {
         type Incoming = Ping;
         type Response = ();
@@ -3130,11 +4435,21 @@ fn cross_worker_resume_via_runtime() {
 
     let resumer = rt.spawn(Resumer { target: actor }).unwrap();
     rt.tick();
-    rt.send_to(resumer, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        resumer,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
 
     // Actor should be alive and resumed (processed the queued SuspendCmd, then suspended again)
-    assert_eq!(rt.stats().workers[0].num_actors, 2, "both actors still alive");
+    assert_eq!(
+        rt.stats().workers[0].num_actors,
+        2,
+        "both actors still alive"
+    );
 }
 
 // ── Capability Tests ─────────────────────────────────────────────────────────
@@ -3142,7 +4457,9 @@ fn cross_worker_resume_via_runtime() {
 /// An unrestricted actor (no CapabilitySet in env) can freely send, spawn, and monitor.
 #[test]
 fn cap_unrestricted_actor_sends_freely() {
-    struct Spawner { reply_to: ActorAddress }
+    struct Spawner {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Spawner {
         type Incoming = Ping;
         type Response = ();
@@ -3158,11 +4475,24 @@ fn cap_unrestricted_actor_sends_freely() {
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    let spawner = rt.spawn(Spawner { reply_to: *inbox.addr() }).unwrap();
+    let spawner = rt
+        .spawn(Spawner {
+            reply_to: *inbox.addr(),
+        })
+        .unwrap();
     rt.tick();
-    rt.send_to(spawner, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        spawner,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
-    assert!(inbox.try_recv().is_some(), "unrestricted actor can send freely");
+    assert!(
+        inbox.try_recv().is_some(),
+        "unrestricted actor can send freely"
+    );
 }
 
 /// A restricted actor (empty CapabilitySet) gets denied when sending to another actor.
@@ -3171,7 +4501,10 @@ fn cap_restricted_actor_denied_send() {
     #[derive(Clone, Debug, PartialEq)]
     struct SendResult(bool);
 
-    struct Restricted { target: ActorAddress, reply_to: ActorAddress }
+    struct Restricted {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Restricted {
         type Incoming = Ping;
         type Response = ();
@@ -3185,14 +4518,25 @@ fn cap_restricted_actor_denied_send() {
     let result_inbox = rt.new_inbox::<SendResult>().unwrap();
     let peer = rt.spawn(PingPongActor).unwrap();
     // Spawn with empty CapabilitySet — restricted but can self-send
-    let restricted = rt.spawn_with_env(
-        Restricted { target: peer, reply_to: *result_inbox.addr() },
-        EnvironmentBuilder::new()
-            .set(CapabilitySet::new().with_send(*result_inbox.addr()))
-            .build(),
-    ).unwrap();
+    let restricted = rt
+        .spawn_with_env(
+            Restricted {
+                target: peer,
+                reply_to: *result_inbox.addr(),
+            },
+            EnvironmentBuilder::new()
+                .set(CapabilitySet::new().with_send(*result_inbox.addr()))
+                .build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(restricted, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        restricted,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let result = result_inbox.try_recv().expect("should get result");
     assert!(!result.0, "send to un-granted peer should fail");
@@ -3201,25 +4545,46 @@ fn cap_restricted_actor_denied_send() {
 /// A restricted actor with `with_send(peer)` can send to that peer.
 #[test]
 fn cap_restricted_actor_allowed_send() {
-    struct GrantedSender { peer: ActorAddress, reply_to: ActorAddress }
+    struct GrantedSender {
+        peer: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for GrantedSender {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-            let _ = ctx.send(self.peer, Ping { reply_to: self.reply_to });
+            let _ = ctx.send(
+                self.peer,
+                Ping {
+                    reply_to: self.reply_to,
+                },
+            );
         }
     }
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let peer = rt.spawn(PingPongActor).unwrap();
-    let caps = CapabilitySet::new().with_send(peer).with_send(*inbox.addr());
-    let sender = rt.spawn_with_env(
-        GrantedSender { peer, reply_to: *inbox.addr() },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let caps = CapabilitySet::new()
+        .with_send(peer)
+        .with_send(*inbox.addr());
+    let sender = rt
+        .spawn_with_env(
+            GrantedSender {
+                peer,
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(sender, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        sender,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     assert!(inbox.try_recv().is_some(), "granted sender should succeed");
 }
@@ -3228,14 +4593,27 @@ fn cap_restricted_actor_allowed_send() {
 #[test]
 fn cap_typed_send_grant() {
     #[derive(Clone, Debug, PartialEq)]
-    struct Report { ping_ok: bool, pong_ok: bool }
+    struct Report {
+        ping_ok: bool,
+        pong_ok: bool,
+    }
 
-    struct TypeChecker { target: ActorAddress, reply_to: ActorAddress }
+    struct TypeChecker {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for TypeChecker {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-            let ping_ok = ctx.send(self.target, Ping { reply_to: ActorAddress::default() }).is_ok();
+            let ping_ok = ctx
+                .send(
+                    self.target,
+                    Ping {
+                        reply_to: ActorAddress::default(),
+                    },
+                )
+                .is_ok();
             let pong_ok = ctx.send(self.target, Pong).is_ok();
             let _ = ctx.send(self.reply_to, Report { ping_ok, pong_ok });
         }
@@ -3247,12 +4625,23 @@ fn cap_typed_send_grant() {
     let caps = CapabilitySet::new()
         .with_send_typed::<Ping>(target)
         .with_send(*inbox.addr());
-    let checker = rt.spawn_with_env(
-        TypeChecker { target, reply_to: *inbox.addr() },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let checker = rt
+        .spawn_with_env(
+            TypeChecker {
+                target,
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(checker, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        checker,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let report = inbox.try_recv().expect("should get report");
     assert!(report.ping_ok, "typed grant for Ping should allow Ping");
@@ -3265,7 +4654,9 @@ fn cap_spawn_denied() {
     #[derive(Clone, Debug, PartialEq)]
     struct SpawnResult(bool);
 
-    struct NoSpawn { reply_to: ActorAddress }
+    struct NoSpawn {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for NoSpawn {
         type Incoming = Ping;
         type Response = ();
@@ -3278,12 +4669,22 @@ fn cap_spawn_denied() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<SpawnResult>().unwrap();
     let caps = CapabilitySet::new().with_send(*inbox.addr());
-    let actor = rt.spawn_with_env(
-        NoSpawn { reply_to: *inbox.addr() },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let actor = rt
+        .spawn_with_env(
+            NoSpawn {
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(actor, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        actor,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let result = inbox.try_recv().expect("should get result");
     assert!(!result.0, "spawn without permission should fail");
@@ -3295,7 +4696,9 @@ fn cap_spawn_allowed() {
     #[derive(Clone, Debug, PartialEq)]
     struct SpawnResult(bool);
 
-    struct CanSpawn { reply_to: ActorAddress }
+    struct CanSpawn {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for CanSpawn {
         type Incoming = Ping;
         type Response = ();
@@ -3308,12 +4711,22 @@ fn cap_spawn_allowed() {
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<SpawnResult>().unwrap();
     let caps = CapabilitySet::new().with_spawn().with_send(*inbox.addr());
-    let actor = rt.spawn_with_env(
-        CanSpawn { reply_to: *inbox.addr() },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let actor = rt
+        .spawn_with_env(
+            CanSpawn {
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(actor, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        actor,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let result = inbox.try_recv().expect("should get result");
     assert!(result.0, "spawn with permission should succeed");
@@ -3325,17 +4738,23 @@ fn cap_capability_inheritance() {
     #[derive(Clone, Debug, PartialEq)]
     struct ChildRestricted(bool);
 
-    struct Parent { reply_to: ActorAddress }
+    struct Parent {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Parent {
         type Incoming = Ping;
         type Response = ();
         fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
             // Child reports in on_start, so no need to send to it
-            let _ = ctx.spawn(Child { reply_to: self.reply_to });
+            let _ = ctx.spawn(Child {
+                reply_to: self.reply_to,
+            });
         }
     }
 
-    struct Child { reply_to: ActorAddress }
+    struct Child {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Child {
         type Incoming = ();
         type Response = ();
@@ -3348,15 +4767,23 @@ fn cap_capability_inheritance() {
 
     let rt = std_runtime(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ChildRestricted>().unwrap();
-    let caps = CapabilitySet::new()
-        .with_spawn()
-        .with_send(*inbox.addr());
-    let parent = rt.spawn_with_env(
-        Parent { reply_to: *inbox.addr() },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let caps = CapabilitySet::new().with_spawn().with_send(*inbox.addr());
+    let parent = rt
+        .spawn_with_env(
+            Parent {
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(parent, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        parent,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 5);
     let result = inbox.try_recv().expect("should get report from child");
     assert!(result.0, "child should inherit parent's CapabilitySet");
@@ -3368,7 +4795,10 @@ fn cap_monitor_denied() {
     #[derive(Clone, Debug, PartialEq)]
     struct MonitorResult(bool);
 
-    struct NoMonitor { target: ActorAddress, reply_to: ActorAddress }
+    struct NoMonitor {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for NoMonitor {
         type Incoming = Ping;
         type Response = ();
@@ -3382,12 +4812,23 @@ fn cap_monitor_denied() {
     let inbox = rt.new_inbox::<MonitorResult>().unwrap();
     let target = rt.spawn(PingPongActor).unwrap();
     let caps = CapabilitySet::new().with_send(*inbox.addr());
-    let actor = rt.spawn_with_env(
-        NoMonitor { target, reply_to: *inbox.addr() },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let actor = rt
+        .spawn_with_env(
+            NoMonitor {
+                target,
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(actor, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        actor,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let result = inbox.try_recv().expect("should get result");
     assert!(!result.0, "monitor without permission should fail");
@@ -3401,7 +4842,9 @@ fn cap_service_access_denied() {
     #[derive(Clone, Debug, PartialEq)]
     struct ServiceResult(bool);
 
-    struct ServiceUser { reply_to: ActorAddress }
+    struct ServiceUser {
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for ServiceUser {
         type Incoming = Ping;
         type Response = ();
@@ -3416,15 +4859,25 @@ fn cap_service_access_denied() {
     // Give the actor a service binding but no capability to access it
     let service_addr = ActorAddress::new_random();
     let caps = CapabilitySet::new().with_send(*inbox.addr());
-    let actor = rt.spawn_with_env(
-        ServiceUser { reply_to: *inbox.addr() },
-        EnvironmentBuilder::new()
-            .set(caps)
-            .set(ServiceBinding::<MyService>::new(service_addr))
-            .build(),
-    ).unwrap();
+    let actor = rt
+        .spawn_with_env(
+            ServiceUser {
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new()
+                .set(caps)
+                .set(ServiceBinding::<MyService>::new(service_addr))
+                .build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(actor, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        actor,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let result = inbox.try_recv().expect("should get result");
     assert!(!result.0, "service access without grant should return None");
@@ -3436,7 +4889,10 @@ fn cap_self_send_always_allowed() {
     #[derive(Clone, Debug, PartialEq)]
     struct SelfSendResult(bool);
 
-    struct SelfSender { reply_to: ActorAddress, sent_self: bool }
+    struct SelfSender {
+        reply_to: ActorAddress,
+        sent_self: bool,
+    }
     impl ActorInterface for SelfSender {
         type Incoming = Ping;
         type Response = ();
@@ -3444,7 +4900,14 @@ fn cap_self_send_always_allowed() {
             if !self.sent_self {
                 self.sent_self = true;
                 // Send to self — should always work even with empty caps
-                let ok = ctx.send(ctx.self_addr(), Ping { reply_to: ActorAddress::default() }).is_ok();
+                let ok = ctx
+                    .send(
+                        ctx.self_addr(),
+                        Ping {
+                            reply_to: ActorAddress::default(),
+                        },
+                    )
+                    .is_ok();
                 let _ = ctx.send(self.reply_to, SelfSendResult(ok));
             }
         }
@@ -3454,12 +4917,23 @@ fn cap_self_send_always_allowed() {
     let inbox = rt.new_inbox::<SelfSendResult>().unwrap();
     // Empty CapabilitySet — only self-send allowed (plus inbox for reporting)
     let caps = CapabilitySet::new().with_send(*inbox.addr());
-    let actor = rt.spawn_with_env(
-        SelfSender { reply_to: *inbox.addr(), sent_self: false },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let actor = rt
+        .spawn_with_env(
+            SelfSender {
+                reply_to: *inbox.addr(),
+                sent_self: false,
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(actor, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        actor,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let result = inbox.try_recv().expect("should get result");
     assert!(result.0, "self-send should always be allowed");
@@ -3471,7 +4945,10 @@ fn cap_stop_actor_requires_send() {
     #[derive(Clone, Debug, PartialEq)]
     struct StopResult(bool);
 
-    struct Stopper { target: ActorAddress, reply_to: ActorAddress }
+    struct Stopper {
+        target: ActorAddress,
+        reply_to: ActorAddress,
+    }
     impl ActorInterface for Stopper {
         type Incoming = Ping;
         type Response = ();
@@ -3486,12 +4963,23 @@ fn cap_stop_actor_requires_send() {
     let target = rt.spawn(PingPongActor).unwrap();
     // No send permission for target
     let caps = CapabilitySet::new().with_send(*inbox.addr());
-    let stopper = rt.spawn_with_env(
-        Stopper { target, reply_to: *inbox.addr() },
-        EnvironmentBuilder::new().set(caps).build(),
-    ).unwrap();
+    let stopper = rt
+        .spawn_with_env(
+            Stopper {
+                target,
+                reply_to: *inbox.addr(),
+            },
+            EnvironmentBuilder::new().set(caps).build(),
+        )
+        .unwrap();
     rt.tick();
-    rt.send_to(stopper, Ping { reply_to: ActorAddress::default() }).unwrap();
+    rt.send_to(
+        stopper,
+        Ping {
+            reply_to: ActorAddress::default(),
+        },
+    )
+    .unwrap();
     tick_n(&rt, 3);
     let result = inbox.try_recv().expect("should get result");
     assert!(!result.0, "stop_actor without send permission should fail");

@@ -1,6 +1,6 @@
 # node
 
-The `node` crate produces the `swactor` binary — the batteries-included entry point for running a swactor node. It composes the actor runtime, SWIM-based cluster membership, content-addressed datastore, data streams, an HTTP dashboard, and an optional embedded relay server into a single process.
+The `node` crate produces the `swactor` binary — the batteries-included entry point for running a swactor node. It composes the actor runtime, SWIM-based cluster membership, data streams, an HTTP dashboard, and an optional embedded relay server into a single process.
 
 Run `swactor --help` for full CLI usage.
 
@@ -43,11 +43,6 @@ Once connected, **SWIM protocol** handles cluster membership: protocol probes ev
 
 Nodes with a public IP auto-promote to embedded relay servers (port 3340). Candidacy is evaluated at startup: the node checks its outbound IP is non-RFC1918 and the relay port is bindable. Relay URLs are announced via SWIM gossip so other nodes discover them automatically. Nodes behind NAT use relays for indirect connectivity — this is why the probe timeout is 600ms instead of the typical 300ms.
 
-### Storage
-
-The **datastore** is a content-addressed, chunked store. Default config persists to `~/.swactor/datastore/`. Auth is enabled by default (ACL files in `~/.swactor/auth/`). The datastore runs as a group of actors inside the runtime and is driven by the main tick loop — GC runs every 1000 ticks (~100s) and dissemination every 50 ticks (~5s). A `StreamManager` actor bridges iroh QUIC streams into the datastore for bulk data transfer between nodes.
-
-Disable with `--no-datastore`. Use `--storage-path` to change location, or omit it from config for in-memory only.
 
 ### Observability
 
@@ -55,7 +50,7 @@ An HTTP dashboard serves on **port 9090**. It exposes runtime stats, cluster mem
 
 ### State & Lifecycle
 
-All persistent state lives under `~/.swactor/`. Deleting this directory fully resets the node (new identity, empty cluster, empty datastore). The node shuts down cleanly on SIGINT (Ctrl+C). `swactor install` copies the binary to `~/.swactor/bin/swactor` and registers it as a system service (systemd user unit, OpenRC/sysvinit init script, or `@reboot` crontab depending on the host).
+All persistent state lives under `~/.swactor/`. Deleting this directory fully resets the node identity and cluster state. The node shuts down cleanly on SIGINT (Ctrl+C). `swactor install` copies the binary to `~/.swactor/bin/swactor` and registers it as a system service (systemd user unit, OpenRC/sysvinit init script, or `@reboot` crontab depending on the host).
 
 ## Exposed Ports
 
@@ -72,8 +67,6 @@ All persistent state lives under `~/.swactor/`. Deleting this directory fully re
 ├── peers.json         # Peer allow-list
 ├── identity/
 │   └── node.key.json  # Persistent Ed25519 keypair
-├── datastore/         # Content-addressed chunk storage
-├── auth/              # ACL and owner key files
 └── bin/
     └── swactor        # Installed binary (after `swactor install`)
 ```
@@ -94,11 +87,8 @@ CLI Args + TOML Config
   │              Actor Runtime                   │
   │  (2 threads, StdExtension, stats hook)       │
   │                                              │
-  │  ┌──────────────┐  ┌──────────────────────┐  │
-  │  │ StreamManager │  │   Datastore Group    │  │
-  │  │   (actor)     │◄─┤ (store, gateway,     │  │
-  │  │               │  │  bridge actors)      │  │
-  │  └──────────────┘  └──────────────────────┘  │
+  │  Distribution actors, runtime stats, and     │
+  │  dashboard telemetry run on one runtime.     │
   └──────────────┬──────────────────────────────┘
                  │
                  ▼
@@ -115,6 +105,6 @@ CLI Args + TOML Config
                  │
                  ▼
          Main Tick Loop (100ms)
-    recv → tick → streams → joins →
-    heartbeats → snapshot → datastore
+    recv → tick → joins →
+    heartbeats → snapshot
 ```

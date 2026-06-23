@@ -8,8 +8,8 @@
 //! view interprets the payload.
 //!
 //! ```text
-//!    producers (typed + text)
-//!             │  bytes tagged by channel        → [`catalog`]
+//!    producers (caller-owned records + text)
+//!             │  bytes tagged by channel        → [`record::Record`]
 //!             ▼
 //!         per-node MUX                          → [`mux::Mux`]
 //!             │  one ordered stream of [`Frame`]s
@@ -26,18 +26,17 @@
 //!         VIEWS                                 → [`views`]
 //! ```
 //!
-//! The data model ([`frame`]) and the wire envelope ([`wire`]) are the
-//! seams a test observes; the catalog ([`catalog`]) is the schema contract
-//! between producers and views. See `DATASTREAM_TESTING_SPEC.md` for how
-//! the pipe is verified.
+//! The data model ([`frame`]), extension contract ([`record`]), and wire
+//! envelope ([`wire`]) are the seams a test observes. Channel meanings live in
+//! producer/consumer crates, not in a datastream-wide catalog.
 
-pub mod catalog;
 pub mod emit;
 pub mod frame;
+pub mod health;
 pub mod ingest;
 pub mod mux;
+pub mod record;
 pub mod sink_actor;
-pub mod source;
 pub mod store;
 pub mod transport;
 pub mod views;
@@ -45,8 +44,9 @@ pub mod wire;
 
 pub use frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 pub use ingest::Consumer;
-pub use sink_actor::{DatastreamSink, DATASTREAM_SINK_NAME};
 pub use mux::Mux;
+pub use record::{ChannelKind, ChannelRegistry, Record};
+pub use sink_actor::{DATASTREAM_SINK_NAME, DatastreamSink};
 pub use store::{GapSpan, Store, StoredStream};
 pub use transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 pub use views::{Body, LogEntry, MergedFrame};

@@ -35,12 +35,21 @@ fn ticks(n: u64) -> Duration {
 }
 
 /// Step the probe once, advancing the synthetic clock by one `TICK` first.
-fn tick_once(probe: &mut SwimProbe, members: &mut MemberList, now: &mut Instant) -> Vec<SwimAction> {
+fn tick_once(
+    probe: &mut SwimProbe,
+    members: &mut MemberList,
+    now: &mut Instant,
+) -> Vec<SwimAction> {
     *now += TICK;
     probe.step(*now, SwimEvent::Tick, members)
 }
 
-fn tick_n(probe: &mut SwimProbe, members: &mut MemberList, now: &mut Instant, n: u64) -> Vec<SwimAction> {
+fn tick_n(
+    probe: &mut SwimProbe,
+    members: &mut MemberList,
+    now: &mut Instant,
+    n: u64,
+) -> Vec<SwimAction> {
     let mut all = Vec::new();
     for _ in 0..n {
         all.extend(tick_once(probe, members, now));
@@ -49,7 +58,9 @@ fn tick_n(probe: &mut SwimProbe, members: &mut MemberList, now: &mut Instant, n:
 }
 
 fn has_ping_req(actions: &[SwimAction]) -> bool {
-    actions.iter().any(|a| matches!(a, SwimAction::SendPingReq { .. }))
+    actions
+        .iter()
+        .any(|a| matches!(a, SwimAction::SendPingReq { .. }))
 }
 
 fn has_suspect(actions: &[SwimAction]) -> bool {
@@ -87,11 +98,17 @@ fn send_failed_reactively_probes_a_known_live_peer_but_ignores_unknown_and_dead(
 
     // Unknown peer: a SendFailed about a node we have never heard of probes nobody.
     let unknown = probe.step(now, SwimEvent::SendFailed { to: node(9) }, &mut members);
-    assert!(ping_target(&unknown).is_none(), "a SendFailed for an unknown peer must not start a probe");
+    assert!(
+        ping_target(&unknown).is_none(),
+        "a SendFailed for an unknown peer must not start a probe"
+    );
 
     // Dead peer: we have already given up on it — no reactive probe.
     let dead = probe.step(now, SwimEvent::SendFailed { to: node(2) }, &mut members);
-    assert!(ping_target(&dead).is_none(), "a SendFailed for a Dead peer must not start a probe");
+    assert!(
+        ping_target(&dead).is_none(),
+        "a SendFailed for a Dead peer must not start a probe"
+    );
 
     // Known live peer, Idle: the failure reactively probes exactly that peer.
     let live = probe.step(now, SwimEvent::SendFailed { to: node(1) }, &mut members);
@@ -127,22 +144,36 @@ fn the_same_probe_timeout_bounds_both_phases() {
     // Tick 5 fires the probe (a SendPing).
     let fired = tick_n(&mut probe, &mut members, &mut now, 5);
     assert!(
-        fired.iter().any(|a| matches!(a, SwimAction::SendPing { .. })),
+        fired
+            .iter()
+            .any(|a| matches!(a, SwimAction::SendPing { .. })),
         "a probe must fire at the probe interval"
     );
 
     // Two ticks later: still inside the direct budget — no indirect fanout yet.
     let early = tick_n(&mut probe, &mut members, &mut now, 2);
-    assert!(!has_ping_req(&early), "indirect probes must not fire before probe_timeout elapses");
+    assert!(
+        !has_ping_req(&early),
+        "indirect probes must not fire before probe_timeout elapses"
+    );
 
     // The third tick hits probe_timeout exactly — the direct phase ends here.
     let at_direct_timeout = tick_once(&mut probe, &mut members, &mut now);
-    assert!(has_ping_req(&at_direct_timeout), "the direct phase must end at exactly probe_timeout");
-    assert!(!has_suspect(&at_direct_timeout), "the target is not suspected yet — the indirect phase just began");
+    assert!(
+        has_ping_req(&at_direct_timeout),
+        "the direct phase must end at exactly probe_timeout"
+    );
+    assert!(
+        !has_suspect(&at_direct_timeout),
+        "the target is not suspected yet — the indirect phase just began"
+    );
 
     // The indirect phase has its OWN probe_timeout: two more ticks, no suspicion.
     let early = tick_n(&mut probe, &mut members, &mut now, 2);
-    assert!(!has_suspect(&early), "suspicion must not fire before the indirect probe_timeout elapses");
+    assert!(
+        !has_suspect(&early),
+        "suspicion must not fire before the indirect probe_timeout elapses"
+    );
 
     // The third tick hits the second probe_timeout — now the target is suspected.
     let at_indirect_timeout = tick_once(&mut probe, &mut members, &mut now);
@@ -177,8 +208,14 @@ fn mid_window_refute_cancels_the_pending_death() {
     tick_n(&mut probe, &mut members, &mut now, 5); // ping
     tick_n(&mut probe, &mut members, &mut now, 3); // direct timeout → indirect phase
     let suspected = tick_n(&mut probe, &mut members, &mut now, 3); // indirect timeout → Suspect
-    assert!(has_suspect(&suspected), "precondition: the unanswered probe must produce Suspect");
-    assert!(members.suspect(node(1)), "the handler applies the Suspect transition");
+    assert!(
+        has_suspect(&suspected),
+        "precondition: the unanswered probe must produce Suspect"
+    );
+    assert!(
+        members.suspect(node(1)),
+        "the handler applies the Suspect transition"
+    );
 
     // Mid-window: node 1 refutes — a higher-incarnation Alive merges in.
     members.apply(node(1), MemberState::Alive, 1);
@@ -188,7 +225,9 @@ fn mid_window_refute_cancels_the_pending_death() {
     // the guard must never declare it Dead.
     let actions = tick_n(&mut probe, &mut members, &mut now, 30);
     assert!(
-        !actions.iter().any(|a| matches!(a, SwimAction::DeclareDead(_))),
+        !actions
+            .iter()
+            .any(|a| matches!(a, SwimAction::DeclareDead(_))),
         "a refuted node must not be declared Dead — the still-Suspect guard honors the refute"
     );
     assert_eq!(members.get(&node(1)).unwrap().state, MemberState::Alive);
@@ -217,38 +256,68 @@ fn unanswered_probe_drives_member_through_suspect_then_dead_with_notifications()
     for _ in 0..40 {
         now += TICK;
         for a in &swim.tick(now) {
-            if let NodeAction::MembershipChanged { node_id, state, incarnation } = a {
+            if let NodeAction::MembershipChanged {
+                node_id,
+                state,
+                incarnation,
+            } = a
+            {
                 notifications.push((*node_id, *state, *incarnation));
             }
         }
     }
 
-    let suspect_at = notifications.iter().position(|(id, s, _)| *id == node(1) && *s == MemberState::Suspect);
-    let dead_at = notifications.iter().position(|(id, s, _)| *id == node(1) && *s == MemberState::Dead);
-    assert!(suspect_at.is_some(), "a silent peer must be notified Suspect, got {notifications:?}");
-    assert!(dead_at.is_some(), "a silent peer must then be notified Dead, got {notifications:?}");
-    assert!(suspect_at < dead_at, "Suspect must precede Dead in the notification stream");
+    let suspect_at = notifications
+        .iter()
+        .position(|(id, s, _)| *id == node(1) && *s == MemberState::Suspect);
+    let dead_at = notifications
+        .iter()
+        .position(|(id, s, _)| *id == node(1) && *s == MemberState::Dead);
+    assert!(
+        suspect_at.is_some(),
+        "a silent peer must be notified Suspect, got {notifications:?}"
+    );
+    assert!(
+        dead_at.is_some(),
+        "a silent peer must then be notified Dead, got {notifications:?}"
+    );
+    assert!(
+        suspect_at < dead_at,
+        "Suspect must precede Dead in the notification stream"
+    );
 
     // The settled membership view agrees: node 1 is Dead, no longer alive.
     assert!(
-        swim.members().all_members().iter().any(|e| e.node_id == node(1) && e.state == MemberState::Dead),
+        swim.members()
+            .all_members()
+            .iter()
+            .any(|e| e.node_id == node(1) && e.state == MemberState::Dead),
         "the settled view must show node 1 as Dead"
     );
-    assert_eq!(swim.members().alive_count(), 0, "a Dead peer is not counted alive");
+    assert_eq!(
+        swim.members().alive_count(),
+        0,
+        "a Dead peer is not counted alive"
+    );
 
     // §10.6/§7 inv.5: the Dead transition was enqueued for dissemination — it
     // rides the next outgoing message. Drain the queue via a throwaway probe,
     // which is topology-independent: in a 1-peer cluster no probe fires once the
     // only member is Dead. (This learns node 9, so it runs after the view check.)
-    let onward = match swim.handle_ping(node(9), 1, &[]).into_iter().find_map(|a| match a {
-        NodeAction::SendAck { piggyback, .. } => Some(piggyback),
-        _ => None,
-    }) {
+    let onward = match swim
+        .handle_ping(node(9), 1, &[])
+        .into_iter()
+        .find_map(|a| match a {
+            NodeAction::SendAck { piggyback, .. } => Some(piggyback),
+            _ => None,
+        }) {
         Some(pb) => DisseminationQueue::unpack_piggyback(&pb),
         None => Vec::new(),
     };
     assert!(
-        onward.iter().any(|u| u.node_id == node(1) && u.state == MemberState::Dead),
+        onward
+            .iter()
+            .any(|u| u.node_id == node(1) && u.state == MemberState::Dead),
         "the Dead transition must be re-gossiped, but the queue held {onward:?}"
     );
 }
@@ -274,7 +343,10 @@ fn ticks_until_dead(config: SwimConfig) -> u64 {
         count += 1;
         now += TICK;
         let actions = probe.step(now, SwimEvent::Tick, &mut members);
-        if actions.iter().any(|a| matches!(a, SwimAction::DeclareDead(_))) {
+        if actions
+            .iter()
+            .any(|a| matches!(a, SwimAction::DeclareDead(_)))
+        {
             return count;
         }
         if count >= 10_000 {
@@ -297,7 +369,10 @@ fn lifeguard_never_shortens_below_the_static_floor() {
         dead_reprobe_interval: ticks(0),
         ..SwimConfig::default()
     };
-    let static_ticks = ticks_until_dead(SwimConfig { lifeguard: None, ..base.clone() });
+    let static_ticks = ticks_until_dead(SwimConfig {
+        lifeguard: None,
+        ..base.clone()
+    });
     let floored_ticks = ticks_until_dead(SwimConfig {
         // A deliberately tiny adaptive band — its dynamic timeout is far below
         // the 10-tick static floor, so the floor must dominate.

@@ -27,7 +27,8 @@ impl KeypairExt for Keypair {
             node_id: self.node_id(),
             generation,
         };
-        let bytes = serde_json::to_vec(&payload).expect("DirectoryEntryPayload is always serializable");
+        let bytes =
+            serde_json::to_vec(&payload).expect("DirectoryEntryPayload is always serializable");
         let signature = self.sign(&bytes);
         DirectoryEntry {
             actor_addr,

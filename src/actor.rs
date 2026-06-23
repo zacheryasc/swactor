@@ -144,9 +144,7 @@ impl std::hash::Hash for ActorAddress {
     #[inline]
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // SAFETY: ActorAddress is always 32 bytes, so [..8] is valid.
-        state.write_u64(u64::from_ne_bytes(
-            self.0[..8].try_into().unwrap(),
-        ));
+        state.write_u64(u64::from_ne_bytes(self.0[..8].try_into().unwrap()));
     }
 }
 
@@ -336,53 +334,78 @@ pub struct CapabilitySet {
 }
 
 impl CapabilitySet {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     // ── Builder methods (fluent) ──
     pub fn with_send(mut self, addr: ActorAddress) -> Self {
-        self.send_any.insert(addr); self
+        self.send_any.insert(addr);
+        self
     }
     pub fn with_send_typed<M: Message>(mut self, addr: ActorAddress) -> Self {
-        self.send_typed.insert((TypeId::of::<M>(), addr)); self
+        self.send_typed.insert((TypeId::of::<M>(), addr));
+        self
     }
     pub fn with_spawn(mut self) -> Self {
-        self.can_spawn = true; self
+        self.can_spawn = true;
+        self
     }
     pub fn with_service<S: 'static + Send + Sync>(mut self) -> Self {
-        self.service_types.insert(TypeId::of::<S>()); self
+        self.service_types.insert(TypeId::of::<S>());
+        self
     }
     pub fn with_monitor(mut self, addr: ActorAddress) -> Self {
-        self.monitor_targets.insert(addr); self
+        self.monitor_targets.insert(addr);
+        self
     }
 
     // ── Mutable builder methods ──
     pub fn grant_send(&mut self, addr: ActorAddress) -> &mut Self {
-        self.send_any.insert(addr); self
+        self.send_any.insert(addr);
+        self
     }
     pub fn grant_send_typed<M: Message>(&mut self, addr: ActorAddress) -> &mut Self {
-        self.send_typed.insert((TypeId::of::<M>(), addr)); self
+        self.send_typed.insert((TypeId::of::<M>(), addr));
+        self
     }
 
     // ── Check methods ──
     pub fn check_send<M: Message>(&self, addr: ActorAddress) -> Result<(), crate::Error> {
-        if self.send_any.contains(&addr) { return Ok(()); }
-        if self.send_typed.contains(&(TypeId::of::<M>(), addr)) { return Ok(()); }
+        if self.send_any.contains(&addr) {
+            return Ok(());
+        }
+        if self.send_typed.contains(&(TypeId::of::<M>(), addr)) {
+            return Ok(());
+        }
         Err(crate::Error::from("capability denied: send"))
     }
     pub fn check_send_addr(&self, addr: ActorAddress) -> Result<(), crate::Error> {
-        if self.send_any.contains(&addr) { return Ok(()); }
+        if self.send_any.contains(&addr) {
+            return Ok(());
+        }
         Err(crate::Error::from("capability denied: send"))
     }
     pub fn check_spawn(&self) -> Result<(), crate::Error> {
-        if self.can_spawn { Ok(()) } else { Err(crate::Error::from("capability denied: spawn")) }
+        if self.can_spawn {
+            Ok(())
+        } else {
+            Err(crate::Error::from("capability denied: spawn"))
+        }
     }
     pub fn check_service<S: 'static + Send + Sync>(&self) -> Result<(), crate::Error> {
-        if self.service_types.contains(&TypeId::of::<S>()) { Ok(()) }
-        else { Err(crate::Error::from("capability denied: service")) }
+        if self.service_types.contains(&TypeId::of::<S>()) {
+            Ok(())
+        } else {
+            Err(crate::Error::from("capability denied: service"))
+        }
     }
     pub fn check_monitor(&self, addr: ActorAddress) -> Result<(), crate::Error> {
-        if self.monitor_targets.contains(&addr) { Ok(()) }
-        else { Err(crate::Error::from("capability denied: monitor")) }
+        if self.monitor_targets.contains(&addr) {
+            Ok(())
+        } else {
+            Err(crate::Error::from("capability denied: monitor"))
+        }
     }
 }
 
@@ -661,9 +684,10 @@ impl<'a> Ctx<'a> {
     /// Returns `Err` if the address is unknown to the runtime.
     pub fn send<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
         if let Some(caps) = self.capabilities()
-            && addr != self.self_addr {
-                caps.check_send::<M>(addr)?;
-            }
+            && addr != self.self_addr
+        {
+            caps.check_send::<M>(addr)?;
+        }
         self.inner.send_any(addr, Box::new(msg))
     }
 
@@ -733,7 +757,8 @@ impl<'a> Ctx<'a> {
     /// monitors (in [`Down::exit_value`]) and watchers (in [`ActorExited::exit_value`]).
     /// The stop reason is [`StopReason::Completed`].
     pub fn stop_with<T: Any + Send + Sync + 'static>(&self, value: T) {
-        self.inner.request_stop_with(self.self_addr, ExitValue::new(value));
+        self.inner
+            .request_stop_with(self.self_addr, ExitValue::new(value));
     }
 
     /// Suspend this actor. Messages continue to queue but are not processed
@@ -760,9 +785,9 @@ impl<'a, A: ActorInterface> SpawnBuilder<'a, A> {
     ///
     /// On the first call, lazily clones the parent's environment map.
     pub fn env<T: Any + Send + Sync>(mut self, value: T) -> Self {
-        let builder = self.env_builder.get_or_insert_with(|| {
-            EnvironmentBuilder::from_env(self.ctx.environment())
-        });
+        let builder = self
+            .env_builder
+            .get_or_insert_with(|| EnvironmentBuilder::from_env(self.ctx.environment()));
         builder.set_mut(value);
         self
     }

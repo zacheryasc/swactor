@@ -1,6 +1,6 @@
-use swactor::actor::ActorAddress;
 use distribution::crypto::{self, Keypair, KeypairExt};
 use distribution::types::{DirectoryEntry, MemberState, NodeId, NodeRecord, Signature};
+use swactor::actor::ActorAddress;
 
 // ─── Keypair generation and identity ────────────────────────────────────────
 

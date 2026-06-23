@@ -70,7 +70,13 @@ fn echo_produces_started_output_and_exit_zero() {
         events
     );
     assert!(
-        has_event(&events, |e| matches!(e, ProcessEvent::OutputReceived { is_stderr: false, .. })),
+        has_event(&events, |e| matches!(
+            e,
+            ProcessEvent::OutputReceived {
+                is_stderr: false,
+                ..
+            }
+        )),
         "should have stdout OutputReceived"
     );
 
@@ -79,7 +85,8 @@ fn echo_produces_started_output_and_exit_zero() {
         .iter()
         .filter_map(|e| match e {
             ProcessEvent::OutputReceived {
-                data, is_stderr: false,
+                data,
+                is_stderr: false,
             } => Some(data.clone()),
             _ => None,
         })
@@ -95,7 +102,9 @@ fn echo_produces_started_output_and_exit_zero() {
     assert!(
         has_event(&events, |e| matches!(
             e,
-            ProcessEvent::Exited { status: ExitStatus::Code(0) }
+            ProcessEvent::Exited {
+                status: ExitStatus::Code(0)
+            }
         )),
         "should have Exited(0)"
     );
@@ -148,7 +157,9 @@ fn cat_stdin_echo_and_close() {
     assert!(
         has_event(&events, |e| matches!(
             e,
-            ProcessEvent::Exited { status: ExitStatus::Code(0) }
+            ProcessEvent::Exited {
+                status: ExitStatus::Code(0)
+            }
         )),
         "cat should exit cleanly after stdin close, got: {:?}",
         events
@@ -182,7 +193,9 @@ fn signal_terminates_long_running_process() {
     assert!(
         has_event(&events, |e| matches!(
             e,
-            ProcessEvent::Exited { status: ExitStatus::Signal(_) }
+            ProcessEvent::Exited {
+                status: ExitStatus::Signal(_)
+            }
         )),
         "sleep should exit with signal status after SIGTERM, got: {:?}",
         events
@@ -248,7 +261,9 @@ fn large_output_no_data_loss() {
     assert!(
         has_event(&events, |e| matches!(
             e,
-            ProcessEvent::Exited { status: ExitStatus::Code(0) }
+            ProcessEvent::Exited {
+                status: ExitStatus::Code(0)
+            }
         )),
         "seq should exit cleanly"
     );
@@ -262,10 +277,7 @@ fn kill_timeout_escalates_to_sigkill() {
 
     // Spawn a process that traps SIGTERM. Use exec to replace the shell so
     // SIGTERM goes directly to the perl process (avoids shell vs child races).
-    let spec = automated_spec(
-        "perl",
-        &["-e", "$SIG{TERM} = 'IGNORE'; sleep 300"],
-    );
+    let spec = automated_spec("perl", &["-e", "$SIG{TERM} = 'IGNORE'; sleep 300"]);
     driver.execute(ProcessAction::SpawnProcess { spec });
 
     // Wait for Started
@@ -278,7 +290,9 @@ fn kill_timeout_escalates_to_sigkill() {
     thread::sleep(Duration::from_millis(100));
 
     // Send SIGTERM (the process ignores it)
-    driver.execute(ProcessAction::SendSignal { signal: Signal::Terminate });
+    driver.execute(ProcessAction::SendSignal {
+        signal: Signal::Terminate,
+    });
     poll_until_match(&mut driver, Duration::from_secs(1), |e| {
         matches!(e, ProcessEvent::SignalSent)
     });
@@ -307,7 +321,9 @@ fn kill_timeout_escalates_to_sigkill() {
     );
 
     // Now send SIGKILL
-    driver.execute(ProcessAction::SendSignal { signal: Signal::Kill });
+    driver.execute(ProcessAction::SendSignal {
+        signal: Signal::Kill,
+    });
 
     // Wait for exit
     let events = poll_until_match(&mut driver, Duration::from_secs(5), |e| {
@@ -316,7 +332,9 @@ fn kill_timeout_escalates_to_sigkill() {
     assert!(
         has_event(&events, |e| matches!(
             e,
-            ProcessEvent::Exited { status: ExitStatus::Signal(_) }
+            ProcessEvent::Exited {
+                status: ExitStatus::Signal(_)
+            }
         )),
         "process should exit with signal after SIGKILL, got: {:?}",
         events

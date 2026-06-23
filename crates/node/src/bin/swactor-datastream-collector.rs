@@ -15,8 +15,14 @@
 use std::io::Write;
 use std::net::UdpSocket;
 
-use datastream::views::decode_body;
+use dashboard::telemetry::{
+    ActorRuntimeDetail, IdentityRecord, ResourceSample, RuntimeStats, WorkerCounters,
+};
+use datastream::ChannelRegistry;
+use datastream::health::DatastreamHealth;
+use datastream::views::decode_body_with;
 use datastream::wire::decode_delivery;
+use distribution::telemetry::{DistributionState, MembershipTransition, TransportInternals};
 
 fn main() {
     let bind = resolve_bind();
@@ -28,6 +34,17 @@ fn main() {
         }
     };
     eprintln!("datastream collector listening on {bind} (one frame per datagram)");
+    let registry = ChannelRegistry::new()
+        .with_record::<IdentityRecord>()
+        .with_record::<ResourceSample>()
+        .with_record::<RuntimeStats>()
+        .with_record::<ActorRuntimeDetail>()
+        .with_record::<WorkerCounters>()
+        .with_record::<DatastreamHealth>()
+        .with_record::<TransportInternals>()
+        .with_record::<MembershipTransition>()
+        .with_record::<DistributionState>()
+        .with_text_prefix("proc.");
 
     // 64 KiB comfortably exceeds a UDP datagram; a frame never spans datagrams.
     let mut buf = vec![0u8; 64 * 1024];
@@ -36,7 +53,7 @@ fn main() {
         match sock.recv_from(&mut buf) {
             Ok((n, _src)) => match decode_delivery(&buf[..n]) {
                 Ok((stream, frame)) => {
-                    let body = decode_body(&frame.channel, &frame.payload);
+                    let body = decode_body_with(&frame.channel, &frame.payload, &registry);
                     let node = stream.node.as_str();
                     let short = &node[..node.len().min(8)];
                     let mut out = stdout.lock();
@@ -50,7 +67,9 @@ fn main() {
                     );
                     let _ = out.flush();
                 }
-                Err(e) => eprintln!("datastream collector: dropped malformed datagram ({n} B): {e:?}"),
+                Err(e) => {
+                    eprintln!("datastream collector: dropped malformed datagram ({n} B): {e:?}")
+                }
             },
             Err(e) => eprintln!("datastream collector: recv error: {e}"),
         }

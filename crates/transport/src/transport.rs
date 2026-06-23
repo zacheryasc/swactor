@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use swactor::actor::ActorAddress;
-use swactor::{AddrBuildHasher, AddrMap};
 use swactor::Error;
+use swactor::{AddrBuildHasher, AddrMap};
 
 use crate::codec::{CodecRegistry, WireEnvelope};
 
@@ -64,7 +64,10 @@ pub struct InMemoryTransport {
 
 impl InMemoryTransport {
     /// Create a linked pair: the transport sends to the returned receiver.
-    pub fn pair() -> (Arc<InMemoryTransport>, std::sync::mpsc::Receiver<WireEnvelope>) {
+    pub fn pair() -> (
+        Arc<InMemoryTransport>,
+        std::sync::mpsc::Receiver<WireEnvelope>,
+    ) {
         let (tx, rx) = std::sync::mpsc::channel();
         let transport = Arc::new(InMemoryTransport {
             tx: std::sync::Mutex::new(tx),

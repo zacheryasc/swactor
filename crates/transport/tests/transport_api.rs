@@ -91,7 +91,12 @@ impl ActorInterface for PongActor {
     type Response = Pong;
 
     fn handle(&mut self, ctx: &Ctx, msg: Ping) {
-        let _ = ctx.send(msg.reply_to, Pong { value: msg.value + 1 });
+        let _ = ctx.send(
+            msg.reply_to,
+            Pong {
+                value: msg.value + 1,
+            },
+        );
     }
 }
 
@@ -158,12 +163,24 @@ fn two_runtimes_communicate_via_in_memory_transport() {
     // B knows inbox_addr is remote (via transport to A)
     router_b.add_route(inbox_addr, transport_b_to_a);
 
-    rt_a.set_remote_sink(Arc::new(CodecRemoteSink::new(codecs.clone(), Arc::new(router_a))));
-    rt_b.set_remote_sink(Arc::new(CodecRemoteSink::new(codecs.clone(), Arc::new(router_b))));
+    rt_a.set_remote_sink(Arc::new(CodecRemoteSink::new(
+        codecs.clone(),
+        Arc::new(router_a),
+    )));
+    rt_b.set_remote_sink(Arc::new(CodecRemoteSink::new(
+        codecs.clone(),
+        Arc::new(router_b),
+    )));
 
     // A sends Ping to pong_addr — this goes via transport
-    rt_a.send_to(pong_addr, Ping { value: 42, reply_to: inbox_addr })
-        .unwrap();
+    rt_a.send_to(
+        pong_addr,
+        Ping {
+            value: 42,
+            reply_to: inbox_addr,
+        },
+    )
+    .unwrap();
 
     // Deliver from A→B transport, tick B to process
     drain_transport(&rx_b, &codecs, &rt_b);
@@ -193,10 +210,13 @@ fn unregistered_type_produces_clear_error() {
     let mut rt = Runtime::new(RuntimeConfig::default());
     rt.set_remote_sink(Arc::new(CodecRemoteSink::new(codecs, Arc::new(router))));
 
-    let result = rt.send_to(fake_addr, Ping {
-        value: 1,
-        reply_to: ActorAddress::default(),
-    });
+    let result = rt.send_to(
+        fake_addr,
+        Ping {
+            value: 1,
+            reply_to: ActorAddress::default(),
+        },
+    );
     let err_msg = format!("{:?}", result.unwrap_err());
     assert!(
         err_msg.contains("not registered"),
@@ -246,10 +266,13 @@ fn local_send_still_bypasses_transport() {
     let inbox = rt.new_inbox::<Pong>().unwrap();
 
     // Send locally — should NOT go through transport
-    rt.send_to(pong_addr, Ping {
-        value: 10,
-        reply_to: *inbox.addr(),
-    })
+    rt.send_to(
+        pong_addr,
+        Ping {
+            value: 10,
+            reply_to: *inbox.addr(),
+        },
+    )
     .unwrap();
 
     tick_n(&rt, 2);
@@ -292,13 +315,25 @@ fn round_trip_across_two_runtimes() {
     router_a.add_route(pong_addr, transport_a2b);
     router_b.add_route(inbox_addr, transport_b2a);
 
-    rt_a.set_remote_sink(Arc::new(CodecRemoteSink::new(codecs.clone(), Arc::new(router_a))));
-    rt_b.set_remote_sink(Arc::new(CodecRemoteSink::new(codecs.clone(), Arc::new(router_b))));
+    rt_a.set_remote_sink(Arc::new(CodecRemoteSink::new(
+        codecs.clone(),
+        Arc::new(router_a),
+    )));
+    rt_b.set_remote_sink(Arc::new(CodecRemoteSink::new(
+        codecs.clone(),
+        Arc::new(router_b),
+    )));
 
     // Send 3 pings and verify 3 pongs come back
     for i in 0..3u32 {
-        rt_a.send_to(pong_addr, Ping { value: i * 10, reply_to: inbox_addr })
-            .unwrap();
+        rt_a.send_to(
+            pong_addr,
+            Ping {
+                value: i * 10,
+                reply_to: inbox_addr,
+            },
+        )
+        .unwrap();
     }
 
     // Flush A→B

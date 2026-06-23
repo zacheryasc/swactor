@@ -182,7 +182,9 @@ pub fn wait_for_death_detection_at(
             let mut diag = String::from("Death detection timeout. Last seen: ");
             for &(host, port) in endpoints {
                 match poll_distribution_at(host, port) {
-                    Some(snap) => diag.push_str(&format!("{host}:{port}={} alive, ", snap.alive_count)),
+                    Some(snap) => {
+                        diag.push_str(&format!("{host}:{port}={} alive, ", snap.alive_count))
+                    }
                     None => diag.push_str(&format!("{host}:{port}=unreachable, ")),
                 }
             }
@@ -230,13 +232,19 @@ fn build_lan_images() {
     BUILD_LAN_ONCE.call_once(|| {
         // Sync repo to thinkpad
         let tar_status = Command::new("bash")
-            .args(["-c", &format!(
-                "tar czf /tmp/swactor-repo.tar.gz -C {} --exclude=target --exclude=.git . \
+            .args([
+                "-c",
+                &format!(
+                    "tar czf /tmp/swactor-repo.tar.gz -C {} --exclude=target --exclude=.git . \
                  && scp -q /tmp/swactor-repo.tar.gz {}:/tmp/ \
                  && ssh {} 'mkdir -p {} && tar xzf /tmp/swactor-repo.tar.gz -C {}'",
-                COMPOSE_DIR.replace("tests/docker", ""),
-                LAN_THINKPAD_SSH, LAN_THINKPAD_SSH, LAN_THINKPAD_REPO, LAN_THINKPAD_REPO,
-            )])
+                    COMPOSE_DIR.replace("tests/docker", ""),
+                    LAN_THINKPAD_SSH,
+                    LAN_THINKPAD_SSH,
+                    LAN_THINKPAD_REPO,
+                    LAN_THINKPAD_REPO,
+                ),
+            ])
             .status()
             .expect("failed to sync repo to thinkpad");
         assert!(tar_status.success(), "repo sync to thinkpad failed");
@@ -340,7 +348,10 @@ pub fn kill_remote_node(service: &str) {
         ])
         .status()
         .expect("failed to kill remote node");
-    assert!(status.success(), "remote docker compose stop {service} failed");
+    assert!(
+        status.success(),
+        "remote docker compose stop {service} failed"
+    );
 }
 
 /// Restart a node on the thinkpad via SSH.
@@ -355,7 +366,10 @@ pub fn restart_remote_node(service: &str) {
         ])
         .status()
         .expect("failed to restart remote node");
-    assert!(status.success(), "remote docker compose start {service} failed");
+    assert!(
+        status.success(),
+        "remote docker compose start {service} failed"
+    );
 }
 
 /// Wait until all LAN endpoints report at least `expected_alive` alive members.
@@ -396,10 +410,21 @@ pub fn wait_for_lan_convergence(
 /// Restart a specific container with fresh flags (simulates deploy lifecycle).
 pub fn redeploy_node(service: &str) {
     let status = Command::new("docker")
-        .args(["compose", "-f", &compose_file(), "up", "-d", "--force-recreate", service])
+        .args([
+            "compose",
+            "-f",
+            &compose_file(),
+            "up",
+            "-d",
+            "--force-recreate",
+            service,
+        ])
         .status()
         .expect("failed to redeploy node");
-    assert!(status.success(), "docker compose force-recreate {service} failed");
+    assert!(
+        status.success(),
+        "docker compose force-recreate {service} failed"
+    );
 }
 
 /// Fetch the node_id from a node's distribution snapshot.

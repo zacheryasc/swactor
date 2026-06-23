@@ -18,7 +18,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use distribution::swim::dissemination::{membership_update, DisseminationQueue};
+use distribution::swim::dissemination::{DisseminationQueue, membership_update};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::node::SwimNode;
 use distribution::swim::probe::SwimConfig;
@@ -182,13 +182,19 @@ fn merge_obeys_dead_over_suspect_over_alive_at_equal_incarnation() {
     ] {
         let mut ml = MemberList::new(node(0));
         ml.apply(node(1), loser, 3);
-        assert!(ml.apply(node(1), winner, 3), "{winner:?} must override {loser:?} at equal inc");
+        assert!(
+            ml.apply(node(1), winner, 3),
+            "{winner:?} must override {loser:?} at equal inc"
+        );
         assert_eq!(ml.get(&node(1)).unwrap().state, winner);
 
         // And the reverse arrival order is a no-op — priority, not recency.
         let mut ml = MemberList::new(node(0));
         ml.apply(node(1), winner, 3);
-        assert!(!ml.apply(node(1), loser, 3), "{loser:?} must not override {winner:?} at equal inc");
+        assert!(
+            !ml.apply(node(1), loser, 3),
+            "{loser:?} must not override {winner:?} at equal inc"
+        );
         assert_eq!(ml.get(&node(1)).unwrap().state, winner);
     }
 }
@@ -214,7 +220,11 @@ fn refute_fires_on_inbound_suspect_at_equal_incarnation() {
     // gossip would leave a node unable to clear a fresh suspicion about itself.
     let mut swim = fresh_node(0);
     assert_eq!(swim.members().self_incarnation(), 0);
-    swim.handle_ping(node(1), 1, &piggyback_about(node(0), MemberState::Suspect, 0));
+    swim.handle_ping(
+        node(1),
+        1,
+        &piggyback_about(node(0), MemberState::Suspect, 0),
+    );
     assert_eq!(
         swim.members().self_incarnation(),
         1,
@@ -228,11 +238,19 @@ fn refute_ignores_stale_suspect_below_current_incarnation() {
     // incarnation is news we have already answered; refuting it again is the
     // unbounded refute storm the `>=` (vs `>`) gate exists to prevent.
     let mut swim = fresh_node(0);
-    swim.handle_ping(node(1), 1, &piggyback_about(node(0), MemberState::Suspect, 0));
+    swim.handle_ping(
+        node(1),
+        1,
+        &piggyback_about(node(0), MemberState::Suspect, 0),
+    );
     assert_eq!(swim.members().self_incarnation(), 1);
 
     // A stale Suspect at incarnation 0 (< our current 1) must NOT bump again.
-    swim.handle_ping(node(2), 1, &piggyback_about(node(0), MemberState::Suspect, 0));
+    swim.handle_ping(
+        node(2),
+        1,
+        &piggyback_about(node(0), MemberState::Suspect, 0),
+    );
     assert_eq!(
         swim.members().self_incarnation(),
         1,
@@ -246,10 +264,22 @@ fn refute_fires_again_when_incarnation_catches_up() {
     // current again and MUST refute. Pins that the gate compares against the
     // *current* incarnation, not the original one.
     let mut swim = fresh_node(0);
-    swim.handle_ping(node(1), 1, &piggyback_about(node(0), MemberState::Suspect, 0));
+    swim.handle_ping(
+        node(1),
+        1,
+        &piggyback_about(node(0), MemberState::Suspect, 0),
+    );
     assert_eq!(swim.members().self_incarnation(), 1);
-    swim.handle_ping(node(2), 1, &piggyback_about(node(0), MemberState::Suspect, 1));
-    assert_eq!(swim.members().self_incarnation(), 2, "Suspect at the current incarnation must refute");
+    swim.handle_ping(
+        node(2),
+        1,
+        &piggyback_about(node(0), MemberState::Suspect, 1),
+    );
+    assert_eq!(
+        swim.members().self_incarnation(),
+        2,
+        "Suspect at the current incarnation must refute"
+    );
 }
 
 #[test]
@@ -258,8 +288,14 @@ fn dead_about_self_refutes_and_self_is_never_stored() {
     // Dead claim about self never becomes a stored member entry.
     let mut swim = fresh_node(0);
     swim.handle_ping(node(1), 1, &piggyback_about(node(0), MemberState::Dead, 0));
-    assert!(swim.members().self_incarnation() > 0, "Dead about self must refute");
-    assert!(swim.members().get(&node(0)).is_none(), "self must never be stored as a member");
+    assert!(
+        swim.members().self_incarnation() > 0,
+        "Dead about self must refute"
+    );
+    assert!(
+        swim.members().get(&node(0)).is_none(),
+        "self must never be stored as a member"
+    );
 }
 
 #[test]

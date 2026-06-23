@@ -7,9 +7,9 @@
 //! view changes nothing in producers, channels, or storage (spec §9.3):
 //! every function here takes only a [`StoredStream`].
 //!
-//! A view decodes a typed channel via its catalog codec; over a channel it
-//! cannot decode — an unknown id, or typed bytes that do not parse — it
-//! **degrades to raw bytes** rather than failing (spec §9.3).
+//! A view decodes bytes with a caller-owned classifier. Over a channel it cannot
+//! decode — an unknown id, or typed bytes that do not parse — it **degrades to
+//! raw bytes** rather than failing (spec §9.3).
 //!
 //! The four named projections of spec §9.2 are:
 //!
@@ -20,8 +20,8 @@
 
 use std::fmt;
 
-use super::catalog::{self, ChannelKind, Record};
 use super::frame::{ChannelId, Frame, Position};
+use super::record::{ChannelClassifier, ChannelKind, Record};
 use super::store::{GapSpan, StoredStream};
 
 /// One entry on the merged timeline: either a frame or a surfaced gap.
@@ -35,8 +35,8 @@ pub enum LogEntry {
 }
 
 /// A frame as the merged log presents it: where it sits on the timeline,
-/// which channel it came from, and its payload decoded as far as the
-/// catalog allows.
+/// which channel it came from, and its payload decoded as far as the caller's
+/// classifier allows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergedFrame {
     /// The frame's position on the node's single timeline.
@@ -47,7 +47,7 @@ pub struct MergedFrame {
     pub body: Body,
 }
 
-/// A payload decoded as far as the catalog allows (spec §9.3).
+/// A payload decoded as far as the caller's classifier allows (spec §9.3).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Body {
     /// A typed channel decoded to a structured value.
@@ -59,11 +59,15 @@ pub enum Body {
     Raw(Vec<u8>),
 }
 
-/// Decode a payload for display, degrading gracefully (spec §9.3): a typed
-/// channel whose bytes do not parse, and any unknown channel, fall back to
-/// raw bytes instead of failing.
-pub fn decode_body(channel: &ChannelId, payload: &[u8]) -> Body {
-    match catalog::classify(channel) {
+/// Decode a payload for display with a caller-owned classifier, degrading
+/// gracefully (spec §9.3): a typed channel whose bytes do not parse, and any
+/// unknown channel, fall back to raw bytes instead of failing.
+pub fn decode_body_with<C: ChannelClassifier + ?Sized>(
+    channel: &ChannelId,
+    payload: &[u8],
+    classifier: &C,
+) -> Body {
+    match classifier.classify(channel) {
         ChannelKind::Typed => match serde_json::from_slice::<serde_json::Value>(payload) {
             Ok(value) => Body::Record(value),
             Err(_) => Body::Raw(payload.to_vec()),
@@ -76,9 +80,16 @@ pub fn decode_body(channel: &ChannelId, payload: &[u8]) -> Body {
     }
 }
 
-/// Build the merged timeline: every stored frame in position order, with a
-/// [`LogEntry::Gap`] inserted wherever an interior position is missing.
-fn timeline(stream: &StoredStream) -> Vec<LogEntry> {
+/// Decode a payload with no caller registry. Unknown is the safe default.
+pub fn decode_body(channel: &ChannelId, payload: &[u8]) -> Body {
+    decode_body_with(channel, payload, &|_: &ChannelId| ChannelKind::Opaque)
+}
+
+/// Build the merged timeline with a caller-owned classifier.
+fn timeline_with<C: ChannelClassifier + ?Sized>(
+    stream: &StoredStream,
+    classifier: &C,
+) -> Vec<LogEntry> {
     let mut out = Vec::with_capacity(stream.len());
     let mut prev: Option<u64> = None;
     for frame in stream.frames() {
@@ -86,12 +97,15 @@ fn timeline(stream: &StoredStream) -> Vec<LogEntry> {
         if let Some(p) = prev
             && pos > p + 1
         {
-            out.push(LogEntry::Gap(GapSpan { start: p + 1, end: pos - 1 }));
+            out.push(LogEntry::Gap(GapSpan {
+                start: p + 1,
+                end: pos - 1,
+            }));
         }
         out.push(LogEntry::Frame(MergedFrame {
             position: frame.position,
             channel: frame.channel.clone(),
-            body: decode_body(&frame.channel, &frame.payload),
+            body: decode_body_with(&frame.channel, &frame.payload, classifier),
         }));
         prev = Some(pos);
     }
@@ -99,18 +113,24 @@ fn timeline(stream: &StoredStream) -> Vec<LogEntry> {
 }
 
 /// **Full merged log view** (spec §9.2): the single timeline across all
-/// channels, in position order, typed records and text lines interleaved,
-/// with gaps surfaced.
+/// channels, in position order, with gaps surfaced. Without a classifier,
+/// payloads render as raw bytes.
 pub fn merged_log(stream: &StoredStream) -> Vec<LogEntry> {
-    timeline(stream)
+    timeline_with(stream, &|_: &ChannelId| ChannelKind::Opaque)
+}
+
+/// Full merged log using a caller-owned classifier for display decoding.
+pub fn merged_log_with<C: ChannelClassifier + ?Sized>(
+    stream: &StoredStream,
+    classifier: &C,
+) -> Vec<LogEntry> {
+    timeline_with(stream, classifier)
 }
 
 /// **Replay** (spec §9.2): reconstruct the timeline after the fact, as if
-/// observed live. It is the merged log presented in position order as a
-/// stream — the same complete record, walked front to back the way a live
-/// observer would have seen it arrive.
+/// observed live. Without a classifier, payloads render as raw bytes.
 pub fn replay(stream: &StoredStream) -> impl Iterator<Item = LogEntry> {
-    timeline(stream).into_iter()
+    timeline_with(stream, &|_: &ChannelId| ChannelKind::Opaque).into_iter()
 }
 
 /// **Typed / metric projection** (spec §9.2): decode one typed channel into
@@ -123,7 +143,11 @@ pub fn metric_series<R: Record>(stream: &StoredStream) -> Vec<(Position, R)> {
     stream
         .frames()
         .filter(|f| f.channel == channel)
-        .filter_map(|f| R::decode(&f.payload).ok().map(|record| (f.position, record)))
+        .filter_map(|f| {
+            R::decode(&f.payload)
+                .ok()
+                .map(|record| (f.position, record))
+        })
         .collect()
 }
 
@@ -148,7 +172,9 @@ where
 /// `needle`. Works uniformly across typed channels (their JSON bytes) and
 /// text channels (their lines); binary payloads simply do not match.
 pub fn grep(stream: &StoredStream, needle: &str) -> Vec<Frame> {
-    filter(stream, |f| String::from_utf8_lossy(&f.payload).contains(needle))
+    filter(stream, |f| {
+        String::from_utf8_lossy(&f.payload).contains(needle)
+    })
 }
 
 // ── Human-readable rendering ───────────────────────────────────────────
@@ -167,10 +193,19 @@ impl fmt::Display for LogEntry {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LogEntry::Frame(frame) => {
-                write!(f, "#{:<4} [{}] {}", frame.position, frame.channel, frame.body)
+                write!(
+                    f,
+                    "#{:<4} [{}] {}",
+                    frame.position, frame.channel, frame.body
+                )
             }
             LogEntry::Gap(span) => {
-                write!(f, "#{:<4} ── gap: {} position(s) missing ──", span.start, span.count())
+                write!(
+                    f,
+                    "#{:<4} ── gap: {} position(s) missing ──",
+                    span.start,
+                    span.count()
+                )
             }
         }
     }

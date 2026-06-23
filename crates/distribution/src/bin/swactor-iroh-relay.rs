@@ -22,10 +22,7 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use datastream::catalog::RuntimeStats;
-use datastream::emit::{
-    DatastreamEmitter, EmitterConfig, NoopSink, TickInput,
-};
+use datastream::emit::{DatastreamEmitter, EmitterConfig, NoopSink};
 use distribution::types::NodeId;
 
 const DEFAULT_BIND: &str = "0.0.0.0:7843";
@@ -48,8 +45,7 @@ fn print_help() {
 
 fn parse_args() -> Result<(SocketAddr, Option<String>), String> {
     let mut bind: Option<String> = std::env::var("SWACTOR_IROH_RELAY_BIND").ok();
-    let mut public_host: Option<String> =
-        std::env::var("SWACTOR_IROH_RELAY_PUBLIC_HOST").ok();
+    let mut public_host: Option<String> = std::env::var("SWACTOR_IROH_RELAY_PUBLIC_HOST").ok();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -96,16 +92,15 @@ async fn main() -> ExitCode {
     let quic = {
         let (_certs, server_config) =
             iroh_relay::server::testing::self_signed_tls_certs_and_config();
-        let quic_bind =
-            SocketAddr::new(bind.ip(), iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT);
+        let quic_bind = SocketAddr::new(bind.ip(), iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT);
         Some(iroh_relay::server::QuicConfig {
             bind_addr: quic_bind,
             server_config,
         })
     };
 
-    let server = match iroh_relay::server::Server::spawn(
-        iroh_relay::server::ServerConfig::<(), ()> {
+    let server =
+        match iroh_relay::server::Server::spawn(iroh_relay::server::ServerConfig::<(), ()> {
             relay: Some(iroh_relay::server::RelayConfig {
                 http_bind_addr: bind,
                 tls: None,
@@ -115,16 +110,15 @@ async fn main() -> ExitCode {
             }),
             quic,
             metrics_addr: None,
-        },
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("swactor-iroh-relay: failed to spawn relay server: {e}");
-            return ExitCode::from(1);
-        }
-    };
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("swactor-iroh-relay: failed to spawn relay server: {e}");
+                return ExitCode::from(1);
+            }
+        };
 
     let addr = match server.http_addr() {
         Some(a) => a,
@@ -142,8 +136,7 @@ async fn main() -> ExitCode {
         iroh_relay::defaults::DEFAULT_RELAY_QUIC_PORT,
     );
 
-    // Datastream telemetry: the same per-node emitter every node runs, draining
-    // into a no-op (the relay is not a cluster member; see the module docs).
+    // Datastream mux drain: the relay is not a cluster member; see module docs.
     let mut emitter = build_emitter(&url);
 
     let mut ticker = tokio::time::interval(Duration::from_secs(1));
@@ -157,20 +150,7 @@ async fn main() -> ExitCode {
                 break;
             }
             _ = ticker.tick() => {
-                emitter.tick(
-                    TickInput {
-                        // The relay is not a SWIM member and iroh-relay's
-                        // native server exposes no session hooks yet, so
-                        // membership and peer counts are honestly empty.
-                        members: &[],
-                        runtime: RuntimeStats::default(),
-                        relay_connected: true,
-                        relay_peers: 0,
-                        // The relay runs no SWIM probe loop, so no real RTT.
-                        rtt_ms_p50: 0,
-                    },
-                    true,
-                );
+                emitter.tick();
             }
         }
     }

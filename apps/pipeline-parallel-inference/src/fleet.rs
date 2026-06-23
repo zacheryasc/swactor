@@ -14,12 +14,13 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use datastream::catalog::{
-    CacheEntryRec, DistributionState, IdentityRecord, MembershipTransition, RegistryEntryRec,
-    RuntimeStats as DsRuntimeStats, WorkerCounters,
+use dashboard::telemetry::{
+    self, IdentityRecord, RuntimeStats as DsRuntimeStats, WorkerCounters,
 };
-use datastream::emit::{
-    ClusterFrameSink, DatastreamEmitter, EmitterConfig, TickInput,
+use datastream::emit::{ClusterFrameSink, DatastreamEmitter, EmitterConfig};
+use datastream::health::DatastreamHealth;
+use distribution::telemetry::{
+    CacheEntryRec, DistributionState, MembershipTransition, RegistryEntryRec, TransportInternals,
 };
 use distribution::registry::RegistrySnapshot;
 use distribution::swim::member_list::MemberEntry;
@@ -41,6 +42,7 @@ pub const FLEET_TICK_INTERVAL: Duration = Duration::from_secs(3);
 /// drop and the bounded mux absorbs the gap.
 pub struct FleetEmitter {
     emitter: DatastreamEmitter,
+    host: telemetry::HostSampler,
 }
 
 impl FleetEmitter {
@@ -56,7 +58,7 @@ impl FleetEmitter {
         listen_addr: &str,
     ) -> Self {
         let sink = ClusterFrameSink::new(rt, sink_slot);
-        let mut emitter = DatastreamEmitter::new(
+        let emitter = DatastreamEmitter::new(
             EmitterConfig {
                 node_hex: node_hex.to_string(),
                 life,
@@ -64,20 +66,16 @@ impl FleetEmitter {
             },
             Box::new(sink),
         );
-        // Supersede the minimal boot identity with the node's name + address so
-        // the Fleet table labels the row instead of showing a bare hex id.
-        emitter.update_identity(&IdentityRecord {
+        // Submit the node's identity first so the Fleet table labels the row
+        // instead of showing a bare hex id.
+        emitter.submit_record(&IdentityRecord {
             node: node_hex.to_string(),
             life,
             node_name: name.to_string(),
             listen_addr: listen_addr.to_string(),
             ..Default::default()
         });
-        // Membership is driven from the SWIM observer (real transitions, with a
-        // cause), so the emitter's reason-less member-list diff is turned off; the
-        // caller drains transitions via [`submit_membership`](Self::submit_membership).
-        emitter.use_external_membership();
-        Self { emitter }
+        Self { emitter, host: telemetry::HostSampler::new() }
     }
 
     /// Ship one periodic sample: host resource + runtime + transport (with the
@@ -92,33 +90,40 @@ impl FleetEmitter {
         relay_peers: u32,
         rtt_ms_p50: u32,
     ) {
-        self.emitter.tick(
-            TickInput {
-                members,
-                runtime,
-                relay_connected,
-                relay_peers,
-                rtt_ms_p50,
-            },
-            true,
-        );
+        self.emitter.submit_record(&telemetry::read_host_resource(&mut self.host));
+        self.emitter.submit_record(&runtime);
+        self.emitter.submit_record(&TransportInternals {
+            relay_connected,
+            direct_peers: members.iter().filter(|(_, s)| s == "alive").count() as u32,
+            relay_peers,
+            rtt_ms_p50,
+        });
+        let assigned = self.emitter.assigned();
+        let dropped = self.emitter.dropped();
+        let loss_rate_ppm = if assigned > 0 {
+            ((dropped as u128 * 1_000_000) / assigned as u128).min(u32::MAX as u128) as u32
+        } else {
+            0
+        };
+        self.emitter.submit_record(&DatastreamHealth { assigned, dropped, loss_rate_ppm });
+        self.emitter.tick();
     }
 
     /// Emit one membership transition from the SWIM observer (carries a real
     /// `reason`). Submit before [`tick`](Self::tick) so it drains this cycle.
     pub fn submit_membership(&self, transition: &MembershipTransition) {
-        self.emitter.submit_membership(transition);
+        self.emitter.submit_record(transition);
     }
 
     /// Emit the consolidated distribution-subsystem state (registry / location
     /// cache / probe targets). Submit before [`tick`](Self::tick).
     pub fn submit_dist_state(&self, state: &DistributionState) {
-        self.emitter.submit_dist_state(state);
+        self.emitter.submit_record(state);
     }
 
     /// Emit the aggregated worker-runtime counters. Submit before [`tick`](Self::tick).
     pub fn submit_worker_counters(&self, counters: &WorkerCounters) {
-        self.emitter.submit_worker_counters(counters);
+        self.emitter.submit_record(counters);
     }
 }
 

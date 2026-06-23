@@ -18,6 +18,10 @@ crossterm = { version = "0.28", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 ctrlc = "3"
 datastream = { path = "../datastream" }
+distribution = { path = "../distribution" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [features]
 default = []

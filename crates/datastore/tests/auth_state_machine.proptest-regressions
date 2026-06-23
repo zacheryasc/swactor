@@ -1,7 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc 4dee9ecb00774d64ef2818551c7fe65951fce524197e3f11f193f6939e2272b3 # shrinks to (initial_state, transitions, seen_counter) = (RefAuthModel { owner_idx: 0, authorized: {}, used_nonces: {}, nonce_timestamps: {}, clock: 1000000, last_nonce: None }, [SignedRequest { signer_idx: 0, fresh_timestamp: true, reuse_nonce: false, nonce_bytes: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] }], None)

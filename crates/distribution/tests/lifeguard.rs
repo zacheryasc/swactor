@@ -158,12 +158,14 @@ fn suspect_timeout_scales_with_cluster_size() {
     assert!(
         timeout_2 < timeout_8,
         "8-node cluster should have longer timeout than 2-node: {:?} vs {:?}",
-        timeout_2, timeout_8
+        timeout_2,
+        timeout_8
     );
     assert!(
         timeout_8 < timeout_100,
         "100-node cluster should have longer timeout than 8-node: {:?} vs {:?}",
-        timeout_8, timeout_100
+        timeout_8,
+        timeout_100
     );
 }
 
@@ -225,7 +227,8 @@ fn degraded_health_further_increases_suspect_timeout() {
     assert!(
         degraded_timeout > healthy_timeout,
         "degraded node ({:?}) should have longer suspect timeout than healthy ({:?})",
-        degraded_timeout, healthy_timeout
+        degraded_timeout,
+        healthy_timeout
     );
     // Specifically: healthy = 30 * log2(17) * 1, degraded = 30 * log2(17) * 3
     assert_eq!(degraded_timeout, healthy_timeout * 3);
@@ -272,7 +275,7 @@ fn mixed_ack_nack_stream_settles_to_moderate_health() {
     // When: 100 rounds of alternating nack, ack
     for _ in 0..100 {
         hm.record_nack(); // +2
-        hm.record_ack();  // -1
+        hm.record_ack(); // -1
     }
 
     // Then: score settles near max (nack caps at 10, final ack brings it to 9)

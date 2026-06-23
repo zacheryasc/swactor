@@ -13,9 +13,6 @@ corpus
 docs/architecture.dot
 docs/architecture.html
 
-# Simulation traces
-crates/simulation/traces
-
 # xtask personal config
 xtask/config.toml
 

@@ -16,8 +16,8 @@ use crate::actor::{ActorAddress, ActorExited, ActorInterface, Down, ExitReason, 
 use crate::config::RuntimeConfig;
 use crate::runtime::{Ctx, Runtime};
 use crate::std::{
-    ChildSpec, CtxMonitoring, CtxWatching, RestartPolicy, StdExtension,
-    Supervisor, SupervisorStrategy,
+    ChildSpec, CtxMonitoring, CtxWatching, RestartPolicy, StdExtension, Supervisor,
+    SupervisorStrategy,
 };
 
 // ─── Helpers ────────────────────────────────────────────────────────────────

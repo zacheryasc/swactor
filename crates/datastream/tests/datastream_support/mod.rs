@@ -17,15 +17,242 @@
 //! some items are unused in some of them.
 #![allow(dead_code)]
 
-use datastream::catalog::{
-    self, ActorRec, ActorRuntimeDetail, CacheEntryRec, DatastoreState, DatastreamHealth,
-    DistributionState, IdentityRecord, MembershipTransition, ObjectRec, ProcStream, Record,
-    RegistryEntryRec, ResourceSample, RuntimeStats, TransferRec, TransportInternals, WorkerCounters,
-};
-use datastream::frame::{ChannelId, Frame, Position, StreamId};
 use datastream::mux::Mux;
 use datastream::store::GapSpan;
 pub use datastream::transport::Delivery;
+use datastream::{ChannelId, Frame, Position, Record, StreamId};
+
+pub mod schema {
+    use datastream::{ChannelId, Record};
+    use serde::{Deserialize, Serialize};
+
+    pub const IDENTITY: &str = "identity";
+    pub const HOST_RESOURCE: &str = "host.resource";
+    pub const TRANSPORT_INTERNALS: &str = "transport.internals";
+    pub const MEMBERSHIP: &str = "membership";
+    pub const RUNTIME_STATS: &str = "runtime.stats";
+    pub const DIST_STATE: &str = "dist.state";
+    pub const RUNTIME_ACTORS: &str = "runtime.actors";
+    pub const RUNTIME_WORKERS: &str = "runtime.workers";
+    pub const DATASTREAM_HEALTH: &str = "datastream.health";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ProcStream {
+        Stdout,
+        Stderr,
+    }
+
+    impl ProcStream {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                ProcStream::Stdout => "stdout",
+                ProcStream::Stderr => "stderr",
+            }
+        }
+    }
+
+    pub fn process_output(label: &str, stream: ProcStream) -> ChannelId {
+        ChannelId::new(format!("proc.{label}.{}", stream.as_str()))
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct IdentityRecord {
+        pub node: String,
+        #[serde(default)]
+        pub life: u64,
+        #[serde(default)]
+        pub node_name: String,
+        #[serde(default)]
+        pub listen_addr: String,
+        #[serde(default)]
+        pub relay_url: String,
+        #[serde(default)]
+        pub version: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct ResourceSample {
+        #[serde(default)]
+        pub cpu_pct: f32,
+        #[serde(default)]
+        pub mem_used_mb: u32,
+        #[serde(default)]
+        pub mem_total_mb: u32,
+        #[serde(default)]
+        pub gpu_pct: f32,
+        #[serde(default)]
+        pub disk_used_gb: u32,
+        #[serde(default)]
+        pub net_rx_kbps: u32,
+        #[serde(default)]
+        pub net_tx_kbps: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    pub struct TransportInternals {
+        #[serde(default)]
+        pub relay_connected: bool,
+        #[serde(default)]
+        pub direct_peers: u32,
+        #[serde(default)]
+        pub relay_peers: u32,
+        #[serde(default)]
+        pub rtt_ms_p50: u32,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct MembershipTransition {
+        pub peer: String,
+        pub from: String,
+        pub to: String,
+        #[serde(default)]
+        pub reason: String,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RuntimeStats {
+        #[serde(default)]
+        pub actors_live: u32,
+        #[serde(default)]
+        pub mailbox_depth: u32,
+        #[serde(default)]
+        pub scheduled_tasks: u32,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DistributionState {
+        #[serde(default)]
+        pub cache_size: u32,
+        #[serde(default)]
+        pub cache_entries: Vec<CacheEntryRec>,
+        #[serde(default)]
+        pub directory_route_count: u32,
+        #[serde(default)]
+        pub registry_size: u32,
+        #[serde(default)]
+        pub registry_tombstones: u32,
+        #[serde(default)]
+        pub registry_entries: Vec<RegistryEntryRec>,
+        #[serde(default)]
+        pub recent_probe_targets: Vec<String>,
+        #[serde(default)]
+        pub peer_auth_mode: String,
+        #[serde(default)]
+        pub authorized_peer_count: u32,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct CacheEntryRec {
+        #[serde(default)]
+        pub actor_addr: String,
+        #[serde(default)]
+        pub node_id: String,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct RegistryEntryRec {
+        #[serde(default)]
+        pub name: String,
+        #[serde(default)]
+        pub actor_addr: String,
+        #[serde(default)]
+        pub node_id: String,
+        #[serde(default)]
+        pub tombstone: bool,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct WorkerCounters {
+        #[serde(default)]
+        pub num_workers: u32,
+        #[serde(default)]
+        pub scheduled_tasks: u32,
+        #[serde(default)]
+        pub local_sends: u64,
+        #[serde(default)]
+        pub cross_sends: u64,
+        #[serde(default)]
+        pub inbox_sends: u64,
+        #[serde(default)]
+        pub type_mismatches: u64,
+        #[serde(default)]
+        pub panics: u64,
+        #[serde(default)]
+        pub messages_dropped: u64,
+        #[serde(default)]
+        pub restarts: u64,
+        #[serde(default)]
+        pub stops: u64,
+        #[serde(default)]
+        pub messages_processed: u64,
+        #[serde(default)]
+        pub tick_p50_us: u64,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DatastreamHealth {
+        #[serde(default)]
+        pub assigned: u64,
+        #[serde(default)]
+        pub dropped: u64,
+        #[serde(default)]
+        pub loss_rate_ppm: u32,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ActorRuntimeDetail {
+        #[serde(default)]
+        pub actors: Vec<ActorRec>,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ActorRec {
+        #[serde(default)]
+        pub address: String,
+        #[serde(default)]
+        pub name: String,
+        #[serde(default)]
+        pub mailbox_depth: u32,
+        #[serde(default)]
+        pub messages_processed: u64,
+        #[serde(default)]
+        pub last_msg_type: String,
+        #[serde(default)]
+        pub poisoned: bool,
+        #[serde(default)]
+        pub message_type_counts: Vec<(String, u64)>,
+    }
+
+    impl Record for IdentityRecord {
+        const CHANNEL: &'static str = IDENTITY;
+    }
+    impl Record for ResourceSample {
+        const CHANNEL: &'static str = HOST_RESOURCE;
+    }
+    impl Record for TransportInternals {
+        const CHANNEL: &'static str = TRANSPORT_INTERNALS;
+    }
+    impl Record for MembershipTransition {
+        const CHANNEL: &'static str = MEMBERSHIP;
+    }
+    impl Record for RuntimeStats {
+        const CHANNEL: &'static str = RUNTIME_STATS;
+    }
+    impl Record for DistributionState {
+        const CHANNEL: &'static str = DIST_STATE;
+    }
+    impl Record for ActorRuntimeDetail {
+        const CHANNEL: &'static str = RUNTIME_ACTORS;
+    }
+    impl Record for WorkerCounters {
+        const CHANNEL: &'static str = RUNTIME_WORKERS;
+    }
+    impl Record for DatastreamHealth {
+        const CHANNEL: &'static str = DATASTREAM_HEALTH;
+    }
+}
+
+use schema::*;
 
 /// An in-process node (testing spec §2 — the faked machine boundary): a
 /// *real* mux plus the producers that feed it. Producers push realistic
@@ -40,7 +267,10 @@ pub struct Node {
 impl Node {
     /// Stand up a node for a given stream (node identity + lifetime).
     pub fn new(stream: StreamId) -> Self {
-        Node { mux: Mux::unbounded(stream.clone()), stream }
+        Node {
+            mux: Mux::unbounded(stream.clone()),
+            stream,
+        }
     }
 
     /// The stream this node produces.
@@ -55,7 +285,8 @@ impl Node {
 
     /// A producer emits a line of raw process output (spec §6.2).
     pub fn emit_text(&self, label: &str, stream: ProcStream, line: &str) -> Position {
-        self.mux.submit(catalog::process_output(label, stream), line.as_bytes().to_vec())
+        self.mux
+            .submit(process_output(label, stream), line.as_bytes().to_vec())
     }
 
     /// A producer emits bytes on a channel the consumer may not know
@@ -117,27 +348,6 @@ pub mod payloads {
         }
     }
 
-    /// A datastore steady-metrics record.
-    pub fn datastore_state(tick: u64) -> DatastoreState {
-        DatastoreState {
-            object_count: 10 + tick % 9,
-            total_bytes: 4096 + (tick % 11) * 512,
-            put_ops: 20 + tick,
-            get_ops: 50 + tick * 2,
-            delete_ops: tick % 7,
-            objects: vec![ObjectRec {
-                hash: format!("blake3-{tick:08x}"),
-                name: Some(format!("file-{}.bin", tick % 4)),
-                size_bytes: 512 + (tick % 6) * 128,
-            }],
-            active_transfers: vec![TransferRec {
-                hash: format!("blake3-{:08x}", tick + 1),
-                chunks_received: tick % 8,
-                chunks_total: 8,
-            }],
-        }
-    }
-
     /// A per-actor runtime-detail record (the real actor table).
     pub fn actor_detail(tick: u64) -> ActorRuntimeDetail {
         ActorRuntimeDetail {
@@ -162,20 +372,6 @@ pub mod payloads {
                 },
             ],
         }
-    }
-
-    /// A datastore operation event — the JSON line the `datastore.events` text
-    /// channel carries (the streaming successor of the old event ring).
-    pub fn datastore_event(tick: u64) -> String {
-        let kind = ["put", "get", "delete"][(tick % 3) as usize];
-        serde_json::json!({
-            "timestamp_ms": 1_700_000_000_000u64 + tick,
-            "kind": kind,
-            "hash": format!("blake3-{tick:08x}"),
-            "name": if kind == "put" { Some(format!("file-{}.bin", tick % 4)) } else { None::<String> },
-            "size_bytes": if kind == "get" { 0u64 } else { 512 + (tick % 6) * 128 },
-        })
-        .to_string()
     }
 
     /// A plausible resource sample; `tick` nudges the values so a series is
@@ -247,7 +443,10 @@ pub mod payloads {
 
     /// A realistic line of process output (without trailing newline).
     pub fn log_line(label: &str, tick: u64) -> String {
-        format!("[{label}] step {tick} loss=0.{:03} lr=3e-4", 250 - (tick % 200))
+        format!(
+            "[{label}] step {tick} loss=0.{:03} lr=3e-4",
+            250 - (tick % 200)
+        )
     }
 }
 
@@ -299,7 +498,10 @@ pub mod reference {
             if let Some(q) = prev
                 && p > q + 1
             {
-                spans.push(GapSpan { start: q + 1, end: p - 1 });
+                spans.push(GapSpan {
+                    start: q + 1,
+                    end: p - 1,
+                });
             }
             prev = Some(p);
         }
@@ -329,9 +531,15 @@ pub mod reference {
             if let Some(p) = prev
                 && pos > p + 1
             {
-                out.push(TimelineItem::Gap { start: p + 1, end: pos - 1 });
+                out.push(TimelineItem::Gap {
+                    start: p + 1,
+                    end: pos - 1,
+                });
             }
-            out.push(TimelineItem::Frame { position: pos, channel: f.channel.to_string() });
+            out.push(TimelineItem::Frame {
+                position: pos,
+                channel: f.channel.to_string(),
+            });
             prev = Some(pos);
         }
         out
@@ -345,7 +553,11 @@ pub fn typed_frame<R: Record>(record: &R, position: u64) -> Frame {
 
 /// Convenience: build a frame on a raw-text process-output channel.
 pub fn text_frame(label: &str, stream: ProcStream, line: &str, position: u64) -> Frame {
-    Frame::new(catalog::process_output(label, stream), Position(position), line.as_bytes().to_vec())
+    Frame::new(
+        process_output(label, stream),
+        Position(position),
+        line.as_bytes().to_vec(),
+    )
 }
 
 /// Convenience: a frame on a channel id the consumer does not know — an

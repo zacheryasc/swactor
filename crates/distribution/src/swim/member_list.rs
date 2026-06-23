@@ -32,10 +32,8 @@ impl MemberEntry {
 /// Iteration order is by `NodeId` byte-ordering, not by insertion. This is
 /// deliberate: a `HashMap` here would randomise iteration per process and
 /// the dissemination layer's `pack_piggyback` order would vary run-to-run,
-/// which prevents byte-identical bundle replay across sim runs and adds a
-/// ±20 % run-to-run variance band to the gossip-flap property's
-/// `self_incarnation_peak` (see `crates/simulation/SWIM_TUNING_REPORT.md`
-/// §6.7 — the determinism prerequisite for evidence-driven retuning).
+/// which prevents deterministic piggyback packing and adds avoidable
+/// run-to-run variance to gossip-flap behavior.
 pub struct MemberList {
     /// Our own node identity.
     self_id: NodeId,
@@ -138,11 +136,14 @@ impl MemberList {
                 }
             }
             None => {
-                self.members.insert(node_id, MemberEntry {
+                self.members.insert(
                     node_id,
-                    state,
-                    incarnation,
-                });
+                    MemberEntry {
+                        node_id,
+                        state,
+                        incarnation,
+                    },
+                );
                 true
             }
         }
@@ -151,10 +152,11 @@ impl MemberList {
     /// Mark a node as suspect (if currently alive and same/higher incarnation).
     pub fn suspect(&mut self, node_id: NodeId) -> bool {
         if let Some(entry) = self.members.get_mut(&node_id)
-            && entry.state == MemberState::Alive {
-                entry.state = MemberState::Suspect;
-                return true;
-            }
+            && entry.state == MemberState::Alive
+        {
+            entry.state = MemberState::Suspect;
+            return true;
+        }
         false
     }
 
@@ -162,10 +164,11 @@ impl MemberList {
     /// enforcing the SWIM lifecycle invariant (Alive → Suspect → Dead).
     pub fn declare_dead(&mut self, node_id: NodeId) -> bool {
         if let Some(entry) = self.members.get_mut(&node_id)
-            && entry.state == MemberState::Suspect {
-                entry.state = MemberState::Dead;
-                return true;
-            }
+            && entry.state == MemberState::Suspect
+        {
+            entry.state = MemberState::Dead;
+            return true;
+        }
         false
     }
 

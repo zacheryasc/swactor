@@ -83,7 +83,9 @@ fn sse_read_loop(
             break;
         }
         debug_log(&format!("header: {}", trimmed));
-        if trimmed.to_ascii_lowercase().starts_with("transfer-encoding:")
+        if trimmed
+            .to_ascii_lowercase()
+            .starts_with("transfer-encoding:")
             && trimmed.to_ascii_lowercase().contains("chunked")
         {
             chunked = true;

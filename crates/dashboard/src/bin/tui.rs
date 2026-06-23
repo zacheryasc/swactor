@@ -1,5 +1,5 @@
 use dashboard::tui::types::RuntimeEndpoint;
-use dashboard::tui::{start_tui_remote, TuiConfig};
+use dashboard::tui::{TuiConfig, start_tui_remote};
 
 fn main() -> std::io::Result<()> {
     let url = std::env::args()

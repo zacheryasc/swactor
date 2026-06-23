@@ -95,16 +95,12 @@ impl NodeMetadataDisseminator {
 
     /// Look up a node's relay URL.
     pub fn relay_url(&self, node_id: &NodeId) -> Option<&str> {
-        self.store
-            .get(node_id)
-            .and_then(|e| e.relay_url.as_deref())
+        self.store.get(node_id).and_then(|e| e.relay_url.as_deref())
     }
 
     /// Look up a node's human-readable name.
     pub fn node_name(&self, node_id: &NodeId) -> Option<&str> {
-        self.store
-            .get(node_id)
-            .and_then(|e| e.node_name.as_deref())
+        self.store.get(node_id).and_then(|e| e.node_name.as_deref())
     }
 
     /// Remove metadata for a dead node.
@@ -152,7 +148,10 @@ impl NodeMetadataDisseminator {
         let budget = self.transmit_budget(cluster_size);
 
         // Replace existing pending entry for same node if present.
-        if let Some(existing) = self.pending.iter_mut().find(|e| e.entry.node_id == entry.node_id)
+        if let Some(existing) = self
+            .pending
+            .iter_mut()
+            .find(|e| e.entry.node_id == entry.node_id)
         {
             existing.entry = entry;
             existing.remaining = budget;

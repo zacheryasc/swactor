@@ -19,7 +19,11 @@ const MON_PAIRS: usize = MON_N * (MON_N - 1); // 6
 
 fn mon_pair(i: usize, j: usize) -> usize {
     debug_assert!(i < MON_N && j < MON_N && i != j);
-    if j < i { i * (MON_N - 1) + j } else { i * (MON_N - 1) + j - 1 }
+    if j < i {
+        i * (MON_N - 1) + j
+    } else {
+        i * (MON_N - 1) + j - 1
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -64,10 +68,14 @@ impl Model for MonitorModel {
 
     fn actions(&self, s: &Self::State, actions: &mut Vec<Self::Action>) {
         for i in 0..MON_N {
-            if !s.alive[i] { continue; }
+            if !s.alive[i] {
+                continue;
+            }
 
             for j in 0..MON_N {
-                if i == j { continue; }
+                if i == j {
+                    continue;
+                }
                 let idx = mon_pair(i, j);
 
                 if s.alive[j] && !s.active[idx] {
@@ -98,10 +106,14 @@ impl Model for MonitorModel {
                 }
             }
             MonAction::Kill(t) => {
-                if !n.alive[t] { return None; }
+                if !n.alive[t] {
+                    return None;
+                }
                 n.alive[t] = false;
                 for w in 0..MON_N {
-                    if w == t { continue; }
+                    if w == t {
+                        continue;
+                    }
                     let idx = mon_pair(w, t);
                     if n.alive[w] && n.active[idx] && n.notif[idx] < 2 {
                         n.notif[idx] += 1;
@@ -114,23 +126,32 @@ impl Model for MonitorModel {
 
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
-            Property::<Self>::always("G6a: exactly one notification per active monitor on dead target", |_, s| {
-                for w in 0..MON_N {
-                    if !s.alive[w] { continue; }
-                    for t in 0..MON_N {
-                        if w == t { continue; }
-                        let idx = mon_pair(w, t);
-                        if s.active[idx] && !s.alive[t] && s.notif[idx] != 1 {
-                            return false;
+            Property::<Self>::always(
+                "G6a: exactly one notification per active monitor on dead target",
+                |_, s| {
+                    for w in 0..MON_N {
+                        if !s.alive[w] {
+                            continue;
+                        }
+                        for t in 0..MON_N {
+                            if w == t {
+                                continue;
+                            }
+                            let idx = mon_pair(w, t);
+                            if s.active[idx] && !s.alive[t] && s.notif[idx] != 1 {
+                                return false;
+                            }
                         }
                     }
-                }
-                true
-            }),
+                    true
+                },
+            ),
             Property::<Self>::always("G6b: no notification for alive targets", |_, s| {
                 for w in 0..MON_N {
                     for t in 0..MON_N {
-                        if w == t { continue; }
+                        if w == t {
+                            continue;
+                        }
                         if s.alive[t] && s.notif[mon_pair(w, t)] > 0 {
                             return false;
                         }
@@ -138,30 +159,35 @@ impl Model for MonitorModel {
                 }
                 true
             }),
-            Property::<Self>::always("G6c: demonitor before death suppresses notification", |_, s| {
-                for w in 0..MON_N {
-                    for t in 0..MON_N {
-                        if w == t { continue; }
-                        let idx = mon_pair(w, t);
-                        // If demonitored while target was alive, no notification should exist
-                        if s.deactivated_while_alive[idx] && s.notif[idx] > 0 {
-                            return false;
+            Property::<Self>::always(
+                "G6c: demonitor before death suppresses notification",
+                |_, s| {
+                    for w in 0..MON_N {
+                        for t in 0..MON_N {
+                            if w == t {
+                                continue;
+                            }
+                            let idx = mon_pair(w, t);
+                            // If demonitored while target was alive, no notification should exist
+                            if s.deactivated_while_alive[idx] && s.notif[idx] > 0 {
+                                return false;
+                            }
                         }
                     }
-                }
-                true
-            }),
+                    true
+                },
+            ),
             // Liveness
-            Property::<Self>::sometimes("L1: monitor fires", |_, s| {
-                s.notif.iter().any(|&c| c > 0)
-            }),
+            Property::<Self>::sometimes("L1: monitor fires", |_, s| s.notif.iter().any(|&c| c > 0)),
             Property::<Self>::sometimes("L2: demonitor suppression reachable", |_, s| {
-                (0..MON_N).any(|w| (0..MON_N).any(|t| {
-                    w != t && {
-                        let idx = mon_pair(w, t);
-                        s.deactivated_while_alive[idx] && !s.alive[t] && s.notif[idx] == 0
-                    }
-                }))
+                (0..MON_N).any(|w| {
+                    (0..MON_N).any(|t| {
+                        w != t && {
+                            let idx = mon_pair(w, t);
+                            s.deactivated_while_alive[idx] && !s.alive[t] && s.notif[idx] == 0
+                        }
+                    })
+                })
             }),
             Property::<Self>::sometimes("L3: multiple monitors on same target", |_, s| {
                 (0..MON_N).any(|t| {
@@ -186,7 +212,11 @@ const ORP_PAIRS: usize = ORP_N * (ORP_N - 1); // 12
 
 fn orp_pair(i: usize, j: usize) -> usize {
     debug_assert!(i < ORP_N && j < ORP_N && i != j);
-    if j < i { i * (ORP_N - 1) + j } else { i * (ORP_N - 1) + j - 1 }
+    if j < i {
+        i * (ORP_N - 1) + j
+    } else {
+        i * (ORP_N - 1) + j - 1
+    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -220,16 +250,20 @@ impl OrphanState {
     }
 
     fn has_parent(&self, c: usize) -> bool {
-        (0..ORP_N).any(|p| p != c && {
-            let idx = orp_pair(p, c);
-            self.parent_unsup[idx] || self.parent_sup[idx]
+        (0..ORP_N).any(|p| {
+            p != c && {
+                let idx = orp_pair(p, c);
+                self.parent_unsup[idx] || self.parent_sup[idx]
+            }
         })
     }
 
     fn has_children(&self, p: usize) -> bool {
-        (0..ORP_N).any(|c| c != p && {
-            let idx = orp_pair(p, c);
-            self.parent_unsup[idx] || self.parent_sup[idx]
+        (0..ORP_N).any(|c| {
+            c != p && {
+                let idx = orp_pair(p, c);
+                self.parent_unsup[idx] || self.parent_sup[idx]
+            }
         })
     }
 }
@@ -257,12 +291,20 @@ impl Model for OrphanModel {
         // SetParent actions only if under link cap
         if s.link_count < MAX_LINKS {
             for p in 0..ORP_N {
-                if !s.alive[p] { continue; }
+                if !s.alive[p] {
+                    continue;
+                }
                 for c in 0..ORP_N {
-                    if p == c || !s.alive[c] { continue; }
-                    if s.has_parent(c) { continue; }
+                    if p == c || !s.alive[c] {
+                        continue;
+                    }
+                    if s.has_parent(c) {
+                        continue;
+                    }
                     // Prevent cycles: c must not be an ancestor of p
-                    if is_ancestor(s, c, p) { continue; }
+                    if is_ancestor(s, c, p) {
+                        continue;
+                    }
                     actions.push(OrpAction::SetParentUnsup(p, c));
                     actions.push(OrpAction::SetParentSup(p, c));
                 }
@@ -291,14 +333,18 @@ impl Model for OrphanModel {
                 n.link_count += 1;
             }
             OrpAction::Kill(i) => {
-                if !n.alive[i] { return None; }
+                if !n.alive[i] {
+                    return None;
+                }
                 n.alive[i] = false;
             }
             OrpAction::OrphanCleanup(dead_parent) => {
                 n.orphan_cleaned[dead_parent] = true;
                 // Kill unsupervised children
                 for c in 0..ORP_N {
-                    if c == dead_parent { continue; }
+                    if c == dead_parent {
+                        continue;
+                    }
                     if n.parent_unsup[orp_pair(dead_parent, c)] && n.alive[c] {
                         n.alive[c] = false;
                         n.orphan_killed[c] = true;
@@ -316,7 +362,9 @@ impl Model for OrphanModel {
                 for p in 0..ORP_N {
                     if !s.alive[p] && s.orphan_cleaned[p] {
                         for c in 0..ORP_N {
-                            if c == p { continue; }
+                            if c == p {
+                                continue;
+                            }
                             if s.parent_unsup[orp_pair(p, c)] && s.alive[c] {
                                 return false;
                             }
@@ -325,7 +373,6 @@ impl Model for OrphanModel {
                 }
                 true
             }),
-
             // G7b: OrphanCleanup never kills supervised-only children.
             // If orphan_killed[c] is true, there must be a parent p with an
             // unsupervised link (parent_unsup[p→c]) that was orphan-cleaned.
@@ -336,9 +383,7 @@ impl Model for OrphanModel {
                     if s.orphan_killed[c] {
                         // There must exist a dead, cleaned parent with unsup link to c
                         let has_unsup_cleaned_parent = (0..ORP_N).any(|p| {
-                            p != c
-                                && s.parent_unsup[orp_pair(p, c)]
-                                && s.orphan_cleaned[p]
+                            p != c && s.parent_unsup[orp_pair(p, c)] && s.orphan_cleaned[p]
                         });
                         if !has_unsup_cleaned_parent {
                             return false;
@@ -347,20 +392,21 @@ impl Model for OrphanModel {
                 }
                 true
             }),
-
             // G7c: Cascading — if orphan-cleaned parent's child also died and was
             // orphan-cleaned, its unsupervised children are dead too
             Property::<Self>::always("G7c: cascading orphan cleanup", |_, s| {
                 for p in 0..ORP_N {
                     if s.orphan_cleaned[p] {
                         for c in 0..ORP_N {
-                            if c == p { continue; }
-                            if s.parent_unsup[orp_pair(p, c)]
-                                && !s.alive[c]
-                                && s.orphan_cleaned[c]
+                            if c == p {
+                                continue;
+                            }
+                            if s.parent_unsup[orp_pair(p, c)] && !s.alive[c] && s.orphan_cleaned[c]
                             {
                                 for gc in 0..ORP_N {
-                                    if gc == c { continue; }
+                                    if gc == c {
+                                        continue;
+                                    }
                                     if s.parent_unsup[orp_pair(c, gc)] && s.alive[gc] {
                                         return false;
                                     }
@@ -371,24 +417,27 @@ impl Model for OrphanModel {
                 }
                 true
             }),
-
             // Liveness
             Property::<Self>::sometimes("L1: orphan cleanup triggers", |_, s| {
                 s.orphan_cleaned.iter().any(|&c| c)
             }),
             Property::<Self>::sometimes("L2: cascading cleanup reachable", |_, s| {
                 // Parent cleaned → child died → child cleaned
-                (0..ORP_N).any(|p| s.orphan_cleaned[p] && (0..ORP_N).any(|c| {
-                    c != p
-                        && s.parent_unsup[orp_pair(p, c)]
-                        && !s.alive[c]
-                        && s.orphan_cleaned[c]
-                }))
+                (0..ORP_N).any(|p| {
+                    s.orphan_cleaned[p]
+                        && (0..ORP_N).any(|c| {
+                            c != p
+                                && s.parent_unsup[orp_pair(p, c)]
+                                && !s.alive[c]
+                                && s.orphan_cleaned[c]
+                        })
+                })
             }),
             Property::<Self>::sometimes("L3: supervised child survives cleanup", |_, s| {
-                (0..ORP_N).any(|p| s.orphan_cleaned[p] && (0..ORP_N).any(|c| {
-                    c != p && s.parent_sup[orp_pair(p, c)] && s.alive[c]
-                }))
+                (0..ORP_N).any(|p| {
+                    s.orphan_cleaned[p]
+                        && (0..ORP_N).any(|c| c != p && s.parent_sup[orp_pair(p, c)] && s.alive[c])
+                })
             }),
         ]
     }
@@ -422,7 +471,10 @@ fn g6_monitor_model_check() {
     let result = MonitorModel.checker().spawn_dfs().join();
     let unique = result.unique_state_count();
     let depth = result.max_depth();
-    println!("Stateright G6 (Monitor): {} unique states, max depth {}", unique, depth);
+    println!(
+        "Stateright G6 (Monitor): {} unique states, max depth {}",
+        unique, depth
+    );
     result.assert_properties();
     assert!(unique > 100, "Too few states ({unique})");
 }
@@ -433,7 +485,10 @@ fn g7_orphan_model_check() {
     let result = OrphanModel.checker().spawn_dfs().join();
     let unique = result.unique_state_count();
     let depth = result.max_depth();
-    println!("Stateright G7 (Orphan): {} unique states, max depth {}", unique, depth);
+    println!(
+        "Stateright G7 (Orphan): {} unique states, max depth {}",
+        unique, depth
+    );
     result.assert_properties();
     assert!(unique > 100, "Too few states ({unique})");
 }

@@ -93,7 +93,10 @@ impl StoredStream {
             if let Some(q) = prev
                 && p > q + 1
             {
-                spans.push(GapSpan { start: q + 1, end: p - 1 });
+                spans.push(GapSpan {
+                    start: q + 1,
+                    end: p - 1,
+                });
             }
             prev = Some(p);
         }

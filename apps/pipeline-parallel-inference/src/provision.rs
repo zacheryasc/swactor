@@ -23,9 +23,10 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::process_observer::ProcessOutputObserver;
 use swactor::runtime::{Ctx, ExternalSender, Runtime};
 
-use datastream::catalog::{self, IdentityRecord, ProcStream, Record};
+use dashboard::telemetry::{process_output, IdentityRecord, ProcStream, IDENTITY};
 use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use datastream::wire::{encode_delivery, DatastreamFrame};
+use datastream::Record;
 
 use swactor_process::ssh::SshConfig;
 use swactor_process::{spawn_ssh_process, ProcessMode, ProcessSpec};
@@ -88,7 +89,7 @@ impl ProcessOutputObserver for BootTelemetry {
         } else {
             ProcStream::Stdout
         };
-        self.ship(catalog::process_output(label, stream), data.to_vec());
+        self.ship(process_output(label, stream), data.to_vec());
     }
 }
 
@@ -105,7 +106,7 @@ pub fn install_boot_telemetry(rt: &Arc<Runtime>, orch_hex: &str, life: u64, sink
     });
     // Label the orchestrator's own row before any process output flows.
     boot.ship(
-        ChannelId::new(catalog::IDENTITY),
+        ChannelId::new(IDENTITY),
         IdentityRecord {
             node: orch_hex.to_string(),
             life,

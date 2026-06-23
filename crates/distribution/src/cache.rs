@@ -54,10 +54,13 @@ impl LocationCache {
         if self.entries.len() >= self.capacity && !self.entries.contains_key(&addr) {
             self.evict_lru();
         }
-        self.entries.insert(addr, CacheEntry {
-            node_id,
-            order: self.counter,
-        });
+        self.entries.insert(
+            addr,
+            CacheEntry {
+                node_id,
+                order: self.counter,
+            },
+        );
     }
 
     /// Evict a stale entry (e.g. on delivery failure).

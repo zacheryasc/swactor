@@ -34,7 +34,10 @@ pub enum RegistryIn {
     /// Membership delta, adapted from the SwimActor's `MembershipChanged` stream.
     Membership(MembershipChanged),
     /// Local: register a name → actor binding owned by this node.
-    RegisterName { name: String, actor_addr: ActorAddress },
+    RegisterName {
+        name: String,
+        actor_addr: ActorAddress,
+    },
     /// Local: unregister a name (writes a tombstone).
     UnregisterName { name: String },
     /// Local request: resolve `name`; the result is sent to `reply`.

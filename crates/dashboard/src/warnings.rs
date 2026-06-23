@@ -180,7 +180,9 @@ impl WarningDetector {
                         entity: format!("Worker {}", w.id),
                         description: format!(
                             "{} actors vs {:.0} average ({:.1}x)",
-                            w.num_actors, avg, w.num_actors as f64 / avg,
+                            w.num_actors,
+                            avg,
+                            w.num_actors as f64 / avg,
                         ),
                     });
                 }
@@ -251,12 +253,13 @@ mod tests {
     #[test]
     fn poisoned_actor_triggers_critical_warning() {
         let mut detector = WarningDetector::new(WarningConfig::default());
-        let stats = make_stats(
-            vec![make_worker(0, 1, 0)],
-            vec![make_actor(1, 0, 10, true)],
-        );
+        let stats = make_stats(vec![make_worker(0, 1, 0)], vec![make_actor(1, 0, 10, true)]);
         let warnings = detector.check(&stats);
-        assert!(warnings.iter().any(|w| w.warning_type == WarningType::PoisonedActor));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.warning_type == WarningType::PoisonedActor)
+        );
         assert!(warnings.iter().any(|w| w.severity == Severity::Critical));
     }
 
@@ -276,11 +279,21 @@ mod tests {
             );
             let warnings = detector.check(&stats);
             if depth < 4 {
-                assert!(!warnings.iter().any(|w| w.warning_type == WarningType::GrowingMailbox),
-                    "should not trigger at depth {}", depth);
+                assert!(
+                    !warnings
+                        .iter()
+                        .any(|w| w.warning_type == WarningType::GrowingMailbox),
+                    "should not trigger at depth {}",
+                    depth
+                );
             } else {
-                assert!(warnings.iter().any(|w| w.warning_type == WarningType::GrowingMailbox),
-                    "should trigger at depth {}", depth);
+                assert!(
+                    warnings
+                        .iter()
+                        .any(|w| w.warning_type == WarningType::GrowingMailbox),
+                    "should trigger at depth {}",
+                    depth
+                );
             }
         }
     }
@@ -302,12 +315,13 @@ mod tests {
             detector.check(&stats);
         }
         // After 1,2 → streak=2; then 1 → streak=0; then 2,3,4 → streak=3 → triggers
-        let stats = make_stats(
-            vec![make_worker(0, 1, 0)],
-            vec![make_actor(1, 5, 0, false)],
-        );
+        let stats = make_stats(vec![make_worker(0, 1, 0)], vec![make_actor(1, 5, 0, false)]);
         let warnings = detector.check(&stats);
-        assert!(warnings.iter().any(|w| w.warning_type == WarningType::GrowingMailbox));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.warning_type == WarningType::GrowingMailbox)
+        );
     }
 
     #[test]
@@ -326,7 +340,10 @@ mod tests {
             );
             let warnings = detector.check(&stats);
             // Last one should trigger
-            if warnings.iter().any(|w| w.warning_type == WarningType::StalledActor) {
+            if warnings
+                .iter()
+                .any(|w| w.warning_type == WarningType::StalledActor)
+            {
                 return; // test passed
             }
         }
@@ -338,56 +355,68 @@ mod tests {
         let mut detector = WarningDetector::new(WarningConfig::default());
         // Worker 0: 10 actors, Worker 1: 1 actor. Avg=5.5, ratio=10/5.5=1.8
         // With ratio threshold 2.0, this should NOT trigger
-        let stats = make_stats(
-            vec![make_worker(0, 10, 0), make_worker(1, 1, 0)],
-            vec![],
-        );
+        let stats = make_stats(vec![make_worker(0, 10, 0), make_worker(1, 1, 0)], vec![]);
         let warnings = detector.check(&stats);
-        assert!(!warnings.iter().any(|w| w.warning_type == WarningType::WorkerImbalance));
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.warning_type == WarningType::WorkerImbalance)
+        );
 
         // Worker 0: 20 actors, Worker 1: 1 actor. Avg=10.5, ratio=20/10.5=1.9 — still no
         // Worker 0: 30 actors, Worker 1: 1 actor. Avg=15.5, ratio=30/15.5=1.9 — still no
         // Worker 0: 100 actors, Worker 1: 1 actor. Avg=50.5, ratio=100/50.5=1.98 — almost
         // Worker 0: 100 actors, Worker 1: 0 actor. Avg=50, ratio=100/50=2.0 — at threshold
 
-        let stats2 = make_stats(
-            vec![make_worker(0, 100, 0), make_worker(1, 1, 0)],
-            vec![],
-        );
+        let stats2 = make_stats(vec![make_worker(0, 100, 0), make_worker(1, 1, 0)], vec![]);
         let warnings2 = detector.check(&stats2);
         // 100 / 50.5 = 1.98 — not > 2.0
-        assert!(!warnings2.iter().any(|w| w.warning_type == WarningType::WorkerImbalance));
+        assert!(
+            !warnings2
+                .iter()
+                .any(|w| w.warning_type == WarningType::WorkerImbalance)
+        );
 
         // Now 200 vs 1: 200/100.5 = ~1.99 — still not. Let's do 300 vs 1: 300/150.5 = ~2.0
         // Actually need > 2x. Let's do 50 vs 1: avg=25.5, ratio=50/25.5=1.96. Nope.
         // 10 vs 1 vs 1: avg=4, ratio=10/4=2.5 — triggers!
         let stats3 = make_stats(
-            vec![make_worker(0, 10, 0), make_worker(1, 1, 0), make_worker(2, 1, 0)],
+            vec![
+                make_worker(0, 10, 0),
+                make_worker(1, 1, 0),
+                make_worker(2, 1, 0),
+            ],
             vec![],
         );
         let warnings3 = detector.check(&stats3);
-        assert!(warnings3.iter().any(|w| w.warning_type == WarningType::WorkerImbalance));
+        assert!(
+            warnings3
+                .iter()
+                .any(|w| w.warning_type == WarningType::WorkerImbalance)
+        );
     }
 
     #[test]
     fn empty_worker_detected() {
         let mut detector = WarningDetector::new(WarningConfig::default());
-        let stats = make_stats(
-            vec![make_worker(0, 5, 0), make_worker(1, 0, 0)],
-            vec![],
-        );
+        let stats = make_stats(vec![make_worker(0, 5, 0), make_worker(1, 0, 0)], vec![]);
         let warnings = detector.check(&stats);
-        assert!(warnings.iter().any(|w| w.warning_type == WarningType::EmptyWorker));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.warning_type == WarningType::EmptyWorker)
+        );
     }
 
     #[test]
     fn mailbox_overflow_detected() {
         let mut detector = WarningDetector::new(WarningConfig::default());
-        let stats = make_stats(
-            vec![make_worker(0, 1, 42)],
-            vec![],
-        );
+        let stats = make_stats(vec![make_worker(0, 1, 42)], vec![]);
         let warnings = detector.check(&stats);
-        assert!(warnings.iter().any(|w| w.warning_type == WarningType::MailboxOverflow));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.warning_type == WarningType::MailboxOverflow)
+        );
     }
 }

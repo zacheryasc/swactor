@@ -118,10 +118,7 @@ impl CommandContext {
         }
     }
 
-    pub fn with_enricher(
-        runtime: Arc<Runtime>,
-        enricher: Arc<dyn StatsEnricher>,
-    ) -> Self {
+    pub fn with_enricher(runtime: Arc<Runtime>, enricher: Arc<dyn StatsEnricher>) -> Self {
         Self {
             runtime,
             enricher: Some(enricher),
@@ -188,11 +185,7 @@ impl CommandRouter {
     ///
     /// The `help` command is handled directly by the router (it needs
     /// access to all registered handlers).
-    pub fn dispatch(
-        &self,
-        req: &CommandRequest,
-        ctx: &CommandContext,
-    ) -> CommandResponse {
+    pub fn dispatch(&self, req: &CommandRequest, ctx: &CommandContext) -> CommandResponse {
         if req.command == "help" {
             return self.cmd_help();
         }
@@ -295,10 +288,7 @@ pub fn parse_line(line: &str) -> CommandRequest {
 
 /// Convert HTTP query parameters to a [`CommandRequest`].
 pub fn from_query_params(params: &HashMap<String, String>) -> CommandRequest {
-    let command = params
-        .get("cmd")
-        .cloned()
-        .unwrap_or_else(|| "help".into());
+    let command = params.get("cmd").cloned().unwrap_or_else(|| "help".into());
     let args: HashMap<String, serde_json::Value> = params
         .iter()
         .filter(|(k, _)| *k != "cmd")

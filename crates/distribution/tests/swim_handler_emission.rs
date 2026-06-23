@@ -15,7 +15,7 @@
 use std::time::Instant;
 
 use distribution::messages::MembershipUpdate;
-use distribution::swim::dissemination::{membership_update, DisseminationQueue};
+use distribution::swim::dissemination::{DisseminationQueue, membership_update};
 use distribution::swim::node::{NodeAction, SwimNode};
 use distribution::swim::probe::SwimConfig;
 use distribution::types::{MemberState, NodeId, NodeRecord};
@@ -33,9 +33,11 @@ fn membership_changes(actions: &[NodeAction]) -> Vec<(NodeId, MemberState, u64)>
     actions
         .iter()
         .filter_map(|a| match a {
-            NodeAction::MembershipChanged { node_id, state, incarnation } => {
-                Some((*node_id, *state, *incarnation))
-            }
+            NodeAction::MembershipChanged {
+                node_id,
+                state,
+                incarnation,
+            } => Some((*node_id, *state, *incarnation)),
             _ => None,
         })
         .collect()
@@ -68,7 +70,11 @@ fn accepted_gossip_emits_one_change_and_re_gossips_it() {
     // §10.0 + §7 inv. 5: an accepted merge emits exactly one MembershipChanged
     // and re-enqueues that update for dissemination — the infection edge.
     let mut swim = fresh_node(0);
-    let actions = swim.handle_ping(node(1), 1, &piggyback_about(node(2), MemberState::Suspect, 3));
+    let actions = swim.handle_ping(
+        node(1),
+        1,
+        &piggyback_about(node(2), MemberState::Suspect, 3),
+    );
 
     let changes = membership_changes(&actions);
     assert!(
@@ -83,7 +89,9 @@ fn accepted_gossip_emits_one_change_and_re_gossips_it() {
     });
     let onward = DisseminationQueue::unpack_piggyback(&ack_pb.expect("Ping must produce an Ack"));
     assert!(
-        onward.iter().any(|u| u.node_id == node(2) && u.state == MemberState::Suspect && u.incarnation == 3),
+        onward
+            .iter()
+            .any(|u| u.node_id == node(2) && u.state == MemberState::Suspect && u.incarnation == 3),
         "every accepted change must be re-gossiped (§7 inv. 5)"
     );
 }
@@ -113,7 +121,11 @@ fn ping_acks_the_sender() {
         NodeAction::SendAck { to, sequence, .. } => Some((*to, *sequence)),
         _ => None,
     });
-    assert_eq!(ack_to, Some((node(1), 42)), "Ping must produce exactly one Ack to the sender");
+    assert_eq!(
+        ack_to,
+        Some((node(1), 42)),
+        "Ping must produce exactly one Ack to the sender"
+    );
 }
 
 #[test]
@@ -175,7 +187,9 @@ fn join_request_admits_joiner_and_replies_with_self_in_the_roster() {
     // §7 inv. 5: the admitted joiner is enqueued for dissemination.
     let drained = drain_dissemination(&mut seed, node(7));
     assert!(
-        drained.iter().any(|u| u.node_id == node(1) && u.state == MemberState::Alive),
+        drained
+            .iter()
+            .any(|u| u.node_id == node(1) && u.state == MemberState::Alive),
         "JoinRequest must enqueue the new member for gossip"
     );
 }
@@ -192,7 +206,9 @@ fn re_join_of_known_member_emits_no_change_but_still_responds() {
         "re-join of a known member must emit no MembershipChanged"
     );
     assert!(
-        actions.iter().any(|a| matches!(a, NodeAction::SendJoinResponse { to, .. } if *to == node(1))),
+        actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::SendJoinResponse { to, .. } if *to == node(1))),
         "a JoinRequest must always be answered with a JoinResponse"
     );
 }
@@ -204,12 +220,27 @@ fn join_response_seeds_the_roster_with_one_change_per_record() {
     // §10.9: the joiner fires one MembershipChanged per newly-learned record.
     let mut joiner = fresh_node(1);
     let actions = joiner.handle_join_response(vec![
-        NodeRecord { node_id: node(2), state: MemberState::Alive, incarnation: 0 },
-        NodeRecord { node_id: node(3), state: MemberState::Alive, incarnation: 0 },
+        NodeRecord {
+            node_id: node(2),
+            state: MemberState::Alive,
+            incarnation: 0,
+        },
+        NodeRecord {
+            node_id: node(3),
+            state: MemberState::Alive,
+            incarnation: 0,
+        },
     ]);
-    let mut changed: Vec<NodeId> = membership_changes(&actions).into_iter().map(|(id, ..)| id).collect();
+    let mut changed: Vec<NodeId> = membership_changes(&actions)
+        .into_iter()
+        .map(|(id, ..)| id)
+        .collect();
     changed.sort();
-    assert_eq!(changed, vec![node(2), node(3)], "one MembershipChanged per newly-seeded record");
+    assert_eq!(
+        changed,
+        vec![node(2), node(3)],
+        "one MembershipChanged per newly-seeded record"
+    );
 }
 
 #[test]
@@ -220,9 +251,21 @@ fn join_response_does_not_re_gossip_the_bulk_snapshot() {
     // burst, and the members are confirmed by subsequent probing.
     let mut joiner = fresh_node(1);
     joiner.handle_join_response(vec![
-        NodeRecord { node_id: node(2), state: MemberState::Alive, incarnation: 0 },
-        NodeRecord { node_id: node(3), state: MemberState::Alive, incarnation: 0 },
-        NodeRecord { node_id: node(4), state: MemberState::Dead, incarnation: 2 },
+        NodeRecord {
+            node_id: node(2),
+            state: MemberState::Alive,
+            incarnation: 0,
+        },
+        NodeRecord {
+            node_id: node(3),
+            state: MemberState::Alive,
+            incarnation: 0,
+        },
+        NodeRecord {
+            node_id: node(4),
+            state: MemberState::Dead,
+            incarnation: 2,
+        },
     ]);
     let drained = drain_dissemination(&mut joiner, node(9));
     assert!(
@@ -246,7 +289,9 @@ fn leave_enqueues_self_dead_without_immediate_notification() {
     );
     let drained = drain_dissemination(&mut swim, node(9));
     assert!(
-        drained.iter().any(|u| u.node_id == node(0) && u.state == MemberState::Dead),
+        drained
+            .iter()
+            .any(|u| u.node_id == node(0) && u.state == MemberState::Dead),
         "Leave must enqueue self as Dead for subsequent piggybacks"
     );
 }
@@ -279,7 +324,12 @@ fn relay_forwards_indirect_ack_to_requester_on_target_ack() {
     relay.handle_ping_req(node(1), node(2), 88, &[]); // requester = 1, target = 2
     let actions = relay.handle_ack(node(2), 88, &[]); // the target answers
     let fwd = actions.iter().find_map(|a| match a {
-        NodeAction::ForwardAck { to, target, sequence, .. } => Some((*to, *target, *sequence)),
+        NodeAction::ForwardAck {
+            to,
+            target,
+            sequence,
+            ..
+        } => Some((*to, *target, *sequence)),
         _ => None,
     });
     assert_eq!(
@@ -296,7 +346,9 @@ fn unmatched_ack_does_not_forward_an_indirect_ack() {
     relay.handle_ping_req(node(1), node(2), 88, &[]);
     let actions = relay.handle_ack(node(2), 999, &[]); // wrong sequence
     assert!(
-        !actions.iter().any(|a| matches!(a, NodeAction::ForwardAck { .. })),
+        !actions
+            .iter()
+            .any(|a| matches!(a, NodeAction::ForwardAck { .. })),
         "an Ack with no matching pending relay must not be forwarded"
     );
 }
@@ -306,7 +358,11 @@ fn indirect_ack_applies_its_piggyback_gossip() {
     // §10.5: as the original prober, an IndirectAck's piggyback is merged like
     // any other gossip — the indirectly-probed peer's news rides home on it.
     let mut prober = fresh_node(0);
-    let actions = prober.handle_indirect_ack(node(2), 5, &piggyback_about(node(3), MemberState::Suspect, 4));
+    let actions = prober.handle_indirect_ack(
+        node(2),
+        5,
+        &piggyback_about(node(3), MemberState::Suspect, 4),
+    );
     assert!(
         membership_changes(&actions).contains(&(node(3), MemberState::Suspect, 4)),
         "an IndirectAck must apply the gossip carried in its piggyback"

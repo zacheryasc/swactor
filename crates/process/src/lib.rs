@@ -25,9 +25,12 @@ pub use pipeline::{
 };
 pub use session::{ProcessSession, ProcessState};
 pub use spawn::{spawn_local_process, spawn_process};
-pub use types::{EventQueue, ExitStatus, FlowControl, ProcessDriver, ProcessError, ProcessMode, ProcessSpec, ProcessWaker, PtySize, Signal};
+pub use types::{
+    EventQueue, ExitStatus, FlowControl, ProcessDriver, ProcessError, ProcessMode, ProcessSpec,
+    ProcessWaker, PtySize, Signal,
+};
 
 #[cfg(feature = "ssh")]
-pub use ssh::{SshConfig, SshDriver};
-#[cfg(feature = "ssh")]
 pub use spawn::spawn_ssh_process;
+#[cfg(feature = "ssh")]
+pub use ssh::{SshConfig, SshDriver};

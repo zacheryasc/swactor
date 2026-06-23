@@ -41,7 +41,11 @@ impl DisseminationQueue {
         let budget = self.transmit_budget(cluster_size);
 
         // Check for existing entry for this node
-        if let Some(existing) = self.entries.iter_mut().find(|e| e.update.node_id == update.node_id) {
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.update.node_id == update.node_id)
+        {
             let dominated = update.incarnation > existing.update.incarnation
                 || (update.incarnation == existing.update.incarnation
                     && update.state > existing.update.state);
@@ -64,9 +68,8 @@ impl DisseminationQueue {
     /// their remaining transmit count. Entries with zero remaining are evicted.
     pub fn take(&mut self, max_count: usize) -> Vec<MembershipUpdate> {
         // Sort by priority: Dead (2) > Suspect (1) > Alive (0), descending
-        self.entries.sort_by(|a, b| {
-            b.update.state.priority().cmp(&a.update.state.priority())
-        });
+        self.entries
+            .sort_by(|a, b| b.update.state.priority().cmp(&a.update.state.priority()));
 
         let count = max_count.min(self.entries.len());
         let mut result = Vec::with_capacity(count);

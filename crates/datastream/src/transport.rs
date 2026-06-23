@@ -78,7 +78,10 @@ impl StreamScript {
 
     /// Drop exactly these positions, otherwise deliver in order.
     pub fn dropping(positions: impl IntoIterator<Item = u64>) -> Self {
-        StreamScript { dropped: positions.into_iter().collect(), reorder: Reorder::InOrder }
+        StreamScript {
+            dropped: positions.into_iter().collect(),
+            reorder: Reorder::InOrder,
+        }
     }
 
     /// Set the reorder behavior (builder style).
@@ -99,10 +102,16 @@ impl ScriptedTransport {
     /// returning the deliveries in arrival order. Dropped positions are
     /// removed; the survivors are reordered; nothing else changes.
     pub fn carry(stream: &StreamId, sent: &[Frame], script: &StreamScript) -> Vec<Delivery> {
-        let survivors: Vec<Frame> =
-            sent.iter().filter(|f| !script.dropped.contains(&f.position.0)).cloned().collect();
+        let survivors: Vec<Frame> = sent
+            .iter()
+            .filter(|f| !script.dropped.contains(&f.position.0))
+            .cloned()
+            .collect();
         let ordered = reorder(survivors, &script.reorder);
-        ordered.into_iter().map(|frame| Delivery::new(stream.clone(), frame)).collect()
+        ordered
+            .into_iter()
+            .map(|frame| Delivery::new(stream.clone(), frame))
+            .collect()
     }
 
     /// Carry several nodes' streams and interleave their deliveries in a
@@ -110,8 +119,10 @@ impl ScriptedTransport {
     /// Cross-node order is meaningless (spec §4.3); this just proves ingest
     /// routes by stream id, not by arrival.
     pub fn carry_all(streams: &[(StreamId, Vec<Frame>, StreamScript)]) -> Vec<Delivery> {
-        let per_stream: Vec<Vec<Delivery>> =
-            streams.iter().map(|(id, sent, script)| Self::carry(id, sent, script)).collect();
+        let per_stream: Vec<Vec<Delivery>> = streams
+            .iter()
+            .map(|(id, sent, script)| Self::carry(id, sent, script))
+            .collect();
         round_robin(per_stream)
     }
 }

@@ -1,9 +1,9 @@
 //! Production SWIM telemetry — the observer the live node installs.
 //!
-//! Outside `simulation`, SWIM ran with `observer = None`, so three live signals
-//! never reached the datastream: per-probe round-trip time, the recent probe
-//! targets, and the *cause* of each membership transition (the M4 state-diff can
-//! see *that* a peer changed but not *why*). This installs a real
+//! Without a production observer, SWIM ran with `observer = None`, so three live
+//! signals never reached the datastream: per-probe round-trip time, the recent
+//! probe targets, and the *cause* of each membership transition (the M4
+//! state-diff can see *that* a peer changed but not *why*). This installs a real
 //! [`SwimObserver`] that reconstructs all three from the observation stream, and
 //! exposes them for the node's telemetry tick to read.
 //!
@@ -121,16 +121,22 @@ impl SwimTelemetry {
     fn record(&self, observation: SwimObservation) {
         let mut inner = self.inner.lock().expect("swim telemetry poisoned");
         match observation {
-            SwimObservation::ProbeSent { target, sequence, .. } => {
+            SwimObservation::ProbeSent {
+                target, sequence, ..
+            } => {
                 // Drop any leaked in-flight entries before tracking a new probe.
-                inner.in_flight.retain(|_, sent| sent.elapsed() < IN_FLIGHT_TTL);
+                inner
+                    .in_flight
+                    .retain(|_, sent| sent.elapsed() < IN_FLIGHT_TTL);
                 inner.in_flight.insert((target, sequence), Instant::now());
                 if inner.targets.len() >= TARGET_RING {
                     inner.targets.pop_front();
                 }
                 inner.targets.push_back(target);
             }
-            SwimObservation::ProbeAcked { target, sequence, .. } => {
+            SwimObservation::ProbeAcked {
+                target, sequence, ..
+            } => {
                 if let Some(sent) = inner.in_flight.remove(&(target, sequence)) {
                     let rtt = sent.elapsed().as_millis().min(u32::MAX as u128) as u32;
                     if inner.rtts.len() >= RTT_RING {
@@ -139,15 +145,27 @@ impl SwimTelemetry {
                     inner.rtts.push_back(rtt);
                 }
             }
-            SwimObservation::ProbeTimedOut { target, sequence, .. } => {
+            SwimObservation::ProbeTimedOut {
+                target, sequence, ..
+            } => {
                 // A timeout is not a round-trip — drop the in-flight entry, no sample.
                 inner.in_flight.remove(&(target, sequence));
             }
-            SwimObservation::Transition { peer, from, to, reason } => {
+            SwimObservation::Transition {
+                peer,
+                from,
+                to,
+                reason,
+            } => {
                 if inner.transitions.len() >= TRANSITION_CAP {
                     inner.transitions.pop_front();
                 }
-                inner.transitions.push_back(ObservedTransition { peer, from, to, reason });
+                inner.transitions.push_back(ObservedTransition {
+                    peer,
+                    from,
+                    to,
+                    reason,
+                });
             }
         }
     }

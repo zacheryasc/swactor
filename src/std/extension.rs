@@ -1,6 +1,9 @@
 use std::any::Any;
 
-use crate::actor::{ActorAddress, Down, Environment, EnvironmentBuilder, ExitReason, ExitValue, SpawnTimestamp, StopReason, StopSignal};
+use crate::actor::{
+    ActorAddress, Down, Environment, EnvironmentBuilder, ExitReason, ExitValue, SpawnTimestamp,
+    StopReason, StopSignal,
+};
 use crate::extension::{RuntimeExtension, WorkerExtension};
 
 use super::children_registry::ChildrenRegistry;
@@ -81,12 +84,18 @@ impl RuntimeExtension for StdExtension {
             // Monitor notifications (Down)
             let watchers = self.monitor_registry.take_monitors(&addr);
             for (_mref, watcher) in watchers {
-                let down = Down { addr, reason, exit_value: exit_value.clone() };
+                let down = Down {
+                    addr,
+                    reason,
+                    exit_value: exit_value.clone(),
+                };
                 notifications.push((watcher, Box::new(down) as Box<dyn Any + Send>));
             }
 
             // Watch notifications (ActorExited)
-            let watch_notifications = self.watch_registry.notify_death(addr, stop_to_exit(reason), exit_value.clone());
+            let watch_notifications =
+                self.watch_registry
+                    .notify_death(addr, stop_to_exit(reason), exit_value.clone());
             for (watcher, exited) in watch_notifications {
                 notifications.push((watcher, Box::new(exited) as Box<dyn Any + Send>));
             }
@@ -118,7 +127,13 @@ impl RuntimeExtension for StdExtension {
         self
     }
 
-    fn on_spawn(&self, child: ActorAddress, parent: Option<ActorAddress>, env: Environment, uptime_ms: u64) -> Environment {
+    fn on_spawn(
+        &self,
+        child: ActorAddress,
+        parent: Option<ActorAddress>,
+        env: Environment,
+        uptime_ms: u64,
+    ) -> Environment {
         // Register parent → child relationship for orphan cleanup
         if let Some(parent_addr) = parent {
             self.children_registry.register(parent_addr, child);

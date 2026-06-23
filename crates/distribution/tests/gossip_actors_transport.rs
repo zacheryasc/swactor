@@ -18,20 +18,20 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
 use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
-use swactor::Error;
 
 use distribution::crypto::{Keypair, KeypairExt};
 use distribution::directory_actor::{DirectoryActor, DirectoryIn, Located};
 use distribution::messages::actor_codec_registry;
 use distribution::node_metadata_actor::{MetadataActor, MetadataIn, RelayInfo};
-use distribution::registry_actor::{NameResolved, RegistryActor, RegistryIn};
 use distribution::registry::RegistryConfig;
+use distribution::registry_actor::{NameResolved, RegistryActor, RegistryIn};
 use distribution::swim::actor::{MembershipChanged, SharedPeerDirectory};
-use distribution::transport_bridge::{peer_addr, NoopRouteBinder, RelayMirror, RouteView};
+use distribution::transport_bridge::{NoopRouteBinder, RelayMirror, RouteView, peer_addr};
 use distribution::types::{MemberState, NodeId};
 
 /// Carries an encoded frame into the destination runtime and performs the
@@ -142,9 +142,18 @@ impl GossipCluster {
                 let syn = peer_addr(ids[j]);
                 nodes[i].dir.bind(ids[j], syn, 0);
                 let mut routes = HashMap::new();
-                routes.insert("swactor_dist::RegistryGossip".to_string(), nodes[j].registry);
-                routes.insert("swactor_dist::MetadataGossip".to_string(), nodes[j].metadata);
-                routes.insert("swactor_dist::DirectoryGossip".to_string(), nodes[j].directory);
+                routes.insert(
+                    "swactor_dist::RegistryGossip".to_string(),
+                    nodes[j].registry,
+                );
+                routes.insert(
+                    "swactor_dist::MetadataGossip".to_string(),
+                    nodes[j].metadata,
+                );
+                routes.insert(
+                    "swactor_dist::DirectoryGossip".to_string(),
+                    nodes[j].directory,
+                );
                 nodes[i].router.add_route(
                     syn,
                     Arc::new(Link {
@@ -250,7 +259,10 @@ impl GossipCluster {
             .rt
             .send_to(
                 self.nodes[observer].directory,
-                DirectoryIn::Resolve { actor, reply: *inbox.addr() },
+                DirectoryIn::Resolve {
+                    actor,
+                    reply: *inbox.addr(),
+                },
             )
             .unwrap();
         self.nodes[observer].rt.tick();
@@ -280,7 +292,10 @@ fn a_registered_name_propagates_to_a_peer_over_the_transport() {
     let propagated = c.run_until(400, |c| {
         (1..c.ids.len()).all(|o| c.resolve_name(o, "billing") == Some((svc, c.ids[0])))
     });
-    assert!(propagated, "registered name did not propagate over the transport");
+    assert!(
+        propagated,
+        "registered name did not propagate over the transport"
+    );
 }
 
 #[test]
@@ -327,14 +342,19 @@ fn all_three_gossip_protocols_coexist_on_one_transport() {
         .rt
         .send_to(
             c.nodes[0].registry,
-            RegistryIn::RegisterName { name: "billing".into(), actor_addr: svc },
+            RegistryIn::RegisterName {
+                name: "billing".into(),
+                actor_addr: svc,
+            },
         )
         .unwrap();
     c.nodes[0]
         .rt
         .send_to(
             c.nodes[0].metadata,
-            MetadataIn::SetRelayUrl { url: Some("http://relay.example:3340/".into()) },
+            MetadataIn::SetRelayUrl {
+                url: Some("http://relay.example:3340/".into()),
+            },
         )
         .unwrap();
     // The directory claim is signed by node 0's key, so its host is c.ids[0].

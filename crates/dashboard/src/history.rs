@@ -50,7 +50,13 @@ impl WorkerHistory {
         }
     }
 
-    fn push(&mut self, messages_processed: u64, mailbox_depth: usize, num_actors: usize, cap: usize) {
+    fn push(
+        &mut self,
+        messages_processed: u64,
+        mailbox_depth: usize,
+        num_actors: usize,
+        cap: usize,
+    ) {
         let rate = messages_processed.saturating_sub(self.prev_messages) as f64;
         self.prev_messages = messages_processed;
 
@@ -145,7 +151,10 @@ impl DashboardHistory {
 
         // Record per-actor data
         for a in &stats.actor_details {
-            let ah = inner.actors.entry(a.address).or_insert_with(|| ActorHistory::new(counter));
+            let ah = inner
+                .actors
+                .entry(a.address)
+                .or_insert_with(|| ActorHistory::new(counter));
             ah.push(a, self.config.max_actor_samples, counter);
         }
 

@@ -244,24 +244,21 @@ impl Model for LifecycleModel {
             }),
             // G4d: on_stop implies actor is removed (no further handle possible)
             Property::<Self>::always("G4d: on_stop implies not alive", |_, state| {
-                state.actors.iter().all(|a| {
-                    if a.on_stop_count > 0 {
-                        !a.alive
-                    } else {
-                        true
-                    }
-                })
+                state
+                    .actors
+                    .iter()
+                    .all(|a| if a.on_stop_count > 0 { !a.alive } else { true })
             }),
             // G4e: on_stop implies the actor was started (no cleanup of
             // never-initialized actors). Enabled by the Stop guard requiring
             // `started`, which mirrors production: StopSignal goes through
             // the mailbox and is processed after on_start.
             Property::<Self>::always("G4e: on_stop implies started", |_, state| {
-                state.actors.iter().all(|a| {
-                    if a.on_stop_count > 0 { a.started } else { true }
-                })
+                state
+                    .actors
+                    .iter()
+                    .all(|a| if a.on_stop_count > 0 { a.started } else { true })
             }),
-
             // ── G5 Safety Properties ──────────────────────────────────────
 
             // G5: every actor's lifecycle invariants hold independently,
@@ -322,9 +319,10 @@ impl Model for LifecycleModel {
             }),
             // L4: on_start panic reachable (poisoned with handle_count == 0)
             Property::<Self>::sometimes("L4: on_start panic reachable", |_, state| {
-                state.actors.iter().any(|a| {
-                    a.poisoned && a.handle_count == 0 && a.on_start_count > 0
-                })
+                state
+                    .actors
+                    .iter()
+                    .any(|a| a.poisoned && a.handle_count == 0 && a.on_start_count > 0)
             }),
         ]
     }

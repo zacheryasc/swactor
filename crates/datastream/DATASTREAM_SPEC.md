@@ -124,7 +124,7 @@ specific channel** — you know a frame is missing, not which channel it carried
 That is the right trade for telemetry.
 
 > **Decision of record — drop attribution.** If a particular source ever needs
-> guaranteed contiguous accounting (e.g. "did I lose a datastore op?"), it
+> guaranteed contiguous accounting, it
 > carries its *own* sequence number as a field in its record. The pipe's
 > position stays global and dumb; domain counting is domain data.
 
@@ -163,7 +163,7 @@ string. They never split it, match it, or validate it. This is what keeps the
 pipe dumb and lets a brand-new channel flow end to end with zero pipe changes.
 
 Its **structure is a read-side convention** — known only to producers (to mint
-paths they own) and to the catalog and consumers (to match and decode them). It
+paths they own) and to consumers/classifiers (to match and decode them). It
 is therefore *both*: a flat string on the wire, a structured path at the edges.
 There is no conflict, because the two views never meet inside the pipe.
 
@@ -174,7 +174,7 @@ A channel path is a dotted sequence of segments:
 ```text
 channel := namespace ( "." qualifier )*
 namespace := the owning subsystem        e.g. host, transport, swim, runtime,
-                                              dist, datastore, proc, identity
+                                              dist, proc, identity
 qualifier := instance-key | leaf         instance-key identifies *which* of a
                                               dynamic source; leaf names the signal
 ```
@@ -240,16 +240,16 @@ node wires that observer to a submission handle. This is the uniform "means of
 population" applied across the codebase:
 
 ```rust
-// e.g. datastore
-trait DatastoreEventObserver { fn on_event(&self, ev: DatastoreEvent); }
+// e.g. process output
+trait ProcessOutputObserver { fn on_output(&self, label: &str, is_stderr: bool, data: &[u8]); }
 // the node installs an observer whose body is `handle.submit(...)`
 ```
 
 This replaces today's inconsistent wiring (some subsystems install a sink, some
 install `None`, some route through the node as an adapter). The rule: **a
 subsystem emits by handing its observer a submission handle — nothing else.**
-Existing observer-shaped seams (`DatastoreEventObserver`, `ProcessOutputObserver`,
-the unused `SwimObserver`) all conform to this one shape.
+Existing observer-shaped seams such as `ProcessOutputObserver` and the unused
+`SwimObserver` conform to this one shape.
 
 ### 4.3 The mux: single position authority
 
@@ -295,44 +295,44 @@ short. A channel is **a name attached to frames** — nothing more. There is:
 A channel **exists** the instant a frame bears its name, and not before.
 Everything below follows from that.
 
-### 5.2 The catalog: a registry of *meaning*, not of *existence*
+### 5.2 Meaning is caller-owned
 
-The catalog maps a channel path to how it should be decoded. It is static,
-compile-time, and finite. It answers *"given this path, what does it mean?"* —
-never *"what paths exist?"* (that is the store's job, §5.8).
+`datastream` defines the vocabulary for classification, not the global list of
+classified channels:
 
 ```rust
 pub enum ChannelKind { Typed, Text, Opaque }
-pub fn classify(channel: &ChannelId) -> ChannelKind;
+pub trait ChannelClassifier {
+    fn classify(&self, channel: &ChannelId) -> ChannelKind;
+}
 ```
 
-The pipe never consults the catalog. Only producers (to tag) and views (to
-decode) do. Adding a channel or teaching a view a new codec changes nothing in
-the mux, transport, ingest, or store.
+Producers and consumers own the records and channel constants for their domains.
+A dashboard, plugin, or application may compose a registry of the channels it
+understands, but the pipe never consults that registry. Adding a channel or
+teaching a view a new codec changes nothing in the mux, transport, ingest, or
+store.
 
 ### 5.3 Static channels and dynamic families
 
 - **Static channel** — a fully literal path known at compile time
-  (`host.resource`). Registered as a constant.
+  (`host.resource`). Defined by the crate that owns that signal.
 - **Dynamic family** — a path *template* with parameter segments
-  (`proc.{label}.stdout`). The template is registered statically; concrete
+  (`proc.{label}.stdout`). The owning crate defines the helper; concrete
   instances are minted at runtime by binding parameters:
 
   ```rust
   pub fn process_output(label: &str, stream: ProcStream) -> ChannelId; // proc.<label>.<stream>
   ```
 
-The catalog therefore knows every channel **shape** even though it cannot know
-every concrete **instance**. "The catalog is the schema contract" survives
-dynamic sources intact: `classify("proc.trainer.stdout")` matches the
-`proc.{label}.*` family and returns `Text` without ever having heard of
-`trainer`.
+A caller-owned classifier can know a family shape without knowing every concrete
+instance: `proc.*` may classify as `Text` while `proc.trainer.stdout` first
+appears only when the trainer emits.
 
 ### 5.4 Typed / Text / Opaque, and the Opaque fallback
 
 - **Typed** — decodes to a structured record under a JSON codec (§5.5).
-- **Text** — opaque text; a view treats it as lines (`proc.*`,
-  `datastore.events`).
+- **Text** — opaque text; a view treats it as lines (`proc.*`).
 - **Opaque** — *unknown to this consumer.* Retained whole, shown as raw bytes.
 
 > **Decision of record — forward-compatible fallback.** An unrecognized path is
@@ -393,16 +393,16 @@ never on the channel identity.
 
 ### 5.8 Discovery
 
-Discovery splits cleanly along the catalog/store line:
+Discovery splits cleanly along the classifier/store line:
 
-- The **catalog** answers *meaning* — given a path, how to decode it. Static,
-  finite, compile-time.
+- A **caller-owned classifier** answers *meaning* — given a path, how should this
+  consumer decode it?
 - The **store** answers *existence* — which paths have actually been seen.
-  Dynamic, discovered by scanning stored frame keys at read time.
+  Dynamic paths are discovered by scanning stored frame keys at read time.
 
 So "list every live process channel" is a **view over the store** (distinct
-paths matching `proc.*`), not a registry lookup. The catalog says what is
-*possible*; the store says what is *real*.
+paths matching `proc.*`), not a registry lookup. A classifier says what this
+consumer understands; the store says what is *real*.
 
 ### 5.9 Namespacing and ownership
 
@@ -545,7 +545,7 @@ assert without reaching into internals (scenario / property / contract style).
    yields one stored frame.
 7. **Order independence.** Reordered or delayed deliveries reconstruct the same
    stored stream as in-order delivery.
-8. **Unknown channels survive.** A frame on an uncatalogued channel is stored
+8. **Unknown channels survive.** A frame on an unrecognized channel is stored
    whole and rendered as raw bytes, never dropped or errored.
 9. **Version skew tolerance.** A typed record missing or carrying extra fields
    decodes (defaults fill, extras ignore) rather than failing.

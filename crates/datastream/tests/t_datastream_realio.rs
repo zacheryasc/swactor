@@ -30,13 +30,13 @@ use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 use std::time::Duration;
 
-use datastream::catalog::ProcStream;
 use datastream::frame::{Frame, Lifetime, NodeId, StreamId};
 use datastream::ingest::Consumer;
 use datastream::transport::Delivery;
 use datastream::wire::{decode_delivery, encode_delivery};
 
-use support::{payloads, Node};
+use support::schema::ProcStream;
+use support::{Node, payloads};
 
 /// A realistic node stream, produced by the real mux.
 fn build_stream() -> (StreamId, Vec<Frame>) {
@@ -57,7 +57,9 @@ fn build_stream() -> (StreamId, Vec<Frame>) {
 /// treated as loss, never as failures.
 fn carry_over_real_socket(stream: &StreamId, frames: &[Frame]) -> Vec<Delivery> {
     let consumer = UdpSocket::bind("127.0.0.1:0").expect("bind consumer socket");
-    consumer.set_read_timeout(Some(Duration::from_millis(300))).expect("set timeout");
+    consumer
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .expect("set timeout");
     let consumer_addr = consumer.local_addr().expect("consumer addr");
 
     let node = UdpSocket::bind("127.0.0.1:0").expect("bind node socket");
@@ -109,7 +111,10 @@ fn real_transport_stays_within_the_envelope() {
             &d.frame, *original,
             "payload byte-identical, channel and position intact — no corruption or alteration"
         );
-        assert!(seen.insert(d.frame.position.0), "no duplicate — a subsequence has no repeats");
+        assert!(
+            seen.insert(d.frame.position.0),
+            "no duplicate — a subsequence has no repeats"
+        );
     }
     // Deliberately no assertion on how many arrived: loss is within the
     // envelope, so the check is sound without requiring delivery.
@@ -132,7 +137,10 @@ fn wiring_smoke_some_frames_arrive_and_reconstruct() {
         .store()
         .stream(&id)
         .expect("the path is connected: the node's frames reached the consumer");
-    assert!(!stored.is_empty(), "some frames arrived over the real transport");
+    assert!(
+        !stored.is_empty(),
+        "some frames arrived over the real transport"
+    );
 
     // Whatever arrived reconstructs correctly: each stored frame is the
     // original at that position, and the store is in position order.
@@ -141,7 +149,9 @@ fn wiring_smoke_some_frames_arrive_and_reconstruct() {
     for frame in stored.frames() {
         assert_eq!(
             frame,
-            *by_position.get(&frame.position.0).expect("only sent frames arrive"),
+            *by_position
+                .get(&frame.position.0)
+                .expect("only sent frames arrive"),
             "a reconstructed frame is the original, byte-identical"
         );
         if let Some(p) = prev {

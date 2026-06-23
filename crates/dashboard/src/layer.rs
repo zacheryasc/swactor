@@ -1,16 +1,16 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
+use tracing::Subscriber;
 use tracing::field::{Field, Visit};
 use tracing::span;
-use tracing::Subscriber;
+use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
-use tracing_subscriber::Layer;
 
 /// A single captured tracing event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +95,9 @@ impl EventStore {
             .filter(|e| {
                 e.actor_addr
                     .as_ref()
-                    .map(|a| a.to_lowercase().starts_with(&lower) || a.to_lowercase().contains(&lower))
+                    .map(|a| {
+                        a.to_lowercase().starts_with(&lower) || a.to_lowercase().contains(&lower)
+                    })
                     .unwrap_or(false)
             })
             .take(limit)
@@ -213,13 +215,15 @@ where
             for span in scope {
                 let exts = span.extensions();
                 if worker_id.is_none()
-                    && let Some(wid) = exts.get::<WorkerIdField>() {
-                        worker_id = Some(wid.0);
-                    }
+                    && let Some(wid) = exts.get::<WorkerIdField>()
+                {
+                    worker_id = Some(wid.0);
+                }
                 if actor_addr.is_none()
-                    && let Some(aa) = exts.get::<ActorAddrField>() {
-                        actor_addr = Some(aa.0.clone());
-                    }
+                    && let Some(aa) = exts.get::<ActorAddrField>()
+                {
+                    actor_addr = Some(aa.0.clone());
+                }
                 if worker_id.is_some() && actor_addr.is_some() {
                     break;
                 }
@@ -228,13 +232,15 @@ where
 
         // Also check if worker_id or actor_addr was a field on the event itself
         if worker_id.is_none()
-            && let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id") {
-                worker_id = n.as_u64().map(|v| v as usize);
-            }
+            && let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id")
+        {
+            worker_id = n.as_u64().map(|v| v as usize);
+        }
         if actor_addr.is_none()
-            && let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
-                actor_addr = Some(s.clone());
-            }
+            && let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr")
+        {
+            actor_addr = Some(s.clone());
+        }
 
         let dashboard_event = DashboardEvent {
             seq: 0, // filled by push()
@@ -256,9 +262,10 @@ where
 
         if let Some(span) = ctx.span(id) {
             if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id")
-                && let Some(wid) = n.as_u64() {
-                    span.extensions_mut().insert(WorkerIdField(wid as usize));
-                }
+                && let Some(wid) = n.as_u64()
+            {
+                span.extensions_mut().insert(WorkerIdField(wid as usize));
+            }
             if let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
                 span.extensions_mut().insert(ActorAddrField(s.clone()));
             }

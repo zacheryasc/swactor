@@ -65,12 +65,10 @@ fn draw_worker_sparklines(f: &mut Frame, app: &App, area: Rect) {
 
     for (i, w) in app.workers.iter().enumerate() {
         if let Some(&col_area) = cols.get(i) {
-            let block = Block::default()
-                .borders(Borders::NONE)
-                .title(Span::styled(
-                    format!(" W{} ", w.id),
-                    Style::default().fg(Color::DarkGray),
-                ));
+            let block = Block::default().borders(Borders::NONE).title(Span::styled(
+                format!(" W{} ", w.id),
+                Style::default().fg(Color::DarkGray),
+            ));
             let sparkline = Sparkline::default()
                 .block(block)
                 .data(&w.sparkline_rates)
@@ -82,11 +80,7 @@ fn draw_worker_sparklines(f: &mut Frame, app: &App, area: Rect) {
 
 fn build_worker_line(w: &super::app::WorkerView, total_width: usize) -> Line<'static> {
     let id_str = format!("{:>3}", w.id);
-    let suffix = format!(
-        "  {} actors  {} m/s",
-        w.num_actors,
-        format_rate(w.msg_rate),
-    );
+    let suffix = format!("  {} actors  {} m/s", w.num_actors, format_rate(w.msg_rate),);
 
     let pct_str = format!("{:>5.1}%", w.load_pct);
     let overhead = id_str.len() + 1 + 1 + pct_str.len() + suffix.len();
@@ -127,10 +121,7 @@ fn build_worker_line(w: &super::app::WorkerView, total_width: usize) -> Line<'st
     for (i, &color) in phase_colors.iter().enumerate() {
         let count = phase_cells[i];
         if count > 0 {
-            spans.push(Span::styled(
-                "|".repeat(count),
-                Style::default().fg(color),
-            ));
+            spans.push(Span::styled("|".repeat(count), Style::default().fg(color)));
         }
     }
 
@@ -141,12 +132,16 @@ fn build_worker_line(w: &super::app::WorkerView, total_width: usize) -> Line<'st
         spans.push(Span::raw(" ".repeat(padding)));
         spans.push(Span::styled(
             pct_str,
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         spans.push(Span::styled(
             pct_str,
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -168,32 +163,45 @@ fn draw_summary(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(" Workers: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", app.num_workers),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  Actors: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", app.total_actors),
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  Msgs: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format_num(app.total_messages),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  Mailbox: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", app.total_mailbox),
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  Panics: ", Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{}", app.total_panics), panics_style),
     ];
 
     if !app.warnings.is_empty() {
-        spans.push(Span::styled("  Warnings: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "  Warnings: ",
+            Style::default().fg(Color::DarkGray),
+        ));
         spans.push(Span::styled(
             format!("{}", app.warnings.len()),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -206,11 +214,8 @@ fn draw_actor_table(f: &mut Frame, app: &App, table_state: &mut TableState, area
     // Split area: optional search bar + table
     let has_search = app.search_active || !app.search_query.is_empty();
     let search_height = if has_search { 1u16 } else { 0 };
-    let chunks = Layout::vertical([
-        Constraint::Length(search_height),
-        Constraint::Fill(1),
-    ])
-    .split(area);
+    let chunks =
+        Layout::vertical([Constraint::Length(search_height), Constraint::Fill(1)]).split(area);
 
     // Draw search bar
     if has_search {
@@ -220,7 +225,11 @@ fn draw_actor_table(f: &mut Frame, app: &App, table_state: &mut TableState, area
             Style::default().fg(Color::DarkGray)
         };
         let cursor = if app.search_active { "\u{2588}" } else { "" };
-        let prefix = if app.search_locked { " [locked] /" } else { " /" };
+        let prefix = if app.search_locked {
+            " [locked] /"
+        } else {
+            " /"
+        };
         let line = Line::from(vec![
             Span::styled(prefix, Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{}{}", app.search_query, cursor), search_style),
@@ -228,7 +237,11 @@ fn draw_actor_table(f: &mut Frame, app: &App, table_state: &mut TableState, area
         f.render_widget(Paragraph::new(line), chunks[0]);
     }
 
-    let sort_arrow = if app.sort_desc { " \u{25bc}" } else { " \u{25b2}" };
+    let sort_arrow = if app.sort_desc {
+        " \u{25bc}"
+    } else {
+        " \u{25b2}"
+    };
 
     let columns = [
         SortColumn::Address,
@@ -251,15 +264,11 @@ fn draw_actor_table(f: &mut Frame, app: &App, table_state: &mut TableState, area
     let header = Row::new(header_cells).height(1);
 
     let visible = app.visible_actor_rows();
-    let rows: Vec<Row> = visible
-        .iter()
-        .map(|a| actor_row_cells(a))
-        .collect();
+    let rows: Vec<Row> = visible.iter().map(|a| actor_row_cells(a)).collect();
 
     table_state.select(Some(app.selected));
 
-    let help_text =
-        " q: quit  /: search  \u{2191}\u{2193}: scroll  s: sort  r: reverse  Tab: worker view  Enter: detail";
+    let help_text = " q: quit  /: search  \u{2191}\u{2193}: scroll  s: sort  r: reverse  Tab: worker view  Enter: detail";
 
     let title = if !app.search_query.is_empty() {
         format!(
@@ -451,9 +460,18 @@ fn draw_worker_summary(f: &mut Frame, app: &App, area: Rect) {
 
 /// Actor table filtered to the focused worker.
 fn draw_focused_actor_table(f: &mut Frame, app: &App, table_state: &mut TableState, area: Rect) {
-    let sort_arrow = if app.sort_desc { " \u{25bc}" } else { " \u{25b2}" };
+    let sort_arrow = if app.sort_desc {
+        " \u{25bc}"
+    } else {
+        " \u{25b2}"
+    };
 
-    let columns = [SortColumn::Address, SortColumn::Mailbox, SortColumn::MsgCount, SortColumn::LastMsg];
+    let columns = [
+        SortColumn::Address,
+        SortColumn::Mailbox,
+        SortColumn::MsgCount,
+        SortColumn::LastMsg,
+    ];
     let header_cells = columns.iter().map(|&col| {
         let mut label = col.label().to_string();
         if col == app.sort_column {
@@ -567,15 +585,25 @@ fn draw_actor_detail(f: &mut Frame, app: &App) {
         Constraint::Length(5),           // Mailbox sparkline
         Constraint::Length(type_height), // Type breakdown
         Constraint::Length(1),           // Help bar
-        Constraint::Fill(1),            // Logs panel
+        Constraint::Fill(1),             // Logs panel
     ])
     .split(f.area());
 
     // Info card
     let addr_str = format!("{}", actor.address);
-    let status = if actor.poisoned { "POISONED" } else { "Healthy" };
-    let status_color = if actor.poisoned { Color::Red } else { Color::Green };
-    let msg_type = actor.last_msg_type.as_deref()
+    let status = if actor.poisoned {
+        "POISONED"
+    } else {
+        "Healthy"
+    };
+    let status_color = if actor.poisoned {
+        Color::Red
+    } else {
+        Color::Green
+    };
+    let msg_type = actor
+        .last_msg_type
+        .as_deref()
         .map(|s| short_type_name(Some(s)))
         .unwrap_or_else(|| "\u{2014}".to_string());
 
@@ -583,32 +611,54 @@ fn draw_actor_detail(f: &mut Frame, app: &App) {
     if let Some(ref name) = actor.name {
         info_lines.push(Line::from(vec![
             Span::styled("  Name: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                name.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("   Address: ", Style::default().fg(Color::DarkGray)),
             Span::styled(addr_str, Style::default().fg(Color::White)),
         ]));
     } else {
         info_lines.push(Line::from(vec![
             Span::styled("  Address: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(addr_str, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                addr_str,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
     }
     info_lines.push(Line::from(vec![
         Span::styled("  Worker: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("W{}", actor.worker_id), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("W{}", actor.worker_id),
+            Style::default().fg(Color::Cyan),
+        ),
         Span::styled("   Status: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(status, Style::default().fg(status_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            status,
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]));
     info_lines.push(Line::from(vec![
         Span::styled("  Messages: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format_num(actor.messages_processed),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("   Mailbox: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}", actor.mailbox_depth),
-            Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled("   Last Msg: ", Style::default().fg(Color::DarkGray)),
         Span::styled(msg_type, Style::default().fg(Color::Green)),
@@ -621,9 +671,10 @@ fn draw_actor_detail(f: &mut Frame, app: &App) {
     f.render_widget(info, chunks[0]);
 
     // Rate sparkline
-    let rate_block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" Msg Rate ", Style::default().fg(Color::Green)));
+    let rate_block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " Msg Rate ",
+        Style::default().fg(Color::Green),
+    ));
     let rate_sparkline = Sparkline::default()
         .block(rate_block)
         .data(&actor.sparkline_rates)
@@ -631,9 +682,10 @@ fn draw_actor_detail(f: &mut Frame, app: &App) {
     f.render_widget(rate_sparkline, chunks[1]);
 
     // Mailbox sparkline
-    let mbox_block = Block::default()
-        .borders(Borders::ALL)
-        .title(Span::styled(" Mailbox Depth ", Style::default().fg(Color::Blue)));
+    let mbox_block = Block::default().borders(Borders::ALL).title(Span::styled(
+        " Mailbox Depth ",
+        Style::default().fg(Color::Blue),
+    ));
     let mbox_sparkline = Sparkline::default()
         .block(mbox_block)
         .data(&actor.sparkline_mailbox)
@@ -647,16 +699,24 @@ fn draw_actor_detail(f: &mut Frame, app: &App) {
 
     // Help bar
     let level_names = ["ERR", "WARN", "INFO", "DBG", "TRC"];
-    let level_colors = [Color::Red, Color::Yellow, Color::Blue, Color::DarkGray, Color::DarkGray];
-    let mut help_spans: Vec<Span> = vec![
-        Span::styled(
-            " Esc: back  \u{2191}\u{2193}: scroll logs  ",
-            Style::default().fg(Color::DarkGray),
-        ),
+    let level_colors = [
+        Color::Red,
+        Color::Yellow,
+        Color::Blue,
+        Color::DarkGray,
+        Color::DarkGray,
     ];
+    let mut help_spans: Vec<Span> = vec![Span::styled(
+        " Esc: back  \u{2191}\u{2193}: scroll logs  ",
+        Style::default().fg(Color::DarkGray),
+    )];
     for (i, &name) in level_names.iter().enumerate() {
         let active = app.log_levels[i];
-        let color = if active { level_colors[i] } else { Color::DarkGray };
+        let color = if active {
+            level_colors[i]
+        } else {
+            Color::DarkGray
+        };
         let style = if active {
             Style::default().fg(color).add_modifier(Modifier::BOLD)
         } else {
@@ -675,7 +735,14 @@ fn draw_type_breakdown(f: &mut Frame, types: &[(String, u64)], area: Rect) {
     let max_count = types.first().map(|(_, c)| *c).unwrap_or(1).max(1);
     let inner_height = area.height.saturating_sub(2) as usize;
 
-    let bar_colors = [Color::Green, Color::Blue, Color::Yellow, Color::Magenta, Color::Cyan, Color::Red];
+    let bar_colors = [
+        Color::Green,
+        Color::Blue,
+        Color::Yellow,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Red,
+    ];
 
     let lines: Vec<Line> = types
         .iter()
@@ -683,7 +750,11 @@ fn draw_type_breakdown(f: &mut Frame, types: &[(String, u64)], area: Rect) {
         .enumerate()
         .map(|(i, (name, count))| {
             let short = name.rsplit("::").next().unwrap_or(name);
-            let pct = if total > 0 { *count as f64 / total as f64 * 100.0 } else { 0.0 };
+            let pct = if total > 0 {
+                *count as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
             let bar_width = 20usize;
             let filled = ((*count as f64 / max_count as f64) * bar_width as f64).round() as usize;
             let color = bar_colors[i % bar_colors.len()];
@@ -693,17 +764,16 @@ fn draw_type_breakdown(f: &mut Frame, types: &[(String, u64)], area: Rect) {
                     format!(" {:>16} ", short),
                     Style::default().fg(Color::White),
                 ),
-                Span::styled(
-                    "\u{2588}".repeat(filled),
-                    Style::default().fg(color),
-                ),
+                Span::styled("\u{2588}".repeat(filled), Style::default().fg(color)),
                 Span::styled(
                     " ".repeat(bar_width.saturating_sub(filled)),
                     Style::default(),
                 ),
                 Span::styled(
                     format!(" {:>8} ", count),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("{:>5.1}%", pct),
@@ -750,26 +820,20 @@ fn draw_actor_logs(f: &mut Frame, app: &App, area: Rect) {
                 format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
             };
             Line::from(vec![
-                Span::styled(
-                    format!(" {} ", ts),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!(" {} ", ts), Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{:<5} ", e.level),
-                    Style::default().fg(level_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(level_color)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    e.message.clone(),
-                    Style::default().fg(Color::White),
-                ),
+                Span::styled(e.message.clone(), Style::default().fg(Color::White)),
             ])
         })
         .collect();
 
     let title = format!(" Logs ({}) ", log_count);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title);
+    let block = Block::default().borders(Borders::ALL).title(title);
     let paragraph = Paragraph::new(lines).block(block);
     f.render_widget(paragraph, area);
 }
