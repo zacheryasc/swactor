@@ -18,8 +18,16 @@ fn token_plan() -> token::TokenEndpointPlan {
     token::TokenEndpointPlan {
         run_id: token::RunId(7),
         orchestrator_node_id: token::NodeId(99),
-        token_in_edge: token::EdgePlan::token_in(token::EdgeId(7000), token::NodeId(99), token::NodeId(10)),
-        token_out_edge: token::EdgePlan::token_out(token::EdgeId(7003), token::NodeId(12), token::NodeId(99)),
+        token_in_edge: token::EdgePlan::token_in(
+            token::EdgeId(7000),
+            token::NodeId(99),
+            token::NodeId(10),
+        ),
+        token_out_edge: token::EdgePlan::token_out(
+            token::EdgeId(7003),
+            token::NodeId(12),
+            token::NodeId(99),
+        ),
         token_spec: token::ObjectSpec::test_tokens(),
         max_tokens: 4,
     }
@@ -95,9 +103,12 @@ fn prompt_injection_is_barrier_gated_sequence_zero_token_object() {
     harness.request_prompt_injection(vec![101, 102, 103]);
 
     // No prompt object may be written before the barrier.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, token::EndpointCommand::WriteTokenObject { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, token::EndpointCommand::WriteTokenObject { .. }) })
+    );
 
     // Passing the global barrier permits the first prompt write.
     pass_global_barrier(&mut harness);
@@ -117,9 +128,12 @@ fn prompt_injection_is_barrier_gated_sequence_zero_token_object() {
 
     // Prompt injection is the start signal; there must not be a separate
     // broadcast start command.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, token::EndpointCommand::BroadcastStart { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, token::EndpointCommand::BroadcastStart { .. }) })
+    );
 }
 
 // This proves token-out is consumed in sequence order and sequence k + 1 is
@@ -242,7 +256,10 @@ fn token_endpoint_failures_fault_the_run_or_teardown() {
     malformed.observe(token::EndpointEvent::TeardownFailed {
         edge_id: token::EdgeId(7003),
     });
-    assert!(malformed.events().iter().any(|event| {
-        matches!(event, token::EndpointLifecycleEvent::TeardownFailed { .. })
-    }));
+    assert!(
+        malformed
+            .events()
+            .iter()
+            .any(|event| { matches!(event, token::EndpointLifecycleEvent::TeardownFailed { .. }) })
+    );
 }

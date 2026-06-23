@@ -169,9 +169,11 @@ fn weights_ready_requires_all_weight_facts_and_precedes_stage_ready() {
     let final_event = events.pop().expect("fixture has final weight event");
     for event in events {
         harness.observe(event);
-        assert!(!harness.events().iter().any(|event| {
-            matches!(event, weights::WeightLifecycleEvent::WeightsReady { .. })
-        }));
+        assert!(
+            !harness.events().iter().any(|event| {
+                matches!(event, weights::WeightLifecycleEvent::WeightsReady { .. })
+            })
+        );
     }
 
     // The final weight prerequisite emits WeightsReady.

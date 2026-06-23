@@ -37,8 +37,7 @@ fn drain_committed(helper: &mut ring::RingHelperHarness) -> Vec<u8> {
 // depending on scheduler internals.
 fn assert_wake_is_payload_free(wake: &ring::WakeHint) {
     match wake {
-        ring::WakeHint::RingReadable { ring_id }
-        | ring::WakeHint::RingWritable { ring_id } => {
+        ring::WakeHint::RingReadable { ring_id } | ring::WakeHint::RingWritable { ring_id } => {
             assert_eq!(*ring_id, ring::RingId(7000));
         }
     }
@@ -85,11 +84,16 @@ fn cursors_are_monotonic_and_wrap_by_modulo_capacity() {
     assert_eq!(helper.cursor_snapshot().consume, 6);
 
     // Wrap the physical index while logical cursors keep increasing.
-    let wrapped = helper.producer_reserve(5).expect("space must exist after consume");
+    let wrapped = helper
+        .producer_reserve(5)
+        .expect("space must exist after consume");
     helper.producer_write(&wrapped, b"ghijk");
     helper.producer_commit(wrapped);
     assert_eq!(helper.cursor_snapshot().commit, 11);
-    assert_eq!(helper.cursor_snapshot().commit % helper.identity().capacity, 3);
+    assert_eq!(
+        helper.cursor_snapshot().commit % helper.identity().capacity,
+        3
+    );
     assert_eq!(drain_committed(&mut helper), b"ghijk");
     assert_eq!(helper.cursor_snapshot().consume, 11);
 }
@@ -101,7 +105,9 @@ fn cursors_are_monotonic_and_wrap_by_modulo_capacity() {
 fn producer_respects_free_space_and_publishes_after_writing() {
     // Reserve the full ring and publish it.
     let mut helper = new_ring();
-    let reservation = helper.producer_reserve(8).expect("full ring reservation fits");
+    let reservation = helper
+        .producer_reserve(8)
+        .expect("full ring reservation fits");
     helper.producer_write(&reservation, b"12345678");
     helper.producer_commit(reservation);
 
@@ -170,12 +176,22 @@ fn wake_hints_are_edge_hints_without_hiding_transitions() {
     // The readable transition must be discoverable even if duplicate wakes are
     // coalesced.
     helper.coalesce_duplicate_wakes();
-    assert!(helper.scheduler_state().readable_rings.contains(&ring::RingId(7000)));
+    assert!(
+        helper
+            .scheduler_state()
+            .readable_rings
+            .contains(&ring::RingId(7000))
+    );
 
     // Fill then release space to cause full-to-writable.
     let _ = drain_committed(&mut helper);
     helper.coalesce_duplicate_wakes();
-    assert!(helper.scheduler_state().writable_rings.contains(&ring::RingId(7000)));
+    assert!(
+        helper
+            .scheduler_state()
+            .writable_rings
+            .contains(&ring::RingId(7000))
+    );
 
     // Every wake remains a payload-free hint.
     for wake in helper.wake_hints() {

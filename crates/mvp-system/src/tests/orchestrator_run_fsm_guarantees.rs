@@ -77,9 +77,12 @@ fn planning_and_provisioning_start_only_after_pool_ready() {
     harness.observe(fsm::RunEvent::PlanAvailable(plan.clone()));
 
     // Without PoolReady, provisioning must not begin.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, fsm::RunCommand::ProvisionStage { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, fsm::RunCommand::ProvisionStage { .. }) })
+    );
 
     // Once PoolReady is observed, the committed plan may be provisioned.
     harness.observe(fsm::RunEvent::PoolReady {
@@ -103,7 +106,10 @@ fn planning_and_provisioning_start_only_after_pool_ready() {
     assert_eq!(provisioned, expected);
 
     // Provisioning must not mention nodes outside the committed plan.
-    let plan_nodes = plan.stage_nodes().into_iter().collect::<std::collections::BTreeSet<_>>();
+    let plan_nodes = plan
+        .stage_nodes()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
     for command in harness.commands() {
         if let fsm::RunCommand::ProvisionStage { provision } = command {
             assert!(plan_nodes.contains(&provision.node_id));
@@ -143,9 +149,12 @@ fn readiness_barrier_controls_prompt_injection() {
     });
     harness.observe(fsm::RunEvent::TokenInEndpointReady);
     harness.observe(fsm::RunEvent::TokenOutEndpointReady);
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, fsm::RunCommand::InjectPrompt { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, fsm::RunCommand::InjectPrompt { .. }) })
+    );
 
     // Complete the remaining stage readiness facts.
     for event in stage_ready_events(&plan).into_iter().skip(1) {
@@ -198,9 +207,12 @@ fn execution_injects_next_sequence_only_after_consuming_previous_token() {
     }
 
     // No separate broadcast start command may exist alongside prompt injection.
-    assert!(!harness.commands().iter().any(|command| {
-        matches!(command, fsm::RunCommand::BroadcastStart { .. })
-    }));
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, fsm::RunCommand::BroadcastStart { .. }) })
+    );
 
     // Sequence 0 must be injected first.
     assert_eq!(harness.injected_sequences(), vec![0]);
@@ -341,9 +353,12 @@ fn terminal_outcome_is_single_and_requires_teardown() {
         .map(|stage| stage.stage_index)
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(stopped_stages, expected_stages);
-    assert!(harness.commands().iter().any(|command| {
-        matches!(command, fsm::RunCommand::TearDownTokenEndpoints { .. })
-    }));
+    assert!(
+        harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, fsm::RunCommand::TearDownTokenEndpoints { .. }) })
+    );
 }
 
 // This proves run_torn_down is emitted exactly once and only after teardown
@@ -369,9 +384,12 @@ fn run_torn_down_is_emitted_once_after_teardown_terminal_state() {
         run_id: fsm::RunId(7),
         stage_index: 0,
     });
-    assert!(!harness.events().iter().any(|event| {
-        matches!(event, fsm::LifecycleEvent::RunTornDown { .. })
-    }));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, fsm::LifecycleEvent::RunTornDown { .. }) })
+    );
 
     // Finish teardown through remaining stopped events and local endpoint stop.
     harness.observe(fsm::RunEvent::StageStopped {

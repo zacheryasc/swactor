@@ -84,9 +84,12 @@ fn control_stream_is_line_framed_json_without_payload_bytes() {
 
     // Stderr alone is diagnostic and does not define lifecycle state.
     harness.receive_stderr_line("loading tinygrad backend");
-    assert!(!harness.events().iter().any(|event| {
-        matches!(event, adapter::AdapterEvent::WorkerFatal { .. })
-    }));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, adapter::AdapterEvent::WorkerFatal { .. }) })
+    );
 }
 
 // This proves worker initialization reads arena environment, waits for
@@ -130,16 +133,24 @@ fn initialization_order_is_env_initialize_map_helper_backend_ready() {
     // Successful initialization emits WorkerReady.
     harness.receive_stdout_line(r#"{"type":"WorkerReady","generation":1}"#);
     assert!(harness.events().iter().any(|event| {
-        matches!(event, adapter::AdapterEvent::WorkerReady { generation: adapter::WorkerGeneration(1) })
+        matches!(
+            event,
+            adapter::AdapterEvent::WorkerReady {
+                generation: adapter::WorkerGeneration(1)
+            }
+        )
     }));
 
     // Initialization failure emits WorkerFatal if possible and exits non-zero.
     let mut failed = new_adapter();
     failed.start_worker_process();
     failed.inject_initialization_failure(adapter::InitializationFailure::BackendUnavailable);
-    assert!(failed.events().iter().any(|event| {
-        matches!(event, adapter::AdapterEvent::WorkerFatal { .. })
-    }));
+    assert!(
+        failed
+            .events()
+            .iter()
+            .any(|event| { matches!(event, adapter::AdapterEvent::WorkerFatal { .. }) })
+    );
     assert_ne!(failed.exit_status(), Some(adapter::ExitStatus::Code(0)));
 }
 
@@ -151,14 +162,26 @@ fn parsing_and_abi_errors_fault_the_worker_process() {
     let mut invalid_json = new_adapter();
     invalid_json.receive_stdout_line("{not-json");
     assert!(invalid_json.events().iter().any(|event| {
-        matches!(event, adapter::AdapterEvent::ProcessFault { reason: adapter::ProcessFaultReason::InvalidJson, .. })
+        matches!(
+            event,
+            adapter::AdapterEvent::ProcessFault {
+                reason: adapter::ProcessFaultReason::InvalidJson,
+                ..
+            }
+        )
     }));
 
     // Unknown event shape faults the adapter.
     let mut unknown = new_adapter();
     unknown.receive_stdout_line(r#"{"type":"NotAWorkerEvent"}"#);
     assert!(unknown.events().iter().any(|event| {
-        matches!(event, adapter::AdapterEvent::ProcessFault { reason: adapter::ProcessFaultReason::UnknownEventShape, .. })
+        matches!(
+            event,
+            adapter::AdapterEvent::ProcessFault {
+                reason: adapter::ProcessFaultReason::UnknownEventShape,
+                ..
+            }
+        )
     }));
 
     // Unsupported helper ABI emits WorkerFatal.
@@ -167,7 +190,13 @@ fn parsing_and_abi_errors_fault_the_worker_process() {
         helper_abi_version: adapter::HelperAbiVersion(999),
     });
     assert!(abi.events().iter().any(|event| {
-        matches!(event, adapter::AdapterEvent::WorkerFatal { reason: adapter::WorkerFatalReason::UnsupportedHelperAbi, .. })
+        matches!(
+            event,
+            adapter::AdapterEvent::WorkerFatal {
+                reason: adapter::WorkerFatalReason::UnsupportedHelperAbi,
+                ..
+            }
+        )
     }));
 }
 
@@ -186,14 +215,20 @@ fn command_discipline_rejects_payload_bearing_control_messages() {
     // Payload bytes in a control command are rejected at the adapter boundary.
     harness.send_raw_json_command(r#"{"type":"ExecuteStep","step_id":1,"payload":[1,2,3]}"#);
     assert!(harness.command_rejections().iter().any(|rejection| {
-        matches!(rejection.reason, adapter::CommandRejectionReason::PayloadBytesForbidden)
+        matches!(
+            rejection.reason,
+            adapter::CommandRejectionReason::PayloadBytesForbidden
+        )
     }));
 
     // Wake hints reload cursors; they do not carry byte ranges or credits.
     harness.send_command(adapter::WorkerCommand::RingReadable {
         ring_id: adapter::RingId(8001),
     });
-    let wake_line = harness.stdin_lines().last().expect("wake command must be written");
+    let wake_line = harness
+        .stdin_lines()
+        .last()
+        .expect("wake command must be written");
     let parsed = adapter::JsonLine::parse(wake_line).expect("wake line must parse");
     assert_no_payload_bytes(&parsed);
     assert!(!parsed.contains_key("range") && !parsed.contains_key("credits"));

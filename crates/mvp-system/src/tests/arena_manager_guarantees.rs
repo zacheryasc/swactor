@@ -74,7 +74,10 @@ fn arena_boot_creates_stable_offset_only_layout_domain() {
     // Layout facts are arena offsets and stay under the reservation ceiling.
     assert!(lease.layout.start_offset < arena_config().reservation_ceiling);
     assert!(lease.layout.end_offset <= arena_config().reservation_ceiling);
-    assert!(matches!(lease.layout.pointer, arena::LayoutPointer::NoProcessPointer));
+    assert!(matches!(
+        lease.layout.pointer,
+        arena::LayoutPointer::NoProcessPointer
+    ));
 
     // Boot failure is typed and emits no usable arena.
     let failed = arena::ArenaManagerHarness::boot(arena::ArenaConfig {
@@ -232,9 +235,12 @@ fn release_requires_quiescence_and_reuse_happens_only_after_release() {
         proof: arena::QuiescenceProof::verified(),
     });
     harness.request(arena::ArenaRequest::LeaseRing(lease_request(3, 1024, 64)));
-    assert!(harness.events().iter().any(|event| {
-        matches!(event, arena::ArenaEvent::RingLeased { .. })
-    }));
+    assert!(
+        harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, arena::ArenaEvent::RingLeased { .. }) })
+    );
 }
 
 // This proves shutdown rejects new leases, preserves live lease records, and

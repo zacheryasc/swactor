@@ -82,8 +82,16 @@ fn edge_actor_messages_are_lifecycle_identity_and_handle_only() {
     }
 
     // Both actors remain tied to exactly one edge id.
-    assert!(tx.messages().iter().all(|message| message.edge_id() == edge_id()));
-    assert!(rx.messages().iter().all(|message| message.edge_id() == edge_id()));
+    assert!(
+        tx.messages()
+            .iter()
+            .all(|message| message.edge_id() == edge_id())
+    );
+    assert!(
+        rx.messages()
+            .iter()
+            .all(|message| message.edge_id() == edge_id())
+    );
 }
 
 // This proves Tx starts in provisioning, becomes ready only after EdgeReady,
@@ -98,9 +106,11 @@ fn tx_lifecycle_gates_production_and_faults_on_stream_or_object_failure() {
         object_id: edge_actor::ObjectId(9000),
         sequence: 0,
     });
-    assert!(!tx.messages().iter().any(|message| {
-        matches!(message, edge_actor::ActorMessage::ObjectIdentity { .. })
-    }));
+    assert!(
+        !tx.messages()
+            .iter()
+            .any(|message| { matches!(message, edge_actor::ActorMessage::ObjectIdentity { .. }) })
+    );
 
     // EdgeReady admits production.
     tx.observe(edge_actor::TxEvent::EdgeReady { edge_id: edge_id() });
@@ -154,9 +164,11 @@ fn rx_lifecycle_gates_loaded_objects_and_faults_on_stream_or_object_failure() {
         sequence: 0,
         handle: edge_actor::OpaqueHandle::new(42),
     });
-    assert!(!rx.messages().iter().any(|message| {
-        matches!(message, edge_actor::ActorMessage::OpaqueHandle { .. })
-    }));
+    assert!(
+        !rx.messages()
+            .iter()
+            .any(|message| { matches!(message, edge_actor::ActorMessage::OpaqueHandle { .. }) })
+    );
 
     // EdgeReady admits ObjectLoaded exposure.
     rx.observe(edge_actor::RxEvent::EdgeReady { edge_id: edge_id() });
@@ -223,12 +235,16 @@ fn stop_and_mismatched_edge_events_do_not_create_run_work() {
         sequence: 0,
         handle: edge_actor::OpaqueHandle::new(42),
     });
-    assert!(!tx.messages().iter().any(|message| {
-        matches!(message, edge_actor::ActorMessage::ObjectIdentity { .. })
-    }));
-    assert!(!rx.messages().iter().any(|message| {
-        matches!(message, edge_actor::ActorMessage::OpaqueHandle { .. })
-    }));
+    assert!(
+        !tx.messages()
+            .iter()
+            .any(|message| { matches!(message, edge_actor::ActorMessage::ObjectIdentity { .. }) })
+    );
+    assert!(
+        !rx.messages()
+            .iter()
+            .any(|message| { matches!(message, edge_actor::ActorMessage::OpaqueHandle { .. }) })
+    );
 
     // A mismatched edge id must reject or fault, not create work on this actor.
     let mut mismatched = new_tx();

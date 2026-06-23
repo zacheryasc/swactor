@@ -59,9 +59,6 @@ proptest = "1"
 proptest-state-machine = "0.3"
 mvp-system = { path = "crates/mvp-system" }
 
-[[test]]
-name = "arena_manager_guarantees"
-path = "tests/mvp_system/arena_manager_guarantees.rs"
 
 [[bench]]
 name = "runtime_benchmarks"
