@@ -10,6 +10,7 @@ members = [
     "crates/distribution",
     "crates/datastream",
     "crates/datastore",
+    "crates/mvp-system",
     "crates/node",
     "tests/docker",
     "tests/integration",
@@ -56,6 +57,11 @@ unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 proptest-state-machine = "0.3"
+mvp-system = { path = "crates/mvp-system" }
+
+[[test]]
+name = "arena_manager_guarantees"
+path = "tests/mvp_system/arena_manager_guarantees.rs"
 
 [[bench]]
 name = "runtime_benchmarks"

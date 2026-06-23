@@ -187,8 +187,6 @@ outside payload ownership. Ring cursors are the authority.
 
 ### 4.4 Device Bridge
 
-USER: If it is determined this is an outsized amount of engineering work, we will defer and require objects to be complete before gpu io.
-
 The worker must have a backend-specific device bridge capable of range copies:
 
 ```text
@@ -445,7 +443,6 @@ may be available. The worker must reload ring cursors from shared memory.
 Duplicate hints may be coalesced.
 
 ### 7.7 ExecuteStep
-USER: Why do we need this explicit? Why doesnt it fall out naturally from the I/O? This whole thing is async message driven, so why do we need a start message?
 
 ```rust
 struct ExecuteStep {
@@ -654,8 +651,6 @@ all copy events for that object have completed.
 committed to the egress ring. It does not mean the remote node received it.
 
 ### 8.5 Step Events
-USER: Why is this here? It seems useless.
-
 
 ```rust
 StepCompleted {
