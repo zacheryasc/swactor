@@ -38,7 +38,10 @@ pub fn load_profile() {
 
     if !path.exists() {
         if explicit {
-            eprintln!("pp: {ENV_PROFILE}={} not found; using env + defaults", path.display());
+            eprintln!(
+                "pp: {ENV_PROFILE}={} not found; using env + defaults",
+                path.display()
+            );
         } else {
             eprintln!("pp: no profile ({}); using env + defaults", path.display());
         }

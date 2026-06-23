@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use dashboard::plugin::{DashboardPlugin, PluginResponse};
-use distribution::iroh_driver::{conn_type_of, ConnType, IrohDriver};
 use iroh::PublicKey;
+use iroh_driver::{ConnType, IrohDriver, conn_type_of};
 
 use crate::dist_plugin::SharedSnapshot;
 
@@ -105,10 +105,7 @@ impl NetmapPlugin {
         let mut v = serde_json::to_value(snap).ok()?;
         if let serde_json::Value::Object(ref mut m) = v {
             m.insert("conn".to_string(), self.conn.to_json());
-            m.insert(
-                "conn_ts_ms".to_string(),
-                serde_json::json!(wall_ms_now()),
-            );
+            m.insert("conn_ts_ms".to_string(), serde_json::json!(wall_ms_now()));
         }
         serde_json::to_string(&v).ok()
     }
@@ -131,7 +128,9 @@ impl DashboardPlugin for NetmapPlugin {
         _body: &[u8],
     ) -> PluginResponse {
         match (method, path) {
-            ("GET", "") => PluginResponse::json(self.rendered_json().unwrap_or_else(|| "{}".into())),
+            ("GET", "") => {
+                PluginResponse::json(self.rendered_json().unwrap_or_else(|| "{}".into()))
+            }
             _ => PluginResponse::not_found(),
         }
     }

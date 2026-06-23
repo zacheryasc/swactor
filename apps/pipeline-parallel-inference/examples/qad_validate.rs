@@ -20,10 +20,10 @@
 use std::net::IpAddr;
 use std::time::{Duration, Instant};
 
-use distribution::iroh_driver::IrohDriverConfig;
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
+use iroh_driver::IrohDriverConfig;
 
 use pipeline_parallel_inference::cluster::ClusterNode;
 use pipeline_parallel_inference::iroh_transport::ACTOR_ALPN;
@@ -75,7 +75,12 @@ fn main() {
     )
     .expect("failed to create cluster node");
 
-    let my_hex: String = cluster.node_id().0.iter().map(|b| format!("{b:02x}")).collect();
+    let my_hex: String = cluster
+        .node_id()
+        .0
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
     eprintln!("qad_validate: node_id = {my_hex}");
 
     // Poll for ~30s, letting iroh's net_report run its QAD probe against the
@@ -112,7 +117,9 @@ fn main() {
     eprintln!("home relay connected:        {saw_relay}");
     eprintln!("public/reflexive addr found: {saw_public}");
     if saw_relay && saw_public {
-        eprintln!("RESULT: PASS — node reached the relay and learned a public address (QAD working).");
+        eprintln!(
+            "RESULT: PASS — node reached the relay and learned a public address (QAD working)."
+        );
     } else if saw_relay {
         eprintln!(
             "RESULT: PARTIAL — relay connected but no public address discovered \

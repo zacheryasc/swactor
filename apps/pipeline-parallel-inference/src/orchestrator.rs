@@ -148,7 +148,10 @@ impl Drop for ChainGuard {
             // child already exited (we ignore the error either way).
             let _ = stage.child.kill();
             let _ = stage.child.wait();
-            eprintln!("pp-orchestrator: stopped stage {} child pid {pid}", stage.stage);
+            eprintln!(
+                "pp-orchestrator: stopped stage {} child pid {pid}",
+                stage.stage
+            );
         }
     }
 }
@@ -273,11 +276,7 @@ where
 /// All output is forwarded verbatim to the parent process's stdout so the
 /// user sees the child's logs. After the announcement is found the
 /// background thread keeps draining so the child never blocks on its pipe.
-fn read_stage_address(
-    stdout: ChildStdout,
-    stage: u32,
-    timeout: Duration,
-) -> Result<StageAddr, ()> {
+fn read_stage_address(stdout: ChildStdout, stage: u32, timeout: Duration) -> Result<StageAddr, ()> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut reader = BufReader::new(stdout);
@@ -489,10 +488,7 @@ where
 /// a resolved roster, attaching the given `drive_seq`. Spec §4.5: the
 /// event MUST list every stage, ordered by `stage_index`, with each
 /// entry carrying `stage_index`, `node_id_hex`, and `node_id_short`.
-pub fn stage_roster_event_fields(
-    drive_seq: u32,
-    roster: &[StageRosterEntry],
-) -> serde_json::Value {
+pub fn stage_roster_event_fields(drive_seq: u32, roster: &[StageRosterEntry]) -> serde_json::Value {
     let stages: Vec<serde_json::Value> = roster
         .iter()
         .map(|e| {

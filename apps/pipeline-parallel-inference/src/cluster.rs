@@ -1,8 +1,8 @@
 //! `ClusterNode` — the actorized distribution protocol bundled behind a
 //! synchronous façade.
 //!
-//! Mirrors the production wiring at `crates/node/src/main.rs:813–1035` and the
-//! test fixture at `crates/distribution/tests/common/iroh.rs`. Every old
+//! Mirrors the actorized test fixture at `crates/distribution/tests/common/iroh.rs`.
+//! Every old
 //! `driver.node()` / `driver.node_mut()` / `driver.recv()` / `driver.tick()`
 //! call site in the pp binaries and tests rewrites to one method on this type.
 //!
@@ -15,7 +15,7 @@
 //!   `MembershipFanout` that adapts `SwimIn::MembershipChanged` into the other
 //!   three actors and folds it into a shared `MemberList` mirror.
 //! * Egress glue: a shared `Outbox`, `RelayMirror`, `RouteView`, and an
-//!   `IrohPeerDirectory` so the actors can resolve a `NodeId` to a route at
+//!   `OutboxPeerDirectory` so the actors can resolve a `NodeId` to a route at
 //!   send time and the driver can pick up frames at drain time.
 //!
 //! Synchronous façade — see [`ClusterNode::register_name`],
@@ -36,7 +36,6 @@ use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, TransportRouter};
 
 use distribution::directory_actor::{DirectoryActor, DirectoryIn};
-use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
 use distribution::node::DistributedNodeConfig;
 use distribution::node_metadata_actor::{MetadataActor, MetadataIn, RelayInfo};
 use distribution::registry::RegistrySnapshot;
@@ -48,9 +47,10 @@ use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::telemetry::{ObservedTransition, SwimTelemetry};
 use distribution::transport_bridge::{
-    IrohPeerDirectory, IrohRouteBinder, Outbox, RelayMirror, RouteView, RouteViewTransport,
+    Outbox, OutboxPeerDirectory, OutboxRouteBinder, RelayMirror, RouteView, RouteViewTransport,
 };
 use distribution::types::{MemberState, NodeId};
+use iroh_driver::{IrohDriver, IrohDriverConfig};
 
 /// Adapts the `SwimActor`'s `MembershipChanged` stream into the registry /
 /// metadata / directory actors' `Membership` control messages and folds it
@@ -172,7 +172,7 @@ impl ClusterNode {
         let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
         let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
-        let peer_directory = Arc::new(IrohPeerDirectory::new(
+        let peer_directory = Arc::new(OutboxPeerDirectory::new(
             Arc::clone(&transport_router),
             Arc::clone(&outbox),
         ));
@@ -208,7 +208,7 @@ impl ClusterNode {
             Arc::clone(&route_view),
             Arc::clone(&outbox),
         ));
-        let route_binder = Arc::new(IrohRouteBinder::new(
+        let route_binder = Arc::new(OutboxRouteBinder::new(
             Arc::clone(&transport_router),
             Arc::clone(&route_view_transport),
         ));
@@ -234,8 +234,13 @@ impl ClusterNode {
                 mirror: Arc::clone(&membership_mirror),
             })
             .expect("spawn MembershipFanout");
-        rt.send_to(swim_addr, SwimIn::Subscribe { observer: fanout_addr })
-            .expect("subscribe membership fanout");
+        rt.send_to(
+            swim_addr,
+            SwimIn::Subscribe {
+                observer: fanout_addr,
+            },
+        )
+        .expect("subscribe membership fanout");
 
         // Ingress: which local actor owns each inbound wire tag.
         let mut routes: HashMap<String, ActorAddress> = HashMap::new();
@@ -261,8 +266,7 @@ impl ClusterNode {
             Arc::clone(&route_view),
         );
 
-        let resolve_inbox: Inbox<NameResolved> =
-            rt.new_inbox().expect("alloc resolve_name inbox");
+        let resolve_inbox: Inbox<NameResolved> = rt.new_inbox().expect("alloc resolve_name inbox");
         let relay_inbox: Inbox<RelayInfo> = rt.new_inbox().expect("alloc relay_lookup inbox");
 
         Self {
@@ -289,7 +293,10 @@ impl ClusterNode {
 
     /// A consistent snapshot of the cluster registry (size / tombstones / entries).
     pub fn registry_snapshot(&self) -> RegistrySnapshot {
-        self.registry_view.read().expect("registry view poisoned").clone()
+        self.registry_view
+            .read()
+            .expect("registry view poisoned")
+            .clone()
     }
 
     /// Median SWIM probe round-trip time (ms); `0` until a probe completes.

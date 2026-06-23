@@ -281,7 +281,7 @@ pipelines:
         artifacts: ["target/criterion/**"]
       docker:
         needs: [test]
-        run: cargo test -p docker-tests -- --ignored
+        run: cargo test -p distribution --features iroh -- --ignored
         docker: true
   release:
     triggers:
@@ -289,8 +289,8 @@ pipelines:
         pattern: "v*"
     jobs:
       build:
-        run: cargo build --release
-        artifacts: ["target/release/swactor"]
+        run: cargo build --release -p xtask
+        artifacts: ["target/release/xtask"]
 "#;
         let ci = parse_ci_yaml(yaml).unwrap();
         assert_eq!(ci.pipelines.len(), 3);

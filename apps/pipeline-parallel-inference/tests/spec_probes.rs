@@ -6,8 +6,7 @@
 //!     cargo test --test spec_probes -- --nocapture
 
 use pipeline_parallel_inference::orchestrator::{
-    spawn_chain, stage_roster_event_fields, resolve_roster,
-    StageRosterEntry, SpawnChainError,
+    SpawnChainError, StageRosterEntry, resolve_roster, spawn_chain, stage_roster_event_fields,
 };
 
 use std::time::Duration;
@@ -83,8 +82,14 @@ fn s46_resolve_roster_times_out_when_a_stage_never_registers() {
     match result {
         Err(e) => {
             let msg = format!("{e}");
-            assert!(msg.contains("[1]"), "missing-stages list must name stage 1: {msg}");
-            assert!(elapsed >= Duration::from_millis(100), "must wait full budget: {elapsed:?}");
+            assert!(
+                msg.contains("[1]"),
+                "missing-stages list must name stage 1: {msg}"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(100),
+                "must wait full budget: {elapsed:?}"
+            );
         }
         Ok(r) => panic!("expected timeout, got Ok({:?})", r),
     }

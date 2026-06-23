@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pipeline_parallel_inference::orchestrator::{
-    await_convergence, spawn_chain, ConvergeError, SpawnChainError, StageSpawnCtx,
+    ConvergeError, SpawnChainError, StageSpawnCtx, await_convergence, spawn_chain,
 };
 use pipeline_parallel_inference::vastai;
 
@@ -60,11 +60,7 @@ impl Drop for TempDir {
 ///
 /// `fake_hex` / `fake_direct` are derived from `ctx.stage` so each
 /// stage's announcement is unique and predictable from the test side.
-fn fake_child_command(
-    ctx: &StageSpawnCtx,
-    pids_file: &PathBuf,
-    sleep_secs: u32,
-) -> Command {
+fn fake_child_command(ctx: &StageSpawnCtx, pids_file: &PathBuf, sleep_secs: u32) -> Command {
     let hex = fake_hex(ctx.stage);
     let direct = fake_direct(ctx.stage);
     let script = format!(
@@ -131,9 +127,10 @@ fn spawn_chain_propagates_each_stage_peer_direct_to_successor() {
     assert_eq!(calls.len(), 4);
     assert!(calls[0].peer.is_none(), "stage 0 must have no PEER_DIRECT");
     for i in 1..calls.len() {
-        let peer = calls[i].peer.as_ref().unwrap_or_else(|| {
-            panic!("stage {i} must have peer set from stage {}", i - 1)
-        });
+        let peer = calls[i]
+            .peer
+            .as_ref()
+            .unwrap_or_else(|| panic!("stage {i} must have peer set from stage {}", i - 1));
         assert_eq!(
             peer.hex,
             fake_hex((i - 1) as u32),
@@ -218,10 +215,7 @@ fn spawn_chain_kills_already_spawned_on_addr_timeout() {
             // Stage 1 starts but never announces PP_GPU_NODE_ADDR.
             // Record its pid so we can verify the kill happened, then
             // sleep so we exceed the timeout.
-            let script = format!(
-                "echo $$ >> {pids}; exec sleep 30",
-                pids = shell_escape(&pf),
-            );
+            let script = format!("echo $$ >> {pids}; exec sleep 30", pids = shell_escape(&pf),);
             let mut cmd = Command::new("sh");
             cmd.arg("-c").arg(script);
             return cmd;
@@ -315,12 +309,13 @@ async fn mount_creates_ok(server: &MockServer, num_stages: u32) {
         let contract_id = 9000 + i;
         Mock::given(method("PUT"))
             .and(path_regex(format!("^/api/v0/asks/{offer_id}/$").as_str()))
-            .and(header("Authorization", format!("Bearer {API_KEY}").as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "new_contract": contract_id,
-                })),
-            )
+            .and(header(
+                "Authorization",
+                format!("Bearer {API_KEY}").as_str(),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "new_contract": contract_id,
+            })))
             .expect(1)
             .mount(server)
             .await;
@@ -337,11 +332,9 @@ async fn mount_creates_for_catalog(server: &MockServer, catalog: u32) {
         let contract_id = 9000 + i;
         Mock::given(method("PUT"))
             .and(path_regex(format!("^/api/v0/asks/{offer_id}/$").as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "new_contract": contract_id,
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "new_contract": contract_id,
+            })))
             .mount(server)
             .await;
     }
@@ -354,16 +347,14 @@ async fn mount_status_running_for_catalog(server: &MockServer, catalog: u32) {
         let id = 9000 + i;
         Mock::given(method("GET"))
             .and(path_regex(format!("^/api/v0/instances/{id}/$").as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "instances": {
-                        "actual_status": "running",
-                        "intended_status": "running",
-                        "public_ipaddr": "203.0.113.10",
-                        "ssh_port": 22,
-                    }
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "instances": {
+                    "actual_status": "running",
+                    "intended_status": "running",
+                    "public_ipaddr": "203.0.113.10",
+                    "ssh_port": 22,
+                }
+            })))
             .mount(server)
             .await;
     }
@@ -376,16 +367,14 @@ async fn mount_status_running(server: &MockServer, contract_ids: &[u64]) {
     for &id in contract_ids {
         Mock::given(method("GET"))
             .and(path_regex(format!("^/api/v0/instances/{id}/$").as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "instances": {
-                        "actual_status": "running",
-                        "intended_status": "running",
-                        "public_ipaddr": "203.0.113.10",
-                        "ssh_port": 22,
-                    }
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "instances": {
+                    "actual_status": "running",
+                    "intended_status": "running",
+                    "public_ipaddr": "203.0.113.10",
+                    "ssh_port": 22,
+                }
+            })))
             .expect(1..)
             .mount(server)
             .await;
@@ -464,10 +453,7 @@ async fn lease_chain_creates_n_instances_with_distinct_stage_env() {
     .expect("lease_chain must succeed");
 
     let reqs = server.received_requests().await.unwrap();
-    let puts: Vec<_> = reqs
-        .iter()
-        .filter(|r| r.method.as_ref() == "PUT")
-        .collect();
+    let puts: Vec<_> = reqs.iter().filter(|r| r.method.as_ref() == "PUT").collect();
     assert_eq!(puts.len(), 3, "exactly one create (PUT) per stage");
 
     // Contract: the three creates collectively cover STAGE 0/1/2 exactly once
@@ -504,11 +490,9 @@ async fn lease_chain_rolls_back_on_partial_creation() {
     for i in 0..2u32 {
         Mock::given(method("PUT"))
             .and(path_regex(format!("^/api/v0/asks/{}/$", 1000 + i).as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "new_contract": 9000 + i,
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "new_contract": 9000 + i,
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -524,8 +508,7 @@ async fn lease_chain_rolls_back_on_partial_creation() {
         Mock::given(method("DELETE"))
             .and(path_regex(format!("^/api/v0/instances/{id}/$").as_str()))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"success": true})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
             )
             .expect(1)
             .mount(&server)
@@ -589,8 +572,7 @@ async fn lease_chain_waits_for_running_per_contract() {
         let polls = reqs
             .iter()
             .filter(|r| {
-                r.method.as_ref() == "GET"
-                    && r.url.path() == format!("/api/v0/instances/{cid}/")
+                r.method.as_ref() == "GET" && r.url.path() == format!("/api/v0/instances/{cid}/")
             })
             .count();
         assert!(

@@ -39,11 +39,11 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use datastream::{DATASTREAM_SINK_NAME, DatastreamSink};
-use distribution::iroh_driver::IrohDriverConfig;
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
 use iroh::{PublicKey, RelayMode, SecretKey};
+use iroh_driver::IrohDriverConfig;
 
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Inbox, RuntimeConfig};

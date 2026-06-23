@@ -41,11 +41,11 @@ fn pipeline_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-use distribution::iroh_driver::IrohDriverConfig;
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
 use iroh::{PublicKey, RelayMode};
+use iroh_driver::IrohDriverConfig;
 
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Inbox, Runtime};
@@ -53,10 +53,10 @@ use swactor_transport::CodecRegistry;
 
 use pipeline_parallel_inference::cluster::ClusterNode;
 use pipeline_parallel_inference::iroh_transport::{
-    ActorMessagePump, IrohActorTransport, ACTOR_ALPN,
+    ACTOR_ALPN, ActorMessagePump, IrohActorTransport,
 };
 use pipeline_parallel_inference::messages::{
-    inference_codec_registry, InferenceRequest, InferenceResponse, NextToken,
+    InferenceRequest, InferenceResponse, NextToken, inference_codec_registry,
 };
 use pipeline_parallel_inference::stage_actor::{
     ActivationBridge, NextTokenBridge, RequestBridge, StageActor, StageActorStatus, StageMsg,
@@ -167,7 +167,10 @@ fn worker_spec(stage: u32, num_stages: u32) -> ProcessSpec {
     env.insert("PP_WORKER_STUB".into(), "1".into());
     ProcessSpec {
         command: "python3".into(),
-        args: vec![format!("{}/pp_tinygrad_worker.py", env!("CARGO_MANIFEST_DIR"))],
+        args: vec![format!(
+            "{}/pp_tinygrad_worker.py",
+            env!("CARGO_MANIFEST_DIR")
+        )],
         env,
         working_dir: None,
         mode: ProcessMode::Automated,
@@ -217,7 +220,12 @@ struct Pipeline {
 /// `eos` optionally pins an EOS token id on the Last stage; `observe_tokens`
 /// installs an extra observer inbox on the Last stage's runtime that receives
 /// a clone of every `NextToken` it emits.
-fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_tokens: bool) -> Pipeline {
+fn build_pipeline(
+    num_stages: u32,
+    max_tokens: u32,
+    eos: Option<u32>,
+    observe_tokens: bool,
+) -> Pipeline {
     assert!(num_stages >= 2, "pipeline requires num_stages >= 2");
     let last_stage = num_stages - 1;
 
@@ -234,17 +242,26 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
     // Per-stage status inbox — `drain_until_ready` blocks until each stage
     // reports its worker pid.
     let status_inboxes: Vec<Inbox<StageActorStatus>> = (0..num_stages)
-        .map(|s| nodes[s as usize + 1].rt.new_inbox::<StageActorStatus>().unwrap())
+        .map(|s| {
+            nodes[s as usize + 1]
+                .rt
+                .new_inbox::<StageActorStatus>()
+                .unwrap()
+        })
         .collect();
 
     // Optional NextToken observer on the Last stage's runtime.
-    let (token_observer_inbox, observer_addr): (Option<Inbox<NextToken>>, Option<ActorAddress>) = if observe_tokens {
-        let inbox = nodes[last_stage as usize + 1].rt.new_inbox::<NextToken>().unwrap();
-        let addr = *inbox.addr();
-        (Some(inbox), Some(addr))
-    } else {
-        (None, None)
-    };
+    let (token_observer_inbox, observer_addr): (Option<Inbox<NextToken>>, Option<ActorAddress>) =
+        if observe_tokens {
+            let inbox = nodes[last_stage as usize + 1]
+                .rt
+                .new_inbox::<NextToken>()
+                .unwrap();
+            let addr = *inbox.addr();
+            (Some(inbox), Some(addr))
+        } else {
+            (None, None)
+        };
 
     let placeholder = ActorAddress([0; 32]);
 
@@ -290,17 +307,23 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
     // each carry an Activation bridge.
     let request_bridge_addr = nodes[1]
         .rt
-        .spawn(RequestBridge { target: stage_actor_addrs[0] })
+        .spawn(RequestBridge {
+            target: stage_actor_addrs[0],
+        })
         .unwrap();
     let nt_bridge_addr = nodes[1]
         .rt
-        .spawn(NextTokenBridge { target: stage_actor_addrs[0] })
+        .spawn(NextTokenBridge {
+            target: stage_actor_addrs[0],
+        })
         .unwrap();
     let mut activation_bridge_addrs: Vec<Option<ActorAddress>> = vec![None; num_stages as usize];
     for s in 1..num_stages {
         let rt = &nodes[s as usize + 1].rt;
         let addr = rt
-            .spawn(ActivationBridge { target: stage_actor_addrs[s as usize] })
+            .spawn(ActivationBridge {
+                target: stage_actor_addrs[s as usize],
+            })
             .unwrap();
         activation_bridge_addrs[s as usize] = Some(addr);
     }
@@ -311,10 +334,7 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
         let (next, prev) = if s == last_stage {
             (None, Some(nt_bridge_addr))
         } else {
-            (
-                activation_bridge_addrs[(s + 1) as usize],
-                None,
-            )
+            (activation_bridge_addrs[(s + 1) as usize], None)
         };
         rt.send_to(
             stage_actor_addrs[s as usize],
@@ -347,7 +367,9 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
         nodes[1].endpoint_addr(),
         nodes[0].driver.tokio_handle(),
     ));
-    nodes[0].transport_router.add_route(request_bridge_addr, orch_to_first);
+    nodes[0]
+        .transport_router
+        .add_route(request_bridge_addr, orch_to_first);
 
     // Stage s (0..N-1) → stage s+1's activation bridge.
     for s in 0..num_stages - 1 {
@@ -377,8 +399,12 @@ fn build_pipeline(num_stages: u32, max_tokens: u32, eos: Option<u32>, observe_to
         nodes[0].endpoint_addr(),
         nodes[last_idx].driver.tokio_handle(),
     ));
-    nodes[last_idx].transport_router.add_route(nt_bridge_addr, last_to_first);
-    nodes[last_idx].transport_router.add_route(inbox_addr, last_to_orch);
+    nodes[last_idx]
+        .transport_router
+        .add_route(nt_bridge_addr, last_to_first);
+    nodes[last_idx]
+        .transport_router
+        .add_route(inbox_addr, last_to_orch);
 
     Pipeline {
         num_stages,
@@ -728,7 +754,9 @@ fn stage_failure_mid_decode_case(victim_stage: u32) {
     // Tear down survivors.
     for s in 0..num_stages {
         if s != victim_stage {
-            let _ = pipeline.nodes[s as usize + 1].rt.stop_actor(pipeline.stage_actor_addrs[s as usize]);
+            let _ = pipeline.nodes[s as usize + 1]
+                .rt
+                .stop_actor(pipeline.stage_actor_addrs[s as usize]);
         }
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -806,7 +834,10 @@ fn activation_request_id_round_trip_through_chain() {
     }
 
     let response = response.expect("N=4: pipeline must produce a response");
-    assert!(!response.text.is_empty(), "N=4: response text must be non-empty");
+    assert!(
+        !response.text.is_empty(),
+        "N=4: response text must be non-empty"
+    );
 
     // Drain anything that arrived after the response.
     if let Some(observer) = pipeline.token_observer_inbox.as_ref() {
@@ -935,7 +966,10 @@ fn real_worker_spec(stage: u32, num_stages: u32) -> ProcessSpec {
     env.insert("PP_WORKER_STUB".into(), "".into());
     ProcessSpec {
         command: "python3".into(),
-        args: vec![format!("{}/pp_tinygrad_worker.py", env!("CARGO_MANIFEST_DIR"))],
+        args: vec![format!(
+            "{}/pp_tinygrad_worker.py",
+            env!("CARGO_MANIFEST_DIR")
+        )],
         env,
         working_dir: None,
         mode: ProcessMode::Automated,
@@ -965,7 +999,12 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
     let inbox_addr = *response_inbox.addr();
 
     let status_inboxes: Vec<Inbox<StageActorStatus>> = (0..num_stages)
-        .map(|s| nodes[s as usize + 1].rt.new_inbox::<StageActorStatus>().unwrap())
+        .map(|s| {
+            nodes[s as usize + 1]
+                .rt
+                .new_inbox::<StageActorStatus>()
+                .unwrap()
+        })
         .collect();
 
     let token_observer_inbox = nodes[last_stage as usize + 1]
@@ -1009,17 +1048,23 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
     // s >= 1.
     let request_bridge_addr = nodes[1]
         .rt
-        .spawn(RequestBridge { target: stage_actor_addrs[0] })
+        .spawn(RequestBridge {
+            target: stage_actor_addrs[0],
+        })
         .unwrap();
     let nt_bridge_addr = nodes[1]
         .rt
-        .spawn(NextTokenBridge { target: stage_actor_addrs[0] })
+        .spawn(NextTokenBridge {
+            target: stage_actor_addrs[0],
+        })
         .unwrap();
     let mut activation_bridge_addrs: Vec<Option<ActorAddress>> = vec![None; num_stages as usize];
     for s in 1..num_stages {
         let rt = &nodes[s as usize + 1].rt;
         let addr = rt
-            .spawn(ActivationBridge { target: stage_actor_addrs[s as usize] })
+            .spawn(ActivationBridge {
+                target: stage_actor_addrs[s as usize],
+            })
             .unwrap();
         activation_bridge_addrs[s as usize] = Some(addr);
     }
@@ -1073,7 +1118,9 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
         nodes[1].endpoint_addr(),
         nodes[0].driver.tokio_handle(),
     ));
-    nodes[0].transport_router.add_route(request_bridge_addr, orch_to_first);
+    nodes[0]
+        .transport_router
+        .add_route(request_bridge_addr, orch_to_first);
 
     for s in 0..num_stages - 1 {
         let rt_idx = s as usize + 1;
@@ -1100,8 +1147,12 @@ fn build_real_pipeline(num_stages: u32, max_tokens: u32) -> Pipeline {
         nodes[0].endpoint_addr(),
         nodes[last_idx].driver.tokio_handle(),
     ));
-    nodes[last_idx].transport_router.add_route(nt_bridge_addr, last_to_first);
-    nodes[last_idx].transport_router.add_route(inbox_addr, last_to_orch);
+    nodes[last_idx]
+        .transport_router
+        .add_route(nt_bridge_addr, last_to_first);
+    nodes[last_idx]
+        .transport_router
+        .add_route(inbox_addr, last_to_orch);
 
     Pipeline {
         num_stages,
@@ -1196,7 +1247,10 @@ impl Pipeline {
     /// `position=0` rewrites the cache positions it needs.
     fn reset_for_next_prompt(&mut self) {
         for (s, addr) in self.stage_actor_addrs.iter().enumerate() {
-            self.nodes[s + 1].rt.send_to(*addr, StageMsg::Reset).unwrap();
+            self.nodes[s + 1]
+                .rt
+                .send_to(*addr, StageMsg::Reset)
+                .unwrap();
         }
         for _ in 0..5 {
             self.pump();
@@ -1290,7 +1344,8 @@ impl ReferenceWorker {
             .iter()
             .map(|t| {
                 t.as_u64()
-                    .unwrap_or_else(|| panic!("reference token not u64: {t}")) as u32
+                    .unwrap_or_else(|| panic!("reference token not u64: {t}"))
+                    as u32
             })
             .collect()
     }

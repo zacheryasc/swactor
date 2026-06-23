@@ -40,8 +40,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::ExternalSender;
 use swactor_process::{
-    ExitStatus, OutputStream, ProcessCommand, ProcessNotification, ProcessSpec,
-    spawn_local_process,
+    ExitStatus, OutputStream, ProcessCommand, ProcessNotification, ProcessSpec, spawn_local_process,
 };
 
 use crate::messages::{InferenceRequest, InferenceResponse, NextToken, StageActivation};
@@ -364,11 +363,7 @@ impl StageActor {
     /// usually the next stage's `ActivationBridge`. Wire the real address
     /// post-spawn via `StageMsg::SetNeighbors { next_stage: Some(_), .. }`
     /// when the resolved address is not known at construction time.
-    pub fn first(
-        spec: ProcessSpec,
-        sender: ExternalSender,
-        next_stage_addr: ActorAddress,
-    ) -> Self {
+    pub fn first(spec: ProcessSpec, sender: ExternalSender, next_stage_addr: ActorAddress) -> Self {
         let mut a = Self::empty(StageRole::First, spec, sender);
         a.next_stage_addr = next_stage_addr;
         a
@@ -593,8 +588,7 @@ impl StageActor {
             val.get("hidden_b64"),
         ) {
             if let Some(pending) = self.pending_first_tokenize.remove(&rid) {
-                let tokens: Vec<i64> =
-                    tokens_val.iter().filter_map(|v| v.as_i64()).collect();
+                let tokens: Vec<i64> = tokens_val.iter().filter_map(|v| v.as_i64()).collect();
                 if tokens.is_empty() {
                     eprintln!(
                         "{}: tokenize reply for rid {rid} had no usable token ids",
@@ -653,10 +647,7 @@ impl StageActor {
                 let hidden = match B64.decode(hidden_b64) {
                     Ok(b) => b,
                     Err(e) => {
-                        eprintln!(
-                            "{}: base64 decode error for rid {rid}: {e}",
-                            self.label()
-                        );
+                        eprintln!("{}: base64 decode error for rid {rid}: {e}", self.label());
                         return;
                     }
                 };

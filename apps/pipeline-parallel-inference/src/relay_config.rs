@@ -4,7 +4,7 @@
 //! use `RelayMode::Custom(<url>)` instead of the canary default. The
 //! orchestrator's [`StageEnv`](crate::vastai::StageEnv) propagates the same
 //! var into every rented container so the whole cluster homes onto one
-//! operator-controlled relay (typically `swactor-iroh-relay` on a VPS).
+//! operator-controlled relay (typically `iroh-driver-relay` on a VPS).
 //!
 //! Falls back to `RelayMode::Default` when unset.
 

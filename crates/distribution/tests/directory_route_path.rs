@@ -7,8 +7,8 @@
 //! converged [`RouteView`], and the frame carries `target` as its wire `dest` so
 //! the receiver delivers it straight into that actor's mailbox.
 //!
-//! The harness uses the **production** §5 machinery — [`IrohRouteBinder`],
-//! [`RouteViewTransport`], [`IrohPeerDirectory`], and the `dest`-carrying
+//! The harness uses the **production** §5 machinery — [`OutboxRouteBinder`],
+//! [`RouteViewTransport`], [`OutboxPeerDirectory`], and the `dest`-carrying
 //! [`OutFrame`] — and a `deliver_wire` step that mirrors the driver's egress
 //! (`drain_outbox`) and dest-first ingress (`pump_inbound_to_actors`): a frame
 //! addressed to a node's peer-mailbox is gossip (routed by tag), anything else is
@@ -30,7 +30,8 @@ use distribution::directory_actor::{DirectoryActor, DirectoryIn};
 use distribution::messages::actor_codec_registry;
 use distribution::swim::actor::MembershipChanged;
 use distribution::transport_bridge::{
-    IrohPeerDirectory, IrohRouteBinder, OutFrame, Outbox, RouteView, RouteViewTransport, peer_addr,
+    OutFrame, Outbox, OutboxPeerDirectory, OutboxRouteBinder, RouteView, RouteViewTransport,
+    peer_addr,
 };
 use distribution::types::{MemberState, NodeId};
 
@@ -134,7 +135,7 @@ impl RouteCluster {
             let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
             // Gossip egress (directory → peer) and app egress (RouteView → host)
             // both feed the one outbox, just like the live driver.
-            let peer_directory = Arc::new(IrohPeerDirectory::new(
+            let peer_directory = Arc::new(OutboxPeerDirectory::new(
                 Arc::clone(&router),
                 Arc::clone(&outbox),
             ));
@@ -142,7 +143,7 @@ impl RouteCluster {
                 Arc::clone(&route_view),
                 Arc::clone(&outbox),
             ));
-            let route_binder = Arc::new(IrohRouteBinder::new(
+            let route_binder = Arc::new(OutboxRouteBinder::new(
                 Arc::clone(&router),
                 Arc::clone(&route_view_transport),
             ));

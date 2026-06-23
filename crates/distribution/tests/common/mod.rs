@@ -27,6 +27,3 @@ pub fn test_config() -> DistributedNodeConfig {
         metadata_lambda: 3,
     }
 }
-
-#[cfg(feature = "iroh")]
-pub mod iroh;

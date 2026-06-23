@@ -1,7 +1,7 @@
 //! Datastream → dashboard adapter.
 //!
-//! Binds the UDP sink the demo cluster ships to (the same wire the dumb
-//! `swactor-datastream-collector` reads), **demultiplexes** the per-node frames,
+//! Binds the UDP sink used by demo clusters, **demultiplexes** the per-node
+//! frames,
 //! and drives the dashboard's *existing* views from them — no bespoke UI:
 //!
 //!   * the single-node **Overview / Actors** page (`/`) via a synthesized

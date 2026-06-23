@@ -7,10 +7,10 @@
 //! `Tick` cadence, and learns membership from the SwimActor's `MembershipChanged`
 //! stream (adapted into [`MetadataIn::Membership`]).
 //!
-//! The iroh egress needs a peer's relay URL synchronously when it dials (it can't
-//! block to `ask` an actor), so the actor mirrors every known `NodeId → relay_url`
-//! into a shared [`RelayMirror`](crate::transport_bridge::RelayMirror) the driver
-//! reads lock-free-ish on the dial path.
+//! The network egress needs a peer's relay URL synchronously when it dials (it
+//! can't block to `ask` an actor), so the actor mirrors every known
+//! `NodeId → relay_url` into a shared [`RelayMirror`](crate::transport_bridge::RelayMirror)
+//! the driver reads lock-free-ish on the dial path.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;

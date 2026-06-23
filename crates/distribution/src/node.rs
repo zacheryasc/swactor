@@ -4,9 +4,10 @@
 //! SWIM membership, the cluster name registry, node-metadata dissemination, and
 //! the actor→host directory now each run as an independent actor on the swactor
 //! runtime — see [`crate::swim::actor`], [`crate::registry_actor`],
-//! [`crate::node_metadata_actor`], and [`crate::directory_actor`]. The transport
-//! bridge that feeds them is [`crate::iroh_driver`]. All that remains here is the
-//! shared configuration bundle the node binary uses to construct those actors.
+//! [`crate::node_metadata_actor`], and [`crate::directory_actor`]. Concrete
+//! network drivers (for example `iroh-driver`) feed those actors. All that
+//! remains here is the shared configuration bundle the node binary uses to
+//! construct them.
 
 use crate::registry::RegistryConfig;
 use crate::swim::probe::SwimConfig;

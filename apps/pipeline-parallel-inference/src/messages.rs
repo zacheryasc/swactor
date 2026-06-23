@@ -5,9 +5,9 @@
 //! autoregressive loop between stage 0 and stage 1.
 
 use serde::{Deserialize, Serialize};
+use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
-use swactor::Error;
 
 // ─── Message Types ─────────────────────────────────────────────────────────
 
@@ -82,8 +82,7 @@ macro_rules! impl_json_codec {
     ($msg:ty, $label:expr) => {
         impl Codec<$msg> for InferenceCodec {
             fn encode(&self, msg: &$msg) -> Result<Vec<u8>, Error> {
-                serde_json::to_vec(msg)
-                    .map_err(|e| Error::from(format!("encode {}: {e}", $label)))
+                serde_json::to_vec(msg).map_err(|e| Error::from(format!("encode {}: {e}", $label)))
             }
             fn decode(&self, bytes: &[u8]) -> Result<$msg, Error> {
                 serde_json::from_slice(bytes)
@@ -140,8 +139,7 @@ impl Codec<StageActivation> for InferenceCodec {
     fn encode(&self, msg: &StageActivation) -> Result<Vec<u8>, Error> {
         let hidden_len = u32::try_from(msg.hidden.len())
             .map_err(|_| Error::from("encode StageActivation: hidden too large for u32"))?;
-        let mut buf =
-            Vec::with_capacity(SA_HEADER_LEN + msg.hidden.len() + SA_CHECKSUM_LEN);
+        let mut buf = Vec::with_capacity(SA_HEADER_LEN + msg.hidden.len() + SA_CHECKSUM_LEN);
         buf.push(SA_MAGIC);
         buf.push(SA_VERSION);
         buf.extend_from_slice(&msg.request_id.to_le_bytes());

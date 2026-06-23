@@ -16,10 +16,10 @@ use std::time::{Duration, Instant};
 use iroh::{PublicKey, RelayMode};
 use tokio::runtime::{Handle, Runtime as TokioRuntime};
 
-use distribution::iroh_driver::IrohDriverConfig;
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
+use iroh_driver::IrohDriverConfig;
 
 use pipeline_parallel_inference::cluster::ClusterNode;
 use pipeline_parallel_inference::messages::inference_codec_registry;

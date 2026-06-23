@@ -24,7 +24,10 @@ async fn create_two_instances_sends_distinct_stage_env_vars() {
 
     Mock::given(method("PUT"))
         .and(path_regex("/api/v0/asks/101/"))
-        .and(header("Authorization", format!("Bearer {API_KEY}").as_str()))
+        .and(header(
+            "Authorization",
+            format!("Bearer {API_KEY}").as_str(),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "new_contract": 9001
         })))
@@ -33,7 +36,10 @@ async fn create_two_instances_sends_distinct_stage_env_vars() {
         .await;
     Mock::given(method("PUT"))
         .and(path_regex("/api/v0/asks/102/"))
-        .and(header("Authorization", format!("Bearer {API_KEY}").as_str()))
+        .and(header(
+            "Authorization",
+            format!("Bearer {API_KEY}").as_str(),
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "new_contract": 9002
         })))
@@ -143,8 +149,13 @@ async fn failure_to_create_second_instance_triggers_destroy_of_first() {
         .await;
     Mock::given(method("DELETE"))
         .and(path_regex("/api/v0/instances/8001/"))
-        .and(header("Authorization", format!("Bearer {API_KEY}").as_str()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})))
+        .and(header(
+            "Authorization",
+            format!("Bearer {API_KEY}").as_str(),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -177,13 +188,17 @@ async fn destroy_two_instances_sends_two_delete_requests() {
 
     Mock::given(method("DELETE"))
         .and(path_regex("/api/v0/instances/4001/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+        )
         .expect(1)
         .mount(&server)
         .await;
     Mock::given(method("DELETE"))
         .and(path_regex("/api/v0/instances/4002/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -212,7 +227,9 @@ async fn destroy_continues_when_one_delete_fails() {
     // Second id must still be attempted and must succeed.
     Mock::given(method("DELETE"))
         .and(path_regex("/api/v0/instances/5002/"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -244,11 +261,9 @@ async fn create_instances_forward_stage_env_to_each_stage_container() {
     for i in 0..3u64 {
         Mock::given(method("PUT"))
             .and(path_regex(format!("^/api/v0/asks/{}/$", 500 + i).as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "new_contract": 9500 + i,
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "new_contract": 9500 + i,
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -288,7 +303,10 @@ async fn create_instances_forward_stage_env_to_each_stage_container() {
         let env = envs_by_stage
             .get(&i.to_string())
             .unwrap_or_else(|| panic!("missing stage {i}"));
-        assert_eq!(env["SSH_PUBLIC_KEY"], "ssh-ed25519 AAAAdeploykey orchestrator");
+        assert_eq!(
+            env["SSH_PUBLIC_KEY"],
+            "ssh-ed25519 AAAAdeploykey orchestrator"
+        );
         assert_eq!(env["SWACTOR_IROH_RELAY_URL"], "https://relay.example");
         // Stage identity still rides the base create payload.
         assert_eq!(env["STAGE"], i.to_string());
@@ -352,11 +370,9 @@ async fn mount_n_creates_ok(server: &MockServer, base_offer: u64, base_contract:
         let contract_id = base_contract + i as u64;
         Mock::given(method("PUT"))
             .and(path_regex(format!("^/api/v0/asks/{offer_id}/$").as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "new_contract": contract_id
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "new_contract": contract_id
+            })))
             .expect(1)
             .mount(server)
             .await;
@@ -416,7 +432,12 @@ async fn run_create_n_and_collect_envs(
 async fn assert_distinct_stages(base_offer: u64, num_stages: u32) {
     let envs = run_create_n_and_collect_envs(base_offer, num_stages).await;
     let mut stages: Vec<String> = (0..num_stages)
-        .map(|i| envs[&(base_offer + i as u64)]["STAGE"].as_str().unwrap().to_string())
+        .map(|i| {
+            envs[&(base_offer + i as u64)]["STAGE"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
         .collect();
     stages.sort();
     let expected: Vec<String> = (0..num_stages).map(|i| i.to_string()).collect();
@@ -440,7 +461,8 @@ async fn assert_same_seed_addr(base_offer: u64, num_stages: u32) {
     let envs = run_create_n_and_collect_envs(base_offer, num_stages).await;
     for i in 0..num_stages {
         assert_eq!(
-            envs[&(base_offer + i as u64)]["SEED_ADDR"], SEED_ADDR,
+            envs[&(base_offer + i as u64)]["SEED_ADDR"],
+            SEED_ADDR,
             "stage {i} must carry the shared SEED_ADDR",
         );
     }
@@ -493,11 +515,9 @@ async fn failure_to_create_kth_instance_triggers_destroy_of_prior_at_n_5() {
     for i in 0..3u64 {
         Mock::given(method("PUT"))
             .and(path_regex(format!("^/api/v0/asks/{}/$", 800 + i).as_str()))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "new_contract": 7000 + i,
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "new_contract": 7000 + i,
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -512,10 +532,11 @@ async fn failure_to_create_kth_instance_triggers_destroy_of_prior_at_n_5() {
     // Each prior contract must be destroyed exactly once.
     for i in 0..3u64 {
         Mock::given(method("DELETE"))
-            .and(path_regex(format!("^/api/v0/instances/{}/$", 7000 + i).as_str()))
+            .and(path_regex(
+                format!("^/api/v0/instances/{}/$", 7000 + i).as_str(),
+            ))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"success": true})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
             )
             .expect(1)
             .mount(&server)
@@ -534,7 +555,10 @@ async fn failure_to_create_kth_instance_triggers_destroy_of_prior_at_n_5() {
         None,
     )
     .await;
-    assert!(result.is_err(), "partial-success creation must surface an error");
+    assert!(
+        result.is_err(),
+        "partial-success creation must surface an error"
+    );
 }
 
 /// `select_offer_pool` drops the suspiciously-cheap slice of each GPU model
@@ -564,7 +588,11 @@ async fn select_offer_pool_drops_cheap_tail_and_ranks_ascending() {
         .expect("catalog has survivors after the cheap-tail drop");
 
     let ids: Vec<u64> = pool.iter().map(|o| o.id).collect();
-    assert_eq!(pool.len(), 4, "5 offers, default 30% drop removes floor(1.5)=1");
+    assert_eq!(
+        pool.len(),
+        4,
+        "5 offers, default 30% drop removes floor(1.5)=1"
+    );
     assert!(
         !ids.contains(&100),
         "the single cheapest offer is dropped as the suspicious tail, got {ids:?}",
@@ -601,8 +629,7 @@ async fn destroy_five_instances_sends_five_delete_requests() {
         Mock::given(method("DELETE"))
             .and(path_regex(format!("^/api/v0/instances/{id}/$").as_str()))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({"success": true})),
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
             )
             .expect(1)
             .mount(&server)
@@ -652,7 +679,11 @@ async fn wait_for_running_waits_out_a_slowly_progressing_node() {
         })))
         .mount(&server)
         .await;
-    for (disk, msg) in [(3.0, "Pulling fs layer 3/3"), (2.0, "Pulling fs layer 2/3"), (1.0, "Pulling from registry")] {
+    for (disk, msg) in [
+        (3.0, "Pulling fs layer 3/3"),
+        (2.0, "Pulling fs layer 2/3"),
+        (1.0, "Pulling from registry"),
+    ] {
         Mock::given(method("GET"))
             .and(path_regex(format!("^{inst}$").as_str()))
             .respond_with(loading(disk, msg))
@@ -760,7 +791,9 @@ async fn lease_chain_does_not_replace_when_max_replace_attempts_is_zero() {
     // Rollback destroys the dead instance.
     Mock::given(method("DELETE"))
         .and(path_regex(r"^/api/v0/instances/8001/$"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"success": true})),
+        )
         .mount(&server)
         .await;
 

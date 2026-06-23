@@ -35,11 +35,11 @@ fn acquire_cluster_lock() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-use distribution::iroh_driver::IrohDriverConfig;
 use distribution::node::DistributedNodeConfig;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
 use iroh::{PublicKey, RelayMode};
+use iroh_driver::IrohDriverConfig;
 
 use swactor::actor::{ActorAddress, Message};
 use swactor::runtime::{Runtime, RuntimeConfig};
@@ -47,10 +47,10 @@ use swactor_transport::{CodecRegistry, TransportRouter};
 
 use pipeline_parallel_inference::cluster::ClusterNode;
 use pipeline_parallel_inference::iroh_transport::{
-    drain_actor_messages, IrohActorTransport, ACTOR_ALPN,
+    ACTOR_ALPN, IrohActorTransport, drain_actor_messages,
 };
 use pipeline_parallel_inference::messages::{
-    inference_codec_registry, InferenceResponse, NextToken, StageActivation,
+    InferenceResponse, NextToken, StageActivation, inference_codec_registry,
 };
 
 // ── Driver config (mirrors single-GPU t_cluster) ─────────────────────────
@@ -250,7 +250,12 @@ fn send_and_receive<T: Message>(
 
     rt_send.send_to(inbox_addr, payload).unwrap();
     std::thread::sleep(Duration::from_millis(200));
-    drain_actor_messages(&receiver.driver, &codecs, &rt_recv, Duration::from_millis(500));
+    drain_actor_messages(
+        &receiver.driver,
+        &codecs,
+        &rt_recv,
+        Duration::from_millis(500),
+    );
     inbox
         .try_recv()
         .expect("payload did not arrive at the receiver inbox")
@@ -331,7 +336,8 @@ fn stage_activation_each_hop_case(num_stages: u32) {
             codecs.clone(),
         );
         assert_eq!(
-            received, payload,
+            received,
+            payload,
             "StageActivation hop ({hop} -> {}) at N={num_stages} must roundtrip intact",
             hop + 1,
         );
@@ -382,12 +388,8 @@ fn next_token_last_to_first_case(num_stages: u32) {
         let (left, right) = nodes.split_at_mut(last_idx);
         (&left[first_idx], &right[0])
     };
-    let received = send_and_receive::<NextToken>(
-        last_part,
-        first_part,
-        payload.clone(),
-        codecs.clone(),
-    );
+    let received =
+        send_and_receive::<NextToken>(last_part, first_part, payload.clone(), codecs.clone());
     assert_eq!(
         received, payload,
         "NextToken from last -> first at N={num_stages} must roundtrip intact",
@@ -460,11 +462,7 @@ fn inference_response_roundtrips_last_to_orchestrator_n_4() {
 /// Shut down the node at `victim_idx`, then pump the remaining nodes
 /// until they all stop seeing the victim alive (or the timeout expires).
 /// Returns whether detection succeeded.
-fn wait_for_death(
-    nodes: &mut [ClusterNode],
-    victim_idx: usize,
-    timeout: Duration,
-) -> bool {
+fn wait_for_death(nodes: &mut [ClusterNode], victim_idx: usize, timeout: Duration) -> bool {
     let victim_key = pubkey_of(&nodes[victim_idx]);
     nodes[victim_idx].driver.shutdown();
 
@@ -475,9 +473,10 @@ fn wait_for_death(
                 n.pump_once();
             }
         }
-        let all_dropped = nodes.iter().enumerate().all(|(i, n)| {
-            i == victim_idx || !sees_alive(n, &victim_key)
-        });
+        let all_dropped = nodes
+            .iter()
+            .enumerate()
+            .all(|(i, n)| i == victim_idx || !sees_alive(n, &victim_key));
         if all_dropped {
             return true;
         }

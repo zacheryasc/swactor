@@ -8,10 +8,10 @@
 //!           `TransportRouter` → `Transport::send` (a serialized `WireEnvelope`);
 //!   ingress: decode the frame → `Runtime::deliver_raw` into the peer's mailbox.
 //!
-//! This is the exact path the iroh bridge will drive; here a `Link` stands in for
-//! iroh, carrying a `WireEnvelope` from one runtime into another in-process. We
-//! observe ONLY the `MembershipChanged` stream (§6.3), and pin eventuality by
-//! converge-or-timeout — never a fixed tick count.
+//! This is the exact path a concrete network bridge will drive; here a `Link`
+//! stands in for the network, carrying a `WireEnvelope` from one runtime into
+//! another in-process. We observe ONLY the `MembershipChanged` stream (§6.3),
+//! and pin eventuality by converge-or-timeout — never a fixed tick count.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -57,9 +57,9 @@ fn brisk_config() -> SwimConfig {
     }
 }
 
-/// Stands in for iroh: serializes nothing itself (the runtime already encoded to
-/// a `WireEnvelope`), it just carries the frame into the destination runtime and
-/// performs the production ingress — `codec.decode(...)` → `deliver_raw(...)`.
+/// Stands in for a network transport: serializes nothing itself (the runtime
+/// already encoded to a `WireEnvelope`), it just carries the frame into the
+/// destination runtime and performs the production ingress.
 /// A `partition` set models nodes that have fallen off the network: a frame whose
 /// source or destination is partitioned is dropped (genuine silence).
 struct Link {
