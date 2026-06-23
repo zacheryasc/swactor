@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
-use swactor::runtime::Runtime;
 use crate::command::{CommandContext, CommandRouter};
+use swactor::runtime::Runtime;
 
 use crate::collector::StatsCollector;
 

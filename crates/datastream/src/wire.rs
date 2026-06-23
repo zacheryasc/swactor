@@ -20,8 +20,8 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 use swactor::Error;
+use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 
 use super::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 
@@ -59,7 +59,8 @@ impl std::error::Error for WireError {}
 pub fn encode_delivery(stream: &StreamId, frame: &Frame) -> Vec<u8> {
     let node = stream.node.as_str().as_bytes();
     let channel = frame.channel.as_str().as_bytes();
-    let mut out = Vec::with_capacity(4 + node.len() + 8 + 8 + 4 + channel.len() + 4 + frame.payload.len());
+    let mut out =
+        Vec::with_capacity(4 + node.len() + 8 + 8 + 4 + channel.len() + 4 + frame.payload.len());
     put_bytes(&mut out, node);
     out.extend_from_slice(&stream.life.0.to_le_bytes());
     out.extend_from_slice(&frame.position.0.to_le_bytes());
@@ -153,7 +154,9 @@ impl<'a> Cursor<'a> {
 
     fn take_u64(&mut self) -> Result<u64, WireError> {
         let b = self.take(8)?;
-        Ok(u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
     }
 
     fn take_bytes(&mut self) -> Result<&'a [u8], WireError> {

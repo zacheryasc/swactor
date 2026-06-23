@@ -64,9 +64,10 @@ impl ProcessDriver for SshDriver {
                     key_file: self.ssh_config.key_file.clone(),
                     key_passphrase: self.ssh_config.key_passphrase.clone(),
                 };
-                self.task_handle = Some(self.tokio_handle.spawn(
-                    task::run_ssh_session(config, spec, queue, waker_slot, rx),
-                ));
+                self.task_handle = Some(
+                    self.tokio_handle
+                        .spawn(task::run_ssh_session(config, spec, queue, waker_slot, rx)),
+                );
             }
             ProcessAction::WriteStdin { data } => {
                 if let Some(ref tx) = self.command_tx {

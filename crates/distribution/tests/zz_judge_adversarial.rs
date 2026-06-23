@@ -14,7 +14,7 @@
 
 use std::time::{Duration, Instant};
 
-use distribution::swim::dissemination::{membership_update, DisseminationQueue};
+use distribution::swim::dissemination::{DisseminationQueue, membership_update};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::node::SwimNode;
 use distribution::swim::probe::{ProbeMode, SwimConfig};
@@ -46,7 +46,11 @@ fn a_stale_suspect_below_current_incarnation_does_not_refute() {
     // Drive self_incarnation to 2 via two fresh accusations (inc 0 then inc 1).
     me.handle_ping(id(1), 1, &pb(id(0), MemberState::Suspect, 0));
     me.handle_ping(id(1), 2, &pb(id(0), MemberState::Suspect, 1));
-    assert_eq!(me.members().self_incarnation(), 2, "two fresh accusations -> inc 2");
+    assert_eq!(
+        me.members().self_incarnation(),
+        2,
+        "two fresh accusations -> inc 2"
+    );
 
     // Now pelt with STALE accusations strictly below the current incarnation.
     for seq in 0..25u64 {
@@ -62,7 +66,11 @@ fn a_stale_suspect_below_current_incarnation_does_not_refute() {
     // A fresh accusation AT the current incarnation still gets through (the gate
     // suppresses stale gossip, never legitimate news).
     me.handle_ping(id(2), 999, &pb(id(0), MemberState::Suspect, 2));
-    assert_eq!(me.members().self_incarnation(), 3, "accusation at current inc must refute");
+    assert_eq!(
+        me.members().self_incarnation(),
+        3,
+        "accusation at current inc must refute"
+    );
 }
 
 // ── §7/§8: merge imports a direct Alive -> Dead jump on a higher incarnation ──
@@ -77,7 +85,10 @@ fn merge_imports_a_direct_alive_to_dead_jump_at_higher_incarnation() {
     assert_eq!(ml.get(&id(1)).map(|e| e.state), Some(MemberState::Alive));
 
     // A higher-incarnation Dead jumps Alive -> Dead directly, skipping Suspect.
-    assert!(ml.apply(id(1), MemberState::Dead, 5), "higher-inc Dead must win");
+    assert!(
+        ml.apply(id(1), MemberState::Dead, 5),
+        "higher-inc Dead must win"
+    );
     let e = ml.get(&id(1)).unwrap();
     assert_eq!(e.state, MemberState::Dead);
     assert_eq!(e.incarnation, 5);
@@ -94,15 +105,24 @@ fn equal_incarnation_alive_never_resurrects_a_dead_entry() {
     assert!(ml.apply(id(1), MemberState::Dead, 7), "peer is Dead@7");
 
     // Alive at the same incarnation: dominated, no change.
-    assert!(!ml.apply(id(1), MemberState::Alive, 7), "Alive@7 must not resurrect Dead@7");
+    assert!(
+        !ml.apply(id(1), MemberState::Alive, 7),
+        "Alive@7 must not resurrect Dead@7"
+    );
     assert_eq!(ml.get(&id(1)).map(|e| e.state), Some(MemberState::Dead));
 
     // Suspect at the same incarnation: also dominated (Suspect < Dead).
-    assert!(!ml.apply(id(1), MemberState::Suspect, 7), "Suspect@7 must not lower Dead@7");
+    assert!(
+        !ml.apply(id(1), MemberState::Suspect, 7),
+        "Suspect@7 must not lower Dead@7"
+    );
     assert_eq!(ml.get(&id(1)).map(|e| e.state), Some(MemberState::Dead));
 
     // A strictly higher incarnation Alive DOES resurrect (the only legal path).
-    assert!(ml.apply(id(1), MemberState::Alive, 8), "Alive@8 must resurrect");
+    assert!(
+        ml.apply(id(1), MemberState::Alive, 8),
+        "Alive@8 must resurrect"
+    );
     assert_eq!(ml.get(&id(1)).map(|e| e.state), Some(MemberState::Alive));
 }
 
@@ -128,7 +148,9 @@ fn a_peer_that_refutes_mid_window_is_not_declared_dead() {
         indirect_probes: 2,
         suspicion_timeout: TICK * 5,
         dead_reprobe_interval: Duration::ZERO,
-        probe_mode: ProbeMode::Reactive { safety_sweep_interval: TICK * 100_000 },
+        probe_mode: ProbeMode::Reactive {
+            safety_sweep_interval: TICK * 100_000,
+        },
         lifeguard: None,
     };
     let t0 = Instant::now();
@@ -136,7 +158,10 @@ fn a_peer_that_refutes_mid_window_is_not_declared_dead() {
 
     // Learn one peer, id(1), Alive@0 (join_request does not enqueue a probe).
     me.handle_join_request(id(1));
-    assert_eq!(me.members().get(&id(1)).map(|e| e.state), Some(MemberState::Alive));
+    assert_eq!(
+        me.members().get(&id(1)).map(|e| e.state),
+        Some(MemberState::Alive)
+    );
 
     // Kick off a single reactive probe of id(1); it never acks, so after the
     // direct + indirect phases (each 100 ticks) it is suspected. Drive ticks until

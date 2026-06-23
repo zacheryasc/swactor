@@ -31,10 +31,7 @@ impl PublicIpRule {
     fn is_public(ip: &IpAddr) -> bool {
         match ip {
             IpAddr::V4(v4) => {
-                !v4.is_loopback()
-                    && !v4.is_private()
-                    && !v4.is_link_local()
-                    && !v4.is_unspecified()
+                !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() && !v4.is_unspecified()
             }
             IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
         }
@@ -66,10 +63,7 @@ impl CandidacyRule for PortBindRule {
     fn evaluate(&self) -> CandidacyResult {
         match std::net::TcpListener::bind(self.addr) {
             Ok(_) => CandidacyResult::Eligible,
-            Err(e) => CandidacyResult::Ineligible(format!(
-                "cannot bind {}: {e}",
-                self.addr
-            )),
+            Err(e) => CandidacyResult::Ineligible(format!("cannot bind {}: {e}", self.addr)),
         }
     }
 }

@@ -1,8 +1,7 @@
-//! Swactor node — unified distributed node with dashboard and datastore.
+//! Swactor node — unified distributed node with dashboard.
 //!
-//! Combines distribution, runtime dashboard, and content-addressed datastore
-//! into a single batteries-included binary. Datastore is on by default
-//! (in-memory) and can be disabled via `--no-datastore`.
+//! Combines distribution, runtime dashboard, data streams, and an optional
+//! embedded relay server into a single batteries-included binary.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,36 +9,37 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 
+use distribution::node::DistributedNodeConfig;
+use distribution::peer_auth::PeerAllowList;
+use distribution::swim::probe::SwimConfig;
 use swactor::actor::{ActorInterface, Ctx};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::Runtime;
 use swactor::stats::StatsHook;
 use swactor_transport::NodeId;
 use swactor_transport::crypto::Keypair;
-use swactor_transport::identity::{base58_encode, base58_decode, hex_encode, load_or_generate_keypair};
-use distribution::node::DistributedNodeConfig;
-use distribution::peer_auth::PeerAllowList;
-use distribution::swim::probe::SwimConfig;
+use swactor_transport::identity::{
+    base58_decode, base58_encode, hex_encode, load_or_generate_keypair,
+};
 
-use datastream::catalog::{
-    self, ActorRec, ActorRuntimeDetail, DatastoreState, DistributionState, IdentityRecord,
-    RuntimeStats as DsRuntimeStats,
+use dashboard::telemetry::{
+    self, ActorRec, ActorRuntimeDetail, IdentityRecord, RuntimeStats as DsRuntimeStats,
+    WorkerCounters,
 };
-use datastream::emit::{
-    DatastreamEmitter, DatastreamEventSink, EmitterConfig, FrameSink, TickInput,
-};
+use datastream::emit::{DatastreamEmitter, EmitterConfig, FrameSink};
 use datastream::frame::{Frame, StreamId};
+use datastream::health::DatastreamHealth;
+use distribution::telemetry::{
+    CacheEntryRec, DistributionState, MembershipTransition, RegistryEntryRec, TransportInternals,
+};
 
 use dashboard::collector::StatsCollector;
 use dashboard::datastream_source::FleetView;
-use dashboard::{start_dashboard, DashboardConfig};
+use dashboard::{DashboardConfig, start_dashboard};
 
-use swactor_datastore::metrics::{DatastoreEventObserver, DatastoreMetrics};
-use swactor_datastore::{DatastoreAuthConfig, DatastoreGroup, DatastoreGroupConfig};
-
-use swactor_node::{config, install, names, plugins};
 #[cfg(feature = "relay")]
 use swactor_node::relay;
+use swactor_node::{config, install, names, plugins};
 
 /// Extra swactor ticks run after `stop` so in-flight messages and stopping
 /// actors drain before teardown.
@@ -60,11 +60,7 @@ fn worker_count(cpus: usize) -> usize {
 
 // ── CLI ──────────────────────────────────────────────────────────────────
 
-const VERSION: &str = concat!(
-    env!("SWACTOR_GIT_BRANCH"),
-    " @ ",
-    env!("SWACTOR_GIT_HASH"),
-);
+const VERSION: &str = concat!(env!("SWACTOR_GIT_BRANCH"), " @ ", env!("SWACTOR_GIT_HASH"),);
 
 #[derive(Subcommand)]
 enum Subcmd {
@@ -90,7 +86,7 @@ enum Subcmd {
 #[command(
     name = "swactor",
     version = VERSION,
-    about = "Unified swactor node: distribution + dashboard + datastore"
+    about = "Unified swactor node: distribution + dashboard"
 )]
 struct Args {
     #[command(subcommand)]
@@ -112,26 +108,6 @@ struct Args {
     #[arg(long, default_value = "0")]
     actors: usize,
 
-    /// Storage directory for persistent datastore (omit for in-memory)
-    #[arg(long)]
-    storage_path: Option<String>,
-
-    /// Disable the datastore entirely
-    #[arg(long)]
-    no_datastore: bool,
-
-    /// Chunk size in bytes
-    #[arg(long, default_value = "1048576")]
-    chunk_size: u32,
-
-    /// GC interval in ticks (each tick is ~100ms)
-    #[arg(long, default_value = "1000")]
-    gc_interval: u64,
-
-    /// Dissemination interval in ticks
-    #[arg(long, default_value = "50")]
-    disseminate_interval: u64,
-
     /// Directory for persistent node identity keypair
     #[arg(long, default_value = "./identity")]
     identity_dir: String,
@@ -139,14 +115,6 @@ struct Args {
     /// Path to peers.json for peer allow-list (omit for open mode)
     #[arg(long)]
     peers_file: Option<String>,
-
-    /// Enable datastore auth (GatewayActor)
-    #[arg(long)]
-    auth: bool,
-
-    /// Directory for auth files (ACL, owner key)
-    #[arg(long, default_value = "./auth")]
-    auth_dir: String,
 
     /// Human-readable node name (e.g. "swift-falcon")
     #[arg(long)]
@@ -224,7 +192,6 @@ impl ActorInterface for MembershipFanout {
 struct LocalRenderSink {
     view: FleetView,
     dist_cache: Arc<Mutex<Option<String>>>,
-    datastore_cache: Arc<Mutex<Option<String>>>,
     fleet_cache: Arc<Mutex<Option<String>>>,
     stats_slot: Arc<Mutex<Option<swactor::stats::RuntimeStats>>>,
     /// Node-local overlays the datastream view does not carry directly: the
@@ -256,10 +223,6 @@ impl FrameSink for LocalRenderSink {
                 &self.join_statuses,
                 &self.members,
             ));
-        }
-        if let Some(ds_json) = update.datastore_json {
-            *self.datastore_cache.lock().unwrap() =
-                Some(format!(r#"{{"is_running":true,"snapshot":{ds_json}}}"#));
         }
     }
 }
@@ -299,27 +262,6 @@ fn overlay_dist(
     v.to_string()
 }
 
-/// Bridges datastore operation events onto the node's datastream. The datastore
-/// defines the observer trait (it owns the events); this node-side adapter holds
-/// the emitter's thread-safe event sink and frames each op as it fires.
-struct NodeDatastoreObserver {
-    sink: DatastreamEventSink,
-}
-
-impl DatastoreEventObserver for NodeDatastoreObserver {
-    fn on_event(
-        &self,
-        timestamp_ms: u64,
-        kind: &str,
-        hash: &str,
-        name: Option<&str>,
-        size_bytes: u64,
-    ) {
-        self.sink
-            .datastore_event(timestamp_ms, kind, hash, name, size_bytes);
-    }
-}
-
 // ── Main ─────────────────────────────────────────────────────────────────
 
 fn default_config_dir() -> std::path::PathBuf {
@@ -334,12 +276,9 @@ fn generate_default_config(config_dir: &std::path::Path) -> std::path::PathBuf {
     let config_path = config_dir.join("node.toml");
 
     // Create directory tree
-    for sub in &["identity", "datastore", "auth"] {
+    for sub in &["identity"] {
         std::fs::create_dir_all(config_dir.join(sub)).unwrap_or_else(|e| {
-            eprintln!(
-                "Failed to create {}: {e}",
-                config_dir.join(sub).display()
-            );
+            eprintln!("Failed to create {}: {e}", config_dir.join(sub).display());
             std::process::exit(1);
         });
     }
@@ -351,11 +290,8 @@ fn generate_default_config(config_dir: &std::path::Path) -> std::path::PathBuf {
     let contents = format!(
         r#"transport = "iroh"
 dashboard_port = 9090
-storage_path = "{dir}/datastore"
 identity_dir = "{dir}/identity"
 peers_file = "{dir}/peers.json"
-auth = true
-auth_dir = "{dir}/auth"
 relay = true
 relay_port = 3340
 {relay_hosts}"#,
@@ -388,8 +324,10 @@ fn detect_public_ip_for_config() -> String {
         let ip = sock.local_addr().ok()?.ip();
         match ip {
             std::net::IpAddr::V4(v4) => {
-                if !v4.is_loopback() && !v4.is_private()
-                    && !v4.is_link_local() && !v4.is_unspecified()
+                if !v4.is_loopback()
+                    && !v4.is_private()
+                    && !v4.is_link_local()
+                    && !v4.is_unspecified()
                 {
                     Some(ip)
                 } else {
@@ -475,38 +413,16 @@ fn main() {
     let identity_dir_str = if args.identity_dir != "./identity" {
         args.identity_dir.clone()
     } else {
-        cfg.identity_dir.unwrap_or_else(|| args.identity_dir.clone())
+        cfg.identity_dir
+            .unwrap_or_else(|| args.identity_dir.clone())
     };
-    let auth_dir_str = if args.auth_dir != "./auth" {
-        args.auth_dir.clone()
-    } else {
-        cfg.auth_dir.unwrap_or_else(|| args.auth_dir.clone())
-    };
-    let storage_path = args.storage_path.clone().or(cfg.storage_path);
     let peers_file = args.peers_file.clone().or(cfg.peers_file);
     let seed_node_id = args.seed_node_id.clone().or(cfg.seed_node_id);
-    let auth_enabled = args.auth || cfg.auth.unwrap_or(false);
     let actors = if args.actors != 0 {
         args.actors
     } else {
         cfg.actors.unwrap_or(args.actors)
     };
-    let chunk_size = if args.chunk_size != 1048576 {
-        args.chunk_size
-    } else {
-        cfg.chunk_size.unwrap_or(args.chunk_size)
-    };
-    let gc_interval = if args.gc_interval != 1000 {
-        args.gc_interval
-    } else {
-        cfg.gc_interval.unwrap_or(args.gc_interval)
-    };
-    let disseminate_interval = if args.disseminate_interval != 50 {
-        args.disseminate_interval
-    } else {
-        cfg.disseminate_interval.unwrap_or(args.disseminate_interval)
-    };
-    let no_datastore = args.no_datastore || cfg.no_datastore.unwrap_or(false);
     let relay_enabled = !args.no_relay && cfg.relay.unwrap_or(true);
     let relay_port = if args.relay_port != 3340 {
         args.relay_port
@@ -586,12 +502,12 @@ fn main() {
             let peer_hex = hex_encode(&peer_bytes);
 
             // Load peers file and add the peer
-            let peers_path = peers_file
-                .as_ref()
-                .cloned()
-                .unwrap_or_else(|| {
-                    default_config_dir().join("peers.json").to_string_lossy().into_owned()
-                });
+            let peers_path = peers_file.as_ref().cloned().unwrap_or_else(|| {
+                default_config_dir()
+                    .join("peers.json")
+                    .to_string_lossy()
+                    .into_owned()
+            });
             let p = std::path::Path::new(&peers_path);
             let mut peer_auth = PeerAllowList::from_file(p).unwrap_or_else(|e| {
                 eprintln!("Failed to load peers file {peers_path}: {e}");
@@ -632,9 +548,10 @@ fn main() {
 
     // Persist to config if not already set
     if cfg.node_name.is_none()
-        && let Some(config_path) = &resolved_config_path {
-            persist_node_name(config_path, &node_name);
-        }
+        && let Some(config_path) = &resolved_config_path
+    {
+        persist_node_name(config_path, &node_name);
+    }
 
     eprintln!("Node name: {node_name}");
 
@@ -710,56 +627,6 @@ fn main() {
     // stays as the per-actor stats *producer* feeding the `runtime.actors`
     // record, and is handed to `run_iroh`.
 
-    // Datastream-reconstructed datastore telemetry JSON, shared between the
-    // node's frame consumer (writer) and the datastore plugin (reader).
-    let datastore_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-
-    // Datastore setup
-    let ds_group = if !no_datastore {
-        let group = DatastoreGroup::spawn(
-            Arc::clone(&rt),
-            DatastoreGroupConfig {
-                node_id,
-                node_id_hex: node_hex.clone(),
-                chunk_size,
-                storage_path: storage_path.clone(),
-                auth: if auth_enabled {
-                    Some(DatastoreAuthConfig {
-                        auth_dir: auth_dir_str.into(),
-                    })
-                } else {
-                    None
-                },
-                gc_interval,
-                disseminate_interval,
-            },
-        )
-        .expect("failed to start datastore");
-        // Register datastore plugin
-        let ds_plugin = plugins::datastore::DatastorePlugin::from_group(
-            &group,
-            Arc::clone(&rt),
-            chunk_size,
-            Arc::clone(&datastore_cache),
-        );
-        dash.register_plugin(Arc::new(ds_plugin));
-        Some(group)
-    } else {
-        eprintln!("Datastore: disabled");
-        // Register stopped datastore plugin (allows starting from dashboard)
-        let ds_plugin = plugins::datastore::DatastorePlugin::stopped(
-            Arc::clone(&rt),
-            chunk_size,
-            Arc::clone(&datastore_cache),
-        );
-        dash.register_plugin(Arc::new(ds_plugin));
-        None
-    };
-    // The datastore's metrics accumulator (the single source the plugin's CRUD
-    // records to) — cloned out before `ds_group` moves into `run_iroh`, so the
-    // emitter can frame its readout and stream its op events.
-    let ds_metrics = ds_group.as_ref().map(|g| Arc::clone(g.metrics()));
-
     // Distribution config
     eprintln!("Distribution: SWIM (transport: iroh, mode: reactive)");
     let swim_config = SwimConfig {
@@ -784,10 +651,7 @@ fn main() {
     let join_tx_dist = join_tx.clone();
 
     // Register peers plugin
-    let peers_plugin = plugins::peers::PeersPlugin::new(
-        Arc::clone(&peer_auth),
-        Some(join_tx),
-    );
+    let peers_plugin = plugins::peers::PeersPlugin::new(Arc::clone(&peer_auth), Some(join_tx));
     dash.register_plugin(Arc::new(peers_plugin));
 
     #[cfg(feature = "iroh")]
@@ -802,7 +666,6 @@ fn main() {
         rt,
         &dash,
         &stop,
-        ds_group,
         node_name,
         invite_code,
         join_rx,
@@ -814,13 +677,11 @@ fn main() {
         actor_codec,
         transport_router,
         collector,
-        ds_metrics,
-        datastore_cache,
     );
 
     #[cfg(not(feature = "iroh"))]
     {
-        let _ = (collector, ds_metrics, datastore_cache);
+        let _ = collector;
         eprintln!("iroh feature is required but not enabled");
         std::process::exit(1);
     }
@@ -843,7 +704,6 @@ fn run_iroh(
     rt: Arc<Runtime>,
     dash: &dashboard::DashboardHandle,
     stop: &Arc<AtomicBool>,
-    ds_group: Option<DatastoreGroup>,
     node_name: String,
     invite_code: String,
     join_rx: std::sync::mpsc::Receiver<dashboard::JoinPeerInfo>,
@@ -855,12 +715,9 @@ fn run_iroh(
     actor_codec: Arc<swactor_transport::CodecRegistry>,
     transport_router: Arc<swactor_transport::TransportRouter>,
     collector: Arc<StatsCollector>,
-    ds_metrics: Option<Arc<DatastoreMetrics>>,
-    datastore_cache: Arc<Mutex<Option<String>>>,
 ) {
     use distribution::iroh_driver::{IrohDriver, IrohDriverConfig};
     use iroh::{RelayMode, SecretKey};
-    use swactor::std::RuntimeNaming;
 
     // Evaluate relay candidacy and determine embedded relay bind address
     #[cfg(feature = "relay")]
@@ -880,9 +737,13 @@ fn run_iroh(
             Ok(()) => {
                 let public_ip = relay::PublicIpRule::outbound_ip();
                 if let Some(ip) = &public_ip {
-                    eprintln!("Relay: candidacy passed, will start on {bind_addr} (public IP: {ip})");
+                    eprintln!(
+                        "Relay: candidacy passed, will start on {bind_addr} (public IP: {ip})"
+                    );
                 } else {
-                    eprintln!("Relay: candidacy passed, will start on {bind_addr} (no public IP detected)");
+                    eprintln!(
+                        "Relay: candidacy passed, will start on {bind_addr} (no public IP detected)"
+                    );
                 }
                 (Some(bind_addr), public_ip)
             }
@@ -901,12 +762,16 @@ fn run_iroh(
 
     // Compute relay mode from known relay hosts (if any)
     let relay_mode = {
-        let urls: Vec<iroh::RelayUrl> = relay_hosts.iter()
+        let urls: Vec<iroh::RelayUrl> = relay_hosts
+            .iter()
             .filter_map(|host| {
                 let url_str = format!("http://{host}:{relay_port}/");
                 match url_str.parse::<iroh::RelayUrl>() {
                     Ok(u) => Some(u),
-                    Err(e) => { eprintln!("Relay: bad host {host}: {e}"); None }
+                    Err(e) => {
+                        eprintln!("Relay: bad host {host}: {e}");
+                        None
+                    }
                 }
             })
             .collect();
@@ -934,7 +799,7 @@ fn run_iroh(
         relay_mode,
         node: node_config,
         peer_auth: Some(peer_auth.clone()),
-        additional_alpns: vec![swactor_datastore::streams::ALPN.to_vec()],
+        additional_alpns: Vec::new(),
         #[cfg(feature = "relay")]
         embedded_relay_bind,
         #[cfg(feature = "relay")]
@@ -963,8 +828,7 @@ fn run_iroh(
     let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
     let relay_mirror: RelayMirror =
         Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-    let route_view: RouteView =
-        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+    let route_view: RouteView = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
     // Read-mirror of the cluster registry the telemetry tick reads to fill the
     // `dist.state` registry fields (size / tombstones / entries).
     let registry_view: RegistryView = Arc::new(std::sync::RwLock::new(Default::default()));
@@ -1030,8 +894,13 @@ fn run_iroh(
             mirror: Arc::clone(&membership_mirror),
         })
         .expect("spawn MembershipFanout");
-    rt.send_to(swim_addr, SwimIn::Subscribe { observer: fanout_addr })
-        .expect("subscribe membership fanout");
+    rt.send_to(
+        swim_addr,
+        SwimIn::Subscribe {
+            observer: fanout_addr,
+        },
+    )
+    .expect("subscribe membership fanout");
 
     // Ingress routing table: which local actor owns each inbound wire tag.
     let mut routes: std::collections::HashMap<String, swactor::actor::ActorAddress> =
@@ -1058,28 +927,13 @@ fn run_iroh(
         Arc::clone(&route_view),
     );
 
-    // Spawn StreamManager actor on the swactor runtime
-    let stream_mgr = swactor_datastore::streams::StreamManager::new(
-        driver.endpoint().clone(),
-        driver.tokio_handle(),
-        Arc::clone(&rt),
-    );
-    let stream_mgr_addr = rt.spawn(stream_mgr).expect("spawn StreamManager");
-    rt.register_name(swactor_datastore::streams::STREAM_MANAGER_NAME, stream_mgr_addr)
-        .expect("register StreamManager");
-
-    // Wire streams into the datastore
-    if let Some(group) = &ds_group {
-        group.configure_streams(stream_mgr_addr, driver.tokio_handle());
-    }
-
     eprintln!("Node {} started (iroh)", hex(&driver.node_id().0[..4]));
 
     // Join seed if provided (accepts hex or base58)
     if let Some(seed_str) = seed_node_id {
-        let seed_bytes = parse_node_id_str(&seed_str).expect("invalid seed node ID (expected hex or base58)");
-        let seed_key =
-            iroh::PublicKey::from_bytes(&seed_bytes).expect("invalid seed public key");
+        let seed_bytes =
+            parse_node_id_str(&seed_str).expect("invalid seed node ID (expected hex or base58)");
+        let seed_key = iroh::PublicKey::from_bytes(&seed_bytes).expect("invalid seed public key");
         let mut seed_addr = iroh::EndpointAddr::from(seed_key);
         // Include relay URLs so iroh can locate the seed through the relay
         for host in &relay_hosts {
@@ -1096,8 +950,13 @@ fn run_iroh(
     let actor_addrs = spawn_actors(actors, &rt, directory_addr, &driver);
 
     // Announce node name and relay URL to cluster gossip (via the MetadataActor).
-    rt.send_to(metadata_addr, MetadataIn::SetNodeName { name: node_name.clone() })
-        .ok();
+    rt.send_to(
+        metadata_addr,
+        MetadataIn::SetNodeName {
+            name: node_name.clone(),
+        },
+    )
+    .ok();
     let home_relay_set = if let Some(url) = driver.relay_url().map(|u| u.to_string()) {
         rt.send_to(metadata_addr, MetadataIn::SetRelayUrl { url: Some(url) })
             .ok();
@@ -1123,33 +982,14 @@ fn run_iroh(
     let join_overlay: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let members_overlay: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-    let dist_plugin = plugins::distribution::DistributionPlugin::new(
-        Arc::clone(&dist_cache),
-        Some(join_tx_dist),
-    );
+    let dist_plugin =
+        plugins::distribution::DistributionPlugin::new(Arc::clone(&dist_cache), Some(join_tx_dist));
     let dismissed_statuses = dist_plugin.dismissed_statuses();
     dash.register_plugin(Arc::new(dist_plugin));
 
     // Start dashboard HTTP on IrohDriver's tokio runtime
     dash.start_http(driver.tokio_handle());
     eprintln!("Dashboard at http://0.0.0.0:{dashboard_port}");
-
-    // ── Periodic side-work: ordinary async tasks on tokio::time::interval ──
-    // (NOT a thread::sleep pump). The datastore keeps its round-based cadence —
-    // one interval tick == one round — preserving the old 100ms/round semantics
-    // with zero datastore-crate change.
-    if let Some(group) = ds_group {
-        let stop = Arc::clone(stop);
-        tokio.spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_millis(100));
-            let mut round: u64 = 0;
-            while !stop.load(Ordering::Relaxed) {
-                interval.tick().await;
-                round += 1;
-                group.tick(round);
-            }
-        });
-    }
 
     // Demo heartbeat: route a Heartbeat to each demo actor on a fixed cadence.
     {
@@ -1178,7 +1018,12 @@ fn run_iroh(
             let mut interval = tokio::time::interval(Duration::from_millis(100));
             while !stop.load(Ordering::Relaxed) {
                 interval.tick().await;
-                let _ = rt.send_to(swim_addr, SwimIn::Tick { now: Instant::now() });
+                let _ = rt.send_to(
+                    swim_addr,
+                    SwimIn::Tick {
+                        now: Instant::now(),
+                    },
+                );
                 let _ = rt.send_to(registry_addr, RegistryIn::Tick);
                 let _ = rt.send_to(metadata_addr, MetadataIn::Tick);
                 let _ = rt.send_to(directory_addr, DirectoryIn::Tick);
@@ -1206,7 +1051,6 @@ fn run_iroh(
     let sink = LocalRenderSink {
         view: FleetView::new(Some(node_hex.clone())),
         dist_cache: Arc::clone(&dist_cache),
-        datastore_cache: Arc::clone(&datastore_cache),
         fleet_cache: Arc::clone(&fleet_cache),
         stats_slot: Arc::clone(&stats_slot),
         invite_code: Arc::clone(&invite_overlay),
@@ -1221,55 +1065,32 @@ fn run_iroh(
         },
         Box::new(sink),
     );
-    // The node drives `membership` from the SWIM observer (real transitions with a
-    // cause), so turn off the emitter's member-list diff to avoid duplicate,
-    // reason-less transitions.
-    emitter.use_external_membership();
-    rt.set_process_output_observer(emitter.process_observer());
-    // Stream datastore op events onto the node's own datastream.
-    if let Some(metrics) = &ds_metrics {
-        metrics.set_event_observer(Arc::new(NodeDatastoreObserver {
-            sink: emitter.event_sink(),
-        }));
-    }
+    rt.set_process_output_observer(
+        emitter.process_observer_with(telemetry::process_output_for_observer),
+    );
     // Seed identity with the descriptive fields known at startup; the relay URL
     // and listen addr are learned lazily and re-emitted from the loop below.
-    emitter.update_identity(&IdentityRecord {
+    emitter.submit_record(&IdentityRecord {
         node: node_hex.clone(),
         life,
         node_name: node_name.clone(),
         listen_addr: driver.listen_addr(),
-        relay_url: driver.relay_url().map(|u| u.to_string()).unwrap_or_default(),
+        relay_url: driver
+            .relay_url()
+            .map(|u| u.to_string())
+            .unwrap_or_default(),
         version: VERSION.to_string(),
     });
 
     tokio.block_on(async move {
         let mut home_relay_set = home_relay_set;
+        let mut host_sampler = telemetry::HostSampler::default();
         let mut last_snapshot = Instant::now();
         while !stop_loop.load(Ordering::Relaxed) {
             tokio::task::yield_now().await; // run iroh reader/writer/accept/dial tasks + reactor
             driver.pump_inbound_to_actors(); // decode received frames → actor mailboxes
             rt.tick(); // advance the actors: consume inbound + Tick, enqueue outbound
             driver.drain_outbox(&outbox); // actor-produced frames → iroh writes
-
-            // Forward incoming stream connections to StreamManager.
-            for (node_id, conn) in driver.drain_other_connections() {
-                let rt_clone = Arc::clone(&rt);
-                let mgr_addr = stream_mgr_addr;
-                let node_bytes = node_id.0;
-                driver.tokio_handle().spawn(async move {
-                    match swactor_datastore::streams::accept::handle_incoming(
-                        node_bytes, conn, &rt_clone, mgr_addr,
-                    )
-                    .await
-                    {
-                        Ok(()) => {}
-                        Err(e) => {
-                            eprintln!("stream accept: failed to handle incoming: {e}");
-                        }
-                    }
-                });
-            }
 
             // Drain discovered peers (dashboard "Add Peer") and auto-join them.
             {
@@ -1288,15 +1109,26 @@ fn run_iroh(
                                 if let Some(url_str) = &info.relay_url {
                                     match url_str.parse::<iroh::RelayUrl>() {
                                         Ok(url) => {
-                                            eprintln!("Auto-joining peer {} via relay {}", base58_encode(&info.node_id), url);
+                                            eprintln!(
+                                                "Auto-joining peer {} via relay {}",
+                                                base58_encode(&info.node_id),
+                                                url
+                                            );
                                             addr = addr.with_relay_url(url);
                                         }
                                         Err(e) => {
-                                            eprintln!("Auto-joining peer {} (bad relay URL {}: {e})", base58_encode(&info.node_id), url_str);
+                                            eprintln!(
+                                                "Auto-joining peer {} (bad relay URL {}: {e})",
+                                                base58_encode(&info.node_id),
+                                                url_str
+                                            );
                                         }
                                     }
                                 } else {
-                                    eprintln!("Auto-joining peer {} (no relay URL)", base58_encode(&info.node_id));
+                                    eprintln!(
+                                        "Auto-joining peer {} (no relay URL)",
+                                        base58_encode(&info.node_id)
+                                    );
                                 }
                                 for sa in &info.direct_addrs {
                                     addr = addr.with_ip_addr(*sa);
@@ -1312,13 +1144,17 @@ fn run_iroh(
             }
 
             // Lazily pick up home relay URL once the endpoint connects.
-            if !home_relay_set
-                && let Some(url) = driver.home_relay_url() {
-                    eprintln!("Relay URL (home): {url}");
-                    rt.send_to(metadata_addr, MetadataIn::SetRelayUrl { url: Some(url.to_string()) })
-                        .ok();
-                    home_relay_set = true;
-                }
+            if !home_relay_set && let Some(url) = driver.home_relay_url() {
+                eprintln!("Relay URL (home): {url}");
+                rt.send_to(
+                    metadata_addr,
+                    MetadataIn::SetRelayUrl {
+                        url: Some(url.to_string()),
+                    },
+                )
+                .ok();
+                home_relay_set = true;
+            }
 
             // Dashboard snapshot — throttled (UI refresh, not protocol cadence:
             // SWIM and the actors advance every iteration above).
@@ -1338,8 +1174,7 @@ fn run_iroh(
                     let mut relay_peers = 0u32;
                     let (mut alive, mut suspect, mut dead) = (0usize, 0usize, 0usize);
                     for e in ml.all_members() {
-                        let id: String =
-                            e.node_id.0.iter().map(|b| format!("{:02x}", b)).collect();
+                        let id: String = e.node_id.0.iter().map(|b| format!("{:02x}", b)).collect();
                         let state = match e.state {
                             MemberState::Alive => {
                                 alive += 1;
@@ -1398,7 +1233,7 @@ fn run_iroh(
                     let registry_entries = registry
                         .entries
                         .iter()
-                        .map(|e| catalog::RegistryEntryRec {
+                        .map(|e| RegistryEntryRec {
                             name: e.name.clone(),
                             actor_addr: hex(&e.actor_addr.0),
                             node_id: hex(&e.node_id.0),
@@ -1408,7 +1243,7 @@ fn run_iroh(
                     let cache = driver.location_cache_entries();
                     let cache_entries = cache
                         .iter()
-                        .map(|(addr, host)| catalog::CacheEntryRec {
+                        .map(|(addr, host)| CacheEntryRec {
                             actor_addr: hex(&addr.0),
                             node_id: hex(&host.0),
                         })
@@ -1418,7 +1253,7 @@ fn run_iroh(
                         .iter()
                         .map(|t| hex(&t.0))
                         .collect();
-                    emitter.submit_dist_state(&DistributionState {
+                    emitter.submit_record(&DistributionState {
                         directory_route_count: driver.directory_route_count() as u32,
                         peer_auth_mode: mode,
                         authorized_peer_count: count,
@@ -1429,36 +1264,6 @@ fn run_iroh(
                         cache_entries,
                         recent_probe_targets,
                         ..Default::default()
-                    });
-                }
-
-                // Consolidated datastore steady metrics from the shared accumulator.
-                if let Some(metrics) = &ds_metrics {
-                    let r = metrics.readout();
-                    emitter.submit_datastore_state(&DatastoreState {
-                        object_count: r.object_count,
-                        total_bytes: r.total_bytes,
-                        put_ops: r.put_ops,
-                        get_ops: r.get_ops,
-                        delete_ops: r.delete_ops,
-                        objects: r
-                            .objects
-                            .iter()
-                            .map(|o| catalog::ObjectRec {
-                                hash: o.hash.clone(),
-                                name: o.name.clone(),
-                                size_bytes: o.size_bytes,
-                            })
-                            .collect(),
-                        active_transfers: r
-                            .active_transfers
-                            .iter()
-                            .map(|t| catalog::TransferRec {
-                                hash: t.hash.clone(),
-                                chunks_received: t.chunks_received as u64,
-                                chunks_total: t.chunks_total as u64,
-                            })
-                            .collect(),
                     });
                 }
 
@@ -1480,13 +1285,13 @@ fn run_iroh(
                             message_type_counts: a.message_type_counts.clone(),
                         })
                         .collect();
-                    emitter.submit_actor_detail(&ActorRuntimeDetail { actors });
+                    emitter.submit_record(&ActorRuntimeDetail { actors });
 
                     // Worker-runtime counters (W7): the routing/error tallies and
                     // tick timing the runtime keeps per worker — live in-process but
                     // never on the pipe until now. Aggregated across workers from the
                     // same snapshot.
-                    let mut wc = catalog::WorkerCounters {
+                    let mut wc = WorkerCounters {
                         num_workers: rs.workers.len() as u32,
                         ..Default::default()
                     };
@@ -1510,16 +1315,20 @@ fn run_iroh(
                         .collect();
                     tick_us.sort_unstable();
                     wc.tick_p50_us = tick_us.get(tick_us.len() / 2).copied().unwrap_or(0);
-                    emitter.submit_worker_counters(&wc);
+                    emitter.submit_record(&wc);
                 }
 
                 // Real membership transitions (with cause) from the SWIM observer,
                 // submitted before the tick so they drain on this iteration. Replaces
                 // the emitter's reason-less member-list diff (`use_external_membership`).
                 for t in swim_telemetry.drain_transitions() {
-                    emitter.submit_membership(&datastream::catalog::MembershipTransition {
+                    emitter.submit_record(&MembershipTransition {
                         peer: hex(&t.peer.0),
-                        from: t.from.map(member_state_str).unwrap_or("unknown").to_string(),
+                        from: t
+                            .from
+                            .map(member_state_str)
+                            .unwrap_or("unknown")
+                            .to_string(),
                         to: member_state_str(t.to).to_string(),
                         reason: t.reason.to_string(),
                     });
@@ -1530,20 +1339,32 @@ fn run_iroh(
                 // observer's real probe round-trip median (0 until a probe completes).
                 {
                     let rs = rt.stats();
-                    emitter.tick(
-                        TickInput {
-                            members: &members,
-                            runtime: DsRuntimeStats {
-                                actors_live: rs.actors.len() as u32,
-                                mailbox_depth: rs.workers.iter().map(|w| w.mailbox_depth as u32).sum(),
-                                scheduled_tasks: rs.workers.iter().map(|w| w.num_actors as u32).sum(),
-                            },
-                            relay_connected: driver.home_relay_url().is_some(),
-                            relay_peers,
-                            rtt_ms_p50: swim_telemetry.rtt_ms_p50(),
-                        },
-                        true,
-                    );
+                    emitter.submit_record(&telemetry::read_host_resource(&mut host_sampler));
+                    emitter.submit_record(&DsRuntimeStats {
+                        actors_live: rs.actors.len() as u32,
+                        mailbox_depth: rs.workers.iter().map(|w| w.mailbox_depth as u32).sum(),
+                        scheduled_tasks: rs.workers.iter().map(|w| w.num_actors as u32).sum(),
+                    });
+                    emitter.submit_record(&TransportInternals {
+                        relay_connected: driver.home_relay_url().is_some(),
+                        direct_peers: 0,
+                        relay_peers,
+                        rtt_ms_p50: swim_telemetry.rtt_ms_p50(),
+                    });
+                    let assigned = emitter.assigned();
+                    let dropped = emitter.dropped();
+                    let loss_rate_ppm = if assigned == 0 {
+                        0
+                    } else {
+                        ((dropped as u128 * 1_000_000) / assigned as u128).min(u32::MAX as u128)
+                            as u32
+                    };
+                    emitter.submit_record(&DatastreamHealth {
+                        assigned,
+                        dropped,
+                        loss_rate_ppm,
+                    });
+                    emitter.tick();
                 }
 
                 // Push the synthesized runtime stats to the Overview/Actors page.
@@ -1611,12 +1432,14 @@ fn run_iroh(
                             let node_id_hex: String =
                                 nid.0.iter().map(|b| format!("{:02x}", b)).collect();
                             let (phase, detail) = match &status.phase {
-                                JoinPhase::Connecting { attempt, max_attempts } => {
-                                    ("connecting", Some(format!("{attempt}/{max_attempts}")))
-                                }
-                                JoinPhase::Sending { attempt, max_attempts } => {
-                                    ("sending", Some(format!("{attempt}/{max_attempts}")))
-                                }
+                                JoinPhase::Connecting {
+                                    attempt,
+                                    max_attempts,
+                                } => ("connecting", Some(format!("{attempt}/{max_attempts}"))),
+                                JoinPhase::Sending {
+                                    attempt,
+                                    max_attempts,
+                                } => ("sending", Some(format!("{attempt}/{max_attempts}"))),
                                 JoinPhase::Sent => ("sent", None),
                                 JoinPhase::Failed { error } => ("failed", Some(error.clone())),
                             };
@@ -1725,7 +1548,10 @@ fn persist_node_name(path: &std::path::Path, name: &str) {
     };
 
     if let Err(e) = std::fs::write(path, &updated) {
-        eprintln!("Warning: could not persist node_name to {}: {e}", path.display());
+        eprintln!(
+            "Warning: could not persist node_name to {}: {e}",
+            path.display()
+        );
     }
 }
 
@@ -1758,13 +1584,17 @@ fn persist_config_key(path: &std::path::Path, key: &str, value: &str) {
     };
 
     if let Err(e) = std::fs::write(path, &updated) {
-        eprintln!("Warning: could not persist {key} to {}: {e}", path.display());
+        eprintln!(
+            "Warning: could not persist {key} to {}: {e}",
+            path.display()
+        );
     }
 }
 
 /// Extract hostname from a relay URL like `http://167.71.x.x:3340/`.
 fn extract_relay_host(url: &str) -> Option<String> {
-    let stripped = url.strip_prefix("http://")
+    let stripped = url
+        .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))?;
     let host_port = stripped.trim_end_matches('/');
     // Handle bracket-enclosed IPv6: [::1]:3340
@@ -1776,7 +1606,11 @@ fn extract_relay_host(url: &str) -> Option<String> {
             Some(idx) => &host_port[..idx],
             None => host_port,
         };
-        if host.is_empty() { None } else { Some(host.to_string()) }
+        if host.is_empty() {
+            None
+        } else {
+            Some(host.to_string())
+        }
     }
 }
 
@@ -1814,7 +1648,10 @@ fn persist_config_array_key(path: &std::path::Path, key: &str, values: &[&str]) 
     };
 
     if let Err(e) = std::fs::write(path, &updated) {
-        eprintln!("Warning: could not persist {key} to {}: {e}", path.display());
+        eprintln!(
+            "Warning: could not persist {key} to {}: {e}",
+            path.display()
+        );
     }
 }
 

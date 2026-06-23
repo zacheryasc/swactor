@@ -6,7 +6,7 @@ pub mod worker;
 pub use process_observer::ProcessOutputObserver;
 
 // Re-export well-known environment key types for convenient access.
-pub use actor::{SpawnTimestamp, LogicalName, ServiceBinding, ExitValue, CapabilitySet};
+pub use actor::{CapabilitySet, ExitValue, LogicalName, ServiceBinding, SpawnTimestamp};
 
 pub(crate) mod channel;
 pub(crate) mod error;
@@ -26,10 +26,10 @@ pub mod std;
 
 // Platform-aware Instant: web_time on wasm, std::time on native.
 // web_time is a no-op re-export of std::time::Instant on non-wasm targets.
-#[cfg(feature = "wasm")]
-pub(crate) use web_time::Instant;
 #[cfg(not(feature = "wasm"))]
 pub(crate) use ::std::time::Instant;
+#[cfg(feature = "wasm")]
+pub(crate) use web_time::Instant;
 
 #[cfg(feature = "getrandom")]
 pub(crate) fn get_random(buf: &mut [u8]) {

@@ -53,8 +53,7 @@ fn from_hex_digit(b: u8) -> Option<u8> {
 // Bitcoin-flavoured base58 alphabet: no `0OIl`. Encoding preserves leading
 // zero bytes as leading `'1'` characters.
 
-const B58_ALPHABET: &[u8; 58] =
-    b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+const B58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /// Base58-encode a byte slice (Bitcoin alphabet).
 pub fn base58_encode(bytes: &[u8]) -> String {
@@ -99,10 +98,7 @@ pub fn base58_decode(input: &str) -> Option<[u8; 32]> {
         }
     }
     let mut buf: Vec<u8> = Vec::with_capacity(input.len());
-    let rest = first_nonzero
-        .into_iter()
-        .chain(chars)
-        .collect::<String>();
+    let rest = first_nonzero.into_iter().chain(chars).collect::<String>();
     for c in rest.chars() {
         let v = B58_ALPHABET.iter().position(|&a| a == c as u8)? as u32;
         let mut carry = v;
@@ -165,12 +161,10 @@ pub fn load_or_generate_keypair(path: &Path) -> Keypair {
         let file = KeyFile {
             secret_key_hex: hex_encode(&kp.secret_bytes()),
         };
-        let raw = serde_json::to_string_pretty(&file)
-            .expect("KeyFile is always serializable");
+        let raw = serde_json::to_string_pretty(&file).expect("KeyFile is always serializable");
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap_or_else(|e| {
-                panic!("failed to create dir {}: {e}", parent.display())
-            });
+            fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("failed to create dir {}: {e}", parent.display()));
         }
         fs::write(path, raw)
             .unwrap_or_else(|e| panic!("failed to write keypair at {}: {e}", path.display()));
@@ -196,17 +190,13 @@ mod tests {
 
     #[test]
     fn base58_roundtrip_node_id_width() {
-        let inputs: [[u8; 32]; 3] = [
-            [0u8; 32],
-            [0xff; 32],
-            {
-                let mut a = [0u8; 32];
-                for (i, slot) in a.iter_mut().enumerate() {
-                    *slot = (i as u8).wrapping_mul(31);
-                }
-                a
-            },
-        ];
+        let inputs: [[u8; 32]; 3] = [[0u8; 32], [0xff; 32], {
+            let mut a = [0u8; 32];
+            for (i, slot) in a.iter_mut().enumerate() {
+                *slot = (i as u8).wrapping_mul(31);
+            }
+            a
+        }];
         for bytes in inputs {
             let s = base58_encode(&bytes);
             assert_eq!(base58_decode(&s), Some(bytes));
@@ -241,4 +231,3 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
-

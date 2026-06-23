@@ -29,7 +29,13 @@ pub trait RuntimeExtension: Send + Sync {
     /// `parent` is the address of the spawning actor, or `None` for runtime-spawned actors.
     /// `uptime_ms` is milliseconds since runtime creation.
     /// Default: no-op (returns env unchanged).
-    fn on_spawn(&self, child: ActorAddress, parent: Option<ActorAddress>, env: Environment, uptime_ms: u64) -> Environment {
+    fn on_spawn(
+        &self,
+        child: ActorAddress,
+        parent: Option<ActorAddress>,
+        env: Environment,
+        uptime_ms: u64,
+    ) -> Environment {
         let _ = (child, parent, uptime_ms);
         env
     }
@@ -55,7 +61,9 @@ pub trait RuntimeExtension: Send + Sync {
 pub trait WorkerExtension: Send {
     /// Returns `true` if this extension has pending work (e.g., active timers).
     /// Used by the fast idle path to avoid unnecessary ticks.
-    fn has_pending_work(&self) -> bool { false }
+    fn has_pending_work(&self) -> bool {
+        false
+    }
 
     /// Called each tick before tick_all. Returns messages to deliver.
     fn on_tick(&mut self) -> Vec<(ActorAddress, Box<dyn Any + Send>)>;

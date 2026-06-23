@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use crate::actor::{ActorAddress, ActorInterface, Ctx, Down, MonitorRef, StopReason};
 use crate::Error;
+use crate::actor::{ActorAddress, ActorInterface, Ctx, Down, MonitorRef, StopReason};
 
-use super::ctx_ext::get_ext;
 use super::CtxMonitoring;
+use super::ctx_ext::get_ext;
 
 /// How a child should be restarted when it dies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,11 +145,7 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(
-        strategy: SupervisorStrategy,
-        max_restarts: u32,
-        specs: Vec<ChildSpec>,
-    ) -> Self {
+    pub fn new(strategy: SupervisorStrategy, max_restarts: u32, specs: Vec<ChildSpec>) -> Self {
         let children = (0..specs.len()).map(|_| None).collect();
         Self {
             strategy,
@@ -164,7 +160,9 @@ impl Supervisor {
     fn start_child(&mut self, ctx: &Ctx, idx: usize) -> Result<(), Error> {
         let addr = (self.specs[idx].start)(ctx)?;
         let mref = ctx.monitor(addr)?;
-        get_ext(ctx).supervisor_registry.register(ctx.self_addr(), addr);
+        get_ext(ctx)
+            .supervisor_registry
+            .register(ctx.self_addr(), addr);
         self.children[idx] = Some(ActiveChild {
             addr,
             _monitor_ref: mref,
@@ -187,9 +185,7 @@ impl Supervisor {
     /// Try to finish the coordinated restart: restart all children in `restart_set`.
     fn finish_restart(&mut self, ctx: &Ctx) {
         let restart_set = match &mut self.phase {
-            SupervisorPhase::Stopping { restart_set, .. } => {
-                std::mem::take(restart_set)
-            }
+            SupervisorPhase::Stopping { restart_set, .. } => std::mem::take(restart_set),
             _ => return,
         };
         self.phase = SupervisorPhase::Normal;

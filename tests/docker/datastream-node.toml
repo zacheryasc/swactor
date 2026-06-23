@@ -1,6 +1,5 @@
 # Minimal node config for the datastream demo cluster.
-# Keeps containers deterministic: no auth, no embedded relay, in-memory
-# datastore. Cluster discovery is driven by CLI flags in the compose file.
+# Keeps containers deterministic: no embedded relay. Cluster discovery is driven
+# by CLI flags in the compose file.
 dashboard_port = 9090
 relay = false
-auth = false

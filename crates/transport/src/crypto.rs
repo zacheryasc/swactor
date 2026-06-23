@@ -1,10 +1,10 @@
 //! Ed25519 keypair, signing, and verification.
 
+use crate::NodeId;
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde::de::{SeqAccess, Visitor};
 use serde::ser::SerializeTuple;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use crate::NodeId;
 
 /// Ed25519 signing keypair.
 ///
@@ -154,6 +154,9 @@ mod tests {
         let restored = Keypair::from_bytes(&kp.secret_bytes());
         assert_eq!(kp.node_id(), restored.node_id());
         // And the signatures match too (ed25519 is deterministic).
-        assert_eq!(kp.sign(b"deterministic").0, restored.sign(b"deterministic").0);
+        assert_eq!(
+            kp.sign(b"deterministic").0,
+            restored.sign(b"deterministic").0
+        );
     }
 }

@@ -178,7 +178,11 @@ fn copy_self_to_bin(dest: &Path) {
         });
     }
 
-    eprintln!("  copying {} -> {}", canonical_exe.display(), dest.display());
+    eprintln!(
+        "  copying {} -> {}",
+        canonical_exe.display(),
+        dest.display()
+    );
     fs::copy(&canonical_exe, dest).unwrap_or_else(|e| {
         eprintln!("  failed to copy binary: {e}");
         std::process::exit(1);

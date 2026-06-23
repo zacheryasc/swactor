@@ -122,15 +122,23 @@ pub enum SwimIn {
     JoinResponse(JoinResponse),
     // local control (§6.2)
     /// The clock. The only source of `now`; every temporal guard keys off it (§4.2).
-    Tick { now: Instant },
+    Tick {
+        now: Instant,
+    },
     /// A fire-and-forget egress to `to` failed (binding miss or transport drop, §4.3).
-    SendFailed { to: NodeId },
+    SendFailed {
+        to: NodeId,
+    },
     /// Application asks to join via `seeds`: send each a `JoinRequest{from=self}`.
-    Join { seeds: Vec<NodeId> },
+    Join {
+        seeds: Vec<NodeId>,
+    },
     /// Application asks to leave: gossip self as `Dead` at the current incarnation.
     Leave,
     /// Register `observer` as a `MembershipChanged` sink (§6.3).
-    Subscribe { observer: ActorAddress },
+    Subscribe {
+        observer: ActorAddress,
+    },
 }
 
 // ─── The sole observable (§6.3) ────────────────────────────────────────────────
@@ -212,39 +220,76 @@ impl SwimActor {
     fn dispatch(&self, ctx: &Ctx, actions: Vec<NodeAction>) {
         for action in actions {
             match action {
-                NodeAction::SendPing { to, sequence, piggyback } => self.send_to_node(
+                NodeAction::SendPing {
+                    to,
+                    sequence,
+                    piggyback,
+                } => self.send_to_node(
                     ctx,
                     to,
-                    SwimIn::Ping(Ping { from: self.self_id, sequence, piggyback }),
+                    SwimIn::Ping(Ping {
+                        from: self.self_id,
+                        sequence,
+                        piggyback,
+                    }),
                 ),
-                NodeAction::SendAck { to, sequence, piggyback } => self.send_to_node(
+                NodeAction::SendAck {
+                    to,
+                    sequence,
+                    piggyback,
+                } => self.send_to_node(
                     ctx,
                     to,
-                    SwimIn::Ack(Ack { from: self.self_id, sequence, piggyback }),
+                    SwimIn::Ack(Ack {
+                        from: self.self_id,
+                        sequence,
+                        piggyback,
+                    }),
                 ),
-                NodeAction::SendPingReq { relay, target, sequence, piggyback } => self
-                    .send_to_node(
-                        ctx,
-                        relay,
-                        SwimIn::PingReq(PingReq {
-                            from: self.self_id,
-                            target,
-                            sequence,
-                            piggyback,
-                        }),
-                    ),
-                NodeAction::ForwardAck { to, target, sequence, piggyback } => self.send_to_node(
+                NodeAction::SendPingReq {
+                    relay,
+                    target,
+                    sequence,
+                    piggyback,
+                } => self.send_to_node(
+                    ctx,
+                    relay,
+                    SwimIn::PingReq(PingReq {
+                        from: self.self_id,
+                        target,
+                        sequence,
+                        piggyback,
+                    }),
+                ),
+                NodeAction::ForwardAck {
+                    to,
+                    target,
+                    sequence,
+                    piggyback,
+                } => self.send_to_node(
                     ctx,
                     to,
                     // IndirectAck carries no `from`: the routing destination IS the
                     // original prober, and the message names only the probed target.
-                    SwimIn::IndirectAck(IndirectAck { target, sequence, piggyback }),
+                    SwimIn::IndirectAck(IndirectAck {
+                        target,
+                        sequence,
+                        piggyback,
+                    }),
                 ),
                 NodeAction::SendJoinResponse { to, members } => {
                     self.send_to_node(ctx, to, SwimIn::JoinResponse(JoinResponse { members }))
                 }
-                NodeAction::MembershipChanged { node_id, state, incarnation } => {
-                    let note = MembershipChanged { node_id, state, incarnation };
+                NodeAction::MembershipChanged {
+                    node_id,
+                    state,
+                    incarnation,
+                } => {
+                    let note = MembershipChanged {
+                        node_id,
+                        state,
+                        incarnation,
+                    };
                     for sub in &self.subscribers {
                         let _ = ctx.send(*sub, note.clone());
                     }
@@ -275,11 +320,15 @@ impl ActorInterface for SwimActor {
                 self.dispatch(ctx, acts);
             }
             SwimIn::PingReq(pr) => {
-                let acts = self.node.handle_ping_req(pr.from, pr.target, pr.sequence, &pr.piggyback);
+                let acts =
+                    self.node
+                        .handle_ping_req(pr.from, pr.target, pr.sequence, &pr.piggyback);
                 self.dispatch(ctx, acts);
             }
             SwimIn::IndirectAck(ia) => {
-                let acts = self.node.handle_indirect_ack(ia.target, ia.sequence, &ia.piggyback);
+                let acts = self
+                    .node
+                    .handle_indirect_ack(ia.target, ia.sequence, &ia.piggyback);
                 self.dispatch(ctx, acts);
             }
             SwimIn::JoinRequest(jr) => {

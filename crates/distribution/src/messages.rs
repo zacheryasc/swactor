@@ -2,8 +2,8 @@
 //! (registry, node metadata, directory), plus their JSON codec.
 
 use serde::{Deserialize, Serialize};
-use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 use swactor::Error;
+use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 
 use crate::node_metadata::NodeMetadataEntry;
 use crate::registry::RegistryEntry;
@@ -244,7 +244,9 @@ pub fn actor_codec_registry() -> CodecRegistry {
             SwimIn::PingReq(pr) => ("swactor_dist::PingReq", json(serde_json::to_vec(pr))?),
             SwimIn::IndirectAck(ia) => ("swactor_dist::IndirectAck", json(serde_json::to_vec(ia))?),
             SwimIn::JoinRequest(jr) => ("swactor_dist::JoinRequest", json(serde_json::to_vec(jr))?),
-            SwimIn::JoinResponse(jr) => ("swactor_dist::JoinResponse", json(serde_json::to_vec(jr))?),
+            SwimIn::JoinResponse(jr) => {
+                ("swactor_dist::JoinResponse", json(serde_json::to_vec(jr))?)
+            }
             // Local-control variants (§6.2) never leave the node.
             SwimIn::Tick { .. }
             | SwimIn::SendFailed { .. }
@@ -267,9 +269,15 @@ pub fn actor_codec_registry() -> CodecRegistry {
     cr.register_decoder::<SwimIn>("swactor_dist::Ping", |b| Ok(SwimIn::Ping(d(b)?)));
     cr.register_decoder::<SwimIn>("swactor_dist::Ack", |b| Ok(SwimIn::Ack(d(b)?)));
     cr.register_decoder::<SwimIn>("swactor_dist::PingReq", |b| Ok(SwimIn::PingReq(d(b)?)));
-    cr.register_decoder::<SwimIn>("swactor_dist::IndirectAck", |b| Ok(SwimIn::IndirectAck(d(b)?)));
-    cr.register_decoder::<SwimIn>("swactor_dist::JoinRequest", |b| Ok(SwimIn::JoinRequest(d(b)?)));
-    cr.register_decoder::<SwimIn>("swactor_dist::JoinResponse", |b| Ok(SwimIn::JoinResponse(d(b)?)));
+    cr.register_decoder::<SwimIn>("swactor_dist::IndirectAck", |b| {
+        Ok(SwimIn::IndirectAck(d(b)?))
+    });
+    cr.register_decoder::<SwimIn>("swactor_dist::JoinRequest", |b| {
+        Ok(SwimIn::JoinRequest(d(b)?))
+    });
+    cr.register_decoder::<SwimIn>("swactor_dist::JoinResponse", |b| {
+        Ok(SwimIn::JoinResponse(d(b)?))
+    });
 
     // ── Registry: RegistryIn::Gossip ⇄ RegistryGossip frame ──
     use crate::registry_actor::RegistryIn;
@@ -280,7 +288,9 @@ pub fn actor_codec_registry() -> CodecRegistry {
         )),
         _ => Err(Error::from("RegistryIn: only Gossip is network-encodable")),
     });
-    cr.register_decoder::<RegistryIn>(RegistryGossip::type_tag(), |b| Ok(RegistryIn::Gossip(d(b)?)));
+    cr.register_decoder::<RegistryIn>(RegistryGossip::type_tag(), |b| {
+        Ok(RegistryIn::Gossip(d(b)?))
+    });
 
     // ── Metadata: MetadataIn::Gossip ⇄ MetadataGossip frame ──
     use crate::node_metadata_actor::MetadataIn;
@@ -291,7 +301,9 @@ pub fn actor_codec_registry() -> CodecRegistry {
         )),
         _ => Err(Error::from("MetadataIn: only Gossip is network-encodable")),
     });
-    cr.register_decoder::<MetadataIn>(MetadataGossip::type_tag(), |b| Ok(MetadataIn::Gossip(d(b)?)));
+    cr.register_decoder::<MetadataIn>(MetadataGossip::type_tag(), |b| {
+        Ok(MetadataIn::Gossip(d(b)?))
+    });
 
     // ── Directory: DirectoryIn::Gossip ⇄ DirectoryGossip frame ──
     use crate::directory_actor::DirectoryIn;
@@ -302,7 +314,9 @@ pub fn actor_codec_registry() -> CodecRegistry {
         )),
         _ => Err(Error::from("DirectoryIn: only Gossip is network-encodable")),
     });
-    cr.register_decoder::<DirectoryIn>(DirectoryGossip::type_tag(), |b| Ok(DirectoryIn::Gossip(d(b)?)));
+    cr.register_decoder::<DirectoryIn>(DirectoryGossip::type_tag(), |b| {
+        Ok(DirectoryIn::Gossip(d(b)?))
+    });
 
     cr
 }

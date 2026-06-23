@@ -15,7 +15,7 @@
 //! - **G4d**: No transition sequence reaches `handle` after `on_stop`.
 //! - **G4e**: Suspension pauses message processing; resume restores it.
 
-use crate::worker::{should_skip_actor, is_on_stop_eligible};
+use crate::worker::{is_on_stop_eligible, should_skip_actor};
 
 // ─── Bounded mirror ─────────────────────────────────────────────────────────
 

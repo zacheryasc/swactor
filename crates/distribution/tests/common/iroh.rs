@@ -113,8 +113,8 @@ impl IrohNode {
     /// `RouteViewTransport` + `IrohRouteBinder`; `MembershipFanout` + `Subscribe`;
     /// the `routes` tag table; `enable_actor_bridge`).
     fn from_config(config: IrohDriverConfig) -> Self {
-        let mut driver =
-            IrohDriver::with_handle(test_tokio_handle(), config).expect("failed to create iroh driver");
+        let mut driver = IrohDriver::with_handle(test_tokio_handle(), config)
+            .expect("failed to create iroh driver");
         let node_id = driver.node_id();
 
         // The node's distribution config (SWIM/registry/metadata params).
@@ -194,8 +194,13 @@ impl IrohNode {
                 mirror: Arc::clone(&membership_mirror),
             })
             .expect("spawn MembershipFanout");
-        rt.send_to(swim_addr, SwimIn::Subscribe { observer: fanout_addr })
-            .expect("subscribe membership fanout");
+        rt.send_to(
+            swim_addr,
+            SwimIn::Subscribe {
+                observer: fanout_addr,
+            },
+        )
+        .expect("subscribe membership fanout");
 
         // Ingress routing table: which local actor owns each inbound wire tag.
         let mut routes: HashMap<String, ActorAddress> = HashMap::new();
@@ -447,7 +452,13 @@ pub fn spawn_test_relay() -> (iroh::RelayUrl, RelayGuard) {
         })
         .unwrap();
     let url = server.http_url().expect("relay has no HTTP URL");
-    (url, RelayGuard { _server: server, _rt: rt })
+    (
+        url,
+        RelayGuard {
+            _server: server,
+            _rt: rt,
+        },
+    )
 }
 
 // ─── N-node cluster ─────────────────────────────────────────────────────────

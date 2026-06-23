@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::Router;
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 
 use swactor::runtime::Runtime;
 
@@ -68,8 +68,14 @@ pub(crate) fn build_live_router(state: AppState) -> Router {
         // Plugin routes. The bare form must be registered separately: a
         // `{*rest}` wildcard never matches an empty remainder, and plugins
         // answer their model snapshot on the bare path.
-        .route("/api/plugin/{name}", get(handle_plugin_get_bare).post(handle_plugin_post_bare))
-        .route("/api/plugin/{name}/{*rest}", get(handle_plugin_get).post(handle_plugin_post))
+        .route(
+            "/api/plugin/{name}",
+            get(handle_plugin_get_bare).post(handle_plugin_post_bare),
+        )
+        .route(
+            "/api/plugin/{name}/{*rest}",
+            get(handle_plugin_get).post(handle_plugin_post),
+        )
         .route("/plugin/{name}", get(handle_plugin_page));
 
     router.with_state(state)
@@ -181,9 +187,10 @@ async fn handle_live_sse(
                     let warnings = warning_detector.check(&stats);
                     if !warnings.is_empty()
                         && let Ok(wjson) = serde_json::to_string(&warnings)
-                            && tx.send(format_sse("warnings", &wjson)).await.is_err() {
-                                return;
-                            }
+                        && tx.send(format_sse("warnings", &wjson)).await.is_err()
+                    {
+                        return;
+                    }
 
                     let json = serde_json::to_string(&stats).unwrap();
                     if tx.send(format_sse("stats", &json)).await.is_err() {
@@ -195,9 +202,10 @@ async fn handle_live_sse(
                     if tick_count.is_multiple_of(5) {
                         let topo = topology::worker_topology(&stats);
                         if let Ok(tjson) = serde_json::to_string(&topo)
-                            && tx.send(format_sse("topology", &tjson)).await.is_err() {
-                                return;
-                            }
+                            && tx.send(format_sse("topology", &tjson)).await.is_err()
+                        {
+                            return;
+                        }
                     }
                 } else if let Some(stats) = maybe_pushed {
                     // No live runtime: serve externally pushed stats (e.g. a
@@ -208,9 +216,10 @@ async fn handle_live_sse(
                     let warnings = warning_detector.check(&stats);
                     if !warnings.is_empty()
                         && let Ok(wjson) = serde_json::to_string(&warnings)
-                            && tx.send(format_sse("warnings", &wjson)).await.is_err() {
-                                return;
-                            }
+                        && tx.send(format_sse("warnings", &wjson)).await.is_err()
+                    {
+                        return;
+                    }
 
                     let json = serde_json::to_string(&stats).unwrap();
                     if tx.send(format_sse("stats", &json)).await.is_err() {
@@ -221,9 +230,10 @@ async fn handle_live_sse(
                     if tick_count.is_multiple_of(5) {
                         let topo = topology::worker_topology(&stats);
                         if let Ok(tjson) = serde_json::to_string(&topo)
-                            && tx.send(format_sse("topology", &tjson)).await.is_err() {
-                                return;
-                            }
+                            && tx.send(format_sse("topology", &tjson)).await.is_err()
+                        {
+                            return;
+                        }
                     }
                 }
             }
@@ -231,9 +241,10 @@ async fn handle_live_sse(
             // Poll all registered plugins
             for plugin in state.plugins.snapshot() {
                 if let Some(json) = plugin.snapshot_json()
-                    && tx.send(format_sse(plugin.name(), &json)).await.is_err() {
-                        return;
-                    }
+                    && tx.send(format_sse(plugin.name(), &json)).await.is_err()
+                {
+                    return;
+                }
             }
 
             // Send new activity events
@@ -255,8 +266,7 @@ async fn handle_live_sse(
         }
     });
 
-    Sse::new(ReceiverStream::new(rx).map(Ok))
-        .keep_alive(KeepAlive::default())
+    Sse::new(ReceiverStream::new(rx).map(Ok)).keep_alive(KeepAlive::default())
 }
 
 // ── JSON API handlers ───────────────────────────────────────────────────
@@ -389,9 +399,7 @@ fn dispatch_plugin(
             let code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             json_error(code, &message)
         }
-        crate::plugin::PluginResponse::NotFound => {
-            json_error(StatusCode::NOT_FOUND, "not found")
-        }
+        crate::plugin::PluginResponse::NotFound => json_error(StatusCode::NOT_FOUND, "not found"),
     }
 }
 
@@ -432,10 +440,7 @@ async fn handle_plugin_post_bare(
     dispatch_plugin(&state, "POST", &name, "", &params, &body)
 }
 
-async fn handle_plugin_page(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+async fn handle_plugin_page(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     let plugins = state.plugins.snapshot();
     let plugin = match plugins.iter().find(|p| p.name() == name) {
         Some(p) => p,
@@ -446,7 +451,11 @@ async fn handle_plugin_page(
     match plugin.html_page() {
         Some(html) => {
             let rendered = html.replace("__DASHBOARD_MODE__", "live");
-            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], rendered).into_response()
+            (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                rendered,
+            )
+                .into_response()
         }
         None => (StatusCode::NOT_FOUND, "no page for this plugin").into_response(),
     }
@@ -483,7 +492,11 @@ async fn handle_replay_sse(
             "total_stats": trace.stats_timeline.len(),
             "speed": speed,
         });
-        if tx.send(format_sse("replay_meta", &meta.to_string())).await.is_err() {
+        if tx
+            .send(format_sse("replay_meta", &meta.to_string()))
+            .await
+            .is_err()
+        {
             return;
         }
 
@@ -524,8 +537,7 @@ async fn handle_replay_sse(
             while stats_idx < trace.stats_timeline.len()
                 && trace.stats_timeline[stats_idx].timestamp_ms <= virtual_time
             {
-                let json =
-                    serde_json::to_string(&trace.stats_timeline[stats_idx].stats).unwrap();
+                let json = serde_json::to_string(&trace.stats_timeline[stats_idx].stats).unwrap();
                 if tx.send(format_sse("stats", &json)).await.is_err() {
                     return;
                 }
@@ -550,9 +562,7 @@ async fn handle_replay_sse(
             }
 
             // Check if replay is complete
-            if event_idx >= trace.events.len()
-                && stats_idx >= trace.stats_timeline.len()
-            {
+            if event_idx >= trace.events.len() && stats_idx >= trace.stats_timeline.len() {
                 let _ = tx.send(format_sse("done", "{}")).await;
                 return;
             }
@@ -561,6 +571,5 @@ async fn handle_replay_sse(
         }
     });
 
-    Sse::new(ReceiverStream::new(rx).map(Ok))
-        .keep_alive(KeepAlive::default())
+    Sse::new(ReceiverStream::new(rx).map(Ok)).keep_alive(KeepAlive::default())
 }

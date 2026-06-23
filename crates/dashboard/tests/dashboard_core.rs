@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use dashboard::RuntimeTrace;
 use dashboard::collector::StatsCollector;
 use dashboard::layer::{DashboardEvent, EventStore};
-use dashboard::RuntimeTrace;
 use swactor::actor::ActorAddress;
 use swactor::stats::{ActorSnapshot, StatsHook};
 
@@ -176,34 +176,43 @@ fn three_workers_report_independently_merged_view_is_complete() {
     let addr_c = ActorAddress::new_random();
 
     // Worker 0 reports 1 actor
-    collector.on_tick(0, &[ActorSnapshot {
-        address: addr_a,
-        mailbox_depth: 5,
-        last_msg_type: Some("Ping"),
-        messages_processed: 100,
-        poisoned: false,
-        message_type_counts: vec![],
-    }]);
+    collector.on_tick(
+        0,
+        &[ActorSnapshot {
+            address: addr_a,
+            mailbox_depth: 5,
+            last_msg_type: Some("Ping"),
+            messages_processed: 100,
+            poisoned: false,
+            message_type_counts: vec![],
+        }],
+    );
 
     // Worker 1 reports 1 actor
-    collector.on_tick(1, &[ActorSnapshot {
-        address: addr_b,
-        mailbox_depth: 0,
-        last_msg_type: None,
-        messages_processed: 50,
-        poisoned: false,
-        message_type_counts: vec![],
-    }]);
+    collector.on_tick(
+        1,
+        &[ActorSnapshot {
+            address: addr_b,
+            mailbox_depth: 0,
+            last_msg_type: None,
+            messages_processed: 50,
+            poisoned: false,
+            message_type_counts: vec![],
+        }],
+    );
 
     // Worker 2 reports 1 actor (poisoned)
-    collector.on_tick(2, &[ActorSnapshot {
-        address: addr_c,
-        mailbox_depth: 3,
-        last_msg_type: Some("BadMsg"),
-        messages_processed: 10,
-        poisoned: true,
-        message_type_counts: vec![],
-    }]);
+    collector.on_tick(
+        2,
+        &[ActorSnapshot {
+            address: addr_c,
+            mailbox_depth: 3,
+            last_msg_type: Some("BadMsg"),
+            messages_processed: 10,
+            poisoned: true,
+            message_type_counts: vec![],
+        }],
+    );
 
     // Dashboard reads merged view
     let details = collector.actor_details();
@@ -226,27 +235,33 @@ fn worker_update_replaces_stale_snapshot() {
     let addr = ActorAddress::new_random();
 
     // First tick: 1 actor with 10 messages
-    collector.on_tick(0, &[ActorSnapshot {
-        address: addr,
-        mailbox_depth: 5,
-        last_msg_type: None,
-        messages_processed: 10,
-        poisoned: false,
-        message_type_counts: vec![],
-    }]);
+    collector.on_tick(
+        0,
+        &[ActorSnapshot {
+            address: addr,
+            mailbox_depth: 5,
+            last_msg_type: None,
+            messages_processed: 10,
+            poisoned: false,
+            message_type_counts: vec![],
+        }],
+    );
 
     assert_eq!(collector.actor_details().len(), 1);
     assert_eq!(collector.actor_details()[0].messages_processed, 10);
 
     // Second tick: same actor now has 25 messages
-    collector.on_tick(0, &[ActorSnapshot {
-        address: addr,
-        mailbox_depth: 2,
-        last_msg_type: Some("Update"),
-        messages_processed: 25,
-        poisoned: false,
-        message_type_counts: vec![],
-    }]);
+    collector.on_tick(
+        0,
+        &[ActorSnapshot {
+            address: addr,
+            mailbox_depth: 2,
+            last_msg_type: Some("Update"),
+            messages_processed: 25,
+            poisoned: false,
+            message_type_counts: vec![],
+        }],
+    );
 
     let details = collector.actor_details();
     assert_eq!(details.len(), 1, "still 1 actor, not 2");
@@ -261,14 +276,17 @@ fn worker_reports_empty_after_all_actors_stop() {
     let addr = ActorAddress::new_random();
 
     // Worker 0 has actors
-    collector.on_tick(0, &[ActorSnapshot {
-        address: addr,
-        mailbox_depth: 0,
-        last_msg_type: None,
-        messages_processed: 5,
-        poisoned: false,
-        message_type_counts: vec![],
-    }]);
+    collector.on_tick(
+        0,
+        &[ActorSnapshot {
+            address: addr,
+            mailbox_depth: 0,
+            last_msg_type: None,
+            messages_processed: 5,
+            poisoned: false,
+            message_type_counts: vec![],
+        }],
+    );
     assert_eq!(collector.actor_details().len(), 1);
 
     // Worker 0 reports empty (all actors stopped)

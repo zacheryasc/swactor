@@ -1,6 +1,6 @@
+use crate::Error;
 use crate::actor::{ActorAddress, ActorInterface, EnvironmentBuilder, LogicalName, Message};
 use crate::runtime::Runtime;
-use crate::Error;
 
 use super::StdExtension;
 
@@ -21,7 +21,11 @@ pub trait RuntimeNaming {
     fn register_name(&self, name: impl Into<String>, addr: ActorAddress) -> Result<(), Error>;
 
     /// Spawn an actor with a registered name, returning its address.
-    fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error>;
+    fn spawn_named<A: ActorInterface>(
+        &self,
+        name: impl Into<String>,
+        actor: A,
+    ) -> Result<ActorAddress, Error>;
 
     /// Look up an actor address by its registered name.
     fn where_is(&self, name: &str) -> Option<ActorAddress>;
@@ -38,7 +42,11 @@ impl RuntimeNaming for Runtime {
         get_ext(self).name_registry.register(name.into(), addr)
     }
 
-    fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error> {
+    fn spawn_named<A: ActorInterface>(
+        &self,
+        name: impl Into<String>,
+        actor: A,
+    ) -> Result<ActorAddress, Error> {
         let name = name.into();
         let env = EnvironmentBuilder::new()
             .set(LogicalName(name.clone()))

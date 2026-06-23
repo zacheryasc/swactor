@@ -1,13 +1,16 @@
+use crate::Instant;
 use std::any::Any;
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread::Thread;
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
-use std::thread::Thread;
-use crate::Instant;
 
-use crate::actor::{Actor, ActorAddress, ActorInterface, AnyActor, Environment, ExitValue, Message, ResumeSignal, SpawnRequest, StopSignal, StopWithSignal, SystemInfo};
+use crate::actor::{
+    Actor, ActorAddress, ActorInterface, AnyActor, Environment, ExitValue, Message, ResumeSignal,
+    SpawnRequest, StopSignal, StopWithSignal, SystemInfo,
+};
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::RuntimeConfig;
@@ -15,9 +18,9 @@ use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContex
 use crate::extension::RuntimeExtension;
 use crate::stats::{StatsHook, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
+use crate::Error;
 pub use crate::stats::{RuntimeStats, WorkerInfo};
 use crate::worker::Worker;
-use crate::Error;
 
 /// Generic message inbox for receiving messages outside of the runtime.
 pub struct Inbox<M: Message> {
@@ -90,8 +93,8 @@ impl RuntimeHandle {
 }
 
 // Re-export Ctx for backwards compatibility
-pub use crate::actor::Ctx;
 use crate::actor::ContextInner;
+pub use crate::actor::Ctx;
 
 // ─── Runtime ─────────────────────────────────────────────────────────────────
 
@@ -194,8 +197,7 @@ impl ExternalSender {
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
             Some(wid) => {
-                self.transfer_txs[wid.as_usize()]
-                    .send(Envelope::new(addr, Box::new(msg)));
+                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(msg)));
                 notify_worker(&self.worker_threads, wid.as_usize());
                 Ok(())
             }
@@ -227,19 +229,13 @@ impl Runtime {
             let transfer_tx = transfer_rx.new_sender();
             transfer_txs.push(transfer_tx);
 
-            let spawn_rx =
-                Receiver::<SpawnRequest>::new(config.max_actors);
+            let spawn_rx = Receiver::<SpawnRequest>::new(config.max_actors);
             let spawn_tx = spawn_rx.new_sender();
             spawn_txs.push(spawn_tx);
 
             let stats = Arc::new(WorkerStats::new());
             worker_stats.push(stats.clone());
-            workers.push(Worker::new(
-                WorkerId(i),
-                transfer_rx,
-                spawn_rx,
-                stats,
-            ));
+            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats));
         }
 
         let placement = Placement::new(num_workers, worker_stats.clone());
@@ -282,8 +278,12 @@ impl Runtime {
         let worker_id = self.placement.next_worker();
         self.address_map.insert(addr, worker_id);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.spawn_txs[worker_id.as_usize()]
-            .send(SpawnRequest { addr, actor: boxed, parent: None, env: Environment::new() });
+        self.spawn_txs[worker_id.as_usize()].send(SpawnRequest {
+            addr,
+            actor: boxed,
+            parent: None,
+            env: Environment::new(),
+        });
 
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -296,13 +296,21 @@ impl Runtime {
     }
 
     /// Spawn an actor with a pre-built environment, returns its address.
-    pub fn spawn_with_env<A: ActorInterface>(&self, actor: A, env: Environment) -> Result<ActorAddress, Error> {
+    pub fn spawn_with_env<A: ActorInterface>(
+        &self,
+        actor: A,
+        env: Environment,
+    ) -> Result<ActorAddress, Error> {
         let addr = ActorAddress::new_random();
         let worker_id = self.placement.next_worker();
         self.address_map.insert(addr, worker_id);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.spawn_txs[worker_id.as_usize()]
-            .send(SpawnRequest { addr, actor: boxed, parent: None, env });
+        self.spawn_txs[worker_id.as_usize()].send(SpawnRequest {
+            addr,
+            actor: boxed,
+            parent: None,
+            env,
+        });
 
         #[cfg(feature = "tracing")]
         tracing::info!(
@@ -435,7 +443,10 @@ impl Runtime {
         self.is_running.store(true, Ordering::Release);
 
         #[cfg(feature = "tracing")]
-        tracing::info!(num_workers = self.config.num_threads.max(1), "runtime.started");
+        tracing::info!(
+            num_workers = self.config.num_threads.max(1),
+            "runtime.started"
+        );
 
         let workers: Vec<Worker> = self.tick_workers.replace(Vec::new());
 
@@ -466,23 +477,42 @@ impl Runtime {
 
     /// Returns a snapshot of runtime stats: actor placements and per-worker info.
     pub fn stats(&self) -> RuntimeStats {
-        let num_workers = if self.config.num_threads < 2 { 1 } else { self.config.num_threads };
+        let num_workers = if self.config.num_threads < 2 {
+            1
+        } else {
+            self.config.num_threads
+        };
 
-        let workers = self.worker_stats.iter().enumerate()
+        let workers = self
+            .worker_stats
+            .iter()
+            .enumerate()
             .map(|(i, ws)| ws.snapshot(i))
             .collect();
 
-        let actors = self.address_map.snapshot().into_iter()
+        let actors = self
+            .address_map
+            .snapshot()
+            .into_iter()
             .map(|(addr, wid)| (addr, wid.as_usize()))
             .collect();
 
-        let tick_timings = self.worker_stats.iter()
+        let tick_timings = self
+            .worker_stats
+            .iter()
             .map(|ws| ws.drain_tick_timings())
             .collect();
 
         let uptime_ms = self.created_at.elapsed().as_millis() as u64;
 
-        RuntimeStats { num_workers, uptime_ms, actors, workers, actor_details: Vec::new(), tick_timings }
+        RuntimeStats {
+            num_workers,
+            uptime_ms,
+            actors,
+            workers,
+            actor_details: Vec::new(),
+            tick_timings,
+        }
     }
 
     /// Request an actor to stop gracefully.
@@ -494,8 +524,7 @@ impl Runtime {
     pub fn stop_actor(&self, addr: ActorAddress) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
             Some(wid) => {
-                self.transfer_txs[wid.as_usize()]
-                    .send(Envelope::new(addr, Box::new(StopSignal)));
+                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(StopSignal)));
                 notify_worker(&self.worker_threads, wid.as_usize());
                 Ok(())
             }
@@ -550,15 +579,10 @@ impl Runtime {
     /// Whoever owns the socket decodes the wire bytes outside core and calls
     /// this to inject the resulting message for a local actor or inbox.
     #[cfg(feature = "transport")]
-    pub fn deliver_raw(
-        &self,
-        addr: ActorAddress,
-        msg: Box<dyn Any + Send>,
-    ) -> Result<(), Error> {
+    pub fn deliver_raw(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
             Some(wid) => {
-                self.transfer_txs[wid.as_usize()]
-                    .send(Envelope::new(addr, msg));
+                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, msg));
                 Ok(())
             }
             None => self.inbox_registry.try_deliver(addr, msg),
@@ -580,8 +604,7 @@ impl ContextInner for Runtime {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
         match self.address_map.lookup(&addr) {
             Some(wid) => {
-                self.transfer_txs[wid.as_usize()]
-                    .send(Envelope::new(addr, msg));
+                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, msg));
                 notify_worker(&self.worker_threads, wid.as_usize());
                 Ok(())
             }
@@ -592,16 +615,14 @@ impl ContextInner for Runtime {
     fn spawn_any(&self, request: SpawnRequest) {
         let worker_id = self.placement.next_worker();
         self.address_map.insert(request.addr, worker_id);
-        self.spawn_txs[worker_id.as_usize()]
-            .send(request);
+        self.spawn_txs[worker_id.as_usize()].send(request);
         notify_worker(&self.worker_threads, worker_id.as_usize());
     }
 
     fn request_stop(&self, addr: ActorAddress) {
         // From spawn context (outside worker), send StopSignal through transfer queue
         if let Some(wid) = self.address_map.lookup(&addr) {
-            self.transfer_txs[wid.as_usize()]
-                .send(Envelope::new(addr, Box::new(StopSignal)));
+            self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(StopSignal)));
             notify_worker(&self.worker_threads, wid.as_usize());
         }
     }
@@ -621,8 +642,7 @@ impl ContextInner for Runtime {
 
     fn request_resume(&self, addr: ActorAddress) {
         if let Some(wid) = self.address_map.lookup(&addr) {
-            self.transfer_txs[wid.as_usize()]
-                .send(Envelope::new(addr, Box::new(ResumeSignal)));
+            self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(ResumeSignal)));
             notify_worker(&self.worker_threads, wid.as_usize());
         }
     }
@@ -645,7 +665,9 @@ impl ContextInner for Runtime {
 
     fn system_info(&self) -> SystemInfo {
         let num_workers = self.config.num_threads.max(1);
-        let total_actors: usize = self.worker_stats.iter()
+        let total_actors: usize = self
+            .worker_stats
+            .iter()
             .map(|ws| ws.num_actors.load(Ordering::Relaxed))
             .sum();
         SystemInfo {

@@ -5,9 +5,9 @@
 //! propagation, tombstone dissemination, death-driven tombstoning across a
 //! cluster) is covered by `gossip_actors_transport.rs` and `registry_actor.rs`.
 
-use swactor::actor::ActorAddress;
 use distribution::registry::{ClusterRegistry, RegistryConfig, RegistryEntry};
 use distribution::types::NodeId;
+use swactor::actor::ActorAddress;
 
 // ─── LWW conflict — higher timestamp wins ──────────────────────────────────
 
@@ -135,5 +135,9 @@ fn tombstone_gc_removes_old_tombstones() {
     reg.gc_tick();
 
     // The tombstone should be gone.
-    assert_eq!(reg.tombstone_count(), 0, "tombstone should be GC'd after TTL");
+    assert_eq!(
+        reg.tombstone_count(),
+        0,
+        "tombstone should be GC'd after TTL"
+    );
 }

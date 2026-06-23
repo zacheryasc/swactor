@@ -1,8 +1,6 @@
 //! Docker cluster integration tests.
 //!
-//! These tests mirror the simulation tests in
-//! `crates/simulation/tests/distribution_sim.rs` but run against real
-//! Docker containers communicating over iroh/QUIC.
+//! These tests run against real Docker containers communicating over iroh/QUIC.
 //!
 //! Run with: `cargo test -p docker-tests -- --ignored`
 //! Requires: Docker with compose v2
@@ -34,8 +32,9 @@ fn cluster_of_five_converges() {
         Ok(()) => {
             // Verify each node's snapshot looks reasonable
             for (i, &port) in DASHBOARD_PORTS.iter().enumerate() {
-                let snap = poll_distribution(port)
-                    .unwrap_or_else(|| panic!("node {} (port {}) unreachable after convergence", i, port));
+                let snap = poll_distribution(port).unwrap_or_else(|| {
+                    panic!("node {} (port {}) unreachable after convergence", i, port)
+                });
                 assert!(
                     snap.alive_count >= 4,
                     "node {} should see >= 4 alive members, got {}",
@@ -86,7 +85,10 @@ fn node_death_is_detected() {
                     .map(|snap| snap.dead_count >= 1)
                     .unwrap_or(false)
             });
-            assert!(any_sees_dead, "at least one survivor should see a dead member");
+            assert!(
+                any_sees_dead,
+                "at least one survivor should see a dead member"
+            );
         }
         Err(diag) => {
             cluster.stop();
@@ -162,8 +164,7 @@ fn actors_resolvable_across_cluster() {
     let mut total_cache_size = 0;
 
     for (i, &port) in DASHBOARD_PORTS.iter().enumerate() {
-        let snap = poll_distribution(port)
-            .unwrap_or_else(|| panic!("node {} unreachable", i));
+        let snap = poll_distribution(port).unwrap_or_else(|| panic!("node {} unreachable", i));
 
         // Then: the directory has converged so each node knows >= its own 2 actors
         // (after convergence it knows the whole cluster's actors).

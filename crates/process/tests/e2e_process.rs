@@ -65,10 +65,15 @@ impl ActorInterface for E2eSpawnerActor {
     type Response = E2eSpawned;
 
     fn handle(&mut self, ctx: &Ctx, msg: E2eSpawnRequest) {
-        let addr = spawn_local_process(ctx, &msg.sender, msg.spec)
-            .expect("spawn_local_process failed");
+        let addr =
+            spawn_local_process(ctx, &msg.sender, msg.spec).expect("spawn_local_process failed");
         // Subscribe the notification inbox
-        let _ = ctx.send(addr, ProcessCommand::Subscribe { address: msg.subscriber });
+        let _ = ctx.send(
+            addr,
+            ProcessCommand::Subscribe {
+                address: msg.subscriber,
+            },
+        );
         let _ = ctx.send(msg.reply_to, E2eSpawned(addr));
     }
 }
@@ -108,7 +113,9 @@ fn echo_hello_full_lifecycle() {
     // Collect notifications: Started, Output("hello\n"), Exited(0)
     let msgs = tick_collect(&rt, &notif_inbox, 3, 200);
 
-    let has_started = msgs.iter().any(|m| matches!(m, ProcessNotification::Started { .. }));
+    let has_started = msgs
+        .iter()
+        .any(|m| matches!(m, ProcessNotification::Started { .. }));
     let has_output = msgs.iter().any(|m| {
         if let ProcessNotification::Output { data, .. } = m {
             String::from_utf8_lossy(data).contains("hello")
@@ -126,9 +133,21 @@ fn echo_hello_full_lifecycle() {
         )
     });
 
-    assert!(has_started, "should receive Started notification, got: {:?}", msgs);
-    assert!(has_output, "should receive Output with 'hello', got: {:?}", msgs);
-    assert!(has_exited, "should receive Exited(0) notification, got: {:?}", msgs);
+    assert!(
+        has_started,
+        "should receive Started notification, got: {:?}",
+        msgs
+    );
+    assert!(
+        has_output,
+        "should receive Output with 'hello', got: {:?}",
+        msgs
+    );
+    assert!(
+        has_exited,
+        "should receive Exited(0) notification, got: {:?}",
+        msgs
+    );
 
     // Verify ordering: Started before Output before Exited
     let started_idx = msgs
@@ -148,10 +167,7 @@ fn echo_hello_full_lifecycle() {
         started_idx < output_idx,
         "Started should come before Output"
     );
-    assert!(
-        output_idx < exited_idx,
-        "Output should come before Exited"
-    );
+    assert!(output_idx < exited_idx, "Output should come before Exited");
 }
 
 /// The per-node process-output observer is the mechanism a telemetry node uses
@@ -208,9 +224,9 @@ fn runtime_observer_taps_managed_process_output_by_basename() {
     let _ = tick_collect(&rt, &notif_inbox, 3, 200);
 
     let seen = recorder.seen.lock().unwrap().clone();
-    let captured = seen
-        .iter()
-        .any(|(label, is_stderr, text)| label == "echo" && !*is_stderr && text.contains("telemetry-line"));
+    let captured = seen.iter().any(|(label, is_stderr, text)| {
+        label == "echo" && !*is_stderr && text.contains("telemetry-line")
+    });
     assert!(
         captured,
         "observer should capture stdout of the managed process under its command basename, got: {seen:?}"
@@ -245,7 +261,8 @@ fn bad_command_reports_error_e2e() {
 
     let msgs = tick_collect(&rt, &notif_inbox, 1, 200);
     assert!(
-        msgs.iter().any(|m| matches!(m, ProcessNotification::Error { .. })),
+        msgs.iter()
+            .any(|m| matches!(m, ProcessNotification::Error { .. })),
         "should receive Error notification for bad command, got: {:?}",
         msgs
     );

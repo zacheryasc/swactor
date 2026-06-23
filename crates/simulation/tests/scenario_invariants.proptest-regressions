@@ -1,9 +1,0 @@
-# Seeds for failure cases proptest has generated in the past. It is
-# automatically read and these particular cases re-run before any
-# novel cases are generated.
-#
-# It is recommended to check this file in to source control so that
-# everyone who runs the test benefits from these saved cases.
-cc cd02addd2c2c3fc954a9e836986372246cfc8287d78ebc745fdbf5ecd62725de # shrinks to text = "name = \"g\"\nseed = 9223372036854775808\nduration_ns = 1\n\n[default_tick]\nperiod_ns = 1\n\n[default_link]\nlatency_ns = 0\njitter_stddev_ns = 0\nloss_prob_ppm = 0\nreorder_prob_ppm = 0\nbandwidth_bps = 1\ncold_dial_penalty_ns = 0\ncache_warm_after_ns = 0\ncache_invalidate_after_idle_ns = 1\n\n[[peers]]\nid = \"p0\"\nkind = \"swim\"\ninitial_state = \"alive\"\nkind_config = { probe_interval_ns = 1, suspicion_timeout_ns = 2 }\n\n"
-cc 70e98618b35dcec06e43194835d3fbc4b489b362bee6dd898585debc335dc215 # shrinks to text = "name = \"g\"\nseed = 9223372036854775808\nduration_ns = 1\n\n[default_tick]\nperiod_ns = 1\n\n[default_link]\nlatency_ns = 0\njitter_stddev_ns = 0\nloss_prob_ppm = 0\nreorder_prob_ppm = 0\nbandwidth_bps = 1\ncold_dial_penalty_ns = 0\ncache_warm_after_ns = 0\ncache_invalidate_after_idle_ns = 1\n\n[[peers]]\nid = \"p0\"\nkind = \"swim\"\ninitial_state = \"alive\"\nkind_config = { probe_interval_ns = 1, suspicion_timeout_ns = 2 }\n\n"
-cc 22d512b97dc56ecae361754da00f9f68d4bffb61ae59f465ad2bdb83dcdefbc6 # shrinks to text = "name = \"g\"\nseed = 9223372036854775808\nduration_ns = 1\n\n[default_tick]\nperiod_ns = 1\n\n[default_link]\nlatency_ns = 0\njitter_stddev_ns = 0\nloss_prob_ppm = 0\nreorder_prob_ppm = 0\nbandwidth_bps = 1\ncold_dial_penalty_ns = 0\ncache_warm_after_ns = 0\ncache_invalidate_after_idle_ns = 1\n\n[[peers]]\nid = \"p0\"\nkind = \"swim\"\ninitial_state = \"alive\"\nkind_config = { probe_interval_ns = 1, suspicion_timeout_ns = 2 }\n\n"

@@ -64,7 +64,8 @@ impl ActorCluster {
     /// Spawn `n` actors. Nodes `1..n` join via node 0 (the seed). Returns once
     /// the join requests have been issued (not yet converged).
     fn new(n: usize) -> Self {
-        let rt = Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
+        let rt =
+            Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
         let dir = SharedPeerDirectory::new();
         let now = Instant::now();
         let ids: Vec<NodeId> = (0..n).map(|i| id(i as u8)).collect();
@@ -73,12 +74,23 @@ impl ActorCluster {
         let mut inboxes = Vec::new();
         for &nid in &ids {
             let addr = rt
-                .spawn(SwimActor::new(nid, brisk_config(), now, Arc::new(dir.clone())))
+                .spawn(SwimActor::new(
+                    nid,
+                    brisk_config(),
+                    now,
+                    Arc::new(dir.clone()),
+                ))
                 .expect("spawn SwimActor");
             // Generation 0 binding; the actor resolves NodeId→ActorAddress here.
             dir.bind(nid, addr, 0);
             let inbox = rt.new_inbox::<MembershipChanged>().expect("inbox");
-            rt.send_to(addr, SwimIn::Subscribe { observer: *inbox.addr() }).unwrap();
+            rt.send_to(
+                addr,
+                SwimIn::Subscribe {
+                    observer: *inbox.addr(),
+                },
+            )
+            .unwrap();
             addrs.push(addr);
             inboxes.push(inbox);
         }
@@ -98,7 +110,8 @@ impl ActorCluster {
         let seed = c.ids[0];
         for i in 1..n {
             let addr = c.addrs[i];
-            c.rt.send_to(addr, SwimIn::Join { seeds: vec![seed] }).unwrap();
+            c.rt.send_to(addr, SwimIn::Join { seeds: vec![seed] })
+                .unwrap();
         }
         c.pump(8);
         c.drain();
@@ -160,7 +173,10 @@ impl ActorCluster {
         for m in &self.streams[observer] {
             ml.apply(m.node_id, m.state, m.incarnation);
         }
-        ml.all_members().iter().map(|e| (e.node_id.0, e.state)).collect()
+        ml.all_members()
+            .iter()
+            .map(|e| (e.node_id.0, e.state))
+            .collect()
     }
 
     /// Does `observer`'s folded view show `subject` in `state`?
@@ -194,7 +210,10 @@ fn an_unreachable_actor_is_detected_dead_by_survivors() {
     // on it being Dead — real detection driven by SendFailed + probe timeout,
     // not an injected death.
     let mut c = ActorCluster::new(4);
-    assert!(c.run_until(400, |c| c.all_converged_alive()), "precondition: must converge");
+    assert!(
+        c.run_until(400, |c| c.all_converged_alive()),
+        "precondition: must converge"
+    );
 
     // Genuinely silence node 3: drop its binding so nobody can deliver to it, and
     // stop ticking it (round() skips unbound nodes).
@@ -204,5 +223,8 @@ fn an_unreachable_actor_is_detected_dead_by_survivors() {
     let detected = c.run_until(2000, |c| {
         (0..4).all(|o| o == dead || c.sees(o, id(dead as u8), MemberState::Dead))
     });
-    assert!(detected, "survivors must converge on the unreachable node being Dead");
+    assert!(
+        detected,
+        "survivors must converge on the unreachable node being Dead"
+    );
 }

@@ -26,15 +26,17 @@ impl EventLoop {
 
         // Input thread
         let tx_input = tx.clone();
-        thread::spawn(move || loop {
-            // Poll with a timeout so the thread can eventually notice if the
-            // channel is dropped (tx_input.send will fail).
-            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    // Only handle key press events, not release/repeat
-                    if key.kind == KeyEventKind::Press {
-                        if tx_input.send(AppEvent::Key(key)).is_err() {
-                            return;
+        thread::spawn(move || {
+            loop {
+                // Poll with a timeout so the thread can eventually notice if the
+                // channel is dropped (tx_input.send will fail).
+                if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                    if let Ok(Event::Key(key)) = event::read() {
+                        // Only handle key press events, not release/repeat
+                        if key.kind == KeyEventKind::Press {
+                            if tx_input.send(AppEvent::Key(key)).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -42,10 +44,12 @@ impl EventLoop {
         });
 
         // Tick thread
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(tick_ms));
-            if tx.send(AppEvent::Tick).is_err() {
-                return;
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(tick_ms));
+                if tx.send(AppEvent::Tick).is_err() {
+                    return;
+                }
             }
         });
 
@@ -57,12 +61,14 @@ impl EventLoop {
         let (tx, rx) = mpsc::channel();
 
         let tx_input = tx.clone();
-        thread::spawn(move || loop {
-            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind == KeyEventKind::Press {
-                        if tx_input.send(AppEvent::Key(key)).is_err() {
-                            return;
+        thread::spawn(move || {
+            loop {
+                if event::poll(Duration::from_millis(100)).unwrap_or(false) {
+                    if let Ok(Event::Key(key)) = event::read() {
+                        if key.kind == KeyEventKind::Press {
+                            if tx_input.send(AppEvent::Key(key)).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
@@ -70,10 +76,12 @@ impl EventLoop {
         });
 
         let tx_tick = tx.clone();
-        thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(tick_ms));
-            if tx_tick.send(AppEvent::Tick).is_err() {
-                return;
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(tick_ms));
+                if tx_tick.send(AppEvent::Tick).is_err() {
+                    return;
+                }
             }
         });
 

@@ -18,9 +18,7 @@ use crate::actor::{ActorAddress, ActorInterface, StopReason};
 use crate::config::RuntimeConfig;
 use crate::runtime::{Ctx, Runtime};
 use crate::std::supervisor::compute_restart_set;
-use crate::std::{
-    ChildSpec, RestartPolicy, StdExtension, Supervisor, SupervisorStrategy,
-};
+use crate::std::{ChildSpec, RestartPolicy, StdExtension, Supervisor, SupervisorStrategy};
 use crate::worker::{is_on_stop_eligible, should_skip_actor};
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -41,7 +39,11 @@ const ALL_POLICIES: [RestartPolicy; 3] = [
     RestartPolicy::Temporary,
 ];
 
-const ALL_REASONS: [StopReason; 3] = [StopReason::Normal, StopReason::Panicked, StopReason::Completed];
+const ALL_REASONS: [StopReason; 3] = [
+    StopReason::Normal,
+    StopReason::Panicked,
+    StopReason::Completed,
+];
 
 const ALL_STRATEGIES: [SupervisorStrategy; 3] = [
     SupervisorStrategy::OneForOne,
@@ -172,10 +174,12 @@ fn g4_healthy_actor_handle_called() {
         let h_inbox = rt.new_inbox::<HandleCalled>().unwrap();
         let report_addr = *h_inbox.addr();
 
-        let addr = rt.spawn(DualReporter {
-            handle_to: report_addr,
-            stop_to: report_addr, // unused for this test path
-        }).unwrap();
+        let addr = rt
+            .spawn(DualReporter {
+                handle_to: report_addr,
+                stop_to: report_addr, // unused for this test path
+            })
+            .unwrap();
         rt.tick(); // on_start
 
         // Production decision: healthy actor should NOT be skipped
@@ -219,10 +223,12 @@ fn g4_poisoned_actor_no_handle_no_on_stop() {
             "production is_on_stop_eligible must return false for poisoned (stopping=false, poisoned=true)"
         );
 
-        let addr = rt.spawn(OnStartPanicker {
-            handle_to: *h_inbox.addr(),
-            stop_to: *s_inbox.addr(),
-        }).unwrap();
+        let addr = rt
+            .spawn(OnStartPanicker {
+                handle_to: *h_inbox.addr(),
+                stop_to: *s_inbox.addr(),
+            })
+            .unwrap();
         rt.tick(); // on_start panics → poisoned
 
         for _ in 0..msg_count {
@@ -231,10 +237,18 @@ fn g4_poisoned_actor_no_handle_no_on_stop() {
         tick_many(&rt, msg_count + 5);
 
         let handle_count: usize = std::iter::from_fn(|| h_inbox.try_recv()).count();
-        assert_eq!(handle_count, 0, "poisoned actor must not call handle (msg_count={})", msg_count);
+        assert_eq!(
+            handle_count, 0,
+            "poisoned actor must not call handle (msg_count={})",
+            msg_count
+        );
 
         let stop_count: usize = std::iter::from_fn(|| s_inbox.try_recv()).count();
-        assert_eq!(stop_count, 0, "poisoned actor must not call on_stop (msg_count={})", msg_count);
+        assert_eq!(
+            stop_count, 0,
+            "poisoned actor must not call on_stop (msg_count={})",
+            msg_count
+        );
     }
 }
 
@@ -259,10 +273,12 @@ fn g4_stopping_actor_no_handle_yes_on_stop() {
         let h_inbox = rt.new_inbox::<HandleCalled>().unwrap();
         let s_inbox = rt.new_inbox::<OnStopCalled>().unwrap();
 
-        let addr = rt.spawn(DualReporter {
-            handle_to: *h_inbox.addr(),
-            stop_to: *s_inbox.addr(),
-        }).unwrap();
+        let addr = rt
+            .spawn(DualReporter {
+                handle_to: *h_inbox.addr(),
+                stop_to: *s_inbox.addr(),
+            })
+            .unwrap();
         rt.tick(); // on_start
 
         rt.stop_actor(addr).unwrap();
@@ -295,9 +311,11 @@ fn g4_handle_panic_poisons_no_on_stop() {
     let rt = Runtime::new(RuntimeConfig::default());
     let s_inbox = rt.new_inbox::<OnStopCalled>().unwrap();
 
-    let addr = rt.spawn(HandlePanicker {
-        stop_to: *s_inbox.addr(),
-    }).unwrap();
+    let addr = rt
+        .spawn(HandlePanicker {
+            stop_to: *s_inbox.addr(),
+        })
+        .unwrap();
     rt.tick(); // on_start
 
     rt.send_to(addr, Ping).unwrap();
@@ -335,14 +353,20 @@ fn g4_exhaustive_decision_function_truth_table() {
                     skip,
                     poisoned || stopping || suspended,
                     "should_skip_actor({}, {}, {}) = {} but expected {}",
-                    poisoned, stopping, suspended, skip,
+                    poisoned,
+                    stopping,
+                    suspended,
+                    skip,
                     poisoned || stopping || suspended
                 );
                 combinations_tested += 1;
             }
         }
     }
-    assert_eq!(combinations_tested, 8, "must test all 8 flag combinations for should_skip_actor");
+    assert_eq!(
+        combinations_tested, 8,
+        "must test all 8 flag combinations for should_skip_actor"
+    );
 
     // is_on_stop_eligible: exhaustive over (stopping, poisoned)
     let mut on_stop_combinations = 0u32;
@@ -353,13 +377,18 @@ fn g4_exhaustive_decision_function_truth_table() {
                 eligible,
                 stopping && !poisoned,
                 "is_on_stop_eligible({}, {}) = {} but expected {}",
-                stopping, poisoned, eligible,
+                stopping,
+                poisoned,
+                eligible,
                 stopping && !poisoned
             );
             on_stop_combinations += 1;
         }
     }
-    assert_eq!(on_stop_combinations, 4, "must test all 4 flag combinations for is_on_stop_eligible");
+    assert_eq!(
+        on_stop_combinations, 4,
+        "must test all 4 flag combinations for is_on_stop_eligible"
+    );
 
     // determine_stop_reason: exhaustive over (poisoned, has_exit_value)
     let mut reason_combinations = 0u32;
@@ -381,7 +410,10 @@ fn g4_exhaustive_decision_function_truth_table() {
             reason_combinations += 1;
         }
     }
-    assert_eq!(reason_combinations, 4, "must test all 4 flag combinations for determine_stop_reason");
+    assert_eq!(
+        reason_combinations, 4,
+        "must test all 4 flag combinations for determine_stop_reason"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -405,20 +437,16 @@ fn g10_should_restart_matches_supervisor() {
             let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let sc = spawn_count.clone();
 
-            let spec = ChildSpec::new(
-                "test-child",
-                policy,
-                move |ctx| {
-                    sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let addr = match reason {
-                        StopReason::Panicked => ctx.spawn(PanicOnPing)?,
-                        StopReason::Completed => ctx.spawn(CompletedOnPing)?,
-                        StopReason::Normal => ctx.spawn(IdleChild)?,
-                    };
-                    let _ = ctx.send(child_report, ChildStarted(addr));
-                    Ok(addr)
-                },
-            );
+            let spec = ChildSpec::new("test-child", policy, move |ctx| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let addr = match reason {
+                    StopReason::Panicked => ctx.spawn(PanicOnPing)?,
+                    StopReason::Completed => ctx.spawn(CompletedOnPing)?,
+                    StopReason::Normal => ctx.spawn(IdleChild)?,
+                };
+                let _ = ctx.send(child_report, ChildStarted(addr));
+                Ok(addr)
+            });
 
             let sup = Supervisor::new(SupervisorStrategy::OneForOne, 10, vec![spec]);
             let _sup_addr = rt.spawn(sup).unwrap();
@@ -455,7 +483,10 @@ fn g10_should_restart_matches_supervisor() {
         }
     }
 
-    assert_eq!(combinations_tested, 9, "must test all 9 policy×reason combinations");
+    assert_eq!(
+        combinations_tested, 9,
+        "must test all 9 policy×reason combinations"
+    );
 }
 
 /// Exhaustive G10: OneForOne strategy restarts only the dead child.
@@ -472,8 +503,9 @@ fn g10_one_for_one_restarts_only_dead() {
             let report_inbox = rt.new_inbox::<ChildStarted>().unwrap();
             let report_addr = *report_inbox.addr();
 
-            let spawn_counts: Vec<Arc<std::sync::atomic::AtomicUsize>> =
-                (0..num_children).map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0))).collect();
+            let spawn_counts: Vec<Arc<std::sync::atomic::AtomicUsize>> = (0..num_children)
+                .map(|_| Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+                .collect();
 
             let specs: Vec<ChildSpec> = (0..num_children)
                 .map(|i| {
@@ -507,7 +539,8 @@ fn g10_one_for_one_restarts_only_dead() {
             }
             assert_eq!(child_addrs.len(), num_children, "all children must start");
 
-            let initial_counts: Vec<usize> = spawn_counts.iter()
+            let initial_counts: Vec<usize> = spawn_counts
+                .iter()
                 .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
                 .collect();
 
@@ -516,9 +549,11 @@ fn g10_one_for_one_restarts_only_dead() {
             tick_many(&rt, 10);
 
             // Verify against production compute_restart_set
-            let expected_set = compute_restart_set(SupervisorStrategy::OneForOne, dead_idx, num_children);
+            let expected_set =
+                compute_restart_set(SupervisorStrategy::OneForOne, dead_idx, num_children);
 
-            let final_counts: Vec<usize> = spawn_counts.iter()
+            let final_counts: Vec<usize> = spawn_counts
+                .iter()
                 .map(|c| c.load(std::sync::atomic::Ordering::SeqCst))
                 .collect();
 
@@ -536,7 +571,10 @@ fn g10_one_for_one_restarts_only_dead() {
         }
     }
 
-    assert_eq!(combinations_tested, 9, "must test all 9 num_children×dead_idx combinations");
+    assert_eq!(
+        combinations_tested, 9,
+        "must test all 9 num_children×dead_idx combinations"
+    );
 }
 
 /// Exhaustive G10: Temporary policy never restarts, regardless of strategy
@@ -563,20 +601,16 @@ fn g10_temporary_never_restarts() {
             let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let sc = spawn_count.clone();
 
-            let spec = ChildSpec::new(
-                "temp-child",
-                RestartPolicy::Temporary,
-                move |ctx| {
-                    sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let addr = match reason {
-                        StopReason::Panicked => ctx.spawn(PanicOnPing)?,
-                        StopReason::Completed => ctx.spawn(CompletedOnPing)?,
-                        StopReason::Normal => ctx.spawn(IdleChild)?,
-                    };
-                    let _ = ctx.send(child_report, ChildStarted(addr));
-                    Ok(addr)
-                },
-            );
+            let spec = ChildSpec::new("temp-child", RestartPolicy::Temporary, move |ctx| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let addr = match reason {
+                    StopReason::Panicked => ctx.spawn(PanicOnPing)?,
+                    StopReason::Completed => ctx.spawn(CompletedOnPing)?,
+                    StopReason::Normal => ctx.spawn(IdleChild)?,
+                };
+                let _ = ctx.send(child_report, ChildStarted(addr));
+                Ok(addr)
+            });
 
             let sup = Supervisor::new(strategy, 10, vec![spec]);
             let _sup_addr = rt.spawn(sup).unwrap();
@@ -609,7 +643,10 @@ fn g10_temporary_never_restarts() {
         }
     }
 
-    assert_eq!(combinations_tested, 9, "must test all 9 strategy×reason combinations");
+    assert_eq!(
+        combinations_tested, 9,
+        "must test all 9 strategy×reason combinations"
+    );
 }
 
 /// Exhaustive G10: Transient policy restarts only on panic.
@@ -628,20 +665,16 @@ fn g10_transient_restart_only_on_panic() {
             let spawn_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let sc = spawn_count.clone();
 
-            let spec = ChildSpec::new(
-                "transient-child",
-                RestartPolicy::Transient,
-                move |ctx| {
-                    sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    let addr = match reason {
-                        StopReason::Panicked => ctx.spawn(PanicOnPing)?,
-                        StopReason::Completed => ctx.spawn(CompletedOnPing)?,
-                        StopReason::Normal => ctx.spawn(IdleChild)?,
-                    };
-                    let _ = ctx.send(child_report, ChildStarted(addr));
-                    Ok(addr)
-                },
-            );
+            let spec = ChildSpec::new("transient-child", RestartPolicy::Transient, move |ctx| {
+                sc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let addr = match reason {
+                    StopReason::Panicked => ctx.spawn(PanicOnPing)?,
+                    StopReason::Completed => ctx.spawn(CompletedOnPing)?,
+                    StopReason::Normal => ctx.spawn(IdleChild)?,
+                };
+                let _ = ctx.send(child_report, ChildStarted(addr));
+                Ok(addr)
+            });
 
             let sup = Supervisor::new(strategy, 10, vec![spec]);
             let _sup_addr = rt.spawn(sup).unwrap();
@@ -677,7 +710,10 @@ fn g10_transient_restart_only_on_panic() {
         }
     }
 
-    assert_eq!(combinations_tested, 9, "must test all 9 strategy×reason combinations");
+    assert_eq!(
+        combinations_tested, 9,
+        "must test all 9 strategy×reason combinations"
+    );
 }
 
 /// Exhaustive G10: verify compute_restart_set for every strategy × child count × dead index.
@@ -695,9 +731,11 @@ fn g10_exhaustive_restart_set_computation() {
                 match strategy {
                     SupervisorStrategy::OneForOne => {
                         assert_eq!(
-                            result, vec![dead_idx],
+                            result,
+                            vec![dead_idx],
                             "OneForOne(dead={}, n={}) should restart only dead child",
-                            dead_idx, num_children
+                            dead_idx,
+                            num_children
                         );
                     }
                     SupervisorStrategy::OneForAll => {
@@ -723,7 +761,10 @@ fn g10_exhaustive_restart_set_computation() {
         }
     }
 
-    assert_eq!(combinations_tested, 30, "must test all 30 strategy×children×dead_idx combinations");
+    assert_eq!(
+        combinations_tested, 30,
+        "must test all 30 strategy×children×dead_idx combinations"
+    );
 }
 
 /// Exhaustive G10: verify should_restart for every policy × reason combination.
@@ -750,5 +791,8 @@ fn g10_exhaustive_should_restart_truth_table() {
         }
     }
 
-    assert_eq!(combinations_tested, 9, "must test all 9 policy×reason combinations");
+    assert_eq!(
+        combinations_tested, 9,
+        "must test all 9 policy×reason combinations"
+    );
 }

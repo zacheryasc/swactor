@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 
-pub use swactor_transport::NodeId;
 pub use crate::crypto::Signature;
+pub use swactor_transport::NodeId;
 
 // ─── MemberState ────────────────────────────────────────────────────────────
 

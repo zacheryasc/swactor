@@ -16,7 +16,7 @@ use swactor::actor::ActorAddress;
 use swactor::runtime::{Runtime, RuntimeConfig};
 
 use dashboard::datastream_source::FleetView;
-use datastream::catalog::RuntimeStats;
+use dashboard::telemetry::RuntimeStats;
 use datastream::DatastreamSink;
 use pipeline_parallel_inference::fleet::FleetEmitter;
 
@@ -58,7 +58,7 @@ fn stage_frames_over_cluster_transport_appear_in_the_fleet_table() {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut found = None;
     while Instant::now() < deadline {
-        emitter.tick(&[], RuntimeStats::default(), false, 0);
+        emitter.tick(&[], RuntimeStats::default(), false, 0, 0);
         rt.tick();
         let snapshot = cache.lock().unwrap().clone();
         if let Some(json) = snapshot {

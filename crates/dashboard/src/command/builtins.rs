@@ -200,7 +200,7 @@ impl CommandHandler for WorkerCommand {
                 return CommandResponse::err(
                     "worker",
                     format!("worker {id} not found (have 0..{})", stats.num_workers),
-                )
+                );
             }
         };
 
@@ -277,7 +277,7 @@ impl CommandHandler for ActorsCommand {
                 return CommandResponse::err(
                     "actors",
                     format!("unknown sort field `{other}` — use mailbox|worker|address"),
-                )
+                );
             }
         }
 
@@ -436,9 +436,10 @@ impl CommandHandler for PhasesCommand {
         let mut results = Vec::new();
         for (i, timings) in stats.tick_timings.iter().enumerate() {
             if let Some(wid) = worker_filter
-                && i != wid {
-                    continue;
-                }
+                && i != wid
+            {
+                continue;
+            }
             let breakdown = compute_phase_breakdown(timings);
             results.push(serde_json::json!({
                 "worker_id": i,

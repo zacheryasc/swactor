@@ -121,4 +121,3 @@ fn registry_and_metadata_gossip_round_trip() {
     assert_eq!(&tag, "swactor_dist::MetadataGossip");
     assert!(codecs.decode(&tag, &bytes).unwrap().is::<MetadataGossip>());
 }
-

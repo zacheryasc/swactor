@@ -7,17 +7,14 @@
 mod common;
 use common::*;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 /// Poll `inbox` until a message arrives or `timeout` elapses.
-fn poll_inbox<M: swactor::actor::Message>(
-    inbox: &Inbox<M>,
-    timeout: Duration,
-) -> Option<M> {
+fn poll_inbox<M: swactor::actor::Message>(inbox: &Inbox<M>, timeout: Duration) -> Option<M> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(msg) = inbox.try_recv() {
@@ -59,33 +56,71 @@ fn single_vs_multi_threaded_basics() {
     let rt = std_runtime(RuntimeConfig::default());
     let addr = rt.spawn(PingPongActor).unwrap();
     let inbox = rt.new_inbox::<Pong>().unwrap();
-    rt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt.send_to(
+        addr,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .unwrap();
 
     assert!(inbox.try_recv().is_none(), "no processing before tick");
     tick_n(&rt, 2);
-    assert!(inbox.try_recv().is_some(), "tick() drives single-threaded processing");
+    assert!(
+        inbox.try_recv().is_some(),
+        "tick() drives single-threaded processing"
+    );
 
     // ── Part B: Multi-threaded processes without ticking ──
-    let rt_mt = std_runtime(RuntimeConfig { num_threads: 4, ..Default::default() });
+    let rt_mt = std_runtime(RuntimeConfig {
+        num_threads: 4,
+        ..Default::default()
+    });
     let addr = rt_mt.spawn(PingPongActor).unwrap();
     let inbox = rt_mt.new_inbox::<Pong>().unwrap();
-    rt_mt.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+    rt_mt
+        .send_to(
+            addr,
+            Ping {
+                reply_to: *inbox.addr(),
+            },
+        )
+        .unwrap();
 
     let handle = rt_mt.run().unwrap();
     let reply = poll_inbox(&inbox, Duration::from_secs(5));
-    assert!(reply.is_some(), "background workers process without manual ticking");
+    assert!(
+        reply.is_some(),
+        "background workers process without manual ticking"
+    );
 
     // ── Part C: Cross-worker delegation (2 threads, spawn child from handler) ──
     let addr2 = handle.runtime.spawn(DelegatorActor).unwrap();
     let done_inbox = handle.runtime.new_inbox::<Done>().unwrap();
-    handle.runtime.send_to(addr2, Forward { value: 3, reply_to: *done_inbox.addr() }).unwrap();
+    handle
+        .runtime
+        .send_to(
+            addr2,
+            Forward {
+                value: 3,
+                reply_to: *done_inbox.addr(),
+            },
+        )
+        .unwrap();
 
     let reply = poll_inbox(&done_inbox, Duration::from_secs(5));
-    assert_eq!(reply, Some(Done(6)), "cross-worker delegation delivers reply");
+    assert_eq!(
+        reply,
+        Some(Done(6)),
+        "cross-worker delegation delivers reply"
+    );
 
     // ── Part D: Custom thread count reflected in stats ──
     let stats = handle.runtime.stats();
-    assert_eq!(stats.num_workers, 4, "runtime respects requested thread count");
+    assert_eq!(
+        stats.num_workers, 4,
+        "runtime respects requested thread count"
+    );
 
     // ── Part E: Clean shutdown ──
     handle.shutdown();
@@ -112,12 +147,22 @@ fn mt_high_volume_delivery() {
         let rt = std_runtime(cfg());
         let counter = Arc::new(AtomicUsize::new(0));
         let dummy = rt.new_inbox::<Pong>().unwrap();
-        let receiver = rt.spawn(CountingPingActor { counter: counter.clone() }).unwrap();
+        let receiver = rt
+            .spawn(CountingPingActor {
+                counter: counter.clone(),
+            })
+            .unwrap();
 
         let total_expected = 50 * 100;
         for _ in 0..50 {
             for _ in 0..100 {
-                rt.send_to(receiver, Ping { reply_to: *dummy.addr() }).unwrap();
+                rt.send_to(
+                    receiver,
+                    Ping {
+                        reply_to: *dummy.addr(),
+                    },
+                )
+                .unwrap();
             }
         }
 
@@ -125,7 +170,10 @@ fn mt_high_volume_delivery() {
         let processed = wait_for_count(&counter, total_expected, Duration::from_secs(5));
         handle.shutdown();
         handle.join();
-        assert_eq!(processed, total_expected, "all 5000 messages delivered to single receiver");
+        assert_eq!(
+            processed, total_expected,
+            "all 5000 messages delivered to single receiver"
+        );
     }
 
     // ── Part B: 200 concurrent spawn+send pairs ──
@@ -134,8 +182,18 @@ fn mt_high_volume_delivery() {
         let counter = Arc::new(AtomicUsize::new(0));
         let dummy = rt.new_inbox::<Pong>().unwrap();
         for _ in 0..200 {
-            let a = rt.spawn(CountingPingActor { counter: counter.clone() }).unwrap();
-            rt.send_to(a, Ping { reply_to: *dummy.addr() }).unwrap();
+            let a = rt
+                .spawn(CountingPingActor {
+                    counter: counter.clone(),
+                })
+                .unwrap();
+            rt.send_to(
+                a,
+                Ping {
+                    reply_to: *dummy.addr(),
+                },
+            )
+            .unwrap();
         }
 
         let handle = rt.run().unwrap();
@@ -147,16 +205,32 @@ fn mt_high_volume_delivery() {
 
     // ── Part C: 50-level chain across workers ──
     {
-        let rt = std_runtime(RuntimeConfig { num_threads: 2, max_actors: 5_000, ..Default::default() });
+        let rt = std_runtime(RuntimeConfig {
+            num_threads: 2,
+            max_actors: 5_000,
+            ..Default::default()
+        });
         let addr = rt.spawn(ChainActor).unwrap();
         let inbox = rt.new_inbox::<Done>().unwrap();
-        rt.send_to(addr, ChainMsg { remaining: 50, depth: 0, reply_to: *inbox.addr() }).unwrap();
+        rt.send_to(
+            addr,
+            ChainMsg {
+                remaining: 50,
+                depth: 0,
+                reply_to: *inbox.addr(),
+            },
+        )
+        .unwrap();
 
         let handle = rt.run().unwrap();
         let reply = poll_inbox(&inbox, Duration::from_secs(5));
         handle.shutdown();
         handle.join();
-        assert_eq!(reply, Some(Done(50)), "50-level chain completes across workers");
+        assert_eq!(
+            reply,
+            Some(Done(50)),
+            "50-level chain completes across workers"
+        );
     }
 }
 
@@ -180,7 +254,12 @@ fn mt_panic_isolation_under_load() {
     let mut healthy_addrs = Vec::new();
     for _ in 0..10 {
         panic_addrs.push(rt.spawn(PanicActor).unwrap());
-        healthy_addrs.push(rt.spawn(CountingPingActor { counter: counter.clone() }).unwrap());
+        healthy_addrs.push(
+            rt.spawn(CountingPingActor {
+                counter: counter.clone(),
+            })
+            .unwrap(),
+        );
     }
 
     // Trigger panics and flood healthy actors.
@@ -189,7 +268,13 @@ fn mt_panic_isolation_under_load() {
     }
     for &addr in &healthy_addrs {
         for _ in 0..100 {
-            rt.send_to(addr, Ping { reply_to: *dummy.addr() }).unwrap();
+            rt.send_to(
+                addr,
+                Ping {
+                    reply_to: *dummy.addr(),
+                },
+            )
+            .unwrap();
         }
     }
 
@@ -213,7 +298,10 @@ fn mt_panic_isolation_under_load() {
 #[test]
 fn worker_parking_and_shutdown() {
     // ── Part A: Parked workers wake on send ──
-    let rt = std_runtime(RuntimeConfig { num_threads: 2, ..Default::default() });
+    let rt = std_runtime(RuntimeConfig {
+        num_threads: 2,
+        ..Default::default()
+    });
     let addr = rt.spawn(PingPongActor).unwrap();
     let inbox = rt.new_inbox::<Pong>().unwrap();
 
@@ -221,27 +309,53 @@ fn worker_parking_and_shutdown() {
     std::thread::sleep(Duration::from_millis(50)); // Let workers park.
 
     let before = Instant::now();
-    handle.runtime.send_to(addr, Ping { reply_to: *inbox.addr() }).unwrap();
+    handle
+        .runtime
+        .send_to(
+            addr,
+            Ping {
+                reply_to: *inbox.addr(),
+            },
+        )
+        .unwrap();
     let reply = poll_inbox(&inbox, Duration::from_secs(1));
     let latency = before.elapsed();
 
     assert!(reply.is_some(), "parked worker should wake and process");
-    assert!(latency.as_millis() < 100, "wake latency should be <100ms, was {:?}", latency);
+    assert!(
+        latency.as_millis() < 100,
+        "wake latency should be <100ms, was {:?}",
+        latency
+    );
 
     // ── Part B: Send after run() delivers ──
     let addr2 = handle.runtime.spawn(PingPongActor).unwrap();
     let inbox2 = handle.runtime.new_inbox::<Pong>().unwrap();
     std::thread::sleep(Duration::from_millis(10));
-    handle.runtime.send_to(addr2, Ping { reply_to: *inbox2.addr() }).unwrap();
+    handle
+        .runtime
+        .send_to(
+            addr2,
+            Ping {
+                reply_to: *inbox2.addr(),
+            },
+        )
+        .unwrap();
 
     let reply2 = poll_inbox(&inbox2, Duration::from_secs(5));
-    assert!(reply2.is_some(), "message sent after run() must be delivered");
+    assert!(
+        reply2.is_some(),
+        "message sent after run() must be delivered"
+    );
 
     handle.shutdown();
     handle.join();
 
     // ── Part C: Shutdown wakes parked workers quickly ──
-    let rt2 = std_runtime(RuntimeConfig { num_threads: 4, ..Default::default() });
+    let rt2 = std_runtime(RuntimeConfig {
+        num_threads: 4,
+        ..Default::default()
+    });
     let h2 = rt2.run().unwrap();
     std::thread::sleep(Duration::from_millis(50)); // Let workers park.
 
@@ -267,11 +381,21 @@ fn sustained_throughput_no_message_loss() {
     let rt = std_runtime(RuntimeConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let dummy = rt.new_inbox::<Pong>().unwrap();
-    let addr = rt.spawn(CountingPingActor { counter: counter.clone() }).unwrap();
+    let addr = rt
+        .spawn(CountingPingActor {
+            counter: counter.clone(),
+        })
+        .unwrap();
 
     for batch in 0..10 {
         for _ in 0..100 {
-            rt.send_to(addr, Ping { reply_to: *dummy.addr() }).unwrap();
+            rt.send_to(
+                addr,
+                Ping {
+                    reply_to: *dummy.addr(),
+                },
+            )
+            .unwrap();
         }
         tick_n(&rt, 5);
         let processed = counter.load(Ordering::SeqCst);
@@ -295,7 +419,10 @@ fn sustained_throughput_no_message_loss() {
 #[test]
 fn load_aware_actor_placement() {
     // ── Part A: Round-robin fallback on fresh runtime (4 workers, 100 actors) ──
-    let rt = std_runtime(RuntimeConfig { num_threads: 4, ..Default::default() });
+    let rt = std_runtime(RuntimeConfig {
+        num_threads: 4,
+        ..Default::default()
+    });
     for _ in 0..100 {
         rt.spawn(CounterActor { count: 0 }).unwrap();
     }
@@ -311,12 +438,16 @@ fn load_aware_actor_placement() {
         assert!(
             w.num_actors >= 20 && w.num_actors <= 30,
             "worker {} has {} actors, expected ~25 (round-robin)",
-            w.id, w.num_actors
+            w.id,
+            w.num_actors
         );
     }
 
     // ── Part B: Imbalanced load biases toward lighter worker ──
-    let rt2 = std_runtime(RuntimeConfig { num_threads: 2, ..Default::default() });
+    let rt2 = std_runtime(RuntimeConfig {
+        num_threads: 2,
+        ..Default::default()
+    });
     let mut addrs = Vec::new();
     for _ in 0..20 {
         addrs.push(rt2.spawn(CounterActor { count: 0 }).unwrap());
@@ -344,11 +475,18 @@ fn load_aware_actor_placement() {
     h2.join();
 
     let total_actors: usize = stats2.workers.iter().map(|w| w.num_actors).sum();
-    assert!(total_actors >= 20, "expected at least 20 actors, got {total_actors}");
+    assert!(
+        total_actors >= 20,
+        "expected at least 20 actors, got {total_actors}"
+    );
     assert!(
         stats2.workers.iter().all(|w| w.num_actors > 0),
         "both workers should have actors: {:?}",
-        stats2.workers.iter().map(|w| w.num_actors).collect::<Vec<_>>()
+        stats2
+            .workers
+            .iter()
+            .map(|w| w.num_actors)
+            .collect::<Vec<_>>()
     );
 
     // ── Part C: Single-worker degrades gracefully ──

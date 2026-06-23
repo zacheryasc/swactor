@@ -48,7 +48,10 @@ impl JobStatus {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobStatus::Passed | JobStatus::Failed { .. } | JobStatus::Skipped | JobStatus::Interrupted
+            JobStatus::Passed
+                | JobStatus::Failed { .. }
+                | JobStatus::Skipped
+                | JobStatus::Interrupted
         )
     }
 }
@@ -109,7 +112,10 @@ pub struct JobSuccess;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum JobFailure {
-    CommandFailed { exit_code: i32, last_lines: Vec<String> },
+    CommandFailed {
+        exit_code: i32,
+        last_lines: Vec<String>,
+    },
     SshError(String),
     ExecError(String),
     Timeout,
@@ -236,16 +242,14 @@ impl PipelineExecution {
         }
 
         // If failure or interruption, skip all transitive dependents.
-        if matches!(
-            status,
-            JobStatus::Failed { .. } | JobStatus::Interrupted
-        ) {
+        if matches!(status, JobStatus::Failed { .. } | JobStatus::Interrupted) {
             let to_skip = self.transitive_dependents(job_name);
             for dep_name in to_skip {
                 if let Some(dep_job) = self.jobs.get_mut(&dep_name)
-                    && dep_job.status == JobStatus::Pending {
-                        dep_job.status = JobStatus::Skipped;
-                    }
+                    && dep_job.status == JobStatus::Pending
+                {
+                    dep_job.status = JobStatus::Skipped;
+                }
             }
         }
 
@@ -262,12 +266,10 @@ impl PipelineExecution {
                 JobStatus::Running | JobStatus::Provisioning | JobStatus::WaitingForProvisioner
             )
         });
-        let any_failed = self.jobs.values().any(|j| {
-            matches!(
-                j.status,
-                JobStatus::Failed { .. } | JobStatus::Interrupted
-            )
-        });
+        let any_failed = self
+            .jobs
+            .values()
+            .any(|j| matches!(j.status, JobStatus::Failed { .. } | JobStatus::Interrupted));
 
         if all_terminal {
             self.status = if any_failed {
@@ -275,12 +277,7 @@ impl PipelineExecution {
             } else {
                 PipelineStatus::Passed
             };
-        } else if any_running
-            || self
-                .jobs
-                .values()
-                .any(|j| j.status == JobStatus::Passed)
-        {
+        } else if any_running || self.jobs.values().any(|j| j.status == JobStatus::Passed) {
             self.status = PipelineStatus::Running;
         }
     }
@@ -321,7 +318,10 @@ pub fn topological_sort(jobs: &HashMap<String, JobDefinition>) -> Result<Vec<Str
                     dependency: dep.clone(),
                 });
             }
-            dependents.entry(dep.as_str()).or_default().push(name.as_str());
+            dependents
+                .entry(dep.as_str())
+                .or_default()
+                .push(name.as_str());
             *in_degree.entry(name.as_str()).or_insert(0) += 1;
         }
     }
@@ -384,8 +384,8 @@ impl std::error::Error for DagError {}
 mod tests {
     use std::collections::HashMap;
 
-    use super::*;
     use super::JobDefinition;
+    use super::*;
 
     fn make_job(name: &str, needs: &[&str]) -> JobDefinition {
         JobDefinition {

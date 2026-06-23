@@ -14,7 +14,7 @@ services:
       - "--actors"
       - "2"
     volumes:
-      - /home/aaron/swactor-pooled-datastore/.dev-cluster/seed-identity:/identity:ro
+      - /home/aaron/swactor-dev-cluster/.dev-cluster/seed-identity:/identity:ro
     networks:
       dev-cluster:
         ipv4_address: 10.0.2.10

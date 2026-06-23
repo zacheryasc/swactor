@@ -51,19 +51,17 @@ use pipeline_parallel_inference::cluster::ClusterNode;
 use pipeline_parallel_inference::fleet;
 
 use dashboard::collector::StatsCollector;
-use dashboard::{start_dashboard, DashboardConfig};
+use dashboard::{DashboardConfig, start_dashboard};
 
 use pipeline_parallel_inference::iroh_transport::{
-    ActorMessagePump, IrohActorTransport, ACTOR_ALPN,
+    ACTOR_ALPN, ActorMessagePump, IrohActorTransport,
 };
 use pipeline_parallel_inference::messages::inference_codec_registry;
 use pipeline_parallel_inference::stage_actor::{
-    ActivationBridge, NextTokenBridge, RequestBridge, StageActor, StageActorStatus,
-    StageMsg, StageRole,
+    ActivationBridge, NextTokenBridge, RequestBridge, StageActor, StageActorStatus, StageMsg,
+    StageRole,
 };
-use pipeline_parallel_inference::topology::{
-    next_stage_name, stage_name, ENTRY_NAME, EXIT_NAME,
-};
+use pipeline_parallel_inference::topology::{ENTRY_NAME, EXIT_NAME, next_stage_name, stage_name};
 use swactor_process::{ProcessMode, ProcessSpec};
 
 /// SWIM name the orchestrator uses to publish the address of its
@@ -143,11 +141,10 @@ fn node_config() -> DistributedNodeConfig {
             indirect_probes: 2,
             // Periodically reprobe dead peers every ~2 s (old: 100 ticks).
             dead_reprobe_interval: Duration::from_secs(2),
-            // Raised above the calibrated SwimConfig::default() (15 s / 45 s;
-            // see crates/simulation/SWIM_RETUNE_REPORT.md) because
+            // Raised above SwimConfig::default() (15 s / 45 s) because
             // relay-mediated iroh paths were declaring peers Dead too eagerly.
             // Doubled to give each probe phase more relay-recovery slack while
-            // preserving the calibrated 1:3 probe:suspicion ratio. Effective
+            // preserving the 1:3 probe:suspicion ratio. Effective
             // time-to-Dead = 2*probe_timeout + suspicion_timeout = 30 + 30 +
             // 90 = 150 s. Do NOT shrink toward the old 15 / 60 pin (300 ms
             // probe budget on a 200-405 ms relay path) — that was the
@@ -164,8 +161,8 @@ fn node_config() -> DistributedNodeConfig {
 
 fn worker_spec(stage: u32, num_stages: u32) -> ProcessSpec {
     let cmd = std::env::var("WORKER_CMD").unwrap_or_else(|_| "python3".into());
-    let script = std::env::var("WORKER_SCRIPT")
-        .unwrap_or_else(|_| "./pp_tinygrad_worker.py".into());
+    let script =
+        std::env::var("WORKER_SCRIPT").unwrap_or_else(|_| "./pp_tinygrad_worker.py".into());
 
     let mut env = HashMap::new();
     env.insert("STAGE".into(), stage.to_string());
@@ -237,10 +234,7 @@ fn resolve_name(
 /// home relay as a fallback. The n0 relay mesh routes by public key, so
 /// a dial via any relay reaches the peer as long as both endpoints have
 /// a home relay.
-fn build_route(
-    cluster: &ClusterNode,
-    node_hex: &str,
-) -> Result<Arc<IrohActorTransport>, String> {
+fn build_route(cluster: &ClusterNode, node_hex: &str) -> Result<Arc<IrohActorTransport>, String> {
     let bytes = parse_hex_node_id(node_hex);
     let key = PublicKey::from_bytes(&bytes)
         .map_err(|e| format!("invalid peer node id {node_hex}: {e}"))?;
@@ -336,7 +330,10 @@ fn install_sighup_handler() {
     // atomic store. `signal()` keeps the handler installed across deliveries
     // under glibc (BSD semantics).
     unsafe {
-        libc::signal(libc::SIGHUP, handle_sighup as *const () as libc::sighandler_t);
+        libc::signal(
+            libc::SIGHUP,
+            handle_sighup as *const () as libc::sighandler_t,
+        );
     }
 }
 
@@ -358,8 +355,12 @@ fn drain_reload_request(rt: &Runtime, stage_actor_addr: ActorAddress) {
 /// §13.3 boot-order tests to simulate a slow-starting node without needing
 /// to rebuild the binary for each scenario.
 fn maybe_simulate_boot_delay(stage: u32) {
-    let target = std::env::var("PP_BOOT_DELAY_STAGE").ok().and_then(|s| s.trim().parse::<u32>().ok());
-    let secs = std::env::var("PP_BOOT_DELAY_SECS").ok().and_then(|s| s.trim().parse::<u64>().ok());
+    let target = std::env::var("PP_BOOT_DELAY_STAGE")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    let secs = std::env::var("PP_BOOT_DELAY_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok());
     if let (Some(target), Some(secs)) = (target, secs) {
         if target == stage && secs > 0 {
             eprintln!("pp-worker: simulated boot delay of {secs}s on stage {stage}");
@@ -418,9 +419,11 @@ fn main() {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(9100);
         let port = base + stage as u16;
-        let collector =
-            StatsCollector::new(swactor::config::RuntimeConfig::default().num_threads);
-        let handle = start_dashboard(DashboardConfig { port, ..Default::default() });
+        let collector = StatsCollector::new(swactor::config::RuntimeConfig::default().num_threads);
+        let handle = start_dashboard(DashboardConfig {
+            port,
+            ..Default::default()
+        });
         Some((handle, collector, port))
     } else {
         None
@@ -457,9 +460,7 @@ fn main() {
         .iter()
         .map(|sa| sa.to_string())
         .collect();
-    eprintln!(
-        "pp-worker: stage {stage}/{num_stages} ({role:?}) started (node_id: {my_hex})"
-    );
+    eprintln!("pp-worker: stage {stage}/{num_stages} ({role:?}) started (node_id: {my_hex})");
     // PP_GPU_NODE_ADDR is printed to stdout (flushed) so a parent process
     // capturing this child's stdout can extract our addressing. The orchestrator
     // uses this to pass each stage's direct addresses to the other stage so
@@ -470,8 +471,7 @@ fn main() {
 
     // Build the seed endpoint and join.
     let seed_bytes = parse_hex_node_id(&seed_hex);
-    let seed_key =
-        PublicKey::from_bytes(&seed_bytes).expect("invalid seed public key");
+    let seed_key = PublicKey::from_bytes(&seed_bytes).expect("invalid seed public key");
     let mut seed_addr = iroh::EndpointAddr::from(seed_key);
     if let Some(relay) = seed_relay_env.as_deref() {
         if let Ok(relay_url) = relay.trim().parse::<iroh::RelayUrl>() {
@@ -494,31 +494,28 @@ fn main() {
     // iroh dials the predecessor — that outbound dial causes the
     // predecessor's iroh to learn the successor's source-socket addresses,
     // so both peers know each other for actor-message dials.
-    let add_peer_from_env = |targets: &mut Vec<iroh::EndpointAddr>,
-                              hex_var: &str,
-                              direct_var: &str,
-                              label: &str| {
-        if let (Ok(peer_hex), Ok(peer_direct)) =
-            (std::env::var(hex_var), std::env::var(direct_var))
-        {
-            let peer_hex = peer_hex.trim();
-            let peer_direct = peer_direct.trim();
-            if peer_hex.is_empty() || peer_direct.is_empty() {
-                return;
-            }
-            let peer_bytes = parse_hex_node_id(peer_hex);
-            let peer_key = PublicKey::from_bytes(&peer_bytes)
-                .expect("invalid peer node id");
-            let mut peer_addr = iroh::EndpointAddr::from(peer_key);
-            for part in peer_direct.split(',') {
-                if let Ok(sa) = part.trim().parse::<SocketAddr>() {
-                    peer_addr = peer_addr.with_ip_addr(sa);
+    let add_peer_from_env =
+        |targets: &mut Vec<iroh::EndpointAddr>, hex_var: &str, direct_var: &str, label: &str| {
+            if let (Ok(peer_hex), Ok(peer_direct)) =
+                (std::env::var(hex_var), std::env::var(direct_var))
+            {
+                let peer_hex = peer_hex.trim();
+                let peer_direct = peer_direct.trim();
+                if peer_hex.is_empty() || peer_direct.is_empty() {
+                    return;
                 }
+                let peer_bytes = parse_hex_node_id(peer_hex);
+                let peer_key = PublicKey::from_bytes(&peer_bytes).expect("invalid peer node id");
+                let mut peer_addr = iroh::EndpointAddr::from(peer_key);
+                for part in peer_direct.split(',') {
+                    if let Ok(sa) = part.trim().parse::<SocketAddr>() {
+                        peer_addr = peer_addr.with_ip_addr(sa);
+                    }
+                }
+                eprintln!("pp-worker: also joining {label} {peer_hex}");
+                targets.push(peer_addr);
             }
-            eprintln!("pp-worker: also joining {label} {peer_hex}");
-            targets.push(peer_addr);
-        }
-    };
+        };
 
     // Predecessor stage's addressing (set by the orchestrator's
     // spawn_chain). Every non-first stage gets this; dialing the
@@ -583,7 +580,13 @@ fn main() {
     }
 
     run_stage(
-        cluster, sender, status_inbox, role, stage, num_stages, max_tokens,
+        cluster,
+        sender,
+        status_inbox,
+        role,
+        stage,
+        num_stages,
+        max_tokens,
     );
     // Keep the dashboard handle alive for the whole stage lifetime.
     drop(stage_dash);
@@ -643,11 +646,7 @@ fn hold_until_worker_ready(
     }
 }
 
-fn pump(
-    cluster: &mut ClusterNode,
-    msg_pump: &ActorMessagePump,
-    duration: Duration,
-) {
+fn pump(cluster: &mut ClusterNode, msg_pump: &ActorMessagePump, duration: Duration) {
     let end = Instant::now() + duration;
     while Instant::now() < end {
         cluster.pump_once();
@@ -681,9 +680,8 @@ fn run_stage(
 
     let actor = match role {
         StageRole::First => {
-            let mut a =
-                StageActor::first(worker_spec(stage, num_stages), sender, placeholder)
-                    .with_status_addr(*status_inbox.addr());
+            let mut a = StageActor::first(worker_spec(stage, num_stages), sender, placeholder)
+                .with_status_addr(*status_inbox.addr());
             if !stub_mode {
                 a = a.with_real_tokenization();
             }
@@ -814,9 +812,7 @@ fn run_stage(
                 .expect("first stage has a next neighbour for N>=2");
             let (next_addr, next_hex) =
                 resolve_or_die(&mut cluster, &next_name, neighbor_resolve_timeout);
-            eprintln!(
-                "pp-worker: resolved {next_name} -> {next_addr:?} on {next_hex}"
-            );
+            eprintln!("pp-worker: resolved {next_name} -> {next_addr:?} on {next_hex}");
             add_route_or_die(&cluster, &router, next_addr, &next_hex, &next_name);
             rt.send_to(
                 stage_actor_addr,
@@ -829,13 +825,11 @@ fn run_stage(
             .expect("send SetNeighbors (first)");
         }
         StageRole::Middle => {
-            let next_name = next_stage_name(stage, num_stages)
-                .expect("middle stage has a next neighbour");
+            let next_name =
+                next_stage_name(stage, num_stages).expect("middle stage has a next neighbour");
             let (next_addr, next_hex) =
                 resolve_or_die(&mut cluster, &next_name, neighbor_resolve_timeout);
-            eprintln!(
-                "pp-worker: resolved {next_name} -> {next_addr:?} on {next_hex}"
-            );
+            eprintln!("pp-worker: resolved {next_name} -> {next_addr:?} on {next_hex}");
             add_route_or_die(&cluster, &router, next_addr, &next_hex, &next_name);
             rt.send_to(
                 stage_actor_addr,
@@ -853,11 +847,8 @@ fn run_stage(
             // step), regardless of N. At N=2 that is the literal prev
             // neighbour; at N>=3 it skips any Middle stages on the wire.
             let feedback_name = stage_name(0);
-            let (feedback_addr, feedback_hex) = resolve_or_die(
-                &mut cluster,
-                &feedback_name,
-                neighbor_resolve_timeout,
-            );
+            let (feedback_addr, feedback_hex) =
+                resolve_or_die(&mut cluster, &feedback_name, neighbor_resolve_timeout);
             let (orch_addr, orch_hex) =
                 resolve_or_die(&mut cluster, ORCHESTRATOR_NAME, neighbor_resolve_timeout);
             eprintln!(
@@ -905,7 +896,12 @@ fn run_stage(
     // orchestrator's `datastream-sink` actor. The sink address is late-bound —
     // resolved in the main pump once the name converges; until then the
     // ClusterFrameSink drops frames and the bounded mux absorbs the gap.
-    let hex: String = cluster.node_id().0.iter().map(|b| format!("{:02x}", b)).collect();
+    let hex: String = cluster
+        .node_id()
+        .0
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
     let name = format!("pp-stage-{stage}");
     let listen = cluster
         .driver
@@ -973,15 +969,12 @@ fn main_pump(
         // destination. Best-effort — until bound, fleet frames are dropped.
         if sink_slot.get().is_none() {
             if let Some((addr, sink_node)) = cluster.resolve_name(DATASTREAM_SINK_NAME) {
-                let sink_hex: String =
-                    sink_node.0.iter().map(|b| format!("{:02x}", b)).collect();
+                let sink_hex: String = sink_node.0.iter().map(|b| format!("{:02x}", b)).collect();
                 match build_route(&cluster, &sink_hex) {
                     Ok(t) => {
                         router.add_route(addr, t);
                         let _ = sink_slot.set(addr);
-                        eprintln!(
-                            "pp-worker: datastream-sink resolved -> {addr:?} on {sink_hex}"
-                        );
+                        eprintln!("pp-worker: datastream-sink resolved -> {addr:?} on {sink_hex}");
                     }
                     Err(e) => eprintln!("pp-worker: datastream-sink route failed: {e}"),
                 }
@@ -1011,7 +1004,13 @@ fn main_pump(
             // Worker-runtime counters (the deep slice behind runtime.stats).
             fleet.submit_worker_counters(&fleet::worker_counters(&cluster.rt));
 
-            fleet.tick(&members, runtime, relay_connected, 0, cluster.swim_rtt_p50());
+            fleet.tick(
+                &members,
+                runtime,
+                relay_connected,
+                0,
+                cluster.swim_rtt_p50(),
+            );
         }
 
         if let Some(status) = status_inbox.try_recv() {

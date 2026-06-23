@@ -15,11 +15,11 @@ use ratatui::widgets::TableState;
 
 use swactor::runtime::Runtime;
 
-use crate::collector::StatsCollector;
-use crate::layer::EventStore;
 use self::app::App;
 use self::event::{AppEvent, EventLoop};
 use self::types::RuntimeEndpoint;
+use crate::collector::StatsCollector;
+use crate::layer::EventStore;
 
 /// Configuration for the TUI dashboard.
 #[derive(Debug, Clone)]
@@ -63,13 +63,7 @@ pub fn start_tui(
     }));
 
     // Run main loop
-    let result = run_loop(
-        &mut terminal,
-        runtime,
-        collector,
-        config,
-        event_store,
-    );
+    let result = run_loop(&mut terminal, runtime, collector, config, event_store);
 
     // Restore terminal
     crossterm::terminal::disable_raw_mode()?;

@@ -1,8 +1,10 @@
-use crate::actor::{ActorAddress, ActorInterface, Ctx, Environment, LogicalName, Message, MonitorRef, SystemInfo};
 use crate::Error;
+use crate::actor::{
+    ActorAddress, ActorInterface, Ctx, Environment, LogicalName, Message, MonitorRef, SystemInfo,
+};
 
-use super::resource_handle::ResourceHandle;
 use super::StdExtension;
+use super::resource_handle::ResourceHandle;
 use super::timer_wheel::{CloneMsg, TimerRequest};
 
 pub(crate) fn get_ext<'a>(ctx: &'a Ctx) -> &'a StdExtension {
@@ -30,7 +32,9 @@ impl CtxMonitoring for Ctx<'_> {
         if let Some(caps) = self.env::<crate::CapabilitySet>() {
             caps.check_monitor(target)?;
         }
-        Ok(get_ext(self).monitor_registry.register(self.self_addr(), target))
+        Ok(get_ext(self)
+            .monitor_registry
+            .register(self.self_addr(), target))
     }
 
     fn demonitor(&self, mref: MonitorRef) {
@@ -50,7 +54,11 @@ pub trait CtxNaming {
     fn register_name(&self, name: impl Into<String>, addr: ActorAddress) -> Result<(), Error>;
 
     /// Spawn an actor with a registered name, returning its address.
-    fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error>;
+    fn spawn_named<A: ActorInterface>(
+        &self,
+        name: impl Into<String>,
+        actor: A,
+    ) -> Result<ActorAddress, Error>;
 }
 
 impl CtxNaming for Ctx<'_> {
@@ -62,9 +70,16 @@ impl CtxNaming for Ctx<'_> {
         get_ext(self).name_registry.register(name.into(), addr)
     }
 
-    fn spawn_named<A: ActorInterface>(&self, name: impl Into<String>, actor: A) -> Result<ActorAddress, Error> {
+    fn spawn_named<A: ActorInterface>(
+        &self,
+        name: impl Into<String>,
+        actor: A,
+    ) -> Result<ActorAddress, Error> {
         let name = name.into();
-        let addr = self.spawn_builder(actor).env(LogicalName(name.clone())).finish()?;
+        let addr = self
+            .spawn_builder(actor)
+            .env(LogicalName(name.clone()))
+            .finish()?;
         if let Err(e) = get_ext(self).name_registry.register(name, addr) {
             let _ = self.stop_actor(addr);
             return Err(e);
@@ -97,7 +112,9 @@ impl CtxWatching for Ctx<'_> {
     }
 
     fn unwatch(&self, target: ActorAddress) {
-        get_ext(self).watch_registry.unwatch(self.self_addr(), target);
+        get_ext(self)
+            .watch_registry
+            .unwatch(self.self_addr(), target);
     }
 }
 
@@ -122,19 +139,21 @@ pub trait CtxTimers {
 
 impl CtxTimers for Ctx<'_> {
     fn send_after_ticks<M: Message>(&self, addr: ActorAddress, msg: M, ticks: u64) {
-        self.raw_inner().post_worker_request(Box::new(TimerRequest::Once {
-            dest: addr,
-            msg: Box::new(msg),
-            ticks,
-        }));
+        self.raw_inner()
+            .post_worker_request(Box::new(TimerRequest::Once {
+                dest: addr,
+                msg: Box::new(msg),
+                ticks,
+            }));
     }
 
     fn send_interval_ticks<M: Message>(&self, addr: ActorAddress, msg: M, period: u64) {
-        self.raw_inner().post_worker_request(Box::new(TimerRequest::Interval {
-            dest: addr,
-            msg: Box::new(msg) as Box<dyn CloneMsg>,
-            period,
-        }));
+        self.raw_inner()
+            .post_worker_request(Box::new(TimerRequest::Interval {
+                dest: addr,
+                msg: Box::new(msg) as Box<dyn CloneMsg>,
+                period,
+            }));
     }
 }
 
@@ -159,7 +178,9 @@ pub trait CtxGroups {
 
 impl CtxGroups for Ctx<'_> {
     fn join_group(&self, group: impl Into<String>) {
-        get_ext(self).group_registry.join(group.into(), self.self_addr());
+        get_ext(self)
+            .group_registry
+            .join(group.into(), self.self_addr());
     }
 
     fn leave_group(&self, group: &str) {
@@ -246,9 +267,7 @@ impl CtxLineage for Ctx<'_> {
     }
 
     fn supervisor(&self) -> Option<ActorAddress> {
-        let ext = self.extension()?
-            .as_any()
-            .downcast_ref::<StdExtension>()?;
+        let ext = self.extension()?.as_any().downcast_ref::<StdExtension>()?;
         ext.supervisor_registry.lookup(&self.self_addr())
     }
 }
@@ -296,9 +315,10 @@ pub trait CtxResources {
 impl CtxResources for Ctx<'_> {
     fn resource<S: 'static + Send + Sync>(&self) -> Option<ActorAddress> {
         if let Some(caps) = self.env::<crate::CapabilitySet>()
-            && caps.check_service::<S>().is_err() {
-                return None;
-            }
+            && caps.check_service::<S>().is_err()
+        {
+            return None;
+        }
         self.env::<crate::ServiceBinding<S>>().map(|b| b.addr)
     }
 }
@@ -376,7 +396,9 @@ impl CtxLifecycle for Ctx<'_> {
             self.raw_inner().request_resume(target);
             return Ok(());
         }
-        Err(Error::from("resume denied: caller is not self or supervisor"))
+        Err(Error::from(
+            "resume denied: caller is not self or supervisor",
+        ))
     }
 }
 

@@ -33,7 +33,12 @@ fn deploy_lifecycle_simulation() {
         .map(|&port| get_node_id(port).expect("missing node_id"))
         .collect();
     let unique: HashSet<&String> = node_ids.iter().collect();
-    assert_eq!(unique.len(), 5, "expected 5 unique node IDs, got {}", unique.len());
+    assert_eq!(
+        unique.len(),
+        5,
+        "expected 5 unique node IDs, got {}",
+        unique.len()
+    );
 
     // Phase 5: Simulate rolling redeploy — recreate one node, verify it rejoins
     redeploy_node("node-3");
@@ -43,10 +48,16 @@ fn deploy_lifecycle_simulation() {
     // Phase 6: Final status report — all metrics healthy
     for &port in &DASHBOARD_PORTS {
         let snap = poll_distribution(port).unwrap();
-        assert!(snap.alive_count >= 4,
-            "port {port}: expected alive_count >= 4, got {}", snap.alive_count);
-        assert!(snap.directory_route_count >= 2,
-            "port {port}: expected directory_route_count >= 2, got {}", snap.directory_route_count);
+        assert!(
+            snap.alive_count >= 4,
+            "port {port}: expected alive_count >= 4, got {}",
+            snap.alive_count
+        );
+        assert!(
+            snap.directory_route_count >= 2,
+            "port {port}: expected directory_route_count >= 2, got {}",
+            snap.directory_route_count
+        );
     }
 
     cluster.stop();

@@ -3,17 +3,14 @@ members = [
     ".",
     "crates/bindings/python",
     "crates/bindings/wasm-runtime",
-    "crates/simulation",
     "crates/dashboard",
     "crates/process",
     "crates/transport",
     "crates/distribution",
     "crates/datastream",
-    "crates/datastore",
     "crates/mvp-system",
     "crates/node",
     "tests/docker",
-    "tests/integration",
     "xtask",
 ]
 exclude = ["crates/bindings/wasm-crypto", "examples", "apps"]
@@ -59,15 +56,3 @@ proptest = "1"
 proptest-state-machine = "0.3"
 mvp-system = { path = "crates/mvp-system" }
 
-
-[[bench]]
-name = "runtime_benchmarks"
-harness = false
-
-[[bench]]
-name = "mt_benchmarks"
-harness = false
-
-[[bench]]
-name = "hasher_benchmarks"
-harness = false

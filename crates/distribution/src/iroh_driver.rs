@@ -28,7 +28,7 @@ use crate::node::DistributedNodeConfig;
 use crate::peer_auth::PeerAllowList;
 use crate::snapshot::DistributionNodeSnapshot;
 use crate::swim::actor::SwimIn;
-use crate::transport_bridge::{peer_addr, Outbox, RelayMirror, RouteView};
+use crate::transport_bridge::{Outbox, RelayMirror, RouteView, peer_addr};
 use crate::types::NodeId;
 
 use swactor::actor::ActorAddress;
@@ -128,11 +128,7 @@ pub fn discover_lan_ips() -> Vec<IpAddr> {
     let mut seen = std::collections::HashSet::new();
 
     // UDP socket trick: connect to a broadcast-ish address, read local_addr
-    let targets: &[&str] = &[
-        "10.255.255.255:1",
-        "192.168.255.255:1",
-        "172.31.255.255:1",
-    ];
+    let targets: &[&str] = &["10.255.255.255:1", "192.168.255.255:1", "172.31.255.255:1"];
     for target in targets {
         if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
             if sock.connect(target).is_ok() {
@@ -158,7 +154,10 @@ pub fn discover_lan_ips() -> Vec<IpAddr> {
                     for i in 0..16 {
                         match u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
                             Ok(b) => bytes[i] = b,
-                            Err(_) => { valid = false; break; }
+                            Err(_) => {
+                                valid = false;
+                                break;
+                            }
                         }
                     }
                     if valid {
@@ -349,7 +348,6 @@ impl IrohDriver {
         owned: Option<tokio::runtime::Runtime>,
         config: IrohDriverConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-
         // Try to start embedded relay if configured
         #[cfg(feature = "relay")]
         let (relay_server, relay_url, effective_relay_mode) = match config.embedded_relay_bind {
@@ -385,8 +383,7 @@ impl IrohDriver {
             // Only relax relay-cert verification for a custom relay; Default /
             // Staging relays keep full WebPKI verification.
             if custom_relay {
-                builder =
-                    builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
+                builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
             }
 
             if let Some(key) = config.secret_key {
@@ -480,7 +477,11 @@ impl IrohDriver {
 
     /// Drain connections accepted on non-SWIM ALPNs.
     pub fn drain_other_connections(&self) -> Vec<(NodeId, Connection)> {
-        self.other_accepted_conns.lock().unwrap().drain(..).collect()
+        self.other_accepted_conns
+            .lock()
+            .unwrap()
+            .drain(..)
+            .collect()
     }
 
     /// The node's identity.
@@ -649,7 +650,10 @@ impl IrohDriver {
             // node is declared dead. Without a relay URL iroh cannot
             // reach the peer through NAT.
             let enriched = if seed_addr.relay_urls().next().is_none() {
-                if let Some(relay) = self.peer_relay_urls.get(&seed_node_id).cloned()
+                if let Some(relay) = self
+                    .peer_relay_urls
+                    .get(&seed_node_id)
+                    .cloned()
                     .or_else(|| self.endpoint.addr().relay_urls().next().cloned())
                 {
                     seed_addr.clone().with_relay_url(relay)
@@ -693,32 +697,45 @@ impl IrohDriver {
                 // Update status: Connecting
                 {
                     let mut map = statuses.lock().unwrap();
-                    map.insert(seed_node_id, JoinStatus {
-                        phase: JoinPhase::Connecting { attempt, max_attempts },
-                        has_relay,
-                        has_direct,
-                        direct_addr_count,
-                        updated_at: Instant::now(),
-                    });
+                    map.insert(
+                        seed_node_id,
+                        JoinStatus {
+                            phase: JoinPhase::Connecting {
+                                attempt,
+                                max_attempts,
+                            },
+                            has_relay,
+                            has_direct,
+                            direct_addr_count,
+                            updated_at: Instant::now(),
+                        },
+                    );
                 }
 
                 let connect_result = tokio::time::timeout(
                     per_attempt_timeout,
                     endpoint.connect(seed_addr.clone(), ALPN),
-                ).await;
+                )
+                .await;
 
                 match connect_result {
                     Ok(Ok(conn)) => {
                         // Update status: Sending
                         {
                             let mut map = statuses.lock().unwrap();
-                            map.insert(seed_node_id, JoinStatus {
-                                phase: JoinPhase::Sending { attempt, max_attempts },
-                                has_relay,
-                                has_direct,
-                                direct_addr_count,
-                                updated_at: Instant::now(),
-                            });
+                            map.insert(
+                                seed_node_id,
+                                JoinStatus {
+                                    phase: JoinPhase::Sending {
+                                        attempt,
+                                        max_attempts,
+                                    },
+                                    has_relay,
+                                    has_direct,
+                                    direct_addr_count,
+                                    updated_at: Instant::now(),
+                                },
+                            );
                         }
 
                         let send_result: Result<(), String> = async {
@@ -731,7 +748,9 @@ impl IrohDriver {
                             let tag_len = (tag.len() as u32).to_be_bytes();
                             send.write_all(&dest.0).await.map_err(|e| e.to_string())?;
                             send.write_all(&tag_len).await.map_err(|e| e.to_string())?;
-                            send.write_all(tag.as_bytes()).await.map_err(|e| e.to_string())?;
+                            send.write_all(tag.as_bytes())
+                                .await
+                                .map_err(|e| e.to_string())?;
                             send.write_all(&payload).await.map_err(|e| e.to_string())?;
                             send.finish().map_err(|e| e.to_string())?;
                             Ok(())
@@ -743,13 +762,16 @@ impl IrohDriver {
                                 // Update status: Sent
                                 {
                                     let mut map = statuses.lock().unwrap();
-                                    map.insert(seed_node_id, JoinStatus {
-                                        phase: JoinPhase::Sent,
-                                        has_relay,
-                                        has_direct,
-                                        direct_addr_count,
-                                        updated_at: Instant::now(),
-                                    });
+                                    map.insert(
+                                        seed_node_id,
+                                        JoinStatus {
+                                            phase: JoinPhase::Sent,
+                                            has_relay,
+                                            has_direct,
+                                            direct_addr_count,
+                                            updated_at: Instant::now(),
+                                        },
+                                    );
                                 }
                                 pending.lock().unwrap().push(JoinResult {
                                     node_id: seed_node_id,
@@ -773,13 +795,18 @@ impl IrohDriver {
             // Update status: Failed
             {
                 let mut map = statuses.lock().unwrap();
-                map.insert(seed_node_id, JoinStatus {
-                    phase: JoinPhase::Failed { error: "all attempts exhausted".into() },
-                    has_relay,
-                    has_direct,
-                    direct_addr_count,
-                    updated_at: Instant::now(),
-                });
+                map.insert(
+                    seed_node_id,
+                    JoinStatus {
+                        phase: JoinPhase::Failed {
+                            error: "all attempts exhausted".into(),
+                        },
+                        has_relay,
+                        has_direct,
+                        direct_addr_count,
+                        updated_at: Instant::now(),
+                    },
+                );
             }
         });
     }
@@ -1101,19 +1128,17 @@ async fn start_embedded_relay(
     bind_addr: std::net::SocketAddr,
     public_ip: Option<std::net::IpAddr>,
 ) -> Result<(iroh_relay::server::Server, iroh::RelayUrl), Box<dyn std::error::Error>> {
-    let server = iroh_relay::server::Server::spawn(
-        iroh_relay::server::ServerConfig::<(), ()> {
-            relay: Some(iroh_relay::server::RelayConfig {
-                http_bind_addr: bind_addr,
-                tls: None,
-                limits: Default::default(),
-                key_cache_capacity: Some(256),
-                access: iroh_relay::server::AccessConfig::Everyone,
-            }),
-            quic: None,
-            metrics_addr: None,
-        },
-    )
+    let server = iroh_relay::server::Server::spawn(iroh_relay::server::ServerConfig::<(), ()> {
+        relay: Some(iroh_relay::server::RelayConfig {
+            http_bind_addr: bind_addr,
+            tls: None,
+            limits: Default::default(),
+            key_cache_capacity: Some(256),
+            access: iroh_relay::server::AccessConfig::Everyone,
+        }),
+        quic: None,
+        metrics_addr: None,
+    })
     .await?;
 
     let url: iroh::RelayUrl = match server.http_addr() {

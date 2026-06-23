@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use dashboard::plugin::{DashboardPlugin, PluginResponse};
 use dashboard::JoinPeerInfo;
+use dashboard::plugin::{DashboardPlugin, PluginResponse};
 
 /// HTML page for the distribution plugin. Owned by the `dashboard` crate so the
 /// live node and the datastream dashboard serve the identical page.
@@ -118,7 +118,11 @@ impl DistributionPlugin {
             })
         });
 
-        match tx.send(JoinPeerInfo { node_id: bytes, relay_url, direct_addrs: vec![] }) {
+        match tx.send(JoinPeerInfo {
+            node_id: bytes,
+            relay_url,
+            direct_addrs: vec![],
+        }) {
             Ok(()) => PluginResponse::json(r#"{"ok":true}"#.into()),
             Err(_) => PluginResponse::json(r#"{"error":"channel closed"}"#.into()),
         }

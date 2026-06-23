@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dashboard::command::{
+    CommandContext, CommandResponse, CommandRouter, from_query_params, parse_line,
+};
 use swactor::actor::ActorInterface;
 use swactor::runtime::{Ctx, Runtime, RuntimeConfig};
-use dashboard::command::{
-    from_query_params, parse_line, CommandContext, CommandResponse, CommandRouter,
-};
 
 // ── Test Helpers ─────────────────────────────────────────────────────────────
 
@@ -32,8 +32,7 @@ fn dispatch_text(router: &CommandRouter, ctx: &CommandContext, line: &str) -> Co
     let resp = router.dispatch(&req, ctx);
     // Verify JSON round-trip works
     let json = resp.to_json_line();
-    serde_json::from_str::<CommandResponse>(&json)
-        .expect("response should be valid JSON")
+    serde_json::from_str::<CommandResponse>(&json).expect("response should be valid JSON")
 }
 
 /// A no-op actor for spawning into the runtime.
@@ -154,7 +153,10 @@ fn worker_command_with_valid_id() {
     assert_eq!(resp.command, "worker");
     let data = resp.data.unwrap();
     assert_eq!(data["id"], 0);
-    assert!(data["tick_phases"].is_object(), "should include phase breakdown");
+    assert!(
+        data["tick_phases"].is_object(),
+        "should include phase breakdown"
+    );
 }
 
 /// Given "worker 99",
@@ -340,8 +342,14 @@ fn custom_command_handler() {
     // Should also appear in help
     let help = dispatch_text(&router, &ctx, "help");
     let commands = help.data.unwrap()["commands"].as_array().unwrap().clone();
-    let names: Vec<&str> = commands.iter().map(|c| c["name"].as_str().unwrap()).collect();
-    assert!(names.contains(&"ping"), "custom command should appear in help");
+    let names: Vec<&str> = commands
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(
+        names.contains(&"ping"),
+        "custom command should appear in help"
+    );
 }
 
 /// Given a JSON-serialized CommandResponse,

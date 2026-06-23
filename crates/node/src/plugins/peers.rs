@@ -6,11 +6,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use dashboard::plugin::{DashboardPlugin, PluginResponse};
 use dashboard::JoinPeerInfo;
+use dashboard::plugin::{DashboardPlugin, PluginResponse};
+use distribution::peer_auth::PeerAllowList;
 use swactor_transport::NodeId;
 use swactor_transport::identity::{base58_decode, hex_decode};
-use distribution::peer_auth::PeerAllowList;
 
 /// Dashboard plugin that exposes peer management operations.
 pub struct PeersPlugin {
@@ -121,7 +121,10 @@ impl PeersPlugin {
         // Parse rich invite code: <base58>#<addr1>,<addr2>@<relay_url>
         // Split on last '@' for relay, then '#' for direct addrs
         let (left, invite_relay_url) = match raw_node_id.rfind('@') {
-            Some(idx) => (&raw_node_id[..idx], Some(raw_node_id[idx + 1..].to_string())),
+            Some(idx) => (
+                &raw_node_id[..idx],
+                Some(raw_node_id[idx + 1..].to_string()),
+            ),
             None => (raw_node_id, None),
         };
         let (node_id_str, invite_addrs_str) = match left.find('#') {
@@ -146,7 +149,10 @@ impl PeersPlugin {
             match b.try_into() {
                 Ok(arr) => arr,
                 Err(_) => {
-                    return PluginResponse::error(400, "invalid node_id (hex decoded to wrong length)");
+                    return PluginResponse::error(
+                        400,
+                        "invalid node_id (hex decoded to wrong length)",
+                    );
                 }
             }
         } else if let Some(arr) = base58_decode(node_id_str) {

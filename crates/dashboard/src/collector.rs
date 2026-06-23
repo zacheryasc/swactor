@@ -21,9 +21,7 @@ pub struct StatsCollector {
 
 impl StatsCollector {
     pub fn new(num_workers: usize) -> Arc<Self> {
-        let slots = (0..num_workers)
-            .map(|_| RwLock::new(Vec::new()))
-            .collect();
+        let slots = (0..num_workers).map(|_| RwLock::new(Vec::new())).collect();
         Arc::new(Self { slots })
     }
 
@@ -69,15 +67,21 @@ impl StatsHook for StatsCollector {
         if let Some(slot) = self.slots.get(worker_id) {
             let mut guard = slot.write().unwrap();
             guard.clear();
-            guard.extend(snapshots.iter().map(|s| ActorInfo {
-                address: s.address,
-                worker_id,
-                mailbox_depth: s.mailbox_depth,
-                last_msg_type: s.last_msg_type.map(|t| t.to_string()),
-                messages_processed: s.messages_processed,
-                poisoned: s.poisoned,
-                name: None,
-                message_type_counts: s.message_type_counts.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            guard.extend(snapshots.iter().map(|s| {
+                ActorInfo {
+                    address: s.address,
+                    worker_id,
+                    mailbox_depth: s.mailbox_depth,
+                    last_msg_type: s.last_msg_type.map(|t| t.to_string()),
+                    messages_processed: s.messages_processed,
+                    poisoned: s.poisoned,
+                    name: None,
+                    message_type_counts: s
+                        .message_type_counts
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), *v))
+                        .collect(),
+                }
             }));
         }
     }

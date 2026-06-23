@@ -115,10 +115,7 @@ impl<D: ProcessDriver> ProcessActor<D> {
                         let _ = ctx.send(sub, notif.clone());
                     }
                 }
-                ProcessAction::NotifyError {
-                    subscribers,
-                    error,
-                } => {
+                ProcessAction::NotifyError { subscribers, error } => {
                     let notif = ProcessNotification::Error {
                         process: self_addr,
                         error,
@@ -145,9 +142,7 @@ impl<D: ProcessDriver> ProcessActor<D> {
             ProcessCommand::CloseStdin => Some(ProcessEvent::CloseStdin),
             ProcessCommand::Close => Some(ProcessEvent::CloseRequested),
             ProcessCommand::Subscribe { address } => Some(ProcessEvent::Subscribe { address }),
-            ProcessCommand::Unsubscribe { address } => {
-                Some(ProcessEvent::Unsubscribe { address })
-            }
+            ProcessCommand::Unsubscribe { address } => Some(ProcessEvent::Unsubscribe { address }),
             ProcessCommand::PollTick => None, // handled by drain
         }
     }

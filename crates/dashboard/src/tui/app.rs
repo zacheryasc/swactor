@@ -170,21 +170,27 @@ impl App {
             self.actor_rows.iter().collect()
         } else {
             let q = self.search_query.to_lowercase();
-            self.actor_rows.iter().filter(|r| {
-                let addr = format!("{}", r.address).to_lowercase();
-                let msg = r.last_msg_type.as_deref().unwrap_or("").to_lowercase();
-                let worker = format!("w{}", r.worker_id);
-                let name = r.name.as_deref().unwrap_or("").to_lowercase();
-                addr.contains(&q) || msg.contains(&q) || worker.contains(&q) || name.contains(&q)
-            }).collect()
+            self.actor_rows
+                .iter()
+                .filter(|r| {
+                    let addr = format!("{}", r.address).to_lowercase();
+                    let msg = r.last_msg_type.as_deref().unwrap_or("").to_lowercase();
+                    let worker = format!("w{}", r.worker_id);
+                    let name = r.name.as_deref().unwrap_or("").to_lowercase();
+                    addr.contains(&q)
+                        || msg.contains(&q)
+                        || worker.contains(&q)
+                        || name.contains(&q)
+                })
+                .collect()
         }
     }
 
     /// Get the focused actor's data (for actor detail view).
     pub fn focused_actor_row(&self) -> Option<&ActorRow> {
-        self.focused_actor.as_ref().and_then(|addr| {
-            self.actor_rows.iter().find(|r| r.address == *addr)
-        })
+        self.focused_actor
+            .as_ref()
+            .and_then(|addr| self.actor_rows.iter().find(|r| r.address == *addr))
     }
 
     /// Refresh the actor log cache from the event store.
@@ -201,15 +207,13 @@ impl App {
     pub fn visible_logs(&self) -> Vec<&DashboardEvent> {
         self.actor_logs
             .iter()
-            .filter(|e| {
-                match e.level.as_str() {
-                    "ERROR" => self.log_levels[0],
-                    "WARN" => self.log_levels[1],
-                    "INFO" => self.log_levels[2],
-                    "DEBUG" => self.log_levels[3],
-                    "TRACE" => self.log_levels[4],
-                    _ => true,
-                }
+            .filter(|e| match e.level.as_str() {
+                "ERROR" => self.log_levels[0],
+                "WARN" => self.log_levels[1],
+                "INFO" => self.log_levels[2],
+                "DEBUG" => self.log_levels[3],
+                "TRACE" => self.log_levels[4],
+                _ => true,
             })
             .collect()
     }
@@ -240,8 +244,10 @@ impl App {
         if self.prev_messages.len() != stats.workers.len() {
             self.prev_messages = stats.workers.iter().map(|w| w.messages_processed).collect();
             self.msg_rates = vec![0.0; stats.workers.len()];
-            self.sparkline_rates.resize_with(stats.workers.len(), VecDeque::new);
-            self.sparkline_mailbox.resize_with(stats.workers.len(), VecDeque::new);
+            self.sparkline_rates
+                .resize_with(stats.workers.len(), VecDeque::new);
+            self.sparkline_mailbox
+                .resize_with(stats.workers.len(), VecDeque::new);
         }
 
         // Compute per-worker views
@@ -267,15 +273,23 @@ impl App {
             self.prev_messages[i] = w.messages_processed;
 
             let spark_rates = &mut self.sparkline_rates[i];
-            if spark_rates.len() >= 60 { spark_rates.pop_front(); }
+            if spark_rates.len() >= 60 {
+                spark_rates.pop_front();
+            }
             spark_rates.push_back(delta);
 
             let spark_mbox = &mut self.sparkline_mailbox[i];
-            if spark_mbox.len() >= 60 { spark_mbox.pop_front(); }
+            if spark_mbox.len() >= 60 {
+                spark_mbox.pop_front();
+            }
             spark_mbox.push_back(w.mailbox_depth as u64);
 
             // Load % and phase fractions from tick timings
-            let timings = stats.tick_timings.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+            let timings = stats
+                .tick_timings
+                .get(i)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
             let (load_pct, phase_fractions) = compute_load_and_phases(timings);
 
             self.workers.push(WorkerView {
@@ -301,15 +315,20 @@ impl App {
         // Build actor table with sparkline history
         self.actor_rows.clear();
         for a in &stats.actor_details {
-            let (prev, rates_buf, mbox_buf) = self.actor_sparklines
+            let (prev, rates_buf, mbox_buf) = self
+                .actor_sparklines
                 .entry(a.address)
                 .or_insert_with(|| (0, VecDeque::new(), VecDeque::new()));
 
             let rate_delta = a.messages_processed.saturating_sub(*prev);
             *prev = a.messages_processed;
-            if rates_buf.len() >= 60 { rates_buf.pop_front(); }
+            if rates_buf.len() >= 60 {
+                rates_buf.pop_front();
+            }
             rates_buf.push_back(rate_delta);
-            if mbox_buf.len() >= 60 { mbox_buf.pop_front(); }
+            if mbox_buf.len() >= 60 {
+                mbox_buf.pop_front();
+            }
             mbox_buf.push_back(a.mailbox_depth as u64);
 
             self.actor_rows.push(ActorRow {
@@ -409,9 +428,13 @@ impl App {
 
         // Global keys
         match key.code {
-            KeyCode::Char('q') => { self.should_quit = true; return; }
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+                return;
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.should_quit = true; return;
+                self.should_quit = true;
+                return;
             }
             KeyCode::Char('/') => {
                 self.search_active = true;
@@ -449,7 +472,11 @@ impl App {
 
     fn handle_key_overview(&mut self, key: KeyEvent) {
         let visible = self.visible_actor_rows();
-        let max = if visible.is_empty() { 0 } else { visible.len() - 1 };
+        let max = if visible.is_empty() {
+            0
+        } else {
+            visible.len() - 1
+        };
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = self.selected.saturating_sub(1);
@@ -463,8 +490,12 @@ impl App {
             KeyCode::PageDown => {
                 self.selected = (self.selected + 20).min(max);
             }
-            KeyCode::Home => { self.selected = 0; }
-            KeyCode::End => { self.selected = max; }
+            KeyCode::Home => {
+                self.selected = 0;
+            }
+            KeyCode::End => {
+                self.selected = max;
+            }
             KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
                 // Enter actor detail for the selected visible actor
                 if let Some(&row) = visible.get(self.selected) {
@@ -480,7 +511,11 @@ impl App {
     }
 
     fn handle_key_worker_detail(&mut self, key: KeyEvent) {
-        let max_w = if self.workers.is_empty() { 0 } else { self.workers.len() - 1 };
+        let max_w = if self.workers.is_empty() {
+            0
+        } else {
+            self.workers.len() - 1
+        };
         match key.code {
             KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
                 self.view_mode = ViewMode::Overview;
@@ -497,8 +532,12 @@ impl App {
             KeyCode::PageDown => {
                 self.focused_worker = (self.focused_worker + 20).min(max_w);
             }
-            KeyCode::Home => { self.focused_worker = 0; }
-            KeyCode::End => { self.focused_worker = max_w; }
+            KeyCode::Home => {
+                self.focused_worker = 0;
+            }
+            KeyCode::End => {
+                self.focused_worker = max_w;
+            }
             _ => {}
         }
     }
@@ -524,8 +563,12 @@ impl App {
             KeyCode::PageUp => {
                 self.log_scroll = self.log_scroll.saturating_sub(20);
             }
-            KeyCode::Home => { self.log_scroll = 0; }
-            KeyCode::End => { self.log_scroll = max_scroll; }
+            KeyCode::Home => {
+                self.log_scroll = 0;
+            }
+            KeyCode::End => {
+                self.log_scroll = max_scroll;
+            }
             KeyCode::Char('1') => self.toggle_log_level(0),
             KeyCode::Char('2') => self.toggle_log_level(1),
             KeyCode::Char('3') => self.toggle_log_level(2),

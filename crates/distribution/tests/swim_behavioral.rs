@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use distribution::swim::dissemination::{membership_update, DisseminationQueue};
+use distribution::swim::dissemination::{DisseminationQueue, membership_update};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::node::{NodeAction, SwimNode};
 use distribution::swim::probe::{ProbeMode, SwimConfig};
@@ -63,7 +63,10 @@ fn fold_stream(stream: &[(NodeId, MemberState, u64)]) -> View {
     for &(nid, st, inc) in stream {
         ml.apply(nid, st, inc);
     }
-    ml.all_members().iter().map(|e| (e.node_id.0, (e.state, e.incarnation))).collect()
+    ml.all_members()
+        .iter()
+        .map(|e| (e.node_id.0, (e.state, e.incarnation)))
+        .collect()
 }
 
 /// In-process cluster of `SwimNode`s with simulated, correct-by-construction
@@ -80,8 +83,16 @@ impl Cluster {
     fn new(n: usize, config: SwimConfig) -> Self {
         let now = Instant::now();
         let ids: Vec<NodeId> = (0..n).map(|i| id(i as u8)).collect();
-        let nodes = ids.iter().map(|&nid| SwimNode::new(nid, config.clone(), now)).collect();
-        let mut c = Cluster { ids, nodes, clock: now, notifications: vec![Vec::new(); n] };
+        let nodes = ids
+            .iter()
+            .map(|&nid| SwimNode::new(nid, config.clone(), now))
+            .collect();
+        let mut c = Cluster {
+            ids,
+            nodes,
+            clock: now,
+            notifications: vec![Vec::new(); n],
+        };
         for i in 1..n {
             let acts = c.nodes[0].handle_join_request(c.ids[i]);
             c.record(0, &acts);
@@ -96,7 +107,12 @@ impl Cluster {
 
     fn record(&mut self, origin: usize, acts: &[NodeAction]) {
         for a in acts {
-            if let NodeAction::MembershipChanged { node_id, state, incarnation } = a {
+            if let NodeAction::MembershipChanged {
+                node_id,
+                state,
+                incarnation,
+            } = a
+            {
                 self.notifications[origin].push((*node_id, *state, *incarnation));
             }
         }
@@ -111,7 +127,11 @@ impl Cluster {
         }
         for a in acts {
             match a {
-                NodeAction::SendPing { to, sequence, piggyback } => {
+                NodeAction::SendPing {
+                    to,
+                    sequence,
+                    piggyback,
+                } => {
                     if let Some(t) = self.index_of(to) {
                         if t != origin && !excluded.contains(&t) {
                             let from = self.ids[origin];
@@ -121,7 +141,11 @@ impl Cluster {
                         }
                     }
                 }
-                NodeAction::SendAck { to, sequence, piggyback } => {
+                NodeAction::SendAck {
+                    to,
+                    sequence,
+                    piggyback,
+                } => {
                     if let Some(t) = self.index_of(to) {
                         if t != origin && !excluded.contains(&t) {
                             let from = self.ids[origin];
@@ -131,20 +155,32 @@ impl Cluster {
                         }
                     }
                 }
-                NodeAction::SendPingReq { relay, target, sequence, piggyback } => {
+                NodeAction::SendPingReq {
+                    relay,
+                    target,
+                    sequence,
+                    piggyback,
+                } => {
                     if let Some(t) = self.index_of(relay) {
                         if t != origin && !excluded.contains(&t) {
                             let from = self.ids[origin];
-                            let resp = self.nodes[t].handle_ping_req(from, target, sequence, &piggyback);
+                            let resp =
+                                self.nodes[t].handle_ping_req(from, target, sequence, &piggyback);
                             self.record(t, &resp);
                             self.route(t, resp, excluded);
                         }
                     }
                 }
-                NodeAction::ForwardAck { to, target, sequence, piggyback } => {
+                NodeAction::ForwardAck {
+                    to,
+                    target,
+                    sequence,
+                    piggyback,
+                } => {
                     if let Some(t) = self.index_of(to) {
                         if t != origin && !excluded.contains(&t) {
-                            let resp = self.nodes[t].handle_indirect_ack(target, sequence, &piggyback);
+                            let resp =
+                                self.nodes[t].handle_indirect_ack(target, sequence, &piggyback);
                             self.record(t, &resp);
                             self.route(t, resp, excluded);
                         }
@@ -181,7 +217,12 @@ impl Cluster {
     /// `cap` rounds elapse. Returns whether `cond` was reached. This pins
     /// eventuality without a fixed count — and, unlike "no new notifications",
     /// it does not mistake an in-flight probe timeout for a settled cluster.
-    fn run_until<F: Fn(&Cluster) -> bool>(&mut self, excluded: &[usize], cap: usize, cond: F) -> bool {
+    fn run_until<F: Fn(&Cluster) -> bool>(
+        &mut self,
+        excluded: &[usize],
+        cap: usize,
+        cond: F,
+    ) -> bool {
         if cond(self) {
             return true;
         }
@@ -195,7 +236,10 @@ impl Cluster {
     }
 
     fn state_of(&self, observer: usize, subject: NodeId) -> Option<MemberState> {
-        self.nodes[observer].members().get(&subject).map(|e| e.state)
+        self.nodes[observer]
+            .members()
+            .get(&subject)
+            .map(|e| e.state)
     }
 
     /// Every node sees every other node as Alive (shared converged view).
@@ -208,7 +252,8 @@ impl Cluster {
 
     /// Every non-excluded node sees `subject` in `state`.
     fn survivors_see(&self, excluded: &[usize], subject: NodeId, state: MemberState) -> bool {
-        (0..self.nodes.len()).all(|o| excluded.contains(&o) || self.state_of(o, subject) == Some(state))
+        (0..self.nodes.len())
+            .all(|o| excluded.contains(&o) || self.state_of(o, subject) == Some(state))
     }
 
     fn view(&self, observer: usize) -> View {
@@ -226,9 +271,16 @@ impl Cluster {
 #[test]
 fn goal1_nodes_join_and_reach_a_shared_alive_view() {
     let mut c = Cluster::new(4, behavioral_config(t(0)));
-    assert!(c.run_until(&[], 500, |c| c.all_converged_alive()), "cluster did not converge to a shared Alive view");
+    assert!(
+        c.run_until(&[], 500, |c| c.all_converged_alive()),
+        "cluster did not converge to a shared Alive view"
+    );
     for observer in 0..4 {
-        assert_eq!(c.nodes[observer].members().alive_count(), 3, "node {observer} must see all 3 peers alive");
+        assert_eq!(
+            c.nodes[observer].members().alive_count(),
+            3,
+            "node {observer} must see all 3 peers alive"
+        );
     }
 }
 
@@ -237,14 +289,22 @@ fn goal1_nodes_join_and_reach_a_shared_alive_view() {
 #[test]
 fn goal2_a_truly_silent_node_is_detected_dead_by_survivors() {
     let mut c = Cluster::new(4, behavioral_config(t(0)));
-    assert!(c.run_until(&[], 500, |c| c.all_converged_alive()), "precondition: cluster must converge");
+    assert!(
+        c.run_until(&[], 500, |c| c.all_converged_alive()),
+        "precondition: cluster must converge"
+    );
 
     // Genuinely silence node 3 — it neither ticks nor sends nor receives, so a
     // survivor's probe TRULY times out (not an injected death). Poll until the
     // survivors converge on it being Dead, or time out.
     let dead = 3usize;
-    let detected = c.run_until(&[dead], 1000, |c| c.survivors_see(&[dead], id(3), MemberState::Dead));
-    assert!(detected, "survivors must converge on the silenced node being Dead within the detection window");
+    let detected = c.run_until(&[dead], 1000, |c| {
+        c.survivors_see(&[dead], id(3), MemberState::Dead)
+    });
+    assert!(
+        detected,
+        "survivors must converge on the silenced node being Dead within the detection window"
+    );
 }
 
 // ─── Goal 3 — death is provisional ───────────────────────────────────────────
@@ -254,21 +314,38 @@ fn goal3_a_silenced_node_resurrects_when_it_answers_again() {
     // dead_reprobe enabled so the partition-heal detector (§9.8) re-probes the
     // Dead node and lets it refute back to Alive.
     let mut c = Cluster::new(4, behavioral_config(t(2)));
-    assert!(c.run_until(&[], 500, |c| c.all_converged_alive()), "precondition: cluster must converge");
+    assert!(
+        c.run_until(&[], 500, |c| c.all_converged_alive()),
+        "precondition: cluster must converge"
+    );
 
     let isolated = 3usize;
-    let died = c.run_until(&[isolated], 1000, |c| c.survivors_see(&[isolated], id(3), MemberState::Dead));
-    assert!(died, "the silenced node must first be detected Dead by the survivors");
+    let died = c.run_until(&[isolated], 1000, |c| {
+        c.survivors_see(&[isolated], id(3), MemberState::Dead)
+    });
+    assert!(
+        died,
+        "the silenced node must first be detected Dead by the survivors"
+    );
 
     // Restore the node: it answers probes again, so the reprobe revives it.
-    let revived = c.run_until(&[], 1000, |c| c.survivors_see(&[isolated], id(3), MemberState::Alive));
-    assert!(revived, "the restored node must resurrect to Alive (death is provisional)");
+    let revived = c.run_until(&[], 1000, |c| {
+        c.survivors_see(&[isolated], id(3), MemberState::Alive)
+    });
+    assert!(
+        revived,
+        "the restored node must resurrect to Alive (death is provisional)"
+    );
 
     // A survivor's notification stream witnessed the full provisional arc.
     let s = if isolated == 0 { 1 } else { 0 };
     let stream = &c.notifications[s];
-    let dead_at = stream.iter().position(|(n, st, _)| *n == id(isolated as u8) && *st == MemberState::Dead);
-    let alive_after = stream.iter().rposition(|(n, st, _)| *n == id(isolated as u8) && *st == MemberState::Alive);
+    let dead_at = stream
+        .iter()
+        .position(|(n, st, _)| *n == id(isolated as u8) && *st == MemberState::Dead);
+    let alive_after = stream
+        .iter()
+        .rposition(|(n, st, _)| *n == id(isolated as u8) && *st == MemberState::Alive);
     assert!(
         matches!((dead_at, alive_after), (Some(d), Some(a)) if a > d),
         "a survivor must witness node {isolated} go Dead then back Alive"
@@ -280,7 +357,10 @@ fn goal3_a_silenced_node_resurrects_when_it_answers_again() {
 #[test]
 fn goal6_a_single_change_known_to_one_node_infects_every_node() {
     let mut c = Cluster::new(4, behavioral_config(t(0)));
-    assert!(c.run_until(&[], 500, |c| c.all_converged_alive()), "precondition: cluster must converge");
+    assert!(
+        c.run_until(&[], 500, |c| c.all_converged_alive()),
+        "precondition: cluster must converge"
+    );
 
     // A change known to ONLY node 0: a phantom peer reported Dead in a single
     // gossip exchange. No other node has ever heard of this peer, and no node
@@ -291,8 +371,13 @@ fn goal6_a_single_change_known_to_one_node_infects_every_node() {
     let pb = piggyback_about(phantom, MemberState::Dead, 5);
     let _ = c.nodes[0].handle_ping(from, 1, &pb);
 
-    let infected = c.run_until(&[], 1000, |c| c.survivors_see(&[], phantom, MemberState::Dead));
-    assert!(infected, "the single change must infect every node — dissemination reaches everyone, not just probe partners");
+    let infected = c.run_until(&[], 1000, |c| {
+        c.survivors_see(&[], phantom, MemberState::Dead)
+    });
+    assert!(
+        infected,
+        "the single change must infect every node — dissemination reaches everyone, not just probe partners"
+    );
 }
 
 // ─── Goal 7 — notification contract ──────────────────────────────────────────
@@ -304,7 +389,10 @@ fn goal7_membership_changed_stream_reconstructs_the_view() {
     // §10.2 learn-sender notification lands — a peer learned via an inbound Ping
     // mutates the view today without emitting MembershipChanged.)
     let mut c = Cluster::new(4, behavioral_config(t(0)));
-    assert!(c.run_until(&[], 500, |c| c.all_converged_alive()), "cluster did not converge");
+    assert!(
+        c.run_until(&[], 500, |c| c.all_converged_alive()),
+        "cluster did not converge"
+    );
     for observer in 0..4 {
         assert_eq!(
             fold_stream(&c.notifications[observer]),
@@ -323,7 +411,12 @@ fn goal7_stream_reconstructs_view_for_a_peer_learned_via_ping() {
     let mut a = SwimNode::new(id(0), behavioral_config(t(0)), now);
     let mut stream: Vec<(NodeId, MemberState, u64)> = Vec::new();
     for act in a.handle_ping(id(5), 1, &[]) {
-        if let NodeAction::MembershipChanged { node_id, state, incarnation } = act {
+        if let NodeAction::MembershipChanged {
+            node_id,
+            state,
+            incarnation,
+        } = act
+        {
             stream.push((node_id, state, incarnation));
         }
     }
@@ -346,7 +439,10 @@ fn goal7_no_duplicate_or_coalesced_notifications() {
     // notification for a given peer must strictly advance (dominate) the previous
     // one for that peer; an identical repeat would be a spurious duplicate.
     let mut c = Cluster::new(4, behavioral_config(t(0)));
-    assert!(c.run_until(&[], 500, |c| c.all_converged_alive()), "cluster did not converge");
+    assert!(
+        c.run_until(&[], 500, |c| c.all_converged_alive()),
+        "cluster did not converge"
+    );
     for observer in 0..4 {
         let mut last: BTreeMap<[u8; 32], (MemberState, u64)> = BTreeMap::new();
         for &(nid, st, inc) in &c.notifications[observer] {

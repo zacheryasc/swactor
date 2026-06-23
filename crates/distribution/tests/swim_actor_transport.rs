@@ -17,16 +17,14 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
 use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
-use swactor::Error;
 
 use distribution::messages::actor_codec_registry;
-use distribution::swim::actor::{
-    MembershipChanged, SharedPeerDirectory, SwimActor, SwimIn,
-};
+use distribution::swim::actor::{MembershipChanged, SharedPeerDirectory, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::probe::{ProbeMode, SwimConfig};
 use distribution::types::{MemberState, NodeId};
@@ -128,13 +126,23 @@ impl TransportCluster {
 
             let dir = SharedPeerDirectory::new();
             let swim = rt
-                .spawn(SwimActor::new(nid, brisk_config(), now, Arc::new(dir.clone())))
+                .spawn(SwimActor::new(
+                    nid,
+                    brisk_config(),
+                    now,
+                    Arc::new(dir.clone()),
+                ))
                 .expect("spawn SwimActor");
             // Self resolves to the local mailbox; peers are wired in phase 2.
             dir.bind(nid, swim, 0);
             let inbox = rt.new_inbox::<MembershipChanged>().expect("inbox");
-            rt.send_to(swim, SwimIn::Subscribe { observer: *inbox.addr() })
-                .unwrap();
+            rt.send_to(
+                swim,
+                SwimIn::Subscribe {
+                    observer: *inbox.addr(),
+                },
+            )
+            .unwrap();
 
             rts.push(rt);
             swims.push(swim);
@@ -181,7 +189,12 @@ impl TransportCluster {
         // Nodes 1..n join via the seed (node 0).
         for i in 1..n {
             c.rts[i]
-                .send_to(c.swims[i], SwimIn::Join { seeds: vec![c.ids[0]] })
+                .send_to(
+                    c.swims[i],
+                    SwimIn::Join {
+                        seeds: vec![c.ids[0]],
+                    },
+                )
                 .unwrap();
         }
         c.pump(12);

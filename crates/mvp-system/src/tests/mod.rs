@@ -5,6 +5,8 @@ mod gpu_worker_ctl_guarantees;
 mod gpu_worker_egress_producer_guarantees;
 mod gpu_worker_ingress_parser_guarantees;
 mod gpu_worker_process_adapter_guarantees;
+mod local_mock;
+mod local_mock_pipeline_integration;
 mod membership_pool_readiness_guarantees;
 mod node_boot_lifecycle_guarantees;
 mod observability_surface_guarantees;

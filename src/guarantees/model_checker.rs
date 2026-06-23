@@ -93,14 +93,8 @@ impl<'a, M: Model> Checker<'a, M> {
         let mut actions_buf: Vec<M::Action> = Vec::new();
 
         // Track property results
-        let mut always_violated: Vec<Option<String>> = properties
-            .iter()
-            .map(|_| None)
-            .collect();
-        let mut sometimes_satisfied: Vec<bool> = properties
-            .iter()
-            .map(|_| false)
-            .collect();
+        let mut always_violated: Vec<Option<String>> = properties.iter().map(|_| None).collect();
+        let mut sometimes_satisfied: Vec<bool> = properties.iter().map(|_| false).collect();
 
         // Seed with init states
         for s in self.model.init_states() {

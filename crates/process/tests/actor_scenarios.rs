@@ -171,14 +171,21 @@ fn happy_path_spawn_output_exit_notifies_subscriber() {
     // Verify SpawnProcess action was sent to driver
     let actions = harness.take_actions();
     assert!(
-        actions.iter().any(|a| matches!(a, ProcessAction::SpawnProcess { .. })),
+        actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::SpawnProcess { .. })),
         "driver should receive SpawnProcess, got: {:?}",
         actions
     );
 
     // Subscribe to notifications
-    rt.send_to(proc_addr, ProcessCommand::Subscribe { address: *notif_inbox.addr() })
-        .unwrap();
+    rt.send_to(
+        proc_addr,
+        ProcessCommand::Subscribe {
+            address: *notif_inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
 
     // Inject Started event from "driver"
@@ -191,7 +198,8 @@ fn happy_path_spawn_output_exit_notifies_subscriber() {
 
     let msgs = tick_collect(&rt, &notif_inbox, 1, 10);
     assert!(
-        msgs.iter().any(|m| matches!(m, ProcessNotification::Started { .. })),
+        msgs.iter()
+            .any(|m| matches!(m, ProcessNotification::Started { .. })),
         "subscriber should get Started notification, got: {:?}",
         msgs
     );
@@ -204,7 +212,8 @@ fn happy_path_spawn_output_exit_notifies_subscriber() {
     rt.send_to(proc_addr, ProcessCommand::PollTick).unwrap();
     let msgs = tick_collect(&rt, &notif_inbox, 1, 10);
     assert!(
-        msgs.iter().any(|m| matches!(m, ProcessNotification::Output { .. })),
+        msgs.iter()
+            .any(|m| matches!(m, ProcessNotification::Output { .. })),
         "subscriber should get Output notification"
     );
 
@@ -217,7 +226,10 @@ fn happy_path_spawn_output_exit_notifies_subscriber() {
     assert!(
         msgs.iter().any(|m| matches!(
             m,
-            ProcessNotification::Exited { status: ExitStatus::Code(0), .. }
+            ProcessNotification::Exited {
+                status: ExitStatus::Code(0),
+                ..
+            }
         )),
         "subscriber should get Exited(0) notification"
     );
@@ -250,8 +262,13 @@ fn polltick_drains_queued_events() {
     let proc_addr = reply_inbox.try_recv().unwrap().0;
 
     // Subscribe
-    rt.send_to(proc_addr, ProcessCommand::Subscribe { address: *notif_inbox.addr() })
-        .unwrap();
+    rt.send_to(
+        proc_addr,
+        ProcessCommand::Subscribe {
+            address: *notif_inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
 
     // Queue multiple events before sending PollTick
@@ -269,7 +286,11 @@ fn polltick_drains_queued_events() {
     rt.send_to(proc_addr, ProcessCommand::PollTick).unwrap();
     let msgs = tick_collect(&rt, &notif_inbox, 3, 20);
 
-    assert_eq!(msgs.len(), 3, "all three events should produce notifications");
+    assert_eq!(
+        msgs.len(),
+        3,
+        "all three events should produce notifications"
+    );
     assert!(matches!(msgs[0], ProcessNotification::Started { .. }));
     assert!(matches!(msgs[1], ProcessNotification::Output { .. }));
     assert!(matches!(msgs[2], ProcessNotification::Output { .. }));
@@ -301,8 +322,13 @@ fn close_command_triggers_graceful_shutdown() {
     let proc_addr = reply_inbox.try_recv().unwrap().0;
 
     // Subscribe and get to Running state
-    rt.send_to(proc_addr, ProcessCommand::Subscribe { address: *notif_inbox.addr() })
-        .unwrap();
+    rt.send_to(
+        proc_addr,
+        ProcessCommand::Subscribe {
+            address: *notif_inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
     harness.inject(ProcessEvent::Started);
     rt.send_to(proc_addr, ProcessCommand::PollTick).unwrap();
@@ -319,7 +345,9 @@ fn close_command_triggers_graceful_shutdown() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            ProcessAction::SendSignal { signal: Signal::Terminate }
+            ProcessAction::SendSignal {
+                signal: Signal::Terminate
+            }
         )),
         "Close should trigger SIGTERM, got: {:?}",
         actions
@@ -373,7 +401,9 @@ fn write_stdin_and_signal_forwarded_to_driver() {
 
     let actions = harness.take_actions();
     assert!(
-        actions.iter().any(|a| matches!(a, ProcessAction::WriteStdin { .. })),
+        actions
+            .iter()
+            .any(|a| matches!(a, ProcessAction::WriteStdin { .. })),
         "WriteStdin should be forwarded to driver, got: {:?}",
         actions
     );
@@ -394,7 +424,9 @@ fn write_stdin_and_signal_forwarded_to_driver() {
     assert!(
         actions.iter().any(|a| matches!(
             a,
-            ProcessAction::SendSignal { signal: Signal::Interrupt }
+            ProcessAction::SendSignal {
+                signal: Signal::Interrupt
+            }
         )),
         "SendSignal should be forwarded to driver, got: {:?}",
         actions
@@ -427,8 +459,13 @@ fn spawn_failure_notifies_error_and_stops_actor() {
     let proc_addr = reply_inbox.try_recv().unwrap().0;
 
     // Subscribe
-    rt.send_to(proc_addr, ProcessCommand::Subscribe { address: *notif_inbox.addr() })
-        .unwrap();
+    rt.send_to(
+        proc_addr,
+        ProcessCommand::Subscribe {
+            address: *notif_inbox.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
 
     // Inject spawn failure
@@ -439,7 +476,8 @@ fn spawn_failure_notifies_error_and_stops_actor() {
 
     let msgs = tick_collect(&rt, &notif_inbox, 1, 20);
     assert!(
-        msgs.iter().any(|m| matches!(m, ProcessNotification::Error { .. })),
+        msgs.iter()
+            .any(|m| matches!(m, ProcessNotification::Error { .. })),
         "subscriber should get Error notification on spawn failure"
     );
 
@@ -477,10 +515,20 @@ fn subscribe_and_unsubscribe_routing() {
     let proc_addr = reply_inbox.try_recv().unwrap().0;
 
     // Subscribe both
-    rt.send_to(proc_addr, ProcessCommand::Subscribe { address: *inbox_a.addr() })
-        .unwrap();
-    rt.send_to(proc_addr, ProcessCommand::Subscribe { address: *inbox_b.addr() })
-        .unwrap();
+    rt.send_to(
+        proc_addr,
+        ProcessCommand::Subscribe {
+            address: *inbox_a.addr(),
+        },
+    )
+    .unwrap();
+    rt.send_to(
+        proc_addr,
+        ProcessCommand::Subscribe {
+            address: *inbox_b.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
 
     // Get to Running
@@ -495,8 +543,13 @@ fn subscribe_and_unsubscribe_routing() {
     assert!(inbox_b.try_recv().is_some(), "inbox_b should get Started");
 
     // Unsubscribe inbox_b
-    rt.send_to(proc_addr, ProcessCommand::Unsubscribe { address: *inbox_b.addr() })
-        .unwrap();
+    rt.send_to(
+        proc_addr,
+        ProcessCommand::Unsubscribe {
+            address: *inbox_b.addr(),
+        },
+    )
+    .unwrap();
     rt.tick();
 
     // Inject output — only inbox_a should receive it
@@ -510,5 +563,8 @@ fn subscribe_and_unsubscribe_routing() {
     }
 
     assert!(inbox_a.try_recv().is_some(), "inbox_a should get Output");
-    assert!(inbox_b.try_recv().is_none(), "inbox_b should NOT get Output after unsubscribe");
+    assert!(
+        inbox_b.try_recv().is_none(),
+        "inbox_b should NOT get Output after unsubscribe"
+    );
 }

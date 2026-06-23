@@ -103,8 +103,7 @@ impl TimerWheel {
         if dead.is_empty() {
             return;
         }
-        self.interval_timers
-            .retain(|t| !dead.contains(&t.dest));
+        self.interval_timers.retain(|t| !dead.contains(&t.dest));
     }
 
     fn add_once(&mut self, dest: ActorAddress, msg: Box<dyn Any + Send>, ticks: u64) {

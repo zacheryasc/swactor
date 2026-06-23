@@ -112,7 +112,7 @@ fn log2_ceil(n: u64) -> u64 {
         return 0;
     }
     // Number of bits needed = position of highest set bit
-    
+
     64 - (n - 1).leading_zeros() as u64
 }
 

@@ -213,8 +213,7 @@ impl Model for SupervisorModel {
         next.total_restarts = new_total;
 
         // Use production compute_restart_set
-        let restart_indices =
-            compute_restart_set(next.strategy, dead_idx, NUM_CHILDREN);
+        let restart_indices = compute_restart_set(next.strategy, dead_idx, NUM_CHILDREN);
 
         for &idx in &restart_indices {
             if idx < NUM_CHILDREN {
@@ -232,95 +231,79 @@ impl Model for SupervisorModel {
     fn properties(&self) -> Vec<Property<Self>> {
         vec![
             // ── G8a: OneForOne restarts only the dead child ─────────────
-            Property::<Self>::always(
-                "G8a: OneForOne restarts only dead child",
-                |_, s| {
-                    if s.strategy != SupervisorStrategy::OneForOne {
-                        return true;
-                    }
-                    let Some(ev) = &s.last_event else { return true };
-                    if !ev.restarted.iter().any(|&r| r) {
-                        return true; // no restart (policy denied or meltdown)
-                    }
-                    // Only the dead child should be in the restart set
-                    for (i, &restarted) in ev.restarted.iter().enumerate() {
-                        if i == ev.dead_idx {
-                            if !restarted { return false; }
-                        } else if restarted {
+            Property::<Self>::always("G8a: OneForOne restarts only dead child", |_, s| {
+                if s.strategy != SupervisorStrategy::OneForOne {
+                    return true;
+                }
+                let Some(ev) = &s.last_event else { return true };
+                if !ev.restarted.iter().any(|&r| r) {
+                    return true; // no restart (policy denied or meltdown)
+                }
+                // Only the dead child should be in the restart set
+                for (i, &restarted) in ev.restarted.iter().enumerate() {
+                    if i == ev.dead_idx {
+                        if !restarted {
                             return false;
                         }
+                    } else if restarted {
+                        return false;
                     }
-                    true
-                },
-            ),
-
+                }
+                true
+            }),
             // ── G8b: OneForAll restarts all children ────────────────────
-            Property::<Self>::always(
-                "G8b: OneForAll restarts all children",
-                |_, s| {
-                    if s.strategy != SupervisorStrategy::OneForAll {
-                        return true;
-                    }
-                    let Some(ev) = &s.last_event else { return true };
-                    if !ev.restarted.iter().any(|&r| r) {
-                        return true;
-                    }
-                    // All children must be in the restart set
-                    ev.restarted.iter().all(|&r| r)
-                },
-            ),
-
+            Property::<Self>::always("G8b: OneForAll restarts all children", |_, s| {
+                if s.strategy != SupervisorStrategy::OneForAll {
+                    return true;
+                }
+                let Some(ev) = &s.last_event else { return true };
+                if !ev.restarted.iter().any(|&r| r) {
+                    return true;
+                }
+                // All children must be in the restart set
+                ev.restarted.iter().all(|&r| r)
+            }),
             // ── G8c: RestForOne restarts dead child + successors ────────
-            Property::<Self>::always(
-                "G8c: RestForOne restarts dead + successors only",
-                |_, s| {
-                    if s.strategy != SupervisorStrategy::RestForOne {
-                        return true;
+            Property::<Self>::always("G8c: RestForOne restarts dead + successors only", |_, s| {
+                if s.strategy != SupervisorStrategy::RestForOne {
+                    return true;
+                }
+                let Some(ev) = &s.last_event else { return true };
+                if !ev.restarted.iter().any(|&r| r) {
+                    return true;
+                }
+                // Children before dead_idx must NOT be restarted
+                for i in 0..ev.dead_idx {
+                    if ev.restarted[i] {
+                        return false;
                     }
-                    let Some(ev) = &s.last_event else { return true };
-                    if !ev.restarted.iter().any(|&r| r) {
-                        return true;
+                }
+                // Dead child + all after must be restarted
+                for i in ev.dead_idx..NUM_CHILDREN {
+                    if !ev.restarted[i] {
+                        return false;
                     }
-                    // Children before dead_idx must NOT be restarted
-                    for i in 0..ev.dead_idx {
-                        if ev.restarted[i] { return false; }
-                    }
-                    // Dead child + all after must be restarted
-                    for i in ev.dead_idx..NUM_CHILDREN {
-                        if !ev.restarted[i] { return false; }
-                    }
-                    true
-                },
-            ),
-
+                }
+                true
+            }),
             // ── G8d: Temporary dead child triggers no restart ───────────
             // When the child that DIES has Temporary policy, should_restart
             // returns false and no children are restarted at all.
-            Property::<Self>::always(
-                "G8d: Temporary dead child triggers no restart",
-                |_, s| {
-                    let Some(ev) = &s.last_event else { return true };
-                    if ev.dead_policy != RestartPolicy::Temporary {
-                        return true;
-                    }
-                    ev.restarted.iter().all(|&r| !r)
-                },
-            ),
-
+            Property::<Self>::always("G8d: Temporary dead child triggers no restart", |_, s| {
+                let Some(ev) = &s.last_event else { return true };
+                if ev.dead_policy != RestartPolicy::Temporary {
+                    return true;
+                }
+                ev.restarted.iter().all(|&r| !r)
+            }),
             // ── G8e: Transient + Normal death → no restart ──────────────
-            Property::<Self>::always(
-                "G8e: Transient + Normal triggers no restart",
-                |_, s| {
-                    let Some(ev) = &s.last_event else { return true };
-                    if ev.dead_policy != RestartPolicy::Transient
-                        || ev.reason != DeathReason::Normal
-                    {
-                        return true;
-                    }
-                    ev.restarted.iter().all(|&r| !r)
-                },
-            ),
-
+            Property::<Self>::always("G8e: Transient + Normal triggers no restart", |_, s| {
+                let Some(ev) = &s.last_event else { return true };
+                if ev.dead_policy != RestartPolicy::Transient || ev.reason != DeathReason::Normal {
+                    return true;
+                }
+                ev.restarted.iter().all(|&r| !r)
+            }),
             // ── G8f: Transient + Panicked → restart (unless meltdown) ──
             Property::<Self>::always(
                 "G8f: Transient + Panicked triggers restart unless meltdown",
@@ -336,49 +319,31 @@ impl Model for SupervisorModel {
                     ev.restarted.iter().any(|&r| r)
                 },
             ),
-
             // ── G8g: Meltdown bounds total restarts ─────────────────────
-            Property::<Self>::always(
-                "G8g: meltdown when total_restarts exceeds max",
-                |_, s| {
-                    if s.melted_down {
-                        true // no further actions (enforced by empty actions)
-                    } else {
-                        s.total_restarts <= MAX_RESTARTS
-                    }
-                },
-            ),
-
+            Property::<Self>::always("G8g: meltdown when total_restarts exceeds max", |_, s| {
+                if s.melted_down {
+                    true // no further actions (enforced by empty actions)
+                } else {
+                    s.total_restarts <= MAX_RESTARTS
+                }
+            }),
             // ── Liveness Canaries ───────────────────────────────────────
-            Property::<Self>::sometimes(
-                "L1: a restart occurs",
-                |_, s| s.children.iter().any(|c| c.restart_count > 0),
-            ),
-            Property::<Self>::sometimes(
-                "L2: meltdown is reachable",
-                |_, s| s.melted_down,
-            ),
-            Property::<Self>::sometimes(
-                "L3: OneForOne exercised with restart",
-                |_, s| {
-                    s.strategy == SupervisorStrategy::OneForOne
-                        && s.children.iter().any(|c| c.restart_count > 0)
-                },
-            ),
-            Property::<Self>::sometimes(
-                "L4: OneForAll exercised with restart",
-                |_, s| {
-                    s.strategy == SupervisorStrategy::OneForAll
-                        && s.children.iter().any(|c| c.restart_count > 0)
-                },
-            ),
-            Property::<Self>::sometimes(
-                "L5: RestForOne exercised with restart",
-                |_, s| {
-                    s.strategy == SupervisorStrategy::RestForOne
-                        && s.children.iter().any(|c| c.restart_count > 0)
-                },
-            ),
+            Property::<Self>::sometimes("L1: a restart occurs", |_, s| {
+                s.children.iter().any(|c| c.restart_count > 0)
+            }),
+            Property::<Self>::sometimes("L2: meltdown is reachable", |_, s| s.melted_down),
+            Property::<Self>::sometimes("L3: OneForOne exercised with restart", |_, s| {
+                s.strategy == SupervisorStrategy::OneForOne
+                    && s.children.iter().any(|c| c.restart_count > 0)
+            }),
+            Property::<Self>::sometimes("L4: OneForAll exercised with restart", |_, s| {
+                s.strategy == SupervisorStrategy::OneForAll
+                    && s.children.iter().any(|c| c.restart_count > 0)
+            }),
+            Property::<Self>::sometimes("L5: RestForOne exercised with restart", |_, s| {
+                s.strategy == SupervisorStrategy::RestForOne
+                    && s.children.iter().any(|c| c.restart_count > 0)
+            }),
         ]
     }
 }

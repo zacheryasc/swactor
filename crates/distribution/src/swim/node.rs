@@ -15,7 +15,7 @@ use std::time::Instant;
 use crate::messages::MembershipUpdate;
 use crate::types::{MemberState, NodeId, NodeRecord};
 
-use super::dissemination::{membership_update, DisseminationQueue};
+use super::dissemination::{DisseminationQueue, membership_update};
 use super::member_list::MemberList;
 use super::probe::{SwimAction, SwimConfig, SwimDiagEvent, SwimEvent, SwimProbe};
 
@@ -25,7 +25,11 @@ use super::probe::{SwimAction, SwimConfig, SwimDiagEvent, SwimEvent, SwimProbe};
 #[derive(Debug, Clone)]
 pub enum NodeAction {
     /// Send a SWIM ping.
-    SendPing { to: NodeId, sequence: u64, piggyback: Vec<u8> },
+    SendPing {
+        to: NodeId,
+        sequence: u64,
+        piggyback: Vec<u8>,
+    },
     /// Send an indirect ping request through a relay.
     SendPingReq {
         relay: NodeId,
@@ -34,13 +38,29 @@ pub enum NodeAction {
         piggyback: Vec<u8>,
     },
     /// Send a SWIM ack.
-    SendAck { to: NodeId, sequence: u64, piggyback: Vec<u8> },
+    SendAck {
+        to: NodeId,
+        sequence: u64,
+        piggyback: Vec<u8>,
+    },
     /// Forward an indirect ack back to the original prober.
-    ForwardAck { to: NodeId, target: NodeId, sequence: u64, piggyback: Vec<u8> },
+    ForwardAck {
+        to: NodeId,
+        target: NodeId,
+        sequence: u64,
+        piggyback: Vec<u8>,
+    },
     /// Send a join response with the current member list.
-    SendJoinResponse { to: NodeId, members: Vec<NodeRecord> },
+    SendJoinResponse {
+        to: NodeId,
+        members: Vec<NodeRecord>,
+    },
     /// Notification: a node state changed (for wiring into the directory actor).
-    MembershipChanged { node_id: NodeId, state: MemberState, incarnation: u64 },
+    MembershipChanged {
+        node_id: NodeId,
+        state: MemberState,
+        incarnation: u64,
+    },
 }
 
 // ─── Observation (diagnostics-free) ─────────────────────────────────────────
@@ -111,11 +131,10 @@ impl SwimNode {
     pub fn new(self_id: NodeId, config: SwimConfig, now: Instant) -> Self {
         const GOSSIP_LAMBDA: usize = 3;
         // Maximum membership updates piggybacked per outgoing message.
-        // Lowered from 8 to 6 as part of the N3 tuning pass (see
-        // `crates/simulation/SWIM_TUNING_REPORT.md`): smaller piggybacks
+        // Lowered from 8 to 6 in the N3 tuning pass: smaller piggybacks
         // cap the wire size each refute-cascade can balloon to without
-        // visibly slowing convergence at the cluster sizes the §10.3
-        // gossip-flap property exercises.
+        // visibly slowing convergence at the cluster sizes covered by
+        // gossip-flap checks.
         const MAX_PIGGYBACK: usize = 6;
         Self {
             members: MemberList::new(self_id),
@@ -192,7 +211,12 @@ impl SwimNode {
     }
 
     /// Handle a received ping.
-    pub fn handle_ping(&mut self, from: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
+    pub fn handle_ping(
+        &mut self,
+        from: NodeId,
+        sequence: u64,
+        piggyback: &[u8],
+    ) -> Vec<NodeAction> {
         let mut actions = self.apply_piggyback(from, piggyback);
 
         // Ensure the sender is in our member list
@@ -232,11 +256,18 @@ impl SwimNode {
         actions.extend(self.translate_probe_actions(probe_actions));
 
         // Check if this ack completes a pending relay (indirect ping path)
-        if let Some(pos) = self.pending_relays.iter().position(|(_, t, s)| *t == from && *s == sequence) {
+        if let Some(pos) = self
+            .pending_relays
+            .iter()
+            .position(|(_, t, s)| *t == from && *s == sequence)
+        {
             let (requester, target, seq) = self.pending_relays.remove(pos);
             let pb = self.dissemination.pack_piggyback(self.max_piggyback);
             actions.push(NodeAction::ForwardAck {
-                to: requester, target, sequence: seq, piggyback: pb,
+                to: requester,
+                target,
+                sequence: seq,
+                piggyback: pb,
             });
         }
 
@@ -280,7 +311,12 @@ impl SwimNode {
     }
 
     /// Handle a received indirect ack (forwarded by a relay node).
-    pub fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, piggyback: &[u8]) -> Vec<NodeAction> {
+    pub fn handle_indirect_ack(
+        &mut self,
+        target: NodeId,
+        sequence: u64,
+        piggyback: &[u8],
+    ) -> Vec<NodeAction> {
         // `target` is the indirectly-probed peer; the membership data
         // ultimately came from there even though a relay forwarded it.
         // Crediting `target` as the gossip source matches the bundle
@@ -323,10 +359,7 @@ impl SwimNode {
             state: MemberState::Alive,
             incarnation: self.members.self_incarnation(),
         });
-        actions.push(NodeAction::SendJoinResponse {
-            to: from,
-            members,
-        });
+        actions.push(NodeAction::SendJoinResponse { to: from, members });
 
         actions
     }
@@ -336,11 +369,9 @@ impl SwimNode {
         let mut actions = Vec::new();
         for record in members {
             let prior = self.members.get(&record.node_id).map(|e| e.state);
-            let changed = self.members.apply(
-                record.node_id,
-                record.state,
-                record.incarnation,
-            );
+            let changed = self
+                .members
+                .apply(record.node_id, record.state, record.incarnation);
             if changed {
                 self.observe_transition(record.node_id, prior, record.state, "join-response");
                 actions.push(NodeAction::MembershipChanged {
@@ -387,8 +418,7 @@ impl SwimNode {
     fn apply_membership_update(&mut self, update: MembershipUpdate) -> Vec<NodeAction> {
         // Check if this is about us
         if update.node_id == self.members.self_id() {
-            // Layer-B1 refute-on-stale-Suspect gate (per
-            // `crates/simulation/SWIM_TUNING_REPORT.md` §6.1): only
+            // Layer-B1 refute-on-stale-Suspect gate: only
             // refute when the incoming Suspect/Dead update is at our
             // *current* incarnation. A gossip path that carries a
             // stale Suspect/Dead record at incarnation N while our
@@ -405,11 +435,7 @@ impl SwimNode {
                 // Refute: bump incarnation and disseminate
                 let new_inc = self.members.refute();
                 self.dissemination.enqueue(
-                    membership_update(
-                        self.members.self_id(),
-                        MemberState::Alive,
-                        new_inc,
-                    ),
+                    membership_update(self.members.self_id(), MemberState::Alive, new_inc),
                     self.cluster_size(),
                 );
             }
@@ -417,11 +443,9 @@ impl SwimNode {
         }
 
         let prior = self.members.get(&update.node_id).map(|e| e.state);
-        let changed = self.members.apply(
-            update.node_id,
-            update.state,
-            update.incarnation,
-        );
+        let changed = self
+            .members
+            .apply(update.node_id, update.state, update.incarnation);
         if changed {
             self.observe_transition(update.node_id, prior, update.state, "gossip");
             if update.state == MemberState::Alive {
@@ -462,12 +486,13 @@ impl SwimNode {
                     // for partition-heal recovery: the target learns it was
                     // suspected/declared dead and refutes by bumping its incarnation.
                     if let Some(entry) = self.members.get(&to)
-                        && (entry.state == MemberState::Dead || entry.state == MemberState::Suspect) {
-                            self.dissemination.enqueue(
-                                membership_update(to, entry.state, entry.incarnation),
-                                self.cluster_size(),
-                            );
-                        }
+                        && (entry.state == MemberState::Dead || entry.state == MemberState::Suspect)
+                    {
+                        self.dissemination.enqueue(
+                            membership_update(to, entry.state, entry.incarnation),
+                            self.cluster_size(),
+                        );
+                    }
                     let pb = self.dissemination.pack_piggyback(self.max_piggyback);
                     actions.push(NodeAction::SendPing {
                         to,
@@ -475,7 +500,11 @@ impl SwimNode {
                         piggyback: pb,
                     });
                 }
-                SwimAction::SendPingReq { relay, target, sequence } => {
+                SwimAction::SendPingReq {
+                    relay,
+                    target,
+                    sequence,
+                } => {
                     // Indirect-phase probe initiation.
                     self.observe(SwimObservation::ProbeSent {
                         target,
@@ -493,7 +522,12 @@ impl SwimNode {
                 SwimAction::Suspect(node_id) => {
                     let prior = self.members.get(&node_id).map(|e| e.state);
                     if self.members.suspect(node_id) {
-                        self.observe_transition(node_id, prior, MemberState::Suspect, "probe-timeout");
+                        self.observe_transition(
+                            node_id,
+                            prior,
+                            MemberState::Suspect,
+                            "probe-timeout",
+                        );
                         if let Some(entry) = self.members.get(&node_id) {
                             self.dissemination.enqueue(
                                 membership_update(node_id, MemberState::Suspect, entry.incarnation),
@@ -503,7 +537,11 @@ impl SwimNode {
                         actions.push(NodeAction::MembershipChanged {
                             node_id,
                             state: MemberState::Suspect,
-                            incarnation: self.members.get(&node_id).map(|e| e.incarnation).unwrap_or(0),
+                            incarnation: self
+                                .members
+                                .get(&node_id)
+                                .map(|e| e.incarnation)
+                                .unwrap_or(0),
                         });
                     }
                 }
@@ -534,10 +572,23 @@ impl SwimNode {
                 // Probe ack/timeout lifecycle — no protocol effect, surfaced to
                 // the observer for per-probe RTT reconstruction.
                 SwimAction::Diag(diag) => match diag {
-                    SwimDiagEvent::ProbeAcked { target, sequence, kind } => {
-                        self.observe(SwimObservation::ProbeAcked { target, sequence, kind });
+                    SwimDiagEvent::ProbeAcked {
+                        target,
+                        sequence,
+                        kind,
+                    } => {
+                        self.observe(SwimObservation::ProbeAcked {
+                            target,
+                            sequence,
+                            kind,
+                        });
                     }
-                    SwimDiagEvent::ProbeTimedOut { target, sequence, kind, budget_ticks } => {
+                    SwimDiagEvent::ProbeTimedOut {
+                        target,
+                        sequence,
+                        kind,
+                        budget_ticks,
+                    } => {
                         self.observe(SwimObservation::ProbeTimedOut {
                             target,
                             sequence,

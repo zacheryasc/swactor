@@ -58,11 +58,10 @@ pub struct SwimConfig {
 
 impl Default for SwimConfig {
     fn default() -> Self {
-        // Retuned against the `1779733878` deployment shape per
-        // `crates/simulation/SWIM_RETUNE_REPORT.md`. Tick units; the
-        // production runtime chooses the tick period.
+        // Retuned against the `1779733878` deployment shape. Tick units;
+        // the production runtime chooses the tick period.
         //
-        // The prior tune (`SWIM_TUNING_REPORT.md`) calibrated against
+        // The prior tune calibrated against
         // 60 ms simulated latency. The `1779733878` deployment ran
         // entirely over relay-mediated paths with tier-2 RTTs of
         // 181–405 ms; the 0.3 s wall-clock probe budget the prior
@@ -108,14 +107,11 @@ impl Default for SwimConfig {
             // callers that want adaptive timeouts construct
             // `SwimConfig { lifeguard: Some(LifeguardConfig {
             // base_suspicion_timeout: <static>, ... }), .. }`. The
-            // calibration scenarios that exercise Lifeguard set it
-            // explicitly via the sim's `kind_config` so the sweep
-            // observation in `SWIM_RETUNE_REPORT.md` §6 is
-            // reproducible. The wiring's anti-target (dead-code
-            // condition) is met: `dynamic_suspicion_timeout` is
+            // Lifeguard calibration scenarios set the adaptive band explicitly
+            // so sweep observations are reproducible. The wiring's anti-target
+            // (dead-code condition) is met: `dynamic_suspicion_timeout` is
             // consumed by `SwimProbe::check_suspicion_timeouts` when
-            // `lifeguard` is `Some`; the §6 sweep table shows the
-            // verdict shift on the canary calibration.
+            // `lifeguard` is `Some`.
             lifeguard: None,
         }
     }
@@ -271,7 +267,9 @@ impl SwimProbe {
             None
         };
         let next_sweep_at = match &config.probe_mode {
-            ProbeMode::Reactive { safety_sweep_interval } => Some(now + *safety_sweep_interval),
+            ProbeMode::Reactive {
+                safety_sweep_interval,
+            } => Some(now + *safety_sweep_interval),
             ProbeMode::Periodic => None,
         };
         let next_probe_at = Some(now + config.probe_interval);
@@ -296,7 +294,12 @@ impl SwimProbe {
     }
 
     /// Process an event and produce zero or more actions.
-    pub fn step(&mut self, now: Instant, event: SwimEvent, members: &mut MemberList) -> Vec<SwimAction> {
+    pub fn step(
+        &mut self,
+        now: Instant,
+        event: SwimEvent,
+        members: &mut MemberList,
+    ) -> Vec<SwimAction> {
         self.now = now;
         let mut actions = Vec::new();
 
@@ -360,7 +363,10 @@ impl SwimProbe {
             // Simple shuffle using XOR of tick and index
             let n = self.probe_order.len();
             for i in (1..n).rev() {
-                let j = ((self.step_counter as usize).wrapping_mul(31).wrapping_add(i)) % (i + 1);
+                let j = ((self.step_counter as usize)
+                    .wrapping_mul(31)
+                    .wrapping_add(i))
+                    % (i + 1);
                 self.probe_order.swap(i, j);
             }
             self.probe_index = 0;
@@ -382,7 +388,11 @@ impl SwimProbe {
 
         let k = self.config.indirect_probes.min(alive.len());
         // Simple selection: take first k after a rotation based on tick
-        let start = if alive.is_empty() { 0 } else { self.step_counter as usize % alive.len() };
+        let start = if alive.is_empty() {
+            0
+        } else {
+            self.step_counter as usize % alive.len()
+        };
         let mut relays = Vec::with_capacity(k);
         for i in 0..k {
             let idx = (start + i) % alive.len();
@@ -425,7 +435,11 @@ impl SwimProbe {
 
     fn check_probe_timeout(&mut self, members: &MemberList, actions: &mut Vec<SwimAction>) {
         match &self.phase {
-            ProbePhase::WaitingDirectAck { target, sequence, sent_at } => {
+            ProbePhase::WaitingDirectAck {
+                target,
+                sequence,
+                sent_at,
+            } => {
                 if self.now.saturating_duration_since(*sent_at) >= self.config.probe_timeout {
                     let target = *target;
                     let sequence = *sequence;
@@ -457,7 +471,11 @@ impl SwimProbe {
                     };
                 }
             }
-            ProbePhase::WaitingIndirectAck { target, sequence, sent_at } => {
+            ProbePhase::WaitingIndirectAck {
+                target,
+                sequence,
+                sent_at,
+            } => {
                 if self.now.saturating_duration_since(*sent_at) >= self.config.probe_timeout {
                     let target = *target;
                     let sequence = *sequence;
@@ -485,12 +503,24 @@ impl SwimProbe {
         }
     }
 
-    fn handle_ack(&mut self, from: NodeId, sequence: u64, _members: &mut MemberList, actions: &mut Vec<SwimAction>) {
+    fn handle_ack(
+        &mut self,
+        from: NodeId,
+        sequence: u64,
+        _members: &mut MemberList,
+        actions: &mut Vec<SwimAction>,
+    ) {
         let kind = match &self.phase {
-            ProbePhase::WaitingDirectAck { target, sequence: expected, .. }
-                if from == *target && sequence == *expected => Some("direct"),
-            ProbePhase::WaitingIndirectAck { target, sequence: expected, .. }
-                if from == *target && sequence == *expected => Some("indirect"),
+            ProbePhase::WaitingDirectAck {
+                target,
+                sequence: expected,
+                ..
+            } if from == *target && sequence == *expected => Some("direct"),
+            ProbePhase::WaitingIndirectAck {
+                target,
+                sequence: expected,
+                ..
+            } if from == *target && sequence == *expected => Some("indirect"),
             _ => None,
         };
         if let Some(kind) = kind {
@@ -508,20 +538,32 @@ impl SwimProbe {
         }
     }
 
-    fn handle_indirect_ack(&mut self, target: NodeId, sequence: u64, _members: &mut MemberList, actions: &mut Vec<SwimAction>) {
-        if let ProbePhase::WaitingIndirectAck { target: expected, sequence: expected_seq, .. } = &self.phase
-            && target == *expected && sequence == *expected_seq {
-                actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
-                    target,
-                    sequence,
-                    kind: "indirect",
-                }));
-                self.cancel_suspicion_timer(target);
-                self.phase = ProbePhase::Idle;
-                if let Some(health) = &mut self.health {
-                    health.record_ack();
-                }
+    fn handle_indirect_ack(
+        &mut self,
+        target: NodeId,
+        sequence: u64,
+        _members: &mut MemberList,
+        actions: &mut Vec<SwimAction>,
+    ) {
+        if let ProbePhase::WaitingIndirectAck {
+            target: expected,
+            sequence: expected_seq,
+            ..
+        } = &self.phase
+            && target == *expected
+            && sequence == *expected_seq
+        {
+            actions.push(SwimAction::Diag(SwimDiagEvent::ProbeAcked {
+                target,
+                sequence,
+                kind: "indirect",
+            }));
+            self.cancel_suspicion_timer(target);
+            self.phase = ProbePhase::Idle;
+            if let Some(health) = &mut self.health {
+                health.record_ack();
             }
+        }
     }
 
     fn start_suspicion_timer(&mut self, node_id: NodeId) {
@@ -539,7 +581,11 @@ impl SwimProbe {
         self.suspicion_timers.retain(|t| t.node_id != node_id);
     }
 
-    fn check_suspicion_timeouts(&mut self, members: &mut MemberList, actions: &mut Vec<SwimAction>) {
+    fn check_suspicion_timeouts(
+        &mut self,
+        members: &mut MemberList,
+        actions: &mut Vec<SwimAction>,
+    ) {
         // Lifeguard §3.6: a degraded local health multiplier stretches
         // the suspect-to-dead window. The clamp band in
         // `LifeguardConfig` keeps a healthy node's effective timeout
@@ -636,7 +682,12 @@ impl SwimProbe {
     }
 
     /// Handle a send failure: start a probe immediately or queue it.
-    fn handle_send_failed(&mut self, target: NodeId, members: &MemberList, actions: &mut Vec<SwimAction>) {
+    fn handle_send_failed(
+        &mut self,
+        target: NodeId,
+        members: &MemberList,
+        actions: &mut Vec<SwimAction>,
+    ) {
         // Ignore failures for dead peers, self, or already-queued targets
         if let Some(entry) = members.get(&target) {
             if entry.state == MemberState::Dead {
@@ -705,7 +756,9 @@ impl SwimProbe {
             }
         }
         let interval = match &self.config.probe_mode {
-            ProbeMode::Reactive { safety_sweep_interval } => *safety_sweep_interval,
+            ProbeMode::Reactive {
+                safety_sweep_interval,
+            } => *safety_sweep_interval,
             ProbeMode::Periodic => return,
         };
         self.next_sweep_at = Some(self.now + interval);

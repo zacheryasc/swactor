@@ -1,16 +1,9 @@
-//! The shared per-node telemetry emitter.
+//! Generic datastream emission helpers.
 //!
-//! Both the generic `swactor` node and the pipeline-parallel GPU worker emit
-//! the same datastream through this one type. A caller extracts only the few
-//! node-specific values each tick (SWIM members, runtime counts, relay flags)
-//! and hands them in via [`TickInput`]; the emitter owns the mux, the host/CPU
-//! sampler, and the membership differ, and ships every assembled [`Frame`]
-//! through a pluggable [`FrameSink`].
-//!
-//! The emitter is transport-agnostic: it never depends on iroh. A node ships
-//! over the swactor cluster ([`ClusterFrameSink`]); a raw demo or test ships
-//! over UDP or collects in memory. Swapping the sink does not change a byte of
-//! emission logic.
+//! This module owns only integration mechanics: a per-node mux, process-output
+//! observer plumbing, generic record/text/byte submission, and sinks that ship
+//! ordered frames. The records and channel names belong to the crates that own
+//! those domains.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -19,14 +12,10 @@ use swactor::actor::ActorAddress;
 use swactor::process_observer::ProcessOutputObserver;
 use swactor::runtime::Runtime;
 
-use super::catalog::{
-    self, ActorRuntimeDetail, DatastoreState, DatastreamHealth, DistributionState, IdentityRecord,
-    MembershipTransition, ProcStream, Record, RuntimeStats, TransportInternals, WorkerCounters,
-};
-use super::frame::{Frame, Lifetime, NodeId, StreamId};
+use super::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use super::mux::Mux;
-use super::source::{self, HostSampler, MembershipTracker};
-use super::wire::{encode_delivery, DatastreamFrame};
+use super::record::Record;
+use super::wire::{DatastreamFrame, encode_delivery};
 
 /// Where assembled frames go once the mux has ordered them. A sink is the only
 /// place transport lives; the emitter knows nothing about it.
@@ -35,202 +24,103 @@ pub trait FrameSink: Send {
     fn ship(&mut self, stream: &StreamId, frame: &Frame);
 }
 
-/// Static identity a node needs to build its emitter.
+/// Static identity a node needs to build its mux.
 pub struct EmitterConfig {
     pub node_hex: String,
     pub life: u64,
     pub mux_capacity: usize,
 }
 
-/// The node-specific values a caller extracts each tick. Everything else the
-/// emitter samples itself.
-pub struct TickInput<'a> {
-    /// `(node_id, swim_state)` for every known peer, keyed by stable id.
-    pub members: &'a [(String, String)],
-    /// Actor-runtime metrics this tick.
-    pub runtime: RuntimeStats,
-    pub relay_connected: bool,
-    pub relay_peers: u32,
-    /// Median SWIM probe round-trip time (ms) this tick; `0` when no probe has
-    /// completed (e.g. a lone node, or before a real SWIM observer is installed).
-    pub rtt_ms_p50: u32,
-}
-
-/// Forwards managed-process output into a node's mux as `proc.<label>.*` text
-/// frames, so every process the node spawns is captured with no per-spawn
-/// wiring. Installed on the runtime via `set_process_output_observer`.
+/// Forwards managed-process output into a node's mux using a caller-owned
+/// channel mapping.
 struct MuxProcObserver {
     mux: Arc<Mux>,
+    channel_for: Arc<dyn Fn(&str, bool) -> ChannelId + Send + Sync>,
 }
 
 impl ProcessOutputObserver for MuxProcObserver {
     fn on_output(&self, label: &str, is_stderr: bool, data: &[u8]) {
-        let stream = if is_stderr {
-            ProcStream::Stderr
-        } else {
-            ProcStream::Stdout
-        };
         self.mux
-            .submit(catalog::process_output(label, stream), data.to_vec());
+            .submit((self.channel_for)(label, is_stderr), data.to_vec());
     }
 }
 
-/// The one per-node emitter. Owns ordering (its [`Mux`]) and the periodic
-/// samplers; ships through its [`FrameSink`].
+/// A per-node emitter. Owns ordering (its [`Mux`]) and ships through its
+/// [`FrameSink`]. It does not know any domain-specific record type.
 pub struct DatastreamEmitter {
     stream_id: StreamId,
     mux: Arc<Mux>,
-    host: HostSampler,
-    membership: MembershipTracker,
     sink: Box<dyn FrameSink>,
-    /// When set, [`tick`](Self::tick) does **not** synthesize membership from the
-    /// member-list diff (M4) — the caller drives `membership` from a real event
-    /// source via [`submit_membership`](Self::submit_membership), so the diff
-    /// would only duplicate it with empty reasons.
-    external_membership: bool,
 }
 
 impl DatastreamEmitter {
-    /// Build a node's emitter: a mux keyed by its stream id, with the identity
-    /// frame emitted first so the consumer can attribute the stream.
+    /// Build a node's emitter: a mux keyed by its stream id.
     pub fn new(cfg: EmitterConfig, sink: Box<dyn FrameSink>) -> Self {
         let stream_id = StreamId::new(NodeId::new(&cfg.node_hex), Lifetime(cfg.life));
         let mux = Arc::new(Mux::new(stream_id.clone(), cfg.mux_capacity));
-        mux.submit(
-            catalog::IDENTITY,
-            source::identity_record(&cfg.node_hex, cfg.life).encode(),
-        );
         Self {
             stream_id,
             mux,
-            host: HostSampler::new(),
-            membership: MembershipTracker::new(),
             sink,
-            external_membership: false,
         }
     }
 
-    /// Switch `membership` to an external event source: [`tick`](Self::tick) stops
-    /// diffing the member list (M4), and the caller emits transitions via
-    /// [`submit_membership`](Self::submit_membership) with a real `reason`.
-    pub fn use_external_membership(&mut self) {
-        self.external_membership = true;
+    /// The stream this emitter produces.
+    pub fn stream_id(&self) -> &StreamId {
+        &self.stream_id
     }
 
-    /// The node's mux, for producers (e.g. a raw demo) that submit directly.
+    /// The node's mux, for producers that submit directly.
     pub fn mux(&self) -> &Arc<Mux> {
         &self.mux
     }
 
+    /// Number of positions assigned by the mux.
+    pub fn assigned(&self) -> u64 {
+        self.mux.assigned()
+    }
+
+    /// Number of frames dropped by the mux on overflow.
+    pub fn dropped(&self) -> u64 {
+        self.mux.dropped()
+    }
+
+    /// Submit a typed record defined by the caller's crate.
+    pub fn submit_record<R: Record>(&self, record: &R) -> Position {
+        self.mux.submit(R::channel(), record.encode())
+    }
+
+    /// Submit UTF-8/text bytes on a caller-owned channel.
+    pub fn submit_text(&self, channel: impl Into<ChannelId>, text: impl AsRef<[u8]>) -> Position {
+        self.mux.submit(channel, text.as_ref().to_vec())
+    }
+
+    /// Submit arbitrary bytes on a caller-owned channel.
+    pub fn submit_bytes(&self, channel: impl Into<ChannelId>, bytes: Vec<u8>) -> Position {
+        self.mux.submit(channel, bytes)
+    }
+
     /// An observer that taps managed-process output onto this node's stream.
-    /// Register it on the runtime with `Runtime::set_process_output_observer`.
-    pub fn process_observer(&self) -> Arc<dyn ProcessOutputObserver> {
+    /// The caller supplies the channel naming convention.
+    pub fn process_observer_with<F>(&self, channel_for: F) -> Arc<dyn ProcessOutputObserver>
+    where
+        F: Fn(&str, bool) -> ChannelId + Send + Sync + 'static,
+    {
         Arc::new(MuxProcObserver {
             mux: self.mux.clone(),
+            channel_for: Arc::new(channel_for),
         })
     }
 
-    /// One main-loop iteration: when `sample_periodic`, submit the
-    /// host/runtime/transport records; every call diff membership and submit
-    /// transitions; then drain the mux and ship every ordered frame.
-    pub fn tick(&mut self, input: TickInput, sample_periodic: bool) {
-        if sample_periodic {
-            self.mux.submit(
-                catalog::HOST_RESOURCE,
-                source::read_host_resource(&mut self.host).encode(),
-            );
-            self.mux.submit(catalog::RUNTIME_STATS, input.runtime.encode());
-            let transport = TransportInternals {
-                relay_connected: input.relay_connected,
-                direct_peers: input
-                    .members
-                    .iter()
-                    .filter(|(_, s)| s == "alive")
-                    .count() as u32,
-                relay_peers: input.relay_peers,
-                rtt_ms_p50: input.rtt_ms_p50,
-            };
-            self.mux
-                .submit(catalog::TRANSPORT_INTERNALS, transport.encode());
-
-            // The pipe reporting on its own integrity: positions assigned vs.
-            // frames dropped on mux overflow. Read before submitting this frame,
-            // so the figures exclude the health frame itself. Rides every tick, so
-            // it ships on any node that ticks (the demo's FleetEmitter included).
-            let assigned = self.mux.assigned();
-            let dropped = self.mux.dropped();
-            let loss_rate_ppm = if assigned > 0 {
-                ((dropped as u128 * 1_000_000) / assigned as u128).min(u32::MAX as u128) as u32
-            } else {
-                0
-            };
-            self.mux.submit(
-                catalog::DATASTREAM_HEALTH,
-                DatastreamHealth {
-                    assigned,
-                    dropped,
-                    loss_rate_ppm,
-                }
-                .encode(),
-            );
-        }
-
-        // M4 fallback: synthesize membership from the member-list diff, unless the
-        // caller drives it from a real event source (`use_external_membership`).
-        if !self.external_membership {
-            for transition in self.membership.diff(input.members) {
-                self.mux.submit(catalog::MEMBERSHIP, transition.encode());
-            }
-        }
-
+    /// Drain the mux and ship every ordered frame.
+    pub fn tick(&mut self) {
         for frame in self.mux.drain() {
             self.sink.ship(&self.stream_id, &frame);
         }
     }
 
-    /// Submit the consolidated distribution-subsystem state. Periodic; the node
-    /// builds this from its actor mirrors each refresh. Drained by the next
-    /// [`tick`](Self::tick).
-    pub fn submit_dist_state(&self, state: &DistributionState) {
-        self.mux.submit(catalog::DIST_STATE, state.encode());
-    }
-
-    /// Submit the consolidated datastore steady metrics. Periodic.
-    pub fn submit_datastore_state(&self, state: &DatastoreState) {
-        self.mux.submit(catalog::DATASTORE_STATE, state.encode());
-    }
-
-    /// Submit the per-actor runtime detail table. Periodic.
-    pub fn submit_actor_detail(&self, detail: &ActorRuntimeDetail) {
-        self.mux.submit(catalog::RUNTIME_ACTORS, detail.encode());
-    }
-
-    /// Submit the aggregated worker-runtime counters (routing/error tallies +
-    /// tick timing) onto the pipe — the deep slice the thin `runtime.stats`
-    /// heartbeat omits. Periodic.
-    pub fn submit_worker_counters(&self, counters: &WorkerCounters) {
-        self.mux.submit(catalog::RUNTIME_WORKERS, counters.encode());
-    }
-
-    /// Submit one membership transition from a real event source (the SWIM
-    /// observer), carrying a non-empty `reason`. Event-driven; pairs with
-    /// [`use_external_membership`](Self::use_external_membership), which turns off
-    /// the M4 diff so this is the sole `membership` source.
-    pub fn submit_membership(&self, transition: &MembershipTransition) {
-        self.mux.submit(catalog::MEMBERSHIP, transition.encode());
-    }
-
-    /// Re-emit the identity record once late-bound fields (name, listen addr,
-    /// relay URL, version) are known. "Latest wins" on the consumer, so this
-    /// supersedes the minimal boot identity emitted in [`new`](Self::new).
-    pub fn update_identity(&self, identity: &IdentityRecord) {
-        self.mux.submit(catalog::IDENTITY, identity.encode());
-    }
-
     /// A cheap, cloneable handle for submitting event-driven frames onto this
-    /// node's stream from any thread — the same shared-mux path as the process
-    /// observer, for sources (e.g. the datastore) whose events fire on their own
-    /// worker threads rather than in the main loop.
+    /// node's stream from any thread.
     pub fn event_sink(&self) -> DatastreamEventSink {
         DatastreamEventSink {
             mux: self.mux.clone(),
@@ -238,41 +128,29 @@ impl DatastreamEmitter {
     }
 }
 
-/// A thread-safe submit handle (see [`DatastreamEmitter::event_sink`]). Holds a
-/// clone of the node's mux; submitted frames drain in the node's main loop.
+/// A thread-safe submit handle. Holds a clone of the node's mux; submitted
+/// frames drain in the node's main loop.
 #[derive(Clone)]
 pub struct DatastreamEventSink {
     mux: Arc<Mux>,
 }
 
 impl DatastreamEventSink {
-    /// Record one datastore operation as a `datastore.events` text line (JSON,
-    /// one object per line — the text channel carries structured op records the
-    /// consumer tails to rebuild the recent-operations timeline).
-    pub fn datastore_event(
-        &self,
-        timestamp_ms: u64,
-        kind: &str,
-        hash: &str,
-        name: Option<&str>,
-        size_bytes: u64,
-    ) {
-        let line = serde_json::json!({
-            "timestamp_ms": timestamp_ms,
-            "kind": kind,
-            "hash": hash,
-            "name": name,
-            "size_bytes": size_bytes,
-        })
-        .to_string();
-        self.mux
-            .submit(catalog::datastore_event(), line.into_bytes());
+    pub fn submit_record<R: Record>(&self, record: &R) -> Position {
+        self.mux.submit(R::channel(), record.encode())
+    }
+
+    pub fn submit_text(&self, channel: impl Into<ChannelId>, text: impl AsRef<[u8]>) -> Position {
+        self.mux.submit(channel, text.as_ref().to_vec())
+    }
+
+    pub fn submit_bytes(&self, channel: impl Into<ChannelId>, bytes: Vec<u8>) -> Position {
+        self.mux.submit(channel, bytes)
     }
 }
 
-/// A sink that drops everything. Used by a node before it knows where to ship
-/// (e.g. a standalone node with no orchestrator), so the mux still drains and
-/// stays bounded.
+/// A sink that drops everything. Used when a node has no collector yet, so the
+/// mux can still drain and stay bounded.
 pub struct NoopSink;
 
 impl FrameSink for NoopSink {
@@ -281,10 +159,7 @@ impl FrameSink for NoopSink {
 
 /// Ships frames over the swactor cluster to the orchestrator's `datastream-sink`
 /// actor, reusing the exact `register_name`/`resolve_name` + transport-router
-/// path the application already uses. The destination is late-bound through a
-/// shared `OnceLock`: until the sink resolves (the orchestrator may not have
-/// joined yet) frames are dropped, and the mux's bounded buffer absorbs the
-/// gap — the same tolerance as a lazily re-resolved collector.
+/// path the application already uses.
 pub struct ClusterFrameSink {
     rt: Arc<Runtime>,
     sink: Arc<OnceLock<ActorAddress>>,

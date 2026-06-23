@@ -6,29 +6,19 @@
 use swactor_transport::crypto::Keypair;
 
 const ADJECTIVES: &[&str] = &[
-    "bold", "brave", "bright", "calm", "clever",
-    "cool", "crisp", "deft", "eager", "fair",
-    "fast", "fierce", "fleet", "fond", "frank",
-    "free", "fresh", "glad", "grand", "green",
-    "happy", "hardy", "keen", "kind", "light",
-    "live", "lucky", "merry", "mild", "neat",
-    "noble", "pale", "plain", "prime", "proud",
-    "pure", "quick", "quiet", "rapid", "ready",
-    "rich", "sharp", "sleek", "smart", "solid",
-    "sound", "stout", "sure", "swift", "wise",
+    "bold", "brave", "bright", "calm", "clever", "cool", "crisp", "deft", "eager", "fair", "fast",
+    "fierce", "fleet", "fond", "frank", "free", "fresh", "glad", "grand", "green", "happy",
+    "hardy", "keen", "kind", "light", "live", "lucky", "merry", "mild", "neat", "noble", "pale",
+    "plain", "prime", "proud", "pure", "quick", "quiet", "rapid", "ready", "rich", "sharp",
+    "sleek", "smart", "solid", "sound", "stout", "sure", "swift", "wise",
 ];
 
 const ANIMALS: &[&str] = &[
-    "badger", "bear", "bison", "bobcat", "crane",
-    "crow", "deer", "dove", "eagle", "elk",
-    "falcon", "finch", "fox", "frog", "goose",
-    "hare", "hawk", "heron", "horse", "ibis",
-    "jackal", "jay", "kite", "lark", "lion",
-    "lynx", "marten", "mink", "moose", "newt",
-    "otter", "owl", "panda", "pike", "puma",
-    "quail", "raven", "robin", "salmon", "seal",
-    "shrike", "snake", "sparrow", "stork", "swan",
-    "tiger", "toad", "trout", "viper", "wolf",
+    "badger", "bear", "bison", "bobcat", "crane", "crow", "deer", "dove", "eagle", "elk", "falcon",
+    "finch", "fox", "frog", "goose", "hare", "hawk", "heron", "horse", "ibis", "jackal", "jay",
+    "kite", "lark", "lion", "lynx", "marten", "mink", "moose", "newt", "otter", "owl", "panda",
+    "pike", "puma", "quail", "raven", "robin", "salmon", "seal", "shrike", "snake", "sparrow",
+    "stork", "swan", "tiger", "toad", "trout", "viper", "wolf",
 ];
 
 /// Generate a deterministic human-readable name from a keypair.

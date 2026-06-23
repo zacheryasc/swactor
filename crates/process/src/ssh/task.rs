@@ -9,8 +9,8 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::event::ProcessEvent;
 use crate::types::EventQueue;
-use crate::types::{ExitStatus, ProcessMode, ProcessSpec, Signal};
 use crate::types::ProcessWaker;
+use crate::types::{ExitStatus, ProcessMode, ProcessSpec, Signal};
 
 use super::config::SshConfig;
 
@@ -55,9 +55,13 @@ pub(super) async fn run_ssh_session(
     let session = match connect_and_auth(&config).await {
         Ok(session) => session,
         Err(e) => {
-            push_and_wake(&queue, &waker_slot, ProcessEvent::SpawnFailed {
-                reason: format!("SSH connection failed: {e}"),
-            });
+            push_and_wake(
+                &queue,
+                &waker_slot,
+                ProcessEvent::SpawnFailed {
+                    reason: format!("SSH connection failed: {e}"),
+                },
+            );
             return;
         }
     };
@@ -66,9 +70,13 @@ pub(super) async fn run_ssh_session(
     let channel = match setup_channel(&session, &spec, has_pty).await {
         Ok(ch) => ch,
         Err(e) => {
-            push_and_wake(&queue, &waker_slot, ProcessEvent::SpawnFailed {
-                reason: format!("SSH channel setup failed: {e}"),
-            });
+            push_and_wake(
+                &queue,
+                &waker_slot,
+                ProcessEvent::SpawnFailed {
+                    reason: format!("SSH channel setup failed: {e}"),
+                },
+            );
             return;
         }
     };
@@ -95,10 +103,7 @@ async fn connect_and_auth(
     )
     .await?;
 
-    let key = russh_keys::load_secret_key(
-        &config.key_file,
-        config.key_passphrase.as_deref(),
-    )?;
+    let key = russh_keys::load_secret_key(&config.key_file, config.key_passphrase.as_deref())?;
 
     let authenticated = session
         .authenticate_publickey(&config.username, Arc::new(key))
@@ -301,7 +306,9 @@ fn shell_escape(s: &str) -> String {
         return "''".to_string();
     }
     // If the string is simple (alphanumeric + safe chars), no quoting needed
-    if s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | ',' | '+' | '=')) {
+    if s.chars().all(|c| {
+        c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | ',' | '+' | '=')
+    }) {
         return s.to_string();
     }
     // Single-quote the string, replacing ' with '\''

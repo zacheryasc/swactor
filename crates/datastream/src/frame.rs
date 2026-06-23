@@ -31,10 +31,10 @@ impl fmt::Display for Position {
 /// belong to (spec §4.2, §3).
 ///
 /// It is an opaque token: the pipe (mux, transport, ingest, store) never
-/// interprets it. Only a *view* resolves it, through the catalog
-/// ([`crate::catalog`]), into a codec. A token with no
-/// registered codec is still carried and stored whole, then decoded later
-/// (spec §6.3) — which is why this type is open (any string) rather than a
+/// interprets it. Producers and consumers define any structure or codec at the
+/// edges, through their own [`crate::record::Record`] types or classifiers. A
+/// token with no registered codec is still carried and stored whole, then decoded
+/// later (spec §6.3) — which is why this type is open (any string) rather than a
 /// closed enum: a new channel is a new id, no pipe code changes.
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChannelId(Arc<str>);
@@ -137,7 +137,10 @@ pub struct StreamId {
 impl StreamId {
     /// Construct a stream id from a node and a lifetime.
     pub fn new(node: impl Into<NodeId>, life: Lifetime) -> Self {
-        StreamId { node: node.into(), life }
+        StreamId {
+            node: node.into(),
+            life,
+        }
     }
 }
 
@@ -171,7 +174,11 @@ pub struct Frame {
 impl Frame {
     /// Assemble a frame from its parts.
     pub fn new(channel: impl Into<ChannelId>, position: Position, payload: Vec<u8>) -> Self {
-        Frame { channel: channel.into(), position, payload }
+        Frame {
+            channel: channel.into(),
+            position,
+            payload,
+        }
     }
 }
 
@@ -181,7 +188,8 @@ impl fmt::Debug for Frame {
         // JSON records both are) so debug output is readable; fall back to
         // a byte count for genuinely binary payloads.
         let mut dbg = f.debug_struct("Frame");
-        dbg.field("channel", &self.channel).field("position", &self.position);
+        dbg.field("channel", &self.channel)
+            .field("position", &self.position);
         match std::str::from_utf8(&self.payload) {
             Ok(text) => dbg.field("payload", &text),
             Err(_) => dbg.field("payload", &format_args!("<{} bytes>", self.payload.len())),

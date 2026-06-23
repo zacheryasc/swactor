@@ -1,11 +1,11 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::actor::{ActorAddress, ActorInterface, Ctx, Down, Message};
 use crate::Error;
+use crate::actor::{ActorAddress, ActorInterface, Ctx, Down, Message};
 
-use super::supervisor::ActiveChild;
 use super::CtxMonitoring;
+use super::supervisor::ActiveChild;
 
 /// Strategy for distributing messages across pool workers.
 #[derive(Debug, Clone)]

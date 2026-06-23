@@ -81,7 +81,10 @@ fn lan_remote_node_death_detected() {
                     .map(|snap| snap.dead_count >= 1)
                     .unwrap_or(false)
             });
-            assert!(any_sees_dead, "at least one survivor should see a dead member");
+            assert!(
+                any_sees_dead,
+                "at least one survivor should see a dead member"
+            );
         }
         Err(diag) => {
             cluster.stop();
@@ -118,11 +121,7 @@ fn lan_killed_remote_node_rejoins() {
     restart_remote_node("node-3");
 
     // Then: node-3 rejoins the cluster across the LAN
-    let result = wait_for_lan_convergence(
-        &[(LAN_THINKPAD_IP, 9093)],
-        1,
-        Duration::from_secs(30),
-    );
+    let result = wait_for_lan_convergence(&[(LAN_THINKPAD_IP, 9093)], 1, Duration::from_secs(30));
 
     match result {
         Ok(()) => {
@@ -160,8 +159,8 @@ fn lan_actors_resolvable_cross_machine() {
     let mut total_cache_size = 0;
 
     for &(host, port) in &LAN_ENDPOINTS {
-        let snap = poll_distribution_at(host, port)
-            .unwrap_or_else(|| panic!("{host}:{port} unreachable"));
+        let snap =
+            poll_distribution_at(host, port).unwrap_or_else(|| panic!("{host}:{port} unreachable"));
 
         // Then: the directory has converged so each node knows >= its own 2 actors.
         assert!(

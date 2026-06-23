@@ -16,7 +16,7 @@
 
 use std::collections::BTreeSet;
 
-use distribution::swim::dissemination::{membership_update, DisseminationQueue};
+use distribution::swim::dissemination::{DisseminationQueue, membership_update};
 use distribution::types::{MemberState, NodeId};
 use proptest::prelude::*;
 
@@ -111,9 +111,15 @@ fn transmit_budget_matches_spec_at_known_cluster_sizes() {
         let mut transmissions = 0;
         while !q.take(10).is_empty() {
             transmissions += 1;
-            assert!(transmissions <= expected + 1, "cluster {cluster}: ran past the spec budget");
+            assert!(
+                transmissions <= expected + 1,
+                "cluster {cluster}: ran past the spec budget"
+            );
         }
-        assert_eq!(transmissions, expected, "cluster {cluster}: wrong transmit budget");
+        assert_eq!(
+            transmissions, expected,
+            "cluster {cluster}: wrong transmit budget"
+        );
     }
 }
 
@@ -140,9 +146,17 @@ fn dominating_update_replaces_entry_and_resets_budget() {
     for _ in 0..3 {
         let got = q.take(10);
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].state, MemberState::Suspect, "the replaced state must be what propagates");
+        assert_eq!(
+            got[0].state,
+            MemberState::Suspect,
+            "the replaced state must be what propagates"
+        );
     }
-    assert_eq!(q.take(10).len(), 0, "entry evicted only after the reset budget is spent");
+    assert_eq!(
+        q.take(10).len(),
+        0,
+        "entry evicted only after the reset budget is spent"
+    );
 }
 
 #[test]
@@ -160,8 +174,16 @@ fn non_dominating_update_neither_replaces_nor_resets() {
 
     for _ in 0..2 {
         let got = q.take(10);
-        assert_eq!(got[0].state, MemberState::Suspect, "non-dominating update must not replace");
+        assert_eq!(
+            got[0].state,
+            MemberState::Suspect,
+            "non-dominating update must not replace"
+        );
         assert_eq!(got[0].incarnation, 5);
     }
-    assert_eq!(q.take(10).len(), 0, "budget was not reset — entry evicts on its original schedule");
+    assert_eq!(
+        q.take(10).len(),
+        0,
+        "budget was not reset — entry evicts on its original schedule"
+    );
 }

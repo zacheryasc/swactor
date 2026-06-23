@@ -1,7 +1,7 @@
 use std::sync::RwLock;
 
-use crate::actor::ActorAddress;
 use crate::AddrMap;
+use crate::actor::ActorAddress;
 
 /// Maps supervised children to their supervisor.
 ///

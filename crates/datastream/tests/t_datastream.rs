@@ -10,28 +10,33 @@
 #[path = "datastream_support/mod.rs"]
 mod support;
 
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-use datastream::catalog::{
-    self, ActorRuntimeDetail, ChannelKind, DatastoreState, DatastreamHealth, DistributionState,
-    IdentityRecord, ProcStream, Record, ResourceSample,
-};
 use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use datastream::ingest::Consumer;
 use datastream::mux::Mux;
 use datastream::store::{GapSpan, StoredStream};
 use datastream::transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 use datastream::views::{self, Body, LogEntry};
-use datastream::wire::{decode_delivery, encode_delivery, WireError};
+use datastream::wire::{WireError, decode_delivery, encode_delivery};
+use datastream::{ChannelKind, ChannelRegistry, Record};
 
 use support::reference::TimelineItem;
-use support::{payloads, reference, Node};
+use support::schema::{
+    self as catalog, ActorRuntimeDetail, DatastreamHealth, DistributionState, IdentityRecord,
+    ProcStream, ResourceSample,
+};
+use support::{Node, payloads, reference};
 
 /// The frames of `sent` that survive dropping `dropped`, in send order —
 /// the scenario's delivered set, derived without running the pipe.
 fn surviving(sent: &[Frame], dropped: &[u64]) -> Vec<Frame> {
     let drop: std::collections::BTreeSet<u64> = dropped.iter().copied().collect();
-    sent.iter().filter(|f| !drop.contains(&f.position.0)).cloned().collect()
+    sent.iter()
+        .filter(|f| !drop.contains(&f.position.0))
+        .cloned()
+        .collect()
 }
 
 /// A node that has emitted a realistic spread of channels: identity, two
@@ -41,7 +46,11 @@ fn busy_node(stream: &StreamId) -> Vec<Frame> {
     let node = Node::new(stream.clone());
     node.emit(&payloads::identity(stream.node.as_str(), stream.life.0)); // 0
     node.emit(&payloads::resource(0)); // 1
-    node.emit_text("trainer", ProcStream::Stdout, &payloads::log_line("trainer", 0)); // 2
+    node.emit_text(
+        "trainer",
+        ProcStream::Stdout,
+        &payloads::log_line("trainer", 0),
+    ); // 2
     node.emit(&payloads::transport(1)); // 3
     node.emit(&payloads::membership("node-beta", "alive", "suspect")); // 4
     node.emit(&payloads::resource(1)); // 5
@@ -67,16 +76,34 @@ fn structure(entries: &[LogEntry]) -> Vec<TimelineItem> {
     entries
         .iter()
         .map(|e| match e {
-            LogEntry::Frame(mf) => {
-                TimelineItem::Frame { position: mf.position.0, channel: mf.channel.to_string() }
-            }
-            LogEntry::Gap(span) => TimelineItem::Gap { start: span.start, end: span.end },
+            LogEntry::Frame(mf) => TimelineItem::Frame {
+                position: mf.position.0,
+                channel: mf.channel.to_string(),
+            },
+            LogEntry::Gap(span) => TimelineItem::Gap {
+                start: span.start,
+                end: span.end,
+            },
         })
         .collect()
 }
 
 fn test_stream() -> StreamId {
     StreamId::new(NodeId::new("node-alpha"), Lifetime(1))
+}
+
+fn test_registry() -> ChannelRegistry {
+    ChannelRegistry::new()
+        .with_record::<IdentityRecord>()
+        .with_record::<ResourceSample>()
+        .with_record::<support::schema::TransportInternals>()
+        .with_record::<support::schema::MembershipTransition>()
+        .with_record::<support::schema::RuntimeStats>()
+        .with_record::<DistributionState>()
+        .with_record::<ActorRuntimeDetail>()
+        .with_record::<support::schema::WorkerCounters>()
+        .with_record::<DatastreamHealth>()
+        .with_text_prefix("proc.")
 }
 
 // ── Kind I — verified vectors (testing spec §5) ────────────────────────
@@ -96,7 +123,6 @@ fn codec_round_trips_every_typed_channel() {
     assert_round_trip(&payloads::membership("node-beta", "alive", "suspect"));
     assert_round_trip(&payloads::runtime(5));
     assert_round_trip(&payloads::dist_state(6));
-    assert_round_trip(&payloads::datastore_state(7));
     assert_round_trip(&payloads::actor_detail(8));
     assert_round_trip(&payloads::worker_counters(9));
     assert_round_trip(&payloads::datastream_health(10));
@@ -105,6 +131,48 @@ fn codec_round_trips_every_typed_channel() {
 fn assert_round_trip<R: Record + PartialEq + std::fmt::Debug>(record: &R) {
     let decoded = R::decode(&record.encode()).expect("round-trips");
     assert_eq!(&decoded, record, "decode(encode(r)) must equal r");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ExternalPluginRecord {
+    #[serde(default)]
+    value: u64,
+    #[serde(default)]
+    label: String,
+}
+
+impl Record for ExternalPluginRecord {
+    const CHANNEL: &'static str = "external.plugin.sample";
+}
+
+#[test]
+fn external_record_full_pipe_round_trips_without_datastream_catalog() {
+    let stream = test_stream();
+    let mux = Mux::unbounded(stream.clone());
+    let record = ExternalPluginRecord {
+        value: 42,
+        label: "owned outside datastream".into(),
+    };
+    let pos = mux.submit(ExternalPluginRecord::channel(), record.encode());
+    let sent = mux.drain();
+
+    let consumer = consume(&stream, &sent, StreamScript::perfect());
+    let stored = consumer.store().stream(&stream).expect("stream stored");
+    let series = views::metric_series::<ExternalPluginRecord>(stored);
+
+    assert_eq!(pos, Position(0));
+    assert_eq!(series, vec![(Position(0), record.clone())]);
+
+    let registry = ChannelRegistry::new().with_record::<ExternalPluginRecord>();
+    let body = views::decode_body_with(
+        &ExternalPluginRecord::channel(),
+        &record.encode(),
+        &registry,
+    );
+    match body {
+        Body::Record(value) => assert_eq!(value["value"], 42),
+        other => panic!("caller registry should decode external record, got {other:?}"),
+    }
 }
 
 /// A typed channel's codec tolerates version skew (spec §6.3): a record
@@ -149,18 +217,29 @@ fn wire_envelope_round_trips() {
         support::typed_frame(&payloads::resource(2), 0),
         support::text_frame("trainer", ProcStream::Stdout, "loss=0.0312 lr=3e-4", 1),
         // Empty payload — a real edge (a channel may emit a zero-length span).
-        Frame::new(ChannelId::new("proc.trainer.stderr"), Position(2), Vec::new()),
+        Frame::new(
+            ChannelId::new("proc.trainer.stderr"),
+            Position(2),
+            Vec::new(),
+        ),
         // Binary payload on an opaque channel — bytes the consumer cannot read.
         support::opaque_frame("sensor.raw", &[0u8, 255, 1, 254, 128, 0, 0, 7], 3),
         // Unicode channel id and payload.
-        Frame::new(ChannelId::new("proc.café.stdout"), Position(4), "café ☕".as_bytes().to_vec()),
+        Frame::new(
+            ChannelId::new("proc.café.stdout"),
+            Position(4),
+            "café ☕".as_bytes().to_vec(),
+        ),
     ];
 
     for frame in &cases {
         let bytes = encode_delivery(&stream, frame);
         let (out_stream, out_frame) = decode_delivery(&bytes).expect("decodes");
         assert_eq!(out_stream, stream, "stream id intact");
-        assert_eq!(&out_frame, frame, "frame intact (channel, position, payload bytes)");
+        assert_eq!(
+            &out_frame, frame,
+            "frame intact (channel, position, payload bytes)"
+        );
         assert_eq!(out_frame.payload, frame.payload, "payload byte-identical");
     }
 }
@@ -185,9 +264,15 @@ fn datastream_frame_codec_is_identity_and_carries_a_delivery() {
 
     let codec = DatastreamFrameCodec;
     let wire = codec.encode(&msg).expect("encode");
-    assert_eq!(wire, msg.payload, "codec must not inflate the envelope bytes");
+    assert_eq!(
+        wire, msg.payload,
+        "codec must not inflate the envelope bytes"
+    );
     let back = codec.decode(&wire).expect("decode");
-    assert_eq!(back.payload, msg.payload, "codec round-trips byte-identical");
+    assert_eq!(
+        back.payload, msg.payload,
+        "codec round-trips byte-identical"
+    );
 
     // The carried delivery decodes back to exactly what was shipped.
     let (out_stream, out_frame) = decode_delivery(&back.payload).expect("delivery decodes");
@@ -231,33 +316,46 @@ fn wire_envelope_rejects_malformed_buffers_without_panicking() {
 /// bytes" (testing spec §5).
 #[test]
 fn opaque_channel_classifies_and_preserves_bytes() {
-    let id = ChannelId::new("v2.gpu.thermals"); // not in the catalog
-    assert_eq!(catalog::classify(&id), ChannelKind::Opaque);
+    let id = ChannelId::new("v2.gpu.thermals"); // not in the caller registry
+    assert_eq!(test_registry().classify_channel(&id), ChannelKind::Opaque);
 
     let payload: Vec<u8> = (0u8..=255).cycle().take(1000).collect();
     let frame = Frame::new(id, Position(42), payload.clone());
     let stream = StreamId::new(NodeId::new("node-z"), Lifetime(3));
 
     let (_, out) = decode_delivery(&encode_delivery(&stream, &frame)).expect("decodes");
-    assert_eq!(out.payload, payload, "opaque bytes retained whole, byte-identical");
+    assert_eq!(
+        out.payload, payload,
+        "opaque bytes retained whole, byte-identical"
+    );
 }
 
-/// The catalog classifies known channels correctly and treats the
+/// A caller-owned registry classifies known channels correctly and treats the
 /// process-output family (spec §6.2) as text without enumerating labels.
 #[test]
-fn catalog_classifies_known_and_text_family() {
-    assert_eq!(catalog::classify(&ChannelId::new(catalog::IDENTITY)), ChannelKind::Typed);
-    assert_eq!(catalog::classify(&ChannelId::new(catalog::HOST_RESOURCE)), ChannelKind::Typed);
+fn caller_registry_classifies_known_and_text_family() {
+    let registry = test_registry();
+    assert_eq!(
+        registry.classify_channel(&ChannelId::new(catalog::IDENTITY)),
+        ChannelKind::Typed
+    );
+    assert_eq!(
+        registry.classify_channel(&ChannelId::new(catalog::HOST_RESOURCE)),
+        ChannelKind::Typed
+    );
     // The consolidated records are typed channels too.
-    assert_eq!(catalog::classify(&ChannelId::new(catalog::DIST_STATE)), ChannelKind::Typed);
-    assert_eq!(catalog::classify(&ChannelId::new(catalog::DATASTORE_STATE)), ChannelKind::Typed);
-    assert_eq!(catalog::classify(&ChannelId::new(catalog::RUNTIME_ACTORS)), ChannelKind::Typed);
+    assert_eq!(
+        registry.classify_channel(&ChannelId::new(catalog::DIST_STATE)),
+        ChannelKind::Typed
+    );
+    assert_eq!(
+        registry.classify_channel(&ChannelId::new(catalog::RUNTIME_ACTORS)),
+        ChannelKind::Typed
+    );
     // A process introduced at runtime gets text channels for free.
     let out = catalog::process_output("inference-server", ProcStream::Stdout);
     assert_eq!(out.as_str(), "proc.inference-server.stdout");
-    assert_eq!(catalog::classify(&out), ChannelKind::Text);
-    // Datastore op events are a text channel (the `proc.*` model for ops).
-    assert_eq!(catalog::classify(&catalog::datastore_event()), ChannelKind::Text);
+    assert_eq!(registry.classify_channel(&out), ChannelKind::Text);
 }
 
 /// A record carries its own channel (spec §6.1 fixed identity), and that
@@ -266,7 +364,10 @@ fn catalog_classifies_known_and_text_family() {
 fn records_name_their_own_typed_channel() {
     assert_eq!(IdentityRecord::channel().as_str(), catalog::IDENTITY);
     assert_eq!(ResourceSample::channel().as_str(), catalog::HOST_RESOURCE);
-    assert_eq!(catalog::classify(&IdentityRecord::channel()), ChannelKind::Typed);
+    assert_eq!(
+        test_registry().classify_channel(&IdentityRecord::channel()),
+        ChannelKind::Typed
+    );
     // An identity record round-trips through its typed codec (spec §6.1).
     let r = payloads::identity("n", 7);
     assert_eq!(IdentityRecord::decode(&r.encode()).unwrap(), r);
@@ -283,13 +384,25 @@ fn mux_numbers_monotonic_and_gap_free() {
     let k = 64u64;
     for i in 0..k {
         let pos = mux.submit(catalog::HOST_RESOURCE, payloads::resource(i).encode());
-        assert_eq!(pos, Position(i), "submit returns the next position, in order");
+        assert_eq!(
+            pos,
+            Position(i),
+            "submit returns the next position, in order"
+        );
     }
-    assert_eq!(mux.assigned(), k, "assigned == number of submissions (never skips)");
+    assert_eq!(
+        mux.assigned(),
+        k,
+        "assigned == number of submissions (never skips)"
+    );
     assert_eq!(mux.dropped(), 0, "no overflow, nothing dropped");
 
     let positions: Vec<u64> = mux.drain().iter().map(|f| f.position.0).collect();
-    assert_eq!(positions, (0..k).collect::<Vec<_>>(), "emitted positions are 0..k, gap-free");
+    assert_eq!(
+        positions,
+        (0..k).collect::<Vec<_>>(),
+        "emitted positions are 0..k, gap-free"
+    );
 }
 
 /// Kind II (testing spec §6) — across the mux seam, every submission
@@ -302,13 +415,22 @@ fn mux_seam_preserves_every_submission_byte_identical() {
     // A realistic interleaving of typed records and raw process output —
     // the same kind of thing on one stream (spec §4.2).
     let submissions: Vec<(ChannelId, Vec<u8>)> = vec![
-        (catalog::IDENTITY.into(), payloads::identity("node-alpha", 1).encode()),
+        (
+            catalog::IDENTITY.into(),
+            payloads::identity("node-alpha", 1).encode(),
+        ),
         (
             catalog::process_output("trainer", ProcStream::Stdout),
             payloads::log_line("trainer", 0).into_bytes(),
         ),
-        (catalog::HOST_RESOURCE.into(), payloads::resource(1).encode()),
-        (catalog::MEMBERSHIP.into(), payloads::membership("node-beta", "alive", "suspect").encode()),
+        (
+            catalog::HOST_RESOURCE.into(),
+            payloads::resource(1).encode(),
+        ),
+        (
+            catalog::MEMBERSHIP.into(),
+            payloads::membership("node-beta", "alive", "suspect").encode(),
+        ),
         (
             catalog::process_output("trainer", ProcStream::Stderr),
             b"WARN cuda oom, retrying".to_vec(),
@@ -321,11 +443,25 @@ fn mux_seam_preserves_every_submission_byte_identical() {
     }
 
     let frames = mux.drain();
-    assert_eq!(frames.len(), submissions.len(), "exactly one frame per submission — none lost");
+    assert_eq!(
+        frames.len(),
+        submissions.len(),
+        "exactly one frame per submission — none lost"
+    );
     for (i, (frame, (channel, payload))) in frames.iter().zip(&submissions).enumerate() {
-        assert_eq!(frame.position, Position(i as u64), "interleaved in submission order, gap-free");
-        assert_eq!(&frame.channel, channel, "channel tag preserved crossing the seam");
-        assert_eq!(&frame.payload, payload, "payload bytes byte-identical crossing the seam");
+        assert_eq!(
+            frame.position,
+            Position(i as u64),
+            "interleaved in submission order, gap-free"
+        );
+        assert_eq!(
+            &frame.channel, channel,
+            "channel tag preserved crossing the seam"
+        );
+        assert_eq!(
+            &frame.payload, payload,
+            "payload bytes byte-identical crossing the seam"
+        );
     }
 }
 
@@ -344,13 +480,25 @@ fn mux_overflow_drops_surface_as_a_gap_not_a_renumber() {
     mux.submit(catalog::HOST_RESOURCE, payloads::resource(3).encode()); // pos 3 -> buffered
     let second = mux.drain();
 
-    assert_eq!(mux.assigned(), 4, "every submission consumed a position — numbering never skips");
-    assert_eq!(mux.dropped(), 1, "exactly the overflowing frame was dropped");
+    assert_eq!(
+        mux.assigned(),
+        4,
+        "every submission consumed a position — numbering never skips"
+    );
+    assert_eq!(
+        mux.dropped(),
+        1,
+        "exactly the overflowing frame was dropped"
+    );
 
     let mut emitted: Vec<Frame> = first;
     emitted.extend(second);
     let positions: Vec<u64> = emitted.iter().map(|f| f.position.0).collect();
-    assert_eq!(positions, vec![0, 1, 3], "dropped position 2 is simply absent, others not renumbered");
+    assert_eq!(
+        positions,
+        vec![0, 1, 3],
+        "dropped position 2 is simply absent, others not renumbered"
+    );
 
     // The dropped position reads as an interior gap, exactly what the
     // consumer will later surface (spec §7.5).
@@ -377,7 +525,10 @@ fn mux_serializes_concurrent_producers_without_collision() {
                 let mut mine = Vec::with_capacity(per_thread as usize);
                 for i in 0..per_thread {
                     // Each thread is a distinct producer writing real bytes.
-                    let pos = mux.submit(catalog::RUNTIME_STATS, payloads::runtime(t * 1000 + i).encode());
+                    let pos = mux.submit(
+                        catalog::RUNTIME_STATS,
+                        payloads::runtime(t * 1000 + i).encode(),
+                    );
                     mine.push(pos.0);
                 }
                 mine
@@ -385,18 +536,29 @@ fn mux_serializes_concurrent_producers_without_collision() {
         })
         .collect();
 
-    let mut assigned: Vec<u64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+    let mut assigned: Vec<u64> = handles
+        .into_iter()
+        .flat_map(|h| h.join().unwrap())
+        .collect();
     let total = threads * per_thread;
     assert_eq!(mux.assigned(), total);
     assert_eq!(mux.dropped(), 0, "unbounded mux drops nothing");
 
     assigned.sort_unstable();
-    assert_eq!(assigned, (0..total).collect::<Vec<_>>(), "each position assigned exactly once");
+    assert_eq!(
+        assigned,
+        (0..total).collect::<Vec<_>>(),
+        "each position assigned exactly once"
+    );
 
     // The buffered frames carry the same complete set of positions.
     let mut emitted: Vec<u64> = mux.drain().iter().map(|f| f.position.0).collect();
     emitted.sort_unstable();
-    assert_eq!(emitted, (0..total).collect::<Vec<_>>(), "no frame lost, no position duplicated");
+    assert_eq!(
+        emitted,
+        (0..total).collect::<Vec<_>>(),
+        "no frame lost, no position duplicated"
+    );
 }
 
 // ── Transport seam + ingest + store (spec §7, §8) ──────────────────────
@@ -406,16 +568,25 @@ fn mux_serializes_concurrent_producers_without_collision() {
 /// the consumer does not know, then take its output.
 fn realistic_stream(stream: &StreamId) -> Vec<Frame> {
     let mux = Mux::unbounded(stream.clone());
-    mux.submit(catalog::IDENTITY, payloads::identity(stream.node.as_str(), stream.life.0).encode());
+    mux.submit(
+        catalog::IDENTITY,
+        payloads::identity(stream.node.as_str(), stream.life.0).encode(),
+    );
     mux.submit(catalog::HOST_RESOURCE, payloads::resource(0).encode());
     // A channel this consumer cannot decode — must still be retained whole.
-    mux.submit(ChannelId::new("v2.gpu.thermals"), vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    mux.submit(
+        ChannelId::new("v2.gpu.thermals"),
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+    );
     mux.submit(
         catalog::process_output("trainer", ProcStream::Stdout),
         payloads::log_line("trainer", 0).into_bytes(),
     );
     mux.submit(catalog::HOST_RESOURCE, payloads::resource(1).encode());
-    mux.submit(catalog::MEMBERSHIP, payloads::membership("node-beta", "alive", "suspect").encode());
+    mux.submit(
+        catalog::MEMBERSHIP,
+        payloads::membership("node-beta", "alive", "suspect").encode(),
+    );
     mux.drain()
 }
 
@@ -458,8 +629,15 @@ fn ingest_seam_stores_every_delivered_frame_and_surfaces_gaps() {
     // The undecodable channel landed whole, byte-identical (spec §8.3).
     let opaque = stored.at(Position(2)).expect("opaque frame retained");
     assert_eq!(opaque.channel, ChannelId::new("v2.gpu.thermals"));
-    assert_eq!(opaque.payload, vec![0xDE, 0xAD, 0xBE, 0xEF], "opaque bytes retained whole");
-    assert_eq!(catalog::classify(&opaque.channel), ChannelKind::Opaque);
+    assert_eq!(
+        opaque.payload,
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        "opaque bytes retained whole"
+    );
+    assert_eq!(
+        test_registry().classify_channel(&opaque.channel),
+        ChannelKind::Opaque
+    );
 }
 
 /// Spec §7.5 — the consumer reconstructs by position, not by arrival: even
@@ -476,13 +654,20 @@ fn ingest_reconstructs_by_position_not_arrival_order() {
         &StreamScript::perfect().with_reorder(Reorder::Reversed),
     );
     // The carrier really did reverse arrival: first delivered is last sent.
-    assert_eq!(reversed.first().unwrap().frame.position, sent.last().unwrap().position);
+    assert_eq!(
+        reversed.first().unwrap().frame.position,
+        sent.last().unwrap().position
+    );
 
     let mut consumer = Consumer::new();
     consumer.ingest(reversed);
     let stored = consumer.store().stream(&stream).unwrap();
 
-    assert_eq!(stored.to_vec(), sent, "reconstruction restores the sent order from reversed arrival");
+    assert_eq!(
+        stored.to_vec(),
+        sent,
+        "reconstruction restores the sent order from reversed arrival"
+    );
 }
 
 /// Spec §9 (no fabrication) — a position delivered twice collapses to one
@@ -496,8 +681,15 @@ fn ingest_is_idempotent_on_duplicate_positions() {
     consumer.accept(Delivery::new(stream.clone(), frame.clone()));
     let was_new = consumer.accept(Delivery::new(stream.clone(), frame.clone()));
 
-    assert!(!was_new, "a repeated position is not recorded a second time");
-    assert_eq!(consumer.store().stream(&stream).unwrap().len(), 1, "exactly one frame stored");
+    assert!(
+        !was_new,
+        "a repeated position is not recorded a second time"
+    );
+    assert_eq!(
+        consumer.store().stream(&stream).unwrap().len(),
+        1,
+        "exactly one frame stored"
+    );
 }
 
 /// Spec §8.4 — a node identity reused across lifetimes does not merge: each
@@ -533,7 +725,10 @@ fn reincarnated_node_does_not_merge_with_prior_life() {
     // Both lives have a position-0 identity frame; they did not collide.
     let id1 = store.stream(&life1).unwrap().at(Position(0)).unwrap();
     let id2 = store.stream(&life2).unwrap().at(Position(0)).unwrap();
-    assert_ne!(id1.payload, id2.payload, "each life's identity frame is its own");
+    assert_ne!(
+        id1.payload, id2.payload,
+        "each life's identity frame is its own"
+    );
     assert_eq!(
         IdentityRecord::decode(&id1.payload).unwrap().life,
         1,
@@ -560,11 +755,16 @@ fn merged_log_matches_oracle_with_surfaced_gap() {
 
     let log = views::merged_log(stored);
     let expected = reference::merged_log(&reference::delivered_frames(&stream, &delivered));
-    assert_eq!(structure(&log), expected, "merged log = timeline in position order with gap surfaced");
+    assert_eq!(
+        structure(&log),
+        expected,
+        "merged log = timeline in position order with gap surfaced"
+    );
 
     // The gap sits between the bracketing frames, not at the end.
     assert!(
-        log.iter().any(|e| matches!(e, LogEntry::Gap(g) if g.start == 3 && g.end == 3)),
+        log.iter()
+            .any(|e| matches!(e, LogEntry::Gap(g) if g.start == 3 && g.end == 3)),
         "position 3 is surfaced as an interior gap"
     );
 }
@@ -576,11 +776,15 @@ fn merged_log_matches_oracle_with_surfaced_gap() {
 /// failing.
 #[test]
 fn view_decodes_each_channel_and_degrades_gracefully() {
+    let registry = test_registry();
     // Typed channel → structured record.
     let resource = payloads::resource(2);
-    match views::decode_body(&ResourceSample::channel(), &resource.encode()) {
+    match views::decode_body_with(&ResourceSample::channel(), &resource.encode(), &registry) {
         Body::Record(value) => {
-            assert!(value.get("cpu_pct").is_some(), "typed channel decodes to its record fields");
+            assert!(
+                value.get("cpu_pct").is_some(),
+                "typed channel decodes to its record fields"
+            );
         }
         other => panic!("typed channel should decode to a record, got {other:?}"),
     }
@@ -588,16 +792,22 @@ fn view_decodes_each_channel_and_degrades_gracefully() {
     // Raw-text channel → its line.
     let line = payloads::log_line("trainer", 7);
     let text_channel = catalog::process_output("trainer", ProcStream::Stdout);
-    assert_eq!(views::decode_body(&text_channel, line.as_bytes()), Body::Text(line.clone()));
+    assert_eq!(
+        views::decode_body_with(&text_channel, line.as_bytes(), &registry),
+        Body::Text(line.clone())
+    );
 
     // Unknown channel → raw bytes (graceful, spec §6.3/§9.3).
     let opaque = ChannelId::new("v2.gpu.thermals");
-    assert_eq!(views::decode_body(&opaque, &[0xDE, 0xAD]), Body::Raw(vec![0xDE, 0xAD]));
+    assert_eq!(
+        views::decode_body_with(&opaque, &[0xDE, 0xAD], &registry),
+        Body::Raw(vec![0xDE, 0xAD])
+    );
 
     // Typed channel, garbage bytes → degrades to raw, never panics or drops.
     let garbage = b"not-json{oops".to_vec();
     assert_eq!(
-        views::decode_body(&ResourceSample::channel(), &garbage),
+        views::decode_body_with(&ResourceSample::channel(), &garbage, &registry),
         Body::Raw(garbage.clone()),
         "a typed channel that fails to parse degrades to bytes (spec §9.3)"
     );
@@ -610,7 +820,10 @@ fn view_decodes_each_channel_and_degrades_gracefully() {
 fn metric_projection_decodes_one_typed_channel_into_a_series() {
     let stream = test_stream();
     let mux = Mux::unbounded(stream.clone());
-    mux.submit(catalog::IDENTITY, payloads::identity("node-alpha", 1).encode());
+    mux.submit(
+        catalog::IDENTITY,
+        payloads::identity("node-alpha", 1).encode(),
+    );
 
     let mut expected: Vec<(Position, ResourceSample)> = Vec::new();
     for i in 0..5 {
@@ -618,47 +831,49 @@ fn metric_projection_decodes_one_typed_channel_into_a_series() {
         let pos = mux.submit(catalog::HOST_RESOURCE, sample.encode());
         expected.push((pos, sample));
         // Interleave an unrelated channel — the projection must ignore it.
-        mux.submit(catalog::MEMBERSHIP, payloads::membership("p", "alive", "dead").encode());
+        mux.submit(
+            catalog::MEMBERSHIP,
+            payloads::membership("p", "alive", "dead").encode(),
+        );
     }
     let sent = mux.drain();
 
     let consumer = consume(&stream, &sent, StreamScript::perfect());
     let series = views::metric_series::<ResourceSample>(consumer.store().stream(&stream).unwrap());
 
-    assert_eq!(series, expected, "the resource series is exactly the samples emitted, in order");
+    assert_eq!(
+        series, expected,
+        "the resource series is exactly the samples emitted, in order"
+    );
 }
 
 /// Kind I (testing spec §5) — the migrated consolidated records (`dist.state`,
-/// `datastore.state`, `runtime.actors`) each survive the pipe unchanged: every
-/// channel projects back into the exact series emitted, even interleaved with
-/// one another and with unrelated channels. This is the "keep the same metric"
-/// contract for the ported metrics — the projection equals the source, so the
-/// framing changed but the metric did not.
+/// `runtime.actors`) each survive the pipe unchanged: every channel projects
+/// back into the exact series emitted, even interleaved with unrelated channels.
 #[test]
 fn metric_projection_recovers_each_consolidated_record() {
     let stream = test_stream();
     let mux = Mux::unbounded(stream.clone());
 
     let mut dist: Vec<(Position, DistributionState)> = Vec::new();
-    let mut store: Vec<(Position, DatastoreState)> = Vec::new();
     let mut actors: Vec<(Position, ActorRuntimeDetail)> = Vec::new();
     for i in 0..5 {
         let d = payloads::dist_state(i);
         dist.push((mux.submit(catalog::DIST_STATE, d.encode()), d));
-        let s = payloads::datastore_state(i);
-        store.push((mux.submit(catalog::DATASTORE_STATE, s.encode()), s));
         let a = payloads::actor_detail(i);
         actors.push((mux.submit(catalog::RUNTIME_ACTORS, a.encode()), a));
         // Unrelated channels each projection must step over.
         mux.submit(catalog::HOST_RESOURCE, payloads::resource(i).encode());
-        mux.submit(catalog::MEMBERSHIP, payloads::membership("p", "alive", "dead").encode());
+        mux.submit(
+            catalog::MEMBERSHIP,
+            payloads::membership("p", "alive", "dead").encode(),
+        );
     }
     let sent = mux.drain();
     let consumer = consume(&stream, &sent, StreamScript::perfect());
     let stored = consumer.store().stream(&stream).unwrap();
 
     assert_eq!(views::metric_series::<DistributionState>(stored), dist);
-    assert_eq!(views::metric_series::<DatastoreState>(stored), store);
     assert_eq!(views::metric_series::<ActorRuntimeDetail>(stored), actors);
 }
 
@@ -673,7 +888,11 @@ fn tail_grep_and_filter_restrict_the_stream() {
 
     // Tail: the last two frames by position.
     let last_two = views::tail(stored, 2);
-    assert_eq!(last_two, stored.to_vec()[4..].to_vec(), "tail(2) is the final two frames in order");
+    assert_eq!(
+        last_two,
+        stored.to_vec()[4..].to_vec(),
+        "tail(2) is the final two frames in order"
+    );
 
     // Grep: only the membership transition mentions "suspect".
     let hits = views::grep(stored, "suspect");
@@ -683,7 +902,11 @@ fn tail_grep_and_filter_restrict_the_stream() {
     // Filter: restrict to a single channel.
     let resources = views::filter(stored, |f| f.channel == ResourceSample::channel());
     assert_eq!(resources.len(), 2, "two resource samples in the stream");
-    assert!(resources.iter().all(|f| f.channel == ResourceSample::channel()));
+    assert!(
+        resources
+            .iter()
+            .all(|f| f.channel == ResourceSample::channel())
+    );
 }
 
 /// Boundary — views over an empty stream are empty, and a single-frame
@@ -700,7 +923,10 @@ fn views_handle_empty_and_singleton_streams() {
     one.record(support::typed_frame(&payloads::resource(0), 0));
     let log = views::merged_log(&one);
     assert_eq!(log.len(), 1, "one frame, one entry");
-    assert!(matches!(log[0], LogEntry::Frame(_)), "no spurious gap around a lone frame");
+    assert!(
+        matches!(log[0], LogEntry::Frame(_)),
+        "no spurious gap around a lone frame"
+    );
 }
 
 /// Resource safety (spec §7.4/§7.5) — surfacing a gap costs O(stored frames),
@@ -714,13 +940,20 @@ fn gap_surfacing_is_bounded_by_frame_count_not_gap_size() {
     // The largest interior gap a u64 position space admits.
     let mut extreme = StoredStream::new();
     extreme.record(support::typed_frame(&payloads::resource(0), 0));
-    let high = Frame::new(ResourceSample::channel(), Position(u64::MAX), payloads::resource(1).encode());
+    let high = Frame::new(
+        ResourceSample::channel(),
+        Position(u64::MAX),
+        payloads::resource(1).encode(),
+    );
     extreme.record(high.clone());
 
     // Were this O(gap size), the next line would never return.
     assert_eq!(
         extreme.gap_spans(),
-        vec![GapSpan { start: 1, end: u64::MAX - 1 }],
+        vec![GapSpan {
+            start: 1,
+            end: u64::MAX - 1
+        }],
         "one span covers the whole interior gap"
     );
     assert_eq!(
@@ -733,7 +966,10 @@ fn gap_surfacing_is_bounded_by_frame_count_not_gap_size() {
     // a single gap span between them, not a billion entries.
     let log = views::merged_log(&extreme);
     assert_eq!(log.len(), 3, "two frames and one gap span");
-    assert!(matches!(log[1], LogEntry::Gap(_)), "the gap sits between the bracketing frames");
+    assert!(
+        matches!(log[1], LogEntry::Gap(_)),
+        "the gap sits between the bracketing frames"
+    );
 
     // A realistic long outage (millions of dropped positions) is just as cheap.
     let mut outage = StoredStream::new();
@@ -743,7 +979,10 @@ fn gap_surfacing_is_bounded_by_frame_count_not_gap_size() {
     }
     assert_eq!(
         outage.gap_spans(),
-        vec![GapSpan { start: 1, end: 4_999_999 }],
+        vec![GapSpan {
+            start: 1,
+            end: 4_999_999
+        }],
         "the outage is one surfaced span, the stream resumes after it"
     );
 }
@@ -780,7 +1019,11 @@ fn full_mock_survives_deepest_reorder() {
         "merged log equals the oracle despite the deepest reorder"
     );
     assert!(stored.gap_spans().is_empty(), "nothing dropped — no gaps");
-    assert_eq!(stored.to_vec(), sent, "full timeline restored from fully reversed arrival");
+    assert_eq!(
+        stored.to_vec(),
+        sent,
+        "full timeline restored from fully reversed arrival"
+    );
 }
 
 /// Adversarial vector — total loss of a span. A whole contiguous run of
@@ -813,10 +1056,20 @@ fn full_mock_surfaces_total_span_loss_and_resumes() {
 
     // The stream resumes with the original post-gap frames — nothing from
     // the lost span reappears, and history is not replayed.
-    assert!(stored.frames().all(|f| !lost.contains(&f.position.0)), "lost span absent");
-    let after: Vec<Frame> = stored.frames().filter(|f| f.position.0 >= 8).cloned().collect();
+    assert!(
+        stored.frames().all(|f| !lost.contains(&f.position.0)),
+        "lost span absent"
+    );
+    let after: Vec<Frame> = stored
+        .frames()
+        .filter(|f| f.position.0 >= 8)
+        .cloned()
+        .collect();
     let original_after: Vec<Frame> = sent.iter().filter(|f| f.position.0 >= 8).cloned().collect();
-    assert_eq!(after, original_after, "resumes at position 8 with the originals, in order");
+    assert_eq!(
+        after, original_after,
+        "resumes at position 8 with the originals, in order"
+    );
 }
 
 /// Adversarial vector — a channel the consumer cannot decode. Its bytes are
@@ -851,15 +1104,25 @@ fn full_mock_stores_undecodable_channel_and_decodes_it_later() {
             _ => None,
         })
         .expect("the unknown-channel frame is on the timeline");
-    assert!(matches!(entry.body, Body::Raw(_)), "unknown channel degrades to raw bytes now");
+    assert!(
+        matches!(entry.body, Body::Raw(_)),
+        "unknown channel degrades to raw bytes now"
+    );
 
     let raw = stored.at(Position(1)).unwrap();
-    assert_eq!(raw.channel, ChannelId::new(future_channel), "retained on its own channel");
+    assert_eq!(
+        raw.channel,
+        ChannelId::new(future_channel),
+        "retained on its own channel"
+    );
 
     // Later: once the channel is learned, the stored bytes decode to the
     // original record — nothing was lost at ingest.
     let decoded = ResourceSample::decode(&raw.payload).expect("decodes once the channel is known");
-    assert_eq!(decoded, future, "the opaque bytes were the record all along");
+    assert_eq!(
+        decoded, future,
+        "the opaque bytes were the record all along"
+    );
 }
 
 /// Adversarial vector — a node identity reused across lifetimes. Two lives
@@ -876,7 +1139,11 @@ fn full_mock_reused_identity_does_not_merge_at_the_view() {
 
     let delivered = ScriptedTransport::carry_all(&[
         (life1.clone(), s1.clone(), StreamScript::perfect()),
-        (life2.clone(), s2.clone(), StreamScript::perfect().with_reorder(Reorder::Reversed)),
+        (
+            life2.clone(),
+            s2.clone(),
+            StreamScript::perfect().with_reorder(Reorder::Reversed),
+        ),
     ]);
 
     let mut consumer = Consumer::new();
@@ -886,15 +1153,39 @@ fn full_mock_reused_identity_does_not_merge_at_the_view() {
 
     let log1 = views::merged_log(store.stream(&life1).unwrap());
     let log2 = views::merged_log(store.stream(&life2).unwrap());
-    assert_eq!(structure(&log1), reference::merged_log(&surviving(&s1, &[])));
-    assert_eq!(structure(&log2), reference::merged_log(&surviving(&s2, &[])));
+    assert_eq!(
+        structure(&log1),
+        reference::merged_log(&surviving(&s1, &[]))
+    );
+    assert_eq!(
+        structure(&log2),
+        reference::merged_log(&surviving(&s2, &[]))
+    );
 
     // Each life's position-0 identity frame is its own, correctly attributed.
-    let id1 = IdentityRecord::decode(&store.stream(&life1).unwrap().at(Position(0)).unwrap().payload)
-        .unwrap();
-    let id2 = IdentityRecord::decode(&store.stream(&life2).unwrap().at(Position(0)).unwrap().payload)
-        .unwrap();
-    assert_eq!((id1.life, id2.life), (1, 2), "identities attribute to their own lifetimes");
+    let id1 = IdentityRecord::decode(
+        &store
+            .stream(&life1)
+            .unwrap()
+            .at(Position(0))
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    let id2 = IdentityRecord::decode(
+        &store
+            .stream(&life2)
+            .unwrap()
+            .at(Position(0))
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert_eq!(
+        (id1.life, id2.life),
+        (1, 2),
+        "identities attribute to their own lifetimes"
+    );
 }
 
 /// Envelope coverage (testing spec §9) — an explicit arrival permutation,
@@ -908,20 +1199,29 @@ fn full_mock_reconstructs_under_explicit_permutation() {
     let n = sent.len();
 
     // Deliver all even indices first, then all odd ones.
-    let perm: Vec<usize> =
-        (0..n).filter(|i| i.is_multiple_of(2)).chain((0..n).filter(|i| !i.is_multiple_of(2))).collect();
+    let perm: Vec<usize> = (0..n)
+        .filter(|i| i.is_multiple_of(2))
+        .chain((0..n).filter(|i| !i.is_multiple_of(2)))
+        .collect();
     let script = StreamScript::perfect().with_reorder(Reorder::Permutation(perm.clone()));
     let delivered = ScriptedTransport::carry(&id, &sent, &script);
 
     // The carrier delivered exactly the scripted permutation of positions.
     let arrival: Vec<u64> = delivered.iter().map(|d| d.frame.position.0).collect();
     let expected_arrival: Vec<u64> = perm.iter().map(|&i| sent[i].position.0).collect();
-    assert_eq!(arrival, expected_arrival, "delivered in the scripted permutation, nothing added or lost");
+    assert_eq!(
+        arrival, expected_arrival,
+        "delivered in the scripted permutation, nothing added or lost"
+    );
 
     let mut consumer = Consumer::new();
     consumer.ingest(delivered);
     let stored = consumer.store().stream(&id).unwrap();
-    assert_eq!(stored.to_vec(), sent, "reconstruction restores send order from the permutation");
+    assert_eq!(
+        stored.to_vec(),
+        sent,
+        "reconstruction restores send order from the permutation"
+    );
     assert_eq!(
         structure(&views::merged_log(stored)),
         reference::merged_log(&surviving(&sent, &[])),
@@ -934,7 +1234,11 @@ fn full_mock_reconstructs_under_explicit_permutation() {
 /// Record the virtual tick at which a position was emitted (positions are
 /// contiguous from 0, so the tick vector is indexed by position).
 fn at_tick(ticks: &mut Vec<u64>, tick: u64, pos: Position) {
-    assert_eq!(pos.0 as usize, ticks.len(), "positions emitted contiguously");
+    assert_eq!(
+        pos.0 as usize,
+        ticks.len(),
+        "positions emitted contiguously"
+    );
     ticks.push(tick);
 }
 
@@ -983,10 +1287,18 @@ fn kind_iv_deployment_simulation() {
     at_tick(&mut b_ticks, 0, b.emit(&payloads::identity("node-b", 1)));
     at_tick(&mut b_ticks, 1, b.emit(&payloads::resource(1)));
     at_tick(&mut b_ticks, 2, b.emit(&payloads::resource(2)));
-    at_tick(&mut b_ticks, 2, b.emit(&payloads::membership("node-c", "alive", "suspect")));
+    at_tick(
+        &mut b_ticks,
+        2,
+        b.emit(&payloads::membership("node-c", "alive", "suspect")),
+    );
     at_tick(&mut b_ticks, 3, b.emit(&payloads::resource(3)));
     at_tick(&mut b_ticks, 4, b.emit(&payloads::resource(4)));
-    at_tick(&mut b_ticks, 4, b.emit(&payloads::membership("node-c", "suspect", "dead")));
+    at_tick(
+        &mut b_ticks,
+        4,
+        b.emit(&payloads::membership("node-c", "suspect", "dead")),
+    );
     at_tick(&mut b_ticks, 5, b.emit(&payloads::resource(5)));
     at_tick(&mut b_ticks, 7, b.emit(&payloads::resource(7)));
     at_tick(&mut b_ticks, 8, b.emit(&payloads::runtime(8)));
@@ -1013,7 +1325,11 @@ fn kind_iv_deployment_simulation() {
     // Each node's surviving frames may also arrive reordered, at varying
     // depth — reconstruction must not care.
     let delivered = ScriptedTransport::carry_all(&[
-        (id_a.clone(), sent_a.clone(), StreamScript::dropping(drop_a.clone())),
+        (
+            id_a.clone(),
+            sent_a.clone(),
+            StreamScript::dropping(drop_a.clone()),
+        ),
         (
             id_b.clone(),
             sent_b.clone(),
@@ -1032,7 +1348,11 @@ fn kind_iv_deployment_simulation() {
 
     // ── The end-to-end answer: each node's full merged-log view equals the
     //    reference model's, derived from the scenario alone. ─────────────
-    assert_eq!(store.len(), 3, "three independent streams; positions not comparable across them");
+    assert_eq!(
+        store.len(),
+        3,
+        "three independent streams; positions not comparable across them"
+    );
     for (id, sent, dropped) in [
         (&id_a, &sent_a, &drop_a),
         (&id_b, &sent_b, &drop_b),
@@ -1053,21 +1373,33 @@ fn kind_iv_deployment_simulation() {
 
     // A: the carrier drop (t3) and the outage (t4–5) coalesce into one
     // surfaced gap, then the stream resumes — without replaying history.
-    assert_eq!(a_stored.gap_spans(), vec![GapSpan { start: 3, end: 5 }], "A: one surfaced gap");
+    assert_eq!(
+        a_stored.gap_spans(),
+        vec![GapSpan { start: 3, end: 5 }],
+        "A: one surfaced gap"
+    );
     let finalize = a_stored.frames().last().unwrap();
     assert_eq!(
-        DatastreamHealth::decode(&finalize.payload).unwrap().assigned,
+        DatastreamHealth::decode(&finalize.payload)
+            .unwrap()
+            .assigned,
         7200,
         "A's run ends with the finalize frame, delivered after the outage"
     );
 
     // B: its outage span (t4–5 emissions) is one surfaced gap; it resumes.
     assert_eq!(b_stored.gap_spans().len(), 1, "B: a single outage gap");
-    assert!(b_stored.frames().count() > 5, "B resumed and kept producing after the outage");
+    assert!(
+        b_stored.frames().count() > 5,
+        "B resumed and kept producing after the outage"
+    );
 
     // C: the dead node's stream ends at its last delivered frame — its
     // outage-lost t4–5 frames are trailing loss (truncation), NOT a gap.
-    assert!(c_stored.gap_spans().is_empty(), "C: dead node truncates, no trailing gap");
+    assert!(
+        c_stored.gap_spans().is_empty(),
+        "C: dead node truncates, no trailing gap"
+    );
     assert_eq!(
         c_stored.frames().last().unwrap().position,
         Position(3),
