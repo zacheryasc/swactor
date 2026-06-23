@@ -202,8 +202,8 @@ pub fn distribution_codec_registry() -> CodecRegistry {
     cr.register::<Ack, _>(JsonCodec);
     cr.register::<PingReq, _>(JsonCodec);
     // §6.1 / §14.5: `IndirectAck` is folded into the shared registry so all six
-    // SWIM message types decode through one uniform path (the iroh driver no
-    // longer needs to hand-dispatch it by tag).
+    // SWIM message types decode through one uniform path; concrete drivers no
+    // longer need to hand-dispatch it by tag.
     cr.register::<IndirectAck, _>(JsonCodec);
     cr.register::<JoinRequest, _>(JsonCodec);
     cr.register::<JoinResponse, _>(JsonCodec);

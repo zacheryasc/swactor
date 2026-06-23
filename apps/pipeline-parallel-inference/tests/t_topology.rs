@@ -81,11 +81,9 @@ fn stage_resolves_next_neighbor_after_cluster_join() {
     let next_name = next_stage_name(0, 2).expect("stage 0 has a next neighbour");
     assert_eq!(next_name, "pp-stage-1");
 
-    let propagated = pump_until(
-        &mut nodes,
-        Duration::from_secs(10),
-        |ns| ns[1].resolve_name("pp-stage-1").is_some(),
-    );
+    let propagated = pump_until(&mut nodes, Duration::from_secs(10), |ns| {
+        ns[1].resolve_name("pp-stage-1").is_some()
+    });
     assert!(
         propagated,
         "stage 0 should resolve pp-stage-1 after gossip within 10s"
@@ -115,11 +113,9 @@ fn stage_resolves_prev_neighbor_after_cluster_join() {
     let prev_name = prev_stage_name(1).expect("stage 1 has a prev neighbour");
     assert_eq!(prev_name, "pp-stage-0");
 
-    let propagated = pump_until(
-        &mut nodes,
-        Duration::from_secs(10),
-        |ns| ns[2].resolve_name("pp-stage-0").is_some(),
-    );
+    let propagated = pump_until(&mut nodes, Duration::from_secs(10), |ns| {
+        ns[2].resolve_name("pp-stage-0").is_some()
+    });
     assert!(
         propagated,
         "stage 1 should resolve pp-stage-0 after gossip within 10s"
@@ -202,12 +198,10 @@ fn last_stage_has_no_next() {
 fn middle_stage_has_both_neighbours() {
     for n in 3..=8u32 {
         for i in 1..(n - 1) {
-            let prev = prev_stage_name(i).unwrap_or_else(|| {
-                panic!("interior stage {i} of {n} should have a prev")
-            });
-            let next = next_stage_name(i, n).unwrap_or_else(|| {
-                panic!("interior stage {i} of {n} should have a next")
-            });
+            let prev = prev_stage_name(i)
+                .unwrap_or_else(|| panic!("interior stage {i} of {n} should have a prev"));
+            let next = next_stage_name(i, n)
+                .unwrap_or_else(|| panic!("interior stage {i} of {n} should have a next"));
             assert_ne!(
                 prev, next,
                 "interior stage {i} of {n}: prev and next must differ",
@@ -319,9 +313,7 @@ fn middle_stage_registers_index_only() {
                 None,
                 "N={n} stage {i}: middle must not expose pp-exit",
             );
-            let idx = node
-                .resolve_name(&stage_name(i))
-                .expect("per-index name");
+            let idx = node.resolve_name(&stage_name(i)).expect("per-index name");
             assert_eq!(idx.0, stage_addr);
 
             node.driver.shutdown();
@@ -383,8 +375,18 @@ fn register_stage_names_uniqueness() {
             }
             node.driver.shutdown();
         }
-        assert_eq!(idx_names.len() as u32, n, "N={n}: every stage owns a unique pp-stage-i");
-        assert_eq!(entry_count, 1, "N={n}: pp-entry must be registered exactly once");
-        assert_eq!(exit_count, 1, "N={n}: pp-exit must be registered exactly once");
+        assert_eq!(
+            idx_names.len() as u32,
+            n,
+            "N={n}: every stage owns a unique pp-stage-i"
+        );
+        assert_eq!(
+            entry_count, 1,
+            "N={n}: pp-entry must be registered exactly once"
+        );
+        assert_eq!(
+            exit_count, 1,
+            "N={n}: pp-exit must be registered exactly once"
+        );
     }
 }

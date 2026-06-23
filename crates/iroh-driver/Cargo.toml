@@ -1,0 +1,40 @@
+[package]
+name = "iroh-driver"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "iroh_driver"
+path = "src/lib.rs"
+
+[features]
+default = []
+relay = [
+    "iroh-relay/server",
+    "tokio/macros",
+    "tokio/signal",
+    "tokio/time",
+]
+
+[dependencies]
+swactor = { path = "../..", features = ["serde", "transport"] }
+swactor-transport = { path = "../transport" }
+distribution = { path = "../distribution" }
+datastream = { path = "../datastream" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+iroh = "0.98"
+# `test-utils` exposes `CaRootsConfig::insecure_skip_verify()` so clients can
+# trust an operator-controlled relay with a self-signed QAD cert. The `relay`
+# feature adds the server side for the standalone relay binary.
+iroh-relay = { version = "0.98", features = ["test-utils"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+[dev-dependencies]
+iroh-relay = { version = "0.98", features = ["server", "test-utils"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+[[bin]]
+name = "iroh-driver-relay"
+path = "src/bin/iroh-driver-relay.rs"
+required-features = ["relay"]

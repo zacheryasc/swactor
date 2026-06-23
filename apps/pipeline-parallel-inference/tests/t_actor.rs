@@ -43,7 +43,10 @@ fn worker_spec(stage: u32, num_stages: u32) -> ProcessSpec {
     env.insert("PP_WORKER_STUB".to_string(), "1".to_string());
     ProcessSpec {
         command: "python3".into(),
-        args: vec![format!("{}/pp_tinygrad_worker.py", env!("CARGO_MANIFEST_DIR"))],
+        args: vec![format!(
+            "{}/pp_tinygrad_worker.py",
+            env!("CARGO_MANIFEST_DIR")
+        )],
         env,
         working_dir: None,
         mode: ProcessMode::Automated,
@@ -165,17 +168,19 @@ impl ActorInterface for PongActor {
 fn assert_runtime_alive(rt: &Runtime) {
     let pong_inbox = rt.new_inbox::<Pong>().unwrap();
     let pong_addr = rt.spawn(PongActor).unwrap();
-    rt.send_to(pong_addr, Ping { reply_to: *pong_inbox.addr() })
-        .unwrap();
+    rt.send_to(
+        pong_addr,
+        Ping {
+            reply_to: *pong_inbox.addr(),
+        },
+    )
+    .unwrap();
     let pong = tick_until_recv(rt, &pong_inbox, Duration::from_secs(2));
     assert_eq!(pong, Some(Pong), "runtime should still be functional");
 }
 
 fn kill_pid(pid: u32) {
-    let _ = Command::new("kill")
-        .arg("-9")
-        .arg(pid.to_string())
-        .status();
+    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -433,7 +438,10 @@ fn first_role_inference_request_produces_stage_activation_to_next() {
     let activation = tick_until_recv(&rt, &activation_inbox, Duration::from_secs(5))
         .expect("first-role actor must emit StageActivation");
 
-    assert!(activation.is_prefill, "prefill flag must be set on first hop");
+    assert!(
+        activation.is_prefill,
+        "prefill flag must be set on first hop"
+    );
     assert_eq!(activation.seq_len, expected_token_count);
     assert_eq!(activation.position, 0);
     assert_eq!(
@@ -475,7 +483,10 @@ fn first_role_next_token_produces_stage_activation_for_decode_step() {
 
     assert!(!activation.is_prefill);
     assert_eq!(activation.seq_len, 1);
-    assert_eq!(activation.position, 11, "decode position must match NextToken");
+    assert_eq!(
+        activation.position, 11,
+        "decode position must match NextToken"
+    );
     assert_eq!(activation.request_id, 0xCAFE);
     assert_eq!(activation.hidden.len(), STUB_BYTES_PER_TOKEN);
 }
@@ -609,9 +620,18 @@ fn last_role_activation_produces_next_token_to_first() {
         .expect("last-role actor must emit NextToken");
 
     assert_eq!(nt.request_id, 0x2A);
-    assert_eq!(nt.position, 6, "next position must be activation.position + seq_len");
-    assert!(!nt.done, "single activation under max_tokens=100 must not be done");
-    assert!(nt.token_id < STUB_VOCAB_SIZE, "token_id must lie in stub vocab range");
+    assert_eq!(
+        nt.position, 6,
+        "next position must be activation.position + seq_len"
+    );
+    assert!(
+        !nt.done,
+        "single activation under max_tokens=100 must not be done"
+    );
+    assert!(
+        nt.token_id < STUB_VOCAB_SIZE,
+        "token_id must lie in stub vocab range"
+    );
 }
 
 #[test]
@@ -711,7 +731,8 @@ fn last_role_emits_response_when_max_tokens_reached() {
             .expect("should receive NextToken per activation");
         let expected_done = i + 1 == cap;
         assert_eq!(
-            nt.done, expected_done,
+            nt.done,
+            expected_done,
             "done should be set exactly on the max_tokens-th NextToken (#{})",
             i + 1
         );
@@ -766,11 +787,8 @@ fn last_role_terminate_clears_pending_state() {
 
     // Trailing activation with the same request id must not produce
     // another NextToken or another InferenceResponse.
-    rt.send_to(
-        addr,
-        StageMsg::Activation(make_activation(7, cap, 0xFF)),
-    )
-    .unwrap();
+    rt.send_to(addr, StageMsg::Activation(make_activation(7, cap, 0xFF)))
+        .unwrap();
     let trailing_nt = tick_until_recv(&rt, &next_token_inbox, Duration::from_millis(500));
     assert!(
         trailing_nt.is_none(),
@@ -806,11 +824,8 @@ fn first_role_drops_activation_messages_defensively() {
 
     // Construct a syntactically valid StageActivation. First should never
     // forward it nor crash the worker.
-    rt.send_to(
-        addr,
-        StageMsg::Activation(make_activation(0xF1, 0, 0x33)),
-    )
-    .unwrap();
+    rt.send_to(addr, StageMsg::Activation(make_activation(0xF1, 0, 0x33)))
+        .unwrap();
 
     let stray_act = tick_until_recv(&rt, &activation_inbox, Duration::from_millis(500));
     assert!(
@@ -818,7 +833,10 @@ fn first_role_drops_activation_messages_defensively() {
         "First must not emit a StageActivation in response to an inbound activation; got {stray_act:?}"
     );
     let stray_nt = tick_until_recv(&rt, &next_token_inbox, Duration::from_millis(100));
-    assert!(stray_nt.is_none(), "First emits no NextToken from a stray Activation");
+    assert!(
+        stray_nt.is_none(),
+        "First emits no NextToken from a stray Activation"
+    );
 
     // Subsequent real request still works — drop did not poison anything.
     rt.send_to(
@@ -886,7 +904,8 @@ fn middle_role_activation_produces_activation_to_next() {
     let _pid = drain_until_ready(&rt, &status_inbox, Duration::from_secs(5));
 
     let inbound = make_middle_activation(0xAB, 5, 3, true, 0x21);
-    rt.send_to(addr, StageMsg::Activation(inbound.clone())).unwrap();
+    rt.send_to(addr, StageMsg::Activation(inbound.clone()))
+        .unwrap();
 
     let outbound = tick_until_recv(&rt, &activation_inbox, Duration::from_secs(5))
         .expect("middle-role actor must emit an outbound StageActivation");
@@ -932,14 +951,24 @@ fn middle_role_preserves_control_fields_property() {
 
     for (rid, position, seq_len, is_prefill, seed) in cases.iter().copied() {
         let inbound = make_middle_activation(rid, position, seq_len, is_prefill, seed);
-        rt.send_to(addr, StageMsg::Activation(inbound.clone())).unwrap();
+        rt.send_to(addr, StageMsg::Activation(inbound.clone()))
+            .unwrap();
 
         let outbound = tick_until_recv(&rt, &activation_inbox, Duration::from_secs(5))
             .expect("middle must emit an outbound activation per inbound activation");
 
-        assert_eq!(outbound.request_id, inbound.request_id, "rid changed (in {inbound:?})");
-        assert_eq!(outbound.position, inbound.position, "position changed (in {inbound:?})");
-        assert_eq!(outbound.seq_len, inbound.seq_len, "seq_len changed (in {inbound:?})");
+        assert_eq!(
+            outbound.request_id, inbound.request_id,
+            "rid changed (in {inbound:?})"
+        );
+        assert_eq!(
+            outbound.position, inbound.position,
+            "position changed (in {inbound:?})"
+        );
+        assert_eq!(
+            outbound.seq_len, inbound.seq_len,
+            "seq_len changed (in {inbound:?})"
+        );
         assert_eq!(
             outbound.is_prefill, inbound.is_prefill,
             "is_prefill changed (in {inbound:?})"
@@ -1048,7 +1077,13 @@ fn middle_role_does_not_emit_inference_response() {
     for i in 0..4u32 {
         rt.send_to(
             addr,
-            StageMsg::Activation(make_middle_activation(0xD0 + i as u64, i, 1, false, 0x40 + i as u8)),
+            StageMsg::Activation(make_middle_activation(
+                0xD0 + i as u64,
+                i,
+                1,
+                false,
+                0x40 + i as u8,
+            )),
         )
         .unwrap();
     }

@@ -1,21 +1,20 @@
-//! Bridge between a real transport (iroh) and the swactor runtime for the
-//! actorized distribution protocol.
+//! Bridge between distribution routing decisions and the swactor runtime's
+//! transport router.
 //!
 //! # Egress
 //! An actor reaches a peer by `ctx.send(peer_addr, SwimIn::…)`, where `peer_addr`
 //! is the peer's *synthetic* mailbox address (see [`peer_addr`]). That address is
 //! never local, so the runtime encodes the message via the actor
 //! [`CodecRegistry`](swactor_transport::CodecRegistry) and routes it through the
-//! [`TransportRouter`] to an [`IrohPeerTransport`], which simply **enqueues** the
-//! framed bytes on a shared [`Outbox`]. The driver loop drains the outbox and
-//! performs the actual iroh write on its own thread (it owns the connection
-//! cache). Worker threads therefore never block on I/O, and the connection
-//! lifecycle stays single-threaded — exactly as before the actorization.
+//! [`TransportRouter`] to an [`OutboxPeerTransport`], which simply **enqueues**
+//! the framed bytes on a shared [`Outbox`]. A concrete network driver drains the
+//! outbox and writes the bytes. Worker threads therefore never block on I/O; the
+//! connection lifecycle stays owned by the concrete driver.
 //!
 //! # Ingress
-//! The driver decodes each received frame via the same `CodecRegistry` and
-//! `deliver_raw`s it straight into the target actor's mailbox; that half lives in
-//! the driver (it owns the iroh readers), not here.
+//! A concrete driver decodes each received frame via the same `CodecRegistry` and
+//! `deliver_raw`s it straight into the target actor's mailbox. This module owns
+//! only the distribution-side routing and outbound queue.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -28,8 +27,8 @@ use crate::swim::actor::PeerDirectory;
 use crate::types::NodeId;
 
 /// Lock-free-ish shared view of every known peer's relay URL, published by the
-/// `MetadataActor` and read synchronously by the iroh egress when it dials (the
-/// dial path can't block to `ask` an actor). A snapshot mirror, not a channel.
+/// `MetadataActor` and read synchronously by the network egress when it dials
+/// (the dial path can't block to `ask` an actor). A snapshot mirror, not a channel.
 pub type RelayMirror = Arc<RwLock<HashMap<NodeId, String>>>;
 
 /// Lock-free-ish shared view of every known actor's host, published by the
@@ -51,8 +50,8 @@ pub fn peer_addr(node: NodeId) -> ActorAddress {
     ActorAddress(node.0)
 }
 
-/// A single outbound frame the actors produced, awaiting an iroh write by the
-/// driver loop. `type_tag` + `payload` are already encoded by the runtime's
+/// A single outbound frame the actors produced, awaiting a concrete network
+/// driver write. `type_tag` + `payload` are already encoded by the runtime's
 /// `CodecRegistry`; the driver just frames and writes them to `to`'s connection.
 ///
 /// `dest` is the *destination actor address* (`DIRECTORY.md` §5). For gossip to a
@@ -68,19 +67,19 @@ pub struct OutFrame {
 }
 
 /// Shared queue of outbound frames, written by worker threads (via
-/// [`IrohPeerTransport`]) and drained by the single driver loop.
+/// [`OutboxPeerTransport`]) and drained by the concrete network driver.
 pub type Outbox = Arc<Mutex<Vec<OutFrame>>>;
 
 /// Per-peer egress transport. The runtime hands it an already-encoded
 /// [`WireEnvelope`] bound for this peer; it just records the frame on the shared
-/// outbox. It touches no iroh state, so it is trivially `Send + Sync` (required
+/// outbox. It touches no network-driver state, so it is trivially `Send + Sync` (required
 /// by the [`Transport`] supertrait) and never blocks the calling worker.
-struct IrohPeerTransport {
+struct OutboxPeerTransport {
     node_id: NodeId,
     outbox: Outbox,
 }
 
-impl Transport for IrohPeerTransport {
+impl Transport for OutboxPeerTransport {
     fn send(&self, envelope: WireEnvelope) -> Result<(), Error> {
         self.outbox.lock().expect("outbox poisoned").push(OutFrame {
             to: self.node_id,
@@ -99,13 +98,13 @@ impl Transport for IrohPeerTransport {
 /// So any peer an actor decides to contact becomes reachable on demand — there
 /// is no separate "binder" step and no window where a known peer lacks a route.
 /// Cheaply cloned (`Arc` the whole thing) and shared across every protocol actor.
-pub struct IrohPeerDirectory {
+pub struct OutboxPeerDirectory {
     router: Arc<TransportRouter>,
     outbox: Outbox,
     bound: Mutex<HashSet<NodeId>>,
 }
 
-impl IrohPeerDirectory {
+impl OutboxPeerDirectory {
     pub fn new(router: Arc<TransportRouter>, outbox: Outbox) -> Self {
         Self {
             router,
@@ -115,14 +114,14 @@ impl IrohPeerDirectory {
     }
 }
 
-impl PeerDirectory for IrohPeerDirectory {
+impl PeerDirectory for OutboxPeerDirectory {
     fn resolve(&self, node: &NodeId) -> Option<ActorAddress> {
         let addr = peer_addr(*node);
         // Register the egress route once, on first contact.
         if self.bound.lock().expect("bound set poisoned").insert(*node) {
             self.router.add_route(
                 addr,
-                Arc::new(IrohPeerTransport {
+                Arc::new(OutboxPeerTransport {
                     node_id: *node,
                     outbox: self.outbox.clone(),
                 }),
@@ -133,12 +132,12 @@ impl PeerDirectory for IrohPeerDirectory {
 }
 
 /// Egress transport for an **application** message addressed to an actor by its
-/// own address (`DIRECTORY.md` §5). Where [`IrohPeerTransport`] knows its peer at
-/// construction, this one discovers the host at send time from the directory's
+/// own address (`DIRECTORY.md` §5). Where [`OutboxPeerTransport`] knows its peer
+/// at construction, this one discovers the host at send time from the directory's
 /// [`RouteView`]: it resolves `envelope.dest → host` and enqueues the frame for
 /// that host. A `dest` absent from the view is dropped, like a lost packet — the
 /// blind best-effort routing contract. One shared instance backs every routed
-/// actor address (see [`IrohRouteBinder`]); re-checking the view on each send
+/// actor address (see [`OutboxRouteBinder`]); re-checking the view on each send
 /// means a stale registered route is harmless (it simply drops on a miss).
 pub struct RouteViewTransport {
     route_view: RouteView,
@@ -179,7 +178,7 @@ impl Transport for RouteViewTransport {
 ///
 /// The [`DirectoryActor`](crate::directory_actor::DirectoryActor) calls
 /// [`ensure_routable`](RouteBinder::ensure_routable) for every actor it learns is
-/// hosted on a peer, mirroring how [`IrohPeerDirectory`] lazily binds a peer's
+/// hosted on a peer, mirroring how [`OutboxPeerDirectory`] lazily binds a peer's
 /// egress on first contact.
 pub trait RouteBinder: Send + Sync + 'static {
     fn ensure_routable(&self, actor: ActorAddress);
@@ -191,13 +190,13 @@ pub trait RouteBinder: Send + Sync + 'static {
 /// Because the single transport re-resolves the [`RouteView`] on every send, the
 /// route never needs updating when an actor moves hosts — only registering once,
 /// the first time the directory learns the actor exists elsewhere.
-pub struct IrohRouteBinder {
+pub struct OutboxRouteBinder {
     router: Arc<TransportRouter>,
     transport: Arc<RouteViewTransport>,
     bound: Mutex<HashSet<ActorAddress>>,
 }
 
-impl IrohRouteBinder {
+impl OutboxRouteBinder {
     pub fn new(router: Arc<TransportRouter>, transport: Arc<RouteViewTransport>) -> Self {
         Self {
             router,
@@ -207,7 +206,7 @@ impl IrohRouteBinder {
     }
 }
 
-impl RouteBinder for IrohRouteBinder {
+impl RouteBinder for OutboxRouteBinder {
     fn ensure_routable(&self, actor: ActorAddress) {
         if self.bound.lock().expect("bound set poisoned").insert(actor) {
             self.router.add_route(actor, self.transport.clone());
@@ -246,7 +245,7 @@ mod tests {
         // driver can write, preserving the target peer, wire tag, and bytes.
         let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
         let peer = id(7);
-        let transport = IrohPeerTransport {
+        let transport = OutboxPeerTransport {
             node_id: peer,
             outbox: outbox.clone(),
         };

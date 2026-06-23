@@ -951,15 +951,11 @@ name = "distribution"
 version = "0.1.0"
 dependencies = [
  "datastream",
- "iroh",
- "iroh-metrics",
- "iroh-relay",
  "libc",
  "serde",
  "serde_json",
  "swactor",
  "swactor-transport",
- "tokio",
  "uuid",
 ]
 
@@ -2045,6 +2041,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "iroh-driver"
+version = "0.1.0"
+dependencies = [
+ "datastream",
+ "distribution",
+ "iroh",
+ "iroh-relay",
+ "serde",
+ "serde_json",
+ "swactor",
+ "swactor-transport",
+ "tokio",
+]
+
+[[package]]
 name = "iroh-metrics"
 version = "0.38.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3014,6 +3025,7 @@ dependencies = [
  "distribution",
  "futures-util",
  "iroh",
+ "iroh-driver",
  "libc",
  "reqwest 0.12.28",
  "serde",
@@ -3021,6 +3033,7 @@ dependencies = [
  "swactor",
  "swactor-process",
  "swactor-transport",
+ "swactor-vastai",
  "tokio",
  "tracing-subscriber",
  "urlencoding",
@@ -4258,6 +4271,17 @@ dependencies = [
  "serde",
  "serde_json",
  "swactor",
+]
+
+[[package]]
+name = "swactor-vastai"
+version = "0.1.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "urlencoding",
 ]
 
 [[package]]

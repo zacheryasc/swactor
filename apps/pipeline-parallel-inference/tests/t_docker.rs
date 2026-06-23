@@ -662,9 +662,7 @@ fn spawn_stream_collector<R: Read + Send + 'static>(mut reader: R) -> StreamBuf 
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let mut guard = inner_for_thread
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner());
+                    let mut guard = inner_for_thread.lock().unwrap_or_else(|p| p.into_inner());
                     guard.extend_from_slice(&chunk[..n]);
                 }
                 Err(_) => break,

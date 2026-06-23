@@ -1,16 +1,13 @@
 use std::process::{Command, ExitCode};
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
 // ── CLI ─────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(name = "xtask", about = "Development task runner")]
 struct Cli {
-    #[command(subcommand)]
-    command: Option<Cmd>,
-
     /// (Legacy) Test group to run directly without subcommand
     #[arg(hide = true)]
     group: Option<String>,
@@ -18,20 +15,6 @@ struct Cli {
     /// Show all groups and the cargo commands they run
     #[arg(long)]
     list: bool,
-}
-
-#[derive(Subcommand)]
-enum Cmd {
-    /// Run a local swactor node with distribution on localhost
-    Node {
-        /// Dashboard HTTP port
-        #[arg(long, default_value = "9090")]
-        dashboard_port: u16,
-
-        /// Pass extra args to the swactor binary
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 }
 
 // ── Test infrastructure ─────────────────────────────────────────────
@@ -84,10 +67,7 @@ fn run_step(group_name: &str, step: &TestStep) -> bool {
 fn print_usage() {
     println!(
         "\
-USAGE: cargo xtask <COMMAND|GROUP>
-
-COMMANDS:
-  node                 Run a local swactor node (distribution, localhost)
+USAGE: cargo xtask <GROUP>
 
 TEST GROUPS:
   core                 Actor runtime, message delivery, property tests
@@ -112,59 +92,6 @@ fn print_list() {
 
     println!("  {:<22}core", "essential");
     println!("  {:<22}Every test group", "all");
-}
-
-// ── Node runner ─────────────────────────────────────────────────────
-
-fn run_node(dashboard_port: u16, extra_args: &[String]) {
-    eprintln!("Building swactor node...");
-    let build = Command::new(cargo_bin())
-        .args(["build", "-p", "node"])
-        .status();
-
-    match build {
-        Ok(s) if s.success() => {}
-        Ok(s) => {
-            eprintln!("Build failed");
-            std::process::exit(s.code().unwrap_or(1));
-        }
-        Err(e) => {
-            eprintln!("Failed to execute cargo build: {e}");
-            std::process::exit(1);
-        }
-    }
-
-    let tmp = std::env::temp_dir().join("swactor-dev-node");
-    std::fs::create_dir_all(&tmp).expect("failed to create temp dir");
-
-    let identity_dir = tmp.join("identity");
-    let auth_dir = tmp.join("auth");
-
-    eprintln!();
-
-    let mut cmd = Command::new("target/debug/swactor");
-    cmd.args([
-        "--transport",
-        "iroh",
-        "--dashboard-port",
-        &dashboard_port.to_string(),
-        "--identity-dir",
-        &identity_dir.to_string_lossy(),
-        "--auth-dir",
-        &auth_dir.to_string_lossy(),
-        "--no-relay",
-    ]);
-    cmd.env("HOME", tmp.to_string_lossy().as_ref());
-    cmd.args(extra_args);
-
-    let status = cmd.status();
-    match status {
-        Ok(s) => std::process::exit(s.code().unwrap_or(0)),
-        Err(e) => {
-            eprintln!("Failed to execute swactor: {e}");
-            std::process::exit(1);
-        }
-    }
 }
 
 fn cargo_bin() -> String {
@@ -218,18 +145,6 @@ fn main() -> ExitCode {
     if cli.list {
         print_list();
         return ExitCode::SUCCESS;
-    }
-
-    if let Some(cmd) = cli.command {
-        return match cmd {
-            Cmd::Node {
-                dashboard_port,
-                args,
-            } => {
-                run_node(dashboard_port, &args);
-                ExitCode::SUCCESS
-            }
-        };
     }
 
     match cli.group {

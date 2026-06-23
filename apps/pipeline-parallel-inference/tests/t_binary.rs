@@ -175,7 +175,10 @@ fn extract_response(lines: &[String]) -> Option<String> {
     const HEADER: &str = "=== pipeline-parallel Inference Response ===";
     const FOOTER: &str = "============================================";
     let header_idx = lines.iter().position(|l| l == HEADER)?;
-    let footer_idx = lines.iter().skip(header_idx + 1).position(|l| l == FOOTER)?;
+    let footer_idx = lines
+        .iter()
+        .skip(header_idx + 1)
+        .position(|l| l == FOOTER)?;
     let body: Vec<&str> = lines[header_idx + 1..header_idx + 1 + footer_idx]
         .iter()
         .map(|s| s.as_str())
@@ -247,8 +250,8 @@ fn run_to_completion(opts: &SmokeRunOpts) -> RunOutcome {
     let (mut smoke, stdout, stderr) = spawn_smoke_run(opts);
     let smoke_pid = smoke.id();
     let n = opts.num_stages as usize;
-    let pre_exit_pids = wait_for_n_children(smoke_pid, n, Duration::from_secs(60))
-        .unwrap_or_else(|| {
+    let pre_exit_pids =
+        wait_for_n_children(smoke_pid, n, Duration::from_secs(60)).unwrap_or_else(|| {
             let _ = smoke.kill();
             let _ = smoke.wait();
             panic!("pp-orchestrator did not spawn {n} pp-worker children within 60s")
@@ -257,7 +260,10 @@ fn run_to_completion(opts: &SmokeRunOpts) -> RunOutcome {
     let status = wait_with_timeout(&mut smoke, HAPPY_PATH_TIMEOUT).unwrap_or_else(|| {
         let _ = smoke.kill();
         let _ = smoke.wait();
-        panic!("pp-orchestrator did not exit within {:?}", HAPPY_PATH_TIMEOUT);
+        panic!(
+            "pp-orchestrator did not exit within {:?}",
+            HAPPY_PATH_TIMEOUT
+        );
     });
     RunOutcome {
         status,
@@ -344,9 +350,11 @@ fn sigkill(pid: u32) {
 /// stage builds this in `StageActor::detokenize_stub`; matching it here lets
 /// the §13.1 token-count test extract the count without parsing freeform text.
 fn stub_token_count(response: &str) -> Option<usize> {
-    let inner = response
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("tokens: [").and_then(|s| s.strip_suffix("]")))?;
+    let inner = response.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("tokens: [")
+            .and_then(|s| s.strip_suffix("]"))
+    })?;
     Some(inner.split_whitespace().count())
 }
 
@@ -539,12 +547,11 @@ fn binary_e2e_orchestrator_sigkilled_children_die_within_timeout() {
     let opts = stub_opts(3);
     let (mut smoke, _stdout, _stderr) = spawn_smoke_run(&opts);
     let smoke_pid = smoke.id();
-    let pids = wait_for_n_children(smoke_pid, 3, Duration::from_secs(60))
-        .unwrap_or_else(|| {
-            let _ = smoke.kill();
-            let _ = smoke.wait();
-            panic!("pp-orchestrator did not spawn 3 children within 60s");
-        });
+    let pids = wait_for_n_children(smoke_pid, 3, Duration::from_secs(60)).unwrap_or_else(|| {
+        let _ = smoke.kill();
+        let _ = smoke.wait();
+        panic!("pp-orchestrator did not spawn 3 children within 60s");
+    });
 
     sigkill(smoke_pid);
     let _ = smoke.wait();
@@ -699,7 +706,10 @@ fn real_tinygrad_at(num_stages: u32) {
             .join("\n"),
     );
     let response = extract_response(&stdout_lines).unwrap_or_else(|| {
-        panic!("missing response banner; stdout:\n{}", stdout_lines.join("\n"))
+        panic!(
+            "missing response banner; stdout:\n{}",
+            stdout_lines.join("\n")
+        )
     });
     assert!(
         !response.trim().is_empty(),
@@ -774,4 +784,3 @@ fn binary_e2e_real_tinygrad_response_matches_single_node_for_say_hello() {
         "binary response at N=3 should match single-node generate() output"
     );
 }
-

@@ -5,8 +5,8 @@
 //! no `#[should_panic]`, per plan rules.
 
 use pipeline_parallel_inference::messages::{
-    inference_codec_registry, InferenceCodec, InferenceRequest, InferenceResponse, NextToken,
-    StageActivation,
+    InferenceCodec, InferenceRequest, InferenceResponse, NextToken, StageActivation,
+    inference_codec_registry,
 };
 use swactor::actor::ActorAddress;
 use swactor_transport::Codec;
@@ -69,11 +69,18 @@ fn stage_activation_roundtrips_with_varied_seq_len() {
             seq_len,
             is_prefill: seq_len > 1,
         };
-        assert_eq!(original.hidden.len(), len, "sanity: payload size matches seq_len");
+        assert_eq!(
+            original.hidden.len(),
+            len,
+            "sanity: payload size matches seq_len"
+        );
 
         let bytes = codec.encode(&original).expect("encode should succeed");
         let decoded = codec.decode(&bytes).expect("decode should succeed");
-        assert_eq!(decoded, original, "direct roundtrip differs at seq_len={seq_len}");
+        assert_eq!(
+            decoded, original,
+            "direct roundtrip differs at seq_len={seq_len}"
+        );
         assert_eq!(
             decoded.hidden, original.hidden,
             "binary payload must survive at seq_len={seq_len}",
@@ -92,7 +99,10 @@ fn stage_activation_roundtrips_with_varied_seq_len() {
         let decoded = any_msg
             .downcast::<StageActivation>()
             .expect("downcast should succeed");
-        assert_eq!(*decoded, original, "registry roundtrip differs at seq_len={seq_len}");
+        assert_eq!(
+            *decoded, original,
+            "registry roundtrip differs at seq_len={seq_len}"
+        );
     }
 }
 
@@ -109,7 +119,10 @@ fn stage_activation_roundtrips_through_codec_and_registry() {
     let bytes = codec.encode(&original).expect("encode should succeed");
     let decoded = codec.decode(&bytes).expect("decode should succeed");
     assert_eq!(decoded, original);
-    assert_eq!(decoded.hidden, original.hidden, "binary payload must survive");
+    assert_eq!(
+        decoded.hidden, original.hidden,
+        "binary payload must survive"
+    );
 
     // Registry (type-erased) path
     let registry = inference_codec_registry();
@@ -388,7 +401,9 @@ fn codec_registry_dispatches_all_four_types() {
         prompt: "dispatch me".into(),
         max_tokens: 16,
     };
-    let response = InferenceResponse { text: "dispatched".into() };
+    let response = InferenceResponse {
+        text: "dispatched".into(),
+    };
     let activation = sample_activation();
     let next_token = NextToken {
         request_id: 11,

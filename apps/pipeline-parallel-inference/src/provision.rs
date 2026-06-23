@@ -23,13 +23,13 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::process_observer::ProcessOutputObserver;
 use swactor::runtime::{Ctx, ExternalSender, Runtime};
 
-use dashboard::telemetry::{process_output, IdentityRecord, ProcStream, IDENTITY};
-use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
-use datastream::wire::{encode_delivery, DatastreamFrame};
+use dashboard::telemetry::{IDENTITY, IdentityRecord, ProcStream, process_output};
 use datastream::Record;
+use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
+use datastream::wire::{DatastreamFrame, encode_delivery};
 
 use swactor_process::ssh::SshConfig;
-use swactor_process::{spawn_ssh_process, ProcessMode, ProcessSpec};
+use swactor_process::{ProcessMode, ProcessSpec, spawn_ssh_process};
 
 /// Path to the orchestrator's deploy SSH private key, from `PP_DEPLOY_KEY`.
 /// `None` (key unset or missing) disables SSH boot telemetry entirely.

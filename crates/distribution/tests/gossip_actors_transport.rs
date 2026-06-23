@@ -319,7 +319,7 @@ fn a_relay_url_propagates_to_a_peer_over_the_transport() {
     });
     assert!(propagated, "relay URL did not propagate over the transport");
 
-    // And the MetadataActor mirrored it for the iroh egress to read synchronously.
+    // And the MetadataActor mirrored it for network egress to read synchronously.
     let mirror = c.nodes[1].relay_mirror.read().unwrap();
     assert_eq!(
         mirror.get(&c.ids[0]).map(String::as_str),

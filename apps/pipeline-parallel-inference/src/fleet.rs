@@ -14,17 +14,15 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use dashboard::telemetry::{
-    self, IdentityRecord, RuntimeStats as DsRuntimeStats, WorkerCounters,
-};
+use dashboard::telemetry::{self, IdentityRecord, RuntimeStats as DsRuntimeStats, WorkerCounters};
 use datastream::emit::{ClusterFrameSink, DatastreamEmitter, EmitterConfig};
 use datastream::health::DatastreamHealth;
-use distribution::telemetry::{
-    CacheEntryRec, DistributionState, MembershipTransition, RegistryEntryRec, TransportInternals,
-};
 use distribution::registry::RegistrySnapshot;
 use distribution::swim::member_list::MemberEntry;
 use distribution::swim::telemetry::ObservedTransition;
+use distribution::telemetry::{
+    CacheEntryRec, DistributionState, MembershipTransition, RegistryEntryRec, TransportInternals,
+};
 use distribution::types::{MemberState, NodeId};
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
@@ -75,7 +73,10 @@ impl FleetEmitter {
             listen_addr: listen_addr.to_string(),
             ..Default::default()
         });
-        Self { emitter, host: telemetry::HostSampler::new() }
+        Self {
+            emitter,
+            host: telemetry::HostSampler::new(),
+        }
     }
 
     /// Ship one periodic sample: host resource + runtime + transport (with the
@@ -90,7 +91,8 @@ impl FleetEmitter {
         relay_peers: u32,
         rtt_ms_p50: u32,
     ) {
-        self.emitter.submit_record(&telemetry::read_host_resource(&mut self.host));
+        self.emitter
+            .submit_record(&telemetry::read_host_resource(&mut self.host));
         self.emitter.submit_record(&runtime);
         self.emitter.submit_record(&TransportInternals {
             relay_connected,
@@ -105,7 +107,11 @@ impl FleetEmitter {
         } else {
             0
         };
-        self.emitter.submit_record(&DatastreamHealth { assigned, dropped, loss_rate_ppm });
+        self.emitter.submit_record(&DatastreamHealth {
+            assigned,
+            dropped,
+            loss_rate_ppm,
+        });
         self.emitter.tick();
     }
 
@@ -144,7 +150,11 @@ fn member_state_str(state: MemberState) -> &'static str {
 pub fn membership_transition(t: &ObservedTransition) -> MembershipTransition {
     MembershipTransition {
         peer: hex(&t.peer.0),
-        from: t.from.map(member_state_str).unwrap_or("unknown").to_string(),
+        from: t
+            .from
+            .map(member_state_str)
+            .unwrap_or("unknown")
+            .to_string(),
         to: member_state_str(t.to).to_string(),
         reason: t.reason.to_string(),
     }

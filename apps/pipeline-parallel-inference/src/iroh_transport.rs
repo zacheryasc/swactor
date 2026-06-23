@@ -9,12 +9,12 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use distribution::iroh_driver::IrohDriver;
 use distribution::types::NodeId;
+use iroh_driver::IrohDriver;
+use swactor::Error;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor_transport::{CodecRegistry, Transport, WireEnvelope};
-use swactor::Error;
 
 /// ALPN protocol for actor-level messages (distinct from SWIM protocol).
 pub const ACTOR_ALPN: &[u8] = b"swactor/actor/1";

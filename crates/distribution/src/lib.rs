@@ -1,8 +1,6 @@
 pub mod cache;
 pub mod crypto;
 pub mod directory_actor;
-#[cfg(feature = "iroh")]
-pub mod iroh_driver;
 pub mod messages;
 pub mod node;
 pub mod node_metadata;
