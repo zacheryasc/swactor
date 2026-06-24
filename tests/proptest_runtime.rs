@@ -8,12 +8,9 @@ use std::collections::HashMap;
 use proptest::prelude::*;
 use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state_machine};
 
-use std::sync::Arc;
-
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Ctx, Inbox, Runtime};
-use swactor::std::{CtxTimers, StdExtension};
 
 // ─── Shared Actor Types ────────────────────────────────────────────────────
 
@@ -112,77 +109,6 @@ proptest! {
             "Too many messages processed: {} > {} (n_actors={}, budget={})",
             replies.len(), n_actors * budget, n_actors, budget,
         );
-    }
-
-    /// One-shot timer fires at exactly the right tick for any delay.
-    #[test]
-    fn one_shot_timer_fires_at_correct_tick(delay in 1u64..20) {
-        let rt = Runtime::new(RuntimeConfig::default())
-            .with_extension(Arc::new(StdExtension::new()));
-        let inbox = rt.new_inbox::<Ping>().unwrap();
-
-        struct TimerActor { target: ActorAddress, delay: u64 }
-        impl ActorInterface for TimerActor {
-            type Incoming = Ping;
-            type Response = ();
-            fn handle(&mut self, _ctx: &Ctx, _msg: Ping) {}
-            fn on_start(&mut self, ctx: &Ctx) {
-                ctx.send_after_ticks(self.target, Ping(42), self.delay);
-            }
-        }
-
-        let _addr = rt.spawn(TimerActor { target: *inbox.addr(), delay }).unwrap();
-
-        // Tick up to the expected fire tick
-        for tick in 1..=(delay + 1) {
-            rt.tick();
-            let msg = inbox.try_recv();
-            if tick <= delay {
-                prop_assert!(msg.is_none(), "Timer fired too early at tick {}", tick);
-            } else {
-                prop_assert!(msg.is_some(), "Timer should have fired at tick {}", tick);
-            }
-        }
-
-        // No second fire (one-shot)
-        rt.tick();
-        prop_assert!(inbox.try_recv().is_none(), "One-shot timer fired twice");
-    }
-
-    /// Interval timer fires at correct periodic ticks for any period.
-    #[test]
-    fn interval_timer_fires_at_correct_period(period in 1u64..10) {
-        let rt = Runtime::new(RuntimeConfig::default())
-            .with_extension(Arc::new(StdExtension::new()));
-        let inbox = rt.new_inbox::<Ping>().unwrap();
-
-        struct IntervalActor { target: ActorAddress, period: u64 }
-        impl ActorInterface for IntervalActor {
-            type Incoming = Ping;
-            type Response = ();
-            fn handle(&mut self, _ctx: &Ctx, _msg: Ping) {}
-            fn on_start(&mut self, ctx: &Ctx) {
-                ctx.send_interval_ticks(self.target, Ping(1), self.period);
-            }
-        }
-
-        let _addr = rt.spawn(IntervalActor { target: *inbox.addr(), period }).unwrap();
-
-        // Verify 3 consecutive fires
-        let mut fire_count = 0;
-        // Timer scheduled on tick 1 (on_start). First fire at tick 1+period.
-        for tick in 1..=(period * 3 + 2) {
-            rt.tick();
-            if let Some(_) = inbox.try_recv() {
-                fire_count += 1;
-                // First fire should be at tick (period + 1)
-                // Subsequent fires every `period` ticks after that
-                let expected_tick = period + 1 + (fire_count - 1) * period;
-                prop_assert_eq!(tick, expected_tick,
-                    "Fire #{} at wrong tick (period={})", fire_count, period);
-            }
-        }
-        prop_assert!(fire_count >= 3, "Expected 3+ fires, got {} (period={})", fire_count, period);
     }
 
     /// Spawn N actors and verify all get unique addresses and appear in stats.

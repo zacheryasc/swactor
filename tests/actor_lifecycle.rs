@@ -1,13 +1,13 @@
 //! Actor Lifecycle Tests — birth, life, death of individual actors.
 //!
 //! Covers: spawning, on_start, parent-child delegation, graceful stop,
-//! panic isolation, dead actor cleanup, watching (ActorExited), and
-//! monitoring (Down notifications).
+//! panic isolation, dead actor cleanup, and watching (ActorExited).
 
 mod common;
 use common::*;
 
 use std::sync::Arc;
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Local actors ────────────────────────────────────────────────────────────
@@ -157,14 +157,13 @@ impl ActorInterface for StopOnTrigger {
 /// Watches targets and counts exit notifications via on_actor_exit.
 struct ExitWatcher {
     exit_count: Arc<AtomicUsize>,
-    last_reason: Arc<std::sync::Mutex<Option<ExitReason>>>,
-    last_addr: Arc<std::sync::Mutex<Option<ActorAddress>>>,
+    last_reason: Arc<Mutex<Option<ExitReason>>>,
+    last_addr: Arc<Mutex<Option<ActorAddress>>>,
 }
 
 #[derive(Clone)]
 enum WatcherCmd {
     WatchThis(ActorAddress),
-    UnwatchThis(ActorAddress),
 }
 
 impl ActorInterface for ExitWatcher {
@@ -173,19 +172,18 @@ impl ActorInterface for ExitWatcher {
     fn handle(&mut self, ctx: &Ctx, msg: WatcherCmd) {
         match msg {
             WatcherCmd::WatchThis(target) => ctx.watch(target),
-            WatcherCmd::UnwatchThis(target) => ctx.unwatch(target),
         }
     }
     fn on_actor_exit(&mut self, _ctx: &Ctx, exited: ActorExited) {
         self.exit_count.fetch_add(1, Ordering::SeqCst);
-        *self.last_reason.lock().unwrap() = Some(exited.reason);
-        *self.last_addr.lock().unwrap() = Some(exited.addr);
+        *self.last_reason.lock() = Some(exited.reason);
+        *self.last_addr.lock() = Some(exited.addr);
     }
 }
 
 struct WatcherState {
     exit_count: Arc<AtomicUsize>,
-    last_reason: Arc<std::sync::Mutex<Option<ExitReason>>>,
+    last_reason: Arc<Mutex<Option<ExitReason>>>,
 }
 
 impl WatcherState {
@@ -193,14 +191,14 @@ impl WatcherState {
         self.exit_count.load(Ordering::SeqCst)
     }
     fn last_reason(&self) -> Option<ExitReason> {
-        self.last_reason.lock().unwrap().clone()
+        self.last_reason.lock().clone()
     }
 }
 
 fn new_exit_watcher() -> (ExitWatcher, WatcherState) {
     let exit_count = Arc::new(AtomicUsize::new(0));
-    let last_reason = Arc::new(std::sync::Mutex::new(None));
-    let last_addr = Arc::new(std::sync::Mutex::new(None));
+    let last_reason = Arc::new(Mutex::new(None));
+    let last_addr = Arc::new(Mutex::new(None));
     let state = WatcherState {
         exit_count: exit_count.clone(),
         last_reason: last_reason.clone(),
@@ -213,43 +211,6 @@ fn new_exit_watcher() -> (ExitWatcher, WatcherState) {
         },
         state,
     )
-}
-
-/// Monitors a target and forwards Down to a reply address.
-struct MonitorWatcherActor {
-    watch_target: ActorAddress,
-    reply_to: ActorAddress,
-    mref: Option<MonitorRef>,
-}
-
-impl ActorInterface for MonitorWatcherActor {
-    type Incoming = Down;
-    type Response = ();
-    fn on_start(&mut self, ctx: &Ctx) {
-        self.mref = Some(ctx.monitor(self.watch_target).unwrap());
-    }
-    fn handle(&mut self, ctx: &Ctx, msg: Down) {
-        ctx.send(self.reply_to, msg).unwrap();
-    }
-}
-
-/// Demonitors on Ping.
-struct DemonitorActor {
-    watch_target: ActorAddress,
-    mref: Option<MonitorRef>,
-}
-
-impl ActorInterface for DemonitorActor {
-    type Incoming = Ping;
-    type Response = ();
-    fn on_start(&mut self, ctx: &Ctx) {
-        self.mref = Some(ctx.monitor(self.watch_target).unwrap());
-    }
-    fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-        if let Some(mref) = self.mref.take() {
-            ctx.demonitor(mref);
-        }
-    }
 }
 
 /// A silent actor that does nothing (target for watching tests).
@@ -688,71 +649,37 @@ fn panic_isolation_and_cleanup() {
 fn watch_notification_contract() {
     let rt = std_runtime(RuntimeConfig::default());
 
-    // Spawn target + 3 watchers + 1 that unwatches
     let target = rt.spawn(PanicActor).unwrap();
     let (w1, s1) = new_exit_watcher();
     let (w2, s2) = new_exit_watcher();
     let (w3, s3) = new_exit_watcher();
-    let (w4, s4) = new_exit_watcher(); // will unwatch
 
     let w1_addr = rt.spawn(w1).unwrap();
     let w2_addr = rt.spawn(w2).unwrap();
     let w3_addr = rt.spawn(w3).unwrap();
-    let w4_addr = rt.spawn(w4).unwrap();
 
-    // All watch the target
     rt.send_to(w1_addr, WatcherCmd::WatchThis(target)).unwrap();
     rt.send_to(w2_addr, WatcherCmd::WatchThis(target)).unwrap();
     rt.send_to(w3_addr, WatcherCmd::WatchThis(target)).unwrap();
-    rt.send_to(w4_addr, WatcherCmd::WatchThis(target)).unwrap();
     tick_n(&rt, 3);
 
-    // w2 double-watches (idempotent test)
+    // w2 double-watches: registration is idempotent.
     rt.send_to(w2_addr, WatcherCmd::WatchThis(target)).unwrap();
     tick_n(&rt, 3);
 
-    // w4 unwatches
-    rt.send_to(w4_addr, WatcherCmd::UnwatchThis(target))
-        .unwrap();
-    tick_n(&rt, 3);
-
-    // Kill target
     rt.send_to(target, PanicMsg).unwrap();
     tick_n(&rt, 5);
 
     assert_eq!(s1.count(), 1, "watcher 1 notified");
     assert_eq!(s2.count(), 1, "double-watch still only one notification");
     assert_eq!(s3.count(), 1, "watcher 3 notified");
-    assert_eq!(s4.count(), 0, "unwatched watcher not notified");
     assert_eq!(s1.last_reason(), Some(ExitReason::Panicked));
-
-    // --- Runtime-level watch ---
-    let rt = std_runtime(RuntimeConfig::default());
-    let target = rt.spawn(PanicActor).unwrap();
-    let (w, s) = new_exit_watcher();
-    let w_addr = rt.spawn(w).unwrap();
-    tick_n(&rt, 2);
-    rt.watch(w_addr, target);
-    rt.send_to(target, PanicMsg).unwrap();
-    tick_n(&rt, 5);
-    assert_eq!(s.count(), 1, "runtime-level watch delivers notification");
 }
 
 /// Watch edge cases: watcher dies before target (no crash), self-watch (no
 /// crash), watcher reacts to death by spawning a replacement.
 #[test]
 fn watch_edge_cases() {
-    // Watcher dies before target — no crash
-    let rt = std_runtime(RuntimeConfig::default());
-    let target = rt.spawn(PanicActor).unwrap();
-    let target2 = rt.spawn(PanicActor).unwrap();
-    rt.watch(target2, target);
-    tick_n(&rt, 3);
-    rt.send_to(target2, PanicMsg).unwrap(); // kill watcher first
-    tick_n(&rt, 5);
-    rt.send_to(target, PanicMsg).unwrap(); // kill target — no crash
-    tick_n(&rt, 5);
-
     // Self-watch — no crash
     let rt = std_runtime(RuntimeConfig::default());
     let (w, _s) = new_exit_watcher();
@@ -804,227 +731,3 @@ fn watch_edge_cases() {
     );
 }
 
-/// Monitor API contract: Down on stop (Normal) and panic (Panicked), multiple
-/// monitors, demonitor cancels, dead watcher cleanup, stacked monitors,
-/// external inbox, handle_down dispatch.
-#[test]
-fn monitor_death_notification_contract() {
-    let rt = std_runtime(RuntimeConfig::default());
-
-    // --- Stop → Down(Normal) ---
-    let inbox = rt.new_inbox::<Down>().unwrap();
-    let target = rt.spawn(PingPongActor).unwrap();
-    rt.spawn(MonitorWatcherActor {
-        watch_target: target,
-        reply_to: *inbox.addr(),
-        mref: None,
-    })
-    .unwrap();
-    rt.tick();
-    rt.stop_actor(target).unwrap();
-    tick_n(&rt, 3);
-    let down = inbox.try_recv().expect("Down on graceful stop");
-    assert_eq!(down.addr, target);
-    assert_eq!(down.reason, StopReason::Normal);
-
-    // --- Panic → Down(Panicked) ---
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Down>().unwrap();
-    let target = rt.spawn(PanicActor).unwrap();
-    rt.spawn(MonitorWatcherActor {
-        watch_target: target,
-        reply_to: *inbox.addr(),
-        mref: None,
-    })
-    .unwrap();
-    rt.tick();
-    rt.send_to(target, PanicMsg).unwrap();
-    tick_n(&rt, 3);
-    let down = inbox.try_recv().expect("Down on panic");
-    assert_eq!(down.reason, StopReason::Panicked);
-
-    // --- Multiple monitors ---
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox1 = rt.new_inbox::<Down>().unwrap();
-    let inbox2 = rt.new_inbox::<Down>().unwrap();
-    let target = rt.spawn(PingPongActor).unwrap();
-    rt.spawn(MonitorWatcherActor {
-        watch_target: target,
-        reply_to: *inbox1.addr(),
-        mref: None,
-    })
-    .unwrap();
-    rt.spawn(MonitorWatcherActor {
-        watch_target: target,
-        reply_to: *inbox2.addr(),
-        mref: None,
-    })
-    .unwrap();
-    rt.tick();
-    rt.stop_actor(target).unwrap();
-    tick_n(&rt, 3);
-    assert!(inbox1.try_recv().is_some(), "watcher 1 notified");
-    assert!(inbox2.try_recv().is_some(), "watcher 2 notified");
-
-    // --- Demonitor cancels ---
-    let rt = std_runtime(RuntimeConfig::default());
-    let down_inbox = rt.new_inbox::<Down>().unwrap();
-    let target = rt.spawn(PingPongActor).unwrap();
-    let watcher = rt
-        .spawn(DemonitorActor {
-            watch_target: target,
-            mref: None,
-        })
-        .unwrap();
-    rt.tick();
-    rt.send_to(
-        watcher,
-        Ping {
-            reply_to: ActorAddress::default(),
-        },
-    )
-    .unwrap();
-    rt.tick(); // demonitor
-    rt.stop_actor(target).unwrap();
-    tick_n(&rt, 3);
-    assert!(
-        down_inbox.try_recv().is_none(),
-        "demonitored: no Down delivered"
-    );
-
-    // --- Dead watcher cleaned up ---
-    let rt = std_runtime(RuntimeConfig::default());
-    let target = rt.spawn(PingPongActor).unwrap();
-    let watcher = rt
-        .spawn(MonitorWatcherActor {
-            watch_target: target,
-            reply_to: ActorAddress::default(),
-            mref: None,
-        })
-        .unwrap();
-    rt.tick();
-    rt.stop_actor(watcher).unwrap();
-    rt.tick(); // watcher dies
-    rt.stop_actor(target).unwrap();
-    tick_n(&rt, 3); // target dies — no crash trying to deliver to dead watcher
-
-    // --- Stacked monitors produce multiple notifications ---
-    struct DoubleMonitor {
-        target: ActorAddress,
-        reply_to: ActorAddress,
-    }
-    impl ActorInterface for DoubleMonitor {
-        type Incoming = Down;
-        type Response = ();
-        fn on_start(&mut self, ctx: &Ctx) {
-            ctx.monitor(self.target).unwrap();
-            ctx.monitor(self.target).unwrap();
-        }
-        fn handle(&mut self, ctx: &Ctx, msg: Down) {
-            ctx.send(self.reply_to, msg).unwrap();
-        }
-    }
-
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Down>().unwrap();
-    let target = rt.spawn(PingPongActor).unwrap();
-    rt.spawn(DoubleMonitor {
-        target,
-        reply_to: *inbox.addr(),
-    })
-    .unwrap();
-    rt.tick();
-    rt.stop_actor(target).unwrap();
-    tick_n(&rt, 3);
-    assert!(
-        inbox.try_recv().is_some(),
-        "first Down from stacked monitor"
-    );
-    assert!(
-        inbox.try_recv().is_some(),
-        "second Down from stacked monitor"
-    );
-    assert!(inbox.try_recv().is_none(), "no more");
-
-    // --- handle_down dispatch ---
-    struct MonitoringTracker {
-        target: ActorAddress,
-        downs: Vec<Down>,
-        inbox: ActorAddress,
-    }
-    impl ActorInterface for MonitoringTracker {
-        type Incoming = Ping;
-        type Response = ();
-        fn on_start(&mut self, ctx: &Ctx) {
-            ctx.monitor(self.target).unwrap();
-        }
-        fn handle(&mut self, ctx: &Ctx, _msg: Ping) {
-            let _ = ctx.send(self.inbox, Count(self.downs.len()));
-        }
-        fn handle_down(&mut self, _ctx: &Ctx, down: Down) {
-            self.downs.push(down);
-        }
-    }
-
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Count>().unwrap();
-    let target = rt.spawn(PanicActor).unwrap();
-    let tracker = rt
-        .spawn(MonitoringTracker {
-            target,
-            downs: vec![],
-            inbox: *inbox.addr(),
-        })
-        .unwrap();
-    rt.tick();
-    rt.send_to(target, PanicMsg).unwrap();
-    tick_n(&rt, 3);
-    rt.send_to(
-        tracker,
-        Ping {
-            reply_to: ActorAddress::default(),
-        },
-    )
-    .unwrap();
-    rt.tick();
-    assert_eq!(
-        inbox.try_recv(),
-        Some(Count(1)),
-        "handle_down received exactly one Down"
-    );
-
-    // --- When Incoming=Down, handle_down is NOT called ---
-    struct DownAsIncoming {
-        target: ActorAddress,
-        inbox: ActorAddress,
-    }
-    impl ActorInterface for DownAsIncoming {
-        type Incoming = Down;
-        type Response = ();
-        fn on_start(&mut self, ctx: &Ctx) {
-            ctx.monitor(self.target).unwrap();
-        }
-        fn handle(&mut self, ctx: &Ctx, msg: Down) {
-            let _ = ctx.send(self.inbox, msg);
-        }
-        fn handle_down(&mut self, _ctx: &Ctx, _down: Down) {
-            panic!("handle_down must not be called when Incoming=Down");
-        }
-    }
-
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Down>().unwrap();
-    let target = rt.spawn(PanicActor).unwrap();
-    rt.spawn(DownAsIncoming {
-        target,
-        inbox: *inbox.addr(),
-    })
-    .unwrap();
-    rt.tick();
-    rt.send_to(target, PanicMsg).unwrap();
-    tick_n(&rt, 3);
-    let received = inbox
-        .try_recv()
-        .expect("Down delivered via handle(), not handle_down");
-    assert_eq!(received.reason, StopReason::Panicked);
-}

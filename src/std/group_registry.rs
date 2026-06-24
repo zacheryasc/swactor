@@ -1,13 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::RwLock;
+
+use parking_lot::RwLock;
 
 use crate::actor::ActorAddress;
 use crate::{AddrBuildHasher, AddrMap, AddrSet};
 
 /// Actor groups (pub-sub). Actors join/leave named groups; messages can be
 /// broadcast to all members of a group.
-///
-/// Groups are created lazily on first join and removed when empty.
 pub struct GroupRegistry {
     /// group_name → set of member addresses
     groups: RwLock<HashMap<String, AddrSet>>,
@@ -33,21 +32,15 @@ impl GroupRegistry {
     pub fn join(&self, group: String, addr: ActorAddress) {
         self.groups
             .write()
-            .unwrap()
             .entry(group.clone())
             .or_insert_with(|| HashSet::with_hasher(AddrBuildHasher))
             .insert(addr);
-        self.memberships
-            .write()
-            .unwrap()
-            .entry(addr)
-            .or_default()
-            .insert(group);
+        self.memberships.write().entry(addr).or_default().insert(group);
     }
 
     /// Remove an actor from a named group. Empty groups are auto-deleted.
     pub fn leave(&self, group: &str, addr: &ActorAddress) {
-        let mut groups = self.groups.write().unwrap();
+        let mut groups = self.groups.write();
         if let Some(members) = groups.get_mut(group) {
             members.remove(addr);
             if members.is_empty() {
@@ -55,7 +48,7 @@ impl GroupRegistry {
             }
         }
         drop(groups);
-        if let Some(membership) = self.memberships.write().unwrap().get_mut(addr) {
+        if let Some(membership) = self.memberships.write().get_mut(addr) {
             membership.remove(group);
         }
     }
@@ -64,7 +57,6 @@ impl GroupRegistry {
     pub fn members(&self, group: &str) -> Vec<ActorAddress> {
         self.groups
             .read()
-            .unwrap()
             .get(group)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default()
@@ -72,9 +64,9 @@ impl GroupRegistry {
 
     /// Remove a dead actor from all its groups.
     pub fn cleanup(&self, addr: &ActorAddress) {
-        let group_names = self.memberships.write().unwrap().remove(addr);
+        let group_names = self.memberships.write().remove(addr);
         if let Some(names) = group_names {
-            let mut groups = self.groups.write().unwrap();
+            let mut groups = self.groups.write();
             for name in names {
                 if let Some(members) = groups.get_mut(&name) {
                     members.remove(addr);
@@ -88,6 +80,6 @@ impl GroupRegistry {
 
     /// Return all active group names.
     pub fn group_names(&self) -> Vec<String> {
-        self.groups.read().unwrap().keys().cloned().collect()
+        self.groups.read().keys().cloned().collect()
     }
 }

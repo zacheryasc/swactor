@@ -1,5 +1,5 @@
 use crate::Error;
-use crate::actor::{ActorAddress, ActorInterface, EnvironmentBuilder, LogicalName, Message};
+use crate::actor::{ActorAddress, Message};
 use crate::runtime::Runtime;
 
 use super::StdExtension;
@@ -14,18 +14,10 @@ fn get_ext(rt: &Runtime) -> &StdExtension {
 
 /// Naming extension for [`Runtime`].
 ///
-/// Provides `spawn_named`, `where_is`, `unregister`, and `registered_names`
-/// via the [`StdExtension`] name registry.
+/// Provides explicit name registration and lookup via [`StdExtension`]'s name registry.
 pub trait RuntimeNaming {
     /// Register a name for an already-spawned actor. Returns `Err` if name is taken.
     fn register_name(&self, name: impl Into<String>, addr: ActorAddress) -> Result<(), Error>;
-
-    /// Spawn an actor with a registered name, returning its address.
-    fn spawn_named<A: ActorInterface>(
-        &self,
-        name: impl Into<String>,
-        actor: A,
-    ) -> Result<ActorAddress, Error>;
 
     /// Look up an actor address by its registered name.
     fn where_is(&self, name: &str) -> Option<ActorAddress>;
@@ -42,23 +34,6 @@ impl RuntimeNaming for Runtime {
         get_ext(self).name_registry.register(name.into(), addr)
     }
 
-    fn spawn_named<A: ActorInterface>(
-        &self,
-        name: impl Into<String>,
-        actor: A,
-    ) -> Result<ActorAddress, Error> {
-        let name = name.into();
-        let env = EnvironmentBuilder::new()
-            .set(LogicalName(name.clone()))
-            .build();
-        let addr = self.spawn_with_env(actor, env)?;
-        if let Err(e) = get_ext(self).name_registry.register(name, addr) {
-            let _ = self.stop_actor(addr);
-            return Err(e);
-        }
-        Ok(addr)
-    }
-
     fn where_is(&self, name: &str) -> Option<ActorAddress> {
         get_ext(self).name_registry.lookup(name)
     }
@@ -72,31 +47,10 @@ impl RuntimeNaming for Runtime {
     }
 }
 
-/// Watching extension for [`Runtime`].
-///
-/// Provides `watch` / `unwatch` via the [`StdExtension`] watch registry.
-pub trait RuntimeWatching {
-    /// Register a watch: `watcher` receives `ActorExited` when `target` dies.
-    fn watch(&self, watcher: ActorAddress, target: ActorAddress);
-
-    /// Cancel a watch.
-    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress);
-}
-
-impl RuntimeWatching for Runtime {
-    fn watch(&self, watcher: ActorAddress, target: ActorAddress) {
-        get_ext(self).watch_registry.watch(watcher, target);
-    }
-
-    fn unwatch(&self, watcher: ActorAddress, target: ActorAddress) {
-        get_ext(self).watch_registry.unwatch(watcher, target);
-    }
-}
-
 /// Group extension for [`Runtime`].
 ///
-/// Provides `join_group`, `leave_group`, `publish_to`, `group_members`,
-/// and `groups` via the [`StdExtension`] group registry.
+/// Provides runtime-level group membership and publication via [`StdExtension`]'s
+/// group registry.
 pub trait RuntimeGroups {
     /// Add an actor to a named group. The group is created if it doesn't exist.
     fn join_group(&self, addr: ActorAddress, group: impl Into<String>);
@@ -141,23 +95,5 @@ impl RuntimeGroups for Runtime {
 
     fn groups(&self) -> Vec<String> {
         get_ext(self).group_registry.group_names()
-    }
-}
-
-/// Service registry extension for [`Runtime`].
-///
-/// Allows registering typed service bindings that are automatically injected
-/// into every actor's environment at spawn time.
-pub trait RuntimeResources {
-    /// Register a service address under marker type `S`.
-    ///
-    /// All actors spawned after this call will have `ServiceBinding<S>` in
-    /// their environment (unless overridden via `spawn_builder`).
-    fn register_service<S: 'static + Send + Sync>(&self, addr: ActorAddress);
-}
-
-impl RuntimeResources for Runtime {
-    fn register_service<S: 'static + Send + Sync>(&self, addr: ActorAddress) {
-        get_ext(self).service_registry.register::<S>(addr);
     }
 }

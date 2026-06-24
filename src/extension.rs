@@ -20,11 +20,11 @@ pub trait RuntimeExtension: Send + Sync {
         dead: &[(ActorAddress, StopReason, Option<ExitValue>)],
     ) -> Vec<(ActorAddress, Box<dyn Any + Send>)>;
 
-    /// Clean up extension state for dead actors (names, groups, monitors).
+    /// Clean up extension state for dead actors.
     fn cleanup_dead(&self, dead: &[ActorAddress]);
 
     /// Called for each newly spawned actor, before it enters the pool.
-    /// Extensions can enrich the actor's environment (e.g., inject SpawnTimestamp).
+    /// Extensions can enrich the actor's environment.
     /// `child` is the address of the newly spawned actor.
     /// `parent` is the address of the spawning actor, or `None` for runtime-spawned actors.
     /// `uptime_ms` is milliseconds since runtime creation.

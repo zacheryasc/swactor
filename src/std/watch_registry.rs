@@ -1,12 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+
+use parking_lot::Mutex;
 
 use crate::actor::{ActorAddress, ActorExited, ExitReason, ExitValue};
 
 /// Tracks watch relationships between actors.
-///
-/// Thread-safe via interior `Mutex`. Watch/unwatch operations are rare
-/// relative to message sends, so contention is negligible.
 pub struct WatchRegistry {
     inner: Mutex<WatchState>,
 }
@@ -35,25 +33,9 @@ impl WatchRegistry {
     }
 
     pub fn watch(&self, watcher: ActorAddress, target: ActorAddress) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock();
         state.watchers.entry(target).or_default().insert(watcher);
         state.watching.entry(watcher).or_default().insert(target);
-    }
-
-    pub fn unwatch(&self, watcher: ActorAddress, target: ActorAddress) {
-        let mut state = self.inner.lock().unwrap();
-        if let Some(set) = state.watchers.get_mut(&target) {
-            set.remove(&watcher);
-            if set.is_empty() {
-                state.watchers.remove(&target);
-            }
-        }
-        if let Some(set) = state.watching.get_mut(&watcher) {
-            set.remove(&target);
-            if set.is_empty() {
-                state.watching.remove(&watcher);
-            }
-        }
     }
 
     /// Called when an actor dies. Returns (watcher_addr, ActorExited) pairs.
@@ -63,37 +45,36 @@ impl WatchRegistry {
         reason: ExitReason,
         exit_value: Option<ExitValue>,
     ) -> Vec<(ActorAddress, ActorExited)> {
-        let mut state = self.inner.lock().unwrap();
-        let notification = ActorExited {
-            addr: target,
-            reason,
-            exit_value,
-        };
-        let mut result = Vec::new();
-
-        if let Some(watcher_set) = state.watchers.remove(&target) {
-            for watcher in &watcher_set {
-                result.push((*watcher, notification.clone()));
-                if let Some(set) = state.watching.get_mut(watcher) {
-                    set.remove(&target);
-                    if set.is_empty() {
-                        state.watching.remove(watcher);
-                    }
-                }
+        let mut state = self.inner.lock();
+        let watchers = state.watchers.remove(&target).unwrap_or_default();
+        for watcher in &watchers {
+            if let Some(targets) = state.watching.get_mut(watcher) {
+                targets.remove(&target);
             }
         }
-
-        result
+        watchers
+            .into_iter()
+            .map(|watcher| {
+                (
+                    watcher,
+                    ActorExited {
+                        addr: target,
+                        reason: reason.clone(),
+                        exit_value: exit_value.clone(),
+                    },
+                )
+            })
+            .collect()
     }
 
     /// Called when a watcher itself dies. Cleans up all its watching entries.
     pub fn cleanup_watcher(&self, watcher: &ActorAddress) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock();
         if let Some(targets) = state.watching.remove(watcher) {
             for target in targets {
-                if let Some(set) = state.watchers.get_mut(&target) {
-                    set.remove(watcher);
-                    if set.is_empty() {
+                if let Some(watchers) = state.watchers.get_mut(&target) {
+                    watchers.remove(watcher);
+                    if watchers.is_empty() {
                         state.watchers.remove(&target);
                     }
                 }

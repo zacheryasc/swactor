@@ -10,7 +10,6 @@ import sys
 import time
 from typing import Any
 
-from tinygrad import Tensor, dtypes
 
 HEADER_LEN = 48
 GENERATION = 1
@@ -21,11 +20,18 @@ telemetry_path = os.environ["SWACTOR_WORKER_EVENT_SOCK"]
 rings: dict[int, dict[str, Any]] = {}
 objects: dict[int, dict[str, Any]] = {}
 role_configured = False
+Tensor: Any = None
+dtypes: Any = None
+
 next_handle = 42
 
 
 def control(**event: Any) -> None:
     print(json.dumps(event, separators=(",", ":")), flush=True)
+
+
+def log(message: str) -> None:
+    print(f"mvp_tinygrad_worker: {message}", file=sys.stderr, flush=True)
 
 
 def observe(kind: str, **fields: Any) -> None:
@@ -57,15 +63,34 @@ def require_arena() -> mmap.mmap:
     return arena
 
 
+def require_tinygrad() -> tuple[Any, Any]:
+    if Tensor is None or dtypes is None:
+        fatal("BackendNotInitialized")
+    return Tensor, dtypes
+
+
 def initialize(cmd: dict[str, Any]) -> None:
-    global arena
+    global arena, Tensor, dtypes
     if int(cmd["helper_abi_version"]) != 1:
         fatal("UnsupportedHelperAbi", helper_abi_version=cmd["helper_abi_version"])
     fd = int(os.environ["SWACTOR_ARENA_FD"])
     size = int(os.environ["SWACTOR_ARENA_BYTES"])
     arena = mmap.mmap(fd, size)
-    Tensor([1], dtype=dtypes.int32).realize()
-    observe("backend_initialized")
+
+    log("importing tinygrad")
+    observe("importing_tinygrad")
+    import_start = time.monotonic()
+    from tinygrad import Tensor as TinyTensor, dtypes as tiny_dtypes
+
+    Tensor = TinyTensor
+    dtypes = tiny_dtypes
+    observe("tinygrad_imported", elapsed_ms=int((time.monotonic() - import_start) * 1000))
+
+    log(f"realizing CUDA probe with DEV={os.environ.get('DEV')}")
+    observe("realizing_cuda_probe", dev=os.environ.get("DEV"))
+    probe_start = time.monotonic()
+    Tensor([1], dtype=dtypes.int32).realize().numpy().tolist()
+    observe("backend_initialized", elapsed_ms=int((time.monotonic() - probe_start) * 1000))
     observe("worker_ready")
     control(type="WorkerReady", generation=GENERATION)
 
@@ -118,6 +143,7 @@ def parse_record(base: int, committed_bytes: int, ring: dict[str, Any]) -> tuple
 
 def ring_readable(cmd: dict[str, Any]) -> None:
     global next_handle
+    Tensor, dtypes = require_tinygrad()
     ring_id = int(cmd["ring_id"])
     ring = rings[ring_id]
     if ring["direction"] != "ingress":
