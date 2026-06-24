@@ -1,13 +1,13 @@
 //! Actor Lifecycle Tests — birth, life, death of individual actors.
 //!
-//! Covers: spawning, on_start, parent-child delegation, graceful stop,
-//! panic isolation, dead actor cleanup, and watching (ActorExited).
+//! Covers: spawning, on_start, lifecycle decision paths, parent-child delegation,
+//! graceful stop, panic isolation, dead actor cleanup, and watching (ActorExited).
 
 mod common;
 use common::*;
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ── Local actors ────────────────────────────────────────────────────────────
@@ -222,6 +222,115 @@ impl ActorInterface for Sleeper {
     type Incoming = Noop;
     type Response = ();
     fn handle(&mut self, _ctx: &Ctx, _msg: Noop) {}
+}
+
+#[derive(Clone)]
+struct Work;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkCount(usize);
+
+struct StartStopCountingActor {
+    started: Arc<AtomicUsize>,
+    stopped: Arc<AtomicUsize>,
+    handled: Arc<AtomicUsize>,
+}
+
+impl ActorInterface for StartStopCountingActor {
+    type Incoming = Work;
+    type Response = ();
+
+    fn on_start(&mut self, _ctx: &Ctx) {
+        self.started.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn handle(&mut self, _ctx: &Ctx, _msg: Work) {
+        self.handled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_stop(&mut self, _ctx: &Ctx) {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct StopReportingCounter {
+    handled: usize,
+    report_to: ActorAddress,
+}
+
+impl ActorInterface for StopReportingCounter {
+    type Incoming = Work;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, _msg: Work) {
+        self.handled += 1;
+    }
+
+    fn on_stop(&mut self, ctx: &Ctx) {
+        let _ = ctx.send(self.report_to, WorkCount(self.handled));
+    }
+}
+
+struct PanicOnWorkNumber {
+    handled: usize,
+    panic_at: usize,
+}
+
+impl ActorInterface for PanicOnWorkNumber {
+    type Incoming = Work;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, _msg: Work) {
+        self.handled += 1;
+        if self.handled == self.panic_at {
+            panic!("intentional panic at work item {}", self.panic_at);
+        }
+    }
+}
+
+struct PanicOnStartWithStopReport {
+    handled: Arc<AtomicUsize>,
+    stopped: Arc<AtomicUsize>,
+}
+
+impl ActorInterface for PanicOnStartWithStopReport {
+    type Incoming = Work;
+    type Response = ();
+
+    fn on_start(&mut self, _ctx: &Ctx) {
+        panic!("intentional on_start panic");
+    }
+
+    fn handle(&mut self, _ctx: &Ctx, _msg: Work) {
+        self.handled.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn on_stop(&mut self, _ctx: &Ctx) {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+struct PanicOnHandleWithStopReport {
+    stopped: Arc<AtomicUsize>,
+}
+
+impl ActorInterface for PanicOnHandleWithStopReport {
+    type Incoming = Work;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, _msg: Work) {
+        panic!("intentional handle panic");
+    }
+
+    fn on_stop(&mut self, _ctx: &Ctx) {
+        self.stopped.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn drain_work_counts(inbox: &Inbox<WorkCount>) -> Vec<usize> {
+    std::iter::from_fn(|| inbox.try_recv())
+        .map(|WorkCount(count)| count)
+        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -731,3 +840,257 @@ fn watch_edge_cases() {
     );
 }
 
+/// Core lifecycle decision paths are observable without the old guarantee module:
+/// healthy actors handle work, stopping actors skip later work and run `on_stop`
+/// once, and poisoned actors never run `handle` or `on_stop` after poisoning.
+#[test]
+fn lifecycle_decision_paths_match_runtime_behavior() {
+    for msg_count in 1..=5 {
+        let rt = Runtime::new(RuntimeConfig::default());
+        let started = Arc::new(AtomicUsize::new(0));
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+
+        let addr = rt
+            .spawn(StartStopCountingActor {
+                started: started.clone(),
+                stopped: stopped.clone(),
+                handled: handled.clone(),
+            })
+            .unwrap();
+        rt.tick();
+
+        for _ in 0..msg_count {
+            rt.send_to(addr, Work).unwrap();
+        }
+        tick_n(&rt, msg_count + 3);
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+        assert_eq!(handled.load(Ordering::SeqCst), msg_count);
+
+        rt.stop_actor(addr).unwrap();
+        tick_n(&rt, 3);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
+
+    for msg_count in 1..=5 {
+        let rt = Runtime::new(RuntimeConfig::default());
+        let started = Arc::new(AtomicUsize::new(0));
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+
+        let addr = rt
+            .spawn(StartStopCountingActor {
+                started,
+                stopped: stopped.clone(),
+                handled: handled.clone(),
+            })
+            .unwrap();
+        rt.tick();
+
+        rt.stop_actor(addr).unwrap();
+        for _ in 0..msg_count {
+            let _ = rt.send_to(addr, Work);
+        }
+        tick_n(&rt, 5);
+        assert_eq!(handled.load(Ordering::SeqCst), 0);
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+    }
+
+    for msg_count in 1..=5 {
+        let rt = Runtime::new(RuntimeConfig::default());
+        let handled = Arc::new(AtomicUsize::new(0));
+        let stopped = Arc::new(AtomicUsize::new(0));
+
+        let addr = rt
+            .spawn(PanicOnStartWithStopReport {
+                handled: handled.clone(),
+                stopped: stopped.clone(),
+            })
+            .unwrap();
+        rt.tick();
+
+        for _ in 0..msg_count {
+            let _ = rt.send_to(addr, Work);
+        }
+        tick_n(&rt, msg_count + 3);
+        assert_eq!(handled.load(Ordering::SeqCst), 0);
+        assert_eq!(stopped.load(Ordering::SeqCst), 0);
+    }
+
+    let rt = Runtime::new(RuntimeConfig::default());
+    let stopped = Arc::new(AtomicUsize::new(0));
+    let addr = rt
+        .spawn(PanicOnHandleWithStopReport {
+            stopped: stopped.clone(),
+        })
+        .unwrap();
+    rt.tick();
+
+    rt.send_to(addr, Work).unwrap();
+    tick_n(&rt, 5);
+    assert_eq!(stopped.load(Ordering::SeqCst), 0);
+}
+
+/// Deterministic replacements for the old property guarantee: delayed panics,
+/// start panics, and same-tick multi-panics must not reduce sibling progress.
+#[test]
+fn panicking_actors_do_not_affect_sibling_progress() {
+    for (healthy_count, msg_count, panic_at) in [(2, 1, 1), (4, 65, 17), (8, 130, 1)] {
+        let rt = Runtime::new(RuntimeConfig::default());
+        let report_inbox = rt.new_inbox::<WorkCount>().unwrap();
+        let report_to = *report_inbox.addr();
+
+        let mut healthy = Vec::with_capacity(healthy_count);
+        for _ in 0..healthy_count {
+            healthy.push(
+                rt.spawn(StopReportingCounter {
+                    handled: 0,
+                    report_to,
+                })
+                .unwrap(),
+            );
+        }
+        let panicker = rt
+            .spawn(PanicOnWorkNumber {
+                handled: 0,
+                panic_at,
+            })
+            .unwrap();
+        rt.tick();
+
+        for _ in 0..msg_count {
+            for &addr in &healthy {
+                rt.send_to(addr, Work).unwrap();
+            }
+            rt.send_to(panicker, Work).unwrap();
+        }
+        tick_n(&rt, (msg_count / 64) + 10);
+
+        for &addr in &healthy {
+            rt.stop_actor(addr).unwrap();
+        }
+        tick_n(&rt, 3);
+
+        let reports = drain_work_counts(&report_inbox);
+        assert_eq!(reports.len(), healthy_count);
+        assert!(
+            reports.iter().all(|&count| count == msg_count),
+            "healthy reports were {reports:?}, expected every actor to process {msg_count}"
+        );
+    }
+}
+
+#[test]
+fn on_start_panic_does_not_block_siblings() {
+    for (before_count, after_count, msgs_each) in [(1, 1, 1), (4, 4, 25), (8, 3, 70)] {
+        let rt = Runtime::new(RuntimeConfig::default());
+        let started = Arc::new(AtomicUsize::new(0));
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let panic_handled = Arc::new(AtomicUsize::new(0));
+        let panic_stopped = Arc::new(AtomicUsize::new(0));
+
+        let mut siblings = Vec::with_capacity(before_count + after_count);
+        for _ in 0..before_count {
+            siblings.push(
+                rt.spawn(StartStopCountingActor {
+                    started: started.clone(),
+                    stopped: stopped.clone(),
+                    handled: handled.clone(),
+                })
+                .unwrap(),
+            );
+        }
+
+        let _panic_addr = rt
+            .spawn(PanicOnStartWithStopReport {
+                handled: panic_handled.clone(),
+                stopped: panic_stopped.clone(),
+            })
+            .unwrap();
+
+        for _ in 0..after_count {
+            siblings.push(
+                rt.spawn(StartStopCountingActor {
+                    started: started.clone(),
+                    stopped: stopped.clone(),
+                    handled: handled.clone(),
+                })
+                .unwrap(),
+            );
+        }
+        tick_n(&rt, 3);
+
+        assert_eq!(started.load(Ordering::SeqCst), siblings.len());
+        assert_eq!(panic_handled.load(Ordering::SeqCst), 0);
+        assert_eq!(panic_stopped.load(Ordering::SeqCst), 0);
+
+        for _ in 0..msgs_each {
+            for &addr in &siblings {
+                rt.send_to(addr, Work).unwrap();
+            }
+        }
+        tick_n(&rt, (msgs_each / 64) + 5);
+        assert_eq!(handled.load(Ordering::SeqCst), siblings.len() * msgs_each);
+
+        for &addr in &siblings {
+            rt.stop_actor(addr).unwrap();
+        }
+        tick_n(&rt, 3);
+        assert_eq!(stopped.load(Ordering::SeqCst), siblings.len());
+    }
+}
+
+#[test]
+fn multiple_panics_in_same_tick_preserve_healthy_actors() {
+    for (healthy_count, panic_count, msgs_each) in [(2, 2, 1), (6, 4, 70)] {
+        let rt = Runtime::new(RuntimeConfig::default());
+        let report_inbox = rt.new_inbox::<WorkCount>().unwrap();
+        let report_to = *report_inbox.addr();
+
+        let mut healthy = Vec::with_capacity(healthy_count);
+        for _ in 0..healthy_count {
+            healthy.push(
+                rt.spawn(StopReportingCounter {
+                    handled: 0,
+                    report_to,
+                })
+                .unwrap(),
+            );
+        }
+
+        let mut panickers = Vec::with_capacity(panic_count);
+        for _ in 0..panic_count {
+            panickers.push(
+                rt.spawn(PanicOnWorkNumber {
+                    handled: 0,
+                    panic_at: 1,
+                })
+                .unwrap(),
+            );
+        }
+        rt.tick();
+
+        for _ in 0..msgs_each {
+            for &addr in &healthy {
+                rt.send_to(addr, Work).unwrap();
+            }
+            for &addr in &panickers {
+                rt.send_to(addr, Work).unwrap();
+            }
+        }
+        tick_n(&rt, (msgs_each / 64) + 10);
+
+        for &addr in &healthy {
+            rt.stop_actor(addr).unwrap();
+        }
+        tick_n(&rt, 3);
+
+        let reports = drain_work_counts(&report_inbox);
+        assert_eq!(reports.len(), healthy_count);
+        assert!(
+            reports.iter().all(|&count| count == msgs_each),
+            "healthy reports were {reports:?}, expected every actor to process {msgs_each}"
+        );
+    }
+}

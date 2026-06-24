@@ -48,9 +48,6 @@ crossbeam-queue = "0.3.12"
 crossbeam-utils = "0.8.21"
 parking_lot = "0.12"
 
-[lints.rust]
-unexpected_cfgs = { level = "allow", check-cfg = ['cfg(kani)'] }
-
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"

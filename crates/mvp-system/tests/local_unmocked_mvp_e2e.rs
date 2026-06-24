@@ -19,6 +19,18 @@ fn local_e2e_binary_drives_real_local_process_deployment() {
     assert_eq!(value["actor_plane"], "iroh-swactor");
     assert_eq!(value["data_plane"], "tcp-loopback-streams");
     assert_eq!(value["worker_processes"], "mvp-dumb-worker-per-node");
+    assert_eq!(
+        value["engine_builder_pattern"],
+        "pool-first-static-launcher"
+    );
+    assert_eq!(value["engine_builder_node_count"], 3);
+    assert_eq!(value["engine_builder_stage_assignments"], 2);
+    assert!(
+        value["engine_builder_event_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 10),
+        "{value}"
+    );
     assert_eq!(value["injected_prompt_observed"], true);
     assert_eq!(value["token_received_observed"], true);
     assert_eq!(value["run_completed_observed"], true);

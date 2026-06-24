@@ -5,6 +5,7 @@
 //! and CUDA while still driving the run through planning, provisioning,
 //! readiness, prompt injection, stage execution, completion, and teardown.
 
+use mvp_system::engine_builder as engine;
 use mvp_system::observability_surface as obs;
 
 use super::local_mock::{
@@ -19,6 +20,7 @@ fn local_mock_two_stage_pipeline_completes_and_tears_down() {
 
     assert_happy_path_lifecycle(&outcome);
     assert_topology_surface(&outcome);
+    assert_engine_builder_surface(&outcome);
     assert_terminal_success(&outcome);
 }
 
@@ -57,6 +59,7 @@ fn local_mock_pipeline_topologies_complete() {
 
         assert_eq!(outcome.injected_sequences, expected_sequences);
         assert_topology_surface(&outcome);
+        assert_engine_builder_surface(&outcome);
         assert_terminal_success(&outcome);
     }
 }
@@ -164,6 +167,44 @@ fn local_mock_rejects_invalid_cross_stage_events() {
         0
     );
     assert_terminal_fault(&sequence_violation);
+}
+
+fn assert_engine_builder_surface(outcome: &LocalMockOutcome) {
+    assert!(
+        outcome
+            .engine_events
+            .iter()
+            .any(|event| matches!(event, engine::EngineEvent::PoolAcquired { .. })),
+        "local mock integration must be built from a neutral engine pool"
+    );
+    assert!(
+        outcome
+            .engine_events
+            .iter()
+            .any(|event| matches!(event, engine::EngineEvent::ClusterConverged { .. })),
+        "local mock integration must pass through the builder convergence barrier"
+    );
+    assert!(
+        outcome
+            .engine_events
+            .iter()
+            .any(|event| matches!(event, engine::EngineEvent::EngineReady { .. })),
+        "local mock integration must return an engine-ready handle before workload IO"
+    );
+    let assigned_stages = outcome
+        .engine_events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                engine::EngineEvent::RoleAssigned {
+                    role: engine::RoleKind::StageWorker { .. },
+                    ..
+                }
+            )
+        })
+        .count();
+    assert_eq!(assigned_stages, outcome.stage_count);
 }
 
 fn count_kind(outcome: &LocalMockOutcome, kind: obs::EventKind) -> usize {
