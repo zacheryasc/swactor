@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use mvp_system::engine_builder as engine;
 use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
 use mvp_system::run_plan as plan;
@@ -29,6 +30,7 @@ pub struct LocalMockCluster {
     run_id: plan::RunId,
     orchestrator_node_id: plan::NodeId,
     max_tokens: u32,
+    engine_events: Vec<engine::EngineEvent>,
     plan: plan::RunPlan,
     nodes: BTreeMap<u32, MockNode>,
     orchestrator: Option<fsm::OrchestratorHarness>,
@@ -44,6 +46,7 @@ pub struct LocalMockCluster {
 #[derive(Clone, Debug)]
 pub struct LocalMockOutcome {
     pub trace: Vec<obs::Event>,
+    pub engine_events: Vec<engine::EngineEvent>,
     pub injected_sequences: Vec<u64>,
     pub stage_count: usize,
     pub live_edges: usize,
@@ -97,6 +100,29 @@ impl ResourceTracker {
     }
 }
 
+fn mock_pool(orchestrator_node_id: plan::NodeId, stage_count: u32) -> engine::StaticPoolProvider {
+    let mut leases = Vec::with_capacity(stage_count as usize + 1);
+    leases.push(
+        engine::NodeLease::new(
+            "mock-coordinator",
+            engine::NodeId(orchestrator_node_id.0),
+            [engine::NodeCapability::Coordinator],
+        )
+        .resources(engine::ResourceFacts::cpu_only(2, 2 << 30)),
+    );
+    for stage_index in 0..stage_count {
+        leases.push(
+            engine::NodeLease::new(
+                format!("mock-worker-{stage_index}"),
+                engine::NodeId(11 + u64::from(stage_index)),
+                [engine::NodeCapability::Worker],
+            )
+            .resources(engine::ResourceFacts::cpu_only(2, 2 << 30)),
+        );
+    }
+    engine::StaticPoolProvider::new(leases)
+}
+
 impl LocalMockCluster {
     pub fn two_stage() -> Self {
         Self::with_config(LocalMockConfig::default())
@@ -111,34 +137,43 @@ impl LocalMockCluster {
 
         let run_id = plan::RunId(77);
         let orchestrator_node_id = plan::NodeId(900);
-        let stages = (0..config.stage_count)
-            .map(|stage_index| plan::StagePlacement {
-                stage_index,
-                node_id: plan::NodeId(11 + u64::from(stage_index)),
-            })
-            .collect::<Vec<_>>();
-        let plan = plan::plan_run(plan::PlannerInput {
-            run_id,
-            orchestrator_node_id,
-            model: plan::ModelFacts {
-                model_id: "mock-gguf".to_owned(),
-                num_layers: config.stage_count * 2,
-                hidden_dim: 8,
-                dtype_family: plan::DTypeFamily::BFloat,
-                dtype_width_bytes: 2,
-                max_seq_len: 8,
-                eos_token_id: 99,
-            },
-            runtime: plan::RuntimeConfig {
-                max_tokens: config.max_tokens,
-            },
-            candidate_pool: stages.iter().map(|stage| stage.node_id).collect(),
-            stage_count: config.stage_count,
-            placement: plan::PlacementInput::FixedLinear(stages),
-            activation_ring: plan::RingSpec::test_default_activation(),
-            token_ring: plan::RingSpec::test_default_token(),
-        })
-        .expect("mock plan must be valid");
+        let engine_cluster = engine::ClusterBuilder::new(
+            "local-mock",
+            engine::ModelSpec::pipelined_causal_llm(
+                "mock-gguf",
+                engine::ModelArtifact::TestTinyLlm {
+                    path: "local-mock://mock-gguf".to_owned(),
+                },
+                config.stage_count * 2,
+                8,
+                engine::DTypeFamily::BFloat,
+                2,
+                8,
+                99,
+            ),
+        )
+        .run_id(run_id.0)
+        .image(
+            engine::NodeImageSpec::new("local-mock-node")
+                .worker_runtime(engine::WorkerRuntimeSpec::DumbProcess),
+        )
+        .pool_provider(mock_pool(orchestrator_node_id, config.stage_count))
+        .launcher(engine::StaticNodeLauncher)
+        .planner(
+            engine::FixedLinearPipelinePlanner::new(config.stage_count).runtime(
+                plan::RuntimeConfig {
+                    max_tokens: config.max_tokens,
+                },
+            ),
+        )
+        .launch()
+        .expect("local mock engine builder must launch");
+        let engine_events = engine_cluster.events().to_vec();
+        let role_plan = engine_cluster.role_plan().clone();
+        engine_cluster
+            .shutdown()
+            .expect("local mock engine builder must shutdown");
+        let plan = role_plan.run_plan;
         let nodes = plan
             .stages
             .iter()
@@ -157,6 +192,7 @@ impl LocalMockCluster {
         Self {
             run_id,
             orchestrator_node_id,
+            engine_events,
             max_tokens: config.max_tokens,
             plan,
             nodes,
@@ -752,6 +788,7 @@ impl LocalMockCluster {
 
     fn finish_outcome(&self) -> LocalMockOutcome {
         LocalMockOutcome {
+            engine_events: self.engine_events.clone(),
             trace: self.trace.clone(),
             injected_sequences: self
                 .orchestrator

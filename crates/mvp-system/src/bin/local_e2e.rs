@@ -21,6 +21,7 @@ use mvp_system::actors::register_mvp_actor_codecs;
 use mvp_system::dashboard::MvpDashboard;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::driver_pumps;
+use mvp_system::engine_builder as engine;
 use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
 use mvp_system::run_plan as plan;
@@ -208,43 +209,52 @@ fn run_supervisor_once(
         orchestrator_addr,
     );
 
+    let topology = build_local_engine_topology(run_id)?;
+    let run_plan = topology.role_plan.run_plan.clone();
+    let stage0 = run_plan
+        .stages
+        .iter()
+        .find(|stage| stage.stage_index == 0)
+        .cloned()
+        .ok_or_else(|| "engine builder did not assign stage 0".to_owned())?;
+    let stage1 = run_plan
+        .stages
+        .iter()
+        .find(|stage| stage.stage_index == 1)
+        .cloned()
+        .ok_or_else(|| "engine builder did not assign stage 1".to_owned())?;
+
     let self_endpoint_json = serde_json::to_string(&driver.endpoint_addr())
         .map_err(|e| format!("serialize endpoint addr: {e}"))?;
     let orchestrator_actor_json = serde_json::to_string(&orchestrator_addr)
         .map_err(|e| format!("serialize orchestrator actor: {e}"))?;
 
     let mut node1 = spawn_node_process(
-        NODE1_LOGICAL_ID,
-        1,
-        7001,
+        stage1.node_id.0,
+        stage1.stage_index,
+        stage1.inbound_edge.0,
         token_out_addr,
         &self_endpoint_json,
         &orchestrator_actor_json,
     )?;
     let mut node0 = spawn_node_process(
-        NODE0_LOGICAL_ID,
-        0,
-        7000,
+        stage0.node_id.0,
+        stage0.stage_index,
+        stage0.inbound_edge.0,
         node1.ready.token_in_addr,
         &self_endpoint_json,
         &orchestrator_actor_json,
     )?;
-    record_dashboard_event(
-        &mut dashboard,
-        node_event(NODE1_LOGICAL_ID, obs::EventKind::NodeStarted),
-    );
-    record_dashboard_event(
-        &mut dashboard,
-        node_event(NODE1_LOGICAL_ID, obs::EventKind::NodeAvailable),
-    );
-    record_dashboard_event(
-        &mut dashboard,
-        node_event(NODE0_LOGICAL_ID, obs::EventKind::NodeStarted),
-    );
-    record_dashboard_event(
-        &mut dashboard,
-        node_event(NODE0_LOGICAL_ID, obs::EventKind::NodeAvailable),
-    );
+    for stage in [&stage1, &stage0] {
+        record_dashboard_event(
+            &mut dashboard,
+            node_event(stage.node_id.0, obs::EventKind::NodeStarted),
+        );
+        record_dashboard_event(
+            &mut dashboard,
+            node_event(stage.node_id.0, obs::EventKind::NodeAvailable),
+        );
+    }
 
     let started_at = Instant::now();
     wait_for_routes(
@@ -254,13 +264,16 @@ fn run_supervisor_once(
         Duration::from_secs(20),
     )?;
 
-    let run_plan = two_stage_plan(run_id)?;
     stack
         .runtime
         .send_to(
             orchestrator_addr,
             OrchestratorMsg::ObservePoolReady {
-                nodes: vec![NODE0_LOGICAL_ID, NODE1_LOGICAL_ID],
+                nodes: run_plan
+                    .stages
+                    .iter()
+                    .map(|stage| stage.node_id.0)
+                    .collect(),
             },
         )
         .map_err(|e| format!("observe pool ready: {e}"))?;
@@ -271,16 +284,14 @@ fn run_supervisor_once(
             orchestrator_addr,
             OrchestratorMsg::ObservePlanAvailable {
                 run_id,
-                stages: vec![
-                    StageRefWire {
-                        stage_index: 0,
-                        node_id: NODE0_LOGICAL_ID,
-                    },
-                    StageRefWire {
-                        stage_index: 1,
-                        node_id: NODE1_LOGICAL_ID,
-                    },
-                ],
+                stages: run_plan
+                    .stages
+                    .iter()
+                    .map(|stage| StageRefWire {
+                        stage_index: stage.stage_index,
+                        node_id: stage.node_id.0,
+                    })
+                    .collect(),
             },
         )
         .map_err(|e| format!("observe plan: {e}"))?;
@@ -432,6 +443,19 @@ fn run_supervisor_once(
         if injected && completed && torn_down && sent_stop_to_node0 && sent_stop_to_node1 {
             shutdown_node(&mut node0);
             shutdown_node(&mut node1);
+            let builder_stage_assignments = topology
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        engine::EngineEvent::RoleAssigned {
+                            role: engine::RoleKind::StageWorker { .. },
+                            ..
+                        }
+                    )
+                })
+                .count();
             let summary = json!({
                 "ok": true,
                 "actor_plane": "iroh-swactor",
@@ -453,6 +477,10 @@ fn run_supervisor_once(
                 "run_completed_observed": completed,
                 "run_torn_down_observed": torn_down,
                 "stop_sent_to_all_nodes": sent_stop_to_node0 && sent_stop_to_node1,
+                "engine_builder_pattern": "pool-first-static-launcher",
+                "engine_builder_event_count": topology.events.len(),
+                "engine_builder_node_count": topology.node_summaries.len(),
+                "engine_builder_stage_assignments": builder_stage_assignments,
                 "node_route_count": stack.route_view.read().map(|view| view.len()).unwrap_or_default(),
                 "stage_ready_stdout_count": stage_ready_count,
             });
@@ -668,39 +696,72 @@ fn wait_for_routes(
     Err("directory routes for node actors did not converge".to_owned())
 }
 
-fn two_stage_plan(run_id: u64) -> Result<plan::RunPlan, String> {
-    plan::plan_run(plan::PlannerInput {
-        run_id: plan::RunId(run_id),
-        orchestrator_node_id: plan::NodeId(ORCHESTRATOR_LOGICAL_NODE_ID),
-        model: plan::ModelFacts {
-            model_id: "local-e2e-fixture".to_owned(),
-            num_layers: 4,
-            hidden_dim: 8,
-            dtype_family: plan::DTypeFamily::BFloat,
-            dtype_width_bytes: 2,
-            max_seq_len: 8,
-            eos_token_id: 99,
-        },
-        runtime: plan::RuntimeConfig { max_tokens: 1 },
-        candidate_pool: vec![
-            plan::NodeId(NODE0_LOGICAL_ID),
-            plan::NodeId(NODE1_LOGICAL_ID),
-        ],
-        stage_count: 2,
-        placement: plan::PlacementInput::FixedLinear(vec![
-            plan::StagePlacement {
-                stage_index: 0,
-                node_id: plan::NodeId(NODE0_LOGICAL_ID),
+struct LocalEngineTopology {
+    role_plan: engine::RoleAssignmentPlan,
+    events: Vec<engine::EngineEvent>,
+    node_summaries: Vec<engine::NodeSummary>,
+}
+
+fn build_local_engine_topology(run_id: u64) -> Result<LocalEngineTopology, String> {
+    let cluster = engine::ClusterBuilder::new(
+        "local-process-e2e",
+        engine::ModelSpec::pipelined_causal_llm(
+            "local-e2e-fixture",
+            engine::ModelArtifact::TestTinyLlm {
+                path: "local-process://local-e2e-fixture".to_owned(),
             },
-            plan::StagePlacement {
-                stage_index: 1,
-                node_id: plan::NodeId(NODE1_LOGICAL_ID),
-            },
-        ]),
-        activation_ring: plan::RingSpec::test_default_activation(),
-        token_ring: plan::RingSpec::test_default_token(),
+            4,
+            8,
+            engine::DTypeFamily::BFloat,
+            2,
+            8,
+            99,
+        ),
+    )
+    .run_id(run_id)
+    .image(
+        engine::NodeImageSpec::new("mvp-local-e2e")
+            .worker_runtime(engine::WorkerRuntimeSpec::DumbProcess),
+    )
+    .pool_provider(engine::StaticPoolProvider::new(vec![
+        engine::NodeLease::new(
+            "orchestrator",
+            engine::NodeId(ORCHESTRATOR_LOGICAL_NODE_ID),
+            [engine::NodeCapability::Coordinator],
+        )
+        .resources(engine::ResourceFacts::cpu_only(2, 2 << 30)),
+        engine::NodeLease::new(
+            "node0",
+            engine::NodeId(NODE0_LOGICAL_ID),
+            [engine::NodeCapability::Worker],
+        )
+        .resources(engine::ResourceFacts::cpu_only(2, 2 << 30)),
+        engine::NodeLease::new(
+            "node1",
+            engine::NodeId(NODE1_LOGICAL_ID),
+            [engine::NodeCapability::Worker],
+        )
+        .resources(engine::ResourceFacts::cpu_only(2, 2 << 30)),
+    ]))
+    .launcher(engine::StaticNodeLauncher)
+    .planner(
+        engine::FixedLinearPipelinePlanner::new(2).runtime(plan::RuntimeConfig {
+            max_tokens: MAX_TOKENS as u32,
+        }),
+    )
+    .launch()
+    .map_err(|e| format!("local engine builder launch: {e}"))?;
+    let role_plan = cluster.role_plan().clone();
+    let events = cluster.events().to_vec();
+    let node_summaries = cluster.node_summaries();
+    cluster
+        .shutdown()
+        .map_err(|e| format!("local engine builder shutdown: {e}"))?;
+    Ok(LocalEngineTopology {
+        role_plan,
+        events,
+        node_summaries,
     })
-    .map_err(|e| format!("plan rejected: {:?}", e.kind()))
 }
 
 fn stage_provision_wire(

@@ -11,6 +11,7 @@ pub mod device_bridge;
 pub mod distribution_stack;
 pub mod driver_pumps;
 pub mod edge_establisher;
+pub mod engine_builder;
 pub mod gpu_worker_ctl;
 pub mod gpu_worker_egress_producer;
 pub mod gpu_worker_ingress_parser;

@@ -17,7 +17,6 @@ use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
 
 use crate::extension::WorkerExtension;
 
-// Extracted pure functions for use in kani to prove guarantees
 
 /// Whether an actor should be skipped during `tick_all`.
 pub(crate) fn should_skip_actor(poisoned: bool, stopping: bool, suspended: bool) -> bool {
@@ -824,5 +823,169 @@ impl ActorPool {
                 message_type_counts: type_counts,
             }
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::actor::StopReason;
+
+    #[test]
+    fn lifecycle_decision_helpers_cover_all_inputs() {
+        let mut skip_combinations = 0;
+        for poisoned in [false, true] {
+            for stopping in [false, true] {
+                for suspended in [false, true] {
+                    assert_eq!(
+                        should_skip_actor(poisoned, stopping, suspended),
+                        poisoned || stopping || suspended
+                    );
+                    skip_combinations += 1;
+                }
+            }
+        }
+        assert_eq!(skip_combinations, 8);
+
+        let mut on_stop_combinations = 0;
+        for stopping in [false, true] {
+            for poisoned in [false, true] {
+                assert_eq!(
+                    is_on_stop_eligible(stopping, poisoned),
+                    stopping && !poisoned
+                );
+                on_stop_combinations += 1;
+            }
+        }
+        assert_eq!(on_stop_combinations, 4);
+
+        let mut reason_combinations = 0;
+        for poisoned in [false, true] {
+            for has_exit_value in [false, true] {
+                let expected = if poisoned {
+                    StopReason::Panicked
+                } else if has_exit_value {
+                    StopReason::Completed
+                } else {
+                    StopReason::Normal
+                };
+                assert_eq!(determine_stop_reason(poisoned, has_exit_value), expected);
+                reason_combinations += 1;
+            }
+        }
+        assert_eq!(reason_combinations, 4);
+    }
+
+    #[test]
+    fn bounded_lifecycle_model_preserves_callback_invariants() {
+        #[derive(Clone, Copy)]
+        enum Step {
+            Tick,
+            RequestStop,
+            Poison,
+            Suspend,
+            Resume,
+            Cleanup,
+        }
+
+        #[derive(Clone, Copy, Default)]
+        struct ActorProbe {
+            started: bool,
+            stopping: bool,
+            poisoned: bool,
+            suspended: bool,
+            removed: bool,
+            on_start_count: u8,
+            handle_count: u8,
+            on_stop_count: u8,
+            handled_after_on_stop: bool,
+        }
+
+        impl ActorProbe {
+            fn apply(&mut self, step: Step) {
+                if self.removed {
+                    return;
+                }
+
+                match step {
+                    Step::Tick => {
+                        let eligible =
+                            !should_skip_actor(self.poisoned, self.stopping, self.suspended);
+                        if !self.started && eligible {
+                            self.started = true;
+                            self.on_start_count += 1;
+                        }
+                        if self.started && eligible {
+                            if self.on_stop_count > 0 {
+                                self.handled_after_on_stop = true;
+                            }
+                            self.handle_count += 1;
+                        }
+                    }
+                    Step::RequestStop => {
+                        self.stopping = true;
+                    }
+                    Step::Poison => {
+                        self.poisoned = true;
+                    }
+                    Step::Suspend => {
+                        self.suspended = true;
+                    }
+                    Step::Resume => {
+                        self.suspended = false;
+                    }
+                    Step::Cleanup => {
+                        if self.stopping || self.poisoned {
+                            if is_on_stop_eligible(self.stopping, self.poisoned) {
+                                self.on_stop_count += 1;
+                            }
+                            self.removed = true;
+                        }
+                    }
+                }
+            }
+
+            fn assert_invariants(self) {
+                assert!(self.on_start_count <= 1, "on_start fired more than once");
+                assert!(self.on_stop_count <= 1, "on_stop fired more than once");
+                assert!(
+                    !self.handled_after_on_stop,
+                    "handle fired after on_stop cleanup"
+                );
+                if self.handle_count > 0 {
+                    assert!(self.started, "handle fired before on_start");
+                }
+                if self.on_stop_count > 0 {
+                    assert!(self.removed, "on_stop fired without cleanup");
+                    assert!(!self.poisoned, "poisoned actor ran on_stop");
+                }
+            }
+        }
+
+        fn walk(depth: usize, state: ActorProbe, checked: &mut usize) {
+            state.assert_invariants();
+            *checked += 1;
+
+            if depth == 0 {
+                return;
+            }
+
+            for step in [
+                Step::Tick,
+                Step::RequestStop,
+                Step::Poison,
+                Step::Suspend,
+                Step::Resume,
+                Step::Cleanup,
+            ] {
+                let mut next = state;
+                next.apply(step);
+                walk(depth - 1, next, checked);
+            }
+        }
+
+        let mut checked = 0;
+        walk(6, ActorProbe::default(), &mut checked);
+        assert_eq!(checked, 55_987);
     }
 }

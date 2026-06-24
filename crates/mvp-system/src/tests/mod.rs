@@ -1,6 +1,7 @@
 mod arena_manager_guarantees;
 mod device_bridge_guarantees;
 mod edge_establisher_guarantees;
+mod engine_builder_guarantees;
 mod gpu_worker_ctl_guarantees;
 mod gpu_worker_egress_producer_guarantees;
 mod gpu_worker_ingress_parser_guarantees;
