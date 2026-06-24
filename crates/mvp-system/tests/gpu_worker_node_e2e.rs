@@ -27,6 +27,8 @@ const INGRESS_BASE: usize = 0;
 const EGRESS_BASE: usize = 4096;
 const RING_BYTES: usize = 1024;
 const HEADER_LEN: usize = 48;
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(45);
+const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[test]
 fn gpu_worker_node_e2e_cuda() {
@@ -53,33 +55,28 @@ fn build_and_run_docker_fixture() {
     copy_workspace_context(&workspace, &context);
     let dockerfile = context.join("crates/mvp-system/tests/gpu_worker_node_e2e/Dockerfile");
 
+    phase("building CUDA Docker fixture image");
     let build = Command::new("docker")
         .args(["build", "-f"])
         .arg(&dockerfile)
         .args(["-t", IMAGE])
         .arg(&context)
-        .output()
+        .status()
         .expect("run docker build");
-    assert!(
-        build.status.success(),
-        "docker build failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&build.stdout),
-        String::from_utf8_lossy(&build.stderr)
-    );
+    assert!(build.success(), "docker build failed with status {build}");
 
+    phase("running CUDA Docker fixture");
     let run = Command::new("docker")
         .args(["run", "--rm", "--gpus"])
         .arg(std::env::var("MVP_CUDA_GPUS").unwrap_or_else(|_| "all".to_owned()))
         .args(["-e", "MVP_SYSTEM_CUDA_E2E_IN_CONTAINER=1"])
         .args(["-e", "CARGO_TARGET_DIR=/tmp/mvp-system-target"])
         .arg(IMAGE)
-        .output()
+        .status()
         .expect("run docker CUDA fixture");
     assert!(
-        run.status.success(),
-        "docker CUDA fixture failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&run.stdout),
-        String::from_utf8_lossy(&run.stderr)
+        run.success(),
+        "docker CUDA fixture failed with status {run}"
     );
 }
 
@@ -120,7 +117,80 @@ fn copy_context_entry(source: &Path, dest: &Path) {
     }
 }
 
+fn phase(message: &str) {
+    eprintln!("gpu-worker-node-e2e: {message}");
+}
+
+fn run_cuda_preflight() {
+    let script = r#"
+import os
+print("cuda preflight: importing tinygrad", flush=True)
+from tinygrad import Tensor, dtypes
+print(f"cuda preflight: DEV={os.environ.get('DEV')}", flush=True)
+print("cuda preflight: realizing Tensor([1])", flush=True)
+value = Tensor([1], dtype=dtypes.int32).realize().numpy().tolist()
+print(f"cuda preflight: ok {value}", flush=True)
+"#;
+    let child = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .env("DEV", "CUDA")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn CUDA preflight");
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+
+    match rx.recv_timeout(PREFLIGHT_TIMEOUT) {
+        Ok(output) => {
+            let output = output.expect("wait CUDA preflight");
+            eprintln!(
+                "gpu-worker-node-e2e: CUDA preflight stdout:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                output.status.success(),
+                "CUDA preflight failed with status {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            let output = rx
+                .recv_timeout(Duration::from_secs(5))
+                .ok()
+                .and_then(Result::ok);
+            let (stdout, stderr) = output
+                .as_ref()
+                .map(|output| {
+                    (
+                        String::from_utf8_lossy(&output.stdout).into_owned(),
+                        String::from_utf8_lossy(&output.stderr).into_owned(),
+                    )
+                })
+                .unwrap_or_else(|| ("<unavailable>".to_owned(), "<unavailable>".to_owned()));
+            panic!(
+                "CUDA preflight timed out after {:?}; killed pid {pid}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                PREFLIGHT_TIMEOUT
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("CUDA preflight waiter disconnected"),
+    }
+}
+
 fn run_integrated_node_harness() {
+    phase("running CUDA tinygrad preflight");
+    run_cuda_preflight();
+
+    phase("creating shared arena and telemetry socket");
     let arena_fd = create_arena(ARENA_BYTES);
     let worker_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/gpu_worker_node_e2e/mvp_tinygrad_worker.py");
@@ -144,12 +214,14 @@ fn run_integrated_node_harness() {
         Arc::clone(&ingest_alive),
     );
 
+    phase("spawning Rust worker node actor");
     let rt = Runtime::new(RuntimeConfig::default());
     let reports = rt.new_inbox::<HarnessReport>().expect("report inbox");
     let node = rt
         .spawn(GpuWorkerNodeActor::new(rt.create_sender(), *reports.addr()))
         .expect("spawn gpu worker node actor");
 
+    phase("spawning tinygrad worker process");
     rt.send_to(
         node,
         NodeMsg::Start(StartWorker {
@@ -160,17 +232,33 @@ fn run_integrated_node_harness() {
         }),
     )
     .expect("send start");
-    wait_for_report(&rt, &mut emitter, &frame_rx, &reports, |report| {
-        matches!(report, HarnessReport::ProcessStarted)
-    });
+    wait_for_report(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "worker process start",
+        |report| matches!(report, HarnessReport::ProcessStarted),
+    );
 
+    phase("initializing CUDA backend");
     send_command(
         &rt,
         node,
         json!({"type":"InitializeWorker","helper_abi_version":1}),
     );
-    wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "WorkerReady");
+    wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "WorkerReady",
+        "worker ready",
+    );
 
+    phase("installing ingress and egress rings");
     send_command(
         &rt,
         node,
@@ -187,12 +275,38 @@ fn run_integrated_node_harness() {
         node,
         install_ring_command(EGRESS_RING_ID, EGRESS_EDGE_ID, "out", "egress", EGRESS_BASE),
     );
-    wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "RingInstalled");
-    wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "RingInstalled");
+    wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "RingInstalled",
+        "ingress ring installed",
+    );
+    wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "RingInstalled",
+        "egress ring installed",
+    );
 
+    phase("configuring worker role");
     send_command(&rt, node, json!({"type":"ConfigureRole","role_id":1}));
-    wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "RoleLoaded");
+    wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "RoleLoaded",
+        "role loaded",
+    );
 
+    phase("copying ingress object into CUDA tensor");
     let input_record = object_record(9000, 0, &[1, 2, 3, 4]);
     pwrite_all(arena_fd, INGRESS_BASE, &input_record);
     send_command(
@@ -200,9 +314,18 @@ fn run_integrated_node_harness() {
         node,
         json!({"type":"RingReadable","ring_id":INGRESS_RING_ID,"committed_bytes":input_record.len()}),
     );
-    let loaded = wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "ObjectLoaded");
+    let loaded = wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "ObjectLoaded",
+        "object loaded",
+    );
     let handle = loaded["handle"]["id"].as_u64().expect("device handle id");
 
+    phase("executing CUDA step and writing egress object");
     send_command(
         &rt,
         node,
@@ -214,8 +337,24 @@ fn run_integrated_node_harness() {
             "output_object_id":9001
         }),
     );
-    let produced = wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "ObjectProduced");
-    wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "StepCompleted");
+    let produced = wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "ObjectProduced",
+        "object produced",
+    );
+    wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "StepCompleted",
+        "step completed",
+    );
     let committed = produced["committed_bytes"]
         .as_u64()
         .expect("committed bytes") as usize;
@@ -223,6 +362,7 @@ fn run_integrated_node_harness() {
     pread_exact(arena_fd, EGRESS_BASE, &mut egress);
     assert_eq!(decode_payload_words(&egress), vec![2, 4, 6, 8]);
 
+    phase("releasing device object");
     send_command(
         &rt,
         node,
@@ -230,19 +370,40 @@ fn run_integrated_node_harness() {
     );
     wait_for_control(
         &rt,
+        node,
         &mut emitter,
         &frame_rx,
         &reports,
         "DeviceObjectReleased",
+        "device object released",
     );
 
+    phase("shutting down worker process");
     send_command(&rt, node, json!({"type":"ShutdownWorker"}));
-    wait_for_control(&rt, &mut emitter, &frame_rx, &reports, "WorkerStopped");
-    wait_for_report(&rt, &mut emitter, &frame_rx, &reports, |report| {
-        matches!(report, HarnessReport::ProcessExited(0))
-    });
+    wait_for_control(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "WorkerStopped",
+        "worker stopped",
+    );
+    wait_for_report(
+        &rt,
+        node,
+        &mut emitter,
+        &frame_rx,
+        &reports,
+        "worker process exit",
+        |report| matches!(report, HarnessReport::ProcessExited(0)),
+    );
 
+    phase("asserting worker telemetry");
     let telemetry = collect_telemetry(&mut emitter, &frame_rx, Duration::from_secs(1));
+    assert_has_worker_event(&telemetry, "importing_tinygrad");
+    assert_has_worker_event(&telemetry, "tinygrad_imported");
+    assert_has_worker_event(&telemetry, "realizing_cuda_probe");
     assert_has_worker_event(&telemetry, "backend_initialized");
     assert_has_worker_event(&telemetry, "worker_ready");
     assert_has_worker_event(&telemetry, "ring_installed");
@@ -292,6 +453,7 @@ enum NodeMsg {
     ControlLine(String),
     StderrLine(String),
     ProcessExited(i32),
+    KillWorker(String),
 }
 
 #[derive(Clone, Debug)]
@@ -306,6 +468,7 @@ struct GpuWorkerNodeActor {
     sender: ExternalSender,
     report_to: ActorAddress,
     stdin: Option<std::process::ChildStdin>,
+    child_pid: Option<u32>,
 }
 
 impl GpuWorkerNodeActor {
@@ -314,6 +477,7 @@ impl GpuWorkerNodeActor {
             sender,
             report_to,
             stdin: None,
+            child_pid: None,
         }
     }
 }
@@ -340,8 +504,12 @@ impl ActorInterface for GpuWorkerNodeActor {
                     .expect("send stderr report");
             }
             NodeMsg::ProcessExited(code) => {
+                self.child_pid = None;
                 ctx.send(self.report_to, HarnessReport::ProcessExited(code))
                     .expect("send exit report");
+            }
+            NodeMsg::KillWorker(reason) => {
+                self.kill_worker(&reason);
             }
         }
     }
@@ -368,6 +536,7 @@ impl GpuWorkerNodeActor {
         let stdout = child.stdout.take().expect("worker stdout");
         let stderr = child.stderr.take().expect("worker stderr");
         self.stdin = Some(child.stdin.take().expect("worker stdin"));
+        self.child_pid = Some(child.id());
 
         let target = ctx.self_addr();
         let sender = self.sender.clone();
@@ -390,6 +559,7 @@ impl GpuWorkerNodeActor {
             for line in BufReader::new(stderr).lines() {
                 match line {
                     Ok(line) => {
+                        eprintln!("gpu-worker-node-e2e worker stderr: {line}");
                         if sender.send_to(target, NodeMsg::StderrLine(line)).is_err() {
                             break;
                         }
@@ -413,6 +583,15 @@ impl GpuWorkerNodeActor {
         ctx.send(self.report_to, HarnessReport::ProcessStarted)
             .expect("send started report");
     }
+
+    fn kill_worker(&mut self, reason: &str) {
+        if let Some(pid) = self.child_pid.take() {
+            eprintln!("gpu-worker-node-e2e: killing worker pid {pid}: {reason}");
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 fn spawn_worker_event_ingest(
@@ -420,8 +599,10 @@ fn spawn_worker_event_ingest(
     sink: datastream::emit::DatastreamEventSink,
     alive: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
         let socket = std::os::unix::net::UnixDatagram::bind(&socket_path).expect("bind UDS ingest");
+        ready_tx.send(()).expect("signal UDS ingest ready");
         socket
             .set_read_timeout(Some(Duration::from_millis(50)))
             .expect("set UDS timeout");
@@ -437,7 +618,11 @@ fn spawn_worker_event_ingest(
                 Err(_) => break,
             }
         }
-    })
+    });
+    ready_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("UDS ingest socket ready");
+    handle
 }
 
 fn send_command(rt: &Runtime, node: ActorAddress, command: Value) {
@@ -447,16 +632,20 @@ fn send_command(rt: &Runtime, node: ActorAddress, command: Value) {
 
 fn wait_for_control(
     rt: &Runtime,
+    node: ActorAddress,
     emitter: &mut DatastreamEmitter,
     frame_rx: &mpsc::Receiver<Frame>,
     reports: &swactor::runtime::Inbox<HarnessReport>,
     kind: &str,
+    phase_name: &str,
 ) -> Value {
     match wait_for_report(
         rt,
+        node,
         emitter,
         frame_rx,
         reports,
+        phase_name,
         |report| matches!(report, HarnessReport::ControlEvent(value) if value["type"] == kind),
     ) {
         HarnessReport::ControlEvent(value) => value,
@@ -466,26 +655,55 @@ fn wait_for_control(
 
 fn wait_for_report(
     rt: &Runtime,
+    node: ActorAddress,
     emitter: &mut DatastreamEmitter,
     _frame_rx: &mpsc::Receiver<Frame>,
     reports: &swactor::runtime::Inbox<HarnessReport>,
+    phase_name: &str,
     mut predicate: impl FnMut(&HarnessReport) -> bool,
 ) -> HarnessReport {
     let started = Instant::now();
     let mut stderr_lines = Vec::new();
-    while started.elapsed() < Duration::from_secs(60) {
+    while started.elapsed() < EVENT_TIMEOUT {
         rt.tick();
         emitter.tick();
         while let Some(report) = reports.try_recv() {
+            if predicate(&report) {
+                return report;
+            }
             match &report {
                 HarnessReport::StderrLine(line) => stderr_lines.push(line.clone()),
-                _ if predicate(&report) => return report,
+                HarnessReport::ControlEvent(value) if value["type"] == "WorkerFatal" => {
+                    rt.send_to(
+                        node,
+                        NodeMsg::KillWorker(format!("fatal while waiting for {phase_name}")),
+                    )
+                    .expect("send kill after fatal");
+                    rt.tick();
+                    panic!(
+                        "worker fatal while waiting for {phase_name}: {value}\nstderr={stderr_lines:?}"
+                    );
+                }
+                HarnessReport::ProcessExited(code) if *code != 0 => {
+                    panic!(
+                        "worker exited with {code} while waiting for {phase_name}; stderr={stderr_lines:?}"
+                    );
+                }
                 _ => {}
             }
         }
         thread::sleep(Duration::from_millis(5));
     }
-    panic!("timed out waiting for report; stderr={stderr_lines:?}");
+    rt.send_to(
+        node,
+        NodeMsg::KillWorker(format!("timeout while waiting for {phase_name}")),
+    )
+    .expect("send kill on timeout");
+    rt.tick();
+    panic!(
+        "timed out after {:?} waiting for {phase_name}; stderr={stderr_lines:?}",
+        EVENT_TIMEOUT
+    );
 }
 
 fn collect_telemetry(

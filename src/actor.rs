@@ -210,8 +210,8 @@ impl Environment {
 
     /// Check if the environment contains a value with the given `TypeId`.
     ///
-    /// Type-erased version of [`contains`](Self::contains) — used by
-    /// `ServiceRegistry::inject_into` to skip keys already present.
+    /// Type-erased version of [`contains`](Self::contains) for extension code
+    /// that merges pre-built values without knowing their concrete types.
     pub fn contains_type_id(&self, type_id: TypeId) -> bool {
         self.inner.contains_key(&type_id)
     }
@@ -255,8 +255,8 @@ impl EnvironmentBuilder {
 
     /// Insert a type-erased value by `TypeId`.
     ///
-    /// Used by `ServiceRegistry::inject_into` to merge pre-built bindings
-    /// without knowing concrete types at compile time.
+    /// Used by extension code to merge pre-built values without knowing concrete
+    /// types at compile time.
     pub fn set_raw(&mut self, type_id: TypeId, value: Arc<dyn Any + Send + Sync>) -> &mut Self {
         self.map.insert(type_id, value);
         self
@@ -279,13 +279,14 @@ impl Default for EnvironmentBuilder {
 // ─── Well-Known Environment Keys ─────────────────────────────────────────────
 
 /// Milliseconds since runtime creation when this actor was spawned.
-/// Injected by StdExtension (opt-in at runtime level). Read via `ctx.env::<SpawnTimestamp>()`.
-/// Uses the same time base as `SystemInfo::uptime_ms`.
+///
+/// Reserved environment key for custom extensions that want a spawn timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SpawnTimestamp(pub u64);
 
-/// Logical name assigned via `spawn_named()`. Read via `ctx.env::<LogicalName>()`.
-/// None for unnamed actors.
+/// Logical name assigned to an actor.
+///
+/// Reserved environment key for custom naming extensions.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LogicalName(pub String);
 
@@ -297,8 +298,8 @@ impl LogicalName {
 
 /// A typed service binding stored in the environment.
 ///
-/// `S` is a zero-sized marker type that identifies the service (e.g., `struct Datastore;`).
-/// Stored via `ServiceRegistry` and read via `ctx.resource::<S>()`.
+/// Reserved environment value for custom resource/service extensions. `S` is a
+/// zero-sized marker type that identifies the service (e.g., `struct Datastore;`).
 #[derive(Clone, Debug)]
 pub struct ServiceBinding<S: 'static + Send + Sync> {
     pub addr: ActorAddress,

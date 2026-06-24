@@ -1,7 +1,7 @@
 //! Message Routing and Handler Behavior Tests.
 //!
 //! Covers: routing correctness at scale, send-from-within-handler patterns,
-//! address error handling, fairness/budgets, and timers.
+//! address error handling, and fairness/budgets.
 
 mod common;
 use common::*;
@@ -36,59 +36,6 @@ impl ActorInterface for SelfSendActor {
             );
         }
     }
-}
-
-/// Schedules a one-shot timer in on_start.
-struct TimerStartActor {
-    target: ActorAddress,
-    delay_ticks: u64,
-}
-
-impl ActorInterface for TimerStartActor {
-    type Incoming = Ping;
-    type Response = Pong;
-    fn on_start(&mut self, ctx: &Ctx) {
-        ctx.send_after_ticks(
-            self.target,
-            Ping {
-                reply_to: ctx.self_addr(),
-            },
-            self.delay_ticks,
-        );
-    }
-    fn handle(&mut self, _ctx: &Ctx, _msg: Ping) {}
-}
-
-/// Schedules a one-shot timer from a handler.
-struct DelayPingPongActor;
-
-impl ActorInterface for DelayPingPongActor {
-    type Incoming = Forward;
-    type Response = Done;
-    fn handle(&mut self, ctx: &Ctx, msg: Forward) {
-        ctx.send_after_ticks(msg.reply_to, Done(msg.value), 3);
-    }
-}
-
-/// Schedules an interval timer on start.
-struct HeartbeatActor {
-    target: ActorAddress,
-    period: u64,
-}
-
-impl ActorInterface for HeartbeatActor {
-    type Incoming = Ping;
-    type Response = Pong;
-    fn on_start(&mut self, ctx: &Ctx) {
-        ctx.send_interval_ticks(
-            self.target,
-            Ping {
-                reply_to: ctx.self_addr(),
-            },
-            self.period,
-        );
-    }
-    fn handle(&mut self, _ctx: &Ctx, _msg: Ping) {}
 }
 
 /// NumberedMsg/Reply for routing correctness tests.
@@ -452,118 +399,3 @@ fn fairness_budget_prevents_starvation() {
     );
 }
 
-/// One-shot timers fire at the right tick and only once. Interval timers fire
-/// repeatedly at the right period. Timers are cleaned up when actors die.
-#[test]
-fn timer_one_shot_and_interval() {
-    // One-shot: delay=3 from on_start
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Ping>().unwrap();
-    rt.spawn(TimerStartActor {
-        target: *inbox.addr(),
-        delay_ticks: 3,
-    })
-    .unwrap();
-    rt.tick(); // tick 1: on_start schedules
-    assert!(inbox.try_recv().is_none(), "no delivery tick 1");
-    rt.tick(); // tick 2
-    assert!(inbox.try_recv().is_none(), "no delivery tick 2");
-    rt.tick(); // tick 3
-    assert!(inbox.try_recv().is_none(), "no delivery tick 3");
-    rt.tick(); // tick 4: fires
-    assert!(inbox.try_recv().is_some(), "timer fires after 3-tick delay");
-
-    // One-shot from handler
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Done>().unwrap();
-    let addr = rt.spawn(DelayPingPongActor).unwrap();
-    rt.send_to(
-        addr,
-        Forward {
-            value: 42,
-            reply_to: *inbox.addr(),
-        },
-    )
-    .unwrap();
-    rt.tick(); // process Forward, schedule timer
-    assert!(inbox.try_recv().is_none());
-    rt.tick(); // tick 2
-    rt.tick(); // tick 3
-    assert!(inbox.try_recv().is_none());
-    rt.tick(); // tick 4: fires
-    assert_eq!(
-        inbox.try_recv(),
-        Some(Done(42)),
-        "delayed reply from handler timer"
-    );
-
-    // One-shot does NOT repeat
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Ping>().unwrap();
-    rt.spawn(TimerStartActor {
-        target: *inbox.addr(),
-        delay_ticks: 1,
-    })
-    .unwrap();
-    rt.tick(); // schedule
-    rt.tick(); // fires
-    assert!(inbox.try_recv().is_some(), "first fire");
-    tick_n(&rt, 5);
-    assert!(inbox.try_recv().is_none(), "one-shot doesn't repeat");
-
-    // Zero-delay fires next tick
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Ping>().unwrap();
-    rt.spawn(TimerStartActor {
-        target: *inbox.addr(),
-        delay_ticks: 0,
-    })
-    .unwrap();
-    rt.tick(); // schedule
-    assert!(
-        inbox.try_recv().is_none(),
-        "not immediate — fires next tick"
-    );
-    rt.tick(); // fires
-    assert!(inbox.try_recv().is_some(), "zero-delay fires next tick");
-
-    // Interval: period=2, fires on ticks 3, 5, 7
-    let rt = std_runtime(RuntimeConfig::default());
-    let inbox = rt.new_inbox::<Ping>().unwrap();
-    rt.spawn(HeartbeatActor {
-        target: *inbox.addr(),
-        period: 2,
-    })
-    .unwrap();
-    rt.tick(); // tick 1: schedule
-    assert!(inbox.try_recv().is_none());
-    rt.tick(); // tick 2
-    assert!(inbox.try_recv().is_none());
-    rt.tick(); // tick 3: first fire
-    assert!(inbox.try_recv().is_some(), "fire on tick 3");
-    rt.tick(); // tick 4
-    assert!(inbox.try_recv().is_none());
-    rt.tick(); // tick 5: second fire
-    assert!(inbox.try_recv().is_some(), "fire on tick 5");
-    rt.tick(); // tick 6
-    assert!(inbox.try_recv().is_none());
-    rt.tick(); // tick 7: third fire
-    assert!(inbox.try_recv().is_some(), "fire on tick 7");
-
-    // Timer cleanup when target actor dies
-    let rt = std_runtime(RuntimeConfig::default());
-    let counter_addr = rt.spawn(CounterActor { count: 0 }).unwrap();
-    rt.spawn(HeartbeatActor {
-        target: counter_addr,
-        period: 1,
-    })
-    .unwrap();
-    tick_n(&rt, 3);
-    rt.stop_actor(counter_addr).unwrap();
-    tick_n(&rt, 5);
-    let stats = rt.stats();
-    assert_eq!(
-        stats.workers[0].num_actors, 1,
-        "only heartbeat actor remains"
-    );
-}

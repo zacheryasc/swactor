@@ -5001,6 +5001,7 @@ dependencies = [
  "crossbeam-utils",
  "getrandom 0.2.17",
  "mvp-system",
+ "parking_lot",
  "proptest",
  "proptest-state-machine",
  "serde",
