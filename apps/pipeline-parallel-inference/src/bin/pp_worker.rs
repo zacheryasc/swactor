@@ -50,9 +50,6 @@ use swactor_transport::TransportRouter;
 use pipeline_parallel_inference::cluster::ClusterNode;
 use pipeline_parallel_inference::fleet;
 
-use dashboard::collector::StatsCollector;
-use dashboard::{DashboardConfig, start_dashboard};
-
 use pipeline_parallel_inference::iroh_transport::{
     ACTOR_ALPN, ActorMessagePump, IrohActorTransport,
 };
@@ -406,29 +403,9 @@ fn main() {
         (false, false) => RelayMode::Disabled,
     };
 
-    // Optional per-stage live dashboard. When PP_STAGE_DASHBOARD is set, each
-    // stage serves the swactor dashboard on PP_STAGE_DASHBOARD_PORT_BASE +
-    // STAGE (default base 9100, so stage 0 → 9100, stage 1 → 9101, …). The
-    // stats hook must be installed before the runtime is wrapped in an Arc;
-    // we wire it through ClusterNode::new's customize_rt closure below.
-    // Stages run with `--network host`, so these ports are reachable on the
-    // host. Built upfront so the closure can install it.
-    let stage_dash = if std::env::var_os("PP_STAGE_DASHBOARD").is_some() {
-        let base: u16 = std::env::var("PP_STAGE_DASHBOARD_PORT_BASE")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(9100);
-        let port = base + stage as u16;
-        let collector = StatsCollector::new(swactor::config::RuntimeConfig::default().num_threads);
-        let handle = start_dashboard(DashboardConfig {
-            port,
-            ..Default::default()
-        });
-        Some((handle, collector, port))
-    } else {
-        None
-    };
-    let stats_hook = stage_dash.as_ref().map(|(_, c, _)| c.clone());
+    // Per-stage HTTP dashboards are intentionally disabled. Stage telemetry is
+    // emitted as datastream frames to the orchestrator, where FleetView folds it
+    // into the single dashboard. Legacy PP_STAGE_DASHBOARD* env vars are ignored.
 
     let mut cluster = ClusterNode::new(
         IrohDriverConfig {
@@ -440,11 +417,7 @@ fn main() {
         },
         node_config(),
         inference_codec_registry(),
-        |rt| {
-            if let Some(hook) = stats_hook {
-                rt.set_stats_hook(hook);
-            }
-        },
+        |_| {},
     )
     .expect("failed to create cluster node");
 
@@ -573,12 +546,6 @@ fn main() {
     let sender = cluster.rt.create_sender();
     let status_inbox = cluster.rt.new_inbox::<StageActorStatus>().unwrap();
 
-    if let Some((handle, collector, port)) = &stage_dash {
-        handle.set_runtime(Arc::clone(&cluster.rt), Arc::clone(collector));
-        handle.start_http(cluster.driver.tokio_handle());
-        eprintln!("pp-worker: stage {stage} dashboard on http://localhost:{port}");
-    }
-
     run_stage(
         cluster,
         sender,
@@ -588,8 +555,6 @@ fn main() {
         num_stages,
         max_tokens,
     );
-    // Keep the dashboard handle alive for the whole stage lifetime.
-    drop(stage_dash);
 }
 
 /// Pump the runtime + driver until the worker reports ready, honouring

@@ -720,12 +720,10 @@ impl EdgeRecord {
     }
 }
 
-#[cfg(test)]
 pub struct EdgeEstablisherHarness {
     establisher: EdgeEstablisher,
 }
 
-#[cfg(test)]
 impl EdgeEstablisherHarness {
     pub fn new(local_node_id: NodeId) -> Self {
         Self {

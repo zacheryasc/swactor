@@ -155,8 +155,9 @@ pub enum RunCommand {
     },
 }
 
-#[cfg(test)]
-pub struct OrchestratorHarness {
+pub type OrchestratorHarness = OrchestratorRun;
+
+pub struct OrchestratorRun {
     config: RunConfig,
     plan: Option<RunPlan>,
     pool_ready: bool,
@@ -174,8 +175,7 @@ pub struct OrchestratorHarness {
     token_endpoints_stopped: bool,
 }
 
-#[cfg(test)]
-impl OrchestratorHarness {
+impl OrchestratorRun {
     pub fn new(config: RunConfig) -> Self {
         Self {
             config,
