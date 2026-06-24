@@ -436,19 +436,6 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
   }
   .status-dot.disconnected { background: #f44336; }
   .status-dot.done { background: #ff9800; }
-  .status-dot.replaying { background: #2196f3; animation: pulse 1.5s infinite; }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-
-  .replay-badge {
-    display: none; background: #2196f3; color: #fff; font-size: 10px; font-weight: 700;
-    padding: 2px 8px; border-radius: 3px; margin-left: 10px; letter-spacing: 1px;
-    vertical-align: middle;
-  }
-  .replay-badge.visible { display: inline-block; }
 
   .nav-links { display: flex; gap: 4px; margin-left: 20px; }
   .nav-link {
@@ -562,7 +549,6 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
     <h1>
       Swactor Runtime Dashboard
       <span id="statusDot" class="status-dot"></span>
-      <span id="replayBadge" class="replay-badge">REPLAY</span>
     </h1>
     <nav class="nav-links">
       <a href="/" class="nav-link">Overview</a>
@@ -572,13 +558,8 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
     </nav>
   </div>
   <div class="header-right">
-    <span id="replaySpeed" style="color:#2196f3;font-size:12px;display:none;"></span>
-    <span id="replayPct" style="color:#888;font-size:12px;display:none;"></span>
     <span id="uptimeLabel" style="color:#888;font-size:12px;"></span>
   </div>
-</div>
-<div id="progressBarWrap" class="progress-bar-wrap">
-  <div id="progressFill" class="progress-fill"></div>
 </div>
 
 <div class="grid">
@@ -661,28 +642,13 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
 
 <script>
 (function() {
-  var DASHBOARD_MODE = '__DASHBOARD_MODE__';
-  var isReplay = (DASHBOARD_MODE === 'replay');
   var lastUptimeMs = null;
   var lastStatsTime = null;
 
   var dot = document.getElementById('statusDot');
   var uptimeLabel = document.getElementById('uptimeLabel');
-  var replayBadge = document.getElementById('replayBadge');
-  var replaySpeed = document.getElementById('replaySpeed');
-  var replayPct = document.getElementById('replayPct');
-  var progressBarWrap = document.getElementById('progressBarWrap');
-  var progressFill = document.getElementById('progressFill');
-
-  if (isReplay) {
-    replayBadge.className = 'replay-badge visible';
-    progressBarWrap.className = 'progress-bar-wrap visible';
-    dot.className = 'status-dot replaying';
-    uptimeLabel.style.display = 'none';
-  }
 
   function updateUptime() {
-    if (isReplay) return;
     var up = lastUptimeMs;
     if (up !== null && lastStatsTime !== null) {
       up += (Date.now() - lastStatsTime);
@@ -1124,14 +1090,10 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
   function setStatus(s) {
     if (s === 'done') {
       dot.className = 'status-dot done';
-      if (isReplay) {
-        replayPct.textContent = '100%';
-        progressFill.style.width = '100%';
-      }
     } else if (s === 'disconnected') {
       dot.className = 'status-dot disconnected';
     } else {
-      dot.className = isReplay ? 'status-dot replaying' : 'status-dot';
+      dot.className = 'status-dot';
     }
   }
 
@@ -1185,24 +1147,6 @@ pub const ACTORS_HTML: &str = r##"<!DOCTYPE html>
     } catch(err) { console.error('stats parse error', err); }
   });
 
-  es.addEventListener('replay_meta', function(e) {
-    try {
-      var meta = JSON.parse(e.data);
-      replaySpeed.textContent = meta.speed + 'x';
-      replaySpeed.style.display = 'inline';
-      replayPct.style.display = 'inline';
-      replayPct.textContent = '0%';
-    } catch(err) { console.error('replay_meta parse error', err); }
-  });
-
-  es.addEventListener('replay_progress', function(e) {
-    try {
-      var data = JSON.parse(e.data);
-      var pct = Math.round(data.progress * 100);
-      replayPct.textContent = pct + '%';
-      progressFill.style.width = pct + '%';
-    } catch(err) { console.error('replay_progress parse error', err); }
-  });
 
   es.addEventListener('done', function() {
     setStatus('done');
@@ -1242,19 +1186,6 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   }
   .status-dot.disconnected { background: #f44336; }
   .status-dot.done { background: #ff9800; }
-  .status-dot.replaying { background: #2196f3; animation: pulse 1.5s infinite; }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
-  }
-
-  .replay-badge {
-    display: none; background: #2196f3; color: #fff; font-size: 10px; font-weight: 700;
-    padding: 2px 8px; border-radius: 3px; margin-left: 10px; letter-spacing: 1px;
-    vertical-align: middle;
-  }
-  .replay-badge.visible { display: inline-block; }
 
   .header-left { display: flex; align-items: center; }
   .nav-links { display: flex; gap: 4px; margin-left: 20px; }
@@ -1267,13 +1198,6 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
   .header-right { display: flex; align-items: center; gap: 12px; }
 
-  .progress-bar-wrap {
-    display: none; width: 100%; height: 3px; background: #2a2d3e;
-  }
-  .progress-bar-wrap.visible { display: block; }
-  .progress-fill {
-    height: 100%; width: 0%; background: #2196f3; transition: width 0.3s;
-  }
 
   .grid {
     display: grid;
@@ -1370,7 +1294,6 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     <h1>
       Swactor Runtime Dashboard
       <span id="statusDot" class="status-dot"></span>
-      <span id="replayBadge" class="replay-badge">REPLAY</span>
     </h1>
     <nav class="nav-links">
       <a href="/" class="nav-link active">Overview</a>
@@ -1380,13 +1303,8 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     </nav>
   </div>
   <div class="header-right">
-    <span id="replaySpeed" style="color:#2196f3;font-size:12px;display:none;"></span>
-    <span id="replayPct" style="color:#888;font-size:12px;display:none;"></span>
     <span id="uptimeLabel" style="color:#888;font-size:12px;"></span>
   </div>
-</div>
-<div id="progressBarWrap" class="progress-bar-wrap">
-  <div id="progressFill" class="progress-fill"></div>
 </div>
 
 <div id="warningBanner" style="display:none;padding:8px 20px;background:#1c1f2e;border-bottom:1px solid #2a2d3e;font-size:12px;"></div>
@@ -1440,31 +1358,14 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 
 <script>
 (function() {
-  var DASHBOARD_MODE = '__DASHBOARD_MODE__';
-  var logRowCount = 0;
-  var MAX_LOG_ROWS = 2000;
-  var isReplay = (DASHBOARD_MODE === 'replay');
   var lastUptimeMs = null;
   var lastStatsTime = null;
   var workerHistory = {}; // { id: { message_rates: [], mailbox_depths: [] } }
 
   var dot = document.getElementById('statusDot');
   var uptimeLabel = document.getElementById('uptimeLabel');
-  var replayBadge = document.getElementById('replayBadge');
-  var replaySpeed = document.getElementById('replaySpeed');
-  var replayPct = document.getElementById('replayPct');
-  var progressBarWrap = document.getElementById('progressBarWrap');
-  var progressFill = document.getElementById('progressFill');
-
-  if (isReplay) {
-    replayBadge.className = 'replay-badge visible';
-    progressBarWrap.className = 'progress-bar-wrap visible';
-    dot.className = 'status-dot replaying';
-    uptimeLabel.style.display = 'none';
-  }
 
   function updateUptime() {
-    if (isReplay) return;
     var up = lastUptimeMs;
     if (up !== null && lastStatsTime !== null) {
       up += (Date.now() - lastStatsTime);
@@ -1789,14 +1690,10 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
   function setStatus(s) {
     if (s === 'done') {
       dot.className = 'status-dot done';
-      if (isReplay) {
-        replayPct.textContent = '100%';
-        progressFill.style.width = '100%';
-      }
     } else if (s === 'disconnected') {
       dot.className = 'status-dot disconnected';
     } else {
-      dot.className = isReplay ? 'status-dot replaying' : 'status-dot';
+      dot.className = 'status-dot';
     }
   }
 
@@ -1848,24 +1745,6 @@ pub const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
     try { addLogEvents(JSON.parse(e.data)); } catch(err) { console.error('activity parse error', err); }
   });
 
-  es.addEventListener('replay_meta', function(e) {
-    try {
-      var meta = JSON.parse(e.data);
-      replaySpeed.textContent = meta.speed + 'x';
-      replaySpeed.style.display = 'inline';
-      replayPct.style.display = 'inline';
-      replayPct.textContent = '0%';
-    } catch(err) { console.error('replay_meta parse error', err); }
-  });
-
-  es.addEventListener('replay_progress', function(e) {
-    try {
-      var data = JSON.parse(e.data);
-      var pct = Math.round(data.progress * 100);
-      replayPct.textContent = pct + '%';
-      progressFill.style.width = pct + '%';
-    } catch(err) { console.error('replay_progress parse error', err); }
-  });
 
   es.addEventListener('done', function() {
     setStatus('done');

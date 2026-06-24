@@ -185,8 +185,9 @@ pub enum StageCommand {
     },
 }
 
-#[cfg(test)]
-pub struct StageControllerHarness {
+pub type StageControllerHarness = StageController;
+
+pub struct StageController {
     local_node_id: NodeId,
     provision: Option<ProvisionStage>,
     worker_ready: bool,
@@ -203,8 +204,7 @@ pub struct StageControllerHarness {
     stopped: bool,
 }
 
-#[cfg(test)]
-impl StageControllerHarness {
+impl StageController {
     pub fn new(local_node_id: NodeId) -> Self {
         Self {
             local_node_id,

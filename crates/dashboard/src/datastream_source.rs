@@ -13,8 +13,8 @@
 //!   * a cross-node **Fleet** table (`/plugin/vastai`) served in the same
 //!     dashboard chrome (nav bar + palette), not a separate app.
 //!
-//! Process output and membership transitions are emitted as `tracing` events so
-//! they flow through the dashboard's activity-log path.
+//! Process output and membership transitions are emitted as dashboard activity
+//! events by the datastream host.
 //!
 //! A node is only shown while it is *live* (has shipped a frame within
 //! [`NODE_TTL`]); a node that stops streaming drops out of every view, so a
@@ -608,8 +608,7 @@ pub struct FleetUpdate {
     /// The selected node's Distribution snapshot JSON, if a node is selected.
     pub dist_json: Option<String>,
     /// Synthesized single-node stats, present only when this frame was for the
-    /// selected node. A UDP demo pushes it via `set_stats`; an orchestrator with
-    /// its own live runtime ignores it.
+    /// selected node. Push it into the dashboard with `DashboardHandle::set_stats`.
     pub stats: Option<RuntimeStats>,
     /// `(is_warn, message)` activity-log lines for the selected node.
     pub logs: Vec<(bool, String)>,
@@ -721,6 +720,16 @@ impl FleetView {
 /// and feeds `cache` from its `datastream-sink`.
 pub fn fleet_cache_plugin(cache: Arc<Mutex<Option<String>>>) -> Arc<dyn DashboardPlugin> {
     Arc::new(CachePlugin::new("vastai", FLEET_HTML, cache))
+}
+
+/// A ready-to-register Distribution plugin backed by `cache`: serves the
+/// canonical Distribution graph page and the `distribution` SSE/JSON model.
+pub fn distribution_cache_plugin(cache: Arc<Mutex<Option<String>>>) -> Arc<dyn DashboardPlugin> {
+    Arc::new(CachePlugin::new(
+        "distribution",
+        crate::DISTRIBUTION_PAGE_HTML,
+        cache,
+    ))
 }
 
 /// Plugin backed by a shared cache string: serves a fixed HTML page, emits its

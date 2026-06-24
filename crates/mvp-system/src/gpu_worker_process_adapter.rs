@@ -121,8 +121,9 @@ pub struct CommandRejection {
     pub reason: CommandRejectionReason,
 }
 
-#[cfg(test)]
-pub struct ProcessAdapterHarness {
+pub type ProcessAdapterHarness = WorkerProcessAdapter;
+
+pub struct WorkerProcessAdapter {
     config: AdapterConfig,
     stdin_lines: Vec<String>,
     events: Vec<AdapterEvent>,
@@ -131,8 +132,7 @@ pub struct ProcessAdapterHarness {
     exit_status: Option<ExitStatus>,
 }
 
-#[cfg(test)]
-impl ProcessAdapterHarness {
+impl WorkerProcessAdapter {
     pub fn new(config: AdapterConfig) -> Self {
         Self {
             config,
@@ -259,7 +259,6 @@ impl ProcessAdapterHarness {
     }
 }
 
-#[cfg(test)]
 fn format_json_command(command: &WorkerCommand) -> String {
     let value = match command {
         WorkerCommand::InitializeWorker { helper_abi_version } => serde_json::json!({

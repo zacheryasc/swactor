@@ -1,92 +1,46 @@
 # dashboard
 
-Visual dashboard for the swactor runtime. Provides a live HTTP dashboard, a
-terminal UI (TUI), trace recording/replay, and an HTTP API for programmatic
-runtime investigation.
+Datastream-only HTTP dashboard for visualizing swactor-derived telemetry in a browser. The dashboard consumes folded datastream records and serves live pages over HTTP/SSE.
 
 ## Features
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `distribution` | yes | `/distribution` page with SWIM membership, gossip directory routes, and location cache |
-| `tui` | no | Terminal UI with overview, worker detail, and distribution views |
+| `distribution` | yes | `/distribution` page with SWIM membership, gossip directory routes, peer auth, and location cache data derived from datastream frames |
+| Fleet view | yes | `/vastai` page showing nodes folded by `datastream_source::FleetView` |
 
 ## HTTP Dashboard
 
-Start the dashboard demo and open it in a browser:
-
-```bash
-cargo run -p dashboard --example dashboard_demo
-```
+The dashboard is embedded by an application that owns a datastream sink. The
+sink folds delivered frames through `datastream_source::FleetView`, then pushes
+the resulting stats, activity lines, and cache-backed plugin JSON into the
+dashboard handle.
 
 Pages:
-- `http://localhost:9090` — live overview (workers, actors, message rates)
-- `http://localhost:9090/actors` — actor table
-- `http://localhost:9090/distribution` — SWIM membership, gossip directory routes, cache entries
+- `http://localhost:9090/` — live overview from the selected datastream node
+- `http://localhost:9090/actors` — actor table reconstructed from actor telemetry records
+- `http://localhost:9090/plugin/distribution` — SWIM membership, gossip directory routes, peer auth, and cache entries
+- `http://localhost:9090/plugin/vastai` — fleet/node view fed by the shared fleet cache
 
-The demo creates a 4-worker runtime with ping-pong and counter actors, plus a
-9-node distribution cluster (1 main node + 8 peers) with simulated SWIM
-membership and actor registrations in the directory/cache.
+The dashboard model is folded by `datastream_source::FleetView`. Producers
+publish telemetry records to datastream channels; the dashboard sink folds those
+records into cached JSON, pushes activity messages, and updates the HTTP/SSE
+views.
 
-## TUI
+## Public API
 
-A standalone binary that connects to any running dashboard over SSE:
+Embed the dashboard by constructing `DashboardConfig` and calling
+`start_dashboard(config)`. The returned handle owns the HTTP server state and
+supports externally pushed stats, activity messages, history access, plugin
+registration, landing page overrides, extra routers, and shutdown.
 
-```bash
-cargo run -p dashboard --features tui --bin swactor-tui
-# or point at a specific endpoint
-cargo run -p dashboard --features tui --bin swactor-tui -- http://localhost:9090
-```
+Plugins are the extension boundary. New dashboard surfaces should register a
+`DashboardPlugin` or use a cache-backed plugin such as
+`fleet_cache_plugin(cache)` / `distribution_cache_plugin(cache)`, then feed it
+from datastream-derived JSON caches.
 
-Views (cycle with Tab):
-- **Overview** — htop-style worker bars, summary line, sortable actor table
-- **Worker Detail** — focused view of a single worker's actors and phase breakdown
-- **Distribution** — cluster summary, scrollable members table, cache entries, gossip directory route count
+## Pipeline app
 
-Key bindings: `q` quit, `Tab` cycle views, `s` sort column, `r` reverse sort,
-arrow keys/`j`/`k` scroll, `Enter` drill into worker, `Esc` back to overview.
-
-## Agent HTTP API (Investigate)
-
-All diagnostic commands are available as HTTP endpoints when the dashboard
-server is running. See [AGENTS.md](AGENTS.md) for full protocol documentation.
-
-```bash
-curl 'http://localhost:9090/api/investigate?cmd=overview'
-curl 'http://localhost:9090/api/investigate?cmd=hot&n=5'
-curl 'http://localhost:9090/api/investigate?cmd=workers'
-curl 'http://localhost:9090/api/investigate?cmd=worker&id=2'
-curl 'http://localhost:9090/api/investigate?cmd=actors&sort=mailbox&limit=10'
-curl 'http://localhost:9090/api/investigate?cmd=diff&seconds=2'
-```
-
-The same commands are also available via a stdin/stdout REPL for direct
-programmatic use (see `investigate::run_investigate`).
-
-## Demos
-
-All examples are run from the workspace root.
-
-**HTTP dashboard** — live workload with distribution cluster, Ctrl+C to stop:
-
-```bash
-cargo run -p dashboard --example dashboard_demo
-# http://localhost:9090              — runtime overview
-# http://localhost:9090/distribution — cluster view
-```
-
-**Benchmarks** — four automated scenarios (~20 s total):
-
-```bash
-cargo run -p dashboard --example bench_dashboard
-# open http://localhost:9090
-```
-
-**Record & replay** — records ~10 s of activity, then serves a replay:
-
-```bash
-cargo run -p dashboard --example record_and_replay_demo
-# live dashboard at http://localhost:9090 during recording
-# replay dashboard at http://localhost:9091 after recording finishes
-# Ctrl+C to stop
-```
+`apps/pipeline-parallel-inference` enables the dashboard with `PP_DASHBOARD=1`.
+Its orchestrator hosts the HTTP server, spawns the `datastream-sink` actor, and
+feeds every dashboard view from `FleetView` updates.

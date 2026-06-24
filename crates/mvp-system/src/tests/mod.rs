@@ -16,5 +16,6 @@ mod resource_inventory_guarantees;
 mod run_plan_guarantees;
 mod shared_ring_helper_abi_guarantees;
 mod stage_controller_guarantees;
+mod telemetry_guarantees;
 mod tx_rx_edge_actor_guarantees;
 mod weight_lifecycle_guarantees;

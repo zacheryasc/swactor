@@ -102,7 +102,7 @@ fn push_bounded<T>(buf: &mut VecDeque<T>, val: T, cap: usize) {
     buf.push_back(val);
 }
 
-/// Thread-safe history store. Written by the sampler, read by SSE/TUI.
+/// Thread-safe history store. Written from datastream-pushed stats, read by SSE.
 pub struct DashboardHistory {
     inner: RwLock<HistoryInner>,
     config: HistoryConfig,

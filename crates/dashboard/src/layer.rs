@@ -5,14 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crossbeam_queue::ArrayQueue;
 use serde::{Deserialize, Serialize};
-use tracing::Subscriber;
-use tracing::field::{Field, Visit};
-use tracing::span;
-use tracing_subscriber::Layer;
-use tracing_subscriber::layer::Context;
-use tracing_subscriber::registry::LookupSpan;
 
-/// A single captured tracing event.
+/// A single dashboard activity event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardEvent {
     pub seq: u64,
@@ -109,7 +103,7 @@ impl EventStore {
     }
 
     /// Drains the full recording log. Only available when recording is enabled.
-    /// This is destructive — events are consumed. Intended for `save_trace()`.
+    /// This is destructive — events are consumed by callers that export logs.
     pub fn all_events(&self) -> Option<Vec<DashboardEvent>> {
         self.full_log.as_ref().map(|log| {
             let mut out = Vec::new();
@@ -127,154 +121,3 @@ pub(crate) fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-
-/// Visitor that extracts the message string and collects other fields.
-struct FieldVisitor {
-    message: String,
-    fields: serde_json::Map<String, serde_json::Value>,
-}
-
-impl FieldVisitor {
-    fn new() -> Self {
-        Self {
-            message: String::new(),
-            fields: serde_json::Map::new(),
-        }
-    }
-}
-
-impl Visit for FieldVisitor {
-    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        if field.name() == "message" {
-            self.message = format!("{:?}", value);
-        } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::Value::String(format!("{:?}", value)),
-            );
-        }
-    }
-
-    fn record_u64(&mut self, field: &Field, value: u64) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::Value::Number(value.into()),
-            );
-        }
-    }
-
-    fn record_i64(&mut self, field: &Field, value: i64) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::Value::Number(value.into()),
-            );
-        }
-    }
-
-    fn record_str(&mut self, field: &Field, value: &str) {
-        if field.name() == "message" {
-            self.message = value.to_string();
-        } else {
-            self.fields.insert(
-                field.name().to_string(),
-                serde_json::Value::String(value.to_string()),
-            );
-        }
-    }
-}
-
-/// A tracing Layer that captures events into an EventStore.
-pub struct DashboardLayer {
-    store: std::sync::Arc<EventStore>,
-}
-
-impl DashboardLayer {
-    pub fn new(store: std::sync::Arc<EventStore>) -> Self {
-        Self { store }
-    }
-}
-
-impl<S> Layer<S> for DashboardLayer
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-{
-    fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
-        let mut visitor = FieldVisitor::new();
-        event.record(&mut visitor);
-
-        // Walk span context to find worker_id and actor_addr
-        let mut worker_id = None;
-        let mut actor_addr = None;
-        if let Some(scope) = ctx.event_scope(event) {
-            for span in scope {
-                let exts = span.extensions();
-                if worker_id.is_none()
-                    && let Some(wid) = exts.get::<WorkerIdField>()
-                {
-                    worker_id = Some(wid.0);
-                }
-                if actor_addr.is_none()
-                    && let Some(aa) = exts.get::<ActorAddrField>()
-                {
-                    actor_addr = Some(aa.0.clone());
-                }
-                if worker_id.is_some() && actor_addr.is_some() {
-                    break;
-                }
-            }
-        }
-
-        // Also check if worker_id or actor_addr was a field on the event itself
-        if worker_id.is_none()
-            && let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id")
-        {
-            worker_id = n.as_u64().map(|v| v as usize);
-        }
-        if actor_addr.is_none()
-            && let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr")
-        {
-            actor_addr = Some(s.clone());
-        }
-
-        let dashboard_event = DashboardEvent {
-            seq: 0, // filled by push()
-            timestamp_ms: now_ms(),
-            level: event.metadata().level().to_string(),
-            message: visitor.message,
-            worker_id,
-            actor_addr,
-            fields: visitor.fields,
-        };
-
-        self.store.push(dashboard_event);
-    }
-
-    fn on_new_span(&self, attrs: &span::Attributes<'_>, id: &span::Id, ctx: Context<'_, S>) {
-        // Extract worker_id and actor_addr from span fields and store in extensions
-        let mut visitor = FieldVisitor::new();
-        attrs.record(&mut visitor);
-
-        if let Some(span) = ctx.span(id) {
-            if let Some(serde_json::Value::Number(n)) = visitor.fields.get("worker_id")
-                && let Some(wid) = n.as_u64()
-            {
-                span.extensions_mut().insert(WorkerIdField(wid as usize));
-            }
-            if let Some(serde_json::Value::String(s)) = visitor.fields.get("actor_addr") {
-                span.extensions_mut().insert(ActorAddrField(s.clone()));
-            }
-        }
-    }
-}
-
-/// Stored in span extensions to propagate worker_id to child events.
-struct WorkerIdField(usize);
-
-/// Stored in span extensions to propagate actor_addr to child events.
-struct ActorAddrField(String);

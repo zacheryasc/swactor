@@ -1,9 +1,7 @@
 pub mod cluster;
-pub mod dist_plugin;
 pub mod fleet;
 pub mod iroh_transport;
 pub mod messages;
-pub mod netmap_plugin;
 pub mod orchestrator;
 pub mod profile;
 pub mod provision;

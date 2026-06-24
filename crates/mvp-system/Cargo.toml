@@ -4,9 +4,51 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+default = []
+local-e2e = [
+    "dep:swactor",
+    "dep:swactor-transport",
+    "dep:distribution",
+    "dep:iroh-driver",
+    "dep:iroh",
+    "dep:tokio",
+    "dep:dashboard",
+    "dep:parking_lot",
+]
 
 [dependencies]
+datastream = { path = "../datastream" }
 serde_json = "1"
+parking_lot = { version = "0.12", optional = true }
+serde = { version = "1", features = ["derive"] }
+swactor = { path = "../..", features = ["serde", "transport"], optional = true }
+swactor-transport = { path = "../transport", optional = true }
+distribution = { path = "../distribution", optional = true }
+iroh-driver = { path = "../iroh-driver", optional = true }
+iroh = { version = "0.98", optional = true }
+dashboard = { path = "../dashboard", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"], optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
+[[bin]]
+name = "mvp-local-e2e"
+path = "src/bin/local_e2e.rs"
+required-features = ["local-e2e"]
+
+[[bin]]
+name = "mvp-dumb-worker"
+path = "src/bin/dumb_worker.rs"
+required-features = ["local-e2e"]
+
+[[test]]
+name = "local_unmocked_mvp_e2e"
+path = "tests/local_unmocked_mvp_e2e.rs"
+required-features = ["local-e2e"]
+
+[[test]]
+name = "gpu_worker_node_e2e"
+path = "tests/gpu_worker_node_e2e.rs"
+required-features = ["local-e2e"]

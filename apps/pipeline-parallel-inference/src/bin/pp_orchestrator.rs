@@ -40,34 +40,33 @@ use serde::{Deserialize, Serialize};
 
 use datastream::{DATASTREAM_SINK_NAME, DatastreamSink};
 use distribution::node::DistributedNodeConfig;
+use distribution::snapshot::DistributionNodeSnapshot;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
 use iroh::{PublicKey, RelayMode, SecretKey};
 use iroh_driver::IrohDriverConfig;
 
 use swactor::actor::ActorAddress;
-use swactor::runtime::{Inbox, RuntimeConfig};
+use swactor::runtime::Inbox;
 
 use pipeline_parallel_inference::cluster::ClusterNode;
 
-use dashboard::collector::StatsCollector;
-use dashboard::datastream_source::{FleetView, fleet_cache_plugin};
+use dashboard::datastream_source::{FleetView, distribution_cache_plugin, fleet_cache_plugin};
 use dashboard::{DashboardConfig, start_dashboard};
 
-use pipeline_parallel_inference::dist_plugin::{DistDashPlugin, SharedSnapshot};
 use pipeline_parallel_inference::iroh_transport::{
     ACTOR_ALPN, ActorMessagePump, IrohActorTransport,
 };
 use pipeline_parallel_inference::messages::{
     InferenceRequest, InferenceResponse, inference_codec_registry,
 };
-use pipeline_parallel_inference::netmap_plugin::{ConnTracker, NetmapPlugin, spawn_conn_poller};
 use pipeline_parallel_inference::orchestrator::{
     ChainGuard, StageSpawnCtx, await_convergence, spawn_chain,
 };
 use pipeline_parallel_inference::topology::{ENTRY_NAME, stage_name};
 
 const ORCHESTRATOR_NAME: &str = "pp-orchestrator";
+type SharedSnapshot = Arc<Mutex<Option<DistributionNodeSnapshot>>>;
 
 fn node_config() -> DistributedNodeConfig {
     DistributedNodeConfig {
@@ -325,9 +324,6 @@ fn build_gpu_node_command(
         "MODEL",
         "PYTHON",
         "CUDA",
-        // Per-stage live dashboard: each stage serves on base + STAGE.
-        "PP_STAGE_DASHBOARD",
-        "PP_STAGE_DASHBOARD_PORT_BASE",
         "PP_BOOT_DELAY_STAGE",
         "PP_BOOT_DELAY_SECS",
     ] {
@@ -402,19 +398,32 @@ fn check_child_death(guard: &mut ChainGuard) -> Result<(), String> {
 /// The caller must register the returned address post-convergence.
 fn wire_fleet_sink(
     cluster: &ClusterNode,
-    handle: &dashboard::DashboardHandle,
+    handle: Arc<dashboard::DashboardHandle>,
 ) -> Option<ActorAddress> {
     let fleet_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let dist_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     handle.register_plugin(fleet_cache_plugin(Arc::clone(&fleet_cache)));
+    handle.register_plugin(distribution_cache_plugin(Arc::clone(&dist_cache)));
 
-    // Fold every received delivery into a FleetView, caching the fleet JSON for
-    // the dashboard — the same fold the old UDP ingest performed, now driven by
-    // the actor instead of a socket loop.
+    // Fold every received delivery into a FleetView, caching datastream-derived
+    // fleet/distribution JSON and pushing synthesized stats/activity into the
+    // dashboard. This keeps the dashboard off the local swactor runtime.
     let mut view = FleetView::new(None);
-    let cache = Arc::clone(&fleet_cache);
+    let fleet_cache = Arc::clone(&fleet_cache);
+    let dist_cache = Arc::clone(&dist_cache);
+    let handle_for_updates = Arc::clone(&handle);
     let sink = DatastreamSink::new(move |stream, frame| {
         let update = view.ingest(&stream, &frame);
-        *cache.lock().unwrap() = Some(update.fleet_json);
+        *fleet_cache.lock().unwrap() = Some(update.fleet_json);
+        if let Some(dist_json) = update.dist_json {
+            *dist_cache.lock().unwrap() = Some(dist_json);
+        }
+        if let Some(stats) = update.stats {
+            handle_for_updates.set_stats(stats);
+        }
+        for (is_warn, message) in update.logs {
+            handle_for_updates.push_activity(is_warn, message);
+        }
     });
     match cluster.rt.spawn(sink) {
         Ok(addr) => {
@@ -460,24 +469,21 @@ fn run_seed(args: &Args) -> i32 {
         return 1;
     }
 
-    // Build the dashboard handle/collector up front so the stats hook can be
-    // installed inside ClusterNode::new's customize_rt closure (the runtime is
-    // wrapped in Arc inside the constructor).
+    // Build the dashboard handle up front. Runtime stats/distribution panels are
+    // fed only by datastream updates folded through `wire_fleet_sink`.
     let dashboard = if std::env::var_os("PP_DASHBOARD").is_some() {
         let port: u16 = std::env::var("PP_DASHBOARD_PORT")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(9090);
-        let collector = StatsCollector::new(RuntimeConfig::default().num_threads);
-        let handle = start_dashboard(DashboardConfig {
+        let handle = Arc::new(start_dashboard(DashboardConfig {
             port,
             ..Default::default()
-        });
-        Some((handle, collector, port))
+        }));
+        Some((handle, port))
     } else {
         None
     };
-    let stats_hook = dashboard.as_ref().map(|(_, c, _)| c.clone());
 
     let mut cluster = match ClusterNode::new(
         IrohDriverConfig {
@@ -489,11 +495,7 @@ fn run_seed(args: &Args) -> i32 {
         },
         node_config(),
         inference_codec_registry(),
-        |rt| {
-            if let Some(hook) = stats_hook {
-                rt.set_stats_hook(hook);
-            }
-        },
+        |_| {},
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -502,8 +504,8 @@ fn run_seed(args: &Args) -> i32 {
         }
     };
 
-    // The Distribution tab is rendered from the orchestrator's own SWIM view;
-    // its snapshot cell exists whenever the in-process dashboard is on.
+    // Keep the existing snapshot cache only for hold/prompt loop refresh paths;
+    // dashboard Distribution is fed from datastream-derived FleetView updates.
     let want_dist = std::env::var_os("PP_DASHBOARD").is_some();
 
     let my_id = cluster.node_id();
@@ -527,9 +529,8 @@ fn run_seed(args: &Args) -> i32 {
         let rt = Arc::clone(&cluster.rt);
         let router = Arc::clone(&cluster.transport_router);
 
-        // Shared distribution snapshot cell, refreshed by the hold loop and read
-        // by the Distribution/Netmap plugins. `None` when the dashboard is off so
-        // the hold loop skips the refresh.
+        // Shared distribution snapshot cell for hold-loop refresh paths. The
+        // dashboard's Distribution plugin is datastream-backed via FleetView.
         let dist_cached: Option<SharedSnapshot> = if want_dist {
             Some(Arc::new(Mutex::new(Some(cluster.snapshot()))))
         } else {
@@ -541,33 +542,19 @@ fn run_seed(args: &Args) -> i32 {
         // `register_fleet_sink_name`).
         let mut seed_fleet_sink_addr: Option<ActorAddress> = None;
 
-        // When the in-process dashboard is on, register the distribution + net map
-        // plugins ("Distribution"/"Netmap" nav tabs) against the shared cell.
-        if let (Some((handle, collector, port)), Some(cached)) = (&dashboard, &dist_cached) {
-            handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
-            handle.register_plugin(Arc::new(DistDashPlugin::new(Arc::clone(cached))));
-            // Net map plugin: a live connection/bandwidth graph. Shares the
-            // cached snapshot; a background poller keeps its transport map fresh
-            // by querying the iroh endpoint directly. The poller's stop flag
-            // rides the process lifetime (the driver's tokio runtime is torn
-            // down at end of run, aborting the task).
-            let conn_tracker = Arc::new(ConnTracker::default());
-            handle.register_plugin(Arc::new(NetmapPlugin::new(
-                Arc::clone(cached),
-                Arc::clone(&conn_tracker),
-            )));
-            let poll_stop = Arc::new(AtomicBool::new(false));
-            spawn_conn_poller(&cluster.driver, Arc::clone(cached), conn_tracker, poll_stop);
+        // When the in-process dashboard is on, register only datastream-backed
+        // plugins. FleetView updates fill both Fleet and Distribution caches.
+        if let Some((handle, port)) = &dashboard {
             // Fleet tab ("Fleet" nav): the orchestrator-hosted datastream
             // consumer. Each stage resolves the `datastream-sink` actor and
             // ships its identity + host.resource frames over the swactor
             // transport; the actor folds them into a live FleetView and serves
             // the cross-node telemetry table beside the orchestrator's own views.
-            seed_fleet_sink_addr = wire_fleet_sink(&cluster, handle);
+            seed_fleet_sink_addr = wire_fleet_sink(&cluster, Arc::clone(handle));
             handle.start_http(cluster.driver.tokio_handle());
             eprintln!(
                 "pp-orchestrator: live dashboard on http://localhost:{port} \
-                 (overview / actors / topology / distribution / netmap / fleet)"
+                 (overview / actors / topology / distribution / fleet)"
             );
         }
 
@@ -771,7 +758,7 @@ fn run_seed(args: &Args) -> i32 {
                     hold_open(
                         &mut cluster,
                         dist_cached.as_ref(),
-                        dashboard.as_ref().map(|(_, _, p)| *p),
+                        dashboard.as_ref().map(|(_, p)| *p),
                     );
                 }
                 (0, "ok")
@@ -909,8 +896,8 @@ impl AwaitError {
 /// (Ctrl-D), at which point the run unwinds and tears the cluster down.
 /// Hold the cluster open after a successful drive. The `ChainGuard` is still
 /// in scope (containers stay up), and we keep ticking the driver so SWIM stays
-/// converged and — when the dashboard is on — refresh the distribution
-/// snapshot each tick so the membership graph and message tallies update live.
+/// converged. The optional snapshot cache is retained for non-dashboard hold-loop
+/// refresh paths; dashboard panels are updated through datastream FleetView.
 /// Returns when the operator presses Enter or closes stdin (Ctrl-D).
 fn hold_open(cluster: &mut ClusterNode, dist_cached: Option<&SharedSnapshot>, port: Option<u16>) {
     match port {
@@ -1440,23 +1427,21 @@ fn run_vastai(args: &Args) -> i32 {
     let num_stages = cluster.num_stages;
     let label = cluster.label.clone();
 
-    // Build the dashboard handle/collector up front so the stats hook can be
-    // installed inside ClusterNode::new's customize_rt closure.
+    // Build the dashboard handle up front. Runtime stats/distribution panels are
+    // fed only by datastream updates folded through `wire_fleet_sink`.
     let dashboard = if std::env::var_os("PP_DASHBOARD").is_some() {
         let port: u16 = std::env::var("PP_DASHBOARD_PORT")
             .ok()
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(9090);
-        let collector = StatsCollector::new(RuntimeConfig::default().num_threads);
-        let handle = start_dashboard(DashboardConfig {
+        let handle = Arc::new(start_dashboard(DashboardConfig {
             port,
             ..Default::default()
-        });
-        Some((handle, collector, port))
+        }));
+        Some((handle, port))
     } else {
         None
     };
-    let stats_hook = dashboard.as_ref().map(|(_, c, _)| c.clone());
 
     let mut cluster_node = match ClusterNode::new(
         IrohDriverConfig {
@@ -1468,11 +1453,7 @@ fn run_vastai(args: &Args) -> i32 {
         },
         node_config(),
         inference_codec_registry(),
-        |rt| {
-            if let Some(hook) = stats_hook {
-                rt.set_stats_hook(hook);
-            }
-        },
+        |_| {},
     ) {
         Ok(c) => c,
         Err(e) => {
@@ -1546,50 +1527,29 @@ fn run_vastai(args: &Args) -> i32 {
     let rt = Arc::clone(&cluster_node.rt);
     let router = Arc::clone(&cluster_node.transport_router);
 
-    // Shared distribution snapshot cell, refreshed by the multi-prompt loop.
-    // The in-process plugins and the remote broadcaster both read this one
-    // cell, so it exists whenever the distribution view is wanted — even
-    // broadcast-only (no local dashboard). `None` when off so the loop skips
-    // the refresh.
+    // Shared distribution snapshot cell for prompt-loop refresh paths. The
+    // dashboard's Distribution plugin is datastream-backed via FleetView; this
+    // cache remains for existing loop bookkeeping and is skipped when off.
     let dist_cached: Option<SharedSnapshot> = if want_dist {
         Some(Arc::new(Mutex::new(Some(cluster_node.snapshot()))))
     } else {
         None
     };
 
-    // When the in-process dashboard is on, register the distribution + net map
-    // plugins ("Distribution"/"Netmap" nav tabs) against the shared cell.
-    if let (Some((handle, collector, port)), Some(cached)) = (&dashboard, &dist_cached) {
-        handle.set_runtime(Arc::clone(&rt), Arc::clone(collector));
-        handle.register_plugin(Arc::new(DistDashPlugin::new(Arc::clone(cached))));
-        // Net map plugin: a live connection/bandwidth graph. Shares the cached
-        // snapshot; a background poller keeps its transport map fresh by querying
-        // the iroh endpoint directly. The poller's stop flag rides the process
-        // lifetime (the driver's tokio runtime is torn down at end of run,
-        // aborting the task).
-        let conn_tracker = Arc::new(ConnTracker::default());
-        handle.register_plugin(Arc::new(NetmapPlugin::new(
-            Arc::clone(cached),
-            Arc::clone(&conn_tracker),
-        )));
-        let poll_stop = Arc::new(AtomicBool::new(false));
-        spawn_conn_poller(
-            &cluster_node.driver,
-            Arc::clone(cached),
-            conn_tracker,
-            poll_stop,
-        );
+    // When the in-process dashboard is on, register only datastream-backed
+    // plugins. FleetView updates fill both Fleet and Distribution caches.
+    if let Some((handle, port)) = &dashboard {
         // Fleet tab: the orchestrator-hosted datastream consumer. Each rented
         // stage resolves the `datastream-sink` actor and ships its telemetry
         // over the swactor transport; the actor folds them into a live FleetView
         // and serves the cross-node table. The returned address also receives
         // each booting node's SSH output (boot phase) and the orchestrator's own
         // frames, in-process.
-        fleet_sink_addr = wire_fleet_sink(&cluster_node, handle);
+        fleet_sink_addr = wire_fleet_sink(&cluster_node, Arc::clone(handle));
         handle.start_http(cluster_node.driver.tokio_handle());
         eprintln!(
             "pp-orchestrator: live dashboard on http://localhost:{port} \
-             (overview / actors / topology / distribution / netmap / fleet)"
+             (overview / actors / topology / distribution / fleet)"
         );
     }
 
@@ -1964,9 +1924,8 @@ fn run_vastai(args: &Args) -> i32 {
         // one-shot (neither set) keeps today's single-drive-then-exit behaviour.
         // Modeled on hold_open: a stdin-reader side thread feeds prompt lines
         // while the main thread pumps the driver (~200 ms) and refreshes the
-        // distribution snapshot so SWIM + the dashboard SSE stay live between
-        // prompts. EOF / blank line / `quit` leaves the loop, after which the
-        // existing finalize + teardown tail runs.
+        // distribution snapshot between prompts. Dashboard panels are fed by
+        // datastream FleetView updates; EOF / blank line / `quit` leaves the loop.
         if std::env::var_os("PP_DASHBOARD").is_some() || args.hold {
             prompt_loop(
                 &mut cluster_node,
@@ -1978,7 +1937,7 @@ fn run_vastai(args: &Args) -> i32 {
                 args.max_tokens,
                 drive_seq,
                 dist_cached.as_ref(),
-                dashboard.as_ref().map(|(_, _, p)| *p),
+                dashboard.as_ref().map(|(_, p)| *p),
             );
         }
 
