@@ -1,4 +1,3 @@
-mod root_page;
 mod server;
 mod store;
 pub mod swactor;

@@ -42,22 +42,98 @@ fn running_controller() -> ctl::GpuWorkerCtlHarness {
     harness
 }
 
+fn ring_layout() -> ctl::RingLayout {
+    ctl::RingLayout {
+        offset: 64,
+        byte_len: 4096,
+        header_bytes: 16,
+    }
+}
+
+fn object_spec() -> ctl::ObjectSpec {
+    ctl::ObjectSpec {
+        max_extent: 1024,
+        alignment: 8,
+        layout: ctl::ObjectLayout::Token,
+    }
+}
+
+fn install_ring_spec(ring_id: ctl::RingId, port: &str) -> ctl::InstallRing {
+    ctl::InstallRing {
+        generation: ctl::WorkerGeneration(1),
+        ring_id,
+        edge_id: ctl::EdgeId(7001),
+        port_id: ctl::PortId(port.into()),
+        direction: ctl::RingDirection::Ingress,
+        layout: ring_layout(),
+        object_spec: object_spec(),
+    }
+}
+
+fn execute_step_spec() -> ctl::ExecuteStep {
+    ctl::ExecuteStep {
+        generation: ctl::WorkerGeneration(1),
+        role_id: ctl::RoleId(3001),
+        step_id: ctl::StepId(9003),
+        inputs: vec![ctl::InputBinding {
+            port_id: ctl::PortId("in".into()),
+            object_id: ctl::ObjectId(5001),
+            sequence: ctl::Sequence(7),
+            device_handle: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
+        }],
+        outputs: vec![ctl::OutputBinding {
+            port_id: ctl::PortId("out".into()),
+            ring_id: ctl::RingId(8002),
+            object_id: ctl::ObjectId(5002),
+            sequence: ctl::Sequence(7),
+            extent: 128,
+            flags: 0,
+        }],
+        runtime: ctl::WorkerJson::empty(),
+        release_inputs_after: true,
+    }
+}
+
 // The command fixture carries identities and handles but no payload bytes. It
 // exercises all command families that should be serialized only while running.
 fn current_generation_commands() -> Vec<ctl::ActorCommand> {
     vec![
+        ctl::ActorCommand::ConfigureRole(ctl::ConfigureRole {
+            generation: ctl::WorkerGeneration(1),
+            role_id: ctl::RoleId(3001),
+            config: ctl::WorkerJson::empty(),
+        }),
         ctl::ActorCommand::InstallRing {
             generation: ctl::WorkerGeneration(1),
             ring_id: ctl::RingId(8001),
+        },
+        ctl::ActorCommand::InstallRingSpec(install_ring_spec(ctl::RingId(8002), "in")),
+        ctl::ActorCommand::RingReadable {
+            generation: ctl::WorkerGeneration(1),
+            ring_id: ctl::RingId(8001),
+        },
+        ctl::ActorCommand::RingWritable {
+            generation: ctl::WorkerGeneration(1),
+            ring_id: ctl::RingId(8002),
         },
         ctl::ActorCommand::ExecuteStep {
             generation: ctl::WorkerGeneration(1),
             step_id: ctl::StepId(9001),
             input: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
         },
+        ctl::ActorCommand::ExecuteStepSpec(execute_step_spec()),
         ctl::ActorCommand::ReleaseDeviceObject {
             generation: ctl::WorkerGeneration(1),
             handle: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
+        },
+        ctl::ActorCommand::UninstallRing(ctl::UninstallRing {
+            generation: ctl::WorkerGeneration(1),
+            ring_id: ctl::RingId(8002),
+            reason: ctl::UninstallReason::Reconfigure,
+        }),
+        ctl::ActorCommand::ShutdownWorker {
+            generation: ctl::WorkerGeneration(1),
+            mode: ctl::ShutdownMode::AbortInFlight,
         },
     ]
 }
@@ -138,12 +214,47 @@ fn command_routing_requires_running_current_generation_and_is_payload_free() {
     for command in harness.serialized_worker_commands() {
         match command {
             ctl::WorkerCommand::InitializeWorker { .. }
+            | ctl::WorkerCommand::ConfigureRole(_)
             | ctl::WorkerCommand::InstallRing { .. }
+            | ctl::WorkerCommand::InstallRingSpec(_)
+            | ctl::WorkerCommand::UninstallRing(_)
+            | ctl::WorkerCommand::RingReadable { .. }
+            | ctl::WorkerCommand::RingWritable { .. }
             | ctl::WorkerCommand::ExecuteStep { .. }
+            | ctl::WorkerCommand::ExecuteStepSpec(_)
             | ctl::WorkerCommand::ReleaseDeviceObject { .. }
             | ctl::WorkerCommand::ShutdownWorker { .. } => {}
         }
     }
+
+    assert!(harness.serialized_worker_commands().iter().any(|command| {
+        matches!(
+            command,
+            ctl::WorkerCommand::InstallRingSpec(install)
+                if install.edge_id == ctl::EdgeId(7001)
+                    && install.port_id == ctl::PortId("in".into())
+                    && install.layout == ring_layout()
+                    && install.object_spec == object_spec()
+        )
+    }));
+    assert!(harness.serialized_worker_commands().iter().any(|command| {
+        matches!(
+            command,
+            ctl::WorkerCommand::ExecuteStepSpec(step)
+                if step.role_id == ctl::RoleId(3001)
+                    && step.inputs.len() == 1
+                    && step.outputs.len() == 1
+                    && step.release_inputs_after
+        )
+    }));
+    assert!(harness.serialized_worker_commands().iter().any(|command| {
+        matches!(
+            command,
+            ctl::WorkerCommand::ShutdownWorker {
+                mode: ctl::ShutdownMode::AbortInFlight
+            }
+        )
+    }));
 
     // Old-generation handles must be rejected after restart.
     harness.observe(ctl::WorkerCtlEvent::RestartRequested);
@@ -204,6 +315,58 @@ fn parsed_worker_events_route_to_their_control_owners() {
     harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
         ctl::WorkerEvent::RingReadable {
             ring_id: ctl::RingId(8001),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::RingInstalledForEdge {
+            ring_id: ctl::RingId(8002),
+            edge_id: ctl::EdgeId(7001),
+            port_id: ctl::PortId("in".into()),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::ObjectLoadedFromRing {
+            ring_id: ctl::RingId(8001),
+            edge_id: ctl::EdgeId(7001),
+            port_id: ctl::PortId("in".into()),
+            object_id: ctl::ObjectId(9000),
+            sequence: ctl::Sequence(0),
+            extent: 128,
+            device_handle: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::ObjectProducedToRing {
+            ring_id: ctl::RingId(8002),
+            edge_id: ctl::EdgeId(7001),
+            port_id: ctl::PortId("out".into()),
+            object_id: ctl::ObjectId(9001),
+            sequence: ctl::Sequence(0),
+            extent: 128,
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::StepCompletedForRole {
+            role_id: ctl::RoleId(3001),
+            step_id: ctl::StepId(77),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::DeviceObjectReleased {
+            device_handle: ctl::DeviceHandle::new(ctl::WorkerGeneration(1), 42),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::WorkerReady {
+            pid: ctl::ProcessId(1234),
+            generation: ctl::WorkerGeneration(1),
+            ring_helper_abi: 1,
+            backend: ctl::WorkerJson::empty(),
+        },
+    ));
+    harness.observe(ctl::WorkerCtlEvent::StdoutEvent(
+        ctl::WorkerEvent::WorkerFatal {
+            reason: ctl::WorkerFatalReason::ProtocolViolation,
         },
     ));
 

@@ -10,9 +10,6 @@ pub mod spawn;
 pub mod types;
 pub mod yaml;
 
-#[cfg(feature = "ssh")]
-pub mod ssh;
-
 pub use action::{OutputStream, ProcessAction};
 pub use actor::ProcessActor;
 pub use event::ProcessEvent;
@@ -29,8 +26,3 @@ pub use types::{
     EventQueue, ExitStatus, FlowControl, ProcessDriver, ProcessError, ProcessMode, ProcessSpec,
     ProcessWaker, PtySize, Signal,
 };
-
-#[cfg(feature = "ssh")]
-pub use spawn::spawn_ssh_process;
-#[cfg(feature = "ssh")]
-pub use ssh::{SshConfig, SshDriver};

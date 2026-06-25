@@ -14,7 +14,6 @@ pub mod node_image;
 pub mod planner;
 pub mod pool;
 pub mod roles;
-#[cfg(feature = "local-e2e")]
 pub mod runtime_stack;
 pub mod workload;
 
@@ -34,6 +33,5 @@ pub use pool::{
     ResourceRequest, StaticPoolProvider,
 };
 pub use roles::{CoordinatorAssignment, RoleAssignment, RoleKind, StageAssignment};
-#[cfg(feature = "local-e2e")]
 pub use runtime_stack::{RuntimeNode, RuntimeNodeConfig, RuntimeNodeError};
 pub use workload::WorkloadAdapter;

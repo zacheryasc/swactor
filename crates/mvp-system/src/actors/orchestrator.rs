@@ -67,6 +67,22 @@ pub enum EndpointKindWire {
     TokenOut,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SamplingDataWire {
+    pub source_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenObjectPayloadWire {
+    Prompt {
+        tokens: Vec<u32>,
+    },
+    Decode {
+        token_id: u32,
+        sampling: SamplingDataWire,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RunCommandWire {
     ProvisionStage {
@@ -80,13 +96,10 @@ pub enum RunCommandWire {
     CreateTokenOutEndpoint {
         run_id: u64,
     },
-    InjectPrompt {
+    InjectTokenObject {
         run_id: u64,
         sequence: u64,
-        prompt: Vec<u32>,
-    },
-    BroadcastStart {
-        run_id: u64,
+        payload: TokenObjectPayloadWire,
     },
     StopRun {
         run_id: u64,
@@ -102,6 +115,7 @@ pub enum LifecycleEventWire {
     RunRejected { run_id: u64 },
     RunFaulted { run_id: u64 },
     RunCompleted { run_id: u64 },
+    RunOperatorStopped { run_id: u64 },
     RunTornDown { run_id: u64 },
 }
 
@@ -282,18 +296,11 @@ impl From<&core::RunCommand> for RunCommandWire {
             core::RunCommand::CreateTokenOutEndpoint { run_id } => {
                 Self::CreateTokenOutEndpoint { run_id: run_id.0 }
             }
-            core::RunCommand::InjectPrompt {
-                run_id,
-                sequence,
-                prompt,
-            } => Self::InjectPrompt {
+            core::RunCommand::InjectTokenObject { run_id, object } => Self::InjectTokenObject {
                 run_id: run_id.0,
-                sequence: *sequence,
-                prompt: prompt.clone(),
+                sequence: object.sequence,
+                payload: (&object.payload).into(),
             },
-            core::RunCommand::BroadcastStart { run_id } => {
-                Self::BroadcastStart { run_id: run_id.0 }
-            }
             core::RunCommand::StopRun {
                 run_id,
                 stage_index,
@@ -320,6 +327,9 @@ impl From<&core::LifecycleEvent> for LifecycleEventWire {
             core::LifecycleEvent::RunCompleted { run_id } => {
                 Self::RunCompleted { run_id: run_id.0 }
             }
+            core::LifecycleEvent::RunOperatorStopped { run_id } => {
+                Self::RunOperatorStopped { run_id: run_id.0 }
+            }
             core::LifecycleEvent::RunTornDown { run_id } => Self::RunTornDown { run_id: run_id.0 },
         }
     }
@@ -328,4 +338,20 @@ impl From<&core::LifecycleEvent> for LifecycleEventWire {
 pub fn register_codecs(registry: &mut CodecRegistry) {
     registry.register::<OrchestratorMsg, _>(JsonCodec::<OrchestratorMsg>::default());
     registry.register::<OrchestratorReport, _>(JsonCodec::<OrchestratorReport>::default());
+}
+
+impl From<&core::TokenObjectPayload> for TokenObjectPayloadWire {
+    fn from(payload: &core::TokenObjectPayload) -> Self {
+        match payload {
+            core::TokenObjectPayload::Prompt { tokens } => Self::Prompt {
+                tokens: tokens.clone(),
+            },
+            core::TokenObjectPayload::Decode { token_id, sampling } => Self::Decode {
+                token_id: *token_id,
+                sampling: SamplingDataWire {
+                    source_sequence: sampling.source_sequence,
+                },
+            },
+        }
+    }
 }

@@ -10,6 +10,171 @@ pub struct RingId(pub u64);
 pub struct StepId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RoleId(pub u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EdgeId(pub u64);
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PortId(pub String);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Sequence(pub u64);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerJson {
+    Null,
+    Bool(bool),
+    Number(i64),
+    String(String),
+    Array(Vec<WorkerJson>),
+    Object(std::collections::BTreeMap<String, WorkerJson>),
+}
+
+impl WorkerJson {
+    pub fn empty() -> Self {
+        Self::Object(std::collections::BTreeMap::new())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingDirection {
+    Ingress,
+    Egress,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObjectLayout {
+    Token,
+    Tensor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RingLayout {
+    pub offset: u64,
+    pub byte_len: u64,
+    pub header_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectSpec {
+    pub max_extent: u64,
+    pub alignment: u64,
+    pub layout: ObjectLayout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UninstallReason {
+    Reconfigure,
+    Shutdown,
+    Fault,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownMode {
+    Graceful,
+    AbortInFlight,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConfigureRole {
+    pub generation: WorkerGeneration,
+    pub role_id: RoleId,
+    pub config: WorkerJson,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InstallRing {
+    pub generation: WorkerGeneration,
+    pub ring_id: RingId,
+    pub edge_id: EdgeId,
+    pub port_id: PortId,
+    pub direction: RingDirection,
+    pub layout: RingLayout,
+    pub object_spec: ObjectSpec,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UninstallRing {
+    pub generation: WorkerGeneration,
+    pub ring_id: RingId,
+    pub reason: UninstallReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InputBinding {
+    pub port_id: PortId,
+    pub object_id: ObjectId,
+    pub sequence: Sequence,
+    pub device_handle: DeviceHandle,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputBinding {
+    pub port_id: PortId,
+    pub ring_id: RingId,
+    pub object_id: ObjectId,
+    pub sequence: Sequence,
+    pub extent: u64,
+    pub flags: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecuteStep {
+    pub generation: WorkerGeneration,
+    pub role_id: RoleId,
+    pub step_id: StepId,
+    pub inputs: Vec<InputBinding>,
+    pub outputs: Vec<OutputBinding>,
+    pub runtime: WorkerJson,
+    pub release_inputs_after: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerFatalReason {
+    UnsupportedHelperAbi,
+    BackendInitializationFailed,
+    ProtocolViolation,
+    RoleUnavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkerStoppedReason {
+    Graceful,
+    AbortInFlight,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleFailure {
+    InvalidConfig,
+    BackendRejected,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RingFaultReason {
+    HelperFailed,
+    InvalidLayout,
+    WorkerCrashed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectFailure {
+    InvalidRecord,
+    DeviceCopyFailed,
+    RingFaulted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StepFailure {
+    RoleUnavailable,
+    InvalidInputHandle,
+    RuntimeFailed,
+    OutputValidationFailed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReleaseFailure {
+    UnknownHandle,
+    InUse,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceHandle {
@@ -47,7 +212,18 @@ pub struct WorkerConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ActorCommand {
+    ConfigureRole(ConfigureRole),
     InstallRing {
+        generation: WorkerGeneration,
+        ring_id: RingId,
+    },
+    InstallRingSpec(InstallRing),
+    UninstallRing(UninstallRing),
+    RingReadable {
+        generation: WorkerGeneration,
+        ring_id: RingId,
+    },
+    RingWritable {
         generation: WorkerGeneration,
         ring_id: RingId,
     },
@@ -56,9 +232,14 @@ pub enum ActorCommand {
         step_id: StepId,
         input: DeviceHandle,
     },
+    ExecuteStepSpec(ExecuteStep),
     ReleaseDeviceObject {
         generation: WorkerGeneration,
         handle: DeviceHandle,
+    },
+    ShutdownWorker {
+        generation: WorkerGeneration,
+        mode: ShutdownMode,
     },
 }
 
@@ -67,26 +248,127 @@ pub enum WorkerCommand {
     InitializeWorker {
         generation: WorkerGeneration,
     },
+    ConfigureRole(ConfigureRole),
     InstallRing {
+        ring_id: RingId,
+    },
+    InstallRingSpec(InstallRing),
+    UninstallRing(UninstallRing),
+    RingReadable {
+        ring_id: RingId,
+    },
+    RingWritable {
         ring_id: RingId,
     },
     ExecuteStep {
         step_id: StepId,
         input: DeviceHandle,
     },
+    ExecuteStepSpec(ExecuteStep),
     ReleaseDeviceObject {
         handle: DeviceHandle,
     },
-    ShutdownWorker,
+    ShutdownWorker {
+        mode: ShutdownMode,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkerEvent {
-    RingInstalled { ring_id: RingId },
-    ObjectLoaded { object_id: ObjectId, sequence: u64 },
-    ObjectProduced { object_id: ObjectId, sequence: u64 },
-    StepCompleted { step_id: StepId },
-    RingReadable { ring_id: RingId },
+    WorkerReady {
+        pid: ProcessId,
+        generation: WorkerGeneration,
+        ring_helper_abi: u16,
+        backend: WorkerJson,
+    },
+    WorkerFatal {
+        reason: WorkerFatalReason,
+    },
+    WorkerStopped {
+        reason: WorkerStoppedReason,
+    },
+    RoleConfigured {
+        role_id: RoleId,
+    },
+    RoleFailed {
+        role_id: RoleId,
+        reason: RoleFailure,
+    },
+    RingInstalled {
+        ring_id: RingId,
+    },
+    RingInstalledForEdge {
+        ring_id: RingId,
+        edge_id: EdgeId,
+        port_id: PortId,
+    },
+    RingFault {
+        ring_id: RingId,
+        edge_id: EdgeId,
+        port_id: PortId,
+        reason: RingFaultReason,
+    },
+    RingQuiesced {
+        ring_id: RingId,
+    },
+    ObjectLoaded {
+        object_id: ObjectId,
+        sequence: u64,
+    },
+    ObjectLoadedFromRing {
+        ring_id: RingId,
+        edge_id: EdgeId,
+        port_id: PortId,
+        object_id: ObjectId,
+        sequence: Sequence,
+        extent: u64,
+        device_handle: DeviceHandle,
+    },
+    ObjectProduced {
+        object_id: ObjectId,
+        sequence: u64,
+    },
+    ObjectProducedToRing {
+        ring_id: RingId,
+        edge_id: EdgeId,
+        port_id: PortId,
+        object_id: ObjectId,
+        sequence: Sequence,
+        extent: u64,
+    },
+    ObjectFailed {
+        ring_id: RingId,
+        edge_id: EdgeId,
+        port_id: PortId,
+        object_id: Option<ObjectId>,
+        sequence: Option<Sequence>,
+        reason: ObjectFailure,
+    },
+    StepCompleted {
+        step_id: StepId,
+    },
+    StepCompletedForRole {
+        role_id: RoleId,
+        step_id: StepId,
+    },
+    StepFailed {
+        role_id: RoleId,
+        step_id: StepId,
+        reason: StepFailure,
+    },
+    DeviceObjectReleased {
+        device_handle: DeviceHandle,
+    },
+    ReleaseFailed {
+        device_handle: DeviceHandle,
+        reason: ReleaseFailure,
+    },
+    RingReadable {
+        ring_id: RingId,
+    },
+    RingWritable {
+        ring_id: RingId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,10 +557,17 @@ impl GpuWorkerCtl {
             });
             return;
         }
-        let command_generation = match command {
+        let command_generation = match &command {
+            ActorCommand::ConfigureRole(configure) => configure.generation,
             ActorCommand::InstallRing { generation, .. }
+            | ActorCommand::RingReadable { generation, .. }
+            | ActorCommand::RingWritable { generation, .. }
             | ActorCommand::ExecuteStep { generation, .. }
-            | ActorCommand::ReleaseDeviceObject { generation, .. } => generation,
+            | ActorCommand::ReleaseDeviceObject { generation, .. }
+            | ActorCommand::ShutdownWorker { generation, .. } => *generation,
+            ActorCommand::InstallRingSpec(install) => install.generation,
+            ActorCommand::UninstallRing(uninstall) => uninstall.generation,
+            ActorCommand::ExecuteStepSpec(step) => step.generation,
         };
         if command_generation != self.current_generation {
             self.events.push(WorkerCtlOut::CommandRejected {
@@ -287,9 +576,31 @@ impl GpuWorkerCtl {
             return;
         }
         match command {
+            ActorCommand::ConfigureRole(configure) => {
+                self.serialized
+                    .push(WorkerCommand::ConfigureRole(configure));
+            }
             ActorCommand::InstallRing { ring_id, .. } => {
                 self.installed_rings.insert(ring_id);
                 self.serialized.push(WorkerCommand::InstallRing { ring_id });
+            }
+            ActorCommand::InstallRingSpec(install) => {
+                self.installed_rings.insert(install.ring_id);
+                self.serialized
+                    .push(WorkerCommand::InstallRingSpec(install));
+            }
+            ActorCommand::UninstallRing(uninstall) => {
+                self.installed_rings.remove(&uninstall.ring_id);
+                self.serialized
+                    .push(WorkerCommand::UninstallRing(uninstall));
+            }
+            ActorCommand::RingReadable { ring_id, .. } => {
+                self.serialized
+                    .push(WorkerCommand::RingReadable { ring_id });
+            }
+            ActorCommand::RingWritable { ring_id, .. } => {
+                self.serialized
+                    .push(WorkerCommand::RingWritable { ring_id });
             }
             ActorCommand::ExecuteStep { step_id, input, .. } => {
                 if input.generation != self.current_generation {
@@ -299,6 +610,19 @@ impl GpuWorkerCtl {
                 } else {
                     self.serialized
                         .push(WorkerCommand::ExecuteStep { step_id, input });
+                }
+            }
+            ActorCommand::ExecuteStepSpec(step) => {
+                if step
+                    .inputs
+                    .iter()
+                    .any(|input| input.device_handle.generation != self.current_generation)
+                {
+                    self.events.push(WorkerCtlOut::CommandRejected {
+                        reason: CommandRejection::OldGenerationHandle,
+                    });
+                } else {
+                    self.serialized.push(WorkerCommand::ExecuteStepSpec(step));
                 }
             }
             ActorCommand::ReleaseDeviceObject { handle, .. } => {
@@ -311,20 +635,41 @@ impl GpuWorkerCtl {
                         .push(WorkerCommand::ReleaseDeviceObject { handle });
                 }
             }
+            ActorCommand::ShutdownWorker { mode, .. } => {
+                self.serialized.push(WorkerCommand::ShutdownWorker { mode });
+                self.state = CtlState::ShuttingDown;
+            }
         }
     }
 
     fn route(&mut self, event: WorkerEvent) {
         match event.clone() {
-            WorkerEvent::RingInstalled { .. } => {
+            WorkerEvent::RingInstalled { .. }
+            | WorkerEvent::RingInstalledForEdge { .. }
+            | WorkerEvent::RingFault { .. }
+            | WorkerEvent::RingQuiesced { .. } => {
                 self.routed.push(RoutedEvent::ToEdgeEstablisher(event))
             }
-            WorkerEvent::ObjectLoaded { .. } => self.routed.push(RoutedEvent::ToRxOrRole(event)),
-            WorkerEvent::ObjectProduced { .. } => self.routed.push(RoutedEvent::ToTxOrRole(event)),
-            WorkerEvent::StepCompleted { .. } => {
+            WorkerEvent::ObjectLoaded { .. }
+            | WorkerEvent::ObjectLoadedFromRing { .. }
+            | WorkerEvent::ObjectFailed { .. } => self.routed.push(RoutedEvent::ToRxOrRole(event)),
+            WorkerEvent::ObjectProduced { .. } | WorkerEvent::ObjectProducedToRing { .. } => {
+                self.routed.push(RoutedEvent::ToTxOrRole(event))
+            }
+            WorkerEvent::StepCompleted { .. }
+            | WorkerEvent::StepCompletedForRole { .. }
+            | WorkerEvent::StepFailed { .. }
+            | WorkerEvent::RoleConfigured { .. }
+            | WorkerEvent::RoleFailed { .. } => {
                 self.routed.push(RoutedEvent::ToStageController(event))
             }
-            WorkerEvent::RingReadable { .. } => {
+            WorkerEvent::RingReadable { .. }
+            | WorkerEvent::RingWritable { .. }
+            | WorkerEvent::DeviceObjectReleased { .. }
+            | WorkerEvent::ReleaseFailed { .. }
+            | WorkerEvent::WorkerReady { .. }
+            | WorkerEvent::WorkerFatal { .. }
+            | WorkerEvent::WorkerStopped { .. } => {
                 self.routed.push(RoutedEvent::ToDriverOrWorkerSide(event))
             }
         }
@@ -366,7 +711,9 @@ impl GpuWorkerCtl {
 
     fn shutdown(&mut self) {
         if self.state == CtlState::Running {
-            self.serialized.push(WorkerCommand::ShutdownWorker);
+            self.serialized.push(WorkerCommand::ShutdownWorker {
+                mode: ShutdownMode::Graceful,
+            });
             self.state = CtlState::ShuttingDown;
         }
     }

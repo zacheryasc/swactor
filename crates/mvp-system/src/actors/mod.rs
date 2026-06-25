@@ -7,9 +7,11 @@
 pub mod codec;
 pub mod node_agent;
 pub mod orchestrator;
+pub mod provisioner;
 pub mod stage_controller;
 
 pub fn register_mvp_actor_codecs(registry: &mut swactor_transport::CodecRegistry) {
     node_agent::register_codecs(registry);
     orchestrator::register_codecs(registry);
+    provisioner::register_codecs(registry);
 }

@@ -250,13 +250,27 @@ fn driver_ready_marks_local_edge_actor_ready() {
 }
 
 // This proves StopEdge cancels queued leases, stops pumps, uninstalls worker
-// rings, releases arena lease only after proof, and makes Stopped terminal.
+// rings, releases arena lease only after pump stop, worker-ring quiescence, and
+// quiescence proof, and makes Stopped terminal.
 #[test]
 fn stop_edge_tears_down_local_state_and_terminal_stopped_ignores_late_events() {
     // Drive an edge to ready.
     let mut harness = leased_and_installed_tx();
     harness.observe(edge::EdgeEvent::DriverEdgeReady {
         edge_id: edge::EdgeId(7001),
+    });
+
+    // Pre-stop proof-like events are stale for teardown and must not satisfy
+    // the later release gate.
+    harness.observe(edge::EdgeEvent::QuiescenceProven {
+        ring_id: edge::RingId(8001),
+    });
+    harness.observe(edge::EdgeEvent::RingQuiesced {
+        ring_id: edge::RingId(8001),
+    });
+    harness.observe(edge::EdgeEvent::PumpStopped {
+        edge_id: edge::EdgeId(7001),
+        ring_id: edge::RingId(8001),
     });
 
     // Stop the edge.
@@ -284,7 +298,8 @@ fn stop_edge_tears_down_local_state_and_terminal_stopped_ignores_late_events() {
             .any(|command| { matches!(command, edge::EdgeCommand::UninstallWorkerRing { .. }) })
     );
 
-    // Arena release is withheld until quiescence proof arrives.
+    // Quiescence proof alone must not release the arena while the pump may
+    // still write and the worker still owns the ring.
     assert!(
         !harness
             .commands()
@@ -292,6 +307,28 @@ fn stop_edge_tears_down_local_state_and_terminal_stopped_ignores_late_events() {
             .any(|command| { matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }) })
     );
     harness.observe(edge::EdgeEvent::QuiescenceProven {
+        ring_id: edge::RingId(8001),
+    });
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }) })
+    );
+
+    // Pump stop plus proof is still insufficient until the worker ring is
+    // quiesced.
+    harness.observe(edge::EdgeEvent::PumpStopped {
+        edge_id: edge::EdgeId(7001),
+        ring_id: edge::RingId(8001),
+    });
+    assert!(
+        !harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }) })
+    );
+    harness.observe(edge::EdgeEvent::RingQuiesced {
         ring_id: edge::RingId(8001),
     });
     assert!(harness.commands().iter().any(|command| {
@@ -304,6 +341,86 @@ fn stop_edge_tears_down_local_state_and_terminal_stopped_ignores_late_events() {
         )
     }));
 
+    // Ring quiescence must not independently release either, and pump stop plus
+    // ring quiescence is still insufficient until the aggregate proof arrives.
+    let mut ring_first = leased_and_installed_tx();
+    ring_first.observe(edge::EdgeEvent::DriverEdgeReady {
+        edge_id: edge::EdgeId(7001),
+    });
+    ring_first.observe(edge::EdgeEvent::StopEdge {
+        edge_id: edge::EdgeId(7001),
+    });
+    ring_first.observe(edge::EdgeEvent::RingQuiesced {
+        ring_id: edge::RingId(8001),
+    });
+    assert!(
+        !ring_first
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }) })
+    );
+    ring_first.observe(edge::EdgeEvent::PumpStopped {
+        edge_id: edge::EdgeId(7001),
+        ring_id: edge::RingId(8001),
+    });
+    assert!(
+        !ring_first
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }) })
+    );
+    ring_first.observe(edge::EdgeEvent::QuiescenceProven {
+        ring_id: edge::RingId(8001),
+    });
+    assert!(ring_first.commands().iter().any(|command| {
+        matches!(
+            command,
+            edge::EdgeCommand::ReleaseArenaLease {
+                ring_id: edge::RingId(8001),
+                ..
+            }
+        )
+    }));
+
+    // If StopEdge races with worker installation before RingInstalled, the
+    // lease is still withheld until worker cleanup and proof complete.
+    let mut install_in_flight = new_establisher();
+    install_in_flight.observe(edge::EdgeEvent::ProvisionTx(tx_provision()));
+    install_in_flight.observe(edge::EdgeEvent::RingLeased {
+        request_id: edge::LeaseRequestId(1),
+        ring_id: edge::RingId(8001),
+        layout: edge::RingLayout::test_layout(0),
+    });
+    install_in_flight.observe(edge::EdgeEvent::StopEdge {
+        edge_id: edge::EdgeId(7001),
+    });
+    assert!(
+        install_in_flight
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::UninstallWorkerRing { .. }) })
+    );
+    assert!(
+        !install_in_flight
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, edge::EdgeCommand::ReleaseArenaLease { .. }) })
+    );
+    install_in_flight.observe(edge::EdgeEvent::RingQuiesced {
+        ring_id: edge::RingId(8001),
+    });
+    install_in_flight.observe(edge::EdgeEvent::QuiescenceProven {
+        ring_id: edge::RingId(8001),
+    });
+    assert!(install_in_flight.commands().iter().any(|command| {
+        matches!(
+            command,
+            edge::EdgeCommand::ReleaseArenaLease {
+                ring_id: edge::RingId(8001),
+                ..
+            }
+        )
+    }));
     // Stopped is terminal: later stale events cannot revive readiness.
     harness.observe(edge::EdgeEvent::Stopped {
         edge_id: edge::EdgeId(7001),

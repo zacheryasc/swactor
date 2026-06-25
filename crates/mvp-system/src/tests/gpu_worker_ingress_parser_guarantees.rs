@@ -45,6 +45,18 @@ fn valid_record(sequence: u64, extent: u64) -> Vec<u8> {
         .encode()
 }
 
+fn flagged_record(sequence: u64, extent: u64) -> Vec<u8> {
+    ingress::ObjectRecordBuilder::new(ingress_ring().object_spec)
+        .object_id(ingress::ObjectId(9000 + sequence))
+        .sequence(sequence)
+        .extent(extent)
+        .flags(ingress::ObjectFlags {
+            end_of_sequence: true,
+        })
+        .payload(vec![7; extent as usize])
+        .encode()
+}
+
 // This helper installs the ingress ring through the public command path.
 fn installed_parser() -> ingress::IngressParserHarness {
     let mut harness = new_parser();
@@ -134,12 +146,30 @@ fn header_validation_rejects_invalid_object_records() {
             matches!(
                 event,
                 ingress::WorkerIngressOut::ObjectFailed {
+                    edge_id: ingress::EdgeId(7001),
+                    port_id,
                     reason,
                     ..
-                } if *reason == expected_reason
+                } if port_id == &ingress::PortId("in".into()) && *reason == expected_reason
             )
         }));
     }
+}
+
+#[test]
+fn parser_decodes_and_propagates_object_header_flags() {
+    let record = flagged_record(0, 8);
+    let parsed = ingress::read_object_record(&record, ingress_ring().object_spec, true)
+        .expect("flagged record parses");
+    let ingress::ObjectRecordRead::Complete(parsed) = parsed else {
+        panic!("record must be complete");
+    };
+    assert_eq!(
+        parsed.flags,
+        ingress::ObjectFlags {
+            end_of_sequence: true
+        }
+    );
 }
 
 // This proves the parser copies exactly extent payload bytes to device memory,
@@ -268,9 +298,13 @@ fn sequence_and_device_failures_fault_and_ring_fault_stops_consumption() {
         matches!(
             event,
             ingress::WorkerIngressOut::ObjectFailed {
+                edge_id: ingress::EdgeId(7001),
+                port_id,
+                object_id: Some(ingress::ObjectId(9000)),
+                sequence: Some(0),
                 reason: ingress::ObjectFailureReason::SequenceViolation,
                 ..
-            }
+            } if port_id == &ingress::PortId("in".into())
         )
     }));
 

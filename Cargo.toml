@@ -8,6 +8,7 @@ members = [
     "crates/distribution",
     "crates/iroh-driver",
     "crates/datastream",
+    "crates/dashboard",
     "crates/mvp-system",
     "xtask",
     "tools/vastai",
@@ -51,5 +52,4 @@ parking_lot = "0.12"
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
 proptest-state-machine = "0.3"
-mvp-system = { path = "crates/mvp-system" }
 

@@ -23,6 +23,7 @@ pub struct WorkerGeneration(pub u64);
 pub enum EventKind {
     NodeStarted,
     NodeAvailable,
+    NodeFaulted,
     PoolReady,
     RunPlanned,
     StageProvisionStarted,
@@ -64,7 +65,49 @@ pub enum Component {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FaultReason {
+    NodeUnavailable,
+    MembershipLoss,
+    ProvisioningRejected,
+    ArenaBootFailed,
+    OversizedRingRequest,
+    PressureTimeout,
+    WeightLifecycleFailed,
+    EdgeEstablishmentFailed,
+    MalformedObjectHeader,
+    EofMidObject,
+    StreamFault,
+    PumpFailure,
+    RingFault,
+    WorkerFatal,
     WorkerCrashed,
+    DeviceOutOfMemory,
+    DeviceCopyFailed,
+    SequenceViolation,
+    StepFailed,
+    TeardownTimeout,
+    UnsupportedRingVersion,
+    RingLayoutInvalid,
+    RingStateInvalid,
+    WorkerProcessExited,
+    WorkerShuttingDown,
+    WorkerInternal,
+    UnsupportedObjectVersion,
+    ExtentExceedsMax,
+    ExtentAlignmentInvalid,
+    DeviceAllocationFailed,
+    RoleUnavailable,
+    InvalidInputHandle,
+    InvalidOutputRing,
+    TinygradError,
+    OutputExtentInvalid,
+    OutputCopyFailed,
+    ArenaMapFailed,
+    RingHelperAbiMismatch,
+    BackendInitFailed,
+    MalformedControlMessage,
+    UnhandledException,
+    EdgeStopped,
+    WorkerShutdown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +121,11 @@ pub enum Event {
     NodeScoped {
         kind: EventKind,
         node_id: NodeId,
+        component: Component,
+    },
+    NodeFaulted {
+        node_id: NodeId,
+        reason: FaultReason,
         component: Component,
     },
     StageScoped {
@@ -126,6 +174,7 @@ impl Event {
             | Event::ObjectScoped { kind, .. }
             | Event::StepScoped { kind, .. }
             | Event::WorkerScoped { kind, .. } => *kind,
+            Event::NodeFaulted { .. } => EventKind::NodeFaulted,
         }
     }
 }
@@ -157,6 +206,20 @@ impl TraceBuilder {
             kind: EventKind::NodeAvailable,
             node_id,
             component: Component::NodeBoot,
+        });
+        self
+    }
+
+    pub fn node_faulted(
+        mut self,
+        node_id: NodeId,
+        reason: FaultReason,
+        component: Component,
+    ) -> Self {
+        self.events.push(Event::NodeFaulted {
+            node_id,
+            reason,
+            component,
         });
         self
     }

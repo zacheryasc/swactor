@@ -88,10 +88,14 @@ fn output_admission_requires_installed_ring_and_explicit_binding() {
 #[test]
 fn header_is_written_and_committed_before_payload() {
     // Start one egress output.
+    let mut output = output_binding(0, 8);
+    output.flags = egress::ObjectFlags {
+        end_of_sequence: true,
+    };
     let mut harness = installed_producer();
     harness.observe(egress::WorkerEgressEvent::ExecuteStep {
         step_id: egress::StepId(77),
-        outputs: vec![output_binding(0, 8)],
+        outputs: vec![output],
     });
 
     // Complete header production but not payload copy.
@@ -102,9 +106,19 @@ fn header_is_written_and_committed_before_payload() {
     // The committed prefix must decode as a header for the configured spec.
     let committed = harness.committed_bytes(egress::RingId(8002));
     let header = egress::ObjectHeader::decode(committed).expect("header must decode");
+    assert_eq!(header.magic, egress::OBJECT_MAGIC);
+    assert_eq!(header.version, egress::OBJECT_VERSION);
+    assert_eq!(header.header_len as usize, egress::HEADER_LEN);
     assert_eq!(header.object_id, egress::ObjectId(9000));
     assert_eq!(header.sequence, 0);
     assert_eq!(header.extent, 8);
+    assert_eq!(
+        header.flags,
+        egress::ObjectFlags {
+            end_of_sequence: true
+        }
+    );
+    assert_eq!(header.reserved, 0);
 
     // Payload bytes are not committed before the payload copy is valid.
     assert_eq!(harness.committed_payload_bytes(egress::RingId(8002)), 0);

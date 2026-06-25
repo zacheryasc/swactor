@@ -55,6 +55,16 @@ fn written_bytes(harness: &driver::DriverHarness, edge_id: driver::EdgeId) -> Ve
         .collect()
 }
 
+// Wake hints are scheduler nudges only: they identify the ring to reload and
+// intentionally carry no edge identity, byte count, or byte range.
+fn assert_wake_is_payload_free(wake: &driver::WakeHint, expected_ring_id: driver::RingId) {
+    match wake {
+        driver::WakeHint::RingReadable { ring_id } | driver::WakeHint::RingWritable { ring_id } => {
+            assert_eq!(*ring_id, expected_ring_id);
+        }
+    }
+}
+
 // This proves the driver owns endpoint, connection cache, ALPN, stream demux,
 // and send/recv pump tasks, while actors do not poll stream futures directly.
 #[test]
@@ -108,14 +118,14 @@ fn send_stream_is_persistent_with_single_edge_preamble() {
         bytes: b"obj0".to_vec(),
     });
     harness.observe(driver::DriverEvent::RingReadable {
-        edge_id: driver::EdgeId(7001),
+        ring_id: driver::RingId(1),
     });
     harness.observe(driver::DriverEvent::EgressBytesCommitted {
         edge_id: driver::EdgeId(7001),
         bytes: b"obj1".to_vec(),
     });
     harness.observe(driver::DriverEvent::RingReadable {
-        edge_id: driver::EdgeId(7001),
+        ring_id: driver::RingId(1),
     });
 
     // Only one stream is opened for the edge.
@@ -193,14 +203,12 @@ fn recv_pump_copies_bytes_without_parsing_and_respects_backpressure() {
     // The public driver event enum has no object-header event; object parsing
     // belongs to the worker ingress parser, not the recv pump.
     assert!(harness.ring_commit(driver::EdgeId(7001)) > 0);
-    assert!(harness.wake_hints().iter().any(|wake| {
-        matches!(
-            wake,
-            driver::WakeHint::RingReadable {
-                edge_id: driver::EdgeId(7001)
-            }
-        )
-    }));
+    let readable_wake = harness
+        .wake_hints()
+        .iter()
+        .find(|wake| matches!(wake, driver::WakeHint::RingReadable { .. }))
+        .expect("recv pump must emit an ingress-ring readable wake");
+    assert_wake_is_payload_free(readable_wake, driver::RingId(2));
 
     // With no ring space, the pump stops reading and waits for RingWritable.
     harness.observe(driver::DriverEvent::IngressRingFull {
@@ -208,7 +216,7 @@ fn recv_pump_copies_bytes_without_parsing_and_respects_backpressure() {
     });
     assert!(!harness.is_reading_stream(driver::EdgeId(7001)));
     harness.observe(driver::DriverEvent::RingWritable {
-        edge_id: driver::EdgeId(7001),
+        ring_id: driver::RingId(2),
     });
     assert!(harness.is_reading_stream(driver::EdgeId(7001)));
 }
@@ -238,14 +246,12 @@ fn send_pump_advances_consume_only_after_write_acceptance() {
         byte_count: 7,
     });
     assert_eq!(harness.ring_consume(driver::EdgeId(7001)), 7);
-    assert!(harness.wake_hints().iter().any(|wake| {
-        matches!(
-            wake,
-            driver::WakeHint::RingWritable {
-                edge_id: driver::EdgeId(7001)
-            }
-        )
-    }));
+    let writable_wake = harness
+        .wake_hints()
+        .iter()
+        .find(|wake| matches!(wake, driver::WakeHint::RingWritable { .. }))
+        .expect("send pump must emit an egress-ring writable wake");
+    assert_wake_is_payload_free(writable_wake, driver::RingId(1));
 }
 
 // This proves read, write, protocol, and stop outcomes are surfaced as

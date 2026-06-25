@@ -74,10 +74,10 @@ pub enum DriverEvent {
         stream_id: StreamId,
     },
     RingReadable {
-        edge_id: EdgeId,
+        ring_id: RingId,
     },
     RingWritable {
-        edge_id: EdgeId,
+        ring_id: RingId,
     },
     EgressBytesCommitted {
         edge_id: EdgeId,
@@ -162,8 +162,8 @@ pub enum StreamFaultReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WakeHint {
-    RingReadable { edge_id: EdgeId },
-    RingWritable { edge_id: EdgeId },
+    RingReadable { ring_id: RingId },
+    RingWritable { ring_id: RingId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -259,8 +259,8 @@ impl DriverState {
             DriverEvent::IncomingUniStream { edge_id, stream_id } => {
                 self.incoming_uni_stream(edge_id, stream_id);
             }
-            DriverEvent::RingReadable { edge_id } => self.flush_send_bytes(edge_id),
-            DriverEvent::RingWritable { edge_id } => self.resume_recv(edge_id),
+            DriverEvent::RingReadable { ring_id } => self.flush_send_bytes(ring_id),
+            DriverEvent::RingWritable { ring_id } => self.resume_recv(ring_id),
             DriverEvent::EgressBytesCommitted { edge_id, bytes } => {
                 if let Some(send) = self.sends.get_mut(&edge_id) {
                     send.pending_bytes.extend(bytes);
@@ -276,7 +276,9 @@ impl DriverState {
                 if let Some(send) = self.sends.get_mut(&edge_id) {
                     send.consume_cursor += byte_count;
                     send.network_stalled = false;
-                    self.wakes.push(WakeHint::RingWritable { edge_id });
+                    self.wakes.push(WakeHint::RingWritable {
+                        ring_id: send.ring_id,
+                    });
                 }
             }
             DriverEvent::NetworkStalled { edge_id } => {
@@ -374,7 +376,17 @@ impl DriverState {
             .push(DriverEventOut::DriverEdgeReady { edge_id });
     }
 
-    fn flush_send_bytes(&mut self, edge_id: EdgeId) {
+    fn flush_send_bytes(&mut self, ring_id: RingId) {
+        let mut send_edge_id = None;
+        for (edge_id, send) in &self.sends {
+            if send.ring_id == ring_id {
+                send_edge_id = Some(*edge_id);
+                break;
+            }
+        }
+        let Some(edge_id) = send_edge_id else {
+            return;
+        };
         let Some(send) = self.sends.get_mut(&edge_id) else {
             return;
         };
@@ -386,9 +398,12 @@ impl DriverState {
         self.stream_writes.push(StreamWrite { edge_id, bytes });
     }
 
-    fn resume_recv(&mut self, edge_id: EdgeId) {
-        if let Some(recv) = self.recvs.get_mut(&edge_id) {
-            recv.reading = true;
+    fn resume_recv(&mut self, ring_id: RingId) {
+        for recv in self.recvs.values_mut() {
+            if recv.ring_id == ring_id {
+                recv.reading = true;
+                return;
+            }
         }
     }
 
@@ -400,7 +415,9 @@ impl DriverState {
             return;
         }
         recv.commit_cursor += bytes.len();
-        self.wakes.push(WakeHint::RingReadable { edge_id });
+        self.wakes.push(WakeHint::RingReadable {
+            ring_id: recv.ring_id,
+        });
     }
 
     fn stop_edge(&mut self, edge_id: EdgeId) {

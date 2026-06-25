@@ -41,31 +41,6 @@ pub fn spawn_process<D: ProcessDriver + 'static>(
     spawn_process_inner(ctx, sender, spec, driver, waker_slot, None)
 }
 
-/// Spawn a process actor using the `SshDriver` (remote host via SSH).
-///
-/// Requires a tokio runtime handle (e.g. from `IrohDriver::tokio_handle()`)
-/// and SSH connection config.
-///
-/// `telemetry_label`, when `Some`, overrides the command-basename label the
-/// node's process-output observer taps output onto (`proc.<label>.*`). A caller
-/// that spawns several remote shells running the same command (e.g. one
-/// `pp-worker` per stage) sets a distinct label per child so their boot output
-/// is attributable.
-#[cfg(feature = "ssh")]
-pub fn spawn_ssh_process(
-    ctx: &Ctx,
-    sender: &ExternalSender,
-    spec: ProcessSpec,
-    tokio_handle: tokio::runtime::Handle,
-    ssh_config: crate::ssh::SshConfig,
-    telemetry_label: Option<String>,
-) -> Result<ActorAddress, Error> {
-    let waker_slot = Arc::new(OnceLock::new());
-    let queue = EventQueue::new();
-    let driver = crate::ssh::SshDriver::new(queue, waker_slot.clone(), tokio_handle, ssh_config);
-    spawn_process_inner(ctx, sender, spec, driver, waker_slot, telemetry_label)
-}
-
 /// The basename of a command path, used as the process's telemetry label.
 /// `/usr/bin/python3` → `python3`, `python` → `python`. Falls back to the whole
 /// string when there is no path separator or trailing component.

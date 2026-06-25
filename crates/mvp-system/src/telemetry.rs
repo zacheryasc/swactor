@@ -4,9 +4,15 @@ use datastream::{ChannelRegistry, Record};
 use serde::{Deserialize, Serialize};
 
 use crate::observability_surface as obs;
+use crate::provisioning;
 
 /// Structured MVP lifecycle facts: run, node, stage, edge, ring, object, step, and worker events.
 pub const MVP_LIFECYCLE: &str = "mvp.lifecycle";
+/// Structured node provisioning milestones emitted before a remote swactor runtime is live.
+pub const MVP_PROVISIONING_EVENTS: &str = "mvp.provisioning.events";
+
+/// Raw provider/process stream lines captured during provisioning.
+pub const MVP_PROVISIONING_LOGS: &str = "mvp.provisioning.logs";
 
 /// Datastream payload for the MVP lifecycle channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,8 +39,43 @@ impl From<obs::Event> for MvpLifecycleRecord {
 impl Record for MvpLifecycleRecord {
     const CHANNEL: &'static str = MVP_LIFECYCLE;
 }
+/// Datastream payload for provisioning lifecycle events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvpProvisionEventRecord {
+    pub event: provisioning::ProvisionEvent,
+}
+
+impl MvpProvisionEventRecord {
+    pub fn new(event: provisioning::ProvisionEvent) -> Self {
+        Self { event }
+    }
+}
+
+impl Record for MvpProvisionEventRecord {
+    const CHANNEL: &'static str = MVP_PROVISIONING_EVENTS;
+}
+
+/// Datastream payload for provisioning stdout/stderr/provider lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MvpProvisionLogRecord {
+    pub line: provisioning::ProvisionLogLine,
+}
+
+impl MvpProvisionLogRecord {
+    pub fn new(line: provisioning::ProvisionLogLine) -> Self {
+        Self { line }
+    }
+}
+
+impl Record for MvpProvisionLogRecord {
+    const CHANNEL: &'static str = MVP_PROVISIONING_LOGS;
+}
 
 /// Registry fragment for consumers that want typed MVP datastream decoding.
 pub fn channel_registry() -> ChannelRegistry {
-    ChannelRegistry::new().with_record::<MvpLifecycleRecord>()
+    let registry = ChannelRegistry::new().with_record::<MvpLifecycleRecord>();
+    let registry = registry
+        .with_record::<MvpProvisionEventRecord>()
+        .with_record::<MvpProvisionLogRecord>();
+    registry
 }

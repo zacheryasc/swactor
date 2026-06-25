@@ -58,6 +58,21 @@ fn local_e2e_cluster_docker_cpu_pipeline_prompt() {
     assert_eq!(value["run_torn_down_observed"], true);
     assert_eq!(value["stop_sent_to_all_nodes"], true);
     assert_eq!(value["stage_ready_stdout_count"], 2);
+    assert_eq!(value["provisioned_node_count"], 2);
+    assert_eq!(value["provision_node_live_count"], 2);
+    assert!(
+        value["provision_stdout_line_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 2),
+        "{value}"
+    );
+    assert!(
+        value["provision_stderr_line_count"]
+            .as_u64()
+            .is_some_and(|count| count >= 2),
+        "{value}"
+    );
+    assert_eq!(value["provision_nodes_stopped"], true);
     assert!(
         value["node0_endpoint"]["addrs"]
             .as_array()

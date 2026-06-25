@@ -2,10 +2,16 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver, Sender},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use datastream::{
+    DatastreamEndpoint, DatastreamProducer, DatastreamSubscription, Lifetime, NodeId, StreamId,
+};
 use distribution::node::DistributedNodeConfig;
 use iroh::EndpointAddr;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
@@ -16,8 +22,10 @@ use mvp_system::actors::orchestrator::{
     LifecycleEventWire, OrchestratorActor, OrchestratorMsg, OrchestratorReport, RunCommandWire,
     StageRefWire,
 };
+use mvp_system::actors::provisioner::{ProvisionerActor, ProvisionerMsg, ProvisionerReport};
 use mvp_system::actors::register_mvp_actor_codecs;
 use mvp_system::arena_manager as arena;
+use mvp_system::dashboard_view::MvpClusterDashboardView;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::driver_pumps as driver_model;
 use mvp_system::edge_establisher as edge;
@@ -26,6 +34,7 @@ use mvp_system::gpu_worker_ctl as worker_ctl;
 use mvp_system::gpu_worker_ingress_parser as ingress;
 use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
+use mvp_system::provisioning::{LocalDockerPlugin, NodeProvisionSpec, ProvisionLogStream};
 use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
 use mvp_system::tx_rx_edge_actor as edge_actor;
@@ -48,18 +57,63 @@ const ARENA_BYTES: usize = 16 * 1024;
 const RING_BYTES: usize = 4096;
 const EDGE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 
-struct MvpDashboard;
+struct MvpDashboard {
+    url: String,
+    endpoint: DatastreamEndpoint,
+    producer: DatastreamProducer,
+    subscription: DatastreamSubscription,
+    handle: dashboard::DashboardHandle,
+}
 
 impl MvpDashboard {
     fn start_from_env() -> Result<Self, String> {
-        Ok(Self)
+        let mut config = dashboard::DashboardConfig::default();
+        if let Some(port) = std::env::var_os("MVP_DASHBOARD_PORT") {
+            let port = port
+                .to_string_lossy()
+                .parse::<u16>()
+                .map_err(|e| format!("invalid MVP_DASHBOARD_PORT: {e}"))?;
+            config.port = port;
+        }
+        let url = format!("http://127.0.0.1:{}/view/mvp/cluster", config.port);
+        let handle = dashboard::start_dashboard(config.clone());
+        handle.register_view(Arc::new(MvpClusterDashboardView::new()));
+        handle.start_http_standalone();
+        let endpoint = DatastreamEndpoint::with_capacity(
+            StreamId::new(NodeId::new("mvp-system-orch"), Lifetime(1)),
+            4096,
+            config.frame_buffer,
+        );
+        let producer = endpoint.producer();
+        let subscription = endpoint.subscribe_all("dashboard");
+        Ok(Self {
+            url,
+            endpoint,
+            producer,
+            subscription,
+            handle,
+        })
     }
 
     fn url(&self) -> &str {
-        "disabled"
+        &self.url
+    }
+    fn producer(&self) -> DatastreamProducer {
+        self.producer.clone()
     }
 
-    fn record_event(&mut self, _event: obs::Event) {}
+    fn drain(&mut self) {
+        self.endpoint.tick();
+        for delivery in self.subscription.drain_available() {
+            self.handle.ingest(&delivery.stream, &delivery.frame);
+        }
+    }
+
+    fn record_event(&mut self, event: obs::Event) {
+        let record = mvp_system::telemetry::MvpLifecycleRecord::new(event);
+        self.producer.submit_record(&record);
+        self.drain();
+    }
 }
 
 fn main() -> ExitCode {
@@ -85,21 +139,26 @@ fn main() -> ExitCode {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-struct NodeReady {
-    #[serde(rename = "type")]
-    kind: String,
-    endpoint: EndpointAddr,
-    node_actor: ActorAddress,
-    logical_node_id: u64,
-    stage_index: u32,
-}
-
-#[derive(Clone, Debug, Deserialize)]
 struct NodeStdoutLine {
     #[serde(rename = "type")]
     kind: String,
     stage_index: Option<u32>,
     event: Option<String>,
+}
+#[derive(Clone, Debug)]
+struct ProvisionedDockerNode {
+    node_id: u64,
+    stage_index: u32,
+    endpoint: EndpointAddr,
+    node_actor: ActorAddress,
+    provider_process_id: Option<u32>,
+}
+
+#[derive(Default)]
+struct ProvisionStats {
+    node_live_count: usize,
+    stdout_line_count: usize,
+    stderr_line_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +226,11 @@ impl DriverRuntime {
 fn record_dashboard_event(dashboard: &mut Option<&mut MvpDashboard>, event: obs::Event) {
     if let Some(dashboard) = dashboard.as_deref_mut() {
         dashboard.record_event(event);
+    }
+}
+fn drain_dashboard(dashboard: &mut Option<&mut MvpDashboard>) {
+    if let Some(dashboard) = dashboard.as_deref_mut() {
+        dashboard.drain();
     }
 }
 
@@ -278,6 +342,19 @@ fn run_supervisor_once(
         ))
         .map_err(|e| format!("spawn orchestrator actor: {e}"))?;
     stack.register_local_actor(driver.register_actor(orchestrator_addr, 1));
+    let provisioner_report = stack
+        .runtime
+        .new_inbox::<ProvisionerReport>()
+        .map_err(|e| format!("provisioner report inbox: {e}"))?;
+    let provisioner_addr = stack
+        .runtime
+        .spawn(ProvisionerActor::new(
+            LocalDockerPlugin::new(format!("mvp-local-e2e-cluster-{}", std::process::id())),
+            stack.runtime.create_sender(),
+            dashboard.as_ref().map(|dashboard| dashboard.producer()),
+        ))
+        .map_err(|e| format!("spawn provisioner actor: {e}"))?;
+    let mut provision_stats = ProvisionStats::default();
 
     let topology = build_local_engine_topology(run_id)?;
     let run_plan = topology.role_plan.run_plan.clone();
@@ -299,21 +376,39 @@ fn run_supervisor_once(
     let orchestrator_actor_json = serde_json::to_string(&orchestrator_addr)
         .map_err(|e| format!("serialize orchestrator actor: {e}"))?;
 
-    let mut node1 = spawn_node_process(
-        stage1.node_id.0,
-        stage1.stage_index,
-        &self_endpoint_json,
-        &self_endpoint_json,
-        &orchestrator_actor_json,
+    let node1 = provision_local_docker_node(
+        provisioner_addr,
+        &provisioner_report,
+        &mut driver,
+        &stack,
+        &mut dashboard,
+        &mut provision_stats,
+        local_docker_spec(
+            run_id,
+            stage1.node_id.0,
+            stage1.stage_index,
+            &self_endpoint_json,
+            &self_endpoint_json,
+            &orchestrator_actor_json,
+        ),
     )?;
-    let node1_endpoint_json = serde_json::to_string(&node1.ready.endpoint)
+    let node1_endpoint_json = serde_json::to_string(&node1.endpoint)
         .map_err(|e| format!("serialize node1 endpoint: {e}"))?;
-    let mut node0 = spawn_node_process(
-        stage0.node_id.0,
-        stage0.stage_index,
-        &node1_endpoint_json,
-        &self_endpoint_json,
-        &orchestrator_actor_json,
+    let node0 = provision_local_docker_node(
+        provisioner_addr,
+        &provisioner_report,
+        &mut driver,
+        &stack,
+        &mut dashboard,
+        &mut provision_stats,
+        local_docker_spec(
+            run_id,
+            stage0.node_id.0,
+            stage0.stage_index,
+            &node1_endpoint_json,
+            &self_endpoint_json,
+            &orchestrator_actor_json,
+        ),
     )?;
 
     for stage in [&stage1, &stage0] {
@@ -331,14 +426,14 @@ fn run_supervisor_once(
     wait_for_routes(
         &mut driver,
         &stack,
-        &[node0.ready.node_actor, node1.ready.node_actor],
+        &[node0.node_actor, node1.node_actor],
         Duration::from_secs(20),
     )?;
 
     let token_in_sender = spawn_send_pump(
         driver.tokio_handle(),
         driver.endpoint().clone(),
-        node0.ready.endpoint.clone(),
+        node0.endpoint.clone(),
         stage0.inbound_edge.0,
     )?;
     let mut token_in_object_allocator =
@@ -467,8 +562,13 @@ fn run_supervisor_once(
                 }
             }
         }
-        stage_ready_count += drain_node_stdout(&node0.stdout_rx, run_id, &mut dashboard);
-        stage_ready_count += drain_node_stdout(&node1.stdout_rx, run_id, &mut dashboard);
+        stage_ready_count += drain_provisioner_reports(
+            &provisioner_report,
+            run_id,
+            &mut dashboard,
+            &mut provision_stats,
+        )?;
+        drain_dashboard(&mut dashboard);
 
         while let Some(report) = orchestrator_report.try_recv() {
             match report {
@@ -476,9 +576,9 @@ fn run_supervisor_once(
                     RunCommandWire::ProvisionStage { stage_index, .. } => {
                         let provision = stage_provision_wire(&run_plan, stage_index)?;
                         let target = if stage_index == 0 {
-                            node0.ready.node_actor
+                            node0.node_actor
                         } else {
-                            node1.ready.node_actor
+                            node1.node_actor
                         };
                         stack
                             .runtime
@@ -489,12 +589,21 @@ fn run_supervisor_once(
                             stage_event(run_id, stage_index, obs::EventKind::StageProvisionStarted),
                         );
                     }
-                    RunCommandWire::InjectPrompt {
-                        sequence, prompt, ..
+                    RunCommandWire::InjectTokenObject {
+                        sequence, payload, ..
                     } => {
                         injected = true;
+                        let tokens = match payload {
+                            mvp_system::actors::orchestrator::TokenObjectPayloadWire::Prompt {
+                                tokens,
+                            } => tokens,
+                            mvp_system::actors::orchestrator::TokenObjectPayloadWire::Decode {
+                                token_id,
+                                ..
+                            } => vec![token_id],
+                        };
                         let prompt_object = token_in_object_allocator.alloc();
-                        let record = object_record(prompt_object.object_id.0, sequence, &prompt);
+                        let record = object_record(prompt_object.object_id.0, sequence, &tokens);
                         token_in_sender.send(record)?;
                         record_dashboard_event(
                             &mut dashboard,
@@ -512,10 +621,10 @@ fn run_supervisor_once(
                     } => {
                         let target = if stage_index == 0 {
                             sent_stop_to_node0 = true;
-                            node0.ready.node_actor
+                            node0.node_actor
                         } else {
                             sent_stop_to_node1 = true;
-                            node1.ready.node_actor
+                            node1.node_actor
                         };
                         stack
                             .runtime
@@ -536,8 +645,7 @@ fn run_supervisor_once(
                             .map_err(|e| format!("observe token endpoints stopped: {e}"))?;
                     }
                     RunCommandWire::CreateTokenInEndpoint { .. }
-                    | RunCommandWire::CreateTokenOutEndpoint { .. }
-                    | RunCommandWire::BroadcastStart { .. } => {}
+                    | RunCommandWire::CreateTokenOutEndpoint { .. } => {}
                 },
                 OrchestratorReport::Lifecycle(event) => match event {
                     LifecycleEventWire::RunCompleted { run_id } => {
@@ -555,7 +663,8 @@ fn run_supervisor_once(
                         torn_down = true;
                     }
                     LifecycleEventWire::RunRejected { run_id }
-                    | LifecycleEventWire::RunFaulted { run_id } => {
+                    | LifecycleEventWire::RunFaulted { run_id }
+                    | LifecycleEventWire::RunOperatorStopped { run_id } => {
                         record_dashboard_event(&mut dashboard, run_fault_event(run_id));
                         return Err(format!("run failed: {event:?}"));
                     }
@@ -571,8 +680,15 @@ fn run_supervisor_once(
             && sent_stop_to_node0
             && sent_stop_to_node1
         {
-            shutdown_node(&mut node0);
-            shutdown_node(&mut node1);
+            stop_provisioned_nodes(
+                run_id,
+                provisioner_addr,
+                &provisioner_report,
+                &mut driver,
+                &stack,
+                &mut dashboard,
+                &mut provision_stats,
+            )?;
             let builder_stage_assignments = topology
                 .events
                 .iter()
@@ -595,15 +711,15 @@ fn run_supervisor_once(
                 "node_local_data_plane": "arena-backed-rings-json-metadata-only",
                 "processes": {
                     "orchestrator": std::process::id(),
-                    "node0": node0.child.id(),
-                    "node1": node1.child.id(),
+                    "node0": node0.provider_process_id,
+                    "node1": node1.provider_process_id,
                 },
-                "node0_endpoint": node0.ready.endpoint,
-                "node1_endpoint": node1.ready.endpoint,
-                "node0_logical_id": node0.ready.logical_node_id,
-                "node1_logical_id": node1.ready.logical_node_id,
-                "node0_stage_index": node0.ready.stage_index,
-                "node1_stage_index": node1.ready.stage_index,
+                "node0_endpoint": node0.endpoint,
+                "node1_endpoint": node1.endpoint,
+                "node0_logical_id": node0.node_id,
+                "node1_logical_id": node1.node_id,
+                "node0_stage_index": node0.stage_index,
+                "node1_stage_index": node1.stage_index,
                 "worker_processes": "docker-tinygrad-cpu-worker-per-node",
                 "docker_image": docker_image(),
                 "prompt_text": prompt_text,
@@ -622,6 +738,11 @@ fn run_supervisor_once(
                 "engine_builder_stage_assignments": builder_stage_assignments,
                 "node_route_count": stack.route_view.read().map(|view| view.len()).unwrap_or_default(),
                 "stage_ready_stdout_count": stage_ready_count,
+                "provisioned_node_count": 2,
+                "provision_node_live_count": provision_stats.node_live_count,
+                "provision_stdout_line_count": provision_stats.stdout_line_count,
+                "provision_stderr_line_count": provision_stats.stderr_line_count,
+                "provision_nodes_stopped": true,
                 "edge_stream_object_count": edge_stream_count,
             });
             if print_summary {
@@ -636,8 +757,15 @@ fn run_supervisor_once(
     }
 
     record_dashboard_event(&mut dashboard, run_fault_event(run_id));
-    shutdown_node(&mut node0);
-    shutdown_node(&mut node1);
+    let _ = stop_provisioned_nodes(
+        run_id,
+        provisioner_addr,
+        &provisioner_report,
+        &mut driver,
+        &stack,
+        &mut dashboard,
+        &mut provision_stats,
+    );
     Err(format!(
         "timed out: injected={injected} token_received={token_received} completed={completed} torn_down={torn_down} stop0={sent_stop_to_node0} stop1={sent_stop_to_node1}"
     ))
@@ -709,6 +837,15 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
     let mut edge_command_cursor = 0usize;
     let mut edge_event_cursor = 0usize;
     let mut driver_event_cursor = 0usize;
+    eprintln!(
+        "{}",
+        json!({
+            "type": "boot_stream",
+            "stream": "stderr",
+            "logical_node_id": logical_node_id,
+            "stage_index": stage_index,
+        })
+    );
     println!(
         "{}",
         json!({
@@ -980,6 +1117,7 @@ fn build_local_engine_topology(run_id: u64) -> Result<LocalEngineTopology, Strin
             2,
             8,
             99,
+            plan::TokenizerSource::EmbeddedGguf,
         ),
     )
     .run_id(run_id)
@@ -1012,6 +1150,12 @@ fn build_local_engine_topology(run_id: u64) -> Result<LocalEngineTopology, Strin
     .planner(
         engine::FixedLinearPipelinePlanner::new(2).runtime(plan::RuntimeConfig {
             max_tokens: MAX_TOKENS as u32,
+            prompt: plan::PromptSource::Inline(DEFAULT_PROMPT.to_owned()),
+            sampling: plan::SamplingPolicy {
+                temperature_millis: 0,
+                top_k: 1,
+            },
+            token_output_policy: plan::TokenOutputPolicy::EmitAll,
         }),
     )
     .launch()
@@ -1224,9 +1368,7 @@ fn handle_node_command(
                 bytes: record.clone(),
             });
             driver_fsm.observe(driver_model::DriverEvent::RingReadable {
-                edge_id: driver_model::EdgeId(
-                    outbound_edge_id.ok_or_else(|| "outbound edge missing".to_owned())?,
-                ),
+                ring_id: driver_model::RingId(output_ring),
             });
             if let Some(tx_actor) = tx_edge_actor.as_mut() {
                 tx_actor.observe(edge_actor::TxEvent::ObjectProduced {
@@ -1248,12 +1390,21 @@ fn handle_node_command(
         StageCommandWire::ReleaseInputHandle { handle_id, .. } => {
             worker.release_device_object(handle_id)
         }
-        StageCommandWire::StopLocalEdges { .. }
-        | StageCommandWire::ReleaseRunDeviceObjects { .. } => {
+        StageCommandWire::StopLocalEdges { run_id } => {
             runtime
-                .send_to(node_actor, NodeAgentMsg::StepCompleted { step_id: 0 })
-                .ok();
-            Ok(())
+                .send_to(node_actor, NodeAgentMsg::LocalEdgesStopped { run_id })
+                .map_err(|e| format!("mark local edges stopped: {e}"))?;
+            runtime
+                .send_to(node_actor, NodeAgentMsg::WorkerRingsQuiesced { run_id })
+                .map_err(|e| format!("mark worker rings quiesced: {e}"))
+        }
+        StageCommandWire::ReleaseRunDeviceObjects { run_id } => {
+            runtime
+                .send_to(node_actor, NodeAgentMsg::DeviceObjectsReleased { run_id })
+                .map_err(|e| format!("mark device objects released: {e}"))?;
+            runtime
+                .send_to(node_actor, NodeAgentMsg::WorkerRoleReset { run_id })
+                .map_err(|e| format!("mark worker role reset: {e}"))
         }
         StageCommandWire::RewireEdge { .. } => Ok(()),
     }
@@ -1893,132 +2044,220 @@ impl Drop for GpuWorkerRuntime {
     }
 }
 
-struct NodeChild {
-    child: Child,
-    stdin: ChildStdin,
-    stdout_rx: Receiver<NodeStdoutLine>,
-    ready: NodeReady,
-}
-
-fn spawn_node_process(
-    logical_node_id: u64,
+fn local_docker_spec(
+    run_id: u64,
+    node_id: u64,
     stage_index: u32,
     outbound_endpoint_json: &str,
     coordinator_endpoint_json: &str,
     orchestrator_actor_json: &str,
-) -> Result<NodeChild, String> {
-    let container_name = format!(
-        "mvp-local-e2e-cluster-{}-{logical_node_id}",
-        std::process::id()
-    );
-    let mut child = Command::new("docker")
-        .arg("run")
-        .arg("--rm")
-        .arg("--add-host")
-        .arg("host.docker.internal:host-gateway")
-        .arg("--name")
-        .arg(&container_name)
-        .arg("-i")
-        .arg("-e")
-        .arg("DEV=CPU")
-        .arg("-e")
-        .arg("PYTHONDONTWRITEBYTECODE=1")
-        .arg("-e")
-        .arg("MVP_TINYGRAD_WORKER=/workspace/crates/mvp-system/tests/local_e2e_cluster/tinygrad_cpu_worker.py")
-        .arg(docker_image())
-        .arg("--role=node")
-        .arg("--logical-node-id")
-        .arg(logical_node_id.to_string())
-        .arg("--stage-index")
-        .arg(stage_index.to_string())
-        .arg("--outbound-endpoint")
-        .arg(outbound_endpoint_json)
-        .arg("--coordinator-endpoint")
-        .arg(coordinator_endpoint_json)
-        .arg("--orchestrator-actor")
-        .arg(orchestrator_actor_json)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("spawn Docker node {stage_index}: {e}"))?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "node stdin missing".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "node stdout missing".to_owned())?;
-    let mut reader = BufReader::new(stdout);
-    let mut ready_line = String::new();
-    reader
-        .read_line(&mut ready_line)
-        .map_err(|e| format!("read node ready: {e}"))?;
-    let ready: NodeReady = serde_json::from_str(&ready_line)
-        .map_err(|e| format!("parse node ready {ready_line:?}: {e}"))?;
-    if ready.kind != "ready" {
-        return Err(format!("node first line was not ready: {ready_line}"));
+) -> NodeProvisionSpec {
+    NodeProvisionSpec {
+        run_id,
+        node_id,
+        stage_index: Some(stage_index),
+        image: docker_image(),
+        env: vec![
+            ("DEV".to_owned(), "CPU".to_owned()),
+            ("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned()),
+            (
+                "MVP_TINYGRAD_WORKER".to_owned(),
+                "/workspace/crates/mvp-system/tests/local_e2e_cluster/tinygrad_cpu_worker.py"
+                    .to_owned(),
+            ),
+        ],
+        args: vec![
+            "--role=node".to_owned(),
+            "--logical-node-id".to_owned(),
+            node_id.to_string(),
+            "--stage-index".to_owned(),
+            stage_index.to_string(),
+            "--outbound-endpoint".to_owned(),
+            outbound_endpoint_json.to_owned(),
+            "--coordinator-endpoint".to_owned(),
+            coordinator_endpoint_json.to_owned(),
+            "--orchestrator-actor".to_owned(),
+            orchestrator_actor_json.to_owned(),
+        ],
     }
+}
 
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        for line in reader.lines().map_while(Result::ok) {
-            if let Ok(value) = serde_json::from_str::<NodeStdoutLine>(&line) {
-                let _ = tx.send(value);
+fn provision_local_docker_node(
+    provisioner_addr: ActorAddress,
+    provisioner_report: &swactor::runtime::Inbox<ProvisionerReport>,
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    dashboard: &mut Option<&mut MvpDashboard>,
+    stats: &mut ProvisionStats,
+    spec: NodeProvisionSpec,
+) -> Result<ProvisionedDockerNode, String> {
+    let expected_run_id = spec.run_id;
+    let expected_node_id = spec.node_id;
+    stack
+        .runtime
+        .send_to(
+            provisioner_addr,
+            ProvisionerMsg::StartNodes {
+                nodes: vec![spec],
+                reply_to: *provisioner_report.addr(),
+            },
+        )
+        .map_err(|e| format!("start provisioning node {expected_node_id}: {e}"))?;
+
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(30) {
+        pump_network(driver, stack);
+        drain_dashboard(dashboard);
+        while let Some(report) = provisioner_report.try_recv() {
+            match report {
+                ProvisionerReport::NodeLive {
+                    run_id,
+                    node_id,
+                    stage_index,
+                    endpoint,
+                    node_actor,
+                    provider_process_id,
+                } if run_id == expected_run_id && node_id == expected_node_id => {
+                    stats.node_live_count += 1;
+                    return Ok(ProvisionedDockerNode {
+                        node_id,
+                        stage_index: stage_index.unwrap_or_default(),
+                        endpoint,
+                        node_actor,
+                        provider_process_id,
+                    });
+                }
+                ProvisionerReport::NodeFailed {
+                    run_id,
+                    node_id,
+                    reason,
+                } if run_id == expected_run_id && node_id == expected_node_id => {
+                    return Err(format!("node {node_id} provisioning failed: {reason}"));
+                }
+                other => {
+                    let _ = handle_provisioner_report(other, expected_run_id, dashboard, stats)?;
+                }
             }
         }
-    });
-
-    Ok(NodeChild {
-        child,
-        stdin,
-        stdout_rx: rx,
-        ready,
-    })
-}
-
-fn shutdown_node(node: &mut NodeChild) {
-    let _ = writeln!(node.stdin, "shutdown");
-    let _ = node.stdin.flush();
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(2) {
-        if matches!(node.child.try_wait(), Ok(Some(_))) {
-            return;
-        }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(10));
     }
-    let _ = node.child.kill();
-    let _ = node.child.wait();
+    Err(format!("timed out provisioning node {expected_node_id}"))
 }
 
-fn drain_node_stdout(
-    rx: &Receiver<NodeStdoutLine>,
+fn drain_provisioner_reports(
+    provisioner_report: &swactor::runtime::Inbox<ProvisionerReport>,
     run_id: u64,
     dashboard: &mut Option<&mut MvpDashboard>,
-) -> usize {
-    let mut ready_count = 0;
-    while let Ok(line) = rx.try_recv() {
-        if line.kind != "node_lifecycle" {
-            continue;
-        }
-        let Some(stage_index) = line.stage_index else {
-            continue;
-        };
-        if line
-            .event
-            .as_deref()
-            .is_some_and(|event| event.contains("StageReady"))
-        {
-            ready_count += 1;
-            record_dashboard_event(
-                dashboard,
-                stage_event(run_id, stage_index, obs::EventKind::StageReady),
-            );
-        }
+    stats: &mut ProvisionStats,
+) -> Result<usize, String> {
+    let mut stage_ready_count = 0usize;
+    while let Some(report) = provisioner_report.try_recv() {
+        stage_ready_count += handle_provisioner_report(report, run_id, dashboard, stats)?;
     }
-    ready_count
+    Ok(stage_ready_count)
+}
+
+fn handle_provisioner_report(
+    report: ProvisionerReport,
+    run_id: u64,
+    dashboard: &mut Option<&mut MvpDashboard>,
+    stats: &mut ProvisionStats,
+) -> Result<usize, String> {
+    match report {
+        ProvisionerReport::LogLine {
+            run_id: line_run_id,
+            stream,
+            line,
+            ..
+        } if line_run_id == run_id => {
+            match stream {
+                ProvisionLogStream::Stdout => stats.stdout_line_count += 1,
+                ProvisionLogStream::Stderr => stats.stderr_line_count += 1,
+                ProvisionLogStream::Provider => {}
+            }
+            Ok(record_stage_ready_from_stdout(
+                run_id, stream, &line, dashboard,
+            ))
+        }
+        ProvisionerReport::NodeFailed {
+            run_id: failed_run_id,
+            node_id,
+            reason,
+        } if failed_run_id == run_id => Err(format!("node {node_id} failed: {reason}")),
+        ProvisionerReport::NodeLive { .. } | ProvisionerReport::NodesStopped { .. } => Ok(0),
+        ProvisionerReport::LogLine { .. } | ProvisionerReport::NodeFailed { .. } => Ok(0),
+    }
+}
+
+fn record_stage_ready_from_stdout(
+    run_id: u64,
+    stream: ProvisionLogStream,
+    line: &str,
+    dashboard: &mut Option<&mut MvpDashboard>,
+) -> usize {
+    if stream != ProvisionLogStream::Stdout {
+        return 0;
+    }
+    let Ok(line) = serde_json::from_str::<NodeStdoutLine>(line) else {
+        return 0;
+    };
+    if line.kind != "node_lifecycle" {
+        return 0;
+    }
+    let Some(stage_index) = line.stage_index else {
+        return 0;
+    };
+    if line
+        .event
+        .as_deref()
+        .is_some_and(|event| event.contains("StageReady"))
+    {
+        record_dashboard_event(
+            dashboard,
+            stage_event(run_id, stage_index, obs::EventKind::StageReady),
+        );
+        1
+    } else {
+        0
+    }
+}
+
+fn stop_provisioned_nodes(
+    run_id: u64,
+    provisioner_addr: ActorAddress,
+    provisioner_report: &swactor::runtime::Inbox<ProvisionerReport>,
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    dashboard: &mut Option<&mut MvpDashboard>,
+    stats: &mut ProvisionStats,
+) -> Result<(), String> {
+    stack
+        .runtime
+        .send_to(
+            provisioner_addr,
+            ProvisionerMsg::StopNodes {
+                run_id,
+                reply_to: *provisioner_report.addr(),
+            },
+        )
+        .map_err(|e| format!("stop provisioned nodes: {e}"))?;
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(10) {
+        pump_network(driver, stack);
+        drain_dashboard(dashboard);
+        while let Some(report) = provisioner_report.try_recv() {
+            match report {
+                ProvisionerReport::NodesStopped {
+                    run_id: stopped_run_id,
+                } if stopped_run_id == run_id => return Ok(()),
+                other => {
+                    let _ = handle_provisioner_report(other, run_id, dashboard, stats)?;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Err("timed out stopping provisioned nodes".to_owned())
 }
 
 fn spawn_send_pump(

@@ -306,10 +306,6 @@ pub fn make_driver() -> IrohNode {
         node: test_config(),
         peer_auth: None,
         additional_alpns: vec![],
-        #[cfg(feature = "relay")]
-        embedded_relay_bind: None,
-        #[cfg(feature = "relay")]
-        relay_public_ip: None,
     })
 }
 
@@ -320,10 +316,6 @@ pub fn make_driver_with_auth(auth: Arc<Mutex<PeerAllowList>>) -> IrohNode {
         node: test_config(),
         peer_auth: Some(auth),
         additional_alpns: vec![],
-        #[cfg(feature = "relay")]
-        embedded_relay_bind: None,
-        #[cfg(feature = "relay")]
-        relay_public_ip: None,
     })
 }
 
@@ -334,10 +326,6 @@ pub fn make_driver_with_relay(relay_url: iroh::RelayUrl) -> IrohNode {
         node: test_config(),
         peer_auth: None,
         additional_alpns: vec![],
-        #[cfg(feature = "relay")]
-        embedded_relay_bind: None,
-        #[cfg(feature = "relay")]
-        relay_public_ip: None,
     })
 }
 
