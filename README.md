@@ -13,12 +13,11 @@ interact through `Ctx` (in `runtime.rs`), and run on worker threads (`worker.rs`
 
 ## Dev commands
 
-`cargo xtask --help` for available test groups.
+`cargo xtask --help` for the basic test command.
 
 ## Testing
 
 ```
 cargo check --workspace
-cargo xtask test <your-feature-crate>
-cargo xtask test essential
+cargo xtask test
 ```

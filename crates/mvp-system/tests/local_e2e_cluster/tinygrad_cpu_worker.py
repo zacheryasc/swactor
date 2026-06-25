@@ -8,7 +8,7 @@ import struct
 import sys
 from typing import Any
 
-HEADER_LEN = 48
+HEADER_LEN = 40
 worker_generation = 0
 arena: mmap.mmap | None = None
 rings: dict[int, dict[str, Any]] = {}
@@ -98,7 +98,9 @@ def parse_record(ring: dict[str, Any]) -> tuple[int, int, int, bytes]:
     view = require_arena()
     base = ring["data_offset"]
     header = view[base : base + HEADER_LEN]
-    if header[0:4] != b"MO01" or header[4] != 1 or header[5] != HEADER_LEN:
+    version = struct.unpack_from("<H", header, 4)[0]
+    header_len = struct.unpack_from("<H", header, 6)[0]
+    if header[0:4] != b"MO01" or version != 1 or header_len != HEADER_LEN:
         fatal("InvalidObjectHeader", ring_id=ring["ring_id"])
     object_id = struct.unpack_from("<Q", header, 8)[0]
     sequence = struct.unpack_from("<Q", header, 16)[0]
@@ -152,8 +154,8 @@ def write_record(ring: dict[str, Any], object_id: int, sequence: int, words: lis
         fatal("OutputExtentInvalid", ring_id=ring["ring_id"], extent=extent)
     header = bytearray(HEADER_LEN)
     header[0:4] = b"MO01"
-    header[4] = 1
-    header[5] = HEADER_LEN
+    struct.pack_into("<H", header, 4, 1)
+    struct.pack_into("<H", header, 6, HEADER_LEN)
     struct.pack_into("<Q", header, 8, object_id)
     struct.pack_into("<Q", header, 16, sequence)
     struct.pack_into("<Q", header, 24, extent)

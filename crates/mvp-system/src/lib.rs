@@ -1,11 +1,11 @@
 #[cfg(test)]
 extern crate self as mvp_system;
 
-#[cfg(feature = "local-e2e")]
 pub mod actors;
 pub mod arena_manager;
-pub mod device_bridge;
 #[cfg(feature = "local-e2e")]
+pub mod dashboard_view;
+pub mod device_bridge;
 pub mod distribution_stack;
 pub mod driver_pumps;
 pub mod edge_establisher;
@@ -19,6 +19,7 @@ pub mod node_boot_lifecycle;
 pub mod observability_surface;
 pub mod orchestrator_run_fsm;
 pub mod orchestrator_token_endpoint;
+pub mod provisioning;
 pub mod resource_inventory;
 pub mod run_plan;
 pub mod shared_ring_helper_abi;

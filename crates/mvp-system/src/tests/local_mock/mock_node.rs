@@ -113,9 +113,17 @@ impl MockNode {
     }
 
     pub fn stop(&mut self, run_id: plan::RunId) {
-        self.controller.observe(stage::StageEvent::StopRun {
-            run_id: stage::RunId(run_id.0),
-        });
+        let run_id = stage::RunId(run_id.0);
+        self.controller
+            .observe(stage::StageEvent::StopRun { run_id });
+        self.controller
+            .observe(stage::StageEvent::LocalEdgesStopped { run_id });
+        self.controller
+            .observe(stage::StageEvent::WorkerRingsQuiesced { run_id });
+        self.controller
+            .observe(stage::StageEvent::DeviceObjectsReleased { run_id });
+        self.controller
+            .observe(stage::StageEvent::WorkerRoleReset { run_id });
     }
 
     pub fn drain_lifecycle_events(&mut self) -> Vec<stage::StageLifecycleEvent> {

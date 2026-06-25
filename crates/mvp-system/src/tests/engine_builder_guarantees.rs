@@ -176,7 +176,6 @@ fn workload_input_semantics_live_outside_the_cluster_builder() {
     cluster.shutdown().expect("shutdown cluster");
 }
 
-#[cfg(feature = "local-e2e")]
 #[test]
 fn runtime_node_builds_the_reusable_iroh_swactor_stack() {
     let mut node = engine::RuntimeNode::start_default().expect("start runtime node");

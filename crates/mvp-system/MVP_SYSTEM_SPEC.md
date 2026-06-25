@@ -217,6 +217,10 @@ struct WorkerGeneration(u64);
 
 `EdgeId` is unique within a run and assigned only by the orchestrator.
 
+`Sequence` names the inference-step index carried on object records. It is not a
+token id, token-array position, byte offset, stream packet number, or transport
+ordering primitive.
+
 `RingId` is unique for the node lifetime. Arena ranges may be reused after
 quiescence, but ring ids are not reused.
 
@@ -516,15 +520,18 @@ peer-to-peer endpoint exchange.
 
 ## 13. Orchestrator FSM
 
-The orchestrator has one run-level FSM:
+The orchestrator subsystem owns planning, validation, and control. The
+run-level FSM described here receives an already-valid `RunPlan`; plan
+validation failures are planner errors and are not FSM states.
 
 ```text
-Planning
+Planning outside this FSM
   build RunPlan
   validate layer ranges, edge ids, object specs, node ids
-  -> Provisioning
+  emit PlanAvailable(valid RunPlan)
 
 Provisioning
+  after PoolReady and PlanAvailable(valid RunPlan)
   send ProvisionStage to every stage node
   create local token-in producer
   create local token-out consumer
@@ -537,28 +544,33 @@ WaitingReady
     -> Faulted
 
 Running
-  inject prompt token object sequence 0
-  consume token objects from token-out edge in sequence order
-  after token sequence k:
-    if EOS or max_tokens reached -> Completed
-    else inject token object sequence k + 1
+  inject input object for inference step 0
+  consume output objects from token-out edge in inference-step order
+  after output object for inference step k:
+    if run policy stops -> Completed
+    else inject next input object for inference step k + 1
   on StageFault, edge fault, endpoint fault, membership loss, or timeout
     -> Faulted
 
 Completed
-  stop injecting tokens
-  finalize output text or token stream
+  stop injecting objects
+  finalize the run output defined by the run contract
   -> TearingDown
 
 Faulted
-  stop injecting tokens
+  stop injecting objects
   record one run-level failure reason
+  -> TearingDown
+
+OperatorStopped
+  stop injecting objects
+  record operator stop
   -> TearingDown
 
 TearingDown
   send StopRun to all provisioned stages
   tear down local token endpoints
-  wait for StageStopped from every stage or timeout
+  wait for StageStopped from every stage or teardown timeout
   -> Done
 
 Done
@@ -670,30 +682,35 @@ Warm model reuse across runs is deferred.
 
 ## 16. Execution Semantics
 
-Sequence `0` is prefill:
+Inference step `0` is the initial/prefill step:
 
 ```text
-orchestrator writes prompt token object sequence 0
-stage 0 executes prefill over prompt tokens
-stage 0 writes activation sequence 0
-each interior stage executes prefill over activation sequence 0
-last stage executes prefill and writes token sequence 0
-orchestrator consumes token sequence 0
+orchestrator writes input object for inference step 0
+stage 0 executes over the input object for inference step 0
+stage 0 writes output object for inference step 0
+each interior stage executes over its input object for inference step 0
+last stage writes output object for inference step 0
+orchestrator consumes output object for inference step 0
 ```
 
-Decode sequences are `1..`:
+Continuation steps are `1..`:
 
 ```text
-orchestrator writes one-token object sequence k
-stage 0 executes decode for sequence k
-each downstream stage executes decode for sequence k
-last stage writes token sequence k
-orchestrator consumes token sequence k
+orchestrator writes input object for inference step k
+stage 0 executes for inference step k
+each downstream stage executes for inference step k
+last stage writes output object for inference step k
+orchestrator consumes output object for inference step k
 ```
+
+Payload bytes are opaque to this protocol. A run plan's `ObjectSpec`, runtime
+policy, and role contract define what an input or output object means and how
+the orchestrator decides whether to continue.
 
 For every stage:
 
-- inbound object sequence equals outbound object sequence
+- inbound object sequence equals outbound object sequence for the same
+  inference step
 - a stage cannot execute before weights are loaded and bound
 - a stage cannot execute before inbound object is loaded
 - a stage cannot produce to an edge that is not ready
@@ -701,16 +718,16 @@ For every stage:
 - `ObjectProduced` is output object committed to egress ring
 - `StepCompleted` is the compute transaction terminal success event
 
-The orchestrator writes sequence `k + 1` only after consuming output token
-sequence `k` and deciding the run should continue.
+The orchestrator writes inference step `k + 1` only after consuming and accepting
+the output object for inference step `k` and deciding the run should continue.
 
 ---
 
 ## 17. Object Specs And Object Records
 
-Objects are logical payloads on an edge: token batches, activations, weights, or
-model shards.
-
+Objects are logical byte payloads on an edge. Their payload meaning is defined
+by the run plan's `ObjectSpec` and role contract; transport, edge, and lifecycle
+components treat payload bytes as opaque.
 Object specs are role-known validation contracts:
 
 ```rust
@@ -748,9 +765,9 @@ struct ObjectHeader {
 }
 ```
 
-The header supplies runtime facts: object id, sequence, extent, and flags.
-`ObjectSpec` supplies dtype, shape/layout family, max extent, alignment, and
-sequence policy.
+The header supplies runtime facts: object id, inference-step sequence, extent,
+and flags. `ObjectSpec` supplies dtype, shape/layout family, max extent,
+alignment, and sequence policy.
 
 Activation maximum extent:
 
@@ -758,8 +775,8 @@ Activation maximum extent:
 max_extent = max_seq_len * hidden_dim * dtype_width_bytes
 ```
 
-For prefill, `extent` may cover many token rows. For decode, `extent` may cover
-one row/token. `extent <= ObjectSpec.max_extent`.
+`extent` may vary by inference step and object contract. It must satisfy
+`extent <= ObjectSpec.max_extent`.
 
 The worker rejects a record before exposing a device object if:
 
@@ -767,7 +784,7 @@ The worker rejects a record before exposing a device object if:
 - header length is malformed
 - `extent > ObjectSpec.max_extent`
 - extent violates alignment/layout rules
-- sequence violates the edge ordering policy
+- sequence violates the edge inference-step ordering policy
 - ring or stream closes before `extent` bytes arrive
 
 Payload content itself is trusted. The worker does not inspect tensor values.
@@ -1955,13 +1972,13 @@ No data is dropped because each layer stops before overwriting unread bytes.
 
 ## 36. Fault Semantics
 
-A run has one terminal outcome:
+A run has one execution terminal outcome:
 
 - completed
 - faulted
 - operator-stopped before completion
 
-Fault sources include:
+Run fault sources include:
 
 - node unavailable before or during run
 - membership loss for a required node
@@ -1980,12 +1997,14 @@ Fault sources include:
 - worker crash
 - device OOM
 - device copy failure
-- sequence violation
+- inference-step ordering violation
 - step failure
-- teardown timeout
+
+Teardown failures are recorded in teardown outcome/status. They do not rewrite
+a completed inference into a faulted run outcome.
 
 MVP recovery policy is fail-stop at the run level. The orchestrator records the
-first run-level failure reason, stops injecting tokens, and begins teardown. It
+first run-level failure reason, stops injecting objects, and begins teardown. It
 does not re-place the run.
 
 After a stage faults, it rejects new run work until stopped.
@@ -2076,13 +2095,20 @@ enum WorkerStoppedReason {
 
 Teardown starts after completion, fault, or operator stop.
 
+Teardown has its own outcome, separate from the run execution outcome:
+
+```text
+RunOutcome = Completed | Faulted | OperatorStopped
+TeardownOutcome = Clean | Faulted | TimedOut
+```
+
 Orchestrator teardown:
 
-1. Stop injecting tokens.
+1. Stop injecting objects.
 2. Send `StopRun` to every provisioned stage.
 3. Stop local token endpoints.
 4. Wait for `StageStopped` from every stage or timeout.
-5. Record run teardown completion.
+5. Record run teardown outcome/status.
 
 Stage teardown:
 
@@ -2155,13 +2181,14 @@ Edge identity:
 - data plane is addressed by `(node_id, edge_id)`
 - remote actor addresses are not needed for data flow
 
-Sequence:
+Inference-step ordering:
 
-- prefill is sequence `0`
-- decode sequences are strictly increasing
-- a stage executes sequence `s` only after loading inbound object sequence `s`
+- prefill is inference step `0`
+- continuation steps are strictly increasing
+- a stage executes step `s` only after loading inbound object sequence `s`
 - stage output object uses sequence `s`
-- orchestrator injects `s + 1` only after consuming output token sequence `s`
+- orchestrator injects `s + 1` only after consuming and accepting output object
+  sequence `s`
 - workers do not invent graph-visible object ids or sequence numbers
 
 Payload isolation:
@@ -2304,9 +2331,9 @@ pool:
 8. Each stage provisions inbound and outbound edges.
 9. Every stage reports `StageReady`.
 10. Orchestrator observes the global readiness barrier.
-11. Orchestrator tokenizes and injects prompt as token object sequence `0`.
-12. Stages execute prefill and return token sequence `0`.
-13. Orchestrator continues decode until EOS or `max_tokens`.
+11. Orchestrator injects the initial input object for inference step `0`.
+12. Stages execute the initial step and return output object sequence `0`.
+13. Orchestrator continues until the run policy stops or `max_tokens` is reached.
 14. Orchestrator records `run_completed`.
 15. Orchestrator tears down edges, worker run state, and token endpoints.
 16. Orchestrator records `run_torn_down`.

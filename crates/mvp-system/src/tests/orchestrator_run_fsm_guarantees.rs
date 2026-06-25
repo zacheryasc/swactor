@@ -153,7 +153,7 @@ fn readiness_barrier_controls_prompt_injection() {
         !harness
             .commands()
             .iter()
-            .any(|command| { matches!(command, fsm::RunCommand::InjectPrompt { .. }) })
+            .any(|command| { matches!(command, fsm::RunCommand::InjectTokenObject { .. }) })
     );
 
     // Complete the remaining stage readiness facts.
@@ -165,11 +165,13 @@ fn readiness_barrier_controls_prompt_injection() {
     assert!(harness.commands().iter().any(|command| {
         matches!(
             command,
-            fsm::RunCommand::InjectPrompt {
+            fsm::RunCommand::InjectTokenObject {
                 run_id: fsm::RunId(7),
-                sequence: 0,
-                ..
-            }
+                object: fsm::TokenObjectInjection {
+                    sequence: 0,
+                    payload: fsm::TokenObjectPayload::Prompt { tokens },
+                },
+            } if tokens.as_slice() == [101, 102, 103]
         )
     }));
 
@@ -206,15 +208,25 @@ fn execution_injects_next_sequence_only_after_consuming_previous_token() {
         harness.observe(event);
     }
 
-    // No separate broadcast start command may exist alongside prompt injection.
-    assert!(
-        !harness
-            .commands()
-            .iter()
-            .any(|command| { matches!(command, fsm::RunCommand::BroadcastStart { .. }) })
+    // Sequence 0 must be injected first as a prompt token object.
+    let initial_objects = harness
+        .commands()
+        .iter()
+        .filter_map(|command| match command {
+            fsm::RunCommand::InjectTokenObject { object, .. } => Some(object),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(initial_objects.len(), 1);
+    assert_eq!(
+        *initial_objects[0],
+        fsm::TokenObjectInjection {
+            sequence: 0,
+            payload: fsm::TokenObjectPayload::Prompt {
+                tokens: vec![101, 102, 103],
+            },
+        }
     );
-
-    // Sequence 0 must be injected first.
     assert_eq!(harness.injected_sequences(), vec![0]);
 
     // Consuming token 0 permits injecting sequence 1.
@@ -224,6 +236,25 @@ fn execution_injects_next_sequence_only_after_consuming_previous_token() {
         eos: false,
     });
     assert_eq!(harness.injected_sequences(), vec![0, 1]);
+    let decode_object = harness
+        .commands()
+        .iter()
+        .filter_map(|command| match command {
+            fsm::RunCommand::InjectTokenObject { object, .. } => Some(object),
+            _ => None,
+        })
+        .last()
+        .expect("decode injection must be recorded");
+    assert_eq!(
+        *decode_object,
+        fsm::TokenObjectInjection {
+            sequence: 1,
+            payload: fsm::TokenObjectPayload::Decode {
+                token_id: 201,
+                sampling: fsm::SamplingData { source_sequence: 0 },
+            },
+        }
+    );
 
     // No additional injection may happen without consuming sequence 1.
     harness.advance_time_ms(10);
@@ -272,6 +303,13 @@ fn first_run_fault_reason_is_terminal_and_sticky() {
         run_id: fsm::RunId(7),
         kind: fsm::TimeoutKind::Execution,
     });
+    harness.observe(fsm::RunEvent::MembershipLost {
+        run_id: fsm::RunId(7),
+        node_id: fsm::NodeId(11),
+    });
+    harness.observe(fsm::RunEvent::TeardownTimeout {
+        run_id: fsm::RunId(7),
+    });
 
     // Exactly one terminal fault is recorded.
     let faults = harness
@@ -290,6 +328,31 @@ fn first_run_fault_reason_is_terminal_and_sticky() {
             reason: fsm::StageFaultReason::WorkerCrashed,
         }
     );
+}
+
+#[test]
+fn membership_loss_faults_run() {
+    let plan = committed_plan();
+    let mut membership_lost = new_run();
+    membership_lost.observe(fsm::RunEvent::PoolReady {
+        nodes: plan.stage_nodes(),
+    });
+    membership_lost.observe(fsm::RunEvent::PlanAvailable(plan.clone()));
+    membership_lost.observe(fsm::RunEvent::MembershipLost {
+        run_id: fsm::RunId(7),
+        node_id: fsm::NodeId(12),
+    });
+    assert!(membership_lost.events().iter().any(|event| {
+        matches!(
+            event,
+            fsm::LifecycleEvent::RunFaulted {
+                reason: fsm::RunFaultReason::MembershipLost {
+                    node_id: fsm::NodeId(12)
+                },
+                ..
+            }
+        )
+    }));
 }
 
 // This proves terminal outcomes are mutually exclusive, reject new work, and
@@ -355,6 +418,33 @@ fn terminal_outcome_is_single_and_requires_teardown() {
     assert_eq!(stopped_stages, expected_stages);
     assert!(
         harness
+            .commands()
+            .iter()
+            .any(|command| { matches!(command, fsm::RunCommand::TearDownTokenEndpoints { .. }) })
+    );
+
+    let mut stopped = new_run();
+    stopped.observe(fsm::RunEvent::PoolReady {
+        nodes: plan.stage_nodes(),
+    });
+    stopped.observe(fsm::RunEvent::PlanAvailable(plan));
+    stopped.observe(fsm::RunEvent::OperatorStop {
+        run_id: fsm::RunId(7),
+    });
+    let stopped_count = stopped
+        .events()
+        .iter()
+        .filter(|event| matches!(event, fsm::LifecycleEvent::RunOperatorStopped { .. }))
+        .count();
+    let stopped_faults = stopped
+        .events()
+        .iter()
+        .filter(|event| matches!(event, fsm::LifecycleEvent::RunFaulted { .. }))
+        .count();
+    assert_eq!(stopped_count, 1);
+    assert_eq!(stopped_faults, 0);
+    assert!(
+        stopped
             .commands()
             .iter()
             .any(|command| { matches!(command, fsm::RunCommand::TearDownTokenEndpoints { .. }) })
@@ -428,4 +518,24 @@ fn run_torn_down_is_emitted_once_after_teardown_terminal_state() {
         },
     );
     assert!(fault_pos < torn_down_pos);
+
+    let mut timeout = new_run();
+    timeout.observe(fsm::RunEvent::PoolReady {
+        nodes: plan.stage_nodes(),
+    });
+    timeout.observe(fsm::RunEvent::PlanAvailable(plan));
+    timeout.observe(fsm::RunEvent::StageFault {
+        run_id: fsm::RunId(7),
+        stage_index: 0,
+        reason: fsm::StageFaultReason::WorkerCrashed,
+    });
+    timeout.observe(fsm::RunEvent::TeardownTimeout {
+        run_id: fsm::RunId(7),
+    });
+    let timeout_torn_down_count = timeout
+        .events()
+        .iter()
+        .filter(|event| matches!(event, fsm::LifecycleEvent::RunTornDown { .. }))
+        .count();
+    assert_eq!(timeout_torn_down_count, 1);
 }

@@ -18,18 +18,29 @@ type EdgeEndpoint = plan::EdgeEndpoint;
 type EdgeId = plan::EdgeId;
 type EdgeKind = plan::EdgeKind;
 type EdgePlan = plan::EdgePlan;
+type GgufSource = plan::GgufSource;
+type HostPinning = plan::HostPinning;
 type InboundEdgeProvision = plan::InboundEdgeProvision;
 type ModelFacts = plan::ModelFacts;
 use plan::NodeId;
+type LayoutRule = plan::LayoutRule;
 type ObjectKind = plan::ObjectKind;
 type OutboundEdgeProvision = plan::OutboundEdgeProvision;
+type PromptSource = plan::PromptSource;
 type PlacementInput = plan::PlacementInput;
 type PlanRejectionKind = plan::PlanRejectionKind;
 type PlannerInput = plan::PlannerInput;
 type RingSpec = plan::RingSpec;
+type RingDirection = plan::RingDirection;
 type RunPlan = plan::RunPlan;
 type RuntimeConfig = plan::RuntimeConfig;
+type SamplingPolicy = plan::SamplingPolicy;
+type SequencePolicy = plan::SequencePolicy;
+type ShapeRule = plan::ShapeRule;
 type StagePlacement = plan::StagePlacement;
+type TokenOutputPolicy = plan::TokenOutputPolicy;
+type TokenizerSource = plan::TokenizerSource;
+type WakeCoalescing = plan::WakeCoalescing;
 
 // Keep test node ids small and readable. The concrete identity mechanism is
 // outside this contract; these ids exist only so assertions can name topology
@@ -68,14 +79,24 @@ fn valid_input(stage_count: u32, num_layers: u32) -> PlannerInput {
         orchestrator_node_id: node(99),
         model: ModelFacts {
             model_id: "test-gguf".into(),
+            gguf_source: GgufSource::LocalPath("/models/test-gguf.gguf".into()),
             num_layers,
             hidden_dim: 4096,
             dtype_family: DTypeFamily::BFloat,
             dtype_width_bytes: 2,
             max_seq_len: 2048,
             eos_token_id: 2,
+            tokenizer: TokenizerSource::LocalPath("/tokenizers/test-gguf.json".into()),
         },
-        runtime: RuntimeConfig::test_default(),
+        runtime: RuntimeConfig {
+            max_tokens: 4,
+            prompt: PromptSource::Inline("hello from planner input".into()),
+            sampling: SamplingPolicy {
+                temperature_millis: 125,
+                top_k: 7,
+            },
+            token_output_policy: TokenOutputPolicy::EmitAll,
+        },
         candidate_pool: valid_nodes(),
         stage_count,
         placement: linear_placement(stage_count),
@@ -129,11 +150,40 @@ fn valid_input_emits_one_complete_plan() {
     assert_eq!(plan.run_id, 7.into());
     assert_eq!(plan.stages.len(), 3);
     assert_eq!(plan.edges.len(), 4);
+    assert_eq!(plan.max_tokens, 4);
+    assert_eq!(plan.model.model_id, "test-gguf");
+    assert_eq!(
+        plan.model.gguf_source,
+        GgufSource::LocalPath("/models/test-gguf.gguf".into())
+    );
+    assert_eq!(plan.model.num_layers, 36);
+    assert_eq!(plan.model.hidden_dim, 4096);
+    assert_eq!(plan.model.dtype_family, DTypeFamily::BFloat);
+    assert_eq!(plan.model.dtype_width_bytes, 2);
+    assert_eq!(plan.model.max_seq_len, 2048);
+    assert_eq!(plan.model.eos_token_id, 2);
+    assert_eq!(
+        plan.model.tokenizer,
+        TokenizerSource::LocalPath("/tokenizers/test-gguf.json".into())
+    );
+    assert_eq!(
+        plan.runtime.sampling,
+        SamplingPolicy {
+            temperature_millis: 125,
+            top_k: 7,
+        }
+    );
+    assert_eq!(
+        plan.runtime.prompt,
+        PromptSource::Inline("hello from planner input".into())
+    );
+    assert_eq!(plan.runtime.token_output_policy, TokenOutputPolicy::EmitAll);
 
     // Every stage must be bound to this run and know the run's stage count.
     for stage in &plan.stages {
         assert_eq!(stage.run_id, plan.run_id);
         assert_eq!(stage.stage_count, 3);
+        assert_eq!(stage.gguf_source, plan.model.gguf_source);
     }
 
     // Every edge must also be bound to this run; no edge can be a loose fact.
@@ -352,6 +402,21 @@ fn provision_stage_projection_is_deterministic_and_stage_local() {
         assert_eq!(first.stage_count, 3);
         assert_eq!(first.layer_start, stage.layer_start);
         assert_eq!(first.layer_end_exclusive, stage.layer_end_exclusive);
+        assert_eq!(first.gguf_source, stage.gguf_source);
+        assert_eq!(first.model.model_id, plan.model.model_id);
+        assert_eq!(first.model.hidden_dim, plan.model.hidden_dim);
+        assert_eq!(first.model.dtype_family, plan.model.dtype_family);
+        assert_eq!(first.model.dtype_width_bytes, plan.model.dtype_width_bytes);
+        assert_eq!(first.model.max_seq_len, plan.model.max_seq_len);
+        assert_eq!(first.runtime.role_id, plan::RoleId(u64::from(stage_index)));
+        assert_eq!(first.runtime.input_port, plan::PortId("input".into()));
+        assert_eq!(first.runtime.output_port, plan::PortId("output".into()));
+        let expected_sampling = if stage_index + 1 == stage.stage_count {
+            Some(plan.runtime.sampling)
+        } else {
+            None
+        };
+        assert_eq!(first.runtime.sampling, expected_sampling);
     }
 }
 
@@ -431,6 +496,13 @@ fn object_and_ring_specs_are_present_and_match_edge_kind() {
     for edge in &plan.edges {
         assert!(edge.object_spec.max_extent > 0);
         assert!(edge.ring_spec.data_capacity > 0);
+        assert!(edge.object_spec.alignment > 0);
+        assert_eq!(edge.object_spec.layout, LayoutRule::Contiguous);
+        assert_eq!(edge.object_spec.sequence_policy, SequencePolicy::Ordered);
+        assert!(edge.ring_spec.alignment > 0);
+        assert_eq!(edge.ring_spec.direction, RingDirection::Egress);
+        assert_eq!(edge.ring_spec.host_pinning, HostPinning::Pageable);
+        assert_eq!(edge.ring_spec.wake_coalescing, WakeCoalescing::PendingBit);
 
         // Edge kind selects the object kind, and activation capacity is derived
         // from model facts.
@@ -438,17 +510,28 @@ fn object_and_ring_specs_are_present_and_match_edge_kind() {
             EdgeKind::Activation => {
                 assert_eq!(edge.object_spec.kind, ObjectKind::Activation);
                 assert_eq!(edge.object_spec.max_extent, expected_activation_extent);
+                assert_eq!(edge.object_spec.dtype_family, DTypeFamily::BFloat);
+                assert_eq!(edge.object_spec.dtype_width_bytes, 2);
+                assert_eq!(
+                    edge.object_spec.shape,
+                    ShapeRule::ActivationRows {
+                        max_seq_len: 2048,
+                        hidden_dim: 4096,
+                    }
+                );
             }
             EdgeKind::TokenIn | EdgeKind::TokenOut => {
                 assert_eq!(edge.object_spec.kind, ObjectKind::Token);
+                assert_eq!(edge.object_spec.dtype_width_bytes, 4);
+                assert_eq!(edge.object_spec.shape, ShapeRule::TokenIds);
             }
         }
     }
 }
 
-// This proves object and ring specs are copied consistently into every stage
-// projection. A stage provision may narrow visibility to its own edges, but it
-// may not revise the specs for those edges.
+// This proves object and ring specs are projected consistently into every stage
+// provision. A stage provision narrows the ring direction to the local role
+// while preserving the edge's capacity, alignment, pinning, and wake policy.
 #[test]
 fn object_and_ring_specs_are_copied_consistently_into_stage_provisions() {
     // Build a canonical plan and index its public edge records.
@@ -459,17 +542,23 @@ fn object_and_ring_specs_are_copied_consistently_into_stage_provisions() {
         // Project a stage-local provisioning message.
         let provision = plan::derive_stage_provision(&plan, stage.stage_index).unwrap();
 
-        // The inbound edge spec must be the plan's exact edge spec.
+        // The inbound edge spec must preserve the plan edge facts and mark the
+        // local ring as ingress.
         let inbound_edge = edges.get(&provision.inbound.edge_id).unwrap();
+        let mut expected_inbound_ring = inbound_edge.ring_spec;
+        expected_inbound_ring.direction = RingDirection::Ingress;
         assert_eq!(provision.inbound.kind, inbound_edge.kind);
         assert_eq!(provision.inbound.object_spec, inbound_edge.object_spec);
-        assert_eq!(provision.inbound.ring_spec, inbound_edge.ring_spec);
+        assert_eq!(provision.inbound.ring_spec, expected_inbound_ring);
 
-        // The outbound edge spec must also be copied, not recomputed or revised.
+        // The outbound edge spec must preserve the plan edge facts and mark the
+        // local ring as egress.
         let outbound_edge = edges.get(&provision.outbound.edge_id).unwrap();
+        let mut expected_outbound_ring = outbound_edge.ring_spec;
+        expected_outbound_ring.direction = RingDirection::Egress;
         assert_eq!(provision.outbound.kind, outbound_edge.kind);
         assert_eq!(provision.outbound.object_spec, outbound_edge.object_spec);
-        assert_eq!(provision.outbound.ring_spec, outbound_edge.ring_spec);
+        assert_eq!(provision.outbound.ring_spec, expected_outbound_ring);
     }
 }
 

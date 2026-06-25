@@ -12,7 +12,6 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::FrameEvent;
-use crate::root_page::ROOT_HTML;
 use crate::store::DashboardStore;
 use crate::view::ViewRegistry;
 
@@ -46,8 +45,61 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn root_page() -> Html<&'static str> {
-    Html(ROOT_HTML)
+async fn root_page(State(state): State<AppState>) -> Html<String> {
+    let mut views = state.views.descriptors();
+    views.sort_by(|left, right| left.title.cmp(right.title));
+    let links = views
+        .iter()
+        .map(|view| {
+            format!(
+                "<li><a href=\"{}\">{}</a> <code>{}</code></li>",
+                escape_html(&view.page),
+                escape_html(view.title),
+                escape_html(view.id)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    Html(format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>swactor dashboard</title>
+  <style>
+    :root {{ color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #e5e7eb; }}
+    body {{ margin: 0; padding: 32px; }}
+    a {{ color: #93c5fd; }}
+    code {{ color: #fbbf24; }}
+    .card {{ max-width: 760px; background: #1f2937; border: 1px solid #374151; border-radius: 16px; padding: 24px; }}
+    li {{ margin: 10px 0; }}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>swactor dashboard</h1>
+    <p>Read-only views over live datastream frames.</p>
+    <h2>Views</h2>
+    <ul>{links}</ul>
+    <h2>Raw APIs</h2>
+    <ul>
+      <li><a href="/api/views">Registered views JSON</a></li>
+      <li><code>/events</code> streams raw incoming frames as SSE.</li>
+      <li><code>/api/frames</code> returns the bounded recent raw frame window.</li>
+    </ul>
+  </main>
+</body>
+</html>"#
+    ))
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn recent_frames(State(state): State<AppState>) -> Json<Vec<FrameEvent>> {

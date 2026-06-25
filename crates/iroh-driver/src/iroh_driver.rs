@@ -52,16 +52,6 @@ pub struct IrohDriverConfig {
     pub peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     /// Additional ALPNs to register beyond SWIM. Opaque to the driver.
     pub additional_alpns: Vec<Vec<u8>>,
-    /// If set, start an embedded relay server on this address.
-    /// Requires the `relay` feature. On success, the driver uses the embedded
-    /// relay for `RelayMode::Custom`; on failure, falls back to `relay_mode`.
-    #[cfg(feature = "relay")]
-    pub embedded_relay_bind: Option<std::net::SocketAddr>,
-    /// Public IP to advertise in the relay URL instead of the bind address.
-    /// When `Some`, the relay URL uses this IP; when `None`, falls back to the
-    /// bind address (which may be `0.0.0.0`).
-    #[cfg(feature = "relay")]
-    pub relay_public_ip: Option<std::net::IpAddr>,
 }
 
 // ─── Pending join result ────────────────────────────────────────────────────
@@ -247,10 +237,7 @@ pub struct IrohDriver {
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
     /// Real-time join status for each peer being joined.
     join_statuses: Arc<Mutex<HashMap<NodeId, JoinStatus>>>,
-    /// Embedded relay server (if started).
-    #[cfg(feature = "relay")]
-    relay_server: Option<iroh_relay::server::Server>,
-    /// URL of the embedded relay server (if started).
+    /// Relay URL exposed by the bound endpoint, if any.
     relay_url: Option<String>,
     /// Actor-bridge wiring, installed via [`Self::enable_actor_bridge`]. When
     /// present, the driver decodes inbound frames into actor messages
@@ -334,31 +321,15 @@ impl IrohDriver {
     /// created one because there was no ambient runtime), or `None` when running
     /// on a shared handle.
     ///
-    /// If `embedded_relay_bind` is set (requires `relay` feature), an embedded
-    /// relay server is started on `rt` before the endpoint is created. On success
-    /// the endpoint uses the embedded relay; on failure it falls back to
-    /// `config.relay_mode`.
+    /// `relay_mode` is passed directly to the endpoint. Custom relays remain
+    /// supported as endpoint configuration; this driver no longer starts relay
+    /// servers itself.
     fn build(
         rt: Handle,
         owned: Option<tokio::runtime::Runtime>,
         config: IrohDriverConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Try to start embedded relay if configured
-        #[cfg(feature = "relay")]
-        let (relay_server, relay_url, effective_relay_mode) = match config.embedded_relay_bind {
-            Some(bind_addr) => {
-                match rt.block_on(start_embedded_relay(bind_addr, config.relay_public_ip)) {
-                    Ok((server, url)) => {
-                        let url_str = url.to_string();
-                        (Some(server), Some(url_str), RelayMode::Custom(url.into()))
-                    }
-                    Err(_) => (None, None, config.relay_mode),
-                }
-            }
-            None => (None, None, config.relay_mode),
-        };
-        #[cfg(not(feature = "relay"))]
-        let (relay_url, effective_relay_mode) = (None::<String>, config.relay_mode);
+        let effective_relay_mode = config.relay_mode;
 
         // A custom relay is operator-controlled (typically `iroh-driver-relay`
         // on a VPS, serving QUIC Address Discovery with a self-signed cert).
@@ -387,6 +358,11 @@ impl IrohDriver {
 
             builder.bind().await
         })?;
+        let relay_url = endpoint
+            .addr()
+            .relay_urls()
+            .next()
+            .map(|url| url.to_string());
 
         // The driver's signing identity matches the iroh endpoint: both use
         // ed25519-dalek, so we reconstruct our Keypair from iroh's secret key.
@@ -451,8 +427,6 @@ impl IrohDriver {
             evict: Arc::new(Mutex::new(Vec::new())),
             peer_relay_urls: HashMap::new(),
             join_statuses: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(feature = "relay")]
-            relay_server,
             relay_url,
             actor_bridge: None,
             _owned_rt: owned,
@@ -1077,7 +1051,7 @@ impl IrohDriver {
         }
     }
 
-    /// URL of the embedded relay server, if one was started.
+    /// Relay URL exposed by the bound endpoint, if any.
     pub fn relay_url(&self) -> Option<&str> {
         self.relay_url.as_deref()
     }
@@ -1090,60 +1064,17 @@ impl IrohDriver {
     /// Async teardown for the unified driver loop, which runs on a tokio worker
     /// where `block_on` would panic. Mirrors [`Self::shutdown`] without blocking.
     pub async fn close(&mut self) {
-        #[cfg(feature = "relay")]
-        if let Some(server) = self.relay_server.take() {
-            let _ = server.shutdown().await;
-        }
         self.endpoint.close().await;
     }
 
-    /// Shut down the driver: stop the embedded relay (if any), then close the
-    /// iroh endpoint. Synchronous (`block_on`); call from a non-async thread
+    /// Shut down the driver by closing the iroh endpoint.
     /// (the test harness / standalone binaries). The node's async driver loop
     /// uses [`Self::close`] instead.
     pub fn shutdown(&mut self) {
-        // Shut down embedded relay first (must stop before endpoint closes)
-        #[cfg(feature = "relay")]
-        if let Some(server) = self.relay_server.take() {
-            self.rt.block_on(async {
-                let _ = server.shutdown().await;
-            });
-        }
         self.rt.block_on(async {
             self.endpoint.close().await;
         });
     }
-}
-
-// ─── Embedded Relay ─────────────────────────────────────────────────────────
-
-#[cfg(feature = "relay")]
-async fn start_embedded_relay(
-    bind_addr: std::net::SocketAddr,
-    public_ip: Option<std::net::IpAddr>,
-) -> Result<(iroh_relay::server::Server, iroh::RelayUrl), Box<dyn std::error::Error>> {
-    let server = iroh_relay::server::Server::spawn(iroh_relay::server::ServerConfig::<(), ()> {
-        relay: Some(iroh_relay::server::RelayConfig {
-            http_bind_addr: bind_addr,
-            tls: None,
-            limits: Default::default(),
-            key_cache_capacity: Some(256),
-            access: iroh_relay::server::AccessConfig::Everyone,
-        }),
-        quic: None,
-        metrics_addr: None,
-    })
-    .await?;
-
-    let url: iroh::RelayUrl = match server.http_addr() {
-        Some(addr) => {
-            let host = public_ip.unwrap_or_else(|| addr.ip());
-            format!("http://{}:{}/", host, addr.port()).parse()?
-        }
-        None => return Err("relay server has no HTTP address".into()),
-    };
-
-    Ok((server, url))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

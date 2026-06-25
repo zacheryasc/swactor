@@ -51,6 +51,88 @@ pub struct ObjectSpec {
     pub layout: ObjectLayout,
 }
 
+pub const HEADER_LEN: usize = 40;
+pub const OBJECT_MAGIC_BYTES: [u8; 4] = *b"MO01";
+pub const OBJECT_MAGIC: u32 = u32::from_le_bytes(OBJECT_MAGIC_BYTES);
+pub const OBJECT_VERSION: u16 = 1;
+pub const FLAG_END_OF_SEQUENCE: u32 = 1;
+pub const KNOWN_FLAGS_MASK: u32 = FLAG_END_OF_SEQUENCE;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ObjectFlags {
+    pub end_of_sequence: bool,
+}
+
+impl ObjectFlags {
+    pub fn bits(self) -> u32 {
+        if self.end_of_sequence {
+            FLAG_END_OF_SEQUENCE
+        } else {
+            0
+        }
+    }
+
+    pub fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !KNOWN_FLAGS_MASK != 0 {
+            return None;
+        }
+        Some(Self {
+            end_of_sequence: bits & FLAG_END_OF_SEQUENCE != 0,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ObjectHeader {
+    pub object_id: ObjectId,
+    pub sequence: u64,
+    pub extent: u64,
+    pub flags: ObjectFlags,
+}
+
+impl ObjectHeader {
+    pub fn encode(self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(HEADER_LEN);
+        out.extend_from_slice(&OBJECT_MAGIC.to_le_bytes());
+        out.extend_from_slice(&OBJECT_VERSION.to_le_bytes());
+        out.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
+        out.extend_from_slice(&self.object_id.0.to_le_bytes());
+        out.extend_from_slice(&self.sequence.to_le_bytes());
+        out.extend_from_slice(&self.extent.to_le_bytes());
+        out.extend_from_slice(&self.flags.bits().to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, ObjectFailureReason> {
+        if bytes.len() < HEADER_LEN {
+            return Err(ObjectFailureReason::EofBeforeFullPayload);
+        }
+        if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != OBJECT_MAGIC {
+            return Err(ObjectFailureReason::UnsupportedMagic);
+        }
+        if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != OBJECT_VERSION {
+            return Err(ObjectFailureReason::UnsupportedVersion);
+        }
+        if u16::from_le_bytes(bytes[6..8].try_into().unwrap()) as usize != HEADER_LEN {
+            return Err(ObjectFailureReason::MalformedHeaderLength);
+        }
+        let flags = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+        if u32::from_le_bytes(bytes[36..40].try_into().unwrap()) != 0 {
+            return Err(ObjectFailureReason::MalformedHeader);
+        }
+        let Some(flags) = ObjectFlags::from_bits(flags) else {
+            return Err(ObjectFailureReason::MalformedHeader);
+        };
+        Ok(Self {
+            object_id: ObjectId(u64::from_le_bytes(bytes[8..16].try_into().unwrap())),
+            sequence: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            extent: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            flags,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallRing {
     pub ring_id: RingId,
@@ -88,6 +170,7 @@ pub enum ObjectFailureReason {
     UnsupportedMagic,
     UnsupportedVersion,
     MalformedHeaderLength,
+    MalformedHeader,
     ExtentExceedsMax,
     ExtentAlignmentViolation,
     SequenceViolation,
@@ -108,7 +191,10 @@ pub enum WorkerIngressOut {
     },
     ObjectFailed {
         ring_id: RingId,
+        edge_id: EdgeId,
+        port_id: PortId,
         object_id: Option<ObjectId>,
+        sequence: Option<u64>,
         reason: ObjectFailureReason,
     },
     RingFault {
@@ -129,9 +215,10 @@ pub struct ObjectRecordBuilder {
     sequence: u64,
     extent: u64,
     payload: Vec<u8>,
-    magic: [u8; 4],
-    version: u8,
-    header_len: u8,
+    magic: u32,
+    version: u16,
+    header_len: u16,
+    flags: ObjectFlags,
 }
 
 impl ObjectRecordBuilder {
@@ -142,9 +229,10 @@ impl ObjectRecordBuilder {
             sequence: 0,
             extent: 0,
             payload: Vec::new(),
-            magic: *b"MO01",
-            version: 1,
-            header_len: HEADER_LEN as u8,
+            magic: OBJECT_MAGIC,
+            version: OBJECT_VERSION,
+            header_len: HEADER_LEN as u16,
+            flags: ObjectFlags::default(),
         }
     }
 
@@ -174,7 +262,7 @@ impl ObjectRecordBuilder {
     }
 
     pub fn unsupported_magic(mut self) -> Self {
-        self.magic = *b"BAD!";
+        self.magic = u32::from_le_bytes(*b"BAD!");
         self
     }
 
@@ -188,32 +276,42 @@ impl ObjectRecordBuilder {
         self
     }
 
+    pub fn flags(mut self, flags: ObjectFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+
     pub fn encode(mut self) -> Vec<u8> {
         if self.extent == 0 && !self.payload.is_empty() {
             self.extent = self.payload.len() as u64;
         }
-        let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
-        out.extend_from_slice(&self.magic);
-        out.push(self.version);
-        out.push(self.header_len);
-        out.extend_from_slice(&[0u8; 2]);
-        out.extend_from_slice(&self.object_id.0.to_le_bytes());
-        out.extend_from_slice(&self.sequence.to_le_bytes());
-        out.extend_from_slice(&self.extent.to_le_bytes());
-        out.extend_from_slice(&self.spec.max_extent.to_le_bytes());
-        out.extend_from_slice(&self.spec.alignment.to_le_bytes());
+        let mut out = ObjectHeader {
+            object_id: self.object_id,
+            sequence: self.sequence,
+            extent: self.extent,
+            flags: self.flags,
+        }
+        .encode();
+        if self.magic != OBJECT_MAGIC {
+            out[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        }
+        if self.version != OBJECT_VERSION {
+            out[4..6].copy_from_slice(&self.version.to_le_bytes());
+        }
+        if self.header_len as usize != HEADER_LEN {
+            out[6..8].copy_from_slice(&self.header_len.to_le_bytes());
+        }
         out.extend_from_slice(&self.payload);
         out
     }
 }
-
-pub const HEADER_LEN: usize = 48;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObjectRecord {
     pub object_id: ObjectId,
     pub sequence: u64,
     pub extent: u64,
+    pub flags: ObjectFlags,
     pub total_len: usize,
 }
 
@@ -355,7 +453,10 @@ impl IngressParserHarness {
                 if record.sequence != self.expected_sequence {
                     self.events.push(WorkerIngressOut::ObjectFailed {
                         ring_id,
+                        edge_id: install.edge_id,
+                        port_id: install.port_id.clone(),
                         object_id: Some(record.object_id),
+                        sequence: Some(record.sequence),
                         reason: ObjectFailureReason::SequenceViolation,
                     });
                     return;
@@ -375,11 +476,17 @@ impl IngressParserHarness {
                 });
             }
             Ok(ObjectRecordRead::Incomplete) => {}
-            Err(reason) => self.events.push(WorkerIngressOut::ObjectFailed {
-                ring_id,
-                object_id: None,
-                reason,
-            }),
+            Err(reason) => {
+                let (object_id, sequence) = object_failure_metadata(&buffer, reason);
+                self.events.push(WorkerIngressOut::ObjectFailed {
+                    ring_id,
+                    edge_id: install.edge_id,
+                    port_id: install.port_id.clone(),
+                    object_id,
+                    sequence,
+                    reason,
+                });
+            }
         }
     }
 
@@ -426,25 +533,14 @@ pub fn read_object_record(
             Ok(ObjectRecordRead::Incomplete)
         };
     }
-    if &bytes[0..4] != b"MO01" {
-        return Err(ObjectFailureReason::UnsupportedMagic);
-    }
-    if bytes[4] != 1 {
-        return Err(ObjectFailureReason::UnsupportedVersion);
-    }
-    if bytes[5] as usize != HEADER_LEN {
-        return Err(ObjectFailureReason::MalformedHeaderLength);
-    }
-    let object_id = ObjectId(u64::from_le_bytes(bytes[8..16].try_into().unwrap()));
-    let sequence = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-    let extent = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-    if extent > spec.max_extent {
+    let header = ObjectHeader::decode(bytes)?;
+    if header.extent > spec.max_extent {
         return Err(ObjectFailureReason::ExtentExceedsMax);
     }
-    if spec.alignment != 0 && extent % spec.alignment != 0 {
+    if spec.alignment != 0 && header.extent % spec.alignment != 0 {
         return Err(ObjectFailureReason::ExtentAlignmentViolation);
     }
-    let total_len = HEADER_LEN + extent as usize;
+    let total_len = HEADER_LEN + header.extent as usize;
     if bytes.len() < total_len {
         return if eof {
             Err(ObjectFailureReason::EofBeforeFullPayload)
@@ -453,9 +549,32 @@ pub fn read_object_record(
         };
     }
     Ok(ObjectRecordRead::Complete(ObjectRecord {
-        object_id,
-        sequence,
-        extent,
+        object_id: header.object_id,
+        sequence: header.sequence,
+        extent: header.extent,
+        flags: header.flags,
         total_len,
     }))
+}
+
+fn object_failure_metadata(
+    bytes: &[u8],
+    reason: ObjectFailureReason,
+) -> (Option<ObjectId>, Option<u64>) {
+    if bytes.len() < HEADER_LEN
+        || matches!(
+            reason,
+            ObjectFailureReason::UnsupportedMagic
+                | ObjectFailureReason::UnsupportedVersion
+                | ObjectFailureReason::MalformedHeaderLength
+        )
+    {
+        return (None, None);
+    }
+    (
+        Some(ObjectId(u64::from_le_bytes(
+            bytes[8..16].try_into().unwrap(),
+        ))),
+        Some(u64::from_le_bytes(bytes[16..24].try_into().unwrap())),
+    )
 }

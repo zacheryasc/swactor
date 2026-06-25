@@ -348,9 +348,8 @@ impl EdgeEstablisherState {
             } => self.ring_fault(edge_id, ring_id, reason),
             EdgeEvent::StopEdge { edge_id } => self.stop_edge(edge_id),
             EdgeEvent::PumpStopped { edge_id, ring_id } => self.pump_stopped(edge_id, ring_id),
-            EdgeEvent::RingQuiesced { ring_id } | EdgeEvent::QuiescenceProven { ring_id } => {
-                self.release_after_quiescence(ring_id);
-            }
+            EdgeEvent::RingQuiesced { ring_id } => self.ring_quiesced(ring_id),
+            EdgeEvent::QuiescenceProven { ring_id } => self.quiescence_proven(ring_id),
             EdgeEvent::Stopped { edge_id } => self.mark_stopped(edge_id),
         }
     }
@@ -412,6 +411,7 @@ impl EdgeEstablisherState {
 
         record.ring_id = Some(ring_id);
         record.layout = Some(layout);
+        record.worker_ring_requested = true;
         record.state = EdgeProvisionState::WaitingForWorkerRing;
         self.commands.push(EdgeCommand::InstallWorkerRing {
             edge_id,
@@ -530,7 +530,7 @@ impl EdgeEstablisherState {
         let request_id = record.lease_request_id;
         let ring_id = record.ring_id;
         let driver_established = record.driver_established;
-        let worker_installed = record.worker_installed;
+        let worker_ring_cleanup_required = record.worker_ring_cleanup_required();
         record.state = EdgeProvisionState::Stopping;
 
         if cancel_lease {
@@ -551,11 +551,11 @@ impl EdgeEstablisherState {
             self.commands
                 .push(EdgeCommand::StopPump { edge_id, ring_id });
         }
-        if worker_installed {
+        if worker_ring_cleanup_required {
             self.commands
                 .push(EdgeCommand::UninstallWorkerRing { edge_id, ring_id });
         }
-        if !driver_established && !worker_installed {
+        if !driver_established && !worker_ring_cleanup_required {
             self.release_ring(edge_id, ring_id);
         }
     }
@@ -564,19 +564,49 @@ impl EdgeEstablisherState {
         let Some(record) = self.records.get_mut(&edge_id) else {
             return;
         };
-        if record.ring_id == Some(ring_id) {
-            record.pump_stopped = true;
+        if record.state != EdgeProvisionState::Stopping || record.ring_id != Some(ring_id) {
+            return;
         }
+        record.pump_stopped = true;
+        self.release_after_teardown_proofs(edge_id, ring_id);
     }
 
-    fn release_after_quiescence(&mut self, ring_id: RingId) {
+    fn ring_quiesced(&mut self, ring_id: RingId) {
         let Some(edge_id) = self.edge_for_ring(ring_id) else {
             return;
         };
-        let Some(record) = self.records.get(&edge_id) else {
+        let Some(record) = self.records.get_mut(&edge_id) else {
             return;
         };
         if record.state != EdgeProvisionState::Stopping {
+            return;
+        }
+        record.worker_ring_quiesced = true;
+        self.release_after_teardown_proofs(edge_id, ring_id);
+    }
+
+    fn quiescence_proven(&mut self, ring_id: RingId) {
+        let Some(edge_id) = self.edge_for_ring(ring_id) else {
+            return;
+        };
+        let Some(record) = self.records.get_mut(&edge_id) else {
+            return;
+        };
+        if record.state != EdgeProvisionState::Stopping {
+            return;
+        }
+        record.quiescence_proven = true;
+        self.release_after_teardown_proofs(edge_id, ring_id);
+    }
+
+    fn release_after_teardown_proofs(&mut self, edge_id: EdgeId, ring_id: RingId) {
+        let Some(record) = self.records.get(&edge_id) else {
+            return;
+        };
+        if record.state != EdgeProvisionState::Stopping
+            || record.ring_id != Some(ring_id)
+            || !record.teardown_quiesced()
+        {
             return;
         }
         self.release_ring(edge_id, ring_id);
@@ -655,9 +685,12 @@ struct EdgeRecord {
     remote_actor_address: Option<ActorAddress>,
     object_spec: ObjectSpec,
     ring_spec: RingSpec,
+    worker_ring_requested: bool,
     worker_installed: bool,
     driver_established: bool,
     pump_stopped: bool,
+    worker_ring_quiesced: bool,
+    quiescence_proven: bool,
 }
 
 impl EdgeRecord {
@@ -675,9 +708,12 @@ impl EdgeRecord {
             remote_actor_address: None,
             object_spec: provision.object_spec,
             ring_spec: provision.ring_spec,
+            worker_ring_requested: false,
             worker_installed: false,
             driver_established: false,
             pump_stopped: false,
+            worker_ring_quiesced: false,
+            quiescence_proven: false,
         }
     }
 
@@ -695,10 +731,23 @@ impl EdgeRecord {
             remote_actor_address: None,
             object_spec: provision.object_spec,
             ring_spec: provision.ring_spec,
+            worker_ring_requested: false,
             worker_installed: false,
             driver_established: false,
             pump_stopped: false,
+            worker_ring_quiesced: false,
+            quiescence_proven: false,
         }
+    }
+
+    fn worker_ring_cleanup_required(&self) -> bool {
+        self.worker_ring_requested || self.worker_installed
+    }
+
+    fn teardown_quiesced(&self) -> bool {
+        (!self.driver_established || self.pump_stopped)
+            && (!self.worker_ring_cleanup_required() || self.worker_ring_quiesced)
+            && self.quiescence_proven
     }
 
     fn snapshot(&self) -> LocalEdgeRecord {

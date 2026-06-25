@@ -248,11 +248,20 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
                             .send_to(target, NodeAgentMsg::ProvisionStage(provision))
                             .map_err(|e| format!("send provision to stage {stage_index}: {e}"))?;
                     }
-                    RunCommandWire::InjectPrompt {
-                        sequence, prompt, ..
+                    RunCommandWire::InjectTokenObject {
+                        sequence, payload, ..
                     } => {
                         injected = true;
 
+                        let token_id = match payload {
+                            mvp_system::actors::orchestrator::TokenObjectPayloadWire::Prompt {
+                                tokens,
+                            } => tokens.first().copied(),
+                            mvp_system::actors::orchestrator::TokenObjectPayloadWire::Decode {
+                                token_id,
+                                ..
+                            } => Some(token_id),
+                        };
                         let prompt_object = token_in_object_allocator.alloc();
                         write_edge_frame(
                             node0.ready.token_in_addr,
@@ -261,7 +270,7 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
                                 object_id: prompt_object.object_id.0,
                                 sequence,
                                 kind: "token".to_owned(),
-                                token_id: prompt.first().copied(),
+                                token_id,
                                 eos: false,
                             },
                         )?;
@@ -292,8 +301,7 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
                             .map_err(|e| format!("observe token endpoints stopped: {e}"))?;
                     }
                     RunCommandWire::CreateTokenInEndpoint { .. }
-                    | RunCommandWire::CreateTokenOutEndpoint { .. }
-                    | RunCommandWire::BroadcastStart { .. } => {}
+                    | RunCommandWire::CreateTokenOutEndpoint { .. } => {}
                 },
                 OrchestratorReport::Lifecycle(event) => match event {
                     LifecycleEventWire::RunCompleted { .. } => {
@@ -304,7 +312,8 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
                         torn_down = true;
                     }
                     LifecycleEventWire::RunRejected { .. }
-                    | LifecycleEventWire::RunFaulted { .. } => {
+                    | LifecycleEventWire::RunFaulted { .. }
+                    | LifecycleEventWire::RunOperatorStopped { .. } => {
                         return Err(format!("run failed: {event:?}"));
                     }
                 },
@@ -593,6 +602,7 @@ fn build_local_engine_topology(run_id: u64) -> Result<LocalEngineTopology, Strin
             2,
             8,
             99,
+            plan::TokenizerSource::EmbeddedGguf,
         ),
     )
     .run_id(run_id)
@@ -624,6 +634,12 @@ fn build_local_engine_topology(run_id: u64) -> Result<LocalEngineTopology, Strin
     .planner(
         engine::FixedLinearPipelinePlanner::new(2).runtime(plan::RuntimeConfig {
             max_tokens: MAX_TOKENS as u32,
+            prompt: plan::PromptSource::Inline("1 2 3".to_owned()),
+            sampling: plan::SamplingPolicy {
+                temperature_millis: 0,
+                top_k: 1,
+            },
+            token_output_policy: plan::TokenOutputPolicy::EmitAll,
         }),
     )
     .launch()
@@ -825,10 +841,23 @@ fn handle_node_command(
                 },
             )
         }
-        StageCommandWire::ReleaseInputHandle { .. }
-        | StageCommandWire::StopLocalEdges { .. }
-        | StageCommandWire::ReleaseRunDeviceObjects { .. }
-        | StageCommandWire::RewireEdge { .. } => Ok(()),
+        StageCommandWire::ReleaseInputHandle { .. } | StageCommandWire::RewireEdge { .. } => Ok(()),
+        StageCommandWire::StopLocalEdges { run_id } => {
+            runtime
+                .send_to(node_actor, NodeAgentMsg::LocalEdgesStopped { run_id })
+                .map_err(|e| format!("mark local edges stopped: {e}"))?;
+            runtime
+                .send_to(node_actor, NodeAgentMsg::WorkerRingsQuiesced { run_id })
+                .map_err(|e| format!("mark worker rings quiesced: {e}"))
+        }
+        StageCommandWire::ReleaseRunDeviceObjects { run_id } => {
+            runtime
+                .send_to(node_actor, NodeAgentMsg::DeviceObjectsReleased { run_id })
+                .map_err(|e| format!("mark device objects released: {e}"))?;
+            runtime
+                .send_to(node_actor, NodeAgentMsg::WorkerRoleReset { run_id })
+                .map_err(|e| format!("mark worker role reset: {e}"))
+        }
     }
 }
 

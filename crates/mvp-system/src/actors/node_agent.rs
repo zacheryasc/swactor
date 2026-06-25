@@ -66,6 +66,18 @@ pub enum NodeAgentMsg {
     StopRun {
         run_id: u64,
     },
+    LocalEdgesStopped {
+        run_id: u64,
+    },
+    WorkerRingsQuiesced {
+        run_id: u64,
+    },
+    DeviceObjectsReleased {
+        run_id: u64,
+    },
+    WorkerRoleReset {
+        run_id: u64,
+    },
     Snapshot {
         reply_to: ActorAddress,
     },
@@ -223,6 +235,26 @@ impl NodeAgentActor {
             NodeAgentMsg::StopRun { run_id } => self.core.observe(stage::StageEvent::StopRun {
                 run_id: stage::RunId(run_id),
             }),
+            NodeAgentMsg::LocalEdgesStopped { run_id } => {
+                self.core.observe(stage::StageEvent::LocalEdgesStopped {
+                    run_id: stage::RunId(run_id),
+                })
+            }
+            NodeAgentMsg::WorkerRingsQuiesced { run_id } => {
+                self.core.observe(stage::StageEvent::WorkerRingsQuiesced {
+                    run_id: stage::RunId(run_id),
+                })
+            }
+            NodeAgentMsg::DeviceObjectsReleased { run_id } => {
+                self.core.observe(stage::StageEvent::DeviceObjectsReleased {
+                    run_id: stage::RunId(run_id),
+                })
+            }
+            NodeAgentMsg::WorkerRoleReset { run_id } => {
+                self.core.observe(stage::StageEvent::WorkerRoleReset {
+                    run_id: stage::RunId(run_id),
+                })
+            }
             NodeAgentMsg::Snapshot { reply_to } => {
                 let _ = ctx.send(
                     reply_to,

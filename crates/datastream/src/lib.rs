@@ -31,6 +31,7 @@
 //! producer/consumer crates, not in a datastream-wide catalog.
 
 pub mod emit;
+pub mod endpoint;
 pub mod frame;
 pub mod health;
 pub mod ingest;
@@ -42,6 +43,10 @@ pub mod transport;
 pub mod views;
 pub mod wire;
 
+pub use endpoint::{
+    DatastreamEndpoint, DatastreamProducer, DatastreamSubscription, DeliveryFanout, EndpointTick,
+    SubscriberSnapshot, SubscriptionId,
+};
 pub use frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 pub use ingest::Consumer;
 pub use mux::Mux;

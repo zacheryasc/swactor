@@ -40,7 +40,7 @@ fn successful_run_trace() -> Vec<obs::Event> {
         .finish()
 }
 
-// A fault trace gives the tests one stable reason enum and detecting component
+// A fault trace gives the tests stable reason enums and detecting components
 // without relying on diagnostic log text.
 fn fault_trace() -> Vec<obs::Event> {
     obs::TraceBuilder::new(obs::RunId(7))
@@ -49,14 +49,19 @@ fn fault_trace() -> Vec<obs::Event> {
         .pool_ready(vec![obs::NodeId(10)])
         .run_planned()
         .stage_provision_started(obs::StageIndex(0), obs::NodeId(10))
+        .node_faulted(
+            obs::NodeId(10),
+            obs::FaultReason::MembershipLoss,
+            obs::Component::Membership,
+        )
         .stage_faulted(
             obs::StageIndex(0),
-            obs::FaultReason::WorkerCrashed,
-            obs::Component::StageController,
+            obs::FaultReason::RingFault,
+            obs::Component::SharedRingHelper,
         )
         .run_faulted(
-            obs::FaultReason::WorkerCrashed,
-            obs::Component::StageController,
+            obs::FaultReason::MembershipLoss,
+            obs::Component::Orchestrator,
         )
         .stop_run_sent(obs::StageIndex(0))
         .stage_stopped(obs::StageIndex(0))
@@ -79,7 +84,9 @@ fn position_of_kind(events: &[obs::Event], kind: obs::EventKind) -> usize {
 fn assert_required_identity(event: &obs::Event) {
     match event {
         obs::Event::RunScoped { run_id, .. } => assert_eq!(*run_id, obs::RunId(7)),
-        obs::Event::NodeScoped { node_id, .. } => assert_eq!(*node_id, obs::NodeId(10)),
+        obs::Event::NodeScoped { node_id, .. } | obs::Event::NodeFaulted { node_id, .. } => {
+            assert_eq!(*node_id, obs::NodeId(10));
+        }
         obs::Event::StageScoped {
             run_id,
             stage_index,
@@ -120,6 +127,11 @@ fn assert_required_identity(event: &obs::Event) {
 fn required_event_identity_is_structured_not_log_derived() {
     // Build one trace that includes all required identity scopes.
     let mut events = successful_run_trace();
+    events.push(obs::Event::NodeFaulted {
+        node_id: obs::NodeId(10),
+        reason: obs::FaultReason::NodeUnavailable,
+        component: obs::Component::NodeBoot,
+    });
     events.push(obs::Event::RingScoped {
         kind: obs::EventKind::RingReadable,
         ring_id: obs::RingId(8000),
@@ -137,12 +149,16 @@ fn required_event_identity_is_structured_not_log_derived() {
     }
 }
 
-// This proves the lifecycle event stream covers the required successful-run
-// milestones from node boot through run teardown.
+// This proves the lifecycle event stream covers the required milestones from
+// node boot through terminal success or fault and run teardown.
 #[test]
-fn lifecycle_events_cover_successful_run_milestones() {
-    // Build the successful trace.
-    let events = successful_run_trace();
+fn lifecycle_events_cover_required_milestones() {
+    // Build success and fault traces because terminal success and fault events
+    // are mutually exclusive in one run.
+    let events = successful_run_trace()
+        .into_iter()
+        .chain(fault_trace())
+        .collect::<Vec<_>>();
     let observed = events
         .iter()
         .map(|event| event.kind())
@@ -153,6 +169,7 @@ fn lifecycle_events_cover_successful_run_milestones() {
     let required = [
         obs::EventKind::NodeStarted,
         obs::EventKind::NodeAvailable,
+        obs::EventKind::NodeFaulted,
         obs::EventKind::PoolReady,
         obs::EventKind::RunPlanned,
         obs::EventKind::StageProvisionStarted,
@@ -170,6 +187,7 @@ fn lifecycle_events_cover_successful_run_milestones() {
         obs::EventKind::StepCompleted,
         obs::EventKind::TokenReceived,
         obs::EventKind::RunCompleted,
+        obs::EventKind::RunFaulted,
         obs::EventKind::StopRunSent,
         obs::EventKind::StageStopped,
         obs::EventKind::RunTornDown,
@@ -182,34 +200,103 @@ fn lifecycle_events_cover_successful_run_milestones() {
     }
 }
 
+// This proves the public fault taxonomy can classify the lifecycle fault
+// families called out by the spec without falling back to worker-crash text.
+#[test]
+fn fault_reason_taxonomy_covers_required_lifecycle_families() {
+    let required = [
+        obs::FaultReason::NodeUnavailable,
+        obs::FaultReason::MembershipLoss,
+        obs::FaultReason::ProvisioningRejected,
+        obs::FaultReason::ArenaBootFailed,
+        obs::FaultReason::OversizedRingRequest,
+        obs::FaultReason::PressureTimeout,
+        obs::FaultReason::WeightLifecycleFailed,
+        obs::FaultReason::EdgeEstablishmentFailed,
+        obs::FaultReason::MalformedObjectHeader,
+        obs::FaultReason::EofMidObject,
+        obs::FaultReason::StreamFault,
+        obs::FaultReason::PumpFailure,
+        obs::FaultReason::RingFault,
+        obs::FaultReason::WorkerFatal,
+        obs::FaultReason::WorkerCrashed,
+        obs::FaultReason::DeviceOutOfMemory,
+        obs::FaultReason::DeviceCopyFailed,
+        obs::FaultReason::SequenceViolation,
+        obs::FaultReason::StepFailed,
+        obs::FaultReason::TeardownTimeout,
+        obs::FaultReason::UnsupportedRingVersion,
+        obs::FaultReason::RingLayoutInvalid,
+        obs::FaultReason::RingStateInvalid,
+        obs::FaultReason::WorkerProcessExited,
+        obs::FaultReason::WorkerShuttingDown,
+        obs::FaultReason::WorkerInternal,
+        obs::FaultReason::UnsupportedObjectVersion,
+        obs::FaultReason::ExtentExceedsMax,
+        obs::FaultReason::ExtentAlignmentInvalid,
+        obs::FaultReason::DeviceAllocationFailed,
+        obs::FaultReason::RoleUnavailable,
+        obs::FaultReason::InvalidInputHandle,
+        obs::FaultReason::InvalidOutputRing,
+        obs::FaultReason::TinygradError,
+        obs::FaultReason::OutputExtentInvalid,
+        obs::FaultReason::OutputCopyFailed,
+        obs::FaultReason::ArenaMapFailed,
+        obs::FaultReason::RingHelperAbiMismatch,
+        obs::FaultReason::BackendInitFailed,
+        obs::FaultReason::MalformedControlMessage,
+        obs::FaultReason::UnhandledException,
+        obs::FaultReason::EdgeStopped,
+        obs::FaultReason::WorkerShutdown,
+    ];
+
+    assert!(required.contains(&obs::FaultReason::MembershipLoss));
+    assert!(required.contains(&obs::FaultReason::RingFault));
+    assert!(required.contains(&obs::FaultReason::WorkerFatal));
+    assert!(required.contains(&obs::FaultReason::WorkerCrashed));
+}
+
 // This proves fault events carry a stable reason enum and detecting component,
 // and tests do not need free-form log text to determine lifecycle progress.
 #[test]
 fn fault_events_include_stable_reason_and_detecting_component() {
-    // Build a fault trace with a stage-detected worker crash.
+    // Build a fault trace with node, stage, and run faults from non-worker
+    // sources.
     let events = fault_trace();
 
-    // The structured stage fault carries the reason and detector.
+    // The structured node fault carries the reason and detector.
     assert!(events.iter().any(|event| {
         matches!(
             event,
-            obs::Event::StageScoped {
-                kind: obs::EventKind::StageFaulted,
-                reason: Some(obs::FaultReason::WorkerCrashed),
-                component: obs::Component::StageController,
+            obs::Event::NodeFaulted {
+                reason: obs::FaultReason::MembershipLoss,
+                component: obs::Component::Membership,
                 ..
             }
         )
     }));
 
-    // The run fault carries the same structured reason.
+    // The structured stage fault carries a non-worker reason and detector.
+    assert!(events.iter().any(|event| {
+        matches!(
+            event,
+            obs::Event::StageScoped {
+                kind: obs::EventKind::StageFaulted,
+                reason: Some(obs::FaultReason::RingFault),
+                component: obs::Component::SharedRingHelper,
+                ..
+            }
+        )
+    }));
+
+    // The run fault carries a structured non-worker reason.
     assert!(events.iter().any(|event| {
         matches!(
             event,
             obs::Event::RunScoped {
                 kind: obs::EventKind::RunFaulted,
-                reason: Some(obs::FaultReason::WorkerCrashed),
-                component: obs::Component::StageController,
+                reason: Some(obs::FaultReason::MembershipLoss),
+                component: obs::Component::Orchestrator,
                 ..
             }
         )

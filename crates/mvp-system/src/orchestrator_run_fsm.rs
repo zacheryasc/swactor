@@ -33,6 +33,28 @@ pub struct RunConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SamplingData {
+    pub source_sequence: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenObjectPayload {
+    Prompt {
+        tokens: Vec<u32>,
+    },
+    Decode {
+        token_id: u32,
+        sampling: SamplingData,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenObjectInjection {
+    pub sequence: u64,
+    pub payload: TokenObjectPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageFaultReason {
     WorkerCrashed,
 }
@@ -78,6 +100,16 @@ pub enum RunEvent {
         run_id: RunId,
         kind: TimeoutKind,
     },
+    OperatorStop {
+        run_id: RunId,
+    },
+    MembershipLost {
+        run_id: RunId,
+        node_id: NodeId,
+    },
+    TeardownTimeout {
+        run_id: RunId,
+    },
     StageStopped {
         run_id: RunId,
         stage_index: u32,
@@ -97,6 +129,10 @@ pub enum RunFaultReason {
     Timeout {
         kind: TimeoutKind,
     },
+    MembershipLost {
+        node_id: NodeId,
+    },
+    TeardownTimeout,
     UnknownStageReady {
         stage_index: u32,
     },
@@ -113,6 +149,9 @@ pub enum LifecycleEvent {
         reason: RunFaultReason,
     },
     RunCompleted {
+        run_id: RunId,
+    },
+    RunOperatorStopped {
         run_id: RunId,
     },
     RunTornDown {
@@ -138,13 +177,9 @@ pub enum RunCommand {
     CreateTokenOutEndpoint {
         run_id: RunId,
     },
-    InjectPrompt {
+    InjectTokenObject {
         run_id: RunId,
-        sequence: u64,
-        prompt: Vec<u32>,
-    },
-    BroadcastStart {
-        run_id: RunId,
+        object: TokenObjectInjection,
     },
     StopRun {
         run_id: RunId,
@@ -225,7 +260,11 @@ impl OrchestratorRun {
                 self.token_out_ready = true;
                 self.maybe_inject_initial();
             }
-            RunEvent::TokenReceived { sequence, eos, .. } => {
+            RunEvent::TokenReceived {
+                sequence,
+                token_id,
+                eos,
+            } => {
                 if self.terminal {
                     return;
                 }
@@ -236,7 +275,7 @@ impl OrchestratorRun {
                 if eos {
                     self.complete();
                 } else if (self.injected_sequences.len() as u64) < self.config.max_tokens {
-                    self.inject(sequence + 1);
+                    self.inject_decode(sequence + 1, token_id, sequence);
                 } else {
                     self.complete();
                 }
@@ -257,6 +296,18 @@ impl OrchestratorRun {
             RunEvent::Timeout { run_id, kind } if run_id == self.config.run_id => {
                 self.fault(RunFaultReason::Timeout { kind });
             }
+            RunEvent::OperatorStop { run_id } if run_id == self.config.run_id => {
+                self.operator_stop();
+            }
+            RunEvent::MembershipLost { run_id, node_id } if run_id == self.config.run_id => {
+                self.fault(RunFaultReason::MembershipLost { node_id });
+            }
+            RunEvent::TeardownTimeout { run_id } if run_id == self.config.run_id => {
+                if !self.terminal {
+                    self.fault(RunFaultReason::TeardownTimeout);
+                }
+                self.mark_torn_down();
+            }
             RunEvent::StageStopped {
                 run_id,
                 stage_index,
@@ -271,6 +322,9 @@ impl OrchestratorRun {
             RunEvent::StageFault { .. }
             | RunEvent::EndpointFault { .. }
             | RunEvent::Timeout { .. }
+            | RunEvent::OperatorStop { .. }
+            | RunEvent::MembershipLost { .. }
+            | RunEvent::TeardownTimeout { .. }
             | RunEvent::StageStopped { .. } => {}
         }
     }
@@ -319,23 +373,37 @@ impl OrchestratorRun {
             return;
         }
         if self.token_in_ready && self.token_out_ready && self.all_stages_ready() {
-            self.inject(0);
+            self.inject_prompt(0);
         }
     }
 
-    fn inject(&mut self, sequence: u64) {
+    fn inject_prompt(&mut self, sequence: u64) {
+        self.inject(TokenObjectInjection {
+            sequence,
+            payload: TokenObjectPayload::Prompt {
+                tokens: self.config.prompt.clone(),
+            },
+        });
+    }
+
+    fn inject_decode(&mut self, sequence: u64, token_id: u32, source_sequence: u64) {
+        self.inject(TokenObjectInjection {
+            sequence,
+            payload: TokenObjectPayload::Decode {
+                token_id,
+                sampling: SamplingData { source_sequence },
+            },
+        });
+    }
+
+    fn inject(&mut self, object: TokenObjectInjection) {
         if self.terminal {
             return;
         }
-        self.injected_sequences.push(sequence);
-        self.commands.push(RunCommand::InjectPrompt {
+        self.injected_sequences.push(object.sequence);
+        self.commands.push(RunCommand::InjectTokenObject {
             run_id: self.config.run_id,
-            sequence,
-            prompt: if sequence == 0 {
-                self.config.prompt.clone()
-            } else {
-                Vec::new()
-            },
+            object,
         });
     }
 
@@ -345,6 +413,16 @@ impl OrchestratorRun {
         }
         self.terminal = true;
         self.events.push(LifecycleEvent::RunCompleted {
+            run_id: self.config.run_id,
+        });
+        self.start_teardown();
+    }
+    fn operator_stop(&mut self) {
+        if self.terminal {
+            return;
+        }
+        self.terminal = true;
+        self.events.push(LifecycleEvent::RunOperatorStopped {
             run_id: self.config.run_id,
         });
         self.start_teardown();
@@ -387,6 +465,10 @@ impl OrchestratorRun {
         if !self.all_stages_stopped() {
             return;
         }
+        self.mark_torn_down();
+    }
+
+    fn mark_torn_down(&mut self) {
         if !self
             .events
             .iter()

@@ -153,6 +153,7 @@ impl LocalMockCluster {
                 2,
                 8,
                 99,
+                plan::TokenizerSource::EmbeddedGguf,
             ),
         )
         .run_id(run_id.0)
@@ -166,6 +167,12 @@ impl LocalMockCluster {
             engine::FixedLinearPipelinePlanner::new(config.stage_count).runtime(
                 plan::RuntimeConfig {
                     max_tokens: config.max_tokens,
+                    prompt: plan::PromptSource::Inline("local mock prompt".to_owned()),
+                    sampling: plan::SamplingPolicy {
+                        temperature_millis: 0,
+                        top_k: 1,
+                    },
+                    token_output_policy: plan::TokenOutputPolicy::EmitAll,
                 },
             ),
         )
@@ -417,16 +424,13 @@ impl LocalMockCluster {
                 self.orchestrator_mut()
                     .observe(fsm::RunEvent::TokenOutEndpointReady);
             }
-            fsm::RunCommand::InjectPrompt {
-                sequence, prompt, ..
-            } => self.inject_prompt_object(sequence, prompt),
+            fsm::RunCommand::InjectTokenObject { object, .. } => self.inject_token_object(object),
             fsm::RunCommand::StopRun { stage_index, .. } => self.stop_stage(stage_index),
             fsm::RunCommand::TearDownTokenEndpoints { .. } => {
                 self.resources.release_all_edges();
                 self.orchestrator_mut()
                     .observe(fsm::RunEvent::TokenEndpointsStopped);
             }
-            fsm::RunCommand::BroadcastStart { .. } => {}
         }
     }
 
@@ -501,8 +505,11 @@ impl LocalMockCluster {
         }
     }
 
-    fn inject_prompt_object(&mut self, sequence: u64, prompt: Vec<u32>) {
-        debug_assert!(sequence > 0 || !prompt.is_empty());
+    fn inject_token_object(&mut self, object: fsm::TokenObjectInjection) {
+        debug_assert!(matches!(
+            object.payload,
+            fsm::TokenObjectPayload::Prompt { .. } | fsm::TokenObjectPayload::Decode { .. }
+        ));
         if !self
             .trace
             .iter()
@@ -518,15 +525,19 @@ impl LocalMockCluster {
         self.push_object(
             obs::EventKind::PromptInjected,
             object_id,
-            sequence,
+            object.sequence,
             obs::Component::TokenEndpoint,
         );
+        let token_id = match object.payload {
+            fsm::TokenObjectPayload::Prompt { .. } => None,
+            fsm::TokenObjectPayload::Decode { token_id, .. } => Some(token_id),
+        };
         let object = self.transport.deliver(MockObject {
             edge_id: token_in_edge,
             object_id,
-            sequence,
+            sequence: object.sequence,
             kind: MockObjectKind::Token,
-            token_id: None,
+            token_id,
             eos: false,
         });
         self.route_object_through_stages(object);
@@ -748,7 +759,8 @@ impl LocalMockCluster {
                     self.push_run(obs::EventKind::RunCompleted, obs::Component::Orchestrator);
                 }
                 fsm::LifecycleEvent::RunFaulted { .. }
-                | fsm::LifecycleEvent::RunRejected { .. } => {
+                | fsm::LifecycleEvent::RunRejected { .. }
+                | fsm::LifecycleEvent::RunOperatorStopped { .. } => {
                     self.push_run(obs::EventKind::RunFaulted, obs::Component::Orchestrator);
                 }
                 fsm::LifecycleEvent::RunTornDown { .. } => {

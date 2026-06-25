@@ -97,7 +97,32 @@ pub enum StageEvent {
         step_id: StepId,
     },
     WorkerCrashed,
+    StepFailed {
+        step_id: StepId,
+    },
+    ObjectFailed {
+        edge_id: EdgeId,
+        object_id: Option<ObjectId>,
+    },
+    OutputFault {
+        edge_id: EdgeId,
+    },
+    EdgeFault {
+        edge_id: EdgeId,
+    },
     StopRun {
+        run_id: RunId,
+    },
+    LocalEdgesStopped {
+        run_id: RunId,
+    },
+    WorkerRingsQuiesced {
+        run_id: RunId,
+    },
+    DeviceObjectsReleased {
+        run_id: RunId,
+    },
+    WorkerRoleReset {
         run_id: RunId,
     },
 }
@@ -107,6 +132,10 @@ pub enum StageFaultReason {
     UnauthorizedProvision,
     SequenceViolation,
     WorkerCrashed,
+    StepFailed,
+    ObjectFailed,
+    OutputFault,
+    EdgeFault,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +231,12 @@ pub struct StageController {
     events: Vec<StageLifecycleEvent>,
     faulted: bool,
     stopped: bool,
+    stopping_run: Option<RunId>,
+    local_edges_stopped: bool,
+    worker_rings_quiesced: bool,
+    release_reset_requested: bool,
+    device_objects_released: bool,
+    worker_role_reset: bool,
 }
 
 impl StageController {
@@ -221,6 +256,12 @@ impl StageController {
             events: Vec::new(),
             faulted: false,
             stopped: false,
+            stopping_run: None,
+            local_edges_stopped: false,
+            worker_rings_quiesced: false,
+            release_reset_requested: false,
+            device_objects_released: false,
+            worker_role_reset: false,
         }
     }
 
@@ -254,8 +295,16 @@ impl StageController {
                 handle,
             } => self.object_loaded(edge_id, object_id, sequence, handle),
             StageEvent::StepCompleted { .. } => self.step_completed(),
+            StageEvent::StepFailed { .. } => self.fault(StageFaultReason::StepFailed),
+            StageEvent::ObjectFailed { .. } => self.fault(StageFaultReason::ObjectFailed),
+            StageEvent::OutputFault { .. } => self.fault(StageFaultReason::OutputFault),
+            StageEvent::EdgeFault { .. } => self.fault(StageFaultReason::EdgeFault),
             StageEvent::WorkerCrashed => self.fault(StageFaultReason::WorkerCrashed),
             StageEvent::StopRun { run_id } => self.stop(run_id),
+            StageEvent::LocalEdgesStopped { run_id } => self.local_edges_stopped(run_id),
+            StageEvent::WorkerRingsQuiesced { run_id } => self.worker_rings_quiesced(run_id),
+            StageEvent::DeviceObjectsReleased { run_id } => self.device_objects_released(run_id),
+            StageEvent::WorkerRoleReset { run_id } => self.worker_role_reset(run_id),
         }
         self.maybe_stage_ready();
     }
@@ -293,7 +342,7 @@ impl StageController {
     }
 
     fn maybe_stage_ready(&mut self) {
-        if self.stage_ready_emitted || self.faulted || self.stopped {
+        if self.stage_ready_emitted || self.faulted || self.stopped || self.stopping_run.is_some() {
             return;
         }
         if self.worker_ready && self.weights_ready && self.inbound_ready && self.outbound_ready {
@@ -314,7 +363,12 @@ impl StageController {
         sequence: u64,
         handle: DeviceHandle,
     ) {
-        if self.faulted || self.stopped || !self.stage_ready_emitted || self.busy {
+        if self.faulted
+            || self.stopped
+            || self.stopping_run.is_some()
+            || !self.stage_ready_emitted
+            || self.busy
+        {
             return;
         }
         let Some(provision) = &self.provision else {
@@ -366,7 +420,7 @@ impl StageController {
     }
 
     fn fault(&mut self, reason: StageFaultReason) {
-        if self.faulted || self.stopped {
+        if self.faulted || self.stopped || self.stopping_run.is_some() {
             return;
         }
         self.faulted = true;
@@ -386,10 +440,70 @@ impl StageController {
         if self.stopped {
             return;
         }
-        self.stopped = true;
-        self.commands.push(StageCommand::StopLocalEdges { run_id });
+        if self.stopping_run.is_none() {
+            self.stopping_run = Some(run_id);
+            self.commands.push(StageCommand::StopLocalEdges { run_id });
+        }
+        self.maybe_request_release_and_reset();
+        self.maybe_stage_stopped();
+    }
+
+    fn local_edges_stopped(&mut self, run_id: RunId) {
+        if self.stopping_run == Some(run_id) && !self.stopped {
+            self.local_edges_stopped = true;
+            self.maybe_request_release_and_reset();
+            self.maybe_stage_stopped();
+        }
+    }
+
+    fn worker_rings_quiesced(&mut self, run_id: RunId) {
+        if self.stopping_run == Some(run_id) && !self.stopped {
+            self.worker_rings_quiesced = true;
+            self.maybe_request_release_and_reset();
+            self.maybe_stage_stopped();
+        }
+    }
+
+    fn device_objects_released(&mut self, run_id: RunId) {
+        if self.stopping_run == Some(run_id) && !self.stopped {
+            self.device_objects_released = true;
+            self.maybe_stage_stopped();
+        }
+    }
+
+    fn worker_role_reset(&mut self, run_id: RunId) {
+        if self.stopping_run == Some(run_id) && !self.stopped {
+            self.worker_role_reset = true;
+            self.maybe_stage_stopped();
+        }
+    }
+
+    fn maybe_request_release_and_reset(&mut self) {
+        if self.release_reset_requested || !self.local_edges_stopped || !self.worker_rings_quiesced
+        {
+            return;
+        }
+        let Some(run_id) = self.stopping_run else {
+            return;
+        };
+        self.release_reset_requested = true;
         self.commands
             .push(StageCommand::ReleaseRunDeviceObjects { run_id });
+    }
+
+    fn maybe_stage_stopped(&mut self) {
+        if self.stopped
+            || !self.local_edges_stopped
+            || !self.worker_rings_quiesced
+            || !self.device_objects_released
+            || !self.worker_role_reset
+        {
+            return;
+        }
+        let Some(run_id) = self.stopping_run else {
+            return;
+        };
+        self.stopped = true;
         let stage_index = self.provision.as_ref().map_or(0, |p| p.stage_index);
         self.events.push(StageLifecycleEvent::StageStopped {
             run_id,

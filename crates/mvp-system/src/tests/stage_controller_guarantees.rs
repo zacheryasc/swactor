@@ -314,45 +314,119 @@ fn step_completed_releases_input_and_admits_next_object() {
     assert_eq!(execute_count, 2);
 }
 
-// This proves worker, object, output-edge, and step failures fault the stage,
-// and after fault no new run work is accepted until StopRun.
+// This proves worker, object, output-edge, edge, and step failures fault the
+// stage with stable public reasons, and after fault no new run work is accepted
+// until StopRun.
 #[test]
-fn stage_fault_rejects_new_work_until_stopped() {
-    // Start from a ready stage and inject a worker crash.
+fn stage_failures_map_to_stable_fault_reasons_and_reject_new_work() {
+    let cases = vec![
+        (
+            stage::StageEvent::WorkerCrashed,
+            stage::StageFaultReason::WorkerCrashed,
+        ),
+        (
+            stage::StageEvent::StepFailed {
+                step_id: stage::StepId(0),
+            },
+            stage::StageFaultReason::StepFailed,
+        ),
+        (
+            stage::StageEvent::ObjectFailed {
+                edge_id: stage::EdgeId(7001),
+                object_id: Some(stage::ObjectId(9000)),
+            },
+            stage::StageFaultReason::ObjectFailed,
+        ),
+        (
+            stage::StageEvent::OutputFault {
+                edge_id: stage::EdgeId(7002),
+            },
+            stage::StageFaultReason::OutputFault,
+        ),
+        (
+            stage::StageEvent::EdgeFault {
+                edge_id: stage::EdgeId(7002),
+            },
+            stage::StageFaultReason::EdgeFault,
+        ),
+    ];
+
+    for (fault_event, expected_reason) in cases {
+        let mut harness = ready_stage();
+        harness.observe(fault_event);
+
+        assert!(harness.events().iter().any(|event| {
+            matches!(
+                event,
+                stage::StageLifecycleEvent::StageFault {
+                    reason,
+                    ..
+                } if *reason == expected_reason
+            )
+        }));
+
+        let before = harness
+            .commands()
+            .iter()
+            .filter(|command| matches!(command, stage::StageCommand::ExecuteStep(_)))
+            .count();
+        harness.observe(stage::StageEvent::ObjectLoaded {
+            edge_id: stage::EdgeId(7001),
+            object_id: stage::ObjectId(9999),
+            sequence: 0,
+            handle: stage::DeviceHandle::new_current(77),
+        });
+        let after = harness
+            .commands()
+            .iter()
+            .filter(|command| matches!(command, stage::StageCommand::ExecuteStep(_)))
+            .count();
+        assert_eq!(after, before);
+
+        harness.observe(stage::StageEvent::StopRun {
+            run_id: stage::RunId(7),
+        });
+        assert!(
+            harness
+                .commands()
+                .iter()
+                .any(|command| { matches!(command, stage::StageCommand::StopLocalEdges { .. }) })
+        );
+        assert!(
+            !harness
+                .events()
+                .iter()
+                .any(|event| { matches!(event, stage::StageLifecycleEvent::StageStopped { .. }) })
+        );
+
+        harness.observe(stage::StageEvent::LocalEdgesStopped {
+            run_id: stage::RunId(7),
+        });
+        harness.observe(stage::StageEvent::WorkerRingsQuiesced {
+            run_id: stage::RunId(7),
+        });
+        harness.observe(stage::StageEvent::DeviceObjectsReleased {
+            run_id: stage::RunId(7),
+        });
+        harness.observe(stage::StageEvent::WorkerRoleReset {
+            run_id: stage::RunId(7),
+        });
+        assert!(
+            harness
+                .events()
+                .iter()
+                .any(|event| { matches!(event, stage::StageLifecycleEvent::StageStopped { .. }) })
+        );
+    }
+}
+
+// This proves StopRun starts teardown but StageStopped is held back until local
+// edges are stopped, worker rings are quiesced, device objects are released, and
+// the worker role reset completes.
+#[test]
+fn stop_run_waits_for_local_teardown_completion_before_stage_stopped() {
     let mut harness = ready_stage();
-    harness.observe(stage::StageEvent::WorkerCrashed);
 
-    // Fault must be visible at the stage boundary.
-    assert!(harness.events().iter().any(|event| {
-        matches!(
-            event,
-            stage::StageLifecycleEvent::StageFault {
-                reason: stage::StageFaultReason::WorkerCrashed,
-                ..
-            }
-        )
-    }));
-
-    // New work after fault must not produce ExecuteStep.
-    let before = harness
-        .commands()
-        .iter()
-        .filter(|command| matches!(command, stage::StageCommand::ExecuteStep(_)))
-        .count();
-    harness.observe(stage::StageEvent::ObjectLoaded {
-        edge_id: stage::EdgeId(7001),
-        object_id: stage::ObjectId(9999),
-        sequence: 0,
-        handle: stage::DeviceHandle::new_current(77),
-    });
-    let after = harness
-        .commands()
-        .iter()
-        .filter(|command| matches!(command, stage::StageCommand::ExecuteStep(_)))
-        .count();
-    assert_eq!(after, before);
-
-    // StopRun moves the stage through local teardown and emits StageStopped.
     harness.observe(stage::StageEvent::StopRun {
         run_id: stage::RunId(7),
     });
@@ -363,14 +437,88 @@ fn stage_fault_rejects_new_work_until_stopped() {
             .any(|command| { matches!(command, stage::StageCommand::StopLocalEdges { .. }) })
     );
     assert!(
-        harness.commands().iter().any(|command| {
-            matches!(command, stage::StageCommand::ReleaseRunDeviceObjects { .. })
-        })
-    );
-    assert!(
-        harness
+        !harness
             .events()
             .iter()
             .any(|event| { matches!(event, stage::StageLifecycleEvent::StageStopped { .. }) })
     );
+    assert!(
+        !harness.commands().iter().any(|command| {
+            matches!(command, stage::StageCommand::ReleaseRunDeviceObjects { .. })
+        })
+    );
+
+    let execute_before_stopping_work = harness
+        .commands()
+        .iter()
+        .filter(|command| matches!(command, stage::StageCommand::ExecuteStep(_)))
+        .count();
+    harness.observe(stage::StageEvent::ObjectLoaded {
+        edge_id: stage::EdgeId(7001),
+        object_id: stage::ObjectId(9999),
+        sequence: 0,
+        handle: stage::DeviceHandle::new_current(77),
+    });
+    let execute_after_stopping_work = harness
+        .commands()
+        .iter()
+        .filter(|command| matches!(command, stage::StageCommand::ExecuteStep(_)))
+        .count();
+    assert_eq!(execute_after_stopping_work, execute_before_stopping_work);
+
+    harness.observe(stage::StageEvent::LocalEdgesStopped {
+        run_id: stage::RunId(7),
+    });
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, stage::StageLifecycleEvent::StageStopped { .. }) })
+    );
+    assert!(
+        !harness.commands().iter().any(|command| {
+            matches!(command, stage::StageCommand::ReleaseRunDeviceObjects { .. })
+        })
+    );
+
+    harness.observe(stage::StageEvent::WorkerRingsQuiesced {
+        run_id: stage::RunId(7),
+    });
+    assert!(harness.commands().iter().any(|command| {
+        matches!(
+            command,
+            stage::StageCommand::ReleaseRunDeviceObjects {
+                run_id: stage::RunId(7)
+            }
+        )
+    }));
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, stage::StageLifecycleEvent::StageStopped { .. }) })
+    );
+
+    harness.observe(stage::StageEvent::DeviceObjectsReleased {
+        run_id: stage::RunId(7),
+    });
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, stage::StageLifecycleEvent::StageStopped { .. }) })
+    );
+
+    harness.observe(stage::StageEvent::WorkerRoleReset {
+        run_id: stage::RunId(7),
+    });
+    assert!(harness.events().iter().any(|event| {
+        matches!(
+            event,
+            stage::StageLifecycleEvent::StageStopped {
+                run_id: stage::RunId(7),
+                stage_index: 1,
+            }
+        )
+    }));
 }
