@@ -5,7 +5,7 @@ use super::roles::RoleKind;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EngineEvent {
     PoolAcquired { node_count: usize },
-    NodeLaunched { node_id: NodeId, seed: bool },
+    NodeLaunched { node_id: NodeId, coordinator: bool },
     NodeBootReady { node_id: NodeId },
     ClusterConverged { node_count: usize },
     RolesPlanned { stage_count: usize },

@@ -6,11 +6,10 @@
 //! on the collector (e.g. the orchestrator) — receives them, decodes each back
 //! into a `(StreamId, Frame)` delivery, and hands it to a caller-supplied fold.
 //!
-//! It deliberately knows nothing about the dashboard: folding a delivery into a
-//! `FleetView` lives in the `dashboard` crate, which `distribution` must not
-//! depend on. The actor therefore owns an opaque callback, and the binary that
-//! has both crates in scope wires a `FleetView` into it. Malformed payloads are
-//! dropped silently — the same best-effort tolerance the UDP ingest had.
+//! It deliberately knows nothing about any view layer. The actor owns an opaque
+//! callback so binaries can wire the decoded deliveries into whichever fold they
+//! need. Malformed payloads are dropped silently — the same best-effort tolerance
+//! the UDP ingest had.
 
 use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;

@@ -3,7 +3,6 @@
 # and fill in your machine details.
 
 [defaults]
-dashboard_port = 9090
 relay_port = 3340
 # image = "swactor"       # Required for --docker mode
 # container = "swactor"   # Required for --docker mode

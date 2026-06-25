@@ -9,6 +9,18 @@ pub struct PortId(pub String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectKey {
+    pub edge_id: EdgeId,
+    pub object_id: ObjectId,
+}
+
+impl ObjectKey {
+    pub fn new(edge_id: EdgeId, object_id: ObjectId) -> Self {
+        Self { edge_id, object_id }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DeviceHandle {
     pub generation: WorkerGeneration,
@@ -195,19 +207,32 @@ impl ObjectRecordBuilder {
     }
 }
 
-const HEADER_LEN: usize = 48;
+pub const HEADER_LEN: usize = 48;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ParsedRecord {
-    object_id: ObjectId,
-    sequence: u64,
-    extent: u64,
-    total_len: usize,
+pub struct ObjectRecord {
+    pub object_id: ObjectId,
+    pub sequence: u64,
+    pub extent: u64,
+    pub total_len: usize,
+}
+
+impl ObjectRecord {
+    pub fn payload<'a>(&self, bytes: &'a [u8]) -> Option<&'a [u8]> {
+        bytes.get(HEADER_LEN..self.total_len)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObjectRecordRead {
+    Incomplete,
+    Complete(ObjectRecord),
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingObject {
-    record: ParsedRecord,
+    record: ObjectRecord,
     copy_done: bool,
     handle: Option<DeviceHandle>,
 }
@@ -221,7 +246,7 @@ pub struct IngressParserHarness {
     cursor_reload: std::collections::BTreeMap<RingId, u64>,
     faulted_rings: std::collections::BTreeSet<RingId>,
     expected_sequence: u64,
-    pending: std::collections::BTreeMap<ObjectId, PendingObject>,
+    pending: std::collections::BTreeMap<ObjectKey, PendingObject>,
     copy_log: Vec<DeviceCopyLog>,
     events: Vec<WorkerIngressOut>,
 }
@@ -263,22 +288,26 @@ impl IngressParserHarness {
                     object_id,
                     byte_count,
                 });
-                if let Some(pending) = self.pending.get_mut(&object_id) {
-                    pending.copy_done = true;
-                    if byte_count == pending.record.extent {
-                        if let Some(install) = &self.install {
-                            *self.consume.entry(install.ring_id).or_insert(0) +=
-                                pending.record.total_len as u64;
+                if let Some(key) = self.object_key(object_id) {
+                    if let Some(pending) = self.pending.get_mut(&key) {
+                        pending.copy_done = true;
+                        if byte_count == pending.record.extent {
+                            if let Some(install) = &self.install {
+                                *self.consume.entry(install.ring_id).or_insert(0) +=
+                                    pending.record.total_len as u64;
+                            }
                         }
                     }
+                    self.maybe_loaded(key);
                 }
-                self.maybe_loaded(object_id);
             }
             WorkerIngressEvent::DeviceHandleCreated { object_id, handle } => {
-                if let Some(pending) = self.pending.get_mut(&object_id) {
-                    pending.handle = Some(handle);
+                if let Some(key) = self.object_key(object_id) {
+                    if let Some(pending) = self.pending.get_mut(&key) {
+                        pending.handle = Some(handle);
+                    }
+                    self.maybe_loaded(key);
                 }
-                self.maybe_loaded(object_id);
             }
             WorkerIngressEvent::RingFault { ring_id } => {
                 self.faulted_rings.insert(ring_id);
@@ -321,8 +350,8 @@ impl IngressParserHarness {
         if buffer.is_empty() {
             return;
         }
-        match decode_record(&buffer, install.object_spec, eof) {
-            Ok(record) => {
+        match read_object_record(&buffer, install.object_spec, eof) {
+            Ok(ObjectRecordRead::Complete(record)) => {
                 if record.sequence != self.expected_sequence {
                     self.events.push(WorkerIngressOut::ObjectFailed {
                         ring_id,
@@ -333,7 +362,7 @@ impl IngressParserHarness {
                 }
                 self.expected_sequence += 1;
                 self.pending.insert(
-                    record.object_id,
+                    ObjectKey::new(install.edge_id, record.object_id),
                     PendingObject {
                         record: record.clone(),
                         copy_done: false,
@@ -345,6 +374,7 @@ impl IngressParserHarness {
                     byte_count: record.extent,
                 });
             }
+            Ok(ObjectRecordRead::Incomplete) => {}
             Err(reason) => self.events.push(WorkerIngressOut::ObjectFailed {
                 ring_id,
                 object_id: None,
@@ -353,8 +383,14 @@ impl IngressParserHarness {
         }
     }
 
-    fn maybe_loaded(&mut self, object_id: ObjectId) {
-        let Some(pending) = self.pending.get(&object_id).cloned() else {
+    fn object_key(&self, object_id: ObjectId) -> Option<ObjectKey> {
+        self.install
+            .as_ref()
+            .map(|install| ObjectKey::new(install.edge_id, object_id))
+    }
+
+    fn maybe_loaded(&mut self, key: ObjectKey) {
+        let Some(pending) = self.pending.get(&key).cloned() else {
             return;
         };
         let Some(handle) = pending.handle else {
@@ -364,12 +400,12 @@ impl IngressParserHarness {
             return;
         }
         let install = self.install.as_ref().unwrap();
-        if !self.events.iter().any(|event| matches!(event, WorkerIngressOut::ObjectLoaded { object_id: seen, .. } if *seen == object_id)) {
+        if !self.events.iter().any(|event| matches!(event, WorkerIngressOut::ObjectLoaded { edge_id, object_id, .. } if *edge_id == key.edge_id && *object_id == key.object_id)) {
             self.events.push(WorkerIngressOut::ObjectLoaded {
                 ring_id: install.ring_id,
                 edge_id: install.edge_id,
                 port_id: install.port_id.clone(),
-                object_id,
+                object_id: key.object_id,
                 sequence: pending.record.sequence,
                 extent: pending.record.extent,
                 handle,
@@ -378,16 +414,16 @@ impl IngressParserHarness {
     }
 }
 
-fn decode_record(
+pub fn read_object_record(
     bytes: &[u8],
     spec: ObjectSpec,
     eof: bool,
-) -> Result<ParsedRecord, ObjectFailureReason> {
+) -> Result<ObjectRecordRead, ObjectFailureReason> {
     if bytes.len() < HEADER_LEN {
-        return if eof {
+        return if eof && !bytes.is_empty() {
             Err(ObjectFailureReason::EofBeforeFullPayload)
         } else {
-            Err(ObjectFailureReason::MalformedHeaderLength)
+            Ok(ObjectRecordRead::Incomplete)
         };
     }
     if &bytes[0..4] != b"MO01" {
@@ -413,13 +449,13 @@ fn decode_record(
         return if eof {
             Err(ObjectFailureReason::EofBeforeFullPayload)
         } else {
-            Err(ObjectFailureReason::MalformedHeaderLength)
+            Ok(ObjectRecordRead::Incomplete)
         };
     }
-    Ok(ParsedRecord {
+    Ok(ObjectRecordRead::Complete(ObjectRecord {
         object_id,
         sequence,
         extent,
         total_len,
-    })
+    }))
 }

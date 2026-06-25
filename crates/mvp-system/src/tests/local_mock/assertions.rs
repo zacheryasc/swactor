@@ -113,11 +113,13 @@ pub fn assert_topology_surface(outcome: &LocalMockOutcome) {
         );
         assert_eq!(deliveries[0].kind, MockObjectKind::Token);
         assert_eq!(deliveries.last().unwrap().kind, MockObjectKind::Token);
-        assert!(
+        assert_eq!(
             deliveries
-                .windows(2)
-                .all(|pair| pair[0].edge_id.0 + 1 == pair[1].edge_id.0),
-            "sequence {sequence} must follow the linear edge chain"
+                .iter()
+                .map(|delivery| delivery.edge_id)
+                .collect::<Vec<_>>(),
+            outcome.edge_chain,
+            "sequence {sequence} must follow the planned linear edge chain"
         );
         assert_eq!(
             deliveries

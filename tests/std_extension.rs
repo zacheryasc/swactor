@@ -82,7 +82,10 @@ fn runtime_naming_lifecycle() {
     tick_n(&rt, 2);
     assert_eq!(inbox.try_recv(), Some(Pong));
 
-    assert!(rt.register_name("worker", rt.spawn(PingPongActor).unwrap()).is_err());
+    assert!(
+        rt.register_name("worker", rt.spawn(PingPongActor).unwrap())
+            .is_err()
+    );
 
     let mut names = rt.registered_names();
     names.sort();

@@ -31,29 +31,29 @@ pub trait NodeControl: Send {
 pub struct NodeLaunchSpec {
     pub cluster_id: String,
     pub image: NodeImageSpec,
-    pub seed: Option<SeedSpec>,
-    pub is_seed: bool,
+    pub coordinator: Option<CoordinatorJoinSpec>,
+    pub is_coordinator: bool,
     pub env: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SeedSpec {
+pub struct CoordinatorJoinSpec {
     pub endpoint: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeFacts {
     pub node_id: NodeId,
-    pub seed_endpoint: Option<String>,
+    pub coordinator_endpoint: Option<String>,
     pub resources: ResourceFacts,
     pub capabilities: BTreeSet<NodeCapability>,
 }
 
 impl NodeFacts {
-    pub fn from_lease(lease: &NodeLease, seed_endpoint: Option<String>) -> Self {
+    pub fn from_lease(lease: &NodeLease, coordinator_endpoint: Option<String>) -> Self {
         Self {
             node_id: lease.logical_node_id,
-            seed_endpoint,
+            coordinator_endpoint,
             resources: lease.expected_resources.clone(),
             capabilities: lease.capabilities.clone(),
         }

@@ -48,11 +48,9 @@ impl RuntimeExtension for StdExtension {
         let mut notifications = Vec::new();
 
         for (addr, reason, exit_value) in dead {
-            let watch_notifications = self.watch_registry.notify_death(
-                *addr,
-                stop_to_exit(*reason),
-                exit_value.clone(),
-            );
+            let watch_notifications =
+                self.watch_registry
+                    .notify_death(*addr, stop_to_exit(*reason), exit_value.clone());
             for (watcher, exited) in watch_notifications {
                 notifications.push((watcher, Box::new(exited) as Box<dyn Any + Send>));
             }

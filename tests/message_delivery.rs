@@ -398,4 +398,3 @@ fn fairness_budget_prevents_starvation() {
         "unlimited budget drains all"
     );
 }
-

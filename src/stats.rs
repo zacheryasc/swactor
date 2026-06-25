@@ -142,7 +142,7 @@ pub trait StatsHook: Send + Sync {
     fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]);
 }
 
-/// Per-actor info for the dashboard.
+/// Per-actor runtime stats.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ActorInfo {

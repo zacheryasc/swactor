@@ -13,6 +13,29 @@ pub struct NodeId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EdgeId(pub u64);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EdgeAllocator {
+    next: u64,
+}
+
+impl EdgeAllocator {
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    pub fn alloc(&mut self) -> EdgeId {
+        let edge_id = EdgeId(self.next);
+        self.next += 1;
+        edge_id
+    }
+}
+
+impl Default for EdgeAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DTypeFamily {
     BFloat,
@@ -227,10 +250,18 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
         max_extent: activation_extent,
     };
 
+    let mut edge_allocator = EdgeAllocator::new();
+    let token_in_edge = edge_allocator.alloc();
+    let mut activation_edges = Vec::with_capacity(input.stage_count.saturating_sub(1) as usize);
+    for _ in 0..input.stage_count.saturating_sub(1) {
+        activation_edges.push(edge_allocator.alloc());
+    }
+    let token_out_edge = edge_allocator.alloc();
+
     let mut edges = Vec::with_capacity(input.stage_count as usize + 1);
     edges.push(EdgePlan {
         run_id: input.run_id,
-        edge_id: EdgeId(7000),
+        edge_id: token_in_edge,
         kind: EdgeKind::TokenIn,
         producer: EdgeEndpoint::Orchestrator {
             node_id: input.orchestrator_node_id,
@@ -246,7 +277,7 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
     for stage_index in 0..input.stage_count.saturating_sub(1) {
         edges.push(EdgePlan {
             run_id: input.run_id,
-            edge_id: EdgeId(7001 + u64::from(stage_index)),
+            edge_id: activation_edges[stage_index as usize],
             kind: EdgeKind::Activation,
             producer: EdgeEndpoint::Stage {
                 node_id: placements[stage_index as usize].node_id,
@@ -263,7 +294,7 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
 
     edges.push(EdgePlan {
         run_id: input.run_id,
-        edge_id: EdgeId(7000 + u64::from(input.stage_count)),
+        edge_id: token_out_edge,
         kind: EdgeKind::TokenOut,
         producer: EdgeEndpoint::Stage {
             node_id: placements[input.stage_count as usize - 1].node_id,
@@ -280,6 +311,16 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
     for placement in &placements {
         let stage_index = placement.stage_index;
         let (start, end) = layer_range(input.model.num_layers, input.stage_count, stage_index);
+        let inbound_edge = if stage_index == 0 {
+            token_in_edge
+        } else {
+            activation_edges[stage_index as usize - 1]
+        };
+        let outbound_edge = if stage_index + 1 == input.stage_count {
+            token_out_edge
+        } else {
+            activation_edges[stage_index as usize]
+        };
         stages.push(StagePlan {
             run_id: input.run_id,
             stage_index,
@@ -287,8 +328,8 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
             node_id: placement.node_id,
             layer_start: start,
             layer_end_exclusive: end,
-            inbound_edge: EdgeId(7000 + u64::from(stage_index)),
-            outbound_edge: EdgeId(7001 + u64::from(stage_index)),
+            inbound_edge,
+            outbound_edge,
         });
     }
 

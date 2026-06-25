@@ -3,7 +3,6 @@ members = [
     ".",
     "crates/bindings/python",
     "crates/bindings/wasm-runtime",
-    "crates/dashboard",
     "crates/process",
     "crates/transport",
     "crates/distribution",

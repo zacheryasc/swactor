@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use swactor::actor::{ActorAddress, ActorInterface, Ctx, Environment, EnvironmentBuilder, ExitValue, StopReason};
+use swactor::actor::{
+    ActorAddress, ActorInterface, Ctx, Environment, EnvironmentBuilder, ExitValue, StopReason,
+};
 use swactor::config::RuntimeConfig;
 use swactor::extension::{RuntimeExtension, WorkerExtension};
 use swactor::runtime::Runtime;
@@ -62,18 +64,16 @@ impl RuntimeExtension for SeamExtension {
         &self,
         dead: &[(ActorAddress, StopReason, Option<ExitValue>)],
     ) -> Vec<(ActorAddress, Box<dyn Any + Send>)> {
-        let _ = dead.iter().map(|(_, reason, value)| (reason, value)).count();
+        let _ = dead
+            .iter()
+            .map(|(_, reason, value)| (reason, value))
+            .count();
         let Some(report_to) = *self.state.death_report_to.lock() else {
             return Vec::new();
         };
 
         dead.iter()
-            .map(|(addr, _, _)| {
-                (
-                    report_to,
-                    Box::new(DeathSeen(*addr)) as Box<dyn Any + Send>,
-                )
-            })
+            .map(|(addr, _, _)| (report_to, Box::new(DeathSeen(*addr)) as Box<dyn Any + Send>))
             .collect()
     }
 
@@ -124,12 +124,7 @@ impl WorkerExtension for SeamWorkerExtension {
             .worker_pending
             .lock()
             .pop()
-            .map(|target| {
-                (
-                    target,
-                    Box::new(WorkerExtFired) as Box<dyn Any + Send>,
-                )
-            })
+            .map(|target| (target, Box::new(WorkerExtFired) as Box<dyn Any + Send>))
             .into_iter()
             .collect()
     }
@@ -238,8 +233,9 @@ impl ActorInterface for WorkerRequestActor {
     type Response = ();
 
     fn handle(&mut self, ctx: &Ctx, _msg: ()) {
-        ctx.raw_inner()
-            .post_worker_request(Box::new(WorkerRequest { target: self.target }));
+        ctx.raw_inner().post_worker_request(Box::new(WorkerRequest {
+            target: self.target,
+        }));
     }
 }
 

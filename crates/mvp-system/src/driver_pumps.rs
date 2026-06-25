@@ -151,9 +151,6 @@ pub enum DriverEventOut {
         edge_id: EdgeId,
         ring_id: RingId,
     },
-    ObjectHeaderParsed {
-        edge_id: EdgeId,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

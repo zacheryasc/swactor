@@ -9,6 +9,17 @@ pub struct PortId(pub String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectKey {
+    pub edge_id: EdgeId,
+    pub object_id: ObjectId,
+}
+
+impl ObjectKey {
+    pub fn new(edge_id: EdgeId, object_id: ObjectId) -> Self {
+        Self { edge_id, object_id }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StepId(pub u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,6 +162,7 @@ pub struct HeaderDecodeError;
 
 const HEADER_LEN: usize = 48;
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingStep {
     step_id: StepId,
@@ -167,7 +179,7 @@ pub struct EgressProducerHarness {
     committed: std::collections::BTreeMap<RingId, Vec<u8>>,
     payload_committed: std::collections::BTreeMap<RingId, u64>,
     full_rings: std::collections::BTreeSet<RingId>,
-    produced: std::collections::BTreeSet<ObjectId>,
+    produced: std::collections::BTreeSet<ObjectKey>,
     wake_hints: Vec<WakeHint>,
     events: Vec<WorkerEgressOut>,
 }
@@ -323,7 +335,10 @@ impl EgressProducerHarness {
             .or_default()
             .extend(std::iter::repeat(0).take(byte_count as usize));
         *self.payload_committed.entry(output.ring_id).or_insert(0) += byte_count;
-        if self.produced.insert(object_id) {
+        let Some(object_key) = self.output_key(output) else {
+            return;
+        };
+        if self.produced.insert(object_key) {
             self.events.push(WorkerEgressOut::ObjectProduced {
                 ring_id: output.ring_id,
                 object_id,
@@ -362,6 +377,12 @@ impl EgressProducerHarness {
         });
     }
 
+    fn output_key(&self, output: OutputBinding) -> Option<ObjectKey> {
+        self.rings
+            .get(&output.ring_id)
+            .map(|ring| ObjectKey::new(ring.edge_id, output.object_id))
+    }
+
     fn maybe_step_completed(&mut self, step_id: StepId) {
         let Some(step) = self.steps.iter().find(|step| step.step_id == step_id) else {
             return;
@@ -369,14 +390,17 @@ impl EgressProducerHarness {
         if !step.role_state_updated {
             return;
         }
-        if step.outputs.iter().all(|output| self.produced.contains(&output.object_id))
-            && !self.events.iter().any(|event| matches!(event, WorkerEgressOut::StepCompleted { step_id: seen } if *seen == step_id))
+        if step.outputs.iter().all(|output| {
+            self.output_key(*output)
+                .is_some_and(|key| self.produced.contains(&key))
+        }) && !self.events.iter().any(|event| matches!(event, WorkerEgressOut::StepCompleted { step_id: seen } if *seen == step_id))
         {
             self.events.push(WorkerEgressOut::StepCompleted { step_id });
         }
     }
 }
 
+#[cfg(test)]
 fn encode_header(output: OutputBinding) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN);
     out.extend_from_slice(b"MO01");

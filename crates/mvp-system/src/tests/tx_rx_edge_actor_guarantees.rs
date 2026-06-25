@@ -16,6 +16,25 @@ fn edge_id() -> edge_actor::EdgeId {
     edge_actor::EdgeId(7001)
 }
 
+#[test]
+fn object_id_allocator_is_scoped_to_one_producer_edge() {
+    let mut stage0_output = edge_actor::ObjectIdAllocator::new(edge_actor::EdgeId(7001));
+    let mut stage1_output = edge_actor::ObjectIdAllocator::new(edge_actor::EdgeId(7002));
+
+    assert_eq!(
+        stage0_output.alloc(),
+        edge_actor::ObjectKey::new(edge_actor::EdgeId(7001), edge_actor::ObjectId(1))
+    );
+    assert_eq!(
+        stage1_output.alloc(),
+        edge_actor::ObjectKey::new(edge_actor::EdgeId(7002), edge_actor::ObjectId(1))
+    );
+    assert_eq!(
+        stage0_output.alloc(),
+        edge_actor::ObjectKey::new(edge_actor::EdgeId(7001), edge_actor::ObjectId(2))
+    );
+}
+
 // Tx starts in provisioning and represents the producer side of one edge. The
 // harness records only actor messages, not bytes or flow-control details.
 fn new_tx() -> edge_actor::TxActorHarness {
@@ -43,12 +62,6 @@ fn assert_actor_message_is_payload_free(message: &edge_actor::ActorMessage) {
         | edge_actor::ActorMessage::ObjectIdentity { .. }
         | edge_actor::ActorMessage::OpaqueHandle { .. }
         | edge_actor::ActorMessage::CoarseFault { .. } => {}
-        edge_actor::ActorMessage::PayloadBytes { .. }
-        | edge_actor::ActorMessage::HostPointer { .. }
-        | edge_actor::ActorMessage::ByteRange { .. }
-        | edge_actor::ActorMessage::CreditCount { .. } => {
-            panic!("edge actor message carried payload or flow-control detail: {message:?}")
-        }
     }
 }
 

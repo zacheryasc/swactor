@@ -78,9 +78,6 @@ pub enum WorkerCommand {
         handle: DeviceHandle,
     },
     ShutdownWorker,
-    PayloadBytes {
-        bytes: Vec<u8>,
-    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,8 +171,7 @@ enum CtlState {
     Stopped,
 }
 
-#[cfg(test)]
-pub struct GpuWorkerCtlHarness {
+pub struct GpuWorkerCtl {
     config: WorkerConfig,
     state: CtlState,
     current_generation: WorkerGeneration,
@@ -188,8 +184,7 @@ pub struct GpuWorkerCtlHarness {
     installed_rings: std::collections::BTreeSet<RingId>,
 }
 
-#[cfg(test)]
-impl GpuWorkerCtlHarness {
+impl GpuWorkerCtl {
     pub fn new(config: WorkerConfig) -> Self {
         Self {
             config,
@@ -376,3 +371,5 @@ impl GpuWorkerCtlHarness {
         }
     }
 }
+
+pub type GpuWorkerCtlHarness = GpuWorkerCtl;

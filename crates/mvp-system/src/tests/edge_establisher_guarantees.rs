@@ -246,12 +246,7 @@ fn driver_ready_marks_local_edge_actor_ready() {
     }));
 
     // After readiness, stream and pump behavior belongs to the driver; the
-    // establisher should not emit hot-path byte commands.
-    assert!(
-        !tx.commands()
-            .iter()
-            .any(|command| { matches!(command, edge::EdgeCommand::CopyHotPathBytes { .. }) })
-    );
+    // public command enum has no hot-path byte variant.
 }
 
 // This proves StopEdge cancels queued leases, stops pumps, uninstalls worker

@@ -197,7 +197,7 @@ fn typed_codec_tolerates_version_skew() {
 
     // A consolidated record evolves the same way: an unknown panel is ignored,
     // and a record predating the per-entry vectors decodes them as empty — so a
-    // newer fleet dashboard and an older node stay compatible (spec §6.3).
+    // newer fleet view and an older node stay compatible (spec §6.3).
     let dist_skew = br#"{"cache_size":4,"unknown_panel":[1,2,3]}"#;
     let decoded = DistributionState::decode(dist_skew).expect("dist.state tolerates skew");
     assert_eq!(decoded.cache_size, 4);
