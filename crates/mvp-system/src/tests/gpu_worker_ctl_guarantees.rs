@@ -142,9 +142,6 @@ fn command_routing_requires_running_current_generation_and_is_payload_free() {
             | ctl::WorkerCommand::ExecuteStep { .. }
             | ctl::WorkerCommand::ReleaseDeviceObject { .. }
             | ctl::WorkerCommand::ShutdownWorker { .. } => {}
-            ctl::WorkerCommand::PayloadBytes { .. } => {
-                panic!("worker control command carried payload bytes: {command:?}")
-            }
         }
     }
 

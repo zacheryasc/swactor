@@ -13,7 +13,6 @@ local-e2e = [
     "dep:iroh-driver",
     "dep:iroh",
     "dep:tokio",
-    "dep:dashboard",
     "dep:parking_lot",
 ]
 
@@ -27,7 +26,6 @@ swactor-transport = { path = "../transport", optional = true }
 distribution = { path = "../distribution", optional = true }
 iroh-driver = { path = "../iroh-driver", optional = true }
 iroh = { version = "0.98", optional = true }
-dashboard = { path = "../dashboard", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -36,6 +34,11 @@ libc = "0.2"
 [[bin]]
 name = "mvp-local-e2e"
 path = "src/bin/local_e2e.rs"
+required-features = ["local-e2e"]
+
+[[bin]]
+name = "mvp-local-e2e-cluster"
+path = "src/bin/local_e2e_cluster.rs"
 required-features = ["local-e2e"]
 
 [[bin]]
@@ -51,4 +54,9 @@ required-features = ["local-e2e"]
 [[test]]
 name = "gpu_worker_node_e2e"
 path = "tests/gpu_worker_node_e2e.rs"
+required-features = ["local-e2e"]
+
+[[test]]
+name = "local-e2e-cluster"
+path = "tests/local_e2e_cluster.rs"
 required-features = ["local-e2e"]

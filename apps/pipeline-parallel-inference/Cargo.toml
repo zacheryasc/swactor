@@ -5,7 +5,6 @@ name = "pipeline-parallel-inference"
 version = "0.1.0"
 edition = "2024"
 publish = false
-
 [dependencies]
 swactor = { path = "../..", features = ["transport", "serde", "std"] }
 swactor-transport = { path = "../../crates/transport" }
@@ -20,9 +19,6 @@ tokio = { version = "1", features = ["full"] }
 distribution = { path = "../../crates/distribution" }
 iroh-driver = { path = "../../crates/iroh-driver" }
 datastream = { path = "../../crates/datastream" }
-# Live runtime dashboard (HTTP overview/actors/topology pages, served on
-# localhost when PP_DASHBOARD is set).
-dashboard = { path = "../../crates/dashboard" }
 iroh = "0.98"
 urlencoding = "2"
 base64 = "0.22"

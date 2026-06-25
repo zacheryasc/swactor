@@ -87,8 +87,8 @@ impl RuntimeNode {
         self.driver.endpoint_addr()
     }
 
-    pub fn join(&mut self, seeds: &[EndpointAddr]) {
-        self.driver.join(seeds);
+    pub fn join(&mut self, coordinators: &[EndpointAddr]) {
+        self.driver.join(coordinators);
     }
 
     pub fn register_actor_route(&mut self, actor_addr: ActorAddress, generation: u64) {

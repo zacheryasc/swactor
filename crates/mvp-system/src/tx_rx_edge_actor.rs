@@ -7,6 +7,36 @@ pub struct PortId(pub String);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectId(pub u64);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ObjectKey {
+    pub edge_id: EdgeId,
+    pub object_id: ObjectId,
+}
+
+impl ObjectKey {
+    pub fn new(edge_id: EdgeId, object_id: ObjectId) -> Self {
+        Self { edge_id, object_id }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectIdAllocator {
+    edge_id: EdgeId,
+    next: u64,
+}
+
+impl ObjectIdAllocator {
+    pub fn new(edge_id: EdgeId) -> Self {
+        Self { edge_id, next: 1 }
+    }
+
+    pub fn alloc(&mut self) -> ObjectKey {
+        let object_key = ObjectKey::new(self.edge_id, ObjectId(self.next));
+        self.next += 1;
+        object_key
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OpaqueHandle(pub u64);
 
@@ -56,23 +86,6 @@ pub enum ActorMessage {
         edge_id: EdgeId,
         reason: ActorFaultReason,
     },
-    PayloadBytes {
-        edge_id: EdgeId,
-        bytes: Vec<u8>,
-    },
-    HostPointer {
-        edge_id: EdgeId,
-        address: usize,
-    },
-    ByteRange {
-        edge_id: EdgeId,
-        start: u64,
-        len: u64,
-    },
-    CreditCount {
-        edge_id: EdgeId,
-        credits: u64,
-    },
 }
 
 impl ActorMessage {
@@ -81,11 +94,7 @@ impl ActorMessage {
             ActorMessage::Lifecycle { edge_id, .. }
             | ActorMessage::ObjectIdentity { edge_id, .. }
             | ActorMessage::OpaqueHandle { edge_id, .. }
-            | ActorMessage::CoarseFault { edge_id, .. }
-            | ActorMessage::PayloadBytes { edge_id, .. }
-            | ActorMessage::HostPointer { edge_id, .. }
-            | ActorMessage::ByteRange { edge_id, .. }
-            | ActorMessage::CreditCount { edge_id, .. } => *edge_id,
+            | ActorMessage::CoarseFault { edge_id, .. } => *edge_id,
         }
     }
 }
@@ -141,15 +150,13 @@ enum ActorState {
     Stopped,
 }
 
-#[cfg(test)]
-pub struct TxActorHarness {
+pub struct TxEdgeActor {
     config: TxConfig,
     state: ActorState,
     messages: Vec<ActorMessage>,
 }
 
-#[cfg(test)]
-impl TxActorHarness {
+impl TxEdgeActor {
     pub fn new(config: TxConfig) -> Self {
         Self {
             config,
@@ -231,15 +238,13 @@ impl TxActorHarness {
     }
 }
 
-#[cfg(test)]
-pub struct RxActorHarness {
+pub struct RxEdgeActor {
     config: RxConfig,
     state: ActorState,
     messages: Vec<ActorMessage>,
 }
 
-#[cfg(test)]
-impl RxActorHarness {
+impl RxEdgeActor {
     pub fn new(config: RxConfig) -> Self {
         Self {
             config,
@@ -322,3 +327,6 @@ impl RxActorHarness {
         });
     }
 }
+
+pub type TxActorHarness = TxEdgeActor;
+pub type RxActorHarness = RxEdgeActor;

@@ -551,9 +551,8 @@ impl IrohDriver {
 
     /// Capture the driver-owned slice of the node's observable state: identity,
     /// listen address, and the directory route-view extent. The core node no
-    /// longer polls this (its telemetry flows over the datastream), but the
-    /// example apps still build their dashboards from this shape, so it is kept
-    /// as a convenience over [`listen_addr`](Self::listen_addr) and
+    /// longer polls this (its telemetry flows over the datastream), so this is
+    /// kept as a convenience over [`listen_addr`](Self::listen_addr) and
     /// [`directory_route_count`](Self::directory_route_count).
     pub fn snapshot(&self) -> DistributionNodeSnapshot {
         let mut snap = DistributionNodeSnapshot::empty(self.node_id());
@@ -596,7 +595,7 @@ impl IrohDriver {
                         .filter(|(_, host)| **host != self_id)
                         .map(|(actor, host)| (*actor, *host))
                         .collect();
-                    // Stable order so the dashboard table doesn't reshuffle each tick.
+                    // Stable order so observers don't reshuffle each tick.
                     entries.sort_by(|a, b| a.0.0.cmp(&b.0.0));
                     entries
                 })

@@ -17,7 +17,6 @@ use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
 
 use crate::extension::WorkerExtension;
 
-
 /// Whether an actor should be skipped during `tick_all`.
 pub(crate) fn should_skip_actor(poisoned: bool, stopping: bool, suspended: bool) -> bool {
     poisoned || stopping || suspended

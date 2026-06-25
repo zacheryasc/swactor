@@ -333,7 +333,7 @@ impl ClusterRegistry {
                 tombstone: e.tombstone,
             })
             .collect();
-        // Stable order so the dashboard table doesn't reshuffle each tick.
+        // Stable order so observers don't reshuffle each tick.
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         let tombstones = entries.iter().filter(|e| e.tombstone).count();
         RegistrySnapshot {

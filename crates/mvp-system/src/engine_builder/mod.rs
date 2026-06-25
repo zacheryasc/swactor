@@ -23,7 +23,7 @@ pub use engine::{ClusterBuilder, ClusterHandle, NodeSummary};
 pub use error::{EngineBuildError, LaunchError, NodeControlError, PlanningError, PoolError};
 pub use events::EngineEvent;
 pub use launcher::{
-    LaunchedNode, NodeControl, NodeFacts, NodeLaunchSpec, NodeLauncher, SeedSpec,
+    CoordinatorJoinSpec, LaunchedNode, NodeControl, NodeFacts, NodeLaunchSpec, NodeLauncher,
     StaticNodeLauncher,
 };
 pub use model::{DTypeFamily, ModelArchitecture, ModelArtifact, ModelSpec};

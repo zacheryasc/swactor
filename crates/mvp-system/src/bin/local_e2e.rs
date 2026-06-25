@@ -18,14 +18,13 @@ use mvp_system::actors::orchestrator::{
     StageRefWire,
 };
 use mvp_system::actors::register_mvp_actor_codecs;
-use mvp_system::dashboard::MvpDashboard;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::driver_pumps;
 use mvp_system::engine_builder as engine;
-use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
 use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
+use mvp_system::tx_rx_edge_actor as edge_actor;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use swactor::actor::ActorAddress;
@@ -41,10 +40,8 @@ fn main() -> ExitCode {
     let args = std::env::args().collect::<Vec<_>>();
     let result = if args.iter().any(|arg| arg == "--role=node") {
         run_node_role(&args)
-    } else if std::env::var_os("MVP_DASHBOARD").is_some() {
-        run_supervisor_dashboard_loop()
     } else {
-        run_supervisor_once(RUN_ID, None, true)
+        run_supervisor_once(RUN_ID, true)
     };
 
     match result {
@@ -81,86 +78,10 @@ struct NodeReady {
 struct NodeStdoutLine {
     #[serde(rename = "type")]
     kind: String,
-    stage_index: Option<u32>,
     event: Option<String>,
 }
 
-fn record_dashboard_event(dashboard: &mut Option<&mut MvpDashboard>, event: obs::Event) {
-    if let Some(dashboard) = dashboard.as_deref_mut() {
-        dashboard.record_event(event);
-    }
-}
-
-fn run_event(run_id: u64, kind: obs::EventKind) -> obs::Event {
-    obs::Event::RunScoped {
-        kind,
-        run_id: obs::RunId(run_id),
-        reason: None,
-        component: obs::Component::Orchestrator,
-    }
-}
-
-fn run_fault_event(run_id: u64) -> obs::Event {
-    obs::Event::RunScoped {
-        kind: obs::EventKind::RunFaulted,
-        run_id: obs::RunId(run_id),
-        reason: Some(obs::FaultReason::WorkerCrashed),
-        component: obs::Component::Orchestrator,
-    }
-}
-
-fn node_event(node_id: u64, kind: obs::EventKind) -> obs::Event {
-    obs::Event::NodeScoped {
-        kind,
-        node_id: obs::NodeId(node_id),
-        component: obs::Component::NodeBoot,
-    }
-}
-
-fn stage_event(run_id: u64, stage_index: u32, kind: obs::EventKind) -> obs::Event {
-    obs::Event::StageScoped {
-        kind,
-        run_id: obs::RunId(run_id),
-        stage_index: obs::StageIndex(stage_index),
-        reason: if kind == obs::EventKind::StageFaulted {
-            Some(obs::FaultReason::WorkerCrashed)
-        } else {
-            None
-        },
-        component: obs::Component::StageController,
-    }
-}
-
-fn object_event(run_id: u64, object_id: u64, sequence: u64, kind: obs::EventKind) -> obs::Event {
-    let _ = run_id;
-    obs::Event::ObjectScoped {
-        kind,
-        object_id: obs::ObjectId(object_id),
-        sequence: obs::Sequence(sequence),
-        component: obs::Component::TokenEndpoint,
-    }
-}
-
-fn run_supervisor_dashboard_loop() -> Result<(), String> {
-    let mut dashboard = MvpDashboard::start_from_env()?;
-    eprintln!("mvp-local-e2e: dashboard {}", dashboard.url());
-    eprintln!("mvp-local-e2e: MVP_DASHBOARD=1, repeating local scenario until Ctrl+C");
-    let mut run_id = RUN_ID;
-    loop {
-        match run_supervisor_once(run_id, Some(&mut dashboard), false) {
-            Ok(()) => eprintln!("mvp-local-e2e: run {run_id} ok"),
-            Err(error) => eprintln!("mvp-local-e2e: run {run_id} failed: {error}"),
-        }
-        run_id = run_id.saturating_add(1);
-        thread::sleep(Duration::from_secs(1));
-    }
-}
-
-fn run_supervisor_once(
-    run_id: u64,
-    mut dashboard: Option<&mut MvpDashboard>,
-    print_summary: bool,
-) -> Result<(), String> {
+fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
     let _tokio = tokio::runtime::Runtime::new().map_err(|e| format!("tokio runtime: {e}"))?;
     let mut driver = new_driver(_tokio.handle().clone())?;
     let stack = DistributionRuntimeStack::new_with_codecs(
@@ -193,10 +114,6 @@ fn run_supervisor_once(
         ))
         .map_err(|e| format!("spawn orchestrator actor: {e}"))?;
     stack.register_local_actor(driver.register_actor(orchestrator_addr, 1));
-    record_dashboard_event(
-        &mut dashboard,
-        node_event(ORCHESTRATOR_LOGICAL_NODE_ID, obs::EventKind::NodeStarted),
-    );
 
     let token_out_listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| format!("bind orchestrator token-out listener: {e}"))?;
@@ -245,16 +162,6 @@ fn run_supervisor_once(
         &self_endpoint_json,
         &orchestrator_actor_json,
     )?;
-    for stage in [&stage1, &stage0] {
-        record_dashboard_event(
-            &mut dashboard,
-            node_event(stage.node_id.0, obs::EventKind::NodeStarted),
-        );
-        record_dashboard_event(
-            &mut dashboard,
-            node_event(stage.node_id.0, obs::EventKind::NodeAvailable),
-        );
-    }
 
     let started_at = Instant::now();
     wait_for_routes(
@@ -277,7 +184,7 @@ fn run_supervisor_once(
             },
         )
         .map_err(|e| format!("observe pool ready: {e}"))?;
-    record_dashboard_event(&mut dashboard, run_event(run_id, obs::EventKind::PoolReady));
+
     stack
         .runtime
         .send_to(
@@ -295,10 +202,7 @@ fn run_supervisor_once(
             },
         )
         .map_err(|e| format!("observe plan: {e}"))?;
-    record_dashboard_event(
-        &mut dashboard,
-        run_event(run_id, obs::EventKind::RunPlanned),
-    );
+
     stack
         .runtime
         .send_to(
@@ -313,10 +217,6 @@ fn run_supervisor_once(
             OrchestratorMsg::ObserveTokenOutEndpointReady,
         )
         .map_err(|e| format!("observe token-out endpoint: {e}"))?;
-    record_dashboard_event(
-        &mut dashboard,
-        run_event(run_id, obs::EventKind::ReadinessBarrierPassed),
-    );
 
     let mut injected = false;
     let mut completed = false;
@@ -326,10 +226,12 @@ fn run_supervisor_once(
     let mut sent_stop_to_node0 = false;
     let mut sent_stop_to_node1 = false;
 
+    let mut token_in_object_allocator =
+        edge_actor::ObjectIdAllocator::new(edge_actor::EdgeId(stage0.inbound_edge.0));
     while started_at.elapsed() < Duration::from_secs(30) {
         pump_network(&mut driver, &stack);
-        stage_ready_count += drain_node_stdout(&node0.stdout_rx, run_id, &mut dashboard);
-        stage_ready_count += drain_node_stdout(&node1.stdout_rx, run_id, &mut dashboard);
+        stage_ready_count += drain_node_stdout(&node0.stdout_rx);
+        stage_ready_count += drain_node_stdout(&node1.stdout_rx);
 
         while let Some(report) = orchestrator_report.try_recv() {
             match report {
@@ -345,29 +247,18 @@ fn run_supervisor_once(
                             .runtime
                             .send_to(target, NodeAgentMsg::ProvisionStage(provision))
                             .map_err(|e| format!("send provision to stage {stage_index}: {e}"))?;
-                        record_dashboard_event(
-                            &mut dashboard,
-                            stage_event(run_id, stage_index, obs::EventKind::StageProvisionStarted),
-                        );
                     }
                     RunCommandWire::InjectPrompt {
                         sequence, prompt, ..
                     } => {
                         injected = true;
-                        record_dashboard_event(
-                            &mut dashboard,
-                            object_event(
-                                run_id,
-                                9_000 + sequence,
-                                sequence,
-                                obs::EventKind::PromptInjected,
-                            ),
-                        );
+
+                        let prompt_object = token_in_object_allocator.alloc();
                         write_edge_frame(
                             node0.ready.token_in_addr,
                             EdgeFrame {
-                                edge_id: 7000,
-                                object_id: 9_000 + sequence,
+                                edge_id: stage0.inbound_edge.0,
+                                object_id: prompt_object.object_id.0,
                                 sequence,
                                 kind: "token".to_owned(),
                                 token_id: prompt.first().copied(),
@@ -390,10 +281,6 @@ fn run_supervisor_once(
                             .runtime
                             .send_to(target, NodeAgentMsg::StopRun { run_id })
                             .map_err(|e| format!("send stop to stage {stage_index}: {e}"))?;
-                        record_dashboard_event(
-                            &mut dashboard,
-                            stage_event(run_id, stage_index, obs::EventKind::StopRunSent),
-                        );
                     }
                     RunCommandWire::TearDownTokenEndpoints { .. } => {
                         stack
@@ -409,28 +296,15 @@ fn run_supervisor_once(
                     | RunCommandWire::BroadcastStart { .. } => {}
                 },
                 OrchestratorReport::Lifecycle(event) => match event {
-                    LifecycleEventWire::RunCompleted { run_id } => {
+                    LifecycleEventWire::RunCompleted { .. } => {
                         token_received = true;
-                        record_dashboard_event(
-                            &mut dashboard,
-                            object_event(run_id, 9_000, 0, obs::EventKind::TokenReceived),
-                        );
-                        record_dashboard_event(
-                            &mut dashboard,
-                            run_event(run_id, obs::EventKind::RunCompleted),
-                        );
                         completed = true;
                     }
-                    LifecycleEventWire::RunTornDown { run_id } => {
-                        record_dashboard_event(
-                            &mut dashboard,
-                            run_event(run_id, obs::EventKind::RunTornDown),
-                        );
+                    LifecycleEventWire::RunTornDown { .. } => {
                         torn_down = true;
                     }
-                    LifecycleEventWire::RunRejected { run_id }
-                    | LifecycleEventWire::RunFaulted { run_id } => {
-                        record_dashboard_event(&mut dashboard, run_fault_event(run_id));
+                    LifecycleEventWire::RunRejected { .. }
+                    | LifecycleEventWire::RunFaulted { .. } => {
                         return Err(format!("run failed: {event:?}"));
                     }
                 },
@@ -495,7 +369,6 @@ fn run_supervisor_once(
         thread::sleep(Duration::from_millis(10));
     }
 
-    record_dashboard_event(&mut dashboard, run_fault_event(run_id));
     shutdown_node(&mut node0);
     shutdown_node(&mut node1);
     Err(format!(
@@ -516,8 +389,9 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
     let outbound_addr = parse_arg(args, "--outbound-addr")?
         .parse::<SocketAddr>()
         .map_err(|e| format!("outbound addr: {e}"))?;
-    let seed: EndpointAddr = serde_json::from_str(parse_arg(args, "--seed-endpoint")?)
-        .map_err(|e| format!("seed endpoint json: {e}"))?;
+    let coordinator: EndpointAddr =
+        serde_json::from_str(parse_arg(args, "--coordinator-endpoint")?)
+            .map_err(|e| format!("coordinator endpoint json: {e}"))?;
     let orchestrator_addr: ActorAddress =
         serde_json::from_str(parse_arg(args, "--orchestrator-actor")?)
             .map_err(|e| format!("orchestrator actor json: {e}"))?;
@@ -537,7 +411,7 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
         stack.relay_mirror.clone(),
         stack.route_view.clone(),
     );
-    driver.join(&[seed]);
+    driver.join(&[coordinator]);
 
     let node_report = stack
         .runtime
@@ -594,6 +468,7 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
     let mut worker = WorkerProc::spawn()?;
     let mut pending_commands = VecDeque::new();
     let mut outbound_stream: Option<TcpStream> = None;
+    let mut outbound_object_allocator: Option<edge_actor::ObjectIdAllocator> = None;
     let started_at = Instant::now();
 
     loop {
@@ -642,6 +517,8 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
                 &mut worker,
                 outbound_addr,
                 &mut outbound_stream,
+                &mut outbound_object_allocator,
+                stage_index,
             )?;
         }
         pending_commands = deferred;
@@ -881,6 +758,8 @@ fn handle_node_command(
     worker: &mut WorkerProc,
     outbound_addr: SocketAddr,
     outbound_stream: &mut Option<TcpStream>,
+    outbound_object_allocator: &mut Option<edge_actor::ObjectIdAllocator>,
+    local_stage_index: u32,
 ) -> Result<(), String> {
     match command {
         StageCommandWire::EstablishInboundEdge { edge_id } => runtime
@@ -895,6 +774,9 @@ fn handle_node_command(
                 )))
                 .map_err(|e| format!("write outbound preamble: {e}"))?;
             *outbound_stream = Some(stream);
+            *outbound_object_allocator = Some(edge_actor::ObjectIdAllocator::new(
+                edge_actor::EdgeId(edge_id),
+            ));
             runtime
                 .send_to(node_actor, NodeAgentMsg::MarkOutboundEdgeReady { edge_id })
                 .map_err(|e| format!("mark outbound ready: {e}"))
@@ -919,22 +801,27 @@ fn handle_node_command(
                 .send_to(node_actor, NodeAgentMsg::StepCompleted { step_id })
                 .map_err(|e| format!("mark step completed: {e}"))?;
             let output_edge_id = output_edge_ids.first().copied().unwrap_or(0);
+            let output_key = outbound_object_allocator
+                .as_mut()
+                .ok_or_else(|| "outbound object allocator missing for ExecuteStep".to_owned())?
+                .alloc();
             let stream = outbound_stream
                 .as_mut()
                 .ok_or_else(|| "outbound stream missing for ExecuteStep".to_owned())?;
+            let final_stage = local_stage_index == 1;
             write_json_frame(
                 stream,
                 &EdgeFrame {
                     edge_id: output_edge_id,
-                    object_id: 10_000 + step_id,
+                    object_id: output_key.object_id.0,
                     sequence,
-                    kind: if output_edge_id == 7002 {
+                    kind: if final_stage {
                         "token".to_owned()
                     } else {
                         "activation".to_owned()
                     },
-                    token_id: (output_edge_id == 7002).then_some(99),
-                    eos: output_edge_id == 7002,
+                    token_id: final_stage.then_some(99),
+                    eos: final_stage,
                 },
             )
         }
@@ -1039,7 +926,7 @@ fn spawn_node_process(
     stage_index: u32,
     inbound_edge_id: u64,
     outbound_addr: SocketAddr,
-    seed_endpoint_json: &str,
+    coordinator_endpoint_json: &str,
     orchestrator_actor_json: &str,
 ) -> Result<NodeChild, String> {
     let mut child = Command::new(std::env::current_exe().map_err(|e| format!("current exe: {e}"))?)
@@ -1052,8 +939,8 @@ fn spawn_node_process(
         .arg(inbound_edge_id.to_string())
         .arg("--outbound-addr")
         .arg(outbound_addr.to_string())
-        .arg("--seed-endpoint")
-        .arg(seed_endpoint_json)
+        .arg("--coordinator-endpoint")
+        .arg(coordinator_endpoint_json)
         .arg("--orchestrator-actor")
         .arg(orchestrator_actor_json)
         .stdin(Stdio::piped())
@@ -1112,38 +999,17 @@ fn shutdown_node(node: &mut NodeChild) {
     let _ = node.child.wait();
 }
 
-fn drain_node_stdout(
-    rx: &Receiver<NodeStdoutLine>,
-    run_id: u64,
-    dashboard: &mut Option<&mut MvpDashboard>,
-) -> usize {
+fn drain_node_stdout(rx: &Receiver<NodeStdoutLine>) -> usize {
     let mut stage_ready_count = 0;
     while let Ok(line) = rx.try_recv() {
         if line.kind != "node_lifecycle" {
             continue;
         }
-        let Some(stage_index) = line.stage_index else {
-            continue;
-        };
         let Some(event) = line.event.as_deref() else {
             continue;
         };
         if event.contains("StageReady") {
             stage_ready_count += 1;
-            record_dashboard_event(
-                dashboard,
-                stage_event(run_id, stage_index, obs::EventKind::StageReady),
-            );
-        } else if event.contains("StageStopped") {
-            record_dashboard_event(
-                dashboard,
-                stage_event(run_id, stage_index, obs::EventKind::StageStopped),
-            );
-        } else if event.contains("StageFault") {
-            record_dashboard_event(
-                dashboard,
-                stage_event(run_id, stage_index, obs::EventKind::StageFaulted),
-            );
         }
     }
     stage_ready_count

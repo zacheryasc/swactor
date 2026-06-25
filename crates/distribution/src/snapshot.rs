@@ -1,13 +1,11 @@
 //! Serializable shape of a node's observable distribution state.
 //!
-//! This is the JSON contract the Distribution page renders. The node no longer
-//! *collects* it by polling — per-node telemetry now flows over the datastream,
-//! and the dashboard's datastream consumer reconstructs this exact field shape
-//! from the `membership` / `identity` / `dist.state` channels. The type is
-//! retained as the shared wire shape so external consumers (the example
-//! clusters, the docker integration tests) can deserialize a node's
-//! `/api/distribution` response, and so a producer that builds the shape
-//! directly (the example apps) has one definition to target.
+//! This is the JSON contract distribution observers render. The node no longer
+//! *collects* it by polling — per-node telemetry now flows over the datastream.
+//! The type is retained as the shared wire shape so external consumers (the
+//! example clusters, the docker integration tests) can deserialize a node's
+//! `/api/distribution` response, and so producers that build the shape directly
+//! have one definition to target.
 
 use serde::{Deserialize, Serialize};
 

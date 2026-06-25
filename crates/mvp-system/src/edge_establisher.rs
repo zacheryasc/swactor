@@ -228,10 +228,6 @@ pub enum EdgeCommand {
         ring_id: RingId,
         proof: QuiescenceProof,
     },
-    CopyHotPathBytes {
-        edge_id: EdgeId,
-        bytes: Vec<u8>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

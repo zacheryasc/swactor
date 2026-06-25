@@ -1,46 +1,16 @@
 # dashboard
 
-Datastream-only HTTP dashboard for visualizing swactor-derived telemetry in a browser. The dashboard consumes folded datastream records and serves live pages over HTTP/SSE.
+Read-only HTML/SSE dashboard over incoming datastream frames.
 
-## Features
+The crate owns the Axum server, bounded raw frame window, and view registry. Component crates can keep their own view implementations beside their code and register them through `DashboardHandle::register_view`. The built-in swactor worker page is hosted here because worker/actor/message processing is universal to swactor programs.
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `distribution` | yes | `/distribution` page with SWIM membership, gossip directory routes, peer auth, and location cache data derived from datastream frames |
-| Fleet view | yes | `/vastai` page showing nodes folded by `datastream_source::FleetView` |
+## Routes
 
-## HTTP Dashboard
+- `GET /` — dashboard index
+- `GET /events` — raw incoming frames as SSE
+- `GET /api/frames` — recent raw frame window
+- `GET /api/views` — registered view metadata
+- `GET /view/swactor/workers` — built-in worker page
+- `GET /api/view/swactor/workers` — worker page JSON snapshot
 
-The dashboard is embedded by an application that owns a datastream sink. The
-sink folds delivered frames through `datastream_source::FleetView`, then pushes
-the resulting stats, activity lines, and cache-backed plugin JSON into the
-dashboard handle.
-
-Pages:
-- `http://localhost:9090/` — live overview from the selected datastream node
-- `http://localhost:9090/actors` — actor table reconstructed from actor telemetry records
-- `http://localhost:9090/plugin/distribution` — SWIM membership, gossip directory routes, peer auth, and cache entries
-- `http://localhost:9090/plugin/vastai` — fleet/node view fed by the shared fleet cache
-
-The dashboard model is folded by `datastream_source::FleetView`. Producers
-publish telemetry records to datastream channels; the dashboard sink folds those
-records into cached JSON, pushes activity messages, and updates the HTTP/SSE
-views.
-
-## Public API
-
-Embed the dashboard by constructing `DashboardConfig` and calling
-`start_dashboard(config)`. The returned handle owns the HTTP server state and
-supports externally pushed stats, activity messages, history access, plugin
-registration, landing page overrides, extra routers, and shutdown.
-
-Plugins are the extension boundary. New dashboard surfaces should register a
-`DashboardPlugin` or use a cache-backed plugin such as
-`fleet_cache_plugin(cache)` / `distribution_cache_plugin(cache)`, then feed it
-from datastream-derived JSON caches.
-
-## Pipeline app
-
-`apps/pipeline-parallel-inference` enables the dashboard with `PP_DASHBOARD=1`.
-Its orchestrator hosts the HTTP server, spawns the `datastream-sink` actor, and
-feeds every dashboard view from `FleetView` updates.
+All state is derived from observed frames. The dashboard sends no control signals back to producers.

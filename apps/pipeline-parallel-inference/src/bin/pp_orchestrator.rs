@@ -29,31 +29,27 @@
 //! 5. Kills any spawned child processes and (on `--vastai`) destroys all
 //!    rented instances regardless of success or failure.
 
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use datastream::{DATASTREAM_SINK_NAME, DatastreamSink};
+use datastream::transport::Delivery;
+use datastream::{Consumer, DATASTREAM_SINK_NAME, DatastreamSink};
 use distribution::node::DistributedNodeConfig;
-use distribution::snapshot::DistributionNodeSnapshot;
 use distribution::registry::RegistryConfig;
 use distribution::swim::probe::SwimConfig;
 use iroh::{PublicKey, RelayMode, SecretKey};
 use iroh_driver::IrohDriverConfig;
-
 use swactor::actor::ActorAddress;
 use swactor::runtime::Inbox;
 
 use pipeline_parallel_inference::cluster::ClusterNode;
-
-use dashboard::datastream_source::{FleetView, distribution_cache_plugin, fleet_cache_plugin};
-use dashboard::{DashboardConfig, start_dashboard};
-
 use pipeline_parallel_inference::iroh_transport::{
     ACTOR_ALPN, ActorMessagePump, IrohActorTransport,
 };
@@ -66,7 +62,6 @@ use pipeline_parallel_inference::orchestrator::{
 use pipeline_parallel_inference::topology::{ENTRY_NAME, stage_name};
 
 const ORCHESTRATOR_NAME: &str = "pp-orchestrator";
-type SharedSnapshot = Arc<Mutex<Option<DistributionNodeSnapshot>>>;
 
 fn node_config() -> DistributedNodeConfig {
     DistributedNodeConfig {
@@ -380,50 +375,13 @@ fn check_child_death(guard: &mut ChainGuard) -> Result<(), String> {
     Ok(())
 }
 
-/// Register the Fleet tab and spawn the orchestrator-hosted datastream
-/// consumer behind it: the [`DatastreamSink`] actor, which every node's
-/// `ClusterFrameSink` resolves (under [`DATASTREAM_SINK_NAME`]) and ships its
-/// telemetry to over the regular swactor transport (no dedicated channel). The
-/// actor folds each delivery into an in-process `FleetView` and caches the
-/// fleet JSON the tab serves. Returns the sink's address so the boot-phase
-/// provisioner can ship the orchestrator's own (and each booting node's) frames
-/// to it in-process.
-///
-/// The actor is spawned here, but the [`DATASTREAM_SINK_NAME`] cluster-name
-/// registration is deliberately NOT done here — see [`register_fleet_sink_name`]
-/// and the [`ORCHESTRATOR_NAME`] registration: a name published before the
-/// cluster is non-empty sizes its SWIM dissemination budget for a one-node
-/// cluster and exhausts it before any stage can observe the entry via piggyback
-/// gossip, so the stages never resolve the sink and the Fleet tab stays empty.
-/// The caller must register the returned address post-convergence.
-fn wire_fleet_sink(
-    cluster: &ClusterNode,
-    handle: Arc<dashboard::DashboardHandle>,
-) -> Option<ActorAddress> {
-    let fleet_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let dist_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    handle.register_plugin(fleet_cache_plugin(Arc::clone(&fleet_cache)));
-    handle.register_plugin(distribution_cache_plugin(Arc::clone(&dist_cache)));
-
-    // Fold every received delivery into a FleetView, caching datastream-derived
-    // fleet/distribution JSON and pushing synthesized stats/activity into the
-    // dashboard. This keeps the dashboard off the local swactor runtime.
-    let mut view = FleetView::new(None);
-    let fleet_cache = Arc::clone(&fleet_cache);
-    let dist_cache = Arc::clone(&dist_cache);
-    let handle_for_updates = Arc::clone(&handle);
+/// Spawn the local datastream consumer and return its actor address. The fold
+/// keeps the raw stream in a datastream store without coupling this binary to
+/// any presentation layer.
+fn wire_datastream_sink(cluster: &ClusterNode) -> Option<ActorAddress> {
+    let mut consumer = Consumer::new();
     let sink = DatastreamSink::new(move |stream, frame| {
-        let update = view.ingest(&stream, &frame);
-        *fleet_cache.lock().unwrap() = Some(update.fleet_json);
-        if let Some(dist_json) = update.dist_json {
-            *dist_cache.lock().unwrap() = Some(dist_json);
-        }
-        if let Some(stats) = update.stats {
-            handle_for_updates.set_stats(stats);
-        }
-        for (is_warn, message) in update.logs {
-            handle_for_updates.push_activity(is_warn, message);
-        }
+        let _ = consumer.accept(Delivery { stream, frame });
     });
     match cluster.rt.spawn(sink) {
         Ok(addr) => {
@@ -437,19 +395,15 @@ fn wire_fleet_sink(
     }
 }
 
-/// Publish the datastream-sink actor under [`DATASTREAM_SINK_NAME`] so the
-/// stages can resolve it and ship their fleet telemetry. MUST be called
-/// post-convergence (see [`wire_fleet_sink`]): registering it earlier would
-/// size the SWIM dissemination budget for a one-node cluster and the entry
-/// would exhaust its budget before any stage could observe it via piggyback
-/// gossip — leaving the Fleet tab empty. Mirrors the [`ORCHESTRATOR_NAME`]
-/// post-convergence registration.
-fn register_fleet_sink_name(cluster: &ClusterNode, addr: Option<ActorAddress>) {
+/// Publish the datastream sink after convergence so the name-dissemination
+/// budget is sized for the real cluster, matching the orchestrator inbox.
+fn register_datastream_sink_name(cluster: &ClusterNode, addr: Option<ActorAddress>) {
     if let Some(addr) = addr {
         cluster.register_name(DATASTREAM_SINK_NAME, addr);
         eprintln!("pp-orchestrator: datastream-sink registered -> {addr:?}");
     }
 }
+
 
 fn run_seed(args: &Args) -> i32 {
     let gpu_node_bin = resolve_gpu_node_path(args);
@@ -469,21 +423,6 @@ fn run_seed(args: &Args) -> i32 {
         return 1;
     }
 
-    // Build the dashboard handle up front. Runtime stats/distribution panels are
-    // fed only by datastream updates folded through `wire_fleet_sink`.
-    let dashboard = if std::env::var_os("PP_DASHBOARD").is_some() {
-        let port: u16 = std::env::var("PP_DASHBOARD_PORT")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(9090);
-        let handle = Arc::new(start_dashboard(DashboardConfig {
-            port,
-            ..Default::default()
-        }));
-        Some((handle, port))
-    } else {
-        None
-    };
 
     let mut cluster = match ClusterNode::new(
         IrohDriverConfig {
@@ -504,9 +443,6 @@ fn run_seed(args: &Args) -> i32 {
         }
     };
 
-    // Keep the existing snapshot cache only for hold/prompt loop refresh paths;
-    // dashboard Distribution is fed from datastream-derived FleetView updates.
-    let want_dist = std::env::var_os("PP_DASHBOARD").is_some();
 
     let my_id = cluster.node_id();
     let my_hex: String = my_id.0.iter().map(|b| format!("{:02x}", b)).collect();
@@ -520,6 +456,7 @@ fn run_seed(args: &Args) -> i32 {
         "pp-orchestrator (--seed --num-stages {n}): orchestrator node {my_hex}, direct={direct:?}",
         n = args.num_stages,
     );
+    let seed_datastream_sink_addr = wire_datastream_sink(&cluster);
 
     // Run inside a labelled block so every failure point can `break`
     // with both an exit code and a stable exit-reason string; the
@@ -529,34 +466,6 @@ fn run_seed(args: &Args) -> i32 {
         let rt = Arc::clone(&cluster.rt);
         let router = Arc::clone(&cluster.transport_router);
 
-        // Shared distribution snapshot cell for hold-loop refresh paths. The
-        // dashboard's Distribution plugin is datastream-backed via FleetView.
-        let dist_cached: Option<SharedSnapshot> = if want_dist {
-            Some(Arc::new(Mutex::new(Some(cluster.snapshot()))))
-        } else {
-            None
-        };
-
-        // Datastream-sink actor address, set when the dashboard wires the Fleet
-        // tab. Its cluster-name publish is deferred to post-convergence (see
-        // `register_fleet_sink_name`).
-        let mut seed_fleet_sink_addr: Option<ActorAddress> = None;
-
-        // When the in-process dashboard is on, register only datastream-backed
-        // plugins. FleetView updates fill both Fleet and Distribution caches.
-        if let Some((handle, port)) = &dashboard {
-            // Fleet tab ("Fleet" nav): the orchestrator-hosted datastream
-            // consumer. Each stage resolves the `datastream-sink` actor and
-            // ships its identity + host.resource frames over the swactor
-            // transport; the actor folds them into a live FleetView and serves
-            // the cross-node telemetry table beside the orchestrator's own views.
-            seed_fleet_sink_addr = wire_fleet_sink(&cluster, Arc::clone(handle));
-            handle.start_http(cluster.driver.tokio_handle());
-            eprintln!(
-                "pp-orchestrator: live dashboard on http://localhost:{port} \
-                 (overview / actors / topology / distribution / fleet)"
-            );
-        }
 
         let response_inbox = match rt.new_inbox::<InferenceResponse>() {
             Ok(i) => i,
@@ -612,9 +521,7 @@ fn run_seed(args: &Args) -> i32 {
         // via SWIM piggyback gossip. Doing it post-convergence gives the registry
         // a budget sized for the real cluster.
         cluster.register_name(ORCHESTRATOR_NAME, inbox_addr);
-        // Publish the datastream-sink now, for the same budget reason: stages
-        // resolve this name to ship their fleet telemetry to the Fleet tab.
-        register_fleet_sink_name(&cluster, seed_fleet_sink_addr);
+        register_datastream_sink_name(&cluster, seed_datastream_sink_addr);
         eprintln!("pp-orchestrator: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
         if let Err(e) = conv_res {
             eprintln!("pp-orchestrator: {e}");
@@ -752,14 +659,9 @@ fn run_seed(args: &Args) -> i32 {
                 println!("{text}");
                 println!("============================================");
                 // The ChainGuard is still in scope here, so the stage
-                // containers stay up while we hold — letting the dashboard
-                // show a live, converged cluster rather than a torn-down one.
-                if dashboard.is_some() || std::env::var_os("PP_HOLD").is_some() {
-                    hold_open(
-                        &mut cluster,
-                        dist_cached.as_ref(),
-                        dashboard.as_ref().map(|(_, p)| *p),
-                    );
+                // containers stay up while we hold.
+                if std::env::var_os("PP_HOLD").is_some() {
+                    hold_open(&mut cluster);
                 }
                 (0, "ok")
             }
@@ -890,25 +792,11 @@ impl AwaitError {
 ///   `dead`. When that happens, a `pp_drive_dead_member` diagnostic
 ///   event is emitted identifying the stage and the dead member's
 ///   `node_id_short` before returning [`AwaitError::ForwardPathDead`].
-/// Block the orchestrator after a successful drive so the live dashboard —
-/// and the stage containers, whose `ChainGuard` is still in scope — stay up
-/// for inspection. Returns when the operator presses Enter or closes stdin
-/// (Ctrl-D), at which point the run unwinds and tears the cluster down.
 /// Hold the cluster open after a successful drive. The `ChainGuard` is still
 /// in scope (containers stay up), and we keep ticking the driver so SWIM stays
-/// converged. The optional snapshot cache is retained for non-dashboard hold-loop
-/// refresh paths; dashboard panels are updated through datastream FleetView.
-/// Returns when the operator presses Enter or closes stdin (Ctrl-D).
-fn hold_open(cluster: &mut ClusterNode, dist_cached: Option<&SharedSnapshot>, port: Option<u16>) {
-    match port {
-        Some(p) => eprintln!(
-            "pp-orchestrator: holding cluster open — orchestrator dashboard at \
-             http://localhost:{p}. Press Enter (or Ctrl-D) to tear down."
-        ),
-        None => eprintln!(
-            "pp-orchestrator: holding cluster open. Press Enter (or Ctrl-D) to tear down."
-        ),
-    }
+/// converged. Returns when the operator presses Enter or closes stdin (Ctrl-D).
+fn hold_open(cluster: &mut ClusterNode) {
+    eprintln!("pp-orchestrator: holding cluster open. Press Enter (or Ctrl-D) to tear down.");
     // Read stdin on a side thread so the main thread can keep pumping the
     // driver; a blocking read here would freeze SWIM and the live snapshot.
     let stop = Arc::new(AtomicBool::new(false));
@@ -920,16 +808,10 @@ fn hold_open(cluster: &mut ClusterNode, dist_cached: Option<&SharedSnapshot>, po
             stop.store(true, Ordering::SeqCst);
         });
     }
-    // Drain inbound ACTOR_ALPN traffic so fleet `DatastreamFrame`s from the
-    // stages reach the `datastream-sink` actor while the cluster is held open;
-    // `pump_once` only services SWIM/protocol gossip, not app messages.
     let msg_pump = ActorMessagePump::new();
     while !stop.load(Ordering::SeqCst) {
         cluster.pump_once();
         msg_pump.pump(&cluster.driver, &cluster.codecs, &cluster.rt);
-        if let Some(cached) = dist_cached {
-            *cached.lock().unwrap() = Some(cluster.snapshot());
-        }
         std::thread::sleep(Duration::from_millis(200));
     }
 }
@@ -1084,13 +966,12 @@ fn drive_once(
     result
 }
 
-/// Live multi-prompt loop for vast.ai mode (dashboard or `--hold`). Keeps the
-/// cluster converged and the dashboard SSE fed while the operator drives more
-/// prompts. A stdin-reader side thread feeds prompt lines so the main thread
-/// can keep pumping the driver; each non-empty line drives one more inference at
-/// the next `drive_seq`. A blank line, `quit`, or EOF (Ctrl-D) ends the loop,
-/// after which the caller's finalize + teardown tail runs.
-#[allow(clippy::too_many_arguments)]
+/// Live multi-prompt loop for vast.ai `--hold` mode. Keeps the cluster
+/// converged while the operator drives more prompts. A stdin-reader side thread
+/// feeds prompt lines so the main thread can keep pumping the driver; each
+/// non-empty line drives one more inference at the next `drive_seq`. A blank
+/// line, `quit`, or EOF (Ctrl-D) ends the loop, after which the caller's
+/// finalize + teardown tail runs.
 fn prompt_loop(
     cluster: &mut ClusterNode,
     response_inbox: &Inbox<InferenceResponse>,
@@ -1100,19 +981,11 @@ fn prompt_loop(
     label: &str,
     max_tokens: u32,
     first_drive_seq: u32,
-    dist_cached: Option<&SharedSnapshot>,
-    port: Option<u16>,
 ) {
-    match port {
-        Some(p) => eprintln!(
-            "pp-orchestrator: cluster live — dashboard at http://localhost:{p}. \
-             Type a prompt + Enter to drive again; blank line / Ctrl-D / `quit` to tear down."
-        ),
-        None => eprintln!(
-            "pp-orchestrator: cluster live. Type a prompt + Enter to drive again; \
-             blank line / Ctrl-D / `quit` to tear down."
-        ),
-    }
+    eprintln!(
+        "pp-orchestrator: cluster live. Type a prompt + Enter to drive again; \
+         blank line / Ctrl-D / `quit` to tear down."
+    );
 
     // Read prompts on a side thread so the main thread keeps pumping the driver;
     // a blocking stdin read here would freeze SWIM and the live snapshot. The
@@ -1139,16 +1012,13 @@ fn prompt_loop(
         });
     }
 
-    // Drain inbound ACTOR_ALPN traffic between drives so fleet telemetry keeps
-    // flowing into the `datastream-sink` while the operator is idle at the prompt.
+    // Drain inbound ACTOR_ALPN traffic between drives while the operator is
+    // idle at the prompt.
     let msg_pump = ActorMessagePump::new();
     let mut drive_seq = first_drive_seq;
     while !stop.load(Ordering::SeqCst) {
         cluster.pump_once();
         msg_pump.pump(&cluster.driver, &cluster.codecs, &cluster.rt);
-        if let Some(cached) = dist_cached {
-            *cached.lock().unwrap() = Some(cluster.snapshot());
-        }
         // Drive any prompts that arrived since the last tick. drive_once pumps
         // the driver itself while awaiting each response.
         while let Ok(prompt) = rx.try_recv() {
@@ -1427,21 +1297,6 @@ fn run_vastai(args: &Args) -> i32 {
     let num_stages = cluster.num_stages;
     let label = cluster.label.clone();
 
-    // Build the dashboard handle up front. Runtime stats/distribution panels are
-    // fed only by datastream updates folded through `wire_fleet_sink`.
-    let dashboard = if std::env::var_os("PP_DASHBOARD").is_some() {
-        let port: u16 = std::env::var("PP_DASHBOARD_PORT")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .unwrap_or(9090);
-        let handle = Arc::new(start_dashboard(DashboardConfig {
-            port,
-            ..Default::default()
-        }));
-        Some((handle, port))
-    } else {
-        None
-    };
 
     let mut cluster_node = match ClusterNode::new(
         IrohDriverConfig {
@@ -1461,10 +1316,6 @@ fn run_vastai(args: &Args) -> i32 {
             return 1;
         }
     };
-
-    // The Distribution tab renders from the orchestrator's own SWIM view; its
-    // snapshot cell exists whenever the in-process dashboard is on.
-    let want_dist = std::env::var_os("PP_DASHBOARD").is_some();
 
     // Per-cluster drive counter, emitted on pp_drive_start / pp_drive_end so
     // the bundle reader can slice the interleaved event stream by attempt.
@@ -1511,47 +1362,9 @@ fn run_vastai(args: &Args) -> i32 {
         eprintln!("pp-orchestrator: no relay URL after 20s — vastai mode usually requires one");
     }
 
-    // Per-stage host telemetry rides the swactor cluster transport: each rented
-    // stage resolves the `datastream-sink` actor and ships its frames there,
-    // and the orchestrator folds the booting node's SSH output into the same
-    // sink. `fleet_sink_addr` is filled when the dashboard wiring spawns the
-    // sink below; the provisioner ships boot frames to it in-process.
-    let mut fleet_sink_addr: Option<ActorAddress> = None;
-
-    // ── Live dashboard + runtime — started BEFORE the lease ──────────────
-    // The lease + image-load phase is the slow, failure-prone part the operator
-    // most needs to watch, so the HTTP server binds here (start_http) rather
-    // than after convergence. Plugins populate as the cluster comes up. The
-    // ClusterNode already owns the runtime + codec + router (shared with the
-    // protocol actors); the dashboard handle was built up front above.
     let rt = Arc::clone(&cluster_node.rt);
     let router = Arc::clone(&cluster_node.transport_router);
 
-    // Shared distribution snapshot cell for prompt-loop refresh paths. The
-    // dashboard's Distribution plugin is datastream-backed via FleetView; this
-    // cache remains for existing loop bookkeeping and is skipped when off.
-    let dist_cached: Option<SharedSnapshot> = if want_dist {
-        Some(Arc::new(Mutex::new(Some(cluster_node.snapshot()))))
-    } else {
-        None
-    };
-
-    // When the in-process dashboard is on, register only datastream-backed
-    // plugins. FleetView updates fill both Fleet and Distribution caches.
-    if let Some((handle, port)) = &dashboard {
-        // Fleet tab: the orchestrator-hosted datastream consumer. Each rented
-        // stage resolves the `datastream-sink` actor and ships its telemetry
-        // over the swactor transport; the actor folds them into a live FleetView
-        // and serves the cross-node table. The returned address also receives
-        // each booting node's SSH output (boot phase) and the orchestrator's own
-        // frames, in-process.
-        fleet_sink_addr = wire_fleet_sink(&cluster_node, Arc::clone(handle));
-        handle.start_http(cluster_node.driver.tokio_handle());
-        eprintln!(
-            "pp-orchestrator: live dashboard on http://localhost:{port} \
-             (overview / actors / topology / distribution / fleet)"
-        );
-    }
 
     // ── Acquire the running cluster ──────────────────────────────────
     // Lease N fresh instances and (on --hold) persist the handle.
@@ -1611,11 +1424,7 @@ fn run_vastai(args: &Args) -> i32 {
             num_stages,
         );
         // Run the lease in 200ms slices instead of one blocking call, so the
-        // main thread can pump SWIM and refresh the dashboard snapshot while
-        // instances come up. Otherwise the membership/topology/net-map panels
-        // freeze at the empty startup snapshot for the entire (multi-minute,
-        // CDI-retrying) lease — even though stages are already joining SWIM —
-        // which defeats the point of binding the dashboard before the lease.
+        // main thread can pump SWIM while instances come up.
         let lease_result = {
             let mut lease_fut = Box::pin(pipeline_parallel_inference::vastai::lease_chain(
                 &http,
@@ -1646,9 +1455,6 @@ fn run_vastai(args: &Args) -> i32 {
                     Ok(res) => break res,
                     Err(_elapsed) => {
                         cluster_node.pump_once();
-                        if let Some(cached) = dist_cached.as_ref() {
-                            *cached.lock().unwrap() = Some(cluster_node.snapshot());
-                        }
                     }
                 }
             }
@@ -1693,62 +1499,7 @@ fn run_vastai(args: &Args) -> i32 {
     };
     eprintln!("pp-orchestrator: cluster contracts {contract_ids:?}");
 
-    // ── Boot-phase telemetry (best-effort, opt-in) ───────────────────────
-    // With a deploy SSH key configured (PP_DEPLOY_KEY) and the fleet sink live,
-    // SSH into each rented node and stream pp-worker's boot log onto the
-    // orchestrator's own datastream (proc.boot.<stage>.*) until the node's
-    // swactor telemetry takes over the cluster transport. No deploy key →
-    // skipped; the container entrypoint still launches the worker, so the run is
-    // unchanged. This is the "ssh signal until the node runs swactor" half.
-    use pipeline_parallel_inference::{provision, vastai};
-    if let (Some(sink_addr), Some(key_file)) = (fleet_sink_addr, provision::deploy_key_path()) {
-        match tokio_rt.block_on(vastai::list_instances_by_label(
-            &http, base_url, &api_key, &label,
-        )) {
-            Ok(list) => {
-                provision::install_boot_telemetry(&rt, &my_hex, 0, sink_addr);
-                match rt.spawn(provision::ProvisionActor::new(
-                    rt.create_sender(),
-                    cluster_node.driver.tokio_handle(),
-                )) {
-                    Ok(prov_addr) => {
-                        for (stage, &cid) in contract_ids.iter().enumerate() {
-                            let Some(inst) = list.iter().find(|i| i.contract_id == cid) else {
-                                continue;
-                            };
-                            let host = if !inst.ssh_host.is_empty() {
-                                inst.ssh_host.clone()
-                            } else {
-                                inst.public_ipaddr.clone()
-                            };
-                            if host.is_empty() || inst.ssh_port == 0 {
-                                eprintln!(
-                                    "pp-orchestrator: stage {stage} has no SSH endpoint yet; boot tail skipped"
-                                );
-                                continue;
-                            }
-                            let _ = rt.send_to(
-                                prov_addr,
-                                provision::ProvisionMsg::TailStage {
-                                    stage: stage as u32,
-                                    ssh: provision::SshTarget {
-                                        host,
-                                        port: inst.ssh_port,
-                                        username: "root".to_string(),
-                                        key_file: key_file.clone(),
-                                    },
-                                },
-                            );
-                        }
-                    }
-                    Err(e) => eprintln!("pp-orchestrator: could not spawn ProvisionActor: {e}"),
-                }
-            }
-            Err(e) => eprintln!(
-                "pp-orchestrator: boot telemetry skipped (SSH endpoint discovery failed: {e})"
-            ),
-        }
-    }
+    let datastream_sink_addr = wire_datastream_sink(&cluster_node);
 
     // Drive the run inside a labelled block returning `(code, reason)` so
     // every failure point can name the reason it bailed; the orchestrator's
@@ -1780,9 +1531,7 @@ fn run_vastai(args: &Args) -> i32 {
             "pp-orchestrator: waiting for SWIM convergence ({} alive peers, {}s budget)...",
             num_stages, orch_converge_secs,
         );
-        // Drain inbound ACTOR_ALPN throughout convergence + pipeline wiring so
-        // each stage's fleet `DatastreamFrame`s reach the `datastream-sink` as it
-        // joins (pump_once only services SWIM/protocol gossip, not app messages).
+        // Drain inbound ACTOR_ALPN throughout convergence + pipeline wiring.
         let fleet_pump = ActorMessagePump::new();
         let conv_res = await_convergence(
             num_stages as usize,
@@ -1792,11 +1541,6 @@ fn run_vastai(args: &Args) -> i32 {
                 cluster_node.pump_once();
                 fleet_pump.pump(&cluster_node.driver, &cluster_node.codecs, &cluster_node.rt);
                 let snap = cluster_node.snapshot();
-                // Keep the dashboard membership/topology panels live as peers
-                // join during convergence.
-                if let Some(cached) = dist_cached.as_ref() {
-                    *cached.lock().unwrap() = Some(snap.clone());
-                }
                 snap.members.iter().filter(|m| m.state == "alive").count()
             },
         );
@@ -1806,10 +1550,8 @@ fn run_vastai(args: &Args) -> i32 {
         }
 
         cluster_node.register_name(ORCHESTRATOR_NAME, inbox_addr);
+        register_datastream_sink_name(&cluster_node, datastream_sink_addr);
         eprintln!("pp-orchestrator: registered {ORCHESTRATOR_NAME} -> {inbox_addr:?}");
-        // Publish the datastream-sink now, for the same budget reason: rented
-        // stages resolve this name to ship their fleet telemetry to the Fleet tab.
-        register_fleet_sink_name(&cluster_node, fleet_sink_addr);
 
         // Spec §4.5 + §4.6: gate the drive on (a) every pp-stage-K
         // resolvable and (b) pp-entry resolvable. Both are proxies for
@@ -1828,10 +1570,7 @@ fn run_vastai(args: &Args) -> i32 {
         let (stage0_addr, stage0_node_id) = loop {
             cluster_node.pump_once();
             fleet_pump.pump(&cluster_node.driver, &cluster_node.codecs, &cluster_node.rt);
-            // Keep the dashboard panels live while the pipeline wires up.
-            if let Some(cached) = dist_cached.as_ref() {
-                *cached.lock().unwrap() = Some(cluster_node.snapshot());
-            }
+            // Keep app messages flowing while the pipeline wires up.
             for k in 0..num_stages {
                 if roster_hex[k as usize].is_some() {
                     continue;
@@ -1920,13 +1659,9 @@ fn run_vastai(args: &Args) -> i32 {
             Err(e) => (1, e.exit_reason()),
         };
 
-        // Live multi-prompt loop, gated on the dashboard or --hold. A plain
-        // one-shot (neither set) keeps today's single-drive-then-exit behaviour.
-        // Modeled on hold_open: a stdin-reader side thread feeds prompt lines
-        // while the main thread pumps the driver (~200 ms) and refreshes the
-        // distribution snapshot between prompts. Dashboard panels are fed by
-        // datastream FleetView updates; EOF / blank line / `quit` leaves the loop.
-        if std::env::var_os("PP_DASHBOARD").is_some() || args.hold {
+        // Live multi-prompt loop for held clusters. A plain one-shot keeps
+        // today's single-drive-then-exit behaviour.
+        if args.hold {
             prompt_loop(
                 &mut cluster_node,
                 &response_inbox,
@@ -1936,8 +1671,6 @@ fn run_vastai(args: &Args) -> i32 {
                 &label,
                 args.max_tokens,
                 drive_seq,
-                dist_cached.as_ref(),
-                dashboard.as_ref().map(|(_, p)| *p),
             );
         }
 

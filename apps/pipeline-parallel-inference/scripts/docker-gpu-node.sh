@@ -102,8 +102,6 @@ exec docker run --rm --init \
     -e FIRST_PEER_DIRECT \
     -e PP_BOOT_DELAY_STAGE \
     -e PP_BOOT_DELAY_SECS \
-    -e PP_STAGE_DASHBOARD \
-    -e PP_STAGE_DASHBOARD_PORT_BASE \
     -e PP_FLEET_SINK \
     -e DEV="$DEV" \
     -e WORKER_SCRIPT=/usr/local/share/pp_tinygrad_worker.py \

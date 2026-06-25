@@ -190,12 +190,8 @@ fn recv_pump_copies_bytes_without_parsing_and_respects_backpressure() {
         edge_id: driver::EdgeId(7001),
         bytes: driver::fake_object_header_bytes(),
     });
-    assert!(
-        !harness
-            .events()
-            .iter()
-            .any(|event| { matches!(event, driver::DriverEventOut::ObjectHeaderParsed { .. }) })
-    );
+    // The public driver event enum has no object-header event; object parsing
+    // belongs to the worker ingress parser, not the recv pump.
     assert!(harness.ring_commit(driver::EdgeId(7001)) > 0);
     assert!(harness.wake_hints().iter().any(|wake| {
         matches!(

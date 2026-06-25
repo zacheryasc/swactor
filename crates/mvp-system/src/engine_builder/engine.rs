@@ -6,7 +6,7 @@ use crate::run_plan::RunId;
 use super::error::EngineBuildError;
 use super::events::EngineEvent;
 use super::launcher::{
-    LaunchedNode, NodeControl, NodeFacts, NodeLaunchSpec, NodeLauncher, SeedSpec,
+    CoordinatorJoinSpec, LaunchedNode, NodeControl, NodeFacts, NodeLaunchSpec, NodeLauncher,
 };
 use super::model::ModelSpec;
 use super::node_image::NodeImageSpec;
@@ -117,33 +117,31 @@ impl ClusterBuilder {
 
         let mut nodes = Vec::with_capacity(leases.len());
         let mut iter = leases.into_iter();
-        let seed_lease = iter.next().ok_or(EngineBuildError::EmptyPool)?;
-        let mut seed = launcher.launch_node(
-            &seed_lease,
+        let coordinator_lease = iter.next().ok_or(EngineBuildError::EmptyPool)?;
+        let mut coordinator = launcher.launch_node(
+            &coordinator_lease,
             NodeLaunchSpec {
                 cluster_id: self.cluster_id.clone(),
                 image: image.clone(),
-                seed: None,
-                is_seed: true,
+                coordinator: None,
+                is_coordinator: true,
                 env: BTreeMap::new(),
             },
         )?;
         events.push(EngineEvent::NodeLaunched {
-            node_id: seed.lease.logical_node_id,
-            seed: true,
+            node_id: coordinator.lease.logical_node_id,
+            coordinator: true,
         });
-        let seed_facts = seed.control.wait_boot_ready(self.boot_timeout)?;
+        let coordinator_facts = coordinator.control.wait_boot_ready(self.boot_timeout)?;
         events.push(EngineEvent::NodeBootReady {
-            node_id: seed_facts.node_id,
+            node_id: coordinator_facts.node_id,
         });
-        let seed_endpoint =
-            seed_facts
-                .seed_endpoint
-                .clone()
-                .ok_or(EngineBuildError::SeedEndpointMissing {
-                    node_id: seed_facts.node_id.0,
-                })?;
-        nodes.push(EngineNode::new(seed, seed_facts));
+        let coordinator_endpoint = coordinator_facts.coordinator_endpoint.clone().ok_or(
+            EngineBuildError::CoordinatorEndpointMissing {
+                node_id: coordinator_facts.node_id.0,
+            },
+        )?;
+        nodes.push(EngineNode::new(coordinator, coordinator_facts));
 
         for lease in iter {
             let mut node = launcher.launch_node(
@@ -151,16 +149,16 @@ impl ClusterBuilder {
                 NodeLaunchSpec {
                     cluster_id: self.cluster_id.clone(),
                     image: image.clone(),
-                    seed: Some(SeedSpec {
-                        endpoint: seed_endpoint.clone(),
+                    coordinator: Some(CoordinatorJoinSpec {
+                        endpoint: coordinator_endpoint.clone(),
                     }),
-                    is_seed: false,
+                    is_coordinator: false,
                     env: BTreeMap::new(),
                 },
             )?;
             events.push(EngineEvent::NodeLaunched {
                 node_id: node.lease.logical_node_id,
-                seed: false,
+                coordinator: false,
             });
             let facts = node.control.wait_boot_ready(self.boot_timeout)?;
             events.push(EngineEvent::NodeBootReady {

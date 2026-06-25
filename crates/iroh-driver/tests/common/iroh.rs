@@ -14,8 +14,7 @@
 //!
 //! Membership is observed through the harness `membership_mirror` (a
 //! `MemberList` filled by the [`MembershipFanout`] from SWIM's
-//! `MembershipChanged` stream) — the same derivation production uses for its
-//! dashboard snapshot. The driver snapshot no longer carries members.
+//! `MembershipChanged` stream). The driver snapshot no longer carries members.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -393,7 +392,7 @@ where
 
 /// Whether `node` sees `peer_key` in membership `state`. Membership comes from
 /// the [`MembershipFanout`]-filled mirror, not the (now memberless) driver
-/// snapshot — exactly as production derives its dashboard members.
+/// snapshot.
 pub fn sees_state(node: &IrohNode, peer_key: &PublicKey, state: &str) -> bool {
     let want = match state {
         "alive" => MemberState::Alive,

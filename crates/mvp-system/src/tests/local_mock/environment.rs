@@ -5,6 +5,7 @@ use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
 use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
+use mvp_system::tx_rx_edge_actor as edge_actor;
 
 use super::mock_node::MockNode;
 use super::mock_transport::{Delivery, MockObject, MockObjectKind, MockTransport};
@@ -40,6 +41,7 @@ pub struct LocalMockCluster {
     transport: MockTransport,
     resources: ResourceTracker,
     observed_edges: BTreeSet<plan::EdgeId>,
+    object_allocators: BTreeMap<plan::EdgeId, edge_actor::ObjectIdAllocator>,
     scenario: LocalMockScenario,
 }
 
@@ -54,6 +56,7 @@ pub struct LocalMockOutcome {
     pub live_stage_runs: usize,
     pub transport_delivery_count: usize,
     pub transport_deliveries: Vec<Delivery>,
+    pub edge_chain: Vec<plan::EdgeId>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -203,6 +206,7 @@ impl LocalMockCluster {
             transport: MockTransport::default(),
             resources: ResourceTracker::default(),
             observed_edges: BTreeSet::new(),
+            object_allocators: BTreeMap::new(),
             scenario: LocalMockScenario::Happy,
         }
     }
@@ -305,6 +309,7 @@ impl LocalMockCluster {
         self.transport = MockTransport::default();
         self.resources = ResourceTracker::default();
         self.observed_edges.clear();
+        self.object_allocators.clear();
         self.orchestrator_command_cursor = 0;
         self.orchestrator_event_cursor = 0;
         self.scenario = scenario;
@@ -508,16 +513,17 @@ impl LocalMockCluster {
                 obs::Component::Orchestrator,
             );
         }
+        let token_in_edge = self.edge_by_kind(plan::EdgeKind::TokenIn).edge_id;
+        let object_id = self.allocate_object_id(token_in_edge);
         self.push_object(
             obs::EventKind::PromptInjected,
-            9_000 + sequence,
+            object_id,
             sequence,
             obs::Component::TokenEndpoint,
         );
-        let token_in_edge = self.edge_by_kind(plan::EdgeKind::TokenIn).edge_id;
         let object = self.transport.deliver(MockObject {
             edge_id: token_in_edge,
-            object_id: 9_000 + sequence,
+            object_id,
             sequence,
             kind: MockObjectKind::Token,
             token_id: None,
@@ -535,7 +541,6 @@ impl LocalMockCluster {
             .map(|stage| stage.stage_index)
             .collect();
         for stage_index in stage_indices {
-            let edge_id = current.edge_id;
             let mut stage_object = current;
             if self.scenario
                 == (LocalMockScenario::SequenceViolation {
@@ -596,7 +601,14 @@ impl LocalMockCluster {
             );
             self.push_step(obs::EventKind::StepCompleted, execution.step_id);
             let delivered = self.transport.deliver(execution.produced);
-            debug_assert_eq!(delivered.edge_id.0, edge_id.0 + 1);
+            let expected_edge = self
+                .plan
+                .stages
+                .iter()
+                .find(|stage| stage.stage_index == stage_index)
+                .expect("mock stage must exist")
+                .outbound_edge;
+            debug_assert_eq!(delivered.edge_id, expected_edge);
             current = delivered;
         }
         self.push_object(
@@ -621,9 +633,11 @@ impl LocalMockCluster {
             .iter()
             .find(|stage| stage.stage_index == stage_index)
             .expect("mock stage must exist");
+        let wrong_edge = stage.outbound_edge;
+        let object_id = self.allocate_object_id(wrong_edge);
         let object = MockObject {
-            edge_id: plan::EdgeId(stage.inbound_edge.0 + 10_000),
-            object_id: 30_000 + u64::from(stage_index),
+            edge_id: wrong_edge,
+            object_id,
             sequence: 0,
             kind: MockObjectKind::Token,
             token_id: None,
@@ -786,6 +800,26 @@ impl LocalMockCluster {
             .expect("mock plan must contain requested edge")
     }
 
+    fn edge_chain(&self) -> Vec<plan::EdgeId> {
+        let mut stages = self.plan.stages.iter().collect::<Vec<_>>();
+        stages.sort_by_key(|stage| stage.stage_index);
+        let mut chain = Vec::with_capacity(stages.len() + 1);
+        if let Some(first) = stages.first() {
+            chain.push(first.inbound_edge);
+        }
+        chain.extend(stages.into_iter().map(|stage| stage.outbound_edge));
+        chain
+    }
+
+    fn allocate_object_id(&mut self, edge_id: plan::EdgeId) -> u64 {
+        self.object_allocators
+            .entry(edge_id)
+            .or_insert_with(|| edge_actor::ObjectIdAllocator::new(edge_actor::EdgeId(edge_id.0)))
+            .alloc()
+            .object_id
+            .0
+    }
+
     fn finish_outcome(&self) -> LocalMockOutcome {
         LocalMockOutcome {
             engine_events: self.engine_events.clone(),
@@ -801,6 +835,7 @@ impl LocalMockCluster {
             live_stage_runs: self.resources.live_stage_runs.len(),
             transport_delivery_count: self.transport.deliveries().len(),
             transport_deliveries: self.transport.deliveries().to_vec(),
+            edge_chain: self.edge_chain(),
         }
     }
 

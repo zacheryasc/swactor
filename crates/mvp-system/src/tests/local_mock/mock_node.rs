@@ -1,5 +1,6 @@
 use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
+use mvp_system::tx_rx_edge_actor as edge_actor;
 
 use super::mock_transport::MockObject;
 use super::mock_worker::MockWorker;
@@ -14,6 +15,7 @@ pub struct MockNode {
     stage_count: u32,
     inbound_edge: Option<plan::EdgeId>,
     outbound_edge: Option<plan::EdgeId>,
+    outbound_object_allocator: Option<edge_actor::ObjectIdAllocator>,
     controller: stage::StageControllerHarness,
     worker: MockWorker,
     event_cursor: usize,
@@ -31,6 +33,7 @@ impl MockNode {
             stage_count,
             inbound_edge: None,
             outbound_edge: None,
+            outbound_object_allocator: None,
             controller: stage::StageControllerHarness::new(stage::NodeId(node_id.0)),
             worker: MockWorker::new(stage_index, eos_after_sequence),
             event_cursor: 0,
@@ -40,6 +43,9 @@ impl MockNode {
     pub fn provision(&mut self, from: stage::NodeId, provision: stage::ProvisionStage) {
         self.inbound_edge = Some(plan::EdgeId(provision.inbound.edge_id.0));
         self.outbound_edge = Some(plan::EdgeId(provision.outbound.edge_id.0));
+        self.outbound_object_allocator = Some(edge_actor::ObjectIdAllocator::new(
+            edge_actor::EdgeId(provision.outbound.edge_id.0),
+        ));
         self.controller
             .observe(stage::StageEvent::ProvisionStage { from, provision });
     }
@@ -47,6 +53,9 @@ impl MockNode {
     pub fn provision_from_wrong_orchestrator(&mut self, provision: stage::ProvisionStage) {
         self.inbound_edge = Some(plan::EdgeId(provision.inbound.edge_id.0));
         self.outbound_edge = Some(plan::EdgeId(provision.outbound.edge_id.0));
+        self.outbound_object_allocator = Some(edge_actor::ObjectIdAllocator::new(
+            edge_actor::EdgeId(provision.outbound.edge_id.0),
+        ));
         self.controller.observe(stage::StageEvent::ProvisionStage {
             from: stage::NodeId(provision.authorized_orchestrator.0 + 1),
             provision,
@@ -87,9 +96,11 @@ impl MockNode {
                 stage::StageCommand::ExecuteStep(step) => Some(step.clone()),
                 _ => None,
             })?;
+        let output_object_id = self.outbound_object_allocator.as_mut()?.alloc().object_id.0;
         let produced = self.worker.execute(
             &step,
             outbound_edge,
+            output_object_id,
             self.stage_index + 1 == self.stage_count,
         );
         self.controller.observe(stage::StageEvent::StepCompleted {

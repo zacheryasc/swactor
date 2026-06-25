@@ -7,7 +7,7 @@ use crate::run_plan;
 pub enum EngineBuildError {
     MissingComponent(&'static str),
     EmptyPool,
-    SeedEndpointMissing { node_id: u64 },
+    CoordinatorEndpointMissing { node_id: u64 },
     RoleTargetMissing { node_id: u64 },
     Pool(PoolError),
     Launch(LaunchError),
@@ -20,8 +20,11 @@ impl fmt::Display for EngineBuildError {
         match self {
             Self::MissingComponent(name) => write!(f, "missing engine builder component: {name}"),
             Self::EmptyPool => write!(f, "pool provider returned no nodes"),
-            Self::SeedEndpointMissing { node_id } => {
-                write!(f, "seed node {node_id} did not report a seed endpoint")
+            Self::CoordinatorEndpointMissing { node_id } => {
+                write!(
+                    f,
+                    "coordinator node {node_id} did not report a coordinator endpoint"
+                )
             }
             Self::RoleTargetMissing { node_id } => {
                 write!(f, "role assignment targeted unknown node {node_id}")

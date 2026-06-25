@@ -308,8 +308,8 @@ pub trait ChannelClassifier {
 ```
 
 Producers and consumers own the records and channel constants for their domains.
-A dashboard, plugin, or application may compose a registry of the channels it
-understands, but the pipe never consults that registry. Adding a channel or
+A plugin or application may compose a registry of the channels it understands,
+but the pipe never consults that registry. Adding a channel or
 teaching a view a new codec changes nothing in the mux, transport, ingest, or
 store.
 
@@ -433,7 +433,7 @@ them changes anything above or below.
 
 ### 6.2 Fan-out: drain once, distribute
 
-A node may feed more than one consumer (a local dashboard render **and** a
+A node may feed more than one consumer (for example, a local renderer and a
 remote collector). Draining is destructive — the buffer can be drained once —
 so fan-out **cannot** be "each sink drains."
 

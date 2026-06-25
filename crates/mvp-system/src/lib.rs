@@ -4,8 +4,6 @@ extern crate self as mvp_system;
 #[cfg(feature = "local-e2e")]
 pub mod actors;
 pub mod arena_manager;
-#[cfg(feature = "local-e2e")]
-pub mod dashboard;
 pub mod device_bridge;
 #[cfg(feature = "local-e2e")]
 pub mod distribution_stack;

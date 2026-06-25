@@ -184,7 +184,7 @@ impl ArenaManager {
         })
     }
 
-    fn request(&mut self, request: ArenaRequest) -> Vec<ArenaEvent> {
+    pub fn request(&mut self, request: ArenaRequest) -> Vec<ArenaEvent> {
         match request {
             ArenaRequest::LeaseRing(request) => self.lease_ring(request),
             ArenaRequest::CancelLease { request_id } => {
@@ -196,14 +196,29 @@ impl ArenaManager {
         }
     }
 
-    fn live_leases(&self) -> &[RingLease] {
+    pub fn live_leases(&self) -> &[RingLease] {
         &self.live_order
     }
 
-    fn lookup_lease(&self, ring_id: RingId) -> Option<&RingLease> {
+    pub fn lookup_lease(&self, ring_id: RingId) -> Option<&RingLease> {
         self.live_index
             .get(&ring_id)
             .and_then(|index| self.live_order.get(*index))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn arena_fd(&self) -> std::os::fd::RawFd {
+        self._backing.fd()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn write_arena(&self, offset: u64, bytes: &[u8]) -> Result<(), std::io::Error> {
+        self._backing.write_at(offset, bytes)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn read_arena(&self, offset: u64, len: usize) -> Result<Vec<u8>, std::io::Error> {
+        self._backing.read_at(offset, len)
     }
 
     fn lease_ring(&mut self, request: LeaseRing) -> Vec<ArenaEvent> {
@@ -479,7 +494,7 @@ fn gcd(mut left: u64, mut right: u64) -> u64 {
 struct ArenaBacking {
     len: usize,
     ptr: *mut libc::c_void,
-    _fd: std::os::fd::OwnedFd,
+    fd: std::os::fd::OwnedFd,
 }
 
 #[cfg(target_os = "linux")]
@@ -497,7 +512,7 @@ impl ArenaBacking {
 
         let fd = unsafe {
             let name = b"mvp-system-arena\0";
-            libc::memfd_create(name.as_ptr().cast(), libc::MFD_CLOEXEC)
+            libc::memfd_create(name.as_ptr().cast(), 0)
         };
         if fd < 0 {
             return Err(ArenaFault::BackingUnavailable);
@@ -524,7 +539,44 @@ impl ArenaBacking {
             return Err(ArenaFault::BackingUnavailable);
         }
 
-        Ok(Self { len, ptr, _fd: fd })
+        Ok(Self { len, ptr, fd })
+    }
+
+    fn fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsRawFd::as_raw_fd(&self.fd)
+    }
+
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> Result<(), std::io::Error> {
+        let written = unsafe {
+            libc::pwrite(
+                self.fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                offset as libc::off_t,
+            )
+        };
+        if written == bytes.len() as isize {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    fn read_at(&self, offset: u64, len: usize) -> Result<Vec<u8>, std::io::Error> {
+        let mut bytes = vec![0u8; len];
+        let read = unsafe {
+            libc::pread(
+                self.fd(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+                offset as libc::off_t,
+            )
+        };
+        if read == len as isize {
+            Ok(bytes)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
     }
 }
 

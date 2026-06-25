@@ -35,7 +35,11 @@ impl GroupRegistry {
             .entry(group.clone())
             .or_insert_with(|| HashSet::with_hasher(AddrBuildHasher))
             .insert(addr);
-        self.memberships.write().entry(addr).or_default().insert(group);
+        self.memberships
+            .write()
+            .entry(addr)
+            .or_default()
+            .insert(group);
     }
 
     /// Remove an actor from a named group. Empty groups are auto-deleted.
