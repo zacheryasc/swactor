@@ -9,6 +9,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
+use dashboard::swactor::{RUNTIME_ACTORS, RUNTIME_STATS, RUNTIME_WORKERS};
+use datastream::frame::{ChannelId, Frame, Position};
 use datastream::{
     DatastreamEndpoint, DatastreamProducer, DatastreamSubscription, Lifetime, NodeId, StreamId,
 };
@@ -39,7 +41,7 @@ use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
 use mvp_system::tx_rx_edge_actor as edge_actor;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
 use tokio::sync::mpsc as tokio_mpsc;
 
@@ -63,6 +65,7 @@ struct MvpDashboard {
     producer: DatastreamProducer,
     subscription: DatastreamSubscription,
     handle: dashboard::DashboardHandle,
+    runtime_position: u64,
 }
 
 impl MvpDashboard {
@@ -92,6 +95,7 @@ impl MvpDashboard {
             producer,
             subscription,
             handle,
+            runtime_position: 0,
         })
     }
 
@@ -113,6 +117,49 @@ impl MvpDashboard {
         let record = mvp_system::telemetry::MvpLifecycleRecord::new(event);
         self.producer.submit_record(&record);
         self.drain();
+    }
+
+    fn publish_runtime_snapshot(&mut self, stack: &DistributionRuntimeStack) {
+        let stats = stack.runtime.stats();
+        let actors = stats
+            .actors
+            .iter()
+            .map(|(address, worker_id)| json!([address.to_string(), worker_id]))
+            .collect::<Vec<_>>();
+        let total_mailbox_depth = stats
+            .workers
+            .iter()
+            .map(|worker| worker.mailbox_depth)
+            .sum::<usize>();
+
+        self.ingest_runtime_json(
+            RUNTIME_STATS,
+            json!({
+                "num_workers": stats.num_workers,
+                "uptime_ms": stats.uptime_ms,
+                "actors_live": stats.actors.len(),
+                "mailbox_depth": total_mailbox_depth,
+                "actors": actors,
+                "workers": &stats.workers,
+                "actor_details": &stats.actor_details,
+                "tick_timings": &stats.tick_timings,
+            }),
+        );
+        self.ingest_runtime_json(RUNTIME_WORKERS, json!({ "workers": &stats.workers }));
+        if !stats.actor_details.is_empty() {
+            self.ingest_runtime_json(RUNTIME_ACTORS, json!({ "actors": &stats.actor_details }));
+        }
+    }
+
+    fn ingest_runtime_json(&mut self, channel: &str, value: Value) {
+        let payload = serde_json::to_vec(&value).expect("serialize runtime dashboard frame");
+        let frame = Frame::new(
+            ChannelId::new(channel),
+            Position(self.runtime_position),
+            payload,
+        );
+        self.runtime_position = self.runtime_position.wrapping_add(1);
+        self.handle.ingest(self.endpoint.stream_id(), &frame);
     }
 }
 
@@ -231,6 +278,15 @@ fn record_dashboard_event(dashboard: &mut Option<&mut MvpDashboard>, event: obs:
 fn drain_dashboard(dashboard: &mut Option<&mut MvpDashboard>) {
     if let Some(dashboard) = dashboard.as_deref_mut() {
         dashboard.drain();
+    }
+}
+
+fn publish_runtime_snapshot(
+    dashboard: &mut Option<&mut MvpDashboard>,
+    stack: &DistributionRuntimeStack,
+) {
+    if let Some(dashboard) = dashboard.as_deref_mut() {
+        dashboard.publish_runtime_snapshot(stack);
     }
 }
 
@@ -354,6 +410,7 @@ fn run_supervisor_once(
             dashboard.as_ref().map(|dashboard| dashboard.producer()),
         ))
         .map_err(|e| format!("spawn provisioner actor: {e}"))?;
+    publish_runtime_snapshot(&mut dashboard, &stack);
     let mut provision_stats = ProvisionStats::default();
 
     let topology = build_local_engine_topology(run_id)?;
@@ -569,6 +626,7 @@ fn run_supervisor_once(
             &mut provision_stats,
         )?;
         drain_dashboard(&mut dashboard);
+        publish_runtime_snapshot(&mut dashboard, &stack);
 
         while let Some(report) = orchestrator_report.try_recv() {
             match report {
@@ -2108,6 +2166,7 @@ fn provision_local_docker_node(
     while started.elapsed() < Duration::from_secs(30) {
         pump_network(driver, stack);
         drain_dashboard(dashboard);
+        publish_runtime_snapshot(dashboard, stack);
         while let Some(report) = provisioner_report.try_recv() {
             match report {
                 ProvisionerReport::NodeLive {
@@ -2245,6 +2304,7 @@ fn stop_provisioned_nodes(
     while started.elapsed() < Duration::from_secs(10) {
         pump_network(driver, stack);
         drain_dashboard(dashboard);
+        publish_runtime_snapshot(dashboard, stack);
         while let Some(report) = provisioner_report.try_recv() {
             match report {
                 ProvisionerReport::NodesStopped {
