@@ -1,11 +1,12 @@
-//! Docker-backed provider and bootstrap wiring for node provisioning tests.
+//! Docker-backed provider and single-node bootstrap wiring.
 //!
 //! Docker is treated as a concrete provider adapter here: it creates and destroys
-//! real Docker container leases through a `DockerCli` boundary. Unit tests use a
-//! deterministic CLI implementation, but the provider behavior remains the same
-//! provider contract as a remote adapter.
+//! real Docker container leases through a `DockerCli` boundary. Higher-level
+//! callers may start many nodes, but this module intentionally exposes only
+//! per-node ownership primitives so deployment code does not grow a cluster
+//! provisioning layer.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::time::SystemTime;
 
 use crate::node_provisioning::{
@@ -13,8 +14,7 @@ use crate::node_provisioning::{
     BootstrapObservation, BootstrapSessionEvent, BootstrapSessionSpec, BootstrapStage,
     CreateLeaseRequest, CreateLeaseResult, DesiredNodeShape, DestroyHandle, LeaseFacts,
     LogicalNodeId, NodeManager, NodeManagerCommand, NodeManagerMsg, NodeRecord, ProviderError,
-    ProviderKind, ProviderLeaseId, ProviderPlugin, RunId, RunNodeGroupSpec, SshEndpoint, SwactorId,
-    SwarmJoinSpec, expand_node_group,
+    ProviderKind, ProviderLeaseId, ProviderPlugin, RunId, SshEndpoint, SwactorId, SwarmJoinSpec,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -391,65 +391,23 @@ impl<C: BootstrapSshClient> SshBootstrapSession<C> {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SwactorJoinEvent {
-    pub logical_node_id: LogicalNodeId,
-    pub swactor_id: SwactorId,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct SwactorJoinRouter {
-    expected_nodes: BTreeSet<LogicalNodeId>,
-}
-
-impl SwactorJoinRouter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register(&mut self, logical_node_id: LogicalNodeId) {
-        self.expected_nodes.insert(logical_node_id);
-    }
-
-    pub fn route(
-        &self,
-        event: SwactorJoinEvent,
-        manager: &mut NodeManager,
-    ) -> Result<Vec<NodeManagerCommand>, DockerClusterError> {
-        if !self.expected_nodes.contains(&event.logical_node_id) {
-            return Err(DockerClusterError::UnknownNode(event.logical_node_id));
-        }
-        manager
-            .handle(NodeManagerMsg::SwactorJoined {
-                logical_node_id: event.logical_node_id,
-                swactor_id: event.swactor_id,
-            })
-            .map_err(|error| DockerClusterError::Node(error.reason))
-    }
-}
-
 pub trait SshBootstrapClientFactory {
     type Client: BootstrapSshClient;
 
     fn client_for(&mut self, spec: &BootstrapSessionSpec) -> Self::Client;
 }
 
-#[derive(Clone, Debug)]
-pub struct ManagedDockerNode<C> {
-    pub manager: NodeManager,
-    pub bootstrap: Option<SshBootstrapSession<C>>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DockerClusterError {
+pub enum DockerNodeProvisionError {
     Provider(String),
     Node(String),
-    UnknownNode(LogicalNodeId),
     EndpointUnavailable(ProviderLeaseId),
     MissingBootstrap(LogicalNodeId),
+    Bootstrap(String),
+    UnexpectedCommand(String),
 }
 
-pub struct DockerClusterHarness<D, F, S>
+pub struct DockerNodeProvisioner<D, F, S>
 where
     D: DockerCli,
     F: SshBootstrapClientFactory,
@@ -458,12 +416,12 @@ where
     provider: DockerProvider<D>,
     client_factory: F,
     datastream: S,
-    router: SwactorJoinRouter,
-    nodes: BTreeMap<LogicalNodeId, ManagedDockerNode<F::Client>>,
+    manager: NodeManager,
+    bootstrap: Option<SshBootstrapSession<F::Client>>,
     teardown_complete: bool,
 }
 
-impl<D, F, S> DockerClusterHarness<D, F, S>
+impl<D, F, S> DockerNodeProvisioner<D, F, S>
 where
     D: DockerCli,
     F: SshBootstrapClientFactory,
@@ -474,9 +432,9 @@ where
             provider,
             client_factory,
             datastream,
-            router: SwactorJoinRouter::new(),
-            nodes: BTreeMap::new(),
-            teardown_complete: false,
+            manager: NodeManager::new(),
+            bootstrap: None,
+            teardown_complete: true,
         }
     }
 
@@ -484,131 +442,96 @@ where
         &self.provider
     }
 
+    pub fn provider_mut(&mut self) -> &mut DockerProvider<D> {
+        &mut self.provider
+    }
+
     pub fn datastream(&self) -> &S {
         &self.datastream
     }
 
-    pub fn nodes(&self) -> &BTreeMap<LogicalNodeId, ManagedDockerNode<F::Client>> {
-        &self.nodes
+    pub fn manager(&self) -> &NodeManager {
+        &self.manager
     }
 
-    pub fn records(&self) -> Vec<NodeRecord> {
-        self.nodes
-            .values()
-            .filter_map(|node| node.manager.record().cloned())
-            .collect()
+    pub fn bootstrap(&self) -> Option<&SshBootstrapSession<F::Client>> {
+        self.bootstrap.as_ref()
     }
 
-    pub fn all_ready(&self) -> bool {
-        !self.nodes.is_empty() && self.nodes.values().all(|node| node.manager.is_ready())
+    pub fn record(&self) -> Option<&NodeRecord> {
+        self.manager.record()
     }
 
-    pub fn start_group(&mut self, group: &RunNodeGroupSpec) -> Result<(), DockerClusterError> {
-        for spec in expand_node_group(group) {
-            let logical_node_id = spec.logical_node_id.clone();
-            self.router.register(logical_node_id.clone());
-            let mut manager = NodeManager::new();
-            let commands = manager
-                .handle(NodeManagerMsg::Start(spec))
-                .map_err(|error| DockerClusterError::Node(error.reason))?;
-            match self.process_start_commands(&mut manager, commands) {
-                Ok(bootstrap) => {
-                    self.nodes
-                        .insert(logical_node_id, ManagedDockerNode { manager, bootstrap });
-                }
-                Err(error) => {
-                    self.nodes.insert(
-                        logical_node_id,
-                        ManagedDockerNode {
-                            manager,
-                            bootstrap: None,
-                        },
-                    );
-                    let _ = self.teardown();
-                    return Err(error);
-                }
-            }
-        }
+    pub fn is_ready(&self) -> bool {
+        self.manager.is_ready()
+    }
+
+    pub fn start(
+        &mut self,
+        spec: crate::node_provisioning::LogicalNodeSpec,
+    ) -> Result<(), DockerNodeProvisionError> {
+        let commands = self
+            .manager
+            .handle(NodeManagerMsg::Start(spec))
+            .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
         self.teardown_complete = false;
-        Ok(())
-    }
-
-    pub fn route_join(&mut self, event: SwactorJoinEvent) -> Result<(), DockerClusterError> {
-        let logical_node_id = event.logical_node_id.clone();
-        let node = self
-            .nodes
-            .get_mut(&logical_node_id)
-            .ok_or_else(|| DockerClusterError::UnknownNode(logical_node_id.clone()))?;
-        let commands = self.router.route(event, &mut node.manager)?;
-        for command in commands {
-            match command {
-                NodeManagerCommand::BootstrapConvergenceObserved { swactor_id, .. } => {
-                    let bootstrap = node.bootstrap.as_mut().ok_or_else(|| {
-                        DockerClusterError::MissingBootstrap(logical_node_id.clone())
-                    })?;
-                    let events = bootstrap.convergence_observed(swactor_id, &mut self.datastream);
-                    Self::feed_bootstrap_events(&mut node.manager, events)?;
-                }
-                other => {
-                    return Err(DockerClusterError::Node(format!(
-                        "unexpected command {other:?}"
-                    )));
-                }
-            }
+        if let Err(error) = self.process_commands(commands) {
+            let _ = self.stop();
+            return Err(error);
         }
         Ok(())
     }
 
-    pub fn teardown(&mut self) -> Result<(), DockerClusterError> {
-        for node in self.nodes.values_mut() {
-            let commands = node
-                .manager
-                .handle(NodeManagerMsg::Destroy)
-                .map_err(|error| DockerClusterError::Node(error.reason))?;
-            for command in commands {
-                match command {
-                    NodeManagerCommand::CancelBootstrap { .. } => {
-                        if let Some(bootstrap) = node.bootstrap.as_mut() {
-                            let _ = bootstrap.cancel();
-                        }
-                    }
-                    NodeManagerCommand::DestroyLease(handle) => {
-                        self.provider
-                            .destroy_lease(&handle)
-                            .map_err(|error| DockerClusterError::Provider(error.reason))?;
-                        node.manager
-                            .handle(NodeManagerMsg::LeaseDestroyed)
-                            .map_err(|error| DockerClusterError::Node(error.reason))?;
-                    }
-                    other => {
-                        return Err(DockerClusterError::Node(format!(
-                            "unexpected command {other:?}"
-                        )));
-                    }
-                }
-            }
+    pub fn observe_swactor_join(
+        &mut self,
+        swactor_id: SwactorId,
+    ) -> Result<(), DockerNodeProvisionError> {
+        let logical_node_id = self
+            .manager
+            .record()
+            .ok_or_else(|| DockerNodeProvisionError::Node("node manager not started".into()))?
+            .logical_node_id
+            .clone();
+        let commands = self
+            .manager
+            .handle(NodeManagerMsg::SwactorJoined {
+                logical_node_id,
+                swactor_id,
+            })
+            .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
+        self.process_commands(commands)
+    }
+
+    pub fn stop(&mut self) -> Result<(), DockerNodeProvisionError> {
+        if self.manager.record().is_none() {
+            self.teardown_complete = true;
+            return Ok(());
         }
+        let commands = self
+            .manager
+            .handle(NodeManagerMsg::Destroy)
+            .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
+        self.process_stop_commands(commands)?;
         self.teardown_complete = true;
         Ok(())
     }
 
-    fn process_start_commands(
+    fn process_commands(
         &mut self,
-        manager: &mut NodeManager,
         commands: Vec<NodeManagerCommand>,
-    ) -> Result<Option<SshBootstrapSession<F::Client>>, DockerClusterError> {
+    ) -> Result<(), DockerNodeProvisionError> {
         let mut pending = commands;
-        let mut bootstrap = None;
         while let Some(command) = pending.pop() {
             match command {
                 NodeManagerCommand::CreateLease(request) => {
                     let result = self
                         .provider
                         .create_lease(request)
-                        .map_err(|error| DockerClusterError::Provider(error.reason))?;
-                    let more = manager
+                        .map_err(|error| DockerNodeProvisionError::Provider(error.reason))?;
+                    let more = self
+                        .manager
                         .handle(NodeManagerMsg::LeaseCreated(result))
-                        .map_err(|error| DockerClusterError::Node(error.reason))?;
+                        .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
                     pending.extend(more);
                 }
                 NodeManagerCommand::LookupEndpoint(lease) => {
@@ -616,58 +539,115 @@ where
                     let endpoint = match self
                         .provider
                         .lookup_endpoint(&lease)
-                        .map_err(|error| DockerClusterError::Provider(error.reason))?
+                        .map_err(|error| DockerNodeProvisionError::Provider(error.reason))?
                     {
                         Some(endpoint) => endpoint,
                         None => {
-                            let _ = manager.handle(NodeManagerMsg::EndpointFailed(
+                            let _ = self.manager.handle(NodeManagerMsg::EndpointFailed(
                                 "docker ssh endpoint unavailable".into(),
                             ));
-                            return Err(DockerClusterError::EndpointUnavailable(lease_id));
+                            return Err(DockerNodeProvisionError::EndpointUnavailable(lease_id));
                         }
                     };
-                    let more = manager
+                    let more = self
+                        .manager
                         .handle(NodeManagerMsg::EndpointKnown(endpoint))
-                        .map_err(|error| DockerClusterError::Node(error.reason))?;
+                        .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
                     pending.extend(more);
                 }
                 NodeManagerCommand::StartBootstrap(spec) => {
+                    let logical_node_id = spec.logical_node_id.clone();
                     let client = self.client_factory.client_for(&spec);
                     let mut session = SshBootstrapSession::new(spec, client);
                     let events = session.start(&mut self.datastream);
-                    Self::feed_bootstrap_events(manager, events)?;
-                    bootstrap = Some(session);
+                    let bootstrap_error = events.iter().find_map(|event| match event {
+                        BootstrapSessionEvent::Failed(reason) => Some(reason.clone()),
+                        BootstrapSessionEvent::Observed(_) | BootstrapSessionEvent::Closed => None,
+                    });
+                    Self::feed_bootstrap_events(&mut self.manager, events)?;
+                    self.bootstrap = Some(session);
+                    if let Some(reason) = bootstrap_error {
+                        return Err(DockerNodeProvisionError::Bootstrap(format!(
+                            "{}: {reason}",
+                            logical_node_id.0
+                        )));
+                    }
                 }
-                other => {
-                    return Err(DockerClusterError::Node(format!(
-                        "unexpected command {other:?}"
+                NodeManagerCommand::BootstrapConvergenceObserved { swactor_id, .. } => {
+                    let logical_node_id = self
+                        .manager
+                        .record()
+                        .ok_or_else(|| {
+                            DockerNodeProvisionError::Node("node manager not started".into())
+                        })?
+                        .logical_node_id
+                        .clone();
+                    let bootstrap = self.bootstrap.as_mut().ok_or_else(|| {
+                        DockerNodeProvisionError::MissingBootstrap(logical_node_id.clone())
+                    })?;
+                    let events = bootstrap.convergence_observed(swactor_id, &mut self.datastream);
+                    Self::feed_bootstrap_events(&mut self.manager, events)?;
+                }
+                NodeManagerCommand::CancelBootstrap { .. }
+                | NodeManagerCommand::DestroyLease(_) => {
+                    return Err(DockerNodeProvisionError::UnexpectedCommand(format!(
+                        "lifecycle command {command:?} outside stop"
                     )));
                 }
             }
         }
-        Ok(bootstrap)
+        Ok(())
+    }
+
+    fn process_stop_commands(
+        &mut self,
+        commands: Vec<NodeManagerCommand>,
+    ) -> Result<(), DockerNodeProvisionError> {
+        for command in commands {
+            match command {
+                NodeManagerCommand::CancelBootstrap { .. } => {
+                    if let Some(bootstrap) = self.bootstrap.as_mut() {
+                        let _ = bootstrap.cancel();
+                    }
+                }
+                NodeManagerCommand::DestroyLease(handle) => {
+                    self.provider
+                        .destroy_lease(&handle)
+                        .map_err(|error| DockerNodeProvisionError::Provider(error.reason))?;
+                    self.manager
+                        .handle(NodeManagerMsg::LeaseDestroyed)
+                        .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
+                }
+                other => {
+                    return Err(DockerNodeProvisionError::UnexpectedCommand(format!(
+                        "unexpected stop command {other:?}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn feed_bootstrap_events(
         manager: &mut NodeManager,
         events: Vec<BootstrapSessionEvent>,
-    ) -> Result<(), DockerClusterError> {
+    ) -> Result<(), DockerNodeProvisionError> {
         for event in events {
             match event {
                 BootstrapSessionEvent::Observed(observation) => {
                     manager
                         .handle(NodeManagerMsg::BootstrapObserved(observation))
-                        .map_err(|error| DockerClusterError::Node(error.reason))?;
+                        .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
                 }
                 BootstrapSessionEvent::Failed(reason) => {
                     manager
                         .handle(NodeManagerMsg::BootstrapFailed(reason))
-                        .map_err(|error| DockerClusterError::Node(error.reason))?;
+                        .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
                 }
                 BootstrapSessionEvent::Closed => {
                     manager
                         .handle(NodeManagerMsg::BootstrapClosed)
-                        .map_err(|error| DockerClusterError::Node(error.reason))?;
+                        .map_err(|error| DockerNodeProvisionError::Node(error.reason))?;
                 }
             }
         }
@@ -675,7 +655,7 @@ where
     }
 }
 
-impl<D, F, S> Drop for DockerClusterHarness<D, F, S>
+impl<D, F, S> Drop for DockerNodeProvisioner<D, F, S>
 where
     D: DockerCli,
     F: SshBootstrapClientFactory,
@@ -683,7 +663,7 @@ where
 {
     fn drop(&mut self) {
         if !self.teardown_complete {
-            let _ = self.teardown();
+            let _ = self.stop();
         }
     }
 }

@@ -11,7 +11,7 @@ use crate::provisioning::{
     NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
     ProvisionEvent, ProvisionEventKind, ProvisionLogLine, ProvisionLogStream, ProvisionPlugin,
 };
-use crate::telemetry::{MvpProvisionEventRecord, MvpProvisionLogRecord};
+use crate::telemetry::{MvpProvisionEventRecord, MvpProvisionLogRecord, mvp_provision_log_channel};
 
 use super::codec::JsonCodec;
 
@@ -346,7 +346,10 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
 
     fn emit_log(&self, line: ProvisionLogLine) {
         if let Some(producer) = &self.telemetry {
-            producer.submit_record(&MvpProvisionLogRecord::new(line));
+            let channel = mvp_provision_log_channel(line.node_id, line.stream);
+            let record = MvpProvisionLogRecord::new(line);
+            let payload = serde_json::to_vec(&record).expect("serialize provisioning log record");
+            producer.submit_bytes(channel, payload);
         }
     }
 }

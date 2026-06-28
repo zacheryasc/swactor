@@ -205,30 +205,6 @@ impl docker::SshBootstrapClientFactory for FakeSshFactory {
     }
 }
 
-fn started_manager() -> (provision::NodeManager, provision::LogicalNodeId) {
-    let spec = one_spec();
-    let logical_node_id = spec.logical_node_id.clone();
-    let mut manager = provision::NodeManager::new();
-    let start_commands = manager
-        .handle(provision::NodeManagerMsg::Start(spec.clone()))
-        .expect("start succeeds");
-    assert!(matches!(
-        start_commands.as_slice(),
-        [provision::NodeManagerCommand::CreateLease(_)]
-    ));
-    let lease = docker::DockerProvider::new(FakeDockerCli::new())
-        .create_lease(provision::CreateLeaseRequest { spec })
-        .expect("docker provider creates lease");
-    let bootstrap_commands = manager
-        .handle(provision::NodeManagerMsg::LeaseCreated(lease))
-        .expect("lease accepted");
-    assert!(matches!(
-        bootstrap_commands.as_slice(),
-        [provision::NodeManagerCommand::StartBootstrap(_)]
-    ));
-    (manager, logical_node_id)
-}
-
 #[test]
 fn docker_provider_maps_node_spec_to_container_lease_and_destroy_handle() {
     let spec = one_spec();
@@ -330,137 +306,110 @@ fn ssh_bootstrap_session_runs_pre_handoff_steps_and_closes_on_convergence() {
 }
 
 #[test]
-fn join_router_routes_known_logical_nodes_and_rejects_unknown_nodes() {
-    let (mut manager, logical_node_id) = started_manager();
-    let mut router = docker::SwactorJoinRouter::new();
-    router.register(logical_node_id.clone());
-
-    let unknown = router.route(
-        docker::SwactorJoinEvent {
-            logical_node_id: provision::LogicalNodeId("workers-99".into()),
-            swactor_id: provision::SwactorId("swactor-wrong".into()),
-        },
-        &mut manager,
+fn docker_node_provisioner_rejects_join_for_wrong_logical_node() {
+    let spec = one_spec();
+    let mut node = docker::DockerNodeProvisioner::new(
+        docker::DockerProvider::new(FakeDockerCli::new()),
+        FakeSshFactory::default(),
+        provision::InMemoryBootstrapDatastream::default(),
     );
-    assert!(matches!(
-        unknown,
-        Err(docker::DockerClusterError::UnknownNode(id)) if id == provision::LogicalNodeId("workers-99".into())
-    ));
+
+    node.start(spec).expect("node starts");
+    let mut manager = node.manager().clone();
+    let wrong_join = manager.handle(provision::NodeManagerMsg::SwactorJoined {
+        logical_node_id: provision::LogicalNodeId("workers-99".into()),
+        swactor_id: provision::SwactorId("swactor-wrong".into()),
+    });
+
+    assert!(wrong_join.is_err());
     assert_eq!(
-        manager.record().expect("record exists").stage,
+        node.record().expect("record exists").stage,
         provision::NodeStage::BootstrapRunning
     );
-
-    let commands = router
-        .route(
-            docker::SwactorJoinEvent {
-                logical_node_id,
-                swactor_id: provision::SwactorId("swactor-workers-0".into()),
-            },
-            &mut manager,
-        )
-        .expect("known join routes");
-    assert!(matches!(
-        commands.as_slice(),
-        [provision::NodeManagerCommand::BootstrapConvergenceObserved { .. }]
-    ));
 }
 
 #[test]
-fn docker_cluster_harness_wires_provider_bootstrap_join_and_teardown() {
+fn docker_node_provisioner_wires_provider_bootstrap_join_and_teardown() {
     let provider = docker::DockerProvider::new(FakeDockerCli::new());
     let datastream = provision::InMemoryBootstrapDatastream::default();
-    let mut harness =
-        docker::DockerClusterHarness::new(provider, FakeSshFactory::default(), datastream);
+    let mut node =
+        docker::DockerNodeProvisioner::new(provider, FakeSshFactory::default(), datastream);
 
-    harness
-        .start_group(&docker_group_spec(2))
-        .expect("cluster starts");
-    assert!(!harness.all_ready());
-    assert_eq!(harness.nodes().len(), 2);
-    assert_eq!(harness.provider().cli().run_requests.len(), 2);
-    assert_eq!(harness.datastream().records().len(), 4);
+    node.start(one_spec()).expect("node starts");
 
-    let ids: Vec<_> = harness.nodes().keys().cloned().collect();
-    for id in ids {
-        harness
-            .route_join(docker::SwactorJoinEvent {
-                swactor_id: provision::SwactorId(format!("swactor-{}", id.0)),
-                logical_node_id: id,
-            })
-            .expect("join routes");
-    }
-
-    assert!(harness.all_ready());
-    assert_eq!(harness.datastream().flush_count(), 2);
-    for record in harness.records() {
-        assert_eq!(record.stage, provision::NodeStage::Dormant);
-        assert!(record.ready);
-        assert_eq!(
-            record.lease.as_ref().unwrap().provider,
-            provision::ProviderKind::Docker
-        );
-    }
-
-    harness.teardown().expect("teardown succeeds");
+    assert!(!node.is_ready());
+    assert_eq!(node.provider().cli().run_requests.len(), 1);
+    assert_eq!(node.datastream().records().len(), 2);
     assert_eq!(
-        harness.provider().cli().removed,
-        vec!["container-1", "container-2"]
-    );
-    for record in harness.records() {
-        assert_eq!(record.stage, provision::NodeStage::Destroyed);
-        assert!(!record.ready);
-    }
-}
-
-#[test]
-fn docker_cluster_harness_teardown_cleans_known_leases_before_join() {
-    let provider = docker::DockerProvider::new(FakeDockerCli::new());
-    let datastream = provision::InMemoryBootstrapDatastream::default();
-    let mut harness =
-        docker::DockerClusterHarness::new(provider, FakeSshFactory::default(), datastream);
-
-    harness
-        .start_group(&docker_group_spec(1))
-        .expect("cluster starts");
-    let id = provision::LogicalNodeId("workers-0".into());
-    assert_eq!(
-        harness.nodes()[&id].manager.record().unwrap().stage,
+        node.record().expect("record exists").stage,
         provision::NodeStage::BootstrapRunning
     );
 
-    harness.teardown().expect("teardown succeeds before join");
+    node.observe_swactor_join(provision::SwactorId("swactor-workers-0".into()))
+        .expect("join completes handoff");
 
-    let node = &harness.nodes()[&id];
+    assert!(node.is_ready());
+    assert_eq!(node.datastream().flush_count(), 1);
+    let record = node.record().expect("record exists");
+    assert_eq!(record.stage, provision::NodeStage::Dormant);
+    assert!(record.ready);
     assert_eq!(
-        node.manager.record().unwrap().stage,
+        record.lease.as_ref().unwrap().provider,
+        provision::ProviderKind::Docker
+    );
+    assert!(node.bootstrap().expect("bootstrap exists").is_closed());
+    assert!(node.bootstrap().unwrap().client().closed);
+
+    node.stop().expect("teardown succeeds");
+    assert_eq!(node.provider().cli().removed, vec!["container-1"]);
+    let record = node.record().expect("record exists");
+    assert_eq!(record.stage, provision::NodeStage::Destroyed);
+    assert!(!record.ready);
+}
+
+#[test]
+fn docker_node_provisioner_teardown_cleans_known_lease_before_join() {
+    let provider = docker::DockerProvider::new(FakeDockerCli::new());
+    let datastream = provision::InMemoryBootstrapDatastream::default();
+    let mut node =
+        docker::DockerNodeProvisioner::new(provider, FakeSshFactory::default(), datastream);
+
+    node.start(one_spec()).expect("node starts");
+    assert_eq!(
+        node.record().unwrap().stage,
+        provision::NodeStage::BootstrapRunning
+    );
+
+    node.stop().expect("teardown succeeds before join");
+
+    assert_eq!(
+        node.record().unwrap().stage,
         provision::NodeStage::Destroyed
     );
-    assert!(node.bootstrap.as_ref().unwrap().is_closed());
-    assert!(node.bootstrap.as_ref().unwrap().client().closed);
-    assert_eq!(harness.provider().cli().removed, vec!["container-1"]);
+    assert!(node.bootstrap().unwrap().is_closed());
+    assert!(node.bootstrap().unwrap().client().closed);
+    assert_eq!(node.provider().cli().removed, vec!["container-1"]);
 }
 
 #[test]
-fn docker_cluster_harness_cleans_known_lease_when_endpoint_never_appears() {
+fn docker_node_provisioner_cleans_known_lease_when_endpoint_never_appears() {
     let mut cli = FakeDockerCli::new();
     cli.endpoints.insert("container-1".into(), None);
     let provider = docker::DockerProvider::new(cli);
     let datastream = provision::InMemoryBootstrapDatastream::default();
-    let mut harness =
-        docker::DockerClusterHarness::new(provider, FakeSshFactory::default(), datastream);
+    let mut node =
+        docker::DockerNodeProvisioner::new(provider, FakeSshFactory::default(), datastream);
 
-    let result = harness.start_group(&docker_group_spec(1));
+    let result = node.start(one_spec());
 
     assert!(matches!(
         result,
-        Err(docker::DockerClusterError::EndpointUnavailable(id))
+        Err(docker::DockerNodeProvisionError::EndpointUnavailable(id))
             if id == provision::ProviderLeaseId("docker:container-1".into())
     ));
-    assert_eq!(harness.provider().cli().removed, vec!["container-1"]);
-    let id = provision::LogicalNodeId("workers-0".into());
+    assert_eq!(node.provider().cli().removed, vec!["container-1"]);
     assert_eq!(
-        harness.nodes()[&id].manager.record().unwrap().stage,
+        node.record().unwrap().stage,
         provision::NodeStage::Destroyed
     );
 }

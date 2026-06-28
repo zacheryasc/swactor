@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
@@ -24,19 +24,20 @@ use mvp_system::actors::orchestrator::{
     LifecycleEventWire, OrchestratorActor, OrchestratorMsg, OrchestratorReport, RunCommandWire,
     StageRefWire,
 };
-use mvp_system::actors::provisioner::{ProvisionerActor, ProvisionerMsg, ProvisionerReport};
 use mvp_system::actors::register_mvp_actor_codecs;
 use mvp_system::arena_manager as arena;
 use mvp_system::dashboard_view::MvpClusterDashboardView;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
+use mvp_system::docker_cluster_provisioning as docker_provision;
 use mvp_system::driver_pumps as driver_model;
 use mvp_system::edge_establisher as edge;
 use mvp_system::engine_builder as engine;
 use mvp_system::gpu_worker_ctl as worker_ctl;
 use mvp_system::gpu_worker_ingress_parser as ingress;
+use mvp_system::node_provisioning as node_provision;
 use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
-use mvp_system::provisioning::{LocalDockerPlugin, NodeProvisionSpec, ProvisionLogStream};
+use mvp_system::provisioning::{NodeProvisionSpec, ProvisionLogStream};
 use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
 use mvp_system::tx_rx_edge_actor as edge_actor;
@@ -58,6 +59,7 @@ const OBJECT_ALIGNMENT: u64 = 4;
 const ARENA_BYTES: usize = 16 * 1024;
 const RING_BYTES: usize = 4096;
 const EDGE_READY_TIMEOUT: Duration = Duration::from_secs(20);
+const DEFAULT_RUNTIME_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 
 struct MvpDashboard {
     url: String,
@@ -66,6 +68,8 @@ struct MvpDashboard {
     subscription: DatastreamSubscription,
     handle: dashboard::DashboardHandle,
     runtime_position: u64,
+    runtime_snapshot_interval: Duration,
+    last_runtime_snapshot: Option<Instant>,
 }
 
 impl MvpDashboard {
@@ -78,6 +82,7 @@ impl MvpDashboard {
                 .map_err(|e| format!("invalid MVP_DASHBOARD_PORT: {e}"))?;
             config.port = port;
         }
+        let runtime_snapshot_interval = runtime_snapshot_interval_from_env()?;
         let url = format!("http://127.0.0.1:{}/view/datastream/live", config.port);
         let handle = dashboard::start_dashboard(config.clone());
         handle.register_view(Arc::new(MvpClusterDashboardView::new()));
@@ -96,14 +101,13 @@ impl MvpDashboard {
             subscription,
             handle,
             runtime_position: 0,
+            runtime_snapshot_interval,
+            last_runtime_snapshot: None,
         })
     }
 
     fn url(&self) -> &str {
         &self.url
-    }
-    fn producer(&self) -> DatastreamProducer {
-        self.producer.clone()
     }
 
     fn drain(&mut self) {
@@ -117,6 +121,23 @@ impl MvpDashboard {
         let record = mvp_system::telemetry::MvpLifecycleRecord::new(event);
         self.producer.submit_record(&record);
         self.drain();
+    }
+
+    fn record_provision_log(&mut self, line: mvp_system::provisioning::ProvisionLogLine) {
+        let channel = mvp_system::telemetry::mvp_provision_log_channel(line.node_id, line.stream);
+        let record = mvp_system::telemetry::MvpProvisionLogRecord::new(line);
+        let payload = serde_json::to_vec(&record).expect("serialize provisioning log record");
+        self.producer.submit_bytes(channel, payload);
+        self.drain();
+    }
+
+    fn publish_runtime_snapshot_throttled(&mut self, stack: &DistributionRuntimeStack) {
+        let due = self.last_runtime_snapshot.map_or(true, |last| {
+            last.elapsed() >= self.runtime_snapshot_interval
+        });
+        if self.runtime_snapshot_interval.is_zero() || due {
+            self.publish_runtime_snapshot(stack);
+        }
     }
 
     fn publish_runtime_snapshot(&mut self, stack: &DistributionRuntimeStack) {
@@ -149,6 +170,7 @@ impl MvpDashboard {
         if !stats.actor_details.is_empty() {
             self.ingest_runtime_json(RUNTIME_ACTORS, json!({ "actors": &stats.actor_details }));
         }
+        self.last_runtime_snapshot = Some(Instant::now());
     }
 
     fn ingest_runtime_json(&mut self, channel: &str, value: Value) {
@@ -161,6 +183,17 @@ impl MvpDashboard {
         self.runtime_position = self.runtime_position.wrapping_add(1);
         self.handle.ingest(self.endpoint.stream_id(), &frame);
     }
+}
+
+fn runtime_snapshot_interval_from_env() -> Result<Duration, String> {
+    let Some(value) = std::env::var_os("MVP_RUNTIME_SNAPSHOT_MS") else {
+        return Ok(DEFAULT_RUNTIME_SNAPSHOT_INTERVAL);
+    };
+    let millis = value
+        .to_string_lossy()
+        .parse::<u64>()
+        .map_err(|e| format!("invalid MVP_RUNTIME_SNAPSHOT_MS: {e}"))?;
+    Ok(Duration::from_millis(millis))
 }
 
 fn main() -> ExitCode {
@@ -191,14 +224,25 @@ struct NodeStdoutLine {
     kind: String,
     stage_index: Option<u32>,
     event: Option<String>,
+    endpoint: Option<EndpointAddr>,
+    node_actor: Option<ActorAddress>,
+    logical_node_id: Option<u64>,
 }
-#[derive(Clone, Debug)]
+
+type LocalDockerNodeProvisioner = docker_provision::DockerNodeProvisioner<
+    LocalE2eDockerCli,
+    LocalE2eBootstrapFactory,
+    LocalE2eBootstrapDatastream,
+>;
+
 struct ProvisionedDockerNode {
     node_id: u64,
     stage_index: u32,
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
     provider_process_id: Option<u32>,
+    provisioner: LocalDockerNodeProvisioner,
+    events: Receiver<LocalDockerNodeEvent>,
 }
 
 #[derive(Default)]
@@ -206,6 +250,13 @@ struct ProvisionStats {
     node_live_count: usize,
     stdout_line_count: usize,
     stderr_line_count: usize,
+}
+
+#[derive(Clone, Debug)]
+enum LocalDockerNodeEvent {
+    Stdout(String),
+    Stderr(String),
+    Exited(Option<i32>),
 }
 
 #[derive(Clone, Debug)]
@@ -275,6 +326,23 @@ fn record_dashboard_event(dashboard: &mut Option<&mut MvpDashboard>, event: obs:
         dashboard.record_event(event);
     }
 }
+fn record_dashboard_provision_log(
+    dashboard: &mut Option<&mut MvpDashboard>,
+    run_id: u64,
+    node_id: u64,
+    stream: ProvisionLogStream,
+    line: &str,
+) {
+    if let Some(dashboard) = dashboard.as_deref_mut() {
+        dashboard.record_provision_log(mvp_system::provisioning::ProvisionLogLine {
+            run_id,
+            node_id,
+            stream,
+            line: line.to_owned(),
+        });
+    }
+}
+
 fn drain_dashboard(dashboard: &mut Option<&mut MvpDashboard>) {
     if let Some(dashboard) = dashboard.as_deref_mut() {
         dashboard.drain();
@@ -287,6 +355,15 @@ fn publish_runtime_snapshot(
 ) {
     if let Some(dashboard) = dashboard.as_deref_mut() {
         dashboard.publish_runtime_snapshot(stack);
+    }
+}
+
+fn publish_runtime_snapshot_throttled(
+    dashboard: &mut Option<&mut MvpDashboard>,
+    stack: &DistributionRuntimeStack,
+) {
+    if let Some(dashboard) = dashboard.as_deref_mut() {
+        dashboard.publish_runtime_snapshot_throttled(stack);
     }
 }
 
@@ -398,18 +475,6 @@ fn run_supervisor_once(
         ))
         .map_err(|e| format!("spawn orchestrator actor: {e}"))?;
     stack.register_local_actor(driver.register_actor(orchestrator_addr, 1));
-    let provisioner_report = stack
-        .runtime
-        .new_inbox::<ProvisionerReport>()
-        .map_err(|e| format!("provisioner report inbox: {e}"))?;
-    let provisioner_addr = stack
-        .runtime
-        .spawn(ProvisionerActor::new(
-            LocalDockerPlugin::new(format!("mvp-local-e2e-cluster-{}", std::process::id())),
-            stack.runtime.create_sender(),
-            dashboard.as_ref().map(|dashboard| dashboard.producer()),
-        ))
-        .map_err(|e| format!("spawn provisioner actor: {e}"))?;
     publish_runtime_snapshot(&mut dashboard, &stack);
     let mut provision_stats = ProvisionStats::default();
 
@@ -433,9 +498,7 @@ fn run_supervisor_once(
     let orchestrator_actor_json = serde_json::to_string(&orchestrator_addr)
         .map_err(|e| format!("serialize orchestrator actor: {e}"))?;
 
-    let node1 = provision_local_docker_node(
-        provisioner_addr,
-        &provisioner_report,
+    let mut node1 = provision_local_docker_node(
         &mut driver,
         &stack,
         &mut dashboard,
@@ -451,9 +514,7 @@ fn run_supervisor_once(
     )?;
     let node1_endpoint_json = serde_json::to_string(&node1.endpoint)
         .map_err(|e| format!("serialize node1 endpoint: {e}"))?;
-    let node0 = provision_local_docker_node(
-        provisioner_addr,
-        &provisioner_report,
+    let mut node0 = match provision_local_docker_node(
         &mut driver,
         &stack,
         &mut dashboard,
@@ -466,7 +527,13 @@ fn run_supervisor_once(
             &self_endpoint_json,
             &orchestrator_actor_json,
         ),
-    )?;
+    ) {
+        Ok(node) => node,
+        Err(error) => {
+            let _ = stop_provisioned_nodes(&mut [&mut node1], &mut driver, &stack, &mut dashboard);
+            return Err(error);
+        }
+    };
 
     for stage in [&stage1, &stage0] {
         record_dashboard_event(
@@ -619,14 +686,14 @@ fn run_supervisor_once(
                 }
             }
         }
-        stage_ready_count += drain_provisioner_reports(
-            &provisioner_report,
+        stage_ready_count += drain_provisioned_node_events(
+            &mut [&mut node0, &mut node1],
             run_id,
             &mut dashboard,
             &mut provision_stats,
         )?;
         drain_dashboard(&mut dashboard);
-        publish_runtime_snapshot(&mut dashboard, &stack);
+        publish_runtime_snapshot_throttled(&mut dashboard, &stack);
 
         while let Some(report) = orchestrator_report.try_recv() {
             match report {
@@ -739,13 +806,10 @@ fn run_supervisor_once(
             && sent_stop_to_node1
         {
             stop_provisioned_nodes(
-                run_id,
-                provisioner_addr,
-                &provisioner_report,
+                &mut [&mut node0, &mut node1],
                 &mut driver,
                 &stack,
                 &mut dashboard,
-                &mut provision_stats,
             )?;
             let builder_stage_assignments = topology
                 .events
@@ -816,13 +880,10 @@ fn run_supervisor_once(
 
     record_dashboard_event(&mut dashboard, run_fault_event(run_id));
     let _ = stop_provisioned_nodes(
-        run_id,
-        provisioner_addr,
-        &provisioner_report,
+        &mut [&mut node0, &mut node1],
         &mut driver,
         &stack,
         &mut dashboard,
-        &mut provision_stats,
     );
     Err(format!(
         "timed out: injected={injected} token_received={token_received} completed={completed} torn_down={torn_down} stop0={sent_stop_to_node0} stop1={sent_stop_to_node1}"
@@ -2140,9 +2201,296 @@ fn local_docker_spec(
     }
 }
 
+struct LocalE2eContainer {
+    container_name: String,
+    stdin: ChildStdin,
+}
+
+struct LocalE2eDockerCli {
+    spec: NodeProvisionSpec,
+    events: Sender<LocalDockerNodeEvent>,
+    nodes: HashMap<String, LocalE2eContainer>,
+    provider_process_id: Option<u32>,
+}
+
+impl LocalE2eDockerCli {
+    fn new(spec: NodeProvisionSpec, events: Sender<LocalDockerNodeEvent>) -> Self {
+        Self {
+            spec,
+            events,
+            nodes: HashMap::new(),
+            provider_process_id: None,
+        }
+    }
+
+    fn provider_process_id(&self) -> Option<u32> {
+        self.provider_process_id
+    }
+}
+
+impl docker_provision::DockerCli for LocalE2eDockerCli {
+    fn run_container(
+        &mut self,
+        request: docker_provision::DockerRunRequest,
+    ) -> Result<docker_provision::DockerRunResult, docker_provision::DockerCliError> {
+        let mut env = request.env.clone();
+        for (key, value) in &self.spec.env {
+            env.insert(key.clone(), value.clone());
+        }
+
+        let mut command = Command::new("docker");
+        command
+            .arg("run")
+            .arg("--rm")
+            .arg("--add-host")
+            .arg("host.docker.internal:host-gateway")
+            .arg("--name")
+            .arg(&request.container_name)
+            .arg("-i");
+        for (key, value) in &request.labels {
+            command.arg("--label").arg(format!("{key}={value}"));
+        }
+        for (key, value) in &env {
+            command.arg("-e").arg(format!("{key}={value}"));
+        }
+        command.arg(&self.spec.image);
+        for arg in &self.spec.args {
+            command.arg(arg);
+        }
+
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                docker_provision::DockerCliError::new(format!(
+                    "spawn Docker node {}: {e}",
+                    self.spec.node_id
+                ))
+            })?;
+
+        let provider_process_id = child.id();
+        self.provider_process_id = Some(provider_process_id);
+        let stdin = child.stdin.take().ok_or_else(|| {
+            docker_provision::DockerCliError::new(format!(
+                "Docker node {} stdin missing",
+                self.spec.node_id
+            ))
+        })?;
+        let stdout = child.stdout.take().ok_or_else(|| {
+            docker_provision::DockerCliError::new(format!(
+                "Docker node {} stdout missing",
+                self.spec.node_id
+            ))
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| {
+            docker_provision::DockerCliError::new(format!(
+                "Docker node {} stderr missing",
+                self.spec.node_id
+            ))
+        })?;
+
+        self.nodes.insert(
+            request.container_name.clone(),
+            LocalE2eContainer {
+                container_name: request.container_name.clone(),
+                stdin,
+            },
+        );
+
+        spawn_local_docker_reader(stdout, self.events.clone(), true);
+        spawn_local_docker_reader(stderr, self.events.clone(), false);
+        let events = self.events.clone();
+        thread::spawn(move || match child.wait() {
+            Ok(status) => {
+                let _ = events.send(LocalDockerNodeEvent::Exited(status.code()));
+            }
+            Err(error) => {
+                let _ = events.send(LocalDockerNodeEvent::Stderr(format!(
+                    "wait Docker node: {error}"
+                )));
+                let _ = events.send(LocalDockerNodeEvent::Exited(None));
+            }
+        });
+
+        Ok(docker_provision::DockerRunResult {
+            container_id: request.container_name,
+        })
+    }
+
+    fn inspect_ssh_endpoint(
+        &mut self,
+        container_id: &str,
+    ) -> Result<Option<node_provision::SshEndpoint>, docker_provision::DockerCliError> {
+        Ok(Some(node_provision::SshEndpoint {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            user: "local-e2e".to_owned(),
+            auth_ref: format!("local-docker:{container_id}"),
+        }))
+    }
+
+    fn remove_force(&mut self, container_id: &str) -> Result<(), docker_provision::DockerCliError> {
+        let Some(mut node) = self.nodes.remove(container_id) else {
+            return Ok(());
+        };
+        let _ = writeln!(node.stdin, "shutdown");
+        let _ = node.stdin.flush();
+        let status = Command::new("docker")
+            .arg("stop")
+            .arg("-t")
+            .arg("2")
+            .arg(&node.container_name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| {
+                docker_provision::DockerCliError::new(format!(
+                    "docker stop {}: {e}",
+                    node.container_name
+                ))
+            })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(docker_provision::DockerCliError::new(format!(
+                "docker stop {} exited with {status}",
+                node.container_name
+            )))
+        }
+    }
+}
+
+#[derive(Default)]
+struct LocalE2eBootstrapFactory;
+
+impl docker_provision::SshBootstrapClientFactory for LocalE2eBootstrapFactory {
+    type Client = LocalE2eBootstrapClient;
+
+    fn client_for(&mut self, _spec: &node_provision::BootstrapSessionSpec) -> Self::Client {
+        LocalE2eBootstrapClient
+    }
+}
+
+struct LocalE2eBootstrapClient;
+
+impl docker_provision::BootstrapSshClient for LocalE2eBootstrapClient {
+    fn connect(
+        &mut self,
+        _endpoint: &node_provision::SshEndpoint,
+    ) -> Result<(), docker_provision::BootstrapSshError> {
+        Ok(())
+    }
+
+    fn probe_stdout(&mut self) -> Result<(), docker_provision::BootstrapSshError> {
+        Ok(())
+    }
+
+    fn read_bootstrap_logs(
+        &mut self,
+        _stdout_sources: &[String],
+        _stderr_sources: &[String],
+    ) -> Result<
+        Vec<(node_provision::BootstrapLogStream, String)>,
+        docker_provision::BootstrapSshError,
+    > {
+        Ok(Vec::new())
+    }
+
+    fn run_verify_commands(
+        &mut self,
+        _commands: &[String],
+    ) -> Result<(), docker_provision::BootstrapSshError> {
+        Ok(())
+    }
+
+    fn start_swactor(
+        &mut self,
+        _command: &str,
+        _join: &node_provision::SwarmJoinSpec,
+    ) -> Result<(), docker_provision::BootstrapSshError> {
+        Ok(())
+    }
+
+    fn close(&mut self) {}
+}
+
+#[derive(Default)]
+struct LocalE2eBootstrapDatastream;
+
+impl node_provision::BootstrapDatastreamSink for LocalE2eBootstrapDatastream {
+    fn record(&mut self, _record: node_provision::BootstrapLogRecord) {}
+
+    fn flush(&mut self) {}
+}
+
+fn spawn_local_docker_reader(
+    stream: impl std::io::Read + Send + 'static,
+    events: Sender<LocalDockerNodeEvent>,
+    stdout: bool,
+) {
+    thread::spawn(move || {
+        let reader = BufReader::new(stream);
+        for next in reader.lines() {
+            let Ok(line) = next else {
+                break;
+            };
+            let event = if stdout {
+                LocalDockerNodeEvent::Stdout(line)
+            } else {
+                LocalDockerNodeEvent::Stderr(line)
+            };
+            if events.send(event).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn logical_node_spec_from_local(spec: &NodeProvisionSpec) -> node_provision::LogicalNodeSpec {
+    let logical_node_id = node_provision::LogicalNodeId(spec.node_id.to_string());
+    node_provision::LogicalNodeSpec {
+        run_id: node_provision::RunId(spec.run_id),
+        logical_node_id: logical_node_id.clone(),
+        group_id: node_provision::NodeGroupId("local-e2e".to_owned()),
+        role: node_provision::RoleId("stage-worker".to_owned()),
+        provider: node_provision::ProviderKind::Docker,
+        shape: node_provision::DesiredNodeShape {
+            image: spec.image.clone(),
+            disk_gb: 0,
+            gpu_name: None,
+            min_gpu_ram_mb: None,
+            min_down_mbps: None,
+            min_up_mbps: None,
+            min_reliability: None,
+            require_verified: false,
+            provider_labels: BTreeMap::from([
+                ("mvp.local_e2e".to_owned(), "true".to_owned()),
+                ("mvp.node_id".to_owned(), spec.node_id.to_string()),
+            ]),
+        },
+        boot: node_provision::BootSpec {
+            ssh_user: "local-e2e".to_owned(),
+            verify_commands: Vec::new(),
+            start_swactor_command: spec.args.join(" "),
+            stdout_sources: Vec::new(),
+            stderr_sources: Vec::new(),
+            timeout_policy: node_provision::BootstrapTimeoutPolicy {
+                ssh_connect_secs: 1,
+                boot_check_secs: 1,
+                swactor_join_secs: 30,
+            },
+        },
+        swarm_join: node_provision::SwarmJoinSpec {
+            orch_swactor_addr: "local-e2e".to_owned(),
+            join_token_ref: "local-e2e".to_owned(),
+            expected_logical_node_id: logical_node_id,
+        },
+    }
+}
+
 fn provision_local_docker_node(
-    provisioner_addr: ActorAddress,
-    provisioner_report: &swactor::runtime::Inbox<ProvisionerReport>,
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     dashboard: &mut Option<&mut MvpDashboard>,
@@ -2151,50 +2499,71 @@ fn provision_local_docker_node(
 ) -> Result<ProvisionedDockerNode, String> {
     let expected_run_id = spec.run_id;
     let expected_node_id = spec.node_id;
-    stack
-        .runtime
-        .send_to(
-            provisioner_addr,
-            ProvisionerMsg::StartNodes {
-                nodes: vec![spec],
-                reply_to: *provisioner_report.addr(),
-            },
-        )
-        .map_err(|e| format!("start provisioning node {expected_node_id}: {e}"))?;
+    let expected_stage_index = spec.stage_index.unwrap_or_default();
+    let logical_spec = logical_node_spec_from_local(&spec);
+    let (events_tx, events_rx) = mpsc::channel();
+    let cli = LocalE2eDockerCli::new(spec, events_tx);
+    let provider = docker_provision::DockerProvider::new(cli);
+    let mut provisioner = docker_provision::DockerNodeProvisioner::new(
+        provider,
+        LocalE2eBootstrapFactory,
+        LocalE2eBootstrapDatastream,
+    );
+    provisioner
+        .start(logical_spec)
+        .map_err(|e| format!("start Docker node {expected_node_id}: {e:?}"))?;
+    let provider_process_id = provisioner.provider().cli().provider_process_id();
 
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(30) {
         pump_network(driver, stack);
         drain_dashboard(dashboard);
-        publish_runtime_snapshot(dashboard, stack);
-        while let Some(report) = provisioner_report.try_recv() {
-            match report {
-                ProvisionerReport::NodeLive {
-                    run_id,
-                    node_id,
-                    stage_index,
-                    endpoint,
-                    node_actor,
-                    provider_process_id,
-                } if run_id == expected_run_id && node_id == expected_node_id => {
-                    stats.node_live_count += 1;
-                    return Ok(ProvisionedDockerNode {
-                        node_id,
-                        stage_index: stage_index.unwrap_or_default(),
-                        endpoint,
-                        node_actor,
-                        provider_process_id,
-                    });
+        publish_runtime_snapshot_throttled(dashboard, stack);
+        while let Ok(event) = events_rx.try_recv() {
+            match event {
+                LocalDockerNodeEvent::Stdout(line) => {
+                    handle_local_node_stdout(
+                        expected_run_id,
+                        expected_node_id,
+                        &line,
+                        dashboard,
+                        stats,
+                    );
+                    if let Some((endpoint, node_actor, stage_index)) =
+                        ready_node_from_stdout(expected_node_id, expected_stage_index, &line)?
+                    {
+                        provisioner
+                            .observe_swactor_join(node_provision::SwactorId(format!(
+                                "local-e2e-node-{expected_node_id}"
+                            )))
+                            .map_err(|e| {
+                                format!("complete Docker node {expected_node_id} handoff: {e:?}")
+                            })?;
+                        stats.node_live_count += 1;
+                        return Ok(ProvisionedDockerNode {
+                            node_id: expected_node_id,
+                            stage_index,
+                            endpoint,
+                            node_actor,
+                            provider_process_id,
+                            provisioner,
+                            events: events_rx,
+                        });
+                    }
                 }
-                ProvisionerReport::NodeFailed {
-                    run_id,
-                    node_id,
-                    reason,
-                } if run_id == expected_run_id && node_id == expected_node_id => {
-                    return Err(format!("node {node_id} provisioning failed: {reason}"));
+                LocalDockerNodeEvent::Stderr(line) => {
+                    handle_local_node_stderr(
+                        expected_run_id,
+                        expected_node_id,
+                        &line,
+                        dashboard,
+                        stats,
+                    );
                 }
-                other => {
-                    let _ = handle_provisioner_report(other, expected_run_id, dashboard, stats)?;
+                LocalDockerNodeEvent::Exited(status) => {
+                    return Err(format!(
+                        "node {expected_node_id} process exited before ready: {status:?}"
+                    ));
                 }
             }
         }
@@ -2203,49 +2572,83 @@ fn provision_local_docker_node(
     Err(format!("timed out provisioning node {expected_node_id}"))
 }
 
-fn drain_provisioner_reports(
-    provisioner_report: &swactor::runtime::Inbox<ProvisionerReport>,
+fn ready_node_from_stdout(
+    expected_node_id: u64,
+    default_stage_index: u32,
+    line: &str,
+) -> Result<Option<(EndpointAddr, ActorAddress, u32)>, String> {
+    let Ok(line) = serde_json::from_str::<NodeStdoutLine>(line) else {
+        return Ok(None);
+    };
+    if line.kind != "ready" {
+        return Ok(None);
+    }
+    if line.logical_node_id != Some(expected_node_id) {
+        return Ok(None);
+    }
+    let endpoint = line
+        .endpoint
+        .ok_or_else(|| format!("ready line for node {expected_node_id} missing endpoint"))?;
+    let node_actor = line
+        .node_actor
+        .ok_or_else(|| format!("ready line for node {expected_node_id} missing node actor"))?;
+    Ok(Some((
+        endpoint,
+        node_actor,
+        line.stage_index.unwrap_or(default_stage_index),
+    )))
+}
+
+fn drain_provisioned_node_events(
+    nodes: &mut [&mut ProvisionedDockerNode],
     run_id: u64,
     dashboard: &mut Option<&mut MvpDashboard>,
     stats: &mut ProvisionStats,
 ) -> Result<usize, String> {
     let mut stage_ready_count = 0usize;
-    while let Some(report) = provisioner_report.try_recv() {
-        stage_ready_count += handle_provisioner_report(report, run_id, dashboard, stats)?;
+    for node in nodes.iter_mut() {
+        while let Ok(event) = node.events.try_recv() {
+            match event {
+                LocalDockerNodeEvent::Stdout(line) => {
+                    stage_ready_count +=
+                        handle_local_node_stdout(run_id, node.node_id, &line, dashboard, stats);
+                }
+                LocalDockerNodeEvent::Stderr(line) => {
+                    handle_local_node_stderr(run_id, node.node_id, &line, dashboard, stats);
+                }
+                LocalDockerNodeEvent::Exited(status) => {
+                    return Err(format!(
+                        "node {} process exited before stop: {status:?}",
+                        node.node_id
+                    ));
+                }
+            }
+        }
     }
     Ok(stage_ready_count)
 }
 
-fn handle_provisioner_report(
-    report: ProvisionerReport,
+fn handle_local_node_stdout(
     run_id: u64,
+    node_id: u64,
+    line: &str,
     dashboard: &mut Option<&mut MvpDashboard>,
     stats: &mut ProvisionStats,
-) -> Result<usize, String> {
-    match report {
-        ProvisionerReport::LogLine {
-            run_id: line_run_id,
-            stream,
-            line,
-            ..
-        } if line_run_id == run_id => {
-            match stream {
-                ProvisionLogStream::Stdout => stats.stdout_line_count += 1,
-                ProvisionLogStream::Stderr => stats.stderr_line_count += 1,
-                ProvisionLogStream::Provider => {}
-            }
-            Ok(record_stage_ready_from_stdout(
-                run_id, stream, &line, dashboard,
-            ))
-        }
-        ProvisionerReport::NodeFailed {
-            run_id: failed_run_id,
-            node_id,
-            reason,
-        } if failed_run_id == run_id => Err(format!("node {node_id} failed: {reason}")),
-        ProvisionerReport::NodeLive { .. } | ProvisionerReport::NodesStopped { .. } => Ok(0),
-        ProvisionerReport::LogLine { .. } | ProvisionerReport::NodeFailed { .. } => Ok(0),
-    }
+) -> usize {
+    stats.stdout_line_count += 1;
+    record_dashboard_provision_log(dashboard, run_id, node_id, ProvisionLogStream::Stdout, line);
+    record_stage_ready_from_stdout(run_id, ProvisionLogStream::Stdout, line, dashboard)
+}
+
+fn handle_local_node_stderr(
+    run_id: u64,
+    node_id: u64,
+    line: &str,
+    dashboard: &mut Option<&mut MvpDashboard>,
+    stats: &mut ProvisionStats,
+) {
+    stats.stderr_line_count += 1;
+    record_dashboard_provision_log(dashboard, run_id, node_id, ProvisionLogStream::Stderr, line);
 }
 
 fn record_stage_ready_from_stdout(
@@ -2282,42 +2685,20 @@ fn record_stage_ready_from_stdout(
 }
 
 fn stop_provisioned_nodes(
-    run_id: u64,
-    provisioner_addr: ActorAddress,
-    provisioner_report: &swactor::runtime::Inbox<ProvisionerReport>,
+    nodes: &mut [&mut ProvisionedDockerNode],
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     dashboard: &mut Option<&mut MvpDashboard>,
-    stats: &mut ProvisionStats,
 ) -> Result<(), String> {
-    stack
-        .runtime
-        .send_to(
-            provisioner_addr,
-            ProvisionerMsg::StopNodes {
-                run_id,
-                reply_to: *provisioner_report.addr(),
-            },
-        )
-        .map_err(|e| format!("stop provisioned nodes: {e}"))?;
-    let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(10) {
-        pump_network(driver, stack);
-        drain_dashboard(dashboard);
-        publish_runtime_snapshot(dashboard, stack);
-        while let Some(report) = provisioner_report.try_recv() {
-            match report {
-                ProvisionerReport::NodesStopped {
-                    run_id: stopped_run_id,
-                } if stopped_run_id == run_id => return Ok(()),
-                other => {
-                    let _ = handle_provisioner_report(other, run_id, dashboard, stats)?;
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(10));
+    for node in nodes.iter_mut().rev() {
+        node.provisioner
+            .stop()
+            .map_err(|e| format!("stop node {}: {e:?}", node.node_id))?;
     }
-    Err("timed out stopping provisioned nodes".to_owned())
+    pump_network(driver, stack);
+    drain_dashboard(dashboard);
+    publish_runtime_snapshot(dashboard, stack);
+    Ok(())
 }
 
 fn spawn_send_pump(
