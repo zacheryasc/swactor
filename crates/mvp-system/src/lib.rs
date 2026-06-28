@@ -24,11 +24,14 @@ pub mod orchestrator_token_endpoint;
 pub mod provisioning;
 pub mod resource_inventory;
 pub mod run_plan;
+pub mod shard_fetch;
+pub mod shard_weight_lifecycle;
 pub mod shared_ring_helper_abi;
 pub mod stage_controller;
 pub mod telemetry;
 pub mod tx_rx_edge_actor;
 pub mod weight_lifecycle;
+pub mod weight_shards;
 
 #[cfg(test)]
 mod tests;
@@ -36,3 +39,13 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/driver_pumps_guarantees.rs"]
 mod driver_pumps_guarantees;
+
+#[cfg(test)]
+#[path = "tests/shard_fetch_guarantees.rs"]
+mod shard_fetch_guarantees;
+#[cfg(test)]
+#[path = "tests/shard_weight_lifecycle_guarantees.rs"]
+mod shard_weight_lifecycle_guarantees;
+#[cfg(test)]
+#[path = "tests/weight_shards_guarantees.rs"]
+mod weight_shards_guarantees;

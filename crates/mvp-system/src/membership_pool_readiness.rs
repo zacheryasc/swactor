@@ -86,6 +86,7 @@ pub enum ReadinessCommand {
     AssignObjectSpec { node_id: NodeId },
 }
 
+#[cfg(test)]
 #[derive(Clone, Default)]
 struct NodeFacts {
     known: bool,

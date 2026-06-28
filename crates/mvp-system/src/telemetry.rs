@@ -1,10 +1,11 @@
 //! MVP-system-owned datastream channel records.
 
+use datastream::frame::ChannelId;
 use datastream::{ChannelRegistry, Record};
 use serde::{Deserialize, Serialize};
 
 use crate::observability_surface as obs;
-use crate::provisioning;
+use crate::provisioning::{self, ProvisionLogStream};
 
 /// Structured MVP lifecycle facts: run, node, stage, edge, ring, object, step, and worker events.
 pub const MVP_LIFECYCLE: &str = "mvp.lifecycle";
@@ -65,6 +66,15 @@ impl MvpProvisionLogRecord {
     pub fn new(line: provisioning::ProvisionLogLine) -> Self {
         Self { line }
     }
+}
+
+pub fn mvp_provision_log_channel(node_id: u64, stream: ProvisionLogStream) -> ChannelId {
+    let stream = match stream {
+        ProvisionLogStream::Stdout => "stdout",
+        ProvisionLogStream::Stderr => "stderr",
+        ProvisionLogStream::Provider => "provider",
+    };
+    ChannelId::new(format!("mvp.provisioning.logs.node.{node_id}.{stream}"))
 }
 
 impl Record for MvpProvisionLogRecord {

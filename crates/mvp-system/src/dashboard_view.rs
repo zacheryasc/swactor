@@ -17,11 +17,8 @@ use crate::telemetry::{
     MvpProvisionEventRecord, MvpProvisionLogRecord,
 };
 
-const CHANNELS: &[&str] = &[
-    MVP_LIFECYCLE,
-    MVP_PROVISIONING_EVENTS,
-    MVP_PROVISIONING_LOGS,
-];
+const CHANNELS: &[&str] = &[];
+const PROVISIONING_LOG_PREFIX: &str = "mvp.provisioning.logs.node.";
 const EVENT_LOG_CAP: usize = 256;
 const LOG_TAIL_CAP: usize = 128;
 
@@ -141,7 +138,10 @@ impl DashboardView for MvpClusterDashboardView {
                     state.apply_provision_event(frame, record);
                 }
             }
-            MVP_PROVISIONING_LOGS => {
+            channel
+                if channel == MVP_PROVISIONING_LOGS
+                    || channel.starts_with(PROVISIONING_LOG_PREFIX) =>
+            {
                 if let Ok(record) = MvpProvisionLogRecord::decode(&frame.payload) {
                     state.apply_provision_log(record);
                 }

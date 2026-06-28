@@ -3,8 +3,9 @@ use mvp_system::observability_surface as obs;
 use mvp_system::provisioning::{
     ProvisionEvent, ProvisionEventKind, ProvisionLogLine, ProvisionLogStream,
 };
-use mvp_system::telemetry::{self, MvpLifecycleRecord};
-use mvp_system::telemetry::{MvpProvisionEventRecord, MvpProvisionLogRecord};
+use mvp_system::telemetry::{
+    self, MvpLifecycleRecord, MvpProvisionEventRecord, MvpProvisionLogRecord,
+};
 
 #[test]
 fn mvp_lifecycle_record_round_trips_on_owned_datastream_channel() {
@@ -63,6 +64,10 @@ fn provisioning_records_round_trip_on_owned_datastream_channels() {
         event
     );
     assert_eq!(MvpProvisionLogRecord::decode(&log.encode()).unwrap(), log);
+    assert_eq!(
+        telemetry::mvp_provision_log_channel(11, ProvisionLogStream::Stdout).as_str(),
+        "mvp.provisioning.logs.node.11.stdout"
+    );
 }
 
 #[test]

@@ -210,7 +210,6 @@ pub struct DeviceCopyLog {
 
 #[derive(Clone, Debug)]
 pub struct ObjectRecordBuilder {
-    spec: ObjectSpec,
     object_id: ObjectId,
     sequence: u64,
     extent: u64,
@@ -222,9 +221,8 @@ pub struct ObjectRecordBuilder {
 }
 
 impl ObjectRecordBuilder {
-    pub fn new(spec: ObjectSpec) -> Self {
+    pub fn new(_spec: ObjectSpec) -> Self {
         Self {
-            spec,
             object_id: ObjectId(9000),
             sequence: 0,
             extent: 0,
@@ -557,6 +555,7 @@ pub fn read_object_record(
     }))
 }
 
+#[cfg(test)]
 fn object_failure_metadata(
     bytes: &[u8],
     reason: ObjectFailureReason,
