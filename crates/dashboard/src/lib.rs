@@ -1,5 +1,6 @@
 mod server;
 mod store;
+mod live_explorer;
 pub mod swactor;
 pub mod view;
 
@@ -143,6 +144,7 @@ impl DashboardHandle {
 /// is called.
 pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     let views = Arc::new(ViewRegistry::new());
+    views.register(Arc::new(live_explorer::LiveDatastreamExplorer));
     views.register(swactor::worker_view());
     let store = Arc::new(DashboardStore::new(
         config.raw_frame_history,

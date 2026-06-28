@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Datastream live explorer</title>
+<style>
+:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0}body{margin:0;padding:18px}header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:14px}h1{margin:0;font-size:26px}.muted{color:#94a3b8}.top{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.pill,button,input,select{background:#111827;color:#e2e8f0;border:1px solid #334155;border-radius:9px;padding:8px 10px}.pill{background:#1e293b;border-radius:999px;font-size:12px}button{cursor:pointer}button[data-active=true]{outline:2px solid #60a5fa;background:#172554}input{min-width:280px}.metrics{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:10px;margin-bottom:12px}.grid{display:grid;grid-template-columns:1fr 420px;gap:12px}.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:14px}.label{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em}.value{font-size:23px;font-variant-numeric:tabular-nums}.table-wrap{max-height:740px;overflow:auto}table{width:100%;border-collapse:collapse;background:#111827;border:1px solid #334155;border-radius:12px;overflow:hidden}th,td{padding:8px 9px;border-bottom:1px solid #1f2937;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}th{background:#1e293b;color:#93c5fd;position:sticky;top:0}tbody tr{cursor:pointer}tr[data-active=true]{outline:2px solid #60a5fa;background:#172554}.tag{font-size:12px;border-radius:999px;padding:3px 8px;background:#334155}.json{color:#86efac}.text{color:#fbbf24}.binary{color:#c4b5fd}.ok{color:#34d399}.warn{color:#fbbf24}.bad{color:#f87171}.kv{display:grid;grid-template-columns:115px 1fr;gap:8px;border-bottom:1px solid #334155;padding:7px 0}pre{white-space:pre-wrap;word-break:break-word;background:#020617;border:1px solid #334155;border-radius:12px;padding:12px;max-height:560px;overflow:auto}.empty{border:1px dashed #475569;border-radius:12px;padding:22px;color:#94a3b8}section[hidden]{display:none}@media(max-width:1100px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}input{min-width:0;width:100%}}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Datastream live explorer</h1>
+    <div class="muted">Auto-connected. Streams/channels are stable DOM rows; incoming frames update only affected counters and the selected channel ring.</div>
+  </div>
+  <span class="pill warn" id="status">starting</span>
+</header>
+
+<section class="top">
+  <button data-level="streams">Streams</button>
+  <button data-level="channels">Channels</button>
+  <button data-level="frames">Frames</button>
+  <button id="clearScope">all streams</button>
+  <input id="filter" placeholder="filter visible rows" spellcheck="false">
+  <select id="kind"><option value="">all payloads</option><option value="json">json</option><option value="text">text</option><option value="binary">binary</option></select>
+  <label class="muted" for="limit">keep/channel</label>
+  <select id="limit"><option>100</option><option selected>500</option><option>1000</option><option>2000</option></select>
+  <button id="reconnect">reconnect</button>
+</section>
+
+<section class="metrics">
+  <div class="card"><div class="label">frames</div><div class="value" id="metricFrames">0</div></div>
+  <div class="card"><div class="label">streams</div><div class="value" id="metricStreams">0</div></div>
+  <div class="card"><div class="label">channels</div><div class="value" id="metricChannels">0</div></div>
+  <div class="card"><div class="label">json</div><div class="value" id="metricJson">0</div></div>
+  <div class="card"><div class="label">scope</div><div class="value" id="metricScope">all</div></div>
+</section>
+
+<div class="grid">
+  <main class="card">
+    <section id="streamsPanel">
+      <div class="label">Streams</div>
+      <div class="table-wrap"><table><thead><tr><th>stream</th><th>retained frames</th><th>channels</th></tr></thead><tbody id="streamsBody"></tbody></table></div>
+    </section>
+    <section id="channelsPanel" hidden>
+      <div class="label" id="channelsTitle">Channels</div>
+      <div class="table-wrap"><table><thead><tr><th>stream</th><th>channel</th><th>retained</th><th>json</th><th>text</th><th>binary</th><th>latest</th></tr></thead><tbody id="channelsBody"></tbody></table></div>
+    </section>
+    <section id="framesPanel" hidden>
+      <div class="label" id="framesTitle">Frames</div>
+      <div class="empty" id="framesEmpty">Select a channel to inspect frames.</div>
+      <div class="table-wrap" id="framesTableWrap" hidden><table><thead><tr><th>position</th><th>kind</th><th>preview</th><th>bytes</th></tr></thead><tbody id="framesBody"></tbody></table></div>
+    </section>
+  </main>
+  <aside class="card">
+    <div class="label">Selection</div>
+    <h2 id="detailTitle">No frame selected</h2>
+    <div id="detailMeta"></div>
+    <pre id="detail">Waiting for frames from /api/frames and /events.</pre>
+  </aside>
+</div>
+
+<script>
+(() => {
+  'use strict';
+
+  const decoder = new TextDecoder();
+  const nodes = Object.fromEntries([...document.querySelectorAll('[id]')].map(el => [el.id, el]));
+
+  const state = {
+    streams: new Map(),
+    channels: new Map(),
+    byId: new Map(),
+    frameRows: new Map(),
+    source: null,
+    level: 'streams',
+    selectedStream: '',
+    selectedChannel: '',
+    selectedFrame: '',
+    connected: false,
+    error: '',
+    totalFrames: 0,
+    jsonFrames: 0,
+    seq: 0,
+    paintQueued: false,
+    paintHandle: 0,
+  };
+
+  const dirty = {
+    metrics: false,
+    streams: new Set(),
+    channels: new Set(),
+    frames: [],
+  };
+
+  function streamKey(event) {
+    const stream = event.stream || {};
+    return `${stream.node || 'unknown'}#${stream.life || 0}`;
+  }
+
+  function frameKey(event) {
+    return `${streamKey(event)}/${event.channel || 'unknown'}/${event.position || 0}`;
+  }
+
+  function channelKey(stream, channel) {
+    return `${stream}\0${channel}`;
+  }
+
+  function frameLimit() {
+    return Number(nodes.limit.value) || 500;
+  }
+
+  function html(value) {
+    return String(value).replace(/[&<>'"]/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;' }[ch]));
+  }
+
+  function decodePayload(payload) {
+    const bytes = Array.isArray(payload) ? Uint8Array.from(payload) : new Uint8Array();
+    const text = decoder.decode(bytes);
+    if (!text) return { bytes: bytes.length, kind: 'binary', text: '', value: null, preview: `${bytes.length} bytes` };
+    try {
+      const value = JSON.parse(text);
+      const compact = JSON.stringify(value);
+      return { bytes: bytes.length, kind: 'json', text, value, preview: compact.length > 120 ? compact.slice(0, 120) + '…' : compact };
+    } catch {
+      const printable = /^[\x09\x0a\x0d\x20-\x7e]*$/.test(text);
+      return { bytes: bytes.length, kind: printable ? 'text' : 'binary', text, value: null, preview: printable ? text.slice(0, 120) : `${bytes.length} bytes` };
+    }
+  }
+
+  function normalize(event) {
+    return {
+      id: frameKey(event),
+      stream: streamKey(event),
+      channel: String(event.channel || 'unknown'),
+      position: Number(event.position || 0),
+      seq: ++state.seq,
+      ...decodePayload(event.payload),
+    };
+  }
+
+  function createStream(stream) {
+    const row = document.createElement('tr');
+    row.dataset.stream = stream.key;
+    row.innerHTML = '<td></td><td></td><td></td>';
+    stream.cells = { key: row.children[0], frames: row.children[1], channels: row.children[2] };
+    stream.row = row;
+    stream.cells.key.textContent = stream.key;
+    nodes.streamsBody.appendChild(row);
+  }
+
+  function createChannel(channel) {
+    const row = document.createElement('tr');
+    row.dataset.stream = channel.stream;
+    row.dataset.channel = channel.channel;
+    row.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td><td></td>';
+    channel.cells = { stream: row.children[0], channel: row.children[1], frames: row.children[2], json: row.children[3], text: row.children[4], binary: row.children[5], latest: row.children[6] };
+    channel.row = row;
+    channel.cells.stream.textContent = channel.stream;
+    channel.cells.channel.textContent = channel.channel;
+    nodes.channelsBody.appendChild(row);
+    applyChannelVisibility(channel);
+  }
+
+  function getStream(frame) {
+    let stream = state.streams.get(frame.stream);
+    if (stream) return stream;
+    stream = { key: frame.stream, frames: 0, channels: new Set(), row: null, cells: null };
+    state.streams.set(frame.stream, stream);
+    createStream(stream);
+    return stream;
+  }
+
+  function getChannel(frame) {
+    const key = channelKey(frame.stream, frame.channel);
+    let channel = state.channels.get(key);
+    if (channel) return channel;
+    channel = { key, stream: frame.stream, channel: frame.channel, frames: [], json: 0, text: 0, binary: 0, bytes: 0, latest: null, row: null, cells: null };
+    state.channels.set(key, channel);
+    createChannel(channel);
+    return channel;
+  }
+
+  function addCounts(stream, channel, frame) {
+    stream.frames++;
+    stream.channels.add(frame.channel);
+    channel[frame.kind]++;
+    channel.bytes += frame.bytes;
+    channel.latest = frame;
+    state.totalFrames++;
+    if (frame.kind === 'json') state.jsonFrames++;
+  }
+
+  function subtractCounts(stream, channel, frame) {
+    stream.frames--;
+    channel[frame.kind]--;
+    channel.bytes -= frame.bytes;
+    state.totalFrames--;
+    if (frame.kind === 'json') state.jsonFrames--;
+  }
+
+  function removeFrameRow(frame) {
+    const row = state.frameRows.get(frame.id);
+    if (row) row.remove();
+    state.frameRows.delete(frame.id);
+    if (state.selectedFrame === frame.id) {
+      state.selectedFrame = '';
+      renderDetail();
+    }
+  }
+
+  function pushFrame(frame, stream, channel) {
+    channel.frames.push(frame);
+    state.byId.set(frame.id, frame);
+    addCounts(stream, channel, frame);
+
+    while (channel.frames.length > frameLimit()) {
+      const old = channel.frames.shift();
+      state.byId.delete(old.id);
+      subtractCounts(stream, channel, old);
+      removeFrameRow(old);
+    }
+  }
+
+  function addFrame(event) {
+    const id = frameKey(event);
+    if (state.byId.has(id)) return;
+    const frame = normalize(event);
+    const stream = getStream(frame);
+    const channel = getChannel(frame);
+    pushFrame(frame, stream, channel);
+    dirty.metrics = true;
+    dirty.streams.add(stream.key);
+    dirty.channels.add(channel.key);
+    dirty.frames.push(frame.id);
+    schedulePaint();
+  }
+
+  function schedulePaint() {
+    if (state.paintQueued) return;
+    state.paintQueued = true;
+    state.paintHandle = requestAnimationFrame(flushPaint);
+  }
+
+  function flushNow() {
+    if (state.paintHandle) cancelAnimationFrame(state.paintHandle);
+    state.paintQueued = false;
+    state.paintHandle = 0;
+    flushPaint();
+  }
+
+  function flushPaint() {
+    state.paintQueued = false;
+    state.paintHandle = 0;
+    if (dirty.metrics) updateMetrics();
+    for (const key of dirty.streams) updateStreamRow(state.streams.get(key));
+    for (const key of dirty.channels) updateChannelRow(state.channels.get(key));
+    for (const id of dirty.frames) maybeAppendFrameRow(state.byId.get(id));
+    dirty.metrics = false;
+    dirty.streams.clear();
+    dirty.channels.clear();
+    dirty.frames.length = 0;
+  }
+
+  function selectedScopeText() {
+    if (state.selectedChannel) {
+      const channel = state.channels.get(state.selectedChannel);
+      return channel ? `${channel.stream} / ${channel.channel}` : state.selectedChannel;
+    }
+    return state.selectedStream || 'all';
+  }
+
+  function updateMetrics() {
+    const status = state.error ? 'error' : state.connected ? 'live' : 'connecting';
+    nodes.status.textContent = status;
+    nodes.status.className = `pill ${status === 'live' ? 'ok' : status === 'error' ? 'bad' : 'warn'}`;
+    nodes.metricFrames.textContent = `${state.totalFrames} (${frameLimit()}/channel)`;
+    nodes.metricStreams.textContent = state.streams.size;
+    nodes.metricChannels.textContent = state.channels.size;
+    nodes.metricJson.textContent = state.jsonFrames;
+    nodes.metricScope.textContent = selectedScopeText();
+  }
+
+  function updateStreamRow(stream) {
+    if (!stream) return;
+    stream.cells.frames.textContent = stream.frames;
+    stream.cells.channels.textContent = stream.channels.size;
+    stream.row.hidden = !matchesFilter(stream.key);
+    stream.row.dataset.active = String(state.selectedStream === stream.key && !state.selectedChannel);
+  }
+
+  function updateChannelRow(channel) {
+    if (!channel) return;
+    channel.cells.frames.textContent = channel.frames.length;
+    channel.cells.json.textContent = channel.json;
+    channel.cells.text.textContent = channel.text;
+    channel.cells.binary.textContent = channel.binary;
+    channel.cells.latest.textContent = channel.latest ? channel.latest.preview : '';
+    channel.row.dataset.active = String(state.selectedChannel === channel.key);
+    applyChannelVisibility(channel);
+  }
+
+  function matchesFilter(text) {
+    const q = nodes.filter.value.trim().toLowerCase();
+    return !q || String(text).toLowerCase().includes(q);
+  }
+
+  function applyChannelVisibility(channel) {
+    const inStream = !state.selectedStream || channel.stream === state.selectedStream;
+    const matches = matchesFilter(`${channel.stream} ${channel.channel} ${channel.latest?.preview || ''}`);
+    channel.row.hidden = !(inStream && matches);
+  }
+
+  function frameMatches(frame) {
+    if (!frame) return false;
+    if (frame.stream !== state.selectedStream || channelKey(frame.stream, frame.channel) !== state.selectedChannel) return false;
+    if (nodes.kind.value && frame.kind !== nodes.kind.value) return false;
+    return matchesFilter(`${frame.position} ${frame.kind} ${frame.preview}`);
+  }
+
+  function createFrameRow(frame) {
+    const row = document.createElement('tr');
+    row.dataset.frame = frame.id;
+    row.innerHTML = `<td>${frame.position}</td><td><span class="tag ${frame.kind}">${frame.kind}</span></td><td>${html(frame.preview)}</td><td>${frame.bytes}</td>`;
+    row.dataset.active = String(state.selectedFrame === frame.id);
+    return row;
+  }
+
+  function maybeAppendFrameRow(frame) {
+    if (!frame || state.level !== 'frames' || !frameMatches(frame) || state.frameRows.has(frame.id)) return;
+    const row = createFrameRow(frame);
+    nodes.framesBody.prepend(row);
+    state.frameRows.set(frame.id, row);
+  }
+
+  function renderSelectedFrames() {
+    state.frameRows.clear();
+    nodes.framesBody.replaceChildren();
+    const channel = state.channels.get(state.selectedChannel);
+    const frames = channel ? channel.frames.filter(frameMatches).slice().sort((a, b) => b.seq - a.seq) : [];
+    nodes.framesEmpty.hidden = Boolean(channel);
+    nodes.framesTableWrap.hidden = !channel;
+    nodes.framesTitle.textContent = channel ? `Frames for ${channel.channel}` : 'Frames';
+    for (const frame of frames) {
+      const row = createFrameRow(frame);
+      nodes.framesBody.appendChild(row);
+      state.frameRows.set(frame.id, row);
+    }
+  }
+
+  function renderDetail() {
+    const frame = state.byId.get(state.selectedFrame);
+    if (!frame) {
+      nodes.detailTitle.textContent = state.selectedChannel || state.selectedStream ? selectedScopeText() : 'No frame selected';
+      nodes.detailMeta.innerHTML = '';
+      nodes.detail.textContent = state.error || 'Select a frame to inspect its decoded payload.';
+      return;
+    }
+    nodes.detailTitle.textContent = `${frame.stream} · #${frame.position}`;
+    nodes.detailMeta.innerHTML = [
+      ['channel', frame.channel],
+      ['kind', frame.kind],
+      ['bytes', frame.bytes],
+    ].map(([key, value]) => `<div class="kv"><span class="muted">${key}</span><b>${html(value)}</b></div>`).join('');
+    nodes.detail.textContent = frame.kind === 'json' ? JSON.stringify(frame.value, null, 2) : frame.text;
+  }
+
+  function selectLevel(level) {
+    state.level = level;
+    for (const button of document.querySelectorAll('[data-level]')) button.dataset.active = String(button.dataset.level === level);
+    nodes.streamsPanel.hidden = level !== 'streams';
+    nodes.channelsPanel.hidden = level !== 'channels';
+    nodes.framesPanel.hidden = level !== 'frames';
+    if (level === 'frames') renderSelectedFrames();
+  }
+
+  function selectStream(streamKeyValue) {
+    state.selectedStream = streamKeyValue;
+    state.selectedChannel = '';
+    state.selectedFrame = '';
+    selectLevel(streamKeyValue ? 'channels' : 'streams');
+    nodes.channelsTitle.textContent = streamKeyValue ? `Channels in ${streamKeyValue}` : 'Channels';
+    for (const stream of state.streams.values()) updateStreamRow(stream);
+    for (const channel of state.channels.values()) updateChannelRow(channel);
+    updateMetrics();
+    renderDetail();
+  }
+
+  function selectChannel(stream, channelName) {
+    state.selectedStream = stream;
+    state.selectedChannel = channelKey(stream, channelName);
+    state.selectedFrame = '';
+    selectLevel('frames');
+    for (const channel of state.channels.values()) updateChannelRow(channel);
+    updateMetrics();
+    renderDetail();
+  }
+
+  function selectFrame(id) {
+    state.selectedFrame = id;
+    for (const row of state.frameRows.values()) row.dataset.active = String(row.dataset.frame === id);
+    renderDetail();
+  }
+
+  function applyFilter() {
+    for (const stream of state.streams.values()) updateStreamRow(stream);
+    for (const channel of state.channels.values()) updateChannelRow(channel);
+    if (state.level === 'frames') renderSelectedFrames();
+  }
+
+  function trimAllChannels() {
+    for (const channel of state.channels.values()) {
+      const stream = state.streams.get(channel.stream);
+      while (channel.frames.length > frameLimit()) {
+        const old = channel.frames.shift();
+        state.byId.delete(old.id);
+        subtractCounts(stream, channel, old);
+        removeFrameRow(old);
+      }
+      updateChannelRow(channel);
+      updateStreamRow(stream);
+    }
+    updateMetrics();
+    if (state.level === 'frames') renderSelectedFrames();
+  }
+
+  async function loadRecent() {
+    try {
+      const response = await fetch('/api/frames', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`/api/frames HTTP ${response.status}`);
+      const events = await response.json();
+      for (const event of events) addFrame(event);
+      state.error = '';
+      flushNow();
+    } catch (error) {
+      state.error = error.message;
+      updateMetrics();
+      renderDetail();
+    }
+  }
+
+  function connectEvents() {
+    if (state.source) state.source.close();
+    state.source = new EventSource('/events');
+    state.source.addEventListener('open', () => {
+      state.connected = true;
+      state.error = '';
+      updateMetrics();
+    });
+    state.source.addEventListener('frame', event => {
+      try { addFrame(JSON.parse(event.data)); }
+      catch (error) { state.error = error.message; updateMetrics(); renderDetail(); }
+    });
+    state.source.addEventListener('lagged', event => {
+      state.error = `SSE lagged: ${event.data}`;
+      updateMetrics();
+      renderDetail();
+    });
+    state.source.onerror = () => {
+      state.connected = false;
+      if (!state.totalFrames) state.error = 'waiting for /events';
+      updateMetrics();
+    };
+  }
+
+  document.querySelector('.top').addEventListener('click', event => {
+    const level = event.target.dataset.level;
+    if (level) selectLevel(level);
+  });
+
+  nodes.streamsBody.addEventListener('click', event => {
+    const row = event.target.closest('tr[data-stream]');
+    if (row) selectStream(row.dataset.stream);
+  });
+
+  nodes.channelsBody.addEventListener('click', event => {
+    const row = event.target.closest('tr[data-channel]');
+    if (row) selectChannel(row.dataset.stream, row.dataset.channel);
+  });
+
+  nodes.framesBody.addEventListener('click', event => {
+    const row = event.target.closest('tr[data-frame]');
+    if (row) selectFrame(row.dataset.frame);
+  });
+
+  nodes.clearScope.addEventListener('click', () => selectStream(''));
+  nodes.filter.addEventListener('input', applyFilter);
+  nodes.kind.addEventListener('change', renderSelectedFrames);
+  nodes.limit.addEventListener('change', trimAllChannels);
+  nodes.reconnect.addEventListener('click', () => { state.error = ''; connectEvents(); loadRecent(); updateMetrics(); });
+
+  selectLevel('streams');
+  updateMetrics();
+  loadRecent();
+  connectEvents();
+})();
+</script>
+</body>
+</html>
