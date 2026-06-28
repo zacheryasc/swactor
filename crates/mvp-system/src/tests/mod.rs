@@ -1,5 +1,6 @@
 mod arena_manager_guarantees;
 mod device_bridge_guarantees;
+mod docker_cluster_provisioning_guarantees;
 mod edge_establisher_guarantees;
 mod engine_builder_guarantees;
 mod gpu_worker_ctl_guarantees;
@@ -10,6 +11,7 @@ mod local_mock;
 mod local_mock_pipeline_integration;
 mod membership_pool_readiness_guarantees;
 mod node_boot_lifecycle_guarantees;
+mod node_provisioning_guarantees;
 mod observability_surface_guarantees;
 mod orchestrator_run_fsm_guarantees;
 mod orchestrator_token_endpoint_guarantees;
