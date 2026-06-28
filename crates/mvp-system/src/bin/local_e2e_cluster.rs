@@ -78,7 +78,7 @@ impl MvpDashboard {
                 .map_err(|e| format!("invalid MVP_DASHBOARD_PORT: {e}"))?;
             config.port = port;
         }
-        let url = format!("http://127.0.0.1:{}/view/mvp/cluster", config.port);
+        let url = format!("http://127.0.0.1:{}/view/datastream/live", config.port);
         let handle = dashboard::start_dashboard(config.clone());
         handle.register_view(Arc::new(MvpClusterDashboardView::new()));
         handle.start_http_standalone();
