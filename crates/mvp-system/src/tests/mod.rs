@@ -1,4 +1,5 @@
 mod arena_manager_guarantees;
+mod bootstrap_datastream_guarantees;
 mod device_bridge_guarantees;
 mod docker_cluster_provisioning_guarantees;
 mod edge_establisher_guarantees;
@@ -21,4 +22,5 @@ mod shared_ring_helper_abi_guarantees;
 mod stage_controller_guarantees;
 mod telemetry_guarantees;
 mod tx_rx_edge_actor_guarantees;
+mod vastai_provisioning_guarantees;
 mod weight_lifecycle_guarantees;

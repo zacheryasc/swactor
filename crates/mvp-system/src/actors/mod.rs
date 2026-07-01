@@ -14,4 +14,5 @@ pub fn register_mvp_actor_codecs(registry: &mut swactor_transport::CodecRegistry
     node_agent::register_codecs(registry);
     orchestrator::register_codecs(registry);
     provisioner::register_codecs(registry);
+    crate::prompt_rpc::register_codecs(registry);
 }

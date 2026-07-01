@@ -343,6 +343,92 @@ fn bootstrap_session_streams_logs_flushes_and_closes_on_convergence() {
 }
 
 #[test]
+fn node_manager_closes_bootstrap_only_after_expected_swactor_convergence() {
+    let spec = one_logical_node();
+    let logical_node_id = spec.logical_node_id.clone();
+    let (mut manager, request) = start_manager(spec);
+    let mut provider = provision::MockProviderPlugin::new();
+    let lease = provider.create_lease(request).expect("mock lease succeeds");
+    let commands = manager
+        .handle(provision::NodeManagerMsg::LeaseCreated(lease))
+        .expect("lease accepted");
+    let bootstrap_spec = start_bootstrap_command(commands);
+    let mut session = provision::BootstrapSession::new(bootstrap_spec);
+    let mut datastream = provision::InMemoryBootstrapDatastream::default();
+    let events = session.start(
+        &provision::MockBootstrapScript::successful(vec![(
+            provision::BootstrapLogStream::Stdout,
+            "boot entered".into(),
+        )]),
+        &mut datastream,
+    );
+    for event in events {
+        if let provision::BootstrapSessionEvent::Observed(observation) = event {
+            manager
+                .handle(provision::NodeManagerMsg::BootstrapObserved(observation))
+                .expect("bootstrap observation accepted");
+        }
+    }
+
+    let wrong_join = manager.handle(provision::NodeManagerMsg::SwactorJoined {
+        logical_node_id: provision::LogicalNodeId("workers-99".into()),
+        swactor_id: provision::SwactorId("swactor-wrong".into()),
+    });
+    assert!(wrong_join.is_err());
+    assert_eq!(
+        manager.active_bootstrap(),
+        Some(provision::BootstrapSessionId(1))
+    );
+    assert_eq!(
+        manager.record().expect("record exists").stage,
+        provision::NodeStage::BootstrapRunning
+    );
+    assert!(!manager.is_ready());
+
+    let commands = manager
+        .handle(provision::NodeManagerMsg::SwactorJoined {
+            logical_node_id,
+            swactor_id: provision::SwactorId("swactor-a".into()),
+        })
+        .expect("expected swactor join accepted");
+    assert!(matches!(
+        commands.as_slice(),
+        [provision::NodeManagerCommand::BootstrapConvergenceObserved {
+            session_id: provision::BootstrapSessionId(1),
+            swactor_id
+        }] if swactor_id == &provision::SwactorId("swactor-a".into())
+    ));
+    assert!(!manager.is_ready(), "join alone must not close bootstrap");
+
+    let events =
+        session.convergence_observed(provision::SwactorId("swactor-a".into()), &mut datastream);
+    assert_eq!(datastream.flush_count(), 1);
+    for event in events {
+        match event {
+            provision::BootstrapSessionEvent::Observed(observation) => {
+                manager
+                    .handle(provision::NodeManagerMsg::BootstrapObserved(observation))
+                    .expect("convergence observation accepted");
+            }
+            provision::BootstrapSessionEvent::Closed => {
+                manager
+                    .handle(provision::NodeManagerMsg::BootstrapClosed)
+                    .expect("bootstrap close accepted");
+            }
+            provision::BootstrapSessionEvent::Failed(reason) => {
+                panic!("convergence must not fail: {reason}");
+            }
+        }
+    }
+
+    let record = manager.record().expect("record exists");
+    assert_eq!(record.stage, provision::NodeStage::Dormant);
+    assert!(record.ready);
+    assert_eq!(manager.active_bootstrap(), None);
+    assert!(session.is_closed());
+}
+
+#[test]
 fn bootstrap_session_reports_boot_check_failure_without_handoff() {
     let spec = one_logical_node();
     let (mut manager, request) = start_manager(spec);

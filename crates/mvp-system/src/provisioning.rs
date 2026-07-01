@@ -4,7 +4,7 @@
 //! report observations back to the provisioner actor through [`PluginSink`].
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::process::{ChildStdin, Command, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -12,6 +12,8 @@ use std::thread;
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
+
+use crate::bootstrap_datastream::BootstrapDatastreamBridge;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeProvisionSpec {
@@ -165,6 +167,17 @@ impl ProvisionPlugin for LocalDockerPlugin {
             .arg("--name")
             .arg(&container_name)
             .arg("-i");
+        let spec_gpus = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == "MVP_DOCKER_GPUS")
+            .map(|(_, value)| value.clone());
+        if let Some(gpus) = spec_gpus
+            .or_else(|| std::env::var("MVP_DOCKER_GPUS").ok())
+            .filter(|value| !value.trim().is_empty())
+        {
+            command.arg("--gpus").arg(gpus);
+        }
         for (key, value) in &spec.env {
             command.arg("-e").arg(format!("{key}={value}"));
         }
@@ -250,54 +263,12 @@ impl ProvisionPlugin for LocalDockerPlugin {
     }
 }
 
-#[derive(Deserialize)]
-struct RuntimeReadyLine {
-    #[serde(rename = "type")]
-    kind: String,
-    endpoint: EndpointAddr,
-    node_actor: ActorAddress,
-    logical_node_id: u64,
-    stage_index: u32,
-}
-
 fn spawn_stdout_reader(
     spec: NodeProvisionSpec,
     sink: PluginSink,
     stdout: impl std::io::Read + Send + 'static,
 ) {
-    thread::spawn(move || {
-        let reader = BufReader::new(stdout);
-        for next in reader.lines() {
-            match next {
-                Ok(line) => {
-                    sink.observe(PluginObservation::StdoutLine {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        line: line.clone(),
-                    });
-                    if let Ok(ready) = serde_json::from_str::<RuntimeReadyLine>(&line) {
-                        if ready.kind == "ready" && ready.logical_node_id == spec.node_id {
-                            sink.observe(PluginObservation::RuntimeReady {
-                                run_id: spec.run_id,
-                                node_id: spec.node_id,
-                                stage_index: Some(ready.stage_index),
-                                endpoint: ready.endpoint,
-                                node_actor: ready.node_actor,
-                            });
-                        }
-                    }
-                }
-                Err(error) => {
-                    sink.observe(PluginObservation::Failed {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        reason: format!("read stdout: {error}"),
-                    });
-                    break;
-                }
-            }
-        }
-    });
+    BootstrapDatastreamBridge::new(spec, sink, None).spawn_stdout_reader(stdout);
 }
 
 fn spawn_stderr_reader(
@@ -305,24 +276,5 @@ fn spawn_stderr_reader(
     sink: PluginSink,
     stderr: impl std::io::Read + Send + 'static,
 ) {
-    thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for next in reader.lines() {
-            match next {
-                Ok(line) => sink.observe(PluginObservation::StderrLine {
-                    run_id: spec.run_id,
-                    node_id: spec.node_id,
-                    line,
-                }),
-                Err(error) => {
-                    sink.observe(PluginObservation::Failed {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        reason: format!("read stderr: {error}"),
-                    });
-                    break;
-                }
-            }
-        }
-    });
+    BootstrapDatastreamBridge::new(spec, sink, None).spawn_stderr_reader(stderr);
 }

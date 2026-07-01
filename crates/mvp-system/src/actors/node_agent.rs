@@ -3,7 +3,7 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
-use crate::stage_controller as stage;
+use crate::{run_plan, stage_controller as stage};
 
 use super::codec::JsonCodec;
 use super::orchestrator::OrchestratorMsg;
@@ -19,7 +19,9 @@ pub struct StageProvisionWire {
     pub layer_end_exclusive: u32,
     pub inbound_edge_id: u64,
     pub outbound_edge_id: u64,
-    pub weight_artifact: String,
+    pub model_id: String,
+    pub gguf_source: run_plan::GgufSource,
+    pub tokenizer: run_plan::TokenizerSource,
 }
 
 impl StageProvisionWire {
@@ -36,7 +38,11 @@ impl StageProvisionWire {
             },
             inbound: stage::EdgeProvision::inbound(stage::EdgeId(self.inbound_edge_id)),
             outbound: stage::EdgeProvision::outbound(stage::EdgeId(self.outbound_edge_id)),
-            weight_source: stage::WeightSource::TestArtifact(self.weight_artifact.clone()),
+            weight_source: stage::WeightSource::new(
+                self.model_id.clone(),
+                self.gguf_source.clone(),
+                self.tokenizer.clone(),
+            ),
         }
     }
 }
@@ -81,6 +87,12 @@ pub enum NodeAgentMsg {
     Snapshot {
         reply_to: ActorAddress,
     },
+    InferPrompt {
+        request_id: u64,
+        prompt: String,
+        max_tokens: u32,
+        reply_to: ActorAddress,
+    },
 }
 
 impl NetworkMessage for NodeAgentMsg {
@@ -104,7 +116,9 @@ pub enum StageCommandWire {
         layer_end_exclusive: u32,
     },
     LoadWeights {
-        artifact: String,
+        model_id: String,
+        gguf_source: run_plan::GgufSource,
+        tokenizer: run_plan::TokenizerSource,
         layer_start: u32,
         layer_end_exclusive: u32,
     },
@@ -156,6 +170,12 @@ pub enum StageLifecycleWire {
 pub enum NodeAgentReport {
     Command(StageCommandWire),
     Lifecycle(StageLifecycleWire),
+    PromptRequested {
+        request_id: u64,
+        prompt: String,
+        max_tokens: u32,
+        reply_to: ActorAddress,
+    },
     Snapshot {
         commands: Vec<StageCommandWire>,
         events: Vec<StageLifecycleWire>,
@@ -254,6 +274,25 @@ impl NodeAgentActor {
                 self.core.observe(stage::StageEvent::WorkerRoleReset {
                     run_id: stage::RunId(run_id),
                 })
+            }
+            NodeAgentMsg::InferPrompt {
+                request_id,
+                prompt,
+                max_tokens,
+                reply_to,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        NodeAgentReport::PromptRequested {
+                            request_id,
+                            prompt,
+                            max_tokens,
+                            reply_to,
+                        },
+                    );
+                }
+                return;
             }
             NodeAgentMsg::Snapshot { reply_to } => {
                 let _ = ctx.send(
@@ -365,9 +404,9 @@ impl From<&stage::StageCommand> for StageCommandWire {
                 layer_end_exclusive: layer_range.end_exclusive,
             },
             stage::StageCommand::LoadWeights { source, range } => Self::LoadWeights {
-                artifact: match source {
-                    stage::WeightSource::TestArtifact(value) => value.clone(),
-                },
+                model_id: source.model_id.clone(),
+                gguf_source: source.gguf_source.clone(),
+                tokenizer: source.tokenizer.clone(),
                 layer_start: range.start,
                 layer_end_exclusive: range.end_exclusive,
             },

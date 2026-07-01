@@ -2477,10 +2477,12 @@ dependencies = [
  "iroh",
  "iroh-driver",
  "libc",
+ "parking_lot",
  "serde",
  "serde_json",
  "swactor",
  "swactor-transport",
+ "swactor-vastai",
  "tokio",
 ]
 

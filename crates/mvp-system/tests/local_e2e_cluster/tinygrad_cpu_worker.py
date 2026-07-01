@@ -94,6 +94,22 @@ def configure_role(cmd: dict[str, Any]) -> None:
     control(type="RoleConfigured", role_id=role["role_id"])
 
 
+def load_weights(cmd: dict[str, Any]) -> None:
+    if not role:
+        fatal("RoleNotConfigured")
+    role["model_id"] = cmd["model_id"]
+    role["gguf_source"] = cmd["gguf_source"]
+    role["tokenizer"] = cmd["tokenizer"]
+    role["weight_layer_start"] = int(cmd["layer_start"])
+    role["weight_layer_end_exclusive"] = int(cmd["layer_end_exclusive"])
+    control(
+        type="WeightsLoaded",
+        model_id=role["model_id"],
+        layer_start=role["weight_layer_start"],
+        layer_end_exclusive=role["weight_layer_end_exclusive"],
+    )
+
+
 def parse_record(ring: dict[str, Any]) -> tuple[int, int, int, bytes]:
     view = require_arena()
     base = ring["data_offset"]
@@ -236,6 +252,7 @@ HANDLERS = {
     "InitializeWorker": initialize,
     "InstallRing": install_ring,
     "ConfigureRole": configure_role,
+    "LoadWeights": load_weights,
     "RingReadable": ring_readable,
     "ExecuteStep": execute_step,
     "ReleaseDeviceObject": release_device_object,

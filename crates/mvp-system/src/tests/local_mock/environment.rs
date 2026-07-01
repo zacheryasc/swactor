@@ -797,10 +797,11 @@ impl LocalMockCluster {
             },
             inbound: stage::EdgeProvision::inbound(stage::EdgeId(provision.inbound.edge_id.0)),
             outbound: stage::EdgeProvision::outbound(stage::EdgeId(provision.outbound.edge_id.0)),
-            weight_source: stage::WeightSource::TestArtifact(format!(
-                "mock-stage-{}",
-                provision.stage_index
-            )),
+            weight_source: stage::WeightSource::new(
+                provision.model.model_id,
+                provision.gguf_source,
+                provision.tokenizer,
+            ),
         }
     }
 

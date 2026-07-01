@@ -1,0 +1,183 @@
+use std::io::{BufRead, BufReader, Read};
+use std::thread::{self, JoinHandle};
+
+use datastream::{ChannelId, DatastreamProducer, Lifetime, NodeId, StreamId};
+use iroh::EndpointAddr;
+use serde::Deserialize;
+use swactor::actor::ActorAddress;
+
+use crate::provisioning::{
+    NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
+};
+use crate::telemetry::{MvpProvisionLogRecord, mvp_provision_log_channel};
+
+pub fn node_datastream_id(node_id: u64) -> String {
+    node_id.to_string()
+}
+
+pub fn node_stream_id(run_id: u64, node_id: u64) -> StreamId {
+    StreamId::new(NodeId::new(&node_datastream_id(node_id)), Lifetime(run_id))
+}
+
+#[derive(Clone)]
+pub struct BootstrapDatastreamBridge {
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+    producer: Option<DatastreamProducer>,
+}
+
+impl BootstrapDatastreamBridge {
+    pub fn new(
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+        producer: Option<DatastreamProducer>,
+    ) -> Self {
+        Self {
+            spec,
+            sink,
+            producer,
+        }
+    }
+
+    pub fn spec(&self) -> &NodeProvisionSpec {
+        &self.spec
+    }
+
+    pub fn stream_id(&self) -> StreamId {
+        node_stream_id(self.spec.run_id, self.spec.node_id)
+    }
+
+    pub fn observe_stdout_line(&self, line: impl Into<String>) {
+        let line = line.into();
+        self.submit_log(ProvisionLogStream::Stdout, &line);
+        self.sink.observe(PluginObservation::StdoutLine {
+            run_id: self.spec.run_id,
+            node_id: self.spec.node_id,
+            line: line.clone(),
+        });
+        if let Some(ready) = parse_runtime_ready(&self.spec, &line) {
+            self.sink.observe(ready);
+        }
+    }
+
+    pub fn observe_stderr_line(&self, line: impl Into<String>) {
+        let line = line.into();
+        self.submit_log(ProvisionLogStream::Stderr, &line);
+        self.sink.observe(PluginObservation::StderrLine {
+            run_id: self.spec.run_id,
+            node_id: self.spec.node_id,
+            line,
+        });
+    }
+
+    pub fn observe_provider_line(&self, line: impl Into<String>) {
+        let line = line.into();
+        self.submit_log(ProvisionLogStream::Provider, &line);
+        self.sink.observe(PluginObservation::ProviderLine {
+            run_id: self.spec.run_id,
+            node_id: self.spec.node_id,
+            line,
+        });
+    }
+
+    pub fn spawn_stdout_reader<R>(&self, stdout: R) -> JoinHandle<()>
+    where
+        R: Read + Send + 'static,
+    {
+        let bridge = self.clone();
+        thread::spawn(move || bridge.read_stdout(stdout))
+    }
+
+    pub fn spawn_stderr_reader<R>(&self, stderr: R) -> JoinHandle<()>
+    where
+        R: Read + Send + 'static,
+    {
+        let bridge = self.clone();
+        thread::spawn(move || bridge.read_stderr(stderr))
+    }
+
+    fn read_stdout<R>(&self, stdout: R)
+    where
+        R: Read,
+    {
+        let reader = BufReader::new(stdout);
+        for next in reader.lines() {
+            match next {
+                Ok(line) => self.observe_stdout_line(line),
+                Err(error) => {
+                    self.sink.observe(PluginObservation::Failed {
+                        run_id: self.spec.run_id,
+                        node_id: self.spec.node_id,
+                        reason: format!("read stdout: {error}"),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    fn read_stderr<R>(&self, stderr: R)
+    where
+        R: Read,
+    {
+        let reader = BufReader::new(stderr);
+        for next in reader.lines() {
+            match next {
+                Ok(line) => self.observe_stderr_line(line),
+                Err(error) => {
+                    self.sink.observe(PluginObservation::Failed {
+                        run_id: self.spec.run_id,
+                        node_id: self.spec.node_id,
+                        reason: format!("read stderr: {error}"),
+                    });
+                    break;
+                }
+            }
+        }
+    }
+
+    fn submit_log(&self, stream: ProvisionLogStream, line: &str) {
+        let Some(producer) = &self.producer else {
+            return;
+        };
+        let record = MvpProvisionLogRecord::new(ProvisionLogLine {
+            run_id: self.spec.run_id,
+            node_id: self.spec.node_id,
+            stream,
+            line: line.to_owned(),
+        });
+        let payload = serde_json::to_vec(&record).expect("serialize bootstrap log record");
+        producer.submit_bytes(
+            mvp_provision_log_channel(self.spec.node_id, stream),
+            payload,
+        );
+    }
+}
+
+#[derive(Deserialize)]
+struct RuntimeReadyLine {
+    #[serde(rename = "type")]
+    kind: String,
+    endpoint: EndpointAddr,
+    node_actor: ActorAddress,
+    logical_node_id: u64,
+    stage_index: u32,
+}
+
+pub fn parse_runtime_ready(spec: &NodeProvisionSpec, line: &str) -> Option<PluginObservation> {
+    let ready = serde_json::from_str::<RuntimeReadyLine>(line).ok()?;
+    if ready.kind != "ready" || ready.logical_node_id != spec.node_id {
+        return None;
+    }
+    Some(PluginObservation::RuntimeReady {
+        run_id: spec.run_id,
+        node_id: spec.node_id,
+        stage_index: Some(ready.stage_index),
+        endpoint: ready.endpoint,
+        node_actor: ready.node_actor,
+    })
+}
+
+pub fn bootstrap_log_channel(node_id: u64, stream: ProvisionLogStream) -> ChannelId {
+    mvp_provision_log_channel(node_id, stream)
+}
