@@ -3,6 +3,7 @@ extern crate self as mvp_system;
 
 pub mod actors;
 pub mod arena_manager;
+pub mod bootstrap_datastream;
 #[cfg(feature = "local-e2e")]
 pub mod dashboard_view;
 pub mod device_bridge;
@@ -21,6 +22,7 @@ pub mod node_provisioning;
 pub mod observability_surface;
 pub mod orchestrator_run_fsm;
 pub mod orchestrator_token_endpoint;
+pub mod prompt_rpc;
 pub mod provisioning;
 pub mod resource_inventory;
 pub mod run_plan;
@@ -30,6 +32,7 @@ pub mod shared_ring_helper_abi;
 pub mod stage_controller;
 pub mod telemetry;
 pub mod tx_rx_edge_actor;
+pub mod vastai_provisioning;
 pub mod weight_lifecycle;
 pub mod weight_shards;
 

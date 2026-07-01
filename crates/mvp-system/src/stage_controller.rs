@@ -1,3 +1,5 @@
+use crate::run_plan::{GgufSource, TokenizerSource};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RunId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -28,8 +30,32 @@ pub struct LayerRange {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WeightSource {
-    TestArtifact(String),
+pub struct WeightSource {
+    pub model_id: String,
+    pub gguf_source: GgufSource,
+    pub tokenizer: TokenizerSource,
+}
+
+impl WeightSource {
+    pub fn new(
+        model_id: impl Into<String>,
+        gguf_source: GgufSource,
+        tokenizer: TokenizerSource,
+    ) -> Self {
+        Self {
+            model_id: model_id.into(),
+            gguf_source,
+            tokenizer,
+        }
+    }
+
+    pub fn embedded_gguf(model_id: impl Into<String>, path: impl Into<String>) -> Self {
+        Self::new(
+            model_id,
+            GgufSource::LocalPath(path.into()),
+            TokenizerSource::EmbeddedGguf,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

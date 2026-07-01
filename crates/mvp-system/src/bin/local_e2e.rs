@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -36,7 +37,10 @@ const NODE0_LOGICAL_ID: u64 = 11;
 const NODE1_LOGICAL_ID: u64 = 12;
 const MAX_TOKENS: u64 = 1;
 
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
 fn main() -> ExitCode {
+    install_signal_handlers();
     let args = std::env::args().collect::<Vec<_>>();
     let result = if args.iter().any(|arg| arg == "--role=node") {
         run_node_role(&args)
@@ -228,7 +232,7 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
 
     let mut token_in_object_allocator =
         edge_actor::ObjectIdAllocator::new(edge_actor::EdgeId(stage0.inbound_edge.0));
-    while started_at.elapsed() < Duration::from_secs(30) {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(30) {
         pump_network(&mut driver, &stack);
         stage_ready_count += drain_node_stdout(&node0.stdout_rx);
         stage_ready_count += drain_node_stdout(&node1.stdout_rx);
@@ -380,6 +384,9 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
 
     shutdown_node(&mut node0);
     shutdown_node(&mut node1);
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        return Err("interrupted".to_owned());
+    }
     Err(format!(
         "timed out: injected={injected} completed={completed} torn_down={torn_down} stop0={sent_stop_to_node0} stop1={sent_stop_to_node1}"
     ))
@@ -480,7 +487,7 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
     let mut outbound_object_allocator: Option<edge_actor::ObjectIdAllocator> = None;
     let started_at = Instant::now();
 
-    loop {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
         if let Ok(value) = stdin_rx.try_recv() {
             if value.get("type").and_then(|value| value.as_str()) == Some("shutdown") {
                 let _ = worker.shutdown();
@@ -504,7 +511,7 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
                     );
                     let _ = std::io::stdout().flush();
                 }
-                NodeAgentReport::Snapshot { .. } => {}
+                NodeAgentReport::PromptRequested { .. } | NodeAgentReport::Snapshot { .. } => {}
             }
         }
 
@@ -533,10 +540,15 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
         pending_commands = deferred;
 
         if started_at.elapsed() > Duration::from_secs(60) {
-            return Err("node role timed out".to_owned());
+            break;
         }
         thread::sleep(Duration::from_millis(10));
     }
+    let _ = worker.shutdown();
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        return Err("interrupted".to_owned());
+    }
+    Err("node role timed out".to_owned())
 }
 
 fn new_driver(handle: tokio::runtime::Handle) -> Result<IrohDriver, String> {
@@ -673,7 +685,9 @@ fn stage_provision_wire(
         layer_end_exclusive: provision.layer_end_exclusive,
         inbound_edge_id: provision.inbound.edge_id.0,
         outbound_edge_id: provision.outbound.edge_id.0,
-        weight_artifact: "local-e2e-fixture".to_owned(),
+        model_id: provision.model.model_id,
+        gguf_source: provision.gguf_source,
+        tokenizer: provision.tokenizer,
     })
 }
 
@@ -875,6 +889,7 @@ struct WorkerProc {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    cleaned: bool,
 }
 
 impl WorkerProc {
@@ -885,18 +900,25 @@ impl WorkerProc {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("spawn dumb worker: {e}"))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "worker stdin missing".to_owned())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "worker stdout missing".to_owned())?;
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                kill_child(&mut child);
+                return Err("worker stdin missing".to_owned());
+            }
+        };
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                kill_child(&mut child);
+                return Err("worker stdout missing".to_owned());
+            }
+        };
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            cleaned: false,
         })
     }
 
@@ -915,7 +937,17 @@ impl WorkerProc {
     }
 
     fn shutdown(&mut self) -> Result<(), String> {
-        self.command(json!({"type":"ShutdownWorker"}), "WorkerStopped")
+        let result = self.command(json!({"type":"ShutdownWorker"}), "WorkerStopped");
+        self.terminate();
+        result
+    }
+
+    fn terminate(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        kill_child(&mut self.child);
     }
 
     fn command(&mut self, command: serde_json::Value, expected: &str) -> Result<(), String> {
@@ -939,7 +971,7 @@ impl WorkerProc {
 
 impl Drop for WorkerProc {
     fn drop(&mut self) {
-        let _ = self.child.try_wait();
+        self.terminate();
     }
 }
 
@@ -948,6 +980,7 @@ struct NodeChild {
     stdin: ChildStdin,
     stdout_rx: Receiver<NodeStdoutLine>,
     ready: NodeReady,
+    cleaned: bool,
 }
 
 fn spawn_node_process(
@@ -978,22 +1011,35 @@ fn spawn_node_process(
         .spawn()
         .map_err(|e| format!("spawn node {stage_index}: {e}"))?;
 
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| "node stdin missing".to_owned())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "node stdout missing".to_owned())?;
+    let stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            kill_child(&mut child);
+            return Err("node stdin missing".to_owned());
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            kill_child(&mut child);
+            return Err("node stdout missing".to_owned());
+        }
+    };
     let mut reader = BufReader::new(stdout);
     let mut ready_line = String::new();
-    reader
-        .read_line(&mut ready_line)
-        .map_err(|e| format!("read node ready: {e}"))?;
-    let ready: NodeReady = serde_json::from_str(&ready_line)
-        .map_err(|e| format!("parse node ready {ready_line:?}: {e}"))?;
+    if let Err(error) = reader.read_line(&mut ready_line) {
+        kill_child(&mut child);
+        return Err(format!("read node ready: {error}"));
+    }
+    let ready: NodeReady = match serde_json::from_str(&ready_line) {
+        Ok(ready) => ready,
+        Err(error) => {
+            kill_child(&mut child);
+            return Err(format!("parse node ready {ready_line:?}: {error}"));
+        }
+    };
     if ready.kind != "ready" {
+        kill_child(&mut child);
         return Err(format!("node first line was not ready: {ready_line}"));
     }
 
@@ -1011,10 +1057,21 @@ fn spawn_node_process(
         stdin,
         stdout_rx: rx,
         ready,
+        cleaned: false,
     })
 }
 
+impl Drop for NodeChild {
+    fn drop(&mut self) {
+        shutdown_node(self);
+    }
+}
+
 fn shutdown_node(node: &mut NodeChild) {
+    if node.cleaned {
+        return;
+    }
+    node.cleaned = true;
     let _ = writeln!(node.stdin, "{}", json!({"type":"shutdown"}));
     let _ = node.stdin.flush();
     let started = Instant::now();
@@ -1024,8 +1081,7 @@ fn shutdown_node(node: &mut NodeChild) {
         }
         thread::sleep(Duration::from_millis(20));
     }
-    let _ = node.child.kill();
-    let _ = node.child.wait();
+    kill_child(&mut node.child);
 }
 
 fn drain_node_stdout(rx: &Receiver<NodeStdoutLine>) -> usize {
@@ -1042,6 +1098,26 @@ fn drain_node_stdout(rx: &Receiver<NodeStdoutLine>) -> usize {
         }
     }
     stage_ready_count
+}
+
+fn kill_child(child: &mut Child) {
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+extern "C" fn request_stop(_: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::signal(libc::SIGINT, request_stop as *const () as usize);
+        libc::signal(libc::SIGTERM, request_stop as *const () as usize);
+        libc::signal(libc::SIGHUP, request_stop as *const () as usize);
+    }
 }
 
 fn parse_arg<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {

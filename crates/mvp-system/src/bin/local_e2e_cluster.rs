@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::sync::{
     Arc,
+    atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
@@ -60,6 +61,7 @@ const ARENA_BYTES: usize = 16 * 1024;
 const RING_BYTES: usize = 4096;
 const EDGE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_RUNTIME_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 struct MvpDashboard {
     url: String,
@@ -185,6 +187,19 @@ impl MvpDashboard {
     }
 }
 
+extern "C" fn request_stop(_: libc::c_int) {
+    STOP_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::signal(libc::SIGINT, request_stop as *const () as usize);
+        libc::signal(libc::SIGTERM, request_stop as *const () as usize);
+        libc::signal(libc::SIGHUP, request_stop as *const () as usize);
+    }
+}
+
 fn runtime_snapshot_interval_from_env() -> Result<Duration, String> {
     let Some(value) = std::env::var_os("MVP_RUNTIME_SNAPSHOT_MS") else {
         return Ok(DEFAULT_RUNTIME_SNAPSHOT_INTERVAL);
@@ -197,6 +212,7 @@ fn runtime_snapshot_interval_from_env() -> Result<Duration, String> {
 }
 
 fn main() -> ExitCode {
+    install_signal_handlers();
     let args = std::env::args().collect::<Vec<_>>();
     let result = if args.iter().any(|arg| arg == "--role=node") {
         run_node_role(&args)
@@ -243,6 +259,26 @@ struct ProvisionedDockerNode {
     provider_process_id: Option<u32>,
     provisioner: LocalDockerNodeProvisioner,
     events: Receiver<LocalDockerNodeEvent>,
+    cleaned: bool,
+}
+
+impl ProvisionedDockerNode {
+    fn stop(&mut self) -> Result<(), String> {
+        if self.cleaned {
+            return Ok(());
+        }
+        self.provisioner
+            .stop()
+            .map_err(|e| format!("stop node {}: {e:?}", self.node_id))?;
+        self.cleaned = true;
+        Ok(())
+    }
+}
+
+impl Drop for ProvisionedDockerNode {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 #[derive(Default)]
@@ -420,7 +456,7 @@ fn run_supervisor_dashboard_loop() -> Result<(), String> {
         "mvp-local-e2e-cluster: MVP_DASHBOARD=1, repeating Docker cluster scenario until Ctrl+C"
     );
     let mut run_id = RUN_ID;
-    loop {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
         match run_supervisor_once(
             run_id,
             Some(&mut dashboard),
@@ -433,6 +469,7 @@ fn run_supervisor_dashboard_loop() -> Result<(), String> {
         run_id = run_id.saturating_add(1);
         thread::sleep(Duration::from_secs(1));
     }
+    Ok(())
 }
 
 fn run_supervisor_once(
@@ -628,7 +665,7 @@ fn run_supervisor_once(
     let mut edge_stream_count = 0usize;
     let mut token_out_streams = HashMap::<u64, Vec<u8>>::new();
 
-    while started_at.elapsed() < Duration::from_secs(30) {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(30) {
         pump_network(&mut driver, &stack);
         driver_runtime.poll_iroh(&driver);
         while let Some(event) = driver_runtime.try_recv() {
@@ -878,6 +915,17 @@ fn run_supervisor_once(
         thread::sleep(Duration::from_millis(10));
     }
 
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        record_dashboard_event(&mut dashboard, run_fault_event(run_id));
+        let _ = stop_provisioned_nodes(
+            &mut [&mut node0, &mut node1],
+            &mut driver,
+            &stack,
+            &mut dashboard,
+        );
+        return Err("interrupted".to_owned());
+    }
+
     record_dashboard_event(&mut dashboard, run_fault_event(run_id));
     let _ = stop_provisioned_nodes(
         &mut [&mut node0, &mut node1],
@@ -992,7 +1040,7 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
     let mut inbound_ring_id = None;
     let mut outbound_ring_id = None;
 
-    loop {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
         pump_network(&mut driver, &stack);
         driver_runtime.poll_iroh(&driver);
         while let Some(event) = driver_runtime.try_recv() {
@@ -1102,7 +1150,7 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
                         .flush()
                         .map_err(|e| format!("flush lifecycle stdout: {e}"))?;
                 }
-                NodeAgentReport::Snapshot { .. } => {}
+                NodeAgentReport::PromptRequested { .. } | NodeAgentReport::Snapshot { .. } => {}
             }
         }
 
@@ -1161,7 +1209,7 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
             )?;
         }
 
-        if shutdown_rx.try_recv().is_ok() {
+        if shutdown_rx.try_recv().is_ok() || STOP_REQUESTED.load(Ordering::SeqCst) {
             worker.shutdown().ok();
             return Ok(());
         }
@@ -1171,6 +1219,8 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(10));
     }
+    worker.shutdown().ok();
+    Ok(())
 }
 
 fn new_driver(handle: tokio::runtime::Handle) -> Result<IrohDriver, String> {
@@ -1308,7 +1358,9 @@ fn stage_provision_wire(
         layer_end_exclusive: provision.layer_end_exclusive,
         inbound_edge_id: provision.inbound.edge_id.0,
         outbound_edge_id: provision.outbound.edge_id.0,
-        weight_artifact: "local-e2e-cluster-tinygrad-cpu-fixture".to_owned(),
+        model_id: provision.model.model_id,
+        gguf_source: provision.gguf_source,
+        tokenizer: provision.tokenizer,
     })
 }
 
@@ -1427,9 +1479,24 @@ fn handle_node_command(
                 .send_to(node_actor, NodeAgentMsg::MarkWorkerReady)
                 .map_err(|e| format!("mark worker ready: {e}"))
         }
-        StageCommandWire::LoadWeights { .. } => runtime
-            .send_to(node_actor, NodeAgentMsg::MarkWeightsReady)
-            .map_err(|e| format!("mark weights ready: {e}")),
+        StageCommandWire::LoadWeights {
+            model_id,
+            gguf_source,
+            tokenizer,
+            layer_start,
+            layer_end_exclusive,
+        } => {
+            worker.load_weights(
+                model_id,
+                gguf_source,
+                tokenizer,
+                layer_start,
+                layer_end_exclusive,
+            )?;
+            runtime
+                .send_to(node_actor, NodeAgentMsg::MarkWeightsReady)
+                .map_err(|e| format!("mark weights ready: {e}"))
+        }
         StageCommandWire::ExecuteStep {
             step_id,
             input_edge_id,
@@ -1971,11 +2038,31 @@ impl GpuWorkerRuntime {
                     "stage_index":stage_index,
                     "layer_start":layer_start,
                     "layer_end_exclusive":layer_end_exclusive,
-                    "model_id":"local-e2e-cluster-tinygrad-cpu-fixture",
-                    "gguf_source":"docker-cpu://local-e2e-cluster-tinygrad-cpu-fixture",
                 }
             }),
             "RoleConfigured",
+        )
+        .map(|_| ())
+    }
+
+    fn load_weights(
+        &mut self,
+        model_id: String,
+        gguf_source: plan::GgufSource,
+        tokenizer: plan::TokenizerSource,
+        layer_start: u32,
+        layer_end_exclusive: u32,
+    ) -> Result<(), String> {
+        self.command(
+            json!({
+                "type":"LoadWeights",
+                "model_id":model_id,
+                "gguf_source":gguf_source,
+                "tokenizer":tokenizer,
+                "layer_start":layer_start,
+                "layer_end_exclusive":layer_end_exclusive,
+            }),
+            "WeightsLoaded",
         )
         .map(|_| ())
     }
@@ -2515,7 +2602,7 @@ fn provision_local_docker_node(
     let provider_process_id = provisioner.provider().cli().provider_process_id();
 
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(30) {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(30) {
         pump_network(driver, stack);
         drain_dashboard(dashboard);
         publish_runtime_snapshot_throttled(dashboard, stack);
@@ -2548,6 +2635,7 @@ fn provision_local_docker_node(
                             provider_process_id,
                             provisioner,
                             events: events_rx,
+                            cleaned: false,
                         });
                     }
                 }
@@ -2569,7 +2657,11 @@ fn provision_local_docker_node(
         }
         thread::sleep(Duration::from_millis(10));
     }
-    Err(format!("timed out provisioning node {expected_node_id}"))
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        Err(format!("interrupted provisioning node {expected_node_id}"))
+    } else {
+        Err(format!("timed out provisioning node {expected_node_id}"))
+    }
 }
 
 fn ready_node_from_stdout(
@@ -2690,15 +2782,24 @@ fn stop_provisioned_nodes(
     stack: &DistributionRuntimeStack,
     dashboard: &mut Option<&mut MvpDashboard>,
 ) -> Result<(), String> {
+    let mut first_error = None;
     for node in nodes.iter_mut().rev() {
-        node.provisioner
-            .stop()
-            .map_err(|e| format!("stop node {}: {e:?}", node.node_id))?;
+        if first_error.is_none() {
+            if let Err(error) = node.stop() {
+                first_error = Some(error);
+            }
+        } else {
+            let _ = node.stop();
+        }
     }
     pump_network(driver, stack);
     drain_dashboard(dashboard);
     publish_runtime_snapshot(dashboard, stack);
-    Ok(())
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 fn spawn_send_pump(

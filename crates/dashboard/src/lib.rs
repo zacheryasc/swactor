@@ -1,6 +1,6 @@
+mod live_explorer;
 mod server;
 mod store;
-mod live_explorer;
 pub mod swactor;
 pub mod view;
 

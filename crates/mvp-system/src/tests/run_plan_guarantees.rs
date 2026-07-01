@@ -403,6 +403,7 @@ fn provision_stage_projection_is_deterministic_and_stage_local() {
         assert_eq!(first.layer_start, stage.layer_start);
         assert_eq!(first.layer_end_exclusive, stage.layer_end_exclusive);
         assert_eq!(first.gguf_source, stage.gguf_source);
+        assert_eq!(first.tokenizer, plan.model.tokenizer);
         assert_eq!(first.model.model_id, plan.model.model_id);
         assert_eq!(first.model.hidden_dim, plan.model.hidden_dim);
         assert_eq!(first.model.dtype_family, plan.model.dtype_family);

@@ -54,7 +54,7 @@ pub struct ModelFacts {
     pub tokenizer: TokenizerSource,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GgufSource {
     LocalPath(String),
     HuggingFaceGguf {
@@ -64,7 +64,7 @@ pub enum GgufSource {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TokenizerSource {
     EmbeddedGguf,
     LocalPath(String),
@@ -345,6 +345,7 @@ pub struct ProvisionStage {
     pub stage_index: u32,
     pub stage_count: u32,
     pub gguf_source: GgufSource,
+    pub tokenizer: TokenizerSource,
     pub layer_start: u32,
     pub layer_end_exclusive: u32,
     pub inbound: InboundEdgeProvision,
@@ -547,6 +548,7 @@ pub fn derive_stage_provision(
         stage_index,
         stage_count: stage.stage_count,
         gguf_source: stage.gguf_source.clone(),
+        tokenizer: plan.model.tokenizer.clone(),
         layer_start: stage.layer_start,
         layer_end_exclusive: stage.layer_end_exclusive,
         inbound: InboundEdgeProvision {
