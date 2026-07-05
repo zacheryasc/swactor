@@ -258,6 +258,17 @@ impl DatastreamEndpoint {
         &self.mux
     }
 
+    /// Enable or disable optional sidecar timing samples for newly submitted
+    /// frames from this endpoint's producers.
+    pub fn set_frame_timing_enabled(&self, enabled: bool) {
+        self.mux.set_frame_timing_enabled(enabled);
+    }
+
+    /// Whether this endpoint currently emits sidecar frame timing samples.
+    pub fn frame_timing_enabled(&self) -> bool {
+        self.mux.frame_timing_enabled()
+    }
+
     pub fn producer(&self) -> DatastreamProducer {
         DatastreamProducer {
             mux: Arc::clone(&self.mux),
@@ -341,6 +352,16 @@ impl DatastreamProducer {
 
     pub fn submit_bytes(&self, channel: impl Into<ChannelId>, bytes: Vec<u8>) -> Position {
         self.mux.submit(channel, bytes)
+    }
+
+    /// Enable or disable optional sidecar timing samples for this producer's mux.
+    pub fn set_frame_timing_enabled(&self, enabled: bool) {
+        self.mux.set_frame_timing_enabled(enabled);
+    }
+
+    /// Whether this producer's mux currently emits sidecar frame timing samples.
+    pub fn frame_timing_enabled(&self) -> bool {
+        self.mux.frame_timing_enabled()
     }
 
     pub fn process_observer_with<F>(&self, channel_for: F) -> Arc<dyn ProcessOutputObserver>

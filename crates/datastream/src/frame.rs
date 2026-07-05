@@ -158,9 +158,9 @@ impl fmt::Display for StreamId {
 /// interpret it (spec §4.1). A typed event and a log line are the same
 /// kind of thing here: bytes on a channel.
 ///
-/// Per the `// USER:` annotation on spec §4.1/§5.2 there is no per-frame
-/// wall-clock timestamp: frames are ordered and correlated by position
-/// alone.
+/// Frames do not carry wall-clock timestamps. Optional frame-construction
+/// timing rides as sidecar records keyed by stream-local position, preserving
+/// the core frame and wire shape.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Frame {
     /// The lane these bytes belong to.

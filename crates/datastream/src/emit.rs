@@ -85,6 +85,17 @@ impl DatastreamEmitter {
         self.mux.dropped()
     }
 
+    /// Enable or disable optional sidecar timing samples for newly submitted
+    /// frames from this emitter and its cloned submit handles.
+    pub fn set_frame_timing_enabled(&self, enabled: bool) {
+        self.mux.set_frame_timing_enabled(enabled);
+    }
+
+    /// Whether this emitter's mux currently emits sidecar frame timing samples.
+    pub fn frame_timing_enabled(&self) -> bool {
+        self.mux.frame_timing_enabled()
+    }
+
     /// Submit a typed record defined by the caller's crate.
     pub fn submit_record<R: Record>(&self, record: &R) -> Position {
         self.mux.submit(R::channel(), record.encode())

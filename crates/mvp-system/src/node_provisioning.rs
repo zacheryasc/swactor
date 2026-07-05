@@ -42,6 +42,26 @@ pub enum ProviderKind {
     VastAi,
 }
 
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mock => "mock",
+            Self::Docker => "docker",
+            Self::VastAi => "vastai",
+        }
+    }
+
+    pub fn parse_deploy(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "docker" | "local_docker" | "local-docker" => Ok(Self::Docker),
+            "vastai" | "vast_ai" | "vast-ai" => Ok(Self::VastAi),
+            other => Err(format!(
+                "unsupported provider {other:?}; use docker or vastai"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DesiredNodeShape {
     pub image: String,

@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use datastream::{
-    ChannelId, DatastreamEndpoint, DeliveryFanout, Frame, Lifetime, NodeId, Position, StreamId,
+    ChannelId, DatastreamEndpoint, DeliveryFanout, FRAME_TIME_CHANNEL, Frame, FrameTimeSample,
+    Lifetime, NodeId, Position, Record, StreamId,
 };
 use serde_json::Value;
 use swactor::actor::ActorAddress;
@@ -15,6 +16,7 @@ fn stream() -> StreamId {
 fn endpoint_without_subscribers_drains_to_bitbucket() {
     let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
     let producer = endpoint.producer();
+    producer.set_frame_timing_enabled(false);
 
     producer.submit_text("runtime.log", "before");
     let tick = endpoint.tick();
@@ -31,6 +33,7 @@ fn endpoint_without_subscribers_drains_to_bitbucket() {
 fn subscription_receives_only_future_frames() {
     let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
     let producer = endpoint.producer();
+    producer.set_frame_timing_enabled(false);
 
     producer.submit_text("runtime.log", "pre-subscription");
     endpoint.tick();
@@ -51,6 +54,7 @@ fn subscription_receives_only_future_frames() {
 fn endpoint_fans_out_ordered_frames_to_multiple_subscribers() {
     let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
     let producer = endpoint.producer();
+    producer.set_frame_timing_enabled(false);
     let left = endpoint.subscribe_all("left");
     let right = endpoint.subscribe_all("right");
 
@@ -70,6 +74,7 @@ fn endpoint_fans_out_ordered_frames_to_multiple_subscribers() {
 fn slow_subscriber_drops_without_blocking_fast_subscriber() {
     let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 8);
     let producer = endpoint.producer();
+    producer.set_frame_timing_enabled(false);
     let slow = endpoint.subscribe_all_with_capacity("slow", 1);
     let fast = endpoint.subscribe_all_with_capacity("fast", 8);
 
@@ -112,9 +117,48 @@ fn delivery_fanout_can_publish_collector_deliveries_without_a_mux() {
 }
 
 #[test]
+fn endpoint_producer_timing_sidecars_are_fanned_out_when_enabled() {
+    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
+    let producer = endpoint.producer();
+    let sub = endpoint.subscribe_all("test");
+
+    producer.set_frame_timing_enabled(true);
+    let data_position = producer.submit_text("runtime.log", "visible");
+    let tick = endpoint.tick();
+
+    assert!(endpoint.frame_timing_enabled());
+    assert!(producer.frame_timing_enabled());
+    assert_eq!(data_position, Position(0));
+    assert_eq!(tick.drained, 2);
+    assert_eq!(tick.delivered, 2);
+
+    let deliveries = sub.drain_available();
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0].stream, stream());
+    assert_eq!(deliveries[0].frame.position, Position(0));
+    assert_eq!(deliveries[0].frame.channel, ChannelId::new("runtime.log"));
+    assert_eq!(deliveries[0].frame.payload, b"visible");
+    assert_eq!(deliveries[1].stream, stream());
+    assert_eq!(deliveries[1].frame.position, Position(1));
+    assert_eq!(
+        deliveries[1].frame.channel,
+        ChannelId::new(FRAME_TIME_CHANNEL)
+    );
+
+    let sample =
+        FrameTimeSample::decode(&deliveries[1].frame.payload).expect("timing sidecar decodes");
+    assert_eq!(sample.target_position, data_position.0);
+    assert!(
+        sample.created_at_unix_ns > 0,
+        "sidecar records a concrete creation timestamp"
+    );
+}
+
+#[test]
 fn process_observer_adapter_submits_configured_channels() {
     let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
     let producer = endpoint.producer();
+    producer.set_frame_timing_enabled(false);
     let observer = producer.process_observer_with(|label, is_stderr| {
         ChannelId::new(format!(
             "proc.{label}.{}",

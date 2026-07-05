@@ -20,14 +20,14 @@ use datastream::store::{GapSpan, StoredStream};
 use datastream::transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 use datastream::views::{self, Body, LogEntry};
 use datastream::wire::{WireError, decode_delivery, encode_delivery};
-use datastream::{ChannelKind, ChannelRegistry, Record};
+use datastream::{ChannelKind, ChannelRegistry, FRAME_TIME_CHANNEL, FrameTimeSample, Record};
 
 use support::reference::TimelineItem;
 use support::schema::{
     self as catalog, ActorRuntimeDetail, DatastreamHealth, DistributionState, IdentityRecord,
     ProcStream, ResourceSample,
 };
-use support::{Node, payloads, reference};
+use support::{payloads, reference};
 
 /// The frames of `sent` that survive dropping `dropped`, in send order —
 /// the scenario's delivered set, derived without running the pipe.
@@ -92,6 +92,49 @@ fn test_stream() -> StreamId {
     StreamId::new(NodeId::new("node-alpha"), Lifetime(1))
 }
 
+fn mux_without_frame_timing(stream: StreamId) -> Mux {
+    let mux = Mux::unbounded(stream);
+    mux.set_frame_timing_enabled(false);
+    mux
+}
+
+fn bounded_mux_without_frame_timing(stream: StreamId, capacity: usize) -> Mux {
+    let mux = Mux::new(stream, capacity);
+    mux.set_frame_timing_enabled(false);
+    mux
+}
+
+struct Node {
+    mux: Mux,
+}
+
+impl Node {
+    fn new(stream: StreamId) -> Self {
+        Node {
+            mux: mux_without_frame_timing(stream),
+        }
+    }
+
+    fn emit<R: Record>(&self, record: &R) -> Position {
+        self.mux.submit(R::channel(), record.encode())
+    }
+
+    fn emit_text(&self, label: &str, stream: ProcStream, line: &str) -> Position {
+        self.mux.submit(
+            catalog::process_output(label, stream),
+            line.as_bytes().to_vec(),
+        )
+    }
+
+    fn emit_opaque(&self, channel: &str, bytes: &[u8]) -> Position {
+        self.mux.submit(ChannelId::new(channel), bytes.to_vec())
+    }
+
+    fn sent(&self) -> Vec<Frame> {
+        self.mux.drain()
+    }
+}
+
 fn test_registry() -> ChannelRegistry {
     ChannelRegistry::new()
         .with_record::<IdentityRecord>()
@@ -148,7 +191,7 @@ impl Record for ExternalPluginRecord {
 #[test]
 fn external_record_full_pipe_round_trips_without_datastream_catalog() {
     let stream = test_stream();
-    let mux = Mux::unbounded(stream.clone());
+    let mux = mux_without_frame_timing(stream.clone());
     let record = ExternalPluginRecord {
         value: 42,
         label: "owned outside datastream".into(),
@@ -380,7 +423,7 @@ fn records_name_their_own_typed_channel() {
 /// exactly, and `submit` returns each position in order.
 #[test]
 fn mux_numbers_monotonic_and_gap_free() {
-    let mux = Mux::unbounded(test_stream());
+    let mux = mux_without_frame_timing(test_stream());
     let k = 64u64;
     for i in 0..k {
         let pos = mux.submit(catalog::HOST_RESOURCE, payloads::resource(i).encode());
@@ -410,7 +453,7 @@ fn mux_numbers_monotonic_and_gap_free() {
 /// A typed event and a log line share the single timeline (spec §5.1).
 #[test]
 fn mux_seam_preserves_every_submission_byte_identical() {
-    let mux = Mux::unbounded(test_stream());
+    let mux = mux_without_frame_timing(test_stream());
 
     // A realistic interleaving of typed records and raw process output —
     // the same kind of thing on one stream (spec §4.2).
@@ -465,13 +508,128 @@ fn mux_seam_preserves_every_submission_byte_identical() {
     }
 }
 
+/// Timing sidecars are enabled by default, and callers can opt out to preserve
+/// the existing one-submission-to-one-frame stream shape.
+#[test]
+fn mux_timing_is_enabled_by_default_and_can_be_disabled() {
+    let mux = Mux::unbounded(test_stream());
+
+    assert!(mux.frame_timing_enabled());
+    let timed_position = mux.submit(catalog::HOST_RESOURCE, payloads::resource(0).encode());
+    let timed_frames = mux.drain();
+
+    assert_eq!(timed_position, Position(0));
+    assert_eq!(mux.assigned(), 2);
+    assert_eq!(timed_frames.len(), 2);
+    assert_eq!(timed_frames[0].position, Position(0));
+    assert_eq!(
+        timed_frames[0].channel,
+        ChannelId::new(catalog::HOST_RESOURCE)
+    );
+    assert_eq!(timed_frames[0].payload, payloads::resource(0).encode());
+    assert_eq!(timed_frames[1].position, Position(1));
+    assert_eq!(timed_frames[1].channel, ChannelId::new(FRAME_TIME_CHANNEL));
+    let sample = FrameTimeSample::decode(&timed_frames[1].payload).expect("timing sidecar decodes");
+    assert_eq!(sample.target_position, timed_position.0);
+
+    mux.set_frame_timing_enabled(false);
+    assert!(!mux.frame_timing_enabled());
+    let untimed_position = mux.submit(catalog::HOST_RESOURCE, payloads::resource(1).encode());
+    let untimed_frames = mux.drain();
+
+    assert_eq!(untimed_position, Position(2));
+    assert_eq!(mux.assigned(), 3);
+    assert_eq!(untimed_frames.len(), 1);
+    assert_eq!(untimed_frames[0].position, Position(2));
+    assert_eq!(
+        untimed_frames[0].channel,
+        ChannelId::new(catalog::HOST_RESOURCE)
+    );
+    assert_eq!(untimed_frames[0].payload, payloads::resource(1).encode());
+}
+
+/// With timing enabled by default, a submitted data frame is immediately
+/// followed by a timing sidecar whose payload keys the sample to the data
+/// frame's position, while the reserved timing channel itself does not recurse.
+#[test]
+fn mux_timing_sidecar_decodes_and_timing_channel_does_not_recurse() {
+    let mux = Mux::unbounded(test_stream());
+    assert!(mux.frame_timing_enabled());
+    let submitted_timing = FrameTimeSample::new(Position(42), 123);
+
+    let data_position = mux.submit(catalog::HOST_RESOURCE, payloads::resource(7).encode());
+    let timing_position = mux.submit(FRAME_TIME_CHANNEL, submitted_timing.encode());
+    let frames = mux.drain();
+
+    assert_eq!(data_position, Position(0));
+    assert_eq!(timing_position, Position(2));
+    assert_eq!(mux.assigned(), 3);
+    assert_eq!(frames.len(), 3);
+    assert_eq!(frames[0].position, Position(0));
+    assert_eq!(frames[0].channel, ChannelId::new(catalog::HOST_RESOURCE));
+    assert_eq!(frames[0].payload, payloads::resource(7).encode());
+    assert_eq!(frames[1].position, Position(1));
+    assert_eq!(frames[1].channel, ChannelId::new(FRAME_TIME_CHANNEL));
+
+    let sample = FrameTimeSample::decode(&frames[1].payload).expect("timing sidecar decodes");
+    assert_eq!(sample.target_position, data_position.0);
+    assert!(
+        sample.created_at_unix_ns > 0,
+        "sidecar records a concrete creation timestamp"
+    );
+
+    assert_eq!(frames[2].position, Position(2));
+    assert_eq!(frames[2].channel, ChannelId::new(FRAME_TIME_CHANNEL));
+    let decoded =
+        FrameTimeSample::decode(&frames[2].payload).expect("submitted timing frame decodes");
+    assert_eq!(decoded, submitted_timing);
+}
+
+/// When timing sidecars fill the buffer with a data frame, a later overflowing
+/// data submission must not leave behind a sidecar for the dropped position.
+#[test]
+fn mux_timing_overflow_does_not_sample_dropped_data_frame() {
+    let mux = Mux::new(test_stream(), 2);
+    assert!(mux.frame_timing_enabled());
+
+    mux.submit(catalog::HOST_RESOURCE, payloads::resource(0).encode());
+    let dropped_position = mux.submit(catalog::HOST_RESOURCE, payloads::resource(1).encode());
+    let frames = mux.drain();
+
+    assert_eq!(dropped_position, Position(2));
+    assert_eq!(mux.assigned(), 3);
+    assert_eq!(mux.dropped(), 1);
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.position.0)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    assert_eq!(frames[0].channel, ChannelId::new(catalog::HOST_RESOURCE));
+    assert_eq!(frames[1].channel, ChannelId::new(FRAME_TIME_CHANNEL));
+
+    let timing_targets: Vec<u64> = frames
+        .iter()
+        .filter(|frame| frame.channel.as_str() == FRAME_TIME_CHANNEL)
+        .map(|frame| {
+            FrameTimeSample::decode(&frame.payload)
+                .expect("timing sidecar decodes")
+                .target_position
+        })
+        .collect();
+    assert_eq!(timing_targets, vec![0]);
+    assert!(!timing_targets.contains(&dropped_position.0));
+}
+
 /// Spec §5.3 — on overflow the mux drops the frame, but its position is
 /// already spent, so the loss surfaces as a missing position (a detectable
 /// gap), never a silent renumber. The reference-model gap oracle confirms
 /// the interior gap.
 #[test]
 fn mux_overflow_drops_surface_as_a_gap_not_a_renumber() {
-    let mux = Mux::new(test_stream(), 2); // tiny buffer
+    let mux = bounded_mux_without_frame_timing(test_stream(), 2); // tiny buffer
 
     mux.submit(catalog::HOST_RESOURCE, payloads::resource(0).encode()); // pos 0 -> buffered
     mux.submit(catalog::HOST_RESOURCE, payloads::resource(1).encode()); // pos 1 -> buffered
@@ -514,7 +672,7 @@ fn mux_overflow_drops_surface_as_a_gap_not_a_renumber() {
 /// duplicate and no gap. This is the single-ordering-authority guarantee.
 #[test]
 fn mux_serializes_concurrent_producers_without_collision() {
-    let mux = Arc::new(Mux::unbounded(test_stream()));
+    let mux = Arc::new(mux_without_frame_timing(test_stream()));
     let threads = 8u64;
     let per_thread = 500u64;
 
@@ -567,7 +725,7 @@ fn mux_serializes_concurrent_producers_without_collision() {
 /// real mux with a mix of typed records, raw process output, and a channel
 /// the consumer does not know, then take its output.
 fn realistic_stream(stream: &StreamId) -> Vec<Frame> {
-    let mux = Mux::unbounded(stream.clone());
+    let mux = mux_without_frame_timing(stream.clone());
     mux.submit(
         catalog::IDENTITY,
         payloads::identity(stream.node.as_str(), stream.life.0).encode(),
@@ -819,7 +977,7 @@ fn view_decodes_each_channel_and_degrades_gracefully() {
 #[test]
 fn metric_projection_decodes_one_typed_channel_into_a_series() {
     let stream = test_stream();
-    let mux = Mux::unbounded(stream.clone());
+    let mux = mux_without_frame_timing(stream.clone());
     mux.submit(
         catalog::IDENTITY,
         payloads::identity("node-alpha", 1).encode(),
@@ -853,7 +1011,7 @@ fn metric_projection_decodes_one_typed_channel_into_a_series() {
 #[test]
 fn metric_projection_recovers_each_consolidated_record() {
     let stream = test_stream();
-    let mux = Mux::unbounded(stream.clone());
+    let mux = mux_without_frame_timing(stream.clone());
 
     let mut dist: Vec<(Position, DistributionState)> = Vec::new();
     let mut actors: Vec<(Position, ActorRuntimeDetail)> = Vec::new();

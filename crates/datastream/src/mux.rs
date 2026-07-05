@@ -24,9 +24,12 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::frame::{ChannelId, Frame, Position, StreamId};
+use super::record::Record;
+use super::timing::{FRAME_TIME_CHANNEL, FrameTimeSample};
 
 /// A node's single position authority and outgoing telemetry buffer.
 ///
@@ -37,6 +40,7 @@ pub struct Mux {
     stream: StreamId,
     next: AtomicU64,
     dropped: AtomicU64,
+    frame_timing_enabled: AtomicBool,
     capacity: usize,
     buffer: Mutex<VecDeque<Frame>>,
 }
@@ -50,6 +54,7 @@ impl Mux {
             stream,
             next: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
+            frame_timing_enabled: AtomicBool::new(true),
             capacity,
             buffer: Mutex::new(VecDeque::new()),
         }
@@ -76,8 +81,15 @@ impl Mux {
         // Assign first, unconditionally: numbering is independent of
         // whether the frame survives the buffer (spec §5.2).
         let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
+        let channel = channel.into();
+        let timing_sample = self
+            .frame_timing_enabled
+            .load(Ordering::Relaxed)
+            .then(|| now_unix_ns())
+            .filter(|_| channel.as_str() != FRAME_TIME_CHANNEL)
+            .map(|created_at_unix_ns| FrameTimeSample::new(position, created_at_unix_ns));
         let frame = Frame {
-            channel: channel.into(),
+            channel,
             position,
             payload,
         };
@@ -85,6 +97,9 @@ impl Mux {
         let mut buffer = self.buffer.lock().expect("mux buffer poisoned");
         if buffer.len() < self.capacity {
             buffer.push_back(frame);
+            if let Some(sample) = timing_sample {
+                self.push_timing_sample_if_room(&mut buffer, sample);
+            }
         } else {
             // Overflow: drop the frame that does not fit. Its position is
             // already spent, so it will read as a gap, not a renumber.
@@ -101,8 +116,32 @@ impl Mux {
         buffer.drain(..).collect()
     }
 
+    /// Enable or disable optional sidecar timing samples for newly submitted
+    /// frames. The core frame shape and wire envelope remain unchanged.
+    pub fn set_frame_timing_enabled(&self, enabled: bool) {
+        self.frame_timing_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether this mux currently emits sidecar frame timing samples.
+    pub fn frame_timing_enabled(&self) -> bool {
+        self.frame_timing_enabled.load(Ordering::Relaxed)
+    }
+
+    fn push_timing_sample_if_room(&self, buffer: &mut VecDeque<Frame>, sample: FrameTimeSample) {
+        if buffer.len() >= self.capacity {
+            return;
+        }
+
+        let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
+        buffer.push_back(Frame {
+            channel: FRAME_TIME_CHANNEL.into(),
+            position,
+            payload: sample.encode(),
+        });
+    }
+
     /// How many positions have been assigned — the gap-free high-water mark
-    /// (spec §5.2). Equal to the number of `submit` calls.
+    /// (spec §5.2). Sidecar timing samples, when enabled, are frames too.
     pub fn assigned(&self) -> u64 {
         self.next.load(Ordering::Relaxed)
     }
@@ -112,4 +151,11 @@ impl Mux {
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
+}
+
+fn now_unix_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }

@@ -42,7 +42,15 @@ fn provisioning_records_round_trip_on_owned_datastream_channels() {
         run_id: 77,
         node_id: 11,
         kind: ProvisionEventKind::NodeLive,
+        provider: Some("docker".to_owned()),
         message: None,
+    });
+    let event_without_provider = MvpProvisionEventRecord::new(ProvisionEvent {
+        run_id: 77,
+        node_id: 12,
+        kind: ProvisionEventKind::ProvisionStart,
+        provider: None,
+        message: Some("queued".to_owned()),
     });
     let log = MvpProvisionLogRecord::new(ProvisionLogLine {
         run_id: 77,
@@ -64,6 +72,10 @@ fn provisioning_records_round_trip_on_owned_datastream_channels() {
         event
     );
     assert_eq!(MvpProvisionLogRecord::decode(&log.encode()).unwrap(), log);
+    assert_eq!(
+        MvpProvisionEventRecord::decode(&event_without_provider.encode()).unwrap(),
+        event_without_provider
+    );
     assert_eq!(
         telemetry::mvp_provision_log_channel(11, ProvisionLogStream::Stdout).as_str(),
         "mvp.provisioning.logs.node.11.stdout"

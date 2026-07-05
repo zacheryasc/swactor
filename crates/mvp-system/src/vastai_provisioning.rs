@@ -1,7 +1,11 @@
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
 
 use datastream::DatastreamProducer;
 use swactor_vastai::{LifecyclePolicy, ProvisionRequest, ProvisionedInstance, SelectionPolicy};
@@ -374,6 +378,7 @@ pub struct SshCommandBootstrapLauncher;
 
 pub struct SshCommandBootstrapHandle {
     child: Arc<Mutex<Child>>,
+    stopping: Arc<AtomicBool>,
 }
 
 impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
@@ -416,20 +421,70 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
             .take()
             .ok_or_else(|| format!("VastAI node {} SSH stderr missing", spec.node_id))?;
 
+        let run_id = spec.run_id;
+        let node_id = spec.node_id;
+        let exit_sink = sink.clone();
+        let child = Arc::new(Mutex::new(child));
+        let stopping = Arc::new(AtomicBool::new(false));
         let bridge = BootstrapDatastreamBridge::new(spec, sink, producer);
         bridge.spawn_stdout_reader(stdout);
         bridge.spawn_stderr_reader(stderr);
+        spawn_ssh_exit_watcher(run_id, node_id, child.clone(), stopping.clone(), exit_sink);
 
-        Ok(SshCommandBootstrapHandle {
-            child: Arc::new(Mutex::new(child)),
-        })
+        Ok(SshCommandBootstrapHandle { child, stopping })
     }
 
     fn stop_bootstrap(&mut self, handle: &mut Self::Handle) {
+        handle.stopping.store(true, Ordering::SeqCst);
         let mut child = handle.child.lock();
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+fn spawn_ssh_exit_watcher(
+    run_id: u64,
+    node_id: u64,
+    child: Arc<Mutex<Child>>,
+    stopping: Arc<AtomicBool>,
+    sink: PluginSink,
+) {
+    std::thread::spawn(move || {
+        loop {
+            match child.lock().try_wait() {
+                Ok(Some(status)) => {
+                    if stopping.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if status.success() {
+                        sink.observe(PluginObservation::Exited {
+                            run_id,
+                            node_id,
+                            status: status.code(),
+                        });
+                    } else {
+                        sink.observe(PluginObservation::Failed {
+                            run_id,
+                            node_id,
+                            reason: format!("VastAI SSH bootstrap exited: {status}"),
+                        });
+                    }
+                    return;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    if !stopping.load(Ordering::SeqCst) {
+                        sink.observe(PluginObservation::Failed {
+                            run_id,
+                            node_id,
+                            reason: format!("wait VastAI SSH bootstrap: {error}"),
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+    });
 }
 
 pub struct VastAiProvisioningPlugin<C, B>
@@ -540,6 +595,9 @@ where
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Result<PluginNodeHandle, String> {
+        if !spec.mounts.is_empty() {
+            return Err("vastai provider does not support host file mounts".to_owned());
+        }
         let stream_id = node_stream_id(spec.run_id, spec.node_id);
         let label = self.label_for(&spec);
         sink.observe(PluginObservation::ProviderLine {

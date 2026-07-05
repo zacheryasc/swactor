@@ -41,6 +41,7 @@ fn spec() -> NodeProvisionSpec {
         image: "worker:latest".to_owned(),
         env: Vec::new(),
         args: Vec::new(),
+        mounts: Vec::new(),
     }
 }
 
