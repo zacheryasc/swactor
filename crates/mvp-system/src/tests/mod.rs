@@ -16,6 +16,7 @@ mod node_provisioning_guarantees;
 mod observability_surface_guarantees;
 mod orchestrator_run_fsm_guarantees;
 mod orchestrator_token_endpoint_guarantees;
+mod relay_provisioning_guarantees;
 mod resource_inventory_guarantees;
 mod run_plan_guarantees;
 mod shared_ring_helper_abi_guarantees;

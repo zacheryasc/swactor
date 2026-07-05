@@ -25,6 +25,8 @@ fn one_node_chat_docker_cuda_e2e() {
     command
         .current_dir(&root)
         .args(["mvp-chat"])
+        .env("MVP_RUNTIME_CONFIG", "local")
+        .env("MVP_IROH_RELAY_MODE", "disabled")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -46,7 +48,7 @@ fn one_node_chat_docker_cuda_e2e() {
     let stdout_reader = spawn_capture(child.stdout.take().expect("stdout"), Arc::clone(&stdout));
     let stderr_reader = spawn_capture(child.stderr.take().expect("stderr"), Arc::clone(&stderr));
 
-    let result = run_full_flow(&mut child, &mut stdin, &stdout, &stderr);
+    let mut result = run_full_flow(&mut child, &mut stdin, &stdout);
     if result.is_err() {
         request_child_interrupt(&child);
         let _ = wait_child(&mut child, SHUTDOWN_TIMEOUT);
@@ -55,6 +57,9 @@ fn one_node_chat_docker_cuda_e2e() {
     }
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
+    if result.is_ok() {
+        result = assert_no_lower_layer_terminal_leaks(&stdout, &stderr);
+    }
     assert_container_removed(&root, DEFAULT_CONTAINER);
 
     if let Err(error) = result {
@@ -71,12 +76,7 @@ fn run_full_flow(
     child: &mut Child,
     stdin: &mut impl Write,
     stdout: &Arc<Mutex<String>>,
-    stderr: &Arc<Mutex<String>>,
 ) -> Result<(), String> {
-    wait_for_child_or(TEST_TIMEOUT, child, || {
-        stderr_contains(stderr, "dashboard_ready")
-    })
-    .map_err(|e| format!("dashboard_ready not observed: {e}"))?;
     wait_for_child_or(TEST_TIMEOUT, child, dashboard_responding)
         .map_err(|e| format!("dashboard API not live: {e}"))?;
     wait_for_child_or(TEST_TIMEOUT, child, || {
@@ -91,27 +91,26 @@ fn run_full_flow(
         dashboard_has_frame("mvp.worker.weights", "WeightsLoaded")
     })
     .map_err(|e| format!("WeightsLoaded not visible in dashboard: {e}"))?;
-    wait_for_child_or(TEST_TIMEOUT, child, || {
-        stderr_contains(stderr, "prompt_loop_ready")
-    })
-    .map_err(|e| format!("prompt_loop_ready not observed: {e}"))?;
+    wait_for_child_or(TEST_TIMEOUT, child, || prompt_visible(stdout))
+        .map_err(|e| format!("chat prompt not visible: {e}"))?;
 
     writeln!(stdin, "hello from full cargo mvp-chat e2e")
         .map_err(|e| format!("write prompt: {e}"))?;
     stdin.flush().map_err(|e| format!("flush prompt: {e}"))?;
-    wait_for_child_or(PROMPT_TIMEOUT, child, || stdout_contains(stdout, ">"))
-        .map_err(|e| format!("prompt marker not visible: {e}"))?;
+    wait_for_child_or(PROMPT_TIMEOUT, child, || {
+        stdout_contains(stdout, "decoding...")
+    })
+    .map_err(|e| format!("prompt was not submitted to chat loop: {e}"))?;
     wait_for_child_or(PROMPT_TIMEOUT, child, || response_text_visible(stdout))
         .map_err(|e| format!("decoded response text not visible: {e}"))?;
-    wait_for_child_or(PROMPT_TIMEOUT, child, || {
-        stderr_contains(stderr, "done request=")
-    })
-    .map_err(|e| format!("prompt did not complete: {e}"))?;
     wait_for_child_or(PROMPT_TIMEOUT, child, || {
         dashboard_has_frame("mvp.worker.prompt", "PromptCompleted")
     })
     .map_err(|e| format!("prompt result not visible in dashboard: {e}"))?;
-
+    wait_for_child_or(PROMPT_TIMEOUT, child, dashboard_has_orch_prompt_lifecycle)
+        .map_err(|e| format!("orchestrator prompt lifecycle not visible in dashboard: {e}"))?;
+    wait_for_child_or(PROMPT_TIMEOUT, child, || prompt_count(stdout) >= 2)
+        .map_err(|e| format!("chat prompt did not return after response: {e}"))?;
     request_child_interrupt(child);
     let status = wait_child(child, SHUTDOWN_TIMEOUT)
         .ok_or_else(|| "cargo mvp-chat did not exit after Ctrl-C".to_owned())?;
@@ -181,6 +180,79 @@ fn dashboard_has_frame(channel_substr: &str, payload_substr: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn dashboard_has_orch_prompt_lifecycle() -> bool {
+    dashboard_frames()
+        .map(|frames| {
+            let events = frames
+                .iter()
+                .filter_map(orch_prompt_observation)
+                .collect::<Vec<_>>();
+
+            events.iter().any(|prompt_work| {
+                prompt_work.phase == "prompt_work"
+                    && prompt_work.status == "observed"
+                    && events.iter().any(|event| {
+                        same_prompt(prompt_work, event)
+                            && event.phase == "node_prompt_send"
+                            && event.status == "ready"
+                    })
+                    && events.iter().any(|event| {
+                        same_prompt(prompt_work, event)
+                            && event.phase == "node_prompt_event"
+                            && event.status == "observed"
+                            && event.detail_event.as_deref() == Some("Done")
+                    })
+                    && events.iter().any(|event| {
+                        same_prompt(prompt_work, event)
+                            && event.phase == "prompt_complete"
+                            && event.status == "ready"
+                            && event.detail_event.as_deref() == Some("Done")
+                    })
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn orch_prompt_observation(frame: &SeenFrame) -> Option<OrchPromptObservation> {
+    if frame.channel != "mvp.orch.prompt" {
+        return None;
+    }
+
+    let value = serde_json::from_str::<Value>(&frame.payload).ok()?;
+    if value.get("type").and_then(Value::as_str)? != "OrchPromptEvent" {
+        return None;
+    }
+    let detail = value.get("detail")?;
+
+    Some(OrchPromptObservation {
+        phase: value.get("phase").and_then(Value::as_str)?.to_owned(),
+        status: value.get("status").and_then(Value::as_str)?.to_owned(),
+        run_id: value.get("run_id").and_then(Value::as_u64)?,
+        node_id: value.get("node_id").and_then(Value::as_u64)?,
+        request_id: value.get("request_id").and_then(Value::as_u64)?,
+        detail_event: detail
+            .get("event")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+fn same_prompt(left: &OrchPromptObservation, right: &OrchPromptObservation) -> bool {
+    left.run_id == right.run_id
+        && left.node_id == right.node_id
+        && left.request_id == right.request_id
+}
+
+#[derive(Debug)]
+struct OrchPromptObservation {
+    phase: String,
+    status: String,
+    run_id: u64,
+    node_id: u64,
+    request_id: u64,
+    detail_event: Option<String>,
 }
 
 #[derive(Debug)]
@@ -255,16 +327,53 @@ fn stdout_contains(stdout: &Arc<Mutex<String>>, needle: &str) -> bool {
     snapshot(stdout).contains(needle)
 }
 
+fn prompt_visible(stdout: &Arc<Mutex<String>>) -> bool {
+    snapshot(stdout).contains("prompt:> ")
+}
+
+fn prompt_count(stdout: &Arc<Mutex<String>>) -> usize {
+    snapshot(stdout).matches("prompt:> ").count()
+}
+
 fn response_text_visible(stdout: &Arc<Mutex<String>>) -> bool {
-    let text = snapshot(stdout);
-    text.lines()
-        .any(|line| line.trim_start_matches('>').trim().len() > 8)
+    snapshot(stdout)
+        .split("Response: ")
+        .skip(1)
+        .any(|text| !text.lines().next().unwrap_or_default().trim().is_empty())
 }
 
-fn stderr_contains(stderr: &Arc<Mutex<String>>, needle: &str) -> bool {
-    snapshot(stderr).contains(needle)
+fn assert_no_lower_layer_terminal_leaks(
+    stdout: &Arc<Mutex<String>>,
+    stderr: &Arc<Mutex<String>>,
+) -> Result<(), String> {
+    let leaks = lower_layer_leak_lines("stdout", &snapshot(stdout))
+        .into_iter()
+        .chain(lower_layer_leak_lines("stderr", &snapshot(stderr)))
+        .collect::<Vec<_>>();
+    if leaks.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "lower-layer runtime output leaked to terminal:\n{}",
+            leaks.join("\n")
+        ))
+    }
 }
 
+fn lower_layer_leak_lines(stream: &str, output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let leaked = trimmed.contains("prompt_loop_ready")
+                || trimmed.contains("dashboard_ready")
+                || trimmed.starts_with("mvp-orch-one-node:")
+                || trimmed.starts_with("mvp-node:")
+                || trimmed.starts_with("mvp_tinygrad_worker:");
+            leaked.then(|| format!("{stream}: {line}"))
+        })
+        .collect()
+}
 fn snapshot(buf: &Arc<Mutex<String>>) -> String {
     buf.lock().expect("capture mutex").clone()
 }

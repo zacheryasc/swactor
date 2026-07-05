@@ -3,7 +3,8 @@ use std::thread::{self, JoinHandle};
 
 use datastream::{ChannelId, DatastreamProducer, Lifetime, NodeId, StreamId};
 use iroh::EndpointAddr;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use swactor::actor::ActorAddress;
 
 use crate::provisioning::{
@@ -49,6 +50,10 @@ impl BootstrapDatastreamBridge {
 
     pub fn observe_stdout_line(&self, line: impl Into<String>) {
         let line = line.into();
+        if let Some(frame) = parse_stdio_datastream_frame(&self.spec, &line) {
+            self.sink.observe(frame);
+            return;
+        }
         self.submit_log(ProvisionLogStream::Stdout, &line);
         self.sink.observe(PluginObservation::StdoutLine {
             run_id: self.spec.run_id,
@@ -152,6 +157,30 @@ impl BootstrapDatastreamBridge {
             payload,
         );
     }
+}
+
+#[derive(Deserialize, Serialize)]
+struct StdioDatastreamFrame {
+    mvp_stdio_event: u32,
+    kind: String,
+    channel: String,
+    payload: Value,
+}
+
+pub fn parse_stdio_datastream_frame(
+    spec: &NodeProvisionSpec,
+    line: &str,
+) -> Option<PluginObservation> {
+    let frame = serde_json::from_str::<StdioDatastreamFrame>(line).ok()?;
+    if frame.mvp_stdio_event != 1 || frame.kind != "datastream_frame" {
+        return None;
+    }
+    Some(PluginObservation::DatastreamFrame {
+        run_id: spec.run_id,
+        node_id: spec.node_id,
+        channel: frame.channel,
+        payload: frame.payload.to_string(),
+    })
 }
 
 #[derive(Deserialize)]

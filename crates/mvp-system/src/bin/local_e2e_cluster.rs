@@ -39,6 +39,9 @@ use mvp_system::node_provisioning as node_provision;
 use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
 use mvp_system::provisioning::{NodeProvisionSpec, ProvisionLogStream};
+use mvp_system::relay_provisioning::{
+    LocalShimRelayProvider, RelayProvider, RelayProvisionRequest, RelayPurpose,
+};
 use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
 use mvp_system::tx_rx_edge_actor as edge_actor;
@@ -1224,11 +1227,17 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
 }
 
 fn new_driver(handle: tokio::runtime::Handle) -> Result<IrohDriver, String> {
+    let mut relay_provider = LocalShimRelayProvider;
+    let relay = relay_provider.provision_relay(RelayProvisionRequest {
+        run_id: RUN_ID,
+        purpose: RelayPurpose::Combined,
+    })?;
+    let relay_mode = relay_provider.relay_mode(&relay)?;
     IrohDriver::with_handle(
         handle,
         IrohDriverConfig {
             secret_key: None,
-            relay_mode: iroh::RelayMode::Disabled,
+            relay_mode,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
             additional_alpns: vec![EDGE_ALPN.to_vec()],
@@ -2285,6 +2294,7 @@ fn local_docker_spec(
             "--orchestrator-actor".to_owned(),
             orchestrator_actor_json.to_owned(),
         ],
+        mounts: Vec::new(),
     }
 }
 

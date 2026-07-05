@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use datastream::DatastreamProducer;
+use datastream::{ChannelId, DatastreamProducer};
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender};
@@ -100,6 +100,7 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
                 run_id: spec.run_id,
                 node_id: spec.node_id,
                 kind: ProvisionEventKind::ProvisionStart,
+                provider: None,
                 message: None,
             });
             let sink = PluginSink::new(Arc::new(ActorPluginSink {
@@ -148,6 +149,7 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
                     run_id,
                     node_id,
                     kind: ProvisionEventKind::NodeStopped,
+                    provider: None,
                     message,
                 });
             }
@@ -196,6 +198,9 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
                     line,
                 },
             ),
+            PluginObservation::DatastreamFrame {
+                channel, payload, ..
+            } => self.emit_datastream_frame(channel, payload),
             PluginObservation::RuntimeReady {
                 run_id,
                 node_id,
@@ -209,6 +214,7 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
                         run_id,
                         node_id,
                         kind: ProvisionEventKind::NodeLive,
+                        provider: None,
                         message: None,
                     });
                     let _ = ctx.send(
@@ -314,6 +320,7 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
             run_id,
             node_id,
             kind: ProvisionEventKind::ProvisionFailed,
+            provider: None,
             message: Some(reason.to_owned()),
         });
     }
@@ -350,6 +357,12 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
             let record = MvpProvisionLogRecord::new(line);
             let payload = serde_json::to_vec(&record).expect("serialize provisioning log record");
             producer.submit_bytes(channel, payload);
+        }
+    }
+
+    fn emit_datastream_frame(&self, channel: String, payload: String) {
+        if let Some(producer) = &self.telemetry {
+            producer.submit_bytes(ChannelId::new(channel), payload.into_bytes());
         }
     }
 }

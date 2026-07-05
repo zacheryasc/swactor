@@ -124,6 +124,7 @@ fn spec() -> NodeProvisionSpec {
         image: "registry.example/mvp-worker:latest".to_owned(),
         env: vec![("EXISTING".to_owned(), "1".to_owned())],
         args: vec!["python".to_owned(), "worker.py".to_owned()],
+        mounts: Vec::new(),
     }
 }
 
