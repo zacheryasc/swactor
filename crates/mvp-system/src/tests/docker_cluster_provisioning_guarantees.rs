@@ -30,11 +30,6 @@ fn docker_group_spec(count: u32) -> provision::RunNodeGroupSpec {
             start_swactor_command: "/opt/mvp/swactor-node --join ${MVP_ORCH_SWACTOR_ADDR}".into(),
             stdout_sources: vec!["/var/log/mvp/bootstrap.out".into()],
             stderr_sources: vec!["/var/log/mvp/bootstrap.err".into()],
-            timeout_policy: provision::BootstrapTimeoutPolicy {
-                ssh_connect_secs: 10,
-                boot_check_secs: 20,
-                swactor_join_secs: 30,
-            },
         },
         swarm_join: provision::SwarmJoinTemplate {
             orch_swactor_addr: "quic://orch.local:9443".into(),
@@ -251,7 +246,6 @@ fn ssh_bootstrap_session_runs_pre_handoff_steps_and_closes_on_convergence() {
         boot: spec.boot.clone(),
         swarm_join: spec.swarm_join.clone(),
         datastream: provision::DatastreamStreamId("run/7/workers-0/bootstrap".into()),
-        timeout_policy: spec.boot.timeout_policy,
     };
     let mut session = docker::SshBootstrapSession::new(
         bootstrap_spec,

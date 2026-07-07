@@ -1,32 +1,9 @@
 **/target
-**/node_modules/
-.vscode/
-.venv
 __pycache__
 fuzz/artifacts/**
 corpus
 .loop/
 .model-cache/
 
-
-# Analysis artifacts (depgraph + spectral)
-**/deps.dot
-**/deps.html
-docs/architecture.dot
-docs/architecture.html
-
-# xtask personal config
-xtask/config.toml
-
-# Deploy config (machine-specific)
-deploy.toml
-.deploy/*
-!.deploy/deploy.example.toml
-
-# Local dev node state
-.dev-node/
-.dev-cluster/
-.sim-cluster/
-
-# vast.ai run logs/artifacts
-.vastai-logs/
+# environment variables for deployment configurations
+.config/

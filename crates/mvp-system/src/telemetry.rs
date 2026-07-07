@@ -1,9 +1,11 @@
 //! MVP-system-owned datastream channel records.
 
 use datastream::frame::ChannelId;
+use datastream::hardware::net::HostNetSample;
 use datastream::{ChannelRegistry, Record};
 use serde::{Deserialize, Serialize};
 
+use crate::arena_manager::ArenaSample;
 use crate::observability_surface as obs;
 use crate::provisioning::{self, ProvisionLogStream};
 
@@ -83,9 +85,11 @@ impl Record for MvpProvisionLogRecord {
 
 /// Registry fragment for consumers that want typed MVP datastream decoding.
 pub fn channel_registry() -> ChannelRegistry {
-    let registry = ChannelRegistry::new().with_record::<MvpLifecycleRecord>();
-    let registry = registry
+    let registry = ChannelRegistry::new()
+        .with_record::<MvpLifecycleRecord>()
         .with_record::<MvpProvisionEventRecord>()
-        .with_record::<MvpProvisionLogRecord>();
+        .with_record::<MvpProvisionLogRecord>()
+        .with_record::<HostNetSample>()
+        .with_record::<ArenaSample>();
     registry
 }

@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use crate::run_plan::RunId;
 
@@ -23,8 +22,6 @@ pub struct ClusterBuilder {
     launcher: Option<Box<dyn NodeLauncher>>,
     planner: Option<Box<dyn RolePlanner>>,
     required_resources: ResourceRequest,
-    boot_timeout: Duration,
-    convergence_timeout: Duration,
 }
 
 impl ClusterBuilder {
@@ -38,8 +35,6 @@ impl ClusterBuilder {
             launcher: None,
             planner: None,
             required_resources: ResourceRequest::default(),
-            boot_timeout: Duration::from_secs(30),
-            convergence_timeout: Duration::from_secs(60),
         }
     }
 
@@ -70,16 +65,6 @@ impl ClusterBuilder {
 
     pub fn required_resources(mut self, required_resources: ResourceRequest) -> Self {
         self.required_resources = required_resources;
-        self
-    }
-
-    pub fn boot_timeout(mut self, timeout: Duration) -> Self {
-        self.boot_timeout = timeout;
-        self
-    }
-
-    pub fn convergence_timeout(mut self, timeout: Duration) -> Self {
-        self.convergence_timeout = timeout;
         self
     }
 
@@ -132,7 +117,7 @@ impl ClusterBuilder {
             node_id: coordinator.lease.logical_node_id,
             coordinator: true,
         });
-        let coordinator_facts = coordinator.control.wait_boot_ready(self.boot_timeout)?;
+        let coordinator_facts = coordinator.control.wait_boot_ready()?;
         events.push(EngineEvent::NodeBootReady {
             node_id: coordinator_facts.node_id,
         });
@@ -160,7 +145,7 @@ impl ClusterBuilder {
                 node_id: node.lease.logical_node_id,
                 coordinator: false,
             });
-            let facts = node.control.wait_boot_ready(self.boot_timeout)?;
+            let facts = node.control.wait_boot_ready()?;
             events.push(EngineEvent::NodeBootReady {
                 node_id: facts.node_id,
             });
@@ -169,8 +154,7 @@ impl ClusterBuilder {
 
         let expected_alive = nodes.len();
         for node in &mut nodes {
-            node.control
-                .wait_cluster_converged(expected_alive, self.convergence_timeout)?;
+            node.control.wait_cluster_converged(expected_alive)?;
         }
         events.push(EngineEvent::ClusterConverged {
             node_count: expected_alive,

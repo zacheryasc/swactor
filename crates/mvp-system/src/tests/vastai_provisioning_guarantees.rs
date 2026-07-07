@@ -137,6 +137,7 @@ fn config() -> VastAiProvisioningConfig {
         lifecycle: LifecyclePolicy::default(),
         confirm_lease: false,
         onstart: None,
+        ssh_public_key: Some("ssh-ed25519 AAAATESTKEY test".to_owned()),
     }
 }
 
@@ -167,11 +168,6 @@ fn logical_spec() -> provision::LogicalNodeSpec {
             start_swactor_command: "/opt/mvp/swactor-node --join".to_owned(),
             stdout_sources: vec!["/var/log/mvp/stdout.log".to_owned()],
             stderr_sources: vec!["/var/log/mvp/stderr.log".to_owned()],
-            timeout_policy: provision::BootstrapTimeoutPolicy {
-                ssh_connect_secs: 10,
-                boot_check_secs: 20,
-                swactor_join_secs: 30,
-            },
         },
         swarm_join: provision::SwarmJoinSpec {
             orch_swactor_addr: "quic://orch.example:9443".to_owned(),
@@ -200,8 +196,12 @@ fn vastai_plugin_builds_one_node_request_and_starts_bootstrap() {
     assert_eq!(request.image, "registry.example/mvp-worker:latest");
     assert_eq!(request.label.as_deref(), Some("test-mvp-9-11"));
     assert_eq!(request.disk_gb, 80);
-    assert_eq!(request.onstart.as_deref(), Some("python worker.py"));
+    assert_eq!(request.onstart, None);
     assert_eq!(request.env.get("EXISTING").map(String::as_str), Some("1"));
+    assert_eq!(
+        request.env.get("SSH_PUBLIC_KEY").map(String::as_str),
+        Some("ssh-ed25519 AAAATESTKEY test")
+    );
 
     assert_eq!(
         plugin.client().endpoint_lookups,
@@ -209,6 +209,7 @@ fn vastai_plugin_builds_one_node_request_and_starts_bootstrap() {
     );
     assert_eq!(plugin.bootstrap().starts.len(), 1);
     assert_eq!(plugin.bootstrap().starts[0].0.env, spec().env);
+    assert_eq!(plugin.bootstrap().starts[0].0.args, spec().args);
     assert_eq!(
         plugin.bootstrap().starts[0].1,
         VastAiSshEndpoint {
@@ -217,6 +218,24 @@ fn vastai_plugin_builds_one_node_request_and_starts_bootstrap() {
             user: "ubuntu".to_owned(),
         }
     );
+}
+
+#[test]
+fn vastai_plugin_omits_ssh_public_key_when_unconfigured() {
+    let config = VastAiProvisioningConfig {
+        ssh_public_key: None,
+        ..config()
+    };
+    let mut plugin = VastAiProvisioningPlugin::new(
+        FakeLeaseClient::default().with_contract(100),
+        FakeBootstrap::default(),
+        config,
+    );
+
+    plugin.start_node(spec(), sink()).unwrap();
+
+    let request = &plugin.client().requests[0];
+    assert_eq!(request.env.get("SSH_PUBLIC_KEY"), None);
 }
 
 #[test]

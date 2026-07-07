@@ -52,8 +52,8 @@ fn bootstrap_bridge_writes_node_stream_and_forwards_plugin_observations() {
     let (recording, sink) = recording_sink();
     let bridge = BootstrapDatastreamBridge::new(spec(), sink, Some(endpoint.producer()));
 
-    bridge.observe_stdout_line("boot entered");
-    bridge.observe_stderr_line("warning");
+    bridge.observe_stdout_line("ssh stdout diagnostic");
+    bridge.observe_stderr_line("debug1: ssh stderr diagnostic");
     endpoint.tick();
 
     let observations = recording.observations();
@@ -63,27 +63,30 @@ fn bootstrap_bridge_writes_node_stream_and_forwards_plugin_observations() {
             PluginObservation::StdoutLine {
                 run_id: 7,
                 node_id: 42,
-                line: "boot entered".to_owned(),
+                line: "ssh stdout diagnostic".to_owned(),
             },
             PluginObservation::StderrLine {
                 run_id: 7,
                 node_id: 42,
-                line: "warning".to_owned(),
+                line: "debug1: ssh stderr diagnostic".to_owned(),
             },
         ]
     );
 
     let deliveries = subscription.drain_available();
-    assert_eq!(deliveries.len(), 2);
-    assert_eq!(deliveries[0].stream, node_stream_id(7, 42));
-    assert_eq!(deliveries[1].stream, node_stream_id(7, 42));
+    let logs = deliveries
+        .iter()
+        .filter(|delivery| delivery.stream == node_stream_id(7, 42))
+        .filter_map(|delivery| MvpProvisionLogRecord::decode(&delivery.frame.payload).ok())
+        .collect::<Vec<_>>();
+    assert_eq!(logs.len(), 2, "{deliveries:?}");
 
-    let stdout = MvpProvisionLogRecord::decode(&deliveries[0].frame.payload).unwrap();
-    let stderr = MvpProvisionLogRecord::decode(&deliveries[1].frame.payload).unwrap();
+    let stdout = &logs[0];
+    let stderr = &logs[1];
     assert_eq!(stdout.line.stream, ProvisionLogStream::Stdout);
-    assert_eq!(stdout.line.line, "boot entered");
+    assert_eq!(stdout.line.line, "ssh stdout diagnostic");
     assert_eq!(stderr.line.stream, ProvisionLogStream::Stderr);
-    assert_eq!(stderr.line.line, "warning");
+    assert_eq!(stderr.line.line, "debug1: ssh stderr diagnostic");
 }
 
 #[test]

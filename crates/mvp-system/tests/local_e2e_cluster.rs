@@ -1,9 +1,30 @@
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode};
+
+#[path = "support/local_e2e_cluster.rs"]
+mod local_e2e_cluster;
 
 const IMAGE: &str = "swactor-mvp-local-e2e-cluster:latest";
 
-#[test]
+fn main() -> ExitCode {
+    let args = std::env::args().collect::<Vec<_>>();
+    match std::env::var("MVP_TEST_ROLE").ok().as_deref() {
+        Some("cluster-supervisor") => return local_e2e_cluster::run_main(),
+        Some(role) => {
+            eprintln!("unknown MVP_TEST_ROLE={role}");
+            return ExitCode::from(2);
+        }
+        None => {}
+    }
+
+    if args.iter().any(|arg| arg == "--role=node") {
+        return local_e2e_cluster::run_main();
+    }
+
+    local_e2e_cluster_docker_cpu_pipeline_prompt();
+    ExitCode::SUCCESS
+}
+
 fn local_e2e_cluster_docker_cpu_pipeline_prompt() {
     if std::env::var_os("MVP_SYSTEM_LOCAL_E2E_CLUSTER").is_none() {
         eprintln!("skipping; set MVP_SYSTEM_LOCAL_E2E_CLUSTER=1 to run Docker CPU cluster e2e");
@@ -12,12 +33,13 @@ fn local_e2e_cluster_docker_cpu_pipeline_prompt() {
 
     build_docker_fixture();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_mvp-local-e2e-cluster"))
+    let output = Command::new(current_test_exe())
+        .env("MVP_TEST_ROLE", "cluster-supervisor")
         .arg("--prompt")
         .arg("ping")
         .env("MVP_LOCAL_E2E_CLUSTER_IMAGE", IMAGE)
         .output()
-        .expect("run mvp-local-e2e-cluster");
+        .expect("run local e2e cluster supervisor");
 
     assert!(
         output.status.success(),
@@ -153,4 +175,8 @@ fn copy_context_entry(source: &Path, dest: &Path) {
 
 fn phase(message: &str) {
     eprintln!("local-e2e-cluster: {message}");
+}
+
+fn current_test_exe() -> PathBuf {
+    std::env::current_exe().expect("current test exe")
 }

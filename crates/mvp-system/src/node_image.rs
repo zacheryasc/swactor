@@ -139,8 +139,15 @@ pub fn prepare_node_image(request: NodeImageRequest) -> Result<PreparedNodeImage
     run_status(
         &root,
         "cargo",
-        &["build", "--quiet", "-p", "mvp-system", "--bin", "mvp-node"],
-        "build mvp-node",
+        &[
+            "build",
+            "--quiet",
+            "-p",
+            "mvp-system",
+            "--bin",
+            "mvp-worker-node",
+        ],
+        "build mvp-worker-node",
     )?;
     let base_image_matches =
         docker_image_labels_match(&root, &request.base_image, &expected_base_labels)?;

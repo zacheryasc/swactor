@@ -31,11 +31,6 @@ fn group_spec(count: u32) -> provision::RunNodeGroupSpec {
             start_swactor_command: "/opt/mvp/swactor-node --join ${ORCH_ADDR}".into(),
             stdout_sources: vec!["/var/log/mvp/stdout.log".into()],
             stderr_sources: vec!["/var/log/mvp/stderr.log".into()],
-            timeout_policy: provision::BootstrapTimeoutPolicy {
-                ssh_connect_secs: 30,
-                boot_check_secs: 60,
-                swactor_join_secs: 90,
-            },
         },
         swarm_join: provision::SwarmJoinTemplate {
             orch_swactor_addr: "quic://orch.example:9443".into(),

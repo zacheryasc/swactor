@@ -1,8 +1,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -50,11 +52,7 @@ const DEFAULT_HF_REPO: &str = "bartowski/Llama-3.2-1B-Instruct-GGUF";
 const DEFAULT_HF_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_MAX_TOKENS: u32 = 64;
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
-const BOOT_TIMEOUT: Duration = Duration::from_secs(180);
-const ROUTE_TIMEOUT: Duration = Duration::from_secs(30);
-const WEIGHT_TIMEOUT: Duration = Duration::from_secs(900);
 const MVP_ORCH_BOOTSTRAP: &str = "mvp.orch.bootstrap";
 const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
 const DATASTREAM_FRAME_LOG_ENV: &str = "MVP_DATASTREAM_FRAME_LOG";
@@ -63,14 +61,16 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mvp-orch-one-node: {error}");
+            eprintln!("mvp-orchestrator: {error}");
             ExitCode::from(1)
         }
     }
 }
 
 fn run() -> Result<(), String> {
-    let config = Config::from_env_and_args()?;
+    let mut config = Config::from_env_and_args()?;
+    config.prepare_vastai_ssh_key()?;
+    let orch_stdio_rx = install_orch_stdio_capture()?;
     let mut orch_datastream =
         OrchDatastream::new(config.run_id, config.datastream_frame_log.as_deref())?;
     orch_datastream.emit_bootstrap(
@@ -90,6 +90,13 @@ fn run() -> Result<(), String> {
             "relay_mode":format!("{:?}", config.relay.mode),
             "provider_config":config.provider_datastream_detail(),
         }),
+    );
+    drain_orch_stdio_capture(
+        orch_stdio_rx.as_ref(),
+        &mut orch_datastream,
+        None,
+        config.run_id,
+        config.node_id,
     );
 
     let tokio = match tokio::runtime::Runtime::new() {
@@ -265,7 +272,7 @@ fn run() -> Result<(), String> {
         "ready",
         json!({
             "provider":config.provider.as_str(),
-            "owner":"mvp-orch-one-node",
+            "owner":"mvp-orchestrator",
             "config":config.provider_datastream_detail(),
         }),
     );
@@ -316,7 +323,18 @@ fn run() -> Result<(), String> {
             "stage_index":config.stage_index,
         }),
     );
-    let handle = match provisioner.start_node(node_spec, sink) {
+    let (returned_provisioner, handle_result) = start_node_with_stdio_capture(
+        provisioner,
+        node_spec,
+        sink,
+        orch_stdio_rx.as_ref(),
+        dashboard.as_ref(),
+        &mut orch_datastream,
+        config.run_id,
+        config.node_id,
+    );
+    provisioner = returned_provisioner;
+    let handle = match handle_result {
         Ok(handle) => handle,
         Err(error) => {
             orch_datastream.emit_bootstrap(
@@ -327,9 +345,24 @@ fn run() -> Result<(), String> {
                 "failed",
                 json!({"provider":config.provider.as_str(),"error":error}),
             );
+            drain_orch_stdio_capture(
+                orch_stdio_rx.as_ref(),
+                &mut orch_datastream,
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+            );
             return Err(error);
         }
     };
+    let mut provisioned_node = ProvisionedNodeGuard::new(&mut *provisioner, handle);
+    drain_orch_stdio_capture(
+        orch_stdio_rx.as_ref(),
+        &mut orch_datastream,
+        dashboard.as_ref(),
+        config.run_id,
+        config.node_id,
+    );
 
     orch_datastream.emit_bootstrap(
         dashboard.as_ref(),
@@ -337,15 +370,19 @@ fn run() -> Result<(), String> {
         config.node_id,
         "node_runtime_ready",
         "started",
-        json!({"timeout_ms":BOOT_TIMEOUT.as_millis()}),
+        json!({}),
     );
     let ready = match wait_for_runtime_ready(
         &mut driver,
         &stack,
         &obs_rx,
         &frame_rx,
+        &stop_rx,
         dashboard.as_ref(),
         &mut orch_datastream,
+        orch_stdio_rx.as_ref(),
+        config.run_id,
+        config.node_id,
         config.provider,
     ) {
         Ok(ready) => {
@@ -357,6 +394,13 @@ fn run() -> Result<(), String> {
                 "ready",
                 json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor}),
             );
+            drain_orch_stdio_capture(
+                orch_stdio_rx.as_ref(),
+                &mut orch_datastream,
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+            );
             ready
         }
         Err(error) => {
@@ -367,6 +411,13 @@ fn run() -> Result<(), String> {
                 "node_runtime_ready",
                 "failed",
                 json!({"error":error}),
+            );
+            drain_orch_stdio_capture(
+                orch_stdio_rx.as_ref(),
+                &mut orch_datastream,
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
             );
             return Err(error);
         }
@@ -380,14 +431,14 @@ fn run() -> Result<(), String> {
         "ready",
         json!({"endpoint":&ready.endpoint}),
     );
-    match wait_for_route(&mut driver, &stack, ready.node_actor) {
+    match wait_for_route(&mut driver, &stack, ready.node_actor, &stop_rx) {
         Ok(()) => orch_datastream.emit_bootstrap(
             dashboard.as_ref(),
             config.run_id,
             config.node_id,
             "node_route",
             "ready",
-            json!({"node_actor":ready.node_actor,"timeout_ms":ROUTE_TIMEOUT.as_millis()}),
+            json!({"node_actor":ready.node_actor}),
         ),
         Err(error) => {
             orch_datastream.emit_bootstrap(
@@ -396,7 +447,7 @@ fn run() -> Result<(), String> {
                 config.node_id,
                 "node_route",
                 "failed",
-                json!({"node_actor":ready.node_actor,"timeout_ms":ROUTE_TIMEOUT.as_millis(),"error":error}),
+                json!({"node_actor":ready.node_actor,"error":error}),
             );
             return Err(error);
         }
@@ -436,15 +487,19 @@ fn run() -> Result<(), String> {
         config.node_id,
         "weights_loaded",
         "started",
-        json!({"model_id":&config.model_id,"timeout_ms":WEIGHT_TIMEOUT.as_millis()}),
+        json!({"model_id":&config.model_id}),
     );
     match wait_for_weights_loaded(
         &mut driver,
         &stack,
         &obs_rx,
         &frame_rx,
+        &stop_rx,
         dashboard.as_ref(),
         &mut orch_datastream,
+        orch_stdio_rx.as_ref(),
+        config.run_id,
+        config.node_id,
         config.provider,
     ) {
         Ok(()) => orch_datastream.emit_bootstrap(
@@ -464,16 +519,18 @@ fn run() -> Result<(), String> {
                 "failed",
                 json!({"error":error}),
             );
+            drain_orch_stdio_capture(
+                orch_stdio_rx.as_ref(),
+                &mut orch_datastream,
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+            );
             return Err(error);
         }
     }
 
-    let rpc_addr = match spawn_prompt_rpc(
-        config.rpc_bind,
-        work_tx,
-        config.default_max_tokens,
-        config.default_timeout_ms,
-    ) {
+    let rpc_addr = match spawn_prompt_rpc(config.rpc_bind, work_tx, config.default_max_tokens) {
         Ok(addr) => {
             orch_datastream.emit_bootstrap(
                 dashboard.as_ref(),
@@ -484,7 +541,6 @@ fn run() -> Result<(), String> {
                 json!({
                     "addr":addr.to_string(),
                     "default_max_tokens":config.default_max_tokens,
-                    "default_timeout_ms":config.default_timeout_ms,
                 }),
             );
             addr
@@ -529,6 +585,7 @@ fn run() -> Result<(), String> {
         &stop_rx,
         dashboard.as_ref(),
         &mut orch_datastream,
+        orch_stdio_rx.as_ref(),
         config.run_id,
         config.node_id,
         ready.node_actor,
@@ -553,7 +610,7 @@ fn run() -> Result<(), String> {
         "started",
         json!({"provider":config.provider.as_str(),"node_id":config.node_id}),
     );
-    let stop_result = provisioner.stop_node(&handle);
+    let stop_result = provisioned_node.stop();
     match &stop_result {
         Ok(()) => orch_datastream.emit_bootstrap(
             dashboard.as_ref(),
@@ -590,6 +647,9 @@ struct VastAiRuntimeConfig {
     api_key: Option<String>,
     provisioning: VastAiProvisioningConfig,
     bootstrap_command: Option<String>,
+    ssh_identity: Option<PathBuf>,
+    ssh_public_key: Option<String>,
+    ssh_public_fingerprint: Option<String>,
 }
 
 impl VastAiRuntimeConfig {
@@ -620,16 +680,15 @@ impl VastAiRuntimeConfig {
         if let Some(poll_interval_secs) = env_optional_u64("MVP_VASTAI_POLL_INTERVAL_SECS")? {
             provisioning.lifecycle.poll_interval = Duration::from_secs(poll_interval_secs);
         }
-        if let Some(max_polls) = env_optional_u32("MVP_VASTAI_MAX_POLLS")? {
-            provisioning.lifecycle.max_polls = max_polls;
-        }
-        if let Some(max_create_attempts) = env_optional_u32("MVP_VASTAI_MAX_CREATE_ATTEMPTS")? {
-            provisioning.lifecycle.max_create_attempts = max_create_attempts;
-        }
         Ok(Self {
             api_key: env_optional("MVP_VASTAI_API_KEY").or_else(|| env_optional("VASTAI_API_KEY")),
             provisioning,
             bootstrap_command: env_optional("MVP_VASTAI_BOOTSTRAP_COMMAND"),
+            ssh_identity: env_optional("MVP_VASTAI_SSH_IDENTITY")
+                .map(|value| expand_home_path(&value))
+                .transpose()?,
+            ssh_public_key: None,
+            ssh_public_fingerprint: None,
         })
     }
 
@@ -647,6 +706,8 @@ impl VastAiRuntimeConfig {
             "has_api_key": self.api_key.is_some(),
             "has_onstart": self.provisioning.onstart.is_some(),
             "has_bootstrap_command": self.bootstrap_command.is_some(),
+            "has_ssh_identity": self.ssh_identity.is_some(),
+            "ssh_public_fingerprint": self.ssh_public_fingerprint.as_deref(),
         })
     }
 }
@@ -757,7 +818,6 @@ struct Config {
     gguf_source: GgufSource,
     tokenizer: TokenizerSource,
     default_max_tokens: u32,
-    default_timeout_ms: u64,
     relay: RelayRuntimeConfig,
     vastai: Option<VastAiRuntimeConfig>,
     cached_model: Option<CachedModelConfig>,
@@ -802,7 +862,6 @@ impl Config {
             gguf_source,
             tokenizer: tokenizer_from_env(),
             default_max_tokens: env_u32("MVP_PROMPT_MAX_TOKENS", DEFAULT_MAX_TOKENS)?,
-            default_timeout_ms: env_u64("MVP_PROMPT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)?,
             relay,
             vastai,
             datastream_frame_log: env_optional(DATASTREAM_FRAME_LOG_ENV).map(PathBuf::from),
@@ -821,9 +880,6 @@ impl Config {
                 "--node-id" => config.node_id = parse_next(&mut args, "--node-id")?,
                 "--max-tokens" => {
                     config.default_max_tokens = parse_next(&mut args, "--max-tokens")?
-                }
-                "--timeout-ms" => {
-                    config.default_timeout_ms = parse_next(&mut args, "--timeout-ms")?
                 }
                 "--datastream-frame-log" => {
                     config.datastream_frame_log = Some(PathBuf::from(next_arg(
@@ -890,9 +946,55 @@ impl Config {
         }
     }
 
+    fn prepare_vastai_ssh_key(&mut self) -> Result<(), String> {
+        if self.provider != ProviderKind::VastAi {
+            return Ok(());
+        }
+
+        let api_key = self
+            .vastai
+            .as_ref()
+            .and_then(|vastai| vastai.api_key.as_deref())
+            .ok_or_else(|| {
+                "MVP_VASTAI_API_KEY or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
+                    .to_owned()
+            })?
+            .to_owned();
+        let identity = resolve_vastai_ssh_identity(
+            self.vastai
+                .as_ref()
+                .and_then(|vastai| vastai.ssh_identity.clone()),
+        )?;
+        if !identity.is_file() {
+            return Err(format!(
+                "missing VastAI SSH identity {}; create/register one with vastai create ssh-key or set MVP_VASTAI_SSH_IDENTITY",
+                identity.display()
+            ));
+        }
+        let public_key = derive_ssh_public_key(&identity)?;
+        let fingerprint = ssh_public_key_fingerprint(&public_key);
+        ensure_vastai_account_ssh_key(&api_key, &public_key)?;
+
+        eprintln!(
+            "VastAI SSH identity {} fingerprint {} registered for account",
+            identity.display(),
+            fingerprint
+        );
+
+        let vastai = self
+            .vastai
+            .as_mut()
+            .expect("VastAI config exists when provider is vastai");
+        vastai.ssh_identity = Some(identity);
+        vastai.provisioning.ssh_public_key = Some(public_key.clone());
+        vastai.ssh_public_key = Some(public_key);
+        vastai.ssh_public_fingerprint = Some(fingerprint);
+        Ok(())
+    }
+
     fn build_provisioner(&self) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider {
-            ProviderKind::Docker => Ok(Box::new(LocalDockerPlugin::new("mvp-orch-one-node"))),
+            ProviderKind::Docker => Ok(Box::new(LocalDockerPlugin::new("mvp-orchestrator"))),
             ProviderKind::VastAi => {
                 let vastai = self.vastai.as_ref().ok_or_else(|| {
                     "VastAI config was not resolved for provider vastai".to_owned()
@@ -907,16 +1009,18 @@ impl Config {
                     "MVP_VASTAI_API_KEY or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
                         .to_owned()
                 })?;
+                let ssh_identity = vastai
+                    .ssh_identity
+                    .clone()
+                    .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
                 let client = ToolsVastAiLeaseClient::from_api_key(api_key)?;
                 Ok(Box::new(VastAiProvisioningPlugin::new(
                     client,
-                    SshCommandBootstrapLauncher,
+                    SshCommandBootstrapLauncher::new(Some(ssh_identity)),
                     vastai.provisioning.clone(),
                 )))
             }
-            ProviderKind::Mock => {
-                Err("mvp-orch-one-node does not support mock provider".to_owned())
-            }
+            ProviderKind::Mock => Err("mvp-orchestrator does not support mock provider".to_owned()),
         }
     }
 
@@ -929,7 +1033,6 @@ impl Config {
             "MVP_COORDINATOR_ENDPOINT",
             "MVP_DATASTREAM_SINK_ACTOR",
             "MVP_MODEL_ID",
-            "MVP_NODE_MAX_RUNTIME_SECS",
             "MVP_IROH_RELAY_MODE",
         ];
         if self.relay.url.is_some() {
@@ -946,9 +1049,6 @@ impl Config {
         }
         if std::env::var_os("MVP_CPU_LINE_PROFILE_INTERVAL_MS").is_some() {
             keys.push("MVP_CPU_LINE_PROFILE_INTERVAL_MS");
-        }
-        if std::env::var_os("MVP_GPU_SAMPLE").is_some() {
-            keys.push("MVP_GPU_SAMPLE");
         }
         if std::env::var_os("MVP_TOKEN_PROGRESS_EVERY").is_some() {
             keys.push("MVP_TOKEN_PROGRESS_EVERY");
@@ -1002,7 +1102,6 @@ impl Config {
                     .map_err(|e| format!("serialize datastream sink actor: {e}"))?,
             ),
             ("MVP_MODEL_ID".to_owned(), self.model_id.clone()),
-            ("MVP_NODE_MAX_RUNTIME_SECS".to_owned(), "0".to_owned()),
             (
                 "MVP_IROH_RELAY_MODE".to_owned(),
                 relay_mode_env_value(&self.relay.mode).to_owned(),
@@ -1017,7 +1116,6 @@ impl Config {
         env.extend(optional_env("MVP_TINYGRAD_TEST_MODE"));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE"));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE_INTERVAL_MS"));
-        env.extend(optional_env("MVP_GPU_SAMPLE"));
         env.extend(optional_env("MVP_TOKEN_PROGRESS_EVERY"));
         env.extend(optional_env("CUDA_DEVICE_SCHEDULE"));
         env.extend(optional_env("MVP_MODEL_CACHE_DIR"));
@@ -1050,7 +1148,7 @@ impl Config {
                 .collect(),
             ProviderKind::Docker => Vec::new(),
             ProviderKind::Mock => {
-                return Err("mvp-orch-one-node does not support mock provider".to_owned());
+                return Err("mvp-orchestrator does not support mock provider".to_owned());
             }
         };
         let mounts = if let Some(cached_model) = &self.cached_model {
@@ -1080,6 +1178,97 @@ struct RuntimeReady {
     node_actor: ActorAddress,
 }
 
+struct ProvisionedNodeGuard<'a> {
+    provisioner: &'a mut dyn ProvisionPlugin,
+    handle: Option<mvp_system::provisioning::PluginNodeHandle>,
+}
+
+impl<'a> ProvisionedNodeGuard<'a> {
+    fn new(
+        provisioner: &'a mut dyn ProvisionPlugin,
+        handle: mvp_system::provisioning::PluginNodeHandle,
+    ) -> Self {
+        Self {
+            provisioner,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        let Some(handle) = self.handle.take() else {
+            return Ok(());
+        };
+        self.provisioner.stop_node(&handle)
+    }
+}
+
+impl Drop for ProvisionedNodeGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+fn start_node_with_stdio_capture(
+    provisioner: Box<dyn ProvisionPlugin>,
+    node_spec: NodeProvisionSpec,
+    sink: PluginSink,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    run_id: u64,
+    node_id: u64,
+) -> (
+    Box<dyn ProvisionPlugin>,
+    Result<mvp_system::provisioning::PluginNodeHandle, String>,
+) {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut provisioner = provisioner;
+        let result = provisioner.start_node(node_spec, sink);
+        let _ = tx.send((provisioner, result));
+    });
+
+    loop {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drain_orch_stdio_capture(
+                    orch_stdio_rx,
+                    orch_datastream,
+                    dashboard,
+                    run_id,
+                    node_id,
+                );
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return (
+                    Box::new(FailedProvisionPlugin),
+                    Err("provider start worker disconnected".to_owned()),
+                );
+            }
+        }
+    }
+}
+
+struct FailedProvisionPlugin;
+
+impl ProvisionPlugin for FailedProvisionPlugin {
+    fn start_node(
+        &mut self,
+        _spec: NodeProvisionSpec,
+        _sink: PluginSink,
+    ) -> Result<mvp_system::provisioning::PluginNodeHandle, String> {
+        Err("provider start worker disconnected".to_owned())
+    }
+
+    fn stop_node(
+        &mut self,
+        _handle: &mvp_system::provisioning::PluginNodeHandle,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 struct PromptWork {
     request: SubmitPrompt,
     events: mpsc::Sender<PromptEvent>,
@@ -1088,7 +1277,6 @@ struct PromptWork {
 struct ActivePrompt {
     request: SubmitPrompt,
     events: mpsc::Sender<PromptEvent>,
-    deadline: Instant,
 }
 
 struct FrameArchive {
@@ -1240,6 +1428,99 @@ impl OrchDatastream {
     }
 }
 
+struct OrchStdioCapture;
+
+struct OrchStdioLine {
+    stream: ProvisionLogStream,
+    line: String,
+}
+
+#[cfg(target_os = "linux")]
+impl OrchStdioCapture {
+    fn install() -> Result<Option<mpsc::Receiver<OrchStdioLine>>, String> {
+        let stdout_read = Self::redirect_stream(libc::STDOUT_FILENO, "stdout")?;
+        let stderr_read = Self::redirect_stream(libc::STDERR_FILENO, "stderr")?;
+        let (tx, rx) = mpsc::channel();
+        Self::spawn_reader(stdout_read, ProvisionLogStream::Stdout, tx.clone());
+        Self::spawn_reader(stderr_read, ProvisionLogStream::Stderr, tx);
+        Ok(Some(rx))
+    }
+
+    fn redirect_stream(fd: libc::c_int, name: &str) -> Result<File, String> {
+        let mut pipe_fds = [0; 2];
+        let pipe_result = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+        if pipe_result != 0 {
+            return Err(format!(
+                "create orchestrator {name} capture pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let dup_result = unsafe { libc::dup2(pipe_fds[1], fd) };
+        let close_write_result = unsafe { libc::close(pipe_fds[1]) };
+        if dup_result < 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = unsafe { libc::close(pipe_fds[0]) };
+            return Err(format!("redirect orchestrator {name}: {error}"));
+        }
+        if close_write_result != 0 {
+            let error = std::io::Error::last_os_error();
+            let _ = unsafe { libc::close(pipe_fds[0]) };
+            return Err(format!("close orchestrator {name} duplicate fd: {error}"));
+        }
+
+        Ok(unsafe { File::from_raw_fd(pipe_fds[0]) })
+    }
+
+    fn spawn_reader(file: File, stream: ProvisionLogStream, tx: mpsc::Sender<OrchStdioLine>) {
+        thread::spawn(move || {
+            let reader = BufReader::new(file);
+            for line in reader.lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if tx.send(OrchStdioLine { stream, line }).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OrchStdioCapture {
+    fn install() -> Result<Option<mpsc::Receiver<OrchStdioLine>>, String> {
+        Ok(None)
+    }
+}
+
+fn install_orch_stdio_capture() -> Result<Option<mpsc::Receiver<OrchStdioLine>>, String> {
+    OrchStdioCapture::install()
+}
+
+fn drain_orch_stdio_capture(
+    rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    datastream: &mut OrchDatastream,
+    dashboard: Option<&DashboardSupport>,
+    run_id: u64,
+    node_id: u64,
+) {
+    let Some(rx) = rx else {
+        return;
+    };
+    while let Ok(line) = rx.try_recv() {
+        datastream.emit_log(
+            dashboard,
+            ProvisionLogLine {
+                run_id,
+                node_id,
+                stream: line.stream,
+                line: line.line,
+            },
+        );
+    }
+}
+
 #[cfg(feature = "local-e2e")]
 struct DashboardSupport {
     handle: dashboard::DashboardHandle,
@@ -1299,7 +1580,6 @@ fn spawn_prompt_rpc(
     bind: SocketAddr,
     work_tx: mpsc::Sender<PromptWork>,
     default_max_tokens: u32,
-    default_timeout_ms: u64,
 ) -> Result<SocketAddr, String> {
     let listener = TcpListener::bind(bind).map_err(|e| format!("bind prompt RPC {bind}: {e}"))?;
     let addr = listener
@@ -1311,12 +1591,7 @@ fn spawn_prompt_rpc(
                 Ok(stream) => {
                     let tx = work_tx.clone();
                     thread::spawn(move || {
-                        let _ = handle_prompt_connection(
-                            stream,
-                            tx,
-                            default_max_tokens,
-                            default_timeout_ms,
-                        );
+                        let _ = handle_prompt_connection(stream, tx, default_max_tokens);
                     });
                 }
                 Err(_) => break,
@@ -1325,12 +1600,10 @@ fn spawn_prompt_rpc(
     });
     Ok(addr)
 }
-
 fn handle_prompt_connection(
     stream: TcpStream,
     work_tx: mpsc::Sender<PromptWork>,
     default_max_tokens: u32,
-    default_timeout_ms: u64,
 ) -> Result<(), String> {
     let mut reader = BufReader::new(
         stream
@@ -1345,7 +1618,7 @@ fn handle_prompt_connection(
             Err(error) if error.contains("expected value at line 1 column 1") => break,
             Err(error) => return Err(error),
         };
-        let request = request.with_defaults(default_max_tokens, default_timeout_ms);
+        let request = request.with_defaults(default_max_tokens);
         let (event_tx, event_rx) = mpsc::channel();
         work_tx
             .send(PromptWork {
@@ -1369,14 +1642,21 @@ fn wait_for_runtime_ready(
     stack: &DistributionRuntimeStack,
     obs_rx: &mpsc::Receiver<PluginObservation>,
     frame_rx: &mpsc::Receiver<(StreamId, Frame)>,
+    stop_rx: &mpsc::Receiver<()>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    run_id: u64,
+    node_id: u64,
     provider: ProviderKind,
 ) -> Result<RuntimeReady, String> {
-    let start = Instant::now();
     loop {
         pump(driver, stack);
         drain_frames(frame_rx, dashboard, orch_datastream);
+        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
+        if stop_requested(stop_rx) {
+            return Err("shutdown requested while waiting for node ready".to_owned());
+        }
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
             match observation {
@@ -1400,9 +1680,6 @@ fn wait_for_runtime_ready(
                 }
             }
         }
-        if start.elapsed() > BOOT_TIMEOUT {
-            return Err("timed out waiting for node ready".to_owned());
-        }
         thread::sleep(PUMP_INTERVAL);
     }
 }
@@ -1411,10 +1688,13 @@ fn wait_for_route(
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     actor: ActorAddress,
+    stop_rx: &mpsc::Receiver<()>,
 ) -> Result<(), String> {
-    let start = Instant::now();
-    while start.elapsed() <= ROUTE_TIMEOUT {
+    loop {
         pump(driver, stack);
+        if stop_requested(stop_rx) {
+            return Err("shutdown requested while waiting for node route".to_owned());
+        }
         let ready = stack
             .route_view
             .read()
@@ -1425,9 +1705,6 @@ fn wait_for_route(
         }
         thread::sleep(PUMP_INTERVAL);
     }
-    Err(format!(
-        "timed out waiting for route to node actor {actor:?}"
-    ))
 }
 
 fn provision_stage(
@@ -1462,13 +1739,20 @@ fn wait_for_weights_loaded(
     stack: &DistributionRuntimeStack,
     obs_rx: &mpsc::Receiver<PluginObservation>,
     frame_rx: &mpsc::Receiver<(StreamId, Frame)>,
+    stop_rx: &mpsc::Receiver<()>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    run_id: u64,
+    node_id: u64,
     provider: ProviderKind,
 ) -> Result<(), String> {
-    let start = Instant::now();
     loop {
         pump(driver, stack);
+        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
+        if stop_requested(stop_rx) {
+            return Err("shutdown requested while waiting for weights loaded".to_owned());
+        }
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
             match observation {
@@ -1496,9 +1780,6 @@ fn wait_for_weights_loaded(
                 return Err(format!("worker fatal while loading weights: {payload}"));
             }
         }
-        if start.elapsed() > WEIGHT_TIMEOUT {
-            return Err("timed out waiting for weights loaded".to_owned());
-        }
         thread::sleep(PUMP_INTERVAL);
     }
 }
@@ -1513,6 +1794,7 @@ fn serve_prompts(
     stop_rx: &mpsc::Receiver<()>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     node_id: u64,
     node_actor: ActorAddress,
@@ -1524,6 +1806,7 @@ fn serve_prompts(
         pump(driver, stack);
         drain_observations(obs_rx, dashboard, orch_datastream, provider)?;
         drain_frames(frame_rx, dashboard, orch_datastream);
+        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_rx.try_recv().is_ok() {
             orch_datastream.emit_bootstrap(
                 dashboard,
@@ -1551,7 +1834,6 @@ fn serve_prompts(
                 json!({
                     "prompt_bytes":request.prompt_text.len(),
                     "max_tokens":request.max_tokens,
-                    "timeout_ms":request.timeout_ms,
                 }),
             );
             orch_datastream.emit_prompt(
@@ -1583,7 +1865,6 @@ fn serve_prompts(
                         json!({"node_actor":node_actor,"reply_to":reply_to}),
                     );
                     active = Some(ActivePrompt {
-                        deadline: Instant::now() + Duration::from_millis(request.timeout_ms),
                         request,
                         events: work.events,
                     });
@@ -1661,34 +1942,6 @@ fn serve_prompts(
             }
         }
 
-        if let Some(current) = active.as_ref()
-            && Instant::now() >= current.deadline
-        {
-            let current = active.take().expect("active prompt checked above");
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
-                current.request.request_id,
-                "prompt_timeout",
-                "failed",
-                json!({"error":"prompt timed out","timeout_ms":current.request.timeout_ms}),
-            );
-            let _ = current.events.send(PromptEvent::Fault {
-                request_id: current.request.request_id,
-                error: "prompt timed out".to_owned(),
-            });
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
-                current.request.request_id,
-                "prompt_complete",
-                "failed",
-                json!({"event":"Timeout","error":"prompt timed out"}),
-            );
-        }
-
         thread::sleep(PUMP_INTERVAL);
     }
 }
@@ -1738,6 +1991,10 @@ fn prompt_completion_detail(event: &PromptEvent) -> Value {
         PromptEvent::Fault { error, .. } => json!({"event":"Fault","error":error}),
         PromptEvent::TextDelta { .. } => json!({"event":"TextDelta"}),
     }
+}
+
+fn stop_requested(stop_rx: &mpsc::Receiver<()>) -> bool {
+    stop_rx.try_recv().is_ok()
 }
 
 fn spawn_stop_listener() -> mpsc::Receiver<()> {
@@ -1962,15 +2219,6 @@ fn env_u32(name: &str, default: u32) -> Result<u32, String> {
         None => Ok(default),
     }
 }
-fn env_optional_u32(name: &str) -> Result<Option<u32>, String> {
-    env_optional(name)
-        .map(|value| {
-            value
-                .parse::<u32>()
-                .map_err(|e| format!("invalid {name}={value:?}: {e}"))
-        })
-        .transpose()
-}
 
 fn env_optional_u64(name: &str) -> Result<Option<u64>, String> {
     env_optional(name)
@@ -2009,6 +2257,160 @@ fn tokenizer_from_env() -> TokenizerSource {
         .unwrap_or(TokenizerSource::EmbeddedGguf)
 }
 
+fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+    match explicit {
+        Some(path) => Ok(path),
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "MVP_VASTAI_SSH_IDENTITY is required because HOME is unset".to_owned()
+                })?;
+            Ok(PathBuf::from(home).join(".ssh").join("id_ed25519"))
+        }
+    }
+}
+
+fn expand_home_path(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| "MVP_VASTAI_SSH_IDENTITY uses ~/ but HOME is unset".to_owned())?;
+        return Ok(PathBuf::from(home).join(rest));
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
+    let output = Command::new("ssh-keygen")
+        .arg("-y")
+        .arg("-f")
+        .arg(identity)
+        .output()
+        .map_err(|e| {
+            format!(
+                "derive VastAI SSH public key from {}: {e}",
+                identity.display()
+            )
+        })?;
+    let public_key = String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_owned();
+    if !output.status.success() || public_key.trim().is_empty() {
+        return Err(format!(
+            "derive VastAI SSH public key from {}: {}",
+            identity.display(),
+            command_output_failure_detail(&output, None)
+        ));
+    }
+    Ok(public_key)
+}
+
+fn ssh_public_key_fingerprint(public_key: &str) -> String {
+    let path = std::env::temp_dir().join(format!("mvp-vastai-ssh-key-{}.pub", std::process::id()));
+    if std::fs::write(&path, format!("{public_key}\n")).is_err() {
+        return "unavailable".to_owned();
+    }
+    let output = Command::new("ssh-keygen")
+        .arg("-l")
+        .arg("-f")
+        .arg(&path)
+        .output();
+    let _ = std::fs::remove_file(&path);
+    let Ok(output) = output else {
+        return "unavailable".to_owned();
+    };
+    if !output.status.success() {
+        return "unavailable".to_owned();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut fields = stdout.split_whitespace();
+    match (fields.next(), fields.next()) {
+        (Some(bits), Some(fingerprint)) => format!("{bits} {fingerprint}"),
+        _ => "unavailable".to_owned(),
+    }
+}
+
+fn vastai_account_has_ssh_key(api_key: &str, public_key: &str) -> Result<bool, String> {
+    let output = Command::new("vastai")
+        .args(["show", "ssh-keys", "--raw", "--api-key", api_key])
+        .output()
+        .map_err(vastai_cli_error)?;
+    if !output.status.success() {
+        return Err(format!(
+            "vastai show ssh-keys failed: {}",
+            command_output_failure_detail(&output, Some(api_key))
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(account_ssh_keys_output_contains_public_key(
+        &stdout, public_key,
+    ))
+}
+
+fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), String> {
+    if vastai_account_has_ssh_key(api_key, public_key)? {
+        return Ok(());
+    }
+
+    let output = Command::new("vastai")
+        .args(["create", "ssh-key"])
+        .arg(public_key)
+        .args(["-y", "--api-key", api_key])
+        .output()
+        .map_err(vastai_cli_error)?;
+    if !output.status.success() {
+        return Err(format!(
+            "vastai create ssh-key failed: {}",
+            command_output_failure_detail(&output, Some(api_key))
+        ));
+    }
+
+    if vastai_account_has_ssh_key(api_key, public_key)? {
+        Ok(())
+    } else {
+        Err(
+            "VastAI SSH key registration did not make the selected key visible in vastai show ssh-keys"
+                .to_owned(),
+        )
+    }
+}
+
+fn account_ssh_keys_output_contains_public_key(output: &str, public_key: &str) -> bool {
+    let public_key = public_key.trim();
+    if public_key.is_empty() {
+        return false;
+    }
+    if output.contains(public_key) {
+        return true;
+    }
+    public_key
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|body| !body.is_empty() && output.contains(body))
+}
+
+fn vastai_cli_error(error: std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        "vastai CLI is required to verify/register MVP_VASTAI_SSH_IDENTITY; install with pip install vastai"
+            .to_owned()
+    } else {
+        format!("run vastai CLI: {error}")
+    }
+}
+
+fn command_output_failure_detail(output: &std::process::Output, secret: Option<&str>) -> String {
+    let mut detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if detail.is_empty() {
+        detail = output.status.to_string();
+    }
+    if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
+        detail = detail.replace(secret, "<redacted>");
+    }
+    detail
+}
+
 #[cfg(test)]
 fn relay_mode_from_env() -> Result<iroh::RelayMode, String> {
     relay_runtime_config_from_env(env_u64("MVP_RUN_ID", 1)?).map(|relay| relay.mode)
@@ -2039,13 +2441,13 @@ mod tests {
 
     const ENV_KEYS: &[&str] = &[
         CACHED_MODEL_HOST_ENV,
+        "HOME",
         "HF_TOKEN",
         "MVP_CPU_LINE_PROFILE",
         "MVP_CPU_LINE_PROFILE_INTERVAL_MS",
         "CUDA_DEVICE_SCHEDULE",
         "MVP_DOCKER_GPUS",
         "MVP_GGUF_FILE",
-        "MVP_GPU_SAMPLE",
         "MVP_GGUF_LOCAL_PATH",
         "MVP_GGUF_REPO",
         "MVP_GGUF_REVISION",
@@ -2060,7 +2462,6 @@ mod tests {
         "MVP_PROVIDER",
         "MVP_PROMPT_MAX_TOKENS",
         "MVP_PROMPT_RPC_BIND",
-        "MVP_PROMPT_TIMEOUT_MS",
         "MVP_RUN_ID",
         "MVP_RUNTIME_CONFIG",
         "MVP_STAGE_INDEX",
@@ -2072,8 +2473,6 @@ mod tests {
         "MVP_VASTAI_CONFIRM_LEASE",
         "MVP_VASTAI_DISK_GB",
         "MVP_VASTAI_GPU_NAME",
-        "MVP_VASTAI_MAX_CREATE_ATTEMPTS",
-        "MVP_VASTAI_MAX_POLLS",
         "MVP_VASTAI_MIN_DOWN_MBPS",
         "MVP_VASTAI_MIN_GPU_RAM_MB",
         "MVP_VASTAI_MIN_RELIABILITY",
@@ -2082,6 +2481,7 @@ mod tests {
         "MVP_VASTAI_POLL_INTERVAL_SECS",
         "MVP_VASTAI_REQUIRE_VERIFIED",
         "MVP_VASTAI_SSH_USER",
+        "MVP_VASTAI_SSH_IDENTITY",
         "VASTAI_API_KEY",
         SWACTOR_IROH_RELAY_URL_ENV,
     ];
@@ -2161,6 +2561,61 @@ mod tests {
         env.iter()
             .find(|(env_key, _)| env_key == key)
             .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn expand_home_path_expands_leading_home_segment() {
+        with_clean_env(&[("HOME", "/tmp/mvp-vastai-home")], || {
+            assert_eq!(
+                expand_home_path("~/keys/deploy").expect("home path expands"),
+                PathBuf::from("/tmp/mvp-vastai-home/keys/deploy")
+            );
+            assert_eq!(
+                expand_home_path("/tmp/not-~/expanded").expect("literal path stays literal"),
+                PathBuf::from("/tmp/not-~/expanded")
+            );
+        });
+    }
+
+    #[test]
+    fn account_ssh_keys_output_contains_public_key_matches_exact_key_material() {
+        let public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyBody vastai";
+
+        assert!(account_ssh_keys_output_contains_public_key(
+            public_key, public_key
+        ));
+        assert!(account_ssh_keys_output_contains_public_key(
+            r#"{"keys":[{"public_key":"AAAAC3NzaC1lZDI1NTE5AAAAITestKeyBody"}]}"#,
+            public_key
+        ));
+        assert!(!account_ssh_keys_output_contains_public_key(
+            r#"{"keys":[{"public_key":"AAAAC3NzaC1lZDI1NTE5AAAADifferent"}]}"#,
+            public_key
+        ));
+    }
+
+    #[test]
+    fn vastai_config_reads_ssh_identity_without_runtime_preparation() {
+        let config = with_clean_env(
+            &[
+                ("MVP_RUNTIME_CONFIG", "deploy"),
+                ("MVP_NODE_PROVIDER", "vastai"),
+                ("MVP_VASTAI_API_KEY", "vast-key"),
+                ("MVP_VASTAI_BOOTSTRAP_COMMAND", "/usr/local/bin/mvp-node"),
+                ("MVP_VASTAI_SSH_IDENTITY", "/tmp/mvp-vastai-key"),
+            ],
+            || {
+                Config::from_env_and_args_iter(std::iter::empty::<String>())
+                    .expect("vastai config parses without ssh-keygen or vastai CLI")
+            },
+        );
+        let vastai = config.vastai.expect("vastai config is present");
+        assert_eq!(
+            vastai.ssh_identity.as_deref(),
+            Some(Path::new("/tmp/mvp-vastai-key"))
+        );
+        assert_eq!(vastai.ssh_public_key, None);
+        assert_eq!(vastai.ssh_public_fingerprint, None);
     }
 
     struct TempModelFile {
@@ -2254,6 +2709,72 @@ mod tests {
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn orchestrator_stdio_drain_archives_stdout_and_stderr_as_provision_logs() {
+        static NEXT_TEMP_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let suffix = NEXT_TEMP_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mvp-orch-stdio-test-{}-{suffix}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let (tx, rx) = mpsc::channel();
+        tx.send(OrchStdioLine {
+            stream: ProvisionLogStream::Stdout,
+            line: "offer pool selected".to_owned(),
+        })
+        .expect("send stdout line");
+        tx.send(OrchStdioLine {
+            stream: ProvisionLogStream::Stderr,
+            line: "lease chain detail".to_owned(),
+        })
+        .expect("send stderr line");
+
+        let mut datastream = OrchDatastream::new(77, Some(&path)).expect("datastream opens");
+        drain_orch_stdio_capture(Some(&rx), &mut datastream, None, 77, 9);
+        drop(datastream);
+
+        let contents = std::fs::read_to_string(&path).expect("read frame archive jsonl");
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("archive line is json"))
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_file(&path);
+
+        let stdout_record = records
+            .iter()
+            .rev()
+            .find(|record| record["channel"] == "mvp.provisioning.logs.node.9.stdout")
+            .expect("stdout provisioning log frame archived");
+        let stderr_record = records
+            .iter()
+            .rev()
+            .find(|record| record["channel"] == "mvp.provisioning.logs.node.9.stderr")
+            .expect("stderr provisioning log frame archived");
+        assert_eq!(stdout_record["source"], "orchestrator");
+        assert_eq!(stderr_record["source"], "orchestrator");
+
+        let stdout_payload = serde_json::from_str::<Value>(
+            stdout_record["payload"]["value"]
+                .as_str()
+                .expect("stdout payload is archived as text"),
+        )
+        .expect("stdout payload is log record json");
+        let stderr_payload = serde_json::from_str::<Value>(
+            stderr_record["payload"]["value"]
+                .as_str()
+                .expect("stderr payload is archived as text"),
+        )
+        .expect("stderr payload is log record json");
+        assert_eq!(stdout_payload["line"]["run_id"], 77);
+        assert_eq!(stdout_payload["line"]["node_id"], 9);
+        assert_eq!(stdout_payload["line"]["stream"], "Stdout");
+        assert_eq!(stdout_payload["line"]["line"], "offer pool selected");
+        assert_eq!(stderr_payload["line"]["stream"], "Stderr");
+        assert_eq!(stderr_payload["line"]["line"], "lease chain detail");
     }
 
     #[test]
@@ -2395,5 +2916,71 @@ mod tests {
             !error.contains("MVP_VASTAI_CONFIRM_LEASE") && !error.contains("MVP_VASTAI_DISK_GB"),
             "cached-model rejection should not require valid VastAI env, got: {error}"
         );
+    }
+
+    #[derive(Default)]
+    struct FakeProvisionPlugin {
+        stopped: Vec<u64>,
+    }
+
+    impl ProvisionPlugin for FakeProvisionPlugin {
+        fn start_node(
+            &mut self,
+            _spec: NodeProvisionSpec,
+            _sink: PluginSink,
+        ) -> Result<mvp_system::provisioning::PluginNodeHandle, String> {
+            unreachable!("guard tests construct handles directly")
+        }
+
+        fn stop_node(
+            &mut self,
+            handle: &mvp_system::provisioning::PluginNodeHandle,
+        ) -> Result<(), String> {
+            self.stopped.push(handle.id);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn provisioned_node_guard_stops_node_on_drop() {
+        let mut plugin = FakeProvisionPlugin::default();
+        {
+            let _guard = ProvisionedNodeGuard::new(
+                &mut plugin,
+                mvp_system::provisioning::PluginNodeHandle {
+                    id: 7,
+                    provider_process_id: Some(99),
+                },
+            );
+        }
+        assert_eq!(plugin.stopped, vec![7]);
+    }
+
+    #[test]
+    fn provisioned_node_guard_explicit_stop_runs_once() {
+        let mut plugin = FakeProvisionPlugin::default();
+        {
+            let mut guard = ProvisionedNodeGuard::new(
+                &mut plugin,
+                mvp_system::provisioning::PluginNodeHandle {
+                    id: 8,
+                    provider_process_id: None,
+                },
+            );
+            guard.stop().expect("first stop succeeds");
+            guard.stop().expect("second stop is a no-op");
+        }
+        assert_eq!(plugin.stopped, vec![8]);
+    }
+
+    #[test]
+    fn stop_requested_observes_shutdown_signal_only() {
+        let (_tx, rx) = mpsc::channel();
+        assert!(!stop_requested(&rx));
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(()).expect("send shutdown");
+        assert!(stop_requested(&rx));
+        assert!(!stop_requested(&rx));
     }
 }

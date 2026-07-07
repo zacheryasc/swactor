@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use serde_json::json;
 
-fn main() -> ExitCode {
+pub fn run_main() -> ExitCode {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 

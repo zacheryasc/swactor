@@ -17,7 +17,6 @@ fn worker_config() -> ctl::WorkerConfig {
     ctl::WorkerConfig {
         node_id: ctl::NodeId(10),
         arena_env: ctl::ArenaEnv::test_default(),
-        initialization_timeout_ms: 1_000,
     }
 }
 
@@ -139,8 +138,8 @@ fn current_generation_commands() -> Vec<ctl::ActorCommand> {
 }
 
 // This proves StartWorker spawns the process boundary, then sends
-// InitializeWorker, and WorkerReady moves the controller to running. Fatal,
-// process exit, and timeout move it to failed or crashed.
+// InitializeWorker, and WorkerReady moves the controller to running. Fatal and
+// process exit move it to failed or crashed.
 #[test]
 fn worker_lifecycle_runs_start_initialize_ready_and_fault_paths() {
     // Start the worker process.
@@ -173,20 +172,6 @@ fn worker_lifecycle_runs_start_initialize_ready_and_fault_paths() {
             event,
             ctl::WorkerCtlOut::WorkerRunning {
                 generation: ctl::WorkerGeneration(1)
-            }
-        )
-    }));
-
-    // Initialization timeout in a fresh controller is terminal failure.
-    let mut timed_out = new_controller();
-    timed_out.observe(ctl::WorkerCtlEvent::StartWorker);
-    timed_out.advance_time_ms(1_001);
-    assert!(timed_out.events().iter().any(|event| {
-        matches!(
-            event,
-            ctl::WorkerCtlOut::WorkerFailed {
-                reason: ctl::WorkerFailure::InitializationTimeout,
-                ..
             }
         )
     }));

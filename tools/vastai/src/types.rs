@@ -87,22 +87,14 @@ impl Default for SelectionPolicy {
 #[derive(Debug, Clone)]
 pub struct LifecyclePolicy {
     pub lease_pace: Duration,
-    pub max_create_attempts: u32,
-    pub max_replace_attempts: u32,
     pub poll_interval: Duration,
-    pub max_polls: u32,
-    pub pull_stall: Option<Duration>,
 }
 
 impl Default for LifecyclePolicy {
     fn default() -> Self {
         Self {
             lease_pace: Duration::from_millis(600),
-            max_create_attempts: 5,
-            max_replace_attempts: 3,
             poll_interval: Duration::from_secs(10),
-            max_polls: 30,
-            pull_stall: Some(Duration::from_secs(180)),
         }
     }
 }

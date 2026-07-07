@@ -62,7 +62,6 @@ const OBJECT_MAX_EXTENT: u64 = 16;
 const OBJECT_ALIGNMENT: u64 = 4;
 const ARENA_BYTES: usize = 16 * 1024;
 const RING_BYTES: usize = 4096;
-const EDGE_READY_TIMEOUT: Duration = Duration::from_secs(20);
 const DEFAULT_RUNTIME_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -214,7 +213,7 @@ fn runtime_snapshot_interval_from_env() -> Result<Duration, String> {
     Ok(Duration::from_millis(millis))
 }
 
-fn main() -> ExitCode {
+pub fn run_main() -> ExitCode {
     install_signal_handlers();
     let args = std::env::args().collect::<Vec<_>>();
     let result = if args.iter().any(|arg| arg == "--role=node") {
@@ -586,13 +585,7 @@ fn run_supervisor_once(
         );
     }
 
-    let started_at = Instant::now();
-    wait_for_routes(
-        &mut driver,
-        &stack,
-        &[node0.node_actor, node1.node_actor],
-        Duration::from_secs(20),
-    )?;
+    wait_for_routes(&mut driver, &stack, &[node0.node_actor, node1.node_actor])?;
 
     let token_in_sender = spawn_send_pump(
         driver.tokio_handle(),
@@ -668,7 +661,7 @@ fn run_supervisor_once(
     let mut edge_stream_count = 0usize;
     let mut token_out_streams = HashMap::<u64, Vec<u8>>::new();
 
-    while !STOP_REQUESTED.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(30) {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
         pump_network(&mut driver, &stack);
         driver_runtime.poll_iroh(&driver);
         while let Some(event) = driver_runtime.try_recv() {
@@ -918,17 +911,6 @@ fn run_supervisor_once(
         thread::sleep(Duration::from_millis(10));
     }
 
-    if STOP_REQUESTED.load(Ordering::SeqCst) {
-        record_dashboard_event(&mut dashboard, run_fault_event(run_id));
-        let _ = stop_provisioned_nodes(
-            &mut [&mut node0, &mut node1],
-            &mut driver,
-            &stack,
-            &mut dashboard,
-        );
-        return Err("interrupted".to_owned());
-    }
-
     record_dashboard_event(&mut dashboard, run_fault_event(run_id));
     let _ = stop_provisioned_nodes(
         &mut [&mut node0, &mut node1],
@@ -936,9 +918,7 @@ fn run_supervisor_once(
         &stack,
         &mut dashboard,
     );
-    Err(format!(
-        "timed out: injected={injected} token_received={token_received} completed={completed} torn_down={torn_down} stop0={sent_stop_to_node0} stop1={sent_stop_to_node1}"
-    ))
+    Err("interrupted".to_owned())
 }
 
 fn run_node_role(args: &[String]) -> Result<(), String> {
@@ -1038,7 +1018,6 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
     let mut outbound_object_allocator: Option<edge_actor::ObjectIdAllocator> = None;
     let mut inbound_edge_id = None;
     let mut outbound_edge_id = None;
-    let started_at = Instant::now();
     let shutdown_rx = spawn_shutdown_listener();
     let mut inbound_ring_id = None;
     let mut outbound_ring_id = None;
@@ -1217,9 +1196,6 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
             return Ok(());
         }
 
-        if started_at.elapsed() > Duration::from_secs(60) {
-            return Err("node role timed out".to_owned());
-        }
         thread::sleep(Duration::from_millis(10));
     }
     worker.shutdown().ok();
@@ -1257,10 +1233,8 @@ fn wait_for_routes(
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     actors: &[ActorAddress],
-    timeout: Duration,
 ) -> Result<(), String> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
+    loop {
         pump_network(driver, stack);
         let ready = stack
             .route_view
@@ -1272,7 +1246,6 @@ fn wait_for_routes(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    Err("directory routes for node actors did not converge".to_owned())
 }
 
 struct LocalEngineTopology {
@@ -1923,7 +1896,6 @@ impl GpuWorkerRuntime {
                 arena_fd,
                 arena_bytes: ARENA_BYTES as u64,
             },
-            initialization_timeout_ms: 10_000,
         });
         ctl.observe(worker_ctl::WorkerCtlEvent::StartWorker);
 
@@ -2573,11 +2545,6 @@ fn logical_node_spec_from_local(spec: &NodeProvisionSpec) -> node_provision::Log
             start_swactor_command: spec.args.join(" "),
             stdout_sources: Vec::new(),
             stderr_sources: Vec::new(),
-            timeout_policy: node_provision::BootstrapTimeoutPolicy {
-                ssh_connect_secs: 1,
-                boot_check_secs: 1,
-                swactor_join_secs: 30,
-            },
         },
         swarm_join: node_provision::SwarmJoinSpec {
             orch_swactor_addr: "local-e2e".to_owned(),
@@ -2611,8 +2578,7 @@ fn provision_local_docker_node(
         .map_err(|e| format!("start Docker node {expected_node_id}: {e:?}"))?;
     let provider_process_id = provisioner.provider().cli().provider_process_id();
 
-    let started = Instant::now();
-    while !STOP_REQUESTED.load(Ordering::SeqCst) && started.elapsed() < Duration::from_secs(30) {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
         pump_network(driver, stack);
         drain_dashboard(dashboard);
         publish_runtime_snapshot_throttled(dashboard, stack);
@@ -2667,11 +2633,7 @@ fn provision_local_docker_node(
         }
         thread::sleep(Duration::from_millis(10));
     }
-    if STOP_REQUESTED.load(Ordering::SeqCst) {
-        Err(format!("interrupted provisioning node {expected_node_id}"))
-    } else {
-        Err(format!("timed out provisioning node {expected_node_id}"))
-    }
+    Err(format!("interrupted provisioning node {expected_node_id}"))
 }
 
 fn ready_node_from_stdout(
@@ -2851,8 +2813,8 @@ fn spawn_send_pump(
         }
     });
     ready_rx
-        .recv_timeout(EDGE_READY_TIMEOUT)
-        .map_err(|e| format!("edge {edge_id} sender did not become ready: {e}"))??;
+        .recv()
+        .map_err(|e| format!("edge {edge_id} sender startup channel closed: {e}"))??;
     Ok(SendPumpHandle { tx })
 }
 

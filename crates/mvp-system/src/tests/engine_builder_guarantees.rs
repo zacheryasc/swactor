@@ -194,7 +194,7 @@ fn runtime_node_builds_the_reusable_iroh_swactor_stack() {
         .spawn_node_agent_actor(mvp_system::stage_controller::NodeId(11), orchestrator, None)
         .expect("spawn node agent actor");
 
-    node.wait_for_routes(&[orchestrator, worker], std::time::Duration::from_secs(1))
+    node.wait_for_routes(&[orchestrator, worker])
         .expect("local actor routes");
     assert_eq!(node.node_id().0, *node.endpoint_addr().id.as_bytes());
 }

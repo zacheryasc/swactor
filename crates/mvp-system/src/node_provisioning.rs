@@ -75,13 +75,6 @@ pub struct DesiredNodeShape {
     pub provider_labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BootstrapTimeoutPolicy {
-    pub ssh_connect_secs: u64,
-    pub boot_check_secs: u64,
-    pub swactor_join_secs: u64,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BootSpec {
     pub ssh_user: String,
@@ -89,7 +82,6 @@ pub struct BootSpec {
     pub start_swactor_command: String,
     pub stdout_sources: Vec<String>,
     pub stderr_sources: Vec<String>,
-    pub timeout_policy: BootstrapTimeoutPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -176,10 +168,10 @@ pub enum BootstrapStage {
     WaitingForSwactorJoin,
     Converged,
     Closed,
-    SshTimeout,
+    SshConnectFailed,
     BootCheckFailed,
     StartFailed,
-    JoinTimeout,
+    SwactorJoinFailed,
     StreamError,
     Cancelled,
 }
@@ -471,7 +463,7 @@ impl NodeManager {
         }
         let session_id = BootstrapSessionId(self.next_bootstrap_session_id);
         self.next_bootstrap_session_id = self.next_bootstrap_session_id.wrapping_add(1).max(1);
-        let (run_id, logical_node_id, lease_id, boot, swarm_join, timeout_policy) = {
+        let (run_id, logical_node_id, lease_id, boot, swarm_join) = {
             let record = self.record_mut()?;
             let lease_id = record
                 .lease
@@ -495,7 +487,6 @@ impl NodeManager {
                 lease_id,
                 record.desired.boot.clone(),
                 record.desired.swarm_join.clone(),
-                record.desired.boot.timeout_policy,
             )
         };
         self.active_bootstrap = Some(session_id);
@@ -511,7 +502,6 @@ impl NodeManager {
                 ssh: endpoint,
                 boot,
                 swarm_join,
-                timeout_policy,
             },
         )])
     }
@@ -717,7 +707,6 @@ pub struct BootstrapSessionSpec {
     pub boot: BootSpec,
     pub swarm_join: SwarmJoinSpec,
     pub datastream: DatastreamStreamId,
-    pub timeout_policy: BootstrapTimeoutPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -784,8 +773,8 @@ impl BootstrapSession {
         let mut events = Vec::new();
         self.stage = BootstrapStage::SshConnecting;
         if !script.ssh_ok {
-            self.stage = BootstrapStage::SshTimeout;
-            return vec![BootstrapSessionEvent::Failed("ssh timeout".into())];
+            self.stage = BootstrapStage::SshConnectFailed;
+            return vec![BootstrapSessionEvent::Failed("ssh connect failed".into())];
         }
         self.stage = BootstrapStage::SshReady;
         events.push(BootstrapSessionEvent::Observed(
@@ -860,9 +849,9 @@ impl BootstrapSession {
         ]
     }
 
-    pub fn join_timeout(&mut self) -> Vec<BootstrapSessionEvent> {
-        self.stage = BootstrapStage::JoinTimeout;
-        vec![BootstrapSessionEvent::Failed("join timeout".into())]
+    pub fn join_failed(&mut self, reason: impl Into<String>) -> Vec<BootstrapSessionEvent> {
+        self.stage = BootstrapStage::SwactorJoinFailed;
+        vec![BootstrapSessionEvent::Failed(reason.into())]
     }
 
     pub fn cancel(&mut self) -> Vec<BootstrapSessionEvent> {

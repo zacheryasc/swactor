@@ -41,9 +41,6 @@ pub enum OrchestratorMsg {
         run_id: u64,
         endpoint: EndpointKindWire,
     },
-    ObserveExecutionTimeout {
-        run_id: u64,
-    },
     ObserveStageStopped {
         run_id: u64,
         stage_index: u32,
@@ -210,12 +207,6 @@ impl OrchestratorActor {
                         EndpointKindWire::TokenIn => core::EndpointKind::TokenIn,
                         EndpointKindWire::TokenOut => core::EndpointKind::TokenOut,
                     },
-                });
-            }
-            OrchestratorMsg::ObserveExecutionTimeout { run_id } => {
-                self.core.observe(core::RunEvent::Timeout {
-                    run_id: core::RunId(run_id),
-                    kind: core::TimeoutKind::Execution,
                 });
             }
             OrchestratorMsg::ObserveStageStopped {

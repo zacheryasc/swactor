@@ -47,20 +47,20 @@ pub async fn destroy_instance_with_retry(
     api_key: &str,
     contract_id: u64,
 ) -> Result<(), String> {
-    const ATTEMPTS: u32 = 5;
-    let mut last = String::new();
-    for attempt in 1..=ATTEMPTS {
+    let mut attempt = 1_u64;
+    loop {
         match destroy_instance(client, base_url, api_key, contract_id).await {
             Ok(()) => return Ok(()),
-            Err(e) => {
-                last = e;
-                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            Err(_) => {
+                let backoff = std::cmp::min(
+                    Duration::from_millis(500_u64.saturating_mul(attempt)),
+                    Duration::from_secs(30),
+                );
+                tokio::time::sleep(backoff).await;
+                attempt = attempt.saturating_add(1);
             }
         }
     }
-    Err(format!(
-        "destroy {contract_id} failed after {ATTEMPTS} attempts: {last}"
-    ))
 }
 
 pub(crate) async fn rollback(

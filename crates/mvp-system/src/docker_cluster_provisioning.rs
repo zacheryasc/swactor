@@ -270,14 +270,14 @@ impl<C: BootstrapSshClient> SshBootstrapSession<C> {
         let mut events = Vec::new();
         self.stage = BootstrapStage::SshConnecting;
         if let Err(error) = self.client.connect(&self.spec.ssh) {
-            self.stage = BootstrapStage::SshTimeout;
+            self.stage = BootstrapStage::SshConnectFailed;
             return vec![BootstrapSessionEvent::Failed(format!(
                 "ssh connect: {}",
                 error.reason
             ))];
         }
         if let Err(error) = self.client.probe_stdout() {
-            self.stage = BootstrapStage::SshTimeout;
+            self.stage = BootstrapStage::SshConnectFailed;
             return vec![BootstrapSessionEvent::Failed(format!(
                 "ssh probe: {}",
                 error.reason

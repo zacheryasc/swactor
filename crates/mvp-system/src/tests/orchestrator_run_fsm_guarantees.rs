@@ -2,7 +2,7 @@
 //!
 //! These tests intentionally know only the public orchestrator surface:
 //!
-//! - pool, plan, stage, endpoint, token, fault, stop, and timeout events in
+//! - pool, plan, stage, endpoint, token, fault, and stop events in
 //! - commands, lifecycle events, and terminal outcome out
 //!
 //! They assert the guarantees in
@@ -299,16 +299,9 @@ fn first_run_fault_reason_is_terminal_and_sticky() {
         run_id: fsm::RunId(7),
         endpoint: fsm::EndpointKind::TokenOut,
     });
-    harness.observe(fsm::RunEvent::Timeout {
-        run_id: fsm::RunId(7),
-        kind: fsm::TimeoutKind::Execution,
-    });
     harness.observe(fsm::RunEvent::MembershipLost {
         run_id: fsm::RunId(7),
         node_id: fsm::NodeId(11),
-    });
-    harness.observe(fsm::RunEvent::TeardownTimeout {
-        run_id: fsm::RunId(7),
     });
 
     // Exactly one terminal fault is recorded.
@@ -452,7 +445,7 @@ fn terminal_outcome_is_single_and_requires_teardown() {
 }
 
 // This proves run_torn_down is emitted exactly once and only after teardown
-// reaches a terminal state by stage stops or timeout.
+// observes every planned stage stop and local endpoint stop.
 #[test]
 fn run_torn_down_is_emitted_once_after_teardown_terminal_state() {
     // Fault a provisioned run so teardown is required.
@@ -481,7 +474,7 @@ fn run_torn_down_is_emitted_once_after_teardown_terminal_state() {
             .any(|event| { matches!(event, fsm::LifecycleEvent::RunTornDown { .. }) })
     );
 
-    // Finish teardown through remaining stopped events and local endpoint stop.
+    // StageStopped for every stage still is not enough until local endpoints stop.
     harness.observe(fsm::RunEvent::StageStopped {
         run_id: fsm::RunId(7),
         stage_index: 1,
@@ -490,6 +483,12 @@ fn run_torn_down_is_emitted_once_after_teardown_terminal_state() {
         run_id: fsm::RunId(7),
         stage_index: 2,
     });
+    assert!(
+        !harness
+            .events()
+            .iter()
+            .any(|event| { matches!(event, fsm::LifecycleEvent::RunTornDown { .. }) })
+    );
     harness.observe(fsm::RunEvent::TokenEndpointsStopped);
 
     // The final event may now appear, exactly once.
@@ -518,24 +517,4 @@ fn run_torn_down_is_emitted_once_after_teardown_terminal_state() {
         },
     );
     assert!(fault_pos < torn_down_pos);
-
-    let mut timeout = new_run();
-    timeout.observe(fsm::RunEvent::PoolReady {
-        nodes: plan.stage_nodes(),
-    });
-    timeout.observe(fsm::RunEvent::PlanAvailable(plan));
-    timeout.observe(fsm::RunEvent::StageFault {
-        run_id: fsm::RunId(7),
-        stage_index: 0,
-        reason: fsm::StageFaultReason::WorkerCrashed,
-    });
-    timeout.observe(fsm::RunEvent::TeardownTimeout {
-        run_id: fsm::RunId(7),
-    });
-    let timeout_torn_down_count = timeout
-        .events()
-        .iter()
-        .filter(|event| matches!(event, fsm::LifecycleEvent::RunTornDown { .. }))
-        .count();
-    assert_eq!(timeout_torn_down_count, 1);
 }

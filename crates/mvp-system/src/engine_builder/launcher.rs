@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration;
 
 use crate::run_plan::NodeId;
 
@@ -17,12 +16,8 @@ pub trait NodeLauncher: Send + Sync {
 }
 
 pub trait NodeControl: Send {
-    fn wait_boot_ready(&mut self, timeout: Duration) -> Result<NodeFacts, NodeControlError>;
-    fn wait_cluster_converged(
-        &mut self,
-        expected_alive: usize,
-        timeout: Duration,
-    ) -> Result<(), NodeControlError>;
+    fn wait_boot_ready(&mut self) -> Result<NodeFacts, NodeControlError>;
+    fn wait_cluster_converged(&mut self, expected_alive: usize) -> Result<(), NodeControlError>;
     fn assign_role(&mut self, assignment: RoleAssignment) -> Result<(), NodeControlError>;
     fn shutdown(&mut self) -> Result<(), NodeControlError>;
 }
@@ -105,7 +100,7 @@ impl StaticNodeControl {
 }
 
 impl NodeControl for StaticNodeControl {
-    fn wait_boot_ready(&mut self, _timeout: Duration) -> Result<NodeFacts, NodeControlError> {
+    fn wait_boot_ready(&mut self) -> Result<NodeFacts, NodeControlError> {
         if self.stopped {
             return Err(NodeControlError::Stopped {
                 node_id: self.node_id(),
@@ -115,11 +110,7 @@ impl NodeControl for StaticNodeControl {
         Ok(self.facts.clone())
     }
 
-    fn wait_cluster_converged(
-        &mut self,
-        expected_alive: usize,
-        _timeout: Duration,
-    ) -> Result<(), NodeControlError> {
+    fn wait_cluster_converged(&mut self, expected_alive: usize) -> Result<(), NodeControlError> {
         if self.stopped {
             return Err(NodeControlError::Stopped {
                 node_id: self.node_id(),

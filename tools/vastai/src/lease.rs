@@ -104,15 +104,14 @@ async fn provision_one(
     tried_offer_ids: &mut Vec<u64>,
     used_host_ids: &mut HashSet<u64>,
 ) -> Result<ProvisionedInstance, String> {
-    let mut last_err: Option<String> = None;
-    for attempt in 1..=req.lifecycle.max_create_attempts {
+    let mut attempt = 1_u64;
+    loop {
         let offer = match next_eligible_offer(pool, tried_offer_ids, used_host_ids) {
             Some(o) => o.clone(),
             None => {
-                last_err = Some(format!(
+                return Err(format!(
                     "pool exhausted for index {index} (no untried offer on an unused host)"
                 ));
-                break;
             }
         };
         tried_offer_ids.push(offer.id);
@@ -159,27 +158,23 @@ async fn provision_one(
             }
             Err(e) => {
                 eprintln!(
-                    "lease_chain: index {index} create on offer {} failed (attempt {attempt}/{}): {e}",
-                    offer.id, req.lifecycle.max_create_attempts,
+                    "lease_chain: index {index} create on offer {} failed (attempt {attempt}): {e}",
+                    offer.id,
                 );
                 let is_429 = e.contains("429") || e.contains("Too Many Requests");
-                last_err = Some(e);
-                if attempt < req.lifecycle.max_create_attempts {
-                    let backoff = if is_429 {
-                        Duration::from_millis(2000 * attempt as u64)
-                    } else {
-                        Duration::from_millis(400)
-                    };
-                    tokio::time::sleep(backoff).await;
-                }
+                let backoff = if is_429 {
+                    std::cmp::min(
+                        Duration::from_millis(2_000_u64.saturating_mul(attempt)),
+                        Duration::from_secs(30),
+                    )
+                } else {
+                    Duration::from_millis(400)
+                };
+                tokio::time::sleep(backoff).await;
+                attempt = attempt.saturating_add(1);
             }
         }
     }
-    Err(format!(
-        "index {index} could not be created after {} attempts: {}",
-        req.lifecycle.max_create_attempts,
-        last_err.unwrap_or_default(),
-    ))
 }
 
 fn as_instance_infos(instances: &[ProvisionedInstance]) -> Vec<InstanceInfo> {
@@ -236,7 +231,6 @@ pub async fn provision_fleet(
 
     for index in 0..req.count {
         let idx = index as usize;
-        let mut replaced = 0u32;
         loop {
             let cid = created[idx].contract_id;
             match wait_for_running_with_policy(client, base_url, api_key, cid, &req.lifecycle).await
@@ -253,27 +247,7 @@ pub async fn provision_fleet(
                             "lease_chain: WARNING could not destroy dead contract {cid}: {de}"
                         );
                     }
-                    replaced += 1;
-                    if replaced > req.lifecycle.max_replace_attempts {
-                        let survivors: Vec<InstanceInfo> = created
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| *i != idx)
-                            .map(|(_, c)| InstanceInfo {
-                                contract_id: c.contract_id,
-                            })
-                            .collect();
-                        rollback(client, base_url, api_key, &survivors).await;
-                        return Err(format!(
-                            "lease_chain: index {index} never reached running after \
-                             {} replacement(s); last error: {e}",
-                            req.lifecycle.max_replace_attempts,
-                        ));
-                    }
-                    eprintln!(
-                        "lease_chain: replacing index {index} (replacement {replaced}/{})",
-                        req.lifecycle.max_replace_attempts,
-                    );
+                    eprintln!("lease_chain: replacing index {index}");
                     match provision_one(
                         client,
                         base_url,

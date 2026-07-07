@@ -10,8 +10,6 @@ pub const ENV_MIN_RELIABILITY: &str = "PP_MIN_RELIABILITY";
 pub const ENV_REQUIRE_VERIFIED: &str = "PP_REQUIRE_VERIFIED";
 pub const ENV_DROP_CHEAP_FRAC: &str = "PP_DROP_CHEAP_FRAC";
 pub const ENV_LEASE_PACE_MS: &str = "PP_LEASE_PACE_MS";
-pub const ENV_MAX_REPLACE_ATTEMPTS: &str = "PP_MAX_REPLACE_ATTEMPTS";
-pub const ENV_PULL_STALL_SECS: &str = "PP_PULL_STALL_SECS";
 pub const ENV_BLACKLIST_HOSTS: &str = "PP_BLACKLIST_HOSTS";
 pub const ENV_ASSUME_YES: &str = "PP_ASSUME_YES";
 
@@ -75,7 +73,7 @@ impl SelectionPolicy {
 
 impl LifecyclePolicy {
     /// Build lifecycle policy from environment, using caller-provided poll cadence.
-    pub fn from_env(poll_interval: Duration, max_polls: u32) -> Self {
+    pub fn from_env(poll_interval: Duration) -> Self {
         let mut policy = Self::default();
         policy.lease_pace = Duration::from_millis(
             std::env::var(ENV_LEASE_PACE_MS)
@@ -83,19 +81,7 @@ impl LifecyclePolicy {
                 .and_then(|s| s.trim().parse::<u64>().ok())
                 .unwrap_or(600),
         );
-        policy.max_replace_attempts = std::env::var(ENV_MAX_REPLACE_ATTEMPTS)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(3);
         policy.poll_interval = poll_interval;
-        policy.max_polls = max_polls;
-        policy.pull_stall = Some(Duration::from_secs(
-            std::env::var(ENV_PULL_STALL_SECS)
-                .ok()
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(180),
-        ))
-        .filter(|d| !d.is_zero());
         policy
     }
 }
