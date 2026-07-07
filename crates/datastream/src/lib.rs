@@ -33,6 +33,7 @@
 pub mod emit;
 pub mod endpoint;
 pub mod frame;
+pub mod hardware;
 pub mod health;
 pub mod ingest;
 pub mod mux;

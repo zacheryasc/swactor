@@ -9,7 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use datastream::ChannelId;
-use datastream::emit::{ClusterFrameSink, DatastreamEmitter, EmitterConfig, FrameSink, NoopSink};
+use datastream::emit::{
+    ClusterFrameSink, DatastreamEmitter, DatastreamEventSink, EmitterConfig, FrameSink, NoopSink,
+};
 
 use distribution::node::DistributedNodeConfig;
 use iroh::EndpointAddr;
@@ -18,11 +20,13 @@ use mvp_system::actors::node_agent::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire,
 };
 use mvp_system::actors::register_mvp_actor_codecs;
+use mvp_system::arena_manager as arena;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::prompt_rpc::PromptEvent;
 use mvp_system::relay_provisioning::relay_runtime_config_from_env;
 use mvp_system::run_plan::{GgufSource, TokenizerSource};
 use mvp_system::stage_controller as stage;
+use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
 
@@ -31,6 +35,8 @@ const DEFAULT_DEVICE: &str = "CUDA";
 const DEFAULT_HF_REPO: &str = "bartowski/Llama-3.2-1B-Instruct-GGUF";
 const DEFAULT_HF_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
+const DEFAULT_ARENA_BYTES: u64 = 64 * 1024 * 1024;
+const DEFAULT_ARENA_ALIGNMENT: u64 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const NODE_BOOTSTRAP_CHANNEL: &str = "mvp.node.bootstrap";
 const NODE_RUNTIME_CHANNEL: &str = "mvp.node.runtime";
@@ -92,11 +98,104 @@ fn emit_node_event(
     datastream.tick();
 }
 
+fn spawn_host_gpu_sampler(handle: tokio::runtime::Handle, sink: DatastreamEventSink) {
+    handle.spawn(async move {
+        let mut seq = 0_u64;
+        let mut interval = tokio::time::interval(datastream::hardware::gpu::GPU_SAMPLE_INTERVAL);
+
+        loop {
+            interval.tick().await;
+
+            let sample_seq = seq;
+            let sample = match tokio::task::spawn_blocking(move || {
+                datastream::hardware::gpu::sample(sample_seq)
+            })
+            .await
+            {
+                Ok(sample) => sample,
+                Err(error) => datastream::hardware::gpu::HostGpuSample::error(
+                    sample_seq,
+                    format!("gpu sampler task failed: {error}"),
+                ),
+            };
+
+            seq = seq.saturating_add(1);
+            sink.submit_record(&sample);
+        }
+    });
+}
+
+fn spawn_host_cpu_sampler(
+    handle: tokio::runtime::Handle,
+    sink: DatastreamEventSink,
+    watched_pids: Vec<u32>,
+) {
+    handle.spawn(async move {
+        let mut seq = 0_u64;
+        let mut sampler = datastream::hardware::cpu::CpuSampler::new(watched_pids);
+        let mut interval = tokio::time::interval(datastream::hardware::cpu::CPU_SAMPLE_INTERVAL);
+
+        loop {
+            interval.tick().await;
+
+            let sample = sampler.sample(seq);
+            seq = seq.saturating_add(1);
+            sink.submit_record(&sample);
+        }
+    });
+}
+fn spawn_host_net_sampler(handle: tokio::runtime::Handle, sink: DatastreamEventSink) {
+    handle.spawn(async move {
+        let mut seq = 0_u64;
+        let mut interval =
+            tokio::time::interval(datastream::hardware::net::HOST_NET_SAMPLE_INTERVAL);
+
+        loop {
+            interval.tick().await;
+
+            let sample_seq = seq;
+            let sample = match tokio::task::spawn_blocking(move || {
+                datastream::hardware::net::sample(sample_seq)
+            })
+            .await
+            {
+                Ok(sample) => sample,
+                Err(error) => datastream::hardware::net::HostNetSample::error(
+                    sample_seq,
+                    format!("network sampler task failed: {error}"),
+                ),
+            };
+
+            seq = seq.saturating_add(1);
+            sink.submit_record(&sample);
+        }
+    });
+}
+
+fn spawn_arena_sampler(
+    handle: tokio::runtime::Handle,
+    sink: DatastreamEventSink,
+    arena_manager: Arc<Mutex<arena::ArenaManager>>,
+) {
+    handle.spawn(async move {
+        let mut seq = 0_u64;
+        let mut interval = tokio::time::interval(arena::ARENA_SAMPLE_INTERVAL);
+
+        loop {
+            interval.tick().await;
+
+            let sample = arena_manager.lock().sample(seq);
+            seq = seq.saturating_add(1);
+            sink.submit_record(&sample);
+        }
+    });
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mvp-node: {error}");
+            eprintln!("mvp-worker-node: {error}");
             ExitCode::from(1)
         }
     }
@@ -117,7 +216,8 @@ fn run() -> Result<(), String> {
             "has_orchestrator_actor":config.orchestrator_actor.is_some(),
             "has_datastream_sink_actor":config.datastream_sink_actor.is_some(),
             "self_test_enabled":config.self_test_prompt.is_some(),
-            "max_runtime_secs":config.max_runtime.as_secs(),
+            "arena_bytes":config.arena_bytes,
+            "arena_alignment":config.arena_alignment,
         }),
     )?;
     emit_stdio_node_event(
@@ -125,7 +225,7 @@ fn run() -> Result<(), String> {
         NODE_BOOTSTRAP_CHANNEL,
         "process",
         "started",
-        json!({"binary":"mvp-node","pid":std::process::id()}),
+        json!({"binary":"mvp-worker-node","pid":std::process::id()}),
     )?;
 
     let tokio = match tokio::runtime::Runtime::new() {
@@ -238,7 +338,44 @@ fn run() -> Result<(), String> {
         json!({"transport":"iroh","routes":"attached"}),
     )?;
 
+    let arena_manager = match arena::ArenaManager::boot(arena::ArenaConfig {
+        node_id: arena::NodeId(config.logical_node_id),
+        reservation_ceiling: config.arena_bytes,
+        base_alignment: config.arena_alignment,
+    }) {
+        Ok(manager) => {
+            emit_stdio_node_event(
+                &config,
+                NODE_BOOTSTRAP_CHANNEL,
+                "arena_manager",
+                "ready",
+                json!({
+                    "arena_bytes":config.arena_bytes,
+                    "arena_alignment":config.arena_alignment,
+                }),
+            )?;
+            Arc::new(Mutex::new(manager))
+        }
+        Err(error) => {
+            emit_stdio_node_event(
+                &config,
+                NODE_BOOTSTRAP_CHANNEL,
+                "arena_manager",
+                "failed",
+                json!({"error":format!("{error:?}")}),
+            )?;
+            return Err(format!("boot arena manager: {error:?}"));
+        }
+    };
+
     let mut datastream = node_datastream(&config, &stack);
+    spawn_host_gpu_sampler(tokio.handle().clone(), datastream.event_sink());
+    spawn_host_net_sampler(tokio.handle().clone(), datastream.event_sink());
+    spawn_arena_sampler(
+        tokio.handle().clone(),
+        datastream.event_sink(),
+        Arc::clone(&arena_manager),
+    );
     emit_stdio_node_event(
         &config,
         NODE_BOOTSTRAP_CHANNEL,
@@ -342,6 +479,11 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
     };
+    spawn_host_cpu_sampler(
+        tokio.handle().clone(),
+        datastream.event_sink(),
+        vec![std::process::id(), worker.pid()],
+    );
     emit_stdio_node_event(
         &config,
         NODE_WORKER_CHANNEL,
@@ -447,10 +589,9 @@ fn run() -> Result<(), String> {
         "started",
         json!({
             "poll_interval_ms":PUMP_INTERVAL.as_millis(),
-            "checks":["network","datastream","node_reports","stdin_shutdown","worker_health","max_runtime"],
+            "checks":["network","datastream","node_reports","stdin_shutdown","worker_health"],
         }),
     );
-    let started = Instant::now();
     loop {
         pump_network(&mut driver, &stack);
         datastream.tick();
@@ -519,27 +660,6 @@ fn run() -> Result<(), String> {
                 .runtime
                 .send_to(node_actor, NodeAgentMsg::WorkerCrashed);
             return Err(format!("tinygrad helper exited with {status}"));
-        }
-        if started.elapsed() > config.max_runtime && config.max_runtime != Duration::ZERO {
-            emit_node_event(
-                &mut datastream,
-                &config,
-                NODE_SHUTDOWN_CHANNEL,
-                "max_runtime",
-                "started",
-                json!({"max_runtime_secs":config.max_runtime.as_secs()}),
-            );
-            let mut pump = || pump_network(&mut driver, &stack);
-            let _ = worker.shutdown(&config, &mut datastream, &mut pump);
-            emit_node_event(
-                &mut datastream,
-                &config,
-                NODE_SHUTDOWN_CHANNEL,
-                "node_exit",
-                "ready",
-                json!({"result":"max_runtime_elapsed"}),
-            );
-            return Ok(());
         }
         thread::sleep(PUMP_INTERVAL);
     }
@@ -1042,7 +1162,7 @@ fn handle_stage_command(
                 NODE_STAGE_CHANNEL,
                 "rewire_edge",
                 "skipped",
-                json!({"reason":"not implemented in mvp-node image path"}),
+                json!({"reason":"not implemented in mvp-worker-node image path"}),
             );
             Ok(())
         }
@@ -1053,12 +1173,12 @@ fn handle_stage_command(
                 NODE_STAGE_CHANNEL,
                 "release_input_handle",
                 "skipped",
-                json!({"reason":"not implemented in mvp-node image path"}),
+                json!({"reason":"not implemented in mvp-worker-node image path"}),
             );
             Ok(())
         }
         StageCommandWire::ExecuteStep { .. } => {
-            let error = "mvp-node image path does not carry ring payload commands yet";
+            let error = "mvp-worker-node image path does not carry ring payload commands yet";
             emit_node_event(
                 datastream,
                 config,
@@ -1145,7 +1265,8 @@ struct DeploymentConfig {
     self_test_prompt: Option<String>,
     self_test_layer_end: u32,
     self_test_max_tokens: u32,
-    max_runtime: Duration,
+    arena_bytes: u64,
+    arena_alignment: u64,
 }
 
 impl DeploymentConfig {
@@ -1169,7 +1290,8 @@ impl DeploymentConfig {
             self_test_prompt: env_optional("MVP_NODE_SELF_TEST_PROMPT"),
             self_test_layer_end: env_u32("MVP_SELF_TEST_LAYER_END", 16)?,
             self_test_max_tokens: env_u32("MVP_SELF_TEST_MAX_TOKENS", 1)?,
-            max_runtime: Duration::from_secs(env_u64("MVP_NODE_MAX_RUNTIME_SECS", 0)?),
+            arena_bytes: env_u64("MVP_ARENA_BYTES", DEFAULT_ARENA_BYTES)?,
+            arena_alignment: env_u64("MVP_ARENA_ALIGNMENT", DEFAULT_ARENA_ALIGNMENT)?,
         })
     }
 
@@ -1234,6 +1356,10 @@ impl TinygradWorker {
             stdout: BufReader::new(stdout),
             stderr_rx,
         })
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     fn initialize(

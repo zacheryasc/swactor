@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
@@ -16,7 +17,8 @@ use crate::node_provisioning::{
     ProviderError, ProviderKind, ProviderLeaseId, ProviderPlugin, SshEndpoint,
 };
 use crate::provisioning::{
-    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionPlugin,
+    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
+    ProvisionPlugin,
 };
 
 #[derive(Clone, Debug)]
@@ -28,6 +30,7 @@ pub struct VastAiProvisioningConfig {
     pub lifecycle: LifecyclePolicy,
     pub confirm_lease: bool,
     pub onstart: Option<String>,
+    pub ssh_public_key: Option<String>,
 }
 
 impl Default for VastAiProvisioningConfig {
@@ -40,6 +43,7 @@ impl Default for VastAiProvisioningConfig {
             lifecycle: LifecyclePolicy::default(),
             confirm_lease: false,
             onstart: None,
+            ssh_public_key: None,
         }
     }
 }
@@ -373,12 +377,19 @@ pub trait VastAiBootstrapLauncher: Send {
     fn stop_bootstrap(&mut self, handle: &mut Self::Handle);
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-pub struct SshCommandBootstrapLauncher;
-
+#[derive(Default, Debug, Clone)]
+pub struct SshCommandBootstrapLauncher {
+    ssh_identity: Option<PathBuf>,
+}
 pub struct SshCommandBootstrapHandle {
-    child: Arc<Mutex<Child>>,
+    child: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
+}
+
+impl SshCommandBootstrapLauncher {
+    pub fn new(ssh_identity: Option<PathBuf>) -> Self {
+        Self { ssh_identity }
+    }
 }
 
 impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
@@ -398,93 +409,231 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
             ));
         }
 
-        let mut command = Command::new("ssh");
-        command
-            .arg("-p")
-            .arg(endpoint.port.to_string())
-            .arg("-o")
-            .arg("BatchMode=yes")
-            .arg(format!("{}@{}", endpoint.user, endpoint.host))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command.arg(spec.args.join(" "));
-
-        let mut child = command
-            .spawn()
-            .map_err(|e| format!("spawn VastAI SSH bootstrap {}: {e}", spec.node_id))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("VastAI node {} SSH stdout missing", spec.node_id))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| format!("VastAI node {} SSH stderr missing", spec.node_id))?;
-
-        let run_id = spec.run_id;
-        let node_id = spec.node_id;
-        let exit_sink = sink.clone();
-        let child = Arc::new(Mutex::new(child));
+        let child = Arc::new(Mutex::new(None));
         let stopping = Arc::new(AtomicBool::new(false));
-        let bridge = BootstrapDatastreamBridge::new(spec, sink, producer);
-        bridge.spawn_stdout_reader(stdout);
-        bridge.spawn_stderr_reader(stderr);
-        spawn_ssh_exit_watcher(run_id, node_id, child.clone(), stopping.clone(), exit_sink);
+        spawn_retrying_ssh_bootstrap(
+            spec,
+            endpoint,
+            sink,
+            producer,
+            self.ssh_identity.clone(),
+            child.clone(),
+            stopping.clone(),
+        );
 
         Ok(SshCommandBootstrapHandle { child, stopping })
     }
 
     fn stop_bootstrap(&mut self, handle: &mut Self::Handle) {
         handle.stopping.store(true, Ordering::SeqCst);
-        let mut child = handle.child.lock();
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(mut child) = handle.child.lock().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
-fn spawn_ssh_exit_watcher(
-    run_id: u64,
-    node_id: u64,
-    child: Arc<Mutex<Child>>,
-    stopping: Arc<AtomicBool>,
+struct ReadyTrackingSink {
+    inner: PluginSink,
+    ready: Arc<AtomicBool>,
+}
+
+impl PluginObservationSink for ReadyTrackingSink {
+    fn observe(&self, observation: PluginObservation) {
+        if matches!(observation, PluginObservation::RuntimeReady { .. }) {
+            self.ready.store(true, Ordering::SeqCst);
+        }
+        self.inner.observe(observation);
+    }
+}
+
+fn spawn_retrying_ssh_bootstrap(
+    spec: NodeProvisionSpec,
+    endpoint: VastAiSshEndpoint,
     sink: PluginSink,
+    producer: Option<DatastreamProducer>,
+    ssh_identity: Option<PathBuf>,
+    child_slot: Arc<Mutex<Option<Child>>>,
+    stopping: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
-        loop {
-            match child.lock().try_wait() {
-                Ok(Some(status)) => {
-                    if stopping.load(Ordering::SeqCst) {
-                        return;
+        let run_id = spec.run_id;
+        let node_id = spec.node_id;
+        let ready = Arc::new(AtomicBool::new(false));
+        let tracking_sink = PluginSink::new(Arc::new(ReadyTrackingSink {
+            inner: sink.clone(),
+            ready: ready.clone(),
+        }));
+        let mut attempt = 1u64;
+        let mut backoff = Duration::from_secs(1);
+
+        while !stopping.load(Ordering::SeqCst) && !ready.load(Ordering::SeqCst) {
+            sink.observe(PluginObservation::ProviderLine {
+                run_id,
+                node_id,
+                line: format!(
+                    "VastAI SSH bootstrap attempt {attempt} to {}@{}:{}",
+                    endpoint.user, endpoint.host, endpoint.port
+                ),
+            });
+
+            match spawn_ssh_bootstrap_attempt(&spec, &endpoint, ssh_identity.as_deref()) {
+                Ok((child, stdout, stderr)) => {
+                    *child_slot.lock() = Some(child);
+                    let bridge = BootstrapDatastreamBridge::new(
+                        spec.clone(),
+                        tracking_sink.clone(),
+                        producer.clone(),
+                    );
+                    bridge.spawn_stdout_reader(stdout);
+                    bridge.spawn_stderr_reader(stderr);
+
+                    loop {
+                        if stopping.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        if ready.load(Ordering::SeqCst) {
+                            sink.observe(PluginObservation::ProviderLine {
+                                run_id,
+                                node_id,
+                                line:
+                                    "VastAI SSH bootstrap observed runtime ready; handoff complete"
+                                        .to_owned(),
+                            });
+                            return;
+                        }
+
+                        let wait_result = {
+                            let mut guard = child_slot.lock();
+                            match guard.as_mut() {
+                                Some(child) => match child.try_wait() {
+                                    Ok(Some(status)) => {
+                                        *guard = None;
+                                        Some(Ok(status))
+                                    }
+                                    Ok(None) => None,
+                                    Err(error) => {
+                                        *guard = None;
+                                        Some(Err(error))
+                                    }
+                                },
+                                None => Some(Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    "ssh child missing",
+                                ))),
+                            }
+                        };
+
+                        match wait_result {
+                            Some(Ok(status)) => {
+                                let line = if status.success() {
+                                    format!(
+                                        "VastAI SSH bootstrap exited before runtime ready: {status}; retrying"
+                                    )
+                                } else {
+                                    format!(
+                                        "VastAI SSH bootstrap failed before runtime ready: {status}; retrying"
+                                    )
+                                };
+                                sink.observe(PluginObservation::ProviderLine {
+                                    run_id,
+                                    node_id,
+                                    line,
+                                });
+                                break;
+                            }
+                            Some(Err(error)) => {
+                                sink.observe(PluginObservation::ProviderLine {
+                                    run_id,
+                                    node_id,
+                                    line: format!("wait VastAI SSH bootstrap: {error}; retrying"),
+                                });
+                                break;
+                            }
+                            None => std::thread::sleep(Duration::from_millis(100)),
+                        }
                     }
-                    if status.success() {
-                        sink.observe(PluginObservation::Exited {
-                            run_id,
-                            node_id,
-                            status: status.code(),
-                        });
-                    } else {
-                        sink.observe(PluginObservation::Failed {
-                            run_id,
-                            node_id,
-                            reason: format!("VastAI SSH bootstrap exited: {status}"),
-                        });
-                    }
-                    return;
                 }
-                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(error) => {
-                    if !stopping.load(Ordering::SeqCst) {
-                        sink.observe(PluginObservation::Failed {
-                            run_id,
-                            node_id,
-                            reason: format!("wait VastAI SSH bootstrap: {error}"),
-                        });
-                    }
-                    return;
+                    sink.observe(PluginObservation::ProviderLine {
+                        run_id,
+                        node_id,
+                        line: format!("spawn VastAI SSH bootstrap failed: {error}; retrying"),
+                    });
                 }
             }
+
+            if stopping.load(Ordering::SeqCst) || ready.load(Ordering::SeqCst) {
+                return;
+            }
+            sink.observe(PluginObservation::ProviderLine {
+                run_id,
+                node_id,
+                line: format!("VastAI SSH bootstrap retrying in {}s", backoff.as_secs()),
+            });
+            std::thread::sleep(backoff);
+            backoff = next_ssh_backoff(backoff);
+            attempt += 1;
         }
     });
+}
+
+fn spawn_ssh_bootstrap_attempt(
+    spec: &NodeProvisionSpec,
+    endpoint: &VastAiSshEndpoint,
+    ssh_identity: Option<&Path>,
+) -> Result<(Child, std::process::ChildStdout, std::process::ChildStderr), String> {
+    let mut command = Command::new("ssh");
+    command
+        .args(ssh_bootstrap_args(
+            endpoint,
+            &spec.args.join(" "),
+            ssh_identity,
+        ))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("spawn VastAI SSH bootstrap {}: {e}", spec.node_id))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("VastAI node {} SSH stdout missing", spec.node_id))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("VastAI node {} SSH stderr missing", spec.node_id))?;
+    Ok((child, stdout, stderr))
+}
+
+fn ssh_bootstrap_args(
+    endpoint: &VastAiSshEndpoint,
+    remote_command: &str,
+    ssh_identity: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-v".to_owned(),
+        "-p".to_owned(),
+        endpoint.port.to_string(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "StrictHostKeyChecking=accept-new".to_owned(),
+    ];
+    if let Some(identity) = ssh_identity {
+        args.push("-i".to_owned());
+        args.push(identity.to_string_lossy().into_owned());
+        args.push("-o".to_owned());
+        args.push("IdentitiesOnly=yes".to_owned());
+    }
+    args.push(format!("{}@{}", endpoint.user, endpoint.host));
+    args.push(remote_command.to_owned());
+    args
+}
+
+fn next_ssh_backoff(current: Duration) -> Duration {
+    std::cmp::min(current.saturating_mul(2), Duration::from_secs(30))
 }
 
 pub struct VastAiProvisioningPlugin<C, B>
@@ -558,7 +707,15 @@ where
     }
 
     fn build_request(&self, spec: &NodeProvisionSpec, label: String) -> ProvisionRequest {
-        let env = spec.env.iter().cloned().collect::<BTreeMap<_, _>>();
+        let mut env = spec.env.iter().cloned().collect::<BTreeMap<_, _>>();
+        if let Some(key) = self
+            .config
+            .ssh_public_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+        {
+            env.insert("SSH_PUBLIC_KEY".to_owned(), key.to_owned());
+        }
         ProvisionRequest {
             count: 1,
             image: spec.image.clone(),
@@ -566,11 +723,7 @@ where
             disk_gb: self.config.disk_gb,
             env,
             per_instance_env: vec![BTreeMap::new()],
-            onstart: self
-                .config
-                .onstart
-                .clone()
-                .or_else(|| (!spec.args.is_empty()).then(|| spec.args.join(" "))),
+            onstart: self.config.onstart.clone(),
             selection: self.config.selection.clone(),
             lifecycle: self.config.lifecycle.clone(),
             confirm_lease: self.config.confirm_lease,
@@ -673,5 +826,172 @@ where
             self.bootstrap.stop_bootstrap(&mut bootstrap);
         }
         self.client.destroy_contract(node.contract_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct NoopLeaseClient;
+
+    impl VastAiLeaseClient for NoopLeaseClient {
+        fn provision_one(
+            &mut self,
+            _request: ProvisionRequest,
+        ) -> Result<ProvisionedInstance, String> {
+            panic!("build_request tests must not provision a real Vast.ai lease")
+        }
+
+        fn ssh_endpoint(
+            &mut self,
+            _contract_id: u64,
+            _label: &str,
+            _lifecycle: &LifecyclePolicy,
+            _ssh_user: &str,
+        ) -> Result<VastAiSshEndpoint, String> {
+            panic!("build_request tests must not query a real Vast.ai endpoint")
+        }
+
+        fn destroy_contract(&mut self, _contract_id: u64) -> Result<(), String> {
+            panic!("build_request tests must not destroy a real Vast.ai lease")
+        }
+    }
+
+    struct NoopBootstrapLauncher;
+
+    impl VastAiBootstrapLauncher for NoopBootstrapLauncher {
+        type Handle = ();
+
+        fn start_bootstrap(
+            &mut self,
+            _spec: NodeProvisionSpec,
+            _endpoint: VastAiSshEndpoint,
+            _sink: PluginSink,
+            _producer: Option<DatastreamProducer>,
+        ) -> Result<Self::Handle, String> {
+            panic!("build_request tests must not start SSH bootstrap")
+        }
+
+        fn stop_bootstrap(&mut self, _handle: &mut Self::Handle) {
+            panic!("build_request tests must not stop SSH bootstrap")
+        }
+    }
+
+    fn node_spec_with_bootstrap_args() -> NodeProvisionSpec {
+        NodeProvisionSpec {
+            run_id: 9,
+            node_id: 11,
+            stage_index: Some(2),
+            image: "registry.example.com/mvp-worker:latest".to_owned(),
+            env: vec![("EXISTING".to_owned(), "1".to_owned())],
+            args: vec!["python".to_owned(), "worker.py".to_owned()],
+            mounts: Vec::new(),
+        }
+    }
+
+    fn plugin_with_onstart(
+        onstart: Option<String>,
+    ) -> VastAiProvisioningPlugin<NoopLeaseClient, NoopBootstrapLauncher> {
+        let config = VastAiProvisioningConfig {
+            onstart,
+            ..VastAiProvisioningConfig::default()
+        };
+        VastAiProvisioningPlugin::new(NoopLeaseClient, NoopBootstrapLauncher, config)
+    }
+
+    #[test]
+    fn vastai_provisioning_build_request_keeps_bootstrap_args_out_of_onstart() {
+        let plugin = plugin_with_onstart(None);
+        let request =
+            plugin.build_request(&node_spec_with_bootstrap_args(), "test-label".to_owned());
+
+        assert_eq!(request.onstart, None);
+        assert_eq!(request.label.as_deref(), Some("test-label"));
+        assert_eq!(request.env.get("EXISTING").map(String::as_str), Some("1"));
+    }
+
+    #[test]
+    fn vastai_provisioning_build_request_uses_explicit_onstart() {
+        let plugin = plugin_with_onstart(Some("echo explicit setup".to_owned()));
+        let request =
+            plugin.build_request(&node_spec_with_bootstrap_args(), "test-label".to_owned());
+
+        assert_eq!(request.onstart.as_deref(), Some("echo explicit setup"));
+    }
+
+    #[test]
+    fn vastai_provisioning_next_ssh_backoff_doubles_until_thirty_second_cap() {
+        for (current, expected) in [
+            (Duration::from_secs(1), Duration::from_secs(2)),
+            (Duration::from_secs(15), Duration::from_secs(30)),
+            (Duration::from_secs(20), Duration::from_secs(30)),
+            (Duration::from_secs(30), Duration::from_secs(30)),
+        ] {
+            assert_eq!(
+                next_ssh_backoff(current),
+                expected,
+                "backoff from {current:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_bootstrap_args_include_verbose_flag_and_identity_when_configured() {
+        let endpoint = VastAiSshEndpoint {
+            host: "ssh5.vast.ai".to_owned(),
+            port: 22017,
+            user: "ubuntu".to_owned(),
+        };
+
+        let args = ssh_bootstrap_args(&endpoint, "python worker.py", Some(Path::new("/tmp/key")));
+
+        assert_eq!(
+            args,
+            vec![
+                "-v",
+                "-p",
+                "22017",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "-i",
+                "/tmp/key",
+                "-o",
+                "IdentitiesOnly=yes",
+                "ubuntu@ssh5.vast.ai",
+                "python worker.py",
+            ]
+        );
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == "-v").count(), 1);
+    }
+
+    #[test]
+    fn ssh_bootstrap_args_keep_identity_absent_when_not_configured() {
+        let endpoint = VastAiSshEndpoint {
+            host: "ssh5.vast.ai".to_owned(),
+            port: 22017,
+            user: "ubuntu".to_owned(),
+        };
+
+        let args = ssh_bootstrap_args(&endpoint, "python worker.py", None);
+
+        assert_eq!(
+            args,
+            vec![
+                "-v",
+                "-p",
+                "22017",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "StrictHostKeyChecking=accept-new",
+                "ubuntu@ssh5.vast.ai",
+                "python worker.py",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "-i"));
+        assert!(!args.iter().any(|arg| arg == "IdentitiesOnly=yes"));
     }
 }

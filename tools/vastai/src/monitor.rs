@@ -7,13 +7,12 @@ pub async fn wait_for_running(
     api_key: &str,
     contract_id: u64,
     poll_interval: std::time::Duration,
-    max_polls: u32,
 ) -> Result<RunningInstance, String> {
-    let policy = LifecyclePolicy::from_env(poll_interval, max_polls);
+    let policy = LifecyclePolicy::from_env(poll_interval);
     wait_for_running_with_policy(client, base_url, api_key, contract_id, &policy).await
 }
 
-/// Poll vast.ai until an instance reaches `running`, or fail on terminal/stalled state.
+/// Poll vast.ai until an instance reaches `running`, or fail on terminal provider state.
 pub async fn wait_for_running_with_policy(
     client: &reqwest::Client,
     base_url: &str,
@@ -23,12 +22,11 @@ pub async fn wait_for_running_with_policy(
 ) -> Result<RunningInstance, String> {
     let url = format!("{base_url}/api/v0/instances/{contract_id}/");
     let mut state_since = std::time::Instant::now();
-    let mut progress_since = std::time::Instant::now();
     let mut last_state: Option<String> = None;
-    let mut last_msg: Option<String> = None;
-    let mut last_disk: Option<f64> = None;
 
-    for poll in 0..policy.max_polls {
+    let mut poll = 0_u64;
+    loop {
+        poll += 1;
         let resp = match client
             .get(&url)
             .header("Authorization", format!("Bearer {api_key}"))
@@ -37,11 +35,7 @@ pub async fn wait_for_running_with_policy(
         {
             Ok(r) => r,
             Err(e) => {
-                eprintln!(
-                    "  contract {contract_id} poll {}/{}: request error: {e} (retrying)",
-                    poll + 1,
-                    policy.max_polls,
-                );
+                eprintln!("  contract {contract_id} poll {poll}: request error: {e} (retrying)");
                 tokio::time::sleep(policy.poll_interval).await;
                 continue;
             }
@@ -51,9 +45,7 @@ pub async fn wait_for_running_with_policy(
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             eprintln!(
-                "  contract {contract_id} poll {}/{}: HTTP {status} (retrying): {}",
-                poll + 1,
-                policy.max_polls,
+                "  contract {contract_id} poll {poll}: HTTP {status} (retrying): {}",
                 body.chars().take(80).collect::<String>(),
             );
             tokio::time::sleep(policy.poll_interval).await;
@@ -71,19 +63,11 @@ pub async fn wait_for_running_with_policy(
 
         let msg = status.status_msg.clone();
         let disk = status.disk_usage;
-        if msg != last_msg || disk != last_disk {
-            progress_since = std::time::Instant::now();
-        }
+
         if last_state.as_deref() != Some(actual) {
             state_since = std::time::Instant::now();
         }
         last_state = Some(actual.to_string());
-        last_msg = msg.clone();
-        last_disk = disk;
-
-        let stalled = policy
-            .pull_stall
-            .is_some_and(|stall| progress_since.elapsed() >= stall);
         let in_state = state_since.elapsed().as_secs();
         let msg_disp = match msg.as_deref() {
             Some(m) if !m.is_empty() => format!(" msg=\"{m}\""),
@@ -94,10 +78,7 @@ pub async fn wait_for_running_with_policy(
             _ => String::new(),
         };
         eprintln!(
-            "  contract {contract_id} poll {}/{}: status={actual} in-state={in_state}s {}{msg_disp}{disk_disp}",
-            poll + 1,
-            policy.max_polls,
-            if stalled { "STALLED" } else { "progressing" },
+            "  contract {contract_id} poll {poll}: status={actual} in-state={in_state}s{msg_disp}{disk_disp}",
         );
 
         if let Some(m) = &msg {
@@ -126,18 +107,8 @@ pub async fn wait_for_running_with_policy(
                 ));
             }
             _ => {
-                if stalled {
-                    return Err(format!(
-                        "instance {contract_id} stalled in '{actual}' for {}s with no status_msg/disk_usage progress",
-                        progress_since.elapsed().as_secs()
-                    ));
-                }
                 tokio::time::sleep(policy.poll_interval).await;
             }
         }
     }
-
-    Err(format!(
-        "instance {contract_id} did not reach running within poll limit"
-    ))
 }

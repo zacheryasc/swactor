@@ -1,8 +1,0 @@
-# Operator's real relay/secrets — never committed. Copy profiles/example.env
-# here and fill in your relay URL.
-profiles/local.env
-*.local.env
-
-# Cluster-handle state (orchestrator secret + rented vast.ai contracts).
-.pp-cluster.json
-smoke.log

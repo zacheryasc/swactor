@@ -14,7 +14,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo build --release -p mvp-system --bin mvp-node
+cargo build --release -p mvp-system --bin mvp-worker-node
 docker build -f apps/mvp-node/Dockerfile.base -t "$BASE_IMAGE" .
 docker build -f apps/mvp-node/Dockerfile --build-arg BASE_IMAGE="$BASE_IMAGE" -t "$IMAGE" .
 

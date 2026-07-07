@@ -7,6 +7,8 @@ target/*
 !target/release/
 target/release/*
 !target/release/mvp-node
+!target/release/mvp-worker-node
 !target/debug/
 target/debug/*
 !target/debug/mvp-node
+!target/debug/mvp-worker-node

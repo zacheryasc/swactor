@@ -65,11 +65,6 @@ pub enum EndpointKind {
     TokenOut,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeoutKind {
-    Execution,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunEvent {
     PoolReady {
@@ -96,19 +91,12 @@ pub enum RunEvent {
         run_id: RunId,
         endpoint: EndpointKind,
     },
-    Timeout {
-        run_id: RunId,
-        kind: TimeoutKind,
-    },
     OperatorStop {
         run_id: RunId,
     },
     MembershipLost {
         run_id: RunId,
         node_id: NodeId,
-    },
-    TeardownTimeout {
-        run_id: RunId,
     },
     StageStopped {
         run_id: RunId,
@@ -126,13 +114,9 @@ pub enum RunFaultReason {
     EndpointFault {
         endpoint: EndpointKind,
     },
-    Timeout {
-        kind: TimeoutKind,
-    },
     MembershipLost {
         node_id: NodeId,
     },
-    TeardownTimeout,
     UnknownStageReady {
         stage_index: u32,
     },
@@ -293,20 +277,11 @@ impl OrchestratorRun {
             RunEvent::EndpointFault { run_id, endpoint } if run_id == self.config.run_id => {
                 self.fault(RunFaultReason::EndpointFault { endpoint });
             }
-            RunEvent::Timeout { run_id, kind } if run_id == self.config.run_id => {
-                self.fault(RunFaultReason::Timeout { kind });
-            }
             RunEvent::OperatorStop { run_id } if run_id == self.config.run_id => {
                 self.operator_stop();
             }
             RunEvent::MembershipLost { run_id, node_id } if run_id == self.config.run_id => {
                 self.fault(RunFaultReason::MembershipLost { node_id });
-            }
-            RunEvent::TeardownTimeout { run_id } if run_id == self.config.run_id => {
-                if !self.terminal {
-                    self.fault(RunFaultReason::TeardownTimeout);
-                }
-                self.mark_torn_down();
             }
             RunEvent::StageStopped {
                 run_id,
@@ -321,10 +296,8 @@ impl OrchestratorRun {
             }
             RunEvent::StageFault { .. }
             | RunEvent::EndpointFault { .. }
-            | RunEvent::Timeout { .. }
             | RunEvent::OperatorStop { .. }
             | RunEvent::MembershipLost { .. }
-            | RunEvent::TeardownTimeout { .. }
             | RunEvent::StageStopped { .. } => {}
         }
     }

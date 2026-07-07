@@ -1,4 +1,29 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use datastream::Record;
+use serde::{Deserialize, Serialize};
+
+pub const ARENA_SAMPLE_CHANNEL: &str = "mvp.arena";
+pub const ARENA_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArenaSample {
+    pub seq: u64,
+    pub sample_unix_ms: u64,
+    pub capacity_bytes: u64,
+    pub live_bytes: u64,
+    pub free_bytes: u64,
+    pub active_leases: u64,
+    pub pending_leases: u64,
+    pub largest_free_range_bytes: u64,
+    pub allocation_failures_total: u64,
+    pub release_failures_total: u64,
+}
+
+impl Record for ArenaSample {
+    const CHANNEL: &'static str = ARENA_SAMPLE_CHANNEL;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
@@ -164,6 +189,8 @@ pub struct ArenaManager {
     pending: VecDeque<QueuedLease>,
     live_order: Vec<RingLease>,
     live_index: BTreeMap<RingId, usize>,
+    allocation_failures_total: u64,
+    release_failures_total: u64,
 }
 
 impl ArenaManager {
@@ -181,6 +208,8 @@ impl ArenaManager {
             pending: VecDeque::new(),
             live_order: Vec::new(),
             live_index: BTreeMap::new(),
+            allocation_failures_total: 0,
+            release_failures_total: 0,
         })
     }
 
@@ -206,6 +235,34 @@ impl ArenaManager {
             .and_then(|index| self.live_order.get(*index))
     }
 
+    pub fn sample(&self, seq: u64) -> ArenaSample {
+        let free_bytes = self
+            .free_ranges
+            .iter()
+            .map(|range| range.end.saturating_sub(range.start))
+            .sum::<u64>();
+        let largest_free_range_bytes = self
+            .free_ranges
+            .iter()
+            .map(|range| range.end.saturating_sub(range.start))
+            .max()
+            .unwrap_or(0);
+        let pending_leases = self.pending.iter().filter(|lease| !lease.cancelled).count();
+
+        ArenaSample {
+            seq,
+            sample_unix_ms: unix_ms_now(),
+            capacity_bytes: self.config.reservation_ceiling,
+            live_bytes: self.config.reservation_ceiling.saturating_sub(free_bytes),
+            free_bytes,
+            active_leases: saturating_usize_to_u64(self.live_order.len()),
+            pending_leases: saturating_usize_to_u64(pending_leases),
+            largest_free_range_bytes,
+            allocation_failures_total: self.allocation_failures_total,
+            release_failures_total: self.release_failures_total,
+        }
+    }
+
     #[cfg(target_os = "linux")]
     pub fn arena_fd(&self) -> std::os::fd::RawFd {
         self._backing.fd()
@@ -223,6 +280,7 @@ impl ArenaManager {
 
     fn lease_ring(&mut self, request: LeaseRing) -> Vec<ArenaEvent> {
         if self.state == ArenaState::ShuttingDown {
+            self.allocation_failures_total = self.allocation_failures_total.saturating_add(1);
             return vec![ArenaEvent::RingLeaseRejected {
                 request_id: request.request_id,
                 reason: RingLeaseRejection::ArenaShuttingDown,
@@ -230,6 +288,7 @@ impl ArenaManager {
         }
 
         if self.request_layout_at(&request.ring_spec, 0).is_none() {
+            self.allocation_failures_total = self.allocation_failures_total.saturating_add(1);
             return vec![ArenaEvent::RingLeaseRejected {
                 request_id: request.request_id,
                 reason: RingLeaseRejection::CannotFitWithinCeiling,
@@ -260,6 +319,7 @@ impl ArenaManager {
 
     fn release_ring(&mut self, ring_id: RingId, proof: QuiescenceProof) -> Vec<ArenaEvent> {
         let Some(index) = self.live_index.get(&ring_id).copied() else {
+            self.release_failures_total = self.release_failures_total.saturating_add(1);
             return vec![ArenaEvent::RingReleaseRejected {
                 ring_id,
                 reason: RingReleaseRejection::UnknownRingId,
@@ -267,6 +327,7 @@ impl ArenaManager {
         };
 
         if !proof.verified {
+            self.release_failures_total = self.release_failures_total.saturating_add(1);
             return vec![ArenaEvent::RingReleaseRejected {
                 ring_id,
                 reason: RingReleaseRejection::MissingQuiescenceProof,
@@ -459,6 +520,10 @@ impl ArenaManagerHarness {
     pub fn lookup_lease(&self, ring_id: RingId) -> Option<&RingLease> {
         self.manager.lookup_lease(ring_id)
     }
+
+    pub fn sample(&self, seq: u64) -> ArenaSample {
+        self.manager.sample(seq)
+    }
 }
 
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
@@ -490,12 +555,30 @@ fn gcd(mut left: u64, mut right: u64) -> u64 {
     left
 }
 
+fn unix_ms_now() -> u64 {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    millis.min(u128::from(u64::MAX)) as u64
+}
+
+fn saturating_usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
 #[cfg(target_os = "linux")]
 struct ArenaBacking {
     len: usize,
     ptr: *mut libc::c_void,
     fd: std::os::fd::OwnedFd,
 }
+
+// The mmap base pointer is only used behind ArenaManager ownership. Moving the
+// backing between threads is safe because the mapping lifetime is tied to this
+// struct and Drop unmaps it exactly once.
+#[cfg(target_os = "linux")]
+unsafe impl Send for ArenaBacking {}
 
 #[cfg(target_os = "linux")]
 impl ArenaBacking {

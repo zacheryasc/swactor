@@ -15,6 +15,6 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV CARGO_TARGET_DIR=/workspace/target
 COPY . /workspace
 WORKDIR /workspace
-RUN cargo build -p mvp-system --features local-e2e --bin mvp-local-e2e-cluster
+RUN cargo test -p mvp-system --features local-e2e --test local-e2e-cluster --no-run
 
-ENTRYPOINT ["/workspace/target/debug/mvp-local-e2e-cluster"]
+ENTRYPOINT ["sh", "-c", "test_bin=$(find /workspace/target/debug/deps -maxdepth 1 -type f -perm /111 \\( -name 'local_e2e_cluster-*' -o -name 'local-e2e-cluster-*' \\) | head -n 1); exec \"$test_bin\" \"$@\"", "local-e2e-cluster"]

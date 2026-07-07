@@ -1,11 +1,38 @@
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::{Command, ExitCode, Stdio};
 
-#[test]
+#[path = "support/dumb_worker.rs"]
+mod dumb_worker;
+#[path = "support/local_e2e.rs"]
+mod local_e2e;
+
+fn main() -> ExitCode {
+    let args = std::env::args().collect::<Vec<_>>();
+    match std::env::var("MVP_TEST_ROLE").ok().as_deref() {
+        Some("dumb-worker") => return dumb_worker::run_main(),
+        Some("local-e2e") => return local_e2e::run_main(),
+        Some(role) => {
+            eprintln!("unknown MVP_TEST_ROLE={role}");
+            return ExitCode::from(2);
+        }
+        None => {}
+    }
+
+    if args.iter().any(|arg| arg == "--role=node") {
+        return local_e2e::run_main();
+    }
+
+    local_e2e_binary_drives_real_local_process_deployment();
+    dumb_worker_is_a_real_child_process_protocol_endpoint();
+    ExitCode::SUCCESS
+}
+
 fn local_e2e_binary_drives_real_local_process_deployment() {
-    let output = Command::new(env!("CARGO_BIN_EXE_mvp-local-e2e"))
+    let output = Command::new(current_test_exe())
+        .env("MVP_TEST_ROLE", "local-e2e")
         .output()
-        .expect("run mvp-local-e2e");
+        .expect("run local e2e supervisor");
 
     assert!(
         output.status.success(),
@@ -53,14 +80,14 @@ fn local_e2e_binary_drives_real_local_process_deployment() {
     );
 }
 
-#[test]
 fn dumb_worker_is_a_real_child_process_protocol_endpoint() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_mvp-dumb-worker"))
+    let mut child = Command::new(current_test_exe())
+        .env("MVP_TEST_ROLE", "dumb-worker")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn mvp-dumb-worker");
+        .expect("spawn dumb worker test role");
 
     {
         let stdin = child.stdin.as_mut().expect("worker stdin");
@@ -85,4 +112,8 @@ fn dumb_worker_is_a_real_child_process_protocol_endpoint() {
     assert!(stdout.contains("\"type\":\"StepCompleted\""), "{stdout}");
     assert!(stdout.contains("\"step_id\":7"), "{stdout}");
     assert!(stdout.contains("\"type\":\"WorkerStopped\""), "{stdout}");
+}
+
+fn current_test_exe() -> PathBuf {
+    std::env::current_exe().expect("current test exe")
 }

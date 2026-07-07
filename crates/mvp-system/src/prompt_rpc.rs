@@ -10,16 +10,12 @@ pub struct SubmitPrompt {
     pub request_id: u64,
     pub prompt_text: String,
     pub max_tokens: u32,
-    pub timeout_ms: u64,
 }
 
 impl SubmitPrompt {
-    pub fn with_defaults(mut self, max_tokens: u32, timeout_ms: u64) -> Self {
+    pub fn with_defaults(mut self, max_tokens: u32) -> Self {
         if self.max_tokens == 0 {
             self.max_tokens = max_tokens;
-        }
-        if self.timeout_ms == 0 {
-            self.timeout_ms = timeout_ms;
         }
         self
     }
@@ -99,12 +95,10 @@ mod tests {
             request_id: 7,
             prompt_text: "hello".to_owned(),
             max_tokens: 0,
-            timeout_ms: 0,
         }
-        .with_defaults(32, 1_000);
+        .with_defaults(32);
 
         assert_eq!(request.max_tokens, 32);
-        assert_eq!(request.timeout_ms, 1_000);
     }
 
     #[test]

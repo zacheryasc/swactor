@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
 import linecache
 import os
-import subprocess
 import sys
 import threading
 import time
@@ -22,7 +20,6 @@ model: Any = None
 tokenizer: Any = None
 role: dict[str, Any] = {}
 loaded: dict[str, Any] = {}
-_nvidia_smi_available: bool | None = None
 
 
 class CpuLineSampler:
@@ -136,104 +133,6 @@ def env_flag(name: str, default: bool = True) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def parse_int(value: str) -> int | None:
-    stripped = value.strip()
-    if not stripped or stripped == "[Not Supported]":
-        return None
-    try:
-        return int(float(stripped))
-    except ValueError:
-        return None
-
-
-def run_nvidia_smi(args: list[str]) -> tuple[bool, str, str]:
-    global _nvidia_smi_available
-    if _nvidia_smi_available is False:
-        return False, "", "nvidia-smi unavailable"
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", *args],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=float(os.environ.get("MVP_GPU_SAMPLE_TIMEOUT_SECS", "2")),
-        )
-    except FileNotFoundError:
-        _nvidia_smi_available = False
-        return False, "", "nvidia-smi not found"
-    except Exception as exc:
-        return False, "", str(exc)
-    _nvidia_smi_available = True
-    return result.returncode == 0, result.stdout, result.stderr.strip()
-
-
-def parse_gpu_rows(raw: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for row in csv.reader(raw.splitlines()):
-        if len(row) < 5:
-            continue
-        memory_total = parse_int(row[2])
-        memory_used = parse_int(row[3])
-        utilization = parse_int(row[4])
-        rows.append(
-            {
-                "index": parse_int(row[0]),
-                "name": row[1].strip(),
-                "memory_total_mib": memory_total,
-                "memory_used_mib": memory_used,
-                "utilization_gpu_percent": utilization,
-            }
-        )
-    return rows
-
-
-def parse_process_rows(raw: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for row in csv.reader(raw.splitlines()):
-        if len(row) < 2:
-            continue
-        pid = parse_int(row[0])
-        memory_used = parse_int(row[1])
-        if pid is None:
-            continue
-        rows.append({"pid": pid, "used_memory_mib": memory_used})
-    return rows
-
-
-def gpu_sample(label: str, **fields: Any) -> None:
-    if not env_flag("MVP_GPU_SAMPLE", True):
-        control(type="GpuSample", label=label, pid=os.getpid(), enabled=False, **fields)
-        return
-    gpu_ok, gpu_stdout, gpu_error = run_nvidia_smi(
-        [
-            "--query-gpu=index,name,memory.total,memory.used,utilization.gpu",
-            "--format=csv,noheader,nounits",
-        ]
-    )
-    proc_ok, proc_stdout, proc_error = run_nvidia_smi(
-        [
-            "--query-compute-apps=pid,used_memory",
-            "--format=csv,noheader,nounits",
-        ]
-    )
-    pid = os.getpid()
-    processes = parse_process_rows(proc_stdout) if proc_ok else []
-    worker_processes = [process for process in processes if process.get("pid") == pid]
-    control(
-        type="GpuSample",
-        label=label,
-        pid=pid,
-        enabled=True,
-        nvidia_smi_available=(_nvidia_smi_available is True),
-        gpu_query_ok=gpu_ok,
-        process_query_ok=proc_ok,
-        gpu_query_error=None if gpu_ok else gpu_error,
-        process_query_error=None if proc_ok else proc_error,
-        gpus=parse_gpu_rows(gpu_stdout) if gpu_ok else [],
-        processes=processes,
-        worker_processes=worker_processes,
-        **fields,
-    )
 
 
 def control(**event: Any) -> None:
@@ -270,7 +169,6 @@ def initialize(cmd: dict[str, Any]) -> None:
     control(type="TinygradDeviceProbeStarted", requested_device=device)
     value = Tensor([1], dtype=dtypes.int32).realize().numpy().tolist()
     control(type="TinygradDeviceProbeReady", requested_device=device, probe_result=value)
-    gpu_sample("after_worker_probe", requested_device=device)
     control(
         type="WorkerReady",
         pid=os.getpid(),
@@ -449,7 +347,6 @@ def load_weights(cmd: dict[str, Any]) -> None:
         control(type="TinygradLlmImportReady", model_id=model_id)
         max_context_raw = os.environ.get("MVP_MAX_CONTEXT", "512")
         max_context = int(max_context_raw) if max_context_raw else 512
-        gpu_sample("before_model_load", model_id=model_id, path=str(path), bytes=model_bytes)
         control(
             type="TransformerFromGgufStarted",
             model_id=model_id,
@@ -469,7 +366,6 @@ def load_weights(cmd: dict[str, Any]) -> None:
             realize=True,
             requested_device=os.environ.get("DEV"),
         )
-        gpu_sample("after_model_load", model_id=model_id, path=str(path), bytes=model_bytes)
         tok_src = cmd.get("tokenizer", {"EmbeddedGguf": None})
         if "EmbeddedGguf" in tok_src:
             control(type="TokenizerBuildStarted", model_id=model_id, source="EmbeddedGguf")
@@ -497,6 +393,35 @@ def load_weights(cmd: dict[str, Any]) -> None:
         elapsed_ms=int((time.monotonic() - started) * 1000),
     )
 
+
+
+def prompt_template_name() -> str:
+    return os.environ.get("MVP_PROMPT_TEMPLATE", "llama3-chat").strip().lower()
+
+
+def model_prompt_text(prompt: str) -> tuple[str, str]:
+    template = prompt_template_name()
+    if template in {"", "raw", "none", "off", "false", "0"}:
+        return prompt, "raw"
+    if template in {"llama3", "llama3-chat", "llama-3", "llama-3-chat"}:
+        return (
+            "<|begin_of_text|>"
+            "<|start_header_id|>user<|end_header_id|>\n\n"
+            f"{prompt}"
+            "<|eot_id|>"
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            "llama3-chat",
+        )
+    return prompt, "raw"
+
+
+def strip_chat_stop_markers(text: str) -> str:
+    cut = len(text)
+    for marker in ("<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"):
+        index = text.find(marker)
+        if index >= 0:
+            cut = min(cut, index)
+    return text[:cut].rstrip()
 
 
 def decode_greedy_device_resident(
@@ -553,7 +478,6 @@ def decode_greedy_device_resident(
                 token_index=1,
                 prompt_tokens=len(prompt_tokens),
             )
-            gpu_sample("after_first_token", request_id=request_id, model_id=model_id)
         elif progress_every > 0 and tokens_generated % progress_every == 0:
             control(
                 type="TokenProgress",
@@ -592,7 +516,6 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
         prompt_chars=len(prompt),
         max_tokens=max_tokens,
     )
-    gpu_sample("before_prompt", request_id=request_id, model_id=loaded.get("model_id"))
     if test_mode():
         text = f"mvp-test response: {prompt}"
         control(
@@ -606,13 +529,21 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
             elapsed_ms=int((time.monotonic() - started) * 1000),
         )
         return
-    control(type="PromptEncodeStarted", request_id=request_id, model_id=loaded.get("model_id"))
-    prompt_tokens = tokenizer.encode(prompt)
+    model_prompt, prompt_template = model_prompt_text(prompt)
+    control(
+        type="PromptEncodeStarted",
+        request_id=request_id,
+        model_id=loaded.get("model_id"),
+        prompt_template=prompt_template,
+    )
+    prompt_tokens = tokenizer.encode(model_prompt)
     control(
         type="PromptEncodeReady",
         request_id=request_id,
         model_id=loaded.get("model_id"),
         prompt_bytes=len(prompt.encode("utf-8")),
+        model_prompt_bytes=len(model_prompt.encode("utf-8")),
+        prompt_template=prompt_template,
         prompt_tokens=len(prompt_tokens),
     )
     progress_every = int(os.environ.get("MVP_TOKEN_PROGRESS_EVERY", "16") or "16")
@@ -646,9 +577,9 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
         prompt_tokens=len(prompt_tokens),
         tokens_generated=len(generated),
     )
-    gpu_sample("after_decode", request_id=request_id, model_id=loaded.get("model_id"))
     control(type="TextDecodeStarted", request_id=request_id, model_id=loaded.get("model_id"), tokens_generated=len(generated))
-    text = tokenizer.decode(generated) if generated else ""
+    raw_text = tokenizer.decode(generated) if generated else ""
+    text = strip_chat_stop_markers(raw_text)
     control(
         type="TextDecodeReady",
         request_id=request_id,

@@ -136,13 +136,8 @@ impl RuntimeNode {
         self.driver.drain_outbox(&self.stack.outbox);
     }
 
-    pub fn wait_for_routes(
-        &mut self,
-        actors: &[ActorAddress],
-        timeout: Duration,
-    ) -> Result<(), RuntimeNodeError> {
-        let started = Instant::now();
-        while started.elapsed() < timeout {
+    pub fn wait_for_routes(&mut self, actors: &[ActorAddress]) -> Result<(), RuntimeNodeError> {
+        loop {
             self.pump_once();
             let ready = self
                 .stack
@@ -155,9 +150,6 @@ impl RuntimeNode {
             }
             thread::sleep(Duration::from_millis(20));
         }
-        Err(RuntimeNodeError::Convergence(
-            "directory routes did not converge".to_owned(),
-        ))
     }
 
     pub fn alive_count(&self) -> usize {
@@ -168,14 +160,12 @@ impl RuntimeNode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeNodeError {
     Start(String),
-    Convergence(String),
 }
 
 impl std::fmt::Display for RuntimeNodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Start(message) => write!(f, "runtime node start failed: {message}"),
-            Self::Convergence(message) => write!(f, "runtime node convergence failed: {message}"),
         }
     }
 }

@@ -1,17 +1,20 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
+use mvp_system::config as chat_config;
+use mvp_system::config::ResolvedVastAiConfig;
 use mvp_system::node_image::{NodeImageProvider, NodeImageRequest, prepare_node_image};
 use mvp_system::node_provisioning::ProviderKind;
 use mvp_system::prompt_rpc::{PromptEvent, SubmitPrompt, write_json_line};
+use mvp_system::vastai_offer_preview::{OfferPreview, OfferPreviewer, VastAiOfferPreviewer};
 use serde_json::Value;
 
 #[cfg(target_os = "linux")]
@@ -25,7 +28,6 @@ const CACHED_MODEL_HOST_ENV: &str = "MVP_CACHED_MODEL_HOST_PATH";
 const DEFAULT_CACHED_MODEL_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const REPO_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_MAX_TOKENS: u32 = 64;
-const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const ORCH_REBUILD_INPUTS: &[&str] = &[
     "Cargo.lock",
     "Cargo.toml",
@@ -45,18 +47,17 @@ const ORCH_REBUILD_INPUTS: &[&str] = &[
     "tools/vastai/Cargo.toml",
     "tools/vastai/src",
 ];
-const ORCH_READY_TIMEOUT: Duration = Duration::from_secs(1_200);
-const ORCH_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
-const INTERRUPT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
-const FORCE_KILL_DELAY: Duration = Duration::from_millis(500);
 const CHAT_READ_TIMEOUT: Duration = Duration::from_millis(100);
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static STOP_ACKNOWLEDGED: AtomicBool = AtomicBool::new(false);
 
-fn main() -> ExitCode {
+pub fn run_from_args<I>(args: I) -> ExitCode
+where
+    I: IntoIterator<Item = String>,
+{
     install_signal_handlers();
-    match run() {
+    match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mvp-one-node-chat: {error}");
@@ -65,18 +66,28 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), String> {
-    let mut config = Config::from_args()?;
+fn run<I>(args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut config = Config::from_args(args)?;
+    confirm_vastai_if_needed(&config, VastAiOfferPreviewer)?;
     let image_ref = prepare_runtime(&config)?;
     let frame_log = configure_progress_frame_log(&mut config)?;
+    if let Some(path) = &config.datastream_frame_log {
+        eprintln!(
+            "mvp-one-node-chat: dumping datastream frames to {}",
+            display_user_path(path)
+        );
+    }
     let mut progress = StartupProgress::new(&frame_log);
     let mut orch = OrchChild::spawn(&config, &image_ref)?;
     let rpc_addr = match orch.wait_ready(config.rpc_addr.clone(), &mut progress) {
         Ok(addr) => addr,
         Err(_) if STOP_REQUESTED.load(Ordering::SeqCst) => {
             acknowledge_stop();
-            let forced = orch.shutdown(true);
-            report_interrupt_shutdown(forced);
+            let _ = orch.shutdown(true);
+            report_interrupt_shutdown();
             return Ok(());
         }
         Err(error) => {
@@ -86,11 +97,11 @@ fn run() -> Result<(), String> {
     };
     progress.poll();
     println!("model successfully loaded.");
-    let result = run_chat_loop(&rpc_addr, config.max_tokens, config.timeout_ms);
+    let result = run_chat_loop(&rpc_addr, config.max_tokens);
     let interrupted = STOP_REQUESTED.load(Ordering::SeqCst);
-    let forced = orch.shutdown(interrupted);
+    let _ = orch.shutdown(interrupted);
     if interrupted {
-        report_interrupt_shutdown(forced);
+        report_interrupt_shutdown();
     }
     result
 }
@@ -103,8 +114,8 @@ struct Config {
     config_profile: RuntimeConfigProfile,
     provider: ProviderKind,
     relay_mode: iroh::RelayMode,
+    relay_url: Option<String>,
     max_tokens: u32,
-    timeout_ms: u64,
     dashboard: bool,
     build_image: bool,
     image_tag: Option<String>,
@@ -112,70 +123,304 @@ struct Config {
     force_image_refresh: bool,
     cached_model: Option<CachedModelConfig>,
     datastream_frame_log: Option<PathBuf>,
+    vastai_yes: bool,
+    vastai: Option<ResolvedVastAiConfig>,
+    model_id: Option<String>,
+    gguf_repo: Option<String>,
+    gguf_file: Option<String>,
+    gguf_revision: Option<String>,
+    max_context: Option<u32>,
 }
+
 impl Config {
-    fn from_args() -> Result<Self, String> {
-        let config_profile = RuntimeConfigProfile::from_env()?;
-        let mut config = Self {
-            orch_bin: default_orch_bin()?,
-            orch_args: Vec::new(),
-            rpc_addr: std::env::var("MVP_PROMPT_RPC_ADDR")
-                .or_else(|_| std::env::var("MVP_PROMPT_RPC_BIND"))
-                .unwrap_or_else(|_| DEFAULT_RPC_ADDR.to_owned()),
-            node_image: std::env::var("MVP_NODE_IMAGE")
-                .unwrap_or_else(|_| DEFAULT_NODE_IMAGE.to_owned()),
-            config_profile,
-            provider: provider_from_env(config_profile)?,
-            relay_mode: relay_mode_from_env()?,
-            max_tokens: env_u32("MVP_PROMPT_MAX_TOKENS", DEFAULT_MAX_TOKENS)?,
-            timeout_ms: env_u64("MVP_PROMPT_TIMEOUT_MS", DEFAULT_TIMEOUT_MS)?,
-            dashboard: env_bool("MVP_DASHBOARD", true)?,
-            build_image: env_bool("MVP_BUILD_NODE_IMAGE", true)?,
-            image_tag: std::env::var("MVP_NODE_IMAGE_TAG")
-                .ok()
-                .filter(|value| !value.trim().is_empty()),
-            push_image: env_bool("MVP_PUSH_NODE_IMAGE", false)?,
-            force_image_refresh: env_bool("MVP_FORCE_NODE_IMAGE_REFRESH", false)?,
-            cached_model: None,
-            datastream_frame_log: env_optional("MVP_DATASTREAM_FRAME_LOG").map(PathBuf::from),
+    fn from_args<I>(provided_args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let args = ParsedArgs::parse(provided_args)?;
+        let loaded = chat_config::Config::load(args.config_path.as_deref())?;
+        let file = loaded.config;
+        let profile = if args.vastai {
+            RuntimeConfigProfile::Deploy
+        } else {
+            RuntimeConfigProfile::from_env()?
+        };
+        let provider = if args.vastai {
+            ProviderKind::VastAi
+        } else {
+            provider_from_env(profile)?
+        };
+        let relay_mode = relay_mode_from_sources(file.relay.mode.as_deref())?;
+        let relay_url = first_non_empty([
+            env_optional("MVP_IROH_RELAY_URL"),
+            env_optional("SWACTOR_IROH_RELAY_URL"),
+            file.relay.url.clone(),
+        ]);
+        let node_image = first_non_empty([
+            args.image,
+            env_optional("MVP_NODE_IMAGE"),
+            if args.vastai {
+                file.vastai.image.clone()
+            } else {
+                None
+            },
+            file.image.node.clone(),
+            Some(DEFAULT_NODE_IMAGE.to_owned()),
+        ])
+        .expect("default image is non-empty");
+        let max_tokens = args
+            .max_tokens
+            .or(env_u32_optional("MVP_PROMPT_MAX_TOKENS")?)
+            .or(file.prompt.max_tokens)
+            .unwrap_or(DEFAULT_MAX_TOKENS);
+        let dashboard = args
+            .dashboard
+            .or(env_bool_optional("MVP_DASHBOARD")?)
+            .or(file.prompt.dashboard)
+            .unwrap_or(true);
+        let build_image = args
+            .build_image
+            .or(env_bool_optional("MVP_BUILD_NODE_IMAGE")?)
+            .or(file.image.build)
+            .unwrap_or(true);
+        let push_image = args
+            .push_image
+            .or(env_bool_optional("MVP_PUSH_NODE_IMAGE")?)
+            .or(file.image.push)
+            .unwrap_or(false);
+        let force_image_refresh = args
+            .force_image_refresh
+            .or(env_bool_optional("MVP_FORCE_NODE_IMAGE_REFRESH")?)
+            .or(file.image.force_refresh)
+            .unwrap_or(false);
+        let image_tag = first_non_empty([
+            args.image_tag,
+            env_optional("MVP_NODE_IMAGE_TAG"),
+            file.image.tag.clone(),
+        ]);
+        let rpc_addr = first_non_empty([
+            args.rpc_addr,
+            env_optional("MVP_PROMPT_RPC_ADDR"),
+            env_optional("MVP_PROMPT_RPC_BIND"),
+            file.prompt.rpc_addr.clone(),
+            Some(DEFAULT_RPC_ADDR.to_owned()),
+        ])
+        .expect("default RPC address is non-empty");
+        let datastream_frame_log = match (args.dump_logs, args.datastream_frame_log) {
+            (true, Some(_)) => {
+                return Err("--dump-logs cannot be combined with --datastream-frame-log; use one datastream log destination".to_owned());
+            }
+            (true, None) => Some(PathBuf::from("mvp-chat.log")),
+            (false, explicit) => {
+                explicit.or_else(|| env_optional("MVP_DATASTREAM_FRAME_LOG").map(PathBuf::from))
+            }
+        };
+        let model_id = first_non_empty([env_optional("MVP_MODEL_ID"), file.model.id.clone()]);
+        let gguf_repo =
+            first_non_empty([env_optional("MVP_GGUF_REPO"), file.model.gguf_repo.clone()]);
+        let gguf_file =
+            first_non_empty([env_optional("MVP_GGUF_FILE"), file.model.gguf_file.clone()]);
+        let gguf_revision = first_non_empty([
+            env_optional("MVP_GGUF_REVISION"),
+            file.model.gguf_revision.clone(),
+        ]);
+        let max_context = env_u32_optional("MVP_MAX_CONTEXT")?.or(file.model.max_context);
+        let vastai = if args.vastai {
+            Some(resolve_vastai_config(
+                &file.vastai,
+                &node_image,
+                relay_url.clone(),
+            )?)
+        } else {
+            None
         };
 
-        let mut args = std::env::args().skip(1).peekable();
+        Ok(Self {
+            orch_bin: args.orch_bin.unwrap_or(default_orch_bin()?),
+            orch_args: args.orch_args,
+            rpc_addr,
+            node_image,
+            config_profile: profile,
+            provider,
+            relay_mode,
+            relay_url,
+            max_tokens,
+            dashboard,
+            build_image,
+            image_tag,
+            push_image,
+            force_image_refresh,
+            cached_model: args.cached_model,
+            datastream_frame_log,
+            vastai_yes: args.vastai_yes,
+            model_id,
+            gguf_repo,
+            gguf_file,
+            gguf_revision,
+            max_context,
+            vastai,
+        })
+    }
+}
+
+#[derive(Default)]
+struct ParsedArgs {
+    vastai: bool,
+    vastai_yes: bool,
+    config_path: Option<PathBuf>,
+    orch_bin: Option<PathBuf>,
+    rpc_addr: Option<String>,
+    image: Option<String>,
+    max_tokens: Option<u32>,
+    datastream_frame_log: Option<PathBuf>,
+    dump_logs: bool,
+    dashboard: Option<bool>,
+    build_image: Option<bool>,
+    image_tag: Option<String>,
+    push_image: Option<bool>,
+    force_image_refresh: Option<bool>,
+    cached_model: Option<CachedModelConfig>,
+    orch_args: Vec<String>,
+}
+
+impl ParsedArgs {
+    fn parse<I>(provided_args: I) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut parsed = Self::default();
+        let mut args = provided_args.into_iter().peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--orch-bin" => config.orch_bin = PathBuf::from(next_arg(&mut args, "--orch-bin")?),
-                "--addr" => config.rpc_addr = next_arg(&mut args, "--addr")?,
-                "--image" => {
-                    config.node_image = next_arg(&mut args, "--image")?;
+                "--vastai" => parsed.vastai = true,
+                "--yes" | "-y" => parsed.vastai_yes = true,
+                "--config" => {
+                    parsed.config_path = Some(PathBuf::from(next_arg(&mut args, "--config")?))
                 }
-                "--max-tokens" => config.max_tokens = parse_next(&mut args, "--max-tokens")?,
-                "--timeout-ms" => config.timeout_ms = parse_next(&mut args, "--timeout-ms")?,
+                "--orch-bin" => {
+                    parsed.orch_bin = Some(PathBuf::from(next_arg(&mut args, "--orch-bin")?))
+                }
+                "--addr" => parsed.rpc_addr = Some(next_arg(&mut args, "--addr")?),
+                "--image" => parsed.image = Some(next_arg(&mut args, "--image")?),
+                "--max-tokens" => parsed.max_tokens = Some(parse_next(&mut args, "--max-tokens")?),
                 "--datastream-frame-log" => {
-                    config.datastream_frame_log = Some(PathBuf::from(next_arg(
+                    parsed.datastream_frame_log = Some(PathBuf::from(next_arg(
                         &mut args,
                         "--datastream-frame-log",
                     )?));
                 }
-                "--dashboard" => config.dashboard = true,
-                "--no-dashboard" => config.dashboard = false,
-                "--no-build-image" => config.build_image = false,
-                "--image-tag" => config.image_tag = Some(next_arg(&mut args, "--image-tag")?),
-                "--push-image" => config.push_image = true,
-                "--no-push-image" => config.push_image = false,
-                "--force-image-refresh" => config.force_image_refresh = true,
+                "--dump-logs" => parsed.dump_logs = true,
+                "--dashboard" => parsed.dashboard = Some(true),
+                "--no-dashboard" => parsed.dashboard = Some(false),
+                "--no-build-image" => parsed.build_image = Some(false),
+                "--image-tag" => parsed.image_tag = Some(next_arg(&mut args, "--image-tag")?),
+                "--push-image" => parsed.push_image = Some(true),
+                "--no-push-image" => parsed.push_image = Some(false),
+                "--force-image-refresh" => parsed.force_image_refresh = Some(true),
                 "--cached-model" => {
                     let path = args.next_if(|value| !value.starts_with("--"));
-                    config.cached_model = Some(CachedModelConfig::from_arg(path)?);
+                    parsed.cached_model = Some(CachedModelConfig::from_arg(path)?);
                 }
                 "--" => {
-                    config.orch_args.extend(args);
+                    parsed.orch_args.extend(args);
                     break;
                 }
-                other => config.orch_args.push(other.to_owned()),
+                other => parsed.orch_args.push(other.to_owned()),
             }
         }
-        Ok(config)
+        Ok(parsed)
     }
+}
+
+fn resolve_vastai_config(
+    file: &chat_config::VastAiConfig,
+    node_image: &str,
+    relay_url: Option<String>,
+) -> Result<ResolvedVastAiConfig, String> {
+    ResolvedVastAiConfig {
+        api_key: first_non_empty([
+            env_optional("MVP_VASTAI_API_KEY"),
+            env_optional("VAST_API_KEY"),
+            file.api_key.clone(),
+        ])
+        .unwrap_or_default(),
+        relay_url: relay_url.unwrap_or_default(),
+        image: node_image.to_owned(),
+        bootstrap_command: first_non_empty([
+            env_optional("MVP_VASTAI_BOOTSTRAP_COMMAND"),
+            file.bootstrap_command.clone(),
+        ])
+        .unwrap_or_default(),
+        disk_gb: env_u32_optional("MVP_VASTAI_DISK_GB")?.or(file.disk_gb),
+        gpu_name: first_non_empty([env_optional("MVP_VASTAI_GPU_NAME"), file.gpu_name.clone()]),
+        min_gpu_ram_mb: env_u64_optional("MVP_VASTAI_MIN_GPU_RAM_MB")?.or(file.min_gpu_ram_mb),
+        min_down_mbps: env_f64_optional("MVP_VASTAI_MIN_DOWN_MBPS")?.or(file.min_down_mbps),
+        min_up_mbps: env_f64_optional("MVP_VASTAI_MIN_UP_MBPS")?.or(file.min_up_mbps),
+        min_reliability: env_f64_optional("MVP_VASTAI_MIN_RELIABILITY")?.or(file.min_reliability),
+        require_verified: env_bool_optional("MVP_VASTAI_REQUIRE_VERIFIED")?
+            .or(file.require_verified),
+        onstart: first_non_empty([env_optional("MVP_VASTAI_ONSTART"), file.onstart.clone()]),
+        ssh_identity: first_non_empty([
+            env_optional("MVP_VASTAI_SSH_IDENTITY"),
+            file.ssh_identity.clone(),
+        ]),
+    }
+    .validate()
+}
+
+fn first_non_empty<const N: usize>(values: [Option<String>; N]) -> Option<String> {
+    values.into_iter().find_map(chat_config::normalize_optional)
+}
+
+fn confirm_vastai_if_needed<P>(config: &Config, previewer: P) -> Result<(), String>
+where
+    P: OfferPreviewer,
+{
+    let Some(vastai) = &config.vastai else {
+        return Ok(());
+    };
+    eprintln!("mvp-one-node-chat: checking Vast.ai offers...");
+    let preview = previewer.preview(&vastai.api_key, &vastai.selection_policy())?;
+    print_offer_preview(&preview);
+    if config.vastai_yes {
+        eprintln!("mvp-one-node-chat: --yes supplied; skipping Vast.ai rental prompt");
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        return Err("Vast.ai rental requires --yes when stdin is not a terminal".to_owned());
+    }
+    if ask_vastai_approval()? {
+        Ok(())
+    } else {
+        Err("Vast.ai rental declined".to_owned())
+    }
+}
+
+fn print_offer_preview(preview: &OfferPreview) {
+    let ram = preview
+        .gpu_ram_mb
+        .map(|mb| format!(", {mb} MB VRAM"))
+        .unwrap_or_default();
+    eprintln!(
+        "mvp-one-node-chat: best Vast.ai offer {}{} at ${:.3}/hr",
+        preview.gpu_name, ram, preview.dollars_per_hour
+    );
+}
+
+fn ask_vastai_approval() -> Result<bool, String> {
+    eprint!("Rent 1 Vast.ai node? [y/N]: ");
+    io::stderr()
+        .flush()
+        .map_err(|e| format!("flush Vast.ai approval prompt: {e}"))?;
+    let mut line = String::new();
+    io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| format!("read Vast.ai approval: {e}"))?;
+    Ok(parse_approval(&line))
+}
+
+fn parse_approval(input: &str) -> bool {
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 struct FrameLogConfig {
@@ -427,11 +672,64 @@ impl OrchChild {
             .env("MVP_PROMPT_RPC_BIND", &config.rpc_addr)
             .env("MVP_PROMPT_RPC_ADDR", &config.rpc_addr)
             .env("MVP_PROMPT_MAX_TOKENS", config.max_tokens.to_string())
-            .env("MVP_PROMPT_TIMEOUT_MS", config.timeout_ms.to_string())
             .env("MVP_DASHBOARD", if config.dashboard { "1" } else { "0" })
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::null());
+        if let Some(relay_url) = &config.relay_url {
+            command.env("MVP_IROH_RELAY_URL", relay_url);
+        }
+        if let Some(vastai) = &config.vastai {
+            command
+                .env("MVP_VASTAI_API_KEY", &vastai.api_key)
+                .env("MVP_VASTAI_BOOTSTRAP_COMMAND", &vastai.bootstrap_command)
+                .env("MVP_VASTAI_CONFIRM_LEASE", "0");
+            if let Some(disk_gb) = vastai.disk_gb {
+                command.env("MVP_VASTAI_DISK_GB", disk_gb.to_string());
+            }
+            if let Some(gpu_name) = &vastai.gpu_name {
+                command.env("MVP_VASTAI_GPU_NAME", gpu_name);
+            }
+            if let Some(min_gpu_ram_mb) = vastai.min_gpu_ram_mb {
+                command.env("MVP_VASTAI_MIN_GPU_RAM_MB", min_gpu_ram_mb.to_string());
+            }
+            if let Some(min_down_mbps) = vastai.min_down_mbps {
+                command.env("MVP_VASTAI_MIN_DOWN_MBPS", min_down_mbps.to_string());
+            }
+            if let Some(min_up_mbps) = vastai.min_up_mbps {
+                command.env("MVP_VASTAI_MIN_UP_MBPS", min_up_mbps.to_string());
+            }
+            if let Some(min_reliability) = vastai.min_reliability {
+                command.env("MVP_VASTAI_MIN_RELIABILITY", min_reliability.to_string());
+            }
+            if let Some(require_verified) = vastai.require_verified {
+                command.env(
+                    "MVP_VASTAI_REQUIRE_VERIFIED",
+                    if require_verified { "1" } else { "0" },
+                );
+            }
+            if let Some(onstart) = &vastai.onstart {
+                command.env("MVP_VASTAI_ONSTART", onstart);
+            }
+            if let Some(ssh_identity) = &vastai.ssh_identity {
+                command.env("MVP_VASTAI_SSH_IDENTITY", ssh_identity);
+            }
+        }
+        if let Some(model_id) = &config.model_id {
+            command.env("MVP_MODEL_ID", model_id);
+        }
+        if let Some(repo) = &config.gguf_repo {
+            command.env("MVP_GGUF_REPO", repo);
+        }
+        if let Some(file) = &config.gguf_file {
+            command.env("MVP_GGUF_FILE", file);
+        }
+        if let Some(revision) = &config.gguf_revision {
+            command.env("MVP_GGUF_REVISION", revision);
+        }
+        if let Some(max_context) = config.max_context {
+            command.env("MVP_MAX_CONTEXT", max_context.to_string());
+        }
         if let Some(cached_model) = &config.cached_model {
             command.env(CACHED_MODEL_HOST_ENV, &cached_model.host_path);
         }
@@ -465,7 +763,6 @@ impl OrchChild {
         rpc_addr: String,
         progress: &mut StartupProgress,
     ) -> Result<String, String> {
-        let start = Instant::now();
         loop {
             progress.poll();
             if STOP_REQUESTED.load(Ordering::SeqCst) {
@@ -499,20 +796,11 @@ impl OrchChild {
                     "orchestrator exited before prompt RPC ready: {status}"
                 ));
             }
-            if start.elapsed() > ORCH_READY_TIMEOUT {
-                progress.poll();
-                if let Some(failure) = progress.failure_summary() {
-                    return Err(failure);
-                }
-                return Err(format!(
-                    "timed out waiting for orchestrator prompt RPC at {rpc_addr}"
-                ));
-            }
             thread::sleep(Duration::from_millis(100));
         }
     }
 
-    fn shutdown(&mut self, interrupt: bool) -> bool {
+    fn shutdown(&mut self, _interrupt: bool) -> bool {
         if self.cleaned {
             return false;
         }
@@ -521,22 +809,8 @@ impl OrchChild {
             let _ = writeln!(stdin, "shutdown");
             let _ = stdin.flush();
         }
-        let timeout = if interrupt {
-            INTERRUPT_SHUTDOWN_TIMEOUT
-        } else {
-            ORCH_SHUTDOWN_TIMEOUT
-        };
-        let start = Instant::now();
-        while start.elapsed() < timeout {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return false,
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(_) => break,
-            }
-        }
-        terminate_process_group(self.child.id(), FORCE_KILL_DELAY);
         let _ = self.child.wait();
-        true
+        false
     }
 }
 
@@ -575,7 +849,7 @@ fn prepare_runtime(config: &Config) -> Result<String, String> {
     Ok(prepared.image_ref)
 }
 
-fn run_chat_loop(addr: &str, max_tokens: u32, timeout_ms: u64) -> Result<(), String> {
+fn run_chat_loop(addr: &str, max_tokens: u32) -> Result<(), String> {
     let mut stream =
         TcpStream::connect(addr).map_err(|e| format!("connect prompt RPC {addr}: {e}"))?;
     stream
@@ -635,7 +909,6 @@ fn run_chat_loop(addr: &str, max_tokens: u32, timeout_ms: u64) -> Result<(), Str
                 request_id,
                 prompt_text: prompt,
                 max_tokens,
-                timeout_ms,
             },
         )?;
         println!("decoding...");
@@ -704,13 +977,13 @@ fn default_orch_bin() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
     let mut path = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    path.set_file_name("mvp-orch-one-node");
+    path.set_file_name("mvp-orchestrator");
     Ok(path)
 }
 
 fn node_bin_for_current_profile() -> Result<PathBuf, String> {
     let mut path = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    path.set_file_name("mvp-node");
+    path.set_file_name("mvp-worker-node");
     let cwd = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
     if let Ok(relative) = path.strip_prefix(&cwd) {
         Ok(relative.to_path_buf())
@@ -744,7 +1017,7 @@ fn ensure_orch_binary(config: &Config) -> Result<(), String> {
     let dashboard_feature_stale =
         config.dashboard && orch_local_e2e_marker_stale(&config.orch_bin, &root)?;
     if !rebuild_needed && !dashboard_feature_stale {
-        eprintln!("mvp-one-node-chat: mvp-orch-one-node is up to date; skipping cargo build");
+        eprintln!("mvp-one-node-chat: mvp-orchestrator is up to date; skipping cargo build");
         return Ok(());
     }
 
@@ -758,9 +1031,9 @@ fn ensure_orch_binary(config: &Config) -> Result<(), String> {
             "--features",
             "local-e2e",
             "--bin",
-            "mvp-orch-one-node",
+            "mvp-orchestrator",
         ],
-        "build mvp-orch-one-node",
+        "build mvp-orchestrator",
     )?;
     write_orch_local_e2e_marker(&config.orch_bin, &root)
 }
@@ -784,7 +1057,7 @@ fn orch_local_e2e_marker(bin: &Path) -> PathBuf {
     let file_name = bin
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or("mvp-orch-one-node");
+        .unwrap_or("mvp-orchestrator");
     marker.set_file_name(format!("{file_name}.local-e2e"));
     marker
 }
@@ -893,26 +1166,8 @@ fn acknowledge_stop() {
     }
 }
 
-fn report_interrupt_shutdown(forced: bool) {
-    if forced {
-        eprintln!("mvp-one-node-chat: runtime did not stop in 5s; force-killed");
-    } else {
-        eprintln!("mvp-one-node-chat: runtime stopped");
-    }
-}
-
-fn terminate_process_group(pid: u32, kill_after: Duration) {
-    #[cfg(target_os = "linux")]
-    unsafe {
-        let pgid = -(pid as libc::pid_t);
-        let _ = libc::kill(pgid, libc::SIGTERM);
-        thread::sleep(kill_after);
-        let _ = libc::kill(pgid, libc::SIGKILL);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, kill_after);
-    }
+fn report_interrupt_shutdown() {
+    eprintln!("mvp-one-node-chat: runtime stopped");
 }
 
 #[derive(Clone, Debug)]
@@ -1009,15 +1264,16 @@ fn env_optional(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn relay_mode_from_env() -> Result<iroh::RelayMode, String> {
+fn relay_mode_from_sources(config_value: Option<&str>) -> Result<iroh::RelayMode, String> {
     match env_optional("MVP_IROH_RELAY_MODE")
         .as_deref()
+        .or(config_value)
         .unwrap_or("default")
     {
         "disabled" => Ok(iroh::RelayMode::Disabled),
         "default" => Ok(iroh::RelayMode::Default),
         other => Err(format!(
-            "unsupported MVP_IROH_RELAY_MODE={other:?}; use disabled or default"
+            "unsupported relay mode {other:?}; use disabled or default"
         )),
     }
 }
@@ -1037,12 +1293,12 @@ fn node_image_provider(provider: ProviderKind) -> Result<NodeImageProvider, Stri
     }
 }
 
-fn env_bool(name: &str, default: bool) -> Result<bool, String> {
-    match std::env::var(name).ok().filter(|value| !value.is_empty()) {
-        None => Ok(default),
+fn env_bool_optional(name: &str) -> Result<Option<bool>, String> {
+    match env_optional(name) {
+        None => Ok(None),
         Some(value) => match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
+            "1" | "true" | "yes" | "on" => Ok(Some(true)),
+            "0" | "false" | "no" | "off" => Ok(Some(false)),
             _ => Err(format!(
                 "invalid {name}={value:?}; use 1/0, true/false, yes/no, or on/off"
             )),
@@ -1050,21 +1306,29 @@ fn env_bool(name: &str, default: bool) -> Result<bool, String> {
     }
 }
 
-fn env_u64(name: &str, default: u64) -> Result<u64, String> {
-    match std::env::var(name).ok().filter(|value| !value.is_empty()) {
-        Some(value) => value
-            .parse::<u64>()
-            .map_err(|e| format!("invalid {name}={value:?}: {e}")),
-        None => Ok(default),
-    }
+fn env_u64_optional(name: &str) -> Result<Option<u64>, String> {
+    env_parse_optional(name)
 }
 
-fn env_u32(name: &str, default: u32) -> Result<u32, String> {
-    match std::env::var(name).ok().filter(|value| !value.is_empty()) {
+fn env_u32_optional(name: &str) -> Result<Option<u32>, String> {
+    env_parse_optional(name)
+}
+
+fn env_f64_optional(name: &str) -> Result<Option<f64>, String> {
+    env_parse_optional(name)
+}
+
+fn env_parse_optional<T>(name: &str) -> Result<Option<T>, String>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match env_optional(name) {
         Some(value) => value
-            .parse::<u32>()
+            .parse::<T>()
+            .map(Some)
             .map_err(|e| format!("invalid {name}={value:?}: {e}")),
-        None => Ok(default),
+        None => Ok(None),
     }
 }
 
@@ -1084,10 +1348,15 @@ where
         .map_err(|e| format!("invalid {name}={value:?}: {e}"))
 }
 
+fn main() -> ExitCode {
+    run_from_args(std::env::args().skip(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    use std::time::Instant;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1151,11 +1420,170 @@ mod tests {
         }
     }
 
+    struct FakeOfferPreviewer;
+
+    impl OfferPreviewer for FakeOfferPreviewer {
+        fn preview(
+            &self,
+            _api_key: &str,
+            _policy: &mvp_system::vastai_offer_preview::SelectionPolicy,
+        ) -> Result<OfferPreview, String> {
+            Ok(OfferPreview {
+                offer_id: 7,
+                host_id: Some(8),
+                gpu_name: "RTX 4090".to_owned(),
+                gpu_ram_mb: Some(24_000),
+                dollars_per_hour: 0.42,
+            })
+        }
+    }
+
+    fn valid_vastai_config() -> ResolvedVastAiConfig {
+        ResolvedVastAiConfig {
+            api_key: "vast-key".to_owned(),
+            relay_url: "https://relay.example.com".to_owned(),
+            image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
+            bootstrap_command: "/usr/local/bin/mvp-node".to_owned(),
+            disk_gb: Some(80),
+            gpu_name: Some("RTX 4090".to_owned()),
+            min_gpu_ram_mb: Some(16_000),
+            min_down_mbps: Some(100.0),
+            min_up_mbps: Some(25.0),
+            min_reliability: Some(0.98),
+            require_verified: Some(true),
+            onstart: None,
+            ssh_identity: Some("~/.ssh/swactor_vastai_ed25519".to_owned()),
+        }
+    }
+
+    fn vastai_yes_chat_config() -> Config {
+        Config {
+            orch_bin: PathBuf::from("mvp-orchestrator"),
+            orch_args: Vec::new(),
+            rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
+            node_image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
+            config_profile: RuntimeConfigProfile::Deploy,
+            provider: ProviderKind::VastAi,
+            relay_mode: iroh::RelayMode::Default,
+            relay_url: Some("https://relay.example.com".to_owned()),
+            max_tokens: 128,
+            dashboard: false,
+            build_image: false,
+            image_tag: Some("trial".to_owned()),
+            push_image: true,
+            force_image_refresh: false,
+            cached_model: None,
+            datastream_frame_log: None,
+            vastai_yes: true,
+            model_id: None,
+            gguf_repo: None,
+            gguf_file: None,
+            gguf_revision: None,
+            max_context: None,
+            vastai: Some(valid_vastai_config()),
+        }
+    }
+
+    #[test]
+    fn approval_parser_accepts_only_y_or_yes() {
+        for (input, expected) in [
+            ("y", true),
+            ("Y", true),
+            (" yes ", true),
+            ("YES", true),
+            ("", false),
+            ("n", false),
+            ("no", false),
+            ("yeah", false),
+            ("yep", false),
+            ("yes please", false),
+        ] {
+            assert_eq!(parse_approval(input), expected, "approval input {input:?}");
+        }
+    }
+
+    #[test]
+    fn parsed_args_handles_vastai_yes_and_config_path() {
+        let parsed = ParsedArgs::parse(
+            [
+                "--vastai",
+                "--yes",
+                "--config",
+                "/tmp/mvp-chat-config.toml",
+                "--",
+                "--orchestrator-flag",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        )
+        .expect("vastai flags parse");
+
+        assert!(parsed.vastai);
+        assert!(parsed.vastai_yes);
+        assert_eq!(
+            parsed.config_path.as_deref(),
+            Some(Path::new("/tmp/mvp-chat-config.toml"))
+        );
+        assert_eq!(parsed.orch_args, vec!["--orchestrator-flag"]);
+    }
+
+    #[test]
+    fn parsed_args_and_config_dump_logs_select_default_log_file() {
+        let parsed = ParsedArgs::parse(["--dump-logs"].into_iter().map(str::to_owned))
+            .expect("--dump-logs parses");
+
+        assert!(parsed.dump_logs);
+
+        let config = Config::from_args(
+            ["--dump-logs", "--orch-bin", "/tmp/mvp-orchestrator"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect("--dump-logs resolves chat config");
+
+        assert_eq!(
+            config.datastream_frame_log.as_deref(),
+            Some(Path::new("mvp-chat.log"))
+        );
+    }
+
+    #[test]
+    fn dump_logs_conflicts_with_explicit_datastream_frame_log() {
+        let result = Config::from_args(
+            [
+                "--dump-logs",
+                "--datastream-frame-log",
+                "/tmp/frames.jsonl",
+                "--orch-bin",
+                "/tmp/mvp-orchestrator",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        let error = match result {
+            Ok(_) => panic!("conflicting datastream log destinations must fail"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error,
+            "--dump-logs cannot be combined with --datastream-frame-log; use one datastream log destination"
+        );
+    }
+
+    #[test]
+    fn confirm_vastai_if_needed_accepts_yes_without_terminal_approval() {
+        let config = vastai_yes_chat_config();
+
+        confirm_vastai_if_needed(&config, FakeOfferPreviewer)
+            .expect("--yes accepts the previewed Vast.ai rental");
+    }
+
     #[test]
     fn orch_rebuild_missing_binary_requires_rebuild() {
         let workspace = TempWorkspace::new("missing-binary");
         workspace.write("src/main.rs", b"fn main() {}\n");
-        let bin = workspace.path("target/debug/mvp-orch-one-node");
+        let bin = workspace.path("target/debug/mvp-orchestrator");
 
         let needed = orch_rebuild_needed(&bin, &workspace.root, &["src/main.rs"])
             .expect("missing binary check succeeds");
@@ -1168,7 +1596,7 @@ mod tests {
         let workspace = TempWorkspace::new("fresh-binary");
         let input = workspace.write("src/main.rs", b"fn main() {}\n");
         let input_mtime = modified_time(&workspace.root, &input).expect("read input mtime");
-        let bin = workspace.path("target/debug/mvp-orch-one-node");
+        let bin = workspace.path("target/debug/mvp-orchestrator");
         write_file_newer_than(&bin, b"orchestrator binary\n", input_mtime);
 
         let needed = orch_rebuild_needed(&bin, &workspace.root, &["src/main.rs"])
@@ -1186,7 +1614,7 @@ mod tests {
         let nested_input = workspace.write("src/nested/orchestrator.rs", b"old source\n");
         let src_mtime =
             latest_mtime(&workspace.root, &workspace.path("src")).expect("read source tree mtime");
-        let bin = workspace.path("target/debug/mvp-orch-one-node");
+        let bin = workspace.path("target/debug/mvp-orchestrator");
         write_file_newer_than(&bin, b"orchestrator binary\n", src_mtime);
         let bin_mtime = modified_time(&workspace.root, &bin).expect("read binary mtime");
         write_file_newer_than(&nested_input, b"new source\n", bin_mtime);

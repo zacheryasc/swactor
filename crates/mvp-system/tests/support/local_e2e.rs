@@ -1,7 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -39,7 +38,7 @@ const MAX_TOKENS: u64 = 1;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-fn main() -> ExitCode {
+pub fn run_main() -> ExitCode {
     install_signal_handlers();
     let args = std::env::args().collect::<Vec<_>>();
     let result = if args.iter().any(|arg| arg == "--role=node") {
@@ -167,12 +166,10 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
         &orchestrator_actor_json,
     )?;
 
-    let started_at = Instant::now();
     wait_for_routes(
         &mut driver,
         &stack,
         &[node0.ready.node_actor, node1.ready.node_actor],
-        Duration::from_secs(20),
     )?;
 
     stack
@@ -232,7 +229,7 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
 
     let mut token_in_object_allocator =
         edge_actor::ObjectIdAllocator::new(edge_actor::EdgeId(stage0.inbound_edge.0));
-    while !STOP_REQUESTED.load(Ordering::SeqCst) && started_at.elapsed() < Duration::from_secs(30) {
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
         pump_network(&mut driver, &stack);
         stage_ready_count += drain_node_stdout(&node0.stdout_rx);
         stage_ready_count += drain_node_stdout(&node1.stdout_rx);
@@ -384,12 +381,7 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
 
     shutdown_node(&mut node0);
     shutdown_node(&mut node1);
-    if STOP_REQUESTED.load(Ordering::SeqCst) {
-        return Err("interrupted".to_owned());
-    }
-    Err(format!(
-        "timed out: injected={injected} completed={completed} torn_down={torn_down} stop0={sent_stop_to_node0} stop1={sent_stop_to_node1}"
-    ))
+    Err("interrupted".to_owned())
 }
 
 fn run_node_role(args: &[String]) -> Result<(), String> {
@@ -485,7 +477,6 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
     let mut pending_commands = VecDeque::new();
     let mut outbound_stream: Option<TcpStream> = None;
     let mut outbound_object_allocator: Option<edge_actor::ObjectIdAllocator> = None;
-    let started_at = Instant::now();
 
     while !STOP_REQUESTED.load(Ordering::SeqCst) {
         if let Ok(value) = stdin_rx.try_recv() {
@@ -539,16 +530,10 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
         }
         pending_commands = deferred;
 
-        if started_at.elapsed() > Duration::from_secs(60) {
-            break;
-        }
         thread::sleep(Duration::from_millis(10));
     }
     let _ = worker.shutdown();
-    if STOP_REQUESTED.load(Ordering::SeqCst) {
-        return Err("interrupted".to_owned());
-    }
-    Err("node role timed out".to_owned())
+    Err("interrupted".to_owned())
 }
 
 fn new_driver(handle: tokio::runtime::Handle) -> Result<IrohDriver, String> {
@@ -576,10 +561,8 @@ fn wait_for_routes(
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     actors: &[ActorAddress],
-    timeout: Duration,
 ) -> Result<(), String> {
-    let started = Instant::now();
-    while started.elapsed() < timeout {
+    loop {
         pump_network(driver, stack);
         let ready = stack
             .route_view
@@ -591,7 +574,6 @@ fn wait_for_routes(
         }
         thread::sleep(Duration::from_millis(20));
     }
-    Err("directory routes for node actors did not converge".to_owned())
 }
 
 struct LocalEngineTopology {
@@ -894,7 +876,8 @@ struct WorkerProc {
 
 impl WorkerProc {
     fn spawn() -> Result<Self, String> {
-        let mut child = Command::new(worker_bin_path())
+        let mut child = Command::new(current_test_exe()?)
+            .env("MVP_TEST_ROLE", "dumb-worker")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1130,11 +1113,6 @@ fn parse_arg<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("missing value for {name}"))
 }
 
-fn worker_bin_path() -> PathBuf {
-    if let Ok(path) = std::env::var("MVP_DUMB_WORKER_BIN") {
-        return PathBuf::from(path);
-    }
-    let mut path = std::env::current_exe().expect("current exe");
-    path.set_file_name(format!("mvp-dumb-worker{}", std::env::consts::EXE_SUFFIX));
-    path
+fn current_test_exe() -> Result<std::path::PathBuf, String> {
+    std::env::current_exe().map_err(|e| format!("current test exe: {e}"))
 }

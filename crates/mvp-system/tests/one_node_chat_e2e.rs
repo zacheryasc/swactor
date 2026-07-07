@@ -10,11 +10,11 @@ use serde_json::Value;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(1_800);
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(600);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+const TEST_WATCHDOG: Duration = Duration::from_secs(1_800);
+const PROMPT_WATCHDOG: Duration = Duration::from_secs(600);
+const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(60);
 const DASHBOARD_ADDR: &str = "127.0.0.1:9090";
-const DEFAULT_CONTAINER: &str = "mvp-orch-one-node-1-1";
+const DEFAULT_CONTAINER: &str = "mvp-orchestrator-1-1";
 
 #[test]
 fn one_node_chat_docker_cuda_e2e() {
@@ -51,7 +51,7 @@ fn one_node_chat_docker_cuda_e2e() {
     let mut result = run_full_flow(&mut child, &mut stdin, &stdout);
     if result.is_err() {
         request_child_interrupt(&child);
-        let _ = wait_child(&mut child, SHUTDOWN_TIMEOUT);
+        let _ = wait_child(&mut child, SHUTDOWN_WATCHDOG);
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -77,42 +77,42 @@ fn run_full_flow(
     stdin: &mut impl Write,
     stdout: &Arc<Mutex<String>>,
 ) -> Result<(), String> {
-    wait_for_child_or(TEST_TIMEOUT, child, dashboard_responding)
+    wait_for_child_or(TEST_WATCHDOG, child, dashboard_responding)
         .map_err(|e| format!("dashboard API not live: {e}"))?;
-    wait_for_child_or(TEST_TIMEOUT, child, || {
+    wait_for_child_or(TEST_WATCHDOG, child, || {
         dashboard_has_channel_or_payload("mvp.provisioning.logs", "mvp-entrypoint")
     })
     .map_err(|e| format!("provisioning frames not visible in dashboard: {e}"))?;
-    wait_for_child_or(TEST_TIMEOUT, child, || {
+    wait_for_child_or(TEST_WATCHDOG, child, || {
         dashboard_has_frame("mvp.worker.weights", "GgufDownloadProgress")
     })
     .map_err(|e| format!("GGUF download progress not visible in dashboard: {e}"))?;
-    wait_for_child_or(TEST_TIMEOUT, child, || {
+    wait_for_child_or(TEST_WATCHDOG, child, || {
         dashboard_has_frame("mvp.worker.weights", "WeightsLoaded")
     })
     .map_err(|e| format!("WeightsLoaded not visible in dashboard: {e}"))?;
-    wait_for_child_or(TEST_TIMEOUT, child, || prompt_visible(stdout))
+    wait_for_child_or(TEST_WATCHDOG, child, || prompt_visible(stdout))
         .map_err(|e| format!("chat prompt not visible: {e}"))?;
 
     writeln!(stdin, "hello from full cargo mvp-chat e2e")
         .map_err(|e| format!("write prompt: {e}"))?;
     stdin.flush().map_err(|e| format!("flush prompt: {e}"))?;
-    wait_for_child_or(PROMPT_TIMEOUT, child, || {
+    wait_for_child_or(PROMPT_WATCHDOG, child, || {
         stdout_contains(stdout, "decoding...")
     })
     .map_err(|e| format!("prompt was not submitted to chat loop: {e}"))?;
-    wait_for_child_or(PROMPT_TIMEOUT, child, || response_text_visible(stdout))
+    wait_for_child_or(PROMPT_WATCHDOG, child, || response_text_visible(stdout))
         .map_err(|e| format!("decoded response text not visible: {e}"))?;
-    wait_for_child_or(PROMPT_TIMEOUT, child, || {
+    wait_for_child_or(PROMPT_WATCHDOG, child, || {
         dashboard_has_frame("mvp.worker.prompt", "PromptCompleted")
     })
     .map_err(|e| format!("prompt result not visible in dashboard: {e}"))?;
-    wait_for_child_or(PROMPT_TIMEOUT, child, dashboard_has_orch_prompt_lifecycle)
+    wait_for_child_or(PROMPT_WATCHDOG, child, dashboard_has_orch_prompt_lifecycle)
         .map_err(|e| format!("orchestrator prompt lifecycle not visible in dashboard: {e}"))?;
-    wait_for_child_or(PROMPT_TIMEOUT, child, || prompt_count(stdout) >= 2)
+    wait_for_child_or(PROMPT_WATCHDOG, child, || prompt_count(stdout) >= 2)
         .map_err(|e| format!("chat prompt did not return after response: {e}"))?;
     request_child_interrupt(child);
-    let status = wait_child(child, SHUTDOWN_TIMEOUT)
+    let status = wait_child(child, SHUTDOWN_WATCHDOG)
         .ok_or_else(|| "cargo mvp-chat did not exit after Ctrl-C".to_owned())?;
     if status.success() || status.code() == Some(130) || status.signal_name() == Some("SIGINT") {
         Ok(())
@@ -122,12 +122,12 @@ fn run_full_flow(
 }
 
 fn wait_for_child_or(
-    timeout: Duration,
+    watchdog: Duration,
     child: &mut Child,
     mut predicate: impl FnMut() -> bool,
 ) -> Result<(), String> {
     let start = Instant::now();
-    while start.elapsed() < timeout {
+    while start.elapsed() < watchdog {
         if predicate() {
             return Ok(());
         }
@@ -136,7 +136,7 @@ fn wait_for_child_or(
         }
         thread::sleep(Duration::from_millis(250));
     }
-    Err("timed out".to_owned())
+    Err("test watchdog".to_owned())
 }
 
 fn spawn_capture(
@@ -306,7 +306,7 @@ fn http_get(path: &str) -> Result<String, String> {
         .map_err(|e| format!("connect dashboard {DASHBOARD_ADDR}: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
-        .map_err(|e| format!("set read timeout: {e}"))?;
+        .map_err(|e| format!("set read watchdog: {e}"))?;
     write!(
         stream,
         "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
@@ -367,8 +367,8 @@ fn lower_layer_leak_lines(stream: &str, output: &str) -> Vec<String> {
             let trimmed = line.trim_start();
             let leaked = trimmed.contains("prompt_loop_ready")
                 || trimmed.contains("dashboard_ready")
-                || trimmed.starts_with("mvp-orch-one-node:")
-                || trimmed.starts_with("mvp-node:")
+                || trimmed.starts_with("mvp-orchestrator:")
+                || trimmed.starts_with("mvp-worker-node:")
                 || trimmed.starts_with("mvp_tinygrad_worker:");
             leaked.then(|| format!("{stream}: {line}"))
         })
@@ -378,9 +378,9 @@ fn snapshot(buf: &Arc<Mutex<String>>) -> String {
     buf.lock().expect("capture mutex").clone()
 }
 
-fn wait_child(child: &mut Child, timeout: Duration) -> Option<std::process::ExitStatus> {
+fn wait_child(child: &mut Child, watchdog: Duration) -> Option<std::process::ExitStatus> {
     let start = Instant::now();
-    while start.elapsed() < timeout {
+    while start.elapsed() < watchdog {
         if let Some(status) = child.try_wait().expect("poll child") {
             return Some(status);
         }

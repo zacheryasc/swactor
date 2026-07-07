@@ -53,6 +53,150 @@ fn assert_non_overlapping(left: &arena::RingLayout, right: &arena::RingLayout) {
     );
 }
 
+// This proves sampling an unused arena reports only reserved capacity and no
+// allocator activity.
+#[test]
+fn sample_reports_empty_arena_capacity_and_zero_activity() {
+    let harness = new_arena();
+
+    let sample = harness.sample(41);
+
+    assert_eq!(sample.seq, 41);
+    assert!(
+        sample.sample_unix_ms > 0,
+        "sample timestamp must be a populated Unix epoch millisecond"
+    );
+    assert_eq!(sample.capacity_bytes, arena_config().reservation_ceiling);
+    assert_eq!(sample.live_bytes, 0);
+    assert_eq!(sample.free_bytes, arena_config().reservation_ceiling);
+    assert_eq!(sample.active_leases, 0);
+    assert_eq!(sample.pending_leases, 0);
+    assert_eq!(
+        sample.largest_free_range_bytes,
+        arena_config().reservation_ceiling
+    );
+    assert_eq!(sample.allocation_failures_total, 0);
+    assert_eq!(sample.release_failures_total, 0);
+}
+
+// This proves a granted lease is reflected in live capacity accounting and the
+// active lease count without relying on private allocator slots.
+#[test]
+fn sample_counts_live_bytes_and_active_leases_after_grant() {
+    let mut harness = new_arena();
+    harness.request(arena::ArenaRequest::LeaseRing(lease_request(1, 512, 64)));
+    let lease = harness.live_leases()[0].clone();
+    let lease_bytes = lease.layout.end_offset - lease.layout.start_offset;
+
+    let sample = harness.sample(42);
+
+    assert_eq!(sample.seq, 42);
+    assert_eq!(sample.capacity_bytes, arena_config().reservation_ceiling);
+    assert_eq!(sample.live_bytes, lease_bytes);
+    assert_eq!(
+        sample.free_bytes,
+        arena_config().reservation_ceiling - lease_bytes
+    );
+    assert_eq!(sample.active_leases, 1);
+    assert_eq!(sample.pending_leases, 0);
+    assert_eq!(sample.allocation_failures_total, 0);
+    assert_eq!(sample.release_failures_total, 0);
+}
+
+// This proves a proof-backed release returns the full range to the free pool and
+// restores the largest allocatable span.
+#[test]
+fn sample_reports_full_free_space_after_release() {
+    let mut harness = new_arena();
+    harness.request(arena::ArenaRequest::LeaseRing(lease_request(1, 512, 64)));
+    let ring_id = harness.live_leases()[0].ring_id;
+
+    harness.request(arena::ArenaRequest::ReleaseRing {
+        ring_id,
+        proof: arena::QuiescenceProof::verified(),
+    });
+    let sample = harness.sample(43);
+
+    assert_eq!(sample.live_bytes, 0);
+    assert_eq!(sample.free_bytes, arena_config().reservation_ceiling);
+    assert_eq!(sample.active_leases, 0);
+    assert_eq!(sample.pending_leases, 0);
+    assert_eq!(
+        sample.largest_free_range_bytes,
+        arena_config().reservation_ceiling
+    );
+}
+
+// This proves queued leases are visible as pending work while existing live
+// leases continue to own their bytes.
+#[test]
+fn sample_counts_queued_requests_as_pending_leases() {
+    let mut harness = new_arena();
+    harness.request(arena::ArenaRequest::LeaseRing(lease_request(1, 3072, 64)));
+    let live = harness.live_leases()[0].clone();
+    let live_bytes = live.layout.end_offset - live.layout.start_offset;
+    harness.request(arena::ArenaRequest::LeaseRing(lease_request(2, 1024, 64)));
+
+    let sample = harness.sample(44);
+
+    assert_eq!(sample.live_bytes, live_bytes);
+    assert_eq!(
+        sample.free_bytes,
+        arena_config().reservation_ceiling - live_bytes
+    );
+    assert_eq!(sample.active_leases, 1);
+    assert_eq!(sample.pending_leases, 1);
+    assert_eq!(sample.allocation_failures_total, 0);
+    assert_eq!(sample.release_failures_total, 0);
+}
+
+// This proves lease rejection increments the allocation failure counter without
+// changing the arena's free capacity.
+#[test]
+fn sample_counts_rejected_leases_as_allocation_failures() {
+    let mut harness = new_arena();
+
+    harness.request(arena::ArenaRequest::LeaseRing(lease_request(1, 8192, 64)));
+    let sample = harness.sample(45);
+
+    assert_eq!(sample.live_bytes, 0);
+    assert_eq!(sample.free_bytes, arena_config().reservation_ceiling);
+    assert_eq!(sample.active_leases, 0);
+    assert_eq!(sample.pending_leases, 0);
+    assert_eq!(
+        sample.largest_free_range_bytes,
+        arena_config().reservation_ceiling
+    );
+    assert_eq!(sample.allocation_failures_total, 1);
+    assert_eq!(sample.release_failures_total, 0);
+}
+
+// This proves release rejection increments the release failure counter and keeps
+// the live lease accounted as active.
+#[test]
+fn sample_counts_rejected_releases_as_release_failures() {
+    let mut harness = new_arena();
+    harness.request(arena::ArenaRequest::LeaseRing(lease_request(1, 512, 64)));
+    let lease = harness.live_leases()[0].clone();
+    let lease_bytes = lease.layout.end_offset - lease.layout.start_offset;
+
+    harness.request(arena::ArenaRequest::ReleaseRing {
+        ring_id: lease.ring_id,
+        proof: arena::QuiescenceProof::missing(),
+    });
+    let sample = harness.sample(46);
+
+    assert_eq!(sample.live_bytes, lease_bytes);
+    assert_eq!(
+        sample.free_bytes,
+        arena_config().reservation_ceiling - lease_bytes
+    );
+    assert_eq!(sample.active_leases, 1);
+    assert_eq!(sample.pending_leases, 0);
+    assert_eq!(sample.allocation_failures_total, 0);
+    assert_eq!(sample.release_failures_total, 1);
+}
+
 // This proves arena boot creates one stable sparse arena with one reservation
 // ceiling, offset-only layouts, and typed boot failure.
 #[test]

@@ -207,7 +207,6 @@ impl ArenaEnv {
 pub struct WorkerConfig {
     pub node_id: NodeId,
     pub arena_env: ArenaEnv,
-    pub initialization_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -392,7 +391,6 @@ pub enum WorkerCtlEvent {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkerFailure {
-    InitializationTimeout,
     ProcessExited,
 }
 
@@ -457,8 +455,6 @@ pub struct GpuWorkerCtl {
     config: WorkerConfig,
     state: CtlState,
     current_generation: WorkerGeneration,
-    now_ms: u64,
-    start_time_ms: Option<u64>,
     commands: Vec<WorkerCtlCommand>,
     serialized: Vec<WorkerCommand>,
     events: Vec<WorkerCtlOut>,
@@ -472,8 +468,6 @@ impl GpuWorkerCtl {
             config,
             state: CtlState::Idle,
             current_generation: WorkerGeneration(1),
-            now_ms: 0,
-            start_time_ms: None,
             commands: Vec::new(),
             serialized: Vec::new(),
             events: Vec::new(),
@@ -507,21 +501,6 @@ impl GpuWorkerCtl {
         }
     }
 
-    pub fn advance_time_ms(&mut self, delta: u64) {
-        self.now_ms = self.now_ms.saturating_add(delta);
-        if self.state == CtlState::Starting {
-            if let Some(start_time) = self.start_time_ms {
-                if self.now_ms.saturating_sub(start_time) > self.config.initialization_timeout_ms {
-                    self.events.push(WorkerCtlOut::WorkerFailed {
-                        generation: self.current_generation,
-                        reason: WorkerFailure::InitializationTimeout,
-                    });
-                    self.state = CtlState::Crashed;
-                }
-            }
-        }
-    }
-
     pub fn commands(&self) -> &[WorkerCtlCommand] {
         &self.commands
     }
@@ -544,7 +523,6 @@ impl GpuWorkerCtl {
 
     fn start(&mut self) {
         self.state = CtlState::Starting;
-        self.start_time_ms = Some(self.now_ms);
         self.commands.push(WorkerCtlCommand::SpawnProcessActor {
             node_id: self.config.node_id,
         });
@@ -706,7 +684,6 @@ impl GpuWorkerCtl {
     fn restart(&mut self) {
         self.state = CtlState::Starting;
         self.current_generation = WorkerGeneration(self.current_generation.0 + 1);
-        self.start_time_ms = Some(self.now_ms);
     }
 
     fn shutdown(&mut self) {

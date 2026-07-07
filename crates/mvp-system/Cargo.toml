@@ -3,6 +3,7 @@ name = "mvp-system"
 version = "0.1.0"
 edition = "2024"
 publish = false
+autobins = false
 
 [features]
 default = []
@@ -22,45 +23,27 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io
 swactor-vastai = { path = "../../tools/vastai" }
 parking_lot = "0.12"
 blake3 = "1"
+toml = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 [[bin]]
-name = "mvp-node"
-path = "src/bin/mvp_node.rs"
+name = "mvp-worker-node"
+path = "src/bin/worker_node.rs"
 
 [[bin]]
-name = "mvp-orch-one-node"
-path = "src/bin/mvp_orch_one_node.rs"
-
-[[bin]]
-name = "mvp-chat"
-path = "src/bin/mvp_chat.rs"
+name = "mvp-orchestrator"
+path = "src/bin/orchestrator.rs"
 
 [[bin]]
 name = "mvp-one-node-chat"
 path = "src/bin/mvp_one_node_chat.rs"
-required-features = ["local-e2e"]
-
-[[bin]]
-name = "mvp-local-e2e"
-path = "src/bin/local_e2e.rs"
-required-features = ["local-e2e"]
-
-[[bin]]
-name = "mvp-local-e2e-cluster"
-path = "src/bin/local_e2e_cluster.rs"
-required-features = ["local-e2e"]
-
-[[bin]]
-name = "mvp-dumb-worker"
-path = "src/bin/dumb_worker.rs"
-required-features = ["local-e2e"]
 
 [[test]]
 name = "local_unmocked_mvp_e2e"
 path = "tests/local_unmocked_mvp_e2e.rs"
+harness = false
 required-features = ["local-e2e"]
 
 [[test]]
@@ -71,4 +54,5 @@ required-features = ["local-e2e"]
 [[test]]
 name = "local-e2e-cluster"
 path = "tests/local_e2e_cluster.rs"
+harness = false
 required-features = ["local-e2e"]
