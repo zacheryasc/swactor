@@ -1,15 +1,19 @@
 use crate::Instant;
-use std::any::Any;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::Thread;
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread::{self, JoinHandle};
 
 use crate::actor::{
-    Actor, ActorAddress, ActorInterface, AnyActor, Environment, ExitValue, Message, ResumeSignal,
-    SpawnRequest, StopSignal, StopWithSignal, SystemInfo,
+    Actor, ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Environment, ExitValue,
+    Message, ResumeSignal, SpawnRequest, StopSignal, StopWithSignal, SystemInfo,
+};
+use crate::admin::{
+    ActorStateSnapshot, Admin, AdminCommand, AdminError, AdminResult, GetActorStateResponse,
+    InspectActorResponse, ListActorsAccumulator, ListActorsResponse, OperationResult, RuntimeAdmin,
 };
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
@@ -106,6 +110,7 @@ pub struct Runtime {
     extension: Option<Arc<dyn RuntimeExtension>>,
     transfer_txs: Vec<Sender<Envelope>>,
     spawn_txs: Vec<Sender<SpawnRequest>>,
+    admin_txs: Vec<Sender<AdminCommand>>,
     placement: Placement,
     is_running: AtomicBool,
     worker_stats: Vec<Arc<WorkerStats>>,
@@ -221,6 +226,7 @@ impl Runtime {
 
         let mut transfer_txs = Vec::with_capacity(num_workers);
         let mut spawn_txs = Vec::with_capacity(num_workers);
+        let mut admin_txs = Vec::with_capacity(num_workers);
         let mut worker_stats = Vec::with_capacity(num_workers);
         let mut workers = Vec::with_capacity(num_workers);
 
@@ -233,9 +239,19 @@ impl Runtime {
             let spawn_tx = spawn_rx.new_sender();
             spawn_txs.push(spawn_tx);
 
+            let admin_rx = Receiver::<AdminCommand>::new(config.channel_buffer_size);
+            let admin_tx = admin_rx.new_sender();
+            admin_txs.push(admin_tx);
+
             let stats = Arc::new(WorkerStats::new());
             worker_stats.push(stats.clone());
-            workers.push(Worker::new(WorkerId(i), transfer_rx, spawn_rx, stats));
+            workers.push(Worker::new(
+                WorkerId(i),
+                transfer_rx,
+                spawn_rx,
+                admin_rx,
+                stats,
+            ));
         }
 
         let placement = Placement::new(num_workers, worker_stats.clone());
@@ -250,6 +266,7 @@ impl Runtime {
             extension: None,
             transfer_txs,
             spawn_txs,
+            admin_txs,
             placement,
             is_running: AtomicBool::new(false),
             worker_stats,
@@ -340,6 +357,10 @@ impl Runtime {
     /// Access the installed runtime extension (if any).
     pub fn extension(&self) -> Option<&dyn RuntimeExtension> {
         self.extension.as_deref()
+    }
+
+    pub fn admin(&self) -> RuntimeAdmin<'_> {
+        RuntimeAdmin { runtime: self }
     }
 
     /// Send a request and get a handle for the response.
@@ -587,6 +608,218 @@ impl Runtime {
             }
             None => self.inbox_registry.try_deliver(addr, msg),
         }
+    }
+}
+
+impl RuntimeAdmin<'_> {
+    fn new_admin<T: Message>(&self) -> Result<(Admin<T>, ActorAddress), Error> {
+        let inbox = self.runtime.new_inbox::<AdminResult<T>>()?;
+        let reply_to = *inbox.addr();
+        Ok((Admin::new(inbox), reply_to))
+    }
+
+    fn ready<T: Message>(&self, result: AdminResult<T>) -> Result<Admin<T>, Error> {
+        let (admin, reply_to) = self.new_admin::<T>()?;
+        let _ = self
+            .runtime
+            .inbox_registry
+            .try_deliver(reply_to, Box::new(result));
+        Ok(admin)
+    }
+
+    pub fn list_actors(&self) -> Result<Admin<ListActorsResponse>, Error> {
+        let (admin, reply_to) = self.new_admin::<ListActorsResponse>()?;
+        let acc = Arc::new(ListActorsAccumulator {
+            remaining: AtomicUsize::new(self.runtime.admin_txs.len()),
+            summaries: parking_lot::Mutex::new(Vec::new()),
+            reply_to,
+        });
+
+        for (idx, tx) in self.runtime.admin_txs.iter().enumerate() {
+            tx.send(AdminCommand::ListActors { acc: acc.clone() });
+            notify_worker(&self.runtime.worker_threads, idx);
+        }
+
+        Ok(admin)
+    }
+
+    pub fn inspect_actor(&self, actor: ActorAddress) -> Result<Admin<InspectActorResponse>, Error> {
+        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+            return self.ready::<InspectActorResponse>(Err(AdminError::ActorNotFound { actor }));
+        };
+        let (admin, reply_to) = self.new_admin::<InspectActorResponse>()?;
+        let worker_idx = wid.as_usize();
+        self.runtime.admin_txs[worker_idx].send(AdminCommand::InspectActor { actor, reply_to });
+        notify_worker(&self.runtime.worker_threads, worker_idx);
+        Ok(admin)
+    }
+
+    pub fn get_actor_state<A>(
+        &self,
+        actor: ActorAddress,
+    ) -> Result<Admin<GetActorStateResponse<A>>, Error>
+    where
+        A: ActorInterface + Clone + Sync,
+    {
+        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+            return self
+                .ready::<GetActorStateResponse<A>>(Err(AdminError::ActorNotFound { actor }));
+        };
+        let (admin, reply_to) = self.new_admin::<GetActorStateResponse<A>>()?;
+
+        let get = Box::new(
+            |actor: ActorAddress,
+             erased: &dyn AnyActor,
+             metadata: ActorTypeMetadata|
+             -> Box<dyn Any + Send> {
+                let expected_actor_type = std::any::type_name::<A>();
+                let expected_message_type = std::any::type_name::<A::Incoming>();
+                if metadata.actor_type_id != TypeId::of::<A>()
+                    || metadata.message_type_id != TypeId::of::<A::Incoming>()
+                {
+                    return Box::new(Err::<GetActorStateResponse<A>, AdminError>(
+                        AdminError::TypeMismatch {
+                            expected_actor_type,
+                            expected_message_type,
+                            actual_actor_type: metadata.actor_type_name,
+                            actual_message_type: metadata.message_type_name,
+                        },
+                    ));
+                }
+
+                let Some(typed) = erased.as_any().downcast_ref::<Actor<A>>() else {
+                    return Box::new(Err::<GetActorStateResponse<A>, AdminError>(
+                        AdminError::TypeMismatch {
+                            expected_actor_type,
+                            expected_message_type,
+                            actual_actor_type: metadata.actor_type_name,
+                            actual_message_type: metadata.message_type_name,
+                        },
+                    ));
+                };
+
+                Box::new(Ok::<GetActorStateResponse<A>, AdminError>(
+                    GetActorStateResponse {
+                        state: ActorStateSnapshot {
+                            actor,
+                            actor_type: metadata.actor_type_name,
+                            message_type: metadata.message_type_name,
+                            actor_instance: typed.inner().clone(),
+                        },
+                    },
+                ))
+            },
+        );
+        let not_found = Box::new(|actor| {
+            Box::new(Err::<GetActorStateResponse<A>, AdminError>(
+                AdminError::ActorNotFound { actor },
+            )) as Box<dyn Any + Send>
+        });
+
+        let worker_idx = wid.as_usize();
+        self.runtime.admin_txs[worker_idx].send(AdminCommand::GetActorState {
+            actor,
+            reply_to,
+            get,
+            not_found,
+        });
+        notify_worker(&self.runtime.worker_threads, worker_idx);
+        Ok(admin)
+    }
+
+    pub fn replace_actor_state<A>(
+        &self,
+        actor: ActorAddress,
+        state: ActorStateSnapshot<A>,
+    ) -> Result<Admin<OperationResult>, Error>
+    where
+        A: ActorInterface,
+    {
+        if state.actor != actor {
+            return self.ready::<OperationResult>(Err(AdminError::AddressMismatch {
+                requested: actor,
+                snapshot: state.actor,
+            }));
+        }
+
+        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+            return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
+        };
+        let (admin, reply_to) = self.new_admin::<OperationResult>()?;
+
+        let actor_instance = state.actor_instance;
+        let replace = Box::new(
+            move |erased: &mut dyn AnyActor,
+                  metadata: ActorTypeMetadata|
+                  -> AdminResult<OperationResult> {
+                let expected_actor_type = std::any::type_name::<A>();
+                let expected_message_type = std::any::type_name::<A::Incoming>();
+                if metadata.actor_type_id != TypeId::of::<A>()
+                    || metadata.message_type_id != TypeId::of::<A::Incoming>()
+                {
+                    return Err(AdminError::TypeMismatch {
+                        expected_actor_type,
+                        expected_message_type,
+                        actual_actor_type: metadata.actor_type_name,
+                        actual_message_type: metadata.message_type_name,
+                    });
+                }
+
+                let Some(typed) = erased.as_any_mut().downcast_mut::<Actor<A>>() else {
+                    return Err(AdminError::TypeMismatch {
+                        expected_actor_type,
+                        expected_message_type,
+                        actual_actor_type: metadata.actor_type_name,
+                        actual_message_type: metadata.message_type_name,
+                    });
+                };
+
+                typed.replace_inner(actor_instance);
+                Ok(OperationResult { applied: true })
+            },
+        );
+
+        let worker_idx = wid.as_usize();
+        self.runtime.admin_txs[worker_idx].send(AdminCommand::ReplaceActorState {
+            actor,
+            reply_to,
+            replace,
+        });
+        notify_worker(&self.runtime.worker_threads, worker_idx);
+        Ok(admin)
+    }
+
+    pub fn stop_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
+        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+            return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
+        };
+        let (admin, reply_to) = self.new_admin::<OperationResult>()?;
+        let worker_idx = wid.as_usize();
+        self.runtime.admin_txs[worker_idx].send(AdminCommand::StopActor { actor, reply_to });
+        notify_worker(&self.runtime.worker_threads, worker_idx);
+        Ok(admin)
+    }
+
+    pub fn suspend_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
+        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+            return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
+        };
+        let (admin, reply_to) = self.new_admin::<OperationResult>()?;
+        let worker_idx = wid.as_usize();
+        self.runtime.admin_txs[worker_idx].send(AdminCommand::SuspendActor { actor, reply_to });
+        notify_worker(&self.runtime.worker_threads, worker_idx);
+        Ok(admin)
+    }
+
+    pub fn resume_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
+        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+            return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
+        };
+        let (admin, reply_to) = self.new_admin::<OperationResult>()?;
+        let worker_idx = wid.as_usize();
+        self.runtime.admin_txs[worker_idx].send(AdminCommand::ResumeActor { actor, reply_to });
+        notify_worker(&self.runtime.worker_threads, worker_idx);
+        Ok(admin)
     }
 }
 

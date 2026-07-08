@@ -443,6 +443,22 @@ impl<A: ActorInterface> Actor<A> {
     pub fn new(inner: A) -> Self {
         Self { inner }
     }
+
+    pub(crate) fn inner(&self) -> &A {
+        &self.inner
+    }
+
+    pub(crate) fn replace_inner(&mut self, inner: A) {
+        self.inner = inner;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorTypeMetadata {
+    pub actor_type_id: TypeId,
+    pub actor_type_name: &'static str,
+    pub message_type_id: TypeId,
+    pub message_type_name: &'static str,
 }
 
 /// Trait for type-erased actors — single-message handler.
@@ -456,6 +472,12 @@ pub trait AnyActor: Send {
 
     /// Called on graceful stop, before removal. See [`ActorInterface::on_stop`].
     fn on_stop(&mut self, _ctx: &Ctx) {}
+
+    fn metadata(&self) -> ActorTypeMetadata;
+
+    fn as_any(&self) -> &dyn Any;
+
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 impl<A> AnyActor for Actor<A>
@@ -492,6 +514,23 @@ where
 
     fn on_stop(&mut self, ctx: &Ctx) {
         self.inner.on_stop(ctx);
+    }
+
+    fn metadata(&self) -> ActorTypeMetadata {
+        ActorTypeMetadata {
+            actor_type_id: TypeId::of::<A>(),
+            actor_type_name: std::any::type_name::<A>(),
+            message_type_id: TypeId::of::<A::Incoming>(),
+            message_type_name: std::any::type_name::<A::Incoming>(),
+        }
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 
