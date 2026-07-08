@@ -24,7 +24,7 @@ const DEFAULT_RPC_ADDR: &str = "127.0.0.1:19777";
 const DEFAULT_NODE_IMAGE: &str = "swactor-mvp-node:latest";
 const BASE_NODE_IMAGE: &str = "swactor-mvp-node-base:cuda12.6";
 const MVP_RUNTIME_CONFIG_ENV: &str = "MVP_RUNTIME_CONFIG";
-const DEFAULT_CACHED_MODEL_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
+const DEFAULT_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
 const REPO_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const ORCH_REBUILD_INPUTS: &[&str] = &[
@@ -212,7 +212,12 @@ impl Config {
             (true, None) => Some(PathBuf::from("mvp-chat.log")),
             (false, explicit) => explicit
                 .or_else(|| env_optional("MVP_DATASTREAM_FRAME_LOG").map(PathBuf::from))
-                .or_else(|| toml.observability.datastream_frame_log.clone().map(PathBuf::from)),
+                .or_else(|| {
+                    toml.observability
+                        .datastream_frame_log
+                        .clone()
+                        .map(PathBuf::from)
+                }),
         };
         let model_id = first_non_empty([env_optional("MVP_MODEL_ID"), toml.model.id.clone()]);
         let gguf_repo =
@@ -224,7 +229,10 @@ impl Config {
             toml.model.gguf_revision.clone(),
         ]);
         let max_context = env_u32_optional("MVP_MAX_CONTEXT")?.or(toml.model.max_context);
-        let cached_model = match (args.cached_model, toml.docker.cached_model_host_path.clone()) {
+        let cached_model = match (
+            args.cached_model,
+            toml.docker.cached_model_host_path.clone(),
+        ) {
             (Some(cached_model), _) => Some(cached_model),
             (None, Some(path)) => Some(CachedModelConfig::from_arg(Some(path))?),
             (None, None) => None,
@@ -339,7 +347,10 @@ impl Config {
                 ]);
             }
             if let Some(min_down_mbps) = vastai.min_down_mbps {
-                args.extend(["--vastai-min-down-mbps".to_owned(), min_down_mbps.to_string()]);
+                args.extend([
+                    "--vastai-min-down-mbps".to_owned(),
+                    min_down_mbps.to_string(),
+                ]);
             }
             if let Some(min_up_mbps) = vastai.min_up_mbps {
                 args.extend(["--vastai-min-up-mbps".to_owned(), min_up_mbps.to_string()]);
@@ -1519,7 +1530,6 @@ mod tests {
             vastai: Some(valid_vastai_config()),
         }
     }
-
 
     fn assert_arg_value(args: &[String], flag: &str, expected: &str) {
         let flag_index = args

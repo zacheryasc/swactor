@@ -1,3 +1,4 @@
+use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
@@ -51,6 +52,13 @@ impl StageProvisionWire {
 pub enum NodeAgentMsg {
     ProvisionStage(StageProvisionWire),
     MarkWorkerReady,
+    RuntimeLoaded {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        endpoint: EndpointAddr,
+        node_actor: ActorAddress,
+    },
     MarkWeightsReady,
     MarkInboundEdgeReady {
         edge_id: u64,
@@ -220,6 +228,25 @@ impl NodeAgentActor {
                 })
             }
             NodeAgentMsg::MarkWorkerReady => self.core.observe(stage::StageEvent::WorkerReady),
+            NodeAgentMsg::RuntimeLoaded {
+                run_id,
+                node_id,
+                stage_index,
+                endpoint,
+                node_actor,
+            } => {
+                self.core.observe(stage::StageEvent::WorkerReady);
+                let _ = ctx.send(
+                    self.orchestrator,
+                    OrchestratorMsg::ObserveNodeRuntimeReady {
+                        run_id,
+                        node_id,
+                        stage_index,
+                        endpoint,
+                        node_actor,
+                    },
+                );
+            }
             NodeAgentMsg::MarkWeightsReady => self.core.observe(stage::StageEvent::WeightsReady),
             NodeAgentMsg::MarkInboundEdgeReady { edge_id } => {
                 self.core.observe(stage::StageEvent::InboundEdgeReady {
@@ -476,4 +503,51 @@ impl From<&stage::StageLifecycleEvent> for StageLifecycleWire {
 pub fn register_codecs(registry: &mut CodecRegistry) {
     registry.register::<NodeAgentMsg, _>(JsonCodec::<NodeAgentMsg>::default());
     registry.register::<NodeAgentReport, _>(JsonCodec::<NodeAgentReport>::default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::Runtime;
+
+    #[test]
+    fn node_agent_runtime_loaded_reports_orchestrator() {
+        let runtime = Runtime::new(RuntimeConfig::default());
+        let orchestrator_inbox = runtime
+            .new_inbox::<OrchestratorMsg>()
+            .expect("orchestrator inbox");
+        let orchestrator = *orchestrator_inbox.addr();
+        let node_actor = ActorAddress::new_random();
+        let endpoint = EndpointAddr::new(SecretKey::from_bytes(&[9; 32]).public());
+        let actor = runtime
+            .spawn(NodeAgentActor::new(stage::NodeId(11), orchestrator, None))
+            .expect("spawn node agent");
+
+        runtime
+            .send_to(
+                actor,
+                NodeAgentMsg::RuntimeLoaded {
+                    run_id: 7,
+                    node_id: 11,
+                    stage_index: 3,
+                    endpoint: endpoint.clone(),
+                    node_actor,
+                },
+            )
+            .expect("send runtime loaded");
+        runtime.tick();
+
+        assert_eq!(
+            orchestrator_inbox.try_recv(),
+            Some(OrchestratorMsg::ObserveNodeRuntimeReady {
+                run_id: 7,
+                node_id: 11,
+                stage_index: 3,
+                endpoint,
+                node_actor,
+            })
+        );
+    }
 }

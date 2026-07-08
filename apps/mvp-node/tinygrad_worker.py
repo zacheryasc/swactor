@@ -368,6 +368,9 @@ def load_weights(cmd: dict[str, Any]) -> None:
         )
         tok_src = cmd.get("tokenizer", {"EmbeddedGguf": None})
         if "EmbeddedGguf" in tok_src:
+            if kv.get("tokenizer.ggml.pre") == "smollm":
+                kv = dict(kv)
+                kv["tokenizer.ggml.pre"] = "qwen2"
             control(type="TokenizerBuildStarted", model_id=model_id, source="EmbeddedGguf")
             tokenizer = SimpleTokenizer.from_gguf_kv(kv)
             control(type="TokenizerBuildReady", model_id=model_id, source="EmbeddedGguf")
@@ -396,7 +399,13 @@ def load_weights(cmd: dict[str, Any]) -> None:
 
 
 def prompt_template_name() -> str:
-    return os.environ.get("MVP_PROMPT_TEMPLATE", "llama3-chat").strip().lower()
+    explicit = os.environ.get("MVP_PROMPT_TEMPLATE")
+    if explicit is not None:
+        return explicit.strip().lower()
+    model_id = str(loaded.get("model_id", "")).lower()
+    if "smollm" in model_id:
+        return "smollm-chat"
+    return "llama3-chat"
 
 
 def model_prompt_text(prompt: str) -> tuple[str, str]:
@@ -412,12 +421,27 @@ def model_prompt_text(prompt: str) -> tuple[str, str]:
             "<|start_header_id|>assistant<|end_header_id|>\n\n",
             "llama3-chat",
         )
+    if template in {"smollm", "smollm-chat", "smollm2", "smollm2-chat"}:
+        return (
+            "<|im_start|>user\n"
+            f"{prompt}"
+            "<|im_end|>\n"
+            "<|im_start|>assistant\n",
+            "smollm-chat",
+        )
     return prompt, "raw"
 
 
 def strip_chat_stop_markers(text: str) -> str:
     cut = len(text)
-    for marker in ("<|eot_id|>", "<|end_of_text|>", "<|start_header_id|>"):
+    for marker in (
+        "<|eot_id|>",
+        "<|end_of_text|>",
+        "<|start_header_id|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "<|im_start|>",
+    ):
         index = text.find(marker)
         if index >= 0:
             cut = min(cut, index)

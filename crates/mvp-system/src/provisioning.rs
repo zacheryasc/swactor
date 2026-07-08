@@ -12,9 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::UNIX_EPOCH;
 
-use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
-use swactor::actor::ActorAddress;
 
 use crate::bootstrap_datastream::BootstrapDatastreamBridge;
 
@@ -93,13 +91,6 @@ pub enum PluginObservation {
         node_id: u64,
         line: String,
     },
-    RuntimeReady {
-        run_id: u64,
-        node_id: u64,
-        stage_index: Option<u32>,
-        endpoint: EndpointAddr,
-        node_actor: ActorAddress,
-    },
     Exited {
         run_id: u64,
         node_id: u64,
@@ -143,6 +134,8 @@ pub trait ProvisionPlugin: Send {
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Result<PluginNodeHandle, String>;
+
+    fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
 
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
 }
@@ -429,6 +422,10 @@ impl ProvisionPlugin for LocalDockerPlugin {
         });
 
         Ok(handle)
+    }
+
+    fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
+        Ok(())
     }
 
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {

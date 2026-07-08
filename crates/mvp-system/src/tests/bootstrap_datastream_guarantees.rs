@@ -9,7 +9,6 @@ use mvp_system::provisioning::{
 use mvp_system::telemetry::MvpProvisionLogRecord;
 use parking_lot::Mutex;
 use serde_json::json;
-use swactor::actor::ActorAddress;
 
 #[derive(Default)]
 struct RecordingSink {
@@ -90,30 +89,26 @@ fn bootstrap_bridge_writes_node_stream_and_forwards_plugin_observations() {
 }
 
 #[test]
-fn ready_json_on_stdout_emits_runtime_ready_through_plugin_sink() {
+fn stdout_ready_json_is_log_only() {
     let (recording, sink) = recording_sink();
     let bridge = BootstrapDatastreamBridge::new(spec(), sink, None);
-    let endpoint = EndpointAddr::new(SecretKey::from_bytes(&[7; 32]).public());
-    let node_actor = ActorAddress::new_random();
     let line = serde_json::to_string(&json!({
         "type": "ready",
-        "endpoint": endpoint,
-        "node_actor": node_actor,
+        "endpoint": EndpointAddr::new(SecretKey::from_bytes(&[7; 32]).public()),
+        "node_actor": "ignored-by-stdout-bridge",
         "logical_node_id": 42,
         "stage_index": 3,
     }))
     .unwrap();
 
-    bridge.observe_stdout_line(line);
+    bridge.observe_stdout_line(line.clone());
 
-    assert!(recording.observations().iter().any(|observation| matches!(
-        observation,
-        PluginObservation::RuntimeReady {
+    assert_eq!(
+        recording.observations(),
+        vec![PluginObservation::StdoutLine {
             run_id: 7,
             node_id: 42,
-            stage_index: Some(3),
-            endpoint: observed_endpoint,
-            node_actor: observed_actor,
-        } if observed_endpoint == &endpoint && observed_actor == &node_actor
-    )));
+            line,
+        }]
+    );
 }

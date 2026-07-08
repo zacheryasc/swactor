@@ -406,10 +406,10 @@ fn run() -> Result<(), String> {
             return Err(format!("node report inbox: {error}"));
         }
     };
-    let (orchestrator, orchestrator_source) = match config.orchestrator_actor {
-        Some(actor) => (actor, "env"),
-        None => (ActorAddress::new_random(), "generated_fallback"),
-    };
+    let orchestrator = config.orchestrator_actor.ok_or_else(|| {
+        "MVP_ORCHESTRATOR_ACTOR is required for runtime readiness signaling".to_owned()
+    })?;
+    let orchestrator_source = "env";
     emit_stdio_node_event(
         &config,
         NODE_BOOTSTRAP_CHANNEL,
@@ -512,26 +512,32 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
     }
-    match stack
-        .runtime
-        .send_to(node_actor, NodeAgentMsg::MarkWorkerReady)
-    {
+    match stack.runtime.send_to(
+        node_actor,
+        NodeAgentMsg::RuntimeLoaded {
+            run_id: config.run_id,
+            node_id: config.logical_node_id,
+            stage_index: config.stage_index,
+            endpoint: driver.endpoint_addr(),
+            node_actor,
+        },
+    ) {
         Ok(()) => emit_stdio_node_event(
             &config,
             NODE_RUNTIME_CHANNEL,
-            "mark_worker_ready",
+            "runtime_loaded",
             "ready",
-            json!({"sent":"NodeAgentMsg::MarkWorkerReady","node_actor":node_actor}),
+            json!({"sent":"NodeAgentMsg::RuntimeLoaded","node_actor":node_actor}),
         )?,
         Err(error) => {
             emit_stdio_node_event(
                 &config,
                 NODE_RUNTIME_CHANNEL,
-                "mark_worker_ready",
+                "runtime_loaded",
                 "failed",
                 json!({"error":error.to_string()}),
             )?;
-            return Err(format!("mark initialized worker ready: {error}"));
+            return Err(format!("signal runtime loaded: {error}"));
         }
     }
 
@@ -553,10 +559,8 @@ fn run() -> Result<(), String> {
             "node_actor":node_actor,
             "logical_node_id":config.logical_node_id,
             "stage_index":config.stage_index,
-            "stdio_ready_line_emitted":true,
         }),
     )?;
-    println!("{ready}");
     datastream.submit_text(ChannelId::new("mvp.node.ready"), ready.to_string());
     emit_stdio_node_event(
         &config,
@@ -565,12 +569,16 @@ fn run() -> Result<(), String> {
         "ready",
         json!({"from":"stdio_envelope","to":"cluster_datastream","channel":NODE_BOOTSTRAP_CHANNEL}),
     )?;
-    std::io::stdout()
-        .flush()
-        .map_err(|e| format!("flush ready line: {e}"))?;
 
     if let Some(prompt) = &config.self_test_prompt {
-        run_self_test(&mut worker, &config, prompt, &mut datastream, &mut driver, &stack)?;
+        run_self_test(
+            &mut worker,
+            &config,
+            prompt,
+            &mut datastream,
+            &mut driver,
+            &stack,
+        )?;
     }
 
     let shutdown_rx = spawn_stdin_shutdown_listener();
@@ -1666,7 +1674,6 @@ impl Drop for TinygradWorker {
         let _ = self.child.wait();
     }
 }
-
 
 fn spawn_stdin_shutdown_listener() -> Receiver<()> {
     let (tx, rx) = mpsc::channel();
