@@ -24,7 +24,6 @@ const DEFAULT_RPC_ADDR: &str = "127.0.0.1:19777";
 const DEFAULT_NODE_IMAGE: &str = "swactor-mvp-node:latest";
 const BASE_NODE_IMAGE: &str = "swactor-mvp-node-base:cuda12.6";
 const MVP_RUNTIME_CONFIG_ENV: &str = "MVP_RUNTIME_CONFIG";
-const CACHED_MODEL_HOST_ENV: &str = "MVP_CACHED_MODEL_HOST_PATH";
 const DEFAULT_CACHED_MODEL_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const REPO_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_MAX_TOKENS: u32 = 64;
@@ -138,8 +137,8 @@ impl Config {
         I: IntoIterator<Item = String>,
     {
         let args = ParsedArgs::parse(provided_args)?;
-        let loaded = chat_config::Config::load(args.config_path.as_deref())?;
-        let file = loaded.config;
+        let loaded = chat_config::TomlConfigOverlay::load(args.config_path.as_deref())?;
+        let toml = loaded.overlay;
         let profile = if args.vastai {
             RuntimeConfigProfile::Deploy
         } else {
@@ -150,59 +149,59 @@ impl Config {
         } else {
             provider_from_env(profile)?
         };
-        let relay_mode = relay_mode_from_sources(file.relay.mode.as_deref())?;
+        let relay_mode = relay_mode_from_sources(toml.relay.mode.as_deref())?;
         let relay_url = first_non_empty([
             env_optional("MVP_IROH_RELAY_URL"),
             env_optional("SWACTOR_IROH_RELAY_URL"),
-            file.relay.url.clone(),
+            toml.relay.url.clone(),
         ]);
         let node_image = first_non_empty([
             args.image,
             env_optional("MVP_NODE_IMAGE"),
             if args.vastai {
-                file.vastai.image.clone()
+                toml.vastai.image.clone()
             } else {
                 None
             },
-            file.image.node.clone(),
+            toml.image.node.clone(),
             Some(DEFAULT_NODE_IMAGE.to_owned()),
         ])
         .expect("default image is non-empty");
         let max_tokens = args
             .max_tokens
             .or(env_u32_optional("MVP_PROMPT_MAX_TOKENS")?)
-            .or(file.prompt.max_tokens)
+            .or(toml.prompt.max_tokens)
             .unwrap_or(DEFAULT_MAX_TOKENS);
         let dashboard = args
             .dashboard
             .or(env_bool_optional("MVP_DASHBOARD")?)
-            .or(file.prompt.dashboard)
+            .or(toml.prompt.dashboard)
             .unwrap_or(true);
         let build_image = args
             .build_image
             .or(env_bool_optional("MVP_BUILD_NODE_IMAGE")?)
-            .or(file.image.build)
+            .or(toml.image.build)
             .unwrap_or(true);
         let push_image = args
             .push_image
             .or(env_bool_optional("MVP_PUSH_NODE_IMAGE")?)
-            .or(file.image.push)
+            .or(toml.image.push)
             .unwrap_or(false);
         let force_image_refresh = args
             .force_image_refresh
             .or(env_bool_optional("MVP_FORCE_NODE_IMAGE_REFRESH")?)
-            .or(file.image.force_refresh)
+            .or(toml.image.force_refresh)
             .unwrap_or(false);
         let image_tag = first_non_empty([
             args.image_tag,
             env_optional("MVP_NODE_IMAGE_TAG"),
-            file.image.tag.clone(),
+            toml.image.tag.clone(),
         ]);
         let rpc_addr = first_non_empty([
             args.rpc_addr,
             env_optional("MVP_PROMPT_RPC_ADDR"),
             env_optional("MVP_PROMPT_RPC_BIND"),
-            file.prompt.rpc_addr.clone(),
+            toml.prompt.rpc_addr.clone(),
             Some(DEFAULT_RPC_ADDR.to_owned()),
         ])
         .expect("default RPC address is non-empty");
@@ -211,23 +210,28 @@ impl Config {
                 return Err("--dump-logs cannot be combined with --datastream-frame-log; use one datastream log destination".to_owned());
             }
             (true, None) => Some(PathBuf::from("mvp-chat.log")),
-            (false, explicit) => {
-                explicit.or_else(|| env_optional("MVP_DATASTREAM_FRAME_LOG").map(PathBuf::from))
-            }
+            (false, explicit) => explicit
+                .or_else(|| env_optional("MVP_DATASTREAM_FRAME_LOG").map(PathBuf::from))
+                .or_else(|| toml.observability.datastream_frame_log.clone().map(PathBuf::from)),
         };
-        let model_id = first_non_empty([env_optional("MVP_MODEL_ID"), file.model.id.clone()]);
+        let model_id = first_non_empty([env_optional("MVP_MODEL_ID"), toml.model.id.clone()]);
         let gguf_repo =
-            first_non_empty([env_optional("MVP_GGUF_REPO"), file.model.gguf_repo.clone()]);
+            first_non_empty([env_optional("MVP_GGUF_REPO"), toml.model.gguf_repo.clone()]);
         let gguf_file =
-            first_non_empty([env_optional("MVP_GGUF_FILE"), file.model.gguf_file.clone()]);
+            first_non_empty([env_optional("MVP_GGUF_FILE"), toml.model.gguf_file.clone()]);
         let gguf_revision = first_non_empty([
             env_optional("MVP_GGUF_REVISION"),
-            file.model.gguf_revision.clone(),
+            toml.model.gguf_revision.clone(),
         ]);
-        let max_context = env_u32_optional("MVP_MAX_CONTEXT")?.or(file.model.max_context);
+        let max_context = env_u32_optional("MVP_MAX_CONTEXT")?.or(toml.model.max_context);
+        let cached_model = match (args.cached_model, toml.docker.cached_model_host_path.clone()) {
+            (Some(cached_model), _) => Some(cached_model),
+            (None, Some(path)) => Some(CachedModelConfig::from_arg(Some(path))?),
+            (None, None) => None,
+        };
         let vastai = if args.vastai {
             Some(resolve_vastai_config(
-                &file.vastai,
+                &toml.vastai,
                 &node_image,
                 relay_url.clone(),
             )?)
@@ -250,7 +254,7 @@ impl Config {
             image_tag,
             push_image,
             force_image_refresh,
-            cached_model: args.cached_model,
+            cached_model,
             datastream_frame_log,
             vastai_yes: args.vastai_yes,
             model_id,
@@ -260,6 +264,107 @@ impl Config {
             max_context,
             vastai,
         })
+    }
+
+    fn orchestrator_cli_args(&self, image_ref: &str) -> Vec<String> {
+        let mut args = vec![
+            "--runtime-config".to_owned(),
+            self.config_profile.as_str().to_owned(),
+            "--provider".to_owned(),
+            self.provider.as_str().to_owned(),
+            "--image".to_owned(),
+            image_ref.to_owned(),
+            "--rpc-bind".to_owned(),
+            self.rpc_addr.clone(),
+            "--max-tokens".to_owned(),
+            self.max_tokens.to_string(),
+            if self.dashboard {
+                "--dashboard".to_owned()
+            } else {
+                "--no-dashboard".to_owned()
+            },
+        ];
+        if let Some(relay_url) = &self.relay_url {
+            args.extend(["--relay-url".to_owned(), relay_url.clone()]);
+        }
+        args.extend([
+            "--relay-mode".to_owned(),
+            relay_mode_env_value(&self.relay_mode).to_owned(),
+        ]);
+        if let Some(model_id) = &self.model_id {
+            args.extend(["--model-id".to_owned(), model_id.clone()]);
+        }
+        if let Some(repo) = &self.gguf_repo {
+            args.extend(["--gguf-repo".to_owned(), repo.clone()]);
+        }
+        if let Some(file) = &self.gguf_file {
+            args.extend(["--gguf-file".to_owned(), file.clone()]);
+        }
+        if let Some(revision) = &self.gguf_revision {
+            args.extend(["--gguf-revision".to_owned(), revision.clone()]);
+        }
+        if let Some(max_context) = self.max_context {
+            args.extend(["--max-context".to_owned(), max_context.to_string()]);
+        }
+        if let Some(cached_model) = &self.cached_model {
+            args.extend([
+                "--cached-model-host-path".to_owned(),
+                cached_model.host_path.to_string_lossy().to_string(),
+            ]);
+        }
+        if let Some(path) = &self.datastream_frame_log {
+            args.extend([
+                "--datastream-frame-log".to_owned(),
+                path.to_string_lossy().to_string(),
+            ]);
+        }
+        if let Some(vastai) = &self.vastai {
+            args.extend([
+                "--vastai-api-key".to_owned(),
+                vastai.api_key.clone(),
+                "--vastai-bootstrap-command".to_owned(),
+                vastai.bootstrap_command.clone(),
+                "--no-vastai-confirm-lease".to_owned(),
+            ]);
+            if let Some(disk_gb) = vastai.disk_gb {
+                args.extend(["--vastai-disk-gb".to_owned(), disk_gb.to_string()]);
+            }
+            if let Some(gpu_name) = &vastai.gpu_name {
+                args.extend(["--vastai-gpu-name".to_owned(), gpu_name.clone()]);
+            }
+            if let Some(min_gpu_ram_mb) = vastai.min_gpu_ram_mb {
+                args.extend([
+                    "--vastai-min-gpu-ram-mb".to_owned(),
+                    min_gpu_ram_mb.to_string(),
+                ]);
+            }
+            if let Some(min_down_mbps) = vastai.min_down_mbps {
+                args.extend(["--vastai-min-down-mbps".to_owned(), min_down_mbps.to_string()]);
+            }
+            if let Some(min_up_mbps) = vastai.min_up_mbps {
+                args.extend(["--vastai-min-up-mbps".to_owned(), min_up_mbps.to_string()]);
+            }
+            if let Some(min_reliability) = vastai.min_reliability {
+                args.extend([
+                    "--vastai-min-reliability".to_owned(),
+                    min_reliability.to_string(),
+                ]);
+            }
+            if let Some(require_verified) = vastai.require_verified {
+                args.push(if require_verified {
+                    "--vastai-require-verified".to_owned()
+                } else {
+                    "--no-vastai-require-verified".to_owned()
+                });
+            }
+            if let Some(onstart) = &vastai.onstart {
+                args.extend(["--vastai-onstart".to_owned(), onstart.clone()]);
+            }
+            if let Some(ssh_identity) = &vastai.ssh_identity {
+                args.extend(["--vastai-ssh-identity".to_owned(), ssh_identity.clone()]);
+            }
+        }
+        args
     }
 }
 
@@ -660,82 +765,13 @@ struct OrchChild {
 impl OrchChild {
     fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
         let mut command = Command::new(&config.orch_bin);
+        let mut orch_args = config.orchestrator_cli_args(image_ref);
+        orch_args.extend(config.orch_args.clone());
         command
-            .args(&config.orch_args)
-            .env("MVP_NODE_PROVIDER", config.provider.as_str())
-            .env(MVP_RUNTIME_CONFIG_ENV, config.config_profile.as_str())
-            .env("MVP_NODE_IMAGE", image_ref)
-            .env(
-                "MVP_IROH_RELAY_MODE",
-                relay_mode_env_value(&config.relay_mode),
-            )
-            .env("MVP_PROMPT_RPC_BIND", &config.rpc_addr)
-            .env("MVP_PROMPT_RPC_ADDR", &config.rpc_addr)
-            .env("MVP_PROMPT_MAX_TOKENS", config.max_tokens.to_string())
-            .env("MVP_DASHBOARD", if config.dashboard { "1" } else { "0" })
+            .args(&orch_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        if let Some(relay_url) = &config.relay_url {
-            command.env("MVP_IROH_RELAY_URL", relay_url);
-        }
-        if let Some(vastai) = &config.vastai {
-            command
-                .env("MVP_VASTAI_API_KEY", &vastai.api_key)
-                .env("MVP_VASTAI_BOOTSTRAP_COMMAND", &vastai.bootstrap_command)
-                .env("MVP_VASTAI_CONFIRM_LEASE", "0");
-            if let Some(disk_gb) = vastai.disk_gb {
-                command.env("MVP_VASTAI_DISK_GB", disk_gb.to_string());
-            }
-            if let Some(gpu_name) = &vastai.gpu_name {
-                command.env("MVP_VASTAI_GPU_NAME", gpu_name);
-            }
-            if let Some(min_gpu_ram_mb) = vastai.min_gpu_ram_mb {
-                command.env("MVP_VASTAI_MIN_GPU_RAM_MB", min_gpu_ram_mb.to_string());
-            }
-            if let Some(min_down_mbps) = vastai.min_down_mbps {
-                command.env("MVP_VASTAI_MIN_DOWN_MBPS", min_down_mbps.to_string());
-            }
-            if let Some(min_up_mbps) = vastai.min_up_mbps {
-                command.env("MVP_VASTAI_MIN_UP_MBPS", min_up_mbps.to_string());
-            }
-            if let Some(min_reliability) = vastai.min_reliability {
-                command.env("MVP_VASTAI_MIN_RELIABILITY", min_reliability.to_string());
-            }
-            if let Some(require_verified) = vastai.require_verified {
-                command.env(
-                    "MVP_VASTAI_REQUIRE_VERIFIED",
-                    if require_verified { "1" } else { "0" },
-                );
-            }
-            if let Some(onstart) = &vastai.onstart {
-                command.env("MVP_VASTAI_ONSTART", onstart);
-            }
-            if let Some(ssh_identity) = &vastai.ssh_identity {
-                command.env("MVP_VASTAI_SSH_IDENTITY", ssh_identity);
-            }
-        }
-        if let Some(model_id) = &config.model_id {
-            command.env("MVP_MODEL_ID", model_id);
-        }
-        if let Some(repo) = &config.gguf_repo {
-            command.env("MVP_GGUF_REPO", repo);
-        }
-        if let Some(file) = &config.gguf_file {
-            command.env("MVP_GGUF_FILE", file);
-        }
-        if let Some(revision) = &config.gguf_revision {
-            command.env("MVP_GGUF_REVISION", revision);
-        }
-        if let Some(max_context) = config.max_context {
-            command.env("MVP_MAX_CONTEXT", max_context.to_string());
-        }
-        if let Some(cached_model) = &config.cached_model {
-            command.env(CACHED_MODEL_HOST_ENV, &cached_model.host_path);
-        }
-        if let Some(path) = &config.datastream_frame_log {
-            command.env("MVP_DATASTREAM_FRAME_LOG", path);
-        }
         #[cfg(target_os = "linux")]
         unsafe {
             command.pre_exec(|| {
@@ -1482,6 +1518,136 @@ mod tests {
             max_context: None,
             vastai: Some(valid_vastai_config()),
         }
+    }
+
+
+    fn assert_arg_value(args: &[String], flag: &str, expected: &str) {
+        let flag_index = args
+            .iter()
+            .position(|arg| arg == flag)
+            .unwrap_or_else(|| panic!("missing CLI flag {flag}; args={args:?}"));
+        assert_eq!(
+            args.get(flag_index + 1).map(String::as_str),
+            Some(expected),
+            "unexpected value for CLI flag {flag}; args={args:?}"
+        );
+    }
+
+    fn assert_flag(args: &[String], flag: &str) {
+        assert!(
+            args.iter().any(|arg| arg == flag),
+            "missing CLI flag {flag}; args={args:?}"
+        );
+    }
+
+    #[test]
+    fn orchestrator_cli_args_cover_wrapper_launch_config() {
+        let config = Config {
+            orch_bin: PathBuf::from("mvp-orchestrator"),
+            orch_args: Vec::new(),
+            rpc_addr: "127.0.0.1:20123".to_owned(),
+            node_image: "docker.io/example/config-node:ignored".to_owned(),
+            config_profile: RuntimeConfigProfile::Local,
+            provider: ProviderKind::Docker,
+            relay_mode: iroh::RelayMode::Default,
+            relay_url: Some("https://relay.example.com".to_owned()),
+            max_tokens: 37,
+            dashboard: false,
+            build_image: false,
+            image_tag: None,
+            push_image: false,
+            force_image_refresh: false,
+            cached_model: Some(CachedModelConfig {
+                host_path: PathBuf::from("/var/cache/swactor/model.gguf"),
+                display_path: PathBuf::from("model.gguf"),
+            }),
+            datastream_frame_log: Some(PathBuf::from("/tmp/mvp-chat-frames.jsonl")),
+            vastai_yes: false,
+            vastai: None,
+            model_id: Some("wrapper-model".to_owned()),
+            gguf_repo: Some("example/wrapper-repo".to_owned()),
+            gguf_file: Some("wrapper-model.gguf".to_owned()),
+            gguf_revision: None,
+            max_context: Some(768),
+        };
+
+        let args = config.orchestrator_cli_args("docker.io/example/prepared-node:latest");
+
+        assert_arg_value(&args, "--runtime-config", "local");
+        assert_arg_value(&args, "--provider", "docker");
+        assert_arg_value(&args, "--image", "docker.io/example/prepared-node:latest");
+        assert_arg_value(&args, "--rpc-bind", "127.0.0.1:20123");
+        assert_arg_value(&args, "--max-tokens", "37");
+        assert_flag(&args, "--no-dashboard");
+        assert_arg_value(&args, "--relay-url", "https://relay.example.com");
+        assert_arg_value(&args, "--model-id", "wrapper-model");
+        assert_arg_value(&args, "--gguf-repo", "example/wrapper-repo");
+        assert_arg_value(&args, "--gguf-file", "wrapper-model.gguf");
+        assert_arg_value(&args, "--max-context", "768");
+        assert_arg_value(
+            &args,
+            "--cached-model-host-path",
+            "/var/cache/swactor/model.gguf",
+        );
+        assert_arg_value(
+            &args,
+            "--datastream-frame-log",
+            "/tmp/mvp-chat-frames.jsonl",
+        );
+    }
+
+    #[test]
+    fn orchestrator_cli_args_cover_vastai_config() {
+        let mut vastai = valid_vastai_config();
+        vastai.onstart = Some("echo preparing vastai node".to_owned());
+        let config = Config {
+            orch_bin: PathBuf::from("mvp-orchestrator"),
+            orch_args: Vec::new(),
+            rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
+            node_image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
+            config_profile: RuntimeConfigProfile::Deploy,
+            provider: ProviderKind::VastAi,
+            relay_mode: iroh::RelayMode::Default,
+            relay_url: Some(vastai.relay_url.clone()),
+            max_tokens: 128,
+            dashboard: false,
+            build_image: false,
+            image_tag: Some("trial".to_owned()),
+            push_image: true,
+            force_image_refresh: false,
+            cached_model: None,
+            datastream_frame_log: None,
+            vastai_yes: true,
+            vastai: Some(vastai),
+            model_id: None,
+            gguf_repo: None,
+            gguf_file: None,
+            gguf_revision: None,
+            max_context: None,
+        };
+
+        let args = config.orchestrator_cli_args("ghcr.io/swactor/mvp-node:latest");
+
+        assert_arg_value(&args, "--vastai-api-key", "vast-key");
+        assert_arg_value(
+            &args,
+            "--vastai-bootstrap-command",
+            "/usr/local/bin/mvp-node",
+        );
+        assert_flag(&args, "--no-vastai-confirm-lease");
+        assert_arg_value(&args, "--vastai-disk-gb", "80");
+        assert_arg_value(&args, "--vastai-gpu-name", "RTX 4090");
+        assert_arg_value(&args, "--vastai-min-gpu-ram-mb", "16000");
+        assert_arg_value(&args, "--vastai-min-down-mbps", "100");
+        assert_arg_value(&args, "--vastai-min-up-mbps", "25");
+        assert_arg_value(&args, "--vastai-min-reliability", "0.98");
+        assert_flag(&args, "--vastai-require-verified");
+        assert_arg_value(&args, "--vastai-onstart", "echo preparing vastai node");
+        assert_arg_value(
+            &args,
+            "--vastai-ssh-identity",
+            "~/.ssh/swactor_vastai_ed25519",
+        );
     }
 
     #[test]

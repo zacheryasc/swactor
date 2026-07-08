@@ -417,18 +417,19 @@ fn run() -> Result<(), String> {
         "ready",
         json!({"actor":orchestrator,"source":orchestrator_source}),
     )?;
-    let node_actor = match stack.runtime.spawn(NodeAgentActor::new(
+    let node_agent = NodeAgentActor::new(
         stage::NodeId(config.logical_node_id),
         orchestrator,
         Some(*reports.addr()),
-    )) {
+    );
+    let node_actor = match stack.runtime.spawn(node_agent) {
         Ok(actor) => {
             emit_stdio_node_event(
                 &config,
                 NODE_BOOTSTRAP_CHANNEL,
                 "node_agent",
                 "ready",
-                json!({"node_actor":actor}),
+                json!({"node_actor":actor,"source":"generated"}),
             )?;
             actor
         }
@@ -438,7 +439,7 @@ fn run() -> Result<(), String> {
                 NODE_BOOTSTRAP_CHANNEL,
                 "node_agent",
                 "failed",
-                json!({"error":error.to_string()}),
+                json!({"error":error.to_string(),"source":"generated"}),
             )?;
             return Err(format!("spawn node agent: {error}"));
         }
@@ -569,7 +570,7 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("flush ready line: {e}"))?;
 
     if let Some(prompt) = &config.self_test_prompt {
-        run_self_test(&mut worker, &config, prompt, &mut datastream)?;
+        run_self_test(&mut worker, &config, prompt, &mut datastream, &mut driver, &stack)?;
     }
 
     let shutdown_rx = spawn_stdin_shutdown_listener();
@@ -1197,6 +1198,8 @@ fn run_self_test(
     config: &DeploymentConfig,
     prompt: &str,
     datastream: &mut DatastreamEmitter,
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
 ) -> Result<(), String> {
     emit_node_event(
         datastream,
@@ -1206,7 +1209,7 @@ fn run_self_test(
         "started",
         json!({"prompt_bytes":prompt.len()}),
     );
-    let mut pump = || {};
+    let mut pump = || pump_network(driver, stack);
     worker.configure_role(
         config.run_id,
         config.stage_index,
@@ -1663,6 +1666,7 @@ impl Drop for TinygradWorker {
         let _ = self.child.wait();
     }
 }
+
 
 fn spawn_stdin_shutdown_listener() -> Receiver<()> {
     let (tx, rx) = mpsc::channel();

@@ -4,16 +4,38 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use swactor_vastai::SelectionPolicy;
 
-const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
+pub const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
 
+/// Transient serde target for `.config/config.toml`.
+/// This is not runtime state; it exists only to interpret TOML fields and overlay them onto hardcoded defaults.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct Config {
+pub struct TomlConfigOverlay {
+    pub runtime: RuntimeConfigOverlay,
+    pub provider: ProviderConfigOverlay,
     pub image: ImageConfig,
     pub relay: RelayConfig,
     pub prompt: PromptConfig,
     pub model: ModelConfig,
+    pub docker: DockerConfigOverlay,
+    pub observability: ObservabilityConfigOverlay,
     pub vastai: VastAiConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct RuntimeConfigOverlay {
+    pub profile: Option<String>,
+    pub run_id: Option<u64>,
+    pub node_id: Option<u64>,
+    pub stage_index: Option<u32>,
+    pub layer_end_exclusive: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ProviderConfigOverlay {
+    pub kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -45,10 +67,25 @@ pub struct PromptConfig {
 #[serde(default)]
 pub struct ModelConfig {
     pub id: Option<String>,
+    pub gguf_local_path: Option<String>,
     pub gguf_repo: Option<String>,
     pub gguf_file: Option<String>,
     pub gguf_revision: Option<String>,
+    pub tokenizer_local_path: Option<String>,
     pub max_context: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct DockerConfigOverlay {
+    pub gpus: Option<String>,
+    pub cached_model_host_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ObservabilityConfigOverlay {
+    pub datastream_frame_log: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -58,20 +95,23 @@ pub struct VastAiConfig {
     pub image: Option<String>,
     pub bootstrap_command: Option<String>,
     pub disk_gb: Option<u32>,
+    pub ssh_user: Option<String>,
+    pub confirm_lease: Option<bool>,
     pub gpu_name: Option<String>,
     pub min_gpu_ram_mb: Option<u64>,
     pub min_down_mbps: Option<f64>,
     pub min_up_mbps: Option<f64>,
     pub min_reliability: Option<f64>,
     pub require_verified: Option<bool>,
+    pub poll_interval_secs: Option<u64>,
     pub onstart: Option<String>,
     pub ssh_identity: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct LoadedConfig {
+pub struct LoadedTomlConfigOverlay {
     pub path: Option<PathBuf>,
-    pub config: Config,
+    pub overlay: TomlConfigOverlay,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -91,27 +131,28 @@ pub struct ResolvedVastAiConfig {
     pub ssh_identity: Option<String>,
 }
 
-impl Config {
-    pub fn load(path: Option<&Path>) -> Result<LoadedConfig, String> {
+impl TomlConfigOverlay {
+    pub fn load(path: Option<&Path>) -> Result<LoadedTomlConfigOverlay, String> {
         match path {
-            Some(path) => Self::load_required(path).map(|config| LoadedConfig {
+            Some(path) => Self::load_required(path).map(|overlay| LoadedTomlConfigOverlay {
                 path: Some(path.to_path_buf()),
-                config,
+                overlay,
             }),
             None => {
                 let default = Path::new(DEFAULT_CONFIG_PATH);
-                if default.is_file() {
-                    Self::load_required(default).map(|config| LoadedConfig {
-                        path: Some(default.to_path_buf()),
-                        config,
-                    })
-                } else {
-                    Ok(LoadedConfig {
-                        path: None,
-                        config: Self::default(),
-                    })
-                }
+                Self::load_optional(default).map(|overlay| LoadedTomlConfigOverlay {
+                    path: overlay.as_ref().map(|_| default.to_path_buf()),
+                    overlay: overlay.unwrap_or_default(),
+                })
             }
+        }
+    }
+
+    pub fn load_optional(path: &Path) -> Result<Option<Self>, String> {
+        if path.is_file() {
+            Self::load_required(path).map(Some)
+        } else {
+            Ok(None)
         }
     }
 
@@ -222,8 +263,19 @@ mod tests {
 
     #[test]
     fn config_toml_parses_explicit_chat_and_vastai_fields() {
-        let config = Config::from_str(
+        let config = TomlConfigOverlay::from_str(
             r#"
+
+[runtime]
+profile = "deploy"
+run_id = 42
+node_id = 7
+stage_index = 2
+layer_end_exclusive = 24
+
+[provider]
+kind = "vastai"
+
 [image]
 node = "ghcr.io/swactor/mvp-node:latest"
 tag = "trial"
@@ -243,15 +295,27 @@ dashboard = false
 
 [model]
 id = "smollm2-135m-instruct-q4"
+gguf_local_path = "/models/local.gguf"
 gguf_repo = "QuantFactory/SmolLM2-135M-Instruct-GGUF"
 gguf_file = "SmolLM2-135M-Instruct.Q4_K_M.gguf"
 gguf_revision = "main"
+tokenizer_local_path = "/models/tokenizer.json"
 max_context = 512
+
+[docker]
+gpus = "all"
+cached_model_host_path = "/cache/model.gguf"
+
+[observability]
+datastream_frame_log = "/tmp/frames.jsonl"
+
 [vastai]
 api_key = "vast-key"
 image = "registry.example.com/team/mvp-node:latest"
 bootstrap_command = "/opt/mvp/node --join"
 disk_gb = 80
+ssh_user = "ubuntu"
+confirm_lease = true
 gpu_name = "RTX 4090"
 min_gpu_ram_mb = 24000
 min_down_mbps = 250.5
@@ -260,10 +324,17 @@ min_reliability = 0.99
 require_verified = true
 onstart = "echo preparing"
 ssh_identity = "~/.ssh/swactor_vastai_ed25519"
+poll_interval_secs = 30
 "#,
         )
         .expect("explicit config TOML parses");
 
+        assert_eq!(config.runtime.profile.as_deref(), Some("deploy"));
+        assert_eq!(config.runtime.run_id, Some(42));
+        assert_eq!(config.runtime.node_id, Some(7));
+        assert_eq!(config.runtime.stage_index, Some(2));
+        assert_eq!(config.runtime.layer_end_exclusive, Some(24));
+        assert_eq!(config.provider.kind.as_deref(), Some("vastai"));
         assert_eq!(
             config.image.node.as_deref(),
             Some("ghcr.io/swactor/mvp-node:latest")
@@ -282,6 +353,10 @@ ssh_identity = "~/.ssh/swactor_vastai_ed25519"
         assert_eq!(config.prompt.dashboard, Some(false));
         assert_eq!(config.model.id.as_deref(), Some("smollm2-135m-instruct-q4"));
         assert_eq!(
+            config.model.gguf_local_path.as_deref(),
+            Some("/models/local.gguf")
+        );
+        assert_eq!(
             config.model.gguf_repo.as_deref(),
             Some("QuantFactory/SmolLM2-135M-Instruct-GGUF")
         );
@@ -290,7 +365,20 @@ ssh_identity = "~/.ssh/swactor_vastai_ed25519"
             Some("SmolLM2-135M-Instruct.Q4_K_M.gguf")
         );
         assert_eq!(config.model.gguf_revision.as_deref(), Some("main"));
+        assert_eq!(
+            config.model.tokenizer_local_path.as_deref(),
+            Some("/models/tokenizer.json")
+        );
         assert_eq!(config.model.max_context, Some(512));
+        assert_eq!(config.docker.gpus.as_deref(), Some("all"));
+        assert_eq!(
+            config.docker.cached_model_host_path.as_deref(),
+            Some("/cache/model.gguf")
+        );
+        assert_eq!(
+            config.observability.datastream_frame_log.as_deref(),
+            Some("/tmp/frames.jsonl")
+        );
         assert_eq!(config.vastai.api_key.as_deref(), Some("vast-key"));
         assert_eq!(
             config.vastai.image.as_deref(),
@@ -301,12 +389,15 @@ ssh_identity = "~/.ssh/swactor_vastai_ed25519"
             Some("/opt/mvp/node --join")
         );
         assert_eq!(config.vastai.disk_gb, Some(80));
+        assert_eq!(config.vastai.ssh_user.as_deref(), Some("ubuntu"));
+        assert_eq!(config.vastai.confirm_lease, Some(true));
         assert_eq!(config.vastai.gpu_name.as_deref(), Some("RTX 4090"));
         assert_eq!(config.vastai.min_gpu_ram_mb, Some(24_000));
         assert_eq!(config.vastai.min_down_mbps, Some(250.5));
         assert_eq!(config.vastai.min_up_mbps, Some(50.25));
         assert_eq!(config.vastai.min_reliability, Some(0.99));
         assert_eq!(config.vastai.require_verified, Some(true));
+        assert_eq!(config.vastai.poll_interval_secs, Some(30));
         assert_eq!(config.vastai.onstart.as_deref(), Some("echo preparing"));
         assert_eq!(
             config.vastai.ssh_identity.as_deref(),
@@ -323,7 +414,7 @@ ssh_identity = "~/.ssh/swactor_vastai_ed25519"
         ));
         let _ = fs::remove_file(&path);
 
-        let error = Config::load(Some(&path)).expect_err("missing explicit config path errors");
+        let error = TomlConfigOverlay::load(Some(&path)).expect_err("missing explicit config path errors");
 
         assert!(
             error.contains(&path.display().to_string()),

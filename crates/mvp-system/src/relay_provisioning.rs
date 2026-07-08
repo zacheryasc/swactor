@@ -126,12 +126,22 @@ impl RelayProvider for StaticRelayProvider {
 }
 
 pub fn relay_runtime_config_from_env(run_id: u64) -> Result<RelayRuntimeConfig, String> {
-    match relay_mode_setting_from_env().as_deref() {
+    let mode = relay_mode_setting_from_env();
+    let url = selected_relay_url_from_env();
+    relay_runtime_config_from_settings(run_id, mode.as_deref(), url.as_deref())
+}
+
+pub fn relay_runtime_config_from_settings(
+    run_id: u64,
+    mode: Option<&str>,
+    url: Option<&str>,
+) -> Result<RelayRuntimeConfig, String> {
+    match mode {
         Some("disabled") => Ok(RelayRuntimeConfig {
             mode: RelayMode::Disabled,
             url: None,
         }),
-        None | Some("default") => relay_runtime_config_from_optional_static_provider(run_id),
+        None | Some("default") => relay_runtime_config_from_optional_static_provider(run_id, url),
         Some(other) => Err(format!(
             "unsupported {MVP_IROH_RELAY_MODE_ENV}={other:?}; use disabled or default"
         )),
@@ -151,13 +161,15 @@ pub fn selected_relay_url_from_env() -> Option<String> {
 
 fn relay_runtime_config_from_optional_static_provider(
     run_id: u64,
+    url: Option<&str>,
 ) -> Result<RelayRuntimeConfig, String> {
-    let Some(mut provider) = StaticRelayProvider::from_env()? else {
+    let Some(raw_url) = url.map(str::trim).filter(|url| !url.is_empty()) else {
         return Ok(RelayRuntimeConfig {
             mode: RelayMode::Default,
             url: None,
         });
     };
+    let mut provider = StaticRelayProvider::from_url_str(raw_url)?;
     let lease = provider.provision_relay(RelayProvisionRequest {
         run_id,
         purpose: RelayPurpose::Combined,
