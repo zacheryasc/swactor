@@ -1,3 +1,4 @@
+use iroh::EndpointAddr;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -24,6 +25,13 @@ pub enum ProvisionerMsg {
     StopNodes {
         run_id: u64,
         reply_to: ActorAddress,
+    },
+    RuntimeReady {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        endpoint: EndpointAddr,
+        node_actor: ActorAddress,
     },
     PluginObservation(PluginObservation),
 }
@@ -201,35 +209,6 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
             PluginObservation::DatastreamFrame {
                 channel, payload, ..
             } => self.emit_datastream_frame(channel, payload),
-            PluginObservation::RuntimeReady {
-                run_id,
-                node_id,
-                stage_index,
-                endpoint,
-                node_actor,
-            } => {
-                let report = self.mark_live(run_id, node_id, stage_index);
-                if let Some((reply_to, provider_process_id, resolved_stage_index)) = report {
-                    self.emit_event(ProvisionEvent {
-                        run_id,
-                        node_id,
-                        kind: ProvisionEventKind::NodeLive,
-                        provider: None,
-                        message: None,
-                    });
-                    let _ = ctx.send(
-                        reply_to,
-                        ProvisionerReport::NodeLive {
-                            run_id,
-                            node_id,
-                            stage_index: resolved_stage_index,
-                            endpoint,
-                            node_actor,
-                            provider_process_id,
-                        },
-                    );
-                }
-            }
             PluginObservation::Exited {
                 run_id,
                 node_id,
@@ -270,6 +249,57 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
                     );
                 }
             }
+        }
+    }
+
+    fn runtime_ready(
+        &mut self,
+        ctx: &Ctx,
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        endpoint: iroh::EndpointAddr,
+        node_actor: ActorAddress,
+    ) {
+        let Some((handle, reply_to)) = self.runs.get(&run_id).and_then(|run| {
+            run.nodes
+                .get(&node_id)
+                .map(|slot| (slot.handle.clone(), slot.reply_to))
+        }) else {
+            return;
+        };
+        if let Err(reason) = self.plugin.complete_bootstrap(&handle) {
+            self.emit_failed(run_id, node_id, &reason);
+            let _ = ctx.send(
+                reply_to,
+                ProvisionerReport::NodeFailed {
+                    run_id,
+                    node_id,
+                    reason,
+                },
+            );
+            return;
+        }
+        let report = self.mark_live(run_id, node_id, Some(stage_index));
+        if let Some((reply_to, provider_process_id, resolved_stage_index)) = report {
+            self.emit_event(ProvisionEvent {
+                run_id,
+                node_id,
+                kind: ProvisionEventKind::NodeLive,
+                provider: None,
+                message: None,
+            });
+            let _ = ctx.send(
+                reply_to,
+                ProvisionerReport::NodeLive {
+                    run_id,
+                    node_id,
+                    stage_index: resolved_stage_index,
+                    endpoint,
+                    node_actor,
+                    provider_process_id,
+                },
+            );
         }
     }
 
@@ -379,6 +409,13 @@ impl<P: ProvisionPlugin + 'static> ActorInterface for ProvisionerActor<P> {
             ProvisionerMsg::StopNodes { run_id, reply_to } => {
                 self.stop_nodes(ctx, run_id, reply_to)
             }
+            ProvisionerMsg::RuntimeReady {
+                run_id,
+                node_id,
+                stage_index,
+                endpoint,
+                node_actor,
+            } => self.runtime_ready(ctx, run_id, node_id, stage_index, endpoint, node_actor),
             ProvisionerMsg::PluginObservation(observation) => self.observe_plugin(ctx, observation),
         }
     }

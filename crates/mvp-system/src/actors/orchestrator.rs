@@ -1,3 +1,4 @@
+use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
@@ -25,6 +26,13 @@ pub enum OrchestratorMsg {
     ObserveStageReady {
         run_id: u64,
         stage_index: u32,
+    },
+    ObserveNodeRuntimeReady {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        endpoint: EndpointAddr,
+        node_actor: ActorAddress,
     },
     ObserveTokenInEndpointReady,
     ObserveTokenOutEndpointReady,
@@ -120,6 +128,13 @@ pub enum LifecycleEventWire {
 pub enum OrchestratorReport {
     Command(RunCommandWire),
     Lifecycle(LifecycleEventWire),
+    NodeRuntimeReady {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        endpoint: EndpointAddr,
+        node_actor: ActorAddress,
+    },
     Snapshot {
         commands: Vec<RunCommandWire>,
         events: Vec<LifecycleEventWire>,
@@ -177,6 +192,7 @@ impl OrchestratorActor {
                 run_id: core::RunId(run_id),
                 stage_index,
             }),
+            OrchestratorMsg::ObserveNodeRuntimeReady { .. } => {}
             OrchestratorMsg::ObserveTokenInEndpointReady => {
                 self.core.observe(core::RunEvent::TokenInEndpointReady)
             }
@@ -247,6 +263,28 @@ impl ActorInterface for OrchestratorActor {
     type Response = ();
 
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
+        if let OrchestratorMsg::ObserveNodeRuntimeReady {
+            run_id,
+            node_id,
+            stage_index,
+            endpoint,
+            node_actor,
+        } = msg.clone()
+        {
+            if let Some(report_to) = self.report_to {
+                let _ = ctx.send(
+                    report_to,
+                    OrchestratorReport::NodeRuntimeReady {
+                        run_id,
+                        node_id,
+                        stage_index,
+                        endpoint,
+                        node_actor,
+                    },
+                );
+            }
+            return;
+        }
         if let OrchestratorMsg::Snapshot { reply_to } = msg.clone() {
             let _ = ctx.send(
                 reply_to,
@@ -344,5 +382,60 @@ impl From<&core::TokenObjectPayload> for TokenObjectPayloadWire {
                 },
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh::SecretKey;
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::Runtime;
+
+    #[test]
+    fn orchestrator_actor_reports_node_runtime_ready() {
+        let runtime = Runtime::new(RuntimeConfig::default());
+        let reports = runtime
+            .new_inbox::<OrchestratorReport>()
+            .expect("orchestrator report inbox");
+        let report_to = *reports.addr();
+        let actor = runtime
+            .spawn(OrchestratorActor::new(
+                core::RunConfig {
+                    run_id: core::RunId(7),
+                    max_tokens: 1,
+                    prompt: Vec::new(),
+                },
+                Some(report_to),
+            ))
+            .expect("spawn orchestrator actor");
+        let endpoint = EndpointAddr::new(SecretKey::from_bytes(&[8; 32]).public());
+        let node_actor = ActorAddress::new_random();
+
+        runtime
+            .send_to(
+                actor,
+                OrchestratorMsg::ObserveNodeRuntimeReady {
+                    run_id: 7,
+                    node_id: 11,
+                    stage_index: 3,
+                    endpoint: endpoint.clone(),
+                    node_actor,
+                },
+            )
+            .expect("send runtime ready");
+        runtime.tick();
+
+        assert_eq!(
+            reports.try_recv(),
+            Some(OrchestratorReport::NodeRuntimeReady {
+                run_id: 7,
+                node_id: 11,
+                stage_index: 3,
+                endpoint,
+                node_actor,
+            })
+        );
+        assert_eq!(reports.try_recv(), None);
     }
 }

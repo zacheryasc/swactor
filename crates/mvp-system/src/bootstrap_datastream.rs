@@ -2,10 +2,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::thread::{self, JoinHandle};
 
 use datastream::{ChannelId, DatastreamProducer, Lifetime, NodeId, StreamId};
-use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use swactor::actor::ActorAddress;
 
 use crate::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
@@ -60,9 +58,6 @@ impl BootstrapDatastreamBridge {
             node_id: self.spec.node_id,
             line: line.clone(),
         });
-        if let Some(ready) = parse_runtime_ready(&self.spec, &line) {
-            self.sink.observe(ready);
-        }
     }
 
     pub fn observe_stderr_line(&self, line: impl Into<String>) {
@@ -180,30 +175,6 @@ pub fn parse_stdio_datastream_frame(
         node_id: spec.node_id,
         channel: frame.channel,
         payload: frame.payload.to_string(),
-    })
-}
-
-#[derive(Deserialize)]
-struct RuntimeReadyLine {
-    #[serde(rename = "type")]
-    kind: String,
-    endpoint: EndpointAddr,
-    node_actor: ActorAddress,
-    logical_node_id: u64,
-    stage_index: u32,
-}
-
-pub fn parse_runtime_ready(spec: &NodeProvisionSpec, line: &str) -> Option<PluginObservation> {
-    let ready = serde_json::from_str::<RuntimeReadyLine>(line).ok()?;
-    if ready.kind != "ready" || ready.logical_node_id != spec.node_id {
-        return None;
-    }
-    Some(PluginObservation::RuntimeReady {
-        run_id: spec.run_id,
-        node_id: spec.node_id,
-        stage_index: Some(ready.stage_index),
-        endpoint: ready.endpoint,
-        node_actor: ready.node_actor,
     })
 }
 

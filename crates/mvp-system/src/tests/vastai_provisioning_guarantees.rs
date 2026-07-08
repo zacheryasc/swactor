@@ -7,8 +7,8 @@ use mvp_system::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink, ProvisionPlugin,
 };
 use mvp_system::vastai_provisioning::{
-    VastAiBootstrapLauncher, VastAiLeaseClient, VastAiProviderPlugin, VastAiProvisioningConfig,
-    VastAiProvisioningPlugin, VastAiSshEndpoint,
+    BootstrapStopReason, VastAiBootstrapLauncher, VastAiLeaseClient, VastAiProviderPlugin,
+    VastAiProvisioningConfig, VastAiProvisioningPlugin, VastAiSshEndpoint,
 };
 use parking_lot::Mutex;
 use swactor_vastai::{LifecyclePolicy, ProvisionRequest, ProvisionedInstance, SelectionPolicy};
@@ -88,7 +88,7 @@ impl VastAiLeaseClient for FakeLeaseClient {
 #[derive(Default)]
 struct FakeBootstrap {
     starts: Vec<(NodeProvisionSpec, VastAiSshEndpoint)>,
-    stops: Vec<usize>,
+    stops: Vec<(usize, BootstrapStopReason)>,
     fail: Option<String>,
     next_handle: usize,
 }
@@ -111,8 +111,8 @@ impl VastAiBootstrapLauncher for FakeBootstrap {
         Ok(self.next_handle)
     }
 
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle) {
-        self.stops.push(*handle);
+    fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason) {
+        self.stops.push((*handle, reason));
     }
 }
 
@@ -251,7 +251,38 @@ fn stop_destroys_known_vastai_contract_exactly_once() {
     plugin.stop_node(&handle).unwrap();
 
     assert_eq!(plugin.client().destroyed, vec![100]);
-    assert_eq!(plugin.bootstrap().stops, vec![1]);
+    assert_eq!(
+        plugin.bootstrap().stops,
+        vec![(1, BootstrapStopReason::NodeStop)]
+    );
+    assert_eq!(plugin.active_contract_count(), 0);
+}
+
+#[test]
+fn vastai_complete_bootstrap_stops_bootstrap_without_destroying_contract() {
+    let mut plugin = VastAiProvisioningPlugin::new(
+        FakeLeaseClient::default().with_contract(100),
+        FakeBootstrap::default(),
+        config(),
+    );
+    let handle = plugin.start_node(spec(), sink()).unwrap();
+
+    plugin.complete_bootstrap(&handle).unwrap();
+
+    assert_eq!(
+        plugin.bootstrap().stops,
+        vec![(1, BootstrapStopReason::RuntimeReady)]
+    );
+    assert_eq!(plugin.client().destroyed, Vec::<u64>::new());
+    assert_eq!(plugin.active_contract_count(), 1);
+
+    plugin.stop_node(&handle).unwrap();
+
+    assert_eq!(plugin.client().destroyed, vec![100]);
+    assert_eq!(
+        plugin.bootstrap().stops,
+        vec![(1, BootstrapStopReason::RuntimeReady)]
+    );
     assert_eq!(plugin.active_contract_count(), 0);
 }
 

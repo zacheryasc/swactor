@@ -414,7 +414,8 @@ poll_interval_secs = 30
         ));
         let _ = fs::remove_file(&path);
 
-        let error = TomlConfigOverlay::load(Some(&path)).expect_err("missing explicit config path errors");
+        let error =
+            TomlConfigOverlay::load(Some(&path)).expect_err("missing explicit config path errors");
 
         assert!(
             error.contains(&path.display().to_string()),

@@ -9,6 +9,9 @@ use std::sync::{
 use std::time::Duration;
 
 use datastream::DatastreamProducer;
+use serde::{Deserialize, Serialize};
+use swactor::actor::{ActorAddress, ActorInterface};
+use swactor::runtime::{Ctx, Runtime};
 use swactor_vastai::{LifecyclePolicy, ProvisionRequest, ProvisionedInstance, SelectionPolicy};
 
 use crate::bootstrap_datastream::{BootstrapDatastreamBridge, node_stream_id};
@@ -17,8 +20,7 @@ use crate::node_provisioning::{
     ProviderError, ProviderKind, ProviderLeaseId, ProviderPlugin, SshEndpoint,
 };
 use crate::provisioning::{
-    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
-    ProvisionPlugin,
+    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionPlugin,
 };
 
 #[derive(Clone, Debug)]
@@ -363,6 +365,12 @@ where
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BootstrapStopReason {
+    RuntimeReady,
+    NodeStop,
+}
+
 pub trait VastAiBootstrapLauncher: Send {
     type Handle: Send;
 
@@ -374,21 +382,63 @@ pub trait VastAiBootstrapLauncher: Send {
         producer: Option<DatastreamProducer>,
     ) -> Result<Self::Handle, String>;
 
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle);
+    fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason);
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct SshCommandBootstrapLauncher {
-    ssh_identity: Option<PathBuf>,
+#[derive(Clone)]
+enum SshBootstrapMsg {
+    Stop { reason: BootstrapStopReason },
 }
-pub struct SshCommandBootstrapHandle {
+
+struct SshBootstrapActor {
     child: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
 }
 
+impl SshBootstrapActor {
+    fn new(child: Arc<Mutex<Option<Child>>>, stopping: Arc<AtomicBool>) -> Self {
+        Self { child, stopping }
+    }
+}
+
+impl ActorInterface for SshBootstrapActor {
+    type Incoming = SshBootstrapMsg;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, msg: Self::Incoming) {
+        match msg {
+            SshBootstrapMsg::Stop { reason: _ } => {
+                self.stopping.store(true, Ordering::SeqCst);
+                stop_ssh_child(&self.child);
+            }
+        }
+    }
+}
+
+fn stop_ssh_child(child_slot: &Arc<Mutex<Option<Child>>>) {
+    let Some(mut child) = child_slot.lock().take() else {
+        return;
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[derive(Clone)]
+pub struct SshCommandBootstrapLauncher {
+    ssh_identity: Option<PathBuf>,
+    runtime: Arc<Runtime>,
+}
+pub struct SshCommandBootstrapHandle {
+    actor: ActorAddress,
+    runtime: Arc<Runtime>,
+}
+
 impl SshCommandBootstrapLauncher {
-    pub fn new(ssh_identity: Option<PathBuf>) -> Self {
-        Self { ssh_identity }
+    pub fn new(ssh_identity: Option<PathBuf>, runtime: Arc<Runtime>) -> Self {
+        Self {
+            ssh_identity,
+            runtime,
+        }
     }
 }
 
@@ -411,39 +461,31 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
 
         let child = Arc::new(Mutex::new(None));
         let stopping = Arc::new(AtomicBool::new(false));
+        let actor = self
+            .runtime
+            .spawn(SshBootstrapActor::new(child.clone(), stopping.clone()))
+            .map_err(|e| format!("spawn VastAI SSH bootstrap actor: {e}"))?;
         spawn_retrying_ssh_bootstrap(
             spec,
             endpoint,
             sink,
             producer,
             self.ssh_identity.clone(),
-            child.clone(),
-            stopping.clone(),
+            child,
+            stopping,
         );
 
-        Ok(SshCommandBootstrapHandle { child, stopping })
+        Ok(SshCommandBootstrapHandle {
+            actor,
+            runtime: Arc::clone(&self.runtime),
+        })
     }
 
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle) {
-        handle.stopping.store(true, Ordering::SeqCst);
-        if let Some(mut child) = handle.child.lock().take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-struct ReadyTrackingSink {
-    inner: PluginSink,
-    ready: Arc<AtomicBool>,
-}
-
-impl PluginObservationSink for ReadyTrackingSink {
-    fn observe(&self, observation: PluginObservation) {
-        if matches!(observation, PluginObservation::RuntimeReady { .. }) {
-            self.ready.store(true, Ordering::SeqCst);
-        }
-        self.inner.observe(observation);
+    fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason) {
+        let _ = handle
+            .runtime
+            .send_to(handle.actor, SshBootstrapMsg::Stop { reason });
+        handle.runtime.tick();
     }
 }
 
@@ -459,15 +501,10 @@ fn spawn_retrying_ssh_bootstrap(
     std::thread::spawn(move || {
         let run_id = spec.run_id;
         let node_id = spec.node_id;
-        let ready = Arc::new(AtomicBool::new(false));
-        let tracking_sink = PluginSink::new(Arc::new(ReadyTrackingSink {
-            inner: sink.clone(),
-            ready: ready.clone(),
-        }));
         let mut attempt = 1u64;
         let mut backoff = Duration::from_secs(1);
 
-        while !stopping.load(Ordering::SeqCst) && !ready.load(Ordering::SeqCst) {
+        while !stopping.load(Ordering::SeqCst) {
             sink.observe(PluginObservation::ProviderLine {
                 run_id,
                 node_id,
@@ -482,7 +519,7 @@ fn spawn_retrying_ssh_bootstrap(
                     *child_slot.lock() = Some(child);
                     let bridge = BootstrapDatastreamBridge::new(
                         spec.clone(),
-                        tracking_sink.clone(),
+                        sink.clone(),
                         producer.clone(),
                     );
                     bridge.spawn_stdout_reader(stdout);
@@ -490,16 +527,6 @@ fn spawn_retrying_ssh_bootstrap(
 
                     loop {
                         if stopping.load(Ordering::SeqCst) {
-                            return;
-                        }
-                        if ready.load(Ordering::SeqCst) {
-                            sink.observe(PluginObservation::ProviderLine {
-                                run_id,
-                                node_id,
-                                line:
-                                    "VastAI SSH bootstrap observed runtime ready; handoff complete"
-                                        .to_owned(),
-                            });
                             return;
                         }
 
@@ -563,7 +590,7 @@ fn spawn_retrying_ssh_bootstrap(
                 }
             }
 
-            if stopping.load(Ordering::SeqCst) || ready.load(Ordering::SeqCst) {
+            if stopping.load(Ordering::SeqCst) {
                 return;
             }
             sink.observe(PluginObservation::ProviderLine {
@@ -818,12 +845,24 @@ where
         Ok(handle)
     }
 
+    fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        let Some(node) = self.nodes.get_mut(&handle.id) else {
+            return Ok(());
+        };
+        if let Some(mut bootstrap) = node.bootstrap.take() {
+            self.bootstrap
+                .stop_bootstrap(&mut bootstrap, BootstrapStopReason::RuntimeReady);
+        }
+        Ok(())
+    }
+
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
         if let Some(mut bootstrap) = node.bootstrap.take() {
-            self.bootstrap.stop_bootstrap(&mut bootstrap);
+            self.bootstrap
+                .stop_bootstrap(&mut bootstrap, BootstrapStopReason::NodeStop);
         }
         self.client.destroy_contract(node.contract_id)
     }
@@ -873,7 +912,7 @@ mod tests {
             panic!("build_request tests must not start SSH bootstrap")
         }
 
-        fn stop_bootstrap(&mut self, _handle: &mut Self::Handle) {
+        fn stop_bootstrap(&mut self, _handle: &mut Self::Handle, _reason: BootstrapStopReason) {
             panic!("build_request tests must not stop SSH bootstrap")
         }
     }
@@ -993,5 +1032,40 @@ mod tests {
         );
         assert!(!args.iter().any(|arg| arg == "-i"));
         assert!(!args.iter().any(|arg| arg == "IdentitiesOnly=yes"));
+    }
+
+    #[test]
+    fn ssh_bootstrap_actor_stop_kills_child() {
+        let runtime = Arc::new(swactor::runtime::Runtime::new(
+            swactor::config::RuntimeConfig::default(),
+        ));
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id();
+        let child_slot = Arc::new(Mutex::new(Some(child)));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let actor = runtime
+            .spawn(SshBootstrapActor::new(child_slot.clone(), stopping.clone()))
+            .expect("spawn ssh bootstrap actor");
+
+        runtime
+            .send_to(
+                actor,
+                SshBootstrapMsg::Stop {
+                    reason: BootstrapStopReason::RuntimeReady,
+                },
+            )
+            .expect("send stop");
+        runtime.tick();
+
+        assert!(stopping.load(Ordering::SeqCst));
+        assert!(child_slot.lock().is_none());
+        #[cfg(target_os = "linux")]
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "child process should be reaped"
+        );
     }
 }

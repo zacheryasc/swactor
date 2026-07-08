@@ -14,12 +14,14 @@ use distribution::node::DistributedNodeConfig;
 use iroh::EndpointAddr;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
 use mvp_system::actors::node_agent::{NodeAgentMsg, StageProvisionWire};
+use mvp_system::actors::orchestrator::{OrchestratorActor, OrchestratorReport};
 use mvp_system::actors::register_mvp_actor_codecs;
+use mvp_system::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 #[cfg(feature = "local-e2e")]
 use mvp_system::dashboard_view::MvpClusterDashboardView;
-use mvp_system::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::node_provisioning::ProviderKind;
+use mvp_system::orchestrator_run_fsm::{RunConfig, RunId};
 use mvp_system::prompt_rpc::{PromptEvent, SubmitPrompt, read_submit_prompt, write_json_line};
 use mvp_system::provisioning::{
     LocalDockerPlugin, NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink,
@@ -237,6 +239,61 @@ fn run() -> Result<(), String> {
         json!({"enabled":dashboard.is_some()}),
     );
 
+    let orchestrator_reports = match stack.runtime.new_inbox::<OrchestratorReport>() {
+        Ok(inbox) => inbox,
+        Err(error) => {
+            orch_datastream.emit_bootstrap(
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+                "orchestrator_report_actor",
+                "failed",
+                json!({"error":error.to_string()}),
+            );
+            return Err(format!("orchestrator report inbox: {error}"));
+        }
+    };
+    let orchestrator_report_actor = *orchestrator_reports.addr();
+    stack.register_local_actor(driver.register_actor(orchestrator_report_actor, 1));
+    orch_datastream.emit_bootstrap(
+        dashboard.as_ref(),
+        config.run_id,
+        config.node_id,
+        "orchestrator_report_actor",
+        "ready",
+        json!({"actor":orchestrator_report_actor}),
+    );
+    let orchestrator_actor = match stack.runtime.spawn(OrchestratorActor::new(
+        RunConfig {
+            run_id: RunId(config.run_id),
+            max_tokens: u64::from(config.default_max_tokens),
+            prompt: Vec::new(),
+        },
+        Some(orchestrator_report_actor),
+    )) {
+        Ok(actor) => actor,
+        Err(error) => {
+            orch_datastream.emit_bootstrap(
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+                "orchestrator_actor",
+                "failed",
+                json!({"error":error.to_string()}),
+            );
+            return Err(format!("spawn orchestrator actor: {error}"));
+        }
+    };
+    stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
+    orch_datastream.emit_bootstrap(
+        dashboard.as_ref(),
+        config.run_id,
+        config.node_id,
+        "orchestrator_actor",
+        "ready",
+        json!({"actor":orchestrator_actor}),
+    );
+
     let prompt_events = match stack.runtime.new_inbox::<PromptEvent>() {
         Ok(inbox) => inbox,
         Err(error) => {
@@ -265,7 +322,7 @@ fn run() -> Result<(), String> {
     let (work_tx, work_rx) = mpsc::channel::<PromptWork>();
     let stop_rx = spawn_stop_listener();
 
-    let mut provisioner = config.build_provisioner()?;
+    let mut provisioner = config.build_provisioner(Arc::clone(&stack.runtime))?;
     orch_datastream.emit_bootstrap(
         dashboard.as_ref(),
         config.run_id,
@@ -282,7 +339,8 @@ fn run() -> Result<(), String> {
     let sink = PluginSink::new(Arc::new(ChannelObservationSink {
         tx: Mutex::new(obs_tx),
     }));
-    let node_spec = config.node_spec(driver.endpoint_addr(), datastream_sink)?;
+    let node_spec =
+        config.node_spec(driver.endpoint_addr(), datastream_sink, orchestrator_actor)?;
     orch_datastream.emit_event(
         dashboard.as_ref(),
         ProvisionEvent {
@@ -379,6 +437,7 @@ fn run() -> Result<(), String> {
         &stack,
         &obs_rx,
         &frame_rx,
+        &orchestrator_reports,
         &stop_rx,
         dashboard.as_ref(),
         &mut orch_datastream,
@@ -394,7 +453,7 @@ fn run() -> Result<(), String> {
                 config.node_id,
                 "node_runtime_ready",
                 "ready",
-                json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor}),
+                json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"stage_index":ready.stage_index}),
             );
             drain_orch_stdio_capture(
                 orch_stdio_rx.as_ref(),
@@ -424,6 +483,7 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
     };
+    provisioned_node.complete_bootstrap()?;
     driver.join(std::slice::from_ref(&ready.endpoint));
     orch_datastream.emit_bootstrap(
         dashboard.as_ref(),
@@ -786,7 +846,6 @@ impl RuntimeConfigProfile {
         }
     }
 
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
@@ -1115,7 +1174,9 @@ impl ConfigBuilder {
             self.layer_end_exclusive =
                 Self::parse_value("MVP_LAYER_END_EXCLUSIVE", &layer_end_exclusive)?;
         }
-        if let Some(provider) = env_optional("MVP_NODE_PROVIDER").or_else(|| env_optional("MVP_PROVIDER")) {
+        if let Some(provider) =
+            env_optional("MVP_NODE_PROVIDER").or_else(|| env_optional("MVP_PROVIDER"))
+        {
             self.provider = Some(ProviderKind::parse_deploy(&provider)?);
         }
         if let Some(image) = env_optional("MVP_NODE_IMAGE") {
@@ -1169,7 +1230,9 @@ impl ConfigBuilder {
         {
             self.relay_url = Some(url);
         }
-        if let Some(api_key) = env_optional("MVP_VASTAI_API_KEY").or_else(|| env_optional("VASTAI_API_KEY")) {
+        if let Some(api_key) =
+            env_optional("MVP_VASTAI_API_KEY").or_else(|| env_optional("VASTAI_API_KEY"))
+        {
             self.vastai_api_key = Some(api_key);
         }
         if let Some(command) = env_optional("MVP_VASTAI_BOOTSTRAP_COMMAND") {
@@ -1280,7 +1343,8 @@ impl ConfigBuilder {
                         Some(next_arg(&mut args, "--vastai-bootstrap-command")?)
                 }
                 "--vastai-ssh-identity" => {
-                    self.vastai_ssh_identity_raw = Some(next_arg(&mut args, "--vastai-ssh-identity")?);
+                    self.vastai_ssh_identity_raw =
+                        Some(next_arg(&mut args, "--vastai-ssh-identity")?);
                 }
                 "--vastai-disk-gb" => {
                     self.vastai_disk_gb = Some(parse_next(&mut args, "--vastai-disk-gb")?);
@@ -1314,8 +1378,7 @@ impl ConfigBuilder {
                     self.vastai_min_down_mbps_raw = None;
                 }
                 "--vastai-min-up-mbps" => {
-                    self.vastai_min_up_mbps =
-                        Some(parse_next(&mut args, "--vastai-min-up-mbps")?);
+                    self.vastai_min_up_mbps = Some(parse_next(&mut args, "--vastai-min-up-mbps")?);
                     self.vastai_min_up_mbps_raw = None;
                 }
                 "--vastai-min-reliability" => {
@@ -1541,7 +1604,10 @@ impl Config {
         Ok(())
     }
 
-    fn build_provisioner(&self) -> Result<Box<dyn ProvisionPlugin>, String> {
+    fn build_provisioner(
+        &self,
+        bootstrap_runtime: Arc<swactor::runtime::Runtime>,
+    ) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider {
             ProviderKind::Docker => Ok(Box::new(LocalDockerPlugin::new("mvp-orchestrator"))),
             ProviderKind::VastAi => {
@@ -1565,7 +1631,7 @@ impl Config {
                 let client = ToolsVastAiLeaseClient::from_api_key(api_key)?;
                 Ok(Box::new(VastAiProvisioningPlugin::new(
                     client,
-                    SshCommandBootstrapLauncher::new(Some(ssh_identity)),
+                    SshCommandBootstrapLauncher::new(Some(ssh_identity), bootstrap_runtime),
                     vastai.provisioning.clone(),
                 )))
             }
@@ -1581,6 +1647,7 @@ impl Config {
             "MVP_STAGE_INDEX",
             "MVP_COORDINATOR_ENDPOINT",
             "MVP_DATASTREAM_SINK_ACTOR",
+            "MVP_ORCHESTRATOR_ACTOR",
             "MVP_MODEL_ID",
             "MVP_IROH_RELAY_MODE",
         ];
@@ -1634,6 +1701,7 @@ impl Config {
         &self,
         coordinator: EndpointAddr,
         datastream_sink: ActorAddress,
+        orchestrator_actor: ActorAddress,
     ) -> Result<NodeProvisionSpec, String> {
         let mut env = vec![
             ("MVP_RUN_ID".to_owned(), self.run_id.to_string()),
@@ -1652,6 +1720,11 @@ impl Config {
                 "MVP_DATASTREAM_SINK_ACTOR".to_owned(),
                 serde_json::to_string(&datastream_sink)
                     .map_err(|e| format!("serialize datastream sink actor: {e}"))?,
+            ),
+            (
+                "MVP_ORCHESTRATOR_ACTOR".to_owned(),
+                serde_json::to_string(&orchestrator_actor)
+                    .map_err(|e| format!("serialize orchestrator actor: {e}"))?,
             ),
             ("MVP_MODEL_ID".to_owned(), self.model_id.clone()),
             (
@@ -1731,6 +1804,7 @@ impl Config {
 struct RuntimeReady {
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
+    stage_index: u32,
 }
 
 struct ProvisionedNodeGuard<'a> {
@@ -1747,6 +1821,13 @@ impl<'a> ProvisionedNodeGuard<'a> {
             provisioner,
             handle: Some(handle),
         }
+    }
+
+    fn complete_bootstrap(&mut self) -> Result<(), String> {
+        let Some(handle) = self.handle.as_ref() else {
+            return Ok(());
+        };
+        self.provisioner.complete_bootstrap(handle)
     }
 
     fn stop(&mut self) -> Result<(), String> {
@@ -1814,6 +1895,13 @@ impl ProvisionPlugin for FailedProvisionPlugin {
         _sink: PluginSink,
     ) -> Result<mvp_system::provisioning::PluginNodeHandle, String> {
         Err("provider start worker disconnected".to_owned())
+    }
+
+    fn complete_bootstrap(
+        &mut self,
+        _handle: &mvp_system::provisioning::PluginNodeHandle,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     fn stop_node(
@@ -2197,6 +2285,7 @@ fn wait_for_runtime_ready(
     stack: &DistributionRuntimeStack,
     obs_rx: &mpsc::Receiver<PluginObservation>,
     frame_rx: &mpsc::Receiver<(StreamId, Frame)>,
+    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
     stop_rx: &mpsc::Receiver<()>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
@@ -2215,16 +2304,6 @@ fn wait_for_runtime_ready(
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
             match observation {
-                PluginObservation::RuntimeReady {
-                    endpoint,
-                    node_actor,
-                    ..
-                } => {
-                    return Ok(RuntimeReady {
-                        endpoint,
-                        node_actor,
-                    });
-                }
                 PluginObservation::DatastreamFrame { .. } => {}
                 PluginObservation::ProviderLine { .. }
                 | PluginObservation::StdoutLine { .. }
@@ -2232,6 +2311,24 @@ fn wait_for_runtime_ready(
                 PluginObservation::Failed { reason, .. } => return Err(reason),
                 PluginObservation::Exited { status, .. } => {
                     return Err(format!("node exited before ready: {status:?}"));
+                }
+            }
+        }
+        while let Some(report) = orchestrator_reports.try_recv() {
+            if let OrchestratorReport::NodeRuntimeReady {
+                run_id: report_run_id,
+                node_id: report_node_id,
+                stage_index,
+                endpoint,
+                node_actor,
+            } = report
+            {
+                if report_run_id == run_id && report_node_id == node_id {
+                    return Ok(RuntimeReady {
+                        endpoint,
+                        node_actor,
+                        stage_index,
+                    });
                 }
             }
         }
@@ -2319,7 +2416,6 @@ fn wait_for_weights_loaded(
                 PluginObservation::ProviderLine { .. }
                 | PluginObservation::StdoutLine { .. }
                 | PluginObservation::StderrLine { .. } => {}
-                PluginObservation::RuntimeReady { .. } => {}
             }
         }
         while let Ok((stream, frame)) = frame_rx.try_recv() {
@@ -2587,7 +2683,6 @@ fn drain_observations(
             PluginObservation::ProviderLine { .. }
             | PluginObservation::StdoutLine { .. }
             | PluginObservation::StderrLine { .. } => {}
-            PluginObservation::RuntimeReady { .. } => {}
         }
     }
     Ok(())
@@ -2646,18 +2741,6 @@ fn emit_plugin_observation(
             ChannelId::new(channel),
             payload.as_bytes().to_vec(),
             "node_bootstrap_stdio",
-        ),
-        PluginObservation::RuntimeReady {
-            run_id, node_id, ..
-        } => orch_datastream.emit_event(
-            dashboard,
-            ProvisionEvent {
-                run_id: *run_id,
-                node_id: *node_id,
-                kind: ProvisionEventKind::NodeLive,
-                provider: Some(provider.as_str().to_owned()),
-                message: None,
-            },
         ),
         PluginObservation::Exited {
             run_id,
@@ -2732,7 +2815,6 @@ fn env_optional(name: &str) -> Option<String> {
 fn optional_env(name: &str) -> Option<(String, String)> {
     env_optional(name).map(|value| (name.to_owned(), value))
 }
-
 
 fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     match explicit {
@@ -3030,8 +3112,9 @@ mod tests {
                 .expect("config parses");
             let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[9; 32]).public());
             let datastream_sink = ActorAddress([11; 32]);
+            let orchestrator_actor = ActorAddress([12; 32]);
             config
-                .node_spec(coordinator, datastream_sink)
+                .node_spec(coordinator, datastream_sink, orchestrator_actor)
                 .expect("node spec builds")
                 .env
         })
@@ -3430,8 +3513,9 @@ bootstrap_command = "/run"
         });
         let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[3; 32]).public());
         let datastream_sink = ActorAddress([17; 32]);
+        let orchestrator_actor = ActorAddress([18; 32]);
         let spec = config
-            .node_spec(coordinator, datastream_sink)
+            .node_spec(coordinator, datastream_sink, orchestrator_actor)
             .expect("node spec builds");
 
         assert_eq!(env_value(&spec.env, "MVP_MAX_CONTEXT"), Some("256"));
@@ -3527,8 +3611,9 @@ bootstrap_command = "/run"
         );
         let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[7; 32]).public());
         let datastream_sink = ActorAddress([13; 32]);
+        let orchestrator_actor = ActorAddress([14; 32]);
         let spec = config
-            .node_spec(coordinator, datastream_sink)
+            .node_spec(coordinator, datastream_sink, orchestrator_actor)
             .expect("cached model node spec builds");
 
         assert_eq!(
@@ -3590,6 +3675,13 @@ bootstrap_command = "/run"
             _sink: PluginSink,
         ) -> Result<mvp_system::provisioning::PluginNodeHandle, String> {
             unreachable!("guard tests construct handles directly")
+        }
+
+        fn complete_bootstrap(
+            &mut self,
+            _handle: &mvp_system::provisioning::PluginNodeHandle,
+        ) -> Result<(), String> {
+            Ok(())
         }
 
         fn stop_node(
