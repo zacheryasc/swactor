@@ -1,4 +1,5 @@
 pub mod actor;
+pub mod admin;
 pub mod extension;
 pub mod process_observer;
 pub mod worker;

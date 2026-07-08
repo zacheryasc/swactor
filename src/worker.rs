@@ -11,6 +11,10 @@ use crate::actor::{
     ActorAddress, AnyActor, ContextInner, Ctx, Environment, ExitValue, ResumeSignal, SpawnRequest,
     StopReason, StopSignal, StopWithSignal, SystemInfo,
 };
+use crate::admin::{
+    ActorStatus, ActorSummary, AdminCommand, AdminError, AdminResult, InspectActorResponse,
+    ListActorsResponse, OperationResult,
+};
 use crate::channel::Receiver;
 use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
 use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
@@ -69,6 +73,7 @@ pub(crate) struct Worker {
     pub(crate) pool: ActorPool,
     transfer_rx: Receiver<Envelope>,
     spawn_rx: Receiver<SpawnRequest>,
+    admin_rx: Receiver<AdminCommand>,
     stats: Arc<WorkerStats>,
     /// Reusable scratch buffer for building per-actor snapshots.
     snapshot_buf: Vec<ActorSnapshot>,
@@ -84,6 +89,7 @@ impl Worker {
         id: WorkerId,
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<SpawnRequest>,
+        admin_rx: Receiver<AdminCommand>,
         stats: Arc<WorkerStats>,
     ) -> Self {
         Self {
@@ -91,6 +97,7 @@ impl Worker {
             pool: ActorPool::new(),
             transfer_rx,
             spawn_rx,
+            admin_rx,
             stats,
             snapshot_buf: Vec::new(),
             worker_ext: None,
@@ -130,6 +137,88 @@ impl Worker {
             );
         }
         did_work
+    }
+
+    fn drain_admin(&mut self, tc: &TickContext) -> bool {
+        let mut did_work = false;
+        while let Some(cmd) = self.admin_rx.try_recv() {
+            did_work = true;
+            self.apply_admin_command(tc, cmd);
+        }
+        did_work
+    }
+
+    fn send_admin_reply<T: crate::actor::Message>(
+        tc: &TickContext,
+        reply_to: ActorAddress,
+        result: AdminResult<T>,
+    ) {
+        let _ = tc.inbox_registry.try_deliver(reply_to, Box::new(result));
+    }
+
+    fn apply_admin_command(&mut self, tc: &TickContext, cmd: AdminCommand) {
+        match cmd {
+            AdminCommand::ListActors { acc } => {
+                let mut local = Vec::new();
+                self.pool.actor_summaries_into(self.id, &mut local);
+                {
+                    let mut summaries = acc.summaries.lock();
+                    summaries.extend(local);
+                }
+                if acc.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let actors = {
+                        let mut summaries = acc.summaries.lock();
+                        std::mem::take(&mut *summaries)
+                    };
+                    Self::send_admin_reply(tc, acc.reply_to, Ok(ListActorsResponse { actors }));
+                }
+            }
+            AdminCommand::InspectActor { actor, reply_to } => {
+                let result = self
+                    .pool
+                    .actor_summary(self.id, actor)
+                    .map(|summary| InspectActorResponse { summary });
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::GetActorState {
+                actor,
+                reply_to,
+                get,
+                not_found,
+            } => {
+                let boxed = match self.pool.get_actor_erased(actor) {
+                    Some(erased) => get(actor, erased, erased.metadata()),
+                    None => not_found(actor),
+                };
+                let _ = tc.inbox_registry.try_deliver(reply_to, boxed);
+            }
+            AdminCommand::ReplaceActorState {
+                actor,
+                reply_to,
+                replace,
+            } => {
+                let result = match self.pool.get_actor_erased_mut(actor) {
+                    Some(erased) => {
+                        let metadata = erased.metadata();
+                        replace(erased, metadata)
+                    }
+                    None => Err(AdminError::ActorNotFound { actor }),
+                };
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::StopActor { actor, reply_to } => {
+                let result = self.pool.stop_actor_admin(actor, &self.stats);
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::SuspendActor { actor, reply_to } => {
+                let result = self.pool.suspend_actor_admin(actor);
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::ResumeActor { actor, reply_to } => {
+                let result = self.pool.resume_actor_admin(actor);
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+        }
     }
 
     /// Phase 7: clean up dead actors, deliver death notifications, GC extension state.
@@ -197,6 +286,7 @@ impl Worker {
         if !self.has_backlog
             && self.spawn_rx.is_empty()
             && self.transfer_rx.is_empty()
+            && self.admin_rx.is_empty()
             && !self
                 .worker_ext
                 .as_ref()
@@ -221,7 +311,10 @@ impl Worker {
         }
         let t2 = Instant::now();
 
-        // 2.5. Fire per-worker extension (e.g., timers) → deliver before tick_all
+        // 3. Drain admin queue → inspect or mutate worker-owned slots before handlers
+        did_work |= self.drain_admin(tc);
+
+        // 4. Fire per-worker extension (e.g., timers) → deliver before tick_all
         let ext_msgs: Vec<_> = self
             .worker_ext
             .as_mut()
@@ -232,7 +325,7 @@ impl Worker {
             did_work = true;
         }
 
-        // 3. Tick all actors with WorkerContext
+        // 5. Tick all actors with WorkerContext
         let pending_local: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
             RefCell::new(Vec::new());
         let stop_requests: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
@@ -275,12 +368,12 @@ impl Worker {
             );
         }
 
-        // 4. Drain spawn queue again — actors spawned during step 3
+        // 6. Drain spawn queue again — actors spawned during step 5
         //    must be in the pool before pending_local delivery.
         did_work |= self.drain_spawns(tc);
         let t4 = Instant::now();
 
-        // 5. Drain pending_local buffer → deliver to local actors
+        // 7. Drain pending_local buffer → deliver to local actors
         let pending = pending_local.into_inner();
         if !pending.is_empty() {
             did_work = true;
@@ -289,7 +382,7 @@ impl Worker {
             self.pool.deliver(&addr, msg);
         }
 
-        // 5.5. Process worker extension requests from handlers (e.g., timer scheduling)
+        // 7.5. Process worker extension requests from handlers (e.g., timer scheduling)
         if let Some(ext) = &mut self.worker_ext {
             for request in worker_requests.into_inner() {
                 ext.handle_request(request);
@@ -298,7 +391,7 @@ impl Worker {
 
         let t5 = Instant::now();
 
-        // 6. Publish stats (skip entirely when idle to avoid allocation + mutex)
+        // 8. Publish stats (skip entirely when idle to avoid allocation + mutex)
         if did_work {
             self.stats
                 .num_actors
@@ -344,7 +437,7 @@ impl Worker {
             );
         }
 
-        // 7. Clean up poisoned and stopping actors
+        // 9. Clean up poisoned and stopping actors
         did_work |= self.cleanup_dead_actors(tc);
 
         self.has_backlog = did_work;
@@ -542,6 +635,95 @@ impl ActorPool {
             true
         } else {
             false
+        }
+    }
+
+    fn get_actor_erased(&self, addr: ActorAddress) -> Option<&dyn AnyActor> {
+        self.actors.get(&addr).map(|slot| slot.actor.as_ref())
+    }
+
+    fn get_actor_erased_mut(
+        &mut self,
+        addr: ActorAddress,
+    ) -> Option<&mut (dyn AnyActor + 'static)> {
+        self.actors.get_mut(&addr).map(|slot| slot.actor.as_mut())
+    }
+
+    fn actor_summary_from_slot(
+        worker_id: WorkerId,
+        address: ActorAddress,
+        slot: &ActorSlot,
+    ) -> ActorSummary {
+        let metadata = slot.actor.metadata();
+        ActorSummary {
+            address,
+            actor_type: metadata.actor_type_name,
+            message_type: metadata.message_type_name,
+            worker_id: worker_id.as_usize(),
+            parent: slot.parent_addr,
+            mailbox_depth: slot.mailbox.len(),
+            status: ActorStatus {
+                started: slot.started,
+                suspended: slot.suspended,
+                stopping: slot.stopping,
+                poisoned: slot.poisoned,
+            },
+            last_message_type: slot.last_msg_type,
+            messages_handled: slot.messages_processed,
+        }
+    }
+
+    fn actor_summary(&self, worker_id: WorkerId, addr: ActorAddress) -> AdminResult<ActorSummary> {
+        self.actors
+            .get(&addr)
+            .map(|slot| Self::actor_summary_from_slot(worker_id, addr, slot))
+            .ok_or(AdminError::ActorNotFound { actor: addr })
+    }
+
+    fn actor_summaries_into(&self, worker_id: WorkerId, out: &mut Vec<ActorSummary>) {
+        out.clear();
+        out.extend(
+            self.actors
+                .iter()
+                .map(|(&addr, slot)| Self::actor_summary_from_slot(worker_id, addr, slot)),
+        );
+    }
+
+    fn suspend_actor_admin(&mut self, addr: ActorAddress) -> AdminResult<OperationResult> {
+        match self.actors.get_mut(&addr) {
+            Some(slot) => {
+                slot.suspended = true;
+                Ok(OperationResult { applied: true })
+            }
+            None => Err(AdminError::ActorNotFound { actor: addr }),
+        }
+    }
+
+    fn resume_actor_admin(&mut self, addr: ActorAddress) -> AdminResult<OperationResult> {
+        match self.actors.get_mut(&addr) {
+            Some(slot) => {
+                slot.suspended = false;
+                Ok(OperationResult { applied: true })
+            }
+            None => Err(AdminError::ActorNotFound { actor: addr }),
+        }
+    }
+
+    fn stop_actor_admin(
+        &mut self,
+        addr: ActorAddress,
+        stats: &WorkerStats,
+    ) -> AdminResult<OperationResult> {
+        match self.actors.get_mut(&addr) {
+            Some(slot) => {
+                if !slot.stopping {
+                    stats.stops.fetch_add(1, Ordering::Relaxed);
+                }
+                slot.stopping = true;
+                slot.mailbox.clear();
+                Ok(OperationResult { applied: true })
+            }
+            None => Err(AdminError::ActorNotFound { actor: addr }),
         }
     }
 
