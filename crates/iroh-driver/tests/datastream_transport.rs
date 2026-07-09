@@ -28,6 +28,7 @@ async fn iroh_datastream_alpn_carries_endpoint_subscription() {
     let endpoint = DatastreamEndpoint::with_capacity(stream.clone(), 8, 8);
     let subscription = endpoint.subscribe_all("iroh");
     let producer = endpoint.producer();
+    producer.set_frame_timing_enabled(false);
 
     producer.submit_text("runtime.log", "alpha");
     producer.submit_text("runtime.log", "beta");

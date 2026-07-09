@@ -11,7 +11,7 @@
 mod common;
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use common::iroh::*;
 use distribution::peer_auth::PeerAllowList;
@@ -36,6 +36,33 @@ fn iroh_driver_reports_listen_addr_and_no_routes() {
     assert!(!driver.listen_addr().is_empty());
     assert_eq!(driver.directory_route_count(), 0);
     driver.shutdown();
+}
+
+#[test]
+fn endpoint_addr_includes_home_relay() {
+    let (relay_url, _relay_guard) = spawn_test_relay();
+    let expected_relay_url = relay_url.to_string();
+    let mut node = make_driver_with_relay(relay_url.clone());
+    let start = Instant::now();
+    let (relay_advertised, observed_relay_url) = loop {
+        let endpoint = node.endpoint_addr();
+        let current_relay_url = endpoint.relay_urls().next().map(|url| url.to_string());
+        if current_relay_url.as_deref() == Some(expected_relay_url.as_str()) {
+            break (true, current_relay_url);
+        }
+        if start.elapsed() >= Duration::from_secs(5) {
+            break (false, current_relay_url);
+        }
+        pump_one(&mut node);
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    node.shutdown();
+
+    assert!(
+        relay_advertised,
+        "advertised endpoint did not include home relay {expected_relay_url} within timeout; last relay URL: {observed_relay_url:?}"
+    );
 }
 
 // ─── Join integration tests ─────────────────────────────────────────────

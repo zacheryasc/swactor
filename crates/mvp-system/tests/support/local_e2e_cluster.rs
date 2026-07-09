@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::sync::{
@@ -40,7 +41,8 @@ use mvp_system::observability_surface as obs;
 use mvp_system::orchestrator_run_fsm as fsm;
 use mvp_system::provisioning::{NodeProvisionSpec, ProvisionLogStream};
 use mvp_system::relay_provisioning::{
-    LocalShimRelayProvider, RelayProvider, RelayProvisionRequest, RelayPurpose,
+    LocalShimRelayProvider, MVP_IROH_RELAY_URL_ENV, RelayProvider, RelayProvisionRequest,
+    RelayPurpose, relay_runtime_config_from_env,
 };
 use mvp_system::run_plan as plan;
 use mvp_system::stage_controller as stage;
@@ -63,6 +65,11 @@ const OBJECT_ALIGNMENT: u64 = 4;
 const ARENA_BYTES: usize = 16 * 1024;
 const RING_BYTES: usize = 4096;
 const DEFAULT_RUNTIME_SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
+const LOCAL_E2E_ROUTE_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_E2E_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(120);
+const LOCAL_E2E_RELAY_LISTEN_ENV: &str = "MVP_LOCAL_E2E_RELAY_LISTEN";
+const LOCAL_E2E_DOCKER_NETWORK_NODE0_ENV: &str = "MVP_LOCAL_E2E_DOCKER_NETWORK_NODE0";
+const LOCAL_E2E_DOCKER_NETWORK_NODE1_ENV: &str = "MVP_LOCAL_E2E_DOCKER_NETWORK_NODE1";
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 struct MvpDashboard {
@@ -216,7 +223,9 @@ fn runtime_snapshot_interval_from_env() -> Result<Duration, String> {
 pub fn run_main() -> ExitCode {
     install_signal_handlers();
     let args = std::env::args().collect::<Vec<_>>();
-    let result = if args.iter().any(|arg| arg == "--role=node") {
+    let result = if std::env::var("MVP_TEST_ROLE").ok().as_deref() == Some("cluster-relay") {
+        run_relay_role()
+    } else if args.iter().any(|arg| arg == "--role=node") {
         run_node_role(&args)
     } else if std::env::var_os("MVP_DASHBOARD").is_some() {
         run_supervisor_dashboard_loop()
@@ -234,6 +243,53 @@ pub fn run_main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+struct LocalRelayGuard {
+    _server: iroh_relay::server::Server,
+    _rt: tokio::runtime::Runtime,
+}
+
+fn run_relay_role() -> Result<(), String> {
+    let listen =
+        std::env::var(LOCAL_E2E_RELAY_LISTEN_ENV).unwrap_or_else(|_| "0.0.0.0:7843".to_owned());
+    let _relay = spawn_local_relay(&listen)?;
+    eprintln!("mvp-local-e2e-cluster: relay ready on {listen}");
+    while !STOP_REQUESTED.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    Ok(())
+}
+
+fn spawn_local_relay(listen: &str) -> Result<LocalRelayGuard, String> {
+    let bind_addr = listen
+        .parse::<SocketAddr>()
+        .map_err(|e| format!("invalid {LOCAL_E2E_RELAY_LISTEN_ENV}={listen:?}: {e}"))?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .map_err(|e| format!("relay tokio runtime: {e}"))?;
+    let server = rt
+        .block_on(async {
+            iroh_relay::server::Server::spawn(iroh_relay::server::ServerConfig::<(), ()> {
+                relay: Some(iroh_relay::server::RelayConfig {
+                    http_bind_addr: bind_addr,
+                    tls: None,
+                    limits: Default::default(),
+                    key_cache_capacity: Some(256),
+                    access: iroh_relay::server::AccessConfig::Everyone,
+                }),
+                quic: None,
+                metrics_addr: None,
+            })
+            .await
+        })
+        .map_err(|e| format!("spawn relay server: {e}"))?;
+    Ok(LocalRelayGuard {
+        _server: server,
+        _rt: rt,
+    })
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -532,7 +588,8 @@ fn run_supervisor_once(
         .cloned()
         .ok_or_else(|| "engine builder did not assign stage 1".to_owned())?;
 
-    let self_endpoint_json = serde_json::to_string(&driver.endpoint_addr())
+    let self_endpoint = driver.endpoint_addr();
+    let self_endpoint_json = serde_json::to_string(&self_endpoint)
         .map_err(|e| format!("serialize endpoint addr: {e}"))?;
     let orchestrator_actor_json = serde_json::to_string(&orchestrator_addr)
         .map_err(|e| format!("serialize orchestrator actor: {e}"))?;
@@ -660,8 +717,22 @@ fn run_supervisor_once(
     let mut response_tokens = Vec::<u32>::new();
     let mut edge_stream_count = 0usize;
     let mut token_out_streams = HashMap::<u64, Vec<u8>>::new();
+    let workflow_started = Instant::now();
 
     while !STOP_REQUESTED.load(Ordering::SeqCst) {
+        if workflow_started.elapsed() >= LOCAL_E2E_WORKFLOW_TIMEOUT {
+            let _ = stop_provisioned_nodes(
+                &mut [&mut node0, &mut node1],
+                &mut driver,
+                &stack,
+                &mut dashboard,
+            );
+            return Err(format!(
+                "workflow timed out after {:?}: injected={injected}, token_received={token_received}, completed={completed}, torn_down={torn_down}, stop_node0={sent_stop_to_node0}, stop_node1={sent_stop_to_node1}, stage_ready_count={stage_ready_count}, edge_stream_count={edge_stream_count}",
+                LOCAL_E2E_WORKFLOW_TIMEOUT
+            ));
+        }
+
         pump_network(&mut driver, &stack);
         driver_runtime.poll_iroh(&driver);
         while let Some(event) = driver_runtime.try_recv() {
@@ -827,7 +898,8 @@ fn run_supervisor_once(
                         return Err(format!("run failed: {event:?}"));
                     }
                 },
-                OrchestratorReport::Snapshot { .. } => {}
+                OrchestratorReport::NodeRuntimeReady { .. }
+                | OrchestratorReport::Snapshot { .. } => {}
             }
         }
 
@@ -858,6 +930,10 @@ fn run_supervisor_once(
                 })
                 .count();
             let response_text = detokenize_response(&response_tokens);
+            let relay_url = relay_url_from_env();
+            let orchestrator_endpoint_relay_url = endpoint_relay_url(&self_endpoint);
+            let node0_endpoint_relay_url = endpoint_relay_url(&node0.endpoint);
+            let node1_endpoint_relay_url = endpoint_relay_url(&node1.endpoint);
             let summary = json!({
                 "ok": true,
                 "actor_plane": "iroh-swactor",
@@ -871,6 +947,15 @@ fn run_supervisor_once(
                 },
                 "node0_endpoint": node0.endpoint,
                 "node1_endpoint": node1.endpoint,
+                "orchestrator_endpoint": self_endpoint,
+                "relay_only": relay_url.is_some(),
+                "relay_url": relay_url,
+                "orchestrator_endpoint_has_relay": orchestrator_endpoint_relay_url.is_some(),
+                "orchestrator_endpoint_relay_url": orchestrator_endpoint_relay_url,
+                "node0_endpoint_has_relay": node0_endpoint_relay_url.is_some(),
+                "node0_endpoint_relay_url": node0_endpoint_relay_url,
+                "node1_endpoint_has_relay": node1_endpoint_relay_url.is_some(),
+                "node1_endpoint_relay_url": node1_endpoint_relay_url,
                 "node0_logical_id": node0.node_id,
                 "node1_logical_id": node1.node_id,
                 "node0_stage_index": node0.stage_index,
@@ -1132,7 +1217,9 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
                         .flush()
                         .map_err(|e| format!("flush lifecycle stdout: {e}"))?;
                 }
-                NodeAgentReport::PromptRequested { .. } | NodeAgentReport::Snapshot { .. } => {}
+                NodeAgentReport::PromptRequested { .. }
+                | NodeAgentReport::RuntimeReadyAck { .. }
+                | NodeAgentReport::Snapshot { .. } => {}
             }
         }
 
@@ -1203,12 +1290,16 @@ fn run_node_role(args: &[String]) -> Result<(), String> {
 }
 
 fn new_driver(handle: tokio::runtime::Handle) -> Result<IrohDriver, String> {
-    let mut relay_provider = LocalShimRelayProvider;
-    let relay = relay_provider.provision_relay(RelayProvisionRequest {
-        run_id: RUN_ID,
-        purpose: RelayPurpose::Combined,
-    })?;
-    let relay_mode = relay_provider.relay_mode(&relay)?;
+    let relay_mode = if relay_url_from_env().is_some() {
+        relay_runtime_config_from_env(RUN_ID)?.mode
+    } else {
+        let mut relay_provider = LocalShimRelayProvider;
+        let relay = relay_provider.provision_relay(RelayProvisionRequest {
+            run_id: RUN_ID,
+            purpose: RelayPurpose::Combined,
+        })?;
+        relay_provider.relay_mode(&relay)?
+    };
     IrohDriver::with_handle(
         handle,
         IrohDriverConfig {
@@ -1234,8 +1325,14 @@ fn wait_for_routes(
     stack: &DistributionRuntimeStack,
     actors: &[ActorAddress],
 ) -> Result<(), String> {
+    let started = Instant::now();
     loop {
         pump_network(driver, stack);
+        let route_count = stack
+            .route_view
+            .read()
+            .map(|view| view.len())
+            .unwrap_or_default();
         let ready = stack
             .route_view
             .read()
@@ -1243,6 +1340,13 @@ fn wait_for_routes(
             .unwrap_or(false);
         if ready {
             return Ok(());
+        }
+        if started.elapsed() >= LOCAL_E2E_ROUTE_TIMEOUT {
+            return Err(format!(
+                "routes not ready after {:?}: expected {} actor routes, observed {route_count}",
+                LOCAL_E2E_ROUTE_TIMEOUT,
+                actors.len()
+            ));
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -2239,20 +2343,26 @@ fn local_docker_spec(
     coordinator_endpoint_json: &str,
     orchestrator_actor_json: &str,
 ) -> NodeProvisionSpec {
+    let mut env = vec![
+        ("DEV".to_owned(), "CPU".to_owned()),
+        ("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned()),
+        (
+            "MVP_TINYGRAD_WORKER".to_owned(),
+            "/workspace/crates/mvp-system/tests/local_e2e_cluster/tinygrad_cpu_worker.py"
+                .to_owned(),
+        ),
+    ];
+    if let Some(relay_url) = relay_url_from_env() {
+        env.push(("MVP_IROH_RELAY_MODE".to_owned(), "default".to_owned()));
+        env.push((MVP_IROH_RELAY_URL_ENV.to_owned(), relay_url));
+    }
+
     NodeProvisionSpec {
         run_id,
         node_id,
         stage_index: Some(stage_index),
         image: docker_image(),
-        env: vec![
-            ("DEV".to_owned(), "CPU".to_owned()),
-            ("PYTHONDONTWRITEBYTECODE".to_owned(), "1".to_owned()),
-            (
-                "MVP_TINYGRAD_WORKER".to_owned(),
-                "/workspace/crates/mvp-system/tests/local_e2e_cluster/tinygrad_cpu_worker.py"
-                    .to_owned(),
-            ),
-        ],
+        env,
         args: vec![
             "--role=node".to_owned(),
             "--logical-node-id".to_owned(),
@@ -2308,14 +2418,15 @@ impl docker_provision::DockerCli for LocalE2eDockerCli {
         }
 
         let mut command = Command::new("docker");
-        command
-            .arg("run")
-            .arg("--rm")
-            .arg("--add-host")
-            .arg("host.docker.internal:host-gateway")
-            .arg("--name")
-            .arg(&request.container_name)
-            .arg("-i");
+        command.arg("run").arg("--rm");
+        if let Some(network) = docker_network_for_node(self.spec.node_id) {
+            command.arg("--network").arg(network);
+        } else {
+            command
+                .arg("--add-host")
+                .arg("host.docker.internal:host-gateway");
+        }
+        command.arg("--name").arg(&request.container_name).arg("-i");
         for (key, value) in &request.labels {
             command.arg("--label").arg(format!("{key}={value}"));
         }
@@ -2937,6 +3048,29 @@ fn spawn_shutdown_listener() -> Receiver<()> {
         }
     });
     rx
+}
+
+fn relay_url_from_env() -> Option<String> {
+    std::env::var(MVP_IROH_RELAY_URL_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn endpoint_relay_url(endpoint: &EndpointAddr) -> Option<String> {
+    endpoint.relay_urls().next().map(|url| url.to_string())
+}
+
+fn docker_network_for_node(node_id: u64) -> Option<String> {
+    let env_name = match node_id {
+        NODE0_LOGICAL_ID => LOCAL_E2E_DOCKER_NETWORK_NODE0_ENV,
+        NODE1_LOGICAL_ID => LOCAL_E2E_DOCKER_NETWORK_NODE1_ENV,
+        _ => return None,
+    };
+    std::env::var(env_name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn parse_arg<'a>(args: &'a [String], name: &str) -> Result<&'a str, String> {

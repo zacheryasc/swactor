@@ -204,6 +204,18 @@ impl DistributionRuntimeStack {
             .filter(|entry| entry.state == MemberState::Alive)
             .count()
     }
+
+    pub fn member_state(&self, node_id: NodeId) -> Option<MemberState> {
+        self.membership_mirror
+            .lock()
+            .ok()?
+            .get(&node_id)
+            .map(|entry| entry.state)
+    }
+
+    pub fn route_owner(&self, actor: ActorAddress) -> Option<NodeId> {
+        self.route_view.read().ok()?.get(&actor).copied()
+    }
 }
 
 struct MembershipFanout {
@@ -225,5 +237,43 @@ impl ActorInterface for MembershipFanout {
         let _ = ctx.send(self.registry, RegistryIn::Membership(change.clone()));
         let _ = ctx.send(self.metadata, MetadataIn::Membership(change.clone()));
         let _ = ctx.send(self.directory, DirectoryIn::Membership(change));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distribution_stack_reports_member_state_and_route_owner() {
+        let stack = DistributionRuntimeStack::new(
+            distribution::types::NodeId([1; 32]),
+            DistributedNodeConfig::default(),
+        );
+        let remote = distribution::types::NodeId([2; 32]);
+
+        stack
+            .runtime
+            .send_to(
+                stack.actors.membership_fanout,
+                distribution::swim::actor::MembershipChanged {
+                    node_id: remote,
+                    state: MemberState::Alive,
+                    incarnation: 1,
+                },
+            )
+            .expect("send membership change");
+        stack.pump_runtime_once();
+        assert_eq!(stack.member_state(remote), Some(MemberState::Alive));
+
+        let actor = ActorAddress::new_random();
+        {
+            let mut route_view = match stack.route_view.write() {
+                Ok(route_view) => route_view,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            route_view.insert(actor, remote);
+        }
+        assert_eq!(stack.route_owner(actor), Some(remote));
     }
 }

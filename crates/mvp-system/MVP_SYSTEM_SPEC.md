@@ -1,4 +1,5 @@
 # MVP System Specification
+ ***STALE! FOR HISTORICAL REFERENCE ONLY*** 
 
 **Status:** draft consolidated system specification.
 

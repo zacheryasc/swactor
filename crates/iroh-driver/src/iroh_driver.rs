@@ -237,8 +237,8 @@ pub struct IrohDriver {
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
     /// Real-time join status for each peer being joined.
     join_statuses: Arc<Mutex<HashMap<NodeId, JoinStatus>>>,
-    /// Relay URL exposed by the bound endpoint, if any.
-    relay_url: Option<String>,
+    /// Relay URL configured or exposed by the bound endpoint, if any.
+    relay_url: Option<iroh::RelayUrl>,
     /// Actor-bridge wiring, installed via [`Self::enable_actor_bridge`]. When
     /// present, the driver decodes inbound frames into actor messages
     /// ([`Self::pump_inbound_to_actors`]) and writes actor-produced outbound
@@ -330,6 +330,11 @@ impl IrohDriver {
         config: IrohDriverConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let effective_relay_mode = config.relay_mode;
+        let configured_relay_url = match &effective_relay_mode {
+            RelayMode::Custom(relay_map) => relay_map.urls::<Vec<_>>().into_iter().next(),
+            _ => None,
+        };
+        let custom_relay = matches!(&effective_relay_mode, RelayMode::Custom(_));
 
         // A custom relay is operator-controlled (typically `iroh-driver-relay`
         // on a VPS, serving QUIC Address Discovery with a self-signed cert).
@@ -337,8 +342,6 @@ impl IrohDriver {
         // that, address discovery fails and every connection stays
         // `conn_type=Relay`, which defeats hole-punching and makes a NAT'd peer
         // (e.g. a locally-run orchestrator) reachable only over the relay.
-        let custom_relay = matches!(effective_relay_mode, RelayMode::Custom(_));
-
         let endpoint = rt.block_on(async {
             let mut alpns = vec![ALPN.to_vec()];
             alpns.extend(config.additional_alpns.iter().cloned());
@@ -362,7 +365,8 @@ impl IrohDriver {
             .addr()
             .relay_urls()
             .next()
-            .map(|url| url.to_string());
+            .cloned()
+            .or(configured_relay_url);
 
         // The driver's signing identity matches the iroh endpoint: both use
         // ed25519-dalek, so we reconstruct our Keypair from iroh's secret key.
@@ -458,16 +462,20 @@ impl IrohDriver {
         self.keypair.node_id()
     }
 
-    /// The endpoint's full address (public key + direct socket addresses).
+    /// The endpoint's current relay/direct advertised address.
     ///
-    /// Constructs the address from the endpoint's public key and bound
-    /// sockets. For sockets bound to `0.0.0.0`, emits one address per
+    /// Starts from Iroh's live endpoint address, which includes the current
+    /// home relay when one is available, then merges normalized direct socket
+    /// addresses. For sockets bound to `0.0.0.0`, emits one address per
     /// discovered LAN IP so that peers on the same network can connect
     /// directly. IPv6 unspecified is mapped to localhost.
     pub fn endpoint_addr(&self) -> EndpointAddr {
-        let key = PublicKey::from_bytes(&self.keypair.node_id().0)
-            .expect("node_id is a valid public key");
-        let mut addr = EndpointAddr::new(key);
+        let mut addr = self.endpoint.addr();
+        if addr.relay_urls().next().is_none() {
+            if let Some(relay) = self.relay_url.clone() {
+                addr = addr.with_relay_url(relay);
+            }
+        }
         for sa in self.direct_addresses() {
             addr = addr.with_ip_addr(sa);
         }
@@ -622,7 +630,7 @@ impl IrohDriver {
                     .peer_relay_urls
                     .get(&seed_node_id)
                     .cloned()
-                    .or_else(|| self.endpoint.addr().relay_urls().next().cloned())
+                    .or_else(|| self.home_relay_url())
                 {
                     seed_addr.clone().with_relay_url(relay)
                 } else {
@@ -983,7 +991,7 @@ impl IrohDriver {
             .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
         {
             Some(r)
-        } else if let Some(r) = self.endpoint.addr().relay_urls().next().cloned() {
+        } else if let Some(r) = self.home_relay_url() {
             Some(r)
         } else {
             None
@@ -1051,14 +1059,19 @@ impl IrohDriver {
         }
     }
 
-    /// Relay URL exposed by the bound endpoint, if any.
+    /// Relay URL configured or exposed by the bound endpoint, if any.
     pub fn relay_url(&self) -> Option<&str> {
-        self.relay_url.as_deref()
+        self.relay_url.as_ref().map(|url| url.as_str())
     }
 
-    /// The endpoint's home relay URL (from RelayMode::Custom), if connected.
+    /// The endpoint's live or configured home relay URL, if any.
     pub fn home_relay_url(&self) -> Option<iroh::RelayUrl> {
-        self.endpoint.addr().relay_urls().next().cloned()
+        self.endpoint
+            .addr()
+            .relay_urls()
+            .next()
+            .cloned()
+            .or_else(|| self.relay_url.clone())
     }
 
     /// Async teardown for the unified driver loop, which runs on a tokio worker

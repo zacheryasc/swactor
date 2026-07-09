@@ -1109,6 +1109,22 @@ fn orch_local_e2e_marker(bin: &Path) -> PathBuf {
     marker
 }
 
+fn orch_binary_fingerprint(bin: &Path, root: &Path) -> Result<String, String> {
+    let display = display_workspace_path(root, bin);
+    let metadata = fs::metadata(bin).map_err(|e| format!("stat {display}: {e}"))?;
+    let modified = metadata
+        .modified()
+        .map_err(|e| format!("modified time {display}: {e}"))?;
+    let modified_ns = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("modified time before Unix epoch for {display}: {e}"))?
+        .as_nanos();
+    Ok(format!(
+        "local-e2e\nlen={}\nmodified_ns={modified_ns}\n",
+        metadata.len()
+    ))
+}
+
 fn orch_local_e2e_marker_stale(bin: &Path, root: &Path) -> Result<bool, String> {
     if !bin.is_file() {
         return Ok(true);
@@ -1117,13 +1133,16 @@ fn orch_local_e2e_marker_stale(bin: &Path, root: &Path) -> Result<bool, String> 
     if !marker.is_file() {
         return Ok(true);
     }
-    Ok(modified_time(root, &marker)? < modified_time(root, bin)?)
+    let expected = orch_binary_fingerprint(bin, root)?;
+    let actual = fs::read_to_string(&marker).unwrap_or_default();
+    Ok(actual != expected)
 }
 
 fn write_orch_local_e2e_marker(bin: &Path, root: &Path) -> Result<(), String> {
     let marker = orch_local_e2e_marker(bin);
     let display = display_workspace_path(root, &marker);
-    fs::write(&marker, b"local-e2e\n").map_err(|e| format!("write {display}: {e}"))
+    let fingerprint = orch_binary_fingerprint(bin, root)?;
+    fs::write(&marker, fingerprint).map_err(|e| format!("write {display}: {e}"))
 }
 
 fn latest_mtime(root: &Path, path: &Path) -> Result<SystemTime, String> {

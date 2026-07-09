@@ -387,7 +387,7 @@ pub trait VastAiBootstrapLauncher: Send {
 
 #[derive(Clone)]
 enum SshBootstrapMsg {
-    Stop { reason: BootstrapStopReason },
+    Stop,
 }
 
 struct SshBootstrapActor {
@@ -407,7 +407,7 @@ impl ActorInterface for SshBootstrapActor {
 
     fn handle(&mut self, _ctx: &Ctx, msg: Self::Incoming) {
         match msg {
-            SshBootstrapMsg::Stop { reason: _ } => {
+            SshBootstrapMsg::Stop => {
                 self.stopping.store(true, Ordering::SeqCst);
                 stop_ssh_child(&self.child);
             }
@@ -481,10 +481,8 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
         })
     }
 
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason) {
-        let _ = handle
-            .runtime
-            .send_to(handle.actor, SshBootstrapMsg::Stop { reason });
+    fn stop_bootstrap(&mut self, handle: &mut Self::Handle, _reason: BootstrapStopReason) {
+        let _ = handle.runtime.send_to(handle.actor, SshBootstrapMsg::Stop);
         handle.runtime.tick();
     }
 }
@@ -1051,12 +1049,7 @@ mod tests {
             .expect("spawn ssh bootstrap actor");
 
         runtime
-            .send_to(
-                actor,
-                SshBootstrapMsg::Stop {
-                    reason: BootstrapStopReason::RuntimeReady,
-                },
-            )
+            .send_to(actor, SshBootstrapMsg::Stop)
             .expect("send stop");
         runtime.tick();
 
