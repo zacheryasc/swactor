@@ -58,6 +58,13 @@ pub enum NodeAgentMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
+        readiness_id: u64,
+    },
+    RuntimeReadyAck {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        readiness_id: u64,
     },
     MarkWeightsReady,
     MarkInboundEdgeReady {
@@ -184,6 +191,12 @@ pub enum NodeAgentReport {
         max_tokens: u32,
         reply_to: ActorAddress,
     },
+    RuntimeReadyAck {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        readiness_id: u64,
+    },
     Snapshot {
         commands: Vec<StageCommandWire>,
         events: Vec<StageLifecycleWire>,
@@ -234,6 +247,7 @@ impl NodeAgentActor {
                 stage_index,
                 endpoint,
                 node_actor,
+                readiness_id,
             } => {
                 self.core.observe(stage::StageEvent::WorkerReady);
                 let _ = ctx.send(
@@ -244,8 +258,28 @@ impl NodeAgentActor {
                         stage_index,
                         endpoint,
                         node_actor,
+                        readiness_id,
                     },
                 );
+            }
+            NodeAgentMsg::RuntimeReadyAck {
+                run_id,
+                node_id,
+                stage_index,
+                readiness_id,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        NodeAgentReport::RuntimeReadyAck {
+                            run_id,
+                            node_id,
+                            stage_index,
+                            readiness_id,
+                        },
+                    );
+                }
+                return;
             }
             NodeAgentMsg::MarkWeightsReady => self.core.observe(stage::StageEvent::WeightsReady),
             NodeAgentMsg::MarkInboundEdgeReady { edge_id } => {
@@ -534,6 +568,7 @@ mod tests {
                     stage_index: 3,
                     endpoint: endpoint.clone(),
                     node_actor,
+                    readiness_id: 99,
                 },
             )
             .expect("send runtime loaded");
@@ -547,7 +582,50 @@ mod tests {
                 stage_index: 3,
                 endpoint,
                 node_actor,
+                readiness_id: 99,
             })
         );
+    }
+
+    #[test]
+    fn node_agent_runtime_ready_ack_reports_worker_loop() {
+        let runtime = Runtime::new(RuntimeConfig::default());
+        let orchestrator_inbox = runtime
+            .new_inbox::<OrchestratorMsg>()
+            .expect("orchestrator inbox");
+        let reports = runtime
+            .new_inbox::<NodeAgentReport>()
+            .expect("node report inbox");
+        let actor = runtime
+            .spawn(NodeAgentActor::new(
+                stage::NodeId(11),
+                *orchestrator_inbox.addr(),
+                Some(*reports.addr()),
+            ))
+            .expect("spawn node agent");
+
+        runtime
+            .send_to(
+                actor,
+                NodeAgentMsg::RuntimeReadyAck {
+                    run_id: 7,
+                    node_id: 11,
+                    stage_index: 3,
+                    readiness_id: 99,
+                },
+            )
+            .expect("send runtime ready ack");
+        runtime.tick();
+
+        assert_eq!(
+            reports.try_recv(),
+            Some(NodeAgentReport::RuntimeReadyAck {
+                run_id: 7,
+                node_id: 11,
+                stage_index: 3,
+                readiness_id: 99,
+            })
+        );
+        assert_eq!(reports.try_recv(), None);
     }
 }

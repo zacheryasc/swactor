@@ -19,7 +19,7 @@ swactor-transport = { path = "../transport" }
 distribution = { path = "../distribution" }
 iroh-driver = { path = "../iroh-driver" }
 iroh = "0.98"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net"] }
 swactor-vastai = { path = "../../tools/vastai" }
 parking_lot = "0.12"
 blake3 = "1"
@@ -27,6 +27,9 @@ toml = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+iroh-relay = { version = "0.98", features = ["server", "test-utils"] }
 
 [[bin]]
 name = "mvp-worker-node"

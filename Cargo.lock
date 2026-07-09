@@ -2477,6 +2477,7 @@ dependencies = [
  "distribution",
  "iroh",
  "iroh-driver",
+ "iroh-relay",
  "libc",
  "parking_lot",
  "serde",

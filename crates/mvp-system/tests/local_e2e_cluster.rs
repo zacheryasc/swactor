@@ -1,15 +1,20 @@
-use std::path::{Path, PathBuf};
+#![recursion_limit = "256"]
+
+use std::path::Path;
 use std::process::{Command, ExitCode};
+use std::time::{Duration, Instant};
 
 #[path = "support/local_e2e_cluster.rs"]
 mod local_e2e_cluster;
 
 const IMAGE: &str = "swactor-mvp-local-e2e-cluster:latest";
+const SKIP_BUILD_ENV: &str = "MVP_LOCAL_E2E_CLUSTER_SKIP_BUILD";
+const BUILD_ONLY_ENV: &str = "MVP_LOCAL_E2E_CLUSTER_BUILD_ONLY";
 
 fn main() -> ExitCode {
     let args = std::env::args().collect::<Vec<_>>();
     match std::env::var("MVP_TEST_ROLE").ok().as_deref() {
-        Some("cluster-supervisor") => return local_e2e_cluster::run_main(),
+        Some("cluster-supervisor" | "cluster-relay") => return local_e2e_cluster::run_main(),
         Some(role) => {
             eprintln!("unknown MVP_TEST_ROLE={role}");
             return ExitCode::from(2);
@@ -30,16 +35,20 @@ fn local_e2e_cluster_docker_cpu_pipeline_prompt() {
         eprintln!("skipping; set MVP_SYSTEM_LOCAL_E2E_CLUSTER=1 to run Docker CPU cluster e2e");
         return;
     }
+    if !Path::new("/var/run/docker.sock").exists() {
+        eprintln!(
+            "skipping; /var/run/docker.sock is required for the relay-only Docker cluster e2e"
+        );
+        return;
+    }
 
     build_docker_fixture();
+    if std::env::var_os(BUILD_ONLY_ENV).is_some() {
+        return;
+    }
 
-    let output = Command::new(current_test_exe())
-        .env("MVP_TEST_ROLE", "cluster-supervisor")
-        .arg("--prompt")
-        .arg("ping")
-        .env("MVP_LOCAL_E2E_CLUSTER_IMAGE", IMAGE)
-        .output()
-        .expect("run local e2e cluster supervisor");
+    let docker = DockerRelayFixture::start();
+    let output = docker.run_supervisor("ping");
 
     assert!(
         output.status.success(),
@@ -95,6 +104,17 @@ fn local_e2e_cluster_docker_cpu_pipeline_prompt() {
         "{value}"
     );
     assert_eq!(value["provision_nodes_stopped"], true);
+    assert_eq!(value["relay_only"], true, "{value}");
+    assert_eq!(value["relay_url"], "http://relay:7843/");
+    assert_eq!(value["orchestrator_endpoint_has_relay"], true, "{value}");
+    assert_eq!(
+        value["orchestrator_endpoint_relay_url"],
+        "http://relay:7843/"
+    );
+    assert_eq!(value["node0_endpoint_has_relay"], true, "{value}");
+    assert_eq!(value["node0_endpoint_relay_url"], "http://relay:7843/");
+    assert_eq!(value["node1_endpoint_has_relay"], true, "{value}");
+    assert_eq!(value["node1_endpoint_relay_url"], "http://relay:7843/");
     assert!(
         value["node0_endpoint"]["addrs"]
             .as_array()
@@ -108,8 +128,166 @@ fn local_e2e_cluster_docker_cpu_pipeline_prompt() {
         "{value}"
     );
 }
+struct DockerRelayFixture {
+    relay_container: String,
+    supervisor_network: String,
+    node0_network: String,
+    node1_network: String,
+}
+
+impl DockerRelayFixture {
+    fn start() -> Self {
+        let suffix = format!("{}-{}", std::process::id(), unique_nanos());
+        let relay_container = format!("mvp-local-e2e-relay-{suffix}");
+        let supervisor_network = format!("mvp-local-e2e-supervisor-{suffix}");
+        let node0_network = format!("mvp-local-e2e-node0-{suffix}");
+        let node1_network = format!("mvp-local-e2e-node1-{suffix}");
+        for network in [&supervisor_network, &node0_network, &node1_network] {
+            docker_status(
+                ["network", "create", network],
+                "create relay-only Docker network",
+            );
+        }
+        docker_status(
+            [
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &relay_container,
+                "--network",
+                &supervisor_network,
+                "--network-alias",
+                "relay",
+                "-e",
+                "MVP_TEST_ROLE=cluster-relay",
+                "-e",
+                "MVP_LOCAL_E2E_RELAY_LISTEN=0.0.0.0:7843",
+                IMAGE,
+            ],
+            "start relay sidecar",
+        );
+        docker_status(
+            [
+                "network",
+                "connect",
+                "--alias",
+                "relay",
+                &node0_network,
+                &relay_container,
+            ],
+            "attach relay to node0 network",
+        );
+        docker_status(
+            [
+                "network",
+                "connect",
+                "--alias",
+                "relay",
+                &node1_network,
+                &relay_container,
+            ],
+            "attach relay to node1 network",
+        );
+        let fixture = Self {
+            relay_container,
+            supervisor_network,
+            node0_network,
+            node1_network,
+        };
+        fixture.wait_for_relay();
+        fixture
+    }
+
+    fn run_supervisor(&self, prompt: &str) -> std::process::Output {
+        Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--name",
+                &format!("mvp-local-e2e-supervisor-{}", unique_nanos()),
+                "--network",
+                &self.supervisor_network,
+                "--network-alias",
+                "supervisor",
+                "-v",
+                "/var/run/docker.sock:/var/run/docker.sock",
+                "-e",
+                "MVP_TEST_ROLE=cluster-supervisor",
+                "-e",
+                &format!("MVP_LOCAL_E2E_CLUSTER_IMAGE={IMAGE}"),
+                "-e",
+                &format!("MVP_LOCAL_E2E_DOCKER_NETWORK_NODE0={}", self.node0_network),
+                "-e",
+                &format!("MVP_LOCAL_E2E_DOCKER_NETWORK_NODE1={}", self.node1_network),
+                "-e",
+                "MVP_IROH_RELAY_MODE=default",
+                "-e",
+                "MVP_IROH_RELAY_URL=http://relay:7843/",
+                IMAGE,
+                "--prompt",
+                prompt,
+            ])
+            .output()
+            .expect("run relay-only local e2e cluster supervisor")
+    }
+
+    fn wait_for_relay(&self) {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(20) {
+            let logs = Command::new("docker")
+                .args(["logs", &self.relay_container])
+                .output()
+                .expect("read relay sidecar logs");
+            let stdout = String::from_utf8_lossy(&logs.stdout);
+            let stderr = String::from_utf8_lossy(&logs.stderr);
+            if stdout.contains("relay ready") || stderr.contains("relay ready") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("relay sidecar did not report ready within 20s");
+    }
+}
+
+impl Drop for DockerRelayFixture {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["stop", "-t", "2", &self.relay_container])
+            .status();
+        for network in [
+            &self.node1_network,
+            &self.node0_network,
+            &self.supervisor_network,
+        ] {
+            let _ = Command::new("docker")
+                .args(["network", "rm", network])
+                .status();
+        }
+    }
+}
+
+fn docker_status<const N: usize>(args: [&str; N], action: &str) {
+    let status = Command::new("docker")
+        .args(args)
+        .status()
+        .unwrap_or_else(|error| panic!("{action}: {error}"));
+    assert!(status.success(), "{action} failed with status {status}");
+}
+
+fn unique_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos()
+}
 
 fn build_docker_fixture() {
+    if std::env::var_os(SKIP_BUILD_ENV).is_some() {
+        phase("using existing Docker CPU cluster fixture image");
+        return;
+    }
+
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = crate_dir
         .parent()
@@ -175,8 +353,4 @@ fn copy_context_entry(source: &Path, dest: &Path) {
 
 fn phase(message: &str) {
     eprintln!("local-e2e-cluster: {message}");
-}
-
-fn current_test_exe() -> PathBuf {
-    std::env::current_exe().expect("current test exe")
 }

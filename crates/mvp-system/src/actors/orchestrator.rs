@@ -33,6 +33,7 @@ pub enum OrchestratorMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
+        readiness_id: u64,
     },
     ObserveTokenInEndpointReady,
     ObserveTokenOutEndpointReady,
@@ -134,6 +135,7 @@ pub enum OrchestratorReport {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
+        readiness_id: u64,
     },
     Snapshot {
         commands: Vec<RunCommandWire>,
@@ -269,6 +271,7 @@ impl ActorInterface for OrchestratorActor {
             stage_index,
             endpoint,
             node_actor,
+            readiness_id,
         } = msg.clone()
         {
             if let Some(report_to) = self.report_to {
@@ -280,6 +283,7 @@ impl ActorInterface for OrchestratorActor {
                         stage_index,
                         endpoint,
                         node_actor,
+                        readiness_id,
                     },
                 );
             }
@@ -421,6 +425,7 @@ mod tests {
                     stage_index: 3,
                     endpoint: endpoint.clone(),
                     node_actor,
+                    readiness_id: 99,
                 },
             )
             .expect("send runtime ready");
@@ -434,6 +439,7 @@ mod tests {
                 stage_index: 3,
                 endpoint,
                 node_actor,
+                readiness_id: 99,
             })
         );
         assert_eq!(reports.try_recv(), None);

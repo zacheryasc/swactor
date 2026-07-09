@@ -1,5 +1,6 @@
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::sync::{
     Arc, OnceLock,
@@ -14,6 +15,7 @@ use datastream::emit::{
 };
 
 use distribution::node::DistributedNodeConfig;
+use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
 use mvp_system::actors::node_agent::{
@@ -29,6 +31,7 @@ use mvp_system::stage_controller as stage;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/mvp/tinygrad_worker.py";
 const DEFAULT_DEVICE: &str = "CUDA";
@@ -38,6 +41,8 @@ const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_ARENA_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_ARENA_ALIGNMENT: u64 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+const RUNTIME_READY_RETRY_INITIAL: Duration = Duration::from_millis(100);
+const RUNTIME_READY_RETRY_MAX: Duration = Duration::from_secs(2);
 const NODE_BOOTSTRAP_CHANNEL: &str = "mvp.node.bootstrap";
 const NODE_RUNTIME_CHANNEL: &str = "mvp.node.runtime";
 const NODE_STAGE_CHANNEL: &str = "mvp.node.stage";
@@ -96,6 +101,298 @@ fn emit_node_event(
         node_event_payload(config, phase, status, detail).to_string(),
     );
     datastream.tick();
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type")]
+enum DebugJoinRequestWire {
+    JoinEndpoint { endpoint: EndpointAddr },
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "type")]
+enum DebugJoinResponseWire {
+    JoinQueued {
+        peer_node_id: String,
+        has_relay: bool,
+        direct_addr_count: usize,
+    },
+    JoinRejected {
+        error: String,
+        detail: String,
+    },
+}
+
+enum DebugJoinCommand {
+    JoinEndpoint {
+        endpoint: EndpointAddr,
+        reply: tokio::sync::oneshot::Sender<DebugJoinResponseWire>,
+    },
+}
+
+enum DebugJoinClientError {
+    Cli(String),
+    Runtime(String),
+}
+
+fn debug_join_client_main(args: Vec<String>) -> ExitCode {
+    match run_debug_join_client(args) {
+        Ok(response) => {
+            let queued = matches!(response, DebugJoinResponseWire::JoinQueued { .. });
+            match serde_json::to_string(&response) {
+                Ok(line) => println!("{line}"),
+                Err(error) => {
+                    eprintln!("mvp-worker-node debug-join: serialize response: {error}");
+                    return ExitCode::from(1);
+                }
+            }
+            if queued {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(1)
+            }
+        }
+        Err(DebugJoinClientError::Cli(error)) => {
+            eprintln!("mvp-worker-node debug-join: {error}");
+            ExitCode::from(2)
+        }
+        Err(DebugJoinClientError::Runtime(error)) => {
+            eprintln!("mvp-worker-node debug-join: {error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_debug_join_client(args: Vec<String>) -> Result<DebugJoinResponseWire, DebugJoinClientError> {
+    let mut socket = None;
+    let mut endpoint_json = None;
+    let mut read_endpoint_stdin = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--socket" => {
+                socket = Some(PathBuf::from(iter.next().ok_or_else(|| {
+                    DebugJoinClientError::Cli("--socket requires a path".to_owned())
+                })?));
+            }
+            "--endpoint-json" => {
+                endpoint_json = Some(iter.next().ok_or_else(|| {
+                    DebugJoinClientError::Cli("--endpoint-json requires JSON".to_owned())
+                })?);
+            }
+            "--endpoint-json-stdin" => read_endpoint_stdin = true,
+            other => {
+                return Err(DebugJoinClientError::Cli(format!(
+                    "unknown argument {other:?}; usage: debug-join --socket <path> (--endpoint-json <json> | --endpoint-json-stdin)"
+                )));
+            }
+        }
+    }
+    let socket = socket.ok_or_else(|| {
+        DebugJoinClientError::Cli(
+            "missing --socket <path>; usage: debug-join --socket <path> (--endpoint-json <json> | --endpoint-json-stdin)".to_owned(),
+        )
+    })?;
+    let endpoint_json = match (endpoint_json, read_endpoint_stdin) {
+        (Some(_), true) => {
+            return Err(DebugJoinClientError::Cli(
+                "use either --endpoint-json or --endpoint-json-stdin, not both".to_owned(),
+            ));
+        }
+        (Some(json), false) => json,
+        (None, true) => {
+            let mut json = String::new();
+            std::io::stdin()
+                .read_to_string(&mut json)
+                .map_err(|e| DebugJoinClientError::Runtime(format!("read endpoint stdin: {e}")))?;
+            json
+        }
+        (None, false) => {
+            return Err(DebugJoinClientError::Cli(
+                "missing endpoint JSON; use --endpoint-json <json> or --endpoint-json-stdin"
+                    .to_owned(),
+            ));
+        }
+    };
+    let endpoint = serde_json::from_str::<EndpointAddr>(&endpoint_json)
+        .map_err(|e| DebugJoinClientError::Cli(format!("parse endpoint JSON: {e}")))?;
+    let request = debug_join_request_line(endpoint).map_err(DebugJoinClientError::Runtime)?;
+    let mut stream = std::os::unix::net::UnixStream::connect(&socket)
+        .map_err(|e| DebugJoinClientError::Runtime(format!("connect {}: {e}", socket.display())))?;
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| DebugJoinClientError::Runtime(format!("write request: {e}")))?;
+    stream
+        .flush()
+        .map_err(|e| DebugJoinClientError::Runtime(format!("flush request: {e}")))?;
+    let mut response_line = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response_line)
+        .map_err(|e| DebugJoinClientError::Runtime(format!("read response: {e}")))?;
+    if response_line.trim().is_empty() {
+        return Err(DebugJoinClientError::Runtime(
+            "debug join socket closed without response".to_owned(),
+        ));
+    }
+    serde_json::from_str::<DebugJoinResponseWire>(&response_line)
+        .map_err(|e| DebugJoinClientError::Runtime(format!("parse response JSON: {e}")))
+}
+
+fn debug_join_request_line(endpoint: EndpointAddr) -> Result<String, String> {
+    serde_json::to_string(&DebugJoinRequestWire::JoinEndpoint { endpoint })
+        .map(|mut line| {
+            line.push('\n');
+            line
+        })
+        .map_err(|e| format!("serialize debug join request: {e}"))
+}
+
+fn spawn_debug_join_listener(
+    handle: tokio::runtime::Handle,
+    path: PathBuf,
+) -> Result<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "remove stale debug join socket {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    let listener = {
+        let _guard = handle.enter();
+        tokio::net::UnixListener::bind(&path)
+            .map_err(|e| format!("bind debug join socket {}: {e}", path.display()))?
+    };
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("chmod debug join socket {}: {e}", path.display()))?;
+    let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<DebugJoinCommand>();
+    handle.spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _addr)) => {
+                    let command_tx = command_tx.clone();
+                    tokio::spawn(async move {
+                        handle_debug_join_stream(stream, command_tx).await;
+                    });
+                }
+                Err(error) => {
+                    eprintln!("mvp-worker-node debug join listener stopped: {error}");
+                    break;
+                }
+            }
+        }
+    });
+    Ok(command_rx)
+}
+
+async fn handle_debug_join_stream(
+    stream: tokio::net::UnixStream,
+    command_tx: tokio::sync::mpsc::UnboundedSender<DebugJoinCommand>,
+) {
+    let mut reader = tokio::io::BufReader::new(stream);
+    let mut line = String::new();
+    let response = match reader.read_line(&mut line).await {
+        Ok(0) => DebugJoinResponseWire::JoinRejected {
+            error: "MalformedCommand".to_owned(),
+            detail: "empty request".to_owned(),
+        },
+        Ok(_) => match parse_debug_join_request(&line) {
+            Ok(DebugJoinRequestWire::JoinEndpoint { endpoint }) => {
+                let (reply, response_rx) = tokio::sync::oneshot::channel();
+                if command_tx
+                    .send(DebugJoinCommand::JoinEndpoint { endpoint, reply })
+                    .is_err()
+                {
+                    DebugJoinResponseWire::JoinRejected {
+                        error: "CommandQueueClosed".to_owned(),
+                        detail: "worker main loop is not accepting debug join commands".to_owned(),
+                    }
+                } else {
+                    response_rx
+                        .await
+                        .unwrap_or_else(|error| DebugJoinResponseWire::JoinRejected {
+                            error: "CommandCancelled".to_owned(),
+                            detail: error.to_string(),
+                        })
+                }
+            }
+            Err(response) => response,
+        },
+        Err(error) => DebugJoinResponseWire::JoinRejected {
+            error: "MalformedCommand".to_owned(),
+            detail: format!("read request: {error}"),
+        },
+    };
+    let mut stream = reader.into_inner();
+    if let Ok(line) = serde_json::to_string(&response) {
+        let _ = stream.write_all(line.as_bytes()).await;
+        let _ = stream.write_all(b"\n").await;
+        let _ = stream.flush().await;
+    }
+}
+
+fn parse_debug_join_request(raw: &str) -> Result<DebugJoinRequestWire, DebugJoinResponseWire> {
+    let value =
+        serde_json::from_str::<Value>(raw).map_err(|e| DebugJoinResponseWire::JoinRejected {
+            error: "MalformedCommand".to_owned(),
+            detail: e.to_string(),
+        })?;
+    let endpoint_decode_error = value.get("type").and_then(Value::as_str) == Some("JoinEndpoint")
+        && value.get("endpoint").is_some();
+    serde_json::from_value::<DebugJoinRequestWire>(value).map_err(|e| {
+        DebugJoinResponseWire::JoinRejected {
+            error: if endpoint_decode_error {
+                "MalformedEndpoint"
+            } else {
+                "MalformedCommand"
+            }
+            .to_owned(),
+            detail: e.to_string(),
+        }
+    })
+}
+
+fn drain_debug_join_commands(
+    debug_join_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>>,
+    driver: &mut IrohDriver,
+    config: &DeploymentConfig,
+    datastream: &mut DatastreamEmitter,
+) {
+    let Some(rx) = debug_join_rx else {
+        return;
+    };
+    while let Ok(command) = rx.try_recv() {
+        match command {
+            DebugJoinCommand::JoinEndpoint { endpoint, reply } => {
+                let peer_node_id = endpoint.id.to_string();
+                let has_relay = endpoint.relay_urls().next().is_some();
+                let direct_addr_count = endpoint.ip_addrs().count();
+                driver.join(std::slice::from_ref(&endpoint));
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_RUNTIME_CHANNEL,
+                    "debug_join",
+                    "queued",
+                    json!({
+                        "peer_node_id":peer_node_id,
+                        "has_relay":has_relay,
+                        "direct_addr_count":direct_addr_count,
+                    }),
+                );
+                let _ = reply.send(DebugJoinResponseWire::JoinQueued {
+                    peer_node_id,
+                    has_relay,
+                    direct_addr_count,
+                });
+            }
+        }
+    }
 }
 
 fn spawn_host_gpu_sampler(handle: tokio::runtime::Handle, sink: DatastreamEventSink) {
@@ -192,6 +489,11 @@ fn spawn_arena_sampler(
 }
 
 fn main() -> ExitCode {
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().map(String::as_str) == Some("debug-join") {
+        args.remove(0);
+        return debug_join_client_main(args);
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -218,6 +520,7 @@ fn run() -> Result<(), String> {
             "self_test_enabled":config.self_test_prompt.is_some(),
             "arena_bytes":config.arena_bytes,
             "arena_alignment":config.arena_alignment,
+            "debug_join_socket":config.debug_join_socket.as_deref().unwrap_or("disabled"),
         }),
     )?;
     emit_stdio_node_event(
@@ -383,6 +686,45 @@ fn run() -> Result<(), String> {
         "ready",
         config.datastream_sink_detail(),
     )?;
+    let mut debug_join_rx = match &config.debug_join_socket {
+        Some(path) => {
+            match spawn_debug_join_listener(tokio.handle().clone(), PathBuf::from(path)) {
+                Ok(rx) => {
+                    emit_node_event(
+                        &mut datastream,
+                        &config,
+                        NODE_RUNTIME_CHANNEL,
+                        "debug_join_socket",
+                        "ready",
+                        json!({"socket":path}),
+                    );
+                    Some(rx)
+                }
+                Err(error) => {
+                    emit_node_event(
+                        &mut datastream,
+                        &config,
+                        NODE_RUNTIME_CHANNEL,
+                        "debug_join_socket",
+                        "failed",
+                        json!({"socket":path,"error":error}),
+                    );
+                    return Err(format!("bind debug join socket {}: {error}", path));
+                }
+            }
+        }
+        None => {
+            emit_node_event(
+                &mut datastream,
+                &config,
+                NODE_RUNTIME_CHANNEL,
+                "debug_join_socket",
+                "skipped",
+                json!({"reason":"MVP_DEBUG_JOIN_SOCKET=disabled"}),
+            );
+            None
+        }
+    };
 
     let reports = match stack.runtime.new_inbox::<NodeAgentReport>() {
         Ok(inbox) => {
@@ -512,34 +854,8 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
     }
-    match stack.runtime.send_to(
-        node_actor,
-        NodeAgentMsg::RuntimeLoaded {
-            run_id: config.run_id,
-            node_id: config.logical_node_id,
-            stage_index: config.stage_index,
-            endpoint: driver.endpoint_addr(),
-            node_actor,
-        },
-    ) {
-        Ok(()) => emit_stdio_node_event(
-            &config,
-            NODE_RUNTIME_CHANNEL,
-            "runtime_loaded",
-            "ready",
-            json!({"sent":"NodeAgentMsg::RuntimeLoaded","node_actor":node_actor}),
-        )?,
-        Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_RUNTIME_CHANNEL,
-                "runtime_loaded",
-                "failed",
-                json!({"error":error.to_string()}),
-            )?;
-            return Err(format!("signal runtime loaded: {error}"));
-        }
-    }
+    let mut pending_runtime_ready =
+        PendingRuntimeReady::new(&config, driver.endpoint_addr(), node_actor);
 
     let ready = json!({
         "type":"ready",
@@ -552,22 +868,15 @@ fn run() -> Result<(), String> {
     emit_stdio_node_event(
         &config,
         NODE_BOOTSTRAP_CHANNEL,
-        "runtime_ready",
+        "runtime_ready_local",
         "ready",
         json!({
             "endpoint":driver.endpoint_addr(),
             "node_actor":node_actor,
             "logical_node_id":config.logical_node_id,
             "stage_index":config.stage_index,
+            "readiness_id":pending_runtime_ready.readiness_id,
         }),
-    )?;
-    datastream.submit_text(ChannelId::new("mvp.node.ready"), ready.to_string());
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "datastream_handoff",
-        "ready",
-        json!({"from":"stdio_envelope","to":"cluster_datastream","channel":NODE_BOOTSTRAP_CHANNEL}),
     )?;
 
     if let Some(prompt) = &config.self_test_prompt {
@@ -603,10 +912,11 @@ fn run() -> Result<(), String> {
     );
     loop {
         pump_network(&mut driver, &stack);
+        drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut datastream);
         datastream.tick();
         worker.drain_stderr(&config, &mut datastream);
         while let Some(report) = reports.try_recv() {
-            handle_node_report(
+            match handle_node_report(
                 report,
                 &config,
                 &stack,
@@ -614,7 +924,72 @@ fn run() -> Result<(), String> {
                 node_actor,
                 &mut worker,
                 &mut datastream,
-            )?;
+            )? {
+                NodeReportOutcome::None => {}
+                NodeReportOutcome::RuntimeReadyAck {
+                    run_id,
+                    node_id,
+                    stage_index,
+                    readiness_id,
+                } => {
+                    if pending_runtime_ready.observe_ack(run_id, node_id, stage_index, readiness_id)
+                    {
+                        emit_node_event(
+                            &mut datastream,
+                            &config,
+                            NODE_BOOTSTRAP_CHANNEL,
+                            "runtime_ready_ack",
+                            "ready",
+                            json!({
+                                "readiness_id":readiness_id,
+                                "attempts":pending_runtime_ready.attempts,
+                                "endpoint":&pending_runtime_ready.endpoint,
+                                "node_actor":pending_runtime_ready.node_actor,
+                            }),
+                        );
+                        datastream.submit_text(ChannelId::new("mvp.node.ready"), ready.to_string());
+                        emit_node_event(
+                            &mut datastream,
+                            &config,
+                            NODE_BOOTSTRAP_CHANNEL,
+                            "datastream_handoff",
+                            "ready",
+                            json!({"from":"runtime_ready_ack","to":"cluster_datastream","channel":"mvp.node.ready"}),
+                        );
+                    }
+                }
+            }
+        }
+        if !pending_runtime_ready.swim_logged && pending_runtime_ready.swim_ready(&stack) {
+            emit_node_event(
+                &mut datastream,
+                &config,
+                NODE_RUNTIME_CHANNEL,
+                "coordinator_swim",
+                "ready",
+                json!({
+                    "coordinator":pending_runtime_ready
+                        .coordinator
+                        .map(|node| format!("{node:?}"))
+                        .unwrap_or_else(|| "standalone".to_owned()),
+                    "readiness_id":pending_runtime_ready.readiness_id,
+                }),
+            );
+            pending_runtime_ready.swim_logged = true;
+        }
+        if !pending_runtime_ready.acked && pending_runtime_ready.maybe_send(&stack, node_actor)? {
+            emit_node_event(
+                &mut datastream,
+                &config,
+                NODE_RUNTIME_CHANNEL,
+                "runtime_ready_signal",
+                "sent",
+                json!({
+                    "readiness_id":pending_runtime_ready.readiness_id,
+                    "attempts":pending_runtime_ready.attempts,
+                    "next_backoff_ms":pending_runtime_ready.backoff.as_millis(),
+                }),
+            );
         }
         if shutdown_rx.try_recv().is_ok() {
             emit_node_event(
@@ -758,6 +1133,115 @@ impl FrameSink for JsonlFrameSink {
     }
 }
 
+enum NodeReportOutcome {
+    None,
+    RuntimeReadyAck {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        readiness_id: u64,
+    },
+}
+
+struct PendingRuntimeReady {
+    run_id: u64,
+    node_id: u64,
+    stage_index: u32,
+    endpoint: EndpointAddr,
+    node_actor: ActorAddress,
+    coordinator: Option<DistNodeId>,
+    readiness_id: u64,
+    attempts: u32,
+    next_attempt_at: Instant,
+    backoff: Duration,
+    acked: bool,
+    swim_logged: bool,
+}
+
+impl PendingRuntimeReady {
+    fn new(config: &DeploymentConfig, endpoint: EndpointAddr, node_actor: ActorAddress) -> Self {
+        Self {
+            run_id: config.run_id,
+            node_id: config.logical_node_id,
+            stage_index: config.stage_index,
+            endpoint,
+            node_actor,
+            coordinator: config
+                .coordinator_endpoint
+                .as_ref()
+                .map(|endpoint| DistNodeId(*endpoint.id.as_bytes())),
+            readiness_id: 1,
+            attempts: 0,
+            next_attempt_at: Instant::now(),
+            backoff: RUNTIME_READY_RETRY_INITIAL,
+            acked: false,
+            swim_logged: false,
+        }
+    }
+
+    fn swim_ready(&self, stack: &DistributionRuntimeStack) -> bool {
+        let Some(coordinator) = self.coordinator else {
+            return true;
+        };
+        stack.member_state(coordinator) == Some(MemberState::Alive)
+    }
+
+    fn observe_ack(
+        &mut self,
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        readiness_id: u64,
+    ) -> bool {
+        if self.acked
+            || self.run_id != run_id
+            || self.node_id != node_id
+            || self.stage_index != stage_index
+            || self.readiness_id != readiness_id
+        {
+            return false;
+        }
+        self.acked = true;
+        true
+    }
+
+    fn maybe_send(
+        &mut self,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+    ) -> Result<bool, String> {
+        if self.acked || !self.swim_ready(stack) {
+            return Ok(false);
+        }
+        let now = Instant::now();
+        if now < self.next_attempt_at {
+            return Ok(false);
+        }
+        stack
+            .runtime
+            .send_to(
+                node_actor,
+                NodeAgentMsg::RuntimeLoaded {
+                    run_id: self.run_id,
+                    node_id: self.node_id,
+                    stage_index: self.stage_index,
+                    endpoint: self.endpoint.clone(),
+                    node_actor: self.node_actor,
+                    readiness_id: self.readiness_id,
+                },
+            )
+            .map_err(|error| format!("signal runtime loaded: {error}"))?;
+        self.attempts = self.attempts.saturating_add(1);
+        self.next_attempt_at = now + self.backoff;
+        self.backoff = self
+            .backoff
+            .checked_mul(2)
+            .unwrap_or(RUNTIME_READY_RETRY_MAX)
+            .min(RUNTIME_READY_RETRY_MAX);
+        Ok(true)
+    }
+}
+
 fn handle_node_report(
     report: NodeAgentReport,
     config: &DeploymentConfig,
@@ -766,11 +1250,12 @@ fn handle_node_report(
     node_actor: ActorAddress,
     worker: &mut TinygradWorker,
     datastream: &mut DatastreamEmitter,
-) -> Result<(), String> {
+) -> Result<NodeReportOutcome, String> {
     let kind = match &report {
         NodeAgentReport::Command(_) => "Command",
         NodeAgentReport::Lifecycle(_) => "Lifecycle",
         NodeAgentReport::PromptRequested { .. } => "PromptRequested",
+        NodeAgentReport::RuntimeReadyAck { .. } => "RuntimeReadyAck",
         NodeAgentReport::Snapshot { .. } => "Snapshot",
     };
     emit_node_event(
@@ -782,9 +1267,12 @@ fn handle_node_report(
         json!({"kind":kind}),
     );
     match report {
-        NodeAgentReport::Command(command) => handle_stage_command(
-            command, config, stack, driver, node_actor, worker, datastream,
-        ),
+        NodeAgentReport::Command(command) => {
+            handle_stage_command(
+                command, config, stack, driver, node_actor, worker, datastream,
+            )?;
+            Ok(NodeReportOutcome::None)
+        }
         NodeAgentReport::Lifecycle(event) => {
             let event = format!("{event:?}");
             datastream.submit_text(
@@ -799,17 +1287,31 @@ fn handle_node_report(
                 "observed",
                 json!({"event":event}),
             );
-            Ok(())
+            Ok(NodeReportOutcome::None)
         }
         NodeAgentReport::PromptRequested {
             request_id,
             prompt,
             max_tokens,
             reply_to,
-        } => handle_prompt_request(
-            request_id, prompt, max_tokens, reply_to, config, stack, driver, worker, datastream,
-        ),
-        NodeAgentReport::Snapshot { .. } => Ok(()),
+        } => {
+            handle_prompt_request(
+                request_id, prompt, max_tokens, reply_to, config, stack, driver, worker, datastream,
+            )?;
+            Ok(NodeReportOutcome::None)
+        }
+        NodeAgentReport::RuntimeReadyAck {
+            run_id,
+            node_id,
+            stage_index,
+            readiness_id,
+        } => Ok(NodeReportOutcome::RuntimeReadyAck {
+            run_id,
+            node_id,
+            stage_index,
+            readiness_id,
+        }),
+        NodeAgentReport::Snapshot { .. } => Ok(NodeReportOutcome::None),
     }
 }
 
@@ -1267,6 +1769,7 @@ struct DeploymentConfig {
     orchestrator_actor: Option<ActorAddress>,
     datastream_sink_actor: Option<ActorAddress>,
     datastream_frame_log: Option<String>,
+    debug_join_socket: Option<String>,
     relay_mode: iroh::RelayMode,
     worker_script: String,
     device: String,
@@ -1283,15 +1786,29 @@ struct DeploymentConfig {
 impl DeploymentConfig {
     fn from_env() -> Result<Self, String> {
         let run_id = env_u64("MVP_RUN_ID", 1)?;
+        let logical_node_id = env_u64("MVP_LOGICAL_NODE_ID", 1)?;
         let relay = relay_runtime_config_from_env(run_id)?;
+        let debug_join_socket = match env_optional("MVP_DEBUG_JOIN_SOCKET").as_deref() {
+            Some("disabled") => None,
+            Some(path) => Some(path.to_owned()),
+            None => Some(
+                std::env::temp_dir()
+                    .join(format!(
+                        "mvp-node-debug-join-{run_id}-{logical_node_id}.sock"
+                    ))
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
         Ok(Self {
             run_id,
-            logical_node_id: env_u64("MVP_LOGICAL_NODE_ID", 1)?,
+            logical_node_id,
             stage_index: env_u32("MVP_STAGE_INDEX", 0)?,
             coordinator_endpoint: env_json("MVP_COORDINATOR_ENDPOINT")?,
             orchestrator_actor: env_json("MVP_ORCHESTRATOR_ACTOR")?,
             datastream_sink_actor: env_json("MVP_DATASTREAM_SINK_ACTOR")?,
             datastream_frame_log: env_optional("MVP_DATASTREAM_FRAME_LOG"),
+            debug_join_socket,
             relay_mode: relay.mode,
             worker_script: env_string("MVP_TINYGRAD_WORKER", DEFAULT_WORKER_SCRIPT),
             device: env_string("DEV", DEFAULT_DEVICE),
@@ -1742,4 +2259,213 @@ fn tokenizer_from_env() -> TokenizerSource {
     env_optional("MVP_TOKENIZER_LOCAL_PATH")
         .map(TokenizerSource::LocalPath)
         .unwrap_or(TokenizerSource::EmbeddedGguf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use distribution::swim::actor::MembershipChanged;
+    use mvp_system::actors::orchestrator::OrchestratorMsg;
+
+    fn endpoint(seed: u8) -> EndpointAddr {
+        EndpointAddr::new(iroh::SecretKey::from_bytes(&[seed; 32]).public())
+    }
+
+    fn test_config(coordinator_endpoint: Option<EndpointAddr>) -> DeploymentConfig {
+        DeploymentConfig {
+            run_id: 7,
+            logical_node_id: 11,
+            stage_index: 3,
+            coordinator_endpoint,
+            orchestrator_actor: Some(ActorAddress::new_random()),
+            datastream_sink_actor: None,
+            datastream_frame_log: None,
+            debug_join_socket: None,
+            relay_mode: iroh::RelayMode::Disabled,
+            worker_script: DEFAULT_WORKER_SCRIPT.to_owned(),
+            device: DEFAULT_DEVICE.to_owned(),
+            model_id: DEFAULT_MODEL_ID.to_owned(),
+            gguf_source: GgufSource::LocalPath("/tmp/model.gguf".to_owned()),
+            tokenizer: TokenizerSource::EmbeddedGguf,
+            self_test_prompt: None,
+            self_test_layer_end: 16,
+            self_test_max_tokens: 1,
+            arena_bytes: DEFAULT_ARENA_BYTES,
+            arena_alignment: DEFAULT_ARENA_ALIGNMENT,
+        }
+    }
+
+    fn test_stack() -> DistributionRuntimeStack {
+        DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default())
+    }
+
+    #[test]
+    fn debug_join_client_serializes_endpoint_from_stdin() {
+        let secret = iroh::SecretKey::from_bytes(&[7; 32]);
+        let endpoint = EndpointAddr::new(secret.public()).with_relay_url(
+            "http://relay.example.com"
+                .parse::<iroh::RelayUrl>()
+                .unwrap(),
+        );
+
+        let line = debug_join_request_line(endpoint).expect("serialize debug join request");
+        let request: DebugJoinRequestWire =
+            serde_json::from_str(&line).expect("deserialize debug join request");
+
+        match request {
+            DebugJoinRequestWire::JoinEndpoint { endpoint } => {
+                assert_eq!(
+                    endpoint.relay_urls().next().map(ToString::to_string),
+                    Some("http://relay.example.com/".to_owned())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn debug_join_listener_queues_join_endpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "mvp-worker-debug-join-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).expect("create debug join test temp dir");
+        let socket_path = root.join("debug-join.sock");
+        let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
+        let mut commands = spawn_debug_join_listener(runtime.handle().clone(), socket_path.clone())
+            .expect("spawn debug join listener");
+
+        let secret = iroh::SecretKey::from_bytes(&[8; 32]);
+        let endpoint = EndpointAddr::new(secret.public()).with_relay_url(
+            "http://relay.example.com"
+                .parse::<iroh::RelayUrl>()
+                .unwrap(),
+        );
+        let request = DebugJoinRequestWire::JoinEndpoint { endpoint };
+        let mut request_line =
+            serde_json::to_string(&request).expect("serialize debug join request");
+        request_line.push('\n');
+
+        runtime.block_on(async {
+            let mut stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .expect("connect to debug join listener");
+            stream
+                .write_all(request_line.as_bytes())
+                .await
+                .expect("write debug join request");
+            stream.flush().await.expect("flush debug join request");
+
+            let DebugJoinCommand::JoinEndpoint { endpoint, reply } =
+                commands.recv().await.expect("receive debug join command");
+            assert_eq!(
+                endpoint.relay_urls().next().map(ToString::to_string),
+                Some("http://relay.example.com/".to_owned())
+            );
+            let peer_node_id = endpoint.id.to_string();
+            assert!(
+                reply
+                    .send(DebugJoinResponseWire::JoinQueued {
+                        peer_node_id,
+                        has_relay: true,
+                        direct_addr_count: 0,
+                    })
+                    .is_ok()
+            );
+
+            let mut reader = tokio::io::BufReader::new(stream);
+            let mut response_line = String::new();
+            reader
+                .read_line(&mut response_line)
+                .await
+                .expect("read debug join response");
+            let response: DebugJoinResponseWire =
+                serde_json::from_str(&response_line).expect("deserialize debug join response");
+            match response {
+                DebugJoinResponseWire::JoinQueued { has_relay, .. } => {
+                    assert!(has_relay);
+                }
+                DebugJoinResponseWire::JoinRejected { error, detail } => {
+                    panic!("debug join was rejected: {error}: {detail}");
+                }
+            }
+        });
+
+        drop(commands);
+        let _ = std::fs::remove_file(&socket_path);
+        std::fs::remove_dir(&root).expect("remove debug join test temp dir");
+    }
+
+    #[test]
+    fn runtime_ready_retry_waits_for_swim() {
+        let stack = test_stack();
+        let node_actor = ActorAddress::new_random();
+        let mut pending = PendingRuntimeReady::new(&test_config(None), endpoint(3), node_actor);
+        pending.coordinator = Some(DistNodeId([2; 32]));
+
+        assert_eq!(pending.maybe_send(&stack, node_actor), Ok(false));
+        assert_eq!(pending.attempts, 0);
+    }
+
+    #[test]
+    fn runtime_ready_retry_stops_after_matching_ack() {
+        let stack = test_stack();
+        let node_actor = ActorAddress::new_random();
+        let mut pending = PendingRuntimeReady::new(&test_config(None), endpoint(4), node_actor);
+
+        assert!(pending.observe_ack(
+            pending.run_id,
+            pending.node_id,
+            pending.stage_index,
+            pending.readiness_id,
+        ));
+        assert!(pending.acked);
+        assert_eq!(pending.maybe_send(&stack, node_actor), Ok(false));
+    }
+
+    #[test]
+    fn runtime_ready_retry_backoff_caps() {
+        let stack = test_stack();
+        let orchestrator_inbox = stack
+            .runtime
+            .new_inbox::<OrchestratorMsg>()
+            .expect("orchestrator inbox");
+        let node_actor = stack
+            .runtime
+            .spawn(NodeAgentActor::new(
+                stage::NodeId(11),
+                *orchestrator_inbox.addr(),
+                None,
+            ))
+            .expect("spawn node agent");
+        let coordinator = DistNodeId([2; 32]);
+        stack
+            .runtime
+            .send_to(
+                stack.actors.membership_fanout,
+                MembershipChanged {
+                    node_id: coordinator,
+                    state: MemberState::Alive,
+                    incarnation: 1,
+                },
+            )
+            .expect("send membership change");
+        stack.pump_runtime_once();
+
+        let mut pending = PendingRuntimeReady::new(&test_config(None), endpoint(5), node_actor);
+        pending.coordinator = Some(coordinator);
+        for expected_attempts in 1..=4 {
+            pending.next_attempt_at = Instant::now();
+            assert!(
+                pending
+                    .maybe_send(&stack, node_actor)
+                    .expect("runtime ready send")
+            );
+            assert_eq!(pending.attempts, expected_attempts);
+            assert!(pending.backoff <= RUNTIME_READY_RETRY_MAX);
+        }
+    }
 }

@@ -49,6 +49,7 @@ mod datastream_records {
     fn distribution_emits_owned_channel_through_datastream_mux() {
         let stream = StreamId::new(NodeId::new("dist-node"), Lifetime(1));
         let mux = Mux::unbounded(stream);
+        mux.set_frame_timing_enabled(false);
         let state = DistributionState {
             registry_size: 9,
             ..Default::default()

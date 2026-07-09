@@ -1,6 +1,7 @@
 # MVP Node Provisioning Specification
+ ***STALE! FOR HISTORICAL REFERENCE ONLY*** 
 
-**Status:** draft node-provisioning specification.
+**Status:**draft node-provisioning specification.
 
 This document defines the MVP path from a static runplan node requirement to a
 remote swactor runtime joined to the orchestrator-side swarm. It covers provider

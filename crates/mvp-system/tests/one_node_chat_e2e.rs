@@ -14,12 +14,13 @@ const TEST_WATCHDOG: Duration = Duration::from_secs(1_800);
 const PROMPT_WATCHDOG: Duration = Duration::from_secs(600);
 const SHUTDOWN_WATCHDOG: Duration = Duration::from_secs(60);
 const DASHBOARD_ADDR: &str = "127.0.0.1:9090";
-const DEFAULT_CONTAINER: &str = "mvp-orchestrator-1-1";
+const DOCKER_CONTAINER_PREFIX_ENV: &str = "MVP_DOCKER_CONTAINER_PREFIX";
 
 #[test]
 fn one_node_chat_docker_cuda_e2e() {
     let root = workspace_root();
     require_docker(&root);
+    let container_prefix = format!("mvp-orchestrator-e2e-{}", std::process::id());
 
     let mut command = Command::new("cargo");
     command
@@ -27,6 +28,9 @@ fn one_node_chat_docker_cuda_e2e() {
         .args(["mvp-chat"])
         .env("MVP_RUNTIME_CONFIG", "local")
         .env("MVP_IROH_RELAY_MODE", "disabled")
+        .env(DOCKER_CONTAINER_PREFIX_ENV, &container_prefix)
+        .env("MVP_TINYGRAD_TEST_MODE", "1")
+        .env("MVP_PROMPT_MAX_TOKENS", "3")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -60,7 +64,7 @@ fn one_node_chat_docker_cuda_e2e() {
     if result.is_ok() {
         result = assert_no_lower_layer_terminal_leaks(&stdout, &stderr);
     }
-    assert_container_removed(&root, DEFAULT_CONTAINER);
+    assert_containers_with_prefix_removed(&root, &container_prefix);
 
     if let Err(error) = result {
         panic!(
@@ -84,9 +88,9 @@ fn run_full_flow(
     })
     .map_err(|e| format!("provisioning frames not visible in dashboard: {e}"))?;
     wait_for_child_or(TEST_WATCHDOG, child, || {
-        dashboard_has_frame("mvp.worker.weights", "GgufDownloadProgress")
+        dashboard_has_frame("mvp.worker.weights", "LoadWeightsStarted")
     })
-    .map_err(|e| format!("GGUF download progress not visible in dashboard: {e}"))?;
+    .map_err(|e| format!("weight loading start not visible in dashboard: {e}"))?;
     wait_for_child_or(TEST_WATCHDOG, child, || {
         dashboard_has_frame("mvp.worker.weights", "WeightsLoaded")
     })
@@ -111,10 +115,13 @@ fn run_full_flow(
         .map_err(|e| format!("orchestrator prompt lifecycle not visible in dashboard: {e}"))?;
     wait_for_child_or(PROMPT_WATCHDOG, child, || prompt_count(stdout) >= 2)
         .map_err(|e| format!("chat prompt did not return after response: {e}"))?;
-    request_child_interrupt(child);
+    writeln!(stdin, "/exit").map_err(|e| format!("write exit command: {e}"))?;
+    stdin
+        .flush()
+        .map_err(|e| format!("flush exit command: {e}"))?;
     let status = wait_child(child, SHUTDOWN_WATCHDOG)
-        .ok_or_else(|| "cargo mvp-chat did not exit after Ctrl-C".to_owned())?;
-    if status.success() || status.code() == Some(130) || status.signal_name() == Some("SIGINT") {
+        .ok_or_else(|| "cargo mvp-chat did not exit after /exit".to_owned())?;
+    if status.success() {
         Ok(())
     } else {
         Err(format!("cargo mvp-chat exited with {status}"))
@@ -400,28 +407,6 @@ fn request_child_interrupt(child: &Child) {
     }
 }
 
-trait ExitStatusSignalName {
-    fn signal_name(&self) -> Option<&'static str>;
-}
-
-impl ExitStatusSignalName for std::process::ExitStatus {
-    fn signal_name(&self) -> Option<&'static str> {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            match self.signal() {
-                Some(libc::SIGINT) => Some("SIGINT"),
-                Some(libc::SIGTERM) => Some("SIGTERM"),
-                _ => None,
-            }
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = self;
-            None
-        }
-    }
-}
 
 fn require_docker(root: &std::path::Path) {
     let version = Command::new("docker")
@@ -437,29 +422,35 @@ fn require_docker(root: &std::path::Path) {
     );
 }
 
-fn assert_container_removed(root: &std::path::Path, container: &str) {
-    let output = Command::new("docker")
-        .current_dir(root)
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("name=^{container}$"),
-            "--format",
-            "{{.Names}}",
-        ])
-        .output()
-        .expect("run docker ps");
-    assert!(
-        output.status.success(),
-        "docker ps failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).trim().is_empty(),
-        "container {container} still exists"
-    );
+fn assert_containers_with_prefix_removed(root: &std::path::Path, prefix: &str) {
+    let start = Instant::now();
+    let mut containers = String::new();
+    while start.elapsed() < SHUTDOWN_WATCHDOG {
+        let output = Command::new("docker")
+            .current_dir(root)
+            .args([
+                "ps",
+                "-a",
+                "--filter",
+                &format!("name=^{prefix}-"),
+                "--format",
+                "{{.Names}}",
+            ])
+            .output()
+            .expect("run docker ps");
+        assert!(
+            output.status.success(),
+            "docker ps failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        containers = String::from_utf8_lossy(&output.stdout).into_owned();
+        if containers.trim().is_empty() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("containers with prefix {prefix} still exist:\n{containers}");
 }
 
 fn workspace_root() -> std::path::PathBuf {

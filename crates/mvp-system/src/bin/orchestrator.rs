@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use datastream::{ChannelId, DatastreamSink, Frame, Lifetime, Mux, NodeId, StreamId};
 use distribution::node::DistributedNodeConfig;
+use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
 use mvp_system::actors::node_agent::{NodeAgentMsg, StageProvisionWire};
@@ -60,6 +61,8 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const MVP_ORCH_BOOTSTRAP: &str = "mvp.orch.bootstrap";
 const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
 const DATASTREAM_FRAME_LOG_ENV: &str = "MVP_DATASTREAM_FRAME_LOG";
+const DEFAULT_DOCKER_CONTAINER_PREFIX: &str = "mvp-orchestrator";
+const MVP_DOCKER_CONTAINER_PREFIX_ENV: &str = "MVP_DOCKER_CONTAINER_PREFIX";
 
 fn main() -> ExitCode {
     match run() {
@@ -484,36 +487,38 @@ fn run() -> Result<(), String> {
         }
     };
     provisioned_node.complete_bootstrap()?;
-    driver.join(std::slice::from_ref(&ready.endpoint));
+    match enqueue_runtime_ready_ack(&stack, &ready, config.run_id, config.node_id) {
+        Ok(()) => {
+            driver.drain_outbox(&stack.outbox);
+            orch_datastream.emit_bootstrap(
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+                "runtime_ready_ack",
+                "ready",
+                json!({"node_actor":ready.node_actor,"readiness_id":ready.readiness_id}),
+            );
+        }
+        Err(error) => {
+            orch_datastream.emit_bootstrap(
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+                "runtime_ready_ack",
+                "failed",
+                json!({"node_actor":ready.node_actor,"readiness_id":ready.readiness_id,"error":error}),
+            );
+            return Err(error);
+        }
+    }
     orch_datastream.emit_bootstrap(
         dashboard.as_ref(),
         config.run_id,
         config.node_id,
         "node_join",
         "ready",
-        json!({"endpoint":&ready.endpoint}),
+        json!({"endpoint":&ready.endpoint,"source":"runtime_ready_barrier"}),
     );
-    match wait_for_route(&mut driver, &stack, ready.node_actor, &stop_rx) {
-        Ok(()) => orch_datastream.emit_bootstrap(
-            dashboard.as_ref(),
-            config.run_id,
-            config.node_id,
-            "node_route",
-            "ready",
-            json!({"node_actor":ready.node_actor}),
-        ),
-        Err(error) => {
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "node_route",
-                "failed",
-                json!({"node_actor":ready.node_actor,"error":error}),
-            );
-            return Err(error);
-        }
-    }
     orch_datastream.emit_bootstrap(
         dashboard.as_ref(),
         config.run_id,
@@ -1609,7 +1614,7 @@ impl Config {
         bootstrap_runtime: Arc<swactor::runtime::Runtime>,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider {
-            ProviderKind::Docker => Ok(Box::new(LocalDockerPlugin::new("mvp-orchestrator"))),
+            ProviderKind::Docker => Ok(Box::new(LocalDockerPlugin::new(docker_container_prefix()))),
             ProviderKind::VastAi => {
                 let vastai = self.vastai.as_ref().ok_or_else(|| {
                     "VastAI config was not resolved for provider vastai".to_owned()
@@ -1805,6 +1810,33 @@ struct RuntimeReady {
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
     stage_index: u32,
+    readiness_id: u64,
+    swim_node_id: DistNodeId,
+}
+
+fn runtime_ready_barrier_met(stack: &DistributionRuntimeStack, ready: &RuntimeReady) -> bool {
+    stack.member_state(ready.swim_node_id) == Some(MemberState::Alive)
+        && stack.route_owner(ready.node_actor) == Some(ready.swim_node_id)
+}
+
+fn enqueue_runtime_ready_ack(
+    stack: &DistributionRuntimeStack,
+    ready: &RuntimeReady,
+    run_id: u64,
+    node_id: u64,
+) -> Result<(), String> {
+    stack
+        .runtime
+        .send_to(
+            ready.node_actor,
+            NodeAgentMsg::RuntimeReadyAck {
+                run_id,
+                node_id,
+                stage_index: ready.stage_index,
+                readiness_id: ready.readiness_id,
+            },
+        )
+        .map_err(|e| format!("send runtime ready ack: {e}"))
 }
 
 struct ProvisionedNodeGuard<'a> {
@@ -2294,6 +2326,10 @@ fn wait_for_runtime_ready(
     node_id: u64,
     provider: ProviderKind,
 ) -> Result<RuntimeReady, String> {
+    let mut pending_ready: Option<RuntimeReady> = None;
+    let mut node_swim_started = false;
+    let mut node_swim_ready = false;
+    let mut node_route_started = false;
     loop {
         pump(driver, stack);
         drain_frames(frame_rx, dashboard, orch_datastream);
@@ -2321,39 +2357,72 @@ fn wait_for_runtime_ready(
                 stage_index,
                 endpoint,
                 node_actor,
+                readiness_id,
             } = report
             {
                 if report_run_id == run_id && report_node_id == node_id {
-                    return Ok(RuntimeReady {
+                    let reset_progress = pending_ready
+                        .as_ref()
+                        .map(|ready| ready.readiness_id != readiness_id)
+                        .unwrap_or(true);
+                    if reset_progress {
+                        node_swim_started = false;
+                        node_swim_ready = false;
+                        node_route_started = false;
+                    }
+                    let swim_node_id = DistNodeId(*endpoint.id.as_bytes());
+                    pending_ready = Some(RuntimeReady {
                         endpoint,
                         node_actor,
                         stage_index,
+                        readiness_id,
+                        swim_node_id,
                     });
                 }
             }
         }
-        thread::sleep(PUMP_INTERVAL);
-    }
-}
-
-fn wait_for_route(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    actor: ActorAddress,
-    stop_rx: &mpsc::Receiver<()>,
-) -> Result<(), String> {
-    loop {
-        pump(driver, stack);
-        if stop_requested(stop_rx) {
-            return Err("shutdown requested while waiting for node route".to_owned());
-        }
-        let ready = stack
-            .route_view
-            .read()
-            .map(|view| view.contains_key(&actor))
-            .unwrap_or(false);
-        if ready {
-            return Ok(());
+        if let Some(ready) = pending_ready.as_ref() {
+            if runtime_ready_barrier_met(stack, ready) {
+                return Ok(ready.clone());
+            }
+            let swim_ready = stack.member_state(ready.swim_node_id) == Some(MemberState::Alive);
+            let route_ready = stack.route_owner(ready.node_actor) == Some(ready.swim_node_id);
+            if !swim_ready {
+                if !node_swim_started {
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        run_id,
+                        node_id,
+                        "node_swim",
+                        "started",
+                        json!({"node":format!("{:?}", ready.swim_node_id),"readiness_id":ready.readiness_id}),
+                    );
+                    node_swim_started = true;
+                }
+            } else if !route_ready {
+                if !node_swim_ready {
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        run_id,
+                        node_id,
+                        "node_swim",
+                        "ready",
+                        json!({"node":format!("{:?}", ready.swim_node_id),"readiness_id":ready.readiness_id}),
+                    );
+                    node_swim_ready = true;
+                }
+                if !node_route_started {
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        run_id,
+                        node_id,
+                        "node_route",
+                        "started",
+                        json!({"node_actor":ready.node_actor,"node":format!("{:?}", ready.swim_node_id),"readiness_id":ready.readiness_id}),
+                    );
+                    node_route_started = true;
+                }
+            }
         }
         thread::sleep(PUMP_INTERVAL);
     }
@@ -2812,6 +2881,11 @@ fn env_optional(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn docker_container_prefix() -> String {
+    env_optional(MVP_DOCKER_CONTAINER_PREFIX_ENV)
+        .unwrap_or_else(|| DEFAULT_DOCKER_CONTAINER_PREFIX.to_owned())
+}
+
 fn optional_env(name: &str) -> Option<(String, String)> {
     env_optional(name).map(|value| (name.to_owned(), value))
 }
@@ -3045,6 +3119,7 @@ mod tests {
         "MVP_VASTAI_SSH_IDENTITY",
         "VASTAI_API_KEY",
         SWACTOR_IROH_RELAY_URL_ENV,
+        MVP_DOCKER_CONTAINER_PREFIX_ENV,
     ];
 
     struct RestoreEnv {
@@ -3124,6 +3199,16 @@ mod tests {
         env.iter()
             .find(|(env_key, _)| env_key == key)
             .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn docker_container_prefix_defaults_and_trims_env_override() {
+        with_clean_env(&[], || {
+            assert_eq!(docker_container_prefix(), DEFAULT_DOCKER_CONTAINER_PREFIX);
+        });
+        with_clean_env(&[(MVP_DOCKER_CONTAINER_PREFIX_ENV, " custom-prefix ")], || {
+            assert_eq!(docker_container_prefix(), "custom-prefix");
+        });
     }
 
     #[test]
@@ -3575,6 +3660,39 @@ bootstrap_command = "/run"
     }
 
     #[test]
+    fn node_spec_preserves_relay_transport_in_coordinator_endpoint() {
+        with_clean_env(&[], || {
+            let config = Config::from_layers_with_path_and_args(None, std::iter::empty::<String>())
+                .expect("config parses");
+            let secret = iroh::SecretKey::from_bytes(&[10; 32]);
+            let coordinator = EndpointAddr::new(secret.public()).with_relay_url(
+                "http://relay.example.com"
+                    .parse::<iroh::RelayUrl>()
+                    .unwrap(),
+            );
+            let datastream_sink = ActorAddress([19; 32]);
+            let orchestrator_actor = ActorAddress([20; 32]);
+
+            let spec = config
+                .node_spec(coordinator, datastream_sink, orchestrator_actor)
+                .expect("node spec builds");
+            let coordinator_endpoint_json = env_value(&spec.env, "MVP_COORDINATOR_ENDPOINT")
+                .expect("coordinator endpoint env is present");
+            let coordinator_endpoint =
+                serde_json::from_str::<EndpointAddr>(coordinator_endpoint_json)
+                    .expect("coordinator endpoint env deserializes");
+
+            assert_eq!(
+                coordinator_endpoint
+                    .relay_urls()
+                    .next()
+                    .map(|url| url.to_string()),
+                Some("http://relay.example.com/".to_owned())
+            );
+        });
+    }
+
+    #[test]
     fn docker_config_construction_ignores_malformed_vastai_environment() {
         let config = with_clean_env(
             &[
@@ -3734,5 +3852,111 @@ bootstrap_command = "/run"
         tx.send(()).expect("send shutdown");
         assert!(stop_requested(&rx));
         assert!(!stop_requested(&rx));
+    }
+
+    fn endpoint(seed: u8) -> EndpointAddr {
+        EndpointAddr::new(iroh::SecretKey::from_bytes(&[seed; 32]).public())
+    }
+
+    fn insert_route(stack: &DistributionRuntimeStack, actor: ActorAddress, owner: DistNodeId) {
+        let mut route_view = match stack.route_view.write() {
+            Ok(route_view) => route_view,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        route_view.insert(actor, owner);
+    }
+
+    fn mark_alive(stack: &DistributionRuntimeStack, node_id: DistNodeId) {
+        stack
+            .runtime
+            .send_to(
+                stack.actors.membership_fanout,
+                distribution::swim::actor::MembershipChanged {
+                    node_id,
+                    state: MemberState::Alive,
+                    incarnation: 1,
+                },
+            )
+            .expect("send membership change");
+        stack.pump_runtime_once();
+    }
+
+    #[test]
+    fn runtime_ready_barrier_waits_for_specific_swim_and_route() {
+        let remote = DistNodeId([2; 32]);
+        let node_actor = ActorAddress::new_random();
+        let ready = RuntimeReady {
+            endpoint: endpoint(2),
+            node_actor,
+            stage_index: 3,
+            readiness_id: 99,
+            swim_node_id: remote,
+        };
+
+        let stack =
+            DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default());
+        assert!(!runtime_ready_barrier_met(&stack, &ready));
+
+        let stack =
+            DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default());
+        mark_alive(&stack, remote);
+        assert!(!runtime_ready_barrier_met(&stack, &ready));
+
+        let stack =
+            DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default());
+        insert_route(&stack, node_actor, remote);
+        assert!(!runtime_ready_barrier_met(&stack, &ready));
+
+        let stack =
+            DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default());
+        mark_alive(&stack, remote);
+        insert_route(&stack, node_actor, remote);
+        assert!(runtime_ready_barrier_met(&stack, &ready));
+    }
+
+    #[test]
+    fn enqueue_runtime_ready_ack_reports_to_node_agent() {
+        use mvp_system::actors::node_agent::{NodeAgentActor, NodeAgentReport};
+        use mvp_system::actors::orchestrator::OrchestratorMsg;
+        use mvp_system::stage_controller as stage;
+
+        let stack =
+            DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default());
+        let orchestrator_inbox = stack
+            .runtime
+            .new_inbox::<OrchestratorMsg>()
+            .expect("orchestrator inbox");
+        let reports = stack
+            .runtime
+            .new_inbox::<NodeAgentReport>()
+            .expect("node report inbox");
+        let node_actor = stack
+            .runtime
+            .spawn(NodeAgentActor::new(
+                stage::NodeId(11),
+                *orchestrator_inbox.addr(),
+                Some(*reports.addr()),
+            ))
+            .expect("spawn node agent");
+        let ready = RuntimeReady {
+            endpoint: endpoint(9),
+            node_actor,
+            stage_index: 3,
+            readiness_id: 99,
+            swim_node_id: DistNodeId([2; 32]),
+        };
+
+        enqueue_runtime_ready_ack(&stack, &ready, 7, 11).expect("enqueue runtime ready ack");
+        stack.pump_runtime_once();
+
+        assert_eq!(
+            reports.try_recv(),
+            Some(NodeAgentReport::RuntimeReadyAck {
+                run_id: 7,
+                node_id: 11,
+                stage_index: ready.stage_index,
+                readiness_id: 99,
+            })
+        );
     }
 }
