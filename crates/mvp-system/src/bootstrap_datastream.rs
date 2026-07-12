@@ -1,14 +1,14 @@
 use std::io::{BufRead, BufReader, Read};
 use std::thread::{self, JoinHandle};
 
-use datastream::{ChannelId, DatastreamProducer, Lifetime, NodeId, StreamId};
+use datastream::{ChannelContent, DatastreamProducer, Lifetime, NodeId, StreamId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
 };
-use crate::telemetry::{MvpProvisionLogRecord, mvp_provision_log_channel};
+use crate::telemetry::{MVP_PROVISIONING_LOGS, MvpProvisionLogRecord, mvp_provision_log_channel};
 
 pub fn node_datastream_id(node_id: u64) -> String {
     node_id.to_string()
@@ -146,11 +146,14 @@ impl BootstrapDatastreamBridge {
             stream,
             line: line.to_owned(),
         });
-        let payload = serde_json::to_vec(&record).expect("serialize bootstrap log record");
-        producer.submit_bytes(
+        let channel = producer.register_channel(
             mvp_provision_log_channel(self.spec.node_id, stream),
-            payload,
+            ChannelContent::JsonRecord {
+                schema: Some(MVP_PROVISIONING_LOGS.to_owned()),
+            },
         );
+        let payload = serde_json::to_vec(&record).expect("serialize bootstrap log record");
+        producer.submit_bytes(channel, payload);
     }
 }
 
@@ -178,6 +181,6 @@ pub fn parse_stdio_datastream_frame(
     })
 }
 
-pub fn bootstrap_log_channel(node_id: u64, stream: ProvisionLogStream) -> ChannelId {
+pub fn bootstrap_log_channel(node_id: u64, stream: ProvisionLogStream) -> String {
     mvp_provision_log_channel(node_id, stream)
 }

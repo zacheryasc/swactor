@@ -1,9 +1,4 @@
 //! Generic datastream emission helpers.
-//!
-//! This module owns only integration mechanics: a per-node mux, process-output
-//! observer plumbing, generic record/text/byte submission, and sinks that ship
-//! ordered frames. The records and channel names belong to the crates that own
-//! those domains.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -17,8 +12,7 @@ use super::mux::Mux;
 use super::record::Record;
 use super::wire::{DatastreamFrame, encode_delivery};
 
-/// Where assembled frames go once the mux has ordered them. A sink is the only
-/// place transport lives; the emitter knows nothing about it.
+/// Where assembled frames go once the mux has ordered them.
 pub trait FrameSink: Send {
     /// Ship one ordered frame for `stream`. Best-effort: a sink may drop.
     fn ship(&mut self, stream: &StreamId, frame: &Frame);
@@ -31,8 +25,6 @@ pub struct EmitterConfig {
     pub mux_capacity: usize,
 }
 
-/// Forwards managed-process output into a node's mux using a caller-owned
-/// channel mapping.
 struct MuxProcObserver {
     mux: Arc<Mux>,
     channel_for: Arc<dyn Fn(&str, bool) -> ChannelId + Send + Sync>,
@@ -45,8 +37,9 @@ impl ProcessOutputObserver for MuxProcObserver {
     }
 }
 
-/// A per-node emitter. Owns ordering (its [`Mux`]) and ships through its
-/// [`FrameSink`]. It does not know any domain-specific record type.
+/// Legacy per-node emitter retained while runtime callsites move to
+/// [`crate::DatastreamEndpoint`]. New code should register channels on the
+/// endpoint and submit through [`crate::DatastreamProducer`].
 pub struct DatastreamEmitter {
     stream_id: StreamId,
     mux: Arc<Mux>,
@@ -54,7 +47,6 @@ pub struct DatastreamEmitter {
 }
 
 impl DatastreamEmitter {
-    /// Build a node's emitter: a mux keyed by its stream id.
     pub fn new(cfg: EmitterConfig, sink: Box<dyn FrameSink>) -> Self {
         let stream_id = StreamId::new(NodeId::new(&cfg.node_hex), Lifetime(cfg.life));
         let mux = Arc::new(Mux::new(stream_id.clone(), cfg.mux_capacity));
@@ -65,54 +57,42 @@ impl DatastreamEmitter {
         }
     }
 
-    /// The stream this emitter produces.
     pub fn stream_id(&self) -> &StreamId {
         &self.stream_id
     }
 
-    /// The node's mux, for producers that submit directly.
     pub fn mux(&self) -> &Arc<Mux> {
         &self.mux
     }
 
-    /// Number of positions assigned by the mux.
     pub fn assigned(&self) -> u64 {
         self.mux.assigned()
     }
 
-    /// Number of frames dropped by the mux on overflow.
     pub fn dropped(&self) -> u64 {
         self.mux.dropped()
     }
 
-    /// Enable or disable optional sidecar timing samples for newly submitted
-    /// frames from this emitter and its cloned submit handles.
     pub fn set_frame_timing_enabled(&self, enabled: bool) {
         self.mux.set_frame_timing_enabled(enabled);
     }
 
-    /// Whether this emitter's mux currently emits sidecar frame timing samples.
     pub fn frame_timing_enabled(&self) -> bool {
         self.mux.frame_timing_enabled()
     }
 
-    /// Submit a typed record defined by the caller's crate.
-    pub fn submit_record<R: Record>(&self, record: &R) -> Position {
-        self.mux.submit(R::channel(), record.encode())
+    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> Position {
+        self.mux.submit(channel, record.encode())
     }
 
-    /// Submit UTF-8/text bytes on a caller-owned channel.
-    pub fn submit_text(&self, channel: impl Into<ChannelId>, text: impl AsRef<[u8]>) -> Position {
+    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> Position {
         self.mux.submit(channel, text.as_ref().to_vec())
     }
 
-    /// Submit arbitrary bytes on a caller-owned channel.
-    pub fn submit_bytes(&self, channel: impl Into<ChannelId>, bytes: Vec<u8>) -> Position {
+    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> Position {
         self.mux.submit(channel, bytes)
     }
 
-    /// An observer that taps managed-process output onto this node's stream.
-    /// The caller supplies the channel naming convention.
     pub fn process_observer_with<F>(&self, channel_for: F) -> Arc<dyn ProcessOutputObserver>
     where
         F: Fn(&str, bool) -> ChannelId + Send + Sync + 'static,
@@ -123,15 +103,12 @@ impl DatastreamEmitter {
         })
     }
 
-    /// Drain the mux and ship every ordered frame.
     pub fn tick(&mut self) {
         for frame in self.mux.drain() {
             self.sink.ship(&self.stream_id, &frame);
         }
     }
 
-    /// A cheap, cloneable handle for submitting event-driven frames onto this
-    /// node's stream from any thread.
     pub fn event_sink(&self) -> DatastreamEventSink {
         DatastreamEventSink {
             mux: self.mux.clone(),
@@ -139,38 +116,34 @@ impl DatastreamEmitter {
     }
 }
 
-/// A thread-safe submit handle. Holds a clone of the node's mux; submitted
-/// frames drain in the node's main loop.
+/// A thread-safe submit handle. Legacy; prefer [`crate::DatastreamProducer`].
 #[derive(Clone)]
 pub struct DatastreamEventSink {
     mux: Arc<Mux>,
 }
 
 impl DatastreamEventSink {
-    pub fn submit_record<R: Record>(&self, record: &R) -> Position {
-        self.mux.submit(R::channel(), record.encode())
+    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> Position {
+        self.mux.submit(channel, record.encode())
     }
 
-    pub fn submit_text(&self, channel: impl Into<ChannelId>, text: impl AsRef<[u8]>) -> Position {
+    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> Position {
         self.mux.submit(channel, text.as_ref().to_vec())
     }
 
-    pub fn submit_bytes(&self, channel: impl Into<ChannelId>, bytes: Vec<u8>) -> Position {
+    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> Position {
         self.mux.submit(channel, bytes)
     }
 }
 
-/// A sink that drops everything. Used when a node has no collector yet, so the
-/// mux can still drain and stay bounded.
+/// A sink that drops everything.
 pub struct NoopSink;
 
 impl FrameSink for NoopSink {
     fn ship(&mut self, _stream: &StreamId, _frame: &Frame) {}
 }
 
-/// Ships frames over the swactor cluster to the orchestrator's `datastream-sink`
-/// actor, reusing the exact `register_name`/`resolve_name` + transport-router
-/// path the application already uses.
+/// Legacy swactor frame sink retained until MVP runtime cutover removes it.
 pub struct ClusterFrameSink {
     rt: Arc<Runtime>,
     sink: Arc<OnceLock<ActorAddress>>,

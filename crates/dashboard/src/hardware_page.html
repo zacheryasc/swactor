@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fleet</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 20px; }
+    a { color: inherit; }
+    .nav {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 18px;
+      padding: 8px;
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 12px;
+    }
+    .nav a {
+      padding: 7px 10px;
+      color: #cbd5e1;
+      border: 1px solid transparent;
+      border-radius: 8px;
+      text-decoration: none;
+    }
+    .nav a:hover { color: #f8fafc; background: #1e293b; }
+    .nav a[data-active="true"] {
+      color: #eff6ff;
+      background: #172554;
+      border-color: #60a5fa;
+    }
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 14px;
+      margin-bottom: 18px;
+    }
+    h1, h2, h3, h4 { margin: 0; }
+    h1 { font-size: 28px; }
+    h2 { font-size: 21px; overflow-wrap: anywhere; }
+    h3 { font-size: 17px; }
+    h4 { font-size: 14px; }
+    .header-copy { display: grid; gap: 5px; }
+    .header-state { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+    .muted { color: #94a3b8; }
+    .ok { color: #34d399; }
+    .warn { color: #fbbf24; }
+    .bad { color: #f87171; font-weight: 700; }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 9px;
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 999px;
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .pill.ok { border-color: #065f46; background: #064e3b55; }
+    .pill.warn { border-color: #92400e; background: #78350f55; }
+    .pill.bad { border-color: #991b1b; background: #7f1d1d55; }
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(130px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+    .card {
+      min-width: 0;
+      padding: 14px;
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 14px;
+    }
+    .label {
+      color: #94a3b8;
+      font-size: 11px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+    .value {
+      margin-top: 6px;
+      font-size: 23px;
+      font-variant-numeric: tabular-nums;
+    }
+    .nodes { min-width: 0; }
+    .fleet-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      gap: 12px;
+    }
+    .focused { display: block; }
+    .fleet-card {
+      display: grid;
+      min-width: 0;
+      gap: 12px;
+      padding: 14px;
+      color: inherit;
+      background: #172033;
+      border: 1px solid #334155;
+      border-radius: 14px;
+      text-decoration: none;
+      transition: border-color .15s ease, background .15s ease, transform .15s ease;
+    }
+    .fleet-card:hover, .fleet-card:focus-visible {
+      background: #1e293b;
+      border-color: #60a5fa;
+      outline: none;
+      transform: translateY(-1px);
+    }
+    .fleet-card[data-live="false"] { border-color: #92400e; }
+    .fleet-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .fleet-card-title { min-width: 0; }
+    .fleet-card-title h2 { font-size: 18px; }
+    .fleet-card-title .muted { margin-top: 3px; font-size: 12px; overflow-wrap: anywhere; }
+    .fleet-card-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .fleet-activity { display: grid; gap: 9px; }
+    .activity-line { display: grid; gap: 5px; }
+    .activity-copy {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 10px;
+      color: #cbd5e1;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .activity-copy span:last-child { color: #f8fafc; text-align: right; }
+    .node-card {
+      min-width: 0;
+      padding: 16px;
+      background: #172033;
+      border: 1px solid #334155;
+      border-radius: 16px;
+    }
+    .node-card[data-live="false"] { border-color: #92400e; }
+    .focus-back {
+      display: inline-flex;
+      margin-bottom: 14px;
+      padding: 8px 12px;
+      color: #bfdbfe;
+      background: #172554;
+      border: 1px solid #60a5fa;
+      border-radius: 9px;
+      font-weight: 700;
+      text-decoration: none;
+    }
+    .focus-back:hover, .focus-back:focus-visible { background: #1e3a8a; }
+    .node-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .node-title { display: grid; gap: 5px; }
+    .node-meta { display: flex; justify-content: flex-end; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .node-metrics {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+    .metric {
+      min-width: 0;
+      padding: 11px;
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 11px;
+    }
+    .metric .value { font-size: 19px; }
+    .chart-scroll {
+      width: 100%;
+      margin-bottom: 14px;
+      overflow-x: auto;
+      overscroll-behavior-inline: contain;
+    }
+    .chart-row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(250px, 1fr));
+      min-width: 780px;
+      gap: 10px;
+    }
+    .chart-card { display: grid; min-width: 0; gap: 7px; padding: 10px; }
+    .chart-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px; color: #94a3b8; font-size: 11px; }
+    .legend i { display: inline-block; width: 14px; height: 3px; margin-right: 4px; vertical-align: middle; border-radius: 99px; }
+    .spark {
+      display: block;
+      width: 100%;
+      height: 80px;
+      max-height: 90px;
+      color: #64748b;
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 9px;
+    }
+    .details-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+    .detail { min-width: 0; padding: 14px; background: #111827; border: 1px solid #334155; border-radius: 12px; }
+    .detail-head { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .detail-meta { color: #94a3b8; font-size: 12px; font-variant-numeric: tabular-nums; }
+    .host-grid, .device-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(110px, 1fr));
+      gap: 9px;
+      margin-bottom: 12px;
+    }
+    .datum { min-width: 0; padding: 9px; background: #0f172a; border-radius: 8px; }
+    .datum .value { font-size: 16px; }
+    .bar-row { display: grid; grid-template-columns: minmax(80px, 150px) minmax(120px, 1fr) 68px; align-items: center; gap: 10px; margin: 8px 0; }
+    .bar-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .bar-track { height: 9px; overflow: hidden; background: #334155; border-radius: 999px; }
+    .bar-fill { height: 100%; border-radius: inherit; }
+    .bar-fill.ok { background: #34d399; }
+    .bar-fill.warn { background: #fbbf24; }
+    .bar-fill.bad { background: #f87171; }
+    .bar-number { text-align: right; color: #cbd5e1; font-variant-numeric: tabular-nums; }
+    .subsection { margin-top: 14px; }
+    .subsection > h4 { margin-bottom: 8px; color: #cbd5e1; }
+    .table-wrap { width: 100%; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; background: #0f172a; border: 1px solid #334155; font-size: 13px; }
+    th, td { padding: 8px 9px; border-bottom: 1px solid #1f2937; text-align: left; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    th { color: #93c5fd; background: #1e293b; font-size: 11px; letter-spacing: .04em; text-transform: uppercase; }
+    tbody tr:last-child td { border-bottom: 0; }
+    td.wrap { min-width: 180px; white-space: normal; overflow-wrap: anywhere; }
+    .gpu-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
+    .gpu-device { min-width: 0; padding: 12px; background: #0f172a; border: 1px solid #334155; border-radius: 10px; }
+    .gpu-device-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+    .error-list { display: grid; gap: 7px; margin-bottom: 14px; }
+    .error-banner { padding: 10px 12px; color: #fecaca; background: #7f1d1d66; border: 1px solid #b91c1c; border-radius: 9px; overflow-wrap: anywhere; }
+    .empty { padding: 28px; color: #94a3b8; border: 1px dashed #475569; border-radius: 12px; }
+    .section-empty { color: #94a3b8; font-size: 13px; }
+    @media (max-width: 1100px) {
+      .summary-grid { grid-template-columns: repeat(3, minmax(130px, 1fr)); }
+      .node-metrics { grid-template-columns: repeat(3, minmax(120px, 1fr)); }
+      .host-grid, .device-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 720px) {
+      body { padding: 12px; }
+      .summary-grid, .node-metrics, .host-grid, .device-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .node-card { padding: 12px; }
+      .bar-row { grid-template-columns: minmax(70px, 120px) minmax(80px, 1fr) 62px; }
+    }
+    @media (max-width: 430px) {
+      .summary-grid, .node-metrics, .host-grid, .device-grid { grid-template-columns: 1fr; }
+      .bar-row { grid-template-columns: 90px minmax(70px, 1fr) 58px; }
+    }
+  </style>
+</head>
+<body>
+  <nav class="nav" aria-label="Dashboard views">
+    <a href="/">Dashboard</a>
+    <a href="/view/datastream/live">Live datastream</a>
+    <a href="/view/fleet" aria-current="page" data-active="true">Fleet</a>
+  </nav>
+
+  <header>
+    <div class="header-copy">
+      <h1 id="page-title">Fleet</h1>
+      <div class="muted" id="page-description">All tracked machines at a glance. Select one for complete telemetry.</div>
+    </div>
+    <div class="header-state">
+      <span class="muted">Refreshes every 1 second</span>
+      <span class="pill warn" id="status" role="status" aria-live="polite">Loading snapshot…</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="summary-grid" id="summary" aria-label="Fleet summary"></section>
+    <section class="nodes fleet-grid" id="nodes" aria-label="Fleet machines">
+      <div class="empty">No machines have reported yet.</div>
+    </section>
+  </main>
+
+  <script>
+  (() => {
+    'use strict';
+
+    const API_URL = '/api/view/fleet';
+    const POLL_MS = 1000;
+    const selectedStream = new URLSearchParams(window.location.search).get('stream');
+    const statusEl = document.getElementById('status');
+    const titleEl = document.getElementById('page-title');
+    const descriptionEl = document.getElementById('page-description');
+    const summaryEl = document.getElementById('summary');
+    const nodesEl = document.getElementById('nodes');
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, character => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;',
+      }[character]));
+    }
+
+    function fmtNumber(value, digits = 0) {
+      if (value === null || value === undefined) return '—';
+      const number = Number(value);
+      if (!Number.isFinite(number)) return '—';
+      return number.toLocaleString(undefined, {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
+      });
+    }
+
+    function fmtPercent(value) {
+      return value === null || value === undefined ? '—' : `${fmtNumber(value, 1)}%`;
+    }
+
+    function fmtScaled(value, units) {
+      if (value === null || value === undefined) return '—';
+      let amount = Number(value);
+      if (!Number.isFinite(amount)) return '—';
+      let unit = 0;
+      while (Math.abs(amount) >= 1024 && unit < units.length - 1) {
+        amount /= 1024;
+        unit += 1;
+      }
+      const digits = amount !== 0 && Math.abs(amount) < 10 ? 1 : 0;
+      return `${fmtNumber(amount, digits)} ${units[unit]}`;
+    }
+
+    function fmtBytesPerSecond(value) {
+      return fmtScaled(value, ['B/s', 'KiB/s', 'MiB/s', 'GiB/s']);
+    }
+
+    function fmtBytes(value) {
+      return fmtScaled(value, ['B', 'KiB', 'MiB', 'GiB']);
+    }
+
+    function fmtMib(value) {
+      if (value === null || value === undefined) return '—';
+      const amount = Number(value);
+      if (!Number.isFinite(amount)) return '—';
+      return amount >= 1024 ? `${fmtNumber(amount / 1024, 1)} GiB` : `${fmtNumber(amount)} MiB`;
+    }
+
+    function fmtDuration(ms) {
+      if (ms === null || ms === undefined) return '—';
+      const value = Math.max(0, Number(ms));
+      if (!Number.isFinite(value)) return '—';
+      if (value < 1000) return `${fmtNumber(value)} ms`;
+      if (value < 60000) return `${fmtNumber(value / 1000, 1)} s`;
+      if (value < 3600000) return `${fmtNumber(value / 60000, 1)} min`;
+      return `${fmtNumber(value / 3600000, 1)} h`;
+    }
+
+    function fmtTimestamp(unixMs) {
+      if (unixMs === null || unixMs === undefined) return '—';
+      const date = new Date(Number(unixMs));
+      return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString();
+    }
+
+    function bar(value, max = 100) {
+      if (value === null || value === undefined) {
+        return '<div class="bar-track" aria-label="Unavailable"><div class="bar-fill" style="width:0"></div></div>';
+      }
+      const amount = Number(value);
+      const ceiling = Number(max);
+      if (!Number.isFinite(amount) || !Number.isFinite(ceiling) || ceiling <= 0) {
+        return '<div class="bar-track" aria-label="Unavailable"><div class="bar-fill" style="width:0"></div></div>';
+      }
+      const percent = Math.max(0, Math.min(100, amount / ceiling * 100));
+      const state = percent >= 90 ? 'bad' : percent >= 70 ? 'warn' : 'ok';
+      return `<div class="bar-track" role="meter" aria-valuemin="0" aria-valuemax="${ceiling}" aria-valuenow="${amount}"><div class="bar-fill ${state}" style="width:${percent.toFixed(2)}%"></div></div>`;
+    }
+
+    function summaryCard(label, value, state = '') {
+      return `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value ${state}">${escapeHtml(value)}</div></div>`;
+    }
+
+    function renderSummary(totals = {}) {
+      const nodeState = Number(totals.stale_nodes || 0) > 0 ? 'warn' : 'ok';
+      const errorState = Number(totals.errors || 0) > 0 ? 'bad' : 'ok';
+      summaryEl.innerHTML = [
+        summaryCard('Nodes live / total', `${fmtNumber(totals.live_nodes)} / ${fmtNumber(totals.nodes)}`, nodeState),
+        summaryCard('GPUs', fmtNumber(totals.gpu_count)),
+        summaryCard('Average CPU', fmtPercent(totals.cpu_avg_percent)),
+        summaryCard('Max GPU', fmtPercent(totals.gpu_max_percent)),
+        summaryCard('VRAM used / total', `${fmtMib(totals.gpu_memory_used_mib)} / ${fmtMib(totals.gpu_memory_total_mib)}`),
+        summaryCard('RX / second', fmtBytesPerSecond(totals.net_rx_bps)),
+        summaryCard('TX / second', fmtBytesPerSecond(totals.net_tx_bps)),
+        summaryCard('Stale nodes', fmtNumber(totals.stale_nodes), nodeState),
+        summaryCard('Errors', fmtNumber(totals.errors), errorState),
+      ].join('');
+    }
+
+    function numericValues(items, getter) {
+      return items.map(getter).filter(value => value !== null && value !== undefined && Number.isFinite(Number(value))).map(Number);
+    }
+
+    function maxOrNull(values) {
+      return values.length ? Math.max(...values) : null;
+    }
+
+    function sumOrNull(values) {
+      return values.length ? values.reduce((sum, value) => sum + value, 0) : null;
+    }
+
+    function nodeMetrics(node) {
+      const cpuHost = node.cpu && node.cpu.host;
+      const gpus = node.gpu && Array.isArray(node.gpu.gpus) ? node.gpu.gpus : [];
+      const interfaces = node.net && Array.isArray(node.net.interfaces) ? node.net.interfaces : [];
+      const gpuUtilization = numericValues(gpus, gpu => gpu.utilization_gpu_percent);
+      const usedMemory = numericValues(gpus, gpu => gpu.memory_used_mib);
+      const totalMemory = numericValues(gpus, gpu => gpu.memory_total_mib);
+      const rxRates = numericValues(interfaces, iface => iface.rx_bps);
+      const txRates = numericValues(interfaces, iface => iface.tx_bps);
+      return {
+        cpuPercent: cpuHost ? cpuHost.total_percent : null,
+        load1: cpuHost ? cpuHost.load1 : null,
+        gpuPercent: maxOrNull(gpuUtilization),
+        memoryUsed: sumOrNull(usedMemory),
+        memoryTotal: sumOrNull(totalMemory),
+        rxBps: sumOrNull(rxRates),
+        txBps: sumOrNull(txRates),
+      };
+    }
+
+    function metric(label, value) {
+      return `<div class="metric"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`;
+    }
+
+    function sparkSegments(points, field, color) {
+      const values = numericValues(points, point => point[field]);
+      if (!values.length) return '';
+      const maximum = Math.max(1, ...values);
+      const denominator = Math.max(1, points.length - 1);
+      const segments = [];
+      let current = [];
+      points.forEach((point, index) => {
+        const raw = point[field];
+        if (raw === null || raw === undefined || !Number.isFinite(Number(raw))) {
+          if (current.length) segments.push(current);
+          current = [];
+          return;
+        }
+        const x = index * 400 / denominator;
+        const y = 68 - Math.max(0, Number(raw)) / maximum * 58;
+        current.push(`${x.toFixed(1)},${Math.max(6, Math.min(72, y)).toFixed(1)}`);
+      });
+      if (current.length) segments.push(current);
+      return segments.map(segment => {
+        if (segment.length === 1) {
+          const [cx, cy] = segment[0].split(',');
+          return `<circle cx="${cx}" cy="${cy}" r="2" fill="${color}" />`;
+        }
+        return `<polyline fill="none" stroke="${color}" stroke-width="2.5" vector-effect="non-scaling-stroke" points="${segment.join(' ')}" />`;
+      }).join('');
+    }
+
+    function compactChart(history, title, series) {
+      const points = Array.isArray(history) ? history.slice(-120) : [];
+      const legend = series.map(item => `<span><i style="background:${item.color}"></i>${escapeHtml(item.label)}</span>`).join('');
+      const lines = points.length ? series.map(item => sparkSegments(points, item.field, item.color)).join('') : '';
+      const content = points.length
+        ? `<line x1="0" y1="70" x2="400" y2="70" stroke="#334155" stroke-width="1" />${lines}`
+        : '<text x="200" y="43" text-anchor="middle" fill="currentColor">waiting for history</text>';
+      return `<section class="card chart-card">
+        <div class="chart-head"><div class="label">${escapeHtml(title)}</div><div class="legend">${legend}</div></div>
+        <svg class="spark" viewBox="0 0 400 78" preserveAspectRatio="none" role="img" aria-label="${escapeHtml(`${title} history`)}">${content}</svg>
+      </section>`;
+    }
+
+    function chartRow(history) {
+      return `<div class="chart-scroll" aria-label="Machine history">
+        <div class="chart-row">
+          ${compactChart(history, 'CPU percentage', [{ field: 'cpu_total_percent', label: 'CPU', color: '#60a5fa' }])}
+          ${compactChart(history, 'GPU percentage', [{ field: 'gpu_max_percent', label: 'GPU', color: '#c084fc' }])}
+          ${compactChart(history, 'Network RX / TX', [
+            { field: 'net_rx_bps', label: 'RX', color: '#34d399' },
+            { field: 'net_tx_bps', label: 'TX', color: '#fbbf24' },
+          ])}
+        </div>
+      </div>`;
+    }
+
+    function detailMeta(sample) {
+      if (!sample) return '';
+      const parts = [
+        `seq ${fmtNumber(sample.seq)}`,
+        fmtTimestamp(sample.sample_unix_ms),
+      ];
+      if (Object.prototype.hasOwnProperty.call(sample, 'query_elapsed_ms')) {
+        parts.push(`query ${fmtDuration(sample.query_elapsed_ms)}`);
+      }
+      return parts.map(escapeHtml).join(' · ');
+    }
+
+    function datum(label, value) {
+      return `<div class="datum"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`;
+    }
+
+    function utilizationRow(label, value, maximum = 100, displayValue = fmtPercent(value)) {
+      return `<div class="bar-row"><div class="bar-label" title="${escapeHtml(label)}">${escapeHtml(label)}</div>${bar(value, maximum)}<div class="bar-number">${escapeHtml(displayValue)}</div></div>`;
+    }
+
+    function renderCpu(cpu) {
+      if (!cpu) {
+        return '<section class="detail"><div class="detail-head"><h3>CPU</h3></div><div class="section-empty">No host.cpu sample received.</div></section>';
+      }
+      const host = cpu.host;
+      const cores = Array.isArray(cpu.cores) ? cpu.cores : [];
+      const processes = Array.isArray(cpu.processes) ? cpu.processes : [];
+      const hostHtml = host ? `
+        ${utilizationRow('Host total', host.total_percent)}
+        <div class="host-grid">
+          ${datum('Logical CPUs', fmtNumber(host.logical_cpus))}
+          ${datum('Idle', fmtPercent(host.idle_percent))}
+          ${datum('I/O wait', fmtPercent(host.iowait_percent))}
+          ${datum('Steal', fmtPercent(host.steal_percent))}
+          ${datum('Load 1', fmtNumber(host.load1, 2))}
+          ${datum('Load 5', fmtNumber(host.load5, 2))}
+          ${datum('Load 15', fmtNumber(host.load15, 2))}
+        </div>` : '<div class="section-empty">Host utilization is unavailable.</div>';
+      const coreHtml = cores.length ? cores.map(core => `
+        <div>
+          ${utilizationRow(`CPU ${fmtNumber(core.index)}`, core.total_percent)}
+          <div class="detail-meta">idle ${escapeHtml(fmtPercent(core.idle_percent))} · I/O wait ${escapeHtml(fmtPercent(core.iowait_percent))} · steal ${escapeHtml(fmtPercent(core.steal_percent))}</div>
+        </div>`).join('') : '<div class="section-empty">No per-core samples.</div>';
+      const processRows = processes.map(process => `<tr>
+        <td>${escapeHtml(fmtNumber(process.pid))}</td>
+        <td class="wrap">${escapeHtml(process.process_name)}</td>
+        <td>${escapeHtml(fmtPercent(process.cpu_percent))}</td>
+        <td>${escapeHtml(fmtBytes(process.rss_bytes))}</td>
+        <td>${escapeHtml(fmtBytes(process.vms_bytes))}</td>
+        <td>${escapeHtml(fmtNumber(process.thread_count))}</td>
+        <td class="wrap ${process.error ? 'bad' : ''}">${escapeHtml(process.error || '—')}</td>
+      </tr>`).join('');
+      const processesHtml = processes.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>PID</th><th>Name</th><th>CPU</th><th>RSS</th><th>VMS</th><th>Threads</th><th>Error</th></tr></thead>
+        <tbody>${processRows}</tbody>
+      </table></div>` : '<div class="section-empty">No CPU processes reported.</div>';
+      return `<section class="detail">
+        <div class="detail-head"><h3>CPU</h3><div class="detail-meta">${detailMeta(cpu)}</div></div>
+        ${hostHtml}
+        <div class="subsection"><h4>Per-core utilization</h4>${coreHtml}</div>
+        <div class="subsection"><h4>Processes</h4>${processesHtml}</div>
+      </section>`;
+    }
+
+    function renderGpu(gpu) {
+      if (!gpu) {
+        return '<section class="detail"><div class="detail-head"><h3>GPU</h3></div><div class="section-empty">No host.gpu sample received.</div></section>';
+      }
+      const devices = Array.isArray(gpu.gpus) ? gpu.gpus : [];
+      const processes = Array.isArray(gpu.processes) ? gpu.processes : [];
+      const devicesHtml = devices.length ? `<div class="gpu-list">${devices.map(device => {
+        const memoryPercent = device.memory_used_mib !== null && device.memory_used_mib !== undefined && Number(device.memory_total_mib) > 0
+          ? Number(device.memory_used_mib) / Number(device.memory_total_mib) * 100
+          : null;
+        const index = device.index === null || device.index === undefined ? 'index —' : `GPU ${fmtNumber(device.index)}`;
+        return `<article class="gpu-device">
+          <div class="gpu-device-head"><h4>${escapeHtml(device.name)}</h4><span class="muted">${escapeHtml(index)}</span></div>
+          <div class="detail-meta">UUID ${escapeHtml(device.uuid)}</div>
+          ${utilizationRow('GPU utilization', device.utilization_gpu_percent)}
+          ${utilizationRow('Memory used', memoryPercent, 100, `${fmtMib(device.memory_used_mib)} / ${fmtMib(device.memory_total_mib)}`)}
+          <div class="device-grid">
+            ${datum('Memory utilization', fmtPercent(device.utilization_memory_percent))}
+            ${datum('Temperature', device.temperature_c === null || device.temperature_c === undefined ? '—' : `${fmtNumber(device.temperature_c)} C`)}
+            ${datum('Power draw', device.power_draw_w === null || device.power_draw_w === undefined ? '—' : `${fmtNumber(device.power_draw_w, 1)} W`)}
+            ${datum('VRAM total', fmtMib(device.memory_total_mib))}
+          </div>
+        </article>`;
+      }).join('')}</div>` : '<div class="section-empty">No GPU devices reported.</div>';
+      const processRows = processes.map(process => `<tr>
+        <td class="wrap">${escapeHtml(process.gpu_uuid)}</td>
+        <td>${escapeHtml(fmtNumber(process.pid))}</td>
+        <td class="wrap">${escapeHtml(process.process_name)}</td>
+        <td>${escapeHtml(fmtMib(process.used_memory_mib))}</td>
+      </tr>`).join('');
+      const processesHtml = processes.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>GPU UUID</th><th>PID</th><th>Name</th><th>Used memory</th></tr></thead>
+        <tbody>${processRows}</tbody>
+      </table></div>` : '<div class="section-empty">No GPU processes reported.</div>';
+      return `<section class="detail">
+        <div class="detail-head"><h3>GPU</h3><div class="detail-meta">${detailMeta(gpu)}</div></div>
+        ${devicesHtml}
+        <div class="subsection"><h4>Processes</h4>${processesHtml}</div>
+      </section>`;
+    }
+
+    function renderNetwork(net) {
+      if (!net) {
+        return '<section class="detail"><div class="detail-head"><h3>Network</h3></div><div class="section-empty">No host.net sample received.</div></section>';
+      }
+      const interfaces = Array.isArray(net.interfaces) ? net.interfaces : [];
+      const rows = interfaces.map(iface => `<tr>
+        <td class="wrap">${escapeHtml(iface.name)}</td>
+        <td>${escapeHtml(fmtBytesPerSecond(iface.rx_bps))}</td>
+        <td>${escapeHtml(fmtBytesPerSecond(iface.tx_bps))}</td>
+        <td>${escapeHtml(iface.rx_pps === null || iface.rx_pps === undefined ? '—' : `${fmtNumber(iface.rx_pps, 1)} pps`)}</td>
+        <td>${escapeHtml(iface.tx_pps === null || iface.tx_pps === undefined ? '—' : `${fmtNumber(iface.tx_pps, 1)} pps`)}</td>
+        <td>${escapeHtml(fmtBytes(iface.rx_bytes))}</td>
+        <td>${escapeHtml(fmtBytes(iface.tx_bytes))}</td>
+        <td>${escapeHtml(fmtNumber(iface.rx_packets))}</td>
+        <td>${escapeHtml(fmtNumber(iface.tx_packets))}</td>
+        <td class="${Number(iface.rx_errors || 0) ? 'bad' : ''}">${escapeHtml(fmtNumber(iface.rx_errors))}</td>
+        <td class="${Number(iface.tx_errors || 0) ? 'bad' : ''}">${escapeHtml(fmtNumber(iface.tx_errors))}</td>
+        <td class="${Number(iface.rx_dropped || 0) ? 'warn' : ''}">${escapeHtml(fmtNumber(iface.rx_dropped))}</td>
+        <td class="${Number(iface.tx_dropped || 0) ? 'warn' : ''}">${escapeHtml(fmtNumber(iface.tx_dropped))}</td>
+      </tr>`).join('');
+      const interfacesHtml = interfaces.length ? `<div class="table-wrap"><table>
+        <thead><tr><th>Interface</th><th>RX/s</th><th>TX/s</th><th>RX packets/s</th><th>TX packets/s</th><th>RX bytes</th><th>TX bytes</th><th>RX packets</th><th>TX packets</th><th>RX errors</th><th>TX errors</th><th>RX dropped</th><th>TX dropped</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>` : '<div class="section-empty">No network interfaces reported.</div>';
+      return `<section class="detail">
+        <div class="detail-head"><h3>Network</h3><div class="detail-meta">${detailMeta(net)}</div></div>
+        ${interfacesHtml}
+      </section>`;
+    }
+
+    function renderErrors(errors) {
+      if (!Array.isArray(errors) || !errors.length) return '';
+      return `<section class="error-list" aria-label="Node errors">${errors.map(error => `<div class="error-banner">${escapeHtml(error)}</div>`).join('')}</section>`;
+    }
+
+    function activityLine(label, value, maximum, displayValue) {
+      return `<div class="activity-line">
+        <div class="activity-copy"><span>${escapeHtml(label)}</span><span>${escapeHtml(displayValue)}</span></div>
+        ${bar(value, maximum)}
+      </div>`;
+    }
+
+    function renderFleetCard(node) {
+      const stream = node.stream || {};
+      const errors = Array.isArray(node.errors) ? node.errors : [];
+      const metrics = nodeMetrics(node);
+      const liveClass = node.live ? 'ok' : 'warn';
+      const liveLabel = node.live ? 'live' : 'stale';
+      const memoryPercent = metrics.memoryUsed !== null && Number(metrics.memoryTotal) > 0
+        ? Number(metrics.memoryUsed) / Number(metrics.memoryTotal) * 100
+        : null;
+      const networkMaximum = Math.max(1, Number(metrics.rxBps) || 0, Number(metrics.txBps) || 0);
+      const key = stream.key === null || stream.key === undefined ? '' : String(stream.key);
+      const href = `/view/fleet?stream=${encodeURIComponent(key)}`;
+      const nodeName = stream.node === null || stream.node === undefined ? 'Unknown node' : stream.node;
+      return `<a class="fleet-card" data-live="${node.live ? 'true' : 'false'}" href="${escapeHtml(href)}" aria-label="${escapeHtml(`Open ${nodeName}, life ${fmtNumber(stream.life)}`)}">
+        <div class="fleet-card-head">
+          <div class="fleet-card-title">
+            <h2>${escapeHtml(nodeName)}</h2>
+            <div class="muted">life ${escapeHtml(fmtNumber(stream.life))} · ${escapeHtml(key || 'unknown stream')}</div>
+          </div>
+          <span class="pill ${liveClass}">${escapeHtml(liveLabel)}</span>
+        </div>
+        <div class="fleet-card-meta">
+          <span class="muted">Seen ${escapeHtml(fmtDuration(node.last_seen_ms_ago))} ago</span>
+          <span class="${errors.length ? 'bad' : 'ok'}">${escapeHtml(fmtNumber(errors.length))} error${errors.length === 1 ? '' : 's'}</span>
+        </div>
+        <div class="fleet-activity">
+          ${activityLine('CPU activity', metrics.cpuPercent, 100, fmtPercent(metrics.cpuPercent))}
+          ${activityLine('GPU activity', metrics.gpuPercent, 100, fmtPercent(metrics.gpuPercent))}
+          ${activityLine('VRAM', memoryPercent, 100, `${fmtMib(metrics.memoryUsed)} / ${fmtMib(metrics.memoryTotal)}`)}
+          ${activityLine('Network RX', metrics.rxBps, networkMaximum, fmtBytesPerSecond(metrics.rxBps))}
+          ${activityLine('Network TX', metrics.txBps, networkMaximum, fmtBytesPerSecond(metrics.txBps))}
+        </div>
+      </a>`;
+    }
+
+    function renderFocusedNode(node) {
+      const stream = node.stream || {};
+      const errors = Array.isArray(node.errors) ? node.errors : [];
+      const metrics = nodeMetrics(node);
+      const liveClass = node.live ? 'ok' : 'warn';
+      const liveLabel = node.live ? 'live' : 'stale';
+      return `<a class="focus-back" href="/view/fleet">← All machines</a>
+      <article class="node-card" data-live="${node.live ? 'true' : 'false'}">
+        <div class="node-head">
+          <div class="node-title">
+            <h2>${escapeHtml(stream.node === null || stream.node === undefined ? 'Unknown node' : stream.node)}</h2>
+            <div class="muted">stream ${escapeHtml(stream.key === null || stream.key === undefined ? '—' : stream.key)} · life ${escapeHtml(fmtNumber(stream.life))}</div>
+          </div>
+          <div class="node-meta">
+            <span class="pill ${liveClass}">${escapeHtml(liveLabel)}</span>
+            <span class="pill">last seen ${escapeHtml(fmtDuration(node.last_seen_ms_ago))} ago</span>
+            <span class="pill" title="${escapeHtml(fmtTimestamp(node.last_sample_unix_ms))}">sample ${escapeHtml(fmtTimestamp(node.last_sample_unix_ms))}</span>
+            <span class="pill ${errors.length ? 'bad' : 'ok'}">${escapeHtml(fmtNumber(errors.length))} error${errors.length === 1 ? '' : 's'}</span>
+          </div>
+        </div>
+        ${renderErrors(errors)}
+        <section class="node-metrics" aria-label="Machine summary">
+          ${metric('CPU total', fmtPercent(metrics.cpuPercent))}
+          ${metric('Load 1', fmtNumber(metrics.load1, 2))}
+          ${metric('GPU max', fmtPercent(metrics.gpuPercent))}
+          ${metric('VRAM used / total', `${fmtMib(metrics.memoryUsed)} / ${fmtMib(metrics.memoryTotal)}`)}
+          ${metric('Network RX / second', fmtBytesPerSecond(metrics.rxBps))}
+          ${metric('Network TX / second', fmtBytesPerSecond(metrics.txBps))}
+        </section>
+        ${chartRow(node.history)}
+        <div class="details-grid">
+          ${renderCpu(node.cpu)}
+          ${renderGpu(node.gpu)}
+          ${renderNetwork(node.net)}
+        </div>
+      </article>`;
+    }
+
+    function render(snapshot) {
+      const nodes = Array.isArray(snapshot && snapshot.nodes) ? snapshot.nodes : [];
+      const focused = selectedStream !== null;
+      summaryEl.hidden = focused;
+      nodesEl.className = focused ? 'nodes focused' : 'nodes fleet-grid';
+      if (!focused) {
+        titleEl.textContent = 'Fleet';
+        descriptionEl.textContent = 'All tracked machines at a glance. Select one for complete telemetry.';
+        renderSummary(snapshot && snapshot.totals ? snapshot.totals : {});
+        nodesEl.innerHTML = nodes.length
+          ? nodes.map(renderFleetCard).join('')
+          : '<div class="empty">No machines have reported yet.</div>';
+        return;
+      }
+
+      const node = nodes.find(candidate => String((candidate.stream || {}).key ?? '') === selectedStream);
+      titleEl.textContent = 'Machine telemetry';
+      descriptionEl.textContent = node
+        ? `Focused view for ${String((node.stream || {}).node ?? selectedStream)}.`
+        : 'The selected machine is not present in the current fleet snapshot.';
+      if (!node) {
+        nodesEl.innerHTML = `<div class="empty">
+          <a class="focus-back" href="/view/fleet">← All machines</a>
+          <h2>Machine not found</h2>
+          <p>No machine with stream key <strong>${escapeHtml(selectedStream)}</strong> is present in this snapshot.</p>
+        </div>`;
+        return;
+      }
+      nodesEl.innerHTML = renderFocusedNode(node);
+    }
+
+    function setStatus(message, state) {
+      statusEl.textContent = message;
+      statusEl.className = `pill ${state}`;
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch(API_URL, { cache: 'no-store' });
+        if (!response.ok) throw new Error(`Snapshot request failed: HTTP ${response.status}`);
+        const snapshot = await response.json();
+        render(snapshot);
+        setStatus(`Updated ${new Date().toLocaleTimeString()}`, 'ok');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setStatus(message, 'bad');
+      }
+    }
+
+    refresh();
+    window.setInterval(refresh, POLL_MS);
+  })();
+  </script>
+</body>
+</html>

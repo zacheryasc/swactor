@@ -13,6 +13,7 @@ pub mod docker_cluster_provisioning;
 pub mod driver_pumps;
 pub mod edge_establisher;
 pub mod engine_builder;
+pub mod gguf_metadata;
 pub mod gpu_worker_ctl;
 pub mod gpu_worker_egress_producer;
 pub mod gpu_worker_ingress_parser;

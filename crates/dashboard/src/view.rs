@@ -52,7 +52,7 @@ impl ViewRegistry {
     }
 
     pub fn dispatch(&self, stream: &StreamId, frame: &Frame, event: &FrameEvent) {
-        let channel = frame.channel.as_str();
+        let channel = event.channel.as_str();
         for view in self.views.read().iter() {
             let channels = view.channels();
             if channels.is_empty() || channels.contains(&channel) {

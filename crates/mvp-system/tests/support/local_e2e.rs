@@ -318,7 +318,15 @@ fn run_supervisor_once(run_id: u64, print_summary: bool) -> Result<(), String> {
                         return Err(format!("run failed: {event:?}"));
                     }
                 },
-                OrchestratorReport::Snapshot { .. } => {}
+                OrchestratorReport::StageFault {
+                    run_id,
+                    stage_index,
+                } => return Err(format!("stage {stage_index} faulted in run {run_id}")),
+                OrchestratorReport::NodeRuntimeReady { .. }
+                | OrchestratorReport::NodeRuntimeReadyAck { .. }
+                | OrchestratorReport::WeightsReady { .. }
+                | OrchestratorReport::StageReady { .. }
+                | OrchestratorReport::Snapshot { .. } => {}
             }
         }
 
@@ -800,7 +808,14 @@ fn handle_node_command(
                 .map_err(|e| format!("mark worker ready: {e}"))
         }
         StageCommandWire::LoadWeights { .. } => runtime
-            .send_to(node_actor, NodeAgentMsg::MarkWeightsReady)
+            .send_to(
+                node_actor,
+                NodeAgentMsg::MarkWeightsReady {
+                    run_id: RUN_ID,
+                    node_id: 0,
+                    stage_index: local_stage_index,
+                },
+            )
             .map_err(|e| format!("mark weights ready: {e}")),
         StageCommandWire::ExecuteStep {
             step_id,

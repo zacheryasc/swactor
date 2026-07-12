@@ -3,13 +3,11 @@
 //! The pipe owns frames, ordering, transport, ingest, and storage. It does not
 //! own the universe of channel meanings. Producers and consumers define records
 //! in their own crates by implementing [`Record`], then optionally compose a
-//! [`ChannelRegistry`] when a view needs to render payload bytes.
+//! [`ChannelRegistry`] when a view needs to render payload bytes by channel name.
 
 use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
-
-use crate::frame::ChannelId;
 
 /// How a view should treat a channel's payload bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,29 +20,29 @@ pub enum ChannelKind {
     Opaque,
 }
 
-/// Caller-owned channel classifier used by views.
+/// Caller-owned channel-name classifier used by views.
 pub trait ChannelClassifier {
-    fn classify(&self, channel: &ChannelId) -> ChannelKind;
+    fn classify(&self, channel_name: &str) -> ChannelKind;
 }
 
 impl<F> ChannelClassifier for F
 where
-    F: Fn(&ChannelId) -> ChannelKind,
+    F: Fn(&str) -> ChannelKind,
 {
-    fn classify(&self, channel: &ChannelId) -> ChannelKind {
-        self(channel)
+    fn classify(&self, channel_name: &str) -> ChannelKind {
+        self(channel_name)
     }
 }
 
 /// A typed channel record: crates define their own records and bind each one to
-/// the channel it rides on.
+/// the channel name it rides on.
 pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
-    /// The concrete channel this record is carried on.
+    /// The concrete channel name this record is carried on.
     const CHANNEL: &'static str;
 
-    /// The channel id this record is carried on.
-    fn channel() -> ChannelId {
-        ChannelId::new(Self::CHANNEL)
+    /// The channel name this record is carried on.
+    fn channel_name() -> &'static str {
+        Self::CHANNEL
     }
 
     /// Encode this record to opaque payload bytes.
@@ -91,15 +89,14 @@ impl ChannelRegistry {
         self
     }
 
-    pub fn classify_channel(&self, channel: &ChannelId) -> ChannelKind {
-        let id = channel.as_str();
-        if self.typed.contains(id) {
+    pub fn classify_name(&self, channel: &str) -> ChannelKind {
+        if self.typed.contains(channel) {
             ChannelKind::Typed
-        } else if self.text.contains(id)
+        } else if self.text.contains(channel)
             || self
                 .text_prefixes
                 .iter()
-                .any(|prefix| id.starts_with(prefix))
+                .any(|prefix| channel.starts_with(prefix))
         {
             ChannelKind::Text
         } else {
@@ -109,7 +106,7 @@ impl ChannelRegistry {
 }
 
 impl ChannelClassifier for ChannelRegistry {
-    fn classify(&self, channel: &ChannelId) -> ChannelKind {
-        self.classify_channel(channel)
+    fn classify(&self, channel_name: &str) -> ChannelKind {
+        self.classify_name(channel_name)
     }
 }

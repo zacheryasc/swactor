@@ -1,3 +1,6 @@
+pub const MO01_HEADER_BYTES: u64 = 40;
+const TOKEN_ID_WIDTH_BYTES: u32 = 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RunId(pub u64);
 
@@ -405,14 +408,22 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
         return Err(reject(PlanRejectionKind::InvalidObjectSpec));
     }
 
+    let token_extent = input
+        .model
+        .max_seq_len
+        .checked_mul(u64::from(TOKEN_ID_WIDTH_BYTES))
+        .ok_or_else(|| reject(PlanRejectionKind::InvalidObjectSpec))?;
+    if token_extent == 0 {
+        return Err(reject(PlanRejectionKind::InvalidObjectSpec));
+    }
     let token_spec = ObjectSpec {
         kind: ObjectKind::Token,
-        max_extent: 64,
+        max_extent: token_extent,
         dtype_family: input.model.dtype_family,
-        dtype_width_bytes: 4,
+        dtype_width_bytes: TOKEN_ID_WIDTH_BYTES,
         shape: ShapeRule::TokenIds,
         layout: LayoutRule::Contiguous,
-        alignment: input.token_ring.alignment,
+        alignment: TOKEN_ID_WIDTH_BYTES,
         sequence_policy: SequencePolicy::Ordered,
     };
     let activation_spec = ObjectSpec {
@@ -425,9 +436,14 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
             hidden_dim,
         },
         layout: LayoutRule::Contiguous,
-        alignment: input.activation_ring.alignment,
+        alignment: dtype_width_bytes,
         sequence_policy: SequencePolicy::Ordered,
     };
+    let token_data_capacity = MO01_HEADER_BYTES
+        .checked_add(token_extent)
+        .ok_or_else(|| reject(PlanRejectionKind::InvalidObjectSpec))?;
+    let mut token_ring = input.token_ring;
+    token_ring.data_capacity = token_ring.data_capacity.max(token_data_capacity);
 
     let mut edge_allocator = EdgeAllocator::new();
     let token_in_edge = edge_allocator.alloc();
@@ -450,7 +466,7 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
             stage_index: 0,
         },
         object_spec: token_spec,
-        ring_spec: input.token_ring,
+        ring_spec: token_ring,
     });
 
     for stage_index in 0..input.stage_count.saturating_sub(1) {
@@ -483,7 +499,7 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
             node_id: input.orchestrator_node_id,
         },
         object_spec: token_spec,
-        ring_spec: input.token_ring,
+        ring_spec: token_ring,
     });
 
     let mut stages = Vec::with_capacity(input.stage_count as usize);

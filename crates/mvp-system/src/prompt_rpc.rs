@@ -60,8 +60,22 @@ impl NetworkMessage for PromptEvent {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TokenizerEvent {
+    PromptEncoded { request_id: u64, tokens: Vec<u32> },
+    TokensDecoded { request_id: u64, text: String },
+    Fault { request_id: u64, error: String },
+}
+
+impl NetworkMessage for TokenizerEvent {
+    fn type_tag() -> &'static str {
+        "mvp_system::TokenizerEvent"
+    }
+}
+
 pub fn register_codecs(registry: &mut CodecRegistry) {
     registry.register::<PromptEvent, _>(JsonCodec::<PromptEvent>::default());
+    registry.register::<TokenizerEvent, _>(JsonCodec::<TokenizerEvent>::default());
 }
 
 pub fn write_json_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(), String> {

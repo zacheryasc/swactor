@@ -40,8 +40,8 @@ name = "mvp-orchestrator"
 path = "src/bin/orchestrator.rs"
 
 [[bin]]
-name = "mvp-one-node-chat"
-path = "src/bin/mvp_one_node_chat.rs"
+name = "mvp-chat"
+path = "src/bin/mvp_chat.rs"
 
 [[test]]
 name = "local_unmocked_mvp_e2e"

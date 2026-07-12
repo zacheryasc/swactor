@@ -6,11 +6,14 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::Path;
-use std::process::{ChildStdin, Command, Stdio};
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +152,29 @@ pub struct LocalDockerPlugin {
 struct LocalDockerNode {
     container_name: String,
     stdin: ChildStdin,
+}
+
+pub struct LocalProcessPlugin {
+    program: PathBuf,
+    next_handle_id: u64,
+    nodes: BTreeMap<u64, LocalProcessNode>,
+}
+
+struct LocalProcessNode {
+    stdin: ChildStdin,
+    child: Arc<Mutex<Option<Child>>>,
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+}
+
+impl LocalProcessPlugin {
+    pub fn new(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+            next_handle_id: 1,
+            nodes: BTreeMap::new(),
+        }
+    }
 }
 
 impl LocalDockerPlugin {
@@ -319,6 +345,213 @@ fn docker_status_vec(args: Vec<String>, label: &str) -> Result<(), String> {
     }
 }
 
+fn lock_process_child(
+    child: &Arc<Mutex<Option<Child>>>,
+) -> std::sync::MutexGuard<'_, Option<Child>> {
+    child
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+impl ProvisionPlugin for LocalProcessPlugin {
+    fn start_node(
+        &mut self,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<PluginNodeHandle, String> {
+        let mut command = Command::new(&self.program);
+        for (key, value) in &spec.env {
+            command.env(key, value);
+        }
+        command.args(&spec.args);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(target_os = "linux")]
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+
+        let mut child = command.spawn().map_err(|e| {
+            format!(
+                "spawn local process node {} with {}: {e}",
+                spec.node_id,
+                self.program.display()
+            )
+        })?;
+        let provider_process_id = child.id();
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| format!("local process node {} stdin missing", spec.node_id))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| format!("local process node {} stdout missing", spec.node_id))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("local process node {} stderr missing", spec.node_id))?;
+
+        let child = Arc::new(Mutex::new(Some(child)));
+        let handle = PluginNodeHandle {
+            id: self.next_handle_id,
+            provider_process_id: Some(provider_process_id),
+        };
+        self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
+        self.nodes.insert(
+            handle.id,
+            LocalProcessNode {
+                stdin,
+                child: Arc::clone(&child),
+                spec: spec.clone(),
+                sink: sink.clone(),
+            },
+        );
+
+        spawn_stdout_reader(spec.clone(), sink.clone(), stdout);
+        spawn_stderr_reader(spec.clone(), sink.clone(), stderr);
+        thread::spawn(move || {
+            loop {
+                let observation = {
+                    let mut slot = lock_process_child(&child);
+                    let Some(child) = slot.as_mut() else {
+                        return;
+                    };
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            *slot = None;
+                            Some(PluginObservation::Exited {
+                                run_id: spec.run_id,
+                                node_id: spec.node_id,
+                                status: status.code(),
+                            })
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            *slot = None;
+                            Some(PluginObservation::Failed {
+                                run_id: spec.run_id,
+                                node_id: spec.node_id,
+                                reason: format!("wait local process node: {error}"),
+                            })
+                        }
+                    }
+                };
+                if let Some(observation) = observation {
+                    sink.observe(observation);
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        Ok(handle)
+    }
+
+    fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        let Some(mut node) = self.nodes.remove(&handle.id) else {
+            return Ok(());
+        };
+        let _ = node.stdin.write_all(b"shutdown\n");
+        let _ = node.stdin.flush();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let observation = {
+                let mut slot = lock_process_child(&node.child);
+                let Some(child) = slot.as_mut() else {
+                    return Ok(());
+                };
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        *slot = None;
+                        Some(PluginObservation::Exited {
+                            run_id: node.spec.run_id,
+                            node_id: node.spec.node_id,
+                            status: status.code(),
+                        })
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        *slot = None;
+                        Some(PluginObservation::Failed {
+                            run_id: node.spec.run_id,
+                            node_id: node.spec.node_id,
+                            reason: format!("wait local process node: {error}"),
+                        })
+                    }
+                }
+            };
+            if let Some(observation) = observation {
+                node.sink.observe(observation);
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let observation = {
+            let mut slot = lock_process_child(&node.child);
+            let Some(child) = slot.as_mut() else {
+                return Ok(());
+            };
+            #[cfg(target_os = "linux")]
+            unsafe {
+                let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            match child.wait() {
+                Ok(status) => {
+                    *slot = None;
+                    PluginObservation::Exited {
+                        run_id: node.spec.run_id,
+                        node_id: node.spec.node_id,
+                        status: status.code(),
+                    }
+                }
+                Err(error) => {
+                    *slot = None;
+                    PluginObservation::Failed {
+                        run_id: node.spec.run_id,
+                        node_id: node.spec.node_id,
+                        reason: format!("kill local process node: {error}"),
+                    }
+                }
+            }
+        };
+        node.sink.observe(observation);
+        Ok(())
+    }
+}
+
+impl Drop for LocalProcessPlugin {
+    fn drop(&mut self) {
+        let handles = self
+            .nodes
+            .keys()
+            .copied()
+            .map(|id| PluginNodeHandle {
+                id,
+                provider_process_id: None,
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let _ = self.stop_node(&handle);
+        }
+    }
+}
+
 impl ProvisionPlugin for LocalDockerPlugin {
     fn start_node(
         &mut self,
@@ -473,6 +706,118 @@ fn spawn_stderr_reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[derive(Default)]
+    struct RecordingSink {
+        observations: Mutex<Vec<PluginObservation>>,
+    }
+
+    impl RecordingSink {
+        fn observations(&self) -> Vec<PluginObservation> {
+            self.observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl PluginObservationSink for RecordingSink {
+        fn observe(&self, observation: PluginObservation) {
+            self.observations
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(observation);
+        }
+    }
+
+    fn recording_sink() -> (Arc<RecordingSink>, PluginSink) {
+        let recorder = Arc::new(RecordingSink::default());
+        (Arc::clone(&recorder), PluginSink::new(recorder))
+    }
+
+    fn wait_for_observation(
+        recorder: &RecordingSink,
+        predicate: impl Fn(&PluginObservation) -> bool,
+    ) -> PluginObservation {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(observation) = recorder
+                .observations()
+                .into_iter()
+                .find(|observation| predicate(observation))
+            {
+                return observation;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for observation; observed: {:?}",
+                recorder.observations()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn process_spec(node_id: u64, args: Vec<String>) -> NodeProvisionSpec {
+        NodeProvisionSpec {
+            run_id: 17,
+            node_id,
+            stage_index: Some(2),
+            image: "unused-for-local-process".to_owned(),
+            env: vec![("MVP_RUN_ID".to_owned(), "17".to_owned())],
+            args,
+            mounts: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    struct TempScript {
+        root: PathBuf,
+        path: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl TempScript {
+        fn new(name: &str, content: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "mvp-local-process-plugin-{name}-{}-{}",
+                std::process::id(),
+                thread::current().name().unwrap_or("unnamed")
+            ));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("create temp script directory");
+            let path = root.join("helper.sh");
+            fs::write(&path, content).expect("write local process helper");
+            let mut permissions = fs::metadata(&path)
+                .expect("stat local process helper")
+                .permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&path, permissions).expect("chmod local process helper");
+            Self { root, path }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TempScript {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_alive(pid: u32) -> bool {
+        unsafe {
+            if libc::kill(pid as i32, 0) == 0 {
+                true
+            } else {
+                std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            }
+        }
+    }
 
     fn spec_with_mounts(mounts: Vec<ProviderMount>) -> NodeProvisionSpec {
         NodeProvisionSpec {
@@ -541,6 +886,109 @@ mod tests {
         assert_eq!(
             docker_mount_arg(&writable_mount),
             "type=bind,src=/cache/models/model.gguf,dst=/models/cached/model.gguf"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_process_plugin_observes_stdio_frames_and_graceful_shutdown() {
+        let helper = TempScript::new(
+            "graceful",
+            r#"#!/bin/sh
+printf '%s\n' '{"mvp_stdio_event":1,"kind":"datastream_frame","channel":"mvp.node.bootstrap","payload":{"type":"TestFrame","status":"ready"}}'
+printf '%s\n' 'local-process-stderr' >&2
+while IFS= read -r line; do
+    if [ "$line" = shutdown ]; then
+        exit 0
+    fi
+done
+exit 0
+"#,
+        );
+        let mut plugin = LocalProcessPlugin::new("/bin/sh");
+        let (recorder, sink) = recording_sink();
+        let spec = process_spec(23, vec![helper.path.to_string_lossy().to_string()]);
+
+        let handle = plugin
+            .start_node(spec, sink)
+            .expect("start local process node");
+
+        assert!(handle.provider_process_id.is_some());
+        wait_for_observation(&recorder, |observation| {
+            matches!(
+                observation,
+                PluginObservation::DatastreamFrame {
+                    channel,
+                    payload,
+                    ..
+                } if channel == "mvp.node.bootstrap"
+                    && payload.contains("\"TestFrame\"")
+                    && payload.contains("\"ready\"")
+            )
+        });
+        wait_for_observation(&recorder, |observation| {
+            matches!(
+                observation,
+                PluginObservation::StderrLine { line, .. } if line == "local-process-stderr"
+            )
+        });
+
+        plugin.stop_node(&handle).expect("stop local process node");
+
+        wait_for_observation(&recorder, |observation| {
+            matches!(
+                observation,
+                PluginObservation::Exited {
+                    node_id: 23,
+                    status: Some(0),
+                    ..
+                }
+            )
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_process_plugin_kills_and_reaps_unresponsive_child() {
+        let helper = TempScript::new(
+            "unresponsive",
+            r#"#!/bin/sh
+while :; do
+    sleep 1
+done
+"#,
+        );
+        let mut plugin = LocalProcessPlugin::new("/bin/sh");
+        let (recorder, sink) = recording_sink();
+        let spec = process_spec(24, vec![helper.path.to_string_lossy().to_string()]);
+        let handle = plugin
+            .start_node(spec, sink)
+            .expect("start unresponsive local process node");
+        let pid = handle
+            .provider_process_id
+            .expect("local process handle exposes child pid");
+
+        plugin
+            .stop_node(&handle)
+            .expect("stop unresponsive local process node");
+
+        wait_for_observation(&recorder, |observation| {
+            matches!(
+                observation,
+                PluginObservation::Exited {
+                    node_id: 24,
+                    status,
+                    ..
+                } if *status != Some(0)
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !process_alive(pid),
+            "local process child {pid} is still live"
         );
     }
 }

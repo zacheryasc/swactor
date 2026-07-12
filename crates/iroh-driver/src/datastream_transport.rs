@@ -1,24 +1,24 @@
 //! Iroh/QUIC transport adapter for datastream subscriptions.
-//!
-//! Swactor actors negotiate whether a subscription should exist; this module is
-//! the byte plane. It uses Iroh's endpoint/connection machinery and an ALPN
-//! separate from actor traffic, so NAT traversal and relay fallback stay owned
-//! by Iroh while datastream frames avoid per-frame actor messages.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
-use datastream::DatastreamSubscription;
-use datastream::transport::Delivery;
-use datastream::wire::{decode_delivery, encode_delivery};
+use datastream::{
+    CatalogSnapshot, ChannelDescriptor, ChannelId, ChannelRef, DatastreamEvent, DatastreamSnapshot,
+    DatastreamSubscription, FrameDelivery, Position, StreamDescriptor,
+};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use tokio::runtime::Handle;
 
 pub const DATASTREAM_ALPN: &[u8] = b"swactor/datastream/0";
 
-const MAGIC: &[u8; 4] = b"DSQ0";
+const MAGIC: &[u8; 4] = b"DSQ1";
+const TAG_CHANNEL_DECLARED: u8 = 0x01;
+const TAG_FRAME: u8 = 0x02;
+const TAG_STREAM_ENDED: u8 = 0x03;
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -27,40 +27,51 @@ type BoxError = Box<dyn Error + Send + Sync + 'static>;
 pub struct DatastreamQuicHeader {
     pub flow_id: [u8; 16],
     pub token: Vec<u8>,
+    pub stream: StreamDescriptor,
+    pub channels: Vec<ChannelDescriptor>,
 }
 
 impl DatastreamQuicHeader {
-    pub fn new(flow_id: [u8; 16], token: impl Into<Vec<u8>>) -> Self {
+    pub fn new(
+        flow_id: [u8; 16],
+        token: impl Into<Vec<u8>>,
+        stream: StreamDescriptor,
+        channels: Vec<ChannelDescriptor>,
+    ) -> Self {
         Self {
             flow_id,
             token: token.into(),
+            stream,
+            channels,
         }
     }
-}
 
-impl Default for DatastreamQuicHeader {
-    fn default() -> Self {
-        Self {
-            flow_id: [0; 16],
-            token: Vec::new(),
-        }
+    pub fn from_snapshot(
+        flow_id: [u8; 16],
+        token: impl Into<Vec<u8>>,
+        snapshot: &DatastreamSnapshot,
+    ) -> Result<Self, BoxError> {
+        let stream = snapshot
+            .streams
+            .first()
+            .cloned()
+            .ok_or("datastream subscription snapshot has no stream")?;
+        Ok(Self::new(flow_id, token, stream, snapshot.channels.clone()))
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct DatastreamQuicWriteStats {
-    pub deliveries: usize,
+    pub events: usize,
     pub bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatastreamQuicRead {
     pub header: DatastreamQuicHeader,
-    pub deliveries: Vec<Delivery>,
+    pub events: Vec<DatastreamEvent>,
 }
 
-/// Connect to `peer` with [`DATASTREAM_ALPN`] and stream a subscription until
-/// the endpoint side is dropped.
 pub fn spawn_subscription_writer(
     handle: &Handle,
     endpoint: Endpoint,
@@ -81,8 +92,6 @@ pub fn spawn_subscription_writer(
     })
 }
 
-/// Drain whatever is currently queued for `subscription`, write it, and finish
-/// the QUIC stream. This is useful for deterministic tests and one-shot tools.
 pub async fn write_available_subscription(
     send: SendStream,
     header: &DatastreamQuicHeader,
@@ -91,7 +100,6 @@ pub async fn write_available_subscription(
     write_subscription_inner(send, header, subscription, None).await
 }
 
-/// Write subscription deliveries until the sender side disappears.
 pub async fn write_subscription_until_closed(
     mut send: SendStream,
     header: DatastreamQuicHeader,
@@ -102,9 +110,12 @@ pub async fn write_subscription_until_closed(
     let mut stats = DatastreamQuicWriteStats::default();
     loop {
         match subscription.try_recv() {
-            Ok(delivery) => {
-                stats.bytes += write_delivery(&mut send, &delivery).await?;
-                stats.deliveries += 1;
+            Ok(event) => {
+                let bytes = write_event(&mut send, &event).await?;
+                if bytes > 0 {
+                    stats.bytes += bytes;
+                    stats.events += 1;
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 tokio::time::sleep(idle_sleep).await;
@@ -126,9 +137,12 @@ async fn write_subscription_inner(
     let mut stats = DatastreamQuicWriteStats::default();
     loop {
         match subscription.try_recv() {
-            Ok(delivery) => {
-                stats.bytes += write_delivery(&mut send, &delivery).await?;
-                stats.deliveries += 1;
+            Ok(event) => {
+                let bytes = write_event(&mut send, &event).await?;
+                if bytes > 0 {
+                    stats.bytes += bytes;
+                    stats.events += 1;
+                }
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => match idle_sleep {
                 Some(delay) => tokio::time::sleep(delay).await,
@@ -141,45 +155,62 @@ async fn write_subscription_inner(
     Ok(stats)
 }
 
-pub async fn write_delivery(send: &mut SendStream, delivery: &Delivery) -> Result<usize, BoxError> {
-    let bytes = encode_delivery(&delivery.stream, &delivery.frame);
-    if bytes.len() > u32::MAX as usize {
-        return Err("datastream delivery exceeds u32 length prefix".into());
+pub async fn write_event(
+    send: &mut SendStream,
+    event: &DatastreamEvent,
+) -> Result<usize, BoxError> {
+    let mut bytes = Vec::new();
+    match event {
+        DatastreamEvent::StreamDeclared(_) => return Ok(0),
+        DatastreamEvent::ChannelDeclared(descriptor) => {
+            bytes.push(TAG_CHANNEL_DECLARED);
+            put_json(&mut bytes, descriptor)?;
+        }
+        DatastreamEvent::Frame(delivery) => {
+            bytes.push(TAG_FRAME);
+            bytes.extend_from_slice(&delivery.channel.channel.0.to_le_bytes());
+            bytes.extend_from_slice(&delivery.position.0.to_le_bytes());
+            put_bytes(&mut bytes, &delivery.payload)?;
+        }
+        DatastreamEvent::StreamEnded(_) => {
+            bytes.push(TAG_STREAM_ENDED);
+        }
+    }
+    if bytes.len() > MAX_RECORD_BYTES {
+        return Err("datastream QUIC record exceeds max size".into());
     }
     send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
     send.write_all(&bytes).await?;
     Ok(4 + bytes.len())
 }
 
-/// Read one unidirectional datastream QUIC stream to completion.
-pub async fn read_deliveries_from_stream(
-    mut recv: RecvStream,
-) -> Result<DatastreamQuicRead, BoxError> {
+pub async fn read_stream_header(recv: &mut RecvStream) -> Result<DatastreamQuicHeader, BoxError> {
+    read_header(recv).await
+}
+
+pub async fn read_events_from_stream(mut recv: RecvStream) -> Result<DatastreamQuicRead, BoxError> {
     let header = read_header(&mut recv).await?;
-    let mut deliveries = Vec::new();
+    let mut events = Vec::new();
     loop {
-        match read_next_delivery(&mut recv).await? {
-            Some(delivery) => deliveries.push(delivery),
+        match read_next_event(&mut recv, &header.stream).await? {
+            Some(event) => events.push(event),
             None => break,
         }
     }
-    Ok(DatastreamQuicRead { header, deliveries })
+    Ok(DatastreamQuicRead { header, events })
 }
 
-/// Read the next accepted unidirectional stream from a datastream connection.
 pub async fn read_next_uni_from_connection(
     conn: &Connection,
 ) -> Result<DatastreamQuicRead, BoxError> {
     let recv = conn.accept_uni().await?;
-    read_deliveries_from_stream(recv).await
+    read_events_from_stream(recv).await
 }
 
-/// Spawn readers for every unidirectional stream on an accepted datastream
-/// connection, forwarding decoded deliveries to `sink`.
 pub fn spawn_connection_reader(
     handle: &Handle,
     conn: Connection,
-    sink: std::sync::mpsc::Sender<Delivery>,
+    sink: std::sync::mpsc::Sender<DatastreamEvent>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     handle.spawn(async move {
         loop {
@@ -187,11 +218,11 @@ pub fn spawn_connection_reader(
                 Ok(recv) => recv,
                 Err(error) => return Err(error.to_string()),
             };
-            let read = read_deliveries_from_stream(recv)
+            let read = read_events_from_stream(recv)
                 .await
                 .map_err(|error| error.to_string())?;
-            for delivery in read.deliveries {
-                if sink.send(delivery).is_err() {
+            for event in read.events {
+                if sink.send(event).is_err() {
                     return Ok(());
                 }
             }
@@ -211,6 +242,8 @@ async fn write_header(
     send.write_all(&(header.token.len() as u16).to_le_bytes())
         .await?;
     send.write_all(&header.token).await?;
+    write_json(send, &header.stream).await?;
+    write_json(send, &header.channels).await?;
     Ok(())
 }
 
@@ -227,10 +260,20 @@ async fn read_header(recv: &mut RecvStream) -> Result<DatastreamQuicHeader, BoxE
     let token_len = u16::from_le_bytes(token_len) as usize;
     let mut token = vec![0u8; token_len];
     recv.read_exact(&mut token).await?;
-    Ok(DatastreamQuicHeader { flow_id, token })
+    let stream = read_json(recv).await?;
+    let channels = read_json(recv).await?;
+    Ok(DatastreamQuicHeader {
+        flow_id,
+        token,
+        stream,
+        channels,
+    })
 }
 
-async fn read_next_delivery(recv: &mut RecvStream) -> Result<Option<Delivery>, BoxError> {
+pub async fn read_next_event(
+    recv: &mut RecvStream,
+    stream: &StreamDescriptor,
+) -> Result<Option<DatastreamEvent>, BoxError> {
     let mut len = [0u8; 4];
     if recv.read_exact(&mut len).await.is_err() {
         return Ok(None);
@@ -241,17 +284,110 @@ async fn read_next_delivery(recv: &mut RecvStream) -> Result<Option<Delivery>, B
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await?;
-    let (stream, frame) = decode_delivery(&buf)?;
-    Ok(Some(Delivery::new(stream, frame)))
+    decode_record(&buf, stream).map(Some)
 }
 
-/// Share an accepted delivery stream with several local consumers without
-/// making those consumers know about Iroh.
+fn decode_record(buf: &[u8], stream: &StreamDescriptor) -> Result<DatastreamEvent, BoxError> {
+    if buf.is_empty() {
+        return Err("empty datastream QUIC record".into());
+    }
+    match buf[0] {
+        TAG_CHANNEL_DECLARED => {
+            let descriptor: ChannelDescriptor = serde_json::from_slice(&buf[1..])?;
+            Ok(DatastreamEvent::ChannelDeclared(descriptor))
+        }
+        TAG_FRAME => {
+            if buf.len() < 1 + 4 + 8 + 4 {
+                return Err("datastream QUIC frame record truncated".into());
+            }
+            let channel = ChannelId(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]));
+            let position = Position(u64::from_le_bytes([
+                buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11], buf[12],
+            ]));
+            let mut len = [0u8; 4];
+            len.copy_from_slice(&buf[13..17]);
+            let payload_len = u32::from_le_bytes(len) as usize;
+            let payload = buf
+                .get(17..17 + payload_len)
+                .ok_or("datastream QUIC frame payload truncated")?;
+            if 17 + payload_len != buf.len() {
+                return Err("bytes remain after datastream QUIC frame record".into());
+            }
+            Ok(DatastreamEvent::Frame(FrameDelivery {
+                channel: ChannelRef {
+                    stream: stream.stream.clone(),
+                    channel,
+                },
+                position,
+                payload: payload.to_vec(),
+            }))
+        }
+        TAG_STREAM_ENDED => Ok(DatastreamEvent::StreamEnded(stream.stream.clone())),
+        _ => Err("unknown datastream QUIC record tag".into()),
+    }
+}
+
 pub async fn read_stream_into_fanout(
     recv: RecvStream,
     fanout: Arc<datastream::DeliveryFanout>,
 ) -> Result<DatastreamQuicHeader, BoxError> {
-    let read = read_deliveries_from_stream(recv).await?;
-    fanout.publish_batch(read.deliveries);
+    let read = read_events_from_stream(recv).await?;
+    let catalog = catalog_from_header(&read.header);
+    fanout.publish_batch(read.events, &catalog);
     Ok(read.header)
+}
+
+fn catalog_from_header(header: &DatastreamQuicHeader) -> CatalogSnapshot {
+    let mut streams = BTreeMap::new();
+    streams.insert(header.stream.stream.clone(), header.stream.clone());
+    let channels = header
+        .channels
+        .iter()
+        .map(|descriptor| {
+            (
+                ChannelRef {
+                    stream: descriptor.stream.clone(),
+                    channel: descriptor.id,
+                },
+                descriptor.clone(),
+            )
+        })
+        .collect();
+    CatalogSnapshot { streams, channels }
+}
+
+fn put_json<T: serde::Serialize>(out: &mut Vec<u8>, value: &T) -> Result<(), BoxError> {
+    out.extend_from_slice(&serde_json::to_vec(value)?);
+    Ok(())
+}
+
+fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), BoxError> {
+    if bytes.len() > u32::MAX as usize {
+        return Err("datastream delivery exceeds u32 length prefix".into());
+    }
+    out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+async fn write_json<T: serde::Serialize>(send: &mut SendStream, value: &T) -> Result<(), BoxError> {
+    let bytes = serde_json::to_vec(value)?;
+    if bytes.len() > u32::MAX as usize {
+        return Err("datastream header JSON exceeds u32 length prefix".into());
+    }
+    send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+    send.write_all(&bytes).await?;
+    Ok(())
+}
+
+async fn read_json<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Result<T, BoxError> {
+    let mut len = [0u8; 4];
+    recv.read_exact(&mut len).await?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_RECORD_BYTES {
+        return Err("datastream QUIC record exceeds max size".into());
+    }
+    let mut bytes = vec![0u8; len];
+    recv.read_exact(&mut bytes).await?;
+    Ok(serde_json::from_slice(&bytes)?)
 }

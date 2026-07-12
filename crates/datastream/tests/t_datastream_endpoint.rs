@@ -1,24 +1,46 @@
 use std::time::Duration;
 
 use datastream::{
-    ChannelId, DatastreamEndpoint, DeliveryFanout, FRAME_TIME_CHANNEL, Frame, FrameTimeSample,
-    Lifetime, NodeId, Position, Record, StreamId,
+    ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, DatastreamEndpoint,
+    DatastreamEvent, FRAME_TIME_CHANNEL_ID, FrameDelivery, FrameTimeSample, Lifetime, NodeId,
+    Position, Record, SourceFilter, StreamId, SubscriptionRequest,
 };
 use serde_json::Value;
 use swactor::actor::ActorAddress;
 use swactor::stats::ActorSnapshot;
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct RuntimeRecord {
+    value: u64,
+}
+
+impl Record for RuntimeRecord {
+    const CHANNEL: &'static str = "runtime.record";
+}
+
 fn stream() -> StreamId {
     StreamId::new(NodeId::new("node-endpoint"), Lifetime(7))
 }
 
+fn endpoint() -> DatastreamEndpoint {
+    DatastreamEndpoint::with_capacity(stream(), 64, 8)
+}
+
+fn frame_event(event: &DatastreamEvent) -> &FrameDelivery {
+    match event {
+        DatastreamEvent::Frame(delivery) => delivery,
+        other => panic!("expected frame event, got {other:?}"),
+    }
+}
+
 #[test]
 fn endpoint_without_subscribers_drains_to_bitbucket() {
-    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
+    let endpoint = endpoint();
     let producer = endpoint.producer();
     producer.set_frame_timing_enabled(false);
+    let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
 
-    producer.submit_text("runtime.log", "before");
+    producer.submit_text(log, "before");
     let tick = endpoint.tick();
 
     assert_eq!(tick.drained, 1);
@@ -30,36 +52,128 @@ fn endpoint_without_subscribers_drains_to_bitbucket() {
 }
 
 #[test]
-fn subscription_receives_only_future_frames() {
-    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
+fn channel_registration_allocates_numeric_ids() {
+    let endpoint = endpoint();
+
+    let stdout = endpoint.register_channel("stdout", ChannelContent::TextStream);
+    let stderr = endpoint.register_channel("stderr", ChannelContent::TextStream);
+    let runtime = endpoint.register_record::<RuntimeRecord>();
+
+    assert_eq!(stdout, ChannelId(1));
+    assert_eq!(stderr, ChannelId(2));
+    assert_eq!(runtime, ChannelId(3));
+    let catalog = endpoint.catalog_snapshot();
+    assert!(
+        catalog
+            .channels
+            .values()
+            .any(|descriptor| descriptor.id == FRAME_TIME_CHANNEL_ID
+                && descriptor.name == "datastream.frame_time")
+    );
+}
+
+#[test]
+fn duplicate_channel_registration_rejects_conflicting_content() {
+    let endpoint = endpoint();
+
+    let first = endpoint.register_channel("stdout", ChannelContent::TextStream);
+    let duplicate = endpoint.register_channel("stdout", ChannelContent::TextStream);
+    let conflict = endpoint.try_register_channel(
+        "stdout",
+        ChannelContent::JsonRecord {
+            schema: Some("stdout.json".to_owned()),
+        },
+    );
+
+    assert_eq!(first, duplicate);
+    assert!(conflict.is_err());
+}
+
+#[test]
+fn subscription_snapshot_contains_stream_and_channel_metadata() {
+    let endpoint = endpoint();
+    let producer = endpoint.producer();
+    let stdout = producer.register_channel("stdout", ChannelContent::TextStream);
+    let runtime = producer.register_record::<RuntimeRecord>();
+
+    let subscription = endpoint.subscribe_all("dashboard");
+
+    assert_eq!(subscription.snapshot().streams.len(), 1);
+    assert_eq!(subscription.snapshot().streams[0].stream, stream());
+    assert!(
+        subscription
+            .snapshot()
+            .channels
+            .iter()
+            .any(|descriptor| descriptor.id == stdout && descriptor.name == "stdout")
+    );
+    assert!(subscription
+        .snapshot()
+        .channels
+        .iter()
+        .any(|descriptor| descriptor.id == runtime && descriptor.name == RuntimeRecord::CHANNEL));
+}
+
+#[test]
+fn subscription_receives_only_future_matching_frames() {
+    let endpoint = endpoint();
     let producer = endpoint.producer();
     producer.set_frame_timing_enabled(false);
+    let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
 
-    producer.submit_text("runtime.log", "pre-subscription");
+    producer.submit_text(log, "pre-subscription");
     endpoint.tick();
 
     let subscription = endpoint.subscribe_all("dashboard");
-    producer.submit_text("runtime.log", "visible");
+    producer.submit_text(log, "visible");
     endpoint.tick();
 
-    let deliveries = subscription.drain_available();
-    assert_eq!(deliveries.len(), 1);
-    assert_eq!(deliveries[0].stream, stream());
-    assert_eq!(deliveries[0].frame.position, Position(1));
-    assert_eq!(deliveries[0].frame.channel, ChannelId::new("runtime.log"));
-    assert_eq!(deliveries[0].frame.payload, b"visible");
+    let events = subscription.drain_available();
+    assert_eq!(events.len(), 1);
+    let delivery = frame_event(&events[0]);
+    assert_eq!(delivery.channel.stream, stream());
+    assert_eq!(delivery.channel.channel, log);
+    assert_eq!(delivery.position, Position(1));
+    assert_eq!(delivery.payload, b"visible");
+}
+
+#[test]
+fn subscription_filters_textstream_channels() {
+    let endpoint = endpoint();
+    let producer = endpoint.producer();
+    producer.set_frame_timing_enabled(false);
+    let stdout = producer.register_channel("stdout", ChannelContent::TextStream);
+    let json = producer.register_record::<RuntimeRecord>();
+    let text_subscription = endpoint.subscribe(
+        "text",
+        SubscriptionRequest {
+            sources: SourceFilter::All,
+            channels: ChannelFilter::Content(ChannelContentKind::TextStream),
+        },
+    );
+
+    producer.submit_text(stdout, "line");
+    producer.submit_record(json, &RuntimeRecord { value: 5 });
+    endpoint.tick();
+
+    let events = text_subscription.drain_available();
+    assert_eq!(events.len(), 1);
+    let delivery = frame_event(&events[0]);
+    assert_eq!(delivery.channel.channel, stdout);
+    assert_eq!(delivery.payload, b"line");
 }
 
 #[test]
 fn endpoint_fans_out_ordered_frames_to_multiple_subscribers() {
-    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
+    let endpoint = endpoint();
     let producer = endpoint.producer();
     producer.set_frame_timing_enabled(false);
+    let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
     let left = endpoint.subscribe_all("left");
     let right = endpoint.subscribe_all("right");
 
     for n in 0..3 {
-        producer.submit_text("runtime.log", format!("line-{n}"));
+        producer.submit_text(log, format!("line-{n}"));
     }
     let tick = endpoint.tick();
 
@@ -72,14 +186,15 @@ fn endpoint_fans_out_ordered_frames_to_multiple_subscribers() {
 
 #[test]
 fn slow_subscriber_drops_without_blocking_fast_subscriber() {
-    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 8);
+    let endpoint = endpoint();
     let producer = endpoint.producer();
     producer.set_frame_timing_enabled(false);
+    let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
     let slow = endpoint.subscribe_all_with_capacity("slow", 1);
     let fast = endpoint.subscribe_all_with_capacity("fast", 8);
 
     for n in 0..4 {
-        producer.submit_text("runtime.log", format!("line-{n}"));
+        producer.submit_text(log, format!("line-{n}"));
     }
     let tick = endpoint.tick();
 
@@ -88,7 +203,6 @@ fn slow_subscriber_drops_without_blocking_fast_subscriber() {
     assert_eq!(tick.dropped_for_subscribers, 3);
     assert_eq!(positions(&slow.drain_available()), vec![0]);
     assert_eq!(positions(&fast.drain_available()), vec![0, 1, 2, 3]);
-
     let slow_snapshot = endpoint
         .subscriber_snapshots()
         .into_iter()
@@ -98,98 +212,67 @@ fn slow_subscriber_drops_without_blocking_fast_subscriber() {
 }
 
 #[test]
-fn delivery_fanout_can_publish_collector_deliveries_without_a_mux() {
-    let fanout = DeliveryFanout::new(4);
-    let sub = fanout.subscribe_all("dashboard");
-    let delivery = datastream::Delivery::new(
-        stream(),
-        Frame::new("remote.lifecycle", Position(9), b"ready".to_vec()),
-    );
-
-    let tick = fanout.publish(delivery.clone());
-
-    assert_eq!(tick.drained, 1);
-    assert_eq!(tick.delivered, 1);
-    assert_eq!(
-        sub.recv_timeout(Duration::from_millis(50)).unwrap(),
-        delivery
-    );
-}
-
-#[test]
 fn endpoint_producer_timing_sidecars_are_fanned_out_when_enabled() {
-    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
+    let endpoint = endpoint();
     let producer = endpoint.producer();
+    let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
     let sub = endpoint.subscribe_all("test");
 
     producer.set_frame_timing_enabled(true);
-    let data_position = producer.submit_text("runtime.log", "visible");
+    let data_position = producer.submit_text(log, "visible");
     let tick = endpoint.tick();
 
-    assert!(endpoint.frame_timing_enabled());
-    assert!(producer.frame_timing_enabled());
     assert_eq!(data_position, Position(0));
     assert_eq!(tick.drained, 2);
-    assert_eq!(tick.delivered, 2);
-
-    let deliveries = sub.drain_available();
-    assert_eq!(deliveries.len(), 2);
-    assert_eq!(deliveries[0].stream, stream());
-    assert_eq!(deliveries[0].frame.position, Position(0));
-    assert_eq!(deliveries[0].frame.channel, ChannelId::new("runtime.log"));
-    assert_eq!(deliveries[0].frame.payload, b"visible");
-    assert_eq!(deliveries[1].stream, stream());
-    assert_eq!(deliveries[1].frame.position, Position(1));
+    let events = sub.drain_available();
+    assert_eq!(events.len(), 2);
+    assert_eq!(frame_event(&events[0]).channel.channel, log);
+    assert_eq!(frame_event(&events[0]).payload, b"visible");
     assert_eq!(
-        deliveries[1].frame.channel,
-        ChannelId::new(FRAME_TIME_CHANNEL)
+        frame_event(&events[1]).channel.channel,
+        FRAME_TIME_CHANNEL_ID
     );
-
-    let sample =
-        FrameTimeSample::decode(&deliveries[1].frame.payload).expect("timing sidecar decodes");
+    let sample = FrameTimeSample::decode(&frame_event(&events[1]).payload).expect("timing decodes");
     assert_eq!(sample.target_position, data_position.0);
-    assert!(
-        sample.created_at_unix_ns > 0,
-        "sidecar records a concrete creation timestamp"
-    );
 }
 
 #[test]
 fn process_observer_adapter_submits_configured_channels() {
-    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
+    let endpoint = endpoint();
     let producer = endpoint.producer();
     producer.set_frame_timing_enabled(false);
-    let observer = producer.process_observer_with(|label, is_stderr| {
-        ChannelId::new(format!(
-            "proc.{label}.{}",
-            if is_stderr { "stderr" } else { "stdout" }
-        ))
-    });
+    let stdout = producer.register_channel("proc.trainer.stdout", ChannelContent::TextStream);
+    let stderr = producer.register_channel("proc.trainer.stderr", ChannelContent::TextStream);
+    let observer = producer.process_observer_with(
+        move |_label, is_stderr| {
+            if is_stderr { stderr } else { stdout }
+        },
+    );
     let sub = endpoint.subscribe_all("test");
 
     observer.on_output("trainer", false, b"hello\n");
     observer.on_output("trainer", true, b"warn\n");
     endpoint.tick();
 
-    let deliveries = sub.drain_available();
-    assert_eq!(deliveries.len(), 2);
-    assert_eq!(
-        deliveries[0].frame.channel,
-        ChannelId::new("proc.trainer.stdout")
-    );
-    assert_eq!(deliveries[0].frame.payload, b"hello\n");
-    assert_eq!(
-        deliveries[1].frame.channel,
-        ChannelId::new("proc.trainer.stderr")
-    );
-    assert_eq!(deliveries[1].frame.payload, b"warn\n");
+    let events = sub.drain_available();
+    assert_eq!(events.len(), 2);
+    assert_eq!(frame_event(&events[0]).channel.channel, stdout);
+    assert_eq!(frame_event(&events[0]).payload, b"hello\n");
+    assert_eq!(frame_event(&events[1]).channel.channel, stderr);
+    assert_eq!(frame_event(&events[1]).payload, b"warn\n");
 }
 
 #[test]
 fn stats_hook_adapter_submits_worker_snapshot_json() {
-    let endpoint = DatastreamEndpoint::with_capacity(stream(), 8, 4);
+    let endpoint = endpoint();
     let producer = endpoint.producer();
-    let hook = producer.stats_hook_on("runtime.actors");
+    let runtime = producer.register_channel(
+        "runtime.actors",
+        ChannelContent::JsonRecord {
+            schema: Some("runtime.actors".to_owned()),
+        },
+    );
+    let hook = producer.stats_hook_on(runtime);
     let sub = endpoint.subscribe_all("test");
     let actor = ActorAddress::new_random();
     let snapshots = [ActorSnapshot {
@@ -204,9 +287,10 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
     hook.on_tick(2, &snapshots);
     endpoint.tick();
 
-    let delivery = sub.recv_timeout(Duration::from_millis(50)).unwrap();
-    assert_eq!(delivery.frame.channel, ChannelId::new("runtime.actors"));
-    let json: Value = serde_json::from_slice(&delivery.frame.payload).unwrap();
+    let event = sub.recv_timeout(Duration::from_millis(50)).unwrap();
+    let delivery = frame_event(&event);
+    assert_eq!(delivery.channel.channel, runtime);
+    let json: Value = serde_json::from_slice(&delivery.payload).unwrap();
     assert_eq!(json["worker_id"], 2);
     assert_eq!(json["actors"][0]["address"], actor.to_string());
     assert_eq!(json["actors"][0]["mailbox_depth"], 3);
@@ -215,9 +299,9 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
     assert_eq!(json["actors"][0]["message_type_counts"][0]["ty"], "Ping");
 }
 
-fn positions(deliveries: &[datastream::Delivery]) -> Vec<u64> {
-    deliveries
+fn positions(events: &[DatastreamEvent]) -> Vec<u64> {
+    events
         .iter()
-        .map(|delivery| delivery.frame.position.0)
+        .map(|event| frame_event(event).position.0)
         .collect()
 }

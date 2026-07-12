@@ -1,22 +1,25 @@
 //! Process-local datastream endpoint.
 //!
-//! This is the sidecar a process creates next to a swactor runtime. It is not
-//! stored in core runtime state: producers get a cheap [`DatastreamProducer`],
-//! frames are ordered by the local [`Mux`], and subscribers receive future
-//! deliveries through bounded queues. With no subscribers, draining is a
-//! bitbucket.
+//! The endpoint is the stream owner: it allocates numeric channel ids, stores
+//! stream/channel metadata, orders producer frames through the mux, and fans
+//! catalog-aware events to subscribers.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use swactor::process_observer::ProcessOutputObserver;
 use swactor::stats::{ActorSnapshot, StatsHook};
 
-use crate::frame::{ChannelId, Position, StreamId};
+use crate::frame::{
+    ChannelContent, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef, DatastreamEvent,
+    FrameDelivery, Position, SourceFilter, StreamDescriptor, StreamId, StreamOrigin,
+    SubscriptionRequest,
+};
 use crate::mux::Mux;
 use crate::record::Record;
+use crate::timing::{FRAME_TIME_CHANNEL, FRAME_TIME_CHANNEL_ID};
 use crate::transport::Delivery;
 
 const DEFAULT_MUX_CAPACITY: usize = 4096;
@@ -30,11 +33,11 @@ pub struct SubscriptionId(pub u64);
 /// Drain statistics for one endpoint tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct EndpointTick {
-    /// Frames drained from the endpoint mux.
+    /// Events drained from the endpoint mux.
     pub drained: usize,
-    /// Delivery copies successfully enqueued to subscribers.
+    /// Event copies successfully enqueued to subscribers.
     pub delivered: usize,
-    /// Delivery copies dropped because a subscriber queue was full or closed.
+    /// Event copies dropped because a subscriber queue was full or closed.
     pub dropped_for_subscribers: usize,
     /// Number of subscribers present when the batch was published.
     pub subscribers: usize,
@@ -48,11 +51,26 @@ pub struct SubscriberSnapshot {
     pub dropped: u64,
 }
 
-/// Bounded future-frame subscription.
+/// Current catalog snapshot delivered at subscription time.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatastreamSnapshot {
+    pub streams: Vec<StreamDescriptor>,
+    pub channels: Vec<ChannelDescriptor>,
+}
+
+/// Channel registration failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChannelRegistrationError {
+    ConflictingName { name: String },
+}
+
+/// Bounded future-event subscription.
 pub struct DatastreamSubscription {
     id: SubscriptionId,
     name: String,
-    rx: mpsc::Receiver<Delivery>,
+    request: SubscriptionRequest,
+    snapshot: DatastreamSnapshot,
+    rx: mpsc::Receiver<DatastreamEvent>,
 }
 
 impl DatastreamSubscription {
@@ -64,25 +82,33 @@ impl DatastreamSubscription {
         &self.name
     }
 
-    pub fn try_recv(&self) -> Result<Delivery, mpsc::TryRecvError> {
+    pub fn request(&self) -> &SubscriptionRequest {
+        &self.request
+    }
+
+    pub fn snapshot(&self) -> &DatastreamSnapshot {
+        &self.snapshot
+    }
+
+    pub fn try_recv(&self) -> Result<DatastreamEvent, mpsc::TryRecvError> {
         self.rx.try_recv()
     }
 
-    pub fn recv(&self) -> Result<Delivery, mpsc::RecvError> {
+    pub fn recv(&self) -> Result<DatastreamEvent, mpsc::RecvError> {
         self.rx.recv()
     }
 
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
-    ) -> Result<Delivery, mpsc::RecvTimeoutError> {
+    ) -> Result<DatastreamEvent, mpsc::RecvTimeoutError> {
         self.rx.recv_timeout(timeout)
     }
 
-    pub fn drain_available(&self) -> Vec<Delivery> {
+    pub fn drain_available(&self) -> Vec<DatastreamEvent> {
         let mut out = Vec::new();
-        while let Ok(delivery) = self.rx.try_recv() {
-            out.push(delivery);
+        while let Ok(event) = self.rx.try_recv() {
+            out.push(event);
         }
         out
     }
@@ -90,7 +116,8 @@ impl DatastreamSubscription {
 
 struct SubscriberSlot {
     name: String,
-    tx: mpsc::SyncSender<Delivery>,
+    request: SubscriptionRequest,
+    tx: mpsc::SyncSender<DatastreamEvent>,
     dropped: u64,
 }
 
@@ -99,12 +126,7 @@ struct FanoutState {
     subscribers: BTreeMap<SubscriptionId, SubscriberSlot>,
 }
 
-/// Local delivery fanout used by endpoints and collectors.
-///
-/// Publishing with zero subscribers is intentionally a drop. This gives the
-/// default runtime behavior requested for v0: telemetry can be produced and
-/// drained without retaining historical frames, and subscriptions receive only
-/// future deliveries.
+/// Local event fanout used by endpoints and collectors.
 pub struct DeliveryFanout {
     default_capacity: usize,
     state: Mutex<FanoutState>,
@@ -121,13 +143,28 @@ impl DeliveryFanout {
         }
     }
 
-    pub fn subscribe_all(&self, name: impl Into<String>) -> DatastreamSubscription {
-        self.subscribe_all_with_capacity(name, self.default_capacity)
-    }
-
-    pub fn subscribe_all_with_capacity(
+    pub fn subscribe_all(
         &self,
         name: impl Into<String>,
+        snapshot: DatastreamSnapshot,
+    ) -> DatastreamSubscription {
+        self.subscribe(name, SubscriptionRequest::all(), snapshot)
+    }
+
+    pub fn subscribe(
+        &self,
+        name: impl Into<String>,
+        request: SubscriptionRequest,
+        snapshot: DatastreamSnapshot,
+    ) -> DatastreamSubscription {
+        self.subscribe_with_capacity(name, request, snapshot, self.default_capacity)
+    }
+
+    pub fn subscribe_with_capacity(
+        &self,
+        name: impl Into<String>,
+        request: SubscriptionRequest,
+        snapshot: DatastreamSnapshot,
         capacity: usize,
     ) -> DatastreamSubscription {
         let name = name.into();
@@ -139,11 +176,18 @@ impl DeliveryFanout {
             id,
             SubscriberSlot {
                 name: name.clone(),
+                request: request.clone(),
                 tx,
                 dropped: 0,
             },
         );
-        DatastreamSubscription { id, name, rx }
+        DatastreamSubscription {
+            id,
+            name,
+            request,
+            snapshot,
+            rx,
+        }
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -168,13 +212,17 @@ impl DeliveryFanout {
             .collect()
     }
 
-    pub fn publish(&self, delivery: Delivery) -> EndpointTick {
-        self.publish_batch(std::iter::once(delivery))
+    pub fn publish(&self, event: DatastreamEvent, catalog: &CatalogSnapshot) -> EndpointTick {
+        self.publish_batch(std::iter::once(event), catalog)
     }
 
-    pub fn publish_batch(&self, deliveries: impl IntoIterator<Item = Delivery>) -> EndpointTick {
-        let deliveries: Vec<Delivery> = deliveries.into_iter().collect();
-        if deliveries.is_empty() {
+    pub fn publish_batch(
+        &self,
+        events: impl IntoIterator<Item = DatastreamEvent>,
+        catalog: &CatalogSnapshot,
+    ) -> EndpointTick {
+        let events: Vec<DatastreamEvent> = events.into_iter().collect();
+        if events.is_empty() {
             return EndpointTick::default();
         }
 
@@ -182,7 +230,7 @@ impl DeliveryFanout {
         let subscribers = state.subscribers.len();
         if subscribers == 0 {
             return EndpointTick {
-                drained: deliveries.len(),
+                drained: events.len(),
                 subscribers: 0,
                 ..EndpointTick::default()
             };
@@ -192,8 +240,11 @@ impl DeliveryFanout {
         let mut dropped = 0;
         let mut disconnected = Vec::new();
         for (id, slot) in state.subscribers.iter_mut() {
-            for delivery in &deliveries {
-                match slot.tx.try_send(delivery.clone()) {
+            for event in &events {
+                if !event_matches_request(event, &slot.request, catalog) {
+                    continue;
+                }
+                match slot.tx.try_send(event.clone()) {
                     Ok(()) => delivered += 1,
                     Err(mpsc::TrySendError::Full(_)) => {
                         slot.dropped = slot.dropped.saturating_add(1);
@@ -213,7 +264,7 @@ impl DeliveryFanout {
         }
 
         EndpointTick {
-            drained: deliveries.len(),
+            drained: events.len(),
             delivered,
             dropped_for_subscribers: dropped,
             subscribers,
@@ -221,11 +272,133 @@ impl DeliveryFanout {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CatalogSnapshot {
+    pub streams: BTreeMap<StreamId, StreamDescriptor>,
+    pub channels: BTreeMap<ChannelRef, ChannelDescriptor>,
+}
+
+impl CatalogSnapshot {
+    pub fn datastream_snapshot(&self, request: &SubscriptionRequest) -> DatastreamSnapshot {
+        let channels: Vec<ChannelDescriptor> = self
+            .channels
+            .values()
+            .filter(|descriptor| descriptor_matches_request(descriptor, request, self))
+            .cloned()
+            .collect();
+        let mut streams = Vec::new();
+        for descriptor in self.streams.values() {
+            if !source_matches(&descriptor.stream, Some(descriptor), &request.sources) {
+                continue;
+            }
+            if matches!(request.channels, ChannelFilter::All)
+                || channels
+                    .iter()
+                    .any(|channel| channel.stream == descriptor.stream)
+            {
+                streams.push(descriptor.clone());
+            }
+        }
+        DatastreamSnapshot { streams, channels }
+    }
+
+    pub fn descriptor_for(&self, channel: &ChannelRef) -> Option<&ChannelDescriptor> {
+        self.channels.get(channel)
+    }
+
+    fn stream_descriptor(&self, stream: &StreamId) -> Option<&StreamDescriptor> {
+        self.streams.get(stream)
+    }
+}
+
+struct ChannelCatalogState {
+    stream: StreamDescriptor,
+    by_id: BTreeMap<ChannelId, ChannelDescriptor>,
+    by_name: BTreeMap<String, ChannelId>,
+    next_channel: u32,
+}
+
+impl ChannelCatalogState {
+    fn new(stream: StreamDescriptor) -> Self {
+        let mut state = Self {
+            stream: stream.clone(),
+            by_id: BTreeMap::new(),
+            by_name: BTreeMap::new(),
+            next_channel: 1,
+        };
+        let timing = ChannelDescriptor {
+            stream: stream.stream.clone(),
+            id: FRAME_TIME_CHANNEL_ID,
+            name: FRAME_TIME_CHANNEL.to_owned(),
+            label: Some("frame construction time".to_owned()),
+            content: ChannelContent::JsonRecord {
+                schema: Some("datastream.frame_time.v1".to_owned()),
+            },
+        };
+        state.by_name.insert(timing.name.clone(), timing.id);
+        state.by_id.insert(timing.id, timing);
+        state
+    }
+
+    fn snapshot(&self) -> CatalogSnapshot {
+        let mut streams = BTreeMap::new();
+        streams.insert(self.stream.stream.clone(), self.stream.clone());
+        let channels = self
+            .by_id
+            .iter()
+            .map(|(id, desc)| {
+                (
+                    ChannelRef {
+                        stream: self.stream.stream.clone(),
+                        channel: *id,
+                    },
+                    desc.clone(),
+                )
+            })
+            .collect();
+        CatalogSnapshot { streams, channels }
+    }
+
+    fn try_register_channel(
+        &mut self,
+        name: String,
+        content: ChannelContent,
+    ) -> Result<Option<ChannelDescriptor>, ChannelRegistrationError> {
+        if let Some(id) = self.by_name.get(&name).copied() {
+            let existing = self
+                .by_id
+                .get(&id)
+                .expect("channel name and id maps stay in sync");
+            if existing.content == content {
+                return Ok(None);
+            }
+            return Err(ChannelRegistrationError::ConflictingName { name });
+        }
+        let id = ChannelId(self.next_channel);
+        self.next_channel = self.next_channel.wrapping_add(1).max(1);
+        let descriptor = ChannelDescriptor {
+            stream: self.stream.stream.clone(),
+            id,
+            name: name.clone(),
+            label: None,
+            content,
+        };
+        self.by_name.insert(name, id);
+        self.by_id.insert(id, descriptor.clone());
+        Ok(Some(descriptor))
+    }
+
+    fn id_for_name(&self, name: &str) -> Option<ChannelId> {
+        self.by_name.get(name).copied()
+    }
+}
+
 /// Process-local datastream endpoint.
 pub struct DatastreamEndpoint {
     stream: StreamId,
     mux: Arc<Mux>,
-    fanout: DeliveryFanout,
+    catalog: Arc<Mutex<ChannelCatalogState>>,
+    fanout: Arc<DeliveryFanout>,
     drained: AtomicU64,
     bitbucketed: AtomicU64,
 }
@@ -240,11 +413,29 @@ impl DatastreamEndpoint {
         mux_capacity: usize,
         subscriber_capacity: usize,
     ) -> Self {
+        Self::with_descriptor(
+            StreamDescriptor {
+                stream,
+                label: None,
+                origin: StreamOrigin::RemoteNode,
+            },
+            mux_capacity,
+            subscriber_capacity,
+        )
+    }
+
+    pub fn with_descriptor(
+        descriptor: StreamDescriptor,
+        mux_capacity: usize,
+        subscriber_capacity: usize,
+    ) -> Self {
+        let stream = descriptor.stream.clone();
         let mux = Arc::new(Mux::new(stream.clone(), mux_capacity.max(1)));
         Self {
             stream,
             mux,
-            fanout: DeliveryFanout::new(subscriber_capacity),
+            catalog: Arc::new(Mutex::new(ChannelCatalogState::new(descriptor))),
+            fanout: Arc::new(DeliveryFanout::new(subscriber_capacity)),
             drained: AtomicU64::new(0),
             bitbucketed: AtomicU64::new(0),
         }
@@ -258,13 +449,17 @@ impl DatastreamEndpoint {
         &self.mux
     }
 
-    /// Enable or disable optional sidecar timing samples for newly submitted
-    /// frames from this endpoint's producers.
+    pub fn catalog_snapshot(&self) -> CatalogSnapshot {
+        self.catalog
+            .lock()
+            .expect("datastream catalog poisoned")
+            .snapshot()
+    }
+
     pub fn set_frame_timing_enabled(&self, enabled: bool) {
         self.mux.set_frame_timing_enabled(enabled);
     }
 
-    /// Whether this endpoint currently emits sidecar frame timing samples.
     pub fn frame_timing_enabled(&self) -> bool {
         self.mux.frame_timing_enabled()
     }
@@ -272,11 +467,48 @@ impl DatastreamEndpoint {
     pub fn producer(&self) -> DatastreamProducer {
         DatastreamProducer {
             mux: Arc::clone(&self.mux),
+            catalog: Arc::clone(&self.catalog),
+            fanout: Arc::clone(&self.fanout),
         }
     }
 
+    pub fn try_register_channel(
+        &self,
+        name: impl Into<String>,
+        content: ChannelContent,
+    ) -> Result<ChannelId, ChannelRegistrationError> {
+        register_channel(&self.catalog, &self.fanout, name.into(), content)
+    }
+
+    pub fn register_channel(&self, name: impl Into<String>, content: ChannelContent) -> ChannelId {
+        self.try_register_channel(name, content.clone())
+            .unwrap_or_else(|err| match err {
+                ChannelRegistrationError::ConflictingName { name } => {
+                    panic!("conflicting datastream channel registration for {name}")
+                }
+            })
+    }
+
+    pub fn register_record<R: Record>(&self) -> ChannelId {
+        self.register_channel(
+            R::CHANNEL,
+            ChannelContent::JsonRecord {
+                schema: Some(R::CHANNEL.to_owned()),
+            },
+        )
+    }
+
+    pub fn subscribe(
+        &self,
+        name: impl Into<String>,
+        request: SubscriptionRequest,
+    ) -> DatastreamSubscription {
+        let snapshot = self.catalog_snapshot().datastream_snapshot(&request);
+        self.fanout.subscribe(name, request, snapshot)
+    }
+
     pub fn subscribe_all(&self, name: impl Into<String>) -> DatastreamSubscription {
-        self.fanout.subscribe_all(name)
+        self.subscribe(name, SubscriptionRequest::all())
     }
 
     pub fn subscribe_all_with_capacity(
@@ -284,7 +516,10 @@ impl DatastreamEndpoint {
         name: impl Into<String>,
         capacity: usize,
     ) -> DatastreamSubscription {
-        self.fanout.subscribe_all_with_capacity(name, capacity)
+        let request = SubscriptionRequest::all();
+        let snapshot = self.catalog_snapshot().datastream_snapshot(&request);
+        self.fanout
+            .subscribe_with_capacity(name, request, snapshot, capacity)
     }
 
     pub fn subscriber_count(&self) -> usize {
@@ -295,7 +530,7 @@ impl DatastreamEndpoint {
         self.fanout.subscriber_snapshots()
     }
 
-    /// Drain the mux and fan out the resulting future deliveries.
+    /// Drain the mux and fan out catalog-aware future events.
     pub fn tick(&self) -> EndpointTick {
         let frames = self.mux.drain();
         if frames.is_empty() {
@@ -303,10 +538,18 @@ impl DatastreamEndpoint {
         }
         let drained = frames.len();
         self.drained.fetch_add(drained as u64, Ordering::Relaxed);
-        let deliveries = frames
-            .into_iter()
-            .map(|frame| Delivery::new(self.stream.clone(), frame));
-        let tick = self.fanout.publish_batch(deliveries);
+        let events = frames.into_iter().map(|frame| {
+            DatastreamEvent::Frame(FrameDelivery {
+                channel: ChannelRef {
+                    stream: self.stream.clone(),
+                    channel: frame.channel,
+                },
+                position: frame.position,
+                payload: frame.payload,
+            })
+        });
+        let catalog = self.catalog_snapshot();
+        let tick = self.fanout.publish_batch(events, &catalog);
         if tick.subscribers == 0 {
             self.bitbucketed
                 .fetch_add(drained as u64, Ordering::Relaxed);
@@ -335,6 +578,8 @@ impl DatastreamEndpoint {
 #[derive(Clone)]
 pub struct DatastreamProducer {
     mux: Arc<Mux>,
+    catalog: Arc<Mutex<ChannelCatalogState>>,
+    fanout: Arc<DeliveryFanout>,
 }
 
 impl DatastreamProducer {
@@ -342,24 +587,55 @@ impl DatastreamProducer {
         self.mux.stream_id()
     }
 
-    pub fn submit_record<R: Record>(&self, record: &R) -> Position {
-        self.mux.submit(R::channel(), record.encode())
+    pub fn try_register_channel(
+        &self,
+        name: impl Into<String>,
+        content: ChannelContent,
+    ) -> Result<ChannelId, ChannelRegistrationError> {
+        register_channel(&self.catalog, &self.fanout, name.into(), content)
     }
 
-    pub fn submit_text(&self, channel: impl Into<ChannelId>, text: impl AsRef<[u8]>) -> Position {
+    pub fn register_channel(&self, name: impl Into<String>, content: ChannelContent) -> ChannelId {
+        self.try_register_channel(name, content.clone())
+            .unwrap_or_else(|err| match err {
+                ChannelRegistrationError::ConflictingName { name } => {
+                    panic!("conflicting datastream channel registration for {name}")
+                }
+            })
+    }
+
+    pub fn register_record<R: Record>(&self) -> ChannelId {
+        self.register_channel(
+            R::CHANNEL,
+            ChannelContent::JsonRecord {
+                schema: Some(R::CHANNEL.to_owned()),
+            },
+        )
+    }
+
+    pub fn channel_id_for_name(&self, name: &str) -> Option<ChannelId> {
+        self.catalog
+            .lock()
+            .expect("datastream catalog poisoned")
+            .id_for_name(name)
+    }
+
+    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> Position {
+        self.mux.submit(channel, record.encode())
+    }
+
+    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> Position {
         self.mux.submit(channel, text.as_ref().to_vec())
     }
 
-    pub fn submit_bytes(&self, channel: impl Into<ChannelId>, bytes: Vec<u8>) -> Position {
+    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> Position {
         self.mux.submit(channel, bytes)
     }
 
-    /// Enable or disable optional sidecar timing samples for this producer's mux.
     pub fn set_frame_timing_enabled(&self, enabled: bool) {
         self.mux.set_frame_timing_enabled(enabled);
     }
 
-    /// Whether this producer's mux currently emits sidecar frame timing samples.
     pub fn frame_timing_enabled(&self) -> bool {
         self.mux.frame_timing_enabled()
     }
@@ -375,15 +651,54 @@ impl DatastreamProducer {
     }
 
     pub fn stats_hook(&self) -> Arc<dyn StatsHook> {
-        self.stats_hook_on(DEFAULT_STATS_CHANNEL)
+        let channel = self.register_channel(
+            DEFAULT_STATS_CHANNEL,
+            ChannelContent::JsonRecord {
+                schema: Some(DEFAULT_STATS_CHANNEL.to_owned()),
+            },
+        );
+        self.stats_hook_on(channel)
     }
 
-    pub fn stats_hook_on(&self, channel: impl Into<ChannelId>) -> Arc<dyn StatsHook> {
+    pub fn stats_hook_on(&self, channel: ChannelId) -> Arc<dyn StatsHook> {
         Arc::new(DatastreamStatsHook {
             producer: self.clone(),
-            channel: channel.into(),
+            channel,
         })
     }
+}
+
+fn register_channel(
+    catalog: &Arc<Mutex<ChannelCatalogState>>,
+    fanout: &Arc<DeliveryFanout>,
+    name: String,
+    content: ChannelContent,
+) -> Result<ChannelId, ChannelRegistrationError> {
+    let (id, event, snapshot) = {
+        let mut catalog = catalog.lock().expect("datastream catalog poisoned");
+        match catalog.try_register_channel(name.clone(), content)? {
+            Some(descriptor) => {
+                let id = descriptor.id;
+                let snapshot = catalog.snapshot();
+                (
+                    id,
+                    Some(DatastreamEvent::ChannelDeclared(descriptor)),
+                    snapshot,
+                )
+            }
+            None => {
+                let id = catalog
+                    .id_for_name(&name)
+                    .expect("duplicate channel name remains registered");
+                let snapshot = catalog.snapshot();
+                (id, None, snapshot)
+            }
+        }
+    };
+    if let Some(event) = event {
+        let _ = fanout.publish(event, &snapshot);
+    }
+    Ok(id)
 }
 
 /// Managed-process output observer that submits stdout/stderr chunks as frames.
@@ -409,7 +724,7 @@ impl StatsHook for DatastreamStatsHook {
     fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]) {
         let payload = RuntimeActorStatsRecord::from_snapshots(worker_id, snapshots);
         let bytes = serde_json::to_vec(&payload).expect("runtime stats record serializes");
-        self.producer.submit_bytes(self.channel.clone(), bytes);
+        self.producer.submit_bytes(self.channel, bytes);
     }
 }
 
@@ -456,4 +771,81 @@ struct RuntimeActorSnapshotRecord<'a> {
 struct RuntimeMessageTypeCount<'a> {
     ty: &'a str,
     count: u64,
+}
+
+fn event_matches_request(
+    event: &DatastreamEvent,
+    request: &SubscriptionRequest,
+    catalog: &CatalogSnapshot,
+) -> bool {
+    match event {
+        DatastreamEvent::StreamDeclared(descriptor) => {
+            source_matches(&descriptor.stream, Some(descriptor), &request.sources)
+                && (matches!(request.channels, ChannelFilter::All)
+                    || catalog.channels.values().any(|channel| {
+                        channel.stream == descriptor.stream
+                            && descriptor_matches_request(channel, request, catalog)
+                    }))
+        }
+        DatastreamEvent::ChannelDeclared(descriptor) => {
+            descriptor_matches_request(descriptor, request, catalog)
+        }
+        DatastreamEvent::Frame(delivery) => catalog
+            .descriptor_for(&delivery.channel)
+            .map(|descriptor| descriptor_matches_request(descriptor, request, catalog))
+            .unwrap_or_else(|| matches!(request.channels, ChannelFilter::All)),
+        DatastreamEvent::StreamEnded(stream) => {
+            source_matches(stream, catalog.stream_descriptor(stream), &request.sources)
+        }
+    }
+}
+
+fn descriptor_matches_request(
+    descriptor: &ChannelDescriptor,
+    request: &SubscriptionRequest,
+    catalog: &CatalogSnapshot,
+) -> bool {
+    let stream_descriptor = catalog.stream_descriptor(&descriptor.stream);
+    source_matches(&descriptor.stream, stream_descriptor, &request.sources)
+        && channel_matches(descriptor, &request.channels)
+}
+
+fn source_matches(
+    stream: &StreamId,
+    descriptor: Option<&StreamDescriptor>,
+    filter: &SourceFilter,
+) -> bool {
+    match filter {
+        SourceFilter::All => true,
+        SourceFilter::Origin(origin) => descriptor
+            .map(|descriptor| descriptor.origin == *origin)
+            .unwrap_or(false),
+        SourceFilter::Node(node) => &stream.node == node,
+        SourceFilter::Stream(target) => stream == target,
+    }
+}
+
+fn channel_matches(descriptor: &ChannelDescriptor, filter: &ChannelFilter) -> bool {
+    match filter {
+        ChannelFilter::All => true,
+        ChannelFilter::Name(name) => descriptor.name == *name,
+        ChannelFilter::Prefix(prefix) => descriptor.name.starts_with(prefix),
+        ChannelFilter::Content(kind) => descriptor.content.kind() == *kind,
+    }
+}
+
+/// Convert a live event back to the legacy transport delivery shape when a
+/// stored-stream test or transitional adapter needs it.
+pub fn frame_event_to_delivery(event: DatastreamEvent) -> Option<Delivery> {
+    match event {
+        DatastreamEvent::Frame(delivery) => Some(Delivery::new(
+            delivery.channel.stream,
+            crate::frame::Frame::new(
+                delivery.channel.channel,
+                delivery.position,
+                delivery.payload,
+            ),
+        )),
+        _ => None,
+    }
 }

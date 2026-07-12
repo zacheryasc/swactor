@@ -585,7 +585,7 @@ impl DashboardView for SwactorWorkerView {
         CHANNELS
     }
 
-    fn ingest(&self, _stream: &StreamId, frame: &Frame, event: &FrameEvent) {
+    fn ingest(&self, _stream: &StreamId, _frame: &Frame, event: &FrameEvent) {
         let now = Instant::now();
         let mut state = self.state.write();
         let key = stream_key(&event.stream);
@@ -593,7 +593,7 @@ impl DashboardView for SwactorWorkerView {
             .runtimes
             .entry(key)
             .or_insert_with(|| RuntimeState::new(event.stream.clone(), now))
-            .update(frame.channel.as_str(), &frame.payload, now);
+            .update(&event.channel, &event.payload, now);
     }
 
     fn snapshot_json(&self) -> Value {

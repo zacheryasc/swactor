@@ -25,11 +25,12 @@ fn one_node_chat_docker_cuda_e2e() {
     let mut command = Command::new("cargo");
     command
         .current_dir(&root)
-        .args(["mvp-chat"])
+        .args(["mvp-chat", "--docker"])
         .env("MVP_RUNTIME_CONFIG", "local")
         .env("MVP_IROH_RELAY_MODE", "disabled")
         .env(DOCKER_CONTAINER_PREFIX_ENV, &container_prefix)
         .env("MVP_TINYGRAD_TEST_MODE", "1")
+        .env("MVP_LAYER_END_EXCLUSIVE", "1")
         .env("MVP_PROMPT_MAX_TOKENS", "3")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -52,7 +53,14 @@ fn one_node_chat_docker_cuda_e2e() {
     let stdout_reader = spawn_capture(child.stdout.take().expect("stdout"), Arc::clone(&stdout));
     let stderr_reader = spawn_capture(child.stderr.take().expect("stderr"), Arc::clone(&stderr));
 
-    let mut result = run_full_flow(&mut child, &mut stdin, &stdout);
+    let mut result = run_full_flow(
+        &mut child,
+        &mut stdin,
+        &stdout,
+        "mvp.provisioning.logs",
+        "mvp-entrypoint",
+        dashboard_has_worker_prompt_completed,
+    );
     if result.is_err() {
         request_child_interrupt(&child);
         let _ = wait_child(&mut child, SHUTDOWN_WATCHDOG);
@@ -76,15 +84,95 @@ fn one_node_chat_docker_cuda_e2e() {
     }
 }
 
+#[test]
+fn one_node_chat_process_cached_model_e2e() {
+    let root = workspace_root();
+    let cached_model = root
+        .join(".model-cache")
+        .join("SmolLM2-135M-Instruct.Q4_0.gguf");
+    assert!(
+        cached_model.is_file(),
+        "cached model fixture is required: {}",
+        cached_model.display()
+    );
+    let container_prefix = format!("mvp-orchestrator-process-e2e-{}", std::process::id());
+
+    let mut command = Command::new("cargo");
+    command
+        .current_dir(&root)
+        .args(["mvp-chat", "--cached-model"])
+        .arg(&cached_model)
+        .args(["-N", "2", "--dump-logs"])
+        .env("MVP_RUNTIME_CONFIG", "local")
+        .env("MVP_IROH_RELAY_MODE", "disabled")
+        .env(DOCKER_CONTAINER_PREFIX_ENV, &container_prefix)
+        .env("MVP_TINYGRAD_TEST_MODE", "1")
+        .env("MVP_LAYER_END_EXCLUSIVE", "1")
+        .env("MVP_PROMPT_MAX_TOKENS", "3")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(target_os = "linux")]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+
+    let mut child = command.spawn().expect("spawn cargo mvp-chat");
+    let mut stdin = child.stdin.take().expect("cargo mvp-chat stdin");
+    let stdout = Arc::new(Mutex::new(String::new()));
+    let stderr = Arc::new(Mutex::new(String::new()));
+    let stdout_reader = spawn_capture(child.stdout.take().expect("stdout"), Arc::clone(&stdout));
+    let stderr_reader = spawn_capture(child.stderr.take().expect("stderr"), Arc::clone(&stderr));
+
+    let mut result = run_full_flow(
+        &mut child,
+        &mut stdin,
+        &stdout,
+        "mvp.node.bootstrap",
+        "runtime_ready_local",
+        dashboard_has_pipeline_prompt_output,
+    );
+    if result.is_err() {
+        request_child_interrupt(&child);
+        let _ = wait_child(&mut child, SHUTDOWN_WATCHDOG);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    if result.is_ok() {
+        result = assert_no_lower_layer_terminal_leaks(&stdout, &stderr);
+    }
+    assert_no_containers_with_prefix_if_docker_available(&root, &container_prefix);
+
+    if let Err(error) = result {
+        panic!(
+            "{error}\nstdout:\n{}\nstderr:\n{}\ndashboard frames:\n{}",
+            snapshot(&stdout),
+            snapshot(&stderr),
+            dashboard_snapshot().unwrap_or_else(|err| format!("<dashboard unavailable: {err}>"))
+        );
+    }
+}
+
 fn run_full_flow(
     child: &mut Child,
     stdin: &mut impl Write,
     stdout: &Arc<Mutex<String>>,
+    provisioning_channel_substr: &str,
+    provisioning_payload_substr: &str,
+    prompt_dashboard: fn() -> bool,
 ) -> Result<(), String> {
     wait_for_child_or(TEST_WATCHDOG, child, dashboard_responding)
         .map_err(|e| format!("dashboard API not live: {e}"))?;
     wait_for_child_or(TEST_WATCHDOG, child, || {
-        dashboard_has_channel_or_payload("mvp.provisioning.logs", "mvp-entrypoint")
+        dashboard_has_channel_or_payload(provisioning_channel_substr, provisioning_payload_substr)
     })
     .map_err(|e| format!("provisioning frames not visible in dashboard: {e}"))?;
     wait_for_child_or(TEST_WATCHDOG, child, || {
@@ -107,10 +195,8 @@ fn run_full_flow(
     .map_err(|e| format!("prompt was not submitted to chat loop: {e}"))?;
     wait_for_child_or(PROMPT_WATCHDOG, child, || response_text_visible(stdout))
         .map_err(|e| format!("decoded response text not visible: {e}"))?;
-    wait_for_child_or(PROMPT_WATCHDOG, child, || {
-        dashboard_has_frame("mvp.worker.prompt", "PromptCompleted")
-    })
-    .map_err(|e| format!("prompt result not visible in dashboard: {e}"))?;
+    wait_for_child_or(PROMPT_WATCHDOG, child, prompt_dashboard)
+        .map_err(|e| format!("prompt result not visible in dashboard: {e}"))?;
     wait_for_child_or(PROMPT_WATCHDOG, child, dashboard_has_orch_prompt_lifecycle)
         .map_err(|e| format!("orchestrator prompt lifecycle not visible in dashboard: {e}"))?;
     wait_for_child_or(PROMPT_WATCHDOG, child, || prompt_count(stdout) >= 2)
@@ -189,6 +275,14 @@ fn dashboard_has_frame(channel_substr: &str, payload_substr: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn dashboard_has_worker_prompt_completed() -> bool {
+    dashboard_has_frame("mvp.worker.prompt", "PromptCompleted")
+}
+
+fn dashboard_has_pipeline_prompt_output() -> bool {
+    dashboard_has_frame("mvp.orch.prompt", "pipeline_token_out")
+}
+
 fn dashboard_has_orch_prompt_lifecycle() -> bool {
     dashboard_frames()
         .map(|frames| {
@@ -200,26 +294,55 @@ fn dashboard_has_orch_prompt_lifecycle() -> bool {
             events.iter().any(|prompt_work| {
                 prompt_work.phase == "prompt_work"
                     && prompt_work.status == "observed"
-                    && events.iter().any(|event| {
-                        same_prompt(prompt_work, event)
-                            && event.phase == "node_prompt_send"
-                            && event.status == "ready"
-                    })
-                    && events.iter().any(|event| {
-                        same_prompt(prompt_work, event)
-                            && event.phase == "node_prompt_event"
-                            && event.status == "observed"
-                            && event.detail_event.as_deref() == Some("Done")
-                    })
-                    && events.iter().any(|event| {
-                        same_prompt(prompt_work, event)
-                            && event.phase == "prompt_complete"
-                            && event.status == "ready"
-                            && event.detail_event.as_deref() == Some("Done")
-                    })
+                    && (direct_orch_prompt_lifecycle(&events, prompt_work)
+                        || pipeline_orch_prompt_lifecycle(&events, prompt_work))
             })
         })
         .unwrap_or(false)
+}
+
+fn direct_orch_prompt_lifecycle(
+    events: &[OrchPromptObservation],
+    prompt_work: &OrchPromptObservation,
+) -> bool {
+    events.iter().any(|event| {
+        same_prompt(prompt_work, event)
+            && event.phase == "node_prompt_send"
+            && event.status == "ready"
+    }) && events.iter().any(|event| {
+        same_prompt(prompt_work, event)
+            && event.phase == "node_prompt_event"
+            && event.status == "observed"
+            && event.detail_event.as_deref() == Some("Done")
+    }) && events.iter().any(|event| {
+        same_prompt(prompt_work, event)
+            && event.phase == "prompt_complete"
+            && event.status == "ready"
+            && event.detail_event.as_deref() == Some("Done")
+    })
+}
+
+fn pipeline_orch_prompt_lifecycle(
+    events: &[OrchPromptObservation],
+    prompt_work: &OrchPromptObservation,
+) -> bool {
+    events.iter().any(|event| {
+        same_prompt(prompt_work, event)
+            && event.phase == "pipeline_tokenizer_encode"
+            && event.status == "ready"
+    }) && events.iter().any(|event| {
+        same_prompt(prompt_work, event)
+            && event.phase == "pipeline_token_in"
+            && event.status == "ready"
+    }) && events.iter().any(|event| {
+        same_prompt(prompt_work, event)
+            && event.phase == "pipeline_token_out"
+            && event.status == "observed"
+    }) && events.iter().any(|event| {
+        same_prompt(prompt_work, event)
+            && event.phase == "pipeline_tokenizer_decode"
+            && event.status == "ready"
+    })
 }
 
 fn orch_prompt_observation(frame: &SeenFrame) -> Option<OrchPromptObservation> {
@@ -407,7 +530,6 @@ fn request_child_interrupt(child: &Child) {
     }
 }
 
-
 fn require_docker(root: &std::path::Path) {
     let version = Command::new("docker")
         .current_dir(root)
@@ -422,6 +544,17 @@ fn require_docker(root: &std::path::Path) {
     );
 }
 
+fn assert_no_containers_with_prefix_if_docker_available(root: &std::path::Path, prefix: &str) {
+    let docker_available = Command::new("docker")
+        .current_dir(root)
+        .arg("version")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false);
+    if docker_available {
+        assert_containers_with_prefix_removed(root, prefix);
+    }
+}
 fn assert_containers_with_prefix_removed(root: &std::path::Path, prefix: &str) {
     let start = Instant::now();
     let mut containers = String::new();

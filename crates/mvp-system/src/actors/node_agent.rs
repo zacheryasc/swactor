@@ -9,6 +9,79 @@ use crate::{run_plan, stage_controller as stage};
 use super::codec::JsonCodec;
 use super::orchestrator::OrchestratorMsg;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StageEdgeKindWire {
+    TokenIn,
+    Activation,
+    TokenOut,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageObjectSpecWire {
+    pub max_extent: u64,
+    pub alignment: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageRingSpecWire {
+    pub data_capacity: u64,
+    pub alignment: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageInboundEdgeWire {
+    pub edge_id: u64,
+    pub kind: StageEdgeKindWire,
+    pub object_spec: StageObjectSpecWire,
+    pub ring_spec: StageRingSpecWire,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageOutboundEdgeWire {
+    pub edge_id: u64,
+    pub kind: StageEdgeKindWire,
+    pub consumer_node_id: u64,
+    pub consumer_endpoint: Option<EndpointAddr>,
+    pub object_spec: StageObjectSpecWire,
+    pub ring_spec: StageRingSpecWire,
+}
+
+impl StageInboundEdgeWire {
+    fn fallback(edge_id: u64) -> Self {
+        Self {
+            edge_id,
+            kind: StageEdgeKindWire::Activation,
+            object_spec: StageObjectSpecWire {
+                max_extent: 4096,
+                alignment: 4,
+            },
+            ring_spec: StageRingSpecWire {
+                data_capacity: 4096 + run_plan::MO01_HEADER_BYTES,
+                alignment: 64,
+            },
+        }
+    }
+}
+
+impl StageOutboundEdgeWire {
+    fn fallback(edge_id: u64) -> Self {
+        Self {
+            edge_id,
+            kind: StageEdgeKindWire::Activation,
+            consumer_node_id: 0,
+            consumer_endpoint: None,
+            object_spec: StageObjectSpecWire {
+                max_extent: 4096,
+                alignment: 4,
+            },
+            ring_spec: StageRingSpecWire {
+                data_capacity: 4096 + run_plan::MO01_HEADER_BYTES,
+                alignment: 64,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StageProvisionWire {
     pub run_id: u64,
@@ -20,6 +93,8 @@ pub struct StageProvisionWire {
     pub layer_end_exclusive: u32,
     pub inbound_edge_id: u64,
     pub outbound_edge_id: u64,
+    pub inbound_edge: Option<StageInboundEdgeWire>,
+    pub outbound_edge: Option<StageOutboundEdgeWire>,
     pub model_id: String,
     pub gguf_source: run_plan::GgufSource,
     pub tokenizer: run_plan::TokenizerSource,
@@ -58,6 +133,7 @@ pub enum NodeAgentMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
+        datastream_publisher: ActorAddress,
         readiness_id: u64,
     },
     RuntimeReadyAck {
@@ -66,7 +142,11 @@ pub enum NodeAgentMsg {
         stage_index: u32,
         readiness_id: u64,
     },
-    MarkWeightsReady,
+    MarkWeightsReady {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+    },
     MarkInboundEdgeReady {
         edge_id: u64,
     },
@@ -108,6 +188,16 @@ pub enum NodeAgentMsg {
         max_tokens: u32,
         reply_to: ActorAddress,
     },
+    EncodePrompt {
+        request_id: u64,
+        prompt: String,
+        reply_to: ActorAddress,
+    },
+    DecodeTokens {
+        request_id: u64,
+        tokens: Vec<u32>,
+        reply_to: ActorAddress,
+    },
 }
 
 impl NetworkMessage for NodeAgentMsg {
@@ -120,9 +210,11 @@ impl NetworkMessage for NodeAgentMsg {
 pub enum StageCommandWire {
     EstablishInboundEdge {
         edge_id: u64,
+        edge: StageInboundEdgeWire,
     },
     EstablishOutboundEdge {
         edge_id: u64,
+        edge: StageOutboundEdgeWire,
     },
     ConfigureWorkerRole {
         run_id: u64,
@@ -191,6 +283,16 @@ pub enum NodeAgentReport {
         max_tokens: u32,
         reply_to: ActorAddress,
     },
+    EncodePromptRequested {
+        request_id: u64,
+        prompt: String,
+        reply_to: ActorAddress,
+    },
+    DecodeTokensRequested {
+        request_id: u64,
+        tokens: Vec<u32>,
+        reply_to: ActorAddress,
+    },
     RuntimeReadyAck {
         run_id: u64,
         node_id: u64,
@@ -213,6 +315,8 @@ pub struct NodeAgentActor {
     core: stage::StageController,
     orchestrator: ActorAddress,
     report_to: Option<ActorAddress>,
+    inbound_edge: Option<StageInboundEdgeWire>,
+    outbound_edge: Option<StageOutboundEdgeWire>,
     command_cursor: usize,
     event_cursor: usize,
 }
@@ -227,6 +331,8 @@ impl NodeAgentActor {
             core: stage::StageController::new(local_node_id),
             orchestrator,
             report_to,
+            inbound_edge: None,
+            outbound_edge: None,
             command_cursor: 0,
             event_cursor: 0,
         }
@@ -238,7 +344,9 @@ impl NodeAgentActor {
                 self.core.observe(stage::StageEvent::ProvisionStage {
                     from: stage::NodeId(provision.authorized_orchestrator),
                     provision: provision.to_core(),
-                })
+                });
+                self.inbound_edge = provision.inbound_edge;
+                self.outbound_edge = provision.outbound_edge;
             }
             NodeAgentMsg::MarkWorkerReady => self.core.observe(stage::StageEvent::WorkerReady),
             NodeAgentMsg::RuntimeLoaded {
@@ -247,6 +355,7 @@ impl NodeAgentActor {
                 stage_index,
                 endpoint,
                 node_actor,
+                datastream_publisher,
                 readiness_id,
             } => {
                 self.core.observe(stage::StageEvent::WorkerReady);
@@ -258,6 +367,7 @@ impl NodeAgentActor {
                         stage_index,
                         endpoint,
                         node_actor,
+                        datastream_publisher,
                         readiness_id,
                     },
                 );
@@ -268,6 +378,15 @@ impl NodeAgentActor {
                 stage_index,
                 readiness_id,
             } => {
+                let _ = ctx.send(
+                    self.orchestrator,
+                    OrchestratorMsg::ObserveNodeRuntimeReadyAck {
+                        run_id,
+                        node_id,
+                        stage_index,
+                        readiness_id,
+                    },
+                );
                 if let Some(report_to) = self.report_to {
                     let _ = ctx.send(
                         report_to,
@@ -279,9 +398,22 @@ impl NodeAgentActor {
                         },
                     );
                 }
-                return;
             }
-            NodeAgentMsg::MarkWeightsReady => self.core.observe(stage::StageEvent::WeightsReady),
+            NodeAgentMsg::MarkWeightsReady {
+                run_id,
+                node_id,
+                stage_index,
+            } => {
+                let _ = ctx.send(
+                    self.orchestrator,
+                    OrchestratorMsg::ObserveWeightsReady {
+                        run_id,
+                        node_id,
+                        stage_index,
+                    },
+                );
+                self.core.observe(stage::StageEvent::WeightsReady)
+            }
             NodeAgentMsg::MarkInboundEdgeReady { edge_id } => {
                 self.core.observe(stage::StageEvent::InboundEdgeReady {
                     edge_id: stage::EdgeId(edge_id),
@@ -355,6 +487,40 @@ impl NodeAgentActor {
                 }
                 return;
             }
+            NodeAgentMsg::EncodePrompt {
+                request_id,
+                prompt,
+                reply_to,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        NodeAgentReport::EncodePromptRequested {
+                            request_id,
+                            prompt,
+                            reply_to,
+                        },
+                    );
+                }
+                return;
+            }
+            NodeAgentMsg::DecodeTokens {
+                request_id,
+                tokens,
+                reply_to,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        NodeAgentReport::DecodeTokensRequested {
+                            request_id,
+                            tokens,
+                            reply_to,
+                        },
+                    );
+                }
+                return;
+            }
             NodeAgentMsg::Snapshot { reply_to } => {
                 let _ = ctx.send(
                     reply_to,
@@ -382,7 +548,10 @@ impl NodeAgentActor {
     fn drain_outputs(&mut self, ctx: &Ctx) {
         for command in &self.core.commands()[self.command_cursor..] {
             if let Some(report_to) = self.report_to {
-                let _ = ctx.send(report_to, NodeAgentReport::Command(command.into()));
+                let _ = ctx.send(
+                    report_to,
+                    NodeAgentReport::Command(self.command_wire(command)),
+                );
             }
         }
         self.command_cursor = self.core.commands().len();
@@ -434,6 +603,34 @@ impl NodeAgentActor {
         }
         self.event_cursor = self.core.events().len();
     }
+
+    fn command_wire(&self, command: &stage::StageCommand) -> StageCommandWire {
+        match command {
+            stage::StageCommand::EstablishInboundEdge { edge_id } => {
+                let edge = self
+                    .inbound_edge
+                    .clone()
+                    .filter(|edge| edge.edge_id == edge_id.0)
+                    .unwrap_or_else(|| StageInboundEdgeWire::fallback(edge_id.0));
+                StageCommandWire::EstablishInboundEdge {
+                    edge_id: edge_id.0,
+                    edge,
+                }
+            }
+            stage::StageCommand::EstablishOutboundEdge { edge_id } => {
+                let edge = self
+                    .outbound_edge
+                    .clone()
+                    .filter(|edge| edge.edge_id == edge_id.0)
+                    .unwrap_or_else(|| StageOutboundEdgeWire::fallback(edge_id.0));
+                StageCommandWire::EstablishOutboundEdge {
+                    edge_id: edge_id.0,
+                    edge,
+                }
+            }
+            _ => command.into(),
+        }
+    }
 }
 
 impl ActorInterface for NodeAgentActor {
@@ -448,12 +645,14 @@ impl ActorInterface for NodeAgentActor {
 impl From<&stage::StageCommand> for StageCommandWire {
     fn from(command: &stage::StageCommand) -> Self {
         match command {
-            stage::StageCommand::EstablishInboundEdge { edge_id } => {
-                Self::EstablishInboundEdge { edge_id: edge_id.0 }
-            }
-            stage::StageCommand::EstablishOutboundEdge { edge_id } => {
-                Self::EstablishOutboundEdge { edge_id: edge_id.0 }
-            }
+            stage::StageCommand::EstablishInboundEdge { edge_id } => Self::EstablishInboundEdge {
+                edge_id: edge_id.0,
+                edge: StageInboundEdgeWire::fallback(edge_id.0),
+            },
+            stage::StageCommand::EstablishOutboundEdge { edge_id } => Self::EstablishOutboundEdge {
+                edge_id: edge_id.0,
+                edge: StageOutboundEdgeWire::fallback(edge_id.0),
+            },
             stage::StageCommand::ConfigureWorkerRole {
                 run_id,
                 stage_index,
@@ -554,6 +753,7 @@ mod tests {
             .expect("orchestrator inbox");
         let orchestrator = *orchestrator_inbox.addr();
         let node_actor = ActorAddress::new_random();
+        let datastream_publisher = ActorAddress::new_random();
         let endpoint = EndpointAddr::new(SecretKey::from_bytes(&[9; 32]).public());
         let actor = runtime
             .spawn(NodeAgentActor::new(stage::NodeId(11), orchestrator, None))
@@ -568,6 +768,7 @@ mod tests {
                     stage_index: 3,
                     endpoint: endpoint.clone(),
                     node_actor,
+                    datastream_publisher,
                     readiness_id: 99,
                 },
             )
@@ -582,6 +783,7 @@ mod tests {
                 stage_index: 3,
                 endpoint,
                 node_actor,
+                datastream_publisher,
                 readiness_id: 99,
             })
         );

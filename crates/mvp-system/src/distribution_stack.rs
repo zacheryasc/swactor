@@ -24,6 +24,7 @@ use distribution::node_metadata_actor::{MetadataActor, MetadataIn};
 use distribution::registry_actor::{RegistryActor, RegistryIn};
 use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
+use distribution::swim::telemetry::{ObservedTransition, SwimTelemetry};
 use distribution::transport_bridge::{
     Outbox, OutboxPeerDirectory, OutboxRouteBinder, RelayMirror, RouteView, RouteViewTransport,
 };
@@ -46,6 +47,7 @@ pub struct DistributionRuntimeStack {
     pub relay_mirror: RelayMirror,
     pub route_view: RouteView,
     pub membership_mirror: Arc<Mutex<MemberList>>,
+    pub swim_telemetry: Arc<SwimTelemetry>,
     pub actors: DistributionActorAddrs,
 }
 
@@ -78,14 +80,18 @@ impl DistributionRuntimeStack {
             Arc::clone(&transport_router),
             Arc::clone(&outbox),
         ));
+        let swim_telemetry = SwimTelemetry::new();
 
         let swim_addr = runtime
-            .spawn(SwimActor::new(
-                node_id,
-                config.swim.clone(),
-                Instant::now(),
-                peer_directory.clone(),
-            ))
+            .spawn(
+                SwimActor::new(
+                    node_id,
+                    config.swim.clone(),
+                    Instant::now(),
+                    peer_directory.clone(),
+                )
+                .with_observer(Box::new(Arc::clone(&swim_telemetry))),
+            )
             .expect("spawn SwimActor");
         let registry_addr = runtime
             .spawn(RegistryActor::new(
@@ -145,6 +151,7 @@ impl DistributionRuntimeStack {
             relay_mirror,
             route_view,
             membership_mirror,
+            swim_telemetry,
             actors: DistributionActorAddrs {
                 swim: swim_addr,
                 registry: registry_addr,
@@ -215,6 +222,10 @@ impl DistributionRuntimeStack {
 
     pub fn route_owner(&self, actor: ActorAddress) -> Option<NodeId> {
         self.route_view.read().ok()?.get(&actor).copied()
+    }
+
+    pub fn drain_swim_transitions(&self) -> Vec<ObservedTransition> {
+        self.swim_telemetry.drain_transitions()
     }
 }
 

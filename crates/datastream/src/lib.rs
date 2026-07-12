@@ -37,6 +37,7 @@ pub mod hardware;
 pub mod health;
 pub mod ingest;
 pub mod mux;
+pub mod publisher_actor;
 pub mod record;
 pub mod sink_actor;
 pub mod store;
@@ -46,15 +47,24 @@ pub mod views;
 pub mod wire;
 
 pub use endpoint::{
-    DatastreamEndpoint, DatastreamProducer, DatastreamSubscription, DeliveryFanout, EndpointTick,
-    SubscriberSnapshot, SubscriptionId,
+    CatalogSnapshot, ChannelRegistrationError, DatastreamEndpoint, DatastreamProducer,
+    DatastreamSnapshot, DatastreamSubscription, DeliveryFanout, EndpointTick, SubscriberSnapshot,
+    SubscriptionId, frame_event_to_delivery,
 };
-pub use frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
+pub use frame::{
+    ChannelContent, ChannelContentKind, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef,
+    DatastreamEvent, Frame, FrameDelivery, Lifetime, NodeId, Position, SourceFilter,
+    StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest,
+};
 pub use ingest::Consumer;
 pub use mux::Mux;
+pub use publisher_actor::{
+    DATASTREAM_PUBLISHER_NAME, DatastreamPublisherActor, DatastreamPublisherMsg,
+    DatastreamSubscribe, register_datastream_publisher_codec,
+};
 pub use record::{ChannelKind, ChannelRegistry, Record};
 pub use sink_actor::{DATASTREAM_SINK_NAME, DatastreamSink};
 pub use store::{GapSpan, Store, StoredStream};
-pub use timing::{FRAME_TIME_CHANNEL, FrameTimeSample};
+pub use timing::{FRAME_TIME_CHANNEL, FRAME_TIME_CHANNEL_ID, FrameTimeSample};
 pub use transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 pub use views::{Body, LogEntry, MergedFrame};

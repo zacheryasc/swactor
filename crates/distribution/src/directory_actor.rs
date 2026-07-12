@@ -42,10 +42,10 @@ const FANOUT: u32 = 3;
 const MAX_ROUNDS: u32 = 8;
 /// Claims shipped in a single gossip batch per `Tick`.
 const BATCH: usize = 16;
-/// Grace window (in `Tick`s) before a gone host's claims are reclaimed from the
-/// map. ~5s at the live node's 100 ms cadence. Routing already hides a dead host
-/// (see [`DirectoryActor::republish`]); this is memory hygiene only.
-const GC_GRACE_TICKS: u32 = 50;
+/// Dead hosts are hidden from the published [`RouteView`], but their signed
+/// claims stay cached so a false-dead peer can become routable again as soon as
+/// SWIM reports it Alive. Claim deletion requires a future explicit tombstone or
+/// owner-side lifecycle signal; raw `Tick` cadence is not a safe GC clock.
 
 /// Everything the `DirectoryActor` receives, as one enum. Only [`Gossip`](DirectoryIn::Gossip)
 /// crosses the wire (it carries the registered `DirectoryGossip` tag); the rest
@@ -66,7 +66,7 @@ pub enum DirectoryIn {
         actor: ActorAddress,
         reply: ActorAddress,
     },
-    /// Clock: disseminate one batch to one peer, then run GC.
+    /// Clock: disseminate one batch to one peer.
     Tick,
 }
 
@@ -90,9 +90,6 @@ pub struct DirectoryActor {
     hot: HashMap<ActorAddress, u32>,
     /// Round-robins the gossip target across `alive`, one per `Tick`.
     cursor: usize,
-    /// Per-gone-host GC grace countdown. Internal bookkeeping (not in `DIRECTORY.md`
-    /// §4.2's state); a host that returns is cleared in [`Self::on_membership`].
-    absent: HashMap<NodeId, u32>,
     peer_directory: Arc<dyn PeerDirectory>,
     /// The §5 read mirror. Single writer = this actor; republished on every change.
     route_view: RouteView,
@@ -114,7 +111,6 @@ impl DirectoryActor {
             alive: BTreeSet::new(),
             hot: HashMap::new(),
             cursor: 0,
-            absent: HashMap::new(),
             peer_directory,
             route_view,
             route_binder,
@@ -163,10 +159,9 @@ impl DirectoryActor {
         match change.state {
             MemberState::Alive if change.node_id != self.self_id => {
                 if self.alive.insert(change.node_id) {
-                    // A (re)joining peer: clear any pending GC and re-arm every held
-                    // claim so the returning peer is caught up — without a full-cluster
-                    // reflood (only the actors we hold, and only via the lazy push).
-                    self.absent.remove(&change.node_id);
+                    // A (re)joining peer: re-arm every held claim so the returning
+                    // peer is caught up — without a full-cluster reflood (only the
+                    // actors we hold, and only via the lazy push).
                     let budget = self.budget();
                     let actors: Vec<ActorAddress> = self.map.keys().copied().collect();
                     for actor in actors {
@@ -175,8 +170,9 @@ impl DirectoryActor {
                 }
             }
             MemberState::Dead => {
-                // Drop from the alive set; republish hides its actors from routing,
-                // and gc reclaims the claims after the grace window.
+                // Drop from the alive set; republish hides its actors from routing.
+                // Keep the signed claim cached so a false-dead host can recover
+                // without depending on wall-clock or pump-tick based GC.
                 self.alive.remove(&change.node_id);
             }
             _ => {} // Suspect, or self: ignore (suspicion is SWIM's transient state)
@@ -186,7 +182,6 @@ impl DirectoryActor {
 
     fn tick(&mut self, ctx: &Ctx) {
         self.disseminate(ctx);
-        self.gc();
     }
 
     /// Send one batch of armed claims to one alive peer (round-robin). Skips the
@@ -210,7 +205,7 @@ impl DirectoryActor {
 
     /// Republish the §5 route view: every actor whose host is reachable right now
     /// (self, or an alive peer). A dead host's actors are omitted, so the egress
-    /// never routes to a host SWIM has buried — even before GC reclaims the claim.
+    /// never routes to a host SWIM has buried; the claim remains cached for recovery.
     ///
     /// Builds the new view locally, swaps it in under the lock, then registers a
     /// route for each remotely-hosted actor *outside* the lock — so the egress
@@ -250,26 +245,6 @@ impl DirectoryActor {
             }
         }
         claims
-    }
-
-    /// Reclaim claims whose host has been gone past the grace window. Memory
-    /// hygiene only — [`Self::republish`] already hides a dead host from routing.
-    fn gc(&mut self) {
-        let gone: Vec<NodeId> = self
-            .map
-            .values()
-            .map(|c| c.node_id)
-            .filter(|h| *h != self.self_id && !self.alive.contains(h))
-            .collect();
-        for h in gone {
-            let n = self.absent.entry(h).or_insert(0);
-            *n += 1;
-            if *n > GC_GRACE_TICKS {
-                self.map.retain(|_, c| c.node_id != h);
-                self.absent.remove(&h);
-            }
-        }
-        // A host that came back was already cleared in on_membership(Alive).
     }
 
     /// Per-claim dissemination budget: `FANOUT · ⌈log2(cluster+1)⌉`, clamped to

@@ -19,10 +19,11 @@
 
 use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use iroh::{EndpointAddr, PublicKey, RelayMode};
+use parking_lot::Mutex;
 use tokio::runtime::{Handle, Runtime as TokioRuntime};
 
 use swactor::actor::{ActorAddress, ActorInterface};
@@ -79,10 +80,7 @@ impl ActorInterface for MembershipFanout {
     type Response = ();
 
     fn handle(&mut self, ctx: &Ctx, m: Self::Incoming) {
-        self.mirror
-            .lock()
-            .unwrap()
-            .apply(m.node_id, m.state, m.incarnation);
+        self.mirror.lock().apply(m.node_id, m.state, m.incarnation);
         let _ = ctx.send(self.registry, RegistryIn::Membership(m.clone()));
         let _ = ctx.send(self.metadata, MetadataIn::Membership(m.clone()));
         let _ = ctx.send(self.directory, DirectoryIn::Membership(m));
@@ -134,7 +132,7 @@ impl IrohNode {
         let rt: Arc<Runtime> = Arc::new(swactor_rt);
 
         // Shared egress state.
-        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let outbox: Outbox = Arc::new(StdMutex::new(Vec::new()));
         let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
         let peer_directory = Arc::new(OutboxPeerDirectory::new(
@@ -289,7 +287,6 @@ impl IrohNode {
     pub fn alive_count(&self) -> usize {
         self.membership_mirror
             .lock()
-            .unwrap()
             .all_members()
             .iter()
             .filter(|e| e.state == MemberState::Alive)
@@ -391,7 +388,6 @@ pub fn sees_state(node: &IrohNode, peer_key: &PublicKey, state: &str) -> bool {
     let peer_bytes = *peer_key.as_bytes();
     node.membership_mirror
         .lock()
-        .unwrap()
         .all_members()
         .iter()
         .any(|e| e.node_id.0 == peer_bytes && e.state == want)

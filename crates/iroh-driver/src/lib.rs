@@ -13,7 +13,7 @@ pub use iroh_driver::{
 
 pub use datastream_transport::{
     DATASTREAM_ALPN, DatastreamQuicHeader, DatastreamQuicRead, DatastreamQuicWriteStats,
-    read_deliveries_from_stream, read_next_uni_from_connection, read_stream_into_fanout,
-    spawn_connection_reader, spawn_subscription_writer, write_available_subscription,
-    write_delivery, write_subscription_until_closed,
+    read_events_from_stream, read_next_event, read_next_uni_from_connection, read_stream_header,
+    read_stream_into_fanout, spawn_connection_reader, spawn_subscription_writer,
+    write_available_subscription, write_event, write_subscription_until_closed,
 };

@@ -131,6 +131,26 @@ fn provisioning_validates_authority_and_assigned_shape_before_setup() {
     );
 }
 
+#[test]
+fn duplicate_identical_provision_is_idempotent() {
+    let mut harness = new_controller();
+    let provision = valid_provision();
+    harness.observe(stage::StageEvent::ProvisionStage {
+        from: stage::NodeId(99),
+        provision: provision.clone(),
+    });
+    let command_count = harness.commands().len();
+    let event_count = harness.events().len();
+
+    harness.observe(stage::StageEvent::ProvisionStage {
+        from: stage::NodeId(99),
+        provision,
+    });
+
+    assert_eq!(harness.commands().len(), command_count);
+    assert_eq!(harness.events().len(), event_count);
+}
+
 // This proves StageReady is emitted only after worker readiness, weight
 // readiness, inbound edge readiness, and outbound edge readiness are all
 // observed.
