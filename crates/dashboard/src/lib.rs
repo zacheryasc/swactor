@@ -1,3 +1,4 @@
+mod hardware_view;
 mod live_explorer;
 mod server;
 mod store;
@@ -56,7 +57,7 @@ impl FrameEvent {
                 node: stream.node.as_str().to_string(),
                 life: stream.life.0,
             },
-            channel: frame.channel.as_str().to_string(),
+            channel: frame.channel.to_string(),
             position: frame.position.0,
             payload: frame.payload.clone(),
         }
@@ -64,11 +65,12 @@ impl FrameEvent {
 
     pub(crate) fn to_datastream_parts(&self) -> Option<(StreamId, Frame)> {
         let stream = StreamId::new(NodeId::new(&self.stream.node), Lifetime(self.stream.life));
-        let frame = Frame::new(
-            ChannelId::new(&self.channel),
-            Position(self.position),
-            self.payload.clone(),
-        );
+        let channel = self
+            .channel
+            .parse::<u32>()
+            .map(ChannelId)
+            .unwrap_or(ChannelId(0));
+        let frame = Frame::new(channel, Position(self.position), self.payload.clone());
         Some((stream, frame))
     }
 }
@@ -144,7 +146,8 @@ impl DashboardHandle {
 /// is called.
 pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     let views = Arc::new(ViewRegistry::new());
-    views.register(Arc::new(live_explorer::LiveDatastreamExplorer));
+    views.register(Arc::new(live_explorer::LiveDatastreamExplorer::default()));
+    views.register(Arc::new(hardware_view::HardwareDashboardView::default()));
     views.register(swactor::worker_view());
     let store = Arc::new(DashboardStore::new(
         config.raw_frame_history,

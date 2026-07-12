@@ -10,12 +10,13 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::iroh::*;
 use distribution::peer_auth::PeerAllowList;
 use iroh::PublicKey;
+use parking_lot::Mutex;
 
 // ─── Identity tests ─────────────────────────────────────────────────────
 
@@ -130,8 +131,8 @@ fn two_nodes_form_cluster_with_peer_auth() {
     let b_addr = node_b.endpoint_addr();
 
     // Switch to restrictive mode by adding each other
-    auth_a.lock().unwrap().add_peer(b_id, "node-b".into());
-    auth_b.lock().unwrap().add_peer(a_id, "node-a".into());
+    auth_a.lock().add_peer(b_id, "node-b".into());
+    auth_b.lock().add_peer(a_id, "node-a".into());
 
     node_a.join(&[b_addr]);
 
@@ -159,7 +160,7 @@ fn peer_auth_prevents_unauthorized_join() {
     // Node B has auth with only a dummy peer — node_a is NOT authorized
     let auth_b = Arc::new(Mutex::new(PeerAllowList::open()));
     let dummy_id = distribution::types::NodeId([0xAA; 32]);
-    auth_b.lock().unwrap().add_peer(dummy_id, "dummy".into());
+    auth_b.lock().add_peer(dummy_id, "dummy".into());
     let mut node_b = make_driver_with_auth(auth_b);
 
     let b_addr = node_b.endpoint_addr();

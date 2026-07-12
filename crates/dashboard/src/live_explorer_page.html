@@ -6,13 +6,19 @@
 <title>Datastream live explorer</title>
 <style>
 :root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0}body{margin:0;padding:18px}header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:14px}h1{margin:0;font-size:26px}.muted{color:#94a3b8}.top{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.pill,button,input,select{background:#111827;color:#e2e8f0;border:1px solid #334155;border-radius:9px;padding:8px 10px}.pill{background:#1e293b;border-radius:999px;font-size:12px}button{cursor:pointer}button[data-active=true]{outline:2px solid #60a5fa;background:#172554}input{min-width:280px}.metrics{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:10px;margin-bottom:12px}.grid{display:grid;grid-template-columns:1fr 420px;gap:12px}.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:14px}.label{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em}.value{font-size:23px;font-variant-numeric:tabular-nums}.table-wrap{max-height:740px;overflow:auto}table{width:100%;border-collapse:collapse;background:#111827;border:1px solid #334155;border-radius:12px;overflow:hidden}th,td{padding:8px 9px;border-bottom:1px solid #1f2937;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}th{background:#1e293b;color:#93c5fd;position:sticky;top:0}tbody tr{cursor:pointer}tr[data-active=true]{outline:2px solid #60a5fa;background:#172554}.tag{font-size:12px;border-radius:999px;padding:3px 8px;background:#334155}.json{color:#86efac}.text{color:#fbbf24}.binary{color:#c4b5fd}.ok{color:#34d399}.warn{color:#fbbf24}.bad{color:#f87171}.kv{display:grid;grid-template-columns:115px 1fr;gap:8px;border-bottom:1px solid #334155;padding:7px 0}pre{white-space:pre-wrap;word-break:break-word;background:#020617;border:1px solid #334155;border-radius:12px;padding:12px;max-height:560px;overflow:auto}.empty{border:1px dashed #475569;border-radius:12px;padding:22px;color:#94a3b8}section[hidden]{display:none}@media(max-width:1100px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}input{min-width:0;width:100%}}
+.nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:8px}.nav a{color:#e2e8f0;text-decoration:none;border:1px solid transparent;border-radius:9px;padding:7px 10px}.nav a[data-active="true"]{background:#172554;border-color:#60a5fa}
 </style>
 </head>
 <body>
+<nav class="nav" aria-label="Dashboard navigation">
+  <a href="/">Dashboard</a>
+  <a href="/view/datastream/live" aria-current="page" data-active="true">Live datastream</a>
+  <a href="/view/fleet">Fleet</a>
+</nav>
 <header>
   <div>
     <h1>Datastream live explorer</h1>
-    <div class="muted">Auto-connected. Streams/channels are stable DOM rows; incoming frames update only affected counters and the selected channel ring.</div>
+    <div class="muted">Auto-connected. Retained channel history is restored from /api/view/datastream/live, then live frames continue from /events.</div>
   </div>
   <span class="pill warn" id="status">starting</span>
 </header>
@@ -57,7 +63,7 @@
     <div class="label">Selection</div>
     <h2 id="detailTitle">No frame selected</h2>
     <div id="detailMeta"></div>
-    <pre id="detail">Waiting for frames from /api/frames and /events.</pre>
+    <pre id="detail">Waiting for retained frames from /api/view/datastream/live and live frames from /events.</pre>
   </aside>
 </div>
 
@@ -80,6 +86,7 @@
     selectedFrame: '',
     connected: false,
     error: '',
+    messageVersion: 0,
     totalFrames: 0,
     jsonFrames: 0,
     seq: 0,
@@ -187,7 +194,6 @@
     stream.channels.add(frame.channel);
     channel[frame.kind]++;
     channel.bytes += frame.bytes;
-    channel.latest = frame;
     state.totalFrames++;
     if (frame.kind === 'json') state.jsonFrames++;
   }
@@ -211,7 +217,14 @@
   }
 
   function pushFrame(frame, stream, channel) {
-    channel.frames.push(frame);
+    let low = 0;
+    let high = channel.frames.length;
+    while (low < high) {
+      const middle = (low + high) >>> 1;
+      if (channel.frames[middle].position <= frame.position) low = middle + 1;
+      else high = middle;
+    }
+    channel.frames.splice(low, 0, frame);
     state.byId.set(frame.id, frame);
     addCounts(stream, channel, frame);
 
@@ -221,6 +234,7 @@
       subtractCounts(stream, channel, old);
       removeFrameRow(old);
     }
+    channel.latest = channel.frames[channel.frames.length - 1] || null;
   }
 
   function addFrame(event) {
@@ -330,7 +344,15 @@
   function maybeAppendFrameRow(frame) {
     if (!frame || state.level !== 'frames' || !frameMatches(frame) || state.frameRows.has(frame.id)) return;
     const row = createFrameRow(frame);
-    nodes.framesBody.prepend(row);
+    let before = null;
+    for (const child of nodes.framesBody.children) {
+      const existing = state.byId.get(child.dataset.frame);
+      if (existing && existing.position < frame.position) {
+        before = child;
+        break;
+      }
+    }
+    nodes.framesBody.insertBefore(row, before);
     state.frameRows.set(frame.id, row);
   }
 
@@ -338,7 +360,7 @@
     state.frameRows.clear();
     nodes.framesBody.replaceChildren();
     const channel = state.channels.get(state.selectedChannel);
-    const frames = channel ? channel.frames.filter(frameMatches).slice().sort((a, b) => b.seq - a.seq) : [];
+    const frames = channel ? channel.frames.filter(frameMatches).slice().sort((a, b) => b.position - a.position) : [];
     nodes.framesEmpty.hidden = Boolean(channel);
     nodes.framesTableWrap.hidden = !channel;
     nodes.framesTitle.textContent = channel ? `Frames for ${channel.channel}` : 'Frames';
@@ -425,41 +447,79 @@
     if (state.level === 'frames') renderSelectedFrames();
   }
 
-  async function loadRecent() {
-    try {
-      const response = await fetch('/api/frames', { cache: 'no-store' });
-      if (!response.ok) throw new Error(`/api/frames HTTP ${response.status}`);
-      const events = await response.json();
-      for (const event of events) addFrame(event);
-      state.error = '';
-      flushNow();
-    } catch (error) {
-      state.error = error.message;
+  async function reconcileSnapshot({ notice = '', minimumNoticeMs = 0 } = {}) {
+    if (notice) {
+      state.error = notice;
+      state.messageVersion++;
       updateMetrics();
       renderDetail();
+    }
+    const messageVersion = state.messageVersion;
+    const startedAt = performance.now();
+    try {
+      const response = await fetch('/api/view/datastream/live', { cache: 'no-store' });
+      if (!response.ok) throw new Error(`/api/view/datastream/live HTTP ${response.status}`);
+      const snapshot = await response.json();
+      if (!snapshot || !Array.isArray(snapshot.frames)) {
+        throw new Error('/api/view/datastream/live returned an invalid snapshot');
+      }
+      for (const event of snapshot.frames) addFrame(event);
+      flushNow();
+
+      const remainingNoticeMs = minimumNoticeMs - (performance.now() - startedAt);
+      if (remainingNoticeMs > 0) {
+        await new Promise(resolve => setTimeout(resolve, remainingNoticeMs));
+      }
+      if (state.messageVersion === messageVersion) {
+        state.error = '';
+        state.messageVersion++;
+        updateMetrics();
+        renderDetail();
+      }
+    } catch (error) {
+      if (state.messageVersion === messageVersion) {
+        state.error = error.message;
+        state.messageVersion++;
+        updateMetrics();
+        renderDetail();
+      }
     }
   }
 
   function connectEvents() {
     if (state.source) state.source.close();
-    state.source = new EventSource('/events');
-    state.source.addEventListener('open', () => {
+    state.connected = false;
+    const source = new EventSource('/events');
+    state.source = source;
+    source.addEventListener('open', () => {
+      if (state.source !== source) return;
       state.connected = true;
       state.error = '';
+      state.messageVersion++;
       updateMetrics();
+      reconcileSnapshot();
     });
-    state.source.addEventListener('frame', event => {
+    source.addEventListener('frame', event => {
+      if (state.source !== source) return;
       try { addFrame(JSON.parse(event.data)); }
-      catch (error) { state.error = error.message; updateMetrics(); renderDetail(); }
+      catch (error) {
+        state.error = error.message;
+        state.messageVersion++;
+        updateMetrics();
+        renderDetail();
+      }
     });
-    state.source.addEventListener('lagged', event => {
-      state.error = `SSE lagged: ${event.data}`;
-      updateMetrics();
-      renderDetail();
+    source.addEventListener('lagged', event => {
+      if (state.source !== source) return;
+      reconcileSnapshot({ notice: `SSE lagged: ${event.data}`, minimumNoticeMs: 1000 });
     });
-    state.source.onerror = () => {
+    source.onerror = () => {
+      if (state.source !== source) return;
       state.connected = false;
-      if (!state.totalFrames) state.error = 'waiting for /events';
+      if (!state.totalFrames) {
+        state.error = 'waiting for /events';
+        state.messageVersion++;
+      }
       updateMetrics();
     };
   }
@@ -488,11 +548,15 @@
   nodes.filter.addEventListener('input', applyFilter);
   nodes.kind.addEventListener('change', renderSelectedFrames);
   nodes.limit.addEventListener('change', trimAllChannels);
-  nodes.reconnect.addEventListener('click', () => { state.error = ''; connectEvents(); loadRecent(); updateMetrics(); });
+  nodes.reconnect.addEventListener('click', () => {
+    state.error = '';
+    state.messageVersion++;
+    connectEvents();
+    updateMetrics();
+  });
 
   selectLevel('streams');
   updateMetrics();
-  loadRecent();
   connectEvents();
 })();
 </script>

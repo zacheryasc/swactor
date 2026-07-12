@@ -18,7 +18,7 @@ fn mvp_lifecycle_record_round_trips_on_owned_datastream_channel() {
     });
 
     assert_eq!(MvpLifecycleRecord::CHANNEL, telemetry::MVP_LIFECYCLE);
-    assert_eq!(MvpLifecycleRecord::channel().as_str(), "mvp.lifecycle");
+    assert_eq!(MvpLifecycleRecord::channel_name(), "mvp.lifecycle");
     assert_eq!(record.kind(), obs::EventKind::StageFaulted);
     assert_eq!(
         MvpLifecycleRecord::decode(&record.encode()).unwrap(),
@@ -31,7 +31,7 @@ fn mvp_channel_registry_marks_lifecycle_payloads_as_typed() {
     let registry = telemetry::channel_registry();
 
     assert_eq!(
-        registry.classify_channel(&MvpLifecycleRecord::channel()),
+        registry.classify_name(MvpLifecycleRecord::channel_name()),
         ChannelKind::Typed
     );
 }
@@ -87,11 +87,11 @@ fn mvp_channel_registry_marks_provisioning_payloads_as_typed() {
     let registry = telemetry::channel_registry();
 
     assert_eq!(
-        registry.classify_channel(&MvpProvisionEventRecord::channel()),
+        registry.classify_name(MvpProvisionEventRecord::channel_name()),
         ChannelKind::Typed
     );
     assert_eq!(
-        registry.classify_channel(&MvpProvisionLogRecord::channel()),
+        registry.classify_name(MvpProvisionLogRecord::channel_name()),
         ChannelKind::Typed
     );
 }

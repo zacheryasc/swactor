@@ -1590,6 +1590,37 @@ mod handler_emission {
     }
 
     #[test]
+    fn join_response_alive_resurrects_dead_peer_at_same_incarnation() {
+        // Re-peer recovery: a peer that was declared Dead may answer a JoinResponse
+        // with its self-report as Alive at the same incarnation. Join must treat that
+        // as fresh liveness, not reject it under normal Dead > Alive CRDT priority.
+        let mut joiner = fresh_node(1);
+        joiner.handle_join_response(vec![NodeRecord {
+            node_id: node(2),
+            state: MemberState::Dead,
+            incarnation: 7,
+        }]);
+        assert_eq!(
+            joiner.members().get(&node(2)).unwrap().state,
+            MemberState::Dead
+        );
+
+        let actions = joiner.handle_join_response(vec![NodeRecord {
+            node_id: node(2),
+            state: MemberState::Alive,
+            incarnation: 7,
+        }]);
+
+        let entry = joiner.members().get(&node(2)).unwrap();
+        assert_eq!(entry.state, MemberState::Alive);
+        assert_eq!(entry.incarnation, 7);
+        assert!(
+            membership_changes(&actions).contains(&(node(2), MemberState::Alive, 7)),
+            "resurrection from Dead must notify directory/routing subscribers"
+        );
+    }
+
+    #[test]
     fn join_response_does_not_re_gossip_the_bulk_snapshot() {
         // §10.9 asymmetry (the lone exception to §7 inv. 5): a JoinResponse seeds
         // the member list and fires notifications, but must NOT enqueue the bulk

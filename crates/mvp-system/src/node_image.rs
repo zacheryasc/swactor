@@ -35,6 +35,9 @@ const NODE_IMAGE_SOURCE_HASH_LABEL: &str = "org.swactor.mvp.node.source-hash";
 const NODE_IMAGE_WORKER_HASH_LABEL: &str = "org.swactor.mvp.node.worker-hash";
 const NODE_IMAGE_BASE_HASH_LABEL: &str = "org.swactor.mvp.node.base-hash";
 const BASE_IMAGE_SOURCE_HASH_LABEL: &str = "org.swactor.mvp.base.source-hash";
+const NODE_IMAGE_PRUNE_ENV: &str = "MVP_NODE_IMAGE_PRUNE";
+const NODE_IMAGE_PRUNE_KEEP_ENV: &str = "MVP_NODE_IMAGE_PRUNE_KEEP";
+const DEFAULT_DIRTY_IMAGE_KEEP: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeImageProvider {
@@ -103,6 +106,7 @@ pub fn prepare_node_image(request: NodeImageRequest) -> Result<PreparedNodeImage
     let remote_available = remote_required && docker_manifest_exists(&root, &image_ref);
     if !request.force_refresh && remote_required && remote_available {
         let pushed = ensure_aliases_for_remote(&root, &image_ref, &image, &alias_tags)?;
+        prune_old_dirty_images(&root, &image, &tag);
         return Ok(PreparedNodeImage {
             image_ref,
             tag,
@@ -117,6 +121,7 @@ pub fn prepare_node_image(request: NodeImageRequest) -> Result<PreparedNodeImage
         for alias in alias_refs(&image, &alias_tags) {
             push_image(&root, &alias)?;
         }
+        prune_old_dirty_images(&root, &image, &tag);
         return Ok(PreparedNodeImage {
             image_ref,
             tag,
@@ -127,6 +132,7 @@ pub fn prepare_node_image(request: NodeImageRequest) -> Result<PreparedNodeImage
     }
     if !request.force_refresh && !remote_required && local_image_matches {
         ensure_aliases_local(&root, &image_ref, &image, &alias_tags)?;
+        prune_old_dirty_images(&root, &image, &tag);
         return Ok(PreparedNodeImage {
             image_ref,
             tag,
@@ -196,6 +202,7 @@ pub fn prepare_node_image(request: NodeImageRequest) -> Result<PreparedNodeImage
         }
     }
 
+    prune_old_dirty_images(&root, &image, &tag);
     Ok(PreparedNodeImage {
         image_ref,
         tag,
@@ -475,6 +482,18 @@ fn docker_image_labels_match(
     image_ref: &str,
     expected: &[(&str, &str)],
 ) -> Result<bool, String> {
+    let Some(labels) = docker_image_labels(root, image_ref)? else {
+        return Ok(false);
+    };
+    Ok(expected
+        .iter()
+        .all(|(key, value)| labels.get(*key).map(String::as_str) == Some(*value)))
+}
+
+fn docker_image_labels(
+    root: &Path,
+    image_ref: &str,
+) -> Result<Option<BTreeMap<String, String>>, String> {
     let output = Command::new("docker")
         .current_dir(root)
         .args([
@@ -488,15 +507,12 @@ fn docker_image_labels_match(
         .output()
         .map_err(|e| format!("inspect docker image {image_ref}: {e}"))?;
     if !output.status.success() {
-        return Ok(false);
+        return Ok(None);
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let labels: Option<BTreeMap<String, String>> = serde_json::from_str(stdout.trim())
         .map_err(|e| format!("parse docker labels for {image_ref}: {e}"))?;
-    let labels = labels.unwrap_or_default();
-    Ok(expected
-        .iter()
-        .all(|(key, value)| labels.get(*key).map(String::as_str) == Some(*value)))
+    Ok(Some(labels.unwrap_or_default()))
 }
 
 fn docker_manifest_exists(root: &Path, image_ref: &str) -> bool {
@@ -509,6 +525,129 @@ fn docker_manifest_exists(root: &Path, image_ref: &str) -> bool {
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+fn prune_old_dirty_images(root: &Path, image: &ImageName, keep_tag: &str) {
+    if !dirty_image_prune_enabled() {
+        return;
+    }
+
+    let output = match Command::new("docker")
+        .current_dir(root)
+        .args([
+            "image",
+            "ls",
+            "--format",
+            "{{.Repository}}\t{{.Tag}}",
+            &image.repository,
+        ])
+        .stdin(Stdio::null())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) => {
+            eprintln!("mvp-node-image: prune old dirty images skipped: {error}");
+            return;
+        }
+    };
+    if !output.status.success() {
+        eprintln!(
+            "mvp-node-image: prune old dirty images skipped: docker image ls failed with {}",
+            output.status
+        );
+        return;
+    }
+
+    let keep_old = dirty_image_prune_keep();
+    let mut retained_old = 0_usize;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let Some((repository, tag)) = line.split_once('\t') else {
+            continue;
+        };
+        if repository != image.repository
+            || !tag.starts_with("dirty-")
+            || tag == keep_tag
+            || tag == "<none>"
+        {
+            continue;
+        }
+
+        let image_ref = image.ref_for_tag(tag);
+        let Ok(Some(labels)) = docker_image_labels(root, &image_ref) else {
+            continue;
+        };
+        if labels.get(NODE_IMAGE_TAG_LABEL).map(String::as_str) != Some(tag)
+            || !labels.contains_key(NODE_IMAGE_SOURCE_HASH_LABEL)
+            || !labels.contains_key(NODE_IMAGE_WORKER_HASH_LABEL)
+            || !labels.contains_key(NODE_IMAGE_BASE_HASH_LABEL)
+        {
+            continue;
+        }
+        if docker_image_has_container(root, &image_ref) {
+            eprintln!(
+                "mvp-node-image: prune old dirty image {image_ref} skipped: container exists"
+            );
+            continue;
+        }
+        if retained_old < keep_old {
+            retained_old += 1;
+            continue;
+        }
+
+        eprintln!("mvp-node-image: prune old dirty image {image_ref}");
+        match Command::new("docker")
+            .current_dir(root)
+            .args(["image", "rm", &image_ref])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                eprintln!(
+                    "mvp-node-image: prune old dirty image {image_ref} skipped: docker image rm failed with {status}"
+                );
+            }
+            Err(error) => {
+                eprintln!("mvp-node-image: prune old dirty image {image_ref} skipped: {error}");
+            }
+        }
+    }
+}
+
+fn dirty_image_prune_enabled() -> bool {
+    std::env::var(NODE_IMAGE_PRUNE_ENV)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true)
+}
+
+fn dirty_image_prune_keep() -> usize {
+    std::env::var(NODE_IMAGE_PRUNE_KEEP_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_DIRTY_IMAGE_KEEP)
+}
+
+fn docker_image_has_container(root: &Path, image_ref: &str) -> bool {
+    Command::new("docker")
+        .current_dir(root)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("ancestor={image_ref}"),
+            "--format",
+            "{{.ID}}",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(true)
 }
 
 fn run_status(root: &Path, program: &str, args: &[&str], label: &str) -> Result<(), String> {

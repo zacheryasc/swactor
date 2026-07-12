@@ -2,11 +2,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::frame::ChannelId;
+
 use crate::frame::Position;
 use crate::record::Record;
 
 /// Reserved channel carrying optional timing samples for frames in the same stream.
 pub const FRAME_TIME_CHANNEL: &str = "datastream.frame_time";
+pub const FRAME_TIME_CHANNEL_ID: ChannelId = ChannelId(0);
 
 /// Sidecar timing sample keyed by the target frame's stream-local position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

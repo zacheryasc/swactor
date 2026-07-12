@@ -4,7 +4,7 @@ use std::thread;
 use std::time::Duration;
 
 use dashboard::swactor::{RUNTIME_ACTORS, RUNTIME_STATS, RUNTIME_WORKERS};
-use dashboard::{DashboardConfig, DashboardHandle, start_dashboard};
+use dashboard::{DashboardConfig, DashboardHandle, FrameEvent, StreamEvent, start_dashboard};
 use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -394,7 +394,19 @@ fn publish_json(
     value: Value,
 ) {
     let payload = serde_json::to_vec(&value).expect("serialize dashboard frame");
-    let frame = Frame::new(ChannelId::new(channel), Position(*position), payload);
-    dashboard.ingest(stream, &frame);
+    let frame = Frame::new(
+        ChannelId(*position as u32 + 1),
+        Position(*position),
+        payload,
+    );
+    dashboard.publish(FrameEvent {
+        stream: StreamEvent {
+            node: stream.node.as_str().to_string(),
+            life: stream.life.0,
+        },
+        channel: channel.to_owned(),
+        position: *position,
+        payload: frame.payload.clone(),
+    });
     *position = position.wrapping_add(1);
 }

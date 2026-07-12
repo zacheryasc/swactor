@@ -30,6 +30,7 @@ pub struct RuntimeConfigOverlay {
     pub node_id: Option<u64>,
     pub stage_index: Option<u32>,
     pub layer_end_exclusive: Option<u32>,
+    pub pipeline_stages: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -272,6 +273,7 @@ run_id = 42
 node_id = 7
 stage_index = 2
 layer_end_exclusive = 24
+pipeline_stages = 3
 
 [provider]
 kind = "vastai"
@@ -334,6 +336,7 @@ poll_interval_secs = 30
         assert_eq!(config.runtime.node_id, Some(7));
         assert_eq!(config.runtime.stage_index, Some(2));
         assert_eq!(config.runtime.layer_end_exclusive, Some(24));
+        assert_eq!(config.runtime.pipeline_stages, Some(3));
         assert_eq!(config.provider.kind.as_deref(), Some("vastai"));
         assert_eq!(
             config.image.node.as_deref(),
@@ -402,6 +405,22 @@ poll_interval_secs = 30
         assert_eq!(
             config.vastai.ssh_identity.as_deref(),
             Some("~/.ssh/swactor_vastai_ed25519")
+        );
+    }
+
+    #[test]
+    fn config_toml_rejects_non_numeric_pipeline_stages() {
+        let error = TomlConfigOverlay::from_str(
+            r#"
+[runtime]
+pipeline_stages = "many"
+"#,
+        )
+        .expect_err("non-numeric pipeline_stages must not parse");
+
+        assert!(
+            error.to_string().contains("pipeline_stages"),
+            "error should identify pipeline_stages: {error}"
         );
     }
 

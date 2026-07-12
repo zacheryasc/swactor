@@ -2,7 +2,7 @@ use iroh::EndpointAddr;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use datastream::{ChannelId, DatastreamProducer};
+use datastream::{ChannelContent, DatastreamProducer};
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender};
@@ -12,7 +12,10 @@ use crate::provisioning::{
     NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
     ProvisionEvent, ProvisionEventKind, ProvisionLogLine, ProvisionLogStream, ProvisionPlugin,
 };
-use crate::telemetry::{MvpProvisionEventRecord, MvpProvisionLogRecord, mvp_provision_log_channel};
+use crate::telemetry::{
+    MVP_PROVISIONING_LOGS, MvpProvisionEventRecord, MvpProvisionLogRecord,
+    mvp_provision_log_channel,
+};
 
 use super::codec::JsonCodec;
 
@@ -377,13 +380,20 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
 
     fn emit_event(&self, event: ProvisionEvent) {
         if let Some(producer) = &self.telemetry {
-            producer.submit_record(&MvpProvisionEventRecord::new(event));
+            let channel = producer.register_record::<MvpProvisionEventRecord>();
+            producer.submit_record(channel, &MvpProvisionEventRecord::new(event));
         }
     }
 
     fn emit_log(&self, line: ProvisionLogLine) {
         if let Some(producer) = &self.telemetry {
-            let channel = mvp_provision_log_channel(line.node_id, line.stream);
+            let name = mvp_provision_log_channel(line.node_id, line.stream);
+            let channel = producer.register_channel(
+                name,
+                ChannelContent::JsonRecord {
+                    schema: Some(MVP_PROVISIONING_LOGS.to_owned()),
+                },
+            );
             let record = MvpProvisionLogRecord::new(line);
             let payload = serde_json::to_vec(&record).expect("serialize provisioning log record");
             producer.submit_bytes(channel, payload);
@@ -392,7 +402,8 @@ impl<P: ProvisionPlugin> ProvisionerActor<P> {
 
     fn emit_datastream_frame(&self, channel: String, payload: String) {
         if let Some(producer) = &self.telemetry {
-            producer.submit_bytes(ChannelId::new(channel), payload.into_bytes());
+            let channel = producer.register_channel(channel, ChannelContent::Bytes);
+            producer.submit_bytes(channel, payload.into_bytes());
         }
     }
 }

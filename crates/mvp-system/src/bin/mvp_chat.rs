@@ -59,7 +59,7 @@ where
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("mvp-one-node-chat: {error}");
+            eprintln!("mvp-chat: {error}");
             ExitCode::from(1)
         }
     }
@@ -75,7 +75,7 @@ where
     let frame_log = configure_progress_frame_log(&mut config)?;
     if let Some(path) = &config.datastream_frame_log {
         eprintln!(
-            "mvp-one-node-chat: dumping datastream frames to {}",
+            "mvp-chat: dumping datastream frames to {}",
             display_user_path(path)
         );
     }
@@ -107,6 +107,7 @@ where
 
 struct Config {
     orch_bin: PathBuf,
+    worker_bin: PathBuf,
     orch_args: Vec<String>,
     rpc_addr: String,
     node_image: String,
@@ -129,6 +130,7 @@ struct Config {
     gguf_file: Option<String>,
     gguf_revision: Option<String>,
     max_context: Option<u32>,
+    pipeline_stages: u32,
 }
 
 impl Config {
@@ -144,11 +146,8 @@ impl Config {
         } else {
             RuntimeConfigProfile::from_env()?
         };
-        let provider = if args.vastai {
-            ProviderKind::VastAi
-        } else {
-            provider_from_env(profile)?
-        };
+        let provider =
+            provider_from_sources(args.provider, toml.provider.kind.as_deref(), profile)?;
         let relay_mode = relay_mode_from_sources(toml.relay.mode.as_deref())?;
         let relay_url = first_non_empty([
             env_optional("MVP_IROH_RELAY_URL"),
@@ -229,6 +228,19 @@ impl Config {
             toml.model.gguf_revision.clone(),
         ]);
         let max_context = env_u32_optional("MVP_MAX_CONTEXT")?.or(toml.model.max_context);
+        let pipeline_stages = args
+            .pipeline_stages
+            .or(env_u32_optional("MVP_PIPELINE_STAGES")?)
+            .or(toml.runtime.pipeline_stages)
+            .unwrap_or(1);
+        if pipeline_stages == 0 {
+            return Err("--pipeline-stages must be greater than 0".to_owned());
+        }
+        if provider == ProviderKind::VastAi && pipeline_stages > 1 {
+            return Err(
+                "pipeline stages greater than 1 are only supported with provider=docker; --vastai cannot be combined with -N/--pipeline-stages > 1".to_owned(),
+            );
+        }
         let cached_model = match (
             args.cached_model,
             toml.docker.cached_model_host_path.clone(),
@@ -249,6 +261,7 @@ impl Config {
 
         Ok(Self {
             orch_bin: args.orch_bin.unwrap_or(default_orch_bin()?),
+            worker_bin: args.worker_bin.unwrap_or(node_bin_for_current_profile()?),
             orch_args: args.orch_args,
             rpc_addr,
             node_image,
@@ -270,6 +283,7 @@ impl Config {
             gguf_file,
             gguf_revision,
             max_context,
+            pipeline_stages,
             vastai,
         })
     }
@@ -286,6 +300,8 @@ impl Config {
             self.rpc_addr.clone(),
             "--max-tokens".to_owned(),
             self.max_tokens.to_string(),
+            "--pipeline-stages".to_owned(),
+            self.pipeline_stages.to_string(),
             if self.dashboard {
                 "--dashboard".to_owned()
             } else {
@@ -299,6 +315,12 @@ impl Config {
             "--relay-mode".to_owned(),
             relay_mode_env_value(&self.relay_mode).to_owned(),
         ]);
+        if self.provider == ProviderKind::Process {
+            args.extend([
+                "--worker-bin".to_owned(),
+                self.worker_bin.to_string_lossy().to_string(),
+            ]);
+        }
         if let Some(model_id) = &self.model_id {
             args.extend(["--model-id".to_owned(), model_id.clone()]);
         }
@@ -379,15 +401,18 @@ impl Config {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct ParsedArgs {
     vastai: bool,
+    provider: Option<ProviderKind>,
     vastai_yes: bool,
     config_path: Option<PathBuf>,
     orch_bin: Option<PathBuf>,
+    worker_bin: Option<PathBuf>,
     rpc_addr: Option<String>,
     image: Option<String>,
     max_tokens: Option<u32>,
+    pipeline_stages: Option<u32>,
     datastream_frame_log: Option<PathBuf>,
     dump_logs: bool,
     dashboard: Option<bool>,
@@ -399,7 +424,17 @@ struct ParsedArgs {
     orch_args: Vec<String>,
 }
 
+const PROVIDER_SELECTOR_CONFLICT: &str = "conflicting provider selectors; use exactly one of --process, --docker, --vastai, or --provider <provider>";
+
 impl ParsedArgs {
+    fn set_provider_selector(&mut self, provider: ProviderKind) -> Result<(), String> {
+        if self.provider.is_some() {
+            return Err(PROVIDER_SELECTOR_CONFLICT.to_owned());
+        }
+        self.provider = Some(provider);
+        Ok(())
+    }
+
     fn parse<I>(provided_args: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = String>,
@@ -408,7 +443,18 @@ impl ParsedArgs {
         let mut args = provided_args.into_iter().peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--vastai" => parsed.vastai = true,
+                "--vastai" => {
+                    parsed.vastai = true;
+                    parsed.set_provider_selector(ProviderKind::VastAi)?;
+                }
+                "--process" | "--local-process" => {
+                    parsed.set_provider_selector(ProviderKind::Process)?
+                }
+                "--docker" => parsed.set_provider_selector(ProviderKind::Docker)?,
+                "--provider" => {
+                    let provider = ProviderKind::parse_deploy(&next_arg(&mut args, "--provider")?)?;
+                    parsed.set_provider_selector(provider)?;
+                }
                 "--yes" | "-y" => parsed.vastai_yes = true,
                 "--config" => {
                     parsed.config_path = Some(PathBuf::from(next_arg(&mut args, "--config")?))
@@ -416,9 +462,16 @@ impl ParsedArgs {
                 "--orch-bin" => {
                     parsed.orch_bin = Some(PathBuf::from(next_arg(&mut args, "--orch-bin")?))
                 }
+                "--worker-bin" => {
+                    parsed.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
+                }
                 "--addr" => parsed.rpc_addr = Some(next_arg(&mut args, "--addr")?),
                 "--image" => parsed.image = Some(next_arg(&mut args, "--image")?),
                 "--max-tokens" => parsed.max_tokens = Some(parse_next(&mut args, "--max-tokens")?),
+                "-N" | "--pipeline-stages" => {
+                    parsed.pipeline_stages =
+                        Some(parse_pipeline_stages_value(&mut args, arg.as_str())?)
+                }
                 "--datastream-frame-log" => {
                     parsed.datastream_frame_log = Some(PathBuf::from(next_arg(
                         &mut args,
@@ -434,7 +487,7 @@ impl ParsedArgs {
                 "--no-push-image" => parsed.push_image = Some(false),
                 "--force-image-refresh" => parsed.force_image_refresh = Some(true),
                 "--cached-model" => {
-                    let path = args.next_if(|value| !value.starts_with("--"));
+                    let path = args.next_if(|value| !value.starts_with('-'));
                     parsed.cached_model = Some(CachedModelConfig::from_arg(path)?);
                 }
                 "--" => {
@@ -495,11 +548,11 @@ where
     let Some(vastai) = &config.vastai else {
         return Ok(());
     };
-    eprintln!("mvp-one-node-chat: checking Vast.ai offers...");
+    eprintln!("mvp-chat: checking Vast.ai offers...");
     let preview = previewer.preview(&vastai.api_key, &vastai.selection_policy())?;
     print_offer_preview(&preview);
     if config.vastai_yes {
-        eprintln!("mvp-one-node-chat: --yes supplied; skipping Vast.ai rental prompt");
+        eprintln!("mvp-chat: --yes supplied; skipping Vast.ai rental prompt");
         return Ok(());
     }
     if !io::stdin().is_terminal() {
@@ -518,7 +571,7 @@ fn print_offer_preview(preview: &OfferPreview) {
         .map(|mb| format!(", {mb} MB VRAM"))
         .unwrap_or_default();
     eprintln!(
-        "mvp-one-node-chat: best Vast.ai offer {}{} at ${:.3}/hr",
+        "mvp-chat: best Vast.ai offer {}{} at ${:.3}/hr",
         preview.gpu_name, ram, preview.dollars_per_hour
     );
 }
@@ -589,6 +642,7 @@ struct StartupProgress {
     last_error_line: Option<String>,
     last_failure: Option<String>,
     last_download_bucket: Option<u64>,
+    provider: Option<String>,
 }
 
 impl StartupProgress {
@@ -601,6 +655,7 @@ impl StartupProgress {
             last_error_line: None,
             last_failure: None,
             last_download_bucket: None,
+            provider: None,
         }
     }
 
@@ -666,6 +721,15 @@ impl StartupProgress {
     fn observe_bootstrap(&mut self, payload: &Value) {
         let phase = payload.get("phase").and_then(Value::as_str).unwrap_or("");
         let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
+        if phase == "config" && status == "ready" {
+            if let Some(provider) = payload
+                .get("detail")
+                .and_then(|detail| detail.get("provider"))
+                .and_then(Value::as_str)
+            {
+                self.provider = Some(provider.to_owned());
+            }
+        }
         if status == "failed" {
             let error = payload
                 .get("detail")
@@ -676,9 +740,7 @@ impl StartupProgress {
             return;
         }
         match (phase, status) {
-            ("provider_start", "started") => {
-                self.print_once("starting_docker_node", "starting docker node")
-            }
+            ("provider_start", "started") => self.print_provider_start(),
             ("node_runtime_ready", "started") => {
                 self.print_once("node_runtime_ready_started", "waiting for node runtime")
             }
@@ -703,7 +765,7 @@ impl StartupProgress {
             return;
         };
         match event.get("kind").and_then(Value::as_str).unwrap_or("") {
-            "ProvisionStart" => self.print_once("starting_docker_node", "starting docker node"),
+            "ProvisionStart" => self.print_provider_start(),
             "NodeLive" => self.print_once("node_runtime_ready", "node runtime ready"),
             "ProvisionFailed" => {
                 let message = event
@@ -737,7 +799,7 @@ impl StartupProgress {
                 let bucket = pct / 10;
                 if self.last_download_bucket != Some(bucket) {
                     self.last_download_bucket = Some(bucket);
-                    eprintln!("mvp-one-node-chat: downloading model weights {pct}%");
+                    eprintln!("mvp-chat: downloading model weights {pct}%");
                 }
             }
             _ => {}
@@ -760,9 +822,21 @@ impl StartupProgress {
         }
     }
 
-    fn print_once(&mut self, key: &str, message: &str) {
-        if self.printed.insert(key.to_owned()) {
-            eprintln!("mvp-one-node-chat: {message}");
+    fn print_provider_start(&mut self) {
+        match self.provider.as_deref().unwrap_or("provider") {
+            "process" => self.print_once("starting_process_node", "starting process node"),
+            "docker" => self.print_once("starting_docker_node", "starting docker node"),
+            "vastai" => self.print_once("starting_vastai_node", "starting Vast.ai node"),
+            other => self.print_once(
+                format!("starting_{other}_node"),
+                format!("starting {other} node"),
+            ),
+        }
+    }
+
+    fn print_once(&mut self, key: impl Into<String>, message: impl AsRef<str>) {
+        if self.printed.insert(key.into()) {
+            eprintln!("mvp-chat: {}", message.as_ref());
         }
     }
 }
@@ -869,13 +943,21 @@ impl Drop for OrchChild {
 
 fn prepare_runtime(config: &Config) -> Result<String, String> {
     ensure_orch_binary(config)?;
+    if config.provider == ProviderKind::Process {
+        ensure_worker_binary(config)?;
+        eprintln!(
+            "mvp-chat: using local worker process {}",
+            display_user_path(&config.worker_bin)
+        );
+        return Ok(config.node_image.clone());
+    }
     if !config.build_image {
-        eprintln!("mvp-one-node-chat: skipping node image preparation (--no-build-image)");
+        eprintln!("mvp-chat: skipping node image preparation (--no-build-image)");
         return Ok(config.node_image.clone());
     }
     if let Some(cached_model) = &config.cached_model {
         eprintln!(
-            "mvp-one-node-chat: using cached model {}",
+            "mvp-chat: using cached model {}",
             cached_model.display_path.display()
         );
     }
@@ -890,7 +972,7 @@ fn prepare_runtime(config: &Config) -> Result<String, String> {
         enabled: true,
     })?;
     eprintln!(
-        "mvp-one-node-chat: using node image {} ({})",
+        "mvp-chat: using node image {} ({})",
         prepared.image_ref, prepared.tag
     );
     Ok(prepared.image_ref)
@@ -917,9 +999,7 @@ fn run_chat_loop(addr: &str, max_tokens: u32) -> Result<(), String> {
         }
     });
     let mut next_request_id = 1_u64;
-    eprintln!(
-        "mvp-one-node-chat: Ctrl-C cleans up the orchestrator and provider node; /exit exits cleanly"
-    );
+    eprintln!("mvp-chat: Ctrl-C cleans up the orchestrator and provider node; /exit exits cleanly");
 
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
@@ -1049,7 +1129,7 @@ fn ensure_orch_binary(config: &Config) -> Result<(), String> {
         if config.orch_bin.is_file() {
             let display_orch = display_workspace_path(&workspace_root(), &config.orch_bin);
             eprintln!(
-                "mvp-one-node-chat: using custom orchestrator binary {display_orch}; skipping cargo build"
+                "mvp-chat: using custom orchestrator binary {display_orch}; skipping cargo build"
             );
             return Ok(());
         }
@@ -1064,7 +1144,7 @@ fn ensure_orch_binary(config: &Config) -> Result<(), String> {
     let dashboard_feature_stale =
         config.dashboard && orch_local_e2e_marker_stale(&config.orch_bin, &root)?;
     if !rebuild_needed && !dashboard_feature_stale {
-        eprintln!("mvp-one-node-chat: mvp-orchestrator is up to date; skipping cargo build");
+        eprintln!("mvp-chat: mvp-orchestrator is up to date; skipping cargo build");
         return Ok(());
     }
 
@@ -1083,6 +1163,43 @@ fn ensure_orch_binary(config: &Config) -> Result<(), String> {
         "build mvp-orchestrator",
     )?;
     write_orch_local_e2e_marker(&config.orch_bin, &root)
+}
+
+fn ensure_worker_binary(config: &Config) -> Result<(), String> {
+    let default_worker = node_bin_for_current_profile()?;
+    if config.worker_bin != default_worker {
+        if config.worker_bin.is_file() {
+            let display_worker = display_workspace_path(&workspace_root(), &config.worker_bin);
+            eprintln!(
+                "mvp-chat: using custom worker binary {display_worker}; skipping cargo build"
+            );
+            return Ok(());
+        }
+        let display_worker = display_workspace_path(&workspace_root(), &config.worker_bin);
+        return Err(format!(
+            "custom worker binary {display_worker} does not exist"
+        ));
+    }
+
+    let root = workspace_root();
+    let rebuild_needed = orch_rebuild_needed(&config.worker_bin, &root, ORCH_REBUILD_INPUTS)?;
+    if !rebuild_needed {
+        eprintln!("mvp-chat: mvp-worker-node is up to date; skipping cargo build");
+        return Ok(());
+    }
+
+    run_status(
+        cargo_command(),
+        &[
+            "build",
+            "--quiet",
+            "-p",
+            "mvp-system",
+            "--bin",
+            "mvp-worker-node",
+        ],
+        "build mvp-worker-node",
+    )
 }
 
 fn orch_rebuild_needed(bin: &Path, root: &Path, inputs: &[&str]) -> Result<bool, String> {
@@ -1199,7 +1316,7 @@ fn display_user_path(path: &Path) -> String {
 }
 
 fn run_status(program: &str, args: &[&str], label: &str) -> Result<(), String> {
-    eprintln!("mvp-one-node-chat: {label}");
+    eprintln!("mvp-chat: {label}");
     let status = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -1228,12 +1345,12 @@ fn install_signal_handlers() {
 
 fn acknowledge_stop() {
     if !STOP_ACKNOWLEDGED.swap(true, Ordering::SeqCst) {
-        eprintln!("mvp-one-node-chat: Ctrl-C received; stopping runtime...");
+        eprintln!("mvp-chat: Ctrl-C received; stopping runtime...");
     }
 }
 
 fn report_interrupt_shutdown() {
-    eprintln!("mvp-one-node-chat: runtime stopped");
+    eprintln!("mvp-chat: runtime stopped");
 }
 
 #[derive(Clone, Debug)]
@@ -1310,17 +1427,30 @@ impl RuntimeConfigProfile {
 
     fn default_provider(self) -> ProviderKind {
         match self {
-            Self::Local => ProviderKind::Docker,
+            Self::Local => ProviderKind::Process,
             Self::Deploy => ProviderKind::VastAi,
         }
     }
 }
 
-fn provider_from_env(config_profile: RuntimeConfigProfile) -> Result<ProviderKind, String> {
-    match env_optional("MVP_NODE_PROVIDER").or_else(|| env_optional("MVP_PROVIDER")) {
-        Some(value) => ProviderKind::parse_deploy(&value),
-        None => Ok(config_profile.default_provider()),
+fn provider_from_sources(
+    cli_provider: Option<ProviderKind>,
+    toml_provider: Option<&str>,
+    config_profile: RuntimeConfigProfile,
+) -> Result<ProviderKind, String> {
+    if let Some(provider) = cli_provider {
+        return Ok(provider);
     }
+    if let Some(value) = env_optional("MVP_NODE_PROVIDER") {
+        return ProviderKind::parse_deploy(&value);
+    }
+    if let Some(value) = env_optional("MVP_PROVIDER") {
+        return ProviderKind::parse_deploy(&value);
+    }
+    if let Some(value) = toml_provider {
+        return ProviderKind::parse_deploy(value);
+    }
+    Ok(config_profile.default_provider())
 }
 
 fn env_optional(name: &str) -> Option<String> {
@@ -1355,7 +1485,8 @@ fn node_image_provider(provider: ProviderKind) -> Result<NodeImageProvider, Stri
     match provider {
         ProviderKind::Docker => Ok(NodeImageProvider::Docker),
         ProviderKind::VastAi => Ok(NodeImageProvider::VastAi),
-        ProviderKind::Mock => Err("mvp-one-node-chat does not support mock provider".to_owned()),
+        ProviderKind::Process => Err("process provider does not use node images".to_owned()),
+        ProviderKind::Mock => Err("mvp-chat does not support mock provider".to_owned()),
     }
 }
 
@@ -1414,6 +1545,17 @@ where
         .map_err(|e| format!("invalid {name}={value:?}: {e}"))
 }
 
+fn parse_pipeline_stages_value(
+    args: &mut impl Iterator<Item = String>,
+    name: &str,
+) -> Result<u32, String> {
+    let value: u32 = parse_next(args, name)?;
+    if value == 0 {
+        return Err(format!("{name} must be greater than 0"));
+    }
+    Ok(value)
+}
+
 fn main() -> ExitCode {
     run_from_args(std::env::args().skip(1))
 }
@@ -1421,10 +1563,68 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::Instant;
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const ENV_KEYS: &[&str] = &[
+        "MVP_BUILD_NODE_IMAGE",
+        "MVP_DASHBOARD",
+        "MVP_DATASTREAM_FRAME_LOG",
+        "MVP_FORCE_NODE_IMAGE_REFRESH",
+        "MVP_GGUF_FILE",
+        "MVP_GGUF_REPO",
+        "MVP_GGUF_REVISION",
+        "MVP_IROH_RELAY_MODE",
+        "MVP_IROH_RELAY_URL",
+        "MVP_MAX_CONTEXT",
+        "MVP_MODEL_ID",
+        "MVP_NODE_IMAGE",
+        "MVP_NODE_IMAGE_TAG",
+        "MVP_NODE_PROVIDER",
+        "MVP_PIPELINE_STAGES",
+        "MVP_PROMPT_MAX_TOKENS",
+        "MVP_PROMPT_RPC_ADDR",
+        "MVP_PROMPT_RPC_BIND",
+        "MVP_PROVIDER",
+        "MVP_PUSH_NODE_IMAGE",
+        "MVP_RUNTIME_CONFIG",
+        "SWACTOR_IROH_RELAY_URL",
+        "VASTAI_API_KEY",
+    ];
+
+    struct RestoreEnv {
+        saved: Vec<(&'static str, Option<OsString>)>,
+    }
+
+    impl Drop for RestoreEnv {
+        fn drop(&mut self) {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
+    fn with_clean_env<T>(test: impl FnOnce() -> T) -> T {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = ENV_KEYS
+            .iter()
+            .map(|&key| (key, std::env::var_os(key)))
+            .collect::<Vec<_>>();
+        for key in ENV_KEYS {
+            unsafe { std::env::remove_var(key) };
+        }
+        let _restore = RestoreEnv { saved };
+        test()
+    }
 
     struct TempWorkspace {
         root: PathBuf,
@@ -1433,10 +1633,8 @@ mod tests {
     impl TempWorkspace {
         fn new(name: &str) -> Self {
             let counter = TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            let root = std::env::temp_dir().join(format!(
-                "mvp-one-node-chat-{name}-{}-{counter}",
-                std::process::id()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("mvp-chat-{name}-{}-{counter}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(&root).expect("create temp workspace");
             Self { root }
@@ -1525,6 +1723,7 @@ mod tests {
     fn vastai_yes_chat_config() -> Config {
         Config {
             orch_bin: PathBuf::from("mvp-orchestrator"),
+            worker_bin: PathBuf::from("mvp-worker-node"),
             orch_args: Vec::new(),
             rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
             node_image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
@@ -1533,6 +1732,7 @@ mod tests {
             relay_mode: iroh::RelayMode::Default,
             relay_url: Some("https://relay.example.com".to_owned()),
             max_tokens: 128,
+            pipeline_stages: 1,
             dashboard: false,
             build_image: false,
             image_tag: Some("trial".to_owned()),
@@ -1573,6 +1773,7 @@ mod tests {
     fn orchestrator_cli_args_cover_wrapper_launch_config() {
         let config = Config {
             orch_bin: PathBuf::from("mvp-orchestrator"),
+            worker_bin: PathBuf::from("mvp-worker-node"),
             orch_args: Vec::new(),
             rpc_addr: "127.0.0.1:20123".to_owned(),
             node_image: "docker.io/example/config-node:ignored".to_owned(),
@@ -1581,6 +1782,7 @@ mod tests {
             relay_mode: iroh::RelayMode::Default,
             relay_url: Some("https://relay.example.com".to_owned()),
             max_tokens: 37,
+            pipeline_stages: 3,
             dashboard: false,
             build_image: false,
             image_tag: None,
@@ -1607,6 +1809,7 @@ mod tests {
         assert_arg_value(&args, "--image", "docker.io/example/prepared-node:latest");
         assert_arg_value(&args, "--rpc-bind", "127.0.0.1:20123");
         assert_arg_value(&args, "--max-tokens", "37");
+        assert_arg_value(&args, "--pipeline-stages", "3");
         assert_flag(&args, "--no-dashboard");
         assert_arg_value(&args, "--relay-url", "https://relay.example.com");
         assert_arg_value(&args, "--model-id", "wrapper-model");
@@ -1626,11 +1829,226 @@ mod tests {
     }
 
     #[test]
+    fn local_cached_model_defaults_to_process_and_forwards_worker_bin() {
+        with_clean_env(|| {
+            let workspace = TempWorkspace::new("process-default-cached-model");
+            let config_path = workspace.write("config.toml", b"");
+            let model_path = workspace.write("cached-model.gguf", b"fake cached model");
+            let model_path_str = model_path.to_str().expect("temp model path is utf8");
+            let config_path_str = config_path.to_str().expect("temp config path is utf8");
+
+            let config = Config::from_args(
+                [
+                    "--cached-model",
+                    model_path_str,
+                    "-N",
+                    "3",
+                    "--config",
+                    config_path_str,
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap_or_else(|error| panic!("process default cached config parses: {error}"));
+
+            let canonical_model = model_path
+                .canonicalize()
+                .expect("canonicalize cached model fixture");
+            assert_eq!(config.provider, ProviderKind::Process);
+            assert_eq!(config.pipeline_stages, 3);
+            assert_eq!(
+                config.cached_model.as_ref().map(|cached| &cached.host_path),
+                Some(&canonical_model)
+            );
+
+            let args = config.orchestrator_cli_args("swactor-mvp-node:latest");
+            assert_arg_value(&args, "--provider", "process");
+            assert_arg_value(&args, "--pipeline-stages", "3");
+            assert_arg_value(
+                &args,
+                "--cached-model-host-path",
+                canonical_model.to_str().expect("canonical path is utf8"),
+            );
+            assert_arg_value(
+                &args,
+                "--worker-bin",
+                config.worker_bin.to_str().expect("worker bin path is utf8"),
+            );
+        });
+    }
+
+    #[test]
+    fn docker_selector_keeps_cached_model_forwarding_for_docker() {
+        with_clean_env(|| {
+            let workspace = TempWorkspace::new("docker-cached-model");
+            let config_path = workspace.write("config.toml", b"");
+            let model_path = workspace.write("cached-model.gguf", b"fake cached model");
+            let config = Config::from_args(
+                [
+                    "--docker",
+                    "--cached-model",
+                    model_path.to_str().expect("temp model path is utf8"),
+                    "--config",
+                    config_path.to_str().expect("temp config path is utf8"),
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap_or_else(|error| panic!("docker cached config parses: {error}"));
+
+            let canonical_model = model_path
+                .canonicalize()
+                .expect("canonicalize cached model fixture");
+            assert_eq!(config.provider, ProviderKind::Docker);
+
+            let args = config.orchestrator_cli_args("docker.io/example/prepared-node:latest");
+            assert_arg_value(&args, "--provider", "docker");
+            assert_arg_value(
+                &args,
+                "--cached-model-host-path",
+                canonical_model.to_str().expect("canonical path is utf8"),
+            );
+            assert!(
+                !args.iter().any(|arg| arg == "--worker-bin"),
+                "docker launch must not forward --worker-bin: {args:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn parsed_args_rejects_conflicting_provider_selectors() {
+        for args in [
+            vec!["--docker", "--process"],
+            vec!["--provider", "process", "--vastai"],
+        ] {
+            let error = ParsedArgs::parse(args.iter().copied().map(str::to_owned))
+                .expect_err("conflicting provider selectors must fail");
+
+            assert_eq!(error, PROVIDER_SELECTOR_CONFLICT);
+        }
+    }
+
+    #[test]
+    fn provider_selection_precedence_is_cli_env_toml_default() {
+        with_clean_env(|| {
+            let workspace = TempWorkspace::new("provider-precedence");
+            let config_path = workspace.write("config.toml", b"[provider]\nkind = \"docker\"\n");
+            let config_path_str = config_path.to_str().expect("temp config path is utf8");
+
+            let toml_config = Config::from_args(
+                [
+                    "--config",
+                    config_path_str,
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("TOML provider config parses");
+            assert_eq!(toml_config.provider, ProviderKind::Docker);
+
+            unsafe {
+                std::env::set_var("MVP_PROVIDER", "vastai");
+            }
+            let mvp_provider_config = Config::from_args(
+                [
+                    "--config",
+                    config_path_str,
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("MVP_PROVIDER config parses");
+            assert_eq!(mvp_provider_config.provider, ProviderKind::VastAi);
+
+            unsafe {
+                std::env::set_var("MVP_NODE_PROVIDER", "process");
+            }
+            let node_provider_config = Config::from_args(
+                [
+                    "--config",
+                    config_path_str,
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("MVP_NODE_PROVIDER config parses");
+            assert_eq!(node_provider_config.provider, ProviderKind::Process);
+
+            let cli_config = Config::from_args(
+                [
+                    "--docker",
+                    "--config",
+                    config_path_str,
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("CLI provider config parses");
+            assert_eq!(cli_config.provider, ProviderKind::Docker);
+        });
+
+        with_clean_env(|| {
+            let workspace = TempWorkspace::new("provider-default");
+            let config_path = workspace.write("config.toml", b"");
+            let default_config = Config::from_args(
+                [
+                    "--config",
+                    config_path.to_str().expect("temp config path is utf8"),
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("default provider config parses");
+            assert_eq!(default_config.provider, ProviderKind::Process);
+        });
+    }
+
+    #[test]
+    fn config_forwards_short_pipeline_stages_alias_to_orchestrator() {
+        with_clean_env(|| {
+            let workspace = TempWorkspace::new("short-pipeline-stages-forward");
+            let config_path = workspace.write("config.toml", b"");
+            let config = Config::from_args(
+                [
+                    "-N",
+                    "6",
+                    "--config",
+                    config_path.to_str().expect("temp config path is utf8"),
+                    "--orch-bin",
+                    "/tmp/mvp-orchestrator",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .unwrap_or_else(|error| panic!("-N should resolve wrapper config: {error}"));
+
+            let args = config.orchestrator_cli_args("docker.io/example/prepared-node:latest");
+
+            assert_arg_value(&args, "--pipeline-stages", "6");
+        });
+    }
+
+    #[test]
     fn orchestrator_cli_args_cover_vastai_config() {
         let mut vastai = valid_vastai_config();
         vastai.onstart = Some("echo preparing vastai node".to_owned());
         let config = Config {
             orch_bin: PathBuf::from("mvp-orchestrator"),
+            worker_bin: PathBuf::from("mvp-worker-node"),
             orch_args: Vec::new(),
             rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
             node_image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
@@ -1639,6 +2057,7 @@ mod tests {
             relay_mode: iroh::RelayMode::Default,
             relay_url: Some(vastai.relay_url.clone()),
             max_tokens: 128,
+            pipeline_stages: 1,
             dashboard: false,
             build_image: false,
             image_tag: Some("trial".to_owned()),
@@ -1677,6 +2096,96 @@ mod tests {
             "--vastai-ssh-identity",
             "~/.ssh/swactor_vastai_ed25519",
         );
+    }
+
+    #[test]
+    fn parsed_args_accepts_pipeline_stages_aliases() {
+        for (flag, value) in [("-N", 3), ("--pipeline-stages", 4)] {
+            let parsed = ParsedArgs::parse(vec![flag.to_owned(), value.to_string()])
+                .unwrap_or_else(|error| panic!("{flag} {value} should parse: {error}"));
+
+            assert_eq!(
+                parsed.pipeline_stages,
+                Some(value),
+                "{flag} must set stage count"
+            );
+        }
+    }
+
+    #[test]
+    fn parsed_cached_model_flag_does_not_consume_following_short_flag() {
+        let workspace = TempWorkspace::new("cached-model-short-flag");
+        workspace.write(
+            ".model-cache/SmolLM2-135M-Instruct.Q4_0.gguf",
+            b"fake cached model",
+        );
+        let previous_cwd = std::env::current_dir().expect("current dir is available");
+        std::env::set_current_dir(&workspace.root).expect("enter temp workspace");
+        let parsed =
+            ParsedArgs::parse(["--cached-model", "-N", "3"].into_iter().map(str::to_owned));
+        std::env::set_current_dir(previous_cwd).expect("restore current dir");
+        let parsed = parsed.expect("cached model flag before -N parses");
+
+        assert!(parsed.cached_model.is_some());
+        assert_eq!(parsed.pipeline_stages, Some(3));
+    }
+
+    #[test]
+    fn parsed_args_rejects_invalid_pipeline_stages_values() {
+        for (args, expected) in [
+            (vec!["-N"], "missing value after -N"),
+            (
+                vec!["--pipeline-stages"],
+                "missing value after --pipeline-stages",
+            ),
+            (vec!["-N", "many"], "invalid -N=\"many\""),
+            (
+                vec!["--pipeline-stages", "many"],
+                "invalid --pipeline-stages=\"many\"",
+            ),
+            (vec!["-N", "0"], "-N must be greater than 0"),
+            (
+                vec!["--pipeline-stages", "0"],
+                "--pipeline-stages must be greater than 0",
+            ),
+        ] {
+            let error = match ParsedArgs::parse(args.iter().copied().map(str::to_owned)) {
+                Ok(_) => panic!("invalid pipeline stage flag must be rejected"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.contains(expected),
+                "error {error:?} should contain {expected:?} for args {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_rejects_vastai_pipeline_stages_count_before_launch() {
+        with_clean_env(|| {
+            let workspace = TempWorkspace::new("vastai-pipeline-rejected");
+            let config_path = workspace.write("config.toml", b"");
+            let error = match Config::from_args(
+                [
+                    "--vastai",
+                    "-N",
+                    "2",
+                    "--config",
+                    config_path.to_str().expect("temp config path is utf8"),
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            ) {
+                Ok(_) => panic!("Vast.ai pipeline stage count above one must fail before launch"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error.contains("--vastai cannot be combined with -N/--pipeline-stages > 1"),
+                "unexpected error: {error}"
+            );
+        });
     }
 
     #[test]

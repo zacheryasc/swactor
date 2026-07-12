@@ -1,5 +1,7 @@
 # The Datastream — Specification
 
+>>**STALE** Stale and not the final advisor on current or future state of the datastream.
+
 > **Status.** This is the canonical specification for the `datastream` crate.
 > It supersedes the implicit spec the old `crates/distribution/src/datastream`
 > doc-comments referred to (`DATASTREAM_SPEC.md §4.1`, etc.). Those section

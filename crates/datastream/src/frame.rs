@@ -1,24 +1,22 @@
 //! Core data model: the framed, channel-multiplexed stream (spec §4).
 //!
-//! These are the values that ride the seams a test observes (testing spec
-//! §2): a [`Frame`] crosses the mux→transport boundary, and a [`StreamId`]
-//! keys the reconstructed stream at ingest. Everything here is a plain
-//! value type with no behavior — the behavior lives in the mux, ingest,
-//! store, and views.
+//! A stream is identified by the producing node and lifetime. Frames carry a
+//! stream-local numeric channel id plus the mux-assigned position and opaque
+//! payload bytes. Channel names, payload content kinds, and display metadata live
+//! in catalog descriptors that consumers receive before or alongside frames.
 
 use std::fmt;
 use std::sync::Arc;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 /// A position assigned by a node's mux (spec §5.2).
 ///
-/// Positions are **monotonic** and **gap-free** within a single node's
-/// stream: the mux never reuses one and never skips one in its numbering.
-/// A position that is assigned but never delivered surfaces downstream as
-/// a missing position — a detectable gap (spec §5.3, §7.5).
-///
-/// Across nodes, positions are **not** comparable (spec §4.3): they order
-/// frames within one node only.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+/// Positions are **monotonic** and **gap-free** within a single node's stream:
+/// the mux never reuses one and never skips one in its numbering. A position
+/// that is assigned but never delivered surfaces downstream as a missing
+/// position — a detectable gap (spec §5.3, §7.5).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct Position(pub u64);
 
 impl fmt::Display for Position {
@@ -27,60 +25,55 @@ impl fmt::Display for Position {
     }
 }
 
-/// The stable identity of a channel — the named lane a frame's bytes
-/// belong to (spec §4.2, §3).
+/// Stream-local numeric channel id.
 ///
-/// It is an opaque token: the pipe (mux, transport, ingest, store) never
-/// interprets it. Producers and consumers define any structure or codec at the
-/// edges, through their own [`crate::record::Record`] types or classifiers. A
-/// token with no registered codec is still carried and stored whole, then decoded
-/// later (spec §6.3) — which is why this type is open (any string) rather than a
-/// closed enum: a new channel is a new id, no pipe code changes.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ChannelId(Arc<str>);
-
-impl ChannelId {
-    /// Construct a channel id from any string-like value.
-    pub fn new(id: impl AsRef<str>) -> Self {
-        ChannelId(Arc::from(id.as_ref()))
-    }
-
-    /// The id as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<&str> for ChannelId {
-    fn from(s: &str) -> Self {
-        ChannelId::new(s)
-    }
-}
-
-impl From<String> for ChannelId {
-    fn from(s: String) -> Self {
-        ChannelId::new(s)
-    }
-}
+/// `ChannelId(0)` is reserved for the datastream frame-timing sidecar. Every
+/// other id is allocated by the stream owner and is meaningful only with the
+/// corresponding [`StreamId`]. Consumers resolve frames by `(stream, channel)`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct ChannelId(pub u32);
 
 impl fmt::Display for ChannelId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        write!(f, "{}", self.0)
     }
 }
 
-impl fmt::Debug for ChannelId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "ChannelId({:?})", &self.0)
+/// Payload content kind without schema details. Used for subscription filters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelContentKind {
+    Bytes,
+    TextStream,
+    JsonRecord,
+}
+
+/// How consumers should decode/display payload bytes for a channel.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelContent {
+    Bytes,
+    TextStream,
+    JsonRecord { schema: Option<String> },
+}
+
+impl ChannelContent {
+    pub fn kind(&self) -> ChannelContentKind {
+        match self {
+            ChannelContent::Bytes => ChannelContentKind::Bytes,
+            ChannelContent::TextStream => ChannelContentKind::TextStream,
+            ChannelContent::JsonRecord { .. } => ChannelContentKind::JsonRecord,
+        }
     }
+}
+
+/// Where a stream originates from in the current process topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamOrigin {
+    Orchestrator,
+    Bootstrap,
+    RemoteNode,
 }
 
 /// The stable identity of a node that produces a stream (spec §4.4, §8.1).
-///
-/// Opaque to the pipe. In a deployment this is whatever durable id the
-/// system already assigns a machine (e.g. its public key); tests use
-/// readable names. A frame records the producing *node*, never a producer
-/// identity within it (spec §4.4).
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(Arc<str>);
 
@@ -102,6 +95,12 @@ impl From<&str> for NodeId {
     }
 }
 
+impl From<String> for NodeId {
+    fn from(s: String) -> Self {
+        NodeId::new(s)
+    }
+}
+
 impl fmt::Display for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -114,19 +113,30 @@ impl fmt::Debug for NodeId {
     }
 }
 
-/// A lifetime discriminator distinguishing a node's incarnations (spec
-/// §8.4). A node that dies and is re-rented starts a new lifetime, so its
-/// fresh stream does not collide with or append to its prior life.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+impl Serialize for NodeId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(NodeId::new)
+    }
+}
+
+/// A lifetime discriminator distinguishing a node's incarnations (spec §8.4).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct Lifetime(pub u64);
 
-/// Identifies exactly one stored stream: a node plus the life it was
-/// produced in (spec §8.4).
-///
-/// This is the ingest key. Two streams with the same [`NodeId`] but
-/// different [`Lifetime`] are different streams and MUST NOT merge — that
-/// is what lets a re-incarnated node not append to its prior life.
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+/// Identifies exactly one stored stream: a node plus the life it was produced in.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct StreamId {
     /// Which node produced the stream.
     pub node: NodeId,
@@ -150,20 +160,86 @@ impl fmt::Display for StreamId {
     }
 }
 
-/// The unit the mux emits (spec §4.1): bytes tagged with a channel and a
-/// position.
-///
-/// The `payload` is **opaque** to everything between the producer and a
-/// view — the mux, the transport, and storage treat it as bytes and never
-/// interpret it (spec §4.1). A typed event and a log line are the same
-/// kind of thing here: bytes on a channel.
-///
-/// Frames do not carry wall-clock timestamps. Optional frame-construction
-/// timing rides as sidecar records keyed by stream-local position, preserving
-/// the core frame and wire shape.
-#[derive(Clone, PartialEq, Eq)]
+/// Stream metadata declared by the stream owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamDescriptor {
+    pub stream: StreamId,
+    pub label: Option<String>,
+    pub origin: StreamOrigin,
+}
+
+/// Channel metadata declared by the stream owner.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelDescriptor {
+    pub stream: StreamId,
+    pub id: ChannelId,
+    pub name: String,
+    pub label: Option<String>,
+    pub content: ChannelContent,
+}
+
+/// Globally resolved channel identity: a stream plus that stream's numeric lane.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+pub struct ChannelRef {
+    pub stream: StreamId,
+    pub channel: ChannelId,
+}
+
+/// A delivered frame with its stream-local channel resolved to a [`ChannelRef`].
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct FrameDelivery {
+    pub channel: ChannelRef,
+    pub position: Position,
+    pub payload: Vec<u8>,
+}
+
+/// Catalog and frame events delivered to subscribers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DatastreamEvent {
+    StreamDeclared(StreamDescriptor),
+    ChannelDeclared(ChannelDescriptor),
+    Frame(FrameDelivery),
+    StreamEnded(StreamId),
+}
+
+/// Source filter used by subscribers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SourceFilter {
+    All,
+    Origin(StreamOrigin),
+    Node(NodeId),
+    Stream(StreamId),
+}
+
+/// Channel filter used by subscribers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChannelFilter {
+    All,
+    Name(String),
+    Prefix(String),
+    Content(ChannelContentKind),
+}
+
+/// A subscription request for catalog metadata and future frame events.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionRequest {
+    pub sources: SourceFilter,
+    pub channels: ChannelFilter,
+}
+
+impl SubscriptionRequest {
+    pub fn all() -> Self {
+        Self {
+            sources: SourceFilter::All,
+            channels: ChannelFilter::All,
+        }
+    }
+}
+
+/// The unit the mux emits (spec §4.1): bytes tagged with a channel and a position.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Frame {
-    /// The lane these bytes belong to.
+    /// The stream-local lane these bytes belong to.
     pub channel: ChannelId,
     /// The mux-assigned position within the node's stream.
     pub position: Position,
@@ -173,9 +249,9 @@ pub struct Frame {
 
 impl Frame {
     /// Assemble a frame from its parts.
-    pub fn new(channel: impl Into<ChannelId>, position: Position, payload: Vec<u8>) -> Self {
+    pub fn new(channel: ChannelId, position: Position, payload: Vec<u8>) -> Self {
         Frame {
-            channel: channel.into(),
+            channel,
             position,
             payload,
         }
@@ -184,9 +260,6 @@ impl Frame {
 
 impl fmt::Debug for Frame {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Render the payload as text when it is valid UTF-8 (log lines,
-        // JSON records both are) so debug output is readable; fall back to
-        // a byte count for genuinely binary payloads.
         let mut dbg = f.debug_struct("Frame");
         dbg.field("channel", &self.channel)
             .field("position", &self.position);

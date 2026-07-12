@@ -25,3 +25,4 @@ mod telemetry_guarantees;
 mod tx_rx_edge_actor_guarantees;
 mod vastai_provisioning_guarantees;
 mod weight_lifecycle_guarantees;
+mod worker_edge_adapter_guarantees;

@@ -368,6 +368,9 @@ impl SwimNode {
     pub fn handle_join_response(&mut self, members: Vec<NodeRecord>) -> Vec<NodeAction> {
         let mut actions = Vec::new();
         for record in members {
+            if record.state == MemberState::Alive {
+                self.clear_dead_member(record.node_id);
+            }
             let prior = self.members.get(&record.node_id).map(|e| e.state);
             let changed = self
                 .members

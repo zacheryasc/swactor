@@ -1,30 +1,38 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::sync::{
-    Arc, OnceLock,
+    Arc,
     mpsc::{self, Receiver},
 };
 use std::thread;
 use std::time::{Duration, Instant};
 
-use datastream::ChannelId;
-use datastream::emit::{
-    ClusterFrameSink, DatastreamEmitter, DatastreamEventSink, EmitterConfig, FrameSink, NoopSink,
+use datastream::{
+    ChannelContent, ChannelId, DATASTREAM_PUBLISHER_NAME, DatastreamEndpoint, DatastreamEvent,
+    DatastreamProducer, DatastreamPublisherActor, DatastreamSubscribe, DatastreamSubscription,
+    Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
 };
 
 use distribution::node::DistributedNodeConfig;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
-use iroh_driver::{IrohDriver, IrohDriverConfig};
+use iroh_driver::{
+    DATASTREAM_ALPN, DatastreamQuicHeader, IrohDriver, IrohDriverConfig, spawn_subscription_writer,
+};
 use mvp_system::actors::node_agent::{
-    NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire,
+    NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
+    StageObjectSpecWire, StageOutboundEdgeWire, StageRingSpecWire,
 };
 use mvp_system::actors::register_mvp_actor_codecs;
 use mvp_system::arena_manager as arena;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
-use mvp_system::prompt_rpc::PromptEvent;
+use mvp_system::driver_pumps as driver_model;
+use mvp_system::edge_establisher as edge;
+use mvp_system::gpu_worker_ingress_parser as ingress;
+use mvp_system::prompt_rpc::{PromptEvent, TokenizerEvent};
 use mvp_system::relay_provisioning::relay_runtime_config_from_env;
 use mvp_system::run_plan::{GgufSource, TokenizerSource};
 use mvp_system::stage_controller as stage;
@@ -32,6 +40,7 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::sync::mpsc as tokio_mpsc;
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/mvp/tinygrad_worker.py";
 const DEFAULT_DEVICE: &str = "CUDA";
@@ -49,6 +58,7 @@ const NODE_STAGE_CHANNEL: &str = "mvp.node.stage";
 const NODE_WORKER_CHANNEL: &str = "mvp.node.worker";
 const NODE_PROMPT_CHANNEL: &str = "mvp.node.prompt";
 const NODE_SHUTDOWN_CHANNEL: &str = "mvp.node.shutdown";
+const EDGE_ALPN: &[u8] = b"mvp/pipeline-edge/0";
 
 fn node_event_payload(
     config: &DeploymentConfig,
@@ -89,15 +99,16 @@ fn emit_stdio_node_event(
 }
 
 fn emit_node_event(
-    datastream: &mut DatastreamEmitter,
+    datastream: &mut NodeDatastream,
     config: &DeploymentConfig,
     channel: &str,
     phase: &str,
     status: &str,
     detail: Value,
 ) {
+    let channel = datastream.channel_by_name(channel);
     datastream.submit_text(
-        ChannelId::new(channel),
+        channel,
         node_event_payload(config, phase, status, detail).to_string(),
     );
     datastream.tick();
@@ -361,7 +372,7 @@ fn drain_debug_join_commands(
     debug_join_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>>,
     driver: &mut IrohDriver,
     config: &DeploymentConfig,
-    datastream: &mut DatastreamEmitter,
+    datastream: &mut NodeDatastream,
 ) {
     let Some(rx) = debug_join_rx else {
         return;
@@ -395,7 +406,11 @@ fn drain_debug_join_commands(
     }
 }
 
-fn spawn_host_gpu_sampler(handle: tokio::runtime::Handle, sink: DatastreamEventSink) {
+fn spawn_host_gpu_sampler(
+    handle: tokio::runtime::Handle,
+    producer: DatastreamProducer,
+    channel: ChannelId,
+) {
     handle.spawn(async move {
         let mut seq = 0_u64;
         let mut interval = tokio::time::interval(datastream::hardware::gpu::GPU_SAMPLE_INTERVAL);
@@ -417,14 +432,15 @@ fn spawn_host_gpu_sampler(handle: tokio::runtime::Handle, sink: DatastreamEventS
             };
 
             seq = seq.saturating_add(1);
-            sink.submit_record(&sample);
+            producer.submit_record(channel, &sample);
         }
     });
 }
 
 fn spawn_host_cpu_sampler(
     handle: tokio::runtime::Handle,
-    sink: DatastreamEventSink,
+    producer: DatastreamProducer,
+    channel: ChannelId,
     watched_pids: Vec<u32>,
 ) {
     handle.spawn(async move {
@@ -437,11 +453,15 @@ fn spawn_host_cpu_sampler(
 
             let sample = sampler.sample(seq);
             seq = seq.saturating_add(1);
-            sink.submit_record(&sample);
+            producer.submit_record(channel, &sample);
         }
     });
 }
-fn spawn_host_net_sampler(handle: tokio::runtime::Handle, sink: DatastreamEventSink) {
+fn spawn_host_net_sampler(
+    handle: tokio::runtime::Handle,
+    producer: DatastreamProducer,
+    channel: ChannelId,
+) {
     handle.spawn(async move {
         let mut seq = 0_u64;
         let mut interval =
@@ -464,14 +484,15 @@ fn spawn_host_net_sampler(handle: tokio::runtime::Handle, sink: DatastreamEventS
             };
 
             seq = seq.saturating_add(1);
-            sink.submit_record(&sample);
+            producer.submit_record(channel, &sample);
         }
     });
 }
 
 fn spawn_arena_sampler(
     handle: tokio::runtime::Handle,
-    sink: DatastreamEventSink,
+    producer: DatastreamProducer,
+    channel: ChannelId,
     arena_manager: Arc<Mutex<arena::ArenaManager>>,
 ) {
     handle.spawn(async move {
@@ -483,9 +504,896 @@ fn spawn_arena_sampler(
 
             let sample = arena_manager.lock().sample(seq);
             seq = seq.saturating_add(1);
-            sink.submit_record(&sample);
+            producer.submit_record(channel, &sample);
         }
     });
+}
+
+#[derive(Clone, Debug)]
+enum DriverIngressEvent {
+    StreamArrived {
+        edge_id: u64,
+        stream_id: u64,
+    },
+    BytesRead {
+        edge_id: u64,
+        stream_id: u64,
+        bytes: Vec<u8>,
+    },
+}
+
+#[derive(Clone)]
+struct SendPumpHandle {
+    tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl SendPumpHandle {
+    fn send(&self, record: Vec<u8>) -> Result<(), String> {
+        self.tx
+            .send(record)
+            .map_err(|_| "edge sender task stopped".to_owned())
+    }
+}
+
+struct DriverRuntime {
+    tx: mpsc::Sender<DriverIngressEvent>,
+    rx: mpsc::Receiver<DriverIngressEvent>,
+    next_stream_id: u64,
+}
+
+impl DriverRuntime {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            tx,
+            rx,
+            next_stream_id: 1,
+        }
+    }
+
+    fn poll_iroh(&mut self, driver: &IrohDriver) {
+        for (_node, conn) in driver.drain_other_connections() {
+            spawn_recv_pump(
+                driver.tokio_handle(),
+                conn,
+                self.tx.clone(),
+                self.next_stream_id,
+            );
+            self.next_stream_id = self.next_stream_id.saturating_add(1);
+        }
+    }
+
+    fn try_recv(&self) -> Option<DriverIngressEvent> {
+        self.rx.try_recv().ok()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ObjectKey {
+    edge_id: u64,
+    object_id: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedObject {
+    object_id: u64,
+    sequence: u64,
+    handle_generation: u64,
+    handle_id: u64,
+}
+
+struct WorkerEdgeRuntime {
+    establisher: edge::EdgeEstablisher,
+    driver_model: driver_model::Driver,
+    driver_runtime: DriverRuntime,
+    edge_command_cursor: usize,
+    edge_event_cursor: usize,
+    driver_event_cursor: usize,
+    inbound_edge: Option<StageInboundEdgeWire>,
+    outbound_edge: Option<StageOutboundEdgeWire>,
+    inbound_ring_id: Option<u64>,
+    outbound_ring_id: Option<u64>,
+    outbound_sender: Option<SendPumpHandle>,
+    next_output_object_id: u64,
+    object_handles: BTreeMap<ObjectKey, LoadedObject>,
+    ingress_streams: BTreeMap<u64, Vec<u8>>,
+}
+
+impl WorkerEdgeRuntime {
+    fn new(local_node_id: u64) -> Self {
+        Self {
+            establisher: edge::EdgeEstablisher::new(edge::NodeId(local_node_id)),
+            driver_model: driver_model::Driver::new(driver_model::DriverConfig {
+                local_node_id: driver_model::NodeId(local_node_id),
+                alpn: driver_model::Alpn(String::from_utf8_lossy(EDGE_ALPN).into_owned()),
+            }),
+            driver_runtime: DriverRuntime::new(),
+            edge_command_cursor: 0,
+            edge_event_cursor: 0,
+            driver_event_cursor: 0,
+            inbound_edge: None,
+            outbound_edge: None,
+            inbound_ring_id: None,
+            outbound_ring_id: None,
+            outbound_sender: None,
+            next_output_object_id: 1,
+            object_handles: BTreeMap::new(),
+            ingress_streams: BTreeMap::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn poll_iroh(
+        &mut self,
+        driver: &IrohDriver,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+    ) -> Result<(), String> {
+        self.driver_runtime.poll_iroh(driver);
+        while let Some(event) = self.driver_runtime.try_recv() {
+            match event {
+                DriverIngressEvent::StreamArrived { edge_id, stream_id } => {
+                    self.driver_model
+                        .observe(driver_model::DriverEvent::IncomingUniStream {
+                            edge_id: driver_model::EdgeId(edge_id),
+                            stream_id: driver_model::StreamId(stream_id),
+                        });
+                    self.drive_edge_workflow(
+                        stack,
+                        node_actor,
+                        worker,
+                        arena_manager,
+                        config,
+                        datastream,
+                        driver.tokio_handle(),
+                        driver.endpoint().clone(),
+                    )?;
+                }
+                DriverIngressEvent::BytesRead {
+                    edge_id,
+                    stream_id,
+                    bytes,
+                } => {
+                    self.ingest_stream_bytes(
+                        edge_id,
+                        stream_id,
+                        bytes,
+                        stack,
+                        node_actor,
+                        worker,
+                        arena_manager,
+                        config,
+                        datastream,
+                        driver.tokio_handle(),
+                        driver.endpoint().clone(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn establish_inbound(
+        &mut self,
+        edge: StageInboundEdgeWire,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        handle: tokio::runtime::Handle,
+        endpoint: iroh::Endpoint,
+    ) -> Result<(), String> {
+        self.inbound_edge = Some(edge.clone());
+        self.establisher
+            .observe(edge::EdgeEvent::ProvisionRx(edge::ProvisionRx {
+                run_id: edge::RunId(config.run_id),
+                edge_id: edge::EdgeId(edge.edge_id),
+                local_node_id: edge::NodeId(config.logical_node_id),
+                object_spec: edge_object_spec(edge.object_spec),
+                ring_spec: edge_ring_spec(edge.ring_spec),
+            }));
+        self.drive_edge_workflow(
+            stack,
+            node_actor,
+            worker,
+            arena_manager,
+            config,
+            datastream,
+            handle,
+            endpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn establish_outbound(
+        &mut self,
+        edge: StageOutboundEdgeWire,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        handle: tokio::runtime::Handle,
+        endpoint: iroh::Endpoint,
+    ) -> Result<(), String> {
+        if edge.consumer_endpoint.is_none() {
+            stack
+                .runtime
+                .send_to(
+                    node_actor,
+                    NodeAgentMsg::MarkOutboundEdgeReady {
+                        edge_id: edge.edge_id,
+                    },
+                )
+                .map_err(|e| format!("mark outbound edge ready: {e}"))?;
+            self.outbound_edge = Some(edge);
+            return Ok(());
+        }
+        self.outbound_edge = Some(edge.clone());
+        self.establisher
+            .observe(edge::EdgeEvent::ProvisionTx(edge::ProvisionTx {
+                run_id: edge::RunId(config.run_id),
+                edge_id: edge::EdgeId(edge.edge_id),
+                local_node_id: edge::NodeId(config.logical_node_id),
+                consumer_node_id: edge::NodeId(edge.consumer_node_id),
+                object_spec: edge_object_spec(edge.object_spec),
+                ring_spec: edge_ring_spec(edge.ring_spec),
+            }));
+        self.drive_edge_workflow(
+            stack,
+            node_actor,
+            worker,
+            arena_manager,
+            config,
+            datastream,
+            handle,
+            endpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_step(
+        &mut self,
+        step_id: u64,
+        input_edge_id: u64,
+        object_id: u64,
+        sequence: u64,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        driver: &mut IrohDriver,
+    ) -> Result<(), String> {
+        let input_key = ObjectKey {
+            edge_id: input_edge_id,
+            object_id,
+        };
+        let loaded = self
+            .object_handles
+            .get(&input_key)
+            .cloned()
+            .ok_or_else(|| format!("object {input_key:?} has no loaded device handle"))?;
+        if loaded.sequence != sequence {
+            return Err(format!(
+                "object {input_key:?} sequence {} does not match command sequence {sequence}",
+                loaded.sequence
+            ));
+        }
+        let outbound = self
+            .outbound_edge
+            .clone()
+            .ok_or_else(|| "outbound edge missing".to_owned())?;
+        let output_ring_id = self
+            .outbound_ring_id
+            .ok_or_else(|| "outbound ring missing".to_owned())?;
+        let output_object_id = self.next_output_object_id;
+        self.next_output_object_id = self.next_output_object_id.saturating_add(1);
+        let final_stage = matches!(
+            outbound.kind,
+            mvp_system::actors::node_agent::StageEdgeKindWire::TokenOut
+        );
+        let mut pump = || pump_network(driver, stack);
+        let committed_bytes = worker.execute_step(
+            u64::from(config.stage_index) + 1,
+            step_id,
+            object_id,
+            sequence,
+            loaded.handle_id,
+            output_ring_id,
+            output_object_id,
+            sequence,
+            final_stage,
+            outbound.object_spec,
+            config,
+            datastream,
+            &mut pump,
+        )?;
+        let record = {
+            let arena = arena_manager.lock();
+            let lease = arena
+                .lookup_lease(arena::RingId(output_ring_id))
+                .ok_or_else(|| format!("outbound ring {output_ring_id} lease missing"))?;
+            arena
+                .read_arena(lease.layout.data_offset, committed_bytes)
+                .map_err(|e| format!("read egress ring: {e}"))?
+        };
+        self.driver_model
+            .observe(driver_model::DriverEvent::EgressBytesCommitted {
+                edge_id: driver_model::EdgeId(outbound.edge_id),
+                bytes: record.clone(),
+            });
+        self.driver_model
+            .observe(driver_model::DriverEvent::RingReadable {
+                ring_id: driver_model::RingId(output_ring_id),
+            });
+        let sender = self
+            .outbound_sender
+            .as_ref()
+            .ok_or_else(|| "outbound edge sender missing".to_owned())?;
+        sender.send(record)?;
+        stack
+            .runtime
+            .send_to(node_actor, NodeAgentMsg::StepCompleted { step_id })
+            .map_err(|e| format!("mark step completed: {e}"))
+    }
+
+    fn release_input_handle(
+        &mut self,
+        handle_id: u64,
+        worker: &mut TinygradWorker,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        driver: &mut IrohDriver,
+        stack: &DistributionRuntimeStack,
+    ) -> Result<(), String> {
+        let mut pump = || pump_network(driver, stack);
+        worker.release_device_object(handle_id, config, datastream, &mut pump)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_stream_bytes(
+        &mut self,
+        edge_id: u64,
+        stream_id: u64,
+        bytes: Vec<u8>,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        handle: tokio::runtime::Handle,
+        endpoint: iroh::Endpoint,
+    ) -> Result<(), String> {
+        let Some(inbound) = self.inbound_edge.clone() else {
+            return Ok(());
+        };
+        if inbound.edge_id != edge_id {
+            return Ok(());
+        }
+        let records = {
+            let buffer = self.ingress_streams.entry(stream_id).or_default();
+            buffer.extend_from_slice(&bytes);
+            let mut records = Vec::new();
+            while let Some(record) = take_complete_ingress_record(buffer, inbound.object_spec)? {
+                records.push(record);
+            }
+            records
+        };
+        for record in records {
+            let ring_id = self
+                .inbound_ring_id
+                .ok_or_else(|| "inbound ring missing".to_owned())?;
+            {
+                let arena = arena_manager.lock();
+                let lease = arena
+                    .lookup_lease(arena::RingId(ring_id))
+                    .ok_or_else(|| format!("inbound ring {ring_id} lease missing"))?;
+                arena
+                    .write_arena(lease.layout.data_offset, &record)
+                    .map_err(|e| format!("write ingress ring: {e}"))?;
+            }
+            let loaded = worker.ring_readable(
+                ring_id,
+                edge_id,
+                inbound.object_spec,
+                config,
+                datastream,
+                &mut || {},
+            )?;
+            let key = ObjectKey {
+                edge_id,
+                object_id: loaded.object_id,
+            };
+            self.object_handles.insert(key, loaded.clone());
+            stack
+                .runtime
+                .send_to(
+                    node_actor,
+                    NodeAgentMsg::ObjectLoaded {
+                        edge_id,
+                        object_id: loaded.object_id,
+                        sequence: loaded.sequence,
+                        handle_generation: loaded.handle_generation,
+                        handle_id: loaded.handle_id,
+                    },
+                )
+                .map_err(|e| format!("report object loaded: {e}"))?;
+        }
+        self.drive_edge_workflow(
+            stack,
+            node_actor,
+            worker,
+            arena_manager,
+            config,
+            datastream,
+            handle,
+            endpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_edge_workflow(
+        &mut self,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        handle: tokio::runtime::Handle,
+        endpoint: iroh::Endpoint,
+    ) -> Result<(), String> {
+        loop {
+            let mut progressed = false;
+            while self.edge_command_cursor < self.establisher.commands().len() {
+                let command = self.establisher.commands()[self.edge_command_cursor].clone();
+                self.edge_command_cursor += 1;
+                progressed = true;
+                match command {
+                    edge::EdgeCommand::LeaseRing {
+                        request_id,
+                        ring_spec,
+                        ..
+                    } => {
+                        let events = arena_manager.lock().request(arena::ArenaRequest::LeaseRing(
+                            arena::LeaseRing {
+                                request_id: arena::LeaseRequestId(request_id.0),
+                                ring_spec: arena::RingSpec {
+                                    header_bytes: ring_spec.header_bytes,
+                                    data_bytes: ring_spec.data_bytes,
+                                    alignment: ring_spec.alignment,
+                                },
+                            },
+                        ));
+                        for event in events {
+                            match event {
+                                arena::ArenaEvent::RingLeased { lease } => {
+                                    self.establisher.observe(edge::EdgeEvent::RingLeased {
+                                        request_id: edge::LeaseRequestId(lease.request_id.0),
+                                        ring_id: edge::RingId(lease.ring_id.0),
+                                        layout: edge::RingLayout {
+                                            start_offset: lease.layout.start_offset,
+                                            header_offset: lease.layout.header_offset,
+                                            data_offset: lease.layout.data_offset,
+                                            end_offset: lease.layout.end_offset,
+                                            data_bytes: lease.layout.data_bytes,
+                                            alignment: lease.layout.alignment,
+                                        },
+                                    });
+                                }
+                                arena::ArenaEvent::RingLeaseRejected { request_id, reason } => {
+                                    let reason = match reason {
+                                        arena::RingLeaseRejection::CannotFitWithinCeiling => {
+                                            edge::RingLeaseRejection::CannotFit
+                                        }
+                                        arena::RingLeaseRejection::ArenaShuttingDown => {
+                                            edge::RingLeaseRejection::ArenaShuttingDown
+                                        }
+                                    };
+                                    self.establisher
+                                        .observe(edge::EdgeEvent::RingLeaseRejected {
+                                            request_id: edge::LeaseRequestId(request_id.0),
+                                            reason,
+                                        });
+                                }
+                                arena::ArenaEvent::RingLeaseQueued { .. }
+                                | arena::ArenaEvent::RingReleased { .. }
+                                | arena::ArenaEvent::RingReleaseRejected { .. }
+                                | arena::ArenaEvent::CancelledFreshLeaseReleased { .. } => {}
+                            }
+                        }
+                    }
+                    edge::EdgeCommand::InstallWorkerRing {
+                        edge_id,
+                        ring_id,
+                        direction,
+                        object_spec,
+                        ..
+                    } => {
+                        let lease = arena_manager
+                            .lock()
+                            .lookup_lease(arena::RingId(ring_id.0))
+                            .ok_or_else(|| format!("ring {} lease missing", ring_id.0))?
+                            .clone();
+                        let (port, direction_name, wire_spec) = match direction {
+                            edge::RingDirection::Ingress => {
+                                self.inbound_ring_id = Some(ring_id.0);
+                                let spec = self
+                                    .inbound_edge
+                                    .as_ref()
+                                    .map(|edge| edge.object_spec)
+                                    .unwrap_or(StageObjectSpecWire {
+                                        max_extent: object_spec.max_extent_bytes,
+                                        alignment: 4,
+                                    });
+                                ("input", "ingress", spec)
+                            }
+                            edge::RingDirection::Egress => {
+                                self.outbound_ring_id = Some(ring_id.0);
+                                let spec = self
+                                    .outbound_edge
+                                    .as_ref()
+                                    .map(|edge| edge.object_spec)
+                                    .unwrap_or(StageObjectSpecWire {
+                                        max_extent: object_spec.max_extent_bytes,
+                                        alignment: 4,
+                                    });
+                                ("output", "egress", spec)
+                            }
+                        };
+                        worker.install_ring(
+                            ring_id.0,
+                            edge_id.0,
+                            port,
+                            direction_name,
+                            lease.layout,
+                            wire_spec,
+                            config,
+                            datastream,
+                            &mut || {},
+                        )?;
+                        self.establisher
+                            .observe(edge::EdgeEvent::RingInstalled { edge_id, ring_id });
+                    }
+                    edge::EdgeCommand::EstablishSend {
+                        edge_id,
+                        consumer_node_id,
+                        ..
+                    } => {
+                        let outbound = self
+                            .outbound_edge
+                            .as_ref()
+                            .ok_or_else(|| "outbound edge missing".to_owned())?;
+                        let peer = outbound
+                            .consumer_endpoint
+                            .clone()
+                            .ok_or_else(|| "outbound consumer endpoint missing".to_owned())?;
+                        let record = self
+                            .establisher
+                            .local_record(edge_id)
+                            .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
+                        let ring_id = record
+                            .ring_id
+                            .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
+                        let ring_capacity = outbound.ring_spec.data_capacity as usize;
+                        self.driver_model
+                            .observe(driver_model::DriverEvent::EstablishSend(
+                                driver_model::EstablishSend {
+                                    edge_id: driver_model::EdgeId(edge_id.0),
+                                    peer_node_id: driver_model::NodeId(consumer_node_id.0),
+                                    layout: driver_model::RingLayout {
+                                        ring_id: driver_model::RingId(ring_id.0),
+                                        byte_capacity: ring_capacity,
+                                        direction: driver_model::RingDirection::Egress,
+                                    },
+                                },
+                            ));
+                        self.outbound_sender = Some(spawn_send_pump(
+                            handle.clone(),
+                            endpoint.clone(),
+                            peer,
+                            edge_id.0,
+                        )?);
+                    }
+                    edge::EdgeCommand::EstablishRecv { edge_id, .. } => {
+                        let record = self
+                            .establisher
+                            .local_record(edge_id)
+                            .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
+                        let ring_id = record
+                            .ring_id
+                            .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
+                        let ring_capacity = self
+                            .inbound_edge
+                            .as_ref()
+                            .map(|edge| edge.ring_spec.data_capacity as usize)
+                            .unwrap_or(4096);
+                        self.driver_model
+                            .observe(driver_model::DriverEvent::EstablishRecv(
+                                driver_model::EstablishRecv {
+                                    edge_id: driver_model::EdgeId(edge_id.0),
+                                    layout: driver_model::RingLayout {
+                                        ring_id: driver_model::RingId(ring_id.0),
+                                        byte_capacity: ring_capacity,
+                                        direction: driver_model::RingDirection::Ingress,
+                                    },
+                                },
+                            ));
+                    }
+                    edge::EdgeCommand::CancelQueuedLease { request_id, .. } => {
+                        let _ = arena_manager
+                            .lock()
+                            .request(arena::ArenaRequest::CancelLease {
+                                request_id: arena::LeaseRequestId(request_id.0),
+                            });
+                    }
+                    edge::EdgeCommand::StopPump { edge_id, .. } => {
+                        self.driver_model
+                            .observe(driver_model::DriverEvent::StopEdge {
+                                edge_id: driver_model::EdgeId(edge_id.0),
+                            });
+                    }
+                    edge::EdgeCommand::UninstallWorkerRing { ring_id, .. } => {
+                        let mut pump = || {};
+                        worker.uninstall_ring(ring_id.0, config, datastream, &mut pump)?;
+                        self.establisher
+                            .observe(edge::EdgeEvent::RingQuiesced { ring_id });
+                    }
+                    edge::EdgeCommand::ReleaseArenaLease { ring_id, proof } => {
+                        let proof = if proof == edge::QuiescenceProof::verified() {
+                            arena::QuiescenceProof::verified()
+                        } else {
+                            arena::QuiescenceProof::missing()
+                        };
+                        let _ = arena_manager
+                            .lock()
+                            .request(arena::ArenaRequest::ReleaseRing {
+                                ring_id: arena::RingId(ring_id.0),
+                                proof,
+                            });
+                    }
+                }
+            }
+
+            while self.driver_event_cursor < self.driver_model.events().len() {
+                let event = self.driver_model.events()[self.driver_event_cursor].clone();
+                self.driver_event_cursor += 1;
+                progressed = true;
+                match event {
+                    driver_model::DriverEventOut::DriverEdgeReady { edge_id } => {
+                        self.establisher.observe(edge::EdgeEvent::DriverEdgeReady {
+                            edge_id: edge::EdgeId(edge_id.0),
+                        });
+                    }
+                    driver_model::DriverEventOut::StreamFault { edge_id, reason } => {
+                        let reason = match reason {
+                            driver_model::StreamFaultReason::ReadError => {
+                                edge::StreamFaultReason::ReadError
+                            }
+                            driver_model::StreamFaultReason::WriteError => {
+                                edge::StreamFaultReason::WriteError
+                            }
+                            driver_model::StreamFaultReason::ProtocolError => {
+                                edge::StreamFaultReason::ProtocolError
+                            }
+                        };
+                        self.establisher.observe(edge::EdgeEvent::StreamFault {
+                            edge_id: edge::EdgeId(edge_id.0),
+                            reason,
+                        });
+                    }
+                    driver_model::DriverEventOut::PumpStopped { edge_id, ring_id } => {
+                        self.establisher.observe(edge::EdgeEvent::PumpStopped {
+                            edge_id: edge::EdgeId(edge_id.0),
+                            ring_id: edge::RingId(ring_id.0),
+                        });
+                    }
+                    driver_model::DriverEventOut::StreamClosed { .. } => {}
+                }
+            }
+
+            while self.edge_event_cursor < self.establisher.events().len() {
+                let event = self.establisher.events()[self.edge_event_cursor].clone();
+                self.edge_event_cursor += 1;
+                progressed = true;
+                match event {
+                    edge::EdgeLifecycleEvent::EdgeReady { edge_id, .. } => {
+                        if self
+                            .inbound_edge
+                            .as_ref()
+                            .is_some_and(|edge| edge.edge_id == edge_id.0)
+                        {
+                            stack
+                                .runtime
+                                .send_to(
+                                    node_actor,
+                                    NodeAgentMsg::MarkInboundEdgeReady { edge_id: edge_id.0 },
+                                )
+                                .map_err(|e| format!("mark inbound ready: {e}"))?;
+                        }
+                        if self
+                            .outbound_edge
+                            .as_ref()
+                            .is_some_and(|edge| edge.edge_id == edge_id.0)
+                        {
+                            stack
+                                .runtime
+                                .send_to(
+                                    node_actor,
+                                    NodeAgentMsg::MarkOutboundEdgeReady { edge_id: edge_id.0 },
+                                )
+                                .map_err(|e| format!("mark outbound ready: {e}"))?;
+                        }
+                    }
+                    edge::EdgeLifecycleEvent::EdgeFaulted { edge_id, reason } => {
+                        stack
+                            .runtime
+                            .send_to(node_actor, NodeAgentMsg::WorkerCrashed)
+                            .map_err(|e| format!("mark worker crashed after edge fault: {e}"))?;
+                        return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
+                    }
+                    edge::EdgeLifecycleEvent::EdgeStopped { .. } => {}
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn edge_object_spec(spec: StageObjectSpecWire) -> edge::ObjectSpec {
+    edge::ObjectSpec {
+        kind: edge::ObjectKind::Activation,
+        dtype: edge::DType::F16,
+        max_extent_bytes: spec.max_extent,
+    }
+}
+
+fn edge_ring_spec(spec: StageRingSpecWire) -> edge::RingSpec {
+    edge::RingSpec {
+        header_bytes: 0,
+        data_bytes: spec.data_capacity,
+        alignment: u64::from(spec.alignment),
+    }
+}
+
+fn ingress_object_spec(spec: StageObjectSpecWire) -> ingress::ObjectSpec {
+    ingress::ObjectSpec {
+        max_extent: spec.max_extent,
+        alignment: u64::from(spec.alignment),
+        layout: ingress::ObjectLayout::Token,
+    }
+}
+
+fn take_complete_ingress_record(
+    buffer: &mut Vec<u8>,
+    spec: StageObjectSpecWire,
+) -> Result<Option<Vec<u8>>, String> {
+    let record = match ingress::read_object_record(buffer, ingress_object_spec(spec), false)
+        .map_err(|reason| format!("invalid object record: {reason:?}"))?
+    {
+        ingress::ObjectRecordRead::Incomplete => return Ok(None),
+        ingress::ObjectRecordRead::Complete(record) => record,
+    };
+    Ok(Some(buffer.drain(..record.total_len).collect()))
+}
+
+fn spawn_send_pump(
+    handle: tokio::runtime::Handle,
+    endpoint: iroh::Endpoint,
+    peer: EndpointAddr,
+    edge_id: u64,
+) -> Result<SendPumpHandle, String> {
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    handle.spawn(async move {
+        let result: Result<(), String> = async {
+            let conn = endpoint
+                .connect(peer, EDGE_ALPN)
+                .await
+                .map_err(|e| format!("connect edge {edge_id}: {e}"))?;
+            let mut send = conn
+                .open_uni()
+                .await
+                .map_err(|e| format!("open edge stream {edge_id}: {e}"))?;
+            send.write_all(&driver_model::encode_edge_preamble(driver_model::EdgeId(
+                edge_id,
+            )))
+            .await
+            .map_err(|e| format!("write edge preamble {edge_id}: {e}"))?;
+            send.flush()
+                .await
+                .map_err(|e| format!("flush edge preamble {edge_id}: {e}"))?;
+            let _ = ready_tx.send(Ok(()));
+            while let Some(record) = rx.recv().await {
+                send.write_all(&record)
+                    .await
+                    .map_err(|e| format!("write edge record {edge_id}: {e}"))?;
+                send.flush()
+                    .await
+                    .map_err(|e| format!("flush edge record {edge_id}: {e}"))?;
+            }
+            send.finish()
+                .map_err(|e| format!("finish edge stream {edge_id}: {e}"))?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = ready_tx.send(Err(error));
+        }
+    });
+    ready_rx
+        .recv()
+        .map_err(|e| format!("edge {edge_id} sender startup channel closed: {e}"))??;
+    Ok(SendPumpHandle { tx })
+}
+
+fn spawn_recv_pump(
+    handle: tokio::runtime::Handle,
+    conn: iroh::endpoint::Connection,
+    tx: mpsc::Sender<DriverIngressEvent>,
+    stream_id: u64,
+) {
+    handle.spawn(async move {
+        let mut next_uni_stream_id = stream_id << 32;
+        while let Ok(mut recv) = conn.accept_uni().await {
+            next_uni_stream_id = next_uni_stream_id.saturating_add(1);
+            let current_stream_id = next_uni_stream_id;
+            let mut preamble = [0u8; 8];
+            if recv.read_exact(&mut preamble).await.is_err() {
+                continue;
+            }
+            let edge_id = u64::from_le_bytes(preamble);
+            if tx
+                .send(DriverIngressEvent::StreamArrived {
+                    edge_id,
+                    stream_id: current_stream_id,
+                })
+                .is_err()
+            {
+                break;
+            }
+            let mut chunk = vec![0u8; 4096];
+            loop {
+                match recv.read(&mut chunk).await {
+                    Ok(Some(0)) | Ok(None) => break,
+                    Ok(Some(n)) => {
+                        if tx
+                            .send(DriverIngressEvent::BytesRead {
+                                edge_id,
+                                stream_id: current_stream_id,
+                                bytes: chunk[..n].to_vec(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+}
+
+fn value_u64(value: &Value, field: &str) -> Result<u64, String> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("helper event missing numeric {field}: {value}"))
 }
 
 fn main() -> ExitCode {
@@ -516,7 +1424,6 @@ fn run() -> Result<(), String> {
             "model_id":&config.model_id,
             "has_coordinator_endpoint":config.coordinator_endpoint.is_some(),
             "has_orchestrator_actor":config.orchestrator_actor.is_some(),
-            "has_datastream_sink_actor":config.datastream_sink_actor.is_some(),
             "self_test_enabled":config.self_test_prompt.is_some(),
             "arena_bytes":config.arena_bytes,
             "arena_alignment":config.arena_alignment,
@@ -560,7 +1467,7 @@ fn run() -> Result<(), String> {
             relay_mode: config.relay_mode.clone(),
             node: DistributedNodeConfig::default(),
             peer_auth: None,
-            additional_alpns: vec![],
+            additional_alpns: vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()],
         },
     ) {
         Ok(driver) => {
@@ -670,22 +1577,51 @@ fn run() -> Result<(), String> {
             return Err(format!("boot arena manager: {error:?}"));
         }
     };
+    let arena_fd = arena_manager.lock().arena_fd();
 
-    let mut datastream = node_datastream(&config, &stack);
-    spawn_host_gpu_sampler(tokio.handle().clone(), datastream.event_sink());
-    spawn_host_net_sampler(tokio.handle().clone(), datastream.event_sink());
+    let mut datastream = node_datastream(&config);
+    let datastream_publisher = match stack
+        .runtime
+        .spawn(datastream.publisher_actor(tokio.handle().clone(), driver.endpoint()))
+    {
+        Ok(actor) => actor,
+        Err(error) => {
+            emit_node_event(
+                &mut datastream,
+                &config,
+                NODE_BOOTSTRAP_CHANNEL,
+                "datastream_publisher",
+                "failed",
+                json!({"error":error.to_string()}),
+            );
+            return Err(format!("spawn datastream publisher: {error}"));
+        }
+    };
+    stack.register_local_actor(driver.register_actor(datastream_publisher, 1));
+    spawn_host_gpu_sampler(
+        tokio.handle().clone(),
+        datastream.producer.clone(),
+        datastream.channels.host_gpu,
+    );
+    spawn_host_net_sampler(
+        tokio.handle().clone(),
+        datastream.producer.clone(),
+        datastream.channels.host_net,
+    );
     spawn_arena_sampler(
         tokio.handle().clone(),
-        datastream.event_sink(),
+        datastream.producer.clone(),
+        datastream.channels.arena,
         Arc::clone(&arena_manager),
     );
-    emit_stdio_node_event(
+    emit_node_event(
+        &mut datastream,
         &config,
         NODE_BOOTSTRAP_CHANNEL,
-        "datastream_emitter",
+        "datastream_publisher",
         "ready",
-        config.datastream_sink_detail(),
-    )?;
+        json!({"actor":datastream_publisher,"name":DATASTREAM_PUBLISHER_NAME,"subscription_transport":"iroh"}),
+    );
     let mut debug_join_rx = match &config.debug_join_socket {
         Some(path) => {
             match spawn_debug_join_listener(tokio.handle().clone(), PathBuf::from(path)) {
@@ -809,7 +1745,7 @@ fn run() -> Result<(), String> {
             "stderr":"piped",
         }),
     )?;
-    let mut worker = match TinygradWorker::spawn(&config) {
+    let mut worker = match TinygradWorker::spawn(&config, arena_fd) {
         Ok(worker) => worker,
         Err(error) => {
             emit_stdio_node_event(
@@ -824,7 +1760,8 @@ fn run() -> Result<(), String> {
     };
     spawn_host_cpu_sampler(
         tokio.handle().clone(),
-        datastream.event_sink(),
+        datastream.producer.clone(),
+        datastream.channels.host_cpu,
         vec![std::process::id(), worker.pid()],
     );
     emit_stdio_node_event(
@@ -854,14 +1791,20 @@ fn run() -> Result<(), String> {
             return Err(error);
         }
     }
-    let mut pending_runtime_ready =
-        PendingRuntimeReady::new(&config, driver.endpoint_addr(), node_actor);
+    let mut edge_runtime = WorkerEdgeRuntime::new(config.logical_node_id);
+    let mut pending_runtime_ready = PendingRuntimeReady::new(
+        &config,
+        driver.endpoint_addr(),
+        node_actor,
+        datastream_publisher,
+    );
 
     let ready = json!({
         "type":"ready",
         "role":"node",
         "endpoint": driver.endpoint_addr(),
         "node_actor": node_actor,
+        "datastream_publisher": datastream_publisher,
         "logical_node_id": config.logical_node_id,
         "stage_index": config.stage_index,
     });
@@ -907,7 +1850,7 @@ fn run() -> Result<(), String> {
         "started",
         json!({
             "poll_interval_ms":PUMP_INTERVAL.as_millis(),
-            "checks":["network","datastream","node_reports","stdin_shutdown","worker_health"],
+            "checks":["network","edge_streams","datastream","node_reports","stdin_shutdown","worker_health"],
         }),
     );
     loop {
@@ -915,6 +1858,15 @@ fn run() -> Result<(), String> {
         drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut datastream);
         datastream.tick();
         worker.drain_stderr(&config, &mut datastream);
+        edge_runtime.poll_iroh(
+            &driver,
+            &stack,
+            node_actor,
+            &mut worker,
+            &arena_manager,
+            &config,
+            &mut datastream,
+        )?;
         while let Some(report) = reports.try_recv() {
             match handle_node_report(
                 report,
@@ -923,6 +1875,8 @@ fn run() -> Result<(), String> {
                 &mut driver,
                 node_actor,
                 &mut worker,
+                &mut edge_runtime,
+                &arena_manager,
                 &mut datastream,
             )? {
                 NodeReportOutcome::None => {}
@@ -947,7 +1901,7 @@ fn run() -> Result<(), String> {
                                 "node_actor":pending_runtime_ready.node_actor,
                             }),
                         );
-                        datastream.submit_text(ChannelId::new("mvp.node.ready"), ready.to_string());
+                        datastream.submit_text(datastream.channels.node_ready, ready.to_string());
                         emit_node_event(
                             &mut datastream,
                             &config,
@@ -1043,6 +1997,7 @@ fn run() -> Result<(), String> {
             let _ = stack
                 .runtime
                 .send_to(node_actor, NodeAgentMsg::WorkerCrashed);
+            pump_network(&mut driver, &stack);
             return Err(format!("tinygrad helper exited with {status}"));
         }
         thread::sleep(PUMP_INTERVAL);
@@ -1056,79 +2011,236 @@ fn pump_network(driver: &mut IrohDriver, stack: &DistributionRuntimeStack) {
     driver.drain_outbox(&stack.outbox);
 }
 
-fn node_datastream(
-    config: &DeploymentConfig,
-    stack: &DistributionRuntimeStack,
-) -> DatastreamEmitter {
-    let mut sinks: Vec<Box<dyn FrameSink>> = Vec::new();
-    if let Some(actor) = config.datastream_sink_actor {
-        let sink_addr = Arc::new(OnceLock::new());
-        let _ = sink_addr.set(actor);
-        sinks.push(Box::new(ClusterFrameSink::new(
-            stack.runtime.clone(),
-            sink_addr,
-        )));
-    }
-    if let Some(path) = &config.datastream_frame_log {
-        match JsonlFrameSink::open(path) {
-            Ok(sink) => {
-                sinks.push(Box::new(sink));
-            }
-            Err(_error) => {}
+fn node_datastream(config: &DeploymentConfig) -> NodeDatastream {
+    NodeDatastream::new(config)
+}
+
+#[derive(Clone, Copy)]
+struct DatastreamChannelSet {
+    node_ready: ChannelId,
+    node_lifecycle: ChannelId,
+    node_self_test: ChannelId,
+    worker_stderr: ChannelId,
+    host_cpu: ChannelId,
+    host_gpu: ChannelId,
+    host_net: ChannelId,
+    arena: ChannelId,
+}
+
+struct NodeDatastream {
+    endpoint: Arc<DatastreamEndpoint>,
+    producer: DatastreamProducer,
+    channels: DatastreamChannelSet,
+    by_name: BTreeMap<String, ChannelId>,
+    by_id: BTreeMap<ChannelId, String>,
+    archive: Option<DatastreamArchive>,
+}
+
+impl NodeDatastream {
+    fn new(config: &DeploymentConfig) -> Self {
+        let stream = StreamId::new(
+            NodeId::new(config.logical_node_id.to_string()),
+            Lifetime(config.run_id),
+        );
+        let endpoint = Arc::new(DatastreamEndpoint::with_descriptor(
+            StreamDescriptor {
+                stream: stream.clone(),
+                label: Some("mvp worker node".to_owned()),
+                origin: StreamOrigin::RemoteNode,
+            },
+            256,
+            1024,
+        ));
+        let producer = endpoint.producer();
+        let mut by_name = BTreeMap::new();
+        let mut by_id = BTreeMap::new();
+
+        for name in [
+            NODE_BOOTSTRAP_CHANNEL,
+            NODE_RUNTIME_CHANNEL,
+            NODE_STAGE_CHANNEL,
+            NODE_WORKER_CHANNEL,
+            NODE_PROMPT_CHANNEL,
+            NODE_SHUTDOWN_CHANNEL,
+            "mvp.worker.initialize",
+            "mvp.worker.role",
+            "mvp.worker.weights",
+            "mvp.worker.prompt",
+            "mvp.worker.tokenizer",
+            "mvp.worker.ring",
+            "mvp.worker.ingress",
+            "mvp.worker.step",
+            "mvp.worker.device_object",
+            "mvp.worker.shutdown",
+        ] {
+            register_json_channel(&producer, &mut by_name, &mut by_id, name);
+        }
+
+        let channels = DatastreamChannelSet {
+            node_ready: register_json_channel(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+                "mvp.node.ready",
+            ),
+            node_lifecycle: register_json_channel(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+                "mvp.node.lifecycle",
+            ),
+            node_self_test: register_json_channel(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+                "mvp.node.self_test",
+            ),
+            worker_stderr: register_json_channel(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+                "mvp.worker.stderr",
+            ),
+            host_cpu: register_record_channel::<datastream::hardware::cpu::HostCpuSample>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
+            host_gpu: register_record_channel::<datastream::hardware::gpu::HostGpuSample>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
+            host_net: register_record_channel::<datastream::hardware::net::HostNetSample>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
+            arena: register_record_channel::<arena::ArenaSample>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
+        };
+        let archive = config.datastream_frame_log.as_deref().and_then(|path| {
+            DatastreamArchive::open(path, endpoint.subscribe_all("frame-log")).ok()
+        });
+
+        Self {
+            endpoint,
+            producer,
+            channels,
+            by_name,
+            by_id,
+            archive,
         }
     }
-    if sinks.is_empty() {
-        sinks.push(Box::new(NoopSink));
+
+    fn channel_by_name(&mut self, name: &str) -> ChannelId {
+        if let Some(id) = self.by_name.get(name).copied() {
+            return id;
+        }
+        register_json_channel(&self.producer, &mut self.by_name, &mut self.by_id, name)
     }
-    let sink: Box<dyn FrameSink> = if sinks.len() == 1 {
-        sinks.pop().expect("one sink")
-    } else {
-        Box::new(TeeFrameSink { sinks })
-    };
-    DatastreamEmitter::new(
-        EmitterConfig {
-            node_hex: config.logical_node_id.to_string(),
-            life: config.run_id,
-            mux_capacity: 256,
+
+    fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) {
+        self.producer.submit_text(channel, text);
+    }
+
+    fn tick(&mut self) {
+        self.endpoint.tick();
+        if let Some(archive) = &mut self.archive {
+            archive.drain(&self.by_id);
+        }
+    }
+
+    fn publisher_actor(
+        &self,
+        tokio: tokio::runtime::Handle,
+        iroh_endpoint: iroh::Endpoint,
+    ) -> DatastreamPublisherActor {
+        DatastreamPublisherActor::new(
+            Arc::clone(&self.endpoint),
+            move |subscribe: DatastreamSubscribe, subscription: DatastreamSubscription| {
+                let Ok(header) = DatastreamQuicHeader::from_snapshot(
+                    subscribe.flow_id,
+                    subscribe.token,
+                    subscription.snapshot(),
+                ) else {
+                    return;
+                };
+                let _ = spawn_subscription_writer(
+                    &tokio,
+                    iroh_endpoint.clone(),
+                    subscribe.collector,
+                    header,
+                    subscription,
+                    Duration::from_millis(10),
+                );
+            },
+        )
+    }
+}
+
+fn register_json_channel(
+    producer: &DatastreamProducer,
+    by_name: &mut BTreeMap<String, ChannelId>,
+    by_id: &mut BTreeMap<ChannelId, String>,
+    name: &str,
+) -> ChannelId {
+    let id = producer.register_channel(
+        name,
+        ChannelContent::JsonRecord {
+            schema: Some(name.to_owned()),
         },
-        sink,
-    )
+    );
+    by_name.insert(name.to_owned(), id);
+    by_id.insert(id, name.to_owned());
+    id
 }
 
-struct TeeFrameSink {
-    sinks: Vec<Box<dyn FrameSink>>,
+fn register_record_channel<R: Record>(
+    producer: &DatastreamProducer,
+    by_name: &mut BTreeMap<String, ChannelId>,
+    by_id: &mut BTreeMap<ChannelId, String>,
+) -> ChannelId {
+    let id = producer.register_record::<R>();
+    by_name.insert(R::CHANNEL.to_owned(), id);
+    by_id.insert(id, R::CHANNEL.to_owned());
+    id
 }
 
-impl FrameSink for TeeFrameSink {
-    fn ship(&mut self, stream: &datastream::StreamId, frame: &datastream::Frame) {
-        for sink in &mut self.sinks {
-            sink.ship(stream, frame);
-        }
-    }
-}
-
-struct JsonlFrameSink {
+struct DatastreamArchive {
     file: File,
+    subscription: DatastreamSubscription,
 }
 
-impl JsonlFrameSink {
-    fn open(path: &str) -> std::io::Result<Self> {
+impl DatastreamArchive {
+    fn open(path: &str, subscription: DatastreamSubscription) -> std::io::Result<Self> {
         Ok(Self {
             file: OpenOptions::new().create(true).append(true).open(path)?,
+            subscription,
         })
     }
-}
 
-impl FrameSink for JsonlFrameSink {
-    fn ship(&mut self, stream: &datastream::StreamId, frame: &datastream::Frame) {
-        let record = json!({
-            "stream":stream.to_string(),
-            "channel":frame.channel.as_str(),
-            "position":frame.position.0,
-            "payload":String::from_utf8_lossy(&frame.payload),
-        });
-        let _ = serde_json::to_writer(&mut self.file, &record);
-        let _ = writeln!(self.file);
+    fn drain(&mut self, channel_names: &BTreeMap<ChannelId, String>) {
+        for event in self.subscription.drain_available() {
+            if let DatastreamEvent::Frame(frame) = event {
+                let channel = channel_names
+                    .get(&frame.channel.channel)
+                    .cloned()
+                    .unwrap_or_else(|| format!("channel#{}", frame.channel.channel.0));
+                let record = json!({
+                    "stream":frame.channel.stream.to_string(),
+                    "channel":channel,
+                    "channel_id":frame.channel.channel.0,
+                    "position":frame.position.0,
+                    "payload":String::from_utf8_lossy(&frame.payload),
+                });
+                let _ = serde_json::to_writer(&mut self.file, &record);
+                let _ = writeln!(self.file);
+            }
+        }
         let _ = self.file.flush();
     }
 }
@@ -1149,6 +2261,7 @@ struct PendingRuntimeReady {
     stage_index: u32,
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
+    datastream_publisher: ActorAddress,
     coordinator: Option<DistNodeId>,
     readiness_id: u64,
     attempts: u32,
@@ -1159,13 +2272,19 @@ struct PendingRuntimeReady {
 }
 
 impl PendingRuntimeReady {
-    fn new(config: &DeploymentConfig, endpoint: EndpointAddr, node_actor: ActorAddress) -> Self {
+    fn new(
+        config: &DeploymentConfig,
+        endpoint: EndpointAddr,
+        node_actor: ActorAddress,
+        datastream_publisher: ActorAddress,
+    ) -> Self {
         Self {
             run_id: config.run_id,
             node_id: config.logical_node_id,
             stage_index: config.stage_index,
             endpoint,
             node_actor,
+            datastream_publisher,
             coordinator: config
                 .coordinator_endpoint
                 .as_ref()
@@ -1227,6 +2346,7 @@ impl PendingRuntimeReady {
                     stage_index: self.stage_index,
                     endpoint: self.endpoint.clone(),
                     node_actor: self.node_actor,
+                    datastream_publisher: self.datastream_publisher,
                     readiness_id: self.readiness_id,
                 },
             )
@@ -1249,12 +2369,16 @@ fn handle_node_report(
     driver: &mut IrohDriver,
     node_actor: ActorAddress,
     worker: &mut TinygradWorker,
-    datastream: &mut DatastreamEmitter,
+    edge_runtime: &mut WorkerEdgeRuntime,
+    arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+    datastream: &mut NodeDatastream,
 ) -> Result<NodeReportOutcome, String> {
     let kind = match &report {
         NodeAgentReport::Command(_) => "Command",
         NodeAgentReport::Lifecycle(_) => "Lifecycle",
         NodeAgentReport::PromptRequested { .. } => "PromptRequested",
+        NodeAgentReport::EncodePromptRequested { .. } => "EncodePromptRequested",
+        NodeAgentReport::DecodeTokensRequested { .. } => "DecodeTokensRequested",
         NodeAgentReport::RuntimeReadyAck { .. } => "RuntimeReadyAck",
         NodeAgentReport::Snapshot { .. } => "Snapshot",
     };
@@ -1269,14 +2393,22 @@ fn handle_node_report(
     match report {
         NodeAgentReport::Command(command) => {
             handle_stage_command(
-                command, config, stack, driver, node_actor, worker, datastream,
+                command,
+                config,
+                stack,
+                driver,
+                node_actor,
+                worker,
+                edge_runtime,
+                arena_manager,
+                datastream,
             )?;
             Ok(NodeReportOutcome::None)
         }
         NodeAgentReport::Lifecycle(event) => {
             let event = format!("{event:?}");
             datastream.submit_text(
-                ChannelId::new("mvp.node.lifecycle"),
+                datastream.channels.node_lifecycle,
                 json!({"type":"node_lifecycle","event":event}).to_string(),
             );
             emit_node_event(
@@ -1297,6 +2429,26 @@ fn handle_node_report(
         } => {
             handle_prompt_request(
                 request_id, prompt, max_tokens, reply_to, config, stack, driver, worker, datastream,
+            )?;
+            Ok(NodeReportOutcome::None)
+        }
+        NodeAgentReport::EncodePromptRequested {
+            request_id,
+            prompt,
+            reply_to,
+        } => {
+            handle_encode_prompt_request(
+                request_id, prompt, reply_to, config, stack, driver, worker, datastream,
+            )?;
+            Ok(NodeReportOutcome::None)
+        }
+        NodeAgentReport::DecodeTokensRequested {
+            request_id,
+            tokens,
+            reply_to,
+        } => {
+            handle_decode_tokens_request(
+                request_id, tokens, reply_to, config, stack, driver, worker, datastream,
             )?;
             Ok(NodeReportOutcome::None)
         }
@@ -1324,7 +2476,7 @@ fn handle_prompt_request(
     stack: &DistributionRuntimeStack,
     driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
-    datastream: &mut DatastreamEmitter,
+    datastream: &mut NodeDatastream,
 ) -> Result<(), String> {
     let started = Instant::now();
     emit_node_event(
@@ -1480,6 +2632,104 @@ fn handle_prompt_request(
     }
 }
 
+fn handle_encode_prompt_request(
+    request_id: u64,
+    prompt: String,
+    reply_to: ActorAddress,
+    config: &DeploymentConfig,
+    stack: &DistributionRuntimeStack,
+    driver: &mut IrohDriver,
+    worker: &mut TinygradWorker,
+    datastream: &mut NodeDatastream,
+) -> Result<(), String> {
+    emit_node_event(
+        datastream,
+        config,
+        NODE_PROMPT_CHANNEL,
+        "encode_prompt",
+        "started",
+        json!({"request_id":request_id,"prompt_bytes":prompt.len(),"reply_to":reply_to}),
+    );
+    let mut pump = || pump_network(driver, stack);
+    let event = match worker.encode_prompt(request_id, &prompt, config, datastream, &mut pump) {
+        Ok(tokens) => {
+            emit_node_event(
+                datastream,
+                config,
+                NODE_PROMPT_CHANNEL,
+                "encode_prompt",
+                "ready",
+                json!({"request_id":request_id,"tokens":tokens.len(),"reply_to":reply_to}),
+            );
+            TokenizerEvent::PromptEncoded { request_id, tokens }
+        }
+        Err(error) => {
+            emit_node_event(
+                datastream,
+                config,
+                NODE_PROMPT_CHANNEL,
+                "encode_prompt",
+                "failed",
+                json!({"request_id":request_id,"error":error,"reply_to":reply_to}),
+            );
+            TokenizerEvent::Fault { request_id, error }
+        }
+    };
+    stack
+        .runtime
+        .send_to(reply_to, event)
+        .map_err(|e| format!("send tokenizer encode response: {e}"))
+}
+
+fn handle_decode_tokens_request(
+    request_id: u64,
+    tokens: Vec<u32>,
+    reply_to: ActorAddress,
+    config: &DeploymentConfig,
+    stack: &DistributionRuntimeStack,
+    driver: &mut IrohDriver,
+    worker: &mut TinygradWorker,
+    datastream: &mut NodeDatastream,
+) -> Result<(), String> {
+    emit_node_event(
+        datastream,
+        config,
+        NODE_PROMPT_CHANNEL,
+        "decode_tokens",
+        "started",
+        json!({"request_id":request_id,"tokens":tokens.len(),"reply_to":reply_to}),
+    );
+    let mut pump = || pump_network(driver, stack);
+    let event = match worker.decode_tokens(request_id, &tokens, config, datastream, &mut pump) {
+        Ok(text) => {
+            emit_node_event(
+                datastream,
+                config,
+                NODE_PROMPT_CHANNEL,
+                "decode_tokens",
+                "ready",
+                json!({"request_id":request_id,"tokens":tokens.len(),"text_bytes":text.len(),"reply_to":reply_to}),
+            );
+            TokenizerEvent::TokensDecoded { request_id, text }
+        }
+        Err(error) => {
+            emit_node_event(
+                datastream,
+                config,
+                NODE_PROMPT_CHANNEL,
+                "decode_tokens",
+                "failed",
+                json!({"request_id":request_id,"error":error,"reply_to":reply_to}),
+            );
+            TokenizerEvent::Fault { request_id, error }
+        }
+    };
+    stack
+        .runtime
+        .send_to(reply_to, event)
+        .map_err(|e| format!("send tokenizer decode response: {e}"))
+}
+
 fn handle_stage_command(
     command: StageCommandWire,
     config: &DeploymentConfig,
@@ -1487,7 +2737,9 @@ fn handle_stage_command(
     driver: &mut IrohDriver,
     node_actor: ActorAddress,
     worker: &mut TinygradWorker,
-    datastream: &mut DatastreamEmitter,
+    edge_runtime: &mut WorkerEdgeRuntime,
+    arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+    datastream: &mut NodeDatastream,
 ) -> Result<(), String> {
     match command {
         StageCommandWire::ConfigureWorkerRole {
@@ -1531,6 +2783,10 @@ fn handle_stage_command(
                         "failed",
                         json!({"error":error}),
                     );
+                    let _ = stack
+                        .runtime
+                        .send_to(node_actor, NodeAgentMsg::WorkerCrashed);
+                    pump();
                     return Err(error);
                 }
             }
@@ -1590,12 +2846,23 @@ fn handle_stage_command(
                         "failed",
                         json!({"error":error}),
                     );
+                    let _ = stack
+                        .runtime
+                        .send_to(node_actor, NodeAgentMsg::WorkerCrashed);
+                    pump();
                     return Err(error);
                 }
             }
             stack
                 .runtime
-                .send_to(node_actor, NodeAgentMsg::MarkWeightsReady)
+                .send_to(
+                    node_actor,
+                    NodeAgentMsg::MarkWeightsReady {
+                        run_id: config.run_id,
+                        node_id: config.logical_node_id,
+                        stage_index: config.stage_index,
+                    },
+                )
                 .map_err(|e| format!("mark weights ready: {e}"))
         }
         StageCommandWire::StopLocalEdges { run_id } => {
@@ -1636,33 +2903,63 @@ fn handle_stage_command(
             );
             Ok(())
         }
-        StageCommandWire::EstablishInboundEdge { edge_id } => {
-            stack
-                .runtime
-                .send_to(node_actor, NodeAgentMsg::MarkInboundEdgeReady { edge_id })
-                .map_err(|e| format!("mark inbound edge ready: {e}"))?;
+        StageCommandWire::EstablishInboundEdge { edge_id, edge } => {
+            emit_node_event(
+                datastream,
+                config,
+                NODE_STAGE_CHANNEL,
+                "inbound_edge",
+                "started",
+                json!({"edge_id":edge_id,"kind":format!("{:?}", edge.kind),"ring_data_capacity":edge.ring_spec.data_capacity}),
+            );
+            edge_runtime.establish_inbound(
+                edge,
+                stack,
+                node_actor,
+                worker,
+                arena_manager,
+                config,
+                datastream,
+                driver.tokio_handle(),
+                driver.endpoint().clone(),
+            )?;
             emit_node_event(
                 datastream,
                 config,
                 NODE_STAGE_CHANNEL,
                 "inbound_edge",
                 "ready",
-                json!({"edge_id":format!("{edge_id:?}")}),
+                json!({"edge_id":edge_id}),
             );
             Ok(())
         }
-        StageCommandWire::EstablishOutboundEdge { edge_id } => {
-            stack
-                .runtime
-                .send_to(node_actor, NodeAgentMsg::MarkOutboundEdgeReady { edge_id })
-                .map_err(|e| format!("mark outbound edge ready: {e}"))?;
+        StageCommandWire::EstablishOutboundEdge { edge_id, edge } => {
+            emit_node_event(
+                datastream,
+                config,
+                NODE_STAGE_CHANNEL,
+                "outbound_edge",
+                "started",
+                json!({"edge_id":edge_id,"kind":format!("{:?}", edge.kind),"consumer_node_id":edge.consumer_node_id,"has_consumer_endpoint":edge.consumer_endpoint.is_some()}),
+            );
+            edge_runtime.establish_outbound(
+                edge,
+                stack,
+                node_actor,
+                worker,
+                arena_manager,
+                config,
+                datastream,
+                driver.tokio_handle(),
+                driver.endpoint().clone(),
+            )?;
             emit_node_event(
                 datastream,
                 config,
                 NODE_STAGE_CHANNEL,
                 "outbound_edge",
                 "ready",
-                json!({"edge_id":format!("{edge_id:?}")}),
+                json!({"edge_id":edge_id}),
             );
             Ok(())
         }
@@ -1677,28 +2974,46 @@ fn handle_stage_command(
             );
             Ok(())
         }
-        StageCommandWire::ReleaseInputHandle { .. } => {
-            emit_node_event(
-                datastream,
-                config,
-                NODE_STAGE_CHANNEL,
-                "release_input_handle",
-                "skipped",
-                json!({"reason":"not implemented in mvp-worker-node image path"}),
-            );
-            Ok(())
+        StageCommandWire::ReleaseInputHandle { handle_id, .. } => {
+            edge_runtime.release_input_handle(handle_id, worker, config, datastream, driver, stack)
         }
-        StageCommandWire::ExecuteStep { .. } => {
-            let error = "mvp-worker-node image path does not carry ring payload commands yet";
+        StageCommandWire::ExecuteStep {
+            step_id,
+            input_edge_id,
+            object_id,
+            sequence,
+            ..
+        } => {
             emit_node_event(
                 datastream,
                 config,
                 NODE_STAGE_CHANNEL,
                 "execute_step",
-                "failed",
-                json!({"error":error}),
+                "started",
+                json!({"step_id":step_id,"input_edge_id":input_edge_id,"object_id":object_id,"sequence":sequence}),
             );
-            Err(format!("{error}: {command:?}"))
+            edge_runtime.execute_step(
+                step_id,
+                input_edge_id,
+                object_id,
+                sequence,
+                stack,
+                node_actor,
+                worker,
+                arena_manager,
+                config,
+                datastream,
+                driver,
+            )?;
+            emit_node_event(
+                datastream,
+                config,
+                NODE_STAGE_CHANNEL,
+                "execute_step",
+                "ready",
+                json!({"step_id":step_id}),
+            );
+            Ok(())
         }
     }
 }
@@ -1707,7 +3022,7 @@ fn run_self_test(
     worker: &mut TinygradWorker,
     config: &DeploymentConfig,
     prompt: &str,
-    datastream: &mut DatastreamEmitter,
+    datastream: &mut NodeDatastream,
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
 ) -> Result<(), String> {
@@ -1748,7 +3063,7 @@ fn run_self_test(
         &mut pump,
     )?;
     let record = json!({"type":"self_test_completed","prompt_bytes":prompt.len(),"result":result});
-    datastream.submit_text(ChannelId::new("mvp.node.self_test"), record.to_string());
+    datastream.submit_text(datastream.channels.node_self_test, record.to_string());
     emit_node_event(
         datastream,
         config,
@@ -1767,7 +3082,6 @@ struct DeploymentConfig {
     stage_index: u32,
     coordinator_endpoint: Option<EndpointAddr>,
     orchestrator_actor: Option<ActorAddress>,
-    datastream_sink_actor: Option<ActorAddress>,
     datastream_frame_log: Option<String>,
     debug_join_socket: Option<String>,
     relay_mode: iroh::RelayMode,
@@ -1806,7 +3120,6 @@ impl DeploymentConfig {
             stage_index: env_u32("MVP_STAGE_INDEX", 0)?,
             coordinator_endpoint: env_json("MVP_COORDINATOR_ENDPOINT")?,
             orchestrator_actor: env_json("MVP_ORCHESTRATOR_ACTOR")?,
-            datastream_sink_actor: env_json("MVP_DATASTREAM_SINK_ACTOR")?,
             datastream_frame_log: env_optional("MVP_DATASTREAM_FRAME_LOG"),
             debug_join_socket,
             relay_mode: relay.mode,
@@ -1822,23 +3135,6 @@ impl DeploymentConfig {
             arena_alignment: env_u64("MVP_ARENA_ALIGNMENT", DEFAULT_ARENA_ALIGNMENT)?,
         })
     }
-
-    fn datastream_sink_detail(&self) -> Value {
-        let sink = match (
-            self.datastream_sink_actor.is_some(),
-            self.datastream_frame_log.is_some(),
-        ) {
-            (true, true) => "tee",
-            (true, false) => "cluster_actor",
-            (false, true) => "frame_log",
-            (false, false) => "noop",
-        };
-        json!({
-            "sink":sink,
-            "cluster_actor":self.datastream_sink_actor,
-            "frame_log":self.datastream_frame_log,
-        })
-    }
 }
 
 struct TinygradWorker {
@@ -1849,10 +3145,12 @@ struct TinygradWorker {
 }
 
 impl TinygradWorker {
-    fn spawn(config: &DeploymentConfig) -> Result<Self, String> {
+    fn spawn(config: &DeploymentConfig, arena_fd: std::os::fd::RawFd) -> Result<Self, String> {
         let mut child = Command::new("python3")
             .arg(&config.worker_script)
             .env("DEV", &config.device)
+            .env("MVP_ARENA_FD", arena_fd.to_string())
+            .env("MVP_ARENA_BYTES", config.arena_bytes.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -1894,7 +3192,7 @@ impl TinygradWorker {
         &mut self,
         device: &str,
         config: &DeploymentConfig,
-        datastream: &mut DatastreamEmitter,
+        datastream: &mut NodeDatastream,
         pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
@@ -1902,7 +3200,7 @@ impl TinygradWorker {
             "WorkerReady",
             config,
             datastream,
-            ChannelId::new("mvp.worker.initialize"),
+            "mvp.worker.initialize",
             pump,
         )
         .map(|_| ())
@@ -1915,7 +3213,7 @@ impl TinygradWorker {
         layer_start: u32,
         layer_end_exclusive: u32,
         config: &DeploymentConfig,
-        datastream: &mut DatastreamEmitter,
+        datastream: &mut NodeDatastream,
         pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
@@ -1932,7 +3230,7 @@ impl TinygradWorker {
             "RoleConfigured",
             config,
             datastream,
-            ChannelId::new("mvp.worker.role"),
+            "mvp.worker.role",
             pump,
         )
         .map(|_| ())
@@ -1946,7 +3244,7 @@ impl TinygradWorker {
         layer_start: u32,
         layer_end_exclusive: u32,
         config: &DeploymentConfig,
-        datastream: &mut DatastreamEmitter,
+        datastream: &mut NodeDatastream,
         pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
@@ -1961,7 +3259,7 @@ impl TinygradWorker {
             "WeightsLoaded",
             config,
             datastream,
-            ChannelId::new("mvp.worker.weights"),
+            "mvp.worker.weights",
             pump,
         )
         .map(|_| ())
@@ -1973,7 +3271,7 @@ impl TinygradWorker {
         prompt: &str,
         max_tokens: u32,
         config: &DeploymentConfig,
-        datastream: &mut DatastreamEmitter,
+        datastream: &mut NodeDatastream,
         pump: &mut dyn FnMut(),
     ) -> Result<Value, String> {
         self.command(
@@ -1981,15 +3279,223 @@ impl TinygradWorker {
             "PromptCompleted",
             config,
             datastream,
-            ChannelId::new("mvp.worker.prompt"),
+            "mvp.worker.prompt",
             pump,
         )
+    }
+
+    fn encode_prompt(
+        &mut self,
+        request_id: u64,
+        prompt: &str,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        pump: &mut dyn FnMut(),
+    ) -> Result<Vec<u32>, String> {
+        let result = self.command(
+            json!({"type":"EncodePrompt","request_id":request_id,"prompt":prompt}),
+            "PromptEncoded",
+            config,
+            datastream,
+            "mvp.worker.tokenizer",
+            pump,
+        )?;
+        result
+            .get("tokens")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "PromptEncoded missing tokens".to_owned())?
+            .iter()
+            .map(|value| {
+                let token = value
+                    .as_u64()
+                    .ok_or_else(|| format!("PromptEncoded token is not u64: {value}"))?;
+                u32::try_from(token)
+                    .map_err(|_| format!("PromptEncoded token exceeds u32: {token}"))
+            })
+            .collect()
+    }
+
+    fn decode_tokens(
+        &mut self,
+        request_id: u64,
+        tokens: &[u32],
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        pump: &mut dyn FnMut(),
+    ) -> Result<String, String> {
+        let result = self.command(
+            json!({"type":"DecodeTokens","request_id":request_id,"tokens":tokens}),
+            "TokensDecoded",
+            config,
+            datastream,
+            "mvp.worker.tokenizer",
+            pump,
+        )?;
+        result
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "TokensDecoded missing text".to_owned())
+    }
+
+    fn install_ring(
+        &mut self,
+        ring_id: u64,
+        edge_id: u64,
+        port: &str,
+        direction: &str,
+        layout: arena::RingLayout,
+        object_spec: StageObjectSpecWire,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        pump: &mut dyn FnMut(),
+    ) -> Result<(), String> {
+        self.command(
+            json!({
+                "type":"InstallRing",
+                "ring_id":ring_id,
+                "edge_id":edge_id,
+                "port":port,
+                "direction":direction,
+                "layout":{
+                    "start_offset":layout.start_offset,
+                    "header_offset":layout.header_offset,
+                    "data_offset":layout.data_offset,
+                    "end_offset":layout.end_offset,
+                    "data_bytes":layout.data_bytes,
+                    "alignment":layout.alignment,
+                },
+                "object_spec":{
+                    "max_extent":object_spec.max_extent,
+                    "alignment":object_spec.alignment,
+                },
+            }),
+            "RingInstalled",
+            config,
+            datastream,
+            "mvp.worker.ring",
+            pump,
+        )
+        .map(|_| ())
+    }
+
+    fn uninstall_ring(
+        &mut self,
+        ring_id: u64,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        pump: &mut dyn FnMut(),
+    ) -> Result<(), String> {
+        self.command(
+            json!({"type":"UninstallRing","ring_id":ring_id}),
+            "RingUninstalled",
+            config,
+            datastream,
+            "mvp.worker.ring",
+            pump,
+        )
+        .map(|_| ())
+    }
+
+    fn ring_readable(
+        &mut self,
+        ring_id: u64,
+        edge_id: u64,
+        object_spec: StageObjectSpecWire,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        pump: &mut dyn FnMut(),
+    ) -> Result<LoadedObject, String> {
+        let event = self.command(
+            json!({
+                "type":"RingReadable",
+                "ring_id":ring_id,
+                "edge_id":edge_id,
+                "object_spec":{
+                    "max_extent":object_spec.max_extent,
+                    "alignment":object_spec.alignment,
+                },
+            }),
+            "ObjectLoaded",
+            config,
+            datastream,
+            "mvp.worker.ingress",
+            pump,
+        )?;
+        Ok(LoadedObject {
+            object_id: value_u64(&event, "object_id")?,
+            sequence: value_u64(&event, "sequence")?,
+            handle_generation: value_u64(&event, "handle_generation")?,
+            handle_id: value_u64(&event, "handle_id")?,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_step(
+        &mut self,
+        role_id: u64,
+        step_id: u64,
+        input_object_id: u64,
+        input_sequence: u64,
+        input_handle_id: u64,
+        output_ring_id: u64,
+        output_object_id: u64,
+        output_sequence: u64,
+        final_stage: bool,
+        output_spec: StageObjectSpecWire,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        pump: &mut dyn FnMut(),
+    ) -> Result<usize, String> {
+        let event = self.command(
+            json!({
+                "type":"ExecuteStep",
+                "role_id":role_id,
+                "step_id":step_id,
+                "input_object_id":input_object_id,
+                "input_sequence":input_sequence,
+                "input_handle_id":input_handle_id,
+                "output_ring_id":output_ring_id,
+                "output_object_id":output_object_id,
+                "output_sequence":output_sequence,
+                "final_stage":final_stage,
+                "output_spec":{
+                    "max_extent":output_spec.max_extent,
+                    "alignment":output_spec.alignment,
+                },
+            }),
+            "StepExecuted",
+            config,
+            datastream,
+            "mvp.worker.step",
+            pump,
+        )?;
+        usize::try_from(value_u64(&event, "committed_bytes")?)
+            .map_err(|_| "StepExecuted committed_bytes does not fit usize".to_owned())
+    }
+
+    fn release_device_object(
+        &mut self,
+        handle_id: u64,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        pump: &mut dyn FnMut(),
+    ) -> Result<(), String> {
+        self.command(
+            json!({"type":"ReleaseDeviceObject","handle_id":handle_id}),
+            "DeviceObjectReleased",
+            config,
+            datastream,
+            "mvp.worker.device_object",
+            pump,
+        )
+        .map(|_| ())
     }
 
     fn shutdown(
         &mut self,
         config: &DeploymentConfig,
-        datastream: &mut DatastreamEmitter,
+        datastream: &mut NodeDatastream,
         pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
@@ -1997,7 +3503,7 @@ impl TinygradWorker {
             "WorkerStopped",
             config,
             datastream,
-            ChannelId::new("mvp.worker.shutdown"),
+            "mvp.worker.shutdown",
             pump,
         )
         .map(|_| ())
@@ -2009,12 +3515,12 @@ impl TinygradWorker {
             .map_err(|e| format!("poll tinygrad helper: {e}"))
     }
 
-    fn drain_stderr(&mut self, config: &DeploymentConfig, datastream: &mut DatastreamEmitter) {
+    fn drain_stderr(&mut self, config: &DeploymentConfig, datastream: &mut NodeDatastream) {
         let mut emitted = false;
         while let Ok(line) = self.stderr_rx.try_recv() {
             let payload =
                 node_event_payload(config, "worker_stderr", "observed", json!({"line":line}));
-            datastream.submit_text(ChannelId::new("mvp.worker.stderr"), payload.to_string());
+            datastream.submit_text(datastream.channels.worker_stderr, payload.to_string());
             emitted = true;
         }
         if emitted {
@@ -2027,10 +3533,11 @@ impl TinygradWorker {
         command: Value,
         expected: &str,
         config: &DeploymentConfig,
-        datastream: &mut DatastreamEmitter,
-        channel: ChannelId,
+        datastream: &mut NodeDatastream,
+        channel_name: &str,
         pump: &mut dyn FnMut(),
     ) -> Result<Value, String> {
+        let channel = datastream.channel_by_name(channel_name);
         let command_type = command
             .get("type")
             .and_then(Value::as_str)
@@ -2076,15 +3583,16 @@ impl TinygradWorker {
             "ready",
             json!({"command_type":command_type.as_str(),"expected_event_type":expected,"command_bytes":command_bytes}),
         );
-        self.expect_event(expected, config, datastream, channel, pump)
+        self.expect_event(expected, config, datastream, channel, channel_name, pump)
     }
 
     fn expect_event(
         &mut self,
         expected: &str,
         config: &DeploymentConfig,
-        datastream: &mut DatastreamEmitter,
+        datastream: &mut NodeDatastream,
         channel: ChannelId,
+        channel_name: &str,
         pump: &mut dyn FnMut(),
     ) -> Result<Value, String> {
         loop {
@@ -2095,7 +3603,7 @@ impl TinygradWorker {
                 NODE_WORKER_CHANNEL,
                 "worker_stdout_read",
                 "started",
-                json!({"expected_event_type":expected,"channel":channel.as_str()}),
+                json!({"expected_event_type":expected,"channel":channel_name}),
             );
             let n = match self.stdout.read_line(&mut line) {
                 Ok(n) => n,
@@ -2106,7 +3614,7 @@ impl TinygradWorker {
                         NODE_WORKER_CHANNEL,
                         "worker_stdout_read",
                         "failed",
-                        json!({"expected_event_type":expected,"channel":channel.as_str(),"error":error.to_string()}),
+                        json!({"expected_event_type":expected,"channel":channel_name,"error":error.to_string()}),
                     );
                     return Err(format!("read helper stdout: {error}"));
                 }
@@ -2119,7 +3627,7 @@ impl TinygradWorker {
                     NODE_WORKER_CHANNEL,
                     "worker_stdout_read",
                     "failed",
-                    json!({"expected_event_type":expected,"channel":channel.as_str(),"line_bytes":0,"error":"stdout closed"}),
+                    json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":0,"error":"stdout closed"}),
                 );
                 return Err(format!(
                     "tinygrad helper stdout closed while waiting for {expected}"
@@ -2131,7 +3639,7 @@ impl TinygradWorker {
                 NODE_WORKER_CHANNEL,
                 "worker_stdout_read",
                 "ready",
-                json!({"expected_event_type":expected,"channel":channel.as_str(),"line_bytes":n}),
+                json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n}),
             );
             emit_node_event(
                 datastream,
@@ -2139,7 +3647,7 @@ impl TinygradWorker {
                 NODE_WORKER_CHANNEL,
                 "worker_stdout_parse",
                 "started",
-                json!({"expected_event_type":expected,"channel":channel.as_str(),"line_bytes":n}),
+                json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n}),
             );
             let value: Value = match serde_json::from_str(&line) {
                 Ok(value) => value,
@@ -2150,7 +3658,7 @@ impl TinygradWorker {
                         NODE_WORKER_CHANNEL,
                         "worker_stdout_parse",
                         "failed",
-                        json!({"expected_event_type":expected,"channel":channel.as_str(),"line_bytes":n,"error":error.to_string()}),
+                        json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n,"error":error.to_string()}),
                     );
                     return Err(format!("parse helper stdout {line:?}: {error}"));
                 }
@@ -2165,11 +3673,14 @@ impl TinygradWorker {
                 NODE_WORKER_CHANNEL,
                 "worker_stdout_parse",
                 "ready",
-                json!({"expected_event_type":expected,"channel":channel.as_str(),"line_bytes":n,"worker_event_type":worker_event_type}),
+                json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n,"worker_event_type":worker_event_type}),
             );
-            datastream.submit_text(channel.clone(), value.to_string());
+            datastream.submit_text(channel, value.to_string());
             datastream.tick();
             pump();
+            if worker_event_type == "WorkerFatal" {
+                return Err(format!("worker fatal: {value}"));
+            }
             if value.get("type").and_then(Value::as_str) == Some(expected) {
                 return Ok(value);
             }
@@ -2278,7 +3789,6 @@ mod tests {
             stage_index: 3,
             coordinator_endpoint,
             orchestrator_actor: Some(ActorAddress::new_random()),
-            datastream_sink_actor: None,
             datastream_frame_log: None,
             debug_join_socket: None,
             relay_mode: iroh::RelayMode::Disabled,
@@ -2403,7 +3913,12 @@ mod tests {
     fn runtime_ready_retry_waits_for_swim() {
         let stack = test_stack();
         let node_actor = ActorAddress::new_random();
-        let mut pending = PendingRuntimeReady::new(&test_config(None), endpoint(3), node_actor);
+        let mut pending = PendingRuntimeReady::new(
+            &test_config(None),
+            endpoint(3),
+            node_actor,
+            ActorAddress::new_random(),
+        );
         pending.coordinator = Some(DistNodeId([2; 32]));
 
         assert_eq!(pending.maybe_send(&stack, node_actor), Ok(false));
@@ -2414,7 +3929,12 @@ mod tests {
     fn runtime_ready_retry_stops_after_matching_ack() {
         let stack = test_stack();
         let node_actor = ActorAddress::new_random();
-        let mut pending = PendingRuntimeReady::new(&test_config(None), endpoint(4), node_actor);
+        let mut pending = PendingRuntimeReady::new(
+            &test_config(None),
+            endpoint(4),
+            node_actor,
+            ActorAddress::new_random(),
+        );
 
         assert!(pending.observe_ack(
             pending.run_id,
@@ -2455,7 +3975,12 @@ mod tests {
             .expect("send membership change");
         stack.pump_runtime_once();
 
-        let mut pending = PendingRuntimeReady::new(&test_config(None), endpoint(5), node_actor);
+        let mut pending = PendingRuntimeReady::new(
+            &test_config(None),
+            endpoint(5),
+            node_actor,
+            ActorAddress::new_random(),
+        );
         pending.coordinator = Some(coordinator);
         for expected_attempts in 1..=4 {
             pending.next_attempt_at = Instant::now();

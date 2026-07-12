@@ -937,6 +937,7 @@ dependencies = [
 name = "datastream"
 version = "0.1.0"
 dependencies = [
+ "iroh",
  "libc",
  "serde",
  "serde_json",
@@ -2107,6 +2108,7 @@ dependencies = [
  "distribution",
  "iroh",
  "iroh-relay",
+ "parking_lot",
  "serde",
  "serde_json",
  "swactor",

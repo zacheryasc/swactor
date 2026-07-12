@@ -11,9 +11,10 @@
 //! silently builds an owned multi-threaded Tokio runtime when no ambient handle
 //! exists; see the crate README before using it.
 
+use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::Connection;
@@ -26,9 +27,10 @@ use distribution::node::DistributedNodeConfig;
 use distribution::peer_auth::PeerAllowList;
 use distribution::snapshot::DistributionNodeSnapshot;
 use distribution::swim::actor::SwimIn;
-use distribution::transport_bridge::{Outbox, RelayMirror, RouteView, peer_addr};
+use distribution::transport_bridge::{OutFrame, Outbox, RelayMirror, RouteView, peer_addr};
 use distribution::types::NodeId;
 
+use crate::datastream_transport::DATASTREAM_ALPN;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor_transport::CodecRegistry;
@@ -60,6 +62,18 @@ pub struct IrohDriverConfig {
 struct JoinResult {
     node_id: NodeId,
     conn: Connection,
+}
+
+#[derive(Clone)]
+struct CachedConnection {
+    generation: u64,
+    conn: Connection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FailedConnection {
+    node_id: NodeId,
+    generation: u64,
 }
 
 // ─── LAN IP Discovery ──────────────────────────────────────────────────────
@@ -210,7 +224,8 @@ pub struct IrohDriver {
     keypair: Keypair,
     endpoint: Endpoint,
     rt: Handle,
-    connections: HashMap<NodeId, Connection>,
+    connections: HashMap<NodeId, CachedConnection>,
+    next_connection_generation: u64,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     /// Collects connections from background join tasks.
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
@@ -221,8 +236,8 @@ pub struct IrohDriver {
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     /// Connections accepted by the background accept loop (SWIM ALPN).
     accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
-    /// Connections accepted on non-SWIM ALPNs (streams, etc.).
-    other_accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
+    /// Connections accepted on non-SWIM ALPNs (streams, datastream, etc.).
+    other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
     /// Frames read by per-connection reader tasks, drained synchronously by
     /// `recv()` / `pump_inbound_to_actors()`. This decouples network reads from the
     /// state machine so `recv()`/`tick()` are pure-sync (no `block_on`) and can run
@@ -232,7 +247,7 @@ pub struct IrohDriver {
     incoming: Arc<Mutex<Vec<(ActorAddress, String, Vec<u8>, NodeId)>>>,
     /// Connections whose fire-and-forget send failed; evicted (and re-dialed)
     /// on the next `recv()`. Populated by the spawned send tasks.
-    evict: Arc<Mutex<Vec<NodeId>>>,
+    evict: Arc<Mutex<Vec<FailedConnection>>>,
     /// Relay URLs learned from join seeds, used for reconnection.
     peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
     /// Real-time join status for each peer being joined.
@@ -378,7 +393,7 @@ impl IrohDriver {
         // Spawn background accept loop so incoming connections are never missed
         let accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>> =
+        let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>> =
             Arc::new(Mutex::new(Vec::new()));
         {
             let ep = endpoint.clone();
@@ -395,18 +410,18 @@ impl IrohDriver {
                                 // Peer auth check
                                 let allowed = match &peer_auth {
                                     None => true,
-                                    Some(auth) => auth.lock().unwrap().is_allowed(&node_id),
+                                    Some(auth) => auth.lock().is_allowed(&node_id),
                                 };
                                 if !allowed {
                                     conn.close(0u32.into(), b"unauthorized");
                                     continue;
                                 }
-                                // Route by negotiated ALPN
-                                let negotiated_alpn = conn.alpn();
+                                // Route by negotiated ALPN.
+                                let negotiated_alpn = conn.alpn().to_vec();
                                 if negotiated_alpn == ALPN {
-                                    swim_buf.lock().unwrap().push((node_id, conn));
+                                    swim_buf.lock().push((node_id, conn));
                                 } else {
-                                    other_buf.lock().unwrap().push((node_id, conn));
+                                    other_buf.lock().push((node_id, negotiated_alpn, conn));
                                 }
                             }
                             Err(_) => {}
@@ -422,6 +437,7 @@ impl IrohDriver {
             endpoint,
             rt,
             connections: HashMap::new(),
+            next_connection_generation: 1,
             peer_auth: config.peer_auth,
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             dialing: Arc::new(Mutex::new(HashSet::new())),
@@ -439,22 +455,50 @@ impl IrohDriver {
 
     /// Get a handle to the tokio runtime this driver runs on (the outer,
     /// ambient runtime — the driver does not own it).
-    pub fn tokio_handle(&self) -> tokio::runtime::Handle {
+    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
         self.rt.clone()
     }
 
-    /// Get a reference to the iroh endpoint (for creating outbound connections).
-    pub fn endpoint(&self) -> &Endpoint {
-        &self.endpoint
+    /// Backward-compatible alias for [`Self::runtime_handle`].
+    pub fn tokio_handle(&self) -> tokio::runtime::Handle {
+        self.runtime_handle()
     }
 
-    /// Drain connections accepted on non-SWIM ALPNs.
+    /// Clone the iroh endpoint for creating outbound connections.
+    pub fn endpoint(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
+    /// Drain accepted connections whose negotiated ALPN exactly matches `alpn`.
+    pub fn drain_accepted_for_alpn(&self, alpn: &[u8]) -> Vec<(NodeId, Connection)> {
+        let mut pending = self.other_accepted_conns.lock();
+        let mut keep = Vec::new();
+        let mut drained = Vec::new();
+        for (node, negotiated, conn) in pending.drain(..) {
+            if negotiated == alpn {
+                drained.push((node, conn));
+            } else {
+                keep.push((node, negotiated, conn));
+            }
+        }
+        *pending = keep;
+        drained
+    }
+
+    /// Drain non-SWIM, non-datastream connections kept for legacy stream users.
     pub fn drain_other_connections(&self) -> Vec<(NodeId, Connection)> {
-        self.other_accepted_conns
-            .lock()
-            .unwrap()
-            .drain(..)
-            .collect()
+        let mut pending = self.other_accepted_conns.lock();
+        let mut keep = Vec::new();
+        let mut drained = Vec::new();
+        for (node, negotiated, conn) in pending.drain(..) {
+            if negotiated == DATASTREAM_ALPN {
+                keep.push((node, negotiated, conn));
+            } else {
+                drained.push((node, conn));
+            }
+        }
+        *pending = keep;
+        drained
     }
 
     /// The node's identity.
@@ -587,12 +631,12 @@ impl IrohDriver {
 
     /// Get a snapshot of all join statuses.
     pub fn join_statuses(&self) -> HashMap<NodeId, JoinStatus> {
-        self.join_statuses.lock().unwrap().clone()
+        self.join_statuses.lock().clone()
     }
 
     /// Clear join statuses for the given node IDs (e.g. peers that are now alive).
     pub fn clear_join_statuses(&self, node_ids: &[NodeId]) {
-        let mut map = self.join_statuses.lock().unwrap();
+        let mut map = self.join_statuses.lock();
         for id in node_ids {
             map.remove(id);
         }
@@ -600,7 +644,7 @@ impl IrohDriver {
 
     /// Clear a single join status entry.
     pub fn clear_join_status(&self, node_id: &NodeId) {
-        self.join_statuses.lock().unwrap().remove(node_id);
+        self.join_statuses.lock().remove(node_id);
     }
 
     /// Join a cluster by connecting to seed nodes via iroh.
@@ -616,10 +660,16 @@ impl IrohDriver {
             if let Some(relay) = seed_addr.relay_urls().next() {
                 self.peer_relay_urls.insert(seed_node_id, relay.clone());
             }
-            // Drop stale cached connection so iroh establishes a fresh one.
-            // (Clearing a Dead SWIM entry to accept the re-join is the SwimActor's
-            // job now; the seed re-establishes via the JoinResponse it returns.)
-            self.connections.remove(&seed_node_id);
+            // Preserve a proven live control connection. Only discard a cached
+            // entry that iroh already reports closed before issuing the semantic
+            // join request.
+            if self
+                .connections
+                .get(&seed_node_id)
+                .is_some_and(|cached| cached.conn.close_reason().is_some())
+            {
+                self.connections.remove(&seed_node_id);
+            }
             // Enrich the seed addr with a cached relay URL if it doesn't
             // have one. The re-peer flow sends only a bare public key
             // because metadata (including relay URL) is stripped when a
@@ -672,7 +722,7 @@ impl IrohDriver {
 
                 // Update status: Connecting
                 {
-                    let mut map = statuses.lock().unwrap();
+                    let mut map = statuses.lock();
                     map.insert(
                         seed_node_id,
                         JoinStatus {
@@ -698,7 +748,7 @@ impl IrohDriver {
                     Ok(Ok(conn)) => {
                         // Update status: Sending
                         {
-                            let mut map = statuses.lock().unwrap();
+                            let mut map = statuses.lock();
                             map.insert(
                                 seed_node_id,
                                 JoinStatus {
@@ -737,7 +787,7 @@ impl IrohDriver {
                             Ok(()) => {
                                 // Update status: Sent
                                 {
-                                    let mut map = statuses.lock().unwrap();
+                                    let mut map = statuses.lock();
                                     map.insert(
                                         seed_node_id,
                                         JoinStatus {
@@ -749,7 +799,7 @@ impl IrohDriver {
                                         },
                                     );
                                 }
-                                pending.lock().unwrap().push(JoinResult {
+                                pending.lock().push(JoinResult {
                                     node_id: seed_node_id,
                                     conn,
                                 });
@@ -770,7 +820,7 @@ impl IrohDriver {
             }
             // Update status: Failed
             {
-                let mut map = statuses.lock().unwrap();
+                let mut map = statuses.lock();
                 map.insert(
                     seed_node_id,
                     JoinStatus {
@@ -787,22 +837,30 @@ impl IrohDriver {
         });
     }
 
-    /// Spawn a persistent reader task for `conn` that pushes every framed SWIM
-    /// message into the shared `incoming` queue until the connection closes.
-    /// Reads run on the tokio pool; `recv()` only drains the queue — that is
-    /// what keeps it `block_on`-free.
-    fn spawn_reader(&self, node_id: NodeId, conn: Connection) {
+    /// Spawn a persistent reader task for `conn` that pushes each valid framed
+    /// message into the shared `incoming` queue. A malformed or truncated
+    /// unidirectional stream is dropped without destroying the connection; an
+    /// accept failure queues generation-aware eviction for the closed connection.
+    /// Reads run on the tokio pool; `recv()` only drains the queue.
+    fn spawn_reader(&self, node_id: NodeId, generation: u64, conn: Connection) {
         let incoming = Arc::clone(&self.incoming);
+        let evict = Arc::clone(&self.evict);
         self.rt.spawn(async move {
             loop {
                 match conn.accept_uni().await {
                     Ok(mut recv) => match read_message(&mut recv).await {
                         Ok((dest, tag, payload)) => {
-                            incoming.lock().unwrap().push((dest, tag, payload, node_id));
+                            incoming.lock().push((dest, tag, payload, node_id));
                         }
-                        Err(_) => break,
+                        Err(_) => continue,
                     },
-                    Err(_) => break, // connection closed
+                    Err(_) => {
+                        evict.lock().push(FailedConnection {
+                            node_id,
+                            generation,
+                        });
+                        break;
+                    }
                 }
             }
         });
@@ -810,8 +868,11 @@ impl IrohDriver {
 
     /// Cache a connection and start reading from it.
     fn cache_connection(&mut self, node_id: NodeId, conn: Connection) {
-        self.spawn_reader(node_id, conn.clone());
-        self.connections.insert(node_id, conn);
+        let generation = self.next_connection_generation;
+        self.next_connection_generation = self.next_connection_generation.wrapping_add(1).max(1);
+        self.spawn_reader(node_id, generation, conn.clone());
+        self.connections
+            .insert(node_id, CachedConnection { generation, conn });
     }
 
     /// Fold completed background dials/joins and accepted connections into the
@@ -820,24 +881,32 @@ impl IrohDriver {
     /// actor ingress pump ([`Self::pump_inbound_to_actors`]).
     fn fold_connections(&mut self) {
         // Fold completed background join connections into the cache (+ read).
-        let joins: Vec<JoinResult> = self.pending_joins.lock().unwrap().drain(..).collect();
+        let joins: Vec<JoinResult> = self.pending_joins.lock().drain(..).collect();
         for result in joins {
             self.cache_connection(result.node_id, result.conn);
         }
 
         // Fold connections accepted from remote peers into the cache (+ read).
-        let accepted: Vec<(NodeId, Connection)> =
-            self.accepted_conns.lock().unwrap().drain(..).collect();
+        let accepted: Vec<(NodeId, Connection)> = self.accepted_conns.lock().drain(..).collect();
         for (node_id, conn) in accepted {
             self.cache_connection(node_id, conn);
         }
 
-        // Evict connections whose fire-and-forget send failed; kick a fresh dial.
-        let evicted: Vec<NodeId> = self.evict.lock().unwrap().drain(..).collect();
-        for node_id in evicted {
-            self.connections.remove(&node_id);
-            if let Ok(key) = PublicKey::from_bytes(&node_id.0) {
-                let _ = self.get_or_connect(node_id, key);
+        // Evict only the connection generation whose fire-and-forget send
+        // failed; a delayed failure from an old connection must not remove its
+        // replacement. Kick a fresh dial for the current failed generation.
+        let evicted: Vec<FailedConnection> = self.evict.lock().drain(..).collect();
+        for failed in evicted {
+            let still_current = self
+                .connections
+                .get(&failed.node_id)
+                .is_some_and(|cached| cached.generation == failed.generation);
+            if !still_current {
+                continue;
+            }
+            self.connections.remove(&failed.node_id);
+            if let Ok(key) = PublicKey::from_bytes(&failed.node_id.0) {
+                let _ = self.get_or_connect(failed.node_id, key);
             }
         }
     }
@@ -869,14 +938,14 @@ impl IrohDriver {
         });
     }
 
-    /// Drain the actors' outbound queue and write each frame to iroh. Runs on the
-    /// driver-loop thread (it owns the connection cache); the actual stream write
-    /// is fire-and-forget on the tokio pool, so this never blocks.
+    /// Drain the actors' outbound queue and submit each current frame to iroh
+    /// exactly once. A connection cache miss starts or continues a background
+    /// dial and drops that frame best-effort; stream writes remain fire-and-forget
+    /// on the tokio pool, so this never blocks.
     pub fn drain_outbox(&mut self, outbox: &Outbox) {
-        let frames: Vec<distribution::transport_bridge::OutFrame> =
-            outbox.lock().unwrap().drain(..).collect();
-        for f in frames {
-            self.send_wire(f.to, f.dest, &f.type_tag, f.payload);
+        let frames: Vec<OutFrame> = outbox.lock().unwrap().drain(..).collect();
+        for frame in frames {
+            self.send_wire(frame);
         }
     }
 
@@ -894,7 +963,7 @@ impl IrohDriver {
     pub fn pump_inbound_to_actors(&mut self) {
         self.fold_connections();
         let messages: Vec<(ActorAddress, String, Vec<u8>, NodeId)> =
-            self.incoming.lock().unwrap().drain(..).collect();
+            self.incoming.lock().drain(..).collect();
         let Some(bridge) = self.actor_bridge.as_ref() else {
             return;
         };
@@ -914,26 +983,32 @@ impl IrohDriver {
         }
     }
 
-    /// Write an already-encoded frame (`type_tag` + `payload`) to `to` over iroh,
-    /// fire-and-forget. On a stream-write failure the connection is evicted and,
-    /// for SWIM frames, `SendFailed{to}` is delivered to the SwimActor (§4.3).
-    fn send_wire(&mut self, to: NodeId, dest: ActorAddress, type_tag: &str, payload: Vec<u8>) {
-        let target_key = match PublicKey::from_bytes(&to.0) {
+    /// Write an already-encoded frame over iroh, fire-and-forget. A connection
+    /// cache miss starts or continues a background dial and drops the current
+    /// frame best-effort. A stream-write failure evicts the failed connection,
+    /// drops the current frame, and, for SWIM frames only, delivers
+    /// `SendFailed { to }` to the SwimActor (§4.3).
+    fn send_wire(&mut self, frame: OutFrame) {
+        let target_key = match PublicKey::from_bytes(&frame.to.0) {
             Ok(k) => k,
             Err(_) => return,
         };
-        let conn = match self.get_or_connect(to, target_key) {
-            Ok(c) => c,
-            // No ready connection: a background dial was kicked. Drop best-effort
-            // — the actor re-sends on a later tick (a dead peer is still detected
-            // via probe/Ack timeout, not masked by a blocking dial).
+        let cached = match self.get_or_connect(frame.to, target_key) {
+            Ok(cached) => cached,
             Err(_) => return,
         };
+        let generation = cached.generation;
+        let conn = cached.conn;
+        let OutFrame {
+            to,
+            dest,
+            type_tag,
+            payload,
+        } = frame;
         let evict = Arc::clone(&self.evict);
-        let tag = type_tag.to_string();
         // Only SWIM frames feed failure detection via SendFailed; gossip is
         // best-effort and just drops.
-        let send_failed = if is_swim_tag(type_tag) {
+        let send_failed = if is_swim_tag(&type_tag) {
             self.actor_bridge
                 .as_ref()
                 .map(|b| (b.rt.clone(), b.swim_addr))
@@ -943,13 +1018,16 @@ impl IrohDriver {
         self.rt.spawn(async move {
             let result: Result<(), Box<dyn std::error::Error>> = async {
                 let mut send = conn.open_uni().await?;
-                write_message(&mut send, dest, tag.as_bytes(), &payload).await?;
+                write_message(&mut send, dest, type_tag.as_bytes(), &payload).await?;
                 send.finish()?;
                 Ok(())
             }
             .await;
             if result.is_err() {
-                evict.lock().unwrap().push(to);
+                evict.lock().push(FailedConnection {
+                    node_id: to,
+                    generation,
+                });
                 if let Some((rt, swim_addr)) = send_failed {
                     let _ = rt.deliver_raw(swim_addr, Box::new(SwimIn::SendFailed { to }));
                 }
@@ -957,11 +1035,14 @@ impl IrohDriver {
         });
     }
 
+    /// Return an open cached connection. On a cache miss or closed entry, start
+    /// or continue a background dial and report that the current frame must be
+    /// dropped best-effort rather than retained by the driver.
     fn get_or_connect(
         &mut self,
         node_id: NodeId,
         key: PublicKey,
-    ) -> Result<Connection, Box<dyn std::error::Error>> {
+    ) -> Result<CachedConnection, Box<dyn std::error::Error>> {
         // Defense in depth: check peer auth before connecting
         if !self.is_peer_allowed(&node_id) {
             return Err(format!(
@@ -972,9 +1053,9 @@ impl IrohDriver {
         }
 
         // Check for cached connection that's still open
-        if let Some(conn) = self.connections.get(&node_id) {
-            if conn.close_reason().is_none() {
-                return Ok(conn.clone());
+        if let Some(cached) = self.connections.get(&node_id) {
+            if cached.conn.close_reason().is_none() {
+                return Ok(cached.clone());
             }
             // Connection closed, remove it
             self.connections.remove(&node_id);
@@ -1022,7 +1103,7 @@ impl IrohDriver {
     /// cleared when the task ends. The WAN-tuned 3 × 10s budget is preserved —
     /// it just no longer stalls the caller.
     fn spawn_connect(&self, node_id: NodeId, dial_addr: EndpointAddr) {
-        if !self.dialing.lock().unwrap().insert(node_id) {
+        if !self.dialing.lock().insert(node_id) {
             return; // a dial is already in flight for this peer
         }
         let endpoint = self.endpoint.clone();
@@ -1038,7 +1119,7 @@ impl IrohDriver {
                 )
                 .await;
                 if let Ok(Ok(conn)) = result {
-                    pending.lock().unwrap().push(JoinResult { node_id, conn });
+                    pending.lock().push(JoinResult { node_id, conn });
                     break;
                 }
                 if attempt < ATTEMPTS {
@@ -1046,7 +1127,7 @@ impl IrohDriver {
                     tokio::time::sleep(Duration::from_millis(backoff)).await;
                 }
             }
-            dialing.lock().unwrap().remove(&node_id);
+            dialing.lock().remove(&node_id);
         });
     }
 
@@ -1055,7 +1136,7 @@ impl IrohDriver {
     fn is_peer_allowed(&self, node_id: &NodeId) -> bool {
         match &self.peer_auth {
             None => true,
-            Some(auth) => auth.lock().unwrap().is_allowed(node_id),
+            Some(auth) => auth.lock().is_allowed(node_id),
         }
     }
 

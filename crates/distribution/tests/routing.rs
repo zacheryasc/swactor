@@ -7,14 +7,14 @@
 //! - The directory is the signed, convergent source of actor-address-to-host truth.
 //! - Only valid host-signed claims can affect routing.
 //! - Actor moves are resolved by generation/conflict rules and converge across peers.
-//! - Dead hosts disappear from routable views while retained claims remain recoverable until GC.
+//! - Dead hosts disappear from routable views while retained claims remain recoverable.
 //! - Address-only app-message delivery follows the current route view.
 //! - Missing, stale, unknown, or dead routes fail as best-effort drops, not panics or false
 //!   deliveries.
 
 mod directory_actor {
     //! DirectoryActor convergence and safety: signed claims, supersede, deterministic conflict
-    //! resolution, dead-host hiding, catch-up, quieting, and GC.
+    //! resolution, dead-host hiding, catch-up, quieting, and retained recovery claims.
 
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -497,12 +497,10 @@ mod directory_actor {
     }
 
     #[test]
-    fn gc_reclaims_a_long_dead_hosts_claims() {
-        // Story: a host's claims survive a *brief* death — held, and routable again the
-        // moment it returns — but once it has been gone past the GC grace window they
-        // are reclaimed, so a long-absent host is NOT resurrected from a stale claim on
-        // return. "Hidden" (brief) and "reclaimed" (long) look identical while the host
-        // is down; they diverge only on its return, which is the observable face of gc.
+    fn long_dead_host_claims_remain_recoverable() {
+        // Story: a host's actors are hidden while the host is Dead, but the signed
+        // claims are retained even across many directory ticks. A false-dead host
+        // must become routable again as soon as SWIM reports it Alive.
         let c = DirectoryCluster::new(2);
         let actor = an_actor();
         c.register(0, c.claim(0, actor, 1));
@@ -511,43 +509,27 @@ mod directory_actor {
             "precondition: node 1 learns the claim"
         );
 
-        // Brief death, within the grace window: hidden while down, still held, so it
-        // routes again as soon as the host is back.
         DirectoryCluster::announce(&c.nodes[1], MemberState::Dead, c.ids[0], 2);
-        for _ in 0..5 {
-            c.round(); // a few gc ticks, well under GC_GRACE_TICKS
+        for _ in 0..70 {
+            c.round();
         }
         assert_eq!(
             c.host_in_view(1, actor),
             None,
             "a dead host is hidden from routing"
         );
+
         DirectoryCluster::announce(&c.nodes[1], MemberState::Alive, c.ids[0], 3);
         c.pump(4);
         assert_eq!(
             c.host_in_view(1, actor),
             Some(c.ids[0]),
-            "a host back within the grace window is still held, so it routes again"
-        );
-
-        // Long death, past the grace window: each `round` delivers one directory Tick,
-        // so >GC_GRACE_TICKS rounds reclaim the claim.
-        DirectoryCluster::announce(&c.nodes[1], MemberState::Dead, c.ids[0], 4);
-        for _ in 0..70 {
-            c.round();
-        }
-        // On return it is NOT resurrected — the claim was reclaimed, not merely hidden.
-        DirectoryCluster::announce(&c.nodes[1], MemberState::Alive, c.ids[0], 5);
-        c.pump(4);
-        assert_eq!(
-            c.host_in_view(1, actor),
-            None,
-            "a host gone past the GC grace window is reclaimed, not resurrected on return"
+            "a host returning after many ticks should route from retained claims"
         );
         assert_eq!(
             c.resolve(1, actor),
-            None,
-            "the reclaimed claim is gone from the map too"
+            Some(c.ids[0]),
+            "the retained claim should remain in the directory map"
         );
     }
 

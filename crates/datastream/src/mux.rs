@@ -1,67 +1,46 @@
 //! The per-node mux: the single ordering authority (spec §5).
 //!
-//! Every producer on a node submits its bytes — tagged with a channel — to
-//! one mux, and the mux interleaves them into the node's single ordered
-//! stream. Because all channels pass through one assigner, a structured
-//! event and a log line emitted close together have a well-defined relative
-//! order (spec §5.1): that is what makes the one-timeline guarantee real.
-//!
-//! Two invariants do the heavy lifting:
-//!
-//! * **Gap-free, monotonic numbering** (spec §5.2). The mux hands out
-//!   positions `0, 1, 2, …` with an atomic counter — never reused, never
-//!   skipped. Numbering is independent of delivery: assigning a position
-//!   does not mean the frame is, or ever will be, delivered.
-//! * **A drop is a missing position, never a renumber** (spec §5.3). The
-//!   mux buffers within a bound to smooth bursts; on overflow it drops the
-//!   frame. But the position was already consumed, so the drop surfaces
-//!   downstream as a detectable gap (spec §7.5) rather than a silent
-//!   renumbering.
-//!
-//! Submission is non-blocking in spirit: the only shared section is an
-//! O(1) counter bump and a push onto a bounded queue, so telemetry never
-//! stalls the node's real work (spec §5.3).
+//! Every producer on a node submits bytes tagged with a stream-local channel id
+//! to one mux, and the mux assigns a single monotonic position sequence across
+//! all channels. A drop consumes a position and is therefore visible downstream
+//! as a gap.
 
-use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::frame::{ChannelId, Frame, Position, StreamId};
 use super::record::Record;
-use super::timing::{FRAME_TIME_CHANNEL, FrameTimeSample};
+use super::timing::FRAME_TIME_CHANNEL_ID;
+use super::timing::FrameTimeSample;
 
-/// A node's single position authority and outgoing telemetry buffer.
-///
-/// One mux belongs to one stream — one life of one node (spec §8.4). It is
-/// `Send + Sync`: producers on different threads may submit concurrently
-/// and the mux serializes them into one position order (spec §5.3).
+/// A node's single position authority and outgoing telemetry queue.
 pub struct Mux {
     stream: StreamId,
     next: AtomicU64,
     dropped: AtomicU64,
     frame_timing_enabled: AtomicBool,
-    capacity: usize,
-    buffer: Mutex<VecDeque<Frame>>,
+    tx: SyncSender<Frame>,
+    rx: Mutex<Receiver<Frame>>,
 }
 
 impl Mux {
-    /// Create a mux for `stream` with a bounded outgoing buffer. When more
-    /// than `capacity` frames are waiting to be drained, further
-    /// submissions are dropped (spec §5.3) — but still consume a position.
+    /// Create a mux for `stream` with a bounded outgoing queue.
     pub fn new(stream: StreamId, capacity: usize) -> Self {
+        let capacity = capacity.max(1).min(1_048_576);
+        let (tx, rx) = sync_channel(capacity);
         Mux {
             stream,
             next: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             frame_timing_enabled: AtomicBool::new(true),
-            capacity,
-            buffer: Mutex::new(VecDeque::new()),
+            tx,
+            rx: Mutex::new(rx),
         }
     }
 
-    /// Create a mux whose buffer never overflows. Useful when a caller
-    /// drains promptly and wants every assigned frame retained.
+    /// Create a mux whose queue is large enough for tests that drain promptly.
     pub fn unbounded(stream: StreamId) -> Self {
         Mux::new(stream, usize::MAX)
     }
@@ -71,22 +50,14 @@ impl Mux {
         &self.stream
     }
 
-    /// Submit opaque bytes on a channel. Assigns and returns the next
-    /// position. The frame is buffered for the transport to drain, or
-    /// dropped on overflow — either way the returned position is consumed,
-    /// so a drop becomes a missing position downstream (spec §5.3).
-    ///
-    /// The mux never inspects `payload`; it is opaque (spec §4.1).
-    pub fn submit(&self, channel: impl Into<ChannelId>, payload: Vec<u8>) -> Position {
-        // Assign first, unconditionally: numbering is independent of
-        // whether the frame survives the buffer (spec §5.2).
+    /// Submit opaque bytes on a registered channel id.
+    pub fn submit(&self, channel: ChannelId, payload: Vec<u8>) -> Position {
         let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
-        let channel = channel.into();
         let timing_sample = self
             .frame_timing_enabled
             .load(Ordering::Relaxed)
             .then(|| now_unix_ns())
-            .filter(|_| channel.as_str() != FRAME_TIME_CHANNEL)
+            .filter(|_| channel != FRAME_TIME_CHANNEL_ID)
             .map(|created_at_unix_ns| FrameTimeSample::new(position, created_at_unix_ns));
         let frame = Frame {
             channel,
@@ -94,30 +65,35 @@ impl Mux {
             payload,
         };
 
-        let mut buffer = self.buffer.lock().expect("mux buffer poisoned");
-        if buffer.len() < self.capacity {
-            buffer.push_back(frame);
-            if let Some(sample) = timing_sample {
-                self.push_timing_sample_if_room(&mut buffer, sample);
+        match self.tx.try_send(frame) {
+            Ok(()) => {
+                if let Some(sample) = timing_sample {
+                    self.push_timing_sample_if_room(sample);
+                }
             }
-        } else {
-            // Overflow: drop the frame that does not fit. Its position is
-            // already spent, so it will read as a gap, not a renumber.
-            self.dropped.fetch_add(1, Ordering::Relaxed);
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
         position
     }
 
-    /// Pull all currently buffered frames, in the order they were buffered,
-    /// emptying the buffer. The transport drains the mux's outgoing stream
-    /// this way.
+    /// Pull all currently queued frames, sorted by mux position.
     pub fn drain(&self) -> Vec<Frame> {
-        let mut buffer = self.buffer.lock().expect("mux buffer poisoned");
-        buffer.drain(..).collect()
+        let rx = self.rx.lock().expect("mux receiver poisoned");
+        let mut frames = Vec::new();
+        loop {
+            match rx.try_recv() {
+                Ok(frame) => frames.push(frame),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        frames.sort_by_key(|frame| frame.position);
+        frames
     }
 
-    /// Enable or disable optional sidecar timing samples for newly submitted
-    /// frames. The core frame shape and wire envelope remain unchanged.
+    /// Enable or disable optional sidecar timing samples for newly submitted frames.
     pub fn set_frame_timing_enabled(&self, enabled: bool) {
         self.frame_timing_enabled.store(enabled, Ordering::Relaxed);
     }
@@ -127,27 +103,22 @@ impl Mux {
         self.frame_timing_enabled.load(Ordering::Relaxed)
     }
 
-    fn push_timing_sample_if_room(&self, buffer: &mut VecDeque<Frame>, sample: FrameTimeSample) {
-        if buffer.len() >= self.capacity {
-            return;
-        }
-
+    fn push_timing_sample_if_room(&self, sample: FrameTimeSample) {
         let position = Position(self.next.fetch_add(1, Ordering::Relaxed));
-        buffer.push_back(Frame {
-            channel: FRAME_TIME_CHANNEL.into(),
+        let frame = Frame {
+            channel: FRAME_TIME_CHANNEL_ID,
             position,
             payload: sample.encode(),
-        });
+        };
+        let _ = self.tx.try_send(frame);
     }
 
-    /// How many positions have been assigned — the gap-free high-water mark
-    /// (spec §5.2). Sidecar timing samples, when enabled, are frames too.
+    /// How many positions have been assigned — the gap-free high-water mark.
     pub fn assigned(&self) -> u64 {
         self.next.load(Ordering::Relaxed)
     }
 
-    /// How many frames have been dropped on overflow (spec §5.3). Each
-    /// dropped frame is one missing position downstream.
+    /// How many data frames have been dropped on overflow.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }

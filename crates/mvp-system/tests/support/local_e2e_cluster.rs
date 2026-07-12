@@ -18,7 +18,7 @@ use datastream::{
 };
 use distribution::node::DistributedNodeConfig;
 use iroh::EndpointAddr;
-use iroh_driver::{IrohDriver, IrohDriverConfig};
+use iroh_driver::{DATASTREAM_ALPN, IrohDriver, IrohDriverConfig};
 use mvp_system::actors::node_agent::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageProvisionWire,
 };
@@ -898,7 +898,17 @@ fn run_supervisor_once(
                         return Err(format!("run failed: {event:?}"));
                     }
                 },
+                OrchestratorReport::StageFault {
+                    run_id,
+                    stage_index,
+                } => {
+                    record_dashboard_event(&mut dashboard, run_fault_event(run_id));
+                    return Err(format!("stage {stage_index} faulted in run {run_id}"));
+                }
                 OrchestratorReport::NodeRuntimeReady { .. }
+                | OrchestratorReport::NodeRuntimeReadyAck { .. }
+                | OrchestratorReport::WeightsReady { .. }
+                | OrchestratorReport::StageReady { .. }
                 | OrchestratorReport::Snapshot { .. } => {}
             }
         }
@@ -1307,7 +1317,7 @@ fn new_driver(handle: tokio::runtime::Handle) -> Result<IrohDriver, String> {
             relay_mode,
             node: DistributedNodeConfig::default(),
             peer_auth: None,
-            additional_alpns: vec![EDGE_ALPN.to_vec()],
+            additional_alpns: vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()],
         },
     )
     .map_err(|e| format!("create iroh driver: {e}"))
@@ -1580,7 +1590,14 @@ fn handle_node_command(
                 layer_end_exclusive,
             )?;
             runtime
-                .send_to(node_actor, NodeAgentMsg::MarkWeightsReady)
+                .send_to(
+                    node_actor,
+                    NodeAgentMsg::MarkWeightsReady {
+                        run_id: RUN_ID,
+                        node_id: u64::from(local_stage_index) + 11,
+                        stage_index: local_stage_index,
+                    },
+                )
                 .map_err(|e| format!("mark weights ready: {e}"))
         }
         StageCommandWire::ExecuteStep {

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -9,25 +10,37 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use datastream::{ChannelId, DatastreamSink, Frame, Lifetime, Mux, NodeId, StreamId};
+use datastream::{
+    ChannelContent, ChannelId, ChannelRef, DatastreamEndpoint, DatastreamEvent, DatastreamProducer,
+    DatastreamPublisherMsg, DatastreamSubscribe, Frame, Lifetime, NodeId, StreamDescriptor,
+    StreamId, StreamOrigin, SubscriptionRequest,
+};
 use distribution::node::DistributedNodeConfig;
 use distribution::types::{MemberState, NodeId as DistNodeId};
-use iroh::EndpointAddr;
-use iroh_driver::{IrohDriver, IrohDriverConfig};
-use mvp_system::actors::node_agent::{NodeAgentMsg, StageProvisionWire};
+use iroh::{Endpoint, EndpointAddr};
+use iroh_driver::{
+    DATASTREAM_ALPN, IrohDriver, IrohDriverConfig, read_next_event, read_stream_header,
+};
+use mvp_system::actors::node_agent::{
+    NodeAgentMsg, StageEdgeKindWire, StageInboundEdgeWire, StageObjectSpecWire,
+    StageOutboundEdgeWire, StageProvisionWire, StageRingSpecWire,
+};
 use mvp_system::actors::orchestrator::{OrchestratorActor, OrchestratorReport};
 use mvp_system::actors::register_mvp_actor_codecs;
 use mvp_system::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 #[cfg(feature = "local-e2e")]
 use mvp_system::dashboard_view::MvpClusterDashboardView;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
+use mvp_system::gpu_worker_ingress_parser as ingress;
 use mvp_system::node_provisioning::ProviderKind;
 use mvp_system::orchestrator_run_fsm::{RunConfig, RunId};
-use mvp_system::prompt_rpc::{PromptEvent, SubmitPrompt, read_submit_prompt, write_json_line};
+use mvp_system::prompt_rpc::{
+    PromptEvent, SubmitPrompt, TokenizerEvent, read_submit_prompt, write_json_line,
+};
 use mvp_system::provisioning::{
-    LocalDockerPlugin, NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink,
-    ProviderMount, ProvisionEvent, ProvisionEventKind, ProvisionLogLine, ProvisionLogStream,
-    ProvisionPlugin,
+    LocalDockerPlugin, LocalProcessPlugin, NodeProvisionSpec, PluginObservation,
+    PluginObservationSink, PluginSink, ProviderMount, ProvisionEvent, ProvisionEventKind,
+    ProvisionLogLine, ProvisionLogStream, ProvisionPlugin,
 };
 #[cfg(test)]
 use mvp_system::relay_provisioning::relay_runtime_config_from_env;
@@ -35,7 +48,7 @@ use mvp_system::relay_provisioning::{
     MVP_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV, relay_mode_env_value,
     relay_runtime_config_from_settings,
 };
-use mvp_system::run_plan::{GgufSource, TokenizerSource};
+use mvp_system::run_plan::{self, GgufSource, TokenizerSource};
 use mvp_system::telemetry::{
     MVP_PROVISIONING_EVENTS, MvpProvisionEventRecord, MvpProvisionLogRecord,
     mvp_provision_log_channel,
@@ -47,22 +60,32 @@ use mvp_system::vastai_provisioning::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc as tokio_mpsc;
 
 const DEFAULT_IMAGE: &str = "swactor-mvp-node:latest";
 const MVP_RUNTIME_CONFIG_ENV: &str = "MVP_RUNTIME_CONFIG";
 const CACHED_MODEL_HOST_ENV: &str = "MVP_CACHED_MODEL_HOST_PATH";
+const MVP_WORKER_BIN_ENV: &str = "MVP_WORKER_BIN";
 const CACHED_MODEL_CONTAINER_DIR: &str = "/models/cached";
+const DEFAULT_PIPELINE_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
+const DEFAULT_PIPELINE_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_RPC_BIND: &str = "127.0.0.1:19777";
 const DEFAULT_HF_REPO: &str = "bartowski/Llama-3.2-1B-Instruct-GGUF";
 const DEFAULT_HF_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
+const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const RUNTIME_READY_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const MVP_ORCH_BOOTSTRAP: &str = "mvp.orch.bootstrap";
 const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
+const MVP_SWIM_MEMBERSHIP: &str = "mvp.swim.membership";
+const MVP_STAGE_ROUTE: &str = "mvp.orch.stage_route";
 const DATASTREAM_FRAME_LOG_ENV: &str = "MVP_DATASTREAM_FRAME_LOG";
 const DEFAULT_DOCKER_CONTAINER_PREFIX: &str = "mvp-orchestrator";
 const MVP_DOCKER_CONTAINER_PREFIX_ENV: &str = "MVP_DOCKER_CONTAINER_PREFIX";
+const EDGE_ALPN: &[u8] = b"mvp/pipeline-edge/0";
 
 fn main() -> ExitCode {
     match run() {
@@ -72,6 +95,41 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn build_pipeline_edge_endpoint(
+    handle: &tokio::runtime::Handle,
+    relay: &RelayRuntimeConfig,
+) -> Result<Endpoint, String> {
+    let relay_mode = relay.mode.clone();
+    let custom_relay = matches!(&relay_mode, iroh::RelayMode::Custom(_));
+    handle
+        .block_on(async move {
+            let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
+                .relay_mode(relay_mode)
+                .alpns(vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()]);
+            if custom_relay {
+                builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
+            }
+            builder.bind().await
+        })
+        .map_err(|e| format!("create pipeline edge endpoint: {e}"))
+}
+
+fn pipeline_edge_endpoint_addr(
+    endpoint: &Endpoint,
+    relay: &RelayRuntimeConfig,
+) -> Result<EndpointAddr, String> {
+    let mut addr = endpoint.addr();
+    if addr.relay_urls().next().is_none() {
+        if let Some(url) = &relay.url {
+            addr = addr.with_relay_url(
+                url.parse()
+                    .map_err(|e| format!("parse pipeline edge relay URL {url:?}: {e}"))?,
+            );
+        }
+    }
+    Ok(addr)
 }
 
 fn run() -> Result<(), String> {
@@ -93,8 +151,9 @@ fn run() -> Result<(), String> {
             "rpc_bind":config.rpc_bind.to_string(),
             "model_id":&config.model_id,
             "stage_index":config.stage_index,
-            "layer_end_exclusive":config.layer_end_exclusive,
+            "legacy_layer_end_exclusive":config.layer_end_exclusive,
             "relay_mode":format!("{:?}", config.relay.mode),
+            "pipeline_stages":config.pipeline_stages,
             "provider_config":config.provider_datastream_detail(),
         }),
     );
@@ -105,6 +164,28 @@ fn run() -> Result<(), String> {
         config.run_id,
         config.node_id,
     );
+    let pipeline_plan = if config.uses_planned_execution() {
+        let plan = config.build_run_plan()?;
+        orch_datastream.emit_bootstrap(
+            None,
+            config.run_id,
+            config.node_id,
+            "run_plan",
+            "ready",
+            json!({
+                "stage_count":plan.stages.len(),
+                "edge_count":plan.edges.len(),
+                "model_layers":plan.model.num_layers,
+                "hidden_dim":plan.model.hidden_dim,
+                "max_seq_len":plan.model.max_seq_len,
+                "eos_token_id":plan.model.eos_token_id,
+            }),
+        );
+        Some(plan)
+    } else {
+        None
+    };
+    let _ = &pipeline_plan;
 
     let tokio = match tokio::runtime::Runtime::new() {
         Ok(runtime) => {
@@ -137,7 +218,7 @@ fn run() -> Result<(), String> {
             relay_mode: config.relay.mode.clone(),
             node: DistributedNodeConfig::default(),
             peer_auth: None,
-            additional_alpns: vec![],
+            additional_alpns: vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()],
         },
     ) {
         Ok(driver) => {
@@ -204,33 +285,14 @@ fn run() -> Result<(), String> {
         json!({"transport":"iroh","routes":"attached"}),
     );
 
-    let (frame_tx, frame_rx) = mpsc::channel::<(StreamId, Frame)>();
-    let datastream_sink = match stack
-        .runtime
-        .spawn(DatastreamSink::new(move |stream, frame| {
-            let _ = frame_tx.send((stream, frame));
-        })) {
-        Ok(actor) => actor,
-        Err(error) => {
-            orch_datastream.emit_bootstrap(
-                None,
-                config.run_id,
-                config.node_id,
-                "datastream_sink",
-                "failed",
-                json!({"error":error.to_string()}),
-            );
-            return Err(format!("spawn datastream sink: {error}"));
-        }
-    };
-    stack.register_local_actor(driver.register_actor(datastream_sink, 1));
+    let (frame_tx, frame_rx) = mpsc::channel::<CollectedDatastreamFrame>();
     orch_datastream.emit_bootstrap(
         None,
         config.run_id,
         config.node_id,
-        "datastream_sink",
+        "datastream_collector",
         "ready",
-        json!({"actor":datastream_sink,"channel":"local_mpsc"}),
+        json!({"alpn":String::from_utf8_lossy(DATASTREAM_ALPN)}),
     );
     let dashboard = DashboardSupport::start(config.dashboard)?;
     orch_datastream.emit_bootstrap(
@@ -322,10 +384,35 @@ fn run() -> Result<(), String> {
         json!({"actor":prompt_reply_actor}),
     );
 
+    let tokenizer_events = match stack.runtime.new_inbox::<TokenizerEvent>() {
+        Ok(inbox) => inbox,
+        Err(error) => {
+            orch_datastream.emit_bootstrap(
+                dashboard.as_ref(),
+                config.run_id,
+                config.node_id,
+                "tokenizer_reply_actor",
+                "failed",
+                json!({"error":error.to_string()}),
+            );
+            return Err(format!("tokenizer event inbox: {error}"));
+        }
+    };
+    let tokenizer_reply_actor = *tokenizer_events.addr();
+    stack.register_local_actor(driver.register_actor(tokenizer_reply_actor, 1));
+    orch_datastream.emit_bootstrap(
+        dashboard.as_ref(),
+        config.run_id,
+        config.node_id,
+        "tokenizer_reply_actor",
+        "ready",
+        json!({"actor":tokenizer_reply_actor}),
+    );
+
     let (work_tx, work_rx) = mpsc::channel::<PromptWork>();
     let stop_rx = spawn_stop_listener();
 
-    let mut provisioner = config.build_provisioner(Arc::clone(&stack.runtime))?;
+    let provisioner = config.build_provisioner(Arc::clone(&stack.runtime))?;
     orch_datastream.emit_bootstrap(
         dashboard.as_ref(),
         config.run_id,
@@ -342,260 +429,48 @@ fn run() -> Result<(), String> {
     let sink = PluginSink::new(Arc::new(ChannelObservationSink {
         tx: Mutex::new(obs_tx),
     }));
-    let node_spec =
-        config.node_spec(driver.endpoint_addr(), datastream_sink, orchestrator_actor)?;
-    orch_datastream.emit_event(
-        dashboard.as_ref(),
-        ProvisionEvent {
-            run_id: config.run_id,
-            node_id: config.node_id,
-            kind: ProvisionEventKind::ProvisionStart,
-            provider: Some(config.provider.as_str().to_owned()),
-            message: Some(format!(
-                "starting {} image {}",
-                config.provider.as_str(),
-                config.image
-            )),
-        },
-    );
-    orch_datastream.emit_bootstrap(
-        dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
-        "node_spec",
-        "ready",
-        json!({
-            "provider":config.provider.as_str(),
-            "image":&config.image,
-            "relay_mode":relay_mode_env_value(&config.relay.mode),
-            "docker_gpus":if config.provider == ProviderKind::Docker { Some(config.docker_gpus.as_str()) } else { None },
-            "provider_config":config.provider_datastream_detail(),
-            "env_keys":config.node_spec_env_keys(),
-        }),
-    );
-    orch_datastream.emit_bootstrap(
-        dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
-        "provider_start",
-        "started",
-        json!({
-            "provider":config.provider.as_str(),
-            "image":&config.image,
-            "node_id":config.node_id,
-            "stage_index":config.stage_index,
-        }),
-    );
-    let (returned_provisioner, handle_result) = start_node_with_stdio_capture(
-        provisioner,
-        node_spec,
-        sink,
-        orch_stdio_rx.as_ref(),
-        dashboard.as_ref(),
-        &mut orch_datastream,
-        config.run_id,
-        config.node_id,
-    );
-    provisioner = returned_provisioner;
-    let handle = match handle_result {
-        Ok(handle) => handle,
-        Err(error) => {
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "provider_start",
-                "failed",
-                json!({"provider":config.provider.as_str(),"error":error}),
-            );
-            drain_orch_stdio_capture(
-                orch_stdio_rx.as_ref(),
-                &mut orch_datastream,
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-            );
-            return Err(error);
-        }
+    let pipeline_edge_endpoint = if pipeline_plan.is_some() {
+        let endpoint = build_pipeline_edge_endpoint(tokio.handle(), &config.relay)?;
+        let addr = pipeline_edge_endpoint_addr(&endpoint, &config.relay)?;
+        orch_datastream.emit_bootstrap(
+            dashboard.as_ref(),
+            config.run_id,
+            config.node_id,
+            "pipeline_edge_endpoint",
+            "ready",
+            json!({"endpoint":addr}),
+        );
+        Some(endpoint)
+    } else {
+        None
     };
-    let mut provisioned_node = ProvisionedNodeGuard::new(&mut *provisioner, handle);
-    drain_orch_stdio_capture(
-        orch_stdio_rx.as_ref(),
-        &mut orch_datastream,
-        dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
-    );
-
-    orch_datastream.emit_bootstrap(
-        dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
-        "node_runtime_ready",
-        "started",
-        json!({}),
-    );
-    let ready = match wait_for_runtime_ready(
+    let pipeline_token_ingress = pipeline_edge_endpoint
+        .as_ref()
+        .map(|endpoint| PipelineTokenIngress::start(tokio.handle().clone(), endpoint.clone()));
+    let coordinator_endpoint = driver.endpoint_addr();
+    let pipeline_coordinator_endpoint = match &pipeline_edge_endpoint {
+        Some(endpoint) => pipeline_edge_endpoint_addr(endpoint, &config.relay)?,
+        None => coordinator_endpoint.clone(),
+    };
+    let (mut provisioned_nodes, ready) = start_and_provision_workers(
+        provisioner,
+        &config,
+        pipeline_plan.as_ref(),
         &mut driver,
         &stack,
         &obs_rx,
         &frame_rx,
+        &frame_tx,
         &orchestrator_reports,
         &stop_rx,
         dashboard.as_ref(),
         &mut orch_datastream,
         orch_stdio_rx.as_ref(),
-        config.run_id,
-        config.node_id,
-        config.provider,
-    ) {
-        Ok(ready) => {
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "node_runtime_ready",
-                "ready",
-                json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"stage_index":ready.stage_index}),
-            );
-            drain_orch_stdio_capture(
-                orch_stdio_rx.as_ref(),
-                &mut orch_datastream,
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-            );
-            ready
-        }
-        Err(error) => {
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "node_runtime_ready",
-                "failed",
-                json!({"error":error}),
-            );
-            drain_orch_stdio_capture(
-                orch_stdio_rx.as_ref(),
-                &mut orch_datastream,
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-            );
-            return Err(error);
-        }
-    };
-    provisioned_node.complete_bootstrap()?;
-    match enqueue_runtime_ready_ack(&stack, &ready, config.run_id, config.node_id) {
-        Ok(()) => {
-            driver.drain_outbox(&stack.outbox);
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "runtime_ready_ack",
-                "ready",
-                json!({"node_actor":ready.node_actor,"readiness_id":ready.readiness_id}),
-            );
-        }
-        Err(error) => {
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "runtime_ready_ack",
-                "failed",
-                json!({"node_actor":ready.node_actor,"readiness_id":ready.readiness_id,"error":error}),
-            );
-            return Err(error);
-        }
-    }
-    orch_datastream.emit_bootstrap(
-        dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
-        "node_join",
-        "ready",
-        json!({"endpoint":&ready.endpoint,"source":"runtime_ready_barrier"}),
-    );
-    orch_datastream.emit_bootstrap(
-        dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
-        "stage_provision",
-        "started",
-        json!({
-            "run_id":config.run_id,
-            "node_id":config.node_id,
-            "stage_index":config.stage_index,
-            "stage_count":1,
-            "layer_range":{"start":0,"end_exclusive":config.layer_end_exclusive},
-            "model_id":&config.model_id,
-        }),
-    );
-    match provision_stage(&stack, ready.node_actor, &config) {
-        Ok(()) => {}
-        Err(error) => {
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "stage_provision",
-                "failed",
-                json!({"error":error}),
-            );
-            return Err(error);
-        }
-    }
-    orch_datastream.emit_bootstrap(
-        dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
-        "weights_loaded",
-        "started",
-        json!({"model_id":&config.model_id}),
-    );
-    match wait_for_weights_loaded(
-        &mut driver,
-        &stack,
-        &obs_rx,
-        &frame_rx,
-        &stop_rx,
-        dashboard.as_ref(),
-        &mut orch_datastream,
-        orch_stdio_rx.as_ref(),
-        config.run_id,
-        config.node_id,
-        config.provider,
-    ) {
-        Ok(()) => orch_datastream.emit_bootstrap(
-            dashboard.as_ref(),
-            config.run_id,
-            config.node_id,
-            "weights_loaded",
-            "ready",
-            json!({"source_channel":"mvp.worker.weights","model_id":&config.model_id}),
-        ),
-        Err(error) => {
-            orch_datastream.emit_bootstrap(
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-                "weights_loaded",
-                "failed",
-                json!({"error":error}),
-            );
-            drain_orch_stdio_capture(
-                orch_stdio_rx.as_ref(),
-                &mut orch_datastream,
-                dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
-            );
-            return Err(error);
-        }
-    }
+        sink,
+        coordinator_endpoint,
+        pipeline_coordinator_endpoint,
+        orchestrator_actor,
+    )?;
 
     let rpc_addr = match spawn_prompt_rpc(config.rpc_bind, work_tx, config.default_max_tokens) {
         Ok(addr) => {
@@ -631,7 +506,7 @@ fn run() -> Result<(), String> {
         config.node_id,
         "prompt_loop",
         "ready",
-        json!({"addr":rpc_addr.to_string(),"node_actor":ready.node_actor}),
+        json!({"addr":rpc_addr.to_string(),"node_actor":ready.first_stage.node_actor}),
     );
 
     orch_datastream.emit_bootstrap(
@@ -647,6 +522,7 @@ fn run() -> Result<(), String> {
         &stack,
         &obs_rx,
         &frame_rx,
+        &frame_tx,
         &work_rx,
         &prompt_events,
         &stop_rx,
@@ -655,9 +531,17 @@ fn run() -> Result<(), String> {
         orch_stdio_rx.as_ref(),
         config.run_id,
         config.node_id,
-        ready.node_actor,
+        ready.first_stage.node_actor,
         prompt_reply_actor,
+        &tokenizer_events,
+        ready.first_stage.node_actor,
+        ready.final_stage.node_actor,
+        tokenizer_reply_actor,
         config.provider,
+        pipeline_plan.as_ref(),
+        pipeline_edge_endpoint.as_ref(),
+        pipeline_token_ingress,
+        ready.first_stage.endpoint.clone(),
     );
     if let Err(error) = &result {
         orch_datastream.emit_bootstrap(
@@ -677,7 +561,7 @@ fn run() -> Result<(), String> {
         "started",
         json!({"provider":config.provider.as_str(),"node_id":config.node_id}),
     );
-    let stop_result = provisioned_node.stop();
+    let stop_result = provisioned_nodes.stop();
     match &stop_result {
         Ok(()) => orch_datastream.emit_bootstrap(
             dashboard.as_ref(),
@@ -860,7 +744,7 @@ impl RuntimeConfigProfile {
 
     fn default_provider(self) -> ProviderKind {
         match self {
-            Self::Local => ProviderKind::Docker,
+            Self::Local => ProviderKind::Process,
             Self::Deploy => ProviderKind::VastAi,
         }
     }
@@ -874,9 +758,9 @@ struct CachedModelConfig {
 
 impl CachedModelConfig {
     fn from_host_path(provider: ProviderKind, requested: PathBuf) -> Result<Self, String> {
-        if provider != ProviderKind::Docker {
+        if !matches!(provider, ProviderKind::Process | ProviderKind::Docker) {
             return Err(format!(
-                "{CACHED_MODEL_HOST_ENV} is a host-local cache path and requires provider=docker"
+                "{CACHED_MODEL_HOST_ENV} is a host-local cache path and is only supported by provider=process or provider=docker"
             ));
         }
         let host_path = requested.canonicalize().map_err(|e| {
@@ -896,6 +780,15 @@ impl CachedModelConfig {
             host_path,
             container_path,
         })
+    }
+
+    fn worker_path(&self, provider: ProviderKind) -> String {
+        match provider {
+            ProviderKind::Process => self.host_path.to_string_lossy().to_string(),
+            ProviderKind::Docker | ProviderKind::VastAi | ProviderKind::Mock => {
+                self.container_path.clone()
+            }
+        }
     }
 
     fn datastream_detail(&self) -> Value {
@@ -921,6 +814,48 @@ fn cached_model_container_path(host_path: &Path) -> Result<String, String> {
     Ok(format!("{CACHED_MODEL_CONTAINER_DIR}/{file_name}"))
 }
 
+fn default_worker_bin() -> Result<PathBuf, String> {
+    let mut path = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+    path.set_file_name("mvp-worker-node");
+    Ok(path)
+}
+
+fn default_pipeline_cached_model_path() -> PathBuf {
+    let relative = PathBuf::from(".")
+        .join(DEFAULT_PIPELINE_MODEL_CACHE_DIR)
+        .join(DEFAULT_PIPELINE_CACHED_MODEL_FILE);
+    if relative.is_file() {
+        return relative;
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join(DEFAULT_PIPELINE_MODEL_CACHE_DIR)
+        .join(DEFAULT_PIPELINE_CACHED_MODEL_FILE)
+}
+
+fn gguf_source_is_default_hf(source: &GgufSource) -> bool {
+    matches!(
+        source,
+        GgufSource::HuggingFaceGguf {
+            repo,
+            file,
+            revision: None,
+        } if repo == DEFAULT_HF_REPO && file == DEFAULT_HF_FILE
+    )
+}
+
+fn gguf_source_matches_default_pipeline_cache(source: &GgufSource) -> bool {
+    matches!(
+        source,
+        GgufSource::HuggingFaceGguf {
+            file,
+            revision: None,
+            ..
+        } if file == DEFAULT_PIPELINE_CACHED_MODEL_FILE
+    )
+}
+
 #[derive(Clone)]
 struct Config {
     config_profile: RuntimeConfigProfile,
@@ -931,7 +866,8 @@ struct Config {
     run_id: u64,
     node_id: u64,
     stage_index: u32,
-    layer_end_exclusive: u32,
+    layer_end_exclusive: Option<u32>,
+    pipeline_stages: u32,
     model_id: String,
     gguf_source: GgufSource,
     tokenizer: TokenizerSource,
@@ -942,6 +878,7 @@ struct Config {
     vastai: Option<VastAiRuntimeConfig>,
     cached_model: Option<CachedModelConfig>,
     datastream_frame_log: Option<PathBuf>,
+    worker_bin: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -957,7 +894,8 @@ struct ConfigBuilder {
     run_id: u64,
     node_id: u64,
     stage_index: u32,
-    layer_end_exclusive: u32,
+    layer_end_exclusive: Option<u32>,
+    pipeline_stages: u32,
     model_id: String,
     gguf_source: GgufSource,
     tokenizer: TokenizerSource,
@@ -990,6 +928,7 @@ struct ConfigBuilder {
     vastai_poll_interval_secs_raw: Option<String>,
     cached_model_host_path: Option<PathBuf>,
     datastream_frame_log: Option<PathBuf>,
+    worker_bin: Option<PathBuf>,
 }
 
 impl ConfigBuilder {
@@ -1006,7 +945,8 @@ impl ConfigBuilder {
             run_id: 1,
             node_id: 1,
             stage_index: 0,
-            layer_end_exclusive: 16,
+            layer_end_exclusive: None,
+            pipeline_stages: 1,
             model_id: DEFAULT_MODEL_ID.to_owned(),
             gguf_source: GgufSource::HuggingFaceGguf {
                 repo: DEFAULT_HF_REPO.to_owned(),
@@ -1043,6 +983,7 @@ impl ConfigBuilder {
             vastai_poll_interval_secs_raw: None,
             cached_model_host_path: None,
             datastream_frame_log: None,
+            worker_bin: None,
         }
     }
 
@@ -1060,7 +1001,10 @@ impl ConfigBuilder {
             self.stage_index = stage_index;
         }
         if let Some(layer_end_exclusive) = overlay.runtime.layer_end_exclusive {
-            self.layer_end_exclusive = layer_end_exclusive;
+            self.layer_end_exclusive = Some(layer_end_exclusive);
+        }
+        if let Some(pipeline_stages) = overlay.runtime.pipeline_stages {
+            self.pipeline_stages = pipeline_stages;
         }
         if let Some(provider) = overlay.provider.kind {
             self.provider = Some(ProviderKind::parse_deploy(&provider)?);
@@ -1176,8 +1120,13 @@ impl ConfigBuilder {
             self.stage_index = Self::parse_value("MVP_STAGE_INDEX", &stage_index)?;
         }
         if let Some(layer_end_exclusive) = env_optional("MVP_LAYER_END_EXCLUSIVE") {
-            self.layer_end_exclusive =
-                Self::parse_value("MVP_LAYER_END_EXCLUSIVE", &layer_end_exclusive)?;
+            self.layer_end_exclusive = Some(Self::parse_value(
+                "MVP_LAYER_END_EXCLUSIVE",
+                &layer_end_exclusive,
+            )?);
+        }
+        if let Some(pipeline_stages) = env_optional("MVP_PIPELINE_STAGES") {
+            self.pipeline_stages = Self::parse_value("MVP_PIPELINE_STAGES", &pipeline_stages)?;
         }
         if let Some(provider) =
             env_optional("MVP_NODE_PROVIDER").or_else(|| env_optional("MVP_PROVIDER"))
@@ -1192,6 +1141,9 @@ impl ConfigBuilder {
         }
         if let Some(path) = env_optional(CACHED_MODEL_HOST_ENV) {
             self.cached_model_host_path = Some(PathBuf::from(path));
+        }
+        if let Some(path) = env_optional(MVP_WORKER_BIN_ENV) {
+            self.worker_bin = Some(PathBuf::from(path));
         }
         if let Some(rpc_bind) = env_optional("MVP_PROMPT_RPC_BIND") {
             self.rpc_bind = rpc_bind;
@@ -1296,6 +1248,9 @@ impl ConfigBuilder {
                         "--provider",
                     )?)?)
                 }
+                "--worker-bin" => {
+                    self.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
+                }
                 "--image" => self.set_process_image(next_arg(&mut args, "--image")?),
                 "--gpus" => self.docker_gpus = next_arg(&mut args, "--gpus")?,
                 "--rpc-bind" => {
@@ -1306,7 +1261,10 @@ impl ConfigBuilder {
                 "--node-id" => self.node_id = parse_next(&mut args, "--node-id")?,
                 "--stage-index" => self.stage_index = parse_next(&mut args, "--stage-index")?,
                 "--layer-end-exclusive" => {
-                    self.layer_end_exclusive = parse_next(&mut args, "--layer-end-exclusive")?
+                    self.layer_end_exclusive = Some(parse_next(&mut args, "--layer-end-exclusive")?)
+                }
+                "-N" | "--pipeline-stages" => {
+                    self.pipeline_stages = parse_next(&mut args, arg.as_str())?
                 }
                 "--max-tokens" => self.default_max_tokens = parse_next(&mut args, "--max-tokens")?,
                 "--dashboard" => self.dashboard = true,
@@ -1420,14 +1378,29 @@ impl ConfigBuilder {
                 image = vastai_image.clone();
             }
         }
-        let cached_model = self
-            .cached_model_host_path
-            .clone()
+        if self.pipeline_stages == 0 {
+            return Err("--pipeline-stages must be greater than 0".to_owned());
+        }
+        if provider == ProviderKind::VastAi && self.pipeline_stages > 1 {
+            return Err(
+                "pipeline stages greater than 1 are only supported with provider=docker; provider=vastai does not support pipelined provisioning yet".to_owned(),
+            );
+        }
+        let mut cached_model_host_path = self.cached_model_host_path.clone();
+        if matches!(provider, ProviderKind::Process | ProviderKind::Docker)
+            && self.pipeline_stages > 1
+            && cached_model_host_path.is_none()
+            && (gguf_source_is_default_hf(&self.gguf_source)
+                || gguf_source_matches_default_pipeline_cache(&self.gguf_source))
+        {
+            cached_model_host_path = Some(default_pipeline_cached_model_path());
+        }
+        let cached_model = cached_model_host_path
             .map(|path| CachedModelConfig::from_host_path(provider, path))
             .transpose()?;
         let mut gguf_source = self.gguf_source.clone();
         if let Some(cached_model) = &cached_model {
-            gguf_source = GgufSource::LocalPath(cached_model.container_path.clone());
+            gguf_source = GgufSource::LocalPath(cached_model.worker_path(provider));
         }
         let relay = relay_runtime_config_from_settings(
             self.run_id,
@@ -1452,6 +1425,7 @@ impl ConfigBuilder {
             node_id: self.node_id,
             stage_index: self.stage_index,
             layer_end_exclusive: self.layer_end_exclusive,
+            pipeline_stages: self.pipeline_stages,
             model_id: self.model_id,
             gguf_source,
             tokenizer: self.tokenizer,
@@ -1461,6 +1435,7 @@ impl ConfigBuilder {
             relay,
             vastai,
             cached_model,
+            worker_bin: self.worker_bin,
             datastream_frame_log: self.datastream_frame_log,
         })
     }
@@ -1549,8 +1524,16 @@ impl Config {
         ConfigBuilder::hardcoded_defaults()
     }
 
+    fn uses_planned_execution(&self) -> bool {
+        self.cached_model.is_some() || self.pipeline_stages > 1
+    }
+
     fn provider_datastream_detail(&self) -> Value {
         match self.provider {
+            ProviderKind::Process => json!({
+                "worker_bin": self.worker_bin.as_ref().map(|path| path.to_string_lossy().to_string()),
+                "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
+            }),
             ProviderKind::Docker => json!({
                 "docker_gpus": &self.docker_gpus,
                 "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
@@ -1560,6 +1543,110 @@ impl Config {
                 .as_ref()
                 .map_or_else(|| json!({}), VastAiRuntimeConfig::datastream_detail),
             ProviderKind::Mock => json!({}),
+        }
+    }
+
+    fn build_run_plan(&self) -> Result<run_plan::RunPlan, String> {
+        let host_path = self.local_planning_gguf_path()?;
+        let metadata = mvp_system::gguf_metadata::read_gguf_planning_metadata(&host_path)?;
+        let model = metadata.to_model_facts(
+            self.model_id.clone(),
+            self.gguf_source.clone(),
+            self.tokenizer.clone(),
+            self.max_context,
+        )?;
+        if self.pipeline_stages > model.num_layers {
+            return Err(format!(
+                "--pipeline-stages={} exceeds GGUF layer count {}; choose N <= {}",
+                self.pipeline_stages, model.num_layers, model.num_layers
+            ));
+        }
+
+        let activation_extent = model
+            .max_seq_len
+            .checked_mul(model.hidden_dim)
+            .and_then(|value| value.checked_mul(model.dtype_width_bytes))
+            .ok_or_else(|| "activation ring size overflow while planning pipeline".to_owned())?;
+        let activation_data_capacity = run_plan::MO01_HEADER_BYTES
+            .checked_add(activation_extent)
+            .ok_or_else(|| {
+            "activation ring data capacity overflow while planning pipeline".to_owned()
+        })?;
+        let token_extent = model
+            .max_seq_len
+            .checked_mul(4)
+            .ok_or_else(|| "token ring size overflow while planning pipeline".to_owned())?;
+        let token_data_capacity = run_plan::MO01_HEADER_BYTES
+            .checked_add(token_extent)
+            .ok_or_else(|| {
+                "token ring data capacity overflow while planning pipeline".to_owned()
+            })?;
+        let candidate_pool = (0..self.pipeline_stages)
+            .map(|stage_index| run_plan::NodeId(self.node_id + 1 + u64::from(stage_index)))
+            .collect::<Vec<_>>();
+        let placement = run_plan::PlacementInput::FixedLinear(
+            candidate_pool
+                .iter()
+                .enumerate()
+                .map(|(stage_index, node_id)| run_plan::StagePlacement {
+                    stage_index: stage_index as u32,
+                    node_id: *node_id,
+                })
+                .collect(),
+        );
+
+        run_plan::plan_run(run_plan::PlannerInput {
+            run_id: run_plan::RunId(self.run_id),
+            orchestrator_node_id: run_plan::NodeId(self.node_id),
+            model,
+            runtime: run_plan::RuntimeConfig {
+                max_tokens: self.default_max_tokens,
+                prompt: run_plan::PromptSource::Inline(String::new()),
+                sampling: run_plan::SamplingPolicy {
+                    temperature_millis: 0,
+                    top_k: 1,
+                },
+                token_output_policy: run_plan::TokenOutputPolicy::EmitAll,
+            },
+            candidate_pool,
+            stage_count: self.pipeline_stages,
+            placement,
+            activation_ring: run_plan::RingSpec {
+                data_capacity: activation_data_capacity,
+                alignment: 64,
+                direction: run_plan::RingDirection::Egress,
+                host_pinning: run_plan::HostPinning::Pageable,
+                wake_coalescing: run_plan::WakeCoalescing::PendingBit,
+            },
+            token_ring: run_plan::RingSpec {
+                data_capacity: token_data_capacity,
+                alignment: 8,
+                direction: run_plan::RingDirection::Egress,
+                host_pinning: run_plan::HostPinning::Pageable,
+                wake_coalescing: run_plan::WakeCoalescing::PendingBit,
+            },
+        })
+        .map_err(|e| format!("plan pipeline run: {:?}", e.kind()))
+    }
+
+    fn local_planning_gguf_path(&self) -> Result<PathBuf, String> {
+        if let Some(cached_model) = &self.cached_model {
+            return Ok(cached_model.host_path.clone());
+        }
+        match &self.gguf_source {
+            GgufSource::LocalPath(path) => {
+                let host_path = PathBuf::from(path);
+                if host_path.is_file() {
+                    Ok(host_path)
+                } else {
+                    Err(format!(
+                        "local pipeline requires a locally inspectable GGUF before provisioning; {path:?} is not a host file, so use --cached-model-host-path"
+                    ))
+                }
+            }
+            GgufSource::HuggingFaceGguf { repo, file, .. } => Err(format!(
+                "local pipeline requires a locally inspectable GGUF before provisioning; selected source {repo}/{file} is remote, so use --cached-model-host-path"
+            )),
         }
     }
 
@@ -1614,6 +1701,16 @@ impl Config {
         bootstrap_runtime: Arc<swactor::runtime::Runtime>,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider {
+            ProviderKind::Process => {
+                let worker_bin = self.worker_bin.clone().unwrap_or(default_worker_bin()?);
+                if !worker_bin.is_file() {
+                    return Err(format!(
+                        "local process worker binary does not exist: {}",
+                        worker_bin.display()
+                    ));
+                }
+                Ok(Box::new(LocalProcessPlugin::new(worker_bin)))
+            }
             ProviderKind::Docker => Ok(Box::new(LocalDockerPlugin::new(docker_container_prefix()))),
             ProviderKind::VastAi => {
                 let vastai = self.vastai.as_ref().ok_or_else(|| {
@@ -1651,10 +1748,10 @@ impl Config {
             "MVP_NODE_PROVIDER",
             "MVP_STAGE_INDEX",
             "MVP_COORDINATOR_ENDPOINT",
-            "MVP_DATASTREAM_SINK_ACTOR",
             "MVP_ORCHESTRATOR_ACTOR",
             "MVP_MODEL_ID",
             "MVP_IROH_RELAY_MODE",
+            "MVP_PIPELINE_STAGES",
         ];
         if self.relay.url.is_some() {
             keys.push(MVP_IROH_RELAY_URL_ENV);
@@ -1664,6 +1761,9 @@ impl Config {
         }
         if std::env::var_os("MVP_TINYGRAD_TEST_MODE").is_some() {
             keys.push("MVP_TINYGRAD_TEST_MODE");
+        }
+        if local_tinygrad_worker_env(self.provider).is_some() {
+            keys.push("MVP_TINYGRAD_WORKER");
         }
         if std::env::var_os("MVP_CPU_LINE_PROFILE").is_some() {
             keys.push("MVP_CPU_LINE_PROFILE");
@@ -1705,13 +1805,34 @@ impl Config {
     fn node_spec(
         &self,
         coordinator: EndpointAddr,
-        datastream_sink: ActorAddress,
         orchestrator_actor: ActorAddress,
+    ) -> Result<NodeProvisionSpec, String> {
+        self.node_spec_for_stage(
+            coordinator,
+            orchestrator_actor,
+            self.node_id,
+            self.stage_index,
+        )
+    }
+
+    fn node_spec_for_stage(
+        &self,
+        coordinator: EndpointAddr,
+        orchestrator_actor: ActorAddress,
+        logical_node_id: u64,
+        stage_index: u32,
     ) -> Result<NodeProvisionSpec, String> {
         let mut env = vec![
             ("MVP_RUN_ID".to_owned(), self.run_id.to_string()),
-            ("MVP_LOGICAL_NODE_ID".to_owned(), self.node_id.to_string()),
-            ("MVP_STAGE_INDEX".to_owned(), self.stage_index.to_string()),
+            (
+                "MVP_LOGICAL_NODE_ID".to_owned(),
+                logical_node_id.to_string(),
+            ),
+            ("MVP_STAGE_INDEX".to_owned(), stage_index.to_string()),
+            (
+                "MVP_PIPELINE_STAGES".to_owned(),
+                self.pipeline_stages.to_string(),
+            ),
             (
                 "MVP_NODE_PROVIDER".to_owned(),
                 self.provider.as_str().to_owned(),
@@ -1720,11 +1841,6 @@ impl Config {
                 "MVP_COORDINATOR_ENDPOINT".to_owned(),
                 serde_json::to_string(&coordinator)
                     .map_err(|e| format!("serialize coordinator endpoint: {e}"))?,
-            ),
-            (
-                "MVP_DATASTREAM_SINK_ACTOR".to_owned(),
-                serde_json::to_string(&datastream_sink)
-                    .map_err(|e| format!("serialize datastream sink actor: {e}"))?,
             ),
             (
                 "MVP_ORCHESTRATOR_ACTOR".to_owned(),
@@ -1744,6 +1860,7 @@ impl Config {
             env.push(("MVP_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
         }
         env.extend(optional_env("MVP_TINYGRAD_TEST_MODE"));
+        env.extend(local_tinygrad_worker_env(self.provider));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE"));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE_INTERVAL_MS"));
         env.extend(optional_env("MVP_TOKEN_PROGRESS_EVERY"));
@@ -1779,24 +1896,29 @@ impl Config {
                 .and_then(|vastai| vastai.bootstrap_command.clone())
                 .into_iter()
                 .collect(),
-            ProviderKind::Docker => Vec::new(),
+            ProviderKind::Process | ProviderKind::Docker => Vec::new(),
             ProviderKind::Mock => {
                 return Err("mvp-orchestrator does not support mock provider".to_owned());
             }
         };
-        let mounts = if let Some(cached_model) = &self.cached_model {
-            vec![ProviderMount {
-                host_path: cached_model.host_path.to_string_lossy().to_string(),
-                container_path: cached_model.container_path.clone(),
-                readonly: false,
-            }]
+        let mounts = if self.provider == ProviderKind::Docker {
+            self.cached_model
+                .as_ref()
+                .map(|cached_model| {
+                    vec![ProviderMount {
+                        host_path: cached_model.host_path.to_string_lossy().to_string(),
+                        container_path: cached_model.container_path.clone(),
+                        readonly: self.uses_planned_execution(),
+                    }]
+                })
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
         Ok(NodeProvisionSpec {
             run_id: self.run_id,
-            node_id: self.node_id,
-            stage_index: Some(self.stage_index),
+            node_id: logical_node_id,
+            stage_index: Some(stage_index),
             image: self.image.clone(),
             env,
             args,
@@ -1809,9 +1931,21 @@ impl Config {
 struct RuntimeReady {
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
+    datastream_publisher: ActorAddress,
     stage_index: u32,
     readiness_id: u64,
     swim_node_id: DistNodeId,
+}
+
+#[derive(Clone)]
+struct PromptRuntimeReady {
+    first_stage: RuntimeReady,
+    final_stage: RuntimeReady,
+}
+#[derive(Clone)]
+struct RuntimeReadyAckTarget {
+    node_id: u64,
+    ready: RuntimeReady,
 }
 
 fn runtime_ready_barrier_met(stack: &DistributionRuntimeStack, ready: &RuntimeReady) -> bool {
@@ -1839,11 +1973,195 @@ fn enqueue_runtime_ready_ack(
         .map_err(|e| format!("send runtime ready ack: {e}"))
 }
 
+fn enqueue_datastream_subscribe(
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    ready: &RuntimeReady,
+    run_id: u64,
+    node_id: u64,
+) -> Result<(), String> {
+    let mut flow_id = [0_u8; 16];
+    flow_id[..8].copy_from_slice(&run_id.to_le_bytes());
+    flow_id[8..].copy_from_slice(&node_id.to_le_bytes());
+    stack
+        .runtime
+        .send_to(
+            ready.datastream_publisher,
+            DatastreamPublisherMsg::Subscribe(DatastreamSubscribe {
+                collector: driver.endpoint_addr(),
+                request: SubscriptionRequest::all(),
+                flow_id,
+                token: Vec::new(),
+            }),
+        )
+        .map_err(|e| format!("send datastream subscribe: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_runtime_ready_acks(
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    obs_rx: &mpsc::Receiver<PluginObservation>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
+    stop_rx: &mpsc::Receiver<()>,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    run_id: u64,
+    orchestrator_node_id: u64,
+    provider: ProviderKind,
+    targets: &[RuntimeReadyAckTarget],
+) -> Result<(), String> {
+    let mut pending = targets
+        .iter()
+        .cloned()
+        .map(|target| {
+            (
+                (
+                    target.node_id,
+                    target.ready.stage_index,
+                    target.ready.readiness_id,
+                ),
+                target,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut attempts = BTreeMap::<(u64, u32, u64), u64>::new();
+    let started = Instant::now();
+    let mut last_send = None::<Instant>;
+
+    while !pending.is_empty() {
+        pump(driver, stack, frame_tx);
+        drain_orch_stdio_capture(
+            orch_stdio_rx,
+            orch_datastream,
+            dashboard,
+            run_id,
+            orchestrator_node_id,
+        );
+        if stop_requested(stop_rx) {
+            return Err(
+                "shutdown requested while waiting for runtime-ready acknowledgements".to_owned(),
+            );
+        }
+        while let Ok(observation) = obs_rx.try_recv() {
+            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+            match observation {
+                PluginObservation::DatastreamFrame { .. } => {}
+                PluginObservation::ProviderLine { .. }
+                | PluginObservation::StdoutLine { .. }
+                | PluginObservation::StderrLine { .. } => {}
+                PluginObservation::Failed { reason, .. } => return Err(reason),
+                PluginObservation::Exited {
+                    status, node_id, ..
+                } => {
+                    return Err(format!("node {node_id} exited before ready: {status:?}"));
+                }
+            }
+        }
+        drain_frames(frame_rx, dashboard, orch_datastream);
+        while let Some(report) = orchestrator_reports.try_recv() {
+            let OrchestratorReport::NodeRuntimeReadyAck {
+                run_id: ack_run_id,
+                node_id,
+                stage_index,
+                readiness_id,
+            } = report
+            else {
+                continue;
+            };
+            if ack_run_id != run_id {
+                continue;
+            }
+            let key = (node_id, stage_index, readiness_id);
+            let Some(target) = pending.remove(&key) else {
+                continue;
+            };
+            orch_datastream.emit_bootstrap(
+                dashboard,
+                run_id,
+                orchestrator_node_id,
+                "runtime_ready_ack",
+                "ready",
+                json!({
+                    "node_id":node_id,
+                    "node_actor":target.ready.node_actor,
+                    "readiness_id":readiness_id,
+                    "attempts":attempts.get(&key).copied().unwrap_or(0),
+                }),
+            );
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= RUNTIME_READY_ACK_TIMEOUT {
+            let pending_list = pending
+                .keys()
+                .map(|(node_id, stage_index, readiness_id)| {
+                    format!("{node_id}/{stage_index}/{readiness_id}")
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "runtime_ready_ack timed out for node(s): {pending_list}"
+            ));
+        }
+        if last_send.is_none_or(|sent_at| sent_at.elapsed() >= RUNTIME_READY_ACK_RETRY_INTERVAL) {
+            for (key, target) in &pending {
+                if stack.route_owner(target.ready.datastream_publisher)
+                    == Some(target.ready.swim_node_id)
+                    && let Err(error) = enqueue_datastream_subscribe(
+                        driver,
+                        stack,
+                        &target.ready,
+                        run_id,
+                        target.node_id,
+                    )
+                {
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        run_id,
+                        orchestrator_node_id,
+                        "datastream_subscribe",
+                        "failed",
+                        json!({"node_id":target.node_id,"error":error}),
+                    );
+                }
+                enqueue_runtime_ready_ack(stack, &target.ready, run_id, target.node_id)?;
+                let attempt = attempts.entry(*key).or_default();
+                *attempt += 1;
+                let attempt = *attempt;
+                orch_datastream.emit_bootstrap(
+                    dashboard,
+                    run_id,
+                    orchestrator_node_id,
+                    "runtime_ready_ack",
+                    "sent",
+                    json!({
+                        "node_id":target.node_id,
+                        "node_actor":target.ready.node_actor,
+                        "readiness_id":target.ready.readiness_id,
+                        "attempt":attempt,
+                    }),
+                );
+            }
+            driver.drain_outbox(&stack.outbox);
+            last_send = Some(Instant::now());
+        }
+        thread::sleep(PUMP_INTERVAL);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 struct ProvisionedNodeGuard<'a> {
     provisioner: &'a mut dyn ProvisionPlugin,
     handle: Option<mvp_system::provisioning::PluginNodeHandle>,
 }
 
+#[cfg(test)]
 impl<'a> ProvisionedNodeGuard<'a> {
     fn new(
         provisioner: &'a mut dyn ProvisionPlugin,
@@ -1855,13 +2173,6 @@ impl<'a> ProvisionedNodeGuard<'a> {
         }
     }
 
-    fn complete_bootstrap(&mut self) -> Result<(), String> {
-        let Some(handle) = self.handle.as_ref() else {
-            return Ok(());
-        };
-        self.provisioner.complete_bootstrap(handle)
-    }
-
     fn stop(&mut self) -> Result<(), String> {
         let Some(handle) = self.handle.take() else {
             return Ok(());
@@ -1870,7 +2181,53 @@ impl<'a> ProvisionedNodeGuard<'a> {
     }
 }
 
+#[cfg(test)]
 impl Drop for ProvisionedNodeGuard<'_> {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+struct ProvisionedClusterGuard {
+    provisioner: Box<dyn ProvisionPlugin>,
+    handles: Vec<mvp_system::provisioning::PluginNodeHandle>,
+}
+
+impl ProvisionedClusterGuard {
+    fn new(
+        provisioner: Box<dyn ProvisionPlugin>,
+        handles: Vec<mvp_system::provisioning::PluginNodeHandle>,
+    ) -> Self {
+        Self {
+            provisioner,
+            handles,
+        }
+    }
+
+    fn complete_bootstrap_all(&mut self) -> Result<(), String> {
+        for handle in &self.handles {
+            self.provisioner.complete_bootstrap(handle)?;
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<(), String> {
+        let mut first_error = None;
+        while let Some(handle) = self.handles.pop() {
+            if let Err(error) = self.provisioner.stop_node(&handle)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ProvisionedClusterGuard {
     fn drop(&mut self) {
         let _ = self.stop();
     }
@@ -1918,6 +2275,792 @@ fn start_node_with_stdio_capture(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_and_provision_workers(
+    mut provisioner: Box<dyn ProvisionPlugin>,
+    config: &Config,
+    pipeline_plan: Option<&run_plan::RunPlan>,
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    obs_rx: &mpsc::Receiver<PluginObservation>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
+    stop_rx: &mpsc::Receiver<()>,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    sink: PluginSink,
+    coordinator: EndpointAddr,
+    pipeline_coordinator: EndpointAddr,
+    orchestrator_actor: ActorAddress,
+) -> Result<(ProvisionedClusterGuard, PromptRuntimeReady), String> {
+    let stage_specs = stage_node_specs(
+        config,
+        pipeline_plan,
+        coordinator.clone(),
+        orchestrator_actor,
+    )?;
+    let expected_node_ids = stage_specs
+        .iter()
+        .map(|spec| spec.node_id)
+        .collect::<Vec<_>>();
+    orch_datastream.emit_bootstrap(
+        dashboard,
+        config.run_id,
+        config.node_id,
+        "node_spec",
+        "ready",
+        json!({
+            "provider":config.provider.as_str(),
+            "image":&config.image,
+            "relay_mode":relay_mode_env_value(&config.relay.mode),
+            "docker_gpus":if config.provider == ProviderKind::Docker { Some(config.docker_gpus.as_str()) } else { None },
+            "provider_config":config.provider_datastream_detail(),
+            "env_keys":config.node_spec_env_keys(),
+            "worker_count":stage_specs.len(),
+            "worker_node_ids":expected_node_ids,
+        }),
+    );
+
+    let mut handles = Vec::with_capacity(stage_specs.len());
+    for node_spec in stage_specs {
+        orch_datastream.emit_event(
+            dashboard,
+            ProvisionEvent {
+                run_id: config.run_id,
+                node_id: node_spec.node_id,
+                kind: ProvisionEventKind::ProvisionStart,
+                provider: Some(config.provider.as_str().to_owned()),
+                message: Some(format!(
+                    "starting {} image {}",
+                    config.provider.as_str(),
+                    config.image
+                )),
+            },
+        );
+        orch_datastream.emit_bootstrap(
+            dashboard,
+            config.run_id,
+            config.node_id,
+            "provider_start",
+            "started",
+            json!({
+                "provider":config.provider.as_str(),
+                "image":&config.image,
+                "node_id":node_spec.node_id,
+                "stage_index":node_spec.stage_index,
+            }),
+        );
+        let (returned_provisioner, handle_result) = start_node_with_stdio_capture(
+            provisioner,
+            node_spec.clone(),
+            sink.clone(),
+            orch_stdio_rx,
+            dashboard,
+            orch_datastream,
+            config.run_id,
+            node_spec.node_id,
+        );
+        provisioner = returned_provisioner;
+        match handle_result {
+            Ok(handle) => handles.push(handle),
+            Err(error) => {
+                orch_datastream.emit_bootstrap(
+                    dashboard,
+                    config.run_id,
+                    config.node_id,
+                    "provider_start",
+                    "failed",
+                    json!({"provider":config.provider.as_str(),"node_id":node_spec.node_id,"error":error}),
+                );
+                stop_started_nodes(&mut *provisioner, &mut handles);
+                drain_orch_stdio_capture(
+                    orch_stdio_rx,
+                    orch_datastream,
+                    dashboard,
+                    config.run_id,
+                    config.node_id,
+                );
+                return Err(error);
+            }
+        }
+    }
+    let mut provisioned_nodes = ProvisionedClusterGuard::new(provisioner, handles);
+    drain_orch_stdio_capture(
+        orch_stdio_rx,
+        orch_datastream,
+        dashboard,
+        config.run_id,
+        config.node_id,
+    );
+
+    orch_datastream.emit_bootstrap(
+        dashboard,
+        config.run_id,
+        config.node_id,
+        "node_runtime_ready",
+        "started",
+        json!({"worker_count":expected_node_ids.len(),"node_ids":expected_node_ids}),
+    );
+    let readies = if pipeline_plan.is_some() {
+        match wait_for_runtime_readies(
+            driver,
+            stack,
+            obs_rx,
+            frame_rx,
+            frame_tx,
+            orchestrator_reports,
+            stop_rx,
+            dashboard,
+            orch_datastream,
+            orch_stdio_rx,
+            config.run_id,
+            &expected_node_ids,
+            config.provider,
+        ) {
+            Ok(readies) => readies,
+            Err(error) => {
+                orch_datastream.emit_bootstrap(
+                    dashboard,
+                    config.run_id,
+                    config.node_id,
+                    "node_runtime_ready",
+                    "failed",
+                    json!({"error":error}),
+                );
+                return Err(error);
+            }
+        }
+    } else {
+        let ready = match wait_for_runtime_ready(
+            driver,
+            stack,
+            obs_rx,
+            frame_rx,
+            frame_tx,
+            orchestrator_reports,
+            stop_rx,
+            dashboard,
+            orch_datastream,
+            orch_stdio_rx,
+            config.run_id,
+            config.node_id,
+            config.provider,
+        ) {
+            Ok(ready) => ready,
+            Err(error) => {
+                orch_datastream.emit_bootstrap(
+                    dashboard,
+                    config.run_id,
+                    config.node_id,
+                    "node_runtime_ready",
+                    "failed",
+                    json!({"error":error}),
+                );
+                return Err(error);
+            }
+        };
+        BTreeMap::from([(config.node_id, ready)])
+    };
+    for (node_id, ready) in &readies {
+        orch_datastream.emit_bootstrap(
+            dashboard,
+            config.run_id,
+            config.node_id,
+            "node_runtime_ready",
+            "ready",
+            json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"node_id":node_id,"stage_index":ready.stage_index}),
+        );
+    }
+    provisioned_nodes.complete_bootstrap_all()?;
+    let ack_targets = readies
+        .iter()
+        .map(|(node_id, ready)| RuntimeReadyAckTarget {
+            node_id: *node_id,
+            ready: ready.clone(),
+        })
+        .collect::<Vec<_>>();
+    wait_for_runtime_ready_acks(
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        orchestrator_reports,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        config.run_id,
+        config.node_id,
+        config.provider,
+        &ack_targets,
+    )?;
+
+    orch_datastream.emit_bootstrap(
+        dashboard,
+        config.run_id,
+        config.node_id,
+        "stage_provision",
+        "started",
+        stage_provision_detail(config, pipeline_plan),
+    );
+    if pipeline_plan.is_none() {
+        let ready = readies
+            .get(&config.node_id)
+            .ok_or_else(|| "missing runtime-ready node for single-stage run".to_owned())?;
+        provision_stage(stack, ready.node_actor, config)?;
+    }
+
+    orch_datastream.emit_bootstrap(
+        dashboard,
+        config.run_id,
+        config.node_id,
+        "weights_loaded",
+        "started",
+        json!({"model_id":&config.model_id,"expected":expected_node_ids.len()}),
+    );
+    let weights_result = if pipeline_plan.is_some() {
+        wait_for_weights_loaded_count(
+            driver,
+            stack,
+            obs_rx,
+            frame_rx,
+            frame_tx,
+            orchestrator_reports,
+            stop_rx,
+            dashboard,
+            orch_datastream,
+            orch_stdio_rx,
+            config.run_id,
+            config.node_id,
+            config.provider,
+            expected_node_ids.len(),
+            pipeline_plan.expect("pipeline mode requires plan"),
+            &readies,
+            &pipeline_coordinator,
+        )
+    } else {
+        wait_for_weights_loaded(
+            driver,
+            stack,
+            obs_rx,
+            frame_rx,
+            frame_tx,
+            orchestrator_reports,
+            stop_rx,
+            dashboard,
+            orch_datastream,
+            orch_stdio_rx,
+            config.run_id,
+            config.node_id,
+            config.provider,
+            config.stage_index,
+        )
+    };
+    match weights_result {
+        Ok(()) => orch_datastream.emit_bootstrap(
+            dashboard,
+            config.run_id,
+            config.node_id,
+            "weights_loaded",
+            "ready",
+            json!({"source":"actor_stage_ready","model_id":&config.model_id,"expected":expected_node_ids.len()}),
+        ),
+        Err(error) => {
+            orch_datastream.emit_bootstrap(
+                dashboard,
+                config.run_id,
+                config.node_id,
+                "weights_loaded",
+                "failed",
+                json!({"error":error}),
+            );
+            drain_orch_stdio_capture(
+                orch_stdio_rx,
+                orch_datastream,
+                dashboard,
+                config.run_id,
+                config.node_id,
+            );
+            return Err(error);
+        }
+    }
+
+    let prompt_ready = if let Some(plan) = pipeline_plan {
+        let first_node_id = plan
+            .stages
+            .iter()
+            .find(|stage| stage.stage_index == 0)
+            .map(|stage| stage.node_id.0)
+            .ok_or_else(|| "pipeline plan missing stage 0".to_owned())?;
+        let final_node_id = plan
+            .stages
+            .iter()
+            .find(|stage| stage.stage_index + 1 == stage.stage_count)
+            .map(|stage| stage.node_id.0)
+            .ok_or_else(|| "pipeline plan missing final stage".to_owned())?;
+        PromptRuntimeReady {
+            first_stage: readies
+                .get(&first_node_id)
+                .cloned()
+                .ok_or_else(|| "missing stage 0 runtime-ready node".to_owned())?,
+            final_stage: readies
+                .get(&final_node_id)
+                .cloned()
+                .ok_or_else(|| "missing final-stage runtime-ready node".to_owned())?,
+        }
+    } else {
+        let ready = readies
+            .get(&config.node_id)
+            .cloned()
+            .ok_or_else(|| "missing single-stage runtime-ready node".to_owned())?;
+        PromptRuntimeReady {
+            first_stage: ready.clone(),
+            final_stage: ready,
+        }
+    };
+    Ok((provisioned_nodes, prompt_ready))
+}
+
+fn stage_node_specs(
+    config: &Config,
+    pipeline_plan: Option<&run_plan::RunPlan>,
+    coordinator: EndpointAddr,
+    orchestrator_actor: ActorAddress,
+) -> Result<Vec<NodeProvisionSpec>, String> {
+    if let Some(plan) = pipeline_plan {
+        let mut stages = plan.stages.clone();
+        stages.sort_by_key(|stage| stage.stage_index);
+        stages
+            .into_iter()
+            .map(|stage| {
+                config.node_spec_for_stage(
+                    coordinator.clone(),
+                    orchestrator_actor,
+                    stage.node_id.0,
+                    stage.stage_index,
+                )
+            })
+            .collect()
+    } else {
+        Ok(vec![config.node_spec(coordinator, orchestrator_actor)?])
+    }
+}
+
+fn stop_started_nodes(
+    provisioner: &mut dyn ProvisionPlugin,
+    handles: &mut Vec<mvp_system::provisioning::PluginNodeHandle>,
+) {
+    while let Some(handle) = handles.pop() {
+        let _ = provisioner.stop_node(&handle);
+    }
+}
+
+fn stage_provision_detail(config: &Config, pipeline_plan: Option<&run_plan::RunPlan>) -> Value {
+    if let Some(plan) = pipeline_plan {
+        json!({
+            "run_id":config.run_id,
+            "stage_count":plan.stages.len(),
+            "stages":plan.stages.iter().map(|stage| {
+                json!({
+                    "node_id":stage.node_id.0,
+                    "stage_index":stage.stage_index,
+                    "layer_range":{"start":stage.layer_start,"end_exclusive":stage.layer_end_exclusive},
+                    "inbound_edge_id":stage.inbound_edge.0,
+                    "outbound_edge_id":stage.outbound_edge.0,
+                })
+            }).collect::<Vec<_>>(),
+            "model_id":&config.model_id,
+        })
+    } else {
+        json!({
+            "run_id":config.run_id,
+            "node_id":config.node_id,
+            "stage_index":config.stage_index,
+            "stage_count":1,
+            "layer_range":{"start":0,"end_exclusive":config.layer_end_exclusive},
+            "model_id":&config.model_id,
+        })
+    }
+}
+
+fn stage_provision_wire_from_plan(
+    plan: &run_plan::RunPlan,
+    stage_index: u32,
+    readies: &BTreeMap<u64, RuntimeReady>,
+    coordinator: &EndpointAddr,
+) -> Result<StageProvisionWire, String> {
+    let provision = run_plan::derive_stage_provision(plan, stage_index)
+        .map_err(|e| format!("derive stage {stage_index} provision: {e:?}"))?;
+    Ok(StageProvisionWire {
+        run_id: provision.run_id.0,
+        authorized_orchestrator: 0,
+        node_id: provision.node_id.0,
+        stage_index: provision.stage_index,
+        stage_count: provision.stage_count,
+        layer_start: provision.layer_start,
+        layer_end_exclusive: provision.layer_end_exclusive,
+        inbound_edge_id: provision.inbound.edge_id.0,
+        outbound_edge_id: provision.outbound.edge_id.0,
+        inbound_edge: Some(StageInboundEdgeWire {
+            edge_id: provision.inbound.edge_id.0,
+            kind: stage_edge_kind_wire(provision.inbound.kind),
+            object_spec: stage_object_spec_wire(provision.inbound.object_spec),
+            ring_spec: stage_ring_spec_wire(provision.inbound.ring_spec),
+        }),
+        outbound_edge: Some(StageOutboundEdgeWire {
+            edge_id: provision.outbound.edge_id.0,
+            kind: stage_edge_kind_wire(provision.outbound.kind),
+            consumer_node_id: provision.outbound.consumer_node_id.0,
+            consumer_endpoint: stage_consumer_endpoint(
+                provision.outbound.consumer_node_id.0,
+                plan,
+                readies,
+                coordinator,
+            )?,
+            object_spec: stage_object_spec_wire(provision.outbound.object_spec),
+            ring_spec: stage_ring_spec_wire(provision.outbound.ring_spec),
+        }),
+        model_id: provision.model.model_id,
+        gguf_source: provision.gguf_source,
+        tokenizer: provision.tokenizer,
+    })
+}
+
+fn provision_stage_from_plan(
+    stack: &DistributionRuntimeStack,
+    node_actor: ActorAddress,
+    plan: &run_plan::RunPlan,
+    stage_index: u32,
+    readies: &BTreeMap<u64, RuntimeReady>,
+    coordinator: &EndpointAddr,
+) -> Result<(), String> {
+    let provision = stage_provision_wire_from_plan(plan, stage_index, readies, coordinator)?;
+    stack
+        .runtime
+        .send_to(node_actor, NodeAgentMsg::ProvisionStage(provision))
+        .map_err(|e| format!("send stage {stage_index} provision: {e}"))
+}
+
+fn stage_consumer_endpoint(
+    consumer_node_id: u64,
+    plan: &run_plan::RunPlan,
+    readies: &BTreeMap<u64, RuntimeReady>,
+    coordinator: &EndpointAddr,
+) -> Result<Option<EndpointAddr>, String> {
+    if consumer_node_id
+        == plan.stages.first().map_or(0, |stage| {
+            plan.edges
+                .iter()
+                .find(|edge| edge.kind == run_plan::EdgeKind::TokenIn)
+                .and_then(|edge| match edge.producer {
+                    run_plan::EdgeEndpoint::Orchestrator { node_id } => Some(node_id.0),
+                    run_plan::EdgeEndpoint::Stage { .. } => None,
+                })
+                .unwrap_or(stage.node_id.0)
+        })
+    {
+        return Ok(Some(coordinator.clone()));
+    }
+    readies
+        .get(&consumer_node_id)
+        .map(|ready| Some(ready.endpoint.clone()))
+        .ok_or_else(|| {
+            format!("missing runtime-ready endpoint for consumer node {consumer_node_id}")
+        })
+}
+
+fn stage_edge_kind_wire(kind: run_plan::EdgeKind) -> StageEdgeKindWire {
+    match kind {
+        run_plan::EdgeKind::TokenIn => StageEdgeKindWire::TokenIn,
+        run_plan::EdgeKind::Activation => StageEdgeKindWire::Activation,
+        run_plan::EdgeKind::TokenOut => StageEdgeKindWire::TokenOut,
+    }
+}
+
+fn stage_object_spec_wire(spec: run_plan::ObjectSpec) -> StageObjectSpecWire {
+    StageObjectSpecWire {
+        max_extent: spec.max_extent,
+        alignment: spec.alignment,
+    }
+}
+
+fn stage_ring_spec_wire(spec: run_plan::RingSpec) -> StageRingSpecWire {
+    StageRingSpecWire {
+        data_capacity: spec.data_capacity,
+        alignment: spec.alignment,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_runtime_readies(
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    obs_rx: &mpsc::Receiver<PluginObservation>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
+    stop_rx: &mpsc::Receiver<()>,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    run_id: u64,
+    expected_node_ids: &[u64],
+    provider: ProviderKind,
+) -> Result<BTreeMap<u64, RuntimeReady>, String> {
+    let expected = expected_node_ids.iter().copied().collect::<BTreeSet<_>>();
+    let mut pending = BTreeMap::<u64, RuntimeReady>::new();
+    loop {
+        pump(driver, stack, frame_tx);
+        emit_swim_transitions(
+            orch_datastream,
+            dashboard,
+            run_id,
+            expected_node_ids.first().copied().unwrap_or(0),
+            stack,
+        );
+        drain_frames(frame_rx, dashboard, orch_datastream);
+        drain_orch_stdio_capture(
+            orch_stdio_rx,
+            orch_datastream,
+            dashboard,
+            run_id,
+            expected_node_ids.first().copied().unwrap_or(0),
+        );
+        if stop_requested(stop_rx) {
+            return Err("shutdown requested while waiting for pipeline nodes ready".to_owned());
+        }
+        while let Ok(observation) = obs_rx.try_recv() {
+            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+            match observation {
+                PluginObservation::DatastreamFrame { .. } => {}
+                PluginObservation::ProviderLine { .. }
+                | PluginObservation::StdoutLine { .. }
+                | PluginObservation::StderrLine { .. } => {}
+                PluginObservation::Failed { reason, .. } => return Err(reason),
+                PluginObservation::Exited {
+                    status, node_id, ..
+                } => {
+                    return Err(format!("node {node_id} exited before ready: {status:?}"));
+                }
+            }
+        }
+        while let Some(report) = orchestrator_reports.try_recv() {
+            if let OrchestratorReport::NodeRuntimeReady {
+                run_id: report_run_id,
+                node_id,
+                stage_index,
+                endpoint,
+                node_actor,
+                datastream_publisher,
+                readiness_id,
+            } = report
+                && report_run_id == run_id
+                && expected.contains(&node_id)
+            {
+                pending.insert(
+                    node_id,
+                    RuntimeReady {
+                        endpoint: endpoint.clone(),
+                        node_actor,
+                        datastream_publisher,
+                        stage_index,
+                        readiness_id,
+                        swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
+                    },
+                );
+            }
+        }
+        if expected.iter().all(|node_id| {
+            pending
+                .get(node_id)
+                .is_some_and(|ready| runtime_ready_barrier_met(stack, ready))
+        }) {
+            return Ok(pending);
+        }
+        thread::sleep(PUMP_INTERVAL);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_weights_loaded_count(
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    obs_rx: &mpsc::Receiver<PluginObservation>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
+    stop_rx: &mpsc::Receiver<()>,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    run_id: u64,
+    node_id: u64,
+    provider: ProviderKind,
+    expected_count: usize,
+    pipeline_plan: &run_plan::RunPlan,
+    readies: &BTreeMap<u64, RuntimeReady>,
+    pipeline_coordinator: &EndpointAddr,
+) -> Result<(), String> {
+    let expected_stages = pipeline_plan
+        .stages
+        .iter()
+        .map(|stage| stage.stage_index)
+        .collect::<BTreeSet<_>>();
+    let mut loaded_stages = BTreeSet::<u32>::new();
+    let mut last_resend = Instant::now();
+    let mut active_stage = None::<u32>;
+    let mut resend_attempt = 0_u64;
+    loop {
+        pump(driver, stack, frame_tx);
+        emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
+        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
+        if stop_requested(stop_rx) {
+            return Err("shutdown requested while waiting for pipeline weights loaded".to_owned());
+        }
+        if loaded_stages.len() >= expected_count {
+            return Ok(());
+        }
+        if active_stage.map_or(true, |stage_index| loaded_stages.contains(&stage_index)) {
+            active_stage =
+                next_pipeline_weight_load_stage(pipeline_plan, &loaded_stages, active_stage)
+                    .map(|stage| stage.stage_index);
+            last_resend = Instant::now() - Duration::from_secs(1);
+        }
+        if last_resend.elapsed() >= Duration::from_secs(1) {
+            resend_attempt += 1;
+            let Some(stage) =
+                next_pipeline_weight_load_stage(pipeline_plan, &loaded_stages, active_stage)
+            else {
+                return Err(format!(
+                    "missing unloaded pipeline weight stage; loaded {} of {expected_count}",
+                    loaded_stages.len()
+                ));
+            };
+            let stage_node_id = stage.node_id.0;
+            let ready = readies.get(&stage_node_id).ok_or_else(|| {
+                format!("missing runtime-ready node for stage {}", stage.stage_index)
+            })?;
+            orch_datastream.emit_bootstrap(
+                dashboard,
+                run_id,
+                node_id,
+                "stage_provision_send",
+                "sent",
+                json!({
+                    "attempt":resend_attempt,
+                    "stage_count":pipeline_plan.stages.len(),
+                    "stage_index":stage.stage_index,
+                    "loaded_stage_count":loaded_stages.len()
+                }),
+            );
+            let route_owner = stack.route_owner(ready.node_actor);
+            let member_state = stack.member_state(ready.swim_node_id);
+            orch_datastream.emit_bootstrap_to_channel(
+                dashboard,
+                MVP_STAGE_ROUTE,
+                run_id,
+                node_id,
+                "stage_route_check",
+                "observed",
+                json!({
+                    "attempt":resend_attempt,
+                    "stage_index":stage.stage_index,
+                    "stage_node_id":stage_node_id,
+                    "node_actor":ready.node_actor,
+                    "datastream_publisher":ready.datastream_publisher,
+                    "swim_node_id":format!("{:?}", ready.swim_node_id),
+                    "member_state":member_state.map(|state| format!("{:?}", state)),
+                    "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
+                    "datastream_route_owner":stack.route_owner(ready.datastream_publisher).map(|owner| format!("{:?}", owner)),
+                    "route_matches_ready":route_owner == Some(ready.swim_node_id),
+                }),
+            );
+            provision_stage_from_plan(
+                stack,
+                ready.node_actor,
+                pipeline_plan,
+                stage.stage_index,
+                readies,
+                pipeline_coordinator,
+            )?;
+            pump(driver, stack, frame_tx);
+            last_resend = Instant::now();
+        }
+        while let Ok(observation) = obs_rx.try_recv() {
+            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+            match observation {
+                PluginObservation::Failed { reason, .. } => return Err(reason),
+                PluginObservation::Exited {
+                    node_id, status, ..
+                } => {
+                    return Err(format!(
+                        "node {node_id} exited while loading weights: {status:?}"
+                    ));
+                }
+                PluginObservation::DatastreamFrame { .. } => {}
+                PluginObservation::ProviderLine { .. }
+                | PluginObservation::StdoutLine { .. }
+                | PluginObservation::StderrLine { .. } => {}
+            }
+        }
+        drain_frames(frame_rx, dashboard, orch_datastream);
+        while let Some(report) = orchestrator_reports.try_recv() {
+            match report {
+                OrchestratorReport::WeightsReady {
+                    run_id: report_run_id,
+                    node_id: _,
+                    stage_index,
+                } if report_run_id == run_id && expected_stages.contains(&stage_index) => {
+                    loaded_stages.insert(stage_index);
+                    if active_stage == Some(stage_index) {
+                        active_stage = None;
+                        last_resend = Instant::now() - Duration::from_secs(1);
+                    }
+                    if loaded_stages.len() >= expected_count {
+                        return Ok(());
+                    }
+                }
+                OrchestratorReport::StageFault {
+                    run_id: report_run_id,
+                    stage_index,
+                } if report_run_id == run_id && expected_stages.contains(&stage_index) => {
+                    return Err(format!(
+                        "stage {stage_index} faulted while loading pipeline weights"
+                    ));
+                }
+                _ => {}
+            }
+        }
+        thread::sleep(PUMP_INTERVAL);
+    }
+}
+
+fn next_pipeline_weight_load_stage<'a>(
+    pipeline_plan: &'a run_plan::RunPlan,
+    loaded_stages: &BTreeSet<u32>,
+    active_stage: Option<u32>,
+) -> Option<&'a run_plan::StagePlan> {
+    if let Some(stage_index) = active_stage {
+        if !loaded_stages.contains(&stage_index) {
+            if let Some(stage) = pipeline_plan
+                .stages
+                .iter()
+                .find(|stage| stage.stage_index == stage_index)
+            {
+                return Some(stage);
+            }
+        }
+    }
+    pipeline_plan
+        .stages
+        .iter()
+        .filter(|stage| !loaded_stages.contains(&stage.stage_index))
+        .min_by_key(|stage| stage.stage_index)
+}
+
 struct FailedProvisionPlugin;
 
 impl ProvisionPlugin for FailedProvisionPlugin {
@@ -1954,6 +3097,82 @@ struct ActivePrompt {
     events: mpsc::Sender<PromptEvent>,
 }
 
+#[derive(Clone, Debug)]
+struct CollectedDatastreamFrame {
+    stream: StreamId,
+    channel_name: String,
+    frame: Frame,
+}
+
+fn drain_datastream_connections(
+    driver: &IrohDriver,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+) {
+    for (_node, conn) in driver.drain_accepted_for_alpn(DATASTREAM_ALPN) {
+        let tx = frame_tx.clone();
+        driver.runtime_handle().spawn(async move {
+            while let Ok(mut recv) = conn.accept_uni().await {
+                let Ok(header) = read_stream_header(&mut recv).await else {
+                    break;
+                };
+                let mut channels = header
+                    .channels
+                    .iter()
+                    .map(|descriptor| {
+                        (
+                            ChannelRef {
+                                stream: descriptor.stream.clone(),
+                                channel: descriptor.id,
+                            },
+                            descriptor.name.clone(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                loop {
+                    let event = match read_next_event(&mut recv, &header.stream).await {
+                        Ok(Some(event)) => event,
+                        Ok(None) => break,
+                        Err(_) => break,
+                    };
+                    match event {
+                        DatastreamEvent::ChannelDeclared(descriptor) => {
+                            channels.insert(
+                                ChannelRef {
+                                    stream: descriptor.stream.clone(),
+                                    channel: descriptor.id,
+                                },
+                                descriptor.name,
+                            );
+                        }
+                        DatastreamEvent::Frame(delivery) => {
+                            let channel_name =
+                                channels.get(&delivery.channel).cloned().unwrap_or_else(|| {
+                                    format!("channel#{}", delivery.channel.channel.0)
+                                });
+                            let frame = Frame::new(
+                                delivery.channel.channel,
+                                delivery.position,
+                                delivery.payload,
+                            );
+                            if tx
+                                .send(CollectedDatastreamFrame {
+                                    stream: delivery.channel.stream,
+                                    channel_name,
+                                    frame,
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        DatastreamEvent::StreamDeclared(_) | DatastreamEvent::StreamEnded(_) => {}
+                    }
+                }
+            }
+        });
+    }
+}
+
 struct FrameArchive {
     file: File,
     next_seq: u64,
@@ -1976,7 +3195,7 @@ impl FrameArchive {
         Ok(Self { file, next_seq: 0 })
     }
 
-    fn record(&mut self, source: &str, stream: &StreamId, frame: &Frame) {
+    fn record(&mut self, source: &str, stream: &StreamId, channel: &str, frame: &Frame) {
         let payload = match std::str::from_utf8(&frame.payload) {
             Ok(text) => json!({"encoding":"utf8","value":text}),
             Err(_) => json!({"encoding":"bytes","value":frame.payload}),
@@ -1985,7 +3204,8 @@ impl FrameArchive {
             "arrival_seq":self.next_seq,
             "source":source,
             "stream":stream.to_string(),
-            "channel":frame.channel.as_str(),
+            "channel":channel,
+            "channel_id":frame.channel.0,
             "position":frame.position.0,
             "payload":payload,
         });
@@ -1998,36 +3218,98 @@ impl FrameArchive {
 
 struct OrchDatastream {
     stream: StreamId,
-    mux: Mux,
+    endpoint: DatastreamEndpoint,
+    producer: DatastreamProducer,
+    channels: BTreeMap<String, ChannelId>,
+    channel_names: BTreeMap<ChannelId, String>,
     archive: Option<FrameArchive>,
 }
 
 impl OrchDatastream {
     fn new(run_id: u64, frame_log: Option<&Path>) -> Result<Self, String> {
         let stream = StreamId::new(NodeId::new("mvp-orchestrator"), Lifetime(run_id));
-        Ok(Self {
-            stream: stream.clone(),
-            mux: Mux::unbounded(stream),
+        let endpoint = DatastreamEndpoint::with_descriptor(
+            StreamDescriptor {
+                stream: stream.clone(),
+                label: Some("mvp orchestrator".to_owned()),
+                origin: StreamOrigin::Orchestrator,
+            },
+            4096,
+            1024,
+        );
+        let producer = endpoint.producer();
+        let mut out = Self {
+            stream,
+            endpoint,
+            producer,
+            channels: BTreeMap::new(),
+            channel_names: BTreeMap::new(),
             archive: frame_log.map(FrameArchive::open).transpose()?,
-        })
+        };
+        for name in [
+            MVP_PROVISIONING_EVENTS,
+            MVP_ORCH_BOOTSTRAP,
+            MVP_ORCH_PROMPT,
+            MVP_SWIM_MEMBERSHIP,
+            MVP_STAGE_ROUTE,
+        ] {
+            out.channel_by_name(name);
+        }
+        Ok(out)
+    }
+
+    fn channel_by_name(&mut self, name: &str) -> ChannelId {
+        if let Some(id) = self.channels.get(name).copied() {
+            return id;
+        }
+        let id = self.producer.register_channel(
+            name,
+            ChannelContent::JsonRecord {
+                schema: Some(name.to_owned()),
+            },
+        );
+        self.channels.insert(name.to_owned(), id);
+        self.channel_names.insert(id, name.to_owned());
+        id
     }
 
     fn emit_event(&mut self, dashboard: Option<&DashboardSupport>, event: ProvisionEvent) {
         let payload = serde_json::to_vec(&MvpProvisionEventRecord::new(event))
             .expect("serialize provisioning event");
-        self.emit_bytes(dashboard, ChannelId::new(MVP_PROVISIONING_EVENTS), payload);
+        self.emit_bytes(dashboard, MVP_PROVISIONING_EVENTS, payload);
     }
 
     fn emit_log(&mut self, dashboard: Option<&DashboardSupport>, line: ProvisionLogLine) {
         let channel = mvp_provision_log_channel(line.node_id, line.stream);
         let payload =
             serde_json::to_vec(&MvpProvisionLogRecord::new(line)).expect("serialize provision log");
-        self.emit_bytes(dashboard, channel, payload);
+        self.emit_bytes(dashboard, &channel, payload);
     }
 
     fn emit_bootstrap(
         &mut self,
         dashboard: Option<&DashboardSupport>,
+        run_id: u64,
+        node_id: u64,
+        phase: &str,
+        status: &str,
+        detail: Value,
+    ) {
+        self.emit_bootstrap_to_channel(
+            dashboard,
+            MVP_ORCH_BOOTSTRAP,
+            run_id,
+            node_id,
+            phase,
+            status,
+            detail,
+        );
+    }
+
+    fn emit_bootstrap_to_channel(
+        &mut self,
+        dashboard: Option<&DashboardSupport>,
+        channel: &str,
         run_id: u64,
         node_id: u64,
         phase: &str,
@@ -2043,7 +3325,7 @@ impl OrchDatastream {
             "detail":detail,
         }))
         .expect("serialize orch bootstrap event");
-        self.emit_bytes(dashboard, ChannelId::new(MVP_ORCH_BOOTSTRAP), payload);
+        self.emit_bytes(dashboard, channel, payload);
     }
 
     fn emit_prompt(
@@ -2066,13 +3348,13 @@ impl OrchDatastream {
             "detail":detail,
         }))
         .expect("serialize orch prompt event");
-        self.emit_bytes(dashboard, ChannelId::new(MVP_ORCH_PROMPT), payload);
+        self.emit_bytes(dashboard, MVP_ORCH_PROMPT, payload);
     }
 
     fn emit_bytes(
         &mut self,
         dashboard: Option<&DashboardSupport>,
-        channel: ChannelId,
+        channel: &str,
         payload: Vec<u8>,
     ) {
         self.emit_bytes_from(dashboard, channel, payload, "orchestrator");
@@ -2081,24 +3363,31 @@ impl OrchDatastream {
     fn emit_bytes_from(
         &mut self,
         dashboard: Option<&DashboardSupport>,
-        channel: ChannelId,
+        channel: &str,
         payload: Vec<u8>,
         source: &str,
     ) {
-        self.mux.submit(channel, payload);
+        let id = self.channel_by_name(channel);
+        self.producer.submit_bytes(id, payload);
         self.flush(dashboard, source);
     }
 
     fn flush(&mut self, dashboard: Option<&DashboardSupport>, source: &str) {
-        for frame in self.mux.drain() {
-            ingest_dashboard_frame(dashboard, &self.stream, &frame);
-            self.archive_frame(source, &self.stream.clone(), &frame);
+        let stream = self.stream.clone();
+        for frame in self.endpoint.mux().drain() {
+            let channel = self
+                .channel_names
+                .get(&frame.channel)
+                .cloned()
+                .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
+            ingest_dashboard_frame(dashboard, &stream, &channel, &frame);
+            self.archive_frame(source, &stream, &channel, &frame);
         }
     }
 
-    fn archive_frame(&mut self, source: &str, stream: &StreamId, frame: &Frame) {
+    fn archive_frame(&mut self, source: &str, stream: &StreamId, channel: &str, frame: &Frame) {
         if let Some(archive) = &mut self.archive {
-            archive.record(source, stream, frame);
+            archive.record(source, stream, channel, frame);
         }
     }
 }
@@ -2219,8 +3508,16 @@ impl DashboardSupport {
         Ok(Some(Self { handle }))
     }
 
-    fn ingest(&self, stream: &StreamId, frame: &Frame) {
-        self.handle.ingest(stream, frame);
+    fn publish_frame(&self, stream: &StreamId, channel: &str, frame: &Frame) {
+        self.handle.publish(dashboard::FrameEvent {
+            stream: dashboard::StreamEvent {
+                node: stream.node.as_str().to_string(),
+                life: stream.life.0,
+            },
+            channel: channel.to_owned(),
+            position: frame.position.0,
+            payload: frame.payload.clone(),
+        });
     }
 }
 
@@ -2238,7 +3535,7 @@ impl DashboardSupport {
         Ok(None)
     }
 
-    fn ingest(&self, _stream: &StreamId, _frame: &Frame) {}
+    fn publish_frame(&self, _stream: &StreamId, _channel: &str, _frame: &Frame) {}
 }
 
 struct ChannelObservationSink {
@@ -2316,7 +3613,8 @@ fn wait_for_runtime_ready(
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<(StreamId, Frame)>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
     orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
     stop_rx: &mpsc::Receiver<()>,
     dashboard: Option<&DashboardSupport>,
@@ -2331,7 +3629,7 @@ fn wait_for_runtime_ready(
     let mut node_swim_ready = false;
     let mut node_route_started = false;
     loop {
-        pump(driver, stack);
+        pump(driver, stack, frame_tx);
         drain_frames(frame_rx, dashboard, orch_datastream);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
@@ -2357,6 +3655,7 @@ fn wait_for_runtime_ready(
                 stage_index,
                 endpoint,
                 node_actor,
+                datastream_publisher,
                 readiness_id,
             } = report
             {
@@ -2374,6 +3673,7 @@ fn wait_for_runtime_ready(
                     pending_ready = Some(RuntimeReady {
                         endpoint,
                         node_actor,
+                        datastream_publisher,
                         stage_index,
                         readiness_id,
                         swim_node_id,
@@ -2437,19 +3737,26 @@ fn provision_stage(
         .runtime
         .send_to(
             node_actor,
-            NodeAgentMsg::ProvisionStage(StageProvisionWire {
-                run_id: config.run_id,
-                authorized_orchestrator: 0,
-                node_id: config.node_id,
-                stage_index: config.stage_index,
-                stage_count: 1,
-                layer_start: 0,
-                layer_end_exclusive: config.layer_end_exclusive,
-                inbound_edge_id: 1,
-                outbound_edge_id: 2,
-                model_id: config.model_id.clone(),
-                gguf_source: config.gguf_source.clone(),
-                tokenizer: config.tokenizer.clone(),
+            NodeAgentMsg::ProvisionStage({
+                let layer_end_exclusive = config.layer_end_exclusive.ok_or_else(|| {
+                    "unplanned single-stage execution requires --layer-end-exclusive or MVP_LAYER_END_EXCLUSIVE; cached-model runs use metadata-derived planning".to_owned()
+                })?;
+                StageProvisionWire {
+                    run_id: config.run_id,
+                    authorized_orchestrator: 0,
+                    node_id: config.node_id,
+                    stage_index: config.stage_index,
+                    stage_count: 1,
+                    layer_start: 0,
+                    layer_end_exclusive,
+                    inbound_edge_id: 1,
+                    outbound_edge_id: 2,
+                    inbound_edge: None,
+                    outbound_edge: None,
+                    model_id: config.model_id.clone(),
+                    gguf_source: config.gguf_source.clone(),
+                    tokenizer: config.tokenizer.clone(),
+                }
             }),
         )
         .map_err(|e| format!("send stage provision: {e}"))
@@ -2459,7 +3766,9 @@ fn wait_for_weights_loaded(
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<(StreamId, Frame)>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
     stop_rx: &mpsc::Receiver<()>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
@@ -2467,9 +3776,10 @@ fn wait_for_weights_loaded(
     run_id: u64,
     node_id: u64,
     provider: ProviderKind,
+    stage_index: u32,
 ) -> Result<(), String> {
     loop {
-        pump(driver, stack);
+        pump(driver, stack, frame_tx);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for weights loaded".to_owned());
@@ -2487,20 +3797,618 @@ fn wait_for_weights_loaded(
                 | PluginObservation::StderrLine { .. } => {}
             }
         }
-        while let Ok((stream, frame)) = frame_rx.try_recv() {
-            ingest_dashboard_frame(dashboard, &stream, &frame);
-            orch_datastream.archive_frame("node_cluster", &stream, &frame);
-            let payload = String::from_utf8_lossy(&frame.payload);
-            if frame.channel == ChannelId::new("mvp.worker.weights")
-                && json_type_is(&payload, "WeightsLoaded")
-            {
-                return Ok(());
-            }
-            if json_type_is(&payload, "WorkerFatal") {
-                return Err(format!("worker fatal while loading weights: {payload}"));
+        drain_frames(frame_rx, dashboard, orch_datastream);
+        while let Some(report) = orchestrator_reports.try_recv() {
+            match report {
+                OrchestratorReport::WeightsReady {
+                    run_id: report_run_id,
+                    node_id: _,
+                    stage_index: report_stage_index,
+                } if report_run_id == run_id && report_stage_index == stage_index => {
+                    return Ok(());
+                }
+                OrchestratorReport::StageFault {
+                    run_id: report_run_id,
+                    stage_index: report_stage_index,
+                } if report_run_id == run_id && report_stage_index == stage_index => {
+                    return Err(format!(
+                        "stage {report_stage_index} faulted while loading weights"
+                    ));
+                }
+                _ => {}
             }
         }
         thread::sleep(PUMP_INTERVAL);
+    }
+}
+
+#[derive(Debug)]
+struct PipelineTokenRecord {
+    object_id: u64,
+    sequence: u64,
+    token_id: u32,
+    eos: bool,
+}
+
+struct PipelineSendHandle {
+    tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+}
+
+impl PipelineSendHandle {
+    fn send(&self, bytes: Vec<u8>) -> Result<(), String> {
+        self.tx
+            .send(bytes)
+            .map_err(|_| "pipeline token-in sender stopped".to_owned())
+    }
+}
+
+struct PipelineTokenIngress {
+    recv_rx: mpsc::Receiver<Vec<u8>>,
+    recv_tx: mpsc::Sender<Vec<u8>>,
+}
+
+impl PipelineTokenIngress {
+    fn start(handle: tokio::runtime::Handle, endpoint: Endpoint) -> Self {
+        let (recv_tx, recv_rx) = mpsc::channel();
+        spawn_pipeline_token_acceptor(handle, endpoint, recv_tx.clone());
+        Self { recv_rx, recv_tx }
+    }
+}
+
+struct PendingEncode {
+    request_id: u64,
+}
+
+struct PendingDecode {
+    request_id: u64,
+    token_id: u32,
+    eos: bool,
+    reached_limit: bool,
+}
+
+struct PipelinePromptRuntime {
+    token_in_edge_id: u64,
+    token_out_edge_id: u64,
+    token_spec: run_plan::ObjectSpec,
+    token_out_spec: run_plan::ObjectSpec,
+    token_in_sender: PipelineSendHandle,
+    recv_rx: mpsc::Receiver<Vec<u8>>,
+    recv_tx: mpsc::Sender<Vec<u8>>,
+    recv_buffer: Vec<u8>,
+    tokenizer_encode_actor: ActorAddress,
+    tokenizer_decode_actor: ActorAddress,
+    tokenizer_reply_to: ActorAddress,
+    pending_encode: Option<PendingEncode>,
+    pending_decode: Option<PendingDecode>,
+    next_sequence: u64,
+    generated_tokens: Vec<u32>,
+    final_text: String,
+    active: Option<ActivePrompt>,
+    started_at: Option<Instant>,
+}
+
+impl PipelinePromptRuntime {
+    fn new(
+        handle: tokio::runtime::Handle,
+        endpoint: Endpoint,
+        plan: &run_plan::RunPlan,
+        first_stage_endpoint: EndpointAddr,
+        ingress: PipelineTokenIngress,
+        tokenizer_encode_actor: ActorAddress,
+        tokenizer_decode_actor: ActorAddress,
+        tokenizer_reply_to: ActorAddress,
+    ) -> Result<Self, String> {
+        let token_in_edge = plan
+            .edges
+            .iter()
+            .find(|edge| edge.kind == run_plan::EdgeKind::TokenIn)
+            .ok_or_else(|| "pipeline plan missing token-in edge".to_owned())?;
+        let token_out_edge = plan
+            .edges
+            .iter()
+            .find(|edge| edge.kind == run_plan::EdgeKind::TokenOut)
+            .ok_or_else(|| "pipeline plan missing token-out edge".to_owned())?;
+        Ok(Self {
+            token_in_edge_id: token_in_edge.edge_id.0,
+            token_out_edge_id: token_out_edge.edge_id.0,
+            token_spec: token_in_edge.object_spec,
+            token_out_spec: token_out_edge.object_spec,
+            token_in_sender: spawn_pipeline_token_sender(
+                handle,
+                endpoint,
+                first_stage_endpoint,
+                token_in_edge.edge_id.0,
+            )?,
+            recv_rx: ingress.recv_rx,
+            recv_tx: ingress.recv_tx,
+            tokenizer_encode_actor,
+            tokenizer_decode_actor,
+            tokenizer_reply_to,
+            pending_encode: None,
+            pending_decode: None,
+            recv_buffer: Vec::new(),
+            next_sequence: 0,
+            generated_tokens: Vec::new(),
+            final_text: String::new(),
+            active: None,
+            started_at: None,
+        })
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn start_prompt(
+        &mut self,
+        request: SubmitPrompt,
+        events: mpsc::Sender<PromptEvent>,
+        runtime: &Arc<swactor::runtime::Runtime>,
+        dashboard: Option<&DashboardSupport>,
+        orch_datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) -> Result<(), String> {
+        let request_id = request.request_id;
+        self.next_sequence = 0;
+        self.generated_tokens.clear();
+        self.final_text.clear();
+        self.recv_buffer.clear();
+        self.pending_decode = None;
+        self.pending_encode = Some(PendingEncode { request_id });
+        self.started_at = Some(Instant::now());
+        orch_datastream.emit_prompt(
+            dashboard,
+            run_id,
+            node_id,
+            request_id,
+            "pipeline_tokenizer_encode",
+            "started",
+            json!({"node_actor":self.tokenizer_encode_actor,"reply_to":self.tokenizer_reply_to,"prompt_bytes":request.prompt_text.len()}),
+        );
+        runtime
+            .send_to(
+                self.tokenizer_encode_actor,
+                NodeAgentMsg::EncodePrompt {
+                    request_id,
+                    prompt: request.prompt_text.clone(),
+                    reply_to: self.tokenizer_reply_to,
+                },
+            )
+            .map_err(|e| format!("send tokenizer encode request: {e}"))?;
+        self.active = Some(ActivePrompt { request, events });
+        Ok(())
+    }
+
+    fn drain_tokenizer_events(
+        &mut self,
+        runtime: &Arc<swactor::runtime::Runtime>,
+        tokenizer_events: &swactor::runtime::Inbox<TokenizerEvent>,
+        dashboard: Option<&DashboardSupport>,
+        orch_datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) -> Result<(), String> {
+        while let Some(event) = tokenizer_events.try_recv() {
+            match event {
+                TokenizerEvent::PromptEncoded { request_id, tokens } => self
+                    .handle_encoded_prompt(
+                        request_id,
+                        tokens,
+                        dashboard,
+                        orch_datastream,
+                        run_id,
+                        node_id,
+                    )?,
+                TokenizerEvent::TokensDecoded { request_id, text } => self.handle_decoded_tokens(
+                    runtime,
+                    request_id,
+                    text,
+                    dashboard,
+                    orch_datastream,
+                    run_id,
+                    node_id,
+                )?,
+                TokenizerEvent::Fault { request_id, error } => {
+                    self.fault_active(request_id, format!("tokenizer request failed: {error}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_encoded_prompt(
+        &mut self,
+        request_id: u64,
+        tokens: Vec<u32>,
+        dashboard: Option<&DashboardSupport>,
+        orch_datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) -> Result<(), String> {
+        let Some(pending) = self.pending_encode.take() else {
+            return Ok(());
+        };
+        if pending.request_id != request_id {
+            self.pending_encode = Some(pending);
+            return Ok(());
+        }
+        let Some(active) = self.active.as_ref() else {
+            return Ok(());
+        };
+        if active.request.request_id != request_id {
+            return Ok(());
+        }
+        orch_datastream.emit_prompt(
+            dashboard,
+            run_id,
+            node_id,
+            request_id,
+            "pipeline_tokenizer_encode",
+            "ready",
+            json!({"node_actor":self.tokenizer_encode_actor,"reply_to":self.tokenizer_reply_to,"tokens":tokens.len()}),
+        );
+        orch_datastream.emit_prompt(
+            dashboard,
+            run_id,
+            node_id,
+            request_id,
+            "pipeline_token_in",
+            "started",
+            json!({"edge_id":self.token_in_edge_id,"sequence":0,"tokens":tokens.len()}),
+        );
+        self.send_token_in(0, &tokens)?;
+        orch_datastream.emit_prompt(
+            dashboard,
+            run_id,
+            node_id,
+            request_id,
+            "pipeline_token_in",
+            "ready",
+            json!({"edge_id":self.token_in_edge_id,"sequence":0}),
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_decoded_tokens(
+        &mut self,
+        _runtime: &Arc<swactor::runtime::Runtime>,
+        request_id: u64,
+        text: String,
+        dashboard: Option<&DashboardSupport>,
+        orch_datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) -> Result<(), String> {
+        let Some(pending) = self.pending_decode.take() else {
+            return Ok(());
+        };
+        if pending.request_id != request_id {
+            self.pending_decode = Some(pending);
+            return Ok(());
+        }
+        let Some(active) = self.active.as_ref() else {
+            return Ok(());
+        };
+        if active.request.request_id != request_id {
+            return Ok(());
+        }
+        orch_datastream.emit_prompt(
+            dashboard,
+            run_id,
+            node_id,
+            request_id,
+            "pipeline_tokenizer_decode",
+            "ready",
+            json!({"node_actor":self.tokenizer_decode_actor,"reply_to":self.tokenizer_reply_to,"text_bytes":text.len()}),
+        );
+        self.final_text.push_str(&text);
+        if !text.is_empty() {
+            let _ = active
+                .events
+                .send(PromptEvent::TextDelta { request_id, text });
+        }
+        if pending.eos || pending.reached_limit {
+            let elapsed_ms = self
+                .started_at
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let final_text = self.final_text.clone();
+            let tokens_generated = self.generated_tokens.len() as u32;
+            let _ = active.events.send(PromptEvent::Done {
+                request_id,
+                final_text,
+                tokens_generated,
+                elapsed_ms,
+            });
+            self.active = None;
+            return Ok(());
+        }
+        self.send_token_in(self.next_sequence, &[pending.token_id])?;
+        Ok(())
+    }
+
+    fn send_token_in(&self, sequence: u64, tokens: &[u32]) -> Result<(), String> {
+        self.token_in_sender.send(encode_token_record(
+            self.token_spec,
+            self.token_in_edge_id,
+            sequence,
+            tokens,
+            false,
+        )?)
+    }
+
+    fn request_decode(
+        &mut self,
+        runtime: &Arc<swactor::runtime::Runtime>,
+        request_id: u64,
+        token_id: u32,
+        eos: bool,
+        reached_limit: bool,
+    ) -> Result<(), String> {
+        self.pending_decode = Some(PendingDecode {
+            request_id,
+            token_id,
+            eos,
+            reached_limit,
+        });
+        runtime
+            .send_to(
+                self.tokenizer_decode_actor,
+                NodeAgentMsg::DecodeTokens {
+                    request_id,
+                    tokens: vec![token_id],
+                    reply_to: self.tokenizer_reply_to,
+                },
+            )
+            .map_err(|e| format!("send tokenizer decode request: {e}"))
+    }
+
+    fn fault_active(&mut self, request_id: u64, error: String) {
+        if let Some(active) = self.active.take()
+            && active.request.request_id == request_id
+        {
+            let _ = active.events.send(PromptEvent::Fault { request_id, error });
+        }
+        self.pending_encode = None;
+        self.pending_decode = None;
+    }
+
+    fn poll_driver(&mut self, driver: &IrohDriver) {
+        for (_node, conn) in driver.drain_other_connections() {
+            spawn_pipeline_token_receiver(driver.tokio_handle(), conn, self.recv_tx.clone());
+        }
+    }
+
+    fn drain_tokens(
+        &mut self,
+        runtime: &Arc<swactor::runtime::Runtime>,
+        dashboard: Option<&DashboardSupport>,
+        orch_datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) -> Result<(), String> {
+        if self.pending_decode.is_some() {
+            return Ok(());
+        }
+        while let Ok(bytes) = self.recv_rx.try_recv() {
+            self.recv_buffer.extend_from_slice(&bytes);
+            while self.pending_decode.is_none()
+                && let Some(record) =
+                    take_pipeline_token_record(&mut self.recv_buffer, self.token_out_spec)?
+            {
+                if record.sequence != self.next_sequence {
+                    return Err(format!(
+                        "pipeline token sequence violation: expected {}, got {}",
+                        self.next_sequence, record.sequence
+                    ));
+                }
+                self.next_sequence = self.next_sequence.saturating_add(1);
+                let Some(active) = self.active.as_ref() else {
+                    continue;
+                };
+                let request_id = active.request.request_id;
+                orch_datastream.emit_prompt(
+                    dashboard,
+                    run_id,
+                    node_id,
+                    request_id,
+                    "pipeline_token_out",
+                    "observed",
+                    json!({"edge_id":self.token_out_edge_id,"object_id":record.object_id,"sequence":record.sequence,"token_id":record.token_id,"eos":record.eos}),
+                );
+                self.generated_tokens.push(record.token_id);
+                let reached_limit = self.generated_tokens.len() as u32 >= active.request.max_tokens;
+                orch_datastream.emit_prompt(
+                    dashboard,
+                    run_id,
+                    node_id,
+                    request_id,
+                    "pipeline_tokenizer_decode",
+                    "started",
+                    json!({"node_actor":self.tokenizer_decode_actor,"reply_to":self.tokenizer_reply_to,"token_id":record.token_id}),
+                );
+                self.request_decode(
+                    runtime,
+                    request_id,
+                    record.token_id,
+                    record.eos,
+                    reached_limit,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn encode_token_record(
+    spec: run_plan::ObjectSpec,
+    _edge_id: u64,
+    sequence: u64,
+    tokens: &[u32],
+    eos: bool,
+) -> Result<Vec<u8>, String> {
+    let payload = tokens
+        .iter()
+        .flat_map(|token| token.to_le_bytes())
+        .collect::<Vec<_>>();
+    let mut flags = ingress::ObjectFlags::default();
+    flags.end_of_sequence = eos;
+    Ok(
+        ingress::ObjectRecordBuilder::new(ingress_object_spec_from_plan(spec))
+            .object_id(ingress::ObjectId(9000_u64.saturating_add(sequence)))
+            .sequence(sequence)
+            .payload(payload)
+            .flags(flags)
+            .encode(),
+    )
+}
+
+fn ingress_object_spec_from_plan(spec: run_plan::ObjectSpec) -> ingress::ObjectSpec {
+    let extent_alignment = match spec.kind {
+        run_plan::ObjectKind::Token => u64::from(spec.dtype_width_bytes),
+        _ => u64::from(spec.alignment),
+    };
+    ingress::ObjectSpec {
+        max_extent: spec.max_extent,
+        alignment: extent_alignment,
+        layout: ingress::ObjectLayout::Token,
+    }
+}
+
+fn take_pipeline_token_record(
+    buffer: &mut Vec<u8>,
+    spec: run_plan::ObjectSpec,
+) -> Result<Option<PipelineTokenRecord>, String> {
+    let record =
+        match ingress::read_object_record(buffer, ingress_object_spec_from_plan(spec), false)
+            .map_err(|reason| format!("invalid token-out record: {reason:?}"))?
+        {
+            ingress::ObjectRecordRead::Incomplete => return Ok(None),
+            ingress::ObjectRecordRead::Complete(record) => record,
+        };
+    let payload = record
+        .payload(buffer)
+        .ok_or_else(|| "token-out record payload missing".to_owned())?;
+    if payload.len() != 4 {
+        return Err(format!(
+            "token-out payload must be exactly one u32, got {}",
+            payload.len()
+        ));
+    }
+    let token_id = u32::from_le_bytes(payload.try_into().unwrap());
+    let out = PipelineTokenRecord {
+        object_id: record.object_id.0,
+        sequence: record.sequence,
+        token_id,
+        eos: record.flags.end_of_sequence,
+    };
+    buffer.drain(..record.total_len);
+    Ok(Some(out))
+}
+
+fn spawn_pipeline_token_sender(
+    handle: tokio::runtime::Handle,
+    endpoint: iroh::Endpoint,
+    peer: EndpointAddr,
+    edge_id: u64,
+) -> Result<PipelineSendHandle, String> {
+    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
+    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
+    handle.spawn(async move {
+        let result: Result<(), String> = async {
+            let conn = endpoint
+                .connect(peer, EDGE_ALPN)
+                .await
+                .map_err(|e| format!("connect token-in edge {edge_id}: {e}"))?;
+            let mut send = conn
+                .open_uni()
+                .await
+                .map_err(|e| format!("open token-in stream {edge_id}: {e}"))?;
+            send.write_all(&edge_id.to_le_bytes())
+                .await
+                .map_err(|e| format!("write token-in preamble {edge_id}: {e}"))?;
+            send.flush()
+                .await
+                .map_err(|e| format!("flush token-in preamble {edge_id}: {e}"))?;
+            let _ = ready_tx.send(Ok(()));
+            while let Some(record) = rx.recv().await {
+                send.write_all(&record)
+                    .await
+                    .map_err(|e| format!("write token-in record {edge_id}: {e}"))?;
+                send.flush()
+                    .await
+                    .map_err(|e| format!("flush token-in record {edge_id}: {e}"))?;
+            }
+            send.finish()
+                .map_err(|e| format!("finish token-in stream {edge_id}: {e}"))?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            let _ = ready_tx.send(Err(error));
+        }
+    });
+    ready_rx
+        .recv()
+        .map_err(|e| format!("token-in sender startup channel closed: {e}"))??;
+    Ok(PipelineSendHandle { tx })
+}
+
+fn spawn_pipeline_token_receiver(
+    handle: tokio::runtime::Handle,
+    conn: iroh::endpoint::Connection,
+    tx: mpsc::Sender<Vec<u8>>,
+) {
+    handle.spawn(async move {
+        while let Ok(mut recv) = conn.accept_uni().await {
+            let mut preamble = [0u8; 8];
+            if recv.read_exact(&mut preamble).await.is_err() {
+                continue;
+            }
+            let mut chunk = vec![0u8; 4096];
+            loop {
+                match recv.read(&mut chunk).await {
+                    Ok(Some(0)) | Ok(None) => break,
+                    Ok(Some(n)) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+}
+
+fn spawn_pipeline_token_acceptor(
+    handle: tokio::runtime::Handle,
+    endpoint: Endpoint,
+    tx: mpsc::Sender<Vec<u8>>,
+) {
+    let accept_handle = handle.clone();
+    handle.spawn(async move {
+        while let Some(incoming) = endpoint.accept().await {
+            if let Ok(conn) = incoming.await {
+                spawn_pipeline_token_receiver(accept_handle.clone(), conn, tx.clone());
+            }
+        }
+    });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PromptRuntimeMode {
+    DirectInferPrompt,
+    PipelineTokenEdges,
+}
+
+fn prompt_runtime_mode(pipeline_plan: Option<&run_plan::RunPlan>) -> PromptRuntimeMode {
+    if pipeline_plan.is_some() {
+        PromptRuntimeMode::PipelineTokenEdges
+    } else {
+        PromptRuntimeMode::DirectInferPrompt
     }
 }
 
@@ -2508,7 +4416,8 @@ fn serve_prompts(
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<(StreamId, Frame)>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
     work_rx: &mpsc::Receiver<PromptWork>,
     prompt_events: &swactor::runtime::Inbox<PromptEvent>,
     stop_rx: &mpsc::Receiver<()>,
@@ -2519,11 +4428,51 @@ fn serve_prompts(
     node_id: u64,
     node_actor: ActorAddress,
     reply_to: ActorAddress,
+    tokenizer_events: &swactor::runtime::Inbox<TokenizerEvent>,
+    tokenizer_encode_actor: ActorAddress,
+    tokenizer_decode_actor: ActorAddress,
+    tokenizer_reply_to: ActorAddress,
     provider: ProviderKind,
+    pipeline_plan: Option<&run_plan::RunPlan>,
+    pipeline_edge_endpoint: Option<&Endpoint>,
+    pipeline_token_ingress: Option<PipelineTokenIngress>,
+    prompt_endpoint: EndpointAddr,
 ) -> Result<(), String> {
+    let mut pipeline_runtime = match prompt_runtime_mode(pipeline_plan) {
+        PromptRuntimeMode::PipelineTokenEdges => {
+            let endpoint = pipeline_edge_endpoint
+                .ok_or_else(|| "pipeline mode requires an edge endpoint".to_owned())?
+                .clone();
+            let ingress = pipeline_token_ingress
+                .ok_or_else(|| "pipeline mode requires edge ingress".to_owned())?;
+            Some(PipelinePromptRuntime::new(
+                driver.tokio_handle(),
+                endpoint,
+                pipeline_plan.expect("pipeline mode requires plan"),
+                prompt_endpoint,
+                ingress,
+                tokenizer_encode_actor,
+                tokenizer_decode_actor,
+                tokenizer_reply_to,
+            )?)
+        }
+        PromptRuntimeMode::DirectInferPrompt => None,
+    };
     let mut active: Option<ActivePrompt> = None;
     loop {
-        pump(driver, stack);
+        pump(driver, stack, frame_tx);
+        if let Some(pipeline) = pipeline_runtime.as_mut() {
+            pipeline.poll_driver(driver);
+            pipeline.drain_tokenizer_events(
+                &stack.runtime,
+                tokenizer_events,
+                dashboard,
+                orch_datastream,
+                run_id,
+                node_id,
+            )?;
+            pipeline.drain_tokens(&stack.runtime, dashboard, orch_datastream, run_id, node_id)?;
+        }
         drain_observations(obs_rx, dashboard, orch_datastream, provider)?;
         drain_frames(frame_rx, dashboard, orch_datastream);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
@@ -2540,6 +4489,9 @@ fn serve_prompts(
         }
 
         if active.is_none()
+            && pipeline_runtime
+                .as_ref()
+                .is_none_or(|pipeline| !pipeline.is_active())
             && let Ok(work) = work_rx.try_recv()
         {
             let request = work.request;
@@ -2556,6 +4508,18 @@ fn serve_prompts(
                     "max_tokens":request.max_tokens,
                 }),
             );
+            if let Some(pipeline) = pipeline_runtime.as_mut() {
+                pipeline.start_prompt(
+                    request,
+                    work.events,
+                    &stack.runtime,
+                    dashboard,
+                    orch_datastream,
+                    run_id,
+                    node_id,
+                )?;
+                continue;
+            }
             orch_datastream.emit_prompt(
                 dashboard,
                 run_id,
@@ -2807,7 +4771,7 @@ fn emit_plugin_observation(
             channel, payload, ..
         } => orch_datastream.emit_bytes_from(
             dashboard,
-            ChannelId::new(channel),
+            channel,
             payload.as_bytes().to_vec(),
             "node_bootstrap_stdio",
         ),
@@ -2843,35 +4807,72 @@ fn emit_plugin_observation(
 }
 
 fn drain_frames(
-    frame_rx: &mpsc::Receiver<(StreamId, Frame)>,
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
 ) {
-    while let Ok((stream, frame)) = frame_rx.try_recv() {
-        ingest_dashboard_frame(dashboard, &stream, &frame);
-        orch_datastream.archive_frame("node_cluster", &stream, &frame);
+    while let Ok(collected) = frame_rx.try_recv() {
+        ingest_dashboard_frame(
+            dashboard,
+            &collected.stream,
+            &collected.channel_name,
+            &collected.frame,
+        );
+        orch_datastream.archive_frame(
+            "node_cluster",
+            &collected.stream,
+            &collected.channel_name,
+            &collected.frame,
+        );
     }
 }
 
-fn ingest_dashboard_frame(dashboard: Option<&DashboardSupport>, stream: &StreamId, frame: &Frame) {
+fn ingest_dashboard_frame(
+    dashboard: Option<&DashboardSupport>,
+    stream: &StreamId,
+    channel: &str,
+    frame: &Frame,
+) {
     if let Some(dashboard) = dashboard {
-        dashboard.ingest(stream, frame);
+        dashboard.publish_frame(stream, channel, frame);
     }
 }
 
-fn pump(driver: &mut IrohDriver, stack: &DistributionRuntimeStack) {
+fn emit_swim_transitions(
+    orch_datastream: &mut OrchDatastream,
+    dashboard: Option<&DashboardSupport>,
+    run_id: u64,
+    node_id: u64,
+    stack: &DistributionRuntimeStack,
+) {
+    for transition in stack.drain_swim_transitions() {
+        orch_datastream.emit_bootstrap_to_channel(
+            dashboard,
+            MVP_SWIM_MEMBERSHIP,
+            run_id,
+            node_id,
+            "membership_transition",
+            "observed",
+            json!({
+                "peer":format!("{:?}", transition.peer),
+                "from":transition.from.map(|state| format!("{:?}", state)),
+                "to":format!("{:?}", transition.to),
+                "reason":transition.reason,
+            }),
+        );
+    }
+}
+
+fn pump(
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+) {
     stack.tick_protocol_actors(Instant::now());
     driver.pump_inbound_to_actors();
     stack.pump_runtime_once();
     driver.drain_outbox(&stack.outbox);
-}
-
-fn json_type_is(payload: &str, expected: &str) -> bool {
-    serde_json::from_str::<Value>(payload)
-        .ok()
-        .and_then(|value| value.get("type").and_then(Value::as_str).map(str::to_owned))
-        .as_deref()
-        == Some(expected)
+    drain_datastream_connections(driver, frame_tx);
 }
 
 fn env_optional(name: &str) -> Option<String> {
@@ -2888,6 +4889,41 @@ fn docker_container_prefix() -> String {
 
 fn optional_env(name: &str) -> Option<(String, String)> {
     env_optional(name).map(|value| (name.to_owned(), value))
+}
+
+fn local_tinygrad_worker_env(provider: ProviderKind) -> Option<(String, String)> {
+    optional_env("MVP_TINYGRAD_WORKER").or_else(|| {
+        if provider != ProviderKind::Process {
+            return None;
+        }
+        default_local_tinygrad_worker_path().map(|path| {
+            (
+                "MVP_TINYGRAD_WORKER".to_owned(),
+                path.to_string_lossy().to_string(),
+            )
+        })
+    })
+}
+
+fn default_local_tinygrad_worker_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("apps").join("mvp-node").join("tinygrad_worker.py"));
+    }
+    candidates.push(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("apps")
+            .join("mvp-node")
+            .join("tinygrad_worker.py"),
+    );
+    for candidate in candidates {
+        if candidate.is_file() {
+            return Some(candidate.canonicalize().unwrap_or(candidate));
+        }
+    }
+    None
 }
 
 fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
@@ -3099,9 +5135,11 @@ mod tests {
         "MVP_PROMPT_RPC_BIND",
         "MVP_RUN_ID",
         "MVP_RUNTIME_CONFIG",
+        "MVP_PIPELINE_STAGES",
         "MVP_STAGE_INDEX",
         "MVP_TOKEN_PROGRESS_EVERY",
         "MVP_TINYGRAD_TEST_MODE",
+        "MVP_TINYGRAD_WORKER",
         "MVP_TOKENIZER_LOCAL_PATH",
         "MVP_VASTAI_API_KEY",
         "MVP_VASTAI_BOOTSTRAP_COMMAND",
@@ -3120,6 +5158,7 @@ mod tests {
         "VASTAI_API_KEY",
         SWACTOR_IROH_RELAY_URL_ENV,
         MVP_DOCKER_CONTAINER_PREFIX_ENV,
+        MVP_WORKER_BIN_ENV,
     ];
 
     struct RestoreEnv {
@@ -3186,10 +5225,9 @@ mod tests {
             let config = Config::from_layers_with_path_and_args(None, std::iter::empty::<String>())
                 .expect("config parses");
             let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[9; 32]).public());
-            let datastream_sink = ActorAddress([11; 32]);
             let orchestrator_actor = ActorAddress([12; 32]);
             config
-                .node_spec(coordinator, datastream_sink, orchestrator_actor)
+                .node_spec(coordinator, orchestrator_actor)
                 .expect("node spec builds")
                 .env
         })
@@ -3201,14 +5239,758 @@ mod tests {
             .map(|(_, value)| value.as_str())
     }
 
+    fn cached_model_config_with_args(model: &TempModelFile, args: &[&str]) -> Config {
+        with_clean_env_os(
+            &[
+                ("MVP_RUNTIME_CONFIG", OsString::from("local")),
+                ("MVP_NODE_PROVIDER", OsString::from("docker")),
+                (CACHED_MODEL_HOST_ENV, model.raw_path.as_os_str().to_owned()),
+            ],
+            || {
+                Config::from_layers_with_path_and_args(
+                    None,
+                    args.iter().copied().map(str::to_owned),
+                )
+                .expect("cached-model config parses")
+            },
+        )
+    }
+
+    fn pipeline_config_with_cached_model(model: &TempModelFile, pipeline_stages: u32) -> Config {
+        let stages_arg = pipeline_stages.to_string();
+        cached_model_config_with_args(
+            model,
+            &[
+                "--pipeline-stages",
+                stages_arg.as_str(),
+                "--max-context",
+                "512",
+            ],
+        )
+    }
+
+    fn expected_layer_ranges(num_layers: u32, stage_count: u32) -> Vec<(u32, u32)> {
+        (0..stage_count)
+            .map(|stage_index| {
+                let start = (u64::from(num_layers) * u64::from(stage_index)
+                    / u64::from(stage_count)) as u32;
+                let end = (u64::from(num_layers) * u64::from(stage_index + 1)
+                    / u64::from(stage_count)) as u32;
+                (start, end)
+            })
+            .collect()
+    }
+    #[test]
+    fn pipeline_weight_load_scheduler_keeps_one_active_stage() {
+        let model = TempModelFile::with_metadata(
+            "seven-stage-scheduler.gguf",
+            TestGgufMetadata {
+                num_layers: 30,
+                ..TestGgufMetadata::default()
+            },
+        );
+        let config = pipeline_config_with_cached_model(&model, 7);
+        let plan = config.build_run_plan().expect("seven-stage plan builds");
+        let mut loaded = BTreeSet::new();
+
+        let first =
+            next_pipeline_weight_load_stage(&plan, &loaded, None).expect("first stage selected");
+        assert_eq!(first.stage_index, 0);
+
+        let resent = next_pipeline_weight_load_stage(&plan, &loaded, Some(first.stage_index))
+            .expect("active stage is resent before it loads");
+        assert_eq!(resent.stage_index, 0);
+
+        for expected_stage in 0..7 {
+            let active = next_pipeline_weight_load_stage(&plan, &loaded, None)
+                .expect("next unloaded stage selected");
+            assert_eq!(active.stage_index, expected_stage);
+            loaded.insert(expected_stage);
+        }
+
+        assert!(
+            next_pipeline_weight_load_stage(&plan, &loaded, None).is_none(),
+            "all stages loaded should leave no active load"
+        );
+    }
+
+    fn assert_plan_matches_metadata(
+        config: &Config,
+        plan: &run_plan::RunPlan,
+        metadata: TestGgufMetadata,
+        stage_count: u32,
+        requested_context: u64,
+    ) {
+        assert_eq!(plan.run_id, run_plan::RunId(config.run_id));
+        assert_eq!(plan.model.model_id, config.model_id);
+        assert_eq!(plan.model.gguf_source, config.gguf_source);
+        assert_eq!(plan.model.num_layers, metadata.num_layers);
+        assert_eq!(plan.model.hidden_dim, metadata.hidden_dim as u32);
+        assert_eq!(
+            plan.model.max_seq_len,
+            requested_context.min(metadata.context_length) as u32
+        );
+        assert_eq!(plan.model.eos_token_id, metadata.eos_token_id);
+        assert_eq!(plan.stages.len(), stage_count as usize);
+        assert_eq!(plan.edges.len(), stage_count as usize + 1);
+        assert_eq!(plan.max_tokens, config.default_max_tokens);
+
+        let mut stages = plan.stages.clone();
+        stages.sort_by_key(|stage| stage.stage_index);
+        let expected_ranges = expected_layer_ranges(metadata.num_layers, stage_count);
+        for (stage, expected_range) in stages.iter().zip(expected_ranges) {
+            assert_eq!(stage.stage_count, stage_count);
+            assert_eq!(
+                stage.node_id,
+                run_plan::NodeId(config.node_id + 1 + u64::from(stage.stage_index))
+            );
+            assert_eq!(
+                (stage.layer_start, stage.layer_end_exclusive),
+                expected_range
+            );
+            assert!(
+                stage.layer_start < stage.layer_end_exclusive,
+                "stage {} must have a non-empty layer range",
+                stage.stage_index
+            );
+        }
+    }
+
+    fn token_object_spec(max_extent: u64, alignment: u32) -> run_plan::ObjectSpec {
+        run_plan::ObjectSpec {
+            kind: run_plan::ObjectKind::Token,
+            max_extent,
+            dtype_family: run_plan::DTypeFamily::BFloat,
+            dtype_width_bytes: 4,
+            shape: run_plan::ShapeRule::TokenIds,
+            layout: run_plan::LayoutRule::Contiguous,
+            alignment,
+            sequence_policy: run_plan::SequencePolicy::Ordered,
+        }
+    }
+
+    fn decode_token_record_payload(
+        bytes: &[u8],
+        spec: run_plan::ObjectSpec,
+    ) -> (u64, Vec<u32>, bool) {
+        let read = ingress::read_object_record(bytes, ingress_object_spec_from_plan(spec), false)
+            .expect("token record should be valid");
+        let ingress::ObjectRecordRead::Complete(record) = read else {
+            panic!("token record should be complete");
+        };
+        let payload = record.payload(bytes).expect("token payload is present");
+        let tokens = payload
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(payload.chunks_exact(4).remainder().is_empty());
+        (record.sequence, tokens, record.flags.end_of_sequence)
+    }
+
+    struct PipelineRuntimeTestFixture {
+        actor_runtime: Arc<swactor::runtime::Runtime>,
+        tokenizer_events: swactor::runtime::Inbox<TokenizerEvent>,
+        encode_requests: swactor::runtime::Inbox<NodeAgentMsg>,
+        decode_requests: swactor::runtime::Inbox<NodeAgentMsg>,
+        runtime: PipelinePromptRuntime,
+        token_in_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+    }
+
+    fn pipeline_runtime_fixture() -> PipelineRuntimeTestFixture {
+        let spec = token_object_spec(64, 64);
+        let (token_in_tx, token_in_rx) = tokio_mpsc::unbounded_channel();
+        let (recv_tx, recv_rx) = mpsc::channel();
+        pipeline_runtime_fixture_from_specs(
+            11,
+            12,
+            spec,
+            spec,
+            token_in_tx,
+            token_in_rx,
+            recv_tx,
+            recv_rx,
+        )
+    }
+
+    fn pipeline_runtime_fixture_from_plan(stage_count: u32) -> PipelineRuntimeTestFixture {
+        let model = TempModelFile::new(&format!("prompt-plan-{stage_count}.gguf"));
+        let config = pipeline_config_with_cached_model(&model, stage_count);
+        let plan = config.build_run_plan().expect("prompt runtime plan builds");
+        let token_in = plan
+            .edges
+            .iter()
+            .find(|edge| edge.kind == run_plan::EdgeKind::TokenIn)
+            .expect("token-in edge");
+        let token_out = plan
+            .edges
+            .iter()
+            .find(|edge| edge.kind == run_plan::EdgeKind::TokenOut)
+            .expect("token-out edge");
+        let (token_in_tx, token_in_rx) = tokio_mpsc::unbounded_channel();
+        let (recv_tx, recv_rx) = mpsc::channel();
+        pipeline_runtime_fixture_from_specs(
+            token_in.edge_id.0,
+            token_out.edge_id.0,
+            token_in.object_spec,
+            token_out.object_spec,
+            token_in_tx,
+            token_in_rx,
+            recv_tx,
+            recv_rx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pipeline_runtime_fixture_from_specs(
+        token_in_edge_id: u64,
+        token_out_edge_id: u64,
+        token_spec: run_plan::ObjectSpec,
+        token_out_spec: run_plan::ObjectSpec,
+        token_in_tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+        token_in_rx: tokio_mpsc::UnboundedReceiver<Vec<u8>>,
+        recv_tx: mpsc::Sender<Vec<u8>>,
+        recv_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> PipelineRuntimeTestFixture {
+        let actor_runtime = Arc::new(swactor::runtime::Runtime::new(
+            swactor::config::RuntimeConfig::default(),
+        ));
+        let encode_requests = actor_runtime
+            .new_inbox::<NodeAgentMsg>()
+            .expect("encode request inbox");
+        let decode_requests = actor_runtime
+            .new_inbox::<NodeAgentMsg>()
+            .expect("decode request inbox");
+        let tokenizer_events = actor_runtime
+            .new_inbox::<TokenizerEvent>()
+            .expect("tokenizer event inbox");
+        PipelineRuntimeTestFixture {
+            runtime: PipelinePromptRuntime {
+                token_in_edge_id,
+                token_out_edge_id,
+                token_spec,
+                token_out_spec,
+                token_in_sender: PipelineSendHandle { tx: token_in_tx },
+                recv_rx,
+                recv_tx,
+                recv_buffer: Vec::new(),
+                tokenizer_encode_actor: *encode_requests.addr(),
+                tokenizer_decode_actor: *decode_requests.addr(),
+                tokenizer_reply_to: *tokenizer_events.addr(),
+                pending_encode: None,
+                pending_decode: None,
+                next_sequence: 0,
+                generated_tokens: Vec::new(),
+                final_text: String::new(),
+                active: None,
+                started_at: None,
+            },
+            actor_runtime,
+            tokenizer_events,
+            encode_requests,
+            decode_requests,
+            token_in_rx,
+        }
+    }
+
+    fn start_fixture_prompt(
+        fixture: &mut PipelineRuntimeTestFixture,
+        request: SubmitPrompt,
+        events: mpsc::Sender<PromptEvent>,
+        datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) {
+        fixture
+            .runtime
+            .start_prompt(
+                request,
+                events,
+                &fixture.actor_runtime,
+                None,
+                datastream,
+                run_id,
+                node_id,
+            )
+            .expect("pipeline prompt starts");
+    }
+
+    fn drain_fixture_tokenizer(
+        fixture: &mut PipelineRuntimeTestFixture,
+        datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) {
+        fixture
+            .runtime
+            .drain_tokenizer_events(
+                &fixture.actor_runtime,
+                &fixture.tokenizer_events,
+                None,
+                datastream,
+                run_id,
+                node_id,
+            )
+            .expect("tokenizer events drain");
+    }
+
+    fn send_encoded_tokens(
+        fixture: &PipelineRuntimeTestFixture,
+        request_id: u64,
+        tokens: Vec<u32>,
+    ) {
+        fixture
+            .actor_runtime
+            .send_to(
+                *fixture.tokenizer_events.addr(),
+                TokenizerEvent::PromptEncoded { request_id, tokens },
+            )
+            .expect("send encoded tokens");
+    }
+
+    fn send_decoded_text(fixture: &PipelineRuntimeTestFixture, request_id: u64, text: &str) {
+        fixture
+            .actor_runtime
+            .send_to(
+                *fixture.tokenizer_events.addr(),
+                TokenizerEvent::TokensDecoded {
+                    request_id,
+                    text: text.to_owned(),
+                },
+            )
+            .expect("send decoded text");
+    }
+
+    fn assert_encode_request(fixture: &PipelineRuntimeTestFixture, request_id: u64, prompt: &str) {
+        match fixture.encode_requests.try_recv() {
+            Some(NodeAgentMsg::EncodePrompt {
+                request_id: actual_request_id,
+                prompt: actual_prompt,
+                reply_to,
+            }) => {
+                assert_eq!(actual_request_id, request_id);
+                assert_eq!(actual_prompt, prompt);
+                assert_eq!(reply_to, *fixture.tokenizer_events.addr());
+            }
+            other => panic!("expected EncodePrompt request, got {other:?}"),
+        }
+    }
+
+    fn assert_decode_request(fixture: &PipelineRuntimeTestFixture, request_id: u64, token: u32) {
+        match fixture.decode_requests.try_recv() {
+            Some(NodeAgentMsg::DecodeTokens {
+                request_id: actual_request_id,
+                tokens,
+                reply_to,
+            }) => {
+                assert_eq!(actual_request_id, request_id);
+                assert_eq!(tokens, vec![token]);
+                assert_eq!(reply_to, *fixture.tokenizer_events.addr());
+            }
+            other => panic!("expected DecodeTokens request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_prompt_token_record_round_trips_one_token_with_eos_and_plan_ring_alignment() {
+        let spec = token_object_spec(64, 64);
+        let bytes = encode_token_record(spec, 12, 7, &[513], true).expect("token record encodes");
+        assert_eq!(&bytes[0..4], b"MO01");
+
+        let mut partial = bytes[..run_plan::MO01_HEADER_BYTES as usize + 2].to_vec();
+        assert!(
+            take_pipeline_token_record(&mut partial, spec)
+                .expect("partial token record is not malformed")
+                .is_none()
+        );
+        assert_eq!(partial.len(), run_plan::MO01_HEADER_BYTES as usize + 2);
+
+        let mut buffer = bytes;
+        let record = take_pipeline_token_record(&mut buffer, spec)
+            .expect("one-u32 token-out payload should parse despite ring alignment")
+            .expect("complete token-out record is available");
+
+        assert_eq!(record.object_id, 9007);
+        assert_eq!(record.sequence, 7);
+        assert_eq!(record.token_id, 513);
+        assert!(record.eos);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn plan_derived_mo01_specs_accept_token_and_activation_record_extents() {
+        let metadata = TestGgufMetadata {
+            num_layers: 7,
+            hidden_dim: 13,
+            context_length: 64,
+            eos_token_id: 11,
+        };
+        let model = TempModelFile::with_metadata("plan-mo01.gguf", metadata);
+        let config = pipeline_config_with_cached_model(&model, 3);
+        let plan = config
+            .build_run_plan()
+            .expect("plan-derived MO01 plan builds");
+        let token_in = plan
+            .edges
+            .iter()
+            .find(|edge| edge.kind == run_plan::EdgeKind::TokenIn)
+            .expect("token-in edge");
+        let activation = plan
+            .edges
+            .iter()
+            .find(|edge| edge.kind == run_plan::EdgeKind::Activation)
+            .expect("activation edge");
+
+        let token_record = encode_token_record(
+            token_in.object_spec,
+            token_in.edge_id.0,
+            0,
+            &[65, 195, 169],
+            false,
+        )
+        .expect("plan token record encodes");
+        assert_eq!(
+            decode_token_record_payload(&token_record, token_in.object_spec),
+            (0, vec![65, 195, 169], false)
+        );
+
+        let activation_payload = vec![
+            0_u8;
+            usize::try_from(metadata.hidden_dim * 2)
+                .expect("activation payload size fits usize")
+        ];
+        let activation_record = ingress::ObjectRecordBuilder::new(ingress_object_spec_from_plan(
+            activation.object_spec,
+        ))
+        .object_id(ingress::ObjectId(9100))
+        .sequence(0)
+        .payload(activation_payload)
+        .encode();
+        let read = ingress::read_object_record(
+            &activation_record,
+            ingress_object_spec_from_plan(activation.object_spec),
+            false,
+        )
+        .expect("plan activation record parses");
+        let ingress::ObjectRecordRead::Complete(record) = read else {
+            panic!("activation record should be complete");
+        };
+        assert_eq!(record.payload(&activation_record).unwrap().len(), 26);
+    }
+
+    #[test]
+    fn pipeline_prompt_token_out_parser_rejects_payloads_that_are_not_one_u32() {
+        let spec = token_object_spec(64, 64);
+        let mut buffer =
+            encode_token_record(spec, 12, 0, &[65, 66], false).expect("multi-token record encodes");
+
+        let error = take_pipeline_token_record(&mut buffer, spec)
+            .expect_err("token-out records must carry exactly one generated token");
+
+        assert!(
+            error.contains("token-out payload must be exactly one u32, got 8"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn pipeline_prompt_runtime_uses_tokenizer_events_for_encode_decode_and_continuations() {
+        let mut fixture = pipeline_runtime_fixture();
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut datastream = OrchDatastream::new(91, None).expect("datastream opens");
+        start_fixture_prompt(
+            &mut fixture,
+            SubmitPrompt {
+                request_id: 42,
+                prompt_text: "Hi".to_owned(),
+                max_tokens: 2,
+            },
+            event_tx,
+            &mut datastream,
+            91,
+            3,
+        );
+        assert_encode_request(&fixture, 42, "Hi");
+        send_encoded_tokens(&fixture, 42, vec![1001, 1002]);
+        drain_fixture_tokenizer(&mut fixture, &mut datastream, 91, 3);
+
+        let initial = fixture
+            .token_in_rx
+            .try_recv()
+            .expect("tokenizer tokens are sent to token-in");
+        assert_eq!(
+            decode_token_record_payload(&initial, fixture.runtime.token_spec),
+            (0, vec![1001, 1002], false)
+        );
+        assert!(fixture.token_in_rx.try_recv().is_err());
+
+        fixture
+            .runtime
+            .recv_tx
+            .send(
+                encode_token_record(
+                    fixture.runtime.token_out_spec,
+                    fixture.runtime.token_out_edge_id,
+                    0,
+                    &[79],
+                    false,
+                )
+                .expect("first token-out record encodes"),
+            )
+            .expect("token-out bytes enqueue");
+        fixture
+            .runtime
+            .drain_tokens(&fixture.actor_runtime, None, &mut datastream, 91, 3)
+            .expect("first token drains");
+        assert_decode_request(&fixture, 42, 79);
+        assert!(event_rx.try_recv().is_err());
+
+        send_decoded_text(&fixture, 42, "O");
+        drain_fixture_tokenizer(&mut fixture, &mut datastream, 91, 3);
+        assert_eq!(
+            event_rx.try_recv().expect("first delta event"),
+            PromptEvent::TextDelta {
+                request_id: 42,
+                text: "O".to_owned(),
+            }
+        );
+        let continuation = fixture
+            .token_in_rx
+            .try_recv()
+            .expect("non-terminal token is fed back to token-in");
+        assert_eq!(
+            decode_token_record_payload(&continuation, fixture.runtime.token_spec),
+            (1, vec![79], false)
+        );
+
+        fixture
+            .runtime
+            .recv_tx
+            .send(
+                encode_token_record(
+                    fixture.runtime.token_out_spec,
+                    fixture.runtime.token_out_edge_id,
+                    1,
+                    &[75],
+                    false,
+                )
+                .expect("second token-out record encodes"),
+            )
+            .expect("token-out bytes enqueue");
+        fixture
+            .runtime
+            .drain_tokens(&fixture.actor_runtime, None, &mut datastream, 91, 3)
+            .expect("second token drains");
+        assert_decode_request(&fixture, 42, 75);
+
+        send_decoded_text(&fixture, 42, "K");
+        drain_fixture_tokenizer(&mut fixture, &mut datastream, 91, 3);
+        assert_eq!(
+            event_rx.try_recv().expect("second delta event"),
+            PromptEvent::TextDelta {
+                request_id: 42,
+                text: "K".to_owned(),
+            }
+        );
+        match event_rx.try_recv().expect("done event at max tokens") {
+            PromptEvent::Done {
+                request_id,
+                final_text,
+                tokens_generated,
+                ..
+            } => {
+                assert_eq!(request_id, 42);
+                assert_eq!(final_text, "OK");
+                assert_eq!(tokens_generated, 2);
+            }
+            event => panic!("expected Done at max tokens, got {event:?}"),
+        }
+        assert!(event_rx.try_recv().is_err());
+        assert!(fixture.token_in_rx.try_recv().is_err());
+        assert!(!fixture.runtime.is_active());
+    }
+
+    #[test]
+    fn prompt_runtime_uses_plan_derived_token_edges_for_cached_n_one() {
+        let mut fixture = pipeline_runtime_fixture_from_plan(1);
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut datastream = OrchDatastream::new(93, None).expect("datastream opens");
+        start_fixture_prompt(
+            &mut fixture,
+            SubmitPrompt {
+                request_id: 88,
+                prompt_text: "Aé".to_owned(),
+                max_tokens: 1,
+            },
+            event_tx,
+            &mut datastream,
+            93,
+            3,
+        );
+        assert_encode_request(&fixture, 88, "Aé");
+        send_encoded_tokens(&fixture, 88, vec![321, 654]);
+        drain_fixture_tokenizer(&mut fixture, &mut datastream, 93, 3);
+
+        let initial = fixture
+            .token_in_rx
+            .try_recv()
+            .expect("plan-derived token-in record is emitted");
+        assert_eq!(
+            decode_token_record_payload(&initial, fixture.runtime.token_spec),
+            (0, vec![321, 654], false)
+        );
+        assert_eq!(fixture.runtime.token_in_edge_id, 1);
+        assert_eq!(fixture.runtime.token_out_edge_id, 2);
+
+        fixture
+            .runtime
+            .recv_tx
+            .send(
+                encode_token_record(
+                    fixture.runtime.token_out_spec,
+                    fixture.runtime.token_out_edge_id,
+                    0,
+                    &[33],
+                    false,
+                )
+                .expect("plan-derived token-out record encodes"),
+            )
+            .expect("token-out bytes enqueue");
+        fixture
+            .runtime
+            .drain_tokens(&fixture.actor_runtime, None, &mut datastream, 93, 3)
+            .expect("plan-derived token drains");
+        assert_decode_request(&fixture, 88, 33);
+        send_decoded_text(&fixture, 88, "!");
+        drain_fixture_tokenizer(&mut fixture, &mut datastream, 93, 3);
+
+        assert_eq!(
+            event_rx.try_recv().expect("delta event"),
+            PromptEvent::TextDelta {
+                request_id: 88,
+                text: "!".to_owned(),
+            }
+        );
+        match event_rx.try_recv().expect("done event at max tokens") {
+            PromptEvent::Done {
+                request_id,
+                final_text,
+                tokens_generated,
+                ..
+            } => {
+                assert_eq!(request_id, 88);
+                assert_eq!(final_text, "!");
+                assert_eq!(tokens_generated, 1);
+            }
+            event => panic!("expected Done at max tokens, got {event:?}"),
+        }
+        assert!(fixture.token_in_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pipeline_prompt_runtime_finishes_on_eos_without_feedback_token() {
+        let mut fixture = pipeline_runtime_fixture();
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut datastream = OrchDatastream::new(92, None).expect("datastream opens");
+        start_fixture_prompt(
+            &mut fixture,
+            SubmitPrompt {
+                request_id: 77,
+                prompt_text: "go".to_owned(),
+                max_tokens: 8,
+            },
+            event_tx,
+            &mut datastream,
+            92,
+            4,
+        );
+        assert_encode_request(&fixture, 77, "go");
+        send_encoded_tokens(&fixture, 77, vec![700]);
+        drain_fixture_tokenizer(&mut fixture, &mut datastream, 92, 4);
+        fixture
+            .token_in_rx
+            .try_recv()
+            .expect("initial prompt token-in record is sent");
+
+        fixture
+            .runtime
+            .recv_tx
+            .send(
+                encode_token_record(
+                    fixture.runtime.token_out_spec,
+                    fixture.runtime.token_out_edge_id,
+                    0,
+                    &[33],
+                    true,
+                )
+                .expect("eos token-out record encodes"),
+            )
+            .expect("token-out bytes enqueue");
+        fixture
+            .runtime
+            .drain_tokens(&fixture.actor_runtime, None, &mut datastream, 92, 4)
+            .expect("eos token drains");
+        assert_decode_request(&fixture, 77, 33);
+        send_decoded_text(&fixture, 77, "!");
+        drain_fixture_tokenizer(&mut fixture, &mut datastream, 92, 4);
+
+        assert_eq!(
+            event_rx.try_recv().expect("delta event before eos done"),
+            PromptEvent::TextDelta {
+                request_id: 77,
+                text: "!".to_owned(),
+            }
+        );
+        match event_rx.try_recv().expect("done event on eos") {
+            PromptEvent::Done {
+                request_id,
+                final_text,
+                tokens_generated,
+                ..
+            } => {
+                assert_eq!(request_id, 77);
+                assert_eq!(final_text, "!");
+                assert_eq!(tokens_generated, 1);
+            }
+            event => panic!("expected Done on eos, got {event:?}"),
+        }
+        assert!(event_rx.try_recv().is_err());
+        assert!(fixture.token_in_rx.try_recv().is_err());
+        assert!(!fixture.runtime.is_active());
+    }
+
+    #[test]
+    fn planned_prompt_runtime_uses_pipeline_edges_for_single_or_multi_stage_cached_models() {
+        assert_eq!(
+            prompt_runtime_mode(None),
+            PromptRuntimeMode::DirectInferPrompt
+        );
+
+        for stage_count in [1_u32, 3] {
+            let model = TempModelFile::new(&format!("prompt-runtime-{stage_count}.gguf"));
+            let config = pipeline_config_with_cached_model(&model, stage_count);
+            let plan = config
+                .build_run_plan()
+                .expect("cached-model planned prompt runtime plan builds");
+
+            assert_eq!(
+                prompt_runtime_mode(Some(&plan)),
+                PromptRuntimeMode::PipelineTokenEdges,
+                "cached-model N={stage_count} must use the planned token-edge runtime"
+            );
+        }
+    }
+
     #[test]
     fn docker_container_prefix_defaults_and_trims_env_override() {
         with_clean_env(&[], || {
             assert_eq!(docker_container_prefix(), DEFAULT_DOCKER_CONTAINER_PREFIX);
         });
-        with_clean_env(&[(MVP_DOCKER_CONTAINER_PREFIX_ENV, " custom-prefix ")], || {
-            assert_eq!(docker_container_prefix(), "custom-prefix");
-        });
+        with_clean_env(
+            &[(MVP_DOCKER_CONTAINER_PREFIX_ENV, " custom-prefix ")],
+            || {
+                assert_eq!(docker_container_prefix(), "custom-prefix");
+            },
+        );
     }
 
     #[test]
@@ -3266,14 +6048,38 @@ mod tests {
         assert_eq!(vastai.ssh_public_fingerprint, None);
     }
 
+    #[derive(Clone, Copy)]
+    struct TestGgufMetadata {
+        num_layers: u32,
+        hidden_dim: u64,
+        context_length: u64,
+        eos_token_id: u32,
+    }
+
+    impl Default for TestGgufMetadata {
+        fn default() -> Self {
+            Self {
+                num_layers: 7,
+                hidden_dim: 13,
+                context_length: 64,
+                eos_token_id: 11,
+            }
+        }
+    }
+
     struct TempModelFile {
         root: PathBuf,
         raw_path: PathBuf,
         canonical_path: PathBuf,
+        metadata: TestGgufMetadata,
     }
 
     impl TempModelFile {
         fn new(file_name: &str) -> Self {
+            Self::with_metadata(file_name, TestGgufMetadata::default())
+        }
+
+        fn with_metadata(file_name: &str, metadata: TestGgufMetadata) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "mvp-cached-model-test-{}-{}",
                 std::process::id(),
@@ -3282,7 +6088,8 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(root.join("nested")).expect("create temp model dir");
             let canonical_path = root.join(file_name);
-            std::fs::write(&canonical_path, b"fake gguf bytes").expect("write temp model file");
+            std::fs::write(&canonical_path, minimal_gguf(metadata))
+                .expect("write temp GGUF metadata file");
             let raw_path = root.join("nested").join("..").join(file_name);
             Self {
                 root,
@@ -3290,8 +6097,59 @@ mod tests {
                 canonical_path: canonical_path
                     .canonicalize()
                     .expect("canonicalize temp model file"),
+                metadata,
             }
         }
+    }
+
+    fn minimal_gguf(metadata: TestGgufMetadata) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&6_u64.to_le_bytes());
+        push_string_kv(&mut bytes, "general.architecture", "llama");
+        push_string_kv(&mut bytes, "general.name", "fixture");
+        push_u32_kv(&mut bytes, "llama.block_count", metadata.num_layers);
+        push_u32_kv(
+            &mut bytes,
+            "llama.embedding_length",
+            metadata
+                .hidden_dim
+                .try_into()
+                .expect("test hidden dimension fits u32"),
+        );
+        push_u32_kv(
+            &mut bytes,
+            "llama.context_length",
+            metadata
+                .context_length
+                .try_into()
+                .expect("test context length fits u32"),
+        );
+        push_u32_kv(
+            &mut bytes,
+            "tokenizer.ggml.eos_token_id",
+            metadata.eos_token_id,
+        );
+        bytes
+    }
+
+    fn push_string_kv(bytes: &mut Vec<u8>, key: &str, value: &str) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&8_u32.to_le_bytes());
+        push_gguf_string(bytes, value);
+    }
+
+    fn push_u32_kv(bytes: &mut Vec<u8>, key: &str, value: u32) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
     }
 
     impl Drop for TempModelFile {
@@ -3339,8 +6197,9 @@ mod tests {
         archive.record(
             "orchestrator",
             &stream,
+            "stdout",
             &Frame::new(
-                "stdout",
+                ChannelId(1),
                 datastream::Position(7),
                 b"hello \xce\xbb".to_vec(),
             ),
@@ -3348,7 +6207,12 @@ mod tests {
         archive.record(
             "orchestrator",
             &stream,
-            &Frame::new("stderr", datastream::Position(8), vec![0xff, 0x00, b'A']),
+            "stderr",
+            &Frame::new(
+                ChannelId(2),
+                datastream::Position(8),
+                vec![0xff, 0x00, b'A'],
+            ),
         );
         drop(archive);
 
@@ -3367,6 +6231,7 @@ mod tests {
                     "source":"orchestrator",
                     "stream":"test-node#42",
                     "channel":"stdout",
+                    "channel_id":1,
                     "position":7,
                     "payload":{"encoding":"utf8","value":"hello λ"},
                 }),
@@ -3375,6 +6240,7 @@ mod tests {
                     "source":"orchestrator",
                     "stream":"test-node#42",
                     "channel":"stderr",
+                    "channel_id":2,
                     "position":8,
                     "payload":{"encoding":"bytes","value":[255,0,65]},
                 }),
@@ -3525,11 +6391,317 @@ mode = "disabled"
         assert_eq!(config.run_id, 41);
         assert_eq!(config.node_id, 9);
         assert_eq!(config.stage_index, 3);
-        assert_eq!(config.layer_end_exclusive, 24);
+        assert_eq!(config.layer_end_exclusive, Some(24));
         assert!(config.dashboard);
         assert_eq!(config.max_context, Some(768));
         assert!(matches!(config.relay.mode, iroh::RelayMode::Default));
         assert!(config.vastai.is_none());
+    }
+
+    #[test]
+    fn pipeline_stages_layers_toml_env_then_cli_aliases() {
+        let toml = TempTomlFile::new(
+            "pipeline-stages.toml",
+            r#"
+[runtime]
+pipeline_stages = 2
+
+[provider]
+kind = "docker"
+"#,
+        );
+
+        for (case, settings, args, expected) in [
+            ("toml", vec![], vec![], 2),
+            (
+                "env-over-toml",
+                vec![("MVP_PIPELINE_STAGES", "3")],
+                vec![],
+                3,
+            ),
+            (
+                "long-cli-over-env",
+                vec![("MVP_PIPELINE_STAGES", "3")],
+                vec!["--pipeline-stages", "4"],
+                4,
+            ),
+            (
+                "short-cli-over-env",
+                vec![("MVP_PIPELINE_STAGES", "3")],
+                vec!["-N", "5"],
+                5,
+            ),
+        ] {
+            let config = with_clean_env(&settings, || {
+                Config::from_layers_with_path_and_args(
+                    Some(&toml.path),
+                    args.iter().copied().map(str::to_owned),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{case} pipeline stage config should parse: {error}")
+                })
+            });
+
+            assert_eq!(config.pipeline_stages, expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn pipeline_stages_rejects_zero_missing_and_non_numeric_values() {
+        for (case, settings, args, expected) in [
+            (
+                "env-zero",
+                vec![("MVP_PIPELINE_STAGES", "0")],
+                vec![],
+                "--pipeline-stages must be greater than 0",
+            ),
+            (
+                "env-non-numeric",
+                vec![("MVP_PIPELINE_STAGES", "many")],
+                vec![],
+                "invalid MVP_PIPELINE_STAGES=\"many\"",
+            ),
+            (
+                "long-cli-zero",
+                vec![],
+                vec!["--pipeline-stages", "0"],
+                "--pipeline-stages must be greater than 0",
+            ),
+            (
+                "long-cli-non-numeric",
+                vec![],
+                vec!["--pipeline-stages", "many"],
+                "invalid --pipeline-stages=\"many\"",
+            ),
+            (
+                "short-cli-missing",
+                vec![],
+                vec!["-N"],
+                "missing value after -N",
+            ),
+        ] {
+            let error =
+                with_clean_env(&settings, || {
+                    match Config::from_layers_with_path_and_args(
+                        None,
+                        args.iter().copied().map(str::to_owned),
+                    ) {
+                        Ok(_) => panic!("invalid pipeline stages setting must fail"),
+                        Err(error) => error,
+                    }
+                });
+
+            assert!(
+                error.contains(expected),
+                "{case} error {error:?} should contain {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vastai_rejects_pipeline_stages_count_above_one() {
+        let error = with_clean_env(&[], || {
+            match Config::from_layers_with_path_and_args(
+                None,
+                ["--provider", "vastai", "--pipeline-stages", "2"]
+                    .into_iter()
+                    .map(str::to_owned),
+            ) {
+                Ok(_) => panic!("VastAI cannot provision more than one pipeline stage yet"),
+                Err(error) => error,
+            }
+        });
+
+        assert!(
+            error.contains("provider=vastai does not support pipelined provisioning yet"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn pipeline_cached_model_resolution_uses_toml_smollm2_gguf_file_with_cli_stage_count() {
+        let toml = TempTomlFile::new(
+            "pipeline-smollm2-model.toml",
+            r#"
+[model]
+gguf_repo = "QuantFactory/SmolLM2-135M-Instruct-GGUF"
+gguf_file = "SmolLM2-135M-Instruct.Q4_0.gguf"
+"#,
+        );
+
+        let config = with_clean_env(&[], || {
+            Config::from_layers_with_path_and_args(
+                Some(&toml.path),
+                ["--pipeline-stages", "3"].into_iter().map(str::to_owned),
+            )
+            .expect("TOML SmolLM2 pipeline config parses")
+        });
+        let expected_cached_host_path = default_pipeline_cached_model_path()
+            .canonicalize()
+            .expect("default cached SmolLM2 GGUF is present for cache resolution tests");
+        let cached_model = config
+            .cached_model
+            .as_ref()
+            .expect("matching TOML SmolLM2 pipeline source should resolve the default cache");
+
+        assert_eq!(config.pipeline_stages, 3);
+        assert_eq!(config.provider, ProviderKind::Process);
+        assert_eq!(cached_model.host_path, expected_cached_host_path);
+        assert_eq!(
+            cached_model.container_path,
+            "/models/cached/SmolLM2-135M-Instruct.Q4_0.gguf"
+        );
+        assert_eq!(
+            config.gguf_source,
+            GgufSource::LocalPath(expected_cached_host_path.to_string_lossy().to_string())
+        );
+    }
+
+    #[test]
+    fn pipeline_cached_model_resolution_does_not_use_default_cache_for_other_toml_gguf_file() {
+        let toml = TempTomlFile::new(
+            "pipeline-other-model.toml",
+            r#"
+[model]
+gguf_repo = "QuantFactory/SmolLM2-135M-Instruct-GGUF"
+gguf_file = "SmolLM2-135M-Instruct.Q8_0.gguf"
+"#,
+        );
+
+        let config = with_clean_env(&[], || {
+            Config::from_layers_with_path_and_args(
+                Some(&toml.path),
+                ["--pipeline-stages", "3"].into_iter().map(str::to_owned),
+            )
+            .expect("non-default TOML GGUF pipeline config parses")
+        });
+
+        assert_eq!(config.pipeline_stages, 3);
+        assert!(config.cached_model.is_none());
+        assert_eq!(
+            config.gguf_source,
+            GgufSource::HuggingFaceGguf {
+                repo: "QuantFactory/SmolLM2-135M-Instruct-GGUF".to_owned(),
+                file: "SmolLM2-135M-Instruct.Q8_0.gguf".to_owned(),
+                revision: None,
+            }
+        );
+
+        let error = config
+            .build_run_plan()
+            .expect_err("non-default remote TOML GGUF should still require an explicit cache");
+
+        assert!(
+            error.contains(
+                "QuantFactory/SmolLM2-135M-Instruct-GGUF/SmolLM2-135M-Instruct.Q8_0.gguf"
+            ),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("--cached-model-host-path"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cached_model_plan_phase_is_metadata_driven_for_each_pipeline_width() {
+        let metadata = TestGgufMetadata {
+            num_layers: 7,
+            hidden_dim: 13,
+            context_length: 64,
+            eos_token_id: 11,
+        };
+        let model = TempModelFile::with_metadata("metadata-driven.gguf", metadata);
+
+        for stage_count in [1_u32, 3, metadata.num_layers] {
+            let config = pipeline_config_with_cached_model(&model, stage_count);
+            assert!(config.uses_planned_execution());
+            let plan = config
+                .build_run_plan()
+                .expect("metadata-derived cached-model plan builds");
+            assert_plan_matches_metadata(&config, &plan, metadata, stage_count, 512);
+        }
+    }
+
+    #[test]
+    fn cached_model_implicit_single_stage_matches_explicit_n_one_plan() {
+        let model = TempModelFile::new("implicit-n-one.gguf");
+        let implicit = cached_model_config_with_args(&model, &["--max-context", "32"]);
+        let explicit = cached_model_config_with_args(
+            &model,
+            &["--pipeline-stages", "1", "--max-context", "32"],
+        );
+
+        let implicit_plan = implicit
+            .build_run_plan()
+            .expect("implicit cached-model N=1 plan builds");
+        let explicit_plan = explicit
+            .build_run_plan()
+            .expect("explicit cached-model N=1 plan builds");
+
+        assert!(implicit.uses_planned_execution());
+        assert!(explicit.uses_planned_execution());
+        assert_plan_matches_metadata(&implicit, &implicit_plan, model.metadata, 1, 32);
+        assert_plan_matches_metadata(&explicit, &explicit_plan, model.metadata, 1, 32);
+        assert_eq!(implicit_plan.model, explicit_plan.model);
+        assert_eq!(implicit_plan.edges, explicit_plan.edges);
+        assert_eq!(implicit_plan.stages, explicit_plan.stages);
+    }
+
+    #[test]
+    fn cached_model_plan_rejects_pipeline_width_above_model_layers() {
+        let metadata = TestGgufMetadata {
+            num_layers: 2,
+            ..TestGgufMetadata::default()
+        };
+        let model = TempModelFile::with_metadata("too-many-stages.gguf", metadata);
+        let config = pipeline_config_with_cached_model(&model, metadata.num_layers + 1);
+
+        let error = config
+            .build_run_plan()
+            .expect_err("pipeline width above layer count must reject before provisioning");
+
+        assert!(
+            error.contains("--pipeline-stages=3 exceeds GGUF layer count 2"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn pipeline_planning_rejects_remote_gguf_source_without_local_cache() {
+        let config = with_clean_env(&[], || {
+            Config::from_layers_with_path_and_args(
+                None,
+                [
+                    "--pipeline-stages",
+                    "3",
+                    "--gguf-repo",
+                    "example/remote",
+                    "--gguf-file",
+                    "remote.gguf",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("non-default remote pipeline config parses")
+        });
+
+        let error = config
+            .build_run_plan()
+            .expect_err("remote GGUF source cannot be inspected before provisioning");
+
+        assert!(
+            error.contains("locally inspectable GGUF before provisioning"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("example/remote/remote.gguf"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("--cached-model-host-path"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
@@ -3579,7 +6751,7 @@ bootstrap_command = "/run"
             .expect("missing optional TOML config uses defaults")
         });
 
-        assert_eq!(config.provider, ProviderKind::Docker);
+        assert_eq!(config.provider, ProviderKind::Process);
         assert_eq!(config.image, DEFAULT_IMAGE);
         assert_eq!(config.model_id, DEFAULT_MODEL_ID);
         assert_eq!(config.default_max_tokens, DEFAULT_MAX_TOKENS);
@@ -3597,10 +6769,9 @@ bootstrap_command = "/run"
             .expect("CLI max context config parses")
         });
         let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[3; 32]).public());
-        let datastream_sink = ActorAddress([17; 32]);
         let orchestrator_actor = ActorAddress([18; 32]);
         let spec = config
-            .node_spec(coordinator, datastream_sink, orchestrator_actor)
+            .node_spec(coordinator, orchestrator_actor)
             .expect("node spec builds");
 
         assert_eq!(env_value(&spec.env, "MVP_MAX_CONTEXT"), Some("256"));
@@ -3610,7 +6781,7 @@ bootstrap_command = "/run"
     fn runtime_profile_selects_provider_and_node_provider_takes_precedence() {
         assert_eq!(
             selected_provider(&[("MVP_RUNTIME_CONFIG", "local")]),
-            ProviderKind::Docker
+            ProviderKind::Process
         );
         assert_eq!(
             selected_provider(&[("MVP_RUNTIME_CONFIG", "deploy")]),
@@ -3670,11 +6841,10 @@ bootstrap_command = "/run"
                     .parse::<iroh::RelayUrl>()
                     .unwrap(),
             );
-            let datastream_sink = ActorAddress([19; 32]);
             let orchestrator_actor = ActorAddress([20; 32]);
 
             let spec = config
-                .node_spec(coordinator, datastream_sink, orchestrator_actor)
+                .node_spec(coordinator, orchestrator_actor)
                 .expect("node spec builds");
             let coordinator_endpoint_json = env_value(&spec.env, "MVP_COORDINATOR_ENDPOINT")
                 .expect("coordinator endpoint env is present");
@@ -3713,8 +6883,7 @@ bootstrap_command = "/run"
     }
 
     #[test]
-    fn docker_cached_model_builds_local_gguf_env_and_writable_file_mount_from_canonical_host_path()
-    {
+    fn docker_cached_model_builds_local_gguf_env_and_planned_file_mount_from_canonical_host_path() {
         let model = TempModelFile::new("weights-q4.gguf");
         let config = with_clean_env_os(
             &[
@@ -3728,10 +6897,9 @@ bootstrap_command = "/run"
             },
         );
         let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[7; 32]).public());
-        let datastream_sink = ActorAddress([13; 32]);
         let orchestrator_actor = ActorAddress([14; 32]);
         let spec = config
-            .node_spec(coordinator, datastream_sink, orchestrator_actor)
+            .node_spec(coordinator, orchestrator_actor)
             .expect("cached model node spec builds");
 
         assert_eq!(
@@ -3745,9 +6913,305 @@ bootstrap_command = "/run"
             vec![ProviderMount {
                 host_path: model.canonical_path.to_string_lossy().to_string(),
                 container_path: "/models/cached/weights-q4.gguf".to_owned(),
-                readonly: false,
+                readonly: true,
             }]
         );
+    }
+
+    #[test]
+    fn process_cached_model_builds_host_gguf_env_without_mounts() {
+        let model = TempModelFile::new("process-weights-q4.gguf");
+        let config = with_clean_env_os(
+            &[
+                ("MVP_RUNTIME_CONFIG", OsString::from("local")),
+                (CACHED_MODEL_HOST_ENV, model.raw_path.as_os_str().to_owned()),
+            ],
+            || {
+                Config::from_layers_with_path_and_args(None, std::iter::empty::<String>())
+                    .expect("process cached model config parses")
+            },
+        );
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[8; 32]).public());
+        let orchestrator_actor = ActorAddress([15; 32]);
+        let spec = config
+            .node_spec(coordinator, orchestrator_actor)
+            .expect("process cached model node spec builds");
+        let host_path = model.canonical_path.to_string_lossy().to_string();
+
+        assert_eq!(config.provider, ProviderKind::Process);
+        assert_eq!(env_value(&spec.env, "MVP_NODE_PROVIDER"), Some("process"));
+        assert_eq!(
+            env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"),
+            Some(host_path.as_str())
+        );
+        assert_eq!(env_value(&spec.env, "MVP_DOCKER_GPUS"), None);
+        assert!(spec.mounts.is_empty(), "process workers use host paths");
+    }
+
+    #[test]
+    fn vectorized_local_docker_stage_node_specs_follow_three_stage_plan() {
+        let model = TempModelFile::new("pipeline-node-spec.gguf");
+        let config = pipeline_config_with_cached_model(&model, 3);
+        let plan = config
+            .build_run_plan()
+            .expect("stage node spec plan builds");
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[21; 32]).public());
+        let orchestrator_actor = ActorAddress([23; 32]);
+        let coordinator_env =
+            serde_json::to_string(&coordinator).expect("coordinator endpoint serializes");
+        let orchestrator_actor_env =
+            serde_json::to_string(&orchestrator_actor).expect("orchestrator actor serializes");
+        let expected_run_id = config.run_id.to_string();
+        let expected_mount = ProviderMount {
+            host_path: model.canonical_path.to_string_lossy().to_string(),
+            container_path: "/models/cached/pipeline-node-spec.gguf".to_owned(),
+            readonly: true,
+        };
+
+        let specs = stage_node_specs(&config, Some(&plan), coordinator, orchestrator_actor)
+            .expect("pipeline stage node specs build");
+
+        assert_eq!(
+            specs.len(),
+            3,
+            "pipeline_stages=3 should provision three Docker workers, not one"
+        );
+        assert!(
+            specs.iter().all(|spec| spec.node_id != config.node_id),
+            "coordinator node {} must not be counted as a worker: {specs:?}",
+            config.node_id
+        );
+
+        for (expected_stage_index, spec) in specs.iter().enumerate() {
+            let expected_stage_index =
+                u32::try_from(expected_stage_index).expect("fixture stage index fits u32");
+            let expected_node_id = config.node_id + 1 + u64::from(expected_stage_index);
+            let expected_node_id_env = expected_node_id.to_string();
+            let expected_stage_index_env = expected_stage_index.to_string();
+
+            assert_eq!(spec.run_id, config.run_id);
+            assert_eq!(spec.node_id, expected_node_id);
+            assert_eq!(spec.stage_index, Some(expected_stage_index));
+            assert_eq!(
+                env_value(&spec.env, "MVP_RUN_ID"),
+                Some(expected_run_id.as_str())
+            );
+            assert_eq!(
+                env_value(&spec.env, "MVP_LOGICAL_NODE_ID"),
+                Some(expected_node_id_env.as_str())
+            );
+            assert_eq!(
+                env_value(&spec.env, "MVP_STAGE_INDEX"),
+                Some(expected_stage_index_env.as_str())
+            );
+            assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("3"));
+            assert_eq!(env_value(&spec.env, "MVP_NODE_PROVIDER"), Some("docker"));
+            assert_eq!(
+                env_value(&spec.env, "MVP_MODEL_ID"),
+                Some(config.model_id.as_str())
+            );
+            assert_eq!(
+                env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"),
+                Some("/models/cached/pipeline-node-spec.gguf")
+            );
+            assert_eq!(env_value(&spec.env, "MVP_MAX_CONTEXT"), Some("512"));
+            assert_eq!(
+                env_value(&spec.env, "MVP_COORDINATOR_ENDPOINT"),
+                Some(coordinator_env.as_str())
+            );
+            assert_eq!(
+                env_value(&spec.env, "MVP_ORCHESTRATOR_ACTOR"),
+                Some(orchestrator_actor_env.as_str())
+            );
+            assert_eq!(
+                spec.mounts,
+                vec![expected_mount.clone()],
+                "pipeline cached GGUF mount should be read-only for stage {expected_stage_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn vectorized_local_process_stage_node_specs_follow_three_stage_plan() {
+        let model = TempModelFile::new("process-pipeline-node-spec.gguf");
+        let config = with_clean_env_os(
+            &[
+                ("MVP_RUNTIME_CONFIG", OsString::from("local")),
+                (CACHED_MODEL_HOST_ENV, model.raw_path.as_os_str().to_owned()),
+            ],
+            || {
+                Config::from_layers_with_path_and_args(
+                    None,
+                    ["--pipeline-stages", "3", "--max-context", "512"]
+                        .into_iter()
+                        .map(str::to_owned),
+                )
+                .expect("process pipeline config parses")
+            },
+        );
+        let plan = config
+            .build_run_plan()
+            .expect("process stage node spec plan builds");
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[22; 32]).public());
+        let orchestrator_actor = ActorAddress([24; 32]);
+        let host_path = model.canonical_path.to_string_lossy().to_string();
+
+        let specs = stage_node_specs(&config, Some(&plan), coordinator, orchestrator_actor)
+            .expect("process pipeline stage node specs build");
+
+        assert_eq!(config.provider, ProviderKind::Process);
+        assert_eq!(specs.len(), 3);
+        for (expected_stage_index, spec) in specs.iter().enumerate() {
+            let expected_stage_index =
+                u32::try_from(expected_stage_index).expect("fixture stage index fits u32");
+            assert_eq!(spec.stage_index, Some(expected_stage_index));
+            assert_eq!(env_value(&spec.env, "MVP_NODE_PROVIDER"), Some("process"));
+            assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("3"));
+            assert_eq!(
+                env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"),
+                Some(host_path.as_str())
+            );
+            assert_eq!(env_value(&spec.env, "MVP_MAX_CONTEXT"), Some("512"));
+            assert!(spec.mounts.is_empty(), "process stage specs must not mount");
+        }
+    }
+
+    #[test]
+    fn planned_single_stage_cached_model_node_spec_follows_generated_plan() {
+        let model = TempModelFile::new("single-stage-node-spec.gguf");
+        let config = pipeline_config_with_cached_model(&model, 1);
+        let plan = config
+            .build_run_plan()
+            .expect("single-stage cached plan builds");
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[31; 32]).public());
+        let orchestrator_actor = ActorAddress([33; 32]);
+
+        let specs = stage_node_specs(&config, Some(&plan), coordinator, orchestrator_actor)
+            .expect("single planned stage node spec builds");
+
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        let stage = &plan.stages[0];
+        assert_eq!(stage.stage_index, 0);
+        assert_eq!(stage.layer_start, 0);
+        assert_eq!(stage.layer_end_exclusive, model.metadata.num_layers);
+        assert_eq!(spec.node_id, stage.node_id.0);
+        assert_ne!(
+            spec.node_id, config.node_id,
+            "planned cached N=1 still provisions a worker separate from the coordinator"
+        );
+        assert_eq!(spec.stage_index, Some(0));
+        assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("1"));
+        assert_eq!(
+            env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"),
+            Some("/models/cached/single-stage-node-spec.gguf")
+        );
+        assert_eq!(
+            spec.mounts,
+            vec![ProviderMount {
+                host_path: model.canonical_path.to_string_lossy().to_string(),
+                container_path: "/models/cached/single-stage-node-spec.gguf".to_owned(),
+                readonly: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn vectorized_local_docker_stage_provision_detail_preserves_plan_edges_and_layers() {
+        let model = TempModelFile::new("pipeline-stage-detail.gguf");
+        let config = pipeline_config_with_cached_model(&model, 3);
+        let plan = config.build_run_plan().expect("stage detail plan builds");
+
+        let detail = stage_provision_detail(&config, Some(&plan));
+
+        assert_eq!(
+            detail,
+            json!({
+                "run_id": config.run_id,
+                "stage_count": 3,
+                "stages": plan.stages.iter().map(|stage| {
+                    json!({
+                        "node_id": stage.node_id.0,
+                        "stage_index": stage.stage_index,
+                        "layer_range": {
+                            "start": stage.layer_start,
+                            "end_exclusive": stage.layer_end_exclusive
+                        },
+                        "inbound_edge_id": stage.inbound_edge.0,
+                        "outbound_edge_id": stage.outbound_edge.0,
+                    })
+                }).collect::<Vec<_>>(),
+                "model_id": config.model_id,
+            })
+        );
+    }
+
+    #[test]
+    fn stage_provision_wire_preserves_plan_edges_for_single_and_multi_stage_cached_models() {
+        for stage_count in [1_u32, 3] {
+            let model = TempModelFile::new(&format!("wire-{stage_count}.gguf"));
+            let config = pipeline_config_with_cached_model(&model, stage_count);
+            let plan = config.build_run_plan().expect("wire test plan builds");
+            let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[41; 32]).public());
+            let readies = plan
+                .stages
+                .iter()
+                .map(|stage| {
+                    let byte = u8::try_from(stage.stage_index + 42).expect("fixture byte fits");
+                    let endpoint =
+                        EndpointAddr::new(iroh::SecretKey::from_bytes(&[byte; 32]).public());
+                    (
+                        stage.node_id.0,
+                        RuntimeReady {
+                            endpoint: endpoint.clone(),
+                            node_actor: ActorAddress([byte; 32]),
+                            datastream_publisher: ActorAddress([byte.wrapping_add(80); 32]),
+                            stage_index: stage.stage_index,
+                            readiness_id: u64::from(stage.stage_index) + 100,
+                            swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
+                        },
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+
+            for stage in &plan.stages {
+                let wire = stage_provision_wire_from_plan(
+                    &plan,
+                    stage.stage_index,
+                    &readies,
+                    &coordinator,
+                )
+                .expect("stage provision wire builds from plan");
+                let inbound = wire.inbound_edge.as_ref().expect("planned inbound edge");
+                let outbound = wire.outbound_edge.as_ref().expect("planned outbound edge");
+
+                assert_eq!(wire.stage_count, stage_count);
+                assert_eq!(wire.node_id, stage.node_id.0);
+                assert_eq!(wire.layer_start, stage.layer_start);
+                assert_eq!(wire.layer_end_exclusive, stage.layer_end_exclusive);
+                assert_eq!(inbound.edge_id, stage.inbound_edge.0);
+                assert_eq!(outbound.edge_id, stage.outbound_edge.0);
+                assert_eq!(
+                    inbound.kind,
+                    if stage.stage_index == 0 {
+                        StageEdgeKindWire::TokenIn
+                    } else {
+                        StageEdgeKindWire::Activation
+                    }
+                );
+                assert_eq!(
+                    outbound.kind,
+                    if stage.stage_index + 1 == stage_count {
+                        StageEdgeKindWire::TokenOut
+                    } else {
+                        StageEdgeKindWire::Activation
+                    }
+                );
+                assert_eq!(wire.model_id, config.model_id);
+                assert_eq!(wire.gguf_source, config.gguf_source);
+                assert_eq!(wire.tokenizer, config.tokenizer);
+            }
+        }
     }
 
     #[test]
@@ -3771,7 +7235,7 @@ bootstrap_command = "/run"
 
         assert!(
             error.contains(
-                "MVP_CACHED_MODEL_HOST_PATH is a host-local cache path and requires provider=docker"
+                "MVP_CACHED_MODEL_HOST_PATH is a host-local cache path and is only supported by provider=process or provider=docker"
             ),
             "unexpected error: {error}"
         );
@@ -3885,9 +7349,11 @@ bootstrap_command = "/run"
     fn runtime_ready_barrier_waits_for_specific_swim_and_route() {
         let remote = DistNodeId([2; 32]);
         let node_actor = ActorAddress::new_random();
+        let datastream_publisher = ActorAddress::new_random();
         let ready = RuntimeReady {
             endpoint: endpoint(2),
             node_actor,
+            datastream_publisher,
             stage_index: 3,
             readiness_id: 99,
             swim_node_id: remote,
@@ -3941,6 +7407,7 @@ bootstrap_command = "/run"
         let ready = RuntimeReady {
             endpoint: endpoint(9),
             node_actor,
+            datastream_publisher: ActorAddress::new_random(),
             stage_index: 3,
             readiness_id: 99,
             swim_node_id: DistNodeId([2; 32]),
@@ -3952,6 +7419,16 @@ bootstrap_command = "/run"
         assert_eq!(
             reports.try_recv(),
             Some(NodeAgentReport::RuntimeReadyAck {
+                run_id: 7,
+                node_id: 11,
+                stage_index: ready.stage_index,
+                readiness_id: 99,
+            })
+        );
+
+        assert_eq!(
+            orchestrator_inbox.try_recv(),
+            Some(OrchestratorMsg::ObserveNodeRuntimeReadyAck {
                 run_id: 7,
                 node_id: 11,
                 stage_index: ready.stage_index,

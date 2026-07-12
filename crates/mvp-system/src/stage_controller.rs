@@ -344,6 +344,9 @@ impl StageController {
     }
 
     fn provision(&mut self, from: NodeId, provision: ProvisionStage) {
+        if self.provision.as_ref() == Some(&provision) {
+            return;
+        }
         if from != provision.authorized_orchestrator || provision.node_id != self.local_node_id {
             self.provision = Some(provision.clone());
             self.fault(StageFaultReason::UnauthorizedProvision);

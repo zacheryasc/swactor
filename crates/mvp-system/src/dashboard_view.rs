@@ -130,11 +130,11 @@ impl DashboardView for MvpClusterDashboardView {
         CHANNELS
     }
 
-    fn ingest(&self, _stream: &StreamId, frame: &Frame, _event: &FrameEvent) {
+    fn ingest(&self, _stream: &StreamId, frame: &Frame, event: &FrameEvent) {
         let mut state = self.state.write().expect("MVP dashboard state poisoned");
-        match frame.channel.as_str() {
+        match event.channel.as_str() {
             MVP_PROVISIONING_EVENTS => {
-                if let Ok(record) = MvpProvisionEventRecord::decode(&frame.payload) {
+                if let Ok(record) = MvpProvisionEventRecord::decode(&event.payload) {
                     state.apply_provision_event(frame, record);
                 }
             }
@@ -142,12 +142,12 @@ impl DashboardView for MvpClusterDashboardView {
                 if channel == MVP_PROVISIONING_LOGS
                     || channel.starts_with(PROVISIONING_LOG_PREFIX) =>
             {
-                if let Ok(record) = MvpProvisionLogRecord::decode(&frame.payload) {
+                if let Ok(record) = MvpProvisionLogRecord::decode(&event.payload) {
                     state.apply_provision_log(record);
                 }
             }
             MVP_LIFECYCLE => {
-                if let Ok(record) = MvpLifecycleRecord::decode(&frame.payload) {
+                if let Ok(record) = MvpLifecycleRecord::decode(&event.payload) {
                     state.apply_lifecycle(frame, record);
                 }
             }

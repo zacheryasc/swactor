@@ -530,6 +530,73 @@ fn object_and_ring_specs_are_present_and_match_edge_kind() {
     }
 }
 
+#[test]
+fn token_object_alignment_is_token_width_not_ring_alignment() {
+    let mut input = valid_input(3, 36);
+    input.token_ring.alignment = 64;
+    let plan = plan::plan_run(input).unwrap();
+
+    for edge in plan
+        .edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::TokenIn | EdgeKind::TokenOut))
+    {
+        assert_eq!(edge.object_spec.dtype_width_bytes, 4);
+        assert_eq!(edge.object_spec.alignment, 4);
+        assert_eq!(edge.ring_spec.alignment, 64);
+    }
+}
+
+#[test]
+fn activation_object_alignment_is_dtype_width_not_ring_alignment() {
+    let mut input = valid_input(3, 36);
+    input.model.hidden_dim = 13;
+    input.activation_ring.alignment = 64;
+    let plan = plan::plan_run(input).unwrap();
+
+    for edge in plan
+        .edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::Activation))
+    {
+        assert_eq!(edge.object_spec.dtype_width_bytes, 2);
+        assert_eq!(edge.object_spec.alignment, 2);
+        assert_eq!(edge.ring_spec.alignment, 64);
+    }
+}
+
+// This proves prompt-token objects are sized from the effective model context,
+// not from a small fixed constant, and that token rings can carry one complete
+// MO01 record for that object.
+#[test]
+fn token_edges_size_extent_from_context_and_expand_ring_capacity() {
+    let mut input = valid_input(3, 36);
+    input.model.max_seq_len = 512;
+    input.token_ring.data_capacity = 64;
+
+    let plan = plan::plan_run(input).expect("valid input must emit a plan");
+    let expected_token_extent = 512 * 4;
+    let expected_token_record_capacity = plan::MO01_HEADER_BYTES + expected_token_extent;
+    let token_edges = plan
+        .edges
+        .iter()
+        .filter(|edge| matches!(edge.kind, EdgeKind::TokenIn | EdgeKind::TokenOut))
+        .collect::<Vec<_>>();
+
+    assert_eq!(token_edges.len(), 2);
+    for edge in token_edges {
+        assert_eq!(edge.object_spec.kind, ObjectKind::Token);
+        assert_eq!(edge.object_spec.max_extent, expected_token_extent);
+        assert_eq!(edge.object_spec.dtype_width_bytes, 4);
+        assert_eq!(edge.object_spec.shape, ShapeRule::TokenIds);
+        assert!(
+            edge.ring_spec.data_capacity >= expected_token_record_capacity,
+            "token ring must carry MO01 header plus max token payload"
+        );
+        assert_eq!(edge.ring_spec.data_capacity, expected_token_record_capacity);
+    }
+}
+
 // This proves object and ring specs are projected consistently into every stage
 // provision. A stage provision narrows the ring direction to the local role
 // while preserving the edge's capacity, alignment, pinning, and wake policy.

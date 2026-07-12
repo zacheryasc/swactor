@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import mmap
 import linecache
 import os
 import sys
 import threading
 import time
+import struct
 import traceback
 import urllib.parse
 import urllib.request
@@ -20,6 +22,12 @@ model: Any = None
 tokenizer: Any = None
 role: dict[str, Any] = {}
 loaded: dict[str, Any] = {}
+arena: mmap.mmap | None = None
+rings: dict[int, dict[str, Any]] = {}
+device_objects: dict[int, dict[str, Any]] = {}
+next_handle = 42
+HEADER_LEN = 40
+WORKER_GENERATION = 1
 
 
 class CpuLineSampler:
@@ -152,14 +160,28 @@ def test_mode() -> bool:
     return os.environ.get("MVP_TINYGRAD_TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-
 def initialize(cmd: dict[str, Any]) -> None:
-    global Tensor, dtypes
+    global Tensor, dtypes, arena
     if int(cmd.get("helper_abi_version", 1)) != 1:
         fatal("UnsupportedHelperAbi", helper_abi_version=cmd.get("helper_abi_version"))
     device = str(cmd.get("backend", {}).get("device") or os.environ.get("DEV") or "CUDA")
     os.environ["DEV"] = device
+    arena_fd = os.environ.get("MVP_ARENA_FD")
+    if arena_fd is not None:
+        arena_bytes = int(os.environ.get("MVP_ARENA_BYTES", "0") or "0")
+        if arena_bytes > 0:
+            arena = mmap.mmap(int(arena_fd), arena_bytes)
     started = time.monotonic()
+    if test_mode():
+        control(
+            type="WorkerReady",
+            pid=os.getpid(),
+            backend={"requested_device": device, "env_DEV": os.environ.get("DEV"), "test_mode": True},
+            cuda_probe=[],
+            test_mode=True,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+        )
+        return
     control(type="TinygradImportStarted", requested_device=device, env_DEV=os.environ.get("DEV"))
     from tinygrad import Tensor as TinyTensor, dtypes as tiny_dtypes
 
@@ -305,9 +327,157 @@ def require_tinygrad() -> Any:
     return Tensor
 
 
+class PipelineStageTinygradModel:
+    def __init__(
+        self,
+        *,
+        block_count: int,
+        dim: int,
+        hidden_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        norm_eps: float,
+        vocab_size: int,
+        head_dim: int,
+        rope_theta: float,
+        max_context: int,
+        qk_norm: int,
+        num_experts: int,
+        num_experts_per_tok: int,
+        first_stage: bool,
+        final_stage: bool,
+        nn_mod: Any,
+        block_cls: Any,
+    ) -> None:
+        self.blk = [
+            block_cls(
+                dim,
+                hidden_dim,
+                n_heads,
+                n_kv_heads,
+                norm_eps,
+                head_dim,
+                rope_theta,
+                max_context,
+                qk_norm,
+                num_experts,
+                num_experts_per_tok,
+            )
+            for _ in range(block_count)
+        ]
+        self.max_context = max_context
+        self.hidden_dim = dim
+        self.first_stage = first_stage
+        self.final_stage = final_stage
+        if first_stage:
+            self.token_embd = nn_mod.Embedding(vocab_size, dim)
+        if final_stage:
+            self.output_norm = nn_mod.RMSNorm(dim, norm_eps)
+            self.output = nn_mod.Linear(dim, vocab_size, bias=False)
+
+    def token_hidden(self, tokens_tensor: Any) -> Any:
+        return self.token_embd(tokens_tensor)
+
+    def forward_hidden(self, hidden: Any, start_pos: int) -> Any:
+        for block in self.blk:
+            hidden = block(hidden, start_pos)
+        return hidden.contiguous()
+
+    def next_token(self, hidden: Any) -> Any:
+        return self.output(self.output_norm(hidden))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+
+
+def remap_stage_state_dict(
+    state_dict: dict[str, Any],
+    *,
+    layer_start: int,
+    layer_end_exclusive: int,
+    first_stage: bool,
+    final_stage: bool,
+) -> dict[str, Any]:
+    if final_stage and "output.weight" not in state_dict and "token_embd.weight" in state_dict:
+        state_dict["output.weight"] = state_dict["token_embd.weight"]
+    remapped: dict[str, Any] = {}
+    prefix = "blk."
+    for key, value in state_dict.items():
+        if key.startswith(prefix):
+            parts = key.split(".", 2)
+            if len(parts) != 3:
+                continue
+            block_index = int(parts[1])
+            if layer_start <= block_index < layer_end_exclusive:
+                remapped[f"blk.{block_index - layer_start}.{parts[2]}"] = value
+        elif first_stage and key == "token_embd.weight":
+            remapped[key] = value
+        elif final_stage and (key == "output_norm.weight" or key == "output.weight"):
+            remapped[key] = value
+    return remapped
+
+
+def load_pipeline_stage_model(
+    path: Path,
+    *,
+    max_context: int,
+    layer_start: int,
+    layer_end_exclusive: int,
+) -> tuple[PipelineStageTinygradModel, dict[str, Any]]:
+    TensorCls = require_tinygrad()
+    from tinygrad import nn
+    from tinygrad.apps.llm import TransformerBlock
+
+    kv, state_dict = nn.state.gguf_load(TensorCls(path).to(None))
+    state_dict = {key: value.cast("float16") if env_flag("HALF", True) else value for key, value in state_dict.items()}
+    arch = kv["general.architecture"]
+    max_context = min(max_context, int(kv[f"{arch}.context_length"]))
+    n_heads = int(kv[f"{arch}.attention.head_count"])
+    n_kv_heads = int(kv[f"{arch}.attention.head_count_kv"])
+    if arch == "llama":
+        for name in list(state_dict):
+            if "attn_q.weight" in name:
+                state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
+            if "attn_k.weight" in name:
+                state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
+    total_layers = int(kv[f"{arch}.block_count"])
+    first_stage = layer_start == 0
+    final_stage = layer_end_exclusive >= total_layers
+    qk_key = f"blk.{layer_start}.attn_q_norm.weight"
+    qk_norm = int(state_dict[qk_key].shape[0]) if qk_key in state_dict else 0
+    stage_model = PipelineStageTinygradModel(
+        block_count=layer_end_exclusive - layer_start,
+        dim=int(kv[f"{arch}.embedding_length"]),
+        hidden_dim=int(kv.get(f"{arch}.expert_feed_forward_length", kv[f"{arch}.feed_forward_length"])),
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        norm_eps=float(kv[f"{arch}.attention.layer_norm_rms_epsilon"]),
+        vocab_size=len(kv["tokenizer.ggml.tokens"]),
+        head_dim=int(kv.get(f"{arch}.attention.key_length", int(kv[f"{arch}.embedding_length"]) // n_heads)),
+        rope_theta=float(kv[f"{arch}.rope.freq_base"]),
+        max_context=max_context,
+        qk_norm=qk_norm,
+        num_experts=int(kv.get(f"{arch}.expert_count", 0)),
+        num_experts_per_tok=int(kv.get(f"{arch}.expert_used_count", 0)),
+        first_stage=first_stage,
+        final_stage=final_stage,
+        nn_mod=nn,
+        block_cls=TransformerBlock,
+    )
+    stage_state = remap_stage_state_dict(
+        state_dict,
+        layer_start=layer_start,
+        layer_end_exclusive=layer_end_exclusive,
+        first_stage=first_stage,
+        final_stage=final_stage,
+    )
+    loaded_params = nn.state.load_state_dict(stage_model, stage_state, verbose=False, consume=True, realize=False)
+    for param in loaded_params:
+        param.replace(param.contiguous())
+    if loaded_params:
+        TensorCls.realize(*loaded_params)
+    return stage_model, kv
+
+
 def load_weights(cmd: dict[str, Any]) -> None:
     global model, tokenizer
-    TensorCls = require_tinygrad()
     started = time.monotonic()
     model_id = str(cmd["model_id"])
     source = cmd["gguf_source"]
@@ -340,30 +510,41 @@ def load_weights(cmd: dict[str, Any]) -> None:
     path = fetch_whole(source)
     model_bytes = path.stat().st_size
     control(type="GgufResolveReady", model_id=model_id, path=str(path), bytes=model_bytes)
+    layer_start = int(cmd.get("layer_start", 0))
+    layer_end_exclusive = int(cmd.get("layer_end_exclusive", 0))
     try:
         control(type="TinygradLlmImportStarted", model_id=model_id)
-        from tinygrad.apps.llm import SimpleTokenizer, Transformer
+        from tinygrad.apps.llm import SimpleTokenizer
 
         control(type="TinygradLlmImportReady", model_id=model_id)
         max_context_raw = os.environ.get("MVP_MAX_CONTEXT", "512")
         max_context = int(max_context_raw) if max_context_raw else 512
         control(
-            type="TransformerFromGgufStarted",
+            type="PipelineStageFromGgufStarted",
             model_id=model_id,
             path=str(path),
             bytes=model_bytes,
             max_context=max_context,
-            realize=True,
+            layer_start=layer_start,
+            layer_end_exclusive=layer_end_exclusive,
             requested_device=os.environ.get("DEV"),
         )
-        model, kv = Transformer.from_gguf(TensorCls(path), max_context=max_context, realize=True)
+        model, kv = load_pipeline_stage_model(
+            path,
+            max_context=max_context,
+            layer_start=layer_start,
+            layer_end_exclusive=layer_end_exclusive,
+        )
         control(
-            type="TransformerFromGgufReady",
+            type="PipelineStageFromGgufReady",
             model_id=model_id,
             path=str(path),
             bytes=model_bytes,
-            max_context=max_context,
-            realize=True,
+            max_context=model.max_context,
+            layer_start=layer_start,
+            layer_end_exclusive=layer_end_exclusive,
+            first_stage=model.first_stage,
+            final_stage=model.final_stage,
             requested_device=os.environ.get("DEV"),
         )
         tok_src = cmd.get("tokenizer", {"EmbeddedGguf": None})
@@ -386,13 +567,18 @@ def load_weights(cmd: dict[str, Any]) -> None:
     loaded.update(
         model_id=model_id,
         path=str(path),
-        layer_start=int(cmd.get("layer_start", 0)),
-        layer_end_exclusive=int(cmd.get("layer_end_exclusive", 0)),
+        layer_start=layer_start,
+        layer_end_exclusive=layer_end_exclusive,
+        hidden_dim=int(getattr(model, "hidden_dim", 0)),
+        max_context=int(getattr(model, "max_context", 0)),
+        eos_token_id=int(kv.get("tokenizer.ggml.eos_token_id", 0)),
     )
     control(
         type="WeightsLoaded",
         model_id=model_id,
         path=str(path),
+        layer_start=layer_start,
+        layer_end_exclusive=layer_end_exclusive,
         elapsed_ms=int((time.monotonic() - started) * 1000),
     )
 
@@ -622,6 +808,269 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
     )
 
 
+def require_arena() -> mmap.mmap:
+    if arena is None:
+        fatal("ArenaNotMapped")
+    return arena
+
+
+def install_ring(cmd: dict[str, Any]) -> None:
+    ring_id = int(cmd["ring_id"])
+    layout = cmd["layout"]
+    spec = cmd["object_spec"]
+    rings[ring_id] = {
+        "ring_id": ring_id,
+        "edge_id": int(cmd["edge_id"]),
+        "port": str(cmd.get("port", "")),
+        "direction": str(cmd["direction"]),
+        "data_offset": int(layout["data_offset"]),
+        "data_capacity": int(layout["data_bytes"]),
+        "max_extent": int(spec["max_extent"]),
+        "alignment": int(spec["alignment"]),
+        "next_sequence": 0,
+    }
+    control(
+        type="RingInstalled",
+        ring_id=ring_id,
+        edge_id=rings[ring_id]["edge_id"],
+        direction=rings[ring_id]["direction"],
+    )
+
+
+def uninstall_ring(cmd: dict[str, Any]) -> None:
+    ring_id = int(cmd["ring_id"])
+    rings.pop(ring_id, None)
+    control(type="RingUninstalled", ring_id=ring_id)
+
+
+def parse_record(ring: dict[str, Any]) -> tuple[int, int, int, int, bytes]:
+    view = require_arena()
+    base = ring["data_offset"]
+    header = view[base : base + HEADER_LEN]
+    if len(header) < HEADER_LEN:
+        fatal("EofBeforeFullHeader", ring_id=ring["ring_id"])
+    if header[0:4] != b"MO01":
+        fatal("InvalidObjectMagic", ring_id=ring["ring_id"])
+    version = struct.unpack_from("<H", header, 4)[0]
+    header_len = struct.unpack_from("<H", header, 6)[0]
+    if version != 1 or header_len != HEADER_LEN:
+        fatal("InvalidObjectHeader", ring_id=ring["ring_id"], version=version, header_len=header_len)
+    object_id = struct.unpack_from("<Q", header, 8)[0]
+    sequence = struct.unpack_from("<Q", header, 16)[0]
+    extent = struct.unpack_from("<Q", header, 24)[0]
+    flags = struct.unpack_from("<I", header, 32)[0]
+    reserved = struct.unpack_from("<I", header, 36)[0]
+    if reserved != 0:
+        fatal("InvalidObjectHeader", ring_id=ring["ring_id"], reserved=reserved)
+    if extent > ring["max_extent"]:
+        fatal("ObjectExtentInvalid", ring_id=ring["ring_id"], object_id=object_id, extent=extent)
+    if ring["alignment"] and extent % ring["alignment"] != 0:
+        fatal(
+            "ObjectExtentAlignmentViolation",
+            ring_id=ring["ring_id"],
+            object_id=object_id,
+            extent=extent,
+            alignment=ring["alignment"],
+        )
+    if sequence != ring["next_sequence"]:
+        fatal("SequenceViolation", ring_id=ring["ring_id"], expected=ring["next_sequence"], actual=sequence)
+    payload = bytes(view[base + HEADER_LEN : base + HEADER_LEN + extent])
+    ring["next_sequence"] += 1
+    return object_id, sequence, extent, flags, payload
+
+
+def payload_words(payload: bytes) -> list[int]:
+    if len(payload) % 4 != 0:
+        fatal("PayloadNotU32Aligned", extent=len(payload))
+    if not payload:
+        return []
+    return list(struct.unpack(f"<{len(payload) // 4}I", payload))
+
+def object_start_pos(sequence: int, token_count: int) -> int:
+    if sequence == 0:
+        role["prompt_tokens"] = token_count
+        return 0
+    return int(role.get("prompt_tokens", 1)) + sequence - 1
+
+
+def materialize_object(payload: bytes, sequence: int) -> dict[str, Any]:
+    if test_mode() or not isinstance(model, PipelineStageTinygradModel):
+        return {
+            "kind": "words",
+            "words": payload_words(payload),
+            "payload": payload,
+            "start_pos": object_start_pos(sequence, max(1, len(payload) // 4)),
+        }
+    TensorCls = require_tinygrad()
+    if bool(getattr(model, "first_stage", False)) and int(role.get("layer_start", 0)) == 0:
+        tokens = payload_words(payload)
+        token_count = len(tokens)
+        return {
+            "kind": "tokens",
+            "tokens": tokens,
+            "tensor": TensorCls([tokens], dtype="int32").realize(),
+            "start_pos": object_start_pos(sequence, token_count),
+        }
+    import numpy as np
+
+    hidden_dim = int(loaded.get("hidden_dim") or getattr(model, "hidden_dim", 0))
+    if hidden_dim <= 0:
+        fatal("HiddenDimMissing")
+    bytes_per_token = hidden_dim * 2
+    if len(payload) % bytes_per_token != 0:
+        fatal("ActivationExtentInvalid", extent=len(payload), hidden_dim=hidden_dim)
+    token_count = len(payload) // bytes_per_token
+    array = np.frombuffer(payload, dtype=np.float16).copy().reshape(1, token_count, hidden_dim)
+    return {
+        "kind": "activation",
+        "tensor": TensorCls(array).realize(),
+        "start_pos": object_start_pos(sequence, token_count),
+    }
+
+
+
+def ring_readable(cmd: dict[str, Any]) -> None:
+    global next_handle
+    ring_id = int(cmd["ring_id"])
+    ring = rings[ring_id]
+    if ring["direction"] != "ingress":
+        fatal("WrongRingDirection", ring_id=ring_id, direction=ring["direction"])
+    object_id, sequence, extent, flags, payload = parse_record(ring)
+    handle = next_handle
+    next_handle += 1
+    materialized = materialize_object(payload, sequence)
+    materialized.update(
+        object_id=object_id,
+        sequence=sequence,
+        extent=extent,
+        flags=flags,
+        payload=payload,
+    )
+    device_objects[handle] = materialized
+    control(
+        type="ObjectLoaded",
+        ring_id=ring_id,
+        edge_id=ring["edge_id"],
+        object_id=object_id,
+        sequence=sequence,
+        extent=extent,
+        handle_generation=WORKER_GENERATION,
+        handle_id=handle,
+    )
+
+
+def encode_record(object_id: int, sequence: int, payload: bytes, flags: int = 0) -> bytes:
+    header = bytearray(HEADER_LEN)
+    header[0:4] = b"MO01"
+    struct.pack_into("<H", header, 4, 1)
+    struct.pack_into("<H", header, 6, HEADER_LEN)
+    struct.pack_into("<Q", header, 8, object_id)
+    struct.pack_into("<Q", header, 16, sequence)
+    struct.pack_into("<Q", header, 24, len(payload))
+    struct.pack_into("<I", header, 32, flags)
+    struct.pack_into("<I", header, 36, 0)
+    return bytes(header) + payload
+
+
+def write_record(ring: dict[str, Any], object_id: int, sequence: int, payload: bytes, flags: int = 0) -> int:
+    if len(payload) > ring["max_extent"]:
+        fatal("OutputExtentInvalid", ring_id=ring["ring_id"], extent=len(payload), max_extent=ring["max_extent"])
+    if ring["alignment"] and len(payload) % ring["alignment"] != 0:
+        fatal("OutputExtentAlignmentViolation", ring_id=ring["ring_id"], extent=len(payload), alignment=ring["alignment"])
+    record = encode_record(object_id, sequence, payload, flags)
+    if len(record) > ring["data_capacity"]:
+        fatal("OutputRingCapacityExceeded", ring_id=ring["ring_id"], record_bytes=len(record), capacity=ring["data_capacity"])
+    view = require_arena()
+    base = ring["data_offset"]
+    view[base : base + len(record)] = record
+    return len(record)
+
+
+def execute_step(cmd: dict[str, Any]) -> None:
+    if not role:
+        fatal("RoleNotConfigured")
+    handle = int(cmd["input_handle_id"])
+    obj = device_objects.get(handle)
+    if obj is None:
+        fatal("UnknownDeviceObject", handle_id=handle)
+    if int(cmd["input_object_id"]) != obj["object_id"] or int(cmd["input_sequence"]) != obj["sequence"]:
+        fatal("InputBindingMismatch", handle_id=handle, step_id=int(cmd["step_id"]))
+    output_ring_id = int(cmd["output_ring_id"])
+    ring = rings[output_ring_id]
+    if ring["direction"] != "egress":
+        fatal("WrongRingDirection", ring_id=output_ring_id, direction=ring["direction"])
+    final_stage = bool(cmd.get("final_stage"))
+    if test_mode() or not isinstance(model, PipelineStageTinygradModel):
+        if final_stage:
+            base = sum(int(word) for word in obj["words"]) + int(role.get("stage_index", 0))
+            token = 6 if base % 2 else 8
+            payload = struct.pack("<I", token)
+            flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
+        else:
+            value = sum(int(word) for word in obj["words"])
+            value += int(role.get("layer_start", 0)) + int(role.get("layer_end_exclusive", 0)) + int(role.get("stage_index", 0))
+            if value <= 0:
+                value = 1
+            payload = struct.pack("<I", value)
+            flags = 0
+    else:
+        if final_stage != bool(getattr(model, "final_stage", False)):
+            fatal("FinalStageMismatch", command_final_stage=final_stage, model_final_stage=bool(getattr(model, "final_stage", False)))
+        input_tensor = model.token_hidden(obj["tensor"]) if obj.get("kind") == "tokens" else obj["tensor"]
+        hidden = model.forward_hidden(input_tensor, int(obj.get("start_pos", 0)))
+        if final_stage:
+            token_array = model.next_token(hidden).realize().numpy().reshape(-1)
+            token = int(token_array[0])
+            payload = struct.pack("<I", token)
+            flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
+        else:
+            import numpy as np
+
+            activation = hidden.realize().numpy().astype(np.float16, copy=False)
+            payload = activation.tobytes()
+            flags = 0
+    committed = write_record(
+        ring,
+        int(cmd["output_object_id"]),
+        int(cmd["output_sequence"]),
+        payload,
+        flags,
+    )
+    control(
+        type="StepExecuted",
+        step_id=int(cmd["step_id"]),
+        ring_id=output_ring_id,
+        object_id=int(cmd["output_object_id"]),
+        sequence=int(cmd["output_sequence"]),
+        committed_bytes=committed,
+    )
+
+
+def release_device_object(cmd: dict[str, Any]) -> None:
+    handle_id = int(cmd["handle_id"])
+    device_objects.pop(handle_id, None)
+    control(type="DeviceObjectReleased", handle_id=handle_id)
+
+
+def encode_prompt(cmd: dict[str, Any]) -> None:
+    prompt = str(cmd.get("prompt", ""))
+    if tokenizer is not None and not test_mode():
+        model_prompt, _ = model_prompt_text(prompt)
+        tokens = [int(token) for token in tokenizer.encode(model_prompt)]
+    else:
+        tokens = [int(byte) for byte in prompt.encode("utf-8")] or [0]
+    control(type="PromptEncoded", request_id=cmd.get("request_id"), tokens=tokens)
+
+
+def decode_tokens(cmd: dict[str, Any]) -> None:
+    tokens = [int(token) for token in cmd.get("tokens", [])]
+    if tokenizer is not None and not test_mode():
+        text = strip_chat_stop_markers(tokenizer.decode(tokens))
+    else:
+        text = "".join(chr(token) if 32 <= token <= 126 else f"<tok:{token}>" for token in tokens)
+    control(type="TokensDecoded", request_id=cmd.get("request_id"), text=text)
+
+
 def shutdown_worker(_: dict[str, Any]) -> None:
     control(type="WorkerStopped", reason="Graceful")
     raise SystemExit(0)
@@ -632,6 +1081,13 @@ HANDLERS = {
     "ConfigureRole": configure_role,
     "LoadWeights": load_weights,
     "InferPrompt": infer_prompt,
+    "InstallRing": install_ring,
+    "UninstallRing": uninstall_ring,
+    "RingReadable": ring_readable,
+    "ExecuteStep": execute_step,
+    "ReleaseDeviceObject": release_device_object,
+    "EncodePrompt": encode_prompt,
+    "DecodeTokens": decode_tokens,
     "ShutdownWorker": shutdown_worker,
 }
 

@@ -75,8 +75,14 @@ fn bootstrap_bridge_writes_node_stream_and_forwards_plugin_observations() {
     let deliveries = subscription.drain_available();
     let logs = deliveries
         .iter()
-        .filter(|delivery| delivery.stream == node_stream_id(7, 42))
-        .filter_map(|delivery| MvpProvisionLogRecord::decode(&delivery.frame.payload).ok())
+        .filter_map(|event| match event {
+            datastream::DatastreamEvent::Frame(delivery)
+                if delivery.channel.stream == node_stream_id(7, 42) =>
+            {
+                MvpProvisionLogRecord::decode(&delivery.payload).ok()
+            }
+            _ => None,
+        })
         .collect::<Vec<_>>();
     assert_eq!(logs.len(), 2, "{deliveries:?}");
 

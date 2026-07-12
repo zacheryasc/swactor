@@ -1,6 +1,5 @@
 //! MVP-system-owned datastream channel records.
 
-use datastream::frame::ChannelId;
 use datastream::hardware::net::HostNetSample;
 use datastream::{ChannelRegistry, Record};
 use serde::{Deserialize, Serialize};
@@ -70,13 +69,13 @@ impl MvpProvisionLogRecord {
     }
 }
 
-pub fn mvp_provision_log_channel(node_id: u64, stream: ProvisionLogStream) -> ChannelId {
+pub fn mvp_provision_log_channel(node_id: u64, stream: ProvisionLogStream) -> String {
     let stream = match stream {
         ProvisionLogStream::Stdout => "stdout",
         ProvisionLogStream::Stderr => "stderr",
         ProvisionLogStream::Provider => "provider",
     };
-    ChannelId::new(format!("mvp.provisioning.logs.node.{node_id}.{stream}"))
+    format!("mvp.provisioning.logs.node.{node_id}.{stream}")
 }
 
 impl Record for MvpProvisionLogRecord {

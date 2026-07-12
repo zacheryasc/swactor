@@ -33,7 +33,19 @@ pub enum OrchestratorMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
+        datastream_publisher: ActorAddress,
         readiness_id: u64,
+    },
+    ObserveNodeRuntimeReadyAck {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        readiness_id: u64,
+    },
+    ObserveWeightsReady {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
     },
     ObserveTokenInEndpointReady,
     ObserveTokenOutEndpointReady,
@@ -135,7 +147,27 @@ pub enum OrchestratorReport {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
+        datastream_publisher: ActorAddress,
         readiness_id: u64,
+    },
+    NodeRuntimeReadyAck {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+        readiness_id: u64,
+    },
+    WeightsReady {
+        run_id: u64,
+        node_id: u64,
+        stage_index: u32,
+    },
+    StageReady {
+        run_id: u64,
+        stage_index: u32,
+    },
+    StageFault {
+        run_id: u64,
+        stage_index: u32,
     },
     Snapshot {
         commands: Vec<RunCommandWire>,
@@ -195,6 +227,8 @@ impl OrchestratorActor {
                 stage_index,
             }),
             OrchestratorMsg::ObserveNodeRuntimeReady { .. } => {}
+            OrchestratorMsg::ObserveNodeRuntimeReadyAck { .. } => {}
+            OrchestratorMsg::ObserveWeightsReady { .. } => {}
             OrchestratorMsg::ObserveTokenInEndpointReady => {
                 self.core.observe(core::RunEvent::TokenInEndpointReady)
             }
@@ -265,52 +299,114 @@ impl ActorInterface for OrchestratorActor {
     type Response = ();
 
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
-        if let OrchestratorMsg::ObserveNodeRuntimeReady {
-            run_id,
-            node_id,
-            stage_index,
-            endpoint,
-            node_actor,
-            readiness_id,
-        } = msg.clone()
-        {
-            if let Some(report_to) = self.report_to {
+        match msg.clone() {
+            OrchestratorMsg::ObserveNodeRuntimeReady {
+                run_id,
+                node_id,
+                stage_index,
+                endpoint,
+                node_actor,
+                datastream_publisher,
+                readiness_id,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        OrchestratorReport::NodeRuntimeReady {
+                            run_id,
+                            node_id,
+                            stage_index,
+                            endpoint,
+                            node_actor,
+                            datastream_publisher,
+                            readiness_id,
+                        },
+                    );
+                }
+                return;
+            }
+            OrchestratorMsg::ObserveNodeRuntimeReadyAck {
+                run_id,
+                node_id,
+                stage_index,
+                readiness_id,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        OrchestratorReport::NodeRuntimeReadyAck {
+                            run_id,
+                            node_id,
+                            stage_index,
+                            readiness_id,
+                        },
+                    );
+                }
+                return;
+            }
+            OrchestratorMsg::ObserveWeightsReady {
+                run_id,
+                node_id,
+                stage_index,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        OrchestratorReport::WeightsReady {
+                            run_id,
+                            node_id,
+                            stage_index,
+                        },
+                    );
+                }
+                return;
+            }
+            OrchestratorMsg::Snapshot { reply_to } => {
                 let _ = ctx.send(
-                    report_to,
-                    OrchestratorReport::NodeRuntimeReady {
-                        run_id,
-                        node_id,
-                        stage_index,
-                        endpoint,
-                        node_actor,
-                        readiness_id,
+                    reply_to,
+                    OrchestratorReport::Snapshot {
+                        commands: self
+                            .core
+                            .commands()
+                            .iter()
+                            .map(RunCommandWire::from)
+                            .collect(),
+                        events: self
+                            .core
+                            .events()
+                            .iter()
+                            .map(LifecycleEventWire::from)
+                            .collect(),
+                        injected_sequences: self.core.injected_sequences(),
                     },
                 );
+                return;
             }
-            return;
+            _ => {}
         }
-        if let OrchestratorMsg::Snapshot { reply_to } = msg.clone() {
-            let _ = ctx.send(
-                reply_to,
-                OrchestratorReport::Snapshot {
-                    commands: self
-                        .core
-                        .commands()
-                        .iter()
-                        .map(RunCommandWire::from)
-                        .collect(),
-                    events: self
-                        .core
-                        .events()
-                        .iter()
-                        .map(LifecycleEventWire::from)
-                        .collect(),
-                    injected_sequences: self.core.injected_sequences(),
-                },
-            );
-            return;
-        }
+
+        let direct_report = match msg.clone() {
+            OrchestratorMsg::ObserveStageReady {
+                run_id,
+                stage_index,
+            } => Some(OrchestratorReport::StageReady {
+                run_id,
+                stage_index,
+            }),
+            OrchestratorMsg::ObserveStageFault {
+                run_id,
+                stage_index,
+            } => Some(OrchestratorReport::StageFault {
+                run_id,
+                stage_index,
+            }),
+            _ => None,
+        };
+
         self.observe(msg);
+        if let (Some(report_to), Some(report)) = (self.report_to, direct_report) {
+            let _ = ctx.send(report_to, report);
+        }
         self.drain_outputs(ctx);
     }
 }
@@ -415,6 +511,7 @@ mod tests {
             .expect("spawn orchestrator actor");
         let endpoint = EndpointAddr::new(SecretKey::from_bytes(&[8; 32]).public());
         let node_actor = ActorAddress::new_random();
+        let datastream_publisher = ActorAddress::new_random();
 
         runtime
             .send_to(
@@ -425,6 +522,7 @@ mod tests {
                     stage_index: 3,
                     endpoint: endpoint.clone(),
                     node_actor,
+                    datastream_publisher,
                     readiness_id: 99,
                 },
             )
@@ -439,6 +537,7 @@ mod tests {
                 stage_index: 3,
                 endpoint,
                 node_actor,
+                datastream_publisher,
                 readiness_id: 99,
             })
         );

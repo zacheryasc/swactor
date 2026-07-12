@@ -263,4 +263,47 @@ mod tests {
         assert_eq!(frames[0].type_tag, "swactor_dist::Ping");
         assert_eq!(frames[0].payload, vec![1, 2, 3]);
     }
+
+    #[test]
+    fn route_view_transport_drops_missing_route_without_error() {
+        let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
+        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let transport = RouteViewTransport::new(route_view, outbox.clone());
+
+        let result = transport.send(WireEnvelope {
+            dest: ActorAddress::new_random(),
+            type_tag: "test::Message".into(),
+            payload: vec![1, 2, 3],
+        });
+
+        assert!(result.is_ok());
+        assert!(outbox.lock().expect("outbox poisoned").is_empty());
+    }
+
+    #[test]
+    fn route_view_transport_enqueues_when_route_present() {
+        let actor = ActorAddress::new_random();
+        let node = id(9);
+        let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
+        route_view
+            .write()
+            .expect("route view poisoned")
+            .insert(actor, node);
+        let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
+        let transport = RouteViewTransport::new(route_view, outbox.clone());
+
+        let result = transport.send(WireEnvelope {
+            dest: actor,
+            type_tag: "test::Message".into(),
+            payload: vec![1, 2, 3],
+        });
+
+        assert!(result.is_ok());
+        let frames = outbox.lock().expect("outbox poisoned");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].to, node);
+        assert_eq!(frames[0].dest, actor);
+        assert_eq!(frames[0].type_tag, "test::Message");
+        assert_eq!(frames[0].payload, vec![1, 2, 3]);
+    }
 }
