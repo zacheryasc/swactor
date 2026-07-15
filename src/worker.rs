@@ -105,6 +105,17 @@ impl Worker {
         }
     }
 
+    pub(crate) fn has_work(&self) -> bool {
+        self.has_backlog
+            || !self.spawn_rx.is_empty()
+            || !self.transfer_rx.is_empty()
+            || !self.admin_rx.is_empty()
+            || self
+                .worker_ext
+                .as_ref()
+                .map_or(false, |e| e.has_pending_work())
+    }
+
     /// Run one iteration of the worker loop. Returns `true` if any work was done.
     /// Drain the spawn queue, inserting new actors into the pool.
     /// Used in phases 1 and 4 of tick_once.
@@ -283,15 +294,7 @@ impl Worker {
 
         // Fast idle path: skip the entire tick when nothing could have changed.
         // Cost: ~3 atomic loads, zero syscalls, zero actor iteration.
-        if !self.has_backlog
-            && self.spawn_rx.is_empty()
-            && self.transfer_rx.is_empty()
-            && self.admin_rx.is_empty()
-            && !self
-                .worker_ext
-                .as_ref()
-                .map_or(false, |e| e.has_pending_work())
-        {
+        if !self.has_work() {
             return false;
         }
 

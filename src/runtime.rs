@@ -438,18 +438,42 @@ impl Runtime {
         }
     }
 
+    /// Return whether the single-threaded runtime currently has schedulable work.
+    ///
+    /// Panics if called on a multi-threaded runtime — use `run()` instead.
+    pub fn has_work(&self) -> bool {
+        assert!(
+            self.config.num_threads < 2,
+            "has_work() is only valid for single-threaded runtimes; use run() for multi-threaded"
+        );
+
+        self.tick_workers.borrow().iter().any(Worker::has_work)
+    }
+
+    /// Try to drive one tick of the single-threaded runtime.
+    ///
+    /// Returns `false` if no worker performed work.
+    /// Returns `true` if at least one worker performed work.
+    ///
+    /// Panics if called on a multi-threaded runtime — use `run()` instead.
+    pub fn try_tick(&self) -> bool {
+        assert!(
+            self.config.num_threads < 2,
+            "try_tick() is only valid for single-threaded runtimes; use run() for multi-threaded"
+        );
+
+        let tc = self.make_tick_context();
+        self.tick_workers
+            .borrow_mut()
+            .iter_mut()
+            .fold(false, |did_work, worker| worker.tick_once(&tc) || did_work)
+    }
+
     /// Drive one tick of the single-threaded worker.
     ///
     /// Panics if called on a multi-threaded runtime — use `run()` instead.
     pub fn tick(&self) {
-        assert!(
-            self.config.num_threads < 2,
-            "tick() is only valid for single-threaded runtimes; use run() for multi-threaded"
-        );
-        let tc = self.make_tick_context();
-        for worker in self.tick_workers.borrow_mut().iter_mut() {
-            worker.tick_once(&tc);
-        }
+        let _ = self.try_tick();
     }
 
     /// Spawn worker threads and start processing, returning a handle
