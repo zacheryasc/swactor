@@ -101,8 +101,7 @@ fn one_node_chat_process_cached_model_e2e() {
     command
         .current_dir(&root)
         .args(["mvp-chat", "--cached-model"])
-        .arg(&cached_model)
-        .args(["-N", "2", "--dump-logs"])
+        .args(["--pipeline-stages", "2", "--dump-logs"])
         .env("MVP_RUNTIME_CONFIG", "local")
         .env("MVP_IROH_RELAY_MODE", "disabled")
         .env(DOCKER_CONTAINER_PREFIX_ENV, &container_prefix)

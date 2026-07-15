@@ -1,61 +1,54 @@
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
+use std::fs;
+use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::net::{Shutdown, TcpStream};
+#[cfg(all(target_os = "linux", not(test)))]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
+use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+#[cfg(target_os = "linux")]
+use signal_hook::consts::signal::{SIGINT, SIGTERM};
+#[cfg(target_os = "linux")]
+use signal_hook::iterator::Signals;
 
 use mvp_system::config as chat_config;
 use mvp_system::config::ResolvedVastAiConfig;
-use mvp_system::node_image::{NodeImageProvider, NodeImageRequest, prepare_node_image};
+use mvp_system::node_image::{
+    NodeImageProvider, NodeImageRequest, PreparedNodeImage, prepare_node_image,
+};
 use mvp_system::node_provisioning::ProviderKind;
 use mvp_system::prompt_rpc::{PromptEvent, SubmitPrompt, write_json_line};
-use mvp_system::vastai_offer_preview::{OfferPreview, OfferPreviewer, VastAiOfferPreviewer};
-use serde_json::Value;
-
-#[cfg(target_os = "linux")]
-use std::os::unix::process::CommandExt;
 
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:19777";
-const DEFAULT_NODE_IMAGE: &str = "swactor-mvp-node:latest";
 const BASE_NODE_IMAGE: &str = "swactor-mvp-node-base:cuda12.6";
-const MVP_RUNTIME_CONFIG_ENV: &str = "MVP_RUNTIME_CONFIG";
-const DEFAULT_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
 const REPO_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_MAX_TOKENS: u32 = 64;
-const ORCH_REBUILD_INPUTS: &[&str] = &[
-    "Cargo.lock",
-    "Cargo.toml",
-    "src",
-    "crates/datastream/Cargo.toml",
-    "crates/datastream/src",
-    "crates/dashboard/Cargo.toml",
-    "crates/dashboard/src",
-    "crates/distribution/Cargo.toml",
-    "crates/distribution/src",
-    "crates/iroh-driver/Cargo.toml",
-    "crates/iroh-driver/src",
-    "crates/mvp-system/Cargo.toml",
-    "crates/mvp-system/src",
-    "crates/transport/Cargo.toml",
-    "crates/transport/src",
-    "tools/vastai/Cargo.toml",
-    "tools/vastai/src",
-];
-const CHAT_READ_TIMEOUT: Duration = Duration::from_millis(100);
+const ORCH_SHUTDOWN_GRACE_MS: u64 = 5_000;
+const ORCH_SHUTDOWN_POLL_MS: u64 = 50;
+
+#[derive(Debug)]
+enum PromptInput {
+    Line(String),
+    Closed,
+    StopRequested,
+}
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
-static STOP_ACKNOWLEDGED: AtomicBool = AtomicBool::new(false);
+static PROMPT_STOP_TX: Mutex<Option<mpsc::Sender<PromptInput>>> = Mutex::new(None);
 
 pub fn run_from_args<I>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = String>,
 {
-    install_signal_handlers();
+    if let Err(error) = install_signal_handlers() {
+        eprintln!("mvp-chat: {error}");
+        return ExitCode::from(1);
+    }
     match run(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -69,68 +62,118 @@ fn run<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
-    let mut config = Config::from_args(args)?;
-    confirm_vastai_if_needed(&config, VastAiOfferPreviewer)?;
+    let config = Config::from_args(args)?;
+    confirm_vastai_if_needed(&config)?;
     let image_ref = prepare_runtime(&config)?;
-    let frame_log = configure_progress_frame_log(&mut config)?;
-    if let Some(path) = &config.datastream_frame_log {
-        eprintln!(
-            "mvp-chat: dumping datastream frames to {}",
-            display_user_path(path)
-        );
-    }
-    let mut progress = StartupProgress::new(&frame_log);
     let mut orch = OrchChild::spawn(&config, &image_ref)?;
-    let rpc_addr = match orch.wait_ready(config.rpc_addr.clone(), &mut progress) {
+    let rpc_addr = match orch.wait_ready(config.rpc_addr.clone()) {
         Ok(addr) => addr,
         Err(_) if STOP_REQUESTED.load(Ordering::SeqCst) => {
-            acknowledge_stop();
-            let _ = orch.shutdown(true);
-            report_interrupt_shutdown();
+            orch.shutdown();
             return Ok(());
         }
-        Err(error) => {
-            progress.poll();
-            return Err(progress.failure_summary().unwrap_or(error));
-        }
+        Err(error) => return Err(error),
     };
-    progress.poll();
-    println!("model successfully loaded.");
     let result = run_chat_loop(&rpc_addr, config.max_tokens);
-    let interrupted = STOP_REQUESTED.load(Ordering::SeqCst);
-    let _ = orch.shutdown(interrupted);
-    if interrupted {
-        report_interrupt_shutdown();
-    }
+    orch.shutdown();
     result
 }
 
 struct Config {
     orch_bin: PathBuf,
     worker_bin: PathBuf,
-    orch_args: Vec<String>,
     rpc_addr: String,
     node_image: String,
-    config_profile: RuntimeConfigProfile,
     provider: ProviderKind,
-    relay_mode: iroh::RelayMode,
-    relay_url: Option<String>,
-    max_tokens: u32,
-    dashboard: bool,
-    build_image: bool,
     image_tag: Option<String>,
-    push_image: bool,
-    force_image_refresh: bool,
     cached_model: Option<CachedModelConfig>,
     datastream_frame_log: Option<PathBuf>,
     vastai_yes: bool,
     vastai: Option<ResolvedVastAiConfig>,
-    model_id: Option<String>,
-    gguf_repo: Option<String>,
-    gguf_file: Option<String>,
-    gguf_revision: Option<String>,
-    max_context: Option<u32>,
     pipeline_stages: u32,
+    max_tokens: u32,
+    skip_rebuild: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatTomlConfig {
+    provider: ChatProviderConfig,
+    runtime: ChatRuntimeConfig,
+    observability: ChatObservabilityConfig,
+    image: ChatImageConfig,
+    vastai: ChatVastAiConfig,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatProviderConfig {
+    kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatRuntimeConfig {
+    pipeline_stages: Option<u32>,
+    max_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatObservabilityConfig {
+    dump_logs: Option<bool>,
+    dump_log_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatImageConfig {
+    node: Option<String>,
+    tag: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatVastAiConfig {
+    relay_url: Option<String>,
+    bootstrap_command: Option<String>,
+    gpu_name: Option<String>,
+    min_gpu_ram_mb: Option<u64>,
+    min_down_mbps: Option<f64>,
+    min_up_mbps: Option<f64>,
+    min_reliability: Option<f64>,
+    require_verified: Option<bool>,
+    disk_gb: Option<u32>,
+    onstart: Option<String>,
+    ssh_identity: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LoadedChatTomlConfig {
+    overlay: ChatTomlConfig,
+}
+
+fn load_chat_config(path: Option<&Path>) -> Result<LoadedChatTomlConfig, String> {
+    let overlay = match path {
+        Some(path) => {
+            let text = fs::read_to_string(path)
+                .map_err(|e| format!("read config {}: {e}", path.display()))?;
+            toml::from_str::<ChatTomlConfig>(&text)
+                .map_err(|e| format!("parse config {}: {e}", path.display()))?
+        }
+        None => {
+            let default = Path::new(chat_config::DEFAULT_CONFIG_PATH);
+            if !default.is_file() {
+                ChatTomlConfig::default()
+            } else {
+                let text = fs::read_to_string(default)
+                    .map_err(|e| format!("read config {}: {e}", default.display()))?;
+                toml::from_str::<ChatTomlConfig>(&text)
+                    .map_err(|e| format!("parse config {}: {e}", default.display()))?
+            }
+        }
+    };
+    Ok(LoadedChatTomlConfig { overlay })
 }
 
 impl Config {
@@ -139,159 +182,69 @@ impl Config {
         I: IntoIterator<Item = String>,
     {
         let args = ParsedArgs::parse(provided_args)?;
-        let loaded = chat_config::TomlConfigOverlay::load(args.config_path.as_deref())?;
+        let loaded = load_chat_config(args.config_path.as_deref())?;
         let toml = loaded.overlay;
-        let profile = if args.vastai {
-            RuntimeConfigProfile::Deploy
-        } else {
-            RuntimeConfigProfile::from_env()?
-        };
-        let provider =
-            provider_from_sources(args.provider, toml.provider.kind.as_deref(), profile)?;
-        let relay_mode = relay_mode_from_sources(toml.relay.mode.as_deref())?;
-        let relay_url = first_non_empty([
-            env_optional("MVP_IROH_RELAY_URL"),
-            env_optional("SWACTOR_IROH_RELAY_URL"),
-            toml.relay.url.clone(),
-        ]);
-        let node_image = first_non_empty([
-            args.image,
-            env_optional("MVP_NODE_IMAGE"),
-            if args.vastai {
-                toml.vastai.image.clone()
-            } else {
-                None
-            },
-            toml.image.node.clone(),
-            Some(DEFAULT_NODE_IMAGE.to_owned()),
-        ])
-        .expect("default image is non-empty");
-        let max_tokens = args
-            .max_tokens
-            .or(env_u32_optional("MVP_PROMPT_MAX_TOKENS")?)
-            .or(toml.prompt.max_tokens)
-            .unwrap_or(DEFAULT_MAX_TOKENS);
-        let dashboard = args
-            .dashboard
-            .or(env_bool_optional("MVP_DASHBOARD")?)
-            .or(toml.prompt.dashboard)
-            .unwrap_or(true);
-        let build_image = args
-            .build_image
-            .or(env_bool_optional("MVP_BUILD_NODE_IMAGE")?)
-            .or(toml.image.build)
-            .unwrap_or(true);
-        let push_image = args
-            .push_image
-            .or(env_bool_optional("MVP_PUSH_NODE_IMAGE")?)
-            .or(toml.image.push)
-            .unwrap_or(false);
-        let force_image_refresh = args
-            .force_image_refresh
-            .or(env_bool_optional("MVP_FORCE_NODE_IMAGE_REFRESH")?)
-            .or(toml.image.force_refresh)
-            .unwrap_or(false);
-        let image_tag = first_non_empty([
-            args.image_tag,
-            env_optional("MVP_NODE_IMAGE_TAG"),
-            toml.image.tag.clone(),
-        ]);
-        let rpc_addr = first_non_empty([
-            args.rpc_addr,
-            env_optional("MVP_PROMPT_RPC_ADDR"),
-            env_optional("MVP_PROMPT_RPC_BIND"),
-            toml.prompt.rpc_addr.clone(),
-            Some(DEFAULT_RPC_ADDR.to_owned()),
-        ])
-        .expect("default RPC address is non-empty");
-        let datastream_frame_log = match (args.dump_logs, args.datastream_frame_log) {
-            (true, Some(_)) => {
-                return Err("--dump-logs cannot be combined with --datastream-frame-log; use one datastream log destination".to_owned());
-            }
-            (true, None) => Some(PathBuf::from("mvp-chat.log")),
-            (false, explicit) => explicit
-                .or_else(|| env_optional("MVP_DATASTREAM_FRAME_LOG").map(PathBuf::from))
-                .or_else(|| {
-                    toml.observability
-                        .datastream_frame_log
-                        .clone()
-                        .map(PathBuf::from)
-                }),
-        };
-        let model_id = first_non_empty([env_optional("MVP_MODEL_ID"), toml.model.id.clone()]);
-        let gguf_repo =
-            first_non_empty([env_optional("MVP_GGUF_REPO"), toml.model.gguf_repo.clone()]);
-        let gguf_file =
-            first_non_empty([env_optional("MVP_GGUF_FILE"), toml.model.gguf_file.clone()]);
-        let gguf_revision = first_non_empty([
-            env_optional("MVP_GGUF_REVISION"),
-            toml.model.gguf_revision.clone(),
-        ]);
-        let max_context = env_u32_optional("MVP_MAX_CONTEXT")?.or(toml.model.max_context);
+        let provider = provider_from_sources(args.provider, toml.provider.kind.as_deref())?;
+        let node_image = first_non_empty([toml.image.node.clone()]).unwrap_or_default();
+        if provider != ProviderKind::Process && node_image.is_empty() {
+            return Err("node image is required for docker or vastai provider".to_owned());
+        }
         let pipeline_stages = args
             .pipeline_stages
-            .or(env_u32_optional("MVP_PIPELINE_STAGES")?)
             .or(toml.runtime.pipeline_stages)
             .unwrap_or(1);
         if pipeline_stages == 0 {
             return Err("--pipeline-stages must be greater than 0".to_owned());
         }
-        if provider == ProviderKind::VastAi && pipeline_stages > 1 {
-            return Err(
-                "pipeline stages greater than 1 are only supported with provider=docker; --vastai cannot be combined with -N/--pipeline-stages > 1".to_owned(),
-            );
+        let max_tokens = toml.runtime.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        if max_tokens == 0 {
+            return Err("[runtime].max_tokens must be greater than 0".to_owned());
         }
-        let cached_model = match (
-            args.cached_model,
-            toml.docker.cached_model_host_path.clone(),
-        ) {
-            (Some(cached_model), _) => Some(cached_model),
-            (None, Some(path)) => Some(CachedModelConfig::from_arg(Some(path))?),
-            (None, None) => None,
+        let cached_model = args
+            .cached_model
+            .map(CachedModelConfig::from_source)
+            .transpose()?;
+        let datastream_frame_log = if args.dump_logs {
+            Some(
+                args.dump_log_path
+                    .unwrap_or_else(|| PathBuf::from("mvp-chat.log")),
+            )
+        } else if toml.observability.dump_logs.unwrap_or(false) {
+            Some(
+                first_non_empty([toml.observability.dump_log_path.clone()])
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("mvp-chat.log")),
+            )
+        } else {
+            None
         };
-        let vastai = if args.vastai {
-            Some(resolve_vastai_config(
-                &toml.vastai,
-                &node_image,
-                relay_url.clone(),
-            )?)
+        let vastai = if provider == ProviderKind::VastAi {
+            Some(resolve_vastai_config(&toml.vastai, &node_image)?)
         } else {
             None
         };
 
         Ok(Self {
-            orch_bin: args.orch_bin.unwrap_or(default_orch_bin()?),
-            worker_bin: args.worker_bin.unwrap_or(node_bin_for_current_profile()?),
-            orch_args: args.orch_args,
-            rpc_addr,
+            orch_bin: default_orch_bin()?,
+            worker_bin: node_bin_for_current_profile()?,
+            rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
             node_image,
-            config_profile: profile,
             provider,
-            relay_mode,
-            relay_url,
-            max_tokens,
-            dashboard,
-            build_image,
-            image_tag,
-            push_image,
-            force_image_refresh,
+            image_tag: first_non_empty([toml.image.tag.clone()]),
             cached_model,
             datastream_frame_log,
             vastai_yes: args.vastai_yes,
-            model_id,
-            gguf_repo,
-            gguf_file,
-            gguf_revision,
-            max_context,
             pipeline_stages,
+            max_tokens,
             vastai,
+            skip_rebuild: args.skip_rebuild,
         })
     }
 
+    // The orchestrator launch spec is still pending. These flags are the current adapter;
+    // adjust this mapping when the approved orchestrator launch contract is finalized.
     fn orchestrator_cli_args(&self, image_ref: &str) -> Vec<String> {
         let mut args = vec![
-            "--runtime-config".to_owned(),
-            self.config_profile.as_str().to_owned(),
             "--provider".to_owned(),
             self.provider.as_str().to_owned(),
             "--image".to_owned(),
@@ -302,39 +255,12 @@ impl Config {
             self.max_tokens.to_string(),
             "--pipeline-stages".to_owned(),
             self.pipeline_stages.to_string(),
-            if self.dashboard {
-                "--dashboard".to_owned()
-            } else {
-                "--no-dashboard".to_owned()
-            },
         ];
-        if let Some(relay_url) = &self.relay_url {
-            args.extend(["--relay-url".to_owned(), relay_url.clone()]);
-        }
-        args.extend([
-            "--relay-mode".to_owned(),
-            relay_mode_env_value(&self.relay_mode).to_owned(),
-        ]);
         if self.provider == ProviderKind::Process {
             args.extend([
                 "--worker-bin".to_owned(),
                 self.worker_bin.to_string_lossy().to_string(),
             ]);
-        }
-        if let Some(model_id) = &self.model_id {
-            args.extend(["--model-id".to_owned(), model_id.clone()]);
-        }
-        if let Some(repo) = &self.gguf_repo {
-            args.extend(["--gguf-repo".to_owned(), repo.clone()]);
-        }
-        if let Some(file) = &self.gguf_file {
-            args.extend(["--gguf-file".to_owned(), file.clone()]);
-        }
-        if let Some(revision) = &self.gguf_revision {
-            args.extend(["--gguf-revision".to_owned(), revision.clone()]);
-        }
-        if let Some(max_context) = self.max_context {
-            args.extend(["--max-context".to_owned(), max_context.to_string()]);
         }
         if let Some(cached_model) = &self.cached_model {
             args.extend([
@@ -403,28 +329,24 @@ impl Config {
 
 #[derive(Default, Debug)]
 struct ParsedArgs {
-    vastai: bool,
     provider: Option<ProviderKind>,
     vastai_yes: bool,
     config_path: Option<PathBuf>,
-    orch_bin: Option<PathBuf>,
-    worker_bin: Option<PathBuf>,
-    rpc_addr: Option<String>,
-    image: Option<String>,
-    max_tokens: Option<u32>,
     pipeline_stages: Option<u32>,
-    datastream_frame_log: Option<PathBuf>,
     dump_logs: bool,
-    dashboard: Option<bool>,
-    build_image: Option<bool>,
-    image_tag: Option<String>,
-    push_image: Option<bool>,
-    force_image_refresh: Option<bool>,
-    cached_model: Option<CachedModelConfig>,
-    orch_args: Vec<String>,
+    dump_log_path: Option<PathBuf>,
+    skip_rebuild: bool,
+    cached_model: Option<CachedModelSource>,
 }
 
-const PROVIDER_SELECTOR_CONFLICT: &str = "conflicting provider selectors; use exactly one of --process, --docker, --vastai, or --provider <provider>";
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CachedModelSource {
+    Discover,
+    Path(PathBuf),
+}
+
+const PROVIDER_SELECTOR_CONFLICT: &str =
+    "conflicting provider selectors; use exactly one of --process, --docker, or --vastai";
 
 impl ParsedArgs {
     fn set_provider_selector(&mut self, provider: ProviderKind) -> Result<(), String> {
@@ -443,58 +365,42 @@ impl ParsedArgs {
         let mut args = provided_args.into_iter().peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--vastai" => {
-                    parsed.vastai = true;
-                    parsed.set_provider_selector(ProviderKind::VastAi)?;
-                }
-                "--process" | "--local-process" => {
-                    parsed.set_provider_selector(ProviderKind::Process)?
-                }
+                "--vastai" => parsed.set_provider_selector(ProviderKind::VastAi)?,
+                "--process" => parsed.set_provider_selector(ProviderKind::Process)?,
                 "--docker" => parsed.set_provider_selector(ProviderKind::Docker)?,
-                "--provider" => {
-                    let provider = ProviderKind::parse_deploy(&next_arg(&mut args, "--provider")?)?;
-                    parsed.set_provider_selector(provider)?;
-                }
                 "--yes" | "-y" => parsed.vastai_yes = true,
                 "--config" => {
                     parsed.config_path = Some(PathBuf::from(next_arg(&mut args, "--config")?))
                 }
-                "--orch-bin" => {
-                    parsed.orch_bin = Some(PathBuf::from(next_arg(&mut args, "--orch-bin")?))
-                }
-                "--worker-bin" => {
-                    parsed.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
-                }
-                "--addr" => parsed.rpc_addr = Some(next_arg(&mut args, "--addr")?),
-                "--image" => parsed.image = Some(next_arg(&mut args, "--image")?),
-                "--max-tokens" => parsed.max_tokens = Some(parse_next(&mut args, "--max-tokens")?),
-                "-N" | "--pipeline-stages" => {
+                "--pipeline-stages" => {
                     parsed.pipeline_stages =
                         Some(parse_pipeline_stages_value(&mut args, arg.as_str())?)
                 }
-                "--datastream-frame-log" => {
-                    parsed.datastream_frame_log = Some(PathBuf::from(next_arg(
-                        &mut args,
-                        "--datastream-frame-log",
-                    )?));
+                "--dump-logs" => {
+                    parsed.dump_logs = true;
                 }
-                "--dump-logs" => parsed.dump_logs = true,
-                "--dashboard" => parsed.dashboard = Some(true),
-                "--no-dashboard" => parsed.dashboard = Some(false),
-                "--no-build-image" => parsed.build_image = Some(false),
-                "--image-tag" => parsed.image_tag = Some(next_arg(&mut args, "--image-tag")?),
-                "--push-image" => parsed.push_image = Some(true),
-                "--no-push-image" => parsed.push_image = Some(false),
-                "--force-image-refresh" => parsed.force_image_refresh = Some(true),
+                value if value.starts_with("--dump-logs=") => {
+                    let path = value.strip_prefix("--dump-logs=").expect("prefix checked");
+                    if path.is_empty() {
+                        return Err("--dump-logs path must not be empty".to_owned());
+                    }
+                    parsed.dump_logs = true;
+                    parsed.dump_log_path = Some(PathBuf::from(path));
+                }
                 "--cached-model" => {
-                    let path = args.next_if(|value| !value.starts_with('-'));
-                    parsed.cached_model = Some(CachedModelConfig::from_arg(path)?);
+                    parsed.cached_model = Some(CachedModelSource::Discover);
                 }
-                "--" => {
-                    parsed.orch_args.extend(args);
-                    break;
+                value if value.starts_with("--cached-model=") => {
+                    let path = value
+                        .strip_prefix("--cached-model=")
+                        .expect("prefix checked");
+                    if path.is_empty() {
+                        return Err("--cached-model path must not be empty".to_owned());
+                    }
+                    parsed.cached_model = Some(CachedModelSource::Path(PathBuf::from(path)));
                 }
-                other => parsed.orch_args.push(other.to_owned()),
+                "--skip-rebuild" => parsed.skip_rebuild = true,
+                other => return Err(format!("unsupported mvp-chat argument {other:?}")),
             }
         }
         Ok(parsed)
@@ -502,37 +408,23 @@ impl ParsedArgs {
 }
 
 fn resolve_vastai_config(
-    file: &chat_config::VastAiConfig,
+    file: &ChatVastAiConfig,
     node_image: &str,
-    relay_url: Option<String>,
 ) -> Result<ResolvedVastAiConfig, String> {
     ResolvedVastAiConfig {
-        api_key: first_non_empty([
-            env_optional("MVP_VASTAI_API_KEY"),
-            env_optional("VAST_API_KEY"),
-            file.api_key.clone(),
-        ])
-        .unwrap_or_default(),
-        relay_url: relay_url.unwrap_or_default(),
+        api_key: first_non_empty([env_optional("VAST_API_KEY")]).unwrap_or_default(),
+        relay_url: first_non_empty([file.relay_url.clone()]).unwrap_or_default(),
         image: node_image.to_owned(),
-        bootstrap_command: first_non_empty([
-            env_optional("MVP_VASTAI_BOOTSTRAP_COMMAND"),
-            file.bootstrap_command.clone(),
-        ])
-        .unwrap_or_default(),
-        disk_gb: env_u32_optional("MVP_VASTAI_DISK_GB")?.or(file.disk_gb),
-        gpu_name: first_non_empty([env_optional("MVP_VASTAI_GPU_NAME"), file.gpu_name.clone()]),
-        min_gpu_ram_mb: env_u64_optional("MVP_VASTAI_MIN_GPU_RAM_MB")?.or(file.min_gpu_ram_mb),
-        min_down_mbps: env_f64_optional("MVP_VASTAI_MIN_DOWN_MBPS")?.or(file.min_down_mbps),
-        min_up_mbps: env_f64_optional("MVP_VASTAI_MIN_UP_MBPS")?.or(file.min_up_mbps),
-        min_reliability: env_f64_optional("MVP_VASTAI_MIN_RELIABILITY")?.or(file.min_reliability),
-        require_verified: env_bool_optional("MVP_VASTAI_REQUIRE_VERIFIED")?
-            .or(file.require_verified),
-        onstart: first_non_empty([env_optional("MVP_VASTAI_ONSTART"), file.onstart.clone()]),
-        ssh_identity: first_non_empty([
-            env_optional("MVP_VASTAI_SSH_IDENTITY"),
-            file.ssh_identity.clone(),
-        ]),
+        bootstrap_command: first_non_empty([file.bootstrap_command.clone()]).unwrap_or_default(),
+        disk_gb: file.disk_gb,
+        gpu_name: first_non_empty([file.gpu_name.clone()]),
+        min_gpu_ram_mb: file.min_gpu_ram_mb,
+        min_down_mbps: file.min_down_mbps,
+        min_up_mbps: file.min_up_mbps,
+        min_reliability: file.min_reliability,
+        require_verified: file.require_verified,
+        onstart: first_non_empty([file.onstart.clone()]),
+        ssh_identity: first_non_empty([file.ssh_identity.clone()]),
     }
     .validate()
 }
@@ -541,48 +433,75 @@ fn first_non_empty<const N: usize>(values: [Option<String>; N]) -> Option<String
     values.into_iter().find_map(chat_config::normalize_optional)
 }
 
-fn confirm_vastai_if_needed<P>(config: &Config, previewer: P) -> Result<(), String>
+fn confirm_vastai_if_needed(config: &Config) -> Result<(), String> {
+    let mut approval = StdinVastAiApproval;
+    confirm_vastai_if_needed_with_approval(config, &mut approval)
+}
+
+trait VastAiApproval {
+    fn stdin_is_terminal(&self) -> bool;
+    fn ask(&mut self) -> Result<bool, String>;
+}
+
+struct StdinVastAiApproval;
+
+impl VastAiApproval for StdinVastAiApproval {
+    fn stdin_is_terminal(&self) -> bool {
+        io::stdin().is_terminal()
+    }
+
+    fn ask(&mut self) -> Result<bool, String> {
+        #[cfg(test)]
+        {
+            let mut input = std::io::Cursor::new(Vec::<u8>::new());
+            let mut output = io::sink();
+            ask_vastai_approval(&mut input, &mut output)
+        }
+        #[cfg(not(test))]
+        {
+            let stdin = io::stdin();
+            let mut input = stdin.lock();
+            let mut output = io::stdout();
+            ask_vastai_approval(&mut input, &mut output)
+        }
+    }
+}
+
+fn confirm_vastai_if_needed_with_approval<A>(
+    config: &Config,
+    approval: &mut A,
+) -> Result<(), String>
 where
-    P: OfferPreviewer,
+    A: VastAiApproval,
 {
-    let Some(vastai) = &config.vastai else {
-        return Ok(());
-    };
-    eprintln!("mvp-chat: checking Vast.ai offers...");
-    let preview = previewer.preview(&vastai.api_key, &vastai.selection_policy())?;
-    print_offer_preview(&preview);
-    if config.vastai_yes {
-        eprintln!("mvp-chat: --yes supplied; skipping Vast.ai rental prompt");
+    if config.vastai.is_none() {
         return Ok(());
     }
-    if !io::stdin().is_terminal() {
+    if config.vastai_yes {
+        return Ok(());
+    }
+    if !approval.stdin_is_terminal() {
         return Err("Vast.ai rental requires --yes when stdin is not a terminal".to_owned());
     }
-    if ask_vastai_approval()? {
+    if approval.ask()? {
         Ok(())
     } else {
         Err("Vast.ai rental declined".to_owned())
     }
 }
 
-fn print_offer_preview(preview: &OfferPreview) {
-    let ram = preview
-        .gpu_ram_mb
-        .map(|mb| format!(", {mb} MB VRAM"))
-        .unwrap_or_default();
-    eprintln!(
-        "mvp-chat: best Vast.ai offer {}{} at ${:.3}/hr",
-        preview.gpu_name, ram, preview.dollars_per_hour
-    );
-}
-
-fn ask_vastai_approval() -> Result<bool, String> {
-    eprint!("Rent 1 Vast.ai node? [y/N]: ");
-    io::stderr()
+fn ask_vastai_approval<R, W>(input: &mut R, output: &mut W) -> Result<bool, String>
+where
+    R: BufRead,
+    W: Write,
+{
+    write!(output, "Rent 1 Vast.ai node? [y/N]: ")
+        .map_err(|e| format!("write Vast.ai approval prompt: {e}"))?;
+    output
         .flush()
         .map_err(|e| format!("flush Vast.ai approval prompt: {e}"))?;
     let mut line = String::new();
-    io::stdin()
+    input
         .read_line(&mut line)
         .map_err(|e| format!("read Vast.ai approval: {e}"))?;
     Ok(parse_approval(&line))
@@ -592,272 +511,20 @@ fn parse_approval(input: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
-struct FrameLogConfig {
-    path: PathBuf,
-    start_offset: u64,
-    remove_on_drop: bool,
-}
-
-fn configure_progress_frame_log(config: &mut Config) -> Result<FrameLogConfig, String> {
-    if let Some(path) = &config.datastream_frame_log {
-        let start_offset = fs::metadata(path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        return Ok(FrameLogConfig {
-            path: path.clone(),
-            start_offset,
-            remove_on_drop: false,
-        });
-    }
-
-    let path = PathBuf::from("target")
-        .join("mvp-chat")
-        .join(format!("startup-{}.frames.jsonl", std::process::id()));
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("create startup frame log dir {}: {e}", parent.display()))?;
-    }
-    File::create(&path).map_err(|e| format!("create startup frame log {}: {e}", path.display()))?;
-    config.datastream_frame_log = Some(path.clone());
-    Ok(FrameLogConfig {
-        path,
-        start_offset: 0,
-        remove_on_drop: true,
-    })
-}
-
-impl Drop for FrameLogConfig {
-    fn drop(&mut self) {
-        if self.remove_on_drop {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
-struct StartupProgress {
-    path: PathBuf,
-    offset: u64,
-    partial: String,
-    printed: HashSet<String>,
-    last_error_line: Option<String>,
-    last_failure: Option<String>,
-    last_download_bucket: Option<u64>,
-    provider: Option<String>,
-}
-
-impl StartupProgress {
-    fn new(frame_log: &FrameLogConfig) -> Self {
-        Self {
-            path: frame_log.path.clone(),
-            offset: frame_log.start_offset,
-            partial: String::new(),
-            printed: HashSet::new(),
-            last_error_line: None,
-            last_failure: None,
-            last_download_bucket: None,
-            provider: None,
-        }
-    }
-
-    fn poll(&mut self) {
-        let mut file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(_) => return,
-        };
-        if file.seek(SeekFrom::Start(self.offset)).is_err() {
-            return;
-        }
-        let mut chunk = String::new();
-        if file.read_to_string(&mut chunk).is_err() || chunk.is_empty() {
-            return;
-        }
-        self.offset += chunk.as_bytes().len() as u64;
-        self.partial.push_str(&chunk);
-        while let Some(newline) = self.partial.find('\n') {
-            let line: String = self.partial.drain(..=newline).collect();
-            let line = line.trim();
-            if !line.is_empty() {
-                self.observe_archive_line(line);
-            }
-        }
-    }
-
-    fn failure_summary(&self) -> Option<String> {
-        if let Some(line) = &self.last_error_line {
-            return Some(format!("node provisioning failed: {line}"));
-        }
-        self.last_failure.clone()
-    }
-
-    fn observe_archive_line(&mut self, line: &str) {
-        let Ok(record) = serde_json::from_str::<Value>(line) else {
-            return;
-        };
-        let Some(channel) = record.get("channel").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(payload_text) = record
-            .get("payload")
-            .and_then(|payload| payload.get("value"))
-            .and_then(Value::as_str)
-        else {
-            return;
-        };
-        let Ok(payload) = serde_json::from_str::<Value>(payload_text) else {
-            return;
-        };
-
-        if channel == "mvp.orch.bootstrap" {
-            self.observe_bootstrap(&payload);
-        } else if channel == "mvp.provisioning.events" {
-            self.observe_provision_event(&payload);
-        } else if channel == "mvp.worker.weights" {
-            self.observe_worker_weights(&payload);
-        } else if channel.starts_with("mvp.provisioning.logs.") {
-            self.observe_provision_log(&payload);
-        }
-    }
-
-    fn observe_bootstrap(&mut self, payload: &Value) {
-        let phase = payload.get("phase").and_then(Value::as_str).unwrap_or("");
-        let status = payload.get("status").and_then(Value::as_str).unwrap_or("");
-        if phase == "config" && status == "ready" {
-            if let Some(provider) = payload
-                .get("detail")
-                .and_then(|detail| detail.get("provider"))
-                .and_then(Value::as_str)
-            {
-                self.provider = Some(provider.to_owned());
-            }
-        }
-        if status == "failed" {
-            let error = payload
-                .get("detail")
-                .and_then(|detail| detail.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            self.last_failure = Some(format!("{phase} failed: {error}"));
-            return;
-        }
-        match (phase, status) {
-            ("provider_start", "started") => self.print_provider_start(),
-            ("node_runtime_ready", "started") => {
-                self.print_once("node_runtime_ready_started", "waiting for node runtime")
-            }
-            ("node_runtime_ready", "ready") => {
-                self.print_once("node_runtime_ready", "node runtime ready")
-            }
-            ("stage_provision", "started") => {
-                self.print_once("stage_provision", "configuring model stage")
-            }
-            ("weights_loaded", "started") => {
-                self.print_once("weights_loaded_started", "loading model")
-            }
-            ("prompt_rpc", "ready") | ("prompt_loop", "ready") => {
-                self.print_once("prompt_ready", "prompt RPC ready")
-            }
-            _ => {}
-        }
-    }
-
-    fn observe_provision_event(&mut self, payload: &Value) {
-        let Some(event) = payload.get("event") else {
-            return;
-        };
-        match event.get("kind").and_then(Value::as_str).unwrap_or("") {
-            "ProvisionStart" => self.print_provider_start(),
-            "NodeLive" => self.print_once("node_runtime_ready", "node runtime ready"),
-            "ProvisionFailed" => {
-                let message = event
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("provisioning failed");
-                self.last_failure = Some(format!("node provisioning failed: {message}"));
-            }
-            _ => {}
-        }
-    }
-
-    fn observe_worker_weights(&mut self, payload: &Value) {
-        match payload.get("type").and_then(Value::as_str).unwrap_or("") {
-            "GgufDownloadStarted" => {
-                self.print_once("download_started", "downloading model weights")
-            }
-            "GgufDownloadProgress" => {
-                let done = payload
-                    .get("bytes_done")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let total = payload
-                    .get("bytes_total")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if total == 0 {
-                    return;
-                }
-                let pct = done.saturating_mul(100).saturating_div(total).min(100);
-                let bucket = pct / 10;
-                if self.last_download_bucket != Some(bucket) {
-                    self.last_download_bucket = Some(bucket);
-                    eprintln!("mvp-chat: downloading model weights {pct}%");
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn observe_provision_log(&mut self, payload: &Value) {
-        let Some(line) = payload
-            .get("line")
-            .and_then(|line| line.get("line"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        else {
-            return;
-        };
-        if line.starts_with("docker:") || line.contains("Error response") || line.contains("error")
-        {
-            self.last_error_line = Some(line.to_owned());
-        }
-    }
-
-    fn print_provider_start(&mut self) {
-        match self.provider.as_deref().unwrap_or("provider") {
-            "process" => self.print_once("starting_process_node", "starting process node"),
-            "docker" => self.print_once("starting_docker_node", "starting docker node"),
-            "vastai" => self.print_once("starting_vastai_node", "starting Vast.ai node"),
-            other => self.print_once(
-                format!("starting_{other}_node"),
-                format!("starting {other} node"),
-            ),
-        }
-    }
-
-    fn print_once(&mut self, key: impl Into<String>, message: impl AsRef<str>) {
-        if self.printed.insert(key.into()) {
-            eprintln!("mvp-chat: {}", message.as_ref());
-        }
-    }
-}
-
 struct OrchChild {
     child: Child,
-    stdin: Option<ChildStdin>,
     cleaned: bool,
 }
 
 impl OrchChild {
     fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
         let mut command = Command::new(&config.orch_bin);
-        let mut orch_args = config.orchestrator_cli_args(image_ref);
-        orch_args.extend(config.orch_args.clone());
         command
-            .args(&orch_args)
-            .stdin(Stdio::piped())
+            .args(config.orchestrator_cli_args(image_ref))
+            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(test)))]
         unsafe {
             command.pre_exec(|| {
                 if libc::setpgid(0, 0) == 0 {
@@ -867,27 +534,18 @@ impl OrchChild {
                 }
             });
         }
-        let display_orch = display_user_path(&config.orch_bin);
-        let mut child = command
+        let child = command
             .spawn()
-            .map_err(|e| format!("spawn {display_orch}: {e}"))?;
-        let stdin = child.stdin.take();
+            .map_err(|e| format!("spawn {}: {e}", config.orch_bin.display()))?;
         Ok(Self {
             child,
-            stdin,
             cleaned: false,
         })
     }
 
-    fn wait_ready(
-        &mut self,
-        rpc_addr: String,
-        progress: &mut StartupProgress,
-    ) -> Result<String, String> {
+    fn wait_ready(&mut self, rpc_addr: String) -> Result<String, String> {
         loop {
-            progress.poll();
             if STOP_REQUESTED.load(Ordering::SeqCst) {
-                acknowledge_stop();
                 return Err("interrupted before orchestrator became ready".to_owned());
             }
             match TcpStream::connect(&rpc_addr) {
@@ -909,10 +567,6 @@ impl OrchChild {
                 .try_wait()
                 .map_err(|e| format!("poll orchestrator: {e}"))?
             {
-                progress.poll();
-                if let Some(failure) = progress.failure_summary() {
-                    return Err(failure);
-                }
                 return Err(format!(
                     "orchestrator exited before prompt RPC ready: {status}"
                 ));
@@ -921,109 +575,180 @@ impl OrchChild {
         }
     }
 
-    fn shutdown(&mut self, _interrupt: bool) -> bool {
+    // The orchestrator shutdown spec is still pending. Replace this with the approved
+    // shutdown contract when it is finalized; do not add private stdin commands here.
+    fn shutdown(&mut self) {
         if self.cleaned {
-            return false;
+            return;
         }
         self.cleaned = true;
-        if let Some(mut stdin) = self.stdin.take() {
-            let _ = writeln!(stdin, "shutdown");
-            let _ = stdin.flush();
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+
+        #[cfg(target_os = "linux")]
+        let _ = signal_orch_process_group(&self.child, libc::SIGTERM);
+
+        let grace = Duration::from_millis(ORCH_SHUTDOWN_GRACE_MS);
+        let poll = Duration::from_millis(ORCH_SHUTDOWN_POLL_MS);
+        let started = Instant::now();
+        while started.elapsed() < grace {
+            match self.child.try_wait() {
+                Ok(Some(_)) => {
+                    let _ = self.child.wait();
+                    return;
+                }
+                Ok(None) | Err(_) => thread::sleep(poll),
+            }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if signal_orch_process_group(&self.child, libc::SIGKILL).is_err() {
+                let _ = self.child.kill();
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = self.child.kill();
         }
         let _ = self.child.wait();
-        false
     }
 }
 
 impl Drop for OrchChild {
     fn drop(&mut self) {
-        let _ = self.shutdown(false);
+        self.shutdown();
     }
 }
 
+#[cfg(target_os = "linux")]
+fn signal_orch_process_group(child: &Child, signal: libc::c_int) -> io::Result<()> {
+    let result = unsafe { libc::kill(-(child.id() as libc::pid_t), signal) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+type PrepareNodeImageFn = fn(NodeImageRequest) -> Result<PreparedNodeImage, String>;
+
 fn prepare_runtime(config: &Config) -> Result<String, String> {
+    prepare_runtime_with(config, prepare_node_image)
+}
+
+fn prepare_runtime_with(
+    config: &Config,
+    prepare_node_image_fn: PrepareNodeImageFn,
+) -> Result<String, String> {
     ensure_orch_binary(config)?;
     if config.provider == ProviderKind::Process {
         ensure_worker_binary(config)?;
-        eprintln!(
-            "mvp-chat: using local worker process {}",
-            display_user_path(&config.worker_bin)
-        );
         return Ok(config.node_image.clone());
     }
-    if !config.build_image {
-        eprintln!("mvp-chat: skipping node image preparation (--no-build-image)");
+    if config.skip_rebuild {
+        ensure_worker_binary(config)?;
         return Ok(config.node_image.clone());
     }
-    if let Some(cached_model) = &config.cached_model {
-        eprintln!(
-            "mvp-chat: using cached model {}",
-            cached_model.display_path.display()
-        );
-    }
-    let prepared = prepare_node_image(NodeImageRequest {
+    let prepared = prepare_node_image_fn(NodeImageRequest {
         requested_image: config.node_image.clone(),
         base_image: BASE_NODE_IMAGE.to_owned(),
         node_bin: node_bin_for_current_profile()?,
         provider: node_image_provider(config.provider)?,
         extra_tag: config.image_tag.clone(),
-        push: config.push_image,
-        force_refresh: config.force_image_refresh,
+        push: false,
+        force_refresh: false,
         enabled: true,
     })?;
-    eprintln!(
-        "mvp-chat: using node image {} ({})",
-        prepared.image_ref, prepared.tag
-    );
     Ok(prepared.image_ref)
 }
 
+fn stdin_prompt_events() -> mpsc::Receiver<PromptInput> {
+    let (tx, rx) = mpsc::channel();
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        let _ = tx.send(PromptInput::StopRequested);
+    }
+    if let Ok(mut stop_tx) = PROMPT_STOP_TX.lock() {
+        *stop_tx = Some(tx.clone());
+    }
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if tx.send(PromptInput::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = tx.send(PromptInput::Closed);
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(PromptInput::Closed);
+    });
+    rx
+}
+
 fn run_chat_loop(addr: &str, max_tokens: u32) -> Result<(), String> {
+    run_chat_loop_with_input(addr, max_tokens, stdin_prompt_events())
+}
+
+fn run_chat_loop_with_input(
+    addr: &str,
+    max_tokens: u32,
+    input_rx: mpsc::Receiver<PromptInput>,
+) -> Result<(), String> {
     let mut stream =
         TcpStream::connect(addr).map_err(|e| format!("connect prompt RPC {addr}: {e}"))?;
-    stream
-        .set_read_timeout(Some(CHAT_READ_TIMEOUT))
-        .map_err(|e| format!("set prompt RPC read timeout: {e}"))?;
-    let mut reader = BufReader::new(
+    let reader = BufReader::new(
         stream
             .try_clone()
             .map_err(|e| format!("clone prompt RPC stream: {e}"))?,
     );
-    let (input_tx, input_rx) = mpsc::channel::<String>();
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines().map_while(Result::ok) {
-            if input_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    run_chat_session(&mut stream, reader, input_rx, max_tokens)
+}
+
+fn run_chat_session<R, W>(
+    writer: &mut W,
+    reader: R,
+    input_rx: mpsc::Receiver<PromptInput>,
+    max_tokens: u32,
+) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write,
+{
+    let mut output = io::stdout();
+    run_chat_session_with_output(writer, reader, input_rx, max_tokens, &mut output)
+}
+
+fn run_chat_session_with_output<R, W, O>(
+    writer: &mut W,
+    mut reader: R,
+    input_rx: mpsc::Receiver<PromptInput>,
+    max_tokens: u32,
+    output: &mut O,
+) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write,
+    O: Write,
+{
     let mut next_request_id = 1_u64;
-    eprintln!("mvp-chat: Ctrl-C cleans up the orchestrator and provider node; /exit exits cleanly");
 
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
-            acknowledge_stop();
             return Ok(());
         }
-        print!("prompt:> ");
-        io::stdout()
-            .flush()
-            .map_err(|e| format!("flush prompt: {e}"))?;
-        let prompt = loop {
-            if STOP_REQUESTED.load(Ordering::SeqCst) {
-                acknowledge_stop();
-                return Ok(());
-            }
-            match input_rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(line) => break line.trim_end().to_owned(),
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
+        write!(output, "prompt:> ").map_err(|e| format!("write prompt: {e}"))?;
+        output.flush().map_err(|e| format!("flush prompt: {e}"))?;
+        let prompt = match input_rx.recv() {
+            Ok(PromptInput::Line(line)) => line.trim_end().to_owned(),
+            Ok(PromptInput::Closed | PromptInput::StopRequested) | Err(_) => return Ok(()),
         };
-        if prompt.eq_ignore_ascii_case("/quit") || prompt.eq_ignore_ascii_case("/exit") {
-            return Ok(());
-        }
         if prompt.trim().is_empty() {
             continue;
         }
@@ -1031,92 +756,71 @@ fn run_chat_loop(addr: &str, max_tokens: u32) -> Result<(), String> {
         let request_id = next_request_id;
         next_request_id = next_request_id.wrapping_add(1).max(1);
         write_json_line(
-            &mut stream,
+            writer,
             &SubmitPrompt {
                 request_id,
                 prompt_text: prompt,
                 max_tokens,
             },
         )?;
-        println!("decoding...");
+        writeln!(output, "decoding...").map_err(|e| format!("write decoding marker: {e}"))?;
         let mut response_started = false;
 
         loop {
             if STOP_REQUESTED.load(Ordering::SeqCst) {
-                acknowledge_stop();
                 return Ok(());
             }
             let mut line = String::new();
             match reader.read_line(&mut line) {
                 Ok(0) => return Err("prompt RPC closed".to_owned()),
                 Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    continue;
-                }
-                Err(error) => return Err(format!("read prompt event: {error}")),
+                Err(error) => return Err(format!("read prompt RPC event: {error}")),
             }
             let event = serde_json::from_str::<PromptEvent>(&line)
-                .map_err(|e| format!("parse prompt event: {e}"))?;
+                .map_err(|e| format!("parse prompt RPC event: {e}"))?;
+            let seen = event.request_id();
+            if seen != request_id {
+                return Err(format!(
+                    "prompt RPC protocol error: response request_id {seen} does not match active request_id {request_id}"
+                ));
+            }
             match event {
-                PromptEvent::TextDelta {
-                    request_id: seen,
-                    text,
-                } if seen == request_id => {
+                PromptEvent::TextDelta { text, .. } => {
                     if !response_started {
-                        print!("Response: ");
+                        write!(output, "Response: ")
+                            .map_err(|e| format!("write response prefix: {e}"))?;
                         response_started = true;
                     }
-                    print!("{text}");
-                    io::stdout()
+                    write!(output, "{text}").map_err(|e| format!("write response text: {e}"))?;
+                    output
                         .flush()
                         .map_err(|e| format!("flush response text: {e}"))?;
                 }
-                PromptEvent::Done {
-                    request_id: seen, ..
-                } if seen == request_id => {
+                PromptEvent::Done { .. } => {
                     if response_started {
-                        println!();
+                        writeln!(output).map_err(|e| format!("write response terminator: {e}"))?;
                     } else {
-                        println!("Response: ");
+                        writeln!(output, "Response: ")
+                            .map_err(|e| format!("write empty response: {e}"))?;
                     }
                     break;
                 }
-                PromptEvent::Fault {
-                    request_id: seen,
-                    error,
-                } if seen == request_id => {
-                    eprintln!("error: {error}");
+                PromptEvent::Fault { error, .. } => {
+                    writeln!(output, "error: {error}")
+                        .map_err(|e| format!("write prompt fault: {e}"))?;
                     break;
                 }
-                _ => {}
             }
         }
     }
 }
 
 fn default_orch_bin() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("MVP_ORCH_BIN") {
-        return Ok(PathBuf::from(path));
-    }
-    let mut path = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    path.set_file_name("mvp-orchestrator");
-    Ok(path)
+    Ok(artifact_root().join("target/debug/mvp-orchestrator"))
 }
 
 fn node_bin_for_current_profile() -> Result<PathBuf, String> {
-    let mut path = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    path.set_file_name("mvp-worker-node");
-    let cwd = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
-    if let Ok(relative) = path.strip_prefix(&cwd) {
-        Ok(relative.to_path_buf())
-    } else {
-        Ok(path)
-    }
+    Ok(artifact_root().join("target/debug/mvp-worker-node"))
 }
 
 fn cargo_command() -> &'static str {
@@ -1124,30 +828,9 @@ fn cargo_command() -> &'static str {
 }
 
 fn ensure_orch_binary(config: &Config) -> Result<(), String> {
-    let default_orch = default_orch_bin()?;
-    if config.orch_bin != default_orch {
-        if config.orch_bin.is_file() {
-            let display_orch = display_workspace_path(&workspace_root(), &config.orch_bin);
-            eprintln!(
-                "mvp-chat: using custom orchestrator binary {display_orch}; skipping cargo build"
-            );
-            return Ok(());
-        }
-        let display_orch = display_workspace_path(&workspace_root(), &config.orch_bin);
-        return Err(format!(
-            "custom orchestrator binary {display_orch} does not exist"
-        ));
+    if config.skip_rebuild {
+        return ensure_existing_artifact(&config.orch_bin, "mvp-orchestrator");
     }
-
-    let root = workspace_root();
-    let rebuild_needed = orch_rebuild_needed(&config.orch_bin, &root, ORCH_REBUILD_INPUTS)?;
-    let dashboard_feature_stale =
-        config.dashboard && orch_local_e2e_marker_stale(&config.orch_bin, &root)?;
-    if !rebuild_needed && !dashboard_feature_stale {
-        eprintln!("mvp-chat: mvp-orchestrator is up to date; skipping cargo build");
-        return Ok(());
-    }
-
     run_status(
         cargo_command(),
         &[
@@ -1155,39 +838,17 @@ fn ensure_orch_binary(config: &Config) -> Result<(), String> {
             "--quiet",
             "-p",
             "mvp-system",
-            "--features",
-            "local-e2e",
             "--bin",
             "mvp-orchestrator",
         ],
         "build mvp-orchestrator",
-    )?;
-    write_orch_local_e2e_marker(&config.orch_bin, &root)
+    )
 }
 
 fn ensure_worker_binary(config: &Config) -> Result<(), String> {
-    let default_worker = node_bin_for_current_profile()?;
-    if config.worker_bin != default_worker {
-        if config.worker_bin.is_file() {
-            let display_worker = display_workspace_path(&workspace_root(), &config.worker_bin);
-            eprintln!(
-                "mvp-chat: using custom worker binary {display_worker}; skipping cargo build"
-            );
-            return Ok(());
-        }
-        let display_worker = display_workspace_path(&workspace_root(), &config.worker_bin);
-        return Err(format!(
-            "custom worker binary {display_worker} does not exist"
-        ));
+    if config.skip_rebuild {
+        return ensure_existing_artifact(&config.worker_bin, "mvp-worker-node");
     }
-
-    let root = workspace_root();
-    let rebuild_needed = orch_rebuild_needed(&config.worker_bin, &root, ORCH_REBUILD_INPUTS)?;
-    if !rebuild_needed {
-        eprintln!("mvp-chat: mvp-worker-node is up to date; skipping cargo build");
-        return Ok(());
-    }
-
     run_status(
         cargo_command(),
         &[
@@ -1202,121 +863,19 @@ fn ensure_worker_binary(config: &Config) -> Result<(), String> {
     )
 }
 
-fn orch_rebuild_needed(bin: &Path, root: &Path, inputs: &[&str]) -> Result<bool, String> {
-    if !bin.is_file() {
-        return Ok(true);
+fn ensure_existing_artifact(path: &PathBuf, label: &str) -> Result<(), String> {
+    let metadata = fs::metadata(path)
+        .map_err(|e| format!("missing required {label} artifact {}: {e}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "missing required {label} artifact {}; not a file",
+            path.display()
+        ));
     }
-    let bin_mtime = modified_time(root, bin)?;
-    for input in inputs {
-        let path = root.join(input);
-        if latest_mtime(root, &path)? > bin_mtime {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn orch_local_e2e_marker(bin: &Path) -> PathBuf {
-    let mut marker = bin.to_path_buf();
-    let file_name = bin
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("mvp-orchestrator");
-    marker.set_file_name(format!("{file_name}.local-e2e"));
-    marker
-}
-
-fn orch_binary_fingerprint(bin: &Path, root: &Path) -> Result<String, String> {
-    let display = display_workspace_path(root, bin);
-    let metadata = fs::metadata(bin).map_err(|e| format!("stat {display}: {e}"))?;
-    let modified = metadata
-        .modified()
-        .map_err(|e| format!("modified time {display}: {e}"))?;
-    let modified_ns = modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|e| format!("modified time before Unix epoch for {display}: {e}"))?
-        .as_nanos();
-    Ok(format!(
-        "local-e2e\nlen={}\nmodified_ns={modified_ns}\n",
-        metadata.len()
-    ))
-}
-
-fn orch_local_e2e_marker_stale(bin: &Path, root: &Path) -> Result<bool, String> {
-    if !bin.is_file() {
-        return Ok(true);
-    }
-    let marker = orch_local_e2e_marker(bin);
-    if !marker.is_file() {
-        return Ok(true);
-    }
-    let expected = orch_binary_fingerprint(bin, root)?;
-    let actual = fs::read_to_string(&marker).unwrap_or_default();
-    Ok(actual != expected)
-}
-
-fn write_orch_local_e2e_marker(bin: &Path, root: &Path) -> Result<(), String> {
-    let marker = orch_local_e2e_marker(bin);
-    let display = display_workspace_path(root, &marker);
-    let fingerprint = orch_binary_fingerprint(bin, root)?;
-    fs::write(&marker, fingerprint).map_err(|e| format!("write {display}: {e}"))
-}
-
-fn latest_mtime(root: &Path, path: &Path) -> Result<SystemTime, String> {
-    let display = display_workspace_path(root, path);
-    let metadata = fs::metadata(path).map_err(|e| format!("stat {display}: {e}"))?;
-    let mut latest = metadata
-        .modified()
-        .map_err(|e| format!("modified time {display}: {e}"))?;
-    if metadata.is_dir() {
-        for entry in fs::read_dir(path).map_err(|e| format!("read dir {display}: {e}"))? {
-            let entry = entry.map_err(|e| format!("read dir entry {display}: {e}"))?;
-            let entry_mtime = latest_mtime(root, &entry.path())?;
-            if entry_mtime > latest {
-                latest = entry_mtime;
-            }
-        }
-    }
-    Ok(latest)
-}
-
-fn modified_time(root: &Path, path: &Path) -> Result<SystemTime, String> {
-    let display = display_workspace_path(root, path);
-    fs::metadata(path)
-        .map_err(|e| format!("stat {display}: {e}"))?
-        .modified()
-        .map_err(|e| format!("modified time {display}: {e}"))
-}
-
-fn display_workspace_path(root: &Path, path: &Path) -> String {
-    match path.strip_prefix(root) {
-        Ok(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
-        Ok(relative) => format!("./{}", relative.display()),
-        Err(_) => path.display().to_string(),
-    }
-}
-
-fn display_user_path(path: &Path) -> String {
-    let root = workspace_root();
-    if let Ok(relative) = path.strip_prefix(&root) {
-        if relative.as_os_str().is_empty() {
-            return ".".to_owned();
-        }
-        return format!("./{}", relative.display());
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Ok(relative) = path.strip_prefix(&cwd) {
-            if relative.as_os_str().is_empty() {
-                return ".".to_owned();
-            }
-            return format!("./{}", relative.display());
-        }
-    }
-    path.display().to_string()
+    Ok(())
 }
 
 fn run_status(program: &str, args: &[&str], label: &str) -> Result<(), String> {
-    eprintln!("mvp-chat: {label}");
     let status = Command::new(program)
         .args(args)
         .stdin(Stdio::null())
@@ -1331,126 +890,113 @@ fn run_status(program: &str, args: &[&str], label: &str) -> Result<(), String> {
     }
 }
 
-extern "C" fn request_stop(_: libc::c_int) {
-    STOP_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-fn install_signal_handlers() {
+fn install_signal_handlers() -> Result<(), String> {
     #[cfg(target_os = "linux")]
-    unsafe {
-        libc::signal(libc::SIGINT, request_stop as *const () as usize);
-        libc::signal(libc::SIGTERM, request_stop as *const () as usize);
+    {
+        let mut signals =
+            Signals::new([SIGINT, SIGTERM]).map_err(|e| format!("install signal handlers: {e}"))?;
+        thread::spawn(move || {
+            for _ in signals.forever() {
+                STOP_REQUESTED.store(true, Ordering::SeqCst);
+                if let Ok(stop_tx) = PROMPT_STOP_TX.lock() {
+                    if let Some(tx) = stop_tx.as_ref() {
+                        let _ = tx.send(PromptInput::StopRequested);
+                    }
+                }
+            }
+        });
     }
-}
-
-fn acknowledge_stop() {
-    if !STOP_ACKNOWLEDGED.swap(true, Ordering::SeqCst) {
-        eprintln!("mvp-chat: Ctrl-C received; stopping runtime...");
-    }
-}
-
-fn report_interrupt_shutdown() {
-    eprintln!("mvp-chat: runtime stopped");
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
 struct CachedModelConfig {
     host_path: PathBuf,
-    display_path: PathBuf,
 }
 
 impl CachedModelConfig {
-    fn from_arg(path: Option<String>) -> Result<Self, String> {
-        let requested = path
-            .map(PathBuf::from)
-            .unwrap_or_else(default_cached_model_path);
-        let host_path = requested
-            .canonicalize()
-            .map_err(|e| format!("resolve --cached-model path {}: {e}", requested.display()))?;
-        let metadata = fs::metadata(&host_path)
-            .map_err(|e| format!("stat cached model {}: {e}", requested.display()))?;
-        if !metadata.is_file() {
+    fn from_source(source: CachedModelSource) -> Result<Self, String> {
+        match source {
+            CachedModelSource::Discover => Self::discover(),
+            CachedModelSource::Path(path) => Self::from_path(path),
+        }
+    }
+
+    fn from_path(path: PathBuf) -> Result<Self, String> {
+        let metadata = fs::metadata(&path)
+            .map_err(|e| format!("stat cached model {}: {e}", path.display()))?;
+        if !is_accepted_cached_model_file(&path, &metadata) {
             return Err(format!(
-                "--cached-model must point at a file: {}",
-                requested.display()
+                "cached model {} must be a regular .gguf file",
+                path.display()
             ));
         }
-        Ok(Self {
-            host_path,
-            display_path: requested,
-        })
+        let host_path = path
+            .canonicalize()
+            .map_err(|e| format!("resolve cached model {}: {e}", path.display()))?;
+        Ok(Self { host_path })
     }
-}
 
-fn default_cached_model_path() -> PathBuf {
-    PathBuf::from(".")
-        .join(REPO_MODEL_CACHE_DIR)
-        .join(DEFAULT_CACHED_MODEL_FILE)
-}
-
-fn workspace_root() -> PathBuf {
-    let git_root = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .stdin(Stdio::null())
-        .output();
-    if let Ok(output) = git_root {
-        if output.status.success() {
-            return PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    fn discover() -> Result<Self, String> {
+        let cache_dir = PathBuf::from(REPO_MODEL_CACHE_DIR);
+        let entries = fs::read_dir(&cache_dir)
+            .map_err(|e| format!("discover cached model in {}: {e}", cache_dir.display()))?;
+        let mut candidates = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|e| format!("read cached model entry in {}: {e}", cache_dir.display()))?;
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .map_err(|e| format!("stat cached model candidate {}: {e}", path.display()))?;
+            if is_accepted_cached_model_file(&path, &metadata) {
+                candidates.push(path);
+            }
         }
+        candidates.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+        let requested = candidates.into_iter().next().ok_or_else(|| {
+            format!(
+                "discover cached model in {}: no usable cached model files found",
+                cache_dir.display()
+            )
+        })?;
+        let host_path = requested
+            .canonicalize()
+            .map_err(|e| format!("resolve cached model {}: {e}", requested.display()))?;
+        Ok(Self { host_path })
     }
+}
+
+fn is_accepted_cached_model_file(path: &Path, metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+}
+
+fn artifact_root() -> PathBuf {
     std::env::current_dir().expect("current directory is available")
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RuntimeConfigProfile {
-    Local,
-    Deploy,
-}
-
-impl RuntimeConfigProfile {
-    fn from_env() -> Result<Self, String> {
-        match env_optional(MVP_RUNTIME_CONFIG_ENV).as_deref() {
-            None | Some("local") => Ok(Self::Local),
-            Some("deploy") => Ok(Self::Deploy),
-            Some(other) => Err(format!(
-                "unsupported {MVP_RUNTIME_CONFIG_ENV}={other:?}; use local or deploy"
-            )),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Deploy => "deploy",
-        }
-    }
-
-    fn default_provider(self) -> ProviderKind {
-        match self {
-            Self::Local => ProviderKind::Process,
-            Self::Deploy => ProviderKind::VastAi,
-        }
-    }
 }
 
 fn provider_from_sources(
     cli_provider: Option<ProviderKind>,
     toml_provider: Option<&str>,
-    config_profile: RuntimeConfigProfile,
 ) -> Result<ProviderKind, String> {
     if let Some(provider) = cli_provider {
         return Ok(provider);
     }
-    if let Some(value) = env_optional("MVP_NODE_PROVIDER") {
-        return ProviderKind::parse_deploy(&value);
-    }
-    if let Some(value) = env_optional("MVP_PROVIDER") {
-        return ProviderKind::parse_deploy(&value);
-    }
     if let Some(value) = toml_provider {
-        return ProviderKind::parse_deploy(value);
+        return match value.trim() {
+            "process" => Ok(ProviderKind::Process),
+            "docker" => Ok(ProviderKind::Docker),
+            "vastai" => Ok(ProviderKind::VastAi),
+            other => Err(format!(
+                "unsupported provider {other:?}; use process, docker, or vastai"
+            )),
+        };
     }
-    Ok(config_profile.default_provider())
+    Ok(ProviderKind::Process)
 }
 
 fn env_optional(name: &str) -> Option<String> {
@@ -1460,72 +1006,12 @@ fn env_optional(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn relay_mode_from_sources(config_value: Option<&str>) -> Result<iroh::RelayMode, String> {
-    match env_optional("MVP_IROH_RELAY_MODE")
-        .as_deref()
-        .or(config_value)
-        .unwrap_or("default")
-    {
-        "disabled" => Ok(iroh::RelayMode::Disabled),
-        "default" => Ok(iroh::RelayMode::Default),
-        other => Err(format!(
-            "unsupported relay mode {other:?}; use disabled or default"
-        )),
-    }
-}
-
-fn relay_mode_env_value(mode: &iroh::RelayMode) -> &'static str {
-    match mode {
-        iroh::RelayMode::Disabled => "disabled",
-        _ => "default",
-    }
-}
-
 fn node_image_provider(provider: ProviderKind) -> Result<NodeImageProvider, String> {
     match provider {
         ProviderKind::Docker => Ok(NodeImageProvider::Docker),
         ProviderKind::VastAi => Ok(NodeImageProvider::VastAi),
         ProviderKind::Process => Err("process provider does not use node images".to_owned()),
         ProviderKind::Mock => Err("mvp-chat does not support mock provider".to_owned()),
-    }
-}
-
-fn env_bool_optional(name: &str) -> Result<Option<bool>, String> {
-    match env_optional(name) {
-        None => Ok(None),
-        Some(value) => match value.to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(Some(true)),
-            "0" | "false" | "no" | "off" => Ok(Some(false)),
-            _ => Err(format!(
-                "invalid {name}={value:?}; use 1/0, true/false, yes/no, or on/off"
-            )),
-        },
-    }
-}
-
-fn env_u64_optional(name: &str) -> Result<Option<u64>, String> {
-    env_parse_optional(name)
-}
-
-fn env_u32_optional(name: &str) -> Result<Option<u32>, String> {
-    env_parse_optional(name)
-}
-
-fn env_f64_optional(name: &str) -> Result<Option<f64>, String> {
-    env_parse_optional(name)
-}
-
-fn env_parse_optional<T>(name: &str) -> Result<Option<T>, String>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    match env_optional(name) {
-        Some(value) => value
-            .parse::<T>()
-            .map(Some)
-            .map_err(|e| format!("invalid {name}={value:?}: {e}")),
-        None => Ok(None),
     }
 }
 
@@ -1563,46 +1049,61 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
+
+    use std::ffi::{OsStr, OsString};
+    use std::io::{Cursor, Read};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    use std::time::Instant;
 
-    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    static PROCESS_STATE_LOCK: Mutex<()> = Mutex::new(());
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    const ENV_KEYS: &[&str] = &[
-        "MVP_BUILD_NODE_IMAGE",
-        "MVP_DASHBOARD",
-        "MVP_DATASTREAM_FRAME_LOG",
-        "MVP_FORCE_NODE_IMAGE_REFRESH",
-        "MVP_GGUF_FILE",
-        "MVP_GGUF_REPO",
-        "MVP_GGUF_REVISION",
-        "MVP_IROH_RELAY_MODE",
-        "MVP_IROH_RELAY_URL",
-        "MVP_MAX_CONTEXT",
-        "MVP_MODEL_ID",
-        "MVP_NODE_IMAGE",
-        "MVP_NODE_IMAGE_TAG",
-        "MVP_NODE_PROVIDER",
-        "MVP_PIPELINE_STAGES",
-        "MVP_PROMPT_MAX_TOKENS",
-        "MVP_PROMPT_RPC_ADDR",
-        "MVP_PROMPT_RPC_BIND",
-        "MVP_PROVIDER",
-        "MVP_PUSH_NODE_IMAGE",
-        "MVP_RUNTIME_CONFIG",
-        "SWACTOR_IROH_RELAY_URL",
-        "VASTAI_API_KEY",
-    ];
+    const PROCESS_ENV_KEYS: &[&str] =
+        &["VAST_API_KEY", "MVP_PIPELINE_STAGES", "MVP_RUNTIME_CONFIG"];
 
-    struct RestoreEnv {
-        saved: Vec<(&'static str, Option<OsString>)>,
+    struct TempDir {
+        path: PathBuf,
     }
 
-    impl Drop for RestoreEnv {
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            let id = NEXT_TEMP_ID.fetch_add(1, AtomicOrdering::SeqCst);
+            let path = std::env::temp_dir().join(format!(
+                "mvp-chat-test-{}-{}-{}",
+                std::process::id(),
+                id,
+                label
+            ));
+            if path.exists() {
+                fs::remove_dir_all(&path).expect("remove stale temp dir");
+            }
+            fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
         fn drop(&mut self) {
-            for (key, value) in &self.saved {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct RestoreProcessState {
+        saved_env: Vec<(&'static str, Option<OsString>)>,
+        saved_cwd: PathBuf,
+    }
+
+    impl Drop for RestoreProcessState {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.saved_cwd);
+            for (key, value) in &self.saved_env {
                 match value {
                     Some(value) => unsafe { std::env::set_var(key, value) },
                     None => unsafe { std::env::remove_var(key) },
@@ -1611,724 +1112,836 @@ mod tests {
         }
     }
 
-    fn with_clean_env<T>(test: impl FnOnce() -> T) -> T {
-        let _lock = ENV_LOCK
+    fn with_process_state<T>(
+        settings: &[(&'static str, Option<&str>)],
+        cwd: Option<&Path>,
+        test: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = PROCESS_STATE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let saved = ENV_KEYS
+        let saved_env = PROCESS_ENV_KEYS
             .iter()
-            .map(|&key| (key, std::env::var_os(key)))
+            .map(|key| (*key, std::env::var_os(key)))
             .collect::<Vec<_>>();
-        for key in ENV_KEYS {
+        for key in PROCESS_ENV_KEYS {
             unsafe { std::env::remove_var(key) };
         }
-        let _restore = RestoreEnv { saved };
+        for (key, value) in settings {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+        let saved_cwd = std::env::current_dir().expect("current directory");
+        if let Some(cwd) = cwd {
+            std::env::set_current_dir(cwd).expect("set test current directory");
+        }
+        let _restore = RestoreProcessState {
+            saved_env,
+            saved_cwd,
+        };
         test()
     }
 
-    struct TempWorkspace {
-        root: PathBuf,
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
     }
 
-    impl TempWorkspace {
-        fn new(name: &str) -> Self {
-            let counter = TEMP_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-            let root = std::env::temp_dir()
-                .join(format!("mvp-chat-{name}-{}-{counter}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("create temp workspace");
-            Self { root }
-        }
-
-        fn path(&self, relative: &str) -> PathBuf {
-            self.root.join(relative)
-        }
-
-        fn write(&self, relative: &str, contents: &[u8]) -> PathBuf {
-            let path = self.path(relative);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).expect("create temp parent directory");
-            }
-            fs::write(&path, contents).expect("write temp file");
-            path
-        }
-    }
-
-    impl Drop for TempWorkspace {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.root);
-        }
-    }
-
-    fn write_file_newer_than(path: &Path, contents: &[u8], older_than: SystemTime) {
+    fn write_config(dir: &TempDir, name: &str, text: &str) -> PathBuf {
+        let path = dir.path().join(name);
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).expect("create temp parent directory");
+            fs::create_dir_all(parent).expect("create config parent");
         }
-
-        let started = Instant::now();
-        loop {
-            fs::write(path, contents).expect("write temp file");
-            let mtime = fs::metadata(path)
-                .expect("stat temp file")
-                .modified()
-                .expect("read temp file mtime");
-            if mtime > older_than {
-                return;
-            }
-            assert!(
-                started.elapsed() <= Duration::from_secs(3),
-                "filesystem did not record a newer mtime for {}",
-                path.display()
-            );
-            thread::sleep(Duration::from_millis(20));
-        }
+        fs::write(&path, text).expect("write config");
+        path
     }
 
-    struct FakeOfferPreviewer;
-
-    impl OfferPreviewer for FakeOfferPreviewer {
-        fn preview(
-            &self,
-            _api_key: &str,
-            _policy: &mvp_system::vastai_offer_preview::SelectionPolicy,
-        ) -> Result<OfferPreview, String> {
-            Ok(OfferPreview {
-                offer_id: 7,
-                host_id: Some(8),
-                gpu_name: "RTX 4090".to_owned(),
-                gpu_ram_mb: Some(24_000),
-                dollars_per_hour: 0.42,
-            })
-        }
-    }
-
-    fn valid_vastai_config() -> ResolvedVastAiConfig {
-        ResolvedVastAiConfig {
-            api_key: "vast-key".to_owned(),
-            relay_url: "https://relay.example.com".to_owned(),
-            image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
-            bootstrap_command: "/usr/local/bin/mvp-node".to_owned(),
-            disk_gb: Some(80),
-            gpu_name: Some("RTX 4090".to_owned()),
-            min_gpu_ram_mb: Some(16_000),
-            min_down_mbps: Some(100.0),
-            min_up_mbps: Some(25.0),
-            min_reliability: Some(0.98),
-            require_verified: Some(true),
-            onstart: None,
-            ssh_identity: Some("~/.ssh/swactor_vastai_ed25519".to_owned()),
-        }
-    }
-
-    fn vastai_yes_chat_config() -> Config {
+    fn base_config(provider: ProviderKind) -> Config {
         Config {
-            orch_bin: PathBuf::from("mvp-orchestrator"),
-            worker_bin: PathBuf::from("mvp-worker-node"),
-            orch_args: Vec::new(),
+            orch_bin: PathBuf::from("/tmp/mvp-orchestrator"),
+            worker_bin: PathBuf::from("/tmp/mvp-worker-node"),
             rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
-            node_image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
-            config_profile: RuntimeConfigProfile::Deploy,
-            provider: ProviderKind::VastAi,
-            relay_mode: iroh::RelayMode::Default,
-            relay_url: Some("https://relay.example.com".to_owned()),
-            max_tokens: 128,
-            pipeline_stages: 1,
-            dashboard: false,
-            build_image: false,
-            image_tag: Some("trial".to_owned()),
-            push_image: true,
-            force_image_refresh: false,
+            node_image: "docker.io/acme/node:latest".to_owned(),
+            provider,
+            image_tag: None,
             cached_model: None,
             datastream_frame_log: None,
-            vastai_yes: true,
-            model_id: None,
-            gguf_repo: None,
-            gguf_file: None,
-            gguf_revision: None,
-            max_context: None,
-            vastai: Some(valid_vastai_config()),
-        }
-    }
-
-    fn assert_arg_value(args: &[String], flag: &str, expected: &str) {
-        let flag_index = args
-            .iter()
-            .position(|arg| arg == flag)
-            .unwrap_or_else(|| panic!("missing CLI flag {flag}; args={args:?}"));
-        assert_eq!(
-            args.get(flag_index + 1).map(String::as_str),
-            Some(expected),
-            "unexpected value for CLI flag {flag}; args={args:?}"
-        );
-    }
-
-    fn assert_flag(args: &[String], flag: &str) {
-        assert!(
-            args.iter().any(|arg| arg == flag),
-            "missing CLI flag {flag}; args={args:?}"
-        );
-    }
-
-    #[test]
-    fn orchestrator_cli_args_cover_wrapper_launch_config() {
-        let config = Config {
-            orch_bin: PathBuf::from("mvp-orchestrator"),
-            worker_bin: PathBuf::from("mvp-worker-node"),
-            orch_args: Vec::new(),
-            rpc_addr: "127.0.0.1:20123".to_owned(),
-            node_image: "docker.io/example/config-node:ignored".to_owned(),
-            config_profile: RuntimeConfigProfile::Local,
-            provider: ProviderKind::Docker,
-            relay_mode: iroh::RelayMode::Default,
-            relay_url: Some("https://relay.example.com".to_owned()),
-            max_tokens: 37,
-            pipeline_stages: 3,
-            dashboard: false,
-            build_image: false,
-            image_tag: None,
-            push_image: false,
-            force_image_refresh: false,
-            cached_model: Some(CachedModelConfig {
-                host_path: PathBuf::from("/var/cache/swactor/model.gguf"),
-                display_path: PathBuf::from("model.gguf"),
-            }),
-            datastream_frame_log: Some(PathBuf::from("/tmp/mvp-chat-frames.jsonl")),
             vastai_yes: false,
             vastai: None,
-            model_id: Some("wrapper-model".to_owned()),
-            gguf_repo: Some("example/wrapper-repo".to_owned()),
-            gguf_file: Some("wrapper-model.gguf".to_owned()),
-            gguf_revision: None,
-            max_context: Some(768),
-        };
-
-        let args = config.orchestrator_cli_args("docker.io/example/prepared-node:latest");
-
-        assert_arg_value(&args, "--runtime-config", "local");
-        assert_arg_value(&args, "--provider", "docker");
-        assert_arg_value(&args, "--image", "docker.io/example/prepared-node:latest");
-        assert_arg_value(&args, "--rpc-bind", "127.0.0.1:20123");
-        assert_arg_value(&args, "--max-tokens", "37");
-        assert_arg_value(&args, "--pipeline-stages", "3");
-        assert_flag(&args, "--no-dashboard");
-        assert_arg_value(&args, "--relay-url", "https://relay.example.com");
-        assert_arg_value(&args, "--model-id", "wrapper-model");
-        assert_arg_value(&args, "--gguf-repo", "example/wrapper-repo");
-        assert_arg_value(&args, "--gguf-file", "wrapper-model.gguf");
-        assert_arg_value(&args, "--max-context", "768");
-        assert_arg_value(
-            &args,
-            "--cached-model-host-path",
-            "/var/cache/swactor/model.gguf",
-        );
-        assert_arg_value(
-            &args,
-            "--datastream-frame-log",
-            "/tmp/mvp-chat-frames.jsonl",
-        );
-    }
-
-    #[test]
-    fn local_cached_model_defaults_to_process_and_forwards_worker_bin() {
-        with_clean_env(|| {
-            let workspace = TempWorkspace::new("process-default-cached-model");
-            let config_path = workspace.write("config.toml", b"");
-            let model_path = workspace.write("cached-model.gguf", b"fake cached model");
-            let model_path_str = model_path.to_str().expect("temp model path is utf8");
-            let config_path_str = config_path.to_str().expect("temp config path is utf8");
-
-            let config = Config::from_args(
-                [
-                    "--cached-model",
-                    model_path_str,
-                    "-N",
-                    "3",
-                    "--config",
-                    config_path_str,
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .unwrap_or_else(|error| panic!("process default cached config parses: {error}"));
-
-            let canonical_model = model_path
-                .canonicalize()
-                .expect("canonicalize cached model fixture");
-            assert_eq!(config.provider, ProviderKind::Process);
-            assert_eq!(config.pipeline_stages, 3);
-            assert_eq!(
-                config.cached_model.as_ref().map(|cached| &cached.host_path),
-                Some(&canonical_model)
-            );
-
-            let args = config.orchestrator_cli_args("swactor-mvp-node:latest");
-            assert_arg_value(&args, "--provider", "process");
-            assert_arg_value(&args, "--pipeline-stages", "3");
-            assert_arg_value(
-                &args,
-                "--cached-model-host-path",
-                canonical_model.to_str().expect("canonical path is utf8"),
-            );
-            assert_arg_value(
-                &args,
-                "--worker-bin",
-                config.worker_bin.to_str().expect("worker bin path is utf8"),
-            );
-        });
-    }
-
-    #[test]
-    fn docker_selector_keeps_cached_model_forwarding_for_docker() {
-        with_clean_env(|| {
-            let workspace = TempWorkspace::new("docker-cached-model");
-            let config_path = workspace.write("config.toml", b"");
-            let model_path = workspace.write("cached-model.gguf", b"fake cached model");
-            let config = Config::from_args(
-                [
-                    "--docker",
-                    "--cached-model",
-                    model_path.to_str().expect("temp model path is utf8"),
-                    "--config",
-                    config_path.to_str().expect("temp config path is utf8"),
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .unwrap_or_else(|error| panic!("docker cached config parses: {error}"));
-
-            let canonical_model = model_path
-                .canonicalize()
-                .expect("canonicalize cached model fixture");
-            assert_eq!(config.provider, ProviderKind::Docker);
-
-            let args = config.orchestrator_cli_args("docker.io/example/prepared-node:latest");
-            assert_arg_value(&args, "--provider", "docker");
-            assert_arg_value(
-                &args,
-                "--cached-model-host-path",
-                canonical_model.to_str().expect("canonical path is utf8"),
-            );
-            assert!(
-                !args.iter().any(|arg| arg == "--worker-bin"),
-                "docker launch must not forward --worker-bin: {args:?}"
-            );
-        });
-    }
-
-    #[test]
-    fn parsed_args_rejects_conflicting_provider_selectors() {
-        for args in [
-            vec!["--docker", "--process"],
-            vec!["--provider", "process", "--vastai"],
-        ] {
-            let error = ParsedArgs::parse(args.iter().copied().map(str::to_owned))
-                .expect_err("conflicting provider selectors must fail");
-
-            assert_eq!(error, PROVIDER_SELECTOR_CONFLICT);
-        }
-    }
-
-    #[test]
-    fn provider_selection_precedence_is_cli_env_toml_default() {
-        with_clean_env(|| {
-            let workspace = TempWorkspace::new("provider-precedence");
-            let config_path = workspace.write("config.toml", b"[provider]\nkind = \"docker\"\n");
-            let config_path_str = config_path.to_str().expect("temp config path is utf8");
-
-            let toml_config = Config::from_args(
-                [
-                    "--config",
-                    config_path_str,
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .expect("TOML provider config parses");
-            assert_eq!(toml_config.provider, ProviderKind::Docker);
-
-            unsafe {
-                std::env::set_var("MVP_PROVIDER", "vastai");
-            }
-            let mvp_provider_config = Config::from_args(
-                [
-                    "--config",
-                    config_path_str,
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .expect("MVP_PROVIDER config parses");
-            assert_eq!(mvp_provider_config.provider, ProviderKind::VastAi);
-
-            unsafe {
-                std::env::set_var("MVP_NODE_PROVIDER", "process");
-            }
-            let node_provider_config = Config::from_args(
-                [
-                    "--config",
-                    config_path_str,
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .expect("MVP_NODE_PROVIDER config parses");
-            assert_eq!(node_provider_config.provider, ProviderKind::Process);
-
-            let cli_config = Config::from_args(
-                [
-                    "--docker",
-                    "--config",
-                    config_path_str,
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .expect("CLI provider config parses");
-            assert_eq!(cli_config.provider, ProviderKind::Docker);
-        });
-
-        with_clean_env(|| {
-            let workspace = TempWorkspace::new("provider-default");
-            let config_path = workspace.write("config.toml", b"");
-            let default_config = Config::from_args(
-                [
-                    "--config",
-                    config_path.to_str().expect("temp config path is utf8"),
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .expect("default provider config parses");
-            assert_eq!(default_config.provider, ProviderKind::Process);
-        });
-    }
-
-    #[test]
-    fn config_forwards_short_pipeline_stages_alias_to_orchestrator() {
-        with_clean_env(|| {
-            let workspace = TempWorkspace::new("short-pipeline-stages-forward");
-            let config_path = workspace.write("config.toml", b"");
-            let config = Config::from_args(
-                [
-                    "-N",
-                    "6",
-                    "--config",
-                    config_path.to_str().expect("temp config path is utf8"),
-                    "--orch-bin",
-                    "/tmp/mvp-orchestrator",
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            )
-            .unwrap_or_else(|error| panic!("-N should resolve wrapper config: {error}"));
-
-            let args = config.orchestrator_cli_args("docker.io/example/prepared-node:latest");
-
-            assert_arg_value(&args, "--pipeline-stages", "6");
-        });
-    }
-
-    #[test]
-    fn orchestrator_cli_args_cover_vastai_config() {
-        let mut vastai = valid_vastai_config();
-        vastai.onstart = Some("echo preparing vastai node".to_owned());
-        let config = Config {
-            orch_bin: PathBuf::from("mvp-orchestrator"),
-            worker_bin: PathBuf::from("mvp-worker-node"),
-            orch_args: Vec::new(),
-            rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
-            node_image: "ghcr.io/swactor/mvp-node:latest".to_owned(),
-            config_profile: RuntimeConfigProfile::Deploy,
-            provider: ProviderKind::VastAi,
-            relay_mode: iroh::RelayMode::Default,
-            relay_url: Some(vastai.relay_url.clone()),
-            max_tokens: 128,
             pipeline_stages: 1,
-            dashboard: false,
-            build_image: false,
-            image_tag: Some("trial".to_owned()),
-            push_image: true,
-            force_image_refresh: false,
-            cached_model: None,
-            datastream_frame_log: None,
-            vastai_yes: true,
-            vastai: Some(vastai),
-            model_id: None,
-            gguf_repo: None,
-            gguf_file: None,
-            gguf_revision: None,
-            max_context: None,
-        };
-
-        let args = config.orchestrator_cli_args("ghcr.io/swactor/mvp-node:latest");
-
-        assert_arg_value(&args, "--vastai-api-key", "vast-key");
-        assert_arg_value(
-            &args,
-            "--vastai-bootstrap-command",
-            "/usr/local/bin/mvp-node",
-        );
-        assert_flag(&args, "--no-vastai-confirm-lease");
-        assert_arg_value(&args, "--vastai-disk-gb", "80");
-        assert_arg_value(&args, "--vastai-gpu-name", "RTX 4090");
-        assert_arg_value(&args, "--vastai-min-gpu-ram-mb", "16000");
-        assert_arg_value(&args, "--vastai-min-down-mbps", "100");
-        assert_arg_value(&args, "--vastai-min-up-mbps", "25");
-        assert_arg_value(&args, "--vastai-min-reliability", "0.98");
-        assert_flag(&args, "--vastai-require-verified");
-        assert_arg_value(&args, "--vastai-onstart", "echo preparing vastai node");
-        assert_arg_value(
-            &args,
-            "--vastai-ssh-identity",
-            "~/.ssh/swactor_vastai_ed25519",
-        );
-    }
-
-    #[test]
-    fn parsed_args_accepts_pipeline_stages_aliases() {
-        for (flag, value) in [("-N", 3), ("--pipeline-stages", 4)] {
-            let parsed = ParsedArgs::parse(vec![flag.to_owned(), value.to_string()])
-                .unwrap_or_else(|error| panic!("{flag} {value} should parse: {error}"));
-
-            assert_eq!(
-                parsed.pipeline_stages,
-                Some(value),
-                "{flag} must set stage count"
-            );
+            max_tokens: DEFAULT_MAX_TOKENS,
+            skip_rebuild: true,
         }
     }
 
-    #[test]
-    fn parsed_cached_model_flag_does_not_consume_following_short_flag() {
-        let workspace = TempWorkspace::new("cached-model-short-flag");
-        workspace.write(
-            ".model-cache/SmolLM2-135M-Instruct.Q4_0.gguf",
-            b"fake cached model",
-        );
-        let previous_cwd = std::env::current_dir().expect("current dir is available");
-        std::env::set_current_dir(&workspace.root).expect("enter temp workspace");
-        let parsed =
-            ParsedArgs::parse(["--cached-model", "-N", "3"].into_iter().map(str::to_owned));
-        std::env::set_current_dir(previous_cwd).expect("restore current dir");
-        let parsed = parsed.expect("cached model flag before -N parses");
-
-        assert!(parsed.cached_model.is_some());
-        assert_eq!(parsed.pipeline_stages, Some(3));
-    }
-
-    #[test]
-    fn parsed_args_rejects_invalid_pipeline_stages_values() {
-        for (args, expected) in [
-            (vec!["-N"], "missing value after -N"),
-            (
-                vec!["--pipeline-stages"],
-                "missing value after --pipeline-stages",
-            ),
-            (vec!["-N", "many"], "invalid -N=\"many\""),
-            (
-                vec!["--pipeline-stages", "many"],
-                "invalid --pipeline-stages=\"many\"",
-            ),
-            (vec!["-N", "0"], "-N must be greater than 0"),
-            (
-                vec!["--pipeline-stages", "0"],
-                "--pipeline-stages must be greater than 0",
-            ),
-        ] {
-            let error = match ParsedArgs::parse(args.iter().copied().map(str::to_owned)) {
-                Ok(_) => panic!("invalid pipeline stage flag must be rejected"),
-                Err(error) => error,
-            };
-
-            assert!(
-                error.contains(expected),
-                "error {error:?} should contain {expected:?} for args {args:?}"
-            );
+    fn valid_vastai() -> ResolvedVastAiConfig {
+        ResolvedVastAiConfig {
+            api_key: "secret".to_owned(),
+            relay_url: "https://relay.example".to_owned(),
+            image: "docker.io/acme/node:latest".to_owned(),
+            bootstrap_command: "boot".to_owned(),
+            disk_gb: None,
+            gpu_name: None,
+            min_gpu_ram_mb: None,
+            min_down_mbps: None,
+            min_up_mbps: None,
+            min_reliability: None,
+            require_verified: None,
+            onstart: None,
+            ssh_identity: None,
         }
     }
 
-    #[test]
-    fn config_rejects_vastai_pipeline_stages_count_before_launch() {
-        with_clean_env(|| {
-            let workspace = TempWorkspace::new("vastai-pipeline-rejected");
-            let config_path = workspace.write("config.toml", b"");
-            let error = match Config::from_args(
-                [
-                    "--vastai",
-                    "-N",
-                    "2",
-                    "--config",
-                    config_path.to_str().expect("temp config path is utf8"),
-                ]
-                .into_iter()
-                .map(str::to_owned),
-            ) {
-                Ok(_) => panic!("Vast.ai pipeline stage count above one must fail before launch"),
-                Err(error) => error,
-            };
-
-            assert!(
-                error.contains("--vastai cannot be combined with -N/--pipeline-stages > 1"),
-                "unexpected error: {error}"
-            );
-        });
+    fn channel_lines(lines: &[&str]) -> mpsc::Receiver<PromptInput> {
+        let (tx, rx) = mpsc::channel();
+        for line in lines {
+            tx.send(PromptInput::Line((*line).to_owned()))
+                .expect("send input line");
+        }
+        drop(tx);
+        rx
     }
 
-    #[test]
-    fn approval_parser_accepts_only_y_or_yes() {
-        for (input, expected) in [
-            ("y", true),
-            ("Y", true),
-            (" yes ", true),
-            ("YES", true),
-            ("", false),
-            ("n", false),
-            ("no", false),
-            ("yeah", false),
-            ("yep", false),
-            ("yes please", false),
-        ] {
-            assert_eq!(parse_approval(input), expected, "approval input {input:?}");
+    fn event_reader(events: &[PromptEvent]) -> Cursor<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for event in events {
+            serde_json::to_writer(&mut bytes, event).expect("serialize prompt event");
+            bytes.push(b'\n');
+        }
+        Cursor::new(bytes)
+    }
+
+    fn done(request_id: u64) -> PromptEvent {
+        PromptEvent::Done {
+            request_id,
+            final_text: String::new(),
+            tokens_generated: 0,
+            elapsed_ms: 0,
         }
     }
 
-    #[test]
-    fn parsed_args_handles_vastai_yes_and_config_path() {
-        let parsed = ParsedArgs::parse(
-            [
-                "--vastai",
-                "--yes",
-                "--config",
-                "/tmp/mvp-chat-config.toml",
-                "--",
-                "--orchestrator-flag",
-            ]
-            .into_iter()
-            .map(str::to_owned),
-        )
-        .expect("vastai flags parse");
+    fn submitted_prompts(bytes: &[u8]) -> Vec<SubmitPrompt> {
+        String::from_utf8(bytes.to_vec())
+            .expect("submitted prompts are UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("submitted prompt JSON"))
+            .collect()
+    }
 
-        assert!(parsed.vastai);
+    #[test]
+    fn parsed_args_accepts_public_flags() {
+        let parsed = ParsedArgs::parse(strings(&[
+            "--docker",
+            "--yes",
+            "--config",
+            "chat.toml",
+            "--pipeline-stages",
+            "3",
+            "--dump-logs=logs.ndjson",
+            "--cached-model",
+            "--skip-rebuild",
+        ]))
+        .expect("public args parse");
+
+        assert_eq!(parsed.provider, Some(ProviderKind::Docker));
         assert!(parsed.vastai_yes);
-        assert_eq!(
-            parsed.config_path.as_deref(),
-            Some(Path::new("/tmp/mvp-chat-config.toml"))
-        );
-        assert_eq!(parsed.orch_args, vec!["--orchestrator-flag"]);
+        assert_eq!(parsed.config_path, Some(PathBuf::from("chat.toml")));
+        assert_eq!(parsed.pipeline_stages, Some(3));
+        assert!(parsed.dump_logs);
+        assert_eq!(parsed.dump_log_path, Some(PathBuf::from("logs.ndjson")));
+        assert_eq!(parsed.cached_model, Some(CachedModelSource::Discover));
+        assert!(parsed.skip_rebuild);
     }
 
     #[test]
-    fn parsed_args_and_config_dump_logs_select_default_log_file() {
-        let parsed = ParsedArgs::parse(["--dump-logs"].into_iter().map(str::to_owned))
-            .expect("--dump-logs parses");
+    fn parsed_args_accepts_cached_model_path() {
+        let parsed = ParsedArgs::parse(strings(&["--cached-model=/tmp/model.gguf"]))
+            .expect("cached model path parses");
+
+        assert_eq!(
+            parsed.cached_model,
+            Some(CachedModelSource::Path(PathBuf::from("/tmp/model.gguf")))
+        );
+    }
+
+    #[test]
+    fn parsed_args_accepts_cached_model_equals_path_with_dash_prefix() {
+        let parsed = ParsedArgs::parse(strings(&["--cached-model=-model.gguf"]))
+            .expect("cached model path parses");
+
+        assert_eq!(
+            parsed.cached_model,
+            Some(CachedModelSource::Path(PathBuf::from("-model.gguf")))
+        );
+    }
+
+    #[test]
+    fn parsed_args_accepts_dump_logs_equals_path_with_dash_prefix() {
+        let parsed = ParsedArgs::parse(strings(&["--dump-logs=-logs.ndjson"]))
+            .expect("dump log path parses");
 
         assert!(parsed.dump_logs);
+        assert_eq!(parsed.dump_log_path, Some(PathBuf::from("-logs.ndjson")));
+    }
 
-        let config = Config::from_args(
-            ["--dump-logs", "--orch-bin", "/tmp/mvp-orchestrator"]
-                .into_iter()
-                .map(str::to_owned),
-        )
-        .expect("--dump-logs resolves chat config");
+    #[test]
+    fn parsed_args_rejects_conflicts_and_pruned_inputs() {
+        for args in [
+            vec!["--process", "--docker"],
+            vec!["-N", "2"],
+            vec!["--pipeline-stages", "0"],
+            vec!["--pipeline-stages", "many"],
+            vec!["--config"],
+            vec!["--dump-logs", "logs.ndjson"],
+            vec!["--dump-logs="],
+            vec!["--cached-model", "/tmp/model.gguf"],
+            vec!["--cached-model="],
+            vec!["--"],
+        ] {
+            assert!(
+                ParsedArgs::parse(strings(&args)).is_err(),
+                "args should fail: {args:?}"
+            );
+        }
+    }
 
-        assert_eq!(
-            config.datastream_frame_log.as_deref(),
-            Some(Path::new("mvp-chat.log"))
+    #[test]
+    fn config_resolution_uses_defaults_toml_and_cli_precedence() {
+        let temp = TempDir::new("config-resolution");
+
+        with_process_state(
+            &[
+                ("MVP_PIPELINE_STAGES", Some("9")),
+                ("MVP_RUNTIME_CONFIG", Some("local")),
+            ],
+            Some(temp.path()),
+            || {
+                let defaults = Config::from_args(Vec::<String>::new()).expect("defaults resolve");
+                assert_eq!(defaults.provider, ProviderKind::Process);
+                assert_eq!(defaults.pipeline_stages, 1);
+                assert!(defaults.datastream_frame_log.is_none());
+                assert!(defaults.cached_model.is_none());
+                assert!(defaults.vastai.is_none());
+                assert!(!defaults.skip_rebuild);
+
+                let config_path = write_config(
+                    &temp,
+                    "chat.toml",
+                    r#"
+[provider]
+kind = "docker"
+
+[runtime]
+pipeline_stages = 2
+
+[observability]
+dump_logs = true
+dump_log_path = "toml.log"
+
+[image]
+node = "docker.io/acme/node:toml"
+tag = " alias "
+"#,
+                );
+                let config_arg = config_path.to_string_lossy().into_owned();
+                let config = Config::from_args(strings(&[
+                    "--config",
+                    config_arg.as_str(),
+                    "--process",
+                    "--pipeline-stages",
+                    "4",
+                    "--dump-logs=cli.log",
+                ]))
+                .expect("config resolves");
+
+                assert_eq!(config.provider, ProviderKind::Process);
+                assert_eq!(config.pipeline_stages, 4);
+                assert_eq!(config.datastream_frame_log, Some(PathBuf::from("cli.log")));
+                assert_eq!(config.node_image, "docker.io/acme/node:toml");
+                assert_eq!(config.image_tag, Some("alias".to_owned()));
+            },
         );
     }
 
     #[test]
-    fn dump_logs_conflicts_with_explicit_datastream_frame_log() {
-        let result = Config::from_args(
-            [
-                "--dump-logs",
-                "--datastream-frame-log",
-                "/tmp/frames.jsonl",
-                "--orch-bin",
-                "/tmp/mvp-orchestrator",
-            ]
-            .into_iter()
-            .map(str::to_owned),
+    fn config_max_tokens_drives_orchestrator_args_and_submit_prompt() {
+        let temp = TempDir::new("config-max-tokens");
+        let config_path = write_config(
+            &temp,
+            "chat.toml",
+            r#"
+[runtime]
+max_tokens = 12
+"#,
         );
-        let error = match result {
-            Ok(_) => panic!("conflicting datastream log destinations must fail"),
-            Err(error) => error,
+
+        with_process_state(&[], Some(temp.path()), || {
+            let config_arg = config_path.to_string_lossy().into_owned();
+            let config = Config::from_args(strings(&["--config", config_arg.as_str()]))
+                .expect("max_tokens config resolves");
+            assert_eq!(config.max_tokens, 12);
+
+            let args = config.orchestrator_cli_args("resolved-image");
+            let max_tokens_arg = args
+                .windows(2)
+                .find(|pair| pair[0] == "--max-tokens")
+                .map(|pair| pair[1].as_str());
+            assert_eq!(max_tokens_arg, Some("12"), "{args:?}");
+
+            let mut rpc_writer = Vec::new();
+            let reader = event_reader(&[done(1)]);
+            let input = channel_lines(&["hello"]);
+            let mut output = Vec::new();
+            run_chat_session_with_output(
+                &mut rpc_writer,
+                reader,
+                input,
+                config.max_tokens,
+                &mut output,
+            )
+            .expect("prompt loop completes");
+
+            assert_eq!(
+                submitted_prompts(&rpc_writer),
+                vec![SubmitPrompt {
+                    request_id: 1,
+                    prompt_text: "hello".to_owned(),
+                    max_tokens: 12,
+                }]
+            );
+        });
+    }
+
+    #[test]
+    fn config_rejects_zero_max_tokens() {
+        let temp = TempDir::new("config-zero-max-tokens");
+        let config_path = write_config(
+            &temp,
+            "chat.toml",
+            r#"
+[runtime]
+max_tokens = 0
+"#,
+        );
+
+        with_process_state(&[], Some(temp.path()), || {
+            let config_arg = config_path.to_string_lossy().into_owned();
+            assert!(Config::from_args(strings(&["--config", config_arg.as_str()])).is_err());
+        });
+    }
+
+    #[test]
+    fn config_rejects_out_of_spec_sections() {
+        let temp = TempDir::new("config-strict-surface");
+        let config_path = write_config(
+            &temp,
+            "chat.toml",
+            r#"
+[prompt]
+max_tokens = 7
+"#,
+        );
+
+        with_process_state(&[], Some(temp.path()), || {
+            let config_arg = config_path.to_string_lossy().into_owned();
+            assert!(Config::from_args(strings(&["--config", config_arg.as_str()])).is_err());
+        });
+    }
+    #[test]
+    fn config_rejects_invalid_pipeline_provider_and_missing_images() {
+        let temp = TempDir::new("config-rejections");
+
+        with_process_state(&[], Some(temp.path()), || {
+            let zero_pipeline = write_config(
+                &temp,
+                "zero-pipeline.toml",
+                r#"
+[runtime]
+pipeline_stages = 0
+"#,
+            );
+            let zero_pipeline_arg = zero_pipeline.to_string_lossy().into_owned();
+            assert!(Config::from_args(strings(&["--config", zero_pipeline_arg.as_str()])).is_err());
+
+            let invalid_provider = write_config(
+                &temp,
+                "invalid-provider.toml",
+                r#"
+[provider]
+kind = "mock"
+"#,
+            );
+            let invalid_provider_arg = invalid_provider.to_string_lossy().into_owned();
+            assert!(
+                Config::from_args(strings(&["--config", invalid_provider_arg.as_str()])).is_err()
+            );
+
+            assert!(Config::from_args(strings(&["--docker"])).is_err());
+            assert!(Config::from_args(strings(&["--vastai"])).is_err());
+        });
+    }
+
+    #[test]
+    fn vastai_config_requires_secret_relay_bootstrap_and_remote_image() {
+        let missing_secret = TempDir::new("vastai-missing-secret");
+        let missing_secret_config = write_config(
+            &missing_secret,
+            "chat.toml",
+            r#"
+[provider]
+kind = "vastai"
+
+[image]
+node = "docker.io/acme/node:latest"
+
+[vastai]
+relay_url = "https://relay.example"
+bootstrap_command = "boot"
+"#,
+        );
+        with_process_state(&[], Some(missing_secret.path()), || {
+            let config_arg = missing_secret_config.to_string_lossy().into_owned();
+            assert!(Config::from_args(strings(&["--config", config_arg.as_str()])).is_err());
+        });
+
+        let missing_relay = TempDir::new("vastai-missing-relay");
+        let missing_relay_config = write_config(
+            &missing_relay,
+            "chat.toml",
+            r#"
+[provider]
+kind = "vastai"
+
+[image]
+node = "docker.io/acme/node:latest"
+
+[vastai]
+bootstrap_command = "boot"
+"#,
+        );
+        with_process_state(
+            &[("VAST_API_KEY", Some("secret"))],
+            Some(missing_relay.path()),
+            || {
+                let config_arg = missing_relay_config.to_string_lossy().into_owned();
+                assert!(Config::from_args(strings(&["--config", config_arg.as_str()])).is_err());
+            },
+        );
+
+        let local_image = TempDir::new("vastai-local-image");
+        let local_image_config = write_config(
+            &local_image,
+            "chat.toml",
+            r#"
+[provider]
+kind = "vastai"
+
+[image]
+node = "local-node:latest"
+
+[vastai]
+relay_url = "https://relay.example"
+bootstrap_command = "boot"
+"#,
+        );
+        with_process_state(
+            &[("VAST_API_KEY", Some("secret"))],
+            Some(local_image.path()),
+            || {
+                let config_arg = local_image_config.to_string_lossy().into_owned();
+                assert!(Config::from_args(strings(&["--config", config_arg.as_str()])).is_err());
+            },
+        );
+
+        let valid = TempDir::new("vastai-valid");
+        let valid_config = write_config(
+            &valid,
+            "chat.toml",
+            r#"
+[provider]
+kind = "vastai"
+
+[image]
+node = "docker.io/acme/node:latest"
+
+[vastai]
+relay_url = "https://relay.example"
+bootstrap_command = "boot"
+"#,
+        );
+        with_process_state(
+            &[("VAST_API_KEY", Some("secret"))],
+            Some(valid.path()),
+            || {
+                let config_arg = valid_config.to_string_lossy().into_owned();
+                let config = Config::from_args(strings(&["--config", config_arg.as_str()]))
+                    .expect("valid Vast.ai config resolves");
+                let vastai = config.vastai.as_ref().expect("resolved Vast.ai config");
+                assert_eq!(vastai.api_key, "secret");
+                assert_eq!(vastai.relay_url, "https://relay.example");
+                assert_eq!(vastai.bootstrap_command, "boot");
+                assert_eq!(vastai.image, "docker.io/acme/node:latest");
+            },
+        );
+    }
+
+    struct MockApproval {
+        terminal: bool,
+        answer: Result<bool, String>,
+    }
+
+    impl VastAiApproval for MockApproval {
+        fn stdin_is_terminal(&self) -> bool {
+            self.terminal
+        }
+
+        fn ask(&mut self) -> Result<bool, String> {
+            self.answer.clone()
+        }
+    }
+
+    #[test]
+    fn parse_approval_accepts_only_yes_variants() {
+        for value in ["y", "Y", " yes \n", "YeS"] {
+            assert!(parse_approval(value), "{value:?} should approve");
+        }
+        for value in ["", "n", "no", "yep", " yes please"] {
+            assert!(!parse_approval(value), "{value:?} should decline");
+        }
+    }
+
+    #[test]
+    fn vastai_approval_is_used_only_when_required() {
+        let process = base_config(ProviderKind::Process);
+        let mut approval = MockApproval {
+            terminal: false,
+            answer: Err("should not ask".to_owned()),
+        };
+        confirm_vastai_if_needed_with_approval(&process, &mut approval)
+            .expect("non-Vast.ai skips approval");
+
+        let mut yes_config = base_config(ProviderKind::VastAi);
+        yes_config.vastai = Some(valid_vastai());
+        yes_config.vastai_yes = true;
+        let mut approval = MockApproval {
+            terminal: false,
+            answer: Err("should not ask".to_owned()),
+        };
+        confirm_vastai_if_needed_with_approval(&yes_config, &mut approval)
+            .expect("--yes skips approval prompt");
+
+        let mut non_terminal = base_config(ProviderKind::VastAi);
+        non_terminal.vastai = Some(valid_vastai());
+        let mut approval = MockApproval {
+            terminal: false,
+            answer: Err("should not ask".to_owned()),
+        };
+        assert!(confirm_vastai_if_needed_with_approval(&non_terminal, &mut approval).is_err());
+
+        let mut accepted = base_config(ProviderKind::VastAi);
+        accepted.vastai = Some(valid_vastai());
+        let mut approval = MockApproval {
+            terminal: true,
+            answer: Ok(true),
+        };
+        confirm_vastai_if_needed_with_approval(&accepted, &mut approval)
+            .expect("interactive approval accepts");
+
+        let mut declined = base_config(ProviderKind::VastAi);
+        declined.vastai = Some(valid_vastai());
+        let mut approval = MockApproval {
+            terminal: true,
+            answer: Ok(false),
+        };
+        assert!(confirm_vastai_if_needed_with_approval(&declined, &mut approval).is_err());
+    }
+
+    #[test]
+    fn cached_model_discovery_selects_first_sorted_gguf_file() {
+        let temp = TempDir::new("cached-model-selects");
+        let cache_dir = temp.path().join(".model-cache");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(cache_dir.join("z.gguf"), b"z").expect("write z model");
+        fs::write(cache_dir.join("a.gguf"), b"a").expect("write a model");
+        fs::write(cache_dir.join("ignored.txt"), b"ignored").expect("write ignored file");
+        fs::create_dir(cache_dir.join("0.gguf")).expect("create ignored directory");
+
+        with_process_state(&[], Some(temp.path()), || {
+            let cached = CachedModelConfig::discover().expect("cached model discovered");
+            assert_eq!(cached.host_path.file_name(), Some(OsStr::new("a.gguf")));
+        });
+    }
+
+    #[test]
+    fn cached_model_discovery_errors_when_no_usable_model_exists() {
+        let missing = TempDir::new("cached-model-missing");
+        with_process_state(&[], Some(missing.path()), || {
+            assert!(CachedModelConfig::discover().is_err());
+        });
+
+        let empty = TempDir::new("cached-model-empty");
+        let cache_dir = empty.path().join(".model-cache");
+        fs::create_dir_all(&cache_dir).expect("create cache dir");
+        fs::write(cache_dir.join("ignored.txt"), b"ignored").expect("write ignored file");
+        fs::create_dir(cache_dir.join("not-a-file.gguf")).expect("create ignored directory");
+        with_process_state(&[], Some(empty.path()), || {
+            assert!(CachedModelConfig::discover().is_err());
+        });
+    }
+
+    #[test]
+    fn cached_model_path_resolves_regular_gguf_file() {
+        let temp = TempDir::new("cached-model-path");
+        let model = temp.path().join("chosen.gguf");
+        fs::write(&model, b"model").expect("write chosen model");
+        let model_arg = model.to_string_lossy().into_owned();
+
+        with_process_state(&[], Some(temp.path()), || {
+            let parsed = ParsedArgs::parse(strings(&[&format!("--cached-model={model_arg}")]))
+                .expect("cached model path parses");
+            assert_eq!(
+                parsed.cached_model,
+                Some(CachedModelSource::Path(PathBuf::from(model_arg.as_str())))
+            );
+
+            let config = Config::from_args(strings(&[&format!("--cached-model={model_arg}")]))
+                .expect("cached model path resolves");
+            assert_eq!(
+                config.cached_model.unwrap().host_path.file_name(),
+                Some(OsStr::new("chosen.gguf"))
+            );
+
+            let upper_model = temp.path().join("upper.GGUF");
+            fs::write(&upper_model, b"model").expect("write uppercase model");
+            let upper = CachedModelConfig::from_path(upper_model)
+                .expect("uppercase cached model extension resolves");
+            assert_eq!(upper.host_path.file_name(), Some(OsStr::new("upper.GGUF")));
+        });
+    }
+
+    fn panic_prepare_node_image(_: NodeImageRequest) -> Result<PreparedNodeImage, String> {
+        panic!("image preparer must not be called when --skip-rebuild is set")
+    }
+
+    #[test]
+    fn skip_rebuild_requires_existing_artifacts_and_skips_image_preparation() {
+        let temp = TempDir::new("skip-rebuild");
+        let orch_bin = temp.path().join("mvp-orchestrator");
+        let worker_bin = temp.path().join("mvp-worker-node");
+        let mut config = base_config(ProviderKind::Docker);
+        config.skip_rebuild = true;
+        config.orch_bin = orch_bin.clone();
+        config.worker_bin = worker_bin.clone();
+        config.node_image = "docker.io/acme/node:latest".to_owned();
+
+        assert!(prepare_runtime_with(&config, panic_prepare_node_image).is_err());
+
+        fs::write(&orch_bin, b"orch").expect("write orchestrator artifact");
+        assert!(prepare_runtime_with(&config, panic_prepare_node_image).is_err());
+
+        fs::write(&worker_bin, b"worker").expect("write worker artifact");
+        let image_ref = prepare_runtime_with(&config, panic_prepare_node_image)
+            .expect("skip rebuild uses existing artifacts");
+        assert_eq!(image_ref, "docker.io/acme/node:latest");
+    }
+
+    #[test]
+    fn artifact_roots_use_current_directory() {
+        let temp = TempDir::new("artifact-root");
+
+        with_process_state(&[], Some(temp.path()), || {
+            let path = default_orch_bin().expect("default orchestrator path resolves");
+            assert!(path.starts_with(temp.path()), "{path:?}");
+            assert!(path.ends_with("target/debug/mvp-orchestrator"), "{path:?}");
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn orch_child_shutdown_sends_sigterm_to_process_group() {
+        let temp = TempDir::new("orch-shutdown");
+        let flag_path = temp.path().join("term.flag");
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                "trap 'echo term > \"$1\"; exit 0' TERM; while true; do sleep 1; done",
+                "sh",
+            ])
+            .arg(&flag_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let child = command.spawn().expect("spawn signal test child");
+        thread::sleep(Duration::from_millis(100));
+        let mut orch = OrchChild {
+            child,
+            cleaned: false,
         };
 
+        orch.shutdown();
+
+        assert!(flag_path.exists(), "SIGTERM trap should write flag");
+    }
+
+    #[test]
+    fn prompt_loop_exits_cleanly_and_ignores_empty_prompts() {
+        let mut rpc_writer = Vec::new();
+        let reader = event_reader(&[]);
+        let input = channel_lines(&["", "   "]);
+        let mut output = Vec::new();
+
+        run_chat_session_with_output(&mut rpc_writer, reader, input, 7, &mut output)
+            .expect("prompt loop exits");
+
+        assert!(rpc_writer.is_empty());
+        let output = String::from_utf8(output).expect("output is UTF-8");
+        assert_eq!(output.matches("prompt:> ").count(), 3, "{output:?}");
+        assert!(!output.contains("decoding..."), "{output:?}");
+    }
+
+    #[test]
+    fn prompt_loop_submits_prompts_streams_text_and_increments_request_ids() {
+        let mut rpc_writer = Vec::new();
+        let reader = event_reader(&[
+            PromptEvent::TextDelta {
+                request_id: 1,
+                text: "hi".to_owned(),
+            },
+            done(1),
+            PromptEvent::TextDelta {
+                request_id: 2,
+                text: "bye".to_owned(),
+            },
+            done(2),
+        ]);
+        let input = channel_lines(&["hello\n", "again"]);
+        let mut output = Vec::new();
+
+        run_chat_session_with_output(&mut rpc_writer, reader, input, 7, &mut output)
+            .expect("prompt loop completes");
+
         assert_eq!(
-            error,
-            "--dump-logs cannot be combined with --datastream-frame-log; use one datastream log destination"
+            submitted_prompts(&rpc_writer),
+            vec![
+                SubmitPrompt {
+                    request_id: 1,
+                    prompt_text: "hello".to_owned(),
+                    max_tokens: 7,
+                },
+                SubmitPrompt {
+                    request_id: 2,
+                    prompt_text: "again".to_owned(),
+                    max_tokens: 7,
+                },
+            ]
+        );
+        assert_eq!(
+            String::from_utf8(output).expect("output is UTF-8"),
+            "prompt:> decoding...\nResponse: hi\nprompt:> decoding...\nResponse: bye\nprompt:> "
         );
     }
 
     #[test]
-    fn confirm_vastai_if_needed_accepts_yes_without_terminal_approval() {
-        let config = vastai_yes_chat_config();
+    fn prompt_loop_rejects_mismatched_response_request_id() {
+        let mut rpc_writer = Vec::new();
+        let reader = event_reader(&[PromptEvent::TextDelta {
+            request_id: 99,
+            text: "wrong".to_owned(),
+        }]);
+        let input = channel_lines(&["hello"]);
+        let mut output = Vec::new();
 
-        confirm_vastai_if_needed(&config, FakeOfferPreviewer)
-            .expect("--yes accepts the previewed Vast.ai rental");
+        let error = run_chat_session_with_output(&mut rpc_writer, reader, input, 7, &mut output)
+            .expect_err("mismatched request id fails");
+
+        assert!(error.contains("prompt RPC protocol error"), "{error}");
+        let prompts = submitted_prompts(&rpc_writer);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].request_id, 1);
     }
 
     #[test]
-    fn orch_rebuild_missing_binary_requires_rebuild() {
-        let workspace = TempWorkspace::new("missing-binary");
-        workspace.write("src/main.rs", b"fn main() {}\n");
-        let bin = workspace.path("target/debug/mvp-orchestrator");
+    fn prompt_loop_fault_is_expected_prompt_result() {
+        let mut rpc_writer = Vec::new();
+        let reader = event_reader(&[PromptEvent::Fault {
+            request_id: 1,
+            error: "boom".to_owned(),
+        }]);
+        let input = channel_lines(&["bad"]);
+        let mut output = Vec::new();
 
-        let needed = orch_rebuild_needed(&bin, &workspace.root, &["src/main.rs"])
-            .expect("missing binary check succeeds");
+        run_chat_session_with_output(&mut rpc_writer, reader, input, 7, &mut output)
+            .expect("fault is a prompt result");
 
-        assert!(needed, "missing orchestrator binary must trigger rebuild");
+        assert_eq!(submitted_prompts(&rpc_writer).len(), 1);
+        let output = String::from_utf8(output).expect("output is UTF-8");
+        assert!(output.contains("error: boom\n"), "{output:?}");
+    }
+
+    struct FailingBufRead;
+
+    impl Read for FailingBufRead {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::Other, "reader failed"))
+        }
+    }
+
+    impl BufRead for FailingBufRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::new(io::ErrorKind::Other, "reader failed"))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
     }
 
     #[test]
-    fn orch_rebuild_binary_newer_than_input_skips_rebuild() {
-        let workspace = TempWorkspace::new("fresh-binary");
-        let input = workspace.write("src/main.rs", b"fn main() {}\n");
-        let input_mtime = modified_time(&workspace.root, &input).expect("read input mtime");
-        let bin = workspace.path("target/debug/mvp-orchestrator");
-        write_file_newer_than(&bin, b"orchestrator binary\n", input_mtime);
+    fn prompt_loop_reports_prompt_rpc_errors() {
+        let mut rpc_writer = Vec::new();
+        let input = channel_lines(&["hello"]);
+        let mut output = Vec::new();
+        let error = run_chat_session_with_output(
+            &mut rpc_writer,
+            Cursor::new(Vec::new()),
+            input,
+            7,
+            &mut output,
+        )
+        .expect_err("closed RPC fails");
+        assert!(error.contains("prompt RPC closed"), "{error}");
 
-        let needed = orch_rebuild_needed(&bin, &workspace.root, &["src/main.rs"])
-            .expect("fresh binary check succeeds");
+        let mut rpc_writer = Vec::new();
+        let input = channel_lines(&["hello"]);
+        let mut output = Vec::new();
+        let error = run_chat_session_with_output(
+            &mut rpc_writer,
+            Cursor::new(b"not-json\n".to_vec()),
+            input,
+            7,
+            &mut output,
+        )
+        .expect_err("malformed event fails");
+        assert!(error.contains("parse prompt RPC event"), "{error}");
 
+        let mut rpc_writer = Vec::new();
+        let input = channel_lines(&["hello"]);
+        let mut output = Vec::new();
+        let error =
+            run_chat_session_with_output(&mut rpc_writer, FailingBufRead, input, 7, &mut output)
+                .expect_err("read error fails");
         assert!(
-            !needed,
-            "binary newer than every tracked input must skip rebuild"
-        );
-    }
-
-    #[test]
-    fn orch_rebuild_nested_directory_input_newer_than_binary_requires_rebuild() {
-        let workspace = TempWorkspace::new("nested-newer-input");
-        let nested_input = workspace.write("src/nested/orchestrator.rs", b"old source\n");
-        let src_mtime =
-            latest_mtime(&workspace.root, &workspace.path("src")).expect("read source tree mtime");
-        let bin = workspace.path("target/debug/mvp-orchestrator");
-        write_file_newer_than(&bin, b"orchestrator binary\n", src_mtime);
-        let bin_mtime = modified_time(&workspace.root, &bin).expect("read binary mtime");
-        write_file_newer_than(&nested_input, b"new source\n", bin_mtime);
-
-        let needed = orch_rebuild_needed(&bin, &workspace.root, &["src"])
-            .expect("stale binary check succeeds");
-
-        assert!(
-            needed,
-            "newer file inside a tracked directory must trigger rebuild"
+            error.contains("read prompt RPC event: reader failed"),
+            "{error}"
         );
     }
 }
