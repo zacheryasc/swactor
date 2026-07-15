@@ -27,6 +27,7 @@ toml = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+signal-hook = "0.3"
 
 [dev-dependencies]
 iroh-relay = { version = "0.98", features = ["server", "test-utils"] }

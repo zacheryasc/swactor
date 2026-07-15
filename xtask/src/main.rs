@@ -61,7 +61,7 @@ fn print_usage() {
 USAGE: cargo xtask <command>
 
 COMMANDS:
-  mvp-chat [--process|--docker|--vastai] [-N n] [--cached-model [path]] [args...]  Run the human chat wrapper against the real orchestrator/worker bins.
+  mvp-chat [--process|--docker|--vastai] [--pipeline-stages n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
   test                Run all basic non-binding tests. This includes the root crate with
                       `cargo test` plus each non-binding repository package with `cargo test -p`.
                       Feature-gated E2E/bin tests are intentionally excluded."

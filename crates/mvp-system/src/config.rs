@@ -6,8 +6,9 @@ use swactor_vastai::SelectionPolicy;
 
 pub const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
 
-/// Transient serde target for `.config/config.toml`.
-/// This is not runtime state; it exists only to interpret TOML fields and overlay them onto hardcoded defaults.
+/// Shared overlay for legacy and multi-binary configuration parsing. This accepts
+/// fields outside the fixed `mvp-chat` public config surface; `mvp-chat` uses a
+/// bin-local strict config loader instead.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct TomlConfigOverlay {
@@ -86,6 +87,8 @@ pub struct DockerConfigOverlay {
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ObservabilityConfigOverlay {
+    pub dump_logs: Option<bool>,
+    pub dump_log_path: Option<String>,
     pub datastream_frame_log: Option<String>,
 }
 
@@ -94,6 +97,7 @@ pub struct ObservabilityConfigOverlay {
 pub struct VastAiConfig {
     pub api_key: Option<String>,
     pub image: Option<String>,
+    pub relay_url: Option<String>,
     pub bootstrap_command: Option<String>,
     pub disk_gb: Option<u32>,
     pub ssh_user: Option<String>,
@@ -170,7 +174,7 @@ impl TomlConfigOverlay {
 
 impl ResolvedVastAiConfig {
     pub fn validate(self) -> Result<Self, String> {
-        require_non_empty("VASTAI_API_KEY", &self.api_key)?;
+        require_non_empty("VAST_API_KEY", &self.api_key)?;
         require_non_empty("relay.url", &self.relay_url)?;
         require_non_empty("vastai.image", &self.image)?;
         require_non_empty("vastai.bootstrap_command", &self.bootstrap_command)?;
