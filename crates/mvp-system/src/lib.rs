@@ -5,8 +5,6 @@ pub mod actors;
 pub mod arena_manager;
 pub mod bootstrap_datastream;
 pub mod config;
-#[cfg(feature = "local-e2e")]
-pub mod dashboard_view;
 pub mod device_bridge;
 pub mod distribution_stack;
 pub mod docker_cluster_provisioning;
@@ -19,6 +17,7 @@ pub mod gpu_worker_egress_producer;
 pub mod gpu_worker_ingress_parser;
 pub mod gpu_worker_process_adapter;
 pub mod membership_pool_readiness;
+pub mod mvp_chat;
 pub mod node_boot_lifecycle;
 pub mod node_image;
 pub mod node_provisioning;

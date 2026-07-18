@@ -1430,23 +1430,28 @@ enum GpuWorkerCtlMsg {
     ExecuteStep(ExecuteStep),
     ReleaseDeviceObject { device_handle: DeviceObjectHandle },
     ShutdownWorker(ShutdownWorker),
-    Process(ProcessNotification),
+    Process(ProcessOutput),
+    WorkerAdapter(WorkerAdapterEvent),
 }
 ```
 
-`Process(ProcessNotification)` is delivered by a small `ProcessBridge` actor.
-`GpuWorkerCtl` sends process input through `ProcessCommand::WriteStdin`.
+`Process(ProcessOutput)` is delivered by the configured upstream process owner;
+there is no process-local notification subscription bridge. If the
+production worker still uses a subprocess stdin/stdout protocol, `GpuWorkerCtl`
+talks to a separate worker I/O adapter. That adapter owns the child stdio handles
+and is outside managed-process core.
 
-The process adapter may use newline-delimited JSON for worker commands/events.
-This is an adapter, not a second distributed protocol.
+The optional worker I/O adapter may use newline-delimited JSON for worker
+commands/events. This is an adapter-local protocol, not part of
+`crates/process` and not a second distributed protocol.
 
 Adapter rules:
 
-- one command/event JSON object per line
-- stdout is reserved for worker events
-- stderr is reserved for logs and diagnostics
-- payload bytes are forbidden in JSON
-- invalid JSON or unknown event shape is a worker/process fault
+- one command/event JSON object per line;
+- adapter-owned stdout may carry worker events;
+- adapter-owned stderr may carry logs and diagnostics;
+- payload bytes are forbidden in JSON;
+- invalid JSON or unknown event shape is a worker/adapter fault.
 
 Worker environment:
 
@@ -1675,7 +1680,7 @@ Wake hints emitted by worker:
 - egress rings: `RingReadable` after advancing `commit`
 
 `GpuWorkerCtl` may synthesize `WorkerCrashed` and `RingFault` after process exit,
-process error, or stdout control-stream failure.
+process error, or worker I/O adapter control-stream failure.
 
 ---
 
@@ -1688,11 +1693,11 @@ NotStarted
   on StartWorker -> Spawning
 
 Spawning
-  spawn ProcessActor with ProcessSpec
-  spawn ProcessBridge
-  subscribe bridge to ProcessActor
-  wait for ProcessNotification::Started
-  send InitializeWorker through ProcessCommand::WriteStdin
+  spawn ProcessActor with ProcessSpec and upstream = GpuWorkerCtl/process owner
+  wait for ProcessOutput::Started
+  if subprocess worker protocol is enabled:
+    start/connect worker I/O adapter
+    send InitializeWorker through worker I/O adapter
   -> Initializing
 
 Initializing
