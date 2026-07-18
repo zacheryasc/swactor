@@ -937,6 +937,7 @@ dependencies = [
 name = "datastream"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "iroh",
  "libc",
  "serde",
@@ -2104,6 +2105,7 @@ dependencies = [
 name = "iroh-driver"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "datastream",
  "distribution",
  "iroh",
@@ -4342,6 +4344,7 @@ name = "swactor-process"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
+ "datastream",
  "libc",
  "proptest",
  "proptest-state-machine",

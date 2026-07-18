@@ -14,7 +14,7 @@ mod datastream_records {
     //! the mux.
 
     use datastream::frame::{Lifetime, NodeId, StreamId};
-    use datastream::{Mux, Record};
+    use datastream::{ChannelId, Mux, Position, Record};
     use distribution::telemetry::{
         CacheEntryRec, DIST_STATE, DistributionState, MembershipTransition, RegistryEntryRec,
     };
@@ -49,18 +49,18 @@ mod datastream_records {
     fn distribution_emits_owned_channel_through_datastream_mux() {
         let stream = StreamId::new(NodeId::new("dist-node"), Lifetime(1));
         let mux = Mux::unbounded(stream);
-        mux.set_frame_timing_enabled(false);
         let state = DistributionState {
             registry_size: 9,
             ..Default::default()
         };
 
-        let pos = mux.submit(DistributionState::channel(), state.encode());
+        let channel = ChannelId(1);
+        assert!(mux.submit(channel, state.encode()));
         let frames = mux.drain();
 
-        assert_eq!(pos.0, 0);
         assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].channel.as_str(), DIST_STATE);
+        assert_eq!(frames[0].channel, channel);
+        assert_eq!(frames[0].position, Position(0));
         assert_eq!(
             DistributionState::decode(&frames[0].payload)
                 .unwrap()

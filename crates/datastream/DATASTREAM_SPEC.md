@@ -1,462 +1,738 @@
 # The Datastream — Specification
 
->>**STALE** Stale and not the final advisor on current or future state of the datastream.
-
-> **Status.** This is the canonical specification for the `datastream` crate.
-> It supersedes the implicit spec the old `crates/distribution/src/datastream`
-> doc-comments referred to (`DATASTREAM_SPEC.md §4.1`, etc.). Those section
-> numbers are not preserved; updating the stale `(spec §…)` references is part
-> of the migration this document drives.
+> **Status.** Current-state specification for the `datastream` crate. This keeps
+> the original outline, but updates the model to the implementation that now
+> exists: stream-local numeric channel ids, a channel catalog, broadcast endpoint
+> subscriptions, and catalog-aware transport events.
 
 ---
 
 ## 1. What the datastream is
 
-The datastream is a **per-node, append-only telemetry pipe**. Every node
-produces exactly one stream of its own observations; one consumer reconstructs
-those streams and reads them.
+The datastream is a **per-node, append-only telemetry pipe**. Every stream is
+produced by one node incarnation, identified by `(node, life)`. A node can feed
+zero, one, or many local/remote consumers: the mux is drained once, then the
+endpoint fans out the resulting events to subscribers.
 
-Its entire value comes from one rule:
+Its core rule is unchanged:
 
-> **Nothing between a producer and a view ever interprets a payload.**
+> **Nothing between a producer and a view ever interprets a producer payload.**
 
-Producers tag bytes with a channel name and hand them off. A single per-node
-**mux** stamps each with a position and interleaves them into one ordered
-stream. A best-effort **transport** carries the stream. **Ingest** reconstructs
-each node's stream by position into a **store**. **Views** decode bytes back
-into meaning — and only here, at read time, does anything look inside a payload.
+The current implementation is catalog-aware. Producers register a channel name
+and content class with their stream owner, receive a stream-local numeric
+`ChannelId`, and submit opaque payload bytes on that id. A single per-stream
+**mux** queues accepted payloads and stamps each drained frame with a position,
+interleaving every channel into one ordered stream. A **catalog** maps numeric
+channel ids back to human-readable names and decode/display metadata.
+A best-effort **transport**
+carries catalog declarations and frame events. **Ingest** reconstructs streams
+by `StreamId` and position into a **store**. **Views** resolve channel names
+from metadata and decode bytes back into meaning — and only here, at read time,
+does anything look inside a producer payload.
 
 ```text
-   producers            tag bytes with a channel
+   producers                  register names, submit opaque bytes by ChannelId
         │
         ▼
-   per-node MUX          stamp position, interleave into one ordered stream
+   endpoint / catalog          allocate ids, declare stream/channel metadata
         │
         ▼
-   transport             best-effort: may drop / reorder / delay, never corrupt
+   per-stream MUX              queue payloads, assign positions on drain
         │
         ▼
-   ingest                reconstruct each node's stream by position
+   endpoint fanout             drain once, broadcast catalog-aware events
         │
         ▼
-   store (the truth)     whole, append-only, position-keyed
+   transport                   best-effort: may drop / reorder / delay / duplicate
         │
         ▼
-   views                 read-time projections — the only place bytes are decoded
+   ingest                      reconstruct each stream by position
+        │
+        ▼
+   store (truth for frames)    whole, append-only, position-keyed
+        │
+        ▼
+   views                       read-time projections; payload decoding lives here
 ```
 
-This collapses the usual telemetry zoo — counters, gauges, histograms, logs,
-events, traces — into **one** thing: positioned bytes on a named channel.
-Collection, transport, and storage are uniform because none of them know which
-of those a frame "is." That distinction does not exist in the pipe. It exists,
-if at all, in a view: "the latest frame on this channel" is a gauge, "every
-frame on this channel" is an event log, and they are the same bytes read two
-ways.
+This still collapses counters, gauges, histograms, logs, events, traces, and
+binary blobs into one mechanism: positioned bytes on named channels. The pipe
+stores and moves frames uniformly because it does not know what a payload
+"means." That distinction exists in a view: "the last frame on this channel" is
+a gauge, "every frame on this channel" is an event log, and both are projections
+over the same stored frames.
 
-### 1.1 Consequences that the rest of this spec just spells out
+### 1.1 Consequences that the rest of this spec spells out
 
-- There is **one way data enters** (§4). No per-channel "kind of producer."
-- A channel is **a name, not a resource** (§5). Nothing to allocate or free.
-- All **semantics live in views** (§8). The pipe is mechanism only.
+- There is **one data-entry shape** (§4): register or reuse a channel id, then
+  submit bytes on that id.
+- A channel name is not a queue, counter, or buffer, but it **is cataloged**
+  (§5): the stream owner allocates a stream-local numeric id and declares its
+  name/content metadata.
+- The **store is frame truth**, not catalog truth (§7). Durable name recovery
+  requires catalog descriptors alongside numeric frames.
+- All **producer-payload semantics live in views** (§8). Catalog content classes
+  help route and display; they do not let mux, transport, ingest, or store
+  inspect producer payloads.
 
 ---
 
 ## 2. The data model
 
-### 2.1 The frame is the only unit
+### 2.1 The frame remains the unit of ordered data
 
 ```rust
 pub struct Frame {
-    pub channel: ChannelId,   // the named lane these bytes belong to
-    pub position: Position,   // the mux-assigned order within the node's stream
+    pub channel: ChannelId,   // stream-local numeric lane
+    pub position: Position,   // mux-assigned order within the stream
     pub payload: Vec<u8>,     // opaque bytes — never interpreted by the pipe
 }
 ```
 
-A typed record, a log line, and a binary blob are the same kind of thing here:
-bytes on a channel. The `payload` is opaque to the mux, the transport, and the
-store.
+A typed record, a log line, and a binary blob are all frames: bytes on a
+stream-local channel id at a stream-local position. `payload` is opaque to the
+mux, transport, ingest, and store.
 
-There is **no per-frame wall-clock timestamp.** Frames are ordered and
-correlated by position alone. A producer that wants wall-clock time puts it
-*inside* the payload, as a field of its record — it is data, not a property of
-the pipe.
+There is still **no timestamp field on `Frame`**. Time, wall-clock correlation,
+latency, or tracing data is producer payload, not a datastream-owned sidecar or
+property on the frame envelope.
 
-### 2.2 The coordinate
-
-Every frame in the system has exactly one address:
-
-```text
-Frame  @  (node, life, channel, position)
-            └── stream ──┘  source   order
-```
-
-| Part       | Type         | Answers          |
-|------------|--------------|------------------|
-| `node`     | `NodeId`     | *who* produced it |
-| `life`     | `Lifetime`   | *which incarnation* of that node |
-| `channel`  | `ChannelId`  | *which source* within that node |
-| `position` | `Position`   | *where in order* within that stream |
-
-`(node, life)` together are the **stream**; `channel` is the **source** within
-it; `position` is the **order**. This four-tuple locates any datum the system
-has ever produced. Addressing (§3) is built entirely on it.
-
-### 2.3 Position: per-stream, monotonic, gap-free
-
-```rust
-pub struct Position(pub u64);
-```
-
-- **One sequence per stream**, not per channel. A node's mux holds a single
-  counter shared across every channel, so a given channel's frames carry
-  *non-contiguous* positions — a sparse projection of the node's one global
-  sequence, interleaved with every other channel.
-- **Monotonic and gap-free in assignment.** The mux never reuses a position and
-  never skips one when numbering. A position that is assigned but never
-  delivered surfaces downstream as a *missing* position — a detectable gap
-  (§4.4, §6.3).
-- **Not comparable across streams.** Positions order frames within one
-  `(node, life)` only. There is no global clock.
-
-**Why one counter and not one per channel.** It keeps the mux a single position
-authority and makes gap detection a whole-stream property: a hole means
-*something* was lost. The cost is that a drop **cannot be attributed to a
-specific channel** — you know a frame is missing, not which channel it carried.
-That is the right trade for telemetry.
-
-> **Decision of record — drop attribution.** If a particular source ever needs
-> guaranteed contiguous accounting, it
-> carries its *own* sequence number as a field in its record. The pipe's
-> position stays global and dumb; domain counting is domain data.
-
-### 2.4 Stream identity — incarnations never merge
+### 2.2 Stream identity — incarnations never merge
 
 ```rust
 pub struct StreamId { pub node: NodeId, pub life: Lifetime }
 ```
 
 `StreamId` is the ingest key. Two streams with the same `node` but different
-`life` are **different streams and must never merge.** A node that dies and is
-restarted (re-rented, re-scheduled) begins a new `life`, so its fresh stream
-does not append to — or collide with — its prior one. Restart is visible, not
-silently glued over.
+`life` are **different streams and must never merge**. A node that dies and is
+restarted (re-rented, re-scheduled, or bootstrapped for a new run) begins a new
+`life`, so the fresh stream does not append to or collide with the prior one.
+Restart is visible, not silently glued over.
+
+The stream descriptor declares where a stream came from:
+
+```rust
+pub enum StreamOrigin { Orchestrator, Bootstrap, RemoteNode }
+
+pub struct StreamDescriptor {
+    pub stream: StreamId,
+    pub label: Option<String>,
+    pub origin: StreamOrigin,
+}
+```
+
+`StreamOrigin` is subscription metadata. It is not a clock and does not order
+streams.
+
+### 2.3 Position: per-stream, monotonic when assigned
+
+```rust
+pub struct Position(pub u64);
+```
+
+- **One sequence per stream**, not per channel. A stream's mux holds a single
+  counter shared across every channel. A single channel therefore has sparse,
+  non-contiguous positions interleaved with every other channel.
+- **Assigned while draining.** `submit` only attempts to enqueue payload bytes.
+  `drain` assigns positions to accepted payloads. A queue-full rejection happens
+  before position assignment and therefore does not create a position gap.
+- **Not comparable across streams.** Positions order frames within one
+  `StreamId` only. There is no global stream order.
+
+**Why one counter and not one per channel.** It keeps the mux a single position
+authority once frames leave the queue and makes assigned-frame loss detection a
+whole-stream property: a hole means *something already assigned* was lost. A
+source needing contiguous domain accounting carries its own sequence number
+inside its payload.
+
+### 2.4 Channels: numeric ids plus catalog descriptors
+
+A raw frame contains a numeric channel id:
+
+```rust
+pub struct ChannelId(pub u32);
+```
+
+`ChannelId` values are **stream-local**. `ChannelId(7)` in one stream is not the
+same channel as `ChannelId(7)` in another stream unless their descriptors say
+so. The current endpoint allocates user channels starting at `ChannelId(1)`;
+`ChannelId(0)` is not allocated by the public registration path.
+
+The human-readable channel name and display/routing metadata live in a channel
+descriptor:
+
+```rust
+pub enum ChannelContentKind { Bytes, TextStream, JsonRecord }
+
+pub enum ChannelContent {
+    Bytes,
+    TextStream,
+    JsonRecord { schema: Option<String> },
+}
+
+pub struct ChannelDescriptor {
+    pub stream: StreamId,
+    pub id: ChannelId,
+    pub name: String,
+    pub label: Option<String>,
+    pub content: ChannelContent,
+}
+
+pub struct ChannelRef {
+    pub stream: StreamId,
+    pub channel: ChannelId,
+}
+```
+
+The globally resolved raw channel identity is `ChannelRef`, not a bare
+`ChannelId`. A view usually needs the `ChannelDescriptor` for that `ChannelRef`
+to recover the channel name and choose a decode/display path.
+
+### 2.5 Datastream events
+
+The live endpoint/subscription path carries catalog-aware events:
+
+```rust
+pub struct FrameDelivery {
+    pub channel: ChannelRef,
+    pub position: Position,
+    pub payload: Vec<u8>,
+}
+
+pub enum DatastreamEvent {
+    StreamDeclared(StreamDescriptor),
+    ChannelDeclared(ChannelDescriptor),
+    Frame(FrameDelivery),
+    StreamEnded(StreamId),
+}
+```
+
+`FrameDelivery` is the live-event form of a frame: stream and channel are
+resolved into a `ChannelRef`, then position and payload follow. The older
+`Delivery { stream, frame }` shape still exists for ingest, store tests, and
+legacy adapters (§6.1, §7.1).
+
+`StreamDeclared` is part of the event vocabulary, but current QUIC transport
+puts the stream descriptor in the stream header and does not emit a separate
+`StreamDeclared` event. `StreamEnded` is also part of the event vocabulary, but
+current `DatastreamEndpoint` exposes no public `end_stream` method; terminal
+source records remain a producer convention until a stream-ending API is added
+(§5.7).
+
 
 ---
 
 ## 3. Addressing
 
-### 3.1 The address is the coordinate
+### 3.1 Raw and resolved coordinates
 
-A frame is addressed by `(node, life, channel, position)`. A *source* is
-addressed by the prefix `(node, life, channel)` — drop `position` and you are
-naming a lane rather than a single datum. A *node's whole stream* is
-`(node, life)`. Nothing else is needed; there is no separate registry of
-producer identities.
+A stored raw frame is addressed by:
 
-### 3.2 Channel paths: opaque on the wire, structured at the edges
-
-```rust
-pub struct ChannelId(Arc<str>);   // an opaque token to the pipe
+```text
+raw-frame @ (stream, numeric-channel, position)
+             └ node/life ┘  ChannelId       order
 ```
 
-To the mux, transport, ingest, and store a `ChannelId` is an uninterpreted
-string. They never split it, match it, or validate it. This is what keeps the
-pipe dumb and lets a brand-new channel flow end to end with zero pipe changes.
+A named channel source is addressed by resolving that raw channel through the
+catalog:
 
-Its **structure is a read-side convention** — known only to producers (to mint
-paths they own) and to consumers/classifiers (to match and decode them). It
-is therefore *both*: a flat string on the wire, a structured path at the edges.
-There is no conflict, because the two views never meet inside the pipe.
+```text
+source @ (stream, channel-name)
+          └ node/life ┘ descriptor.name
+```
 
-### 3.3 The path grammar
+A payload datum is therefore either:
 
-A channel path is a dotted sequence of segments:
+- raw: `(StreamId, ChannelId, Position)`, sufficient for storage and ordering;
+- resolved: `(StreamId, ChannelDescriptor.name, Position)`, required for
+  human-facing selection and decoding.
+
+No bare `ChannelId` is globally meaningful. A consumer that receives a frame
+before its descriptor can store it raw, but cannot render a stable name until the
+catalog descriptor arrives or is recovered from durable catalog state.
+
+### 3.2 Channel names: structured catalog paths, not wire ids
+
+Channel names remain dotted paths, but they are catalog descriptor fields rather
+than the frame's wire identity. The mux, ingest, and store do not split names;
+subscription matching and views may match names through descriptors.
+
+A channel name is a dotted sequence of segments:
 
 ```text
 channel := namespace ( "." qualifier )*
-namespace := the owning subsystem        e.g. host, transport, swim, runtime,
-                                              dist, proc, identity
-qualifier := instance-key | leaf         instance-key identifies *which* of a
-                                              dynamic source; leaf names the signal
+namespace := owning subsystem          e.g. datastream, host, runtime, proc,
+                                            mvp, transport, dist, identity
+qualifier := instance-key | leaf       instance-key identifies a dynamic source;
+                                            leaf names the signal
 ```
 
-Examples, current and proposed:
+Current names and families seen in code include:
 
-| Path                          | Namespace   | Instance      | Leaf       |
-|-------------------------------|-------------|---------------|------------|
-| `identity`                    | identity    | —             | —          |
-| `host.resource`               | host        | —             | resource   |
-| `transport.internals`         | transport   | —             | internals  |
-| `proc.trainer.stdout`         | proc        | `trainer`     | stdout     |
-| `transport.peer.<id>.conn` *(proposed)* | transport | `peer/<id>` | conn |
+| Path or family                                      | Owner / meaning |
+|-----------------------------------------------------|-----------------|
+| `datastream.health`                                 | datastream self-health record |
+| `host.cpu`, `host.gpu`, `host.net`                  | host hardware samples |
+| `runtime.actors`                                    | swactor runtime actor stats |
+| `proc.<label>.stdout`, `proc.<label>.stderr`        | managed process output streams |
+| `mvp.lifecycle`                                     | MVP lifecycle record |
+| `mvp.provisioning.events`                           | MVP provisioning events |
+| `mvp.provisioning.logs.node.<id>.<stdout|stderr|provider>` | MVP provisioning logs |
 
-A single-segment path (`identity`, `membership`) is the degenerate case: a
-namespace with one global signal and no multiplicity. Instance segments appear
-only where a source has many instances (one per process, per peer, per actor).
+Single-segment names are allowed, but most current code uses namespaced paths.
+Instance segments appear only where a source has many instances: a process
+label, node id, actor id, peer id, run id, or similar domain-owned key.
 
-### 3.4 Source selectors
+### 3.3 Namespacing and ownership
 
-A consumer addresses sources by a **stream scope plus a channel prefix**:
+Collisions are prevented by namespace ownership plus catalog conflict checks:
 
-```text
-selector := (node?, life?)  channel-prefix [ ".*" ]
+- Each subsystem owns its first path segment. Only that subsystem should mint
+  names below it.
+- Dynamic instance segments must be stable identifiers already unique in that
+  subsystem's domain.
+- Within one stream catalog, registering the same name with the same content
+  returns the existing id; registering the same name with conflicting content is
+  an error.
+- Two streams may allocate different numeric ids for the same channel name.
+
+### 3.4 Source and channel selectors
+
+Subscriptions use structured filters rather than a single textual selector:
+
+```rust
+pub struct SubscriptionRequest {
+    pub sources: SourceFilter,
+    pub channels: ChannelFilter,
+}
+
+pub enum SourceFilter {
+    All,
+    Origin(StreamOrigin),
+    Node(NodeId),
+    Stream(StreamId),
+}
+
+pub enum ChannelFilter {
+    All,
+    Name(String),
+    Prefix(String),
+    Content(ChannelContentKind),
+}
 ```
 
-- `(*, *)  membership`            — every node's membership signal.
-- `(X, *)  proc.trainer.*`        — everything the trainer process on node `X`
-                                     ever emitted, across that node's restarts.
-- `(X, Y)  host.resource`         — one exact source.
-- `(*, *)  proc.*`                — all process output, fleet-wide.
+`SourceFilter::Node(node)` means every known life of that node. `Stream(stream)`
+means exactly one `(node, life)`. `Origin(origin)` matches stream descriptor
+metadata. `ChannelFilter::Prefix(prefix)` is a plain string `starts_with` over
+`ChannelDescriptor.name`; the old `.*` notation is user-interface sugar, not the
+internal API. `ChannelFilter::Content(kind)` matches catalog content metadata,
+not payload inspection.
 
-Prefix matching over the path **is** the query model. Because instances live in
-the path, "all processes" or "one peer's view" is a prefix, never a side table
-of what exists. This is the whole reason the path is structured.
+Examples:
+
+| Request | Meaning |
+|---------|---------|
+| `{ sources: All, channels: Prefix("proc.") }` | all process-output channels with descriptors visible to the subscriber |
+| `{ sources: Node(X), channels: Prefix("proc.trainer.") }` | trainer process output from every life of node `X` |
+| `{ sources: Stream(S), channels: Name("host.cpu") }` | exact host CPU channel in one stream |
+| `{ sources: Origin(Bootstrap), channels: Content(JsonRecord) }` | JSON-record channels from bootstrap streams |
 
 ---
 
 ## 4. Population — the one way in
 
-### 4.1 A producer holds a submission handle
+### 4.1 The endpoint owns stream-local allocation and fanout
 
-There is exactly one means of population. A producer holds a **submission
-handle** to its node's mux and calls:
-
-```rust
-fn submit(&self, channel: impl Into<ChannelId>, payload: Vec<u8>);
-```
-
-Everything else is sugar over this. A typed record encodes itself and submits
-(`record.emit_to(&handle)`); a text source submits a line; a binary source
-submits bytes. There is no second mechanism, no "event vs sample vs one-shot"
-path. *When* a producer calls `submit` — on a timer, in a callback, once at boot
-— is the producer's own business and is invisible to the stream.
-
-The handle is cheaply cloneable and `Send`, so any number of producers, on any
-threads, feed the same mux. The mux serializes them into one order (§4.3).
-
-### 4.2 One observer per subsystem
-
-Every subsystem that produces telemetry exposes **one observer trait**, and the
-node wires that observer to a submission handle. This is the uniform "means of
-population" applied across the codebase:
+The current public owner of a stream is `DatastreamEndpoint`:
 
 ```rust
-// e.g. process output
-trait ProcessOutputObserver { fn on_output(&self, label: &str, is_stderr: bool, data: &[u8]); }
-// the node installs an observer whose body is `handle.submit(...)`
+pub struct DatastreamEndpoint { /* stream, mux, catalog, fanout, counters */ }
 ```
 
-This replaces today's inconsistent wiring (some subsystems install a sink, some
-install `None`, some route through the node as an adapter). The rule: **a
-subsystem emits by handing its observer a submission handle — nothing else.**
-Existing observer-shaped seams such as `ProcessOutputObserver` and the unused
-`SwimObserver` conform to this one shape.
+An endpoint owns:
 
-### 4.3 The mux: single position authority
+- the stream id;
+- the mux that assigns positions;
+- the catalog that maps names to stream-local channel ids;
+- local subscriber fanout;
+- counters for assigned, drained, mux-dropped, and bitbucketed frames.
+
+Code that emits telemetry normally asks the endpoint for a cloneable
+`DatastreamProducer`:
 
 ```rust
-pub struct Mux { stream: StreamId, next: AtomicU64, buffer: Mutex<VecDeque<Frame>> }
+let producer = endpoint.producer();
 ```
 
-One mux per node. It is the sole assigner of positions and the outgoing buffer:
+Legacy `DatastreamEmitter` / `DatastreamEventSink` APIs still exist for old
+call sites. New code should register channels on `DatastreamEndpoint` or
+`DatastreamProducer` and submit through `DatastreamProducer`.
 
-1. On `submit`, it atomically takes the next position **before** buffering the
-   frame. Positions are consumed in submission order and never reused.
-2. The frame goes into a bounded buffer.
-3. The transport `drain`s the buffer each tick, emptying it in insertion order.
+### 4.2 Register or reuse a channel, then submit bytes
 
-Because the position is taken before buffering, the numbering is gap-free even
-when the buffer is not.
+A producer registers a channel name and content descriptor, receiving a numeric
+`ChannelId`:
 
-### 4.4 Drops are gaps (the back-pressure policy)
+```rust
+fn register_channel(name: impl Into<String>, content: ChannelContent) -> ChannelId;
+fn try_register_channel(
+    name: impl Into<String>,
+    content: ChannelContent,
+) -> Result<ChannelId, ChannelRegistrationError>;
+fn register_record<R: Record>() -> ChannelId;
+```
 
-The buffer is **bounded**. On overflow the mux **drops the frame but keeps its
-position consumed.** The producer never blocks. Downstream, the dropped position
-is simply missing — a detectable gap, never a silent renumber.
+Then it submits payload bytes on that id:
 
-> **Decision of record — lossy, not blocking.** Telemetry must never apply
-> back-pressure to the work it observes. A datastream is allowed to lose frames;
-> it is not allowed to stall a producer or to hide that a loss happened. Anything
-> that cannot tolerate loss does not belong on the datastream (§9).
+```rust
+fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> bool;
+fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> bool;
+fn submit_text_owned(&self, channel: ChannelId, text: String) -> bool;
+fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> bool;
+```
+
+Everything entering the stream goes through the same shape: numeric channel id
+and payload bytes. The submit APIs return `true` when the payload entered the
+mux queue and `false` when it was dropped before position assignment. Text and
+typed records are API sugar over bytes. *When* a producer emits — timer,
+callback, process output, once at boot — is the producer's business.
+
+### 4.3 Observers and subsystem adapters
+
+Subsystems should expose observer/hook seams that can be wired to a producer.
+The current endpoint includes adapters for process output and runtime stats:
+
+```rust
+trait ProcessOutputObserver {
+    fn on_output(&self, label: &str, is_stderr: bool, data: &[u8]);
+}
+
+trait StatsHook {
+    fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]);
+}
+```
+
+Process output uses a caller-provided closure from `(label, is_stderr)` to an
+already registered `ChannelId`. Runtime stats default to `runtime.actors` as a
+JSON record channel. Other subsystems follow the same rule: register or reuse a
+channel id, encode their own payload, submit bytes.
+
+### 4.4 The mux: single position authority
+
+```rust
+struct PendingFrame {
+    channel: ChannelId,
+    payload: Vec<u8>,
+}
+
+pub struct Mux {
+    stream: StreamId,
+    next: AtomicU64,
+    dropped: AtomicU64,
+    tx: crossbeam_channel::Sender<PendingFrame>,
+    rx: crossbeam_channel::Receiver<PendingFrame>,
+}
+```
+
+The receiver is stored directly; no outer receiver mutex is used for `drain()`.
+
+One mux owns one stream's position sequence. On `submit`:
+
+1. The mux attempts a nonblocking send of `PendingFrame { channel, payload }`
+   into a bounded queue.
+2. If the send succeeds, `submit` returns `true`.
+3. If the queue is full or disconnected, the mux increments `dropped` and
+   returns `false`; no position has been consumed.
+4. `drain` takes all currently queued pending frames, assigns each one the next
+   stream position, and returns frames in queue-drain order.
+
+The queue capacity is bounded and clamped by the implementation. Position is the
+canonical store/view ordering key after drain; the drain/fanout batch itself is
+not specified as a sorted-position replay guarantee.
+
+### 4.5 Queue drops are pre-position; producers do not block
+
+Telemetry must not apply back-pressure to the work it observes. A full mux queue
+causes `try_send` failure; the producer does not block and no position is
+assigned to the rejected payload.
+
+The `dropped` mux counter counts submissions lost to mux overflow or
+receiver-disconnect before they enter the queue. Once a frame has been drained
+and assigned a position, later transport or store loss can still surface as an
+interior gap if bracketing positions arrive.
+
+> **Decision of record — lossy, not blocking.** A datastream is allowed to lose
+> frames; it is not allowed to stall a producer or silently renumber around a
+> loss. Anything that cannot tolerate loss does not belong on the datastream as
+> its sole source of truth.
 
 ---
 
 ## 5. Channels
 
-### 5.1 Channels are names, not resources
+### 5.1 Channels are catalog entries, not independent resources
 
-This is the core of channel management, and it makes the rest of this section
-short. A channel is **a name attached to frames** — nothing more. There is:
+A channel is a cataloged name/content descriptor mapped to a stream-local
+numeric id. It is **not** a separate queue, counter, lifecycle object, task, or
+storage partition.
 
-- no channel object, no `open`/`close`,
-- no per-channel counter (positions are per-stream, §2.3),
-- no per-channel buffer (one buffer per mux, §4.3),
-- no registration call at runtime.
+There is:
 
-A channel **exists** the instant a frame bears its name, and not before.
-Everything below follows from that.
+- one mux queue per stream, not per channel;
+- one position counter per stream, not per channel;
+- a stream-local catalog mapping `name <-> ChannelId`;
+- a conflict check for duplicate names with different content metadata;
+- no per-channel close or garbage collection operation.
 
-### 5.2 Meaning is caller-owned
+A channel can be declared before its first frame. A frame can be stored with
+only its numeric channel id, but human-readable decoding requires its descriptor.
 
-`datastream` defines the vocabulary for classification, not the global list of
-classified channels:
+### 5.2 Meaning is split: catalog content vs view classifier
+
+There are two related but distinct classification layers.
+
+Catalog metadata describes how a channel is expected to be routed/displayed:
+
+```rust
+pub enum ChannelContent {
+    Bytes,
+    TextStream,
+    JsonRecord { schema: Option<String> },
+}
+```
+
+This metadata is allowed in the endpoint, subscription snapshot matcher, and
+transport catalog. It is not payload inspection.
+
+View classification remains caller-owned:
 
 ```rust
 pub enum ChannelKind { Typed, Text, Opaque }
+
 pub trait ChannelClassifier {
-    fn classify(&self, channel: &ChannelId) -> ChannelKind;
+    fn classify(&self, channel_name: &str) -> ChannelKind;
 }
 ```
 
-Producers and consumers own the records and channel constants for their domains.
-A plugin or application may compose a registry of the channels it understands,
-but the pipe never consults that registry. Adding a channel or
-teaching a view a new codec changes nothing in the mux, transport, ingest, or
-store.
+A `ChannelRegistry` can classify exact typed/text names and text prefixes, but
+unknown names default to `Opaque`. The pipe may route by `ChannelContentKind`; a
+view decides how far to decode a payload by `ChannelKind` and the caller's
+registry.
 
 ### 5.3 Static channels and dynamic families
 
-- **Static channel** — a fully literal path known at compile time
-  (`host.resource`). Defined by the crate that owns that signal.
-- **Dynamic family** — a path *template* with parameter segments
-  (`proc.{label}.stdout`). The owning crate defines the helper; concrete
-  instances are minted at runtime by binding parameters:
+- **Static channel** — a fully literal path known at compile time, such as
+  `host.cpu`, `host.net`, `datastream.health`, or `runtime.actors`.
+- **Dynamic family** — a path template with domain-owned parameter segments,
+  such as `proc.<label>.stdout` or
+  `mvp.provisioning.logs.node.<id>.<stream>`.
 
-  ```rust
-  pub fn process_output(label: &str, stream: ProcStream) -> ChannelId; // proc.<label>.<stream>
-  ```
+Dynamic helpers should return channel **names** or registration descriptors, not
+bare `ChannelId`s, unless they also have access to the endpoint/producer that
+allocates ids. Current code registers each concrete dynamic name, then submits
+on the allocated numeric id.
 
 A caller-owned classifier can know a family shape without knowing every concrete
-instance: `proc.*` may classify as `Text` while `proc.trainer.stdout` first
-appears only when the trainer emits.
+instance: for example, `proc.` may classify as text while
+`proc.trainer.stdout` first appears only when the trainer emits and registers.
 
-### 5.4 Typed / Text / Opaque, and the Opaque fallback
+### 5.4 Bytes / TextStream / JsonRecord, and the raw fallback
 
-- **Typed** — decodes to a structured record under a JSON codec (§5.5).
-- **Text** — opaque text; a view treats it as lines (`proc.*`).
-- **Opaque** — *unknown to this consumer.* Retained whole, shown as raw bytes.
+Catalog content classes are:
 
-> **Decision of record — forward-compatible fallback.** An unrecognized path is
-> `Opaque`, never an error. A newer producer may introduce a channel an older
-> consumer has never heard of; that consumer carries it, stores it, and renders
-> it as raw bytes rather than rejecting it. A consumer never drops a frame it
-> does not understand.
+- **Bytes** — arbitrary bytes. Display as raw unless a view knows more.
+- **TextStream** — UTF-8-ish stream chunks. A view may render valid UTF-8 as
+  text and invalid bytes as raw.
+- **JsonRecord** — payloads encoded with serde JSON for a record type. The
+  optional `schema` string is catalog metadata, not a versioned wire envelope.
+
+View decode results are:
+
+- **Record** — a typed/JSON channel decoded to a structured JSON value.
+- **Text** — a text channel decoded as UTF-8.
+- **Raw** — unknown, invalid, or intentionally opaque bytes.
+
+> **Decision of record — forward-compatible fallback.** An unrecognized channel
+> name is `Opaque` to the caller's view, never a pipe error. A newer producer may
+> introduce a channel an older consumer has never heard of; that consumer stores
+> the frame and renders raw bytes rather than rejecting it.
 
 ### 5.5 Record ↔ channel binding
 
-A typed channel's schema is a Rust type that knows its own channel and
-round-trips through the codec:
+A typed record binds to a channel name, not directly to a numeric id:
 
 ```rust
-pub trait Record: Serialize + DeserializeOwned + Sized {
-    const CHANNEL: &'static str;            // or a template, for dynamic families
-    fn channel() -> ChannelId;              // the concrete path
-    fn encode(&self) -> Vec<u8>;            // serde_json by default
-    fn decode(bytes: &[u8]) -> Result<Self>;
+pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
+    const CHANNEL: &'static str;
+
+    fn channel_name() -> &'static str { Self::CHANNEL }
+    fn encode(&self) -> Vec<u8> { serde_json::to_vec(self).unwrap() }
+    fn decode(payload: &[u8]) -> Result<Self, serde_json::Error>;
 }
 ```
 
-The codec contract is `decode(encode(r)) == r`. In practice most dynamic
-families are `Text`/`Opaque` (process output), and typed records are mostly
-static; typed-dynamic is supported but uncommon and deliberately un-elaborated.
+To emit a record, register the record's channel name on a producer/endpoint to
+obtain a `ChannelId`, then call `submit_record(channel, &record)`. The codec
+contract is still `decode(encode(r)) == r` for compatible producer/consumer
+versions.
 
-### 5.6 Schema evolution
+### 5.6 Schema evolution and schema metadata
 
-Schema evolution is serde discipline, stated as a rule rather than a mechanism:
+Schema evolution is still serde discipline:
 
 - **Add fields freely.** New fields are emitted by new producers.
-- **Tolerate missing.** `#[serde(default)]` fills a field an older producer did
+- **Tolerate missing.** `#[serde(default)]` fills fields an older producer did
   not send.
 - **Ignore unknown.** A consumer drops fields it does not recognize.
 - **Never remove or repurpose.** Retire a field by leaving it unused; introduce
-  meaning as a new field.
+  new meaning as a new field.
 
-There is **no schema-version number** in the path or the frame. Append-only
-field evolution makes one unnecessary, and absent is simpler than present.
+Current `JsonRecord` descriptors carry `schema: Option<String>`. In the current
+implementation, `register_record<R>()` uses `Some(R::CHANNEL.to_owned())` as the
+schema string. Treat this as catalog metadata for display/subscription tooling,
+not as a frame-level schema version. There is still no schema version field in
+`Frame` itself.
 
 ### 5.7 Lifecycle and liveness
 
-Because the stream is append-only, **a source is never deleted.** Its lifecycle
-is "first frame → silence":
+A channel source's data lifecycle remains append-only: first frame, then more
+frames, then silence. Prior frames remain in the store as history. There is no
+channel teardown or channel garbage collection.
 
-- A source comes into existence by emitting.
-- When it ends (a process exits, an actor stops), it emits a **terminal frame**
-  if it has something to say (`proc.<label>.exit` with the code) and then stops.
-- Its prior frames remain in the store as history. There is no teardown and no
-  channel GC.
+A producer may emit a terminal **data record** if the domain has something to
+say, such as a process exit record. Separately, the event vocabulary includes
+`DatastreamEvent::StreamEnded(StreamId)` for stream-level control, and QUIC can
+encode it. Current `DatastreamEndpoint` does not expose a public method to emit
+`StreamEnded`, so it is a defined control event whose emission policy is not yet
+wired through the endpoint API.
 
-**Liveness is a view concern, never a pipe concern.** A consumer decides a
-source is dead by TTL-since-last-frame or by observing its terminal frame. The
-pipe has no notion of "alive."
-
-Bounding, if any, is on the **stored frames** (the store has finite capacity),
-never on the channel identity.
+Liveness remains a view/subscriber concern. A consumer decides a source is dead
+by TTL-since-last-frame, a terminal data record, or a future stream-ended event.
+The store does not infer liveness.
 
 ### 5.8 Discovery
 
-Discovery splits cleanly along the classifier/store line:
+Discovery has moved from store-only scanning to catalog metadata:
 
-- A **caller-owned classifier** answers *meaning* — given a path, how should this
-  consumer decode it?
-- The **store** answers *existence* — which paths have actually been seen.
-  Dynamic paths are discovered by scanning stored frame keys at read time.
+- The **catalog** answers which names and content classes have been declared for
+  a stream.
+- The **store** answers which numeric frames were delivered and stored.
+- A **view** joins the two when it wants named projections.
 
-So "list every live process channel" is a **view over the store** (distinct
-paths matching `proc.*`), not a registry lookup. A classifier says what this
-consumer understands; the store says what is *real*.
+A live subscriber receives an initial `DatastreamSnapshot { streams, channels }`
+and future `ChannelDeclared` events. A durable store that must render names
+after restart must persist or reconstruct catalog descriptors alongside frames;
+frames alone contain only numeric channel ids.
 
-### 5.9 Namespacing and ownership
+### 5.9 Namespaces currently in use
 
-Collisions are prevented by construction, not by a central allocator:
+The spec does not reserve every name below, but these current code paths should
+not be contradicted:
 
-- Each subsystem **owns its namespace** (the first segment): only the `proc`
-  code mints `proc.*`, only the `swim` code mints `swim.*`. One module is the
-  single source of a namespace's paths.
-- An **instance segment must be a stable identifier already unique within that
-  namespace's domain**: an actor address, a peer `NodeId`, a process label.
-  Uniqueness is inherited from the domain; no coordination is required.
+| Namespace/path | Current meaning |
+|----------------|-----------------|
+| `datastream.health` | datastream self-health counters |
+| `host.cpu`, `host.gpu`, `host.net` | host hardware samples |
+| `runtime.actors` | runtime actor stats hook output |
+| `proc.<label>.stdout`, `proc.<label>.stderr` | managed process output |
+| `mvp.lifecycle` | MVP lifecycle facts |
+| `mvp.provisioning.events` | MVP provisioning lifecycle facts |
+| `mvp.provisioning.logs.node.<id>.<stream>` | MVP provisioning stdout/stderr/provider lines |
 
 ---
 
 ## 6. Transport
 
-### 6.1 Best-effort carriage
+### 6.1 Two transport-facing shapes
+
+The crate currently has two related seams.
+
+The older store/test seam is `Delivery`:
 
 ```rust
-pub trait FrameSink { fn deliver(&self, frames: &[Frame]); }
-pub struct Delivery { pub stream: StreamId, pub frame: Frame }
+pub struct Delivery {
+    pub stream: StreamId,
+    pub frame: Frame,
+}
 ```
 
-The transport drains the mux and carries `(StreamId, Frame)` pairs to the
-consumer. Implementations are pluggable: in-process, UDP datagrams, the cluster
-actor transport, or a scripted transport that injects faults for tests. None of
-them changes anything above or below.
+`Consumer::accept` ingests `Delivery`. Scripted transport and the legacy actor
+wire envelope still use this shape.
 
-### 6.2 Fan-out: drain once, distribute
+The live endpoint/subscription seam is `DatastreamEvent` (§2.5). It carries
+catalog declarations and `FrameDelivery` events. A transitional helper converts
+`DatastreamEvent::Frame` back to `Delivery` when a stored-stream test or adapter
+needs the old shape.
 
-A node may feed more than one consumer (for example, a local renderer and a
-remote collector). Draining is destructive — the buffer can be drained once —
-so fan-out **cannot** be "each sink drains."
+### 6.2 Local fanout: drain once, publish to subscribers
 
-> **Decision of record — fan-out shape.** The driver drains the mux **once** per
-> tick into a batch, then distributes that batch to each registered
-> `FrameSink`. Fan-out is the driver's responsibility, not the mux's and not a
-> sink-chaining trick. The mux stays a single drain; sinks stay independent and
-> side-effect-only.
+Draining the mux is destructive, so the endpoint drains once per tick:
 
-### 6.3 What the transport may and may not do
+```rust
+pub struct EndpointTick {
+    pub drained: usize,
+    pub delivered: usize,
+    pub dropped_for_subscribers: usize,
+    pub subscribers: usize,
+}
+```
 
-| May (consumer must tolerate) | May **not** |
-|------------------------------|-------------|
-| **Drop** a frame → a gap     | **Corrupt** a payload, channel, or position |
-| **Reorder** frames           | **Renumber** a frame |
-| **Delay** a frame            | **Fabricate** a frame |
-| **Duplicate** a frame        | Merge two streams' frames |
+`DatastreamEndpoint::tick` drains queued mux frames, converts them to
+`DatastreamEvent::Frame`, and publishes the batch to `DeliveryFanout`
+subscribers. Future-event fanout is broadcast-only: every current subscriber is
+offered every future event, regardless of its `SubscriptionRequest`. A slow
+subscriber drops only its own copies; other subscribers can still receive the
+same batch. If no subscribers exist, drained frames are bitbucketed and counted.
 
-The envelope is self-describing (length-prefixed fields) and decodes a delivery
-or fails cleanly; it never yields a *plausible but wrong* frame. So ingest must
-handle drop / reorder / delay / duplicate, and may assume away corruption.
+Subscriptions are **future-event streams plus an initial snapshot**. A new
+subscriber receives catalog metadata filtered by its `SubscriptionRequest`; the
+same request remains useful to subscribers and downstream filters, but the
+endpoint does not filter future fanout events. It does not replay prior frames
+unless a caller separately reads a store.
+
+### 6.3 What transport may and may not do
+
+A consumer/store must tolerate:
+
+| May happen | Required response |
+|------------|-------------------|
+| Drop an assigned frame | surface an interior gap when bracketing positions exist |
+| Reorder frames | assemble by position |
+| Delay frames | same as reorder from the store's perspective |
+| Duplicate frames | keep one frame for the position; first stored frame wins |
+| Drop subscriber copies | count the subscriber drop; do not block producer or other subscribers |
+
+A conforming transport may **not** corrupt payload bytes, renumber frames,
+fabricate plausible frames, or merge two streams' frames under one `StreamId`.
+Decode failures drop/abort the malformed record instead of yielding a plausible
+but wrong frame.
+
+Current `ScriptedTransport` deliberately models drops and reorders/delays only;
+it does not inject duplicates even though ingest/store remain idempotent.
+
+### 6.4 Wire formats in current use
+
+The legacy delivery envelope encodes:
+
+```text
+node_len/node, life, position, channel_id_u32, payload_len/payload
+```
+
+This supports old actor transport and real-I/O envelope tests.
+
+The current QUIC adapter uses a catalog-aware stream:
+
+1. A header: magic, flow id, token, stream descriptor, channel descriptors.
+2. Tagged records:
+   - `ChannelDeclared` as JSON descriptor.
+   - `Frame` as numeric channel id, position, and payload bytes.
+   - `StreamEnded` as a tag.
+   - `StreamDeclared` is skipped because the stream descriptor is already in the
+     header.
+
+The new spec treats the event stream as the live transport shape and the legacy
+`Delivery` envelope as a compatibility/test seam unless a caller explicitly uses
+it.
 
 ---
 
@@ -469,8 +745,12 @@ pub struct Consumer { store: Store }
 impl Consumer { fn accept(&mut self, d: Delivery) -> bool; }
 ```
 
-Ingest is stateless routing: route each delivery to its stream by `StreamId`,
-record the frame at its position. No decoding, no thinning, no aggregation.
+Ingest routes each `Delivery` to its `StreamId` and records the frame at its
+position. It does not decode, thin, aggregate, or inspect payload bytes.
+
+Live `DatastreamEvent::Frame` values can be converted to `Delivery` when feeding
+the store. Catalog events are not stored by `Store`; callers that need durable
+name resolution must persist catalog metadata elsewhere or extend storage.
 
 ### 7.2 Out-of-order, idempotent assembly
 
@@ -482,74 +762,134 @@ pub struct StoredStream { frames: BTreeMap<u64, Frame> }
   position key, so it lands in order regardless of arrival order.
 - **Duplicates collapse:** a position delivered twice is recorded once; the
   first frame wins. Ingest is idempotent.
+- **Payloads stay whole:** a frame on an unknown channel id is stored exactly
+  like any other frame.
 
-### 7.3 The store is the truth; gaps are derived
+### 7.3 The store is frame truth; gaps are derived
 
 ```rust
 pub struct Store { streams: BTreeMap<StreamId, StoredStream> }
 ```
 
-The store holds each node's frames whole and append-only, keyed by `StreamId`.
-**Gaps are not stored — they are derived** at read time by walking adjacent
-stored positions. An interior hole (a position between two stored frames that is
-itself absent) is a gap; trailing absence is just "nothing yet," not a gap.
+The store holds each stream's frames whole and append-only, keyed by `StreamId`.
+Gaps are not stored. They are derived by walking adjacent stored positions. An
+interior hole — a missing position between two stored frames — is a gap.
+Trailing absence after the last delivered frame is not knowable as a gap; it is
+just the stream ending or going silent from the store's perspective.
+
+Gap derivation is proportional to the number of stored frames, not the size of
+the missing position span.
+
+### 7.4 Store/catalog boundary
+
+A stored `Frame` contains `ChannelId`, `Position`, and payload bytes, but not the
+channel name or `ChannelContent`. Therefore:
+
+- the store can reconstruct order and gaps without catalog metadata;
+- a raw view can render payload bytes without catalog metadata;
+- a named/typed view needs a `ChannelId -> channel name` resolver and usually a
+  classifier/registry;
+- durable systems that want named views after restart must persist catalog
+  descriptors together with or near the frame store.
 
 ---
 
-## 8. Views — where all semantics live
+## 8. Views — where payload semantics live
 
 ### 8.1 Read-time projections
 
-A view is the only thing that interprets a payload. Everything displayed is
-*computed at read time* from the stored stream; nothing is precomputed in the
-pipe. This is where the telemetry zoo of §1 re-enters — as queries, not as types.
+A view is the only place producer payload bytes are interpreted. Everything
+displayed is computed at read time from stored frames plus optional catalog
+metadata/classifiers; nothing is precomputed in the mux, transport, ingest, or
+store.
 
-### 8.2 Standard views
+The current view API operates over `StoredStream`, whose frames carry numeric
+channels. Named decoding therefore needs a resolver from `ChannelId` to channel
+name and a caller-owned `ChannelClassifier`.
 
-| View              | Meaning |
-|-------------------|---------|
-| `latest(channel)` | the most recent frame on a channel — i.e. a *gauge* |
-| `merged_log()`    | all frames in position order, gaps surfaced as `LogEntry::Gap` — i.e. an *event log* |
-| `metric_series<R>(channel)` | a typed channel decoded to `Vec<(Position, R)>` — a *time series* |
-| `tail(n)` / `grep(pat)` / `filter(pred)` | windowed and predicate-restricted views |
+### 8.2 Implemented standard views
 
-`latest` vs `merged_log` over the *same channel* is exactly the gauge-vs-log
-distinction — chosen per query by the consumer, never bound to the channel.
+| View/API | Meaning |
+|----------|---------|
+| `merged_log(stream)` | all stored frames in position order, gaps surfaced as `LogEntry::Gap`, bodies raw |
+| `merged_log_with_names(stream, classifier, resolve_name)` | merged log with `ChannelId -> name` resolution and caller-owned body decoding |
+| `replay(stream)` | iterator over the raw merged timeline |
+| `metric_series_on<R>(stream, channel)` | decode frames on one numeric channel as `R` |
+| `metric_series<R>(stream)` | attempt to decode every frame as `R`, regardless of channel |
+| `tail(n)` / `grep(needle)` / `filter(pred)` | windowed and predicate-restricted raw frame views |
+
+`latest(channel)` was in the old spec but is not currently implemented in
+`views.rs`; do not treat it as a current conformance requirement until an API is
+added.
 
 ### 8.3 Graceful degradation
 
-A view never fails on data it cannot interpret:
+A view never fails the whole query because one payload is unknown or invalid:
 
-- An unknown channel decodes to `Body::Raw(bytes)` (§5.4).
-- A typed frame that will not parse (version skew, truncation upstream) is
-  skipped or shown raw, not fatal.
-- A gap is rendered as a gap, not as missing context that silently corrupts a
-  series.
+- Unknown channel name or missing resolver result decodes to `Body::Raw(bytes)`.
+- A typed/JSON payload that will not parse is shown raw or skipped by the typed
+  series API, depending on the view.
+- Invalid UTF-8 on a text channel is shown raw.
+- A gap is rendered as a gap, not silently collapsed.
+
+### 8.4 Gauge, log, and time series are projections
+
+Gauge-vs-log-vs-series is still a query choice, not a pipe type:
+
+- "latest value" means a view selects the last stored frame for a channel.
+- "event log" means a view walks all frames, usually with gaps surfaced.
+- "time series" means a view decodes selected frames into records keyed by
+  `Position`.
+
+The same stored bytes can participate in multiple projections.
 
 ---
 
-## 9. Invariants (conformance checklist)
+## 9. Invariants and conformance notes
 
-A conforming implementation upholds all of these. Each is a property a test can
-assert without reaching into internals (scenario / property / contract style).
+### 9.1 Invariants
 
-1. **Opaque payloads.** No code between a producer's `submit` and a view's
-   decode inspects, parses, or branches on payload bytes.
-2. **Gap-free numbering.** Within a stream, assigned positions are monotonic and
-   never reused; a dropped frame leaves its position permanently absent.
-3. **Drops are detectable, not silent.** A lost frame appears as a gap, never as
-   a renumber or a backfill.
-4. **No back-pressure.** A full buffer drops; it never blocks or stalls a
+A conforming implementation upholds these properties. Each should be testable
+without reaching into private internals.
+
+1. **Opaque producer payloads.** No code between producer submission and a view's
+   decode inspects, parses, or branches on producer payload bytes.
+2. **Stream-local numeric channel ids.** A raw `ChannelId` is meaningful only
+   with its `StreamId`; named rendering requires a channel descriptor.
+3. **Catalog consistency.** Within one stream, duplicate registration with the
+   same name/content returns the existing channel id; duplicate registration
+   with conflicting content errors.
+4. **Drain-time position assignment.** Within a stream, drain-assigned positions
+   are monotonic and never reused.
+5. **Queue drops are pre-position.** A full mux queue drops before assignment and
+   does not create a position hole.
+6. **Assigned-frame drops are detectable when bracketed.** A lost interior frame
+   appears as a derived gap, never as renumbering or backfill.
+7. **No producer back-pressure.** A full mux queue drops instead of blocking a
    producer.
-5. **Incarnations never merge.** Frames from the same `node` but different `life`
-   are stored as distinct streams.
-6. **Idempotent ingest.** Delivering the same `(StreamId, position)` twice
-   yields one stored frame.
-7. **Order independence.** Reordered or delayed deliveries reconstruct the same
-   stored stream as in-order delivery.
-8. **Unknown channels survive.** A frame on an unrecognized channel is stored
-   whole and rendered as raw bytes, never dropped or errored.
-9. **Version skew tolerance.** A typed record missing or carrying extra fields
-   decodes (defaults fill, extras ignore) rather than failing.
-10. **Semantics only in views.** Removing every view leaves a pipe that still
-    transports and stores every frame correctly.
+8. **Position order is canonical for store/views.** Store and view replay use
+   mux positions; endpoint drain/fanout order is queue order, not a
+   sorted-position guarantee.
+9. **Incarnations never merge.** Frames from the same `node` but different
+   `life` are stored as distinct streams.
+10. **Idempotent ingest.** Delivering the same `(StreamId, position)` twice
+    yields one stored frame; first stored frame wins.
+11. **Order independence.** Reordered or delayed deliveries reconstruct the same
+    stored stream as in-order delivery, modulo drops and duplicate collapse.
+12. **Unknown channels survive.** A frame with an unknown numeric id/name is
+    stored whole and rendered raw unless metadata later enables decoding.
+13. **Version skew tolerance.** Typed JSON records use serde-compatible
+    evolution: defaults for missing fields, ignored unknown fields, no field
+    repurposing.
+14. **Subscriber isolation.** A slow subscriber can lose its own event copies
+    without blocking the endpoint or other subscribers.
+15. **Semantics only in views.** Removing every view leaves a pipe that still
+    allocates channels, orders frames, transports events, ingests deliveries,
+    and stores frames correctly.
+
+### 9.2 Compatibility notes
+
+The old `DatastreamEmitter`, `DatastreamEventSink`, legacy actor envelope, and
+`Delivery` test seam are compatibility surfaces. New producer code should prefer
+`DatastreamEndpoint` and `DatastreamProducer`; new live transports should prefer
+catalog-aware `DatastreamEvent` streams.

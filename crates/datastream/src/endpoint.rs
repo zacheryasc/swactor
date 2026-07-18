@@ -6,7 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
+
+use crossbeam_channel::{
+    Receiver, RecvError, RecvTimeoutError, Sender, TryRecvError, TrySendError, bounded,
+};
 
 use serde::{Deserialize, Serialize};
 use swactor::process_observer::ProcessOutputObserver;
@@ -14,12 +18,10 @@ use swactor::stats::{ActorSnapshot, StatsHook};
 
 use crate::frame::{
     ChannelContent, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef, DatastreamEvent,
-    FrameDelivery, Position, SourceFilter, StreamDescriptor, StreamId, StreamOrigin,
-    SubscriptionRequest,
+    FrameDelivery, SourceFilter, StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest,
 };
 use crate::mux::Mux;
 use crate::record::Record;
-use crate::timing::{FRAME_TIME_CHANNEL, FRAME_TIME_CHANNEL_ID};
 use crate::transport::Delivery;
 
 const DEFAULT_MUX_CAPACITY: usize = 4096;
@@ -51,7 +53,7 @@ pub struct SubscriberSnapshot {
     pub dropped: u64,
 }
 
-/// Current catalog snapshot delivered at subscription time.
+/// Current catalog snapshot delivered at subscription time, filtered by request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatastreamSnapshot {
     pub streams: Vec<StreamDescriptor>,
@@ -70,7 +72,7 @@ pub struct DatastreamSubscription {
     name: String,
     request: SubscriptionRequest,
     snapshot: DatastreamSnapshot,
-    rx: mpsc::Receiver<DatastreamEvent>,
+    rx: Receiver<DatastreamEvent>,
 }
 
 impl DatastreamSubscription {
@@ -90,18 +92,18 @@ impl DatastreamSubscription {
         &self.snapshot
     }
 
-    pub fn try_recv(&self) -> Result<DatastreamEvent, mpsc::TryRecvError> {
+    pub fn try_recv(&self) -> Result<DatastreamEvent, TryRecvError> {
         self.rx.try_recv()
     }
 
-    pub fn recv(&self) -> Result<DatastreamEvent, mpsc::RecvError> {
+    pub fn recv(&self) -> Result<DatastreamEvent, RecvError> {
         self.rx.recv()
     }
 
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
-    ) -> Result<DatastreamEvent, mpsc::RecvTimeoutError> {
+    ) -> Result<DatastreamEvent, RecvTimeoutError> {
         self.rx.recv_timeout(timeout)
     }
 
@@ -116,9 +118,19 @@ impl DatastreamSubscription {
 
 struct SubscriberSlot {
     name: String,
-    request: SubscriptionRequest,
-    tx: mpsc::SyncSender<DatastreamEvent>,
+    tx: Sender<DatastreamEvent>,
     dropped: u64,
+}
+
+struct FanoutTarget {
+    id: SubscriptionId,
+    tx: Sender<DatastreamEvent>,
+}
+
+struct FanoutReport {
+    id: SubscriptionId,
+    dropped: u64,
+    disconnected: bool,
 }
 
 struct FanoutState {
@@ -126,7 +138,7 @@ struct FanoutState {
     subscribers: BTreeMap<SubscriptionId, SubscriberSlot>,
 }
 
-/// Local event fanout used by endpoints and collectors.
+/// Local fanout; future events are broadcast to every subscriber without request filtering.
 pub struct DeliveryFanout {
     default_capacity: usize,
     state: Mutex<FanoutState>,
@@ -168,7 +180,7 @@ impl DeliveryFanout {
         capacity: usize,
     ) -> DatastreamSubscription {
         let name = name.into();
-        let (tx, rx) = mpsc::sync_channel(capacity.max(1));
+        let (tx, rx) = bounded(capacity.max(1));
         let mut state = self.state.lock().expect("datastream fanout poisoned");
         let id = SubscriptionId(state.next_id);
         state.next_id = state.next_id.wrapping_add(1).max(1);
@@ -176,7 +188,6 @@ impl DeliveryFanout {
             id,
             SubscriberSlot {
                 name: name.clone(),
-                request: request.clone(),
                 tx,
                 dropped: 0,
             },
@@ -212,23 +223,34 @@ impl DeliveryFanout {
             .collect()
     }
 
-    pub fn publish(&self, event: DatastreamEvent, catalog: &CatalogSnapshot) -> EndpointTick {
-        self.publish_batch(std::iter::once(event), catalog)
+    pub fn publish(&self, event: DatastreamEvent) -> EndpointTick {
+        self.publish_batch(std::iter::once(event))
     }
 
-    pub fn publish_batch(
-        &self,
-        events: impl IntoIterator<Item = DatastreamEvent>,
-        catalog: &CatalogSnapshot,
-    ) -> EndpointTick {
+    pub fn publish_batch(&self, events: impl IntoIterator<Item = DatastreamEvent>) -> EndpointTick {
         let events: Vec<DatastreamEvent> = events.into_iter().collect();
         if events.is_empty() {
             return EndpointTick::default();
         }
 
-        let mut state = self.state.lock().expect("datastream fanout poisoned");
-        let subscribers = state.subscribers.len();
-        if subscribers == 0 {
+        // Snapshot sender handles while holding the subscriber map lock, then
+        // deliver outside the lock so large batches or slow subscribers do not
+        // block subscribe/snapshot control-plane operations.
+        let (targets, subscribers) = {
+            let state = self.state.lock().expect("datastream fanout poisoned");
+            let subscribers = state.subscribers.len();
+            let targets = state
+                .subscribers
+                .iter()
+                .map(|(id, slot)| FanoutTarget {
+                    id: *id,
+                    tx: slot.tx.clone(),
+                })
+                .collect::<Vec<_>>();
+            (targets, subscribers)
+        };
+
+        if targets.is_empty() {
             return EndpointTick {
                 drained: events.len(),
                 subscribers: 0,
@@ -237,36 +259,48 @@ impl DeliveryFanout {
         }
 
         let mut delivered = 0;
-        let mut dropped = 0;
-        let mut disconnected = Vec::new();
-        for (id, slot) in state.subscribers.iter_mut() {
+        let mut reports = Vec::new();
+        for target in targets {
+            let mut dropped = 0;
+            let mut disconnected = false;
             for event in &events {
-                if !event_matches_request(event, &slot.request, catalog) {
-                    continue;
-                }
-                match slot.tx.try_send(event.clone()) {
+                match target.tx.try_send(event.clone()) {
                     Ok(()) => delivered += 1,
-                    Err(mpsc::TrySendError::Full(_)) => {
-                        slot.dropped = slot.dropped.saturating_add(1);
+                    Err(TrySendError::Full(_)) => dropped += 1,
+                    Err(TrySendError::Disconnected(_)) => {
                         dropped += 1;
-                    }
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        slot.dropped = slot.dropped.saturating_add(1);
-                        dropped += 1;
-                        disconnected.push(*id);
-                        break;
+                        disconnected = true;
                     }
                 }
             }
+            if dropped > 0 || disconnected {
+                reports.push(FanoutReport {
+                    id: target.id,
+                    dropped,
+                    disconnected,
+                });
+            }
         }
-        for id in disconnected {
-            state.subscribers.remove(&id);
+
+        let dropped_for_subscribers = reports.iter().map(|report| report.dropped).sum::<u64>();
+        if !reports.is_empty() {
+            let mut state = self.state.lock().expect("datastream fanout poisoned");
+            for report in &reports {
+                if let Some(slot) = state.subscribers.get_mut(&report.id) {
+                    slot.dropped = slot.dropped.saturating_add(report.dropped);
+                }
+            }
+            for report in &reports {
+                if report.disconnected {
+                    state.subscribers.remove(&report.id);
+                }
+            }
         }
 
         EndpointTick {
             drained: events.len(),
             delivered,
-            dropped_for_subscribers: dropped,
+            dropped_for_subscribers: usize::try_from(dropped_for_subscribers).unwrap_or(usize::MAX),
             subscribers,
         }
     }
@@ -279,6 +313,7 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    /// Apply a subscription request to the initial metadata snapshot only.
     pub fn datastream_snapshot(&self, request: &SubscriptionRequest) -> DatastreamSnapshot {
         let channels: Vec<ChannelDescriptor> = self
             .channels
@@ -320,24 +355,12 @@ struct ChannelCatalogState {
 
 impl ChannelCatalogState {
     fn new(stream: StreamDescriptor) -> Self {
-        let mut state = Self {
-            stream: stream.clone(),
+        Self {
+            stream,
             by_id: BTreeMap::new(),
             by_name: BTreeMap::new(),
             next_channel: 1,
-        };
-        let timing = ChannelDescriptor {
-            stream: stream.stream.clone(),
-            id: FRAME_TIME_CHANNEL_ID,
-            name: FRAME_TIME_CHANNEL.to_owned(),
-            label: Some("frame construction time".to_owned()),
-            content: ChannelContent::JsonRecord {
-                schema: Some("datastream.frame_time.v1".to_owned()),
-            },
-        };
-        state.by_name.insert(timing.name.clone(), timing.id);
-        state.by_id.insert(timing.id, timing);
-        state
+        }
     }
 
     fn snapshot(&self) -> CatalogSnapshot {
@@ -456,14 +479,6 @@ impl DatastreamEndpoint {
             .snapshot()
     }
 
-    pub fn set_frame_timing_enabled(&self, enabled: bool) {
-        self.mux.set_frame_timing_enabled(enabled);
-    }
-
-    pub fn frame_timing_enabled(&self) -> bool {
-        self.mux.frame_timing_enabled()
-    }
-
     pub fn producer(&self) -> DatastreamProducer {
         DatastreamProducer {
             mux: Arc::clone(&self.mux),
@@ -530,26 +545,36 @@ impl DatastreamEndpoint {
         self.fanout.subscriber_snapshots()
     }
 
-    /// Drain the mux and fan out catalog-aware future events.
+    /// Drain the mux once and broadcast future frame events; with no subscribers, drained frames are bitbucketed.
     pub fn tick(&self) -> EndpointTick {
-        let frames = self.mux.drain();
-        if frames.is_empty() {
+        let events = self.drain_events();
+        if events.is_empty() {
             return EndpointTick::default();
         }
-        let drained = frames.len();
-        self.drained.fetch_add(drained as u64, Ordering::Relaxed);
-        let events = frames.into_iter().map(|frame| {
-            DatastreamEvent::Frame(FrameDelivery {
-                channel: ChannelRef {
-                    stream: self.stream.clone(),
-                    channel: frame.channel,
-                },
-                position: frame.position,
-                payload: frame.payload,
+        self.publish_events(events)
+    }
+
+    fn drain_events(&self) -> Vec<DatastreamEvent> {
+        self.mux
+            .drain()
+            .into_iter()
+            .map(|frame| {
+                DatastreamEvent::Frame(FrameDelivery {
+                    channel: ChannelRef {
+                        stream: self.stream.clone(),
+                        channel: frame.channel,
+                    },
+                    position: frame.position,
+                    payload: frame.payload,
+                })
             })
-        });
-        let catalog = self.catalog_snapshot();
-        let tick = self.fanout.publish_batch(events, &catalog);
+            .collect()
+    }
+
+    fn publish_events(&self, events: Vec<DatastreamEvent>) -> EndpointTick {
+        let drained = events.len();
+        self.drained.fetch_add(drained as u64, Ordering::Relaxed);
+        let tick = self.fanout.publish_batch(events);
         if tick.subscribers == 0 {
             self.bitbucketed
                 .fetch_add(drained as u64, Ordering::Relaxed);
@@ -620,24 +645,20 @@ impl DatastreamProducer {
             .id_for_name(name)
     }
 
-    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> Position {
+    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> bool {
         self.mux.submit(channel, record.encode())
     }
 
-    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> Position {
+    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> bool {
         self.mux.submit(channel, text.as_ref().to_vec())
     }
 
-    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> Position {
+    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> bool {
         self.mux.submit(channel, bytes)
     }
 
-    pub fn set_frame_timing_enabled(&self, enabled: bool) {
-        self.mux.set_frame_timing_enabled(enabled);
-    }
-
-    pub fn frame_timing_enabled(&self) -> bool {
-        self.mux.frame_timing_enabled()
+    pub fn submit_text_owned(&self, channel: ChannelId, text: String) -> bool {
+        self.mux.submit(channel, text.into_bytes())
     }
 
     pub fn process_observer_with<F>(&self, channel_for: F) -> Arc<dyn ProcessOutputObserver>
@@ -674,29 +695,25 @@ fn register_channel(
     name: String,
     content: ChannelContent,
 ) -> Result<ChannelId, ChannelRegistrationError> {
-    let (id, event, snapshot) = {
+    // New channel declarations publish a future event immediately; existing-name
+    // reuse only returns the prior id.
+    let (id, event) = {
         let mut catalog = catalog.lock().expect("datastream catalog poisoned");
         match catalog.try_register_channel(name.clone(), content)? {
-            Some(descriptor) => {
-                let id = descriptor.id;
-                let snapshot = catalog.snapshot();
-                (
-                    id,
-                    Some(DatastreamEvent::ChannelDeclared(descriptor)),
-                    snapshot,
-                )
-            }
+            Some(descriptor) => (
+                descriptor.id,
+                Some(DatastreamEvent::ChannelDeclared(descriptor)),
+            ),
             None => {
                 let id = catalog
                     .id_for_name(&name)
                     .expect("duplicate channel name remains registered");
-                let snapshot = catalog.snapshot();
-                (id, None, snapshot)
+                (id, None)
             }
         }
     };
     if let Some(event) = event {
-        let _ = fanout.publish(event, &snapshot);
+        let _ = fanout.publish(event);
     }
     Ok(id)
 }
@@ -771,33 +788,6 @@ struct RuntimeActorSnapshotRecord<'a> {
 struct RuntimeMessageTypeCount<'a> {
     ty: &'a str,
     count: u64,
-}
-
-fn event_matches_request(
-    event: &DatastreamEvent,
-    request: &SubscriptionRequest,
-    catalog: &CatalogSnapshot,
-) -> bool {
-    match event {
-        DatastreamEvent::StreamDeclared(descriptor) => {
-            source_matches(&descriptor.stream, Some(descriptor), &request.sources)
-                && (matches!(request.channels, ChannelFilter::All)
-                    || catalog.channels.values().any(|channel| {
-                        channel.stream == descriptor.stream
-                            && descriptor_matches_request(channel, request, catalog)
-                    }))
-        }
-        DatastreamEvent::ChannelDeclared(descriptor) => {
-            descriptor_matches_request(descriptor, request, catalog)
-        }
-        DatastreamEvent::Frame(delivery) => catalog
-            .descriptor_for(&delivery.channel)
-            .map(|descriptor| descriptor_matches_request(descriptor, request, catalog))
-            .unwrap_or_else(|| matches!(request.channels, ChannelFilter::All)),
-        DatastreamEvent::StreamEnded(stream) => {
-            source_matches(stream, catalog.stream_descriptor(stream), &request.sources)
-        }
-    }
 }
 
 fn descriptor_matches_request(

@@ -59,7 +59,7 @@ pub fn decode_delivery(buf: &[u8]) -> Result<(StreamId, Frame), WireError> {
     Ok((stream, frame))
 }
 
-/// One datastream event, addressed to a local/cluster datastream actor.
+/// Legacy actor-message payload wrapper for datastream bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DatastreamFrame {
     pub payload: Vec<u8>,

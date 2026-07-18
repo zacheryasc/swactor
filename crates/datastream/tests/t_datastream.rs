@@ -7,8 +7,7 @@ use datastream::transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 use datastream::views::{self, Body, LogEntry};
 use datastream::wire::{decode_delivery, encode_delivery};
 use datastream::{
-    ChannelId, ChannelKind, ChannelRegistry, FRAME_TIME_CHANNEL_ID, Frame, FrameTimeSample,
-    Lifetime, NodeId, Position, Record, StreamId,
+    ChannelId, ChannelKind, ChannelRegistry, Frame, Lifetime, NodeId, Position, Record, StreamId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,67 +57,81 @@ fn record_codecs_round_trip_without_global_catalog() {
 }
 
 #[test]
-fn mux_numbers_monotonic_and_gap_free() {
+fn mux_assigns_positions_when_drained() {
     let mux = Mux::unbounded(stream());
-    mux.set_frame_timing_enabled(false);
 
     for i in 0..64u64 {
-        let position = mux.submit(RESOURCE_CHANNEL, resource(i as u32).encode());
-        assert_eq!(position, Position(i));
+        assert!(mux.submit(RESOURCE_CHANNEL, resource(i as u32).encode()));
     }
 
-    assert_eq!(mux.assigned(), 64);
+    assert_eq!(mux.assigned(), 0);
     assert_eq!(mux.dropped(), 0);
-    let positions: Vec<u64> = mux.drain().iter().map(|frame| frame.position.0).collect();
+    let mut positions: Vec<u64> = mux.drain().iter().map(|frame| frame.position.0).collect();
+    positions.sort_unstable();
     assert_eq!(positions, (0..64).collect::<Vec<_>>());
+    assert_eq!(mux.assigned(), 64);
 }
 
 #[test]
-fn mux_queue_preserves_position_order_across_producers() {
+fn mux_concurrent_producers_assign_unique_positions_on_drain() {
     let mux = Arc::new(Mux::unbounded(stream()));
-    mux.set_frame_timing_enabled(false);
 
     let mut threads = Vec::new();
     for producer in 0..4u8 {
         let mux = Arc::clone(&mux);
         threads.push(thread::spawn(move || {
+            let mut accepted = 0;
             for seq in 0..32u8 {
-                mux.submit(LOG_CHANNEL, vec![producer, seq]);
+                if mux.submit(LOG_CHANNEL, vec![producer, seq]) {
+                    accepted += 1;
+                }
             }
+            accepted
         }));
     }
-    for thread in threads {
-        thread.join().expect("producer thread completes");
-    }
+    let accepted: usize = threads
+        .into_iter()
+        .map(|thread| thread.join().expect("producer thread completes"))
+        .sum();
 
+    assert_eq!(accepted, 128);
+    assert_eq!(mux.assigned(), 0);
     let frames = mux.drain();
     assert_eq!(frames.len(), 128);
-    for (expected, frame) in frames.iter().enumerate() {
-        assert_eq!(frame.position, Position(expected as u64));
-    }
+    let mut positions: Vec<u64> = frames.iter().map(|frame| frame.position.0).collect();
+    positions.sort_unstable();
+    assert_eq!(positions, (0..128).collect::<Vec<_>>());
+    assert_eq!(mux.assigned(), 128);
 }
 
 #[test]
-fn mux_timing_sidecar_uses_reserved_numeric_channel_and_does_not_recurse() {
-    let mux = Mux::unbounded(stream());
-    assert!(mux.frame_timing_enabled());
+fn mux_full_queue_drops_without_consuming_position() {
+    let mux = Mux::new(stream(), 1);
 
-    let data_position = mux.submit(RESOURCE_CHANNEL, resource(0).encode());
-    let timing_position = mux.submit(
-        FRAME_TIME_CHANNEL_ID,
-        FrameTimeSample::new(Position(42), 123).encode(),
-    );
+    assert!(mux.submit(LOG_CHANNEL, b"first".to_vec()));
+    assert!(!mux.submit(LOG_CHANNEL, b"second".to_vec()));
+    assert_eq!(mux.dropped(), 1);
+    assert_eq!(mux.assigned(), 0);
+
+    let frames = mux.drain();
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].channel, LOG_CHANNEL);
+    assert_eq!(frames[0].position, Position(0));
+    assert_eq!(frames[0].payload, b"first");
+    assert_eq!(mux.assigned(), 1);
+}
+
+#[test]
+fn mux_one_submit_one_drained_frame_without_timing_sidecar() {
+    let mux = Mux::unbounded(stream());
+
+    assert!(mux.submit(RESOURCE_CHANNEL, resource(0).encode()));
     let frames = mux.drain();
 
-    assert_eq!(data_position, Position(0));
-    assert_eq!(timing_position, Position(2));
-    assert_eq!(mux.assigned(), 3);
-    assert_eq!(frames.len(), 3);
+    assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].channel, RESOURCE_CHANNEL);
-    assert_eq!(frames[1].channel, FRAME_TIME_CHANNEL_ID);
-    assert_eq!(frames[2].channel, FRAME_TIME_CHANNEL_ID);
-    let sample = FrameTimeSample::decode(&frames[1].payload).expect("timing decodes");
-    assert_eq!(sample.target_position, data_position.0);
+    assert_eq!(frames[0].position, Position(0));
+    assert_eq!(frames[0].payload, resource(0).encode());
 }
 
 #[test]

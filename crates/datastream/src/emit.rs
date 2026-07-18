@@ -7,14 +7,14 @@ use swactor::actor::ActorAddress;
 use swactor::process_observer::ProcessOutputObserver;
 use swactor::runtime::Runtime;
 
-use super::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
+use super::frame::{ChannelId, Frame, Lifetime, NodeId, StreamId};
 use super::mux::Mux;
 use super::record::Record;
 use super::wire::{DatastreamFrame, encode_delivery};
 
-/// Where assembled frames go once the mux has ordered them.
+/// Legacy sink for frames after mux drain has assigned positions.
 pub trait FrameSink: Send {
-    /// Ship one ordered frame for `stream`. Best-effort: a sink may drop.
+    /// Ship one positioned frame for `stream`. Best-effort: a sink may drop.
     fn ship(&mut self, stream: &StreamId, frame: &Frame);
 }
 
@@ -73,24 +73,20 @@ impl DatastreamEmitter {
         self.mux.dropped()
     }
 
-    pub fn set_frame_timing_enabled(&self, enabled: bool) {
-        self.mux.set_frame_timing_enabled(enabled);
-    }
-
-    pub fn frame_timing_enabled(&self) -> bool {
-        self.mux.frame_timing_enabled()
-    }
-
-    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> Position {
+    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> bool {
         self.mux.submit(channel, record.encode())
     }
 
-    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> Position {
+    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> bool {
         self.mux.submit(channel, text.as_ref().to_vec())
     }
 
-    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> Position {
+    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> bool {
         self.mux.submit(channel, bytes)
+    }
+
+    pub fn submit_text_owned(&self, channel: ChannelId, text: String) -> bool {
+        self.mux.submit(channel, text.into_bytes())
     }
 
     pub fn process_observer_with<F>(&self, channel_for: F) -> Arc<dyn ProcessOutputObserver>
@@ -123,16 +119,20 @@ pub struct DatastreamEventSink {
 }
 
 impl DatastreamEventSink {
-    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> Position {
+    pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> bool {
         self.mux.submit(channel, record.encode())
     }
 
-    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> Position {
+    pub fn submit_text(&self, channel: ChannelId, text: impl AsRef<[u8]>) -> bool {
         self.mux.submit(channel, text.as_ref().to_vec())
     }
 
-    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> Position {
+    pub fn submit_bytes(&self, channel: ChannelId, bytes: Vec<u8>) -> bool {
         self.mux.submit(channel, bytes)
+    }
+
+    pub fn submit_text_owned(&self, channel: ChannelId, text: String) -> bool {
+        self.mux.submit(channel, text.into_bytes())
     }
 }
 

@@ -28,7 +28,6 @@ impl Record for ResourceSample {
 fn build_stream() -> (StreamId, Vec<Frame>) {
     let id = StreamId::new(NodeId::new("node-real"), Lifetime(1));
     let mux = Mux::unbounded(id.clone());
-    mux.set_frame_timing_enabled(false);
     for tick in 0..20 {
         mux.submit(
             RESOURCE_CHANNEL,
