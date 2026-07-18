@@ -718,7 +718,7 @@ fn register_channel(
     Ok(id)
 }
 
-/// Managed-process output observer that submits stdout/stderr chunks as frames.
+/// Legacy/custom process-output observer adapter that submits stdout/stderr chunks as frames.
 pub struct DatastreamProcessObserver {
     producer: DatastreamProducer,
     channel_for: Arc<dyn Fn(&str, bool) -> ChannelId + Send + Sync>,

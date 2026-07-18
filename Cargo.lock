@@ -4346,8 +4346,6 @@ dependencies = [
  "crossbeam-queue",
  "datastream",
  "libc",
- "proptest",
- "proptest-state-machine",
  "serde",
  "serde_json",
  "serde_yaml",
