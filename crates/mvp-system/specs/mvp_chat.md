@@ -160,7 +160,7 @@ Accepted runtime fields:
 - `[runtime].max_tokens`
 
 `[runtime].max_tokens` sets the maximum number of tokens requested for each
-prompt submission. It must be a positive integer.
+prompt submission. A value of `0` implies no specified limit.
 
 Accepted observability fields:
 
@@ -352,15 +352,12 @@ Default values:
 
 - provider: `process`;
 - pipeline stages: `1`;
-- max tokens: `64`;
+- max tokens: `0`;
 - dump logs: disabled;
 - cached model: disabled unless `--cached-model` is supplied;
 - rebuild: enabled unless `--skip-rebuild` is supplied.
 
 Invalid values must fail before runtime preparation begins.
-
-`[runtime].max_tokens` must be greater than zero. Zero and invalid values are
-configuration errors detected before runtime preparation.
 
 For provider `process`, no node image is required.
 
