@@ -598,17 +598,6 @@ impl Runtime {
         self.stats_hook = Some(hook);
     }
 
-    /// Install the per-node process-output observer. Every process spawned
-    /// through the process facility on this runtime hands its stdout/stderr to
-    /// `obs`, labeled by command basename. Takes `&self` (the slot is a
-    /// `OnceLock`) so it can be installed on an already-shared `Arc<Runtime>`,
-    /// before the first managed process is spawned. Subsequent calls are no-ops.
-    pub fn set_process_output_observer(
-        &self,
-        obs: Arc<dyn crate::process_observer::ProcessOutputObserver>,
-    ) {
-        let _ = self.process_output_observer.set(obs);
-    }
 
     /// Set the sink for non-local (remote) message delivery.
     ///

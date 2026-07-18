@@ -5,12 +5,9 @@ edition = "2024"
 
 [dependencies]
 swactor = { path = "../..", default-features = false, features = ["no_random"] }
+datastream = { path = "../datastream" }
 crossbeam-queue = "0.3.12"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-
-[dev-dependencies]
-proptest = "1"
-proptest-state-machine = "0.3"

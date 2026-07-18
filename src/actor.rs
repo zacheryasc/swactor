@@ -681,14 +681,6 @@ impl<'a> Ctx<'a> {
         self.inner.extension()
     }
 
-    /// Access the per-runtime process-output observer (if installed). The
-    /// process facility reads this when spawning so every managed process's
-    /// output is taped automatically.
-    pub fn process_output_observer(
-        &self,
-    ) -> Option<std::sync::Arc<dyn crate::process_observer::ProcessOutputObserver>> {
-        self.inner.process_output_observer()
-    }
 
     /// Return system-level information (worker count, actor count, uptime).
     pub fn system_info(&self) -> SystemInfo {

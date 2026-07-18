@@ -89,6 +89,7 @@ impl DatastreamEmitter {
         self.mux.submit(channel, text.into_bytes())
     }
 
+    /// Build a legacy/custom process-output observer that writes chunks into this mux.
     pub fn process_observer_with<F>(&self, channel_for: F) -> Arc<dyn ProcessOutputObserver>
     where
         F: Fn(&str, bool) -> ChannelId + Send + Sync + 'static,

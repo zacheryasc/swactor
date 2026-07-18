@@ -1,174 +1,283 @@
 use std::sync::{Arc, OnceLock};
 
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
-use swactor::process_observer::ProcessOutputObserver;
+use swactor::runtime::ExternalSender;
 
-use crate::action::{OutputStream, ProcessAction};
-use crate::event::ProcessEvent;
-use crate::message::{ProcessCommand, ProcessNotification};
-use crate::session::ProcessSession;
-use crate::types::{ProcessDriver, ProcessWaker};
+use crate::lifecycle::PreparedProcessOutput;
+use crate::message::{ProcessActorCommand, ProcessCommand, ProcessOutput};
+use crate::supervisor::{
+    ProcessSupervisorThread, ProcessThreadHandle, ThreadEvent, ThreadEventReceiver,
+    thread_event_channel,
+};
+use crate::types::{ExitStatus, ProcessSpec};
 
-/// Actor wrapper around a `ProcessSession` and its driver.
-///
-/// Generic over `D: ProcessDriver` so that tests can use `MockDriver` or
-/// `TestDriver` while production uses `LocalDriver`.
-pub struct ProcessActor<D: ProcessDriver> {
-    session: ProcessSession,
-    driver: D,
-    self_addr: Option<ActorAddress>,
-    /// Actions from `ProcessSession::new()`, executed in `on_start`.
-    deferred_actions: Option<Vec<ProcessAction>>,
-    /// Shared slot for the waker — filled after the actor address is known.
-    pub waker_slot: Arc<OnceLock<ProcessWaker>>,
-    /// Per-node observer that taps this process's output (command-basename
-    /// `label`) onto the node's telemetry stream. `None` when the runtime has
-    /// no observer installed.
-    output_observer: Option<Arc<dyn ProcessOutputObserver>>,
-    /// Command basename used to label this process's output to the observer.
-    label: String,
+enum ProcessActorState {
+    Spawning { stop_requested: bool },
+    Running,
+    Stopping,
+    Done(ProcessDoneState),
 }
 
-impl<D: ProcessDriver> ProcessActor<D> {
-    pub fn new(
-        session: ProcessSession,
-        driver: D,
-        initial_actions: Vec<ProcessAction>,
-        waker_slot: Arc<OnceLock<ProcessWaker>>,
-        output_observer: Option<Arc<dyn ProcessOutputObserver>>,
-        label: String,
+enum ProcessDoneState {
+    Exited(ExitStatus),
+    SpawnFailed(String),
+    SupervisorFailed(String),
+}
+
+impl ProcessDoneState {
+    fn observe(&self) {
+        match self {
+            Self::Exited(status) => {
+                let _ = *status;
+            }
+            Self::SpawnFailed(error) | Self::SupervisorFailed(error) => {
+                let _ = error.as_str();
+            }
+        }
+    }
+}
+
+pub(crate) struct ProcessActor {
+    spec: Option<ProcessSpec>,
+    output: PreparedProcessOutput,
+    sender: ExternalSender,
+    addr_slot: Arc<OnceLock<ActorAddress>>,
+    state: ProcessActorState,
+    pid: Option<u32>,
+    supervisor: Option<ProcessThreadHandle>,
+    supervisor_events: Option<ThreadEventReceiver>,
+}
+
+impl ProcessActor {
+    pub(crate) fn new(
+        spec: ProcessSpec,
+        output: PreparedProcessOutput,
+        sender: ExternalSender,
+        addr_slot: Arc<OnceLock<ActorAddress>>,
     ) -> Self {
         Self {
-            session,
-            driver,
-            self_addr: None,
-            deferred_actions: Some(initial_actions),
-            waker_slot,
-            output_observer,
-            label,
+            spec: Some(spec),
+            output,
+            sender,
+            addr_slot,
+            state: ProcessActorState::Spawning {
+                stop_requested: false,
+            },
+            pid: None,
+            supervisor: None,
+            supervisor_events: None,
         }
     }
 
-    /// Drain events from the driver, apply each to the session, and dispatch
-    /// all resulting actions.
-    fn drain_and_dispatch(&mut self, ctx: &Ctx) {
-        let events = self.driver.poll();
+    fn emit_process_output(&self, ctx: &Ctx, output: ProcessOutput) {
+        let _ = ctx.send(self.output.upstream, output.clone());
+        if let Some(mirror) = &self.output.mirror {
+            mirror.submit(&output);
+        }
+    }
+
+    fn apply_stop(&mut self, ctx: &Ctx, kill_after: Option<std::time::Duration>) {
+        let mut next_state = None;
+        let mut terminal_error = None;
+
+        match &mut self.state {
+            ProcessActorState::Spawning { stop_requested } => {
+                if *stop_requested {
+                    return;
+                }
+
+                match self
+                    .supervisor
+                    .as_ref()
+                    .expect("supervisor started before commands")
+                    .stop(kill_after)
+                {
+                    Ok(()) => *stop_requested = true,
+                    Err(error) => terminal_error = Some(error),
+                }
+            }
+            ProcessActorState::Running => {
+                match self
+                    .supervisor
+                    .as_ref()
+                    .expect("supervisor started before commands")
+                    .stop(kill_after)
+                {
+                    Ok(()) => next_state = Some(ProcessActorState::Stopping),
+                    Err(error) => terminal_error = Some(error),
+                }
+            }
+            ProcessActorState::Stopping | ProcessActorState::Done(_) => {}
+        }
+
+        if let Some(state) = next_state {
+            self.state = state;
+        }
+        if let Some(error) = terminal_error {
+            self.emit_terminal_error(ctx, error);
+        }
+    }
+
+    fn drain_supervisor_events(&mut self, ctx: &Ctx) {
+        let events = self
+            .supervisor_events
+            .as_ref()
+            .map(ThreadEventReceiver::drain)
+            .unwrap_or_default();
+
         for event in events {
-            let actions = self.session.apply(event);
-            self.dispatch_actions(ctx, actions);
+            self.handle_thread_event(ctx, event);
+            self.finish_if_safe(ctx);
         }
+        self.finish_if_safe(ctx);
     }
 
-    /// Execute actions produced by the session state machine.
-    fn dispatch_actions(&mut self, ctx: &Ctx, actions: Vec<ProcessAction>) {
-        let self_addr = self.self_addr.expect("self_addr not set");
-        for action in actions {
-            match action {
-                // Driver commands — forward to the driver
-                ProcessAction::SpawnProcess { .. }
-                | ProcessAction::WriteStdin { .. }
-                | ProcessAction::SendSignal { .. }
-                | ProcessAction::ResizePty { .. }
-                | ProcessAction::CloseStdin
-                | ProcessAction::ScheduleKillTimeout { .. } => {
-                    self.driver.execute(action);
-                }
+    fn handle_thread_event(&mut self, ctx: &Ctx, event: ThreadEvent) {
+        match event {
+            ThreadEvent::Started { pid } => {
+                let stop_requested = match &self.state {
+                    ProcessActorState::Spawning { stop_requested } => *stop_requested,
+                    ProcessActorState::Running
+                    | ProcessActorState::Stopping
+                    | ProcessActorState::Done(_) => return,
+                };
 
-                // Subscriber notifications — send to each subscriber
-                ProcessAction::NotifyStarted { subscribers } => {
-                    let notif = ProcessNotification::Started {
-                        process: self_addr,
-                        pid: self.driver.pid(),
-                    };
-                    for sub in subscribers {
-                        let _ = ctx.send(sub, notif.clone());
+                self.pid = Some(pid);
+                self.emit_process_output(ctx, ProcessOutput::Started { pid });
+                self.state = if stop_requested {
+                    ProcessActorState::Stopping
+                } else {
+                    ProcessActorState::Running
+                };
+            }
+            ThreadEvent::SpawnFailed { error } => {
+                if !matches!(self.state, ProcessActorState::Done(_)) {
+                    self.emit_process_output(
+                        ctx,
+                        ProcessOutput::SpawnFailed {
+                            error: error.clone(),
+                        },
+                    );
+                    self.state = ProcessActorState::Done(ProcessDoneState::SpawnFailed(error));
+                }
+            }
+            ThreadEvent::Exited { status } => {
+                if !matches!(self.state, ProcessActorState::Done(_)) {
+                    self.emit_process_output(ctx, ProcessOutput::Exited { status });
+                    self.state = ProcessActorState::Done(ProcessDoneState::Exited(status));
+                }
+            }
+            ThreadEvent::Error { error } => {
+                if !matches!(self.state, ProcessActorState::Done(_)) {
+                    self.emit_process_output(
+                        ctx,
+                        ProcessOutput::Error {
+                            error: error.clone(),
+                        },
+                    );
+                    self.state = ProcessActorState::Done(ProcessDoneState::SupervisorFailed(error));
+                }
+            }
+            ThreadEvent::ThreadFinished => {
+                if let Some(supervisor) = self.supervisor.as_mut() {
+                    match supervisor.join_if_finished() {
+                        Ok(_) => {}
+                        Err(_) => {
+                            if !matches!(self.state, ProcessActorState::Done(_)) {
+                                let error = "process supervisor thread failed".to_owned();
+                                self.emit_process_output(
+                                    ctx,
+                                    ProcessOutput::Error {
+                                        error: error.clone(),
+                                    },
+                                );
+                                self.state = ProcessActorState::Done(
+                                    ProcessDoneState::SupervisorFailed(error),
+                                );
+                            }
+                        }
                     }
                 }
-                ProcessAction::NotifyOutput {
-                    subscribers,
-                    data,
-                    stream,
-                } => {
-                    // Tap the node's telemetry observer before the data is moved
-                    // into the subscriber notification. Per-node, auto-attached.
-                    if let Some(obs) = &self.output_observer {
-                        obs.on_output(&self.label, matches!(stream, OutputStream::Stderr), &data);
-                    }
-                    let notif = ProcessNotification::Output {
-                        process: self_addr,
-                        data,
-                        stream,
-                    };
-                    for sub in subscribers {
-                        let _ = ctx.send(sub, notif.clone());
-                    }
-                }
-                ProcessAction::NotifyExited {
-                    subscribers,
-                    status,
-                } => {
-                    let notif = ProcessNotification::Exited {
-                        process: self_addr,
-                        status,
-                    };
-                    for sub in subscribers {
-                        let _ = ctx.send(sub, notif.clone());
-                    }
-                }
-                ProcessAction::NotifyError { subscribers, error } => {
-                    let notif = ProcessNotification::Error {
-                        process: self_addr,
-                        error,
-                    };
-                    for sub in subscribers {
-                        let _ = ctx.send(sub, notif.clone());
-                    }
-                }
-
-                // Lifecycle
-                ProcessAction::SelfTerminate => {
-                    ctx.stop_self();
-                }
+                self.supervisor = None;
+                self.supervisor_events = None;
             }
         }
     }
 
-    /// Map a `ProcessCommand` to the corresponding `ProcessEvent`.
-    fn command_to_event(cmd: ProcessCommand) -> Option<ProcessEvent> {
-        match cmd {
-            ProcessCommand::WriteStdin { data } => Some(ProcessEvent::WriteStdin { data }),
-            ProcessCommand::SendSignal { signal } => Some(ProcessEvent::SendSignal { signal }),
-            ProcessCommand::ResizePty { size } => Some(ProcessEvent::ResizePty { size }),
-            ProcessCommand::CloseStdin => Some(ProcessEvent::CloseStdin),
-            ProcessCommand::Close => Some(ProcessEvent::CloseRequested),
-            ProcessCommand::Subscribe { address } => Some(ProcessEvent::Subscribe { address }),
-            ProcessCommand::Unsubscribe { address } => Some(ProcessEvent::Unsubscribe { address }),
-            ProcessCommand::PollTick => None, // handled by drain
+    fn finish_if_safe(&mut self, ctx: &Ctx) {
+        if let ProcessActorState::Done(done) = &self.state {
+            done.observe();
+            let _ = self.pid;
+            if self.supervisor.is_none() {
+                ctx.stop_self();
+            }
         }
+    }
+
+    fn emit_terminal_error(&mut self, ctx: &Ctx, error: String) {
+        if matches!(self.state, ProcessActorState::Done(_)) {
+            return;
+        }
+
+        self.emit_process_output(
+            ctx,
+            ProcessOutput::Error {
+                error: error.clone(),
+            },
+        );
+        self.state = ProcessActorState::Done(ProcessDoneState::SupervisorFailed(error));
+        ctx.stop_self();
     }
 }
 
-impl<D: ProcessDriver + 'static> ActorInterface for ProcessActor<D> {
-    type Incoming = ProcessCommand;
+impl ActorInterface for ProcessActor {
+    type Incoming = ProcessActorCommand;
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        self.self_addr = Some(ctx.self_addr());
-        if let Some(actions) = self.deferred_actions.take() {
-            self.dispatch_actions(ctx, actions);
+        let sender = self.sender.clone();
+        let addr_slot = self.addr_slot.clone();
+        let (event_sink, event_receiver) = thread_event_channel(move || {
+            if let Some(addr) = addr_slot.get() {
+                let _ = sender.send_to(*addr, ProcessActorCommand::SupervisorWake);
+            }
+        });
+
+        let spec = self.spec.take().expect("process spec already taken");
+        match ProcessSupervisorThread::start(spec, event_sink) {
+            Ok(supervisor) => {
+                self.supervisor = Some(supervisor);
+                self.supervisor_events = Some(event_receiver);
+                self.drain_supervisor_events(ctx);
+            }
+            Err(err) => {
+                let error = format!("process supervisor thread failed: {err}");
+                self.emit_process_output(
+                    ctx,
+                    ProcessOutput::Error {
+                        error: error.clone(),
+                    },
+                );
+                self.state = ProcessActorState::Done(ProcessDoneState::SupervisorFailed(error));
+                ctx.stop_self();
+            }
         }
     }
 
-    fn handle(&mut self, ctx: &Ctx, msg: ProcessCommand) {
-        // Process the incoming command first — this ensures Subscribe
-        // registers before drain dispatches notifications, and keeps
-        // user commands (Close, WriteStdin) responsive.
-        if let Some(event) = Self::command_to_event(msg) {
-            let actions = self.session.apply(event);
-            self.dispatch_actions(ctx, actions);
+    fn handle(&mut self, ctx: &Ctx, msg: ProcessActorCommand) {
+        match msg {
+            ProcessActorCommand::SupervisorWake => self.drain_supervisor_events(ctx),
+            ProcessActorCommand::Command(ProcessCommand::Stop { kill_after }) => {
+                self.drain_supervisor_events(ctx);
+                self.apply_stop(ctx, kill_after);
+                self.drain_supervisor_events(ctx);
+            }
         }
+    }
 
-        // Then drain pending I/O events from background threads.
-        self.drain_and_dispatch(ctx);
+    fn on_stop(&mut self, _ctx: &Ctx) {
+        if let Some(supervisor) = &self.supervisor {
+            let _ = supervisor.shutdown_now();
+        }
     }
 }

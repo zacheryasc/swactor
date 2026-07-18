@@ -5,89 +5,32 @@ use swactor::actor::{ActorAddress, Ctx};
 use swactor::runtime::ExternalSender;
 
 use crate::actor::ProcessActor;
-use crate::local::LocalDriver;
-use crate::message::ProcessCommand;
-use crate::session::ProcessSession;
-use crate::types::{EventQueue, ProcessDriver, ProcessSpec, ProcessWaker};
+use crate::lifecycle::{ProcessOutputConfig, prepare_process_output};
+use crate::message::{ProcessActorCommand, ProcessCommand};
+use crate::types::ProcessSpec;
 
-/// Spawn a process actor using the real `LocalDriver` (OS subprocess).
-///
-/// Creates a `ProcessActor<LocalDriver>`, spawns it in the runtime, and
-/// wires up the waker so that I/O thread events automatically wake the actor.
-///
-/// Returns the actor's address. Send `ProcessCommand` messages to control it.
+/// Spawn a process actor using the OS subprocess supervisor.
 pub fn spawn_local_process(
     ctx: &Ctx,
     sender: &ExternalSender,
     spec: ProcessSpec,
+    output: ProcessOutputConfig,
 ) -> Result<ActorAddress, Error> {
-    let waker_slot = Arc::new(OnceLock::new());
-    let queue = EventQueue::new();
-    let driver = LocalDriver::new(queue, waker_slot.clone());
-    spawn_process_inner(ctx, sender, spec, driver, waker_slot, None)
-}
-
-/// Spawn a process actor with a custom driver.
-///
-/// Useful for testing with `MockDriver` or other custom drivers while
-/// still getting the full actor integration (waker, lifecycle, etc.).
-pub fn spawn_process<D: ProcessDriver + 'static>(
-    ctx: &Ctx,
-    sender: &ExternalSender,
-    spec: ProcessSpec,
-    driver: D,
-    waker_slot: Arc<OnceLock<ProcessWaker>>,
-) -> Result<ActorAddress, Error> {
-    spawn_process_inner(ctx, sender, spec, driver, waker_slot, None)
-}
-
-/// The basename of a command path, used as the process's telemetry label.
-/// `/usr/bin/python3` → `python3`, `python` → `python`. Falls back to the whole
-/// string when there is no path separator or trailing component.
-fn command_basename(command: &str) -> String {
-    command
-        .rsplit(['/', '\\'])
-        .find(|s| !s.is_empty())
-        .unwrap_or(command)
-        .to_string()
-}
-
-fn spawn_process_inner<D: ProcessDriver + 'static>(
-    ctx: &Ctx,
-    sender: &ExternalSender,
-    spec: ProcessSpec,
-    driver: D,
-    waker_slot: Arc<OnceLock<ProcessWaker>>,
-    label_override: Option<String>,
-) -> Result<ActorAddress, Error> {
-    // Label this process's output so the node's per-runtime observer (if any)
-    // taps it onto `proc.<label>.*` automatically. Default to the command
-    // basename; a caller can override (e.g. to keep several remote shells
-    // running the same command distinguishable).
-    let label = label_override.unwrap_or_else(|| command_basename(&spec.command));
-    let observer = ctx.process_output_observer();
-    let (session, initial_actions) = ProcessSession::new(spec);
-    let actor = ProcessActor::new(
-        session,
-        driver,
-        initial_actions,
-        waker_slot.clone(),
-        observer,
-        label,
-    );
+    let prepared_output = prepare_process_output(&spec, output)?;
+    let addr_slot = Arc::new(OnceLock::new());
+    let actor = ProcessActor::new(spec, prepared_output, sender.clone(), addr_slot.clone());
     let addr = ctx.spawn(actor)?;
-
-    // Now that we have the address, fill the waker
-    let sender = sender.clone();
-    let waker = ProcessWaker::new(move || {
-        let _ = sender.send_to(addr, ProcessCommand::PollTick);
-    });
-    waker_slot
-        .set(waker.clone())
-        .expect("waker slot already set");
-
-    // Flush any events from the startup race window
-    waker.wake();
-
+    addr_slot
+        .set(addr)
+        .expect("process actor address already set");
+    let _ = sender.send_to(addr, ProcessActorCommand::SupervisorWake);
     Ok(addr)
+}
+
+pub fn send_process_command(
+    sender: &ExternalSender,
+    process: ActorAddress,
+    command: ProcessCommand,
+) -> Result<(), Error> {
+    sender.send_to(process, ProcessActorCommand::Command(command))
 }

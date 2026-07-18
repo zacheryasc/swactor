@@ -1,58 +1,24 @@
-use swactor::actor::ActorAddress;
+use crate::types::ExitStatus;
 
-use crate::action::OutputStream;
-use crate::types::{ExitStatus, ProcessError, PtySize, Signal};
-
-/// Commands sent to a process actor.
-#[derive(Debug, Clone)]
+/// Public managed-process commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessCommand {
-    /// Write data to the process's stdin.
-    WriteStdin { data: Vec<u8> },
-    /// Send a signal to the process.
-    SendSignal { signal: Signal },
-    /// Resize the process's PTY.
-    ResizePty { size: PtySize },
-    /// Close the process's stdin pipe.
-    CloseStdin,
-    /// Request a graceful close of the process.
-    Close,
-    /// Subscribe to process notifications.
-    Subscribe { address: ActorAddress },
-    /// Unsubscribe from process notifications.
-    Unsubscribe { address: ActorAddress },
-    /// Internal: sent by the waker to trigger event draining.
-    #[doc(hidden)]
-    PollTick,
+    Stop {
+        kill_after: Option<std::time::Duration>,
+    },
 }
 
-/// Notifications sent from a process actor to subscribers.
+/// Public managed-process outputs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProcessOutput {
+    Started { pid: u32 },
+    SpawnFailed { error: String },
+    Exited { status: ExitStatus },
+    Error { error: String },
+}
+
 #[derive(Debug, Clone)]
-pub enum ProcessNotification {
-    /// The process started successfully.
-    ///
-    /// `pid` is `Some(u32)` when the underlying driver knows the OS
-    /// pid (real `LocalDriver`) and `None` when it doesn't
-    /// (mock drivers, future SSH-tunnel-style drivers). Telemetry hooks
-    /// can read this to attribute the subprocess in a per-node datastream.
-    Started {
-        process: ActorAddress,
-        #[doc(hidden)]
-        pid: Option<u32>,
-    },
-    /// Output was received from the process.
-    Output {
-        process: ActorAddress,
-        data: Vec<u8>,
-        stream: OutputStream,
-    },
-    /// The process exited.
-    Exited {
-        process: ActorAddress,
-        status: ExitStatus,
-    },
-    /// An error occurred.
-    Error {
-        process: ActorAddress,
-        error: ProcessError,
-    },
+pub(crate) enum ProcessActorCommand {
+    Command(ProcessCommand),
+    SupervisorWake,
 }
