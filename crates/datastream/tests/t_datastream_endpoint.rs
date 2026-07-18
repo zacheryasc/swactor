@@ -2,8 +2,8 @@ use std::time::Duration;
 
 use datastream::{
     ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, DatastreamEndpoint,
-    DatastreamEvent, FRAME_TIME_CHANNEL_ID, FrameDelivery, FrameTimeSample, Lifetime, NodeId,
-    Position, Record, SourceFilter, StreamId, SubscriptionRequest,
+    DatastreamEvent, FrameDelivery, Lifetime, NodeId, Position, Record, SourceFilter, StreamId,
+    SubscriptionRequest,
 };
 use serde_json::Value;
 use swactor::actor::ActorAddress;
@@ -37,7 +37,6 @@ fn frame_event(event: &DatastreamEvent) -> &FrameDelivery {
 fn endpoint_without_subscribers_drains_to_bitbucket() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
-    producer.set_frame_timing_enabled(false);
     let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
 
     producer.submit_text(log, "before");
@@ -63,12 +62,12 @@ fn channel_registration_allocates_numeric_ids() {
     assert_eq!(stderr, ChannelId(2));
     assert_eq!(runtime, ChannelId(3));
     let catalog = endpoint.catalog_snapshot();
+    let removed_timing_name = ["datastream", "frame_time"].join(".");
     assert!(
-        catalog
+        !catalog
             .channels
             .values()
-            .any(|descriptor| descriptor.id == FRAME_TIME_CHANNEL_ID
-                && descriptor.name == "datastream.frame_time")
+            .any(|descriptor| descriptor.name == removed_timing_name)
     );
 }
 
@@ -118,7 +117,6 @@ fn subscription_snapshot_contains_stream_and_channel_metadata() {
 fn subscription_receives_only_future_matching_frames() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
-    producer.set_frame_timing_enabled(false);
     let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
 
     producer.submit_text(log, "pre-subscription");
@@ -138,10 +136,9 @@ fn subscription_receives_only_future_matching_frames() {
 }
 
 #[test]
-fn subscription_filters_textstream_channels() {
+fn subscription_snapshot_filters_but_future_fanout_broadcasts() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
-    producer.set_frame_timing_enabled(false);
     let stdout = producer.register_channel("stdout", ChannelContent::TextStream);
     let json = producer.register_record::<RuntimeRecord>();
     let text_subscription = endpoint.subscribe(
@@ -152,22 +149,26 @@ fn subscription_filters_textstream_channels() {
         },
     );
 
+    assert_eq!(text_subscription.snapshot().channels.len(), 1);
+    assert_eq!(text_subscription.snapshot().channels[0].id, stdout);
+
     producer.submit_text(stdout, "line");
     producer.submit_record(json, &RuntimeRecord { value: 5 });
     endpoint.tick();
 
     let events = text_subscription.drain_available();
-    assert_eq!(events.len(), 1);
-    let delivery = frame_event(&events[0]);
-    assert_eq!(delivery.channel.channel, stdout);
-    assert_eq!(delivery.payload, b"line");
+    assert_eq!(events.len(), 2);
+    let channels: Vec<ChannelId> = events
+        .iter()
+        .map(|event| frame_event(event).channel.channel)
+        .collect();
+    assert_eq!(channels, vec![stdout, json]);
 }
 
 #[test]
 fn endpoint_fans_out_ordered_frames_to_multiple_subscribers() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
-    producer.set_frame_timing_enabled(false);
     let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
     let left = endpoint.subscribe_all("left");
     let right = endpoint.subscribe_all("right");
@@ -188,7 +189,6 @@ fn endpoint_fans_out_ordered_frames_to_multiple_subscribers() {
 fn slow_subscriber_drops_without_blocking_fast_subscriber() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
-    producer.set_frame_timing_enabled(false);
     let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
     let slow = endpoint.subscribe_all_with_capacity("slow", 1);
     let fast = endpoint.subscribe_all_with_capacity("fast", 8);
@@ -212,35 +212,56 @@ fn slow_subscriber_drops_without_blocking_fast_subscriber() {
 }
 
 #[test]
-fn endpoint_producer_timing_sidecars_are_fanned_out_when_enabled() {
+fn channel_declared_is_broadcast_to_filtered_subscribers() {
+    let endpoint = endpoint();
+    let subscription = endpoint.subscribe(
+        "text-only",
+        SubscriptionRequest {
+            sources: SourceFilter::All,
+            channels: ChannelFilter::Content(ChannelContentKind::TextStream),
+        },
+    );
+
+    let channel = endpoint.register_channel(
+        "runtime.json",
+        ChannelContent::JsonRecord {
+            schema: Some("runtime.json".to_owned()),
+        },
+    );
+
+    let events = subscription.drain_available();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        DatastreamEvent::ChannelDeclared(descriptor) => {
+            assert_eq!(descriptor.id, channel);
+            assert_eq!(descriptor.name, "runtime.json");
+        }
+        other => panic!("expected channel declaration, got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_text_owned_queues_owned_string() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
     let log = producer.register_channel("runtime.log", ChannelContent::TextStream);
     let sub = endpoint.subscribe_all("test");
 
-    producer.set_frame_timing_enabled(true);
-    let data_position = producer.submit_text(log, "visible");
+    assert!(producer.submit_text_owned(log, String::from("hello")));
     let tick = endpoint.tick();
 
-    assert_eq!(data_position, Position(0));
-    assert_eq!(tick.drained, 2);
-    let events = sub.drain_available();
-    assert_eq!(events.len(), 2);
-    assert_eq!(frame_event(&events[0]).channel.channel, log);
-    assert_eq!(frame_event(&events[0]).payload, b"visible");
-    assert_eq!(
-        frame_event(&events[1]).channel.channel,
-        FRAME_TIME_CHANNEL_ID
-    );
-    let sample = FrameTimeSample::decode(&frame_event(&events[1]).payload).expect("timing decodes");
-    assert_eq!(sample.target_position, data_position.0);
+    assert_eq!(tick.drained, 1);
+    assert_eq!(tick.delivered, 1);
+    let event = sub.recv_timeout(Duration::from_millis(50)).unwrap();
+    let delivery = frame_event(&event);
+    assert_eq!(delivery.channel.channel, log);
+    assert_eq!(delivery.payload, b"hello");
 }
 
 #[test]
 fn process_observer_adapter_submits_configured_channels() {
     let endpoint = endpoint();
     let producer = endpoint.producer();
-    producer.set_frame_timing_enabled(false);
     let stdout = producer.register_channel("proc.trainer.stdout", ChannelContent::TextStream);
     let stderr = producer.register_channel("proc.trainer.stderr", ChannelContent::TextStream);
     let observer = producer.process_observer_with(
@@ -300,8 +321,10 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
 }
 
 fn positions(events: &[DatastreamEvent]) -> Vec<u64> {
-    events
+    let mut positions: Vec<u64> = events
         .iter()
         .map(|event| frame_event(event).position.0)
-        .collect()
+        .collect();
+    positions.sort_unstable();
+    positions
 }

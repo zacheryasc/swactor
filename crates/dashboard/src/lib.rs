@@ -8,7 +8,6 @@ pub mod view;
 use std::sync::Arc;
 
 use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
-use parking_lot::Mutex;
 use serde::Serialize;
 use tokio::sync::broadcast;
 
@@ -86,10 +85,32 @@ pub struct DashboardHandle {
     store: Arc<DashboardStore>,
     views: Arc<ViewRegistry>,
     shutdown_notify: Arc<tokio::sync::Notify>,
-    standalone_rt: Mutex<Option<tokio::runtime::Runtime>>,
 }
 
 impl DashboardHandle {
+    /// Create the datastream dashboard state.
+    ///
+    /// The HTTP server is not started until `start_http` or `start_http_standalone`
+    /// is called.
+    pub fn new(config: DashboardConfig) -> Self {
+        let views = Arc::new(ViewRegistry::new());
+        views.register(Arc::new(live_explorer::LiveDatastreamExplorer::default()));
+        views.register(Arc::new(hardware_view::HardwareDashboardView::default()));
+        views.register(swactor::worker_view());
+        let store = Arc::new(DashboardStore::new(
+            config.raw_frame_history,
+            Arc::clone(&views),
+        ));
+        let (frames, _) = broadcast::channel(config.frame_buffer.max(1));
+        Self {
+            port: config.port,
+            frames,
+            store,
+            views,
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
     /// Register a read-only view. External crates can keep their interpretation
     /// code beside their component and plug it into this registry.
     pub fn register_view(&self, view: Arc<dyn DashboardView>) {
@@ -113,8 +134,8 @@ impl DashboardHandle {
         self.shutdown_notify.notify_waiters();
     }
 
-    /// Start the HTTP server on an existing Tokio runtime.
-    pub fn start_http(&self, handle: tokio::runtime::Handle) {
+    /// Build the HTTP server future for an embedding runtime to poll directly.
+    pub fn http_server(&self) -> impl Future<Output = ()> + Send + 'static {
         let state = server::AppState {
             frames: self.frames.clone(),
             store: Arc::clone(&self.store),
@@ -122,44 +143,13 @@ impl DashboardHandle {
             shutdown_notify: Arc::clone(&self.shutdown_notify),
         };
         let port = self.port;
-        handle.spawn(async move {
+        async move {
             server::run_server(state, port).await;
-        });
+        }
     }
 
-    /// Start the HTTP server on a standalone Tokio runtime.
-    pub fn start_http_standalone(&self) {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("failed to create tokio runtime for dashboard HTTP");
-        let handle = rt.handle().clone();
-        *self.standalone_rt.lock() = Some(rt);
-        self.start_http(handle);
-    }
-}
-
-/// Create the datastream dashboard state.
-///
-/// The HTTP server is not started until `start_http` or `start_http_standalone`
-/// is called.
-pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
-    let views = Arc::new(ViewRegistry::new());
-    views.register(Arc::new(live_explorer::LiveDatastreamExplorer::default()));
-    views.register(Arc::new(hardware_view::HardwareDashboardView::default()));
-    views.register(swactor::worker_view());
-    let store = Arc::new(DashboardStore::new(
-        config.raw_frame_history,
-        Arc::clone(&views),
-    ));
-    let (frames, _) = broadcast::channel(config.frame_buffer.max(1));
-    DashboardHandle {
-        port: config.port,
-        frames,
-        store,
-        views,
-        shutdown_notify: Arc::new(tokio::sync::Notify::new()),
-        standalone_rt: Mutex::new(None),
+    /// Spawn the HTTP server on an existing Tokio runtime and return its task handle.
+    pub fn spawn_http(&self, handle: &tokio::runtime::Handle) -> tokio::task::JoinHandle<()> {
+        handle.spawn(self.http_server())
     }
 }

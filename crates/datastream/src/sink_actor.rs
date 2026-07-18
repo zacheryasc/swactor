@@ -1,15 +1,15 @@
-//! `DatastreamSink` — the cluster-side consumer of [`DatastreamFrame`] messages.
+//! Legacy `DatastreamSink` for [`DatastreamFrame`] actor messages.
 //!
-//! This is the counterpart to [`ClusterFrameSink`](super::emit::ClusterFrameSink):
-//! a node ships its ordered telemetry as `DatastreamFrame` actor messages over the
-//! regular swactor transport, and this actor — registered under a well-known name
-//! on the collector (e.g. the orchestrator) — receives them, decodes each back
-//! into a `(StreamId, Frame)` delivery, and hands it to a caller-supplied fold.
+//! New live transports should prefer catalog-aware [`crate::DatastreamEvent`]
+//! streams. This actor remains as the counterpart to
+//! [`ClusterFrameSink`](super::emit::ClusterFrameSink): a node ships positioned
+//! telemetry as legacy `DatastreamFrame` actor messages over regular Swactor
+//! transport, and this actor receives them, decodes each back into a
+//! `(StreamId, Frame)` delivery, and hands it to a caller-supplied fold.
 //!
 //! It deliberately knows nothing about any view layer. The actor owns an opaque
-//! callback so binaries can wire the decoded deliveries into whichever fold they
-//! need. Malformed payloads are dropped silently — the same best-effort tolerance
-//! the UDP ingest had.
+//! callback so binaries can wire decoded deliveries into whichever fold they
+//! need. Malformed payloads are dropped silently.
 
 use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;
@@ -17,9 +17,9 @@ use swactor::runtime::Ctx;
 use super::frame::{Frame, StreamId};
 use super::wire::{DatastreamFrame, decode_delivery};
 
-/// Receives [`DatastreamFrame`] cluster messages and folds each decoded delivery
-/// through `on_frame`. Spawn it, then publish its address under
-/// [`DATASTREAM_SINK_NAME`] so emitters can resolve and ship to it.
+/// Receives legacy [`DatastreamFrame`] cluster messages and folds each decoded
+/// delivery through `on_frame`. Spawn it, then publish its address under
+/// [`DATASTREAM_SINK_NAME`] so legacy emitters can resolve and ship to it.
 pub struct DatastreamSink {
     on_frame: Box<dyn FnMut(StreamId, Frame) + Send>,
 }

@@ -1,34 +1,35 @@
 //! The per-node telemetry **datastream** (see `DATASTREAM_SPEC.md`).
 //!
-//! A deliberately dumb pipe: producers dump bytes tagged by channel, a
-//! single per-node mux interleaves them into one ordered stream, a
-//! best-effort transport carries that stream to the one consumer, ingest
-//! reconstructs each node's stream by position, and views are read-time
-//! projections over the stored stream. Nothing between a producer and a
+//! A deliberately dumb pipe: producers dump bytes tagged by stream-local
+//! channel id, a single per-node mux accepts those bytes and assigns canonical
+//! positions during drain, the endpoint broadcasts catalog-aware events to
+//! subscribers, ingest reconstructs streams by position, and views are
+//! read-time projections over stored frames. Nothing between a producer and a
 //! view interprets the payload.
 //!
 //! ```text
 //!    producers (caller-owned records + text)
-//!             │  bytes tagged by channel        → [`record::Record`]
+//!             │  bytes tagged by registered ChannelId
 //!             ▼
-//!         per-node MUX                          → [`mux::Mux`]
-//!             │  one ordered stream of [`Frame`]s
+//!    endpoint / catalog                         → [`endpoint`]
+//!             │  channel metadata + producer handles
 //!             ▼
-//!    best-effort transport                      → [`transport`]
-//!             │  delivery: frames, maybe dropped/reordered/delayed
+//!    per-node MUX                               → [`mux::Mux`]
+//!             │  positioned [`frame::Frame`]s
 //!             ▼
-//!       consumer INGEST                         → [`ingest::Consumer`]
-//!             │  complete stream, stored whole
+//!    endpoint fanout                            → [`endpoint::DeliveryFanout`]
+//!             │  catalog-aware events, maybe dropped per subscriber
 //!             ▼
-//!      stored STREAM (truth)                    → [`store`]
-//!             │  read-time only
+//!    ingest / store                             → [`ingest`], [`store`]
+//!             │  position-keyed frame truth
 //!             ▼
-//!         VIEWS                                 → [`views`]
+//!    views                                      → [`views`]
 //! ```
 //!
-//! The data model ([`frame`]), extension contract ([`record`]), and wire
-//! envelope ([`wire`]) are the seams a test observes. Channel meanings live in
-//! producer/consumer crates, not in a datastream-wide catalog.
+//! The data model ([`frame`]), extension contract ([`record`]), endpoint/fanout
+//! seam ([`endpoint`]), and compatibility wire helpers ([`wire`]) are the seams
+//! tests observe. Channel meanings live in producer/consumer crates, not in a
+//! datastream-wide global registry.
 
 pub mod emit;
 pub mod endpoint;
@@ -41,7 +42,6 @@ pub mod publisher_actor;
 pub mod record;
 pub mod sink_actor;
 pub mod store;
-pub mod timing;
 pub mod transport;
 pub mod views;
 pub mod wire;
@@ -65,6 +65,5 @@ pub use publisher_actor::{
 pub use record::{ChannelKind, ChannelRegistry, Record};
 pub use sink_actor::{DATASTREAM_SINK_NAME, DatastreamSink};
 pub use store::{GapSpan, Store, StoredStream};
-pub use timing::{FRAME_TIME_CHANNEL, FRAME_TIME_CHANNEL_ID, FrameTimeSample};
 pub use transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 pub use views::{Body, LogEntry, MergedFrame};

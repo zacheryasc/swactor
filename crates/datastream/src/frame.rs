@@ -1,4 +1,4 @@
-//! Core data model: the framed, channel-multiplexed stream (spec §4).
+//! Core data model: the framed, channel-multiplexed stream (spec §2).
 //!
 //! A stream is identified by the producing node and lifetime. Frames carry a
 //! stream-local numeric channel id plus the mux-assigned position and opaque
@@ -10,12 +10,12 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// A position assigned by a node's mux (spec §5.2).
+/// A position assigned by a node's mux during drain (spec §2.3).
 ///
-/// Positions are **monotonic** and **gap-free** within a single node's stream:
-/// the mux never reuses one and never skips one in its numbering. A position
-/// that is assigned but never delivered surfaces downstream as a missing
-/// position — a detectable gap (spec §5.3, §7.5).
+/// Assignment is monotonic and gap-free for accepted frames: the mux never
+/// reuses one and never skips one while draining. A frame assigned a position
+/// can still be lost by transport and later surface downstream as a detectable
+/// gap.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct Position(pub u64);
 
@@ -27,9 +27,9 @@ impl fmt::Display for Position {
 
 /// Stream-local numeric channel id.
 ///
-/// `ChannelId(0)` is reserved for the datastream frame-timing sidecar. Every
-/// other id is allocated by the stream owner and is meaningful only with the
-/// corresponding [`StreamId`]. Consumers resolve frames by `(stream, channel)`.
+/// A raw `ChannelId` is meaningful only together with its [`StreamId`]. The
+/// public endpoint allocator currently starts at `ChannelId(1)`, leaving
+/// `ChannelId(0)` unallocated by normal registration.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct ChannelId(pub u32);
 
@@ -73,7 +73,7 @@ pub enum StreamOrigin {
     RemoteNode,
 }
 
-/// The stable identity of a node that produces a stream (spec §4.4, §8.1).
+/// The stable identity of a node that produces a stream (spec §2.2, §7.1).
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeId(Arc<str>);
 
@@ -131,7 +131,7 @@ impl<'de> Deserialize<'de> for NodeId {
     }
 }
 
-/// A lifetime discriminator distinguishing a node's incarnations (spec §8.4).
+/// A lifetime discriminator distinguishing a node's incarnations (spec §2.2).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 pub struct Lifetime(pub u64);
 
@@ -168,7 +168,7 @@ pub struct StreamDescriptor {
     pub origin: StreamOrigin,
 }
 
-/// Channel metadata declared by the stream owner.
+/// Catalog metadata declared by the stream owner; frames store only `id` and payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelDescriptor {
     pub stream: StreamId,
@@ -236,7 +236,7 @@ impl SubscriptionRequest {
     }
 }
 
-/// The unit the mux emits (spec §4.1): bytes tagged with a channel and a position.
+/// The unit the mux emits (spec §2.1): bytes tagged with a channel and a position.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Frame {
     /// The stream-local lane these bytes belong to.

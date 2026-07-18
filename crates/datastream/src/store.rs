@@ -1,15 +1,15 @@
-//! The stored stream — the consumer's source of truth (spec §8).
+//! The stored stream — the consumer's frame source of truth (spec §7).
 //!
-//! Storage holds each node's **complete** stream, whole and append-only.
-//! Nothing is thinned, aggregated, decoded-and-discarded, or truncated at
-//! ingest (spec §8.2); everything a view ever shows is derived from here
-//! (spec §9.1). Frames on channels the consumer cannot decode are kept as
-//! opaque bytes, in order, alongside the rest (spec §8.3) — the store never
-//! looks at a channel or a payload.
+//! Storage holds each node's complete stream, whole and append-only. Nothing is
+//! thinned, aggregated, decoded-and-discarded, or truncated at ingest (spec
+//! §7.1, §7.2); everything a view shows is derived from here (spec §8.1).
+//! Frames on channels the consumer cannot decode are kept as opaque bytes,
+//! alongside the rest (spec §7.2, §8.3) — the store never looks at a channel or
+//! payload.
 //!
 //! A [`StoredStream`] is keyed in the [`Store`] by [`StreamId`] — node plus
-//! lifetime — so a re-incarnated node does not append to its prior life
-//! (spec §8.4).
+//! lifetime — so a re-incarnated node does not append to its prior life (spec
+//! §2.2, §7.1).
 
 use std::collections::BTreeMap;
 
@@ -19,8 +19,8 @@ use super::frame::{Frame, Position, StreamId};
 ///
 /// Backed by a position-keyed map so out-of-order arrivals land in order
 /// and a position seen twice collapses to one (the carrier may not
-/// fabricate content, spec §9). Gaps are not stored — they are *derived*
-/// at read time from the positions that are present (spec §9.1).
+/// fabricate content, spec §9.1). Gaps are not stored — they are *derived*
+/// at read time from the positions that are present (spec §7.3, §8.1).
 #[derive(Debug, Clone, Default)]
 pub struct StoredStream {
     frames: BTreeMap<u64, Frame>,
@@ -34,7 +34,7 @@ impl StoredStream {
 
     /// Record a delivered frame. Idempotent by position: the first frame
     /// seen for a position wins and is never mutated (append-only,
-    /// spec §8.2). Returns `true` if this was the first time the position
+    /// spec §7.2). Returns `true` if this was the first time the position
     /// was seen.
     pub fn record(&mut self, frame: Frame) -> bool {
         match self.frames.entry(frame.position.0) {
@@ -73,19 +73,19 @@ impl StoredStream {
     }
 
     /// The **interior** gaps — runs of positions assigned between the first
-    /// and last delivered frame but never delivered (spec §7.5, §8), each as
-    /// one [`GapSpan`].
+    /// and last delivered frame but never delivered (spec §7.3), each as one
+    /// [`GapSpan`].
     ///
     /// Cost is O(stored frames), never O(gap size): it walks adjacent stored
     /// positions and reads each span's endpoints from them, rather than
     /// enumerating the (possibly enormous) range in between. A stream that
     /// brackets a huge interior gap — what a long consumer outage produces
-    /// (spec §7.4), or a single wild position from a corrupt datagram — still
-    /// surfaces in work proportional to the frames held, not to `u64::MAX`.
+    /// (spec §6.3, §7.3), or a single wild position from a corrupt datagram —
+    /// still surfaces in work proportional to the frames held, not to `u64::MAX`.
     ///
-    /// Only interior gaps are knowable: a position lost *after* the last
-    /// delivered frame leaves no bracketing frame to reveal it, so it shows
-    /// up as the stream simply ending (spec §7.4 node death), not a gap.
+    /// Leading and trailing losses are not derivable from stored frames because
+    /// no bracketing position exists. A position lost after the last delivered
+    /// frame shows up as the stream simply ending (spec §5.7, §7.3), not a gap.
     pub fn gap_spans(&self) -> Vec<GapSpan> {
         let mut spans = Vec::new();
         let mut prev: Option<u64> = None;
@@ -105,7 +105,7 @@ impl StoredStream {
 }
 
 /// A contiguous run of missing positions surfaced in a stored stream
-/// (spec §7.5). Inclusive on both ends.
+/// (spec §7.3). Inclusive on both ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GapSpan {
     /// First missing position.
@@ -121,7 +121,7 @@ impl GapSpan {
     }
 }
 
-/// All stored streams at the consumer, keyed by [`StreamId`] (spec §8.4).
+/// All stored streams at the consumer, keyed by [`StreamId`] (spec §2.2, §7.1).
 ///
 /// Two streams with the same node but different lifetime are distinct keys
 /// and never merge.

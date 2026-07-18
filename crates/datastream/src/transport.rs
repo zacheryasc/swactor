@@ -1,28 +1,26 @@
-//! Transport: best-effort carriage of a node's stream to the one consumer
-//! (spec §7), and a scripted in-process carrier for offline tests (testing
-//! spec §2, §9).
+//! Legacy transport/test seam for carrying positioned frames into ingest.
 //!
-//! A [`Delivery`] is the value on the transport→ingest seam: which stream a
-//! frame belongs to, and the frame. A real carrier rides the connections
-//! the system already maintains (spec §7.1); a test replaces it with the
-//! [`ScriptedTransport`] here, whose faults are chosen by the scenario and
-//! stay inside the **envelope** (testing spec §9): a carrier may *deliver*,
-//! *drop*, *reorder*, or *delay*, and it MUST NOT corrupt a payload,
-//! fabricate a frame, or alter a position.
+//! The live endpoint path now fans out catalog-aware [`DatastreamEvent`] values;
+//! this module keeps the older [`Delivery`] shape used by ingest, storage tests,
+//! and scripted conformance checks.
 //!
-//! Under position-ordering a *delay* is indistinguishable from a *reorder*
-//! (a delayed frame simply arrives later), so the envelope's delay is
-//! covered by [`Reorder`]. Everything the scripted carrier produces is a
-//! reordered subsequence of what was sent — never a superset, never a
-//! mutation — which is exactly the property the real-transport conformance
-//! check pins (testing spec §9).
+//! A [`Delivery`] pairs the producing stream id with one frame. A real carrier
+//! rides connections the system already maintains; tests can replace it with
+//! [`ScriptedTransport`], whose faults stay inside the transport envelope: it
+//! may *deliver*, *drop*, *reorder*, or *delay*, and it MUST NOT corrupt a
+//! payload, fabricate a frame, or alter a position.
+//!
+//! Under position-ordering a *delay* is indistinguishable from a *reorder*:
+//! a delayed frame simply arrives later. Everything the scripted carrier
+//! produces is a reordered subsequence of what was sent — never a superset and
+//! never a mutation.
 
 use std::collections::BTreeSet;
 
 use super::frame::{Frame, StreamId};
 
-/// A frame as the consumer receives it from the transport (testing spec §2
-/// seam): tagged with the stream it belongs to.
+/// A frame as the legacy transport/ingest seam receives it: tagged with the
+/// stream it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delivery {
     /// Which node's life produced the frame (spec §8.1 ingest key).
@@ -38,9 +36,9 @@ impl Delivery {
     }
 }
 
-/// How the surviving frames of a stream are reordered on arrival. This is
-/// the envelope's *reorder* (and *delay*) axis (testing spec §9); each
-/// variant is a permutation of the survivors, never adding or dropping.
+/// How the surviving frames of a stream are reordered on arrival. This is the
+/// envelope's *reorder* and *delay* axis (spec §6.3, §9.1); each variant is a
+/// permutation of the survivors, never adding or dropping.
 #[derive(Debug, Clone, Default)]
 pub enum Reorder {
     /// Delivered in the order sent.
@@ -57,7 +55,7 @@ pub enum Reorder {
     Permutation(Vec<usize>),
 }
 
-/// The faults a scripted carrier applies to one stream (testing spec §9
+/// The faults a scripted carrier applies to one stream (spec §6.3, §9.1
 /// envelope). Drops and reorders only — payloads and positions are never
 /// touched.
 #[derive(Debug, Clone, Default)]
@@ -91,10 +89,9 @@ impl StreamScript {
     }
 }
 
-/// A scripted, in-process transport (testing spec §2). It is a pure,
-/// deterministic transform from what a node *sent* to what the consumer is
-/// *delivered* — the entanglement of real wires replaced by a script so a
-/// run completes in microseconds and returns the same result every time.
+/// A scripted, in-process transport for conformance scenarios (spec §9.1). It
+/// is a pure, deterministic transform from what a node sent to what the
+/// consumer receives, replacing real wire behavior with a fast test script.
 pub struct ScriptedTransport;
 
 impl ScriptedTransport {

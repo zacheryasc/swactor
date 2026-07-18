@@ -1,4 +1,4 @@
-//! Views: read-time projections over a stored stream (spec §9).
+//! Views: read-time projections over a stored stream (spec §8).
 
 use std::fmt;
 
@@ -70,6 +70,7 @@ where
     C: ChannelClassifier + ?Sized,
     R: Fn(ChannelId) -> Option<String>,
 {
+    // Capacity covers stored frames; surfaced gaps may add extra log entries.
     let mut out = Vec::with_capacity(stream.len());
     let mut prev: Option<u64> = None;
     for frame in stream.frames() {
@@ -114,7 +115,8 @@ where
     timeline_with_resolver(stream, classifier, resolve_name)
 }
 
-/// Transitional merged log using numeric channel ids as strings for classifier lookup.
+/// Transitional helper for callers that still classify by rendered numeric ids;
+/// named decoding should use [`merged_log_with_names`].
 pub fn merged_log_with<C: ChannelClassifier + ?Sized>(
     stream: &StoredStream,
     classifier: &C,
