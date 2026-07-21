@@ -1390,7 +1390,7 @@ Each node has one `GpuWorkerCtl` actor. It owns:
 - worker process spawn and termination through `swactor_process`
 - worker generation numbering
 - arena fd inheritance or passing setup
-- process actor address and notification bridge
+- process actor address and upstream `ProcessOutput` handling
 - table of installed rings for current worker generation
 - routing worker events to EdgeEstablisher, Driver, Tx/Rx actors, and role layer
 - crash detection and crash fanout
@@ -1717,7 +1717,7 @@ Stopping
 
 Killing
   close/kill ProcessActor according to policy
-  reap process notification
+  handle terminal ProcessOutput
   mark installed rings faulted
   -> Stopped
 

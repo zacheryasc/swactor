@@ -10,8 +10,8 @@ contract.
 
 ## 1. Purpose
 
-`mvp-chat` is the user-facing process that starts an MVP runtime and attaches an
-interactive prompt session to it.
+`mvp-chat` is the user-facing process that starts the `mvp-chat` library runtime
+and attaches an interactive prompt session to it.
 
 The wrapper is responsible for:
 
@@ -19,7 +19,7 @@ The wrapper is responsible for:
 - resolving provider and runtime launch configuration;
 - preparing required local runtime artifacts through Cargo unless rebuilds are
   explicitly skipped;
-- starting the orchestrator through the approved orchestrator launch contract;
+- starting the library runtime and its orchestrator, prompt, and datastream leaves;
 - waiting until the runtime can accept prompt requests;
 - running the interactive prompt loop;
 - notifying the runtime to shut down on normal exit or interruption;
@@ -42,9 +42,9 @@ The wrapper is responsible for:
 
 This specification covers Linux only.
 
-Linux signal handling, child-process lifecycle, Cargo artifact discovery, and
-runtime shutdown semantics are the only supported platform behavior. Non-Linux
-behavior is out of scope until explicitly specified.
+Linux signal handling, managed component and process-leaf lifecycle, Cargo
+artifact discovery, and runtime shutdown semantics are the only supported
+platform behavior. Non-Linux behavior is out of scope until explicitly specified.
 
 ---
 
@@ -267,11 +267,11 @@ in the runtime launch request.
 
 ### 3.7 Network and Runtime Inputs
 
-Network inputs:
+Runtime inputs:
 
-- prompt RPC readiness outcome;
-- prompt RPC stream records;
-- orchestrator progress events received through the progress datastream.
+- prompt engine readiness outcome;
+- prompt engine `PromptEvent` stream records;
+- orchestrator and component progress events written to the local datastream.
 
 Additional provider/image inputs:
 
@@ -279,27 +279,30 @@ Additional provider/image inputs:
 - registry responses when checking remote image availability;
 - registry responses when pushing images for remote providers.
 
-Prompt RPC stream records are newline-delimited prompt events:
+Prompt engine stream records are runtime-local prompt events:
 
 - text delta;
 - request completion;
 - request fault.
 
-The detailed progress-event channel schema is not specified here. This spec only
+Detailed progress payload schemas are not specified here. This spec only
 requires that `mvp-chat` receive enough progress information to present the
 user-facing progress states defined in Section 7.
 
-### 3.8 Child-Process Inputs
+### 3.8 Managed Component Inputs
 
-Child-process inputs observed by `mvp-chat`:
+Managed component inputs observed by `mvp-chat`:
 
-- orchestrator process start success or failure;
-- orchestrator process readiness result;
-- orchestrator process exit before readiness;
-- failure to notify or wait for orchestrator shutdown.
+- orchestrator leaf start success or failure;
+- orchestrator leaf readiness result;
+- orchestrator leaf fault or exit before readiness;
+- prompt engine leaf readiness result;
+- prompt engine leaf fault before readiness;
+- failure to request or wait for managed-component shutdown.
 
-The OS process APIs used to observe these states are implementation details. The
-observable contract is the resulting success, failure, or controlled shutdown.
+The OS process APIs, process actors, and actor-runtime notifications used to
+observe these states are implementation details. The observable contract is the
+resulting success, failure, readiness, fault, or controlled shutdown.
 
 ---
 
@@ -483,17 +486,26 @@ to the path parsing rules in Section 3.1.
 `mvp-chat` must not create hidden startup archive files as part of the public
 contract.
 
-Progress observation uses datastream, not archive-file polling.
+Progress observation uses the `mvp-chat` local datastream endpoint, not
+archive-file polling.
 
-The intended topology is:
+The runtime owns one local endpoint:
 
-- the orchestrator exposes or publishes runtime progress;
-- `mvp-chat` subscribes to orchestrator progress;
-- `mvp-chat` exposes a process datastream endpoint for dashboard and user-facing
-  observers.
+- stream id: `StreamId::new(NodeId::new("mvp-chat"), Lifetime(run_id))`;
+- label: `"mvp chat"`;
+- origin: `StreamOrigin::Orchestrator` until a chat-specific origin exists.
 
-Detailed progress channel names and payload schemas are out of scope. They belong
-in a datastream/progress contract.
+Required channels:
+
+- `mvp.chat.lifecycle`;
+- `mvp.chat.runtime`;
+- `mvp.chat.prompt`;
+- `mvp.chat.component`.
+
+Components write through cloned `DatastreamProducer` handles or through local
+adapters installed when a component leaf starts. The datastream task drains the
+local endpoint and fans frames out to subscribers. Payload schemas remain owned
+by the datastream/progress contract.
 
 The user-facing progress model must eventually define visible transitions for
 runtime startup. Until that model is approved, this spec only fixes prompt-loop
@@ -545,7 +557,9 @@ Exact orchestrator argv is out of scope until the orchestrator launch contract i
 specified.
 
 `mvp-chat` is responsible for handing the resolved runtime request to the
-orchestrator through that approved launch contract.
+orchestrator leaf through the library runtime. The production process-backed leaf
+owns binary resolution, `ProcessSpec` construction, and managed process actor
+startup; successor in-process leaves start the orchestrator actor group directly.
 
 The semantic launch request must include, as applicable:
 
@@ -555,25 +569,25 @@ The semantic launch request must include, as applicable:
 - cached model selection result;
 - dump-log configuration;
 - provider-specific runtime configuration;
-- prompt RPC connection information required by the orchestrator contract;
-- progress datastream connection information required by the orchestrator
-  contract.
+- datastream producer or adapter wiring required by the orchestrator leaf.
 
-The orchestrator launch contract must define the prompt RPC address shared by
-the orchestrator and `mvp-chat`. The default prompt RPC address is
-`127.0.0.1:19777` unless the orchestrator launch contract provides another
-address.
+The orchestrator launch contract does not define prompt transport. Prompt work is
+handled by the `mvp-chat` prompt engine actor/task through runtime-local
+messages.
 
 The resolved node image reference is the image the orchestrator must use for the
 provider-backed node. Exact argv or wire encoding remains owned by the
 orchestrator launch contract.
 
-The wrapper starts the orchestrator as a child runtime process or through the
-approved successor mechanism.
+The wrapper starts the `mvp-chat` library runtime. The runtime starts the
+orchestrator leaf, prompt engine leaf, datastream task, swactor runtime, and
+control path. Production process-backed leaves are managed by process actors;
+`mvp-chat` must not directly own `std::process::Child` for long-lived
+components.
 
-On shutdown, `mvp-chat` must notify the orchestrator process to stop. This spec
-does not expose stdin or any specific control string as the normative shutdown
-mechanism. The shutdown mechanism is owned by the orchestrator contract.
+On shutdown, `mvp-chat` must request shutdown through the runtime control path.
+The shutdown mechanism for each managed component is owned by that component's
+leaf contract.
 
 Shutdown must be idempotent from the user's perspective. Normal prompt exit,
 input EOF, startup interruption, and signal interruption must not leave the
@@ -593,21 +607,28 @@ For each cycle, `mvp-chat` must:
   preserving leading whitespace;
 - exit cleanly for EOF, input disconnection, or standard-input read error;
 - ignore prompts that are empty after whitespace trimming;
-- submit non-empty prompts to prompt RPC;
+- submit non-empty prompts to the prompt engine actor/task;
 - display that decoding has started;
-- stream response text as prompt RPC events arrive;
+- stream response text as `PromptEvent` values arrive;
 - return to the prompt marker after completion or prompt fault.
 
-Prompt RPC submissions carry:
+Prompt requests carry:
 
 - request id;
 - prompt text;
-- max token limit resolved from `mvp-chat` configuration.
+- max token limit resolved from `mvp-chat` configuration;
+- reply target for the `PromptEvent` stream.
 
-`mvp-chat` submits at most one prompt at a time on its prompt RPC connection. It
-waits for a terminal `Done` or `Fault` event before submitting the next prompt.
-Prompt RPC guarantees that response events on the connection belong to the active
-request and arrive in order.
+Prompt responses are:
+
+- `PromptEvent::TextDelta`;
+- `PromptEvent::Done`;
+- `PromptEvent::Fault`.
+
+`mvp-chat` submits at most one prompt at a time to the prompt engine. It waits
+for a terminal `Done` or `Fault` event before submitting the next prompt. The
+prompt engine guarantees that response events for an active request arrive in
+order on the reply target.
 
 The prompt-loop output states are:
 
@@ -622,8 +643,8 @@ The prompt-loop output states are:
 Prompt-loop user output goes to standard output unless it is an actual wrapper
 error. Expected model faults are prompt-loop results, not wrapper diagnostics.
 
-A fixed TCP read timeout is not part of the contract. The implementation must
-remain interruptible, but this spec does not require a specific timeout-based
+A fixed transport or read timeout is not part of the contract. The implementation
+must remain interruptible, but this spec does not require a timeout-based
 mechanism.
 
 ---
@@ -635,7 +656,7 @@ mechanism.
 Exit code `0` means clean completion or controlled interrupted shutdown.
 
 Exit code `1` means configuration failure, preparation failure, startup failure,
-prompt RPC failure, or another wrapper error.
+prompt engine failure, managed runtime failure, or another wrapper error.
 
 ### 11.2 Standard Output
 
@@ -696,8 +717,6 @@ Filesystem outputs are limited to:
 
 Network-visible outputs:
 
-- prompt RPC connection attempts;
-- prompt RPC prompt submissions;
 - `mvp-chat` datastream endpoint for dashboard/user observers when progress
   observation is active.
 
@@ -707,16 +726,18 @@ Additional network-visible outputs when preparing remote images:
 - image layer uploads;
 - image manifest or tag pushes.
 
-Prompt RPC submissions are newline-delimited request messages according to the
-prompt RPC contract. The prompt RPC contract owns the exact wire schema.
+Prompt submissions are runtime-local messages to the prompt engine actor/task;
+they are not network-visible outputs.
 
-### 11.6 Child Runtime Outputs
+### 11.6 Managed Runtime Outputs
 
-Outputs to the child runtime are limited to the approved orchestrator launch and
-shutdown contracts.
+Outputs to managed runtime components are limited to the approved orchestrator
+leaf launch and shutdown contracts, prompt engine request messages, and
+datastream frames.
 
-This spec does not define exact argv names, stdin control strings, or private
-orchestrator flags.
+This spec does not define exact argv names, stdin control strings, private
+orchestrator flags, or internal actor message encodings beyond the prompt request
+and event shapes in Section 10.
 
 ---
 
@@ -730,8 +751,8 @@ operation, or invalid provider configuration.
 Startup errors must identify the failed startup phase when progress information
 is available.
 
-Prompt RPC errors must identify whether connection, write, read, protocol, or
-remote closure failed.
+Unexpected prompt engine errors must identify whether request submission,
+event-stream closure, prompt event handling, or component fault failed.
 
 Controlled shutdown is not an error.
 
@@ -746,7 +767,7 @@ Out of scope for this document:
 
 - path display formatting as a standalone contract;
 - exact orchestrator argv;
-- detailed datastream channel schemas;
+- detailed datastream payload schemas;
 - non-Linux support;
 - Dockerfile contents;
 - base-image implementation details;

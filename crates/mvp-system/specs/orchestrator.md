@@ -1,2730 +1,954 @@
-# MVP Orchestrator Fixed Specification
+# MVP Orchestrator Actor Specification
 
-**Status:** draft outline for `mvp-orchestrator`.
+**Status:** normative contract for the actor-only MVP orchestrator.
 
-This document will define the intended public and runtime contract for the MVP orchestrator. Section contents are intentionally left for section-by-section review.
+This document defines the observable behavior of the MVP orchestrator as a Swactor actor or actor group. The orchestrator is not specified as an operating-system process, executable, command-line program, or owner of a Tokio/Iroh/Swactor engine. It runs inside any host that supplies a compatible Swactor runtime plus iroh-driver transport bridge.
 
 ---
 
 ## 1. Purpose and Contract Boundary
 
-This specification defines the observable contract of `mvp-orchestrator`: what it accepts, what it emits, how it moves a runtime from launch to shutdown, and what behavior callers may rely on.
+The orchestrator is the run authority for one MVP worker runtime. It turns an already-resolved launch request into actor commands, readiness decisions, prompt execution, lifecycle observations, and teardown decisions.
 
-The orchestrator is responsible for turning a resolved launch request into a running MVP worker runtime. That responsibility includes:
+The orchestrator is responsible for:
 
-- Resolving runtime configuration from fixed defaults, optional TOML config, environment variables, and process arguments.
+- accepting a typed run request from its host or supervisor actor;
+- building or accepting the execution shape for the run;
+- requesting worker provisioning through actor-managed provider/provisioner leaves;
+- driving readiness from actor reports plus engine route and membership facts;
+- acknowledging worker runtime readiness;
+- provisioning worker stages;
+- waiting for weights and stage readiness;
+- accepting prompt work through actor messages;
+- dispatching direct or pipeline prompt execution through worker actors and token edges;
+- emitting lifecycle, prompt, provisioning, readiness, and fault observations;
+- initiating actor-based teardown for stages, token endpoints, and provider-owned workers.
 
-- Preparing provider prerequisites that must exist before workers can start, including Vast.ai SSH identity registration when the Vast.ai provider is selected.
+The orchestrator is not responsible for:
 
-- Initializing the local orchestration runtime: Tokio, Iroh transport, the Swactor distribution stack, actor codecs, local reply actors, datastream production, and optional dashboard publication.
+- parsing CLI arguments, environment variables, or TOML files;
+- owning an executable or binary launch contract;
+- choosing or creating a Tokio runtime;
+- creating or owning a Swactor runtime;
+- creating or owning an `IrohDriver` endpoint;
+- owning the actor scheduler, pump loop, or runtime shutdown;
+- managing raw QUIC streams, ALPN negotiation, iroh connections, or Tokio tasks;
+- supervising operating-system child processes directly;
+- reading standard input or writing status to standard output/error;
+- exposing prompt TCP RPC;
+- implementing dashboard rendering;
+- implementing provider marketplace behavior, worker internals, model execution, tokenizer quality, or GGUF parsing beyond the typed facts it receives.
 
-- Building the execution shape for the run. For direct execution this is a single worker stage. For planned execution this is a pipeline run plan derived from cached or locally inspectable model metadata.
-
-- Provisioning worker nodes through the selected provider. The orchestrator supplies each worker with its image, logical node id, stage index, environment, mounts, coordinator endpoint, and orchestrator actor address.
-
-- Driving runtime readiness. The orchestrator waits for worker runtime-ready reports, SWIM membership, actor route ownership, runtime-ready acknowledgements, stage provisioning, and weight-loaded reports before accepting prompt work.
-
-- Serving prompt requests through prompt RPC. In direct mode it forwards prompt requests to the worker node agent. In pipeline mode it coordinates tokenizer encode/decode work and token-edge traffic between the orchestrator and pipeline stages.
-
-- Emitting runtime observations. Bootstrap progress, prompt progress, provisioning events, provider logs, worker stdout/stderr, orchestrator stdio capture, SWIM transitions, stage-route checks, node datastream frames, dashboard frames, and optional frame-archive records are all orchestrator outputs.
-
-- Shutting down controlled runtimes. On stop, shutdown, prompt-serving completion, or fatal error, the orchestrator stops provider-owned worker nodes before exiting when it has enough state to do so.
-
-The orchestrator is not responsible for model quality, worker-node internals, tokenizer implementation details, provider implementation internals, Docker image construction, Vast.ai marketplace behavior, dashboard rendering semantics, or the interactive user-facing prompt loop owned by `mvp-chat`.
+The orchestrator may run in the same process as a wrapper, worker supervisor, dashboard, or test harness. That process is the host. Host behavior is outside this orchestrator actor contract unless it is observed through the actor/datastream surfaces defined here.
 
 ---
 
-## 2. Input Channels
+## 2. Engine and Host Contract
 
-The orchestrator accepts input through configuration files, environment variables, process arguments, filesystem paths, prompt/control RPC, Swactor inbox delivery, provisioning datastream observations, and Iroh datastream connections.
+The host supplies an actor-capable engine. The engine must provide:
 
-Configuration inputs describe the requested runtime. Runtime inputs report what workers, providers, and network peers do after launch. Prompt text and RPC control inputs enter only through prompt/control RPC. Downstream shutdown propagation uses Swactor runtime and actor delivery, not standard input.
+- a Swactor runtime with typed actor mailboxes;
+- actor addresses (`ActorAddress`);
+- local actor spawn/send/inbox semantics;
+- registered codecs for MVP actor messages;
+- an iroh-driver actor bridge for remote actor delivery when remote workers exist;
+- a route view that can answer which node owns a remote actor address;
+- a membership view that can answer whether a worker node is alive;
+- datastream logical subscription and collection support when observability is enabled.
 
-### 2.1 Configuration File
+A conforming engine must be able to perform this work:
 
-The orchestrator reads configuration from the path provided by `--runtime-config <path>` when that argument is present. Otherwise, it reads `.config/config.toml` if it exists.
+```text
+Tokio handle
+-> IrohDriver::with_handle
+-> DistributionRuntimeStack
+-> register_mvp_actor_codecs
+-> enable_actor_bridge
+-> spawn orchestrator actor/group
+-> register local actor route
+-> pump engine work
+```
 
-The config file is optional when the default path is used and absent. A provided config path must exist, be readable, and contain valid TOML.
+The exact host API is not part of this specification. The observable requirement is that actor messages accepted by the runtime make progress according to Swactor delivery semantics and remote actor traffic is routed through the iroh-driver actor bridge when the destination is remote.
 
-Accepted TOML configuration:
+The host owns engine progress. It may drive progress with a tick loop, a worker-thread runtime, or a wake-driven loop. A blocking host wait that prevents actor delivery, iroh ingress, iroh egress, datastream collection, membership updates, or route updates from progressing violates the orchestrator runtime model.
 
-- `[runtime]`: `profile`, `run_id`, `node_id`, `stage_index`, `layer_end_exclusive`, `pipeline_stages`
-- `[provider]`: `kind`
-- `[image]`: `node`
-- `[relay]`: `mode`, `url`
-- `[prompt]`: `rpc_addr`
-- `[model]`: `id`, `gguf_local_path`, `gguf_repo`, `gguf_file`, `gguf_revision`, `tokenizer_local_path`, `max_context`
-- `[docker]`: `gpus`
-- `[observability]`: `datastream_frame_log`
-- `[vastai]`: `image`, `api_key`, `bootstrap_command`, `disk_gb`, `ssh_user`, `confirm_lease`, `onstart`, `ssh_identity`, `gpu_name`, `min_gpu_ram_mb`, `min_down_mbps`, `min_up_mbps`, `min_reliability`, `require_verified`, `poll_interval_secs`
+The orchestrator must not depend on a particular host executable, test harness, wrapper, or process name.
 
-TOML values are configuration inputs, not protocol messages. Unsupported values, malformed values, or invalid combinations are configuration errors.
+---
 
-### 2.2 Environment Variables
+## 3. Actor Topology
 
-Environment variables provide secrets and tokens that should not be written into configuration files. Environment variables are not a general runtime configuration surface: runtime identity, provider selection, worker image, relay configuration, prompt serving, observability, model paths, and pipeline shape are configured through TOML or the accepted process arguments.
+The orchestrator contract is defined at actor-group boundaries. An implementation may split the group differently, but the same observable messages, reports, lifecycle decisions, and ordering guarantees must hold.
 
-Accepted environment inputs:
+### 3.1 Required Actor Participants
 
-- provider credentials:
-  - `VASTAI_API_KEY`
+Required participants:
 
-- model and tokenizer credentials:
-  - `HF_TOKEN`
+- **Orchestrator actor/group**
+  - owns run-level state;
+  - accepts run observations, prompt submissions, shutdown requests, and snapshots;
+  - emits commands and lifecycle reports.
 
-`VASTAI_API_KEY` supplies the Vast.ai API key when the Vast.ai provider is selected. If both `[vastai].api_key` and `VASTAI_API_KEY` are present, `VASTAI_API_KEY` is used.
+- **Provisioner actor/group**
+  - owns provider-facing node lifecycle;
+  - starts/stops provider-owned worker leaves;
+  - converts provider/plugin/managed-process observations into actor reports and datastream records.
 
-`HF_TOKEN` is passed only to runtime paths that need Hugging Face authentication for model or tokenizer access.
+- **Worker node agent actor**
+  - lives on each worker runtime;
+  - receives stage provisioning, readiness acknowledgements, prompt inference, tokenizer encode/decode, and stop messages;
+  - reports runtime readiness, weights, stage readiness, faults, and stop completion back to the orchestrator.
 
-Unsupported `MVP_*` environment variables are not accepted orchestrator configuration inputs.
+- **Datastream publisher/collector actors or adapters**
+  - carry logical datastream subscription and frame transport;
+  - do not own lifecycle authority.
 
-Environment values are parsed only when the selected runtime path needs them. Missing required secret values, malformed secret values, or unsupported environment configuration are configuration errors.
+- **Prompt reply actor or reply target**
+  - receives prompt events for an active request.
 
-### 2.3 Process Arguments
+- **Tokenizer reply actor or reply target**
+  - receives tokenizer encode/decode events in pipeline mode.
 
-Process arguments are a small launch-time convenience surface. Values not listed here must be configured through TOML.
+### 3.2 Optional Actor Participants
 
-Accepted process arguments:
+Optional participants:
 
-- configuration:
-  - `--runtime-config <path>`
+- dashboard sinks;
+- frame archive sinks;
+- managed process actors for local workers or helper processes;
+- provider-specific actor leaves;
+- mock/stub actor leaves for tests.
 
-- provider:
-  - `--provider <value>`
+Optional participants must not change orchestrator lifecycle authority. They may observe, mirror, or adapt behavior; they do not make readiness, prompt completion, or shutdown true by themselves.
 
-- worker launch:
-  - `--worker-bin <path>`
+### 3.3 Actor Codecs
 
-- runtime shape:
-  - `--pipeline-stages <count>`
+The MVP actor codec registry must include the message families required by the active topology:
 
-- Vast.ai:
-  - `--vastai-ssh-identity <path>`
+```text
+NodeAgentMsg / NodeAgentReport
+OrchestratorMsg / OrchestratorReport
+ProvisionerMsg / ProvisionerReport
+DatastreamPublisherMsg
+PromptEvent / TokenizerEvent or their actor-prompt successors
+```
 
-`--runtime-config` selects the TOML file used for this invocation. Relative paths are resolved against the current working directory.
+The module or source file where a codec is registered is not a public contract. The contract is that every actor message that may cross the iroh actor bridge has a registered codec and type tag.
 
-The other accepted process arguments override the corresponding TOML values for this invocation only.
+---
 
-No process argument is accepted for runtime identity, model or tokenizer selection, relay settings, prompt serving, observability, Docker GPU settings, Vast.ai API keys, Vast.ai lease parameters, or Vast.ai search parameters.
+## 4. Inputs
 
-Unknown arguments, missing argument values, unreadable config paths, invalid TOML, invalid numbers, unsupported provider names, unsupported runtime profiles, and invalid paths required by the selected runtime are configuration errors.
+The orchestrator accepts typed actor inputs only. Configuration files, environment variables, process arguments, filesystem discovery, interactive input, OS signals, and TCP connections are host or adapter inputs. A host may translate those inputs into typed actor messages, but the translation is outside this orchestrator actor contract.
 
+### 4.1 Run Request
 
-### 2.4 Filesystem Inputs
+A run starts with a typed run request delivered to the orchestrator actor/group.
 
-Filesystem inputs are paths that the orchestrator reads or validates while preparing the runtime:
+Required run request facts:
 
-- default or configured TOML configuration path
-- current executable path, used to derive the default worker binary path
-- configured worker binary path
-- configured cached model host path
-- default pipeline cached model path
-- configured local GGUF path
-- configured local tokenizer path
-- configured Vast.ai SSH identity path
-- current working directory for relative paths
-- model cache paths exposed to workers
+```text
+RunRequest {
+    run_id,
+    orchestrator_node_id,
+    provider_policy,
+    worker_image_or_artifact_reference,
+    worker_count_or_run_plan_input,
+    model_identity,
+    model_source,
+    tokenizer_source,
+    pipeline_stages,
+    default_max_tokens,
+    max_context,
+    relay_or_endpoint_facts_needed_by workers,
+    observability_policy,
+    provider_preparation_result,
+    prompt_policy,
+}
+```
 
-A missing file is an error only when the selected runtime path requires that file.
+The request must be typed before the orchestrator receives it. The orchestrator must not parse raw strings from CLI, TOML, or environment variables as part of this contract.
 
-### 2.5 Prompt and Control RPC Input
+If a provider requires secrets or external preparation, the host or provider actor supplies prepared typed facts. Secret values must not be emitted by orchestrator-owned datastream records or lifecycle reports.
 
-Prompt/control RPC input is newline-delimited JSON over TCP.
+### 4.2 Run Plan Input
 
-Prompt request datatype:
+The orchestrator may either:
+
+- receive a committed `RunPlan`; or
+- receive locally inspectable model facts sufficient for a planner actor/component to produce a committed `RunPlan`.
+
+A committed plan includes:
+
+```text
+RunPlan {
+    run_id,
+    orchestrator_node_id,
+    stage_count,
+    stage_refs,
+    layer_ranges,
+    token_in_edge,
+    activation_edges,
+    token_out_edge,
+    object_specs,
+    ring_specs,
+    tokenizer_source,
+    model_source,
+}
+```
+
+Direct execution is represented as one stage. Pipeline execution is represented as two or more planned stages or any run whose prompt path requires token-in/token-out endpoints.
+
+The orchestrator must not accept a worker-generated topology. Workers may report boot/runtime facts; they do not assign stage indexes, layer ranges, edge ids, object specs, or consumer endpoints.
+
+### 4.3 Provisioning Reports
+
+The orchestrator receives provisioning reports through actors. Active report kinds:
+
+```text
+ProvisionerReport::NodeLive { ... }
+ProvisionerReport::NodeFailed { ... }
+ProvisionerReport::LogLine { ... }
+ProvisionerReport::NodesStopped { ... }
+```
+
+`LogLine` is observational. It must not make a node ready or failed by itself unless accompanied by a typed failure report.
+
+### 4.4 Worker Runtime Reports
+
+Workers report runtime readiness and stage state through actor messages.
+
+A runtime-ready report contains:
+
+```text
+NodeRuntimeReady {
+    run_id,
+    node_id,
+    stage_index,
+    endpoint,
+    node_actor,
+    datastream_publisher,
+    readiness_id,
+}
+```
+
+A runtime-ready acknowledgement report contains:
+
+```text
+NodeRuntimeReadyAck {
+    run_id,
+    node_id,
+    stage_index,
+    readiness_id,
+}
+```
+
+Weight/stage reports contain:
+
+```text
+WeightsReady { run_id, node_id, stage_index }
+StageReady { run_id, stage_index }
+StageFault { run_id, stage_index, reason }
+StageStopped { run_id, stage_index }
+```
+
+Reports with mismatched run id, node id, stage index, or readiness id must not advance the active run.
+
+### 4.5 Prompt Input
+
+Prompt input is an actor message, not TCP RPC.
+
+Prompt request shape:
 
 ```text
 SubmitPrompt {
-    request_id: u64,
-    prompt_text: String,
-    max_tokens: Option<u32>,
+    request_id,
+    prompt_text,
+    max_tokens,
+    reply_to,
 }
 ```
 
-`max_tokens` is optional. When omitted or set to `0`, the orchestrator does not impose an arbitrary generated-token cap. Generation still ends on model EOS, context/window exhaustion, worker fault, client disconnect, shutdown, or runtime/model limits. When positive, `max_tokens` is the maximum number of generated completion tokens the orchestrator permits for that request.
+`reply_to` is the actor address that receives prompt events for this request.
 
-The RPC channel may also carry a shutdown control request. After accepted, downstream shutdown signals sent to actors, providers, and worker-runtime components are delivered through the Swactor runtime and actor planes.
+When `max_tokens` is absent or zero, the orchestrator does not impose an arbitrary generated-token cap. Generation may still stop on EOS, context/window exhaustion, worker fault, shutdown, or runtime/model limits.
 
-A valid request is enqueued as prompt work. A malformed request is a prompt RPC protocol error for that connection.
+### 4.6 Shutdown Input
 
-A prompt RPC TCP connection supports at most one in-flight `SubmitPrompt` request
-at a time. The client must not submit another prompt on the same connection until
-the previous request has produced a terminal `Done` or `Fault` event. Submitting
-a second prompt before the active prompt reaches a terminal event is a prompt RPC
-protocol error for that connection.
+Shutdown is an actor/control message.
 
-### 2.6 Actor Message Input Channel
-
-Actor-message input reaches the orchestrator through two surfaces:
-
-- **Iroh actor plane surface**: remote actor messages arrive through the Iroh actor bridge and are handled by the Swactor runtime and registered actor routes.
-
-- **Swactor inbox surface**: process-visible actor messages are delivered into local Swactor inboxes owned and drained by the orchestrator process.
-
-This section defines the input surfaces only. Actor message schemas belong in the `Actors` section.
-
-### 2.7 Provisioning Datastream Observations
-
-Provisioner actor subsystems publish node lifecycle and log observations as datastream records. The orchestrator receives these records through datastream ingestion, not through a provider plugin control surface.
-
-Observation payload datatype:
+Required shutdown shape:
 
 ```text
-PluginObservation
-```
-
-Accepted datastream observation kinds:
-
-- worker stdout line
-- worker stderr line
-- provider log line
-- provider datastream frame
-- node exited
-- provisioning failed
-
-Node exit and provisioning-failed observations in this channel are datastream records only. They do not drive lifecycle decisions by themselves. Startup, prompt-serving, and shutdown failures are driven by actor-plane reports, provider actor results, prompt/control RPC shutdown, or runtime state checks.
-
-### 2.8 Datastream Input
-
-Worker datastream input arrives over the datastream ALPN.
-
-Accepted datastream inputs:
-
-- stream header
-- channel declaration
-- frame
-- stream end
-
-Frame payloads are opaque bytes at this boundary. The orchestrator records channel name, channel id, stream id, frame position, and payload, then forwards the frame to configured sinks.
-
----
-
-## 3. Output Channels
-
-The orchestrator emits output through process status, stdio log streams, provisional prompt output, Swactor actor delivery, Iroh transport, datastream frames, optional dashboard publication, and optional frame archives.
-
-This section defines output channels only. Detailed actor message schemas belong in the `Actors` section. Detailed datastream record contents belong in `Datastream and Logs`.
-
-### 3.1 Process Exit Status
-
-The orchestrator exits with process status:
-
-```text
-0
-```
-
-for successful completion or controlled shutdown.
-
-The orchestrator exits with process status:
-
-```text
-1
-```
-
-for configuration failure, startup failure, provisioning failure, prompt-serving failure, provider-stop failure, or any other fatal orchestrator error.
-
-### 3.2 Standard Output and Standard Error
-
-Standard output and standard error are log streams only. They are not user-facing status protocols, report channels, control channels, signaling channels, or fatal-error reporting contracts.
-
-On Linux, after stdio capture is installed, orchestrator stdout and stderr lines are redirected into the orchestrator log/datastream path as log observations. Before capture is installed, any stdout or stderr bytes are still logs only and are not part of the orchestrator contract.
-
-Provisioner and provider logs are owned by their managing actor subsystems and enter the orchestrator datastream through those subsystem publications.
-
-Structured runtime state, lifecycle progress, failures, prompt progress, worker logs, provider logs, and datastream frames are emitted through datastream, RPC, or actor-plane outputs, not through standard output or standard error.
-
-### 3.3 Prompt RPC Output
-
-Prompt RPC output is provisional and intentionally not specified here.
-
-The prompt interface is being moved from RPC/TCP response streams to Swactor messaging. This section will be rewritten with the Swactor prompt output contract when that migration is specified.
-
-### 3.4 Swactor Actor Output Channel
-
-The orchestrator has one actor-output surface: its owned local Swactor runtime.
-
-All actor messages emitted by the orchestrator process are submitted to that runtime. Swactor owns routing. If the destination is local, the runtime routes locally. If the destination is remote, the runtime uses the Iroh actor bridge.
-
-The orchestrator does not maintain separate local and remote actor outboxes.
-
-Process-owned Swactor inboxes may be supplied as reply addresses for reports, prompt events, tokenizer events, or other actor responses. Those inboxes are input queues drained by the orchestrator process; they are not a second actor-output channel.
-
-Outgoing actor traffic includes:
-
-- runtime-ready acknowledgements to worker node agents;
-- stage provisioning commands;
-- direct prompt inference commands;
-- tokenizer encode requests;
-- tokenizer decode requests;
-- datastream subscription requests;
-- shutdown or stop commands to managed runtime actors.
-
-This section defines the actor-output surface only. Message schemas belong in the `Actors` section.
-
-
-
-
-### 3.9 Datastream Output
-
-The orchestrator datastream is the process-owned observation stream for a single orchestrator run.
-
-The orchestrator datastream is responsible for collecting:
-
-- records produced directly by the orchestrator process;
-- captured orchestrator stdout and stderr, converted into log records;
-- datastreams published by provider/provisioner actor subsystems;
-- datastreams published by provisioned worker processes and managed nodes.
-
-Datastream records are observational. They do not carry lifecycle authority, actor commands, provider control, shutdown control, prompt control, or readiness gates. Lifecycle decisions are driven through the Swactor actor/control plane and runtime state checks.
-
-The orchestrator directly owns these datastream channels:
-
-- `mvp.orch.bootstrap`
-  - Orchestrator startup, configuration resolution, runtime initialization, readiness waiting, prompt-service availability, shutdown progress, and process-exit observations.
-
-- `mvp.orch.prompt`
-  - Prompt-serving observations owned by the orchestrator process, such as prompt accepted, prompt dispatched, prompt completed, prompt faulted, or prompt cancelled.
-
-- `mvp.orch.stdio.stdout`
-  - Captured stdout lines emitted by the orchestrator process after stdio capture is installed.
-
-- `mvp.orch.stdio.stderr`
-  - Captured stderr lines emitted by the orchestrator process after stdio capture is installed.
-
-- `mvp.swim.membership`
-  - SWIM membership observations visible to the orchestrator runtime.
-
-- `mvp.orch.stage_route`
-  - Stage route and actor-route ownership observations used to explain readiness and routing state.
-
-The orchestrator datastream also collects downstream datastream publications. These channels are not directly authored by the orchestrator process, but they must be published into the orchestrator datastream for observation:
-
-- provisioning lifecycle event channels published by provider/provisioner actor subsystems;
-- provisioning log channels published by provider/provisioner actor subsystems;
-- worker log channels published by provisioned processes or managed nodes;
-- worker-defined datastream channels declared by provisioned processes or managed nodes;
-- provider-defined diagnostic channels published by provider/provisioner actor subsystems.
-
-Collected downstream frames preserve their source identity, stream identity, channel name, channel id, frame position, and payload bytes. The orchestrator may add collection metadata, but it must not rewrite downstream payloads into prompt output, lifecycle control, or actor messages.
-
-Provisioning events and logs are managed by provider/provisioner actor subsystems. The orchestrator datastream is responsible for collecting and publishing those records as observations, not for interpreting them as control signals.
-
-Worker and node datastream frames collected by the orchestrator are forwarded to configured observability sinks, such as datastream subscribers, dashboard subscribers, or frame archives.
-
-
-### 3.11 Filesystem Output
-
-Filesystem output is optional and exists only when datastream frame logging is configured.
-
-When enabled, the orchestrator starts a file-log sink task. That task subscribes to the orchestrator datastream endpoint and appends received datastream frames to the configured file.
-
-The file-log sink is a datastream subscriber. It does not own lifecycle state, does not emit control signals, and does not change runtime behavior when absent.
-
-Frame archive output is JSON lines appended to the configured path.
-
-Frame archive records include:
-
-```text
-FrameArchiveRecord {
-    arrival_seq,
-    source,
-    stream,
-    channel,
-    channel_id,
-    position,
-    payload,
+RequestShutdown {
+    run_id,
+    reason,
+    reply_to: optional,
 }
 ```
 
-The file-log sink may create parent directories for the configured frame archive path.
+Shutdown reason examples:
 
-Without datastream frame logging, the file-log sink is not started and no frame archive is created.
+```text
+operator_requested
+host_requested
+prompt_session_closed
+fatal_dependency
+```
 
+Text commands such as `stop`, `shutdown`, and `quit` are wrapper inputs only if a wrapper chooses to support them. They are not orchestrator actor inputs until translated into `RequestShutdown`.
+
+### 4.7 Membership and Route Observations
+
+The orchestrator may observe membership loss and route changes through host-provided actor messages or by querying engine-provided views.
+
+Required facts:
+
+```text
+member_state(worker_swim_node_id) == Alive
+route_owner(node_actor) == worker_swim_node_id
+```
+
+A membership loss for an active worker after readiness is a run fault unless the run is already tearing down.
 
 ---
 
-## 4. Runtime Lifecycle
+## 5. Outputs
 
-The orchestrator lifecycle is a single owned run: resolve configuration, initialize local runtime services, provision workers, wait for readiness, serve prompts, stop workers, and exit.
+The orchestrator emits typed actor outputs and datastream observations.
 
-Lifecycle summary:
+### 5.1 Command Reports
+
+Run commands are emitted as actor reports or sent directly to the responsible actor. Required command semantics:
 
 ```text
-configure
--> prepare provider prerequisites
--> initialize observability
--> initialize local runtime
--> build optional run plan
--> provision workers
--> wait for runtime readiness
--> acknowledge runtime readiness
--> provision stages
--> wait for weights loaded
--> bind prompt RPC
--> serve prompts
--> stop provider-owned workers
--> exit
+ProvisionNodes
+ProvisionStage
+CreateTokenInEndpoint
+CreateTokenOutEndpoint
+RuntimeReadyAck
+SubscribeDatastream
+InferPrompt
+EncodePrompt
+DecodeTokens
+InjectTokenObject
+StopRun
+TearDownTokenEndpoints
+StopNodes
 ```
 
-A fatal error may terminate the lifecycle at any phase. Once worker handles are owned by the provisioned-cluster guard, dropping the guard attempts to stop all remaining workers.
+A successful actor send means the runtime accepted the message for routing. It does not prove the destination acted. Every command requiring acknowledgement must have an explicit acknowledgement or later lifecycle report.
 
-### 4.1 Configuration Phase
+### 5.2 Lifecycle Reports
 
-The orchestrator first resolves its effective configuration from defaults, optional TOML, environment variables, and process arguments.
+Lifecycle reports include:
 
-This phase also validates configuration that must be known before runtime setup, including provider kind, prompt RPC bind address, pipeline stage count, cached model path, relay configuration, and Vast.ai-specific requirements.
+```text
+RunAccepted
+RunRejected
+RunPlanningStarted
+RunPlanningReady
+RunProvisioningStarted
+RunReadinessStarted
+RunReady
+PromptAccepted
+PromptCompleted
+PromptFaulted
+RunOperatorStopped
+RunFaulted
+RunTearingDown
+RunTornDown
+```
 
-If the selected provider is Vast.ai, the orchestrator prepares the SSH identity before installing stdio capture. Preparation includes resolving the identity path, deriving the public key, ensuring the key is registered with the Vast.ai account, and recording the prepared identity in the resolved provider config.
+Lifecycle message names are normative at the actor boundary. Internal types may use different names as long as the required states remain observable.
 
-Failure in this phase exits before workers are started.
+### 5.3 Prompt Events
 
-### 4.2 Observability Startup Phase
+Prompt reply targets receive:
 
-The orchestrator installs its own stdout/stderr capture and creates the orchestrator datastream.
+```text
+PromptEvent::TextDelta { request_id, text }
+PromptEvent::Done { request_id, final_text, tokens_generated, elapsed_ms }
+PromptEvent::Fault { request_id, error }
+```
 
-The first bootstrap records describe the resolved configuration and runtime setup progress. If frame archive logging is configured, the frame archive is opened during datastream initialization.
+`TextDelta` is non-terminal. `Done` and `Fault` are terminal. A prompt request must receive exactly one terminal event unless the reply target disappears; if the reply target disappears, the orchestrator must cancel or fault the active prompt and continue teardown rules correctly.
 
-From this point forward, ordinary orchestrator stdout and stderr lines are captured as log records rather than treated as terminal UI.
+### 5.4 Datastream Output
 
-### 4.3 Local Runtime Initialization Phase
+Datastream records are observational. They may describe lifecycle transitions, prompt progress, provisioning events, worker logs, provider logs, membership transitions, route checks, token-edge progress, dashboard frames, or frame archive records.
 
-The orchestrator initializes the local runtime services required to coordinate the cluster:
+Datastream records must not carry lifecycle authority. They must not be interpreted as commands. They must not make readiness, prompt completion, failure, or shutdown true.
 
-- Tokio runtime;
-- Iroh driver;
-- distribution runtime stack;
-- actor codecs;
-- actor bridge;
-- datastream collector;
-- optional dashboard support;
-- local Swactor inboxes for orchestrator reports, prompt replies, and tokenizer replies;
-- local orchestrator actor;
-- stop-listener thread for standard-input control.
+Required core observation channels are logical, not process-owned:
 
-The Iroh driver and Swactor runtime are pumped together throughout later phases. Actor messages, transport traffic, SWIM state, route ownership, datastream connections, and prompt work only progress while the orchestrator pump loop is running.
+```text
+mvp.orch.bootstrap
+mvp.orch.prompt
+mvp.orch.lifecycle
+mvp.orch.stage_route
+mvp.swim.membership
+mvp.provisioning.events
+mvp.provisioning.logs.node.<node>.<stream>
+```
 
-### 4.4 Run Planning Phase
-
-The orchestrator enters planned execution when either cached-model execution is selected or more than one pipeline stage is requested.
-
-In planned execution, the orchestrator reads locally inspectable GGUF metadata and builds a run plan. The plan determines stage placement, layer ranges, token edges, activation edges, object sizes, and ring sizes.
-
-In direct execution, no run plan is built. The runtime is treated as a single worker stage.
-
-A planning failure exits before workers are started.
-
-### 4.5 Worker Provisioning Phase
-
-The orchestrator builds a provider-specific provisioner and computes one `NodeProvisionSpec` per worker.
-
-Direct execution provisions one worker.
-
-Planned pipeline execution provisions one worker per planned stage.
-
-For each worker, the orchestrator emits provider-start progress, calls the provider plugin, captures provider observations, and stores the returned worker handle. If one worker fails to start, workers already started in that provisioning attempt are stopped before the error is returned.
-
-Once all workers are started, the provisioned-cluster guard owns the worker handles.
-
-### 4.6 Runtime Readiness Phase
-
-After workers are started, the orchestrator waits for runtime readiness.
-
-A worker is not considered ready when it merely reports its endpoint and actor addresses. The readiness barrier requires:
-
-- a matching runtime-ready report for the active run;
-- SWIM membership showing the worker node as alive;
-- actor route ownership showing the node actor is reachable through that worker;
-- no provider failure or premature node exit.
-
-For planned pipeline execution, every expected stage worker must pass this readiness barrier.
-
-For direct execution, the single expected worker must pass this readiness barrier.
-
-### 4.7 Runtime-Ready Acknowledgement Phase
-
-After readiness barriers pass, the orchestrator acknowledges each worker’s runtime-ready report.
-
-The acknowledgement is sent to the worker node agent. The orchestrator also attempts to subscribe to the worker datastream publisher when the datastream publisher route is available.
-
-Acknowledgements are retried until all expected acknowledgement reports arrive or the acknowledgement timeout expires.
-
-Failure to receive required acknowledgements is a startup failure.
-
-### 4.8 Stage Provisioning Phase
-
-After worker readiness is acknowledged, the orchestrator provisions stages.
-
-In direct execution, the orchestrator sends a single stage provisioning command to the worker node agent.
-
-In planned pipeline execution, the orchestrator provisions stages from the run plan. Stage provisioning includes model identity, GGUF source, tokenizer source, layer range, stage index, stage count, inbound edge information, outbound edge information, object specs, ring specs, and consumer endpoint information.
-
-Stage provisioning is complete only after the corresponding weight-loaded reports are observed.
-
-### 4.9 Weight Loading Phase
-
-After stage provisioning begins, the orchestrator waits for workers to report that weights are loaded.
-
-Direct execution waits for the single configured stage.
-
-Planned pipeline execution loads stages sequentially. The orchestrator sends or resends stage provisioning for the next unloaded pipeline stage, waits for its weight-ready report, then advances to the next stage.
-
-A stage fault during weight loading is a startup failure.
-
-A provider failure or worker exit during weight loading is a startup failure.
-
-### 4.10 Prompt RPC Startup Phase
-
-The prompt RPC listener is created only after workers are ready and weights are loaded.
-
-When prompt RPC binds successfully, the orchestrator emits prompt-loop readiness. At that point external clients may submit prompt requests.
-
-Prompt RPC bind failure is a startup failure.
-
-### 4.11 Prompt Serving Phase
-
-Prompt serving is the steady-state runtime phase.
-
-During prompt serving, the orchestrator repeatedly:
-
-- pumps Iroh and Swactor runtime work;
-- drains provider observations;
-- drains worker datastream frames;
-- drains captured orchestrator stdio;
-- checks for shutdown control input;
-- accepts at most one active prompt request;
-- forwards prompt work through direct or pipeline execution;
-- streams prompt events back to the prompt RPC client.
-
-In direct execution, prompt work is sent to the worker node agent as an inference command.
-
-In planned pipeline execution, prompt work is encoded by the tokenizer actor, sent into the token-in edge, received from the token-out edge, decoded by the tokenizer actor, and streamed back as prompt RPC events.
-
-Prompt serving continues until shutdown is requested or a fatal runtime error occurs.
-
-### 4.12 Shutdown Phase
-
-Shutdown begins when prompt serving returns successfully or with an error.
-
-The orchestrator emits provider-stop progress and calls `stop_node` for every provisioned worker handle. Handles are stopped in guard-owned order until none remain. The first provider-stop error is preserved.
-
-If prompt serving succeeded and provider stop succeeded, the orchestrator emits an orchestrator-exit success record and exits successfully.
-
-If prompt serving failed, provider stop failed, or both failed, the orchestrator exits with failure after attempting worker cleanup.
-
-### 4.13 Cleanup Guarantee
-
-The orchestrator owns provider worker handles through `ProvisionedClusterGuard`.
-
-The guard attempts to stop remaining workers on explicit shutdown and again on drop if any handles remain. This makes worker cleanup best-effort even when the lifecycle exits through an error path.
-
-Cleanup is best-effort, not proof that external provider resources were removed. Provider failures during cleanup are reported when they occur through the explicit provider-stop path.
+The orchestrator actor/group does not own stdout/stderr channels. Worker/provider stdout/stderr may be observed by provider or managed-process adapters and published as provisioning log records.
 
 ---
 
-## 5. Core Runtime Dataflow
+## 6. Runtime Lifecycle
 
-The orchestrator is a coordinator. It does not perform model inference itself. It transforms configuration into worker launch requests, worker reports into lifecycle decisions, prompt requests into actor or pipeline commands, and runtime observations into datastream/log outputs.
-
-The core dataflow has five paths:
+The actor-only lifecycle is:
 
 ```text
-configuration -> resolved runtime request -> worker provisioning
-
-worker reports -> readiness/stage/prompt decisions
-
-prompt RPC -> prompt execution -> prompt RPC events
-
-worker/provider/orchestrator observations -> datastream/log sinks
-
-shutdown request/error -> provider stop -> process exit
+host starts engine
+-> host spawns orchestrator actor/group
+-> host sends RunRequest
+-> orchestrator validates typed request
+-> orchestrator obtains or builds committed run plan
+-> orchestrator requests node provisioning through ProvisionerActor
+-> provisioner reports nodes live/failure/logs
+-> worker node agents report runtime ready
+-> orchestrator waits for membership + route ownership
+-> orchestrator sends runtime-ready acknowledgements
+-> workers report runtime-ready acknowledgement
+-> orchestrator provisions stages
+-> workers report weights/stage ready
+-> orchestrator reports prompt-ready
+-> prompt messages are served through actors/token edges
+-> shutdown/fault/completion triggers actor teardown
+-> provisioner stops provider-owned worker leaves
+-> orchestrator reports torn down or faulted teardown result
 ```
 
-### 5.1 Runtime Pump
+The host may stop the engine only after the orchestrator actor/group has reached a terminal lifecycle state or after the host has declared the actor group failed. Engine shutdown itself is outside this specification.
 
-The runtime advances through an explicit pump loop.
+### 6.1 Request Validation
 
-Each pump cycle performs the same basic work:
+The orchestrator must reject a typed run request before provisioning when required facts are missing or invalid.
+
+Examples:
+
+- missing run id;
+- duplicate stage indexes;
+- stage count of zero;
+- stage count inconsistent with the committed plan;
+- unknown node in a committed placement;
+- missing model or tokenizer source required by stage provisioning;
+- missing provider/provisioner actor address;
+- missing orchestrator node id for token-edge endpoints;
+- missing worker image/artifact reference required by the selected provider policy.
+
+Rejecting a run emits a typed lifecycle report and must not start workers.
+
+### 6.2 Planning
+
+Planning must complete before provisioning.
+
+If the orchestrator builds a run plan, the plan must be derived from trusted host-supplied model facts or locally inspectable model metadata supplied through a typed component. Workers do not negotiate placement after boot.
+
+A planning failure rejects the run before provisioning.
+
+### 6.3 Provisioning
+
+The orchestrator must request provisioning through actor-managed provider/provisioner leaves. It must not directly supervise worker processes as part of this contract.
+
+Provisioning request shape:
 
 ```text
-tick protocol actors
--> move inbound Iroh actor messages into Swactor
--> run local Swactor work once
--> drain Swactor outbound actor messages into Iroh
--> accept datastream connections
+StartNodes {
+    nodes: Vec<NodeProvisionSpec>,
+    reply_to,
+}
 ```
 
-This pump is the coordination boundary between the local Swactor runtime and Iroh transport. Actor delivery, SWIM state, route ownership, datastream connection handling, and remote worker reports only progress while the orchestrator is pumping.
-
-### 5.2 Configuration to Provisioning
-
-Configuration data enters through TOML, environment variables, process arguments, and defaults.
-
-The orchestrator resolves those inputs into one effective runtime request:
-
-```text
-defaults
--> optional TOML overlay
--> environment overlay
--> process argument overlay
--> Config
-```
-
-The resolved `Config` drives:
-
-- provider selection;
-- worker image selection;
-- worker binary selection for process provider;
-- Docker GPU configuration;
-- relay configuration;
-- prompt RPC bind address;
-- model and tokenizer source selection;
-- cached model selection;
-- Vast.ai provisioning settings;
-- observability settings.
-
-For direct execution, the `Config` creates one `NodeProvisionSpec`.
-
-For planned pipeline execution, the `Config` first creates a run plan, then creates one `NodeProvisionSpec` per planned stage.
-
-### 5.3 Run Plan Dataflow
-
-Planned execution starts from locally inspectable GGUF metadata.
-
-```text
-cached/local GGUF
--> planning metadata
--> model facts
--> run plan
--> stage provisioning wires
-```
-
-The run plan determines:
-
-- stage count;
-- worker node ids;
-- stage indexes;
-- layer ranges;
-- token-in edge;
-- activation edges;
-- token-out edge;
-- object specs;
-- ring specs;
-- consumer endpoints.
-
-The run plan is used twice:
-
-- before provisioning, to decide which workers to start;
-- after readiness, to derive the stage provisioning commands sent to workers.
-
-Direct execution skips this path.
-
-### 5.4 Provisioning Dataflow
-
-Worker provisioning flows from the orchestrator to the selected provider plugin.
-
-```text
-Config / RunPlan
--> NodeProvisionSpec
--> ProvisionPlugin::start_node
--> worker runtime
--> PluginObservation / OrchestratorReport
-```
-
-The `NodeProvisionSpec` carries the data the provider needs to start a worker:
+Each `NodeProvisionSpec` must include enough data for the provider leaf to start the worker runtime:
 
 ```text
 NodeProvisionSpec {
     run_id,
     node_id,
     stage_index,
-    image,
-    env,
-    args,
-    mounts,
+    image_or_artifact_reference,
+    environment_or_runtime_facts,
+    mounts_or_resource_bindings,
+    coordinator_endpoint,
+    orchestrator_actor,
 }
 ```
 
-The provider returns a worker handle. The orchestrator stores that handle in the provisioned-cluster guard.
+If provisioning one node fails after earlier nodes started, the actor group must attempt to stop already-started nodes before reporting startup failure.
 
-After the worker has passed readiness acknowledgement, the orchestrator calls `complete_bootstrap` for that handle.
+### 6.4 Runtime Readiness
 
-During shutdown, the same handle is passed to `stop_node`.
+A runtime-ready actor report is necessary but not sufficient.
 
-### 5.5 Worker Readiness Dataflow
-
-Worker readiness reaches the orchestrator through actor reports.
-
-```text
-worker node agent
--> orchestrator actor
--> orchestrator report inbox
--> readiness wait loop
-```
-
-A runtime-ready report contains the worker endpoint, node actor address, datastream publisher address, stage index, and readiness id.
-
-The orchestrator does not treat the report alone as sufficient. It combines the report with local runtime state:
-
-```text
-runtime-ready report
-+ SWIM member is alive
-+ actor route owner matches worker
-= worker ready
-```
-
-After that barrier passes, the orchestrator sends runtime-ready acknowledgement back to the worker node agent.
-
-### 5.6 Stage Provisioning Dataflow
-
-Stage provisioning flows from the orchestrator to worker node agents after readiness acknowledgement.
-
-Direct execution:
-
-```text
-Config
--> StageProvisionWire
--> NodeAgentMsg::ProvisionStage
--> worker loads stage
--> WeightsReady or StageFault report
-```
-
-Planned execution:
-
-```text
-RunPlan + worker readiness map
--> StageProvisionWire for stage N
--> NodeAgentMsg::ProvisionStage
--> worker loads stage N
--> WeightsReady or StageFault report
--> next stage
-```
-
-Pipeline stages are loaded sequentially. The orchestrator advances to the next unloaded stage only after the active stage reports weights ready.
-
-### 5.7 Prompt Dataflow: Direct Mode
-
-Direct prompt execution is used when no planned pipeline runtime is active.
-
-```text
-prompt RPC SubmitPrompt
--> PromptWork queue
--> serve_prompts loop
--> NodeAgentMsg::InferPrompt
--> worker prompt execution
--> PromptEvent inbox
--> prompt RPC response stream
-```
-
-The orchestrator accepts at most one active prompt request at a time.
-
-Prompt events whose request id does not match the active prompt are dropped from the active prompt flow.
-
-Terminal prompt events clear the active prompt and allow the next prompt request to begin.
-
-### 5.8 Prompt Dataflow: Pipeline Mode
-
-Pipeline prompt execution is used for planned pipeline runtimes.
-
-```text
-prompt RPC SubmitPrompt
--> PromptWork queue
--> tokenizer encode actor
--> token-in edge
--> pipeline stages
--> token-out edge
--> tokenizer decode actor
--> prompt RPC response stream
-```
-
-The pipeline prompt runtime keeps the active prompt state, generated token list, final text buffer, token sequence number, pending tokenizer encode state, and pending tokenizer decode state.
-
-Prompt text is first sent to the tokenizer encode actor.
-
-Encoded tokens are sent to the first pipeline stage over the token-in edge.
-
-Generated token records return over the token-out edge.
-
-Each generated token is sent to the tokenizer decode actor.
-
-Decoded text is emitted to the prompt RPC client as `TextDelta`.
-
-The prompt completes when the pipeline reports EOS or when the request reaches its max-token limit.
-
-### 5.9 Observability Dataflow
-
-Observability has three sources:
-
-```text
-orchestrator internal events
-provider observations
-worker datastream frames
-```
-
-Orchestrator internal events become bootstrap or prompt datastream records.
-
-Provider observations become provisioning events or provisioning log records.
-
-Worker datastream frames are collected over the datastream ALPN.
-
-Configured observability sinks receive frames from these sources:
-
-```text
-orchestrator datastream
--> dashboard sink, if enabled
--> frame archive, if configured
-
-worker datastream
--> dashboard sink, if enabled
--> frame archive, if configured
-```
-
-Prompt RPC does not receive observability frames. Prompt RPC receives only prompt events.
-
-### 5.10 Shutdown Dataflow
-
-Shutdown begins from either control input or a fatal lifecycle result.
-
-```text
-stdin stop/shutdown/quit
-or prompt-serving error
-or provider/runtime failure
--> serve_prompts returns
--> provider_stop starts
--> stop_node for each worker handle
--> process exit
-```
-
-The provisioned-cluster guard owns cleanup. Explicit shutdown drains the guard by calling `stop_node` for each worker handle. If the guard is dropped with handles still present, it attempts best-effort cleanup.
-
-The process exit result is computed from prompt-serving result and provider-stop result.
-
----
-
-## 6. Actors
-
-Actors are the orchestrator control plane. They carry runtime state transitions, worker commands, prompt commands, tokenizer commands, and readiness reports.
-
-Actor messages are distinct from prompt RPC records, provider plugin observations, datastream frames, worker stdout/stderr logs, and pipeline token-edge bytes.
-
-Actor delivery is asynchronous. Messages only make progress while the orchestrator pumps the Swactor runtime and Iroh driver.
-
-### 6.1 Actor Runtime
-
-The orchestrator creates a local Swactor runtime as part of the distribution runtime stack.
-
-The runtime is connected to Iroh through the actor bridge:
-
-```text
-Swactor runtime
-<-> actor bridge
-<-> Iroh driver
-<-> remote worker node actors
-```
-
-Local actor messages stay inside the process.
-
-Remote actor messages are serialized with registered codecs and delivered through the Iroh actor bridge.
-
-Actor route availability is part of worker readiness. A worker node is not ready for orchestration until the route owner for its node actor matches the worker’s Iroh node identity.
-
-The actor runtime has these operational states from the orchestrator’s perspective:
-
-- **initializing**: codecs, local actors, and actor bridge are being registered;
-- **pumping**: inbound Iroh messages, local actor work, and outbound actor messages are advanced by the orchestrator pump loop;
-- **stopped by process exit**: actor progress ends when the orchestrator process exits.
-
-There is no independent actor scheduler contract outside the orchestrator pump loop.
-
-### 6.2 Actor Addresses
-
-Actors are addressed by `ActorAddress`.
-
-The orchestrator uses actor addresses for:
-
-- the local orchestrator actor;
-- the local orchestrator report inbox;
-- the local prompt reply inbox;
-- the local tokenizer reply inbox;
-- each worker node agent actor;
-- each worker datastream publisher actor.
-
-Worker actor addresses are learned from runtime-ready reports. The orchestrator does not construct remote worker actor addresses by convention.
-
-An actor address becomes usable for remote delivery only after the route view reports that the address is owned by the expected worker node.
-
-### 6.3 Local Inbox Actors
-
-The orchestrator creates local inbox actors for receiving reports and replies.
-
-Local inbox actors are queue endpoints. Their state is the set of messages not yet drained by the orchestrator loop.
-
-The local inbox actors are:
-
-- **orchestrator report inbox**  
-  Holds `OrchestratorReport` values emitted by the orchestrator actor.
-
-- **prompt reply inbox**  
-  Holds `PromptEvent` values emitted by direct prompt inference.
-
-- **tokenizer reply inbox**  
-  Holds `TokenizerEvent` values emitted by tokenizer encode/decode work in pipeline mode.
-
-Inbox states are:
-
-- **empty**: no pending messages;
-- **pending**: one or more messages are queued;
-- **drained**: the orchestrator loop has consumed all currently available messages.
-
-Inbox actors do not own lifecycle decisions. They only buffer messages until the orchestrator loop drains them.
-
-### 6.4 Orchestrator Actor
-
-The orchestrator actor wraps the run-level FSM.
-
-It receives `OrchestratorMsg` actor messages and may emit `OrchestratorReport` actor messages to the orchestrator report inbox.
-
-State owned by the orchestrator actor:
-
-```text
-OrchestratorActor {
-    core: OrchestratorRun,
-    report_to: Option<ActorAddress>,
-    command_cursor,
-    event_cursor,
-}
-```
-
-The `OrchestratorRun` state includes:
-
-```text
-OrchestratorRun {
-    config,
-    plan,
-    pool_ready,
-    provisioned,
-    token_in_ready,
-    token_out_ready,
-    ready_stages,
-    injected_sequences,
-    expected_token_sequence,
-    events,
-    commands,
-    terminal,
-    teardown_started,
-    stopped_stages,
-    token_endpoints_stopped,
-}
-```
-
-Logical states:
-
-- **waiting for plan and pool**: the actor has a run config but cannot provision until required plan/pool facts are observed.
-- **provisioned**: the FSM has emitted or recorded stage provisioning intent.
-- **waiting for token endpoints**: the actor has not yet observed both token-in and token-out endpoint readiness.
-- **waiting for stage readiness**: the actor is collecting ready stage indexes.
-- **generating tokens**: the actor tracks injected token sequences and expected returned token sequence.
-- **terminal**: the actor has observed run completion or a run fault. Further token receipt does not advance generation.
-- **tearing down**: the actor has begun teardown and waits for stage stops and token endpoint teardown.
-- **torn down**: all required stopped-stage and token-endpoint stopped facts have been observed.
-
-Incoming actor messages to `OrchestratorActor` are variants of `OrchestratorMsg`.
-
-Common incoming observations:
-
-```text
-OrchestratorMsg::ObserveNodeRuntimeReady { ... }
-OrchestratorMsg::ObserveNodeRuntimeReadyAck { ... }
-OrchestratorMsg::ObserveWeightsReady { ... }
-OrchestratorMsg::ObserveStageReady { ... }
-OrchestratorMsg::ObserveStageFault { ... }
-OrchestratorMsg::ObserveStageStopped { ... }
-OrchestratorMsg::ObserveTokenReceived { ... }
-OrchestratorMsg::ObserveEndpointFault { ... }
-OrchestratorMsg::ObserveTokenEndpointsStopped
-```
-
-These are typed actor messages delivered by Swactor. When sent by a remote worker, delivery passes through the Iroh actor bridge.
-
-Reports emitted by `OrchestratorActor` are variants of `OrchestratorReport`.
-
-Common report messages:
-
-```text
-OrchestratorReport::NodeRuntimeReady { ... }
-OrchestratorReport::NodeRuntimeReadyAck { ... }
-OrchestratorReport::WeightsReady { ... }
-OrchestratorReport::StageReady { ... }
-OrchestratorReport::StageFault { ... }
-OrchestratorReport::Command(...)
-OrchestratorReport::Lifecycle(...)
-```
-
-These are typed actor messages sent by `OrchestratorActor` to the local orchestrator report inbox. The orchestrator process drains that inbox and uses the reports to advance startup, provisioning, weight-loading, and failure handling.
-
-The orchestrator binary uses direct readiness, acknowledgement, weight, and fault reports as lifecycle gates. FSM command and lifecycle reports remain part of the actor surface, but they are not the primary startup gates in the current binary.
-
-### 6.5 Worker Node Agent Actor
-
-Each worker has a node agent actor.
-
-The node agent actor is the orchestrator’s primary control target on a worker. It receives stage provisioning, prompt, tokenizer, and readiness acknowledgement commands.
-
-State owned by the node agent actor:
-
-```text
-NodeAgentActor {
-    core: StageController,
-    orchestrator: ActorAddress,
-    report_to: Option<ActorAddress>,
-    inbound_edge: Option<StageInboundEdgeWire>,
-    outbound_edge: Option<StageOutboundEdgeWire>,
-    command_cursor,
-    event_cursor,
-}
-```
-
-The node agent’s `StageController` state includes:
-
-```text
-StageController {
-    provision,
-    worker_ready,
-    weights_ready,
-    inbound_ready,
-    outbound_ready,
-    stage_ready_emitted,
-    busy,
-    expected_sequence,
-    active_input,
-    commands,
-    events,
-    faulted,
-    stopped,
-    stopping_run,
-    local_edges_stopped,
-    worker_rings_quiesced,
-    release_reset_requested,
-    device_objects_released,
-    worker_role_reset,
-}
-```
-
-Logical states:
-
-- **unprovisioned**: no stage provision has been accepted.
-- **provisioning**: a valid `ProvisionStage` message has been accepted. The stage controller has emitted commands to establish inbound edge, establish outbound edge, configure worker role, and load weights.
-- **waiting for stage readiness**: the stage has provision data but has not yet observed every readiness prerequisite.
-- **ready idle**: worker ready, weights ready, inbound edge ready, and outbound edge ready have all been observed. `StageReady` has been emitted. No step is active.
-- **busy executing step**: a valid inbound object has arrived with the expected sequence. The controller has emitted an execute-step command and is waiting for completion or failure.
-- **faulted**: the actor has observed an unauthorized provision, sequence violation, worker crash, step failure, object failure, output fault, or edge fault. Faulted stages do not accept new execution work.
-- **stopping**: a stop has been requested for the run. The actor has emitted stop/release/reset commands and waits for local edges, worker rings, device objects, and worker role reset facts.
-- **stopped**: all stop prerequisites have been observed and `StageStopped` has been emitted.
-
-Important orchestrator-sent messages:
-
-```text
-NodeAgentMsg::RuntimeReadyAck { ... }
-NodeAgentMsg::ProvisionStage(StageProvisionWire)
-NodeAgentMsg::InferPrompt { ... }
-NodeAgentMsg::EncodePrompt { ... }
-NodeAgentMsg::DecodeTokens { ... }
-```
-
-Important worker-side or stage-side observations accepted by the node agent:
-
-```text
-NodeAgentMsg::RuntimeLoaded { ... }
-NodeAgentMsg::MarkWeightsReady { ... }
-NodeAgentMsg::MarkInboundEdgeReady { ... }
-NodeAgentMsg::MarkOutboundEdgeReady { ... }
-NodeAgentMsg::ObjectLoaded { ... }
-NodeAgentMsg::StepCompleted { ... }
-NodeAgentMsg::WorkerCrashed
-NodeAgentMsg::StopRun { ... }
-NodeAgentMsg::LocalEdgesStopped { ... }
-NodeAgentMsg::WorkerRingsQuiesced { ... }
-NodeAgentMsg::DeviceObjectsReleased { ... }
-NodeAgentMsg::WorkerRoleReset { ... }
-```
-
-Important outputs to the orchestrator actor:
-
-```text
-OrchestratorMsg::ObserveNodeRuntimeReady { ... }
-OrchestratorMsg::ObserveNodeRuntimeReadyAck { ... }
-OrchestratorMsg::ObserveWeightsReady { ... }
-OrchestratorMsg::ObserveStageReady { ... }
-OrchestratorMsg::ObserveStageFault { ... }
-OrchestratorMsg::ObserveStageStopped { ... }
-```
-
-These outputs are actor messages sent to `OrchestratorActor`, not datastream records or prompt RPC events.
-
-### 6.6 Stage Provision Message
-
-Stage provisioning is carried by `StageProvisionWire`.
-
-```text
-StageProvisionWire {
-    run_id,
-    authorized_orchestrator,
-    node_id,
-    stage_index,
-    stage_count,
-    layer_start,
-    layer_end_exclusive,
-    inbound_edge_id,
-    outbound_edge_id,
-    inbound_edge,
-    outbound_edge,
-    model_id,
-    gguf_source,
-    tokenizer,
-}
-```
-
-For direct execution, inbound and outbound edge details may be absent.
-
-For planned pipeline execution, inbound and outbound edge details describe the token or activation edge assigned by the run plan.
-
-A node agent accepts a stage provision only when:
-
-- `authorized_orchestrator` matches the expected orchestrator identity;
-- `node_id` matches the local worker node id.
-
-Invalid provisioning faults the stage.
-
-### 6.7 Datastream Publisher Actor
-
-Each worker reports a datastream publisher actor address.
-
-The datastream publisher actor accepts:
-
-```text
-DatastreamPublisherMsg::Subscribe(DatastreamSubscribe)
-```
-
-Subscription request shape:
-
-```text
-DatastreamSubscribe {
-    collector,
-    request,
-    flow_id,
-    token,
-}
-```
-
-State owned by the publisher actor:
-
-```text
-DatastreamPublisherActor {
-    endpoint,
-    on_subscribe,
-}
-```
-
-Logical states:
-
-- **waiting for subscription**: the actor owns a datastream endpoint and waits for subscribe messages.
-- **subscription accepted**: a subscribe message has been accepted. The actor creates a local datastream subscription from the endpoint and passes it to the transport-specific `on_subscribe` callback.
-
-The publisher actor does not itself stream bytes. It creates the subscription and hands it to transport code that writes datastream frames.
-
-### 6.8 Provisioner Actor
-
-The codebase defines a `ProvisionerActor`, but the orchestrator binary covered by this spec provisions workers directly through `ProvisionPlugin`.
-
-Therefore, the `ProvisionerActor` is not part of the current orchestrator runtime lifecycle.
-
-If a future orchestrator path uses it, its state and message contracts must be specified before it becomes part of this document’s active contract.
-
-### 6.9 Prompt Actor Flow
-
-Direct prompt mode uses actor messages for worker prompt execution.
-
-```text
-SubmitPrompt
--> PromptWork
--> NodeAgentMsg::InferPrompt
--> worker
--> PromptEvent
--> prompt reply inbox
--> prompt RPC stream
-```
-
-State involved in this flow:
-
-- prompt-serving loop tracks the active prompt;
-- prompt reply inbox buffers `PromptEvent`;
-- node agent actor receives `InferPrompt`;
-- worker prompt implementation produces prompt events.
-
-The `reply_to` address in `InferPrompt` is the local prompt reply inbox.
-
-Prompt events with a mismatched request id are dropped from the active prompt flow.
-
-### 6.10 Pipeline Tokenizer Actor Flow
-
-Pipeline prompt mode uses actor messages for tokenizer work and edge transport for generated tokens.
-
-```text
-SubmitPrompt
--> PromptWork
--> NodeAgentMsg::EncodePrompt
--> TokenizerEvent::PromptEncoded
--> token-in edge
--> token-out edge
--> NodeAgentMsg::DecodeTokens
--> TokenizerEvent::TokensDecoded
--> prompt RPC stream
-```
-
-State involved in this flow:
-
-- pipeline prompt runtime tracks active prompt state;
-- tokenizer reply inbox buffers `TokenizerEvent`;
-- encode actor receives `EncodePrompt`;
-- decode actor receives `DecodeTokens`;
-- token-edge transport carries generated token records;
-- prompt RPC stream receives decoded text.
-
-The encode actor is the first-stage node actor.
-
-The decode actor is the final-stage node actor.
-
-The `reply_to` address for tokenizer messages is the local tokenizer reply inbox.
-
-Tokenizer faults become prompt faults for the active request.
-
-### 6.11 Actor Delivery Contracts
-
-Actor send failure is a runtime error for the phase that attempted the send.
-
-Actor delivery is not synchronous execution. A successful send means the message was accepted by the local runtime for delivery, not that the remote worker has acted on it.
-
-Remote actor delivery requires:
-
-- Iroh transport progress;
-- actor bridge progress;
-- route availability;
-- SWIM membership state sufficient for route ownership.
-
-The orchestrator must keep pumping runtime and transport while waiting for actor-driven results.
-
-### 6.12 Actor Message Filtering
-
-Actor reports are accepted only when they match the active orchestration context.
-
-Lifecycle reports are filtered by `run_id`.
-
-Worker readiness reports are filtered by expected `node_id`.
-
-Stage reports are filtered by expected `stage_index`.
-
-Prompt and tokenizer events are filtered by active `request_id`.
-
-Mismatched reports do not advance the active lifecycle or prompt state.
-
----
-
-## 7. Subcomponents and Behaviors
-
-This section describes the in-process subcomponents that implement orchestration behavior.
-
-Actors are covered in `Actors`. Datastream record schemas are covered in `Datastream and Logs`. This section focuses on non-actor runtime components and the state they own.
-
-### 7.1 Configuration Resolver
-
-The configuration resolver turns defaults, TOML, environment variables, and process arguments into one `Config`.
-
-Owned state:
-
-```text
-Config {
-    config_profile: RuntimeConfigProfile,
-    provider: ProviderKind,
-    image: String,
-    docker_gpus: String,
-    rpc_bind: SocketAddr,
-    run_id: u64,
-    node_id: u64,
-    stage_index: u32,
-    layer_end_exclusive: Option<u32>,
-    pipeline_stages: u32,
-    model_id: String,
-    gguf_source: GgufSource,
-    tokenizer: TokenizerSource,
-    default_max_tokens: u32,
-    dashboard: bool,
-    max_context: Option<u32>,
-    relay: RelayRuntimeConfig,
-    vastai: Option<VastAiRuntimeConfig>,
-    cached_model: Option<CachedModelConfig>,
-    worker_bin: Option<PathBuf>,
-    datastream_frame_log: Option<PathBuf>,
-}
-```
-
-Defaults:
-
-- `config_profile` defaults to `Local`.
-- `provider` defaults from `config_profile`:
-  - `Local` uses `Process`.
-  - `Deploy` uses `VastAi`.
-- `image` defaults to `swactor-mvp-node:latest`.
-- `docker_gpus` defaults to `all`.
-- `rpc_bind` defaults to `127.0.0.1:19777`.
-- `run_id` defaults to `1`.
-- `node_id` defaults to `1`.
-- `stage_index` defaults to `0`.
-- `layer_end_exclusive` defaults to absent.
-- `pipeline_stages` defaults to `1`.
-- `default_max_tokens` defaults to `64`.
-- `dashboard` defaults to disabled.
-- `max_context` defaults to absent.
-- `vastai` defaults to absent unless the resolved provider is `VastAi`.
-- `cached_model` defaults to absent.
-- `worker_bin` defaults to absent.
-- `datastream_frame_log` defaults to absent.
-
-`model_id`, `gguf_source`, and `tokenizer` are resolved model inputs. This section records their typed presence in `Config`, but does not define a hardcoded default model contract.
-
-Behavior:
-
-- starts from fixed defaults;
-- overlays optional TOML;
-- overlays environment variables;
-- overlays process arguments;
-- validates provider-specific constraints;
-- resolves relay configuration;
-- resolves cached model configuration;
-- rejects invalid pipeline stage counts;
-- rejects unsupported provider/profile values;
-- rejects malformed prompt RPC bind addresses.
-
-The resolver is the only component that should interpret raw configuration strings. Later components receive typed runtime state.
-
-### 7.2 Cached Model Resolver
-
-The cached model resolver validates host-local cached model paths and converts them into worker-visible paths.
-
-Owned state:
-
-```text
-CachedModelConfig {
-    host_path,
-    container_path,
-}
-```
-
-Behavior:
-
-- canonicalizes the host path;
-- requires the host path to point to a file;
-- derives a container path under the cached model container directory;
-- exposes the host path to process workers;
-- exposes the container path to Docker workers;
-- enables planned execution when cached-model execution is selected.
-
-Cached model paths are supported only for process and Docker providers.
-
-### 7.3 Vast.ai Runtime Preparation
-
-Vast.ai runtime preparation resolves provider-specific launch requirements before workers are started.
-
-Owned state:
-
-```text
-VastAiRuntimeConfig {
-    api_key,
-    provisioning,
-    bootstrap_command,
-    ssh_identity,
-    ssh_public_key,
-    ssh_public_fingerprint,
-}
-```
-
-Behavior:
-
-- requires an API key when Vast.ai is selected;
-- resolves the SSH identity path;
-- verifies the SSH identity file exists;
-- derives the public key from the identity;
-- ensures the public key is registered with the Vast.ai account;
-- records the prepared identity and public-key metadata into provider config;
-- requires a bootstrap command before constructing the Vast.ai provisioner.
-
-Failure in this component stops startup before worker provisioning begins.
-
-### 7.4 Run Planner
-
-The run planner is used only for planned execution.
-
-Planned execution is selected when:
-
-```text
-cached_model is present
-or pipeline_stages > 1
-```
-
-Behavior:
-
-- reads locally inspectable GGUF metadata;
-- converts metadata into model facts;
-- rejects pipeline stage counts larger than model layer count;
-- computes activation ring size;
-- computes token ring size;
-- assigns fixed linear stage placement;
-- produces a `RunPlan`.
-
-The run plan drives:
-
-- number of workers;
-- stage indexes;
-- logical node ids;
-- layer ranges;
-- token-in edge;
-- activation edges;
-- token-out edge;
-- object specs;
-- ring specs;
-- stage provisioning payloads.
-
-Direct execution skips this component.
-
-### 7.5 Provisioner Builder
-
-The provisioner builder constructs the provider implementation used to start and stop workers.
-
-Behavior by provider:
-
-- **process**  
-  Resolves the worker binary path and requires it to exist.
-
-- **Docker**  
-  Constructs a local Docker provisioner using the configured container name prefix.
-
-- **Vast.ai**  
-  Requires prepared Vast.ai config, API key, bootstrap command, and SSH identity; constructs a Vast.ai provisioning plugin backed by the Vast.ai client and SSH launcher.
-
-The orchestrator does not use the `ProvisionerActor` in the current binary. It calls the selected `ProvisionPlugin` directly.
-
-### 7.6 Provisioned Cluster Guard
-
-The provisioned-cluster guard owns worker handles after successful provider startup.
-
-Owned state:
-
-```text
-ProvisionedClusterGuard {
-    provisioner,
-    handles,
-}
-```
-
-Behavior:
-
-- stores each returned provider handle;
-- calls `complete_bootstrap` for all handles after runtime-ready acknowledgement succeeds;
-- calls `stop_node` for each handle during explicit shutdown;
-- preserves the first stop error;
-- attempts best-effort cleanup on drop if handles remain.
-
-The guard is the ownership boundary for worker cleanup. Once a handle is in the guard, the orchestrator is responsible for attempting to stop it.
-
-### 7.7 Runtime Stack and Iroh Driver
-
-The runtime stack and Iroh driver provide transport, actor delivery, routing, SWIM membership, and datastream connection acceptance.
-
-Owned state is split across:
-
-- `IrohDriver`;
-- `DistributionRuntimeStack`;
-- route view;
-- relay mirror;
-- SWIM actor state;
-- actor bridge routes;
-- runtime outbox.
-
-Behavior:
-
-- registers actor and datastream codecs;
-- enables the actor bridge;
-- registers local actor routes;
-- pumps inbound Iroh messages into actors;
-- pumps local actor runtime work;
-- drains outbound actor messages to Iroh;
-- accepts datastream connections;
-- exposes route owner and member state checks used by readiness barriers.
-
-This subcomponent is not autonomous. It advances only when the orchestrator calls the pump function.
-
-### 7.8 Prompt RPC Server
-
-The prompt RPC server accepts external prompt submissions over TCP.
-
-Owned state:
-
-```text
-Prompt RPC listener {
-    bind_addr,
-    work_tx,
-    default_max_tokens,
-}
-```
-
-Behavior:
-
-- binds the configured prompt RPC address;
-- spawns an accept loop;
-- spawns one handler thread per accepted connection;
-- reads newline-delimited `SubmitPrompt` JSON;
-- applies default max tokens when request max tokens is zero;
-- sends accepted work into the prompt work queue;
-- writes newline-delimited `PromptEvent` JSON back to the client;
-- stops writing for a request after `Done` or `Fault`.
-
-Prompt RPC starts only after runtime readiness and weight loading have completed.
-
-### 7.9 Prompt Serving Loop
-
-The prompt serving loop is the steady-state coordinator after prompt RPC is ready.
-
-Owned state:
-
-```text
-serve_prompts {
-    active: Option<ActivePrompt>,
-    optional pipeline runtime,
-}
-```
-
-Behavior:
-
-- pumps actor and transport runtime;
-- drains provider observations;
-- drains worker datastream frames;
-- drains captured orchestrator stdio;
-- checks for stop requests;
-- accepts prompt work only when no prompt is active;
-- sends direct prompt work to the worker node agent in direct mode;
-- delegates prompt work to `PipelinePromptRuntime` in pipeline mode;
-- forwards matching prompt events to the prompt RPC client;
-- drops prompt events for non-active request ids;
-- clears active prompt state on terminal prompt event.
-
-The prompt serving loop enforces the one-active-prompt rule.
-
-### 7.10 Pipeline Prompt Runtime
-
-The pipeline prompt runtime coordinates prompt execution for planned pipeline mode.
-
-Owned state:
-
-```text
-PipelinePromptRuntime {
-    token_in_edge_id,
-    token_out_edge_id,
-    token_spec,
-    token_out_spec,
-    token_in_sender,
-    recv_rx,
-    recv_tx,
-    recv_buffer,
-    tokenizer_encode_actor,
-    tokenizer_decode_actor,
-    tokenizer_reply_to,
-    pending_encode,
-    pending_decode,
-    next_sequence,
-    generated_tokens,
-    final_text,
-    active,
-    started_at,
-}
-```
-
-Behavior:
-
-- starts one active prompt;
-- requests tokenizer encode for prompt text;
-- sends encoded prompt tokens over the token-in edge;
-- receives generated token records from the token-out edge;
-- validates token sequence order;
-- requests tokenizer decode for each generated token;
-- emits text deltas to the prompt RPC client;
-- appends decoded text to final text;
-- stops on EOS or max-token limit;
-- sends `Done` on successful completion;
-- sends `Fault` on tokenizer failure or runtime error;
-- clears active prompt state after terminal output.
-
-The pipeline prompt runtime owns prompt-generation state, not worker stage state.
-
-### 7.11 Pipeline Token Sender and Receiver
-
-Pipeline token transport is handled by token sender, receiver, and acceptor helpers.
-
-Behavior:
-
-- token sender opens a unidirectional stream to the first stage endpoint;
-- token sender writes encoded token-in records;
-- token acceptor accepts incoming pipeline edge connections;
-- token receiver reads bytes from accepted streams;
-- received bytes are buffered until complete token records can be decoded.
-
-The token transport carries bytes. The pipeline prompt runtime owns record sequencing and prompt semantics.
-
-### 7.12 Orchestrator Datastream
-
-The orchestrator datastream component emits runtime observations produced by the orchestrator itself.
-
-Owned state:
-
-```text
-OrchDatastream {
-    stream,
-    endpoint,
-    producer,
-    channels,
-    channel_names,
-    archive,
-}
-```
-
-Behavior:
-
-- creates the orchestrator stream id;
-- registers core channels;
-- emits bootstrap records;
-- emits prompt records;
-- emits provisioning events;
-- emits provisioning log records;
-- emits arbitrary channel payloads from provider observations;
-- flushes frames to dashboard if enabled;
-- writes frames to the frame archive if configured.
-
-The orchestrator datastream is the primary structured observation path for orchestrator-owned events.
-
-### 7.13 Datastream Frame Archive
-
-The frame archive records datastream frames to a JSON-lines file when configured.
-
-Owned state:
-
-```text
-FrameArchive {
-    file,
-    next_seq,
-}
-```
-
-Behavior:
-
-- creates parent directories for the configured path when needed;
-- opens the archive file in append mode;
-- records frames with an arrival sequence;
-- records source, stream, channel, channel id, position, and payload;
-- encodes UTF-8 payloads as text;
-- encodes non-UTF-8 payloads as bytes;
-- flushes after each record.
-
-Without configured datastream frame logging, this component is absent.
-
-### 7.14 Orchestrator Stdio Capture
-
-The stdio capture component redirects orchestrator stdout and stderr into provisioning log records.
-
-Owned state:
-
-```text
-optional mpsc receiver of captured stdio lines
-```
-
-Behavior:
-
-- on Linux, redirects stdout and stderr through pipes;
-- spawns reader threads for captured stdout and stderr;
-- converts captured lines into `OrchStdioLine`;
-- drains captured lines into the orchestrator datastream as log records;
-- on non-capturing targets, may be absent.
-
-Captured orchestrator stdio is observability data. It is not a terminal UI contract.
-
-### 7.15 Dashboard Support
-
-Dashboard support is an optional sink for datastream frames.
-
-Owned state:
-
-```text
-optional DashboardSupport
-```
-
-Behavior:
-
-- starts only when dashboard support is enabled;
-- receives frames from orchestrator datastream flushes;
-- receives frames collected from worker datastream streams;
-- publishes frames to the dashboard handle;
-- does not affect runtime correctness when absent.
-
-Dashboard output is derived from datastream frames and does not own lifecycle state.
-
-### 7.16 Stop Listener
-
-The stop listener watches standard input for shutdown control lines.
-
-Owned state:
-
-```text
-mpsc receiver of stop notifications
-```
-
-Behavior:
-
-- runs in a background thread;
-- reads standard input line by line;
-- trims each line;
-- accepts `stop`, `shutdown`, or `quit` case-insensitively;
-- sends one stop notification;
-- causes wait loops or prompt serving to exit through controlled shutdown paths.
-
-The stop listener is not a prompt input path.
-
----
-
-## 8. Datastream and Logs
-
-Datastream is the orchestrator’s structured observation path. Logs are represented as datastream records, not as terminal UI.
-
-This section defines the datastream and log channels used by the orchestrator process. It does not define prompt RPC payloads, actor message schemas, or provider command protocols.
-
-### 8.1 Datastream Model
-
-A datastream is an ordered stream of frames.
-
-Each frame has:
-
-```text
-Frame {
-    channel,
-    position,
-    payload,
-}
-```
-
-A channel gives meaning to the payload. The datastream transport itself treats payloads as opaque bytes.
-
-The orchestrator uses datastream for:
-
-- bootstrap progress;
-- prompt progress;
-- provisioning events;
-- worker stdout/stderr logs;
-- provider logs;
-- captured orchestrator stdout/stderr logs;
-- SWIM membership observations;
-- stage route observations;
-- worker-emitted datastream frames;
-- dashboard publication;
-- optional frame archive output.
-
-Datastream records are observational. They do not drive prompt RPC response text, actor delivery, or provider lifecycle by themselves.
-
-### 8.2 Orchestrator Datastream
-
-The orchestrator creates its own datastream at startup.
-
-Its stream identity is tied to the orchestrator and the active run id.
-
-The orchestrator datastream owns:
-
-```text
-OrchDatastream {
-    stream,
-    endpoint,
-    producer,
-    channels,
-    channel_names,
-    archive,
-}
-```
-
-The orchestrator datastream registers core channels, emits records into those channels, flushes produced frames to configured sinks, and records frames to the archive when frame logging is enabled.
-
-### 8.3 Core Orchestrator Channels
-
-The orchestrator emits these core channels:
-
-```text
-mvp.orch.bootstrap
-mvp.orch.prompt
-mvp.swim.membership
-mvp.orch.stage_route
-mvp.provisioning.events
-mvp.provisioning.logs.node.<node_id>.stdout
-mvp.provisioning.logs.node.<node_id>.stderr
-mvp.provisioning.logs.node.<node_id>.provider
-```
-
-`mvp.orch.bootstrap` carries orchestrator lifecycle progress.
-
-`mvp.orch.prompt` carries prompt-serving progress.
-
-`mvp.swim.membership` carries observed membership transitions.
-
-`mvp.orch.stage_route` carries route checks during pipeline stage provisioning.
-
-`mvp.provisioning.events` carries node provisioning lifecycle events.
-
-`mvp.provisioning.logs.node.<node_id>.<stream>` carries stdout, stderr, or provider log lines for a node id.
-
-Provider-supplied datastream frames may create additional channels by name. Worker datastream frames may also use worker-defined channel names.
-
-### 8.4 Bootstrap Records
-
-Bootstrap records use this envelope:
-
-```text
-OrchBootstrap {
-    type: "OrchBootstrap",
-    phase,
-    status,
-    run_id,
-    node_id,
-    detail,
-}
-```
-
-`phase` identifies the lifecycle area being reported.
-
-`status` identifies the transition or outcome, such as:
-
-```text
-started
-ready
-failed
-sent
-observed
-```
-
-`detail` is phase-specific JSON.
-
-Bootstrap records are emitted for runtime setup, provider start/stop, node specs, readiness waiting, stage provisioning, weight loading, prompt RPC readiness, shutdown, and process exit.
-
-### 8.5 Prompt Records
-
-Prompt records use this envelope:
-
-```text
-OrchPromptEvent {
-    type: "OrchPromptEvent",
-    phase,
-    status,
-    run_id,
-    node_id,
-    request_id,
-    detail,
-}
-```
-
-Prompt records describe orchestration progress for a prompt request. They are not the prompt response stream.
-
-Prompt record phases include:
-
-- prompt work observed;
-- direct prompt send started/ready/failed;
-- direct prompt event observed/dropped;
-- prompt complete;
-- pipeline tokenizer encode started/ready;
-- pipeline token-in started/ready;
-- pipeline token-out observed;
-- pipeline tokenizer decode started/ready.
-
-Prompt response text is emitted through prompt RPC as `PromptEvent`. Prompt datastream records are diagnostic and observational.
-
-### 8.6 Provisioning Event Records
-
-Provisioning lifecycle events are emitted on:
-
-```text
-mvp.provisioning.events
-```
-
-Record shape:
-
-```text
-MvpProvisionEventRecord {
-    event: ProvisionEvent,
-}
-```
-
-Provision event shape:
-
-```text
-ProvisionEvent {
-    run_id,
-    node_id,
-    kind,
-    provider,
-    message,
-}
-```
-
-Accepted event kinds:
-
-```text
-ProvisionStart
-NodeLive
-ProvisionFailed
-NodeStopped
-```
-
-Provisioning events are emitted when provider startup begins, nodes become live, provider startup fails, or nodes stop.
-
-### 8.7 Provisioning Log Records
-
-Provisioning logs are emitted on node-specific log channels:
-
-```text
-mvp.provisioning.logs.node.<node_id>.stdout
-mvp.provisioning.logs.node.<node_id>.stderr
-mvp.provisioning.logs.node.<node_id>.provider
-```
-
-Record shape:
-
-```text
-MvpProvisionLogRecord {
-    line: ProvisionLogLine,
-}
-```
-
-Log line shape:
-
-```text
-ProvisionLogLine {
-    run_id,
-    node_id,
-    stream,
-    line,
-}
-```
-
-Accepted log streams:
-
-```text
-Stdout
-Stderr
-Provider
-```
-
-Worker stdout, worker stderr, provider log lines, and captured orchestrator stdout/stderr are represented through this log record format.
-
-Log lines are observational. They are not parsed as commands.
-
-### 8.8 Orchestrator Stdio Logs
-
-After stdio capture is installed, orchestrator stdout and stderr are redirected into log records.
-
-Captured stdout becomes a provisioning log record with stream `Stdout`.
-
-Captured stderr becomes a provisioning log record with stream `Stderr`.
-
-The capture path is used so startup/runtime diagnostics appear in the same datastream/log stream as worker and provider logs.
-
-Fatal errors before capture may still appear on process stderr.
-
-### 8.9 Provider Observation Logs
-
-Provider plugin observations are converted into datastream output.
-
-Conversion rules:
-
-- `StdoutLine` becomes a provisioning stdout log record.
-- `StderrLine` becomes a provisioning stderr log record.
-- `ProviderLine` becomes a provisioning provider log record.
-- `DatastreamFrame` is emitted to the supplied channel as a raw payload.
-- `Exited` becomes a provisioning node-stopped event.
-- `Failed` becomes a provisioning failed event.
-
-Provider observation logs keep provider output visible without making provider stdout/stderr a direct user interface contract.
-
-### 8.10 Worker Datastream Collection
-
-Worker datastream frames arrive over the datastream ALPN.
-
-The orchestrator accepts datastream connections and reads:
-
-- stream headers;
-- channel declarations;
-- frame deliveries;
-- stream end notifications.
-
-For each frame, the orchestrator records:
-
-- source stream id;
-- channel name;
-- channel id;
-- frame position;
-- payload bytes.
-
-Collected worker frames are forwarded to configured sinks:
-
-```text
-worker datastream frame
--> dashboard, if enabled
--> frame archive, if configured
-```
-
-Worker datastream frames are not re-emitted through prompt RPC.
-
-### 8.11 Dashboard Sink
-
-The dashboard receives datastream frames when dashboard support is enabled.
-
-The dashboard sink consumes frames from:
-
-- orchestrator datastream flushes;
-- collected worker datastream frames.
-
-Dashboard state is derived from datastream frames. The dashboard is not the source of runtime truth.
-
-If dashboard support is disabled, the orchestrator still runs and emits datastream frames to other configured sinks.
-
-### 8.12 Frame Archive
-
-The frame archive is enabled by datastream frame log configuration.
-
-Frame archive output is JSON lines.
-
-Archive record shape:
-
-```text
-FrameArchiveRecord {
-    arrival_seq,
-    source,
-    stream,
-    channel,
-    channel_id,
-    position,
-    payload,
-}
-```
-
-`arrival_seq` is assigned by the archive and increases for each archived frame.
-
-`position` is the frame position inside its source datastream.
-
-`source` identifies the ingestion path, such as orchestrator-originated frames, node bootstrap stdio frames, or node cluster datastream frames.
-
-Payload encoding is recorded as either:
-
-```text
-{ encoding: "utf8", value: <text> }
-```
-
-or:
-
-```text
-{ encoding: "bytes", value: <bytes> }
-```
-
-The archive may create parent directories for the configured path.
-
-Without frame logging, the frame archive component is absent.
-
-### 8.13 Ordering and Scope
-
-Frame ordering is local to its stream and channel position.
-
-Archive `arrival_seq` is the archive’s observed arrival order, not a global runtime ordering guarantee.
-
-Datastream frames from different streams may interleave.
-
-Log line ordering is preserved only to the extent that the producing stream, capture pipe, provider observation channel, and archive arrival order preserve it.
-
-### 8.14 Secret Handling
-
-Secret values must not be emitted as datastream payloads or log lines by orchestrator-owned records.
-
-The orchestrator may emit secret presence as metadata, such as whether a Vast.ai API key is configured.
-
-External tools and providers may produce output outside the orchestrator’s control. The orchestrator should avoid copying secret values into structured records when it handles provider errors.
-
-### 8.15 Datastream Non-Goals
-
-Datastream is not:
-
-- prompt RPC;
-- actor transport;
-- provider control;
-- worker stdin;
-- an ordering authority across all runtime systems;
-- a replacement for lifecycle gates.
-
-Lifecycle gates are driven by explicit actor reports, provider results, process/control inputs, and runtime state checks. Datastream records explain what happened; they do not by themselves make the runtime ready, failed, or stopped.
-
----
-
-## 9. Behavioral Contracts
-
-Behavioral contracts are runtime invariants that callers, wrappers, tests, and maintainers may rely on.
-
-### 9.1 Configuration Must Resolve Before Runtime Startup
-
-The orchestrator must resolve configuration before it initializes the runtime stack or starts workers.
-
-Configuration failure must prevent worker provisioning.
-
-Configuration failures include:
-
-- unknown process arguments;
-- missing process-argument values;
-- unsupported runtime profile;
-- unsupported provider;
-- invalid prompt RPC bind address;
-- invalid pipeline stage count;
-- invalid cached model path when cached model execution is selected;
-- missing worker binary for process provider;
-- missing Vast.ai requirements when Vast.ai is selected.
-
-The mock provider is not a supported orchestrator runtime provider.
-
-### 9.2 Provider Constraints Must Be Enforced Before Provisioning
-
-Provider-specific constraints must be checked before workers are started.
-
-Contracts:
-
-- process provider requires a local worker binary;
-- Docker provider may use Docker GPU and mount settings;
-- cached model host paths are supported only for process and Docker providers;
-- Vast.ai requires prepared API and SSH configuration;
-- Vast.ai does not support multi-stage pipeline provisioning in the current orchestrator contract.
-
-A provider constraint failure must stop startup before node provisioning.
-
-### 9.3 Planned Execution Requires Local Model Metadata
-
-Planned execution requires locally inspectable GGUF metadata before provisioning.
-
-Planned execution is selected when:
-
-```text
-cached_model is present
-or pipeline_stages > 1
-```
-
-The orchestrator must reject planned execution when it cannot inspect the selected GGUF metadata locally.
-
-The orchestrator must reject a pipeline stage count greater than the model layer count.
-
-### 9.4 Prompt RPC Must Start After Runtime Readiness
-
-Prompt RPC must not be advertised or bound as ready until workers are ready and weights are loaded.
-
-Required prerequisites:
-
-```text
-workers started
-runtime-ready reports received
-SWIM membership alive
-actor routes owned by expected workers
-runtime-ready acknowledgements completed
-stage provisioning sent
-weights loaded
-```
-
-If these prerequisites fail, prompt RPC startup must not be reported as ready.
-
-### 9.5 Worker Runtime Readiness Requires More Than a Worker Report
-
-A worker runtime-ready report is necessary but not sufficient.
-
-A worker is ready only when all readiness facts are true:
+A worker is runtime-ready only when all facts are true:
 
 ```text
 matching NodeRuntimeReady report
-+ SWIM member state is Alive
-+ route owner for node actor matches worker node
-= worker ready
++ expected run_id / node_id / stage_index
++ SWIM member state is Alive for the worker endpoint node id
++ route owner for node_actor is the worker endpoint node id
++ no provider/node failure has been reported
+= runtime readiness barrier passed for that worker
 ```
 
-For planned pipeline execution, every expected worker must satisfy this barrier.
+For planned pipeline execution, every expected stage worker must pass this barrier. For direct execution, the single expected worker must pass it.
 
-For direct execution, the single expected worker must satisfy this barrier.
+A TCP port, dashboard frame, provider log line, worker stdout line, or datastream frame must not satisfy runtime readiness.
 
-### 9.6 Runtime-Ready Acknowledgement Must Complete
+### 6.5 Runtime-Ready Acknowledgement
 
-After readiness barriers pass, the orchestrator must send runtime-ready acknowledgements to every expected worker.
+After a worker passes the readiness barrier, the orchestrator sends:
 
-The acknowledgement must include:
+```text
+NodeAgentMsg::RuntimeReadyAck {
+    run_id,
+    node_id,
+    stage_index,
+    readiness_id,
+}
+```
+
+The orchestrator must keep actor/transport progress running while waiting for acknowledgement reports.
+
+If acknowledgement is not observed after the configured retry/timeout policy, startup fails.
+
+If the datastream publisher route is available, the orchestrator may subscribe to worker datastream output during this phase. Subscription success is observability setup, not readiness authority.
+
+### 6.6 Stage Provisioning
+
+Stage provisioning occurs after runtime-ready acknowledgement.
+
+Direct execution provisions one stage. Pipeline execution provisions stages from the committed run plan.
+
+Stage provision payloads must include:
 
 ```text
 run_id
+orchestrator authority identity
 node_id
 stage_index
-readiness_id
+stage_count
+layer range
+inbound edge id and facts
+outbound edge id and facts
+model identity
+GGUF/model source
+tokenizer source
+object specs
+ring specs
+consumer endpoint facts
 ```
 
-The orchestrator retries acknowledgements until all expected acknowledgement reports arrive or the acknowledgement timeout expires.
+A stage must reject unauthorized provisioning. `authorized_orchestrator` must be a stable orchestrator authority identity for the run, not a placeholder value.
 
-Timeout is a startup failure.
+### 6.7 Weights and Stage Readiness
 
-### 9.7 Stage Provisioning Must Follow Readiness
+A stage is ready only after the worker-side stage controller has observed all local readiness prerequisites:
 
-Stage provisioning must occur after worker readiness and runtime-ready acknowledgement.
+```text
+valid provision accepted
++ worker runtime ready
++ weights ready
++ inbound edge ready
++ outbound edge ready
+= StageReady
+```
 
-Direct execution provisions one stage.
+In planned pipeline execution, stages are weight-loaded/provisioned sequentially unless a later spec explicitly introduces parallel load behavior. The orchestrator must not advance to the next unloaded stage until the active stage reports weights ready or faults.
 
-Planned pipeline execution provisions stages from the run plan.
+### 6.8 Prompt Serving Readiness
 
-Stage provisioning must include the model identity, tokenizer source, layer range, stage index, stage count, and edge wiring needed by that stage.
+The orchestrator reports prompt-ready only after:
 
-A stage fault during provisioning or weight loading is a startup failure.
+```text
+all expected workers provisioned
++ runtime readiness barriers passed
++ runtime-ready acknowledgements completed
++ stages provisioned
++ required weights/stages ready
++ token endpoints ready when pipeline mode uses them
+```
 
-### 9.8 Pipeline Weight Loading Is Sequential
+Prompt-ready is an actor/datastream lifecycle state, not a TCP listener state.
 
-In planned pipeline execution, stages are weight-loaded sequentially.
+---
 
-The orchestrator must not advance to the next unloaded stage until the active stage reports weights ready.
+## 7. Prompt Behavior
 
-If a stage faults while loading weights, pipeline startup fails.
+The orchestrator accepts at most one active prompt at a time. Additional prompt submissions remain pending in actor/mailbox order unless the actor group exposes a bounded queue and returns a typed `Fault` or rejection when full.
 
-If a worker exits while loading weights, pipeline startup fails.
+Prompt events are matched by `request_id`. Events for a non-active request must not advance the active prompt.
 
-### 9.9 Prompt Serving Allows One Active Prompt
+### 7.1 Direct Prompt Mode
 
-The orchestrator accepts at most one active prompt at a time.
+Direct mode is used when no pipeline token-edge runtime is active.
 
-While a prompt is active:
+Flow:
 
-- additional prompt work remains queued;
-- direct prompt events are matched by request id;
-- pipeline tokenizer events are matched by request id;
-- mismatched prompt or tokenizer events are ignored or dropped for the active prompt.
+```text
+SubmitPrompt actor message
+-> active prompt state
+-> NodeAgentMsg::InferPrompt { request_id, prompt, max_tokens, reply_to }
+-> worker prompt engine
+-> PromptEvent actor messages to reply target
+-> terminal Done or Fault
+```
 
-A terminal prompt event clears active prompt state.
+The prompt reply target must be supplied to the worker node agent. A send failure to the node actor is a prompt-serving error for that request and may become a run fault if the worker path is no longer usable.
 
-### 9.10 Prompt Terminal Events End a Request
+### 7.2 Pipeline Prompt Mode
 
-A prompt request ends with exactly one terminal outcome:
+Pipeline mode uses actor messages for tokenizer work and token-edge transport for generated token records.
+
+Flow:
+
+```text
+SubmitPrompt actor message
+-> tokenizer encode actor
+-> TokenizerEvent::PromptEncoded
+-> token-in edge bytes
+-> pipeline stages
+-> token-out edge bytes
+-> tokenizer decode actor
+-> TokenizerEvent::TokensDecoded
+-> PromptEvent::TextDelta / Done / Fault
+```
+
+The first-stage node actor is the tokenizer encode actor unless the run request explicitly supplies a different tokenizer actor. The final-stage node actor is the tokenizer decode actor unless explicitly supplied otherwise.
+
+Token-edge bytes are data-plane traffic. They must not be carried in actor mailboxes.
+
+### 7.3 Token Sequence Rule
+
+Pipeline token output records must be consumed in strict sequence order.
+
+Expected rule:
+
+```text
+first expected token-out sequence = 0
+received sequence must equal expected
+on valid sequence: expected += 1
+on EOS or max_tokens: complete prompt
+on mismatch: fault prompt or run according to phase policy
+```
+
+Sequence validation protects prompt output order and prevents feedback injection out of order.
+
+### 7.4 Prompt Terminal Rule
+
+A prompt ends with exactly one terminal event:
 
 ```text
 Done
 Fault
 ```
 
-`TextDelta` is non-terminal.
+Expected model/prompt failures should become prompt `Fault` events. Infrastructure failures that make the run unusable may also fault the run.
 
-After `Done` or `Fault`, the prompt RPC response stream for that request is complete.
+After a terminal prompt event, the active prompt state is cleared and the next pending prompt may begin if the run is still prompt-ready.
 
-Expected model or prompt failures should be represented as prompt `Fault` events, not as orchestrator process errors, unless the orchestration path itself failed.
+---
 
-### 9.11 Direct Prompt Mode Must Use Node Actor Inference
+## 8. Shutdown and Teardown
 
-In direct prompt mode, the orchestrator must send prompt work to the worker node actor as an inference command.
+Shutdown begins from one of these actor-visible causes:
 
-Direct prompt flow:
+- `RequestShutdown`;
+- terminal prompt-serving policy for one-shot runs;
+- stage fault;
+- endpoint fault;
+- membership loss;
+- provider/node failure;
+- host-declared fatal dependency failure.
 
-```text
-SubmitPrompt
--> NodeAgentMsg::InferPrompt
--> PromptEvent
--> prompt RPC stream
-```
-
-The prompt reply actor address must be supplied as `reply_to`.
-
-### 9.12 Pipeline Prompt Mode Must Use Tokenizer and Token Edges
-
-In pipeline prompt mode, prompt text must flow through tokenizer encode, token-in edge, pipeline stages, token-out edge, tokenizer decode, and prompt RPC.
-
-Pipeline prompt flow:
+The orchestrator must emit or send teardown commands:
 
 ```text
-SubmitPrompt
--> EncodePrompt
--> PromptEncoded
--> token-in edge
--> token-out edge
--> DecodeTokens
--> TokensDecoded
--> prompt RPC stream
+RunCommand::StopRun for each provisioned stage
+RunCommand::TearDownTokenEndpoints when token endpoints exist
+ProvisionerMsg::StopNodes for provider-owned workers
 ```
 
-The first-stage node actor is the tokenizer encode actor.
+Worker stage teardown is complete only after every expected `StageStopped` report is observed. Token endpoint teardown is complete only after token endpoint stopped state is observed. Provider teardown is complete only after `ProvisionerReport::NodesStopped` or a typed provider stop failure is observed.
 
-The final-stage node actor is the tokenizer decode actor.
+`RunTornDown` is emitted once, after all required teardown facts are observed.
 
-Tokenizer failures become prompt faults for the active request.
+Cleanup is best effort for external resources. A successful actor stop sequence proves only that the actor-managed stop calls completed. It does not prove that a cloud provider or OS removed every external resource.
 
-### 9.13 Pipeline Token Sequence Must Be Monotonic
+---
 
-Pipeline token output records must arrive in the expected sequence order.
+## 9. Error and Fault Model
 
-The orchestrator tracks the next expected token sequence.
+Errors are reported through typed lifecycle reports, prompt events, provisioner reports, and datastream records.
 
-If a received token record sequence does not equal the expected sequence, prompt serving fails.
+### 9.1 Run Rejection
 
-Sequence validation protects prompt output ordering and prevents feeding token feedback out of order.
+Run rejection occurs before provisioning. Examples:
 
-### 9.14 Runtime Pumping Is Required for Progress
+- invalid typed run request;
+- invalid committed plan;
+- missing provisioner actor;
+- missing required provider preparation result;
+- missing model/tokenizer facts;
+- unsupported provider policy;
+- unsupported pipeline shape.
 
-Actor delivery, Iroh transport, SWIM membership, route ownership, datastream connection acceptance, provider observation draining, and prompt progress require the orchestrator pump loop to run.
+A rejected run must not provision workers.
 
-A wait loop must keep pumping runtime work while waiting for actor or transport-driven facts.
+### 9.2 Startup Fault
 
-A blocking wait that does not pump runtime work violates the runtime model.
+Startup fault occurs after a run is accepted but before prompt-ready. Examples:
 
-### 9.15 Provider Failures Are Fatal in Active Runtime Phases
+- provisioning failure;
+- worker exit before readiness;
+- runtime-ready report mismatch for expected worker;
+- membership never reaches alive state within policy;
+- route owner never matches expected worker;
+- runtime-ready acknowledgement timeout;
+- stage provisioning send failure;
+- stage fault while loading weights;
+- provider failure before prompt-ready.
 
-Provider observations can fail startup or prompt serving.
+Startup fault triggers teardown for any started workers.
 
-Contracts:
+### 9.3 Prompt-Serving Fault
 
-- provider failure before readiness is a startup failure;
-- worker exit before readiness is a startup failure;
-- worker exit while loading weights is a startup failure;
-- worker exit during prompt serving is a runtime failure;
-- provider stop failure is a shutdown failure.
+Prompt-serving fault occurs after prompt-ready. Examples:
 
-Provider stdout/stderr/provider log lines are observational and do not by themselves indicate failure.
+- actor send failure to an active worker path;
+- tokenizer actor send failure;
+- tokenizer fault;
+- token sequence violation;
+- token record decode failure;
+- worker exit during active serving;
+- provider failure during active serving;
+- membership loss for an active worker.
 
-### 9.16 Shutdown Must Attempt Worker Cleanup
+A prompt-local fault may be returned as `PromptEvent::Fault` without faulting the entire run when the run remains usable. A worker/runtime fault must fault the run.
 
-Once worker handles are owned by the provisioned-cluster guard, the orchestrator must attempt to stop all remaining workers on shutdown.
+### 9.4 Teardown Fault
 
-Shutdown cleanup is best-effort.
+Teardown fault occurs when actor-managed stop/cleanup reports a failure. The orchestrator must continue attempting remaining stop actions and preserve the first stop failure for reporting.
 
-The orchestrator preserves and reports the first provider-stop error from explicit shutdown.
+### 9.5 Secret Redaction
 
-The guard also attempts cleanup on drop if handles remain.
+Secret values must not appear in orchestrator-owned lifecycle, prompt, or datastream records.
 
-Cleanup success does not prove that all external provider resources were removed; it only proves that the orchestrator’s provider stop calls completed successfully.
+Secrets include:
 
-### 9.17 Stop Commands Are Controlled Shutdown Requests
+- provider API keys;
+- Hugging Face tokens;
+- SSH private-key material;
+- provider credentials;
+- raw bearer/session tokens.
 
-The accepted standard-input stop commands are:
+Secret presence may be reported as metadata. Secret values must not be copied.
 
-```text
-stop
-shutdown
-quit
-```
+---
 
-They are trimmed and compared case-insensitively.
+## 10. Actor Message Filtering
 
-A stop command requests controlled shutdown. It is not a prompt request.
-
-### 9.18 Datastream Is Observational
-
-Datastream records do not make runtime state true.
-
-Readiness, provisioning, prompt completion, failure, and shutdown are driven by actor reports, provider results, runtime state checks, prompt events, and explicit control inputs.
-
-Datastream records may describe those transitions, but they are not lifecycle gates.
-
-### 9.19 Actor Reports Must Match Active Context
-
-Actor reports must match the active run and expected target before they can advance lifecycle state.
+Reports must match the active orchestration context before they can advance state.
 
 Filtering rules:
 
 - run-scoped reports must match `run_id`;
-- worker readiness reports must match expected `node_id`;
-- stage reports must match expected `stage_index`;
-- prompt events must match active `request_id`;
-- tokenizer events must match active `request_id`.
+- worker reports must match an expected `node_id`;
+- stage reports must match an expected `stage_index`;
+- runtime-ready ack reports must match `readiness_id`;
+- prompt events must match the active `request_id`;
+- tokenizer events must match the active `request_id`;
+- route ownership must match the worker endpoint node identity;
+- membership facts must apply to the expected worker node identity.
 
-Mismatched reports are ignored or dropped for the active lifecycle path.
-
-### 9.20 Secrets Must Not Be Emitted by Orchestrator-Owned Records
-
-Orchestrator-owned datastream records and logs must not emit secret values.
-
-Allowed secret-related output is limited to presence metadata, such as whether a Vast.ai API key is configured.
-
-Provider tools may emit output outside the orchestrator’s control. When the orchestrator handles provider errors, it should redact or avoid copying secret values into structured records.
+Mismatched reports are ignored, dropped, or reported as diagnostic observations according to phase policy. They must not make the active lifecycle progress.
 
 ---
 
-## 10. Error Handling
+## 11. Datastream and Logs
 
-The orchestrator treats errors as phase-specific failures. Each failure should identify the phase that failed and the concrete operation or runtime condition that failed.
+Datastream is the structured observation path. It is not the control path.
 
-Top-level process error format:
+The orchestrator actor/group may publish:
 
-```text
-mvp-orchestrator: <error>
-```
+- run accepted/rejected/faulted/completed/torn-down records;
+- planning records;
+- provisioning request/result records;
+- runtime readiness barrier records;
+- route and membership observations;
+- prompt accepted/dispatched/delta/completed/faulted records;
+- stage provision/ready/fault/stopped records;
+- shutdown progress records;
+- provider/provisioner log records received from actor-managed leaves;
+- worker datastream frames collected through datastream subscriptions.
 
-Top-level process exit code:
+Provider logs, worker stdout/stderr, managed-process lifecycle records, and dashboard frames are adapter-owned observations. They may be included in the orchestrator observation stream, but they do not become orchestrator actor inputs unless translated into typed actor reports by their owning actors.
 
-```text
-0 = successful completion or controlled shutdown
-1 = configuration, startup, provisioning, prompt-serving, shutdown, or runtime failure
-```
-
-### 10.1 Error Propagation Model
-
-Most orchestrator operations return:
-
-```text
-Result<(), String>
-```
-
-or a typed success value with `String` error:
-
-```text
-Result<T, String>
-```
-
-The top-level `run()` function propagates the first unrecovered fatal error.
-
-When prompt serving has already started, shutdown combines two results:
-
-```text
-prompt-serving result
-provider-stop result
-```
-
-The process succeeds only when both succeed.
-
-If prompt serving fails, the orchestrator still attempts provider stop.
-
-If provider stop fails, the first provider-stop error is preserved and returned.
-
-### 10.2 Configuration Errors
-
-Configuration errors happen before worker provisioning.
-
-Configuration errors include:
-
-- unreadable or invalid TOML;
-- unsupported runtime profile;
-- unsupported provider;
-- unknown process argument;
-- missing process-argument value;
-- invalid integer value;
-- invalid floating-point value;
-- invalid boolean value;
-- invalid prompt RPC bind address;
-- pipeline stage count of zero;
-- pipeline stage count unsupported by the selected provider;
-- missing process worker binary;
-- invalid cached model path;
-- cached model path selected with unsupported provider;
-- missing required Vast.ai API key;
-- missing required Vast.ai bootstrap command;
-- missing or invalid Vast.ai SSH identity.
-
-Configuration errors must stop startup before workers are provisioned.
-
-### 10.3 Runtime Initialization Errors
-
-Runtime initialization errors happen while creating local orchestration services.
-
-Runtime initialization errors include:
-
-- failure to install stdio capture;
-- failure to open the datastream frame archive;
-- failure to create the Tokio runtime;
-- failure to create the Iroh driver;
-- failure to create the distribution runtime stack;
-- failure to create local actor inboxes;
-- failure to spawn the local orchestrator actor;
-- failure to register local actors with the actor bridge;
-- failure to start dashboard support;
-- failure to create the pipeline edge endpoint.
-
-When possible, runtime initialization failures emit a bootstrap failure record before returning the error.
-
-### 10.4 Planning Errors
-
-Planning errors happen before workers are started.
-
-Planning errors include:
-
-- selected GGUF source is remote when local inspection is required;
-- selected local GGUF path does not exist or is not a file;
-- GGUF metadata cannot be read;
-- GGUF metadata cannot be converted into model facts;
-- requested pipeline stage count exceeds model layer count;
-- activation ring sizing overflows;
-- token ring sizing overflows;
-- run planner rejects the requested placement or model facts.
-
-Planning errors stop startup before provider provisioning.
-
-### 10.5 Provider Preparation Errors
-
-Provider preparation errors happen before or during provider construction.
-
-Provider preparation errors include:
-
-- process provider worker binary missing;
-- Docker provisioner setup failure;
-- Vast.ai API client construction failure;
-- Vast.ai SSH identity resolution failure;
-- Vast.ai public-key derivation failure;
-- Vast.ai account key lookup failure;
-- Vast.ai account key registration failure;
-- missing Vast.ai bootstrap command;
-- missing prepared Vast.ai SSH identity.
-
-Provider preparation errors stop startup before workers are started.
-
-### 10.6 Provisioning Errors
-
-Provisioning errors happen while starting workers.
-
-Provisioning errors include:
-
-- provider `start_node` returns an error;
-- provider reports `Failed`;
-- provider reports worker `Exited` before readiness;
-- worker process exits before ready;
-- Docker container exits before ready;
-- remote provider bootstrap fails before ready.
-
-If one worker fails to start after earlier workers started in the same provisioning attempt, the orchestrator must stop the already-started workers before returning the provisioning error.
-
-Once the provisioned-cluster guard owns worker handles, the guard is responsible for cleanup attempts.
-
-### 10.7 Runtime Readiness Errors
-
-Runtime readiness errors happen while waiting for workers to become usable.
-
-Readiness errors include:
-
-- shutdown requested while waiting for node ready;
-- provider failure while waiting for node ready;
-- worker exit while waiting for node ready;
-- missing expected runtime-ready report;
-- runtime-ready report for unexpected run or node;
-- SWIM membership never reaches required alive state;
-- actor route owner never matches expected worker;
-- runtime-ready acknowledgement timeout;
-- failure to send runtime-ready acknowledgement.
-
-Readiness wait loops must keep pumping actor and transport runtime while waiting.
-
-Some readiness waits do not have a fixed timeout. They end only when readiness succeeds, a shutdown request arrives, or a failure is observed.
-
-### 10.8 Stage Provisioning and Weight Loading Errors
-
-Stage provisioning and weight loading errors happen after runtime readiness and before prompt RPC readiness.
-
-Errors include:
-
-- unplanned single-stage execution missing required layer range;
-- failure to send `ProvisionStage`;
-- missing runtime-ready state for a planned stage;
-- missing consumer endpoint for a planned edge;
-- failure to derive stage provisioning from the run plan;
-- stage fault while loading weights;
-- worker exit while loading weights;
-- provider failure while loading weights;
-- shutdown requested while loading weights.
-
-A stage fault during weight loading is a startup failure.
-
-Prompt RPC must not be reported ready after a stage provisioning or weight-loading failure.
-
-### 10.9 Prompt RPC Errors
-
-Prompt RPC errors happen while binding, reading, writing, or forwarding prompt work.
-
-Errors include:
-
-- failure to bind the configured prompt RPC socket;
-- failure to read the bound socket address;
-- failure to clone a prompt TCP stream;
-- malformed prompt request JSON;
-- prompt work queue stopped;
-- failure to serialize a prompt response;
-- failure to write a prompt response;
-- failure to flush a prompt response.
-
-Prompt RPC bind failure is a startup failure.
-
-Malformed prompt request handling is scoped to the client connection. It does not by itself require the orchestrator process to fail unless it stops prompt serving or exposes a runtime error.
-
-### 10.10 Prompt Serving Errors
-
-Prompt serving errors happen after prompt RPC is ready.
-
-Errors include:
-
-- provider reports failure;
-- provider reports worker exit;
-- actor send failure for direct prompt inference;
-- actor send failure for tokenizer encode/decode;
-- pipeline token-in sender stops;
-- pipeline token sequence violation;
-- token record decode failure;
-- shutdown channel behavior that prevents controlled exit.
-
-Expected prompt-level faults are not prompt-serving errors.
-
-Prompt-level faults include:
-
-- worker returns `PromptEvent::Fault`;
-- tokenizer returns `TokenizerEvent::Fault`.
-
-Prompt-level faults should be returned to the prompt RPC client as prompt `Fault` events for the active request.
-
-### 10.11 Datastream and Log Errors
-
-Datastream and log errors are split into startup errors and best-effort observation errors.
-
-Startup datastream/log errors include:
-
-- failure to create parent directories for the configured frame archive path;
-- failure to open the configured frame archive file;
-- failure to initialize the orchestrator datastream endpoint.
-
-These are startup failures.
-
-Best-effort observation errors include:
-
-- malformed datastream frame from a node;
-- closed datastream connection;
-- per-frame archive write failure after archive open;
-- dashboard publication failure, when the dashboard sink can drop or reject frames without affecting runtime state.
-
-Best-effort observation errors should not change lifecycle state unless the code explicitly treats them as fatal.
-
-### 10.12 Actor Delivery Errors
-
-Actor delivery errors happen when sending through the Swactor runtime fails.
-
-Actor send failures are phase errors.
-
-Examples:
-
-- failure to send runtime-ready acknowledgement;
-- failure to send datastream subscription request;
-- failure to send stage provisioning;
-- failure to send direct prompt inference;
-- failure to send tokenizer encode request;
-- failure to send tokenizer decode request.
-
-The error belongs to the lifecycle phase that attempted the send.
-
-A successful send means the actor runtime accepted the message for delivery. It does not prove the remote actor processed the message.
-
-### 10.13 Provider Stop Errors
-
-Provider stop errors happen during explicit shutdown or guard cleanup.
-
-Explicit provider stop behavior:
-
-- stop every remaining worker handle;
-- preserve the first stop error;
-- continue attempting to stop remaining handles;
-- return the first stop error after all handles have been attempted.
-
-Drop cleanup behavior:
-
-- attempt to stop remaining handles;
-- ignore stop errors because drop cannot return them.
-
-Provider stop failure makes the orchestrator exit with failure unless a prior fatal error is already being reported.
-
-### 10.14 Controlled Shutdown
-
-Controlled shutdown is requested by standard input control words:
-
-```text
-stop
-shutdown
-quit
-```
-
-Controlled shutdown is not an error by itself.
-
-A controlled shutdown succeeds only if prompt serving exits cleanly and provider stop succeeds.
-
-If controlled shutdown is requested while startup is waiting for readiness or weight loading, the wait loop returns a shutdown-requested error for that startup phase.
-
-### 10.15 Error Reporting Through Datastream
-
-When the orchestrator has a datastream available, it should emit failure records for the phase that failed.
-
-Failure records should include:
-
-- phase;
-- status `failed`;
-- run id;
-- node id when applicable;
-- provider when applicable;
-- error string or reason.
-
-Datastream failure records are diagnostic. The actual process result is still determined by returned errors and provider stop result.
-
-### 10.16 Secret Redaction
-
-Error messages and datastream failure records must avoid exposing configured secrets.
-
-Secrets include:
-
-- Vast.ai API keys;
-- Hugging Face tokens;
-- SSH private-key material;
-- provider credentials.
-
-Secret presence may be reported. Secret values must not be copied into orchestrator-owned records.
+Frame archive output, when enabled by the host, is a datastream subscriber. It does not own lifecycle state and must not affect runtime behavior when absent.
 
 ---
 
-## 11. Out of Scope
+## 12. Verification Requirements
 
-This document defines the orchestrator contract. It does not define every subsystem the orchestrator calls, hosts, or observes.
+Conforming systems must be verified by behavior, not by matching a preferred internal file layout.
 
-Out of scope:
+### 12.1 Boundary Checks
 
-- `mvp-chat` behavior, including interactive terminal UX, wrapper argument parsing, image preparation, rebuild policy, and user-facing prompt formatting.
+Boundary compliance assertions:
 
-- Worker-node internals, including model execution, TinyGrad helper behavior, CUDA behavior, worker process command protocol, weight loading implementation, tensor allocation, and device cleanup details.
+- the orchestrator actor does not define process exit status;
+- prompt submission is actor message delivery, not TCP RPC;
+- CLI/env/TOML parsing happens outside the actor contract;
+- shutdown is not standard-input stop-word handling;
+- the orchestrator actor does not own stdout/stderr;
+- spawning the orchestrator actor does not execute a separate orchestrator binary;
+- worker processes are supervised by host, provider, or process actors.
 
-- Model quality, sampling quality, tokenizer correctness, generated text quality, or semantic correctness of model outputs.
+### 12.2 Engine-Agnostic Spawn Check
 
-- GGUF format semantics beyond the orchestrator’s need to inspect metadata for planned execution.
+Start an engine with the reusable swactor + iroh-driver stack. Spawn the orchestrator actor/group into that engine, register its route, and drive only the generic pump:
 
-- Docker image construction, Dockerfile contents, registry authentication, image freshness, image tagging policy, image push behavior, and image garbage collection.
+```text
+tick_protocol_actors
+-> pump_inbound_to_actors
+-> runtime tick/run progress
+-> drain_outbox
+-> datastream adapter progress when enabled
+```
 
-- Docker daemon behavior beyond the provider result and observations returned to the orchestrator.
+Assert the orchestrator accepts a typed run request and emits actor reports without executing a separate orchestrator binary or binding prompt RPC.
 
-- Vast.ai marketplace semantics, offer selection quality, billing behavior, host reliability, remote image pull behavior, and remote shell behavior beyond provider success, failure, logs, and bootstrap status.
+### 12.3 Actor Delivery Check
 
-- SSH protocol details, SSH agent behavior, host key policy, key generation UX, and remote shell semantics beyond the orchestrator’s use of a configured identity and provider bootstrap launcher.
+Send orchestrator messages locally and, where applicable, through the iroh actor bridge. Assert reports arrive through actor reply targets/inboxes. Remote delivery must depend on codec registration and route ownership, not on hardcoded address construction.
 
-- Iroh protocol internals, relay implementation details, NAT traversal behavior, transport congestion behavior, and cryptographic details beyond the actor and datastream connectivity required by this contract.
+### 12.4 Run FSM Checks
 
-- Swactor runtime internals beyond actor addressing, message delivery through the local runtime, and Iroh actor bridge integration used by the orchestrator.
+Keep or extend black-box FSM checks:
 
-- Datastream library internals beyond the frame, channel, record, dashboard, and archive behavior stated in this document.
+- planning/provisioning starts only after pool/plan prerequisites;
+- stage readiness and token endpoint readiness gate initial prompt injection;
+- token feedback injects the next sequence only after consuming the previous sequence;
+- EOS and max token limit stop generation;
+- the first run fault is terminal and sticky;
+- operator stop is terminal and distinct from fault;
+- teardown emits stop commands and `RunTornDown` only after every stage and token endpoint stop is observed.
 
-- Dashboard rendering semantics, dashboard UI layout, dashboard persistence, and dashboard query APIs.
+### 12.5 Readiness Checks
 
-- Full security threat model, authentication model, authorization model, secret storage policy, or audit-log policy.
+Verify prompt-ready is not emitted until:
 
-- External provider resource cleanup guarantees after the orchestrator has issued its provider stop calls.
+- expected runtime-ready actor reports arrive;
+- SWIM membership is alive for each worker endpoint node id;
+- route owner for each node actor matches that worker node id;
+- runtime-ready acknowledgements are observed;
+- stage provisioning is sent;
+- weights/stage readiness is observed.
 
-- Cross-process supervision outside the orchestrator process.
+Negative checks:
 
-- Long-term compatibility guarantees for implementation-private phase names, debug details, or non-contract telemetry fields.
+- TCP port availability must not make readiness true;
+- datastream frames must not make readiness true;
+- provider log lines must not make readiness true;
+- mismatched run/node/stage/readiness reports must not advance readiness.
 
-- Performance guarantees, latency targets, throughput targets, GPU utilization targets, and prompt generation speed.
+### 12.6 Provisioner Actor Checks
 
-- Retry policies not explicitly stated in this document.
+With a stub provider/provisioner leaf:
 
-- Recovery after orchestrator process crash.
+- `StartNodes` emits node start observations;
+- node start failure reports `NodeFailed` and stops already-started nodes;
+- plugin/adapter log observations emit `LogLine` and datastream log records;
+- runtime-ready/bootstrap completion reports `NodeLive` only once;
+- clean stop reports `NodesStopped`;
+- stop failure preserves the first error while continuing stop attempts.
 
-- Multi-run orchestration in a single process.
+### 12.7 Direct Prompt Checks
+
+Submit a direct prompt by actor message. Assert:
+
+- one active prompt;
+- `InferPrompt` is sent to the expected node actor;
+- prompt events are sent to the request reply target;
+- mismatched request ids are ignored/dropped;
+- terminal `Done` or `Fault` occurs exactly once;
+- active prompt state clears after terminal event.
+
+### 12.8 Pipeline Prompt Checks
+
+Submit a pipeline prompt by actor message. Assert:
+
+- tokenizer encode request goes to the expected actor;
+- encoded prompt enters token-in edge as sequence zero;
+- generated token records from token-out are consumed in order;
+- decode requests go to the expected actor;
+- text deltas preserve request id;
+- EOS and max token limit produce `Done`;
+- tokenizer fault produces prompt `Fault`;
+- token sequence violation faults prompt or run according to phase policy.
+
+### 12.9 Shutdown Checks
+
+Send actor shutdown. Assert:
+
+- no stdin, OS signal, or process-group control is required;
+- stage stop commands are emitted for every provisioned stage;
+- token endpoint teardown is emitted when endpoints exist;
+- provider/provisioner stop is requested;
+- all stop reports are required before `RunTornDown`;
+- stop failures are reported while remaining stops continue.
+
+### 12.10 Datastream Non-Authority Checks
+
+Simulate logs and frames. Assert:
+
+- worker stdout/stderr/provider logs are recorded as observations;
+- datastream frames can be archived or sent to dashboard sinks;
+- logs/frames do not advance readiness, prompt completion, failure, or teardown;
+- secret values are redacted from orchestrator-owned records.
+
+### 12.11 Wrapper/Host Boundary Checks
+
+For wrapper or host implementations that start an MVP run:
+
+- spawning the orchestrator actor does not resolve or execute a separate orchestrator binary;
+- readiness is actor/datastream lifecycle readiness, not TCP connect success;
+- prompt submission is actor message delivery;
+- shutdown is actor/control shutdown;
+- worker processes, if used, are managed leaves and not the orchestrator execution boundary.
+
+---
+
+## 13. Out of Scope
+
+Out of scope for this orchestrator actor contract:
+
+- wrapper CLI UX;
+- TOML/env parsing;
+- Cargo artifact resolution;
+- binary launch policy;
+- process exit codes;
+- prompt TCP compatibility adapters;
+- OS signal handling;
+- standard input command handling;
+- stdout/stderr terminal behavior;
+- actor scheduler internals;
+- Tokio runtime lifecycle;
+- iroh endpoint construction;
+- QUIC/ALPN/stream internals;
+- SWIM protocol internals beyond observed membership state;
+- directory/registry internals beyond observed route ownership;
+- datastream storage internals;
+- dashboard rendering;
+- provider marketplace semantics;
+- Docker image construction;
+- worker model execution internals;
+- tokenizer correctness;
+- model output quality;
+- external resource cleanup guarantees after actor-managed stop requests complete;
+- recovery after host/engine crash;
+- multi-run orchestration in one actor group unless a later spec adds it.
