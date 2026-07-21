@@ -29,7 +29,6 @@ async fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
     let stream = StreamId::new(NodeId::new("source-node"), Lifetime(1));
     let endpoint = DatastreamEndpoint::with_capacity(stream.clone(), 8, 8);
     let producer = endpoint.producer();
-    producer.set_frame_timing_enabled(false);
     let runtime_log = producer.register_channel("runtime.log", ChannelContent::TextStream);
     let subscription = endpoint.subscribe_all("iroh");
 

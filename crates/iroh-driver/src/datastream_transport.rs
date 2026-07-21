@@ -1,12 +1,12 @@
 //! Iroh/QUIC transport adapter for datastream subscriptions.
 
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crossbeam_channel::TryRecvError;
 use datastream::{
-    CatalogSnapshot, ChannelDescriptor, ChannelId, ChannelRef, DatastreamEvent, DatastreamSnapshot,
+    ChannelDescriptor, ChannelId, ChannelRef, DatastreamEvent, DatastreamSnapshot,
     DatastreamSubscription, FrameDelivery, Position, StreamDescriptor,
 };
 use iroh::endpoint::{Connection, RecvStream, SendStream};
@@ -117,10 +117,10 @@ pub async fn write_subscription_until_closed(
                     stats.events += 1;
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
+            Err(TryRecvError::Empty) => {
                 tokio::time::sleep(idle_sleep).await;
             }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     send.finish()?;
@@ -144,11 +144,11 @@ async fn write_subscription_inner(
                     stats.events += 1;
                 }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => match idle_sleep {
+            Err(TryRecvError::Empty) => match idle_sleep {
                 Some(delay) => tokio::time::sleep(delay).await,
                 None => break,
             },
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Disconnected) => break,
         }
     }
     send.finish()?;
@@ -332,28 +332,8 @@ pub async fn read_stream_into_fanout(
     fanout: Arc<datastream::DeliveryFanout>,
 ) -> Result<DatastreamQuicHeader, BoxError> {
     let read = read_events_from_stream(recv).await?;
-    let catalog = catalog_from_header(&read.header);
-    fanout.publish_batch(read.events, &catalog);
+    fanout.publish_batch(read.events);
     Ok(read.header)
-}
-
-fn catalog_from_header(header: &DatastreamQuicHeader) -> CatalogSnapshot {
-    let mut streams = BTreeMap::new();
-    streams.insert(header.stream.stream.clone(), header.stream.clone());
-    let channels = header
-        .channels
-        .iter()
-        .map(|descriptor| {
-            (
-                ChannelRef {
-                    stream: descriptor.stream.clone(),
-                    channel: descriptor.id,
-                },
-                descriptor.clone(),
-            )
-        })
-        .collect();
-    CatalogSnapshot { streams, channels }
 }
 
 fn put_json<T: serde::Serialize>(out: &mut Vec<u8>, value: &T) -> Result<(), BoxError> {
