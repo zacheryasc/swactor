@@ -17,9 +17,9 @@ use datastream::{
 };
 use distribution::node::DistributedNodeConfig;
 use distribution::types::{MemberState, NodeId as DistNodeId};
-use iroh::{Endpoint, EndpointAddr};
+use iroh::EndpointAddr;
 use iroh_driver::{
-    DATASTREAM_ALPN, IrohDriver, IrohDriverConfig, read_next_event, read_stream_header,
+    DATASTREAM_ALPN, EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, IrohDriver, IrohDriverConfig,
 };
 use mvp_system::actors::node_agent::{
     NodeAgentMsg, StageEdgeKindWire, StageInboundEdgeWire, StageObjectSpecWire,
@@ -28,7 +28,7 @@ use mvp_system::actors::node_agent::{
 use mvp_system::actors::orchestrator::{OrchestratorActor, OrchestratorReport};
 use mvp_system::actors::register_mvp_actor_codecs;
 use mvp_system::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
-#[cfg(feature = "local-e2e")]
+#[cfg(feature = "dashboard")]
 use mvp_system::dashboard_view::MvpClusterDashboardView;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::gpu_worker_ingress_parser as ingress;
@@ -60,7 +60,7 @@ use mvp_system::vastai_provisioning::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
-use tokio::io::AsyncWriteExt;
+#[cfg(test)]
 use tokio::sync::mpsc as tokio_mpsc;
 
 const DEFAULT_IMAGE: &str = "swactor-mvp-node:latest";
@@ -85,7 +85,6 @@ const MVP_STAGE_ROUTE: &str = "mvp.orch.stage_route";
 const DATASTREAM_FRAME_LOG_ENV: &str = "MVP_DATASTREAM_FRAME_LOG";
 const DEFAULT_DOCKER_CONTAINER_PREFIX: &str = "mvp-orchestrator";
 const MVP_DOCKER_CONTAINER_PREFIX_ENV: &str = "MVP_DOCKER_CONTAINER_PREFIX";
-const EDGE_ALPN: &[u8] = b"mvp/pipeline-edge/0";
 
 fn main() -> ExitCode {
     match run() {
@@ -95,41 +94,6 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
-}
-
-fn build_pipeline_edge_endpoint(
-    handle: &tokio::runtime::Handle,
-    relay: &RelayRuntimeConfig,
-) -> Result<Endpoint, String> {
-    let relay_mode = relay.mode.clone();
-    let custom_relay = matches!(&relay_mode, iroh::RelayMode::Custom(_));
-    handle
-        .block_on(async move {
-            let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
-                .relay_mode(relay_mode)
-                .alpns(vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()]);
-            if custom_relay {
-                builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
-            }
-            builder.bind().await
-        })
-        .map_err(|e| format!("create pipeline edge endpoint: {e}"))
-}
-
-fn pipeline_edge_endpoint_addr(
-    endpoint: &Endpoint,
-    relay: &RelayRuntimeConfig,
-) -> Result<EndpointAddr, String> {
-    let mut addr = endpoint.addr();
-    if addr.relay_urls().next().is_none() {
-        if let Some(url) = &relay.url {
-            addr = addr.with_relay_url(
-                url.parse()
-                    .map_err(|e| format!("parse pipeline edge relay URL {url:?}: {e}"))?,
-            );
-        }
-    }
-    Ok(addr)
 }
 
 fn run() -> Result<(), String> {
@@ -429,29 +393,8 @@ fn run() -> Result<(), String> {
     let sink = PluginSink::new(Arc::new(ChannelObservationSink {
         tx: Mutex::new(obs_tx),
     }));
-    let pipeline_edge_endpoint = if pipeline_plan.is_some() {
-        let endpoint = build_pipeline_edge_endpoint(tokio.handle(), &config.relay)?;
-        let addr = pipeline_edge_endpoint_addr(&endpoint, &config.relay)?;
-        orch_datastream.emit_bootstrap(
-            dashboard.as_ref(),
-            config.run_id,
-            config.node_id,
-            "pipeline_edge_endpoint",
-            "ready",
-            json!({"endpoint":addr}),
-        );
-        Some(endpoint)
-    } else {
-        None
-    };
-    let pipeline_token_ingress = pipeline_edge_endpoint
-        .as_ref()
-        .map(|endpoint| PipelineTokenIngress::start(tokio.handle().clone(), endpoint.clone()));
     let coordinator_endpoint = driver.endpoint_addr();
-    let pipeline_coordinator_endpoint = match &pipeline_edge_endpoint {
-        Some(endpoint) => pipeline_edge_endpoint_addr(endpoint, &config.relay)?,
-        None => coordinator_endpoint.clone(),
-    };
+    let pipeline_coordinator_endpoint = coordinator_endpoint.clone();
     let (mut provisioned_nodes, ready) = start_and_provision_workers(
         provisioner,
         &config,
@@ -539,8 +482,6 @@ fn run() -> Result<(), String> {
         tokenizer_reply_actor,
         config.provider,
         pipeline_plan.as_ref(),
-        pipeline_edge_endpoint.as_ref(),
-        pipeline_token_ingress,
         ready.first_stage.endpoint.clone(),
     );
     if let Err(error) = &result {
@@ -3105,71 +3046,60 @@ struct CollectedDatastreamFrame {
 }
 
 fn drain_datastream_connections(
-    driver: &IrohDriver,
+    driver: &mut IrohDriver,
     frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
 ) {
-    for (_node, conn) in driver.drain_accepted_for_alpn(DATASTREAM_ALPN) {
-        let tx = frame_tx.clone();
-        driver.runtime_handle().spawn(async move {
-            while let Ok(mut recv) = conn.accept_uni().await {
-                let Ok(header) = read_stream_header(&mut recv).await else {
-                    break;
-                };
-                let mut channels = header
-                    .channels
-                    .iter()
-                    .map(|descriptor| {
-                        (
-                            ChannelRef {
-                                stream: descriptor.stream.clone(),
-                                channel: descriptor.id,
-                            },
-                            descriptor.name.clone(),
-                        )
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                loop {
-                    let event = match read_next_event(&mut recv, &header.stream).await {
-                        Ok(Some(event)) => event,
-                        Ok(None) => break,
-                        Err(_) => break,
-                    };
-                    match event {
-                        DatastreamEvent::ChannelDeclared(descriptor) => {
-                            channels.insert(
-                                ChannelRef {
-                                    stream: descriptor.stream.clone(),
-                                    channel: descriptor.id,
-                                },
-                                descriptor.name,
-                            );
-                        }
-                        DatastreamEvent::Frame(delivery) => {
-                            let channel_name =
-                                channels.get(&delivery.channel).cloned().unwrap_or_else(|| {
-                                    format!("channel#{}", delivery.channel.channel.0)
-                                });
-                            let frame = Frame::new(
-                                delivery.channel.channel,
-                                delivery.position,
-                                delivery.payload,
-                            );
-                            if tx
-                                .send(CollectedDatastreamFrame {
-                                    stream: delivery.channel.stream,
-                                    channel_name,
-                                    frame,
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        DatastreamEvent::StreamDeclared(_) | DatastreamEvent::StreamEnded(_) => {}
+    driver.pump_datastream_ingress();
+    for read in driver.drain_datastream_reads() {
+        let mut channels = read
+            .header
+            .channels
+            .iter()
+            .map(|descriptor| {
+                (
+                    ChannelRef {
+                        stream: descriptor.stream.clone(),
+                        channel: descriptor.id,
+                    },
+                    descriptor.name.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for event in read.events {
+            match event {
+                DatastreamEvent::ChannelDeclared(descriptor) => {
+                    channels.insert(
+                        ChannelRef {
+                            stream: descriptor.stream.clone(),
+                            channel: descriptor.id,
+                        },
+                        descriptor.name,
+                    );
+                }
+                DatastreamEvent::Frame(delivery) => {
+                    let channel_name = channels
+                        .get(&delivery.channel)
+                        .cloned()
+                        .unwrap_or_else(|| format!("channel#{}", delivery.channel.channel.0));
+                    let frame = Frame::new(
+                        delivery.channel.channel,
+                        delivery.position,
+                        delivery.payload,
+                    );
+                    if frame_tx
+                        .send(CollectedDatastreamFrame {
+                            stream: delivery.channel.stream,
+                            channel_name,
+                            frame,
+                        })
+                        .is_err()
+                    {
+                        return;
                     }
                 }
+                DatastreamEvent::StreamDeclared(_) | DatastreamEvent::StreamEnded(_) => {}
             }
-        });
+        }
     }
 }
 
@@ -3485,12 +3415,13 @@ fn drain_orch_stdio_capture(
     }
 }
 
-#[cfg(feature = "local-e2e")]
+#[cfg(feature = "dashboard")]
 struct DashboardSupport {
     handle: dashboard::DashboardHandle,
+    _runtime: tokio::runtime::Runtime,
 }
 
-#[cfg(feature = "local-e2e")]
+#[cfg(feature = "dashboard")]
 impl DashboardSupport {
     fn start(enabled: bool) -> Result<Option<Self>, String> {
         if !enabled {
@@ -3502,10 +3433,17 @@ impl DashboardSupport {
                 .parse::<u16>()
                 .map_err(|e| format!("invalid MVP_DASHBOARD_PORT={port:?}: {e}"))?;
         }
-        let handle = dashboard::start_dashboard(config);
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| format!("dashboard runtime: {e}"))?;
+        let handle = dashboard::DashboardHandle::new(config);
         handle.register_view(Arc::new(MvpClusterDashboardView::new()));
-        handle.start_http_standalone();
-        Ok(Some(Self { handle }))
+        handle.spawn_http(runtime.handle());
+        Ok(Some(Self {
+            handle,
+            _runtime: runtime,
+        }))
     }
 
     fn publish_frame(&self, stream: &StreamId, channel: &str, frame: &Frame) {
@@ -3521,15 +3459,15 @@ impl DashboardSupport {
     }
 }
 
-#[cfg(not(feature = "local-e2e"))]
+#[cfg(not(feature = "dashboard"))]
 struct DashboardSupport;
 
-#[cfg(not(feature = "local-e2e"))]
+#[cfg(not(feature = "dashboard"))]
 impl DashboardSupport {
     fn start(enabled: bool) -> Result<Option<Self>, String> {
         if enabled {
             return Err(
-                "MVP_DASHBOARD requires building mvp-system with feature local-e2e".to_owned(),
+                "MVP_DASHBOARD requires building mvp-system with feature dashboard".to_owned(),
             );
         }
         Ok(None)
@@ -3830,31 +3768,23 @@ struct PipelineTokenRecord {
     eos: bool,
 }
 
-struct PipelineSendHandle {
-    tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
+enum PipelineSendHandle {
+    Driver(EdgeSendHandle),
+    #[cfg(test)]
+    Channel(tokio_mpsc::UnboundedSender<Vec<u8>>),
 }
 
 impl PipelineSendHandle {
     fn send(&self, bytes: Vec<u8>) -> Result<(), String> {
-        self.tx
-            .send(bytes)
-            .map_err(|_| "pipeline token-in sender stopped".to_owned())
+        match self {
+            Self::Driver(handle) => handle.send(bytes),
+            #[cfg(test)]
+            Self::Channel(tx) => tx
+                .send(bytes)
+                .map_err(|_| "pipeline token-in sender stopped".to_owned()),
+        }
     }
 }
-
-struct PipelineTokenIngress {
-    recv_rx: mpsc::Receiver<Vec<u8>>,
-    recv_tx: mpsc::Sender<Vec<u8>>,
-}
-
-impl PipelineTokenIngress {
-    fn start(handle: tokio::runtime::Handle, endpoint: Endpoint) -> Self {
-        let (recv_tx, recv_rx) = mpsc::channel();
-        spawn_pipeline_token_acceptor(handle, endpoint, recv_tx.clone());
-        Self { recv_rx, recv_tx }
-    }
-}
-
 struct PendingEncode {
     request_id: u64,
 }
@@ -3889,11 +3819,9 @@ struct PipelinePromptRuntime {
 
 impl PipelinePromptRuntime {
     fn new(
-        handle: tokio::runtime::Handle,
-        endpoint: Endpoint,
+        driver: &IrohDriver,
         plan: &run_plan::RunPlan,
         first_stage_endpoint: EndpointAddr,
-        ingress: PipelineTokenIngress,
         tokenizer_encode_actor: ActorAddress,
         tokenizer_decode_actor: ActorAddress,
         tokenizer_reply_to: ActorAddress,
@@ -3908,19 +3836,17 @@ impl PipelinePromptRuntime {
             .iter()
             .find(|edge| edge.kind == run_plan::EdgeKind::TokenOut)
             .ok_or_else(|| "pipeline plan missing token-out edge".to_owned())?;
+        let (recv_tx, recv_rx) = mpsc::channel();
         Ok(Self {
             token_in_edge_id: token_in_edge.edge_id.0,
             token_out_edge_id: token_out_edge.edge_id.0,
             token_spec: token_in_edge.object_spec,
             token_out_spec: token_out_edge.object_spec,
-            token_in_sender: spawn_pipeline_token_sender(
-                handle,
-                endpoint,
-                first_stage_endpoint,
-                token_in_edge.edge_id.0,
-            )?,
-            recv_rx: ingress.recv_rx,
-            recv_tx: ingress.recv_tx,
+            token_in_sender: PipelineSendHandle::Driver(
+                driver.spawn_edge_send_pump(first_stage_endpoint, token_in_edge.edge_id.0)?,
+            ),
+            recv_rx,
+            recv_tx,
             tokenizer_encode_actor,
             tokenizer_decode_actor,
             tokenizer_reply_to,
@@ -3950,7 +3876,6 @@ impl PipelinePromptRuntime {
         node_id: u64,
     ) -> Result<(), String> {
         let request_id = request.request_id;
-        self.next_sequence = 0;
         self.generated_tokens.clear();
         self.final_text.clear();
         self.recv_buffer.clear();
@@ -4048,6 +3973,7 @@ impl PipelinePromptRuntime {
             "ready",
             json!({"node_actor":self.tokenizer_encode_actor,"reply_to":self.tokenizer_reply_to,"tokens":tokens.len()}),
         );
+        let sequence = self.next_sequence;
         orch_datastream.emit_prompt(
             dashboard,
             run_id,
@@ -4055,9 +3981,9 @@ impl PipelinePromptRuntime {
             request_id,
             "pipeline_token_in",
             "started",
-            json!({"edge_id":self.token_in_edge_id,"sequence":0,"tokens":tokens.len()}),
+            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":tokens.len()}),
         );
-        self.send_token_in(0, &tokens)?;
+        self.send_token_in(sequence, &tokens)?;
         orch_datastream.emit_prompt(
             dashboard,
             run_id,
@@ -4065,7 +3991,7 @@ impl PipelinePromptRuntime {
             request_id,
             "pipeline_token_in",
             "ready",
-            json!({"edge_id":self.token_in_edge_id,"sequence":0}),
+            json!({"edge_id":self.token_in_edge_id,"sequence":sequence}),
         );
         Ok(())
     }
@@ -4175,9 +4101,31 @@ impl PipelinePromptRuntime {
         self.pending_decode = None;
     }
 
-    fn poll_driver(&mut self, driver: &IrohDriver) {
-        for (_node, conn) in driver.drain_other_connections() {
-            spawn_pipeline_token_receiver(driver.tokio_handle(), conn, self.recv_tx.clone());
+    fn poll_driver(&mut self, driver: &mut IrohDriver) {
+        driver.pump_edge_ingress();
+        for event in driver.drain_edge_events() {
+            match event {
+                EdgeTransportEvent::BytesRead { edge_id, bytes, .. }
+                    if edge_id == self.token_out_edge_id =>
+                {
+                    let _ = self.recv_tx.send(bytes);
+                }
+                EdgeTransportEvent::StreamFault {
+                    edge_id: Some(edge_id),
+                    reason,
+                    ..
+                } if edge_id == self.token_out_edge_id => {
+                    if let Some(request_id) =
+                        self.active.as_ref().map(|active| active.request.request_id)
+                    {
+                        self.fault_active(
+                            request_id,
+                            format!("pipeline token-out stream fault: {reason:?}"),
+                        );
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
@@ -4308,96 +4256,6 @@ fn take_pipeline_token_record(
     Ok(Some(out))
 }
 
-fn spawn_pipeline_token_sender(
-    handle: tokio::runtime::Handle,
-    endpoint: iroh::Endpoint,
-    peer: EndpointAddr,
-    edge_id: u64,
-) -> Result<PipelineSendHandle, String> {
-    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-    handle.spawn(async move {
-        let result: Result<(), String> = async {
-            let conn = endpoint
-                .connect(peer, EDGE_ALPN)
-                .await
-                .map_err(|e| format!("connect token-in edge {edge_id}: {e}"))?;
-            let mut send = conn
-                .open_uni()
-                .await
-                .map_err(|e| format!("open token-in stream {edge_id}: {e}"))?;
-            send.write_all(&edge_id.to_le_bytes())
-                .await
-                .map_err(|e| format!("write token-in preamble {edge_id}: {e}"))?;
-            send.flush()
-                .await
-                .map_err(|e| format!("flush token-in preamble {edge_id}: {e}"))?;
-            let _ = ready_tx.send(Ok(()));
-            while let Some(record) = rx.recv().await {
-                send.write_all(&record)
-                    .await
-                    .map_err(|e| format!("write token-in record {edge_id}: {e}"))?;
-                send.flush()
-                    .await
-                    .map_err(|e| format!("flush token-in record {edge_id}: {e}"))?;
-            }
-            send.finish()
-                .map_err(|e| format!("finish token-in stream {edge_id}: {e}"))?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            let _ = ready_tx.send(Err(error));
-        }
-    });
-    ready_rx
-        .recv()
-        .map_err(|e| format!("token-in sender startup channel closed: {e}"))??;
-    Ok(PipelineSendHandle { tx })
-}
-
-fn spawn_pipeline_token_receiver(
-    handle: tokio::runtime::Handle,
-    conn: iroh::endpoint::Connection,
-    tx: mpsc::Sender<Vec<u8>>,
-) {
-    handle.spawn(async move {
-        while let Ok(mut recv) = conn.accept_uni().await {
-            let mut preamble = [0u8; 8];
-            if recv.read_exact(&mut preamble).await.is_err() {
-                continue;
-            }
-            let mut chunk = vec![0u8; 4096];
-            loop {
-                match recv.read(&mut chunk).await {
-                    Ok(Some(0)) | Ok(None) => break,
-                    Ok(Some(n)) => {
-                        if tx.send(chunk[..n].to_vec()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    });
-}
-
-fn spawn_pipeline_token_acceptor(
-    handle: tokio::runtime::Handle,
-    endpoint: Endpoint,
-    tx: mpsc::Sender<Vec<u8>>,
-) {
-    let accept_handle = handle.clone();
-    handle.spawn(async move {
-        while let Some(incoming) = endpoint.accept().await {
-            if let Ok(conn) = incoming.await {
-                spawn_pipeline_token_receiver(accept_handle.clone(), conn, tx.clone());
-            }
-        }
-    });
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PromptRuntimeMode {
     DirectInferPrompt,
@@ -4434,28 +4292,17 @@ fn serve_prompts(
     tokenizer_reply_to: ActorAddress,
     provider: ProviderKind,
     pipeline_plan: Option<&run_plan::RunPlan>,
-    pipeline_edge_endpoint: Option<&Endpoint>,
-    pipeline_token_ingress: Option<PipelineTokenIngress>,
     prompt_endpoint: EndpointAddr,
 ) -> Result<(), String> {
     let mut pipeline_runtime = match prompt_runtime_mode(pipeline_plan) {
-        PromptRuntimeMode::PipelineTokenEdges => {
-            let endpoint = pipeline_edge_endpoint
-                .ok_or_else(|| "pipeline mode requires an edge endpoint".to_owned())?
-                .clone();
-            let ingress = pipeline_token_ingress
-                .ok_or_else(|| "pipeline mode requires edge ingress".to_owned())?;
-            Some(PipelinePromptRuntime::new(
-                driver.tokio_handle(),
-                endpoint,
-                pipeline_plan.expect("pipeline mode requires plan"),
-                prompt_endpoint,
-                ingress,
-                tokenizer_encode_actor,
-                tokenizer_decode_actor,
-                tokenizer_reply_to,
-            )?)
-        }
+        PromptRuntimeMode::PipelineTokenEdges => Some(PipelinePromptRuntime::new(
+            driver,
+            pipeline_plan.expect("pipeline mode requires plan"),
+            prompt_endpoint,
+            tokenizer_encode_actor,
+            tokenizer_decode_actor,
+            tokenizer_reply_to,
+        )?),
         PromptRuntimeMode::DirectInferPrompt => None,
     };
     let mut active: Option<ActivePrompt> = None;
@@ -5469,7 +5316,7 @@ mod tests {
                 token_out_edge_id,
                 token_spec,
                 token_out_spec,
-                token_in_sender: PipelineSendHandle { tx: token_in_tx },
+                token_in_sender: PipelineSendHandle::Channel(token_in_tx),
                 recv_rx,
                 recv_tx,
                 recv_buffer: Vec::new(),

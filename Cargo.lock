@@ -2481,7 +2481,6 @@ dependencies = [
  "distribution",
  "iroh",
  "iroh-driver",
- "iroh-relay",
  "libc",
  "parking_lot",
  "serde",
@@ -5736,6 +5735,10 @@ dependencies = [
 [[package]]
 name = "xtask"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde_json",
+]
 
 [[package]]
 name = "yasna"

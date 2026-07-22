@@ -7,6 +7,7 @@ autobins = false
 
 [features]
 default = []
+dashboard = []
 
 [dependencies]
 datastream = { path = "../datastream" }
@@ -28,9 +29,6 @@ toml = "0.8"
 libc = "0.2"
 signal-hook = "0.3"
 
-[dev-dependencies]
-iroh-relay = { version = "0.98", features = ["server", "test-utils"] }
-
 [[bin]]
 name = "mvp-worker-node"
 path = "src/bin/worker_node.rs"
@@ -42,23 +40,6 @@ path = "src/bin/orchestrator.rs"
 [[bin]]
 name = "mvp-chat"
 path = "src/bin/mvp_chat.rs"
-
-[[test]]
-name = "local_unmocked_mvp_e2e"
-path = "tests/local_unmocked_mvp_e2e.rs"
-harness = false
-required-features = ["local-e2e"]
-
-[[test]]
-name = "gpu_worker_node_e2e"
-path = "tests/gpu_worker_node_e2e.rs"
-required-features = ["local-e2e"]
-
-[[test]]
-name = "local-e2e-cluster"
-path = "tests/local_e2e_cluster.rs"
-harness = false
-required-features = ["local-e2e"]
 
 [[test]]
 name = "mvp_chat_mock"

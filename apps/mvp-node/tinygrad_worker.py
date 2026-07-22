@@ -11,6 +11,7 @@ import threading
 import time
 import struct
 import traceback
+import shutil
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -159,6 +160,17 @@ def fatal(reason: str, **fields: Any) -> None:
 def test_mode() -> bool:
     return os.environ.get("MVP_TINYGRAD_TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
+def configure_tinygrad_cuda_compiler(device: str) -> None:
+    if device.split(":", 1)[0].upper() != "CUDA":
+        return
+    if os.environ.get("CUDA_PTX") or os.environ.get("CUDA_CC"):
+        return
+    if shutil.which("nvcc") is not None:
+        return
+    os.environ["CUDA_PTX"] = "1"
+    control(type="TinygradCudaCompilerSelected", requested_device=device, compiler="PTX", reason="nvcc_not_found")
+
+
 
 def initialize(cmd: dict[str, Any]) -> None:
     global Tensor, dtypes, arena
@@ -182,6 +194,7 @@ def initialize(cmd: dict[str, Any]) -> None:
             elapsed_ms=int((time.monotonic() - started) * 1000),
         )
         return
+    configure_tinygrad_cuda_compiler(device)
     control(type="TinygradImportStarted", requested_device=device, env_DEV=os.environ.get("DEV"))
     from tinygrad import Tensor as TinyTensor, dtypes as tiny_dtypes
 

@@ -20,7 +20,8 @@ use distribution::node::DistributedNodeConfig;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
-    DATASTREAM_ALPN, DatastreamQuicHeader, IrohDriver, IrohDriverConfig, spawn_subscription_writer,
+    DATASTREAM_ALPN, DatastreamPublishHandle, DatastreamQuicHeader, EDGE_ALPN, EdgeSendHandle,
+    EdgeTransportEvent, IrohDriver, IrohDriverConfig,
 };
 use mvp_system::actors::node_agent::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
@@ -40,7 +41,6 @@ use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio::sync::mpsc as tokio_mpsc;
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/mvp/tinygrad_worker.py";
 const DEFAULT_DEVICE: &str = "CUDA";
@@ -58,7 +58,6 @@ const NODE_STAGE_CHANNEL: &str = "mvp.node.stage";
 const NODE_WORKER_CHANNEL: &str = "mvp.node.worker";
 const NODE_PROMPT_CHANNEL: &str = "mvp.node.prompt";
 const NODE_SHUTDOWN_CHANNEL: &str = "mvp.node.shutdown";
-const EDGE_ALPN: &[u8] = b"mvp/pipeline-edge/0";
 
 fn node_event_payload(
     config: &DeploymentConfig,
@@ -509,65 +508,6 @@ fn spawn_arena_sampler(
     });
 }
 
-#[derive(Clone, Debug)]
-enum DriverIngressEvent {
-    StreamArrived {
-        edge_id: u64,
-        stream_id: u64,
-    },
-    BytesRead {
-        edge_id: u64,
-        stream_id: u64,
-        bytes: Vec<u8>,
-    },
-}
-
-#[derive(Clone)]
-struct SendPumpHandle {
-    tx: tokio_mpsc::UnboundedSender<Vec<u8>>,
-}
-
-impl SendPumpHandle {
-    fn send(&self, record: Vec<u8>) -> Result<(), String> {
-        self.tx
-            .send(record)
-            .map_err(|_| "edge sender task stopped".to_owned())
-    }
-}
-
-struct DriverRuntime {
-    tx: mpsc::Sender<DriverIngressEvent>,
-    rx: mpsc::Receiver<DriverIngressEvent>,
-    next_stream_id: u64,
-}
-
-impl DriverRuntime {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel();
-        Self {
-            tx,
-            rx,
-            next_stream_id: 1,
-        }
-    }
-
-    fn poll_iroh(&mut self, driver: &IrohDriver) {
-        for (_node, conn) in driver.drain_other_connections() {
-            spawn_recv_pump(
-                driver.tokio_handle(),
-                conn,
-                self.tx.clone(),
-                self.next_stream_id,
-            );
-            self.next_stream_id = self.next_stream_id.saturating_add(1);
-        }
-    }
-
-    fn try_recv(&self) -> Option<DriverIngressEvent> {
-        self.rx.try_recv().ok()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct ObjectKey {
     edge_id: u64,
@@ -585,7 +525,6 @@ struct LoadedObject {
 struct WorkerEdgeRuntime {
     establisher: edge::EdgeEstablisher,
     driver_model: driver_model::Driver,
-    driver_runtime: DriverRuntime,
     edge_command_cursor: usize,
     edge_event_cursor: usize,
     driver_event_cursor: usize,
@@ -593,7 +532,7 @@ struct WorkerEdgeRuntime {
     outbound_edge: Option<StageOutboundEdgeWire>,
     inbound_ring_id: Option<u64>,
     outbound_ring_id: Option<u64>,
-    outbound_sender: Option<SendPumpHandle>,
+    outbound_sender: Option<EdgeSendHandle>,
     next_output_object_id: u64,
     object_handles: BTreeMap<ObjectKey, LoadedObject>,
     ingress_streams: BTreeMap<u64, Vec<u8>>,
@@ -607,7 +546,6 @@ impl WorkerEdgeRuntime {
                 local_node_id: driver_model::NodeId(local_node_id),
                 alpn: driver_model::Alpn(String::from_utf8_lossy(EDGE_ALPN).into_owned()),
             }),
-            driver_runtime: DriverRuntime::new(),
             edge_command_cursor: 0,
             edge_event_cursor: 0,
             driver_event_cursor: 0,
@@ -625,7 +563,7 @@ impl WorkerEdgeRuntime {
     #[allow(clippy::too_many_arguments)]
     fn poll_iroh(
         &mut self,
-        driver: &IrohDriver,
+        driver: &mut IrohDriver,
         stack: &DistributionRuntimeStack,
         node_actor: ActorAddress,
         worker: &mut TinygradWorker,
@@ -633,10 +571,12 @@ impl WorkerEdgeRuntime {
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
     ) -> Result<(), String> {
-        self.driver_runtime.poll_iroh(driver);
-        while let Some(event) = self.driver_runtime.try_recv() {
+        driver.pump_edge_ingress();
+        for event in driver.drain_edge_events() {
             match event {
-                DriverIngressEvent::StreamArrived { edge_id, stream_id } => {
+                EdgeTransportEvent::StreamArrived {
+                    edge_id, stream_id, ..
+                } => {
                     self.driver_model
                         .observe(driver_model::DriverEvent::IncomingUniStream {
                             edge_id: driver_model::EdgeId(edge_id),
@@ -649,14 +589,14 @@ impl WorkerEdgeRuntime {
                         arena_manager,
                         config,
                         datastream,
-                        driver.tokio_handle(),
-                        driver.endpoint().clone(),
+                        driver,
                     )?;
                 }
-                DriverIngressEvent::BytesRead {
+                EdgeTransportEvent::BytesRead {
                     edge_id,
                     stream_id,
                     bytes,
+                    ..
                 } => {
                     self.ingest_stream_bytes(
                         edge_id,
@@ -668,10 +608,29 @@ impl WorkerEdgeRuntime {
                         arena_manager,
                         config,
                         datastream,
-                        driver.tokio_handle(),
-                        driver.endpoint().clone(),
+                        driver,
                     )?;
                 }
+                EdgeTransportEvent::StreamEnded { .. } => {}
+                EdgeTransportEvent::StreamFault {
+                    edge_id: Some(edge_id),
+                    ..
+                } => {
+                    self.driver_model
+                        .observe(driver_model::DriverEvent::ReadError {
+                            edge_id: driver_model::EdgeId(edge_id),
+                        });
+                    self.drive_edge_workflow(
+                        stack,
+                        node_actor,
+                        worker,
+                        arena_manager,
+                        config,
+                        datastream,
+                        driver,
+                    )?;
+                }
+                EdgeTransportEvent::StreamFault { edge_id: None, .. } => {}
             }
         }
         Ok(())
@@ -687,8 +646,7 @@ impl WorkerEdgeRuntime {
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        handle: tokio::runtime::Handle,
-        endpoint: iroh::Endpoint,
+        driver: &mut IrohDriver,
     ) -> Result<(), String> {
         self.inbound_edge = Some(edge.clone());
         self.establisher
@@ -706,8 +664,7 @@ impl WorkerEdgeRuntime {
             arena_manager,
             config,
             datastream,
-            handle,
-            endpoint,
+            driver,
         )
     }
 
@@ -721,8 +678,7 @@ impl WorkerEdgeRuntime {
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        handle: tokio::runtime::Handle,
-        endpoint: iroh::Endpoint,
+        driver: &mut IrohDriver,
     ) -> Result<(), String> {
         if edge.consumer_endpoint.is_none() {
             stack
@@ -754,8 +710,7 @@ impl WorkerEdgeRuntime {
             arena_manager,
             config,
             datastream,
-            handle,
-            endpoint,
+            driver,
         )
     }
 
@@ -872,8 +827,7 @@ impl WorkerEdgeRuntime {
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        handle: tokio::runtime::Handle,
-        endpoint: iroh::Endpoint,
+        driver: &mut IrohDriver,
     ) -> Result<(), String> {
         let Some(inbound) = self.inbound_edge.clone() else {
             return Ok(());
@@ -937,8 +891,7 @@ impl WorkerEdgeRuntime {
             arena_manager,
             config,
             datastream,
-            handle,
-            endpoint,
+            driver,
         )
     }
 
@@ -951,8 +904,7 @@ impl WorkerEdgeRuntime {
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        handle: tokio::runtime::Handle,
-        endpoint: iroh::Endpoint,
+        driver: &mut IrohDriver,
     ) -> Result<(), String> {
         loop {
             let mut progressed = false;
@@ -1099,12 +1051,7 @@ impl WorkerEdgeRuntime {
                                     },
                                 },
                             ));
-                        self.outbound_sender = Some(spawn_send_pump(
-                            handle.clone(),
-                            endpoint.clone(),
-                            peer,
-                            edge_id.0,
-                        )?);
+                        self.outbound_sender = Some(driver.spawn_edge_send_pump(peer, edge_id.0)?);
                     }
                     edge::EdgeCommand::EstablishRecv { edge_id, .. } => {
                         let record = self
@@ -1289,104 +1236,6 @@ fn take_complete_ingress_record(
         ingress::ObjectRecordRead::Complete(record) => record,
     };
     Ok(Some(buffer.drain(..record.total_len).collect()))
-}
-
-fn spawn_send_pump(
-    handle: tokio::runtime::Handle,
-    endpoint: iroh::Endpoint,
-    peer: EndpointAddr,
-    edge_id: u64,
-) -> Result<SendPumpHandle, String> {
-    let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
-    handle.spawn(async move {
-        let result: Result<(), String> = async {
-            let conn = endpoint
-                .connect(peer, EDGE_ALPN)
-                .await
-                .map_err(|e| format!("connect edge {edge_id}: {e}"))?;
-            let mut send = conn
-                .open_uni()
-                .await
-                .map_err(|e| format!("open edge stream {edge_id}: {e}"))?;
-            send.write_all(&driver_model::encode_edge_preamble(driver_model::EdgeId(
-                edge_id,
-            )))
-            .await
-            .map_err(|e| format!("write edge preamble {edge_id}: {e}"))?;
-            send.flush()
-                .await
-                .map_err(|e| format!("flush edge preamble {edge_id}: {e}"))?;
-            let _ = ready_tx.send(Ok(()));
-            while let Some(record) = rx.recv().await {
-                send.write_all(&record)
-                    .await
-                    .map_err(|e| format!("write edge record {edge_id}: {e}"))?;
-                send.flush()
-                    .await
-                    .map_err(|e| format!("flush edge record {edge_id}: {e}"))?;
-            }
-            send.finish()
-                .map_err(|e| format!("finish edge stream {edge_id}: {e}"))?;
-            Ok(())
-        }
-        .await;
-        if let Err(error) = result {
-            let _ = ready_tx.send(Err(error));
-        }
-    });
-    ready_rx
-        .recv()
-        .map_err(|e| format!("edge {edge_id} sender startup channel closed: {e}"))??;
-    Ok(SendPumpHandle { tx })
-}
-
-fn spawn_recv_pump(
-    handle: tokio::runtime::Handle,
-    conn: iroh::endpoint::Connection,
-    tx: mpsc::Sender<DriverIngressEvent>,
-    stream_id: u64,
-) {
-    handle.spawn(async move {
-        let mut next_uni_stream_id = stream_id << 32;
-        while let Ok(mut recv) = conn.accept_uni().await {
-            next_uni_stream_id = next_uni_stream_id.saturating_add(1);
-            let current_stream_id = next_uni_stream_id;
-            let mut preamble = [0u8; 8];
-            if recv.read_exact(&mut preamble).await.is_err() {
-                continue;
-            }
-            let edge_id = u64::from_le_bytes(preamble);
-            if tx
-                .send(DriverIngressEvent::StreamArrived {
-                    edge_id,
-                    stream_id: current_stream_id,
-                })
-                .is_err()
-            {
-                break;
-            }
-            let mut chunk = vec![0u8; 4096];
-            loop {
-                match recv.read(&mut chunk).await {
-                    Ok(Some(0)) | Ok(None) => break,
-                    Ok(Some(n)) => {
-                        if tx
-                            .send(DriverIngressEvent::BytesRead {
-                                edge_id,
-                                stream_id: current_stream_id,
-                                bytes: chunk[..n].to_vec(),
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        }
-    });
 }
 
 fn value_u64(value: &Value, field: &str) -> Result<u64, String> {
@@ -1580,9 +1429,10 @@ fn run() -> Result<(), String> {
     let arena_fd = arena_manager.lock().arena_fd();
 
     let mut datastream = node_datastream(&config);
+    let datastream_transport = driver.datastream_publish_handle();
     let datastream_publisher = match stack
         .runtime
-        .spawn(datastream.publisher_actor(tokio.handle().clone(), driver.endpoint()))
+        .spawn(datastream.publisher_actor(datastream_transport))
     {
         Ok(actor) => actor,
         Err(error) => {
@@ -1859,7 +1709,7 @@ fn run() -> Result<(), String> {
         datastream.tick();
         worker.drain_stderr(&config, &mut datastream);
         edge_runtime.poll_iroh(
-            &driver,
+            &mut driver,
             &stack,
             node_actor,
             &mut worker,
@@ -2154,11 +2004,7 @@ impl NodeDatastream {
         }
     }
 
-    fn publisher_actor(
-        &self,
-        tokio: tokio::runtime::Handle,
-        iroh_endpoint: iroh::Endpoint,
-    ) -> DatastreamPublisherActor {
+    fn publisher_actor(&self, transport: DatastreamPublishHandle) -> DatastreamPublisherActor {
         DatastreamPublisherActor::new(
             Arc::clone(&self.endpoint),
             move |subscribe: DatastreamSubscribe, subscription: DatastreamSubscription| {
@@ -2169,9 +2015,7 @@ impl NodeDatastream {
                 ) else {
                     return;
                 };
-                let _ = spawn_subscription_writer(
-                    &tokio,
-                    iroh_endpoint.clone(),
+                transport.publish_subscription(
                     subscribe.collector,
                     header,
                     subscription,
@@ -2920,8 +2764,7 @@ fn handle_stage_command(
                 arena_manager,
                 config,
                 datastream,
-                driver.tokio_handle(),
-                driver.endpoint().clone(),
+                driver,
             )?;
             emit_node_event(
                 datastream,
@@ -2950,8 +2793,7 @@ fn handle_stage_command(
                 arena_manager,
                 config,
                 datastream,
-                driver.tokio_handle(),
-                driver.endpoint().clone(),
+                driver,
             )?;
             emit_node_event(
                 datastream,

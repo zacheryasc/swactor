@@ -30,7 +30,14 @@ use distribution::swim::actor::SwimIn;
 use distribution::transport_bridge::{OutFrame, Outbox, RelayMirror, RouteView, peer_addr};
 use distribution::types::NodeId;
 
-use crate::datastream_transport::DATASTREAM_ALPN;
+use crate::datastream_transport::{
+    DATASTREAM_ALPN, DatastreamQuicHeader, DatastreamQuicRead, read_events_from_stream,
+    spawn_subscription_writer,
+};
+use crate::edge_transport::{
+    EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, spawn_edge_recv_pump,
+    spawn_edge_send_pump as spawn_edge_sender_task,
+};
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor_transport::CodecRegistry;
@@ -207,6 +214,34 @@ pub struct JoinStatus {
 
 // ─── Driver ─────────────────────────────────────────────────────────────────
 
+/// Cloneable logical datastream publisher transport. It hides the raw iroh
+/// endpoint and Tokio task handle from callers while leaving datastream
+/// subscription/catalog semantics in the datastream crate.
+#[derive(Clone)]
+pub struct DatastreamPublishHandle {
+    rt: Handle,
+    endpoint: Endpoint,
+}
+
+impl DatastreamPublishHandle {
+    pub fn publish_subscription(
+        &self,
+        peer: EndpointAddr,
+        header: DatastreamQuicHeader,
+        subscription: datastream::DatastreamSubscription,
+        idle_sleep: Duration,
+    ) {
+        let _ = spawn_subscription_writer(
+            &self.rt,
+            self.endpoint.clone(),
+            peer,
+            header,
+            subscription,
+            idle_sleep,
+        );
+    }
+}
+
 /// iroh P2P network transport bridge.
 ///
 /// Bridges the actorized distribution protocol (running on a swactor runtime)
@@ -236,8 +271,13 @@ pub struct IrohDriver {
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     /// Connections accepted by the background accept loop (SWIM ALPN).
     accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
-    /// Connections accepted on non-SWIM ALPNs (streams, datastream, etc.).
+    /// Connections accepted on non-SWIM ALPNs before driver-owned adapters claim them.
     other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
+    /// Completed datastream QUIC reads from driver-owned DATASTREAM_ALPN adapters.
+    datastream_reads: Arc<Mutex<Vec<DatastreamQuicRead>>>,
+    /// Logical edge events emitted by driver-owned EDGE_ALPN byte pumps.
+    edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
+    next_edge_stream_group: u64,
     /// Frames read by per-connection reader tasks, drained synchronously by
     /// `recv()` / `pump_inbound_to_actors()`. This decouples network reads from the
     /// state machine so `recv()`/`tick()` are pure-sync (no `block_on`) and can run
@@ -395,6 +435,9 @@ impl IrohDriver {
             Arc::new(Mutex::new(Vec::new()));
         let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>> =
             Arc::new(Mutex::new(Vec::new()));
+        let datastream_reads: Arc<Mutex<Vec<DatastreamQuicRead>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let ep = endpoint.clone();
             let peer_auth = config.peer_auth.clone();
@@ -443,6 +486,9 @@ impl IrohDriver {
             dialing: Arc::new(Mutex::new(HashSet::new())),
             accepted_conns,
             other_accepted_conns,
+            datastream_reads,
+            edge_events,
+            next_edge_stream_group: 1,
             incoming: Arc::new(Mutex::new(Vec::new())),
             evict: Arc::new(Mutex::new(Vec::new())),
             peer_relay_urls: HashMap::new(),
@@ -499,6 +545,81 @@ impl IrohDriver {
         }
         *pending = keep;
         drained
+    }
+
+    /// Claim accepted datastream connections and read them inside driver-owned tasks.
+    pub fn pump_datastream_ingress(&mut self) {
+        for (_node, conn) in self.drain_accepted_for_alpn(DATASTREAM_ALPN) {
+            let reads = Arc::clone(&self.datastream_reads);
+            self.rt.spawn(async move {
+                while let Ok(recv) = conn.accept_uni().await {
+                    match read_events_from_stream(recv).await {
+                        Ok(read) => reads.lock().push(read),
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    }
+
+    /// Drain decoded datastream QUIC reads emitted by driver-owned adapter tasks.
+    pub fn drain_datastream_reads(&self) -> Vec<DatastreamQuicRead> {
+        self.datastream_reads.lock().drain(..).collect()
+    }
+
+    /// Start a driver-owned datastream subscription writer task.
+    pub fn publish_datastream_subscription(
+        &self,
+        peer: EndpointAddr,
+        header: DatastreamQuicHeader,
+        subscription: datastream::DatastreamSubscription,
+        idle_sleep: Duration,
+    ) {
+        let _ = spawn_subscription_writer(
+            &self.rt,
+            self.endpoint.clone(),
+            peer,
+            header,
+            subscription,
+            idle_sleep,
+        );
+    }
+
+    /// Return a cloneable logical datastream transport handle for publisher actors.
+    pub fn datastream_publish_handle(&self) -> DatastreamPublishHandle {
+        DatastreamPublishHandle {
+            rt: self.rt.clone(),
+            endpoint: self.endpoint.clone(),
+        }
+    }
+
+    /// Claim accepted MVP edge connections and read opaque edge bytes inside the driver.
+    pub fn pump_edge_ingress(&mut self) {
+        for (node, conn) in self.drain_accepted_for_alpn(EDGE_ALPN) {
+            let stream_group = self.next_edge_stream_group;
+            self.next_edge_stream_group = self.next_edge_stream_group.saturating_add(1).max(1);
+            spawn_edge_recv_pump(
+                self.rt.clone(),
+                conn,
+                node,
+                Arc::clone(&self.edge_events),
+                stream_group,
+            );
+        }
+    }
+
+    /// Drain logical edge transport events emitted by driver-owned byte pumps.
+    pub fn drain_edge_events(&self) -> Vec<EdgeTransportEvent> {
+        self.edge_events.lock().drain(..).collect()
+    }
+
+    /// Start a driver-owned EDGE_ALPN send pump and return its logical byte input handle.
+    pub fn spawn_edge_send_pump(
+        &self,
+        peer: EndpointAddr,
+        edge_id: u64,
+    ) -> Result<EdgeSendHandle, String> {
+        spawn_edge_sender_task(self.rt.clone(), self.endpoint.clone(), peer, edge_id)
     }
 
     /// The node's identity.
