@@ -1,4 +1,4 @@
-//! swactor actor shells for the MVP system local E2E stack.
+//! swactor actor shells for the MVP system runtime.
 //!
 //! Each actor module owns its message type. Pure state machines remain in the
 //! existing domain modules; actors translate mailbox messages into those cores and

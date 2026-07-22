@@ -5,11 +5,15 @@
 //! wire message definitions.
 
 pub mod datastream_transport;
+pub mod edge_transport;
 pub mod iroh_driver;
 
 pub use iroh_driver::{
-    ConnType, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus, conn_type_of, discover_lan_ips,
+    ConnType, DatastreamPublishHandle, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus,
+    conn_type_of, discover_lan_ips,
 };
+
+pub use edge_transport::{EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, EdgeTransportFault};
 
 pub use datastream_transport::{
     DATASTREAM_ALPN, DatastreamQuicHeader, DatastreamQuicRead, DatastreamQuicWriteStats,

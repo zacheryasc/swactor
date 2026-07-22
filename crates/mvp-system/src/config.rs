@@ -174,7 +174,7 @@ impl TomlConfigOverlay {
 
 impl ResolvedVastAiConfig {
     pub fn validate(self) -> Result<Self, String> {
-        require_non_empty("VAST_API_KEY", &self.api_key)?;
+        require_non_empty("VASTAI_API_KEY", &self.api_key)?;
         require_non_empty("relay.url", &self.relay_url)?;
         require_non_empty("vastai.image", &self.image)?;
         require_non_empty("vastai.bootstrap_command", &self.bootstrap_command)?;

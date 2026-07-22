@@ -1,4 +1,5 @@
-use std::fs;
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::net::{Shutdown, TcpStream};
 #[cfg(all(target_os = "linux", not(test)))]
@@ -10,7 +11,12 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use datastream::{
+    ChannelContent, ChannelId, DatastreamEndpoint, DatastreamProducer, Frame, Lifetime, NodeId,
+    StreamDescriptor, StreamId, StreamOrigin,
+};
 use serde::Deserialize;
+use serde_json::{Value, json};
 #[cfg(target_os = "linux")]
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(target_os = "linux")]
@@ -30,6 +36,10 @@ const REPO_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const ORCH_SHUTDOWN_GRACE_MS: u64 = 5_000;
 const ORCH_SHUTDOWN_POLL_MS: u64 = 50;
+const CHAT_LIFECYCLE_CHANNEL: &str = "mvp.chat.lifecycle";
+const CHAT_RUNTIME_CHANNEL: &str = "mvp.chat.runtime";
+const CHAT_PROMPT_CHANNEL: &str = "mvp.chat.prompt";
+const CHAT_COMPONENT_CHANNEL: &str = "mvp.chat.component";
 
 #[derive(Debug)]
 enum PromptInput {
@@ -63,19 +73,122 @@ where
     I: IntoIterator<Item = String>,
 {
     let config = Config::from_args(args)?;
+    let mut progress = ChatDatastream::new(1, config.datastream_frame_log.clone())?;
+    progress.emit(
+        CHAT_LIFECYCLE_CHANNEL,
+        "config",
+        "ready",
+        json!({
+            "provider": config.provider.as_str(),
+            "pipeline_stages": config.pipeline_stages,
+            "max_tokens": config.max_tokens,
+            "cached_model": config.cached_model.as_ref().map(|model| model.host_path.to_string_lossy().to_string()),
+            "dump_logs": config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+        }),
+    );
     confirm_vastai_if_needed(&config)?;
-    let image_ref = prepare_runtime(&config)?;
-    let mut orch = OrchChild::spawn(&config, &image_ref)?;
+    let image_ref = match prepare_runtime(&config) {
+        Ok(image_ref) => {
+            progress.emit(
+                CHAT_RUNTIME_CHANNEL,
+                "prepare_runtime",
+                "ready",
+                json!({"image_ref": image_ref}),
+            );
+            image_ref
+        }
+        Err(error) => {
+            progress.emit(
+                CHAT_RUNTIME_CHANNEL,
+                "prepare_runtime",
+                "failed",
+                json!({"error": error}),
+            );
+            progress.archive_pending()?;
+            return Err(error);
+        }
+    };
+    let mut orch = match OrchChild::spawn(&config, &image_ref) {
+        Ok(orch) => {
+            progress.emit(
+                CHAT_COMPONENT_CHANNEL,
+                "orchestrator_process",
+                "started",
+                json!({"binary": config.orch_bin.to_string_lossy()}),
+            );
+            orch
+        }
+        Err(error) => {
+            progress.emit(
+                CHAT_COMPONENT_CHANNEL,
+                "orchestrator_process",
+                "failed",
+                json!({"error": error}),
+            );
+            progress.archive_pending()?;
+            return Err(error);
+        }
+    };
     let rpc_addr = match orch.wait_ready(config.rpc_addr.clone()) {
-        Ok(addr) => addr,
+        Ok(addr) => {
+            progress.emit(
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc",
+                "ready",
+                json!({"addr": addr}),
+            );
+            addr
+        }
         Err(_) if STOP_REQUESTED.load(Ordering::SeqCst) => {
+            progress.emit(
+                CHAT_LIFECYCLE_CHANNEL,
+                "shutdown",
+                "requested",
+                json!({"reason": "interrupted_before_ready"}),
+            );
             orch.shutdown();
+            progress.emit(
+                CHAT_COMPONENT_CHANNEL,
+                "orchestrator_process",
+                "stopped",
+                json!({"reason": "interrupted_before_ready"}),
+            );
+            progress.archive_pending()?;
             return Ok(());
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            progress.emit(
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc",
+                "failed",
+                json!({"error": error}),
+            );
+            orch.shutdown();
+            progress.emit(
+                CHAT_COMPONENT_CHANNEL,
+                "orchestrator_process",
+                "stopped",
+                json!({"reason": "startup_failed"}),
+            );
+            progress.archive_pending()?;
+            return Err(error);
+        }
     };
-    let result = run_chat_loop(&rpc_addr, config.max_tokens);
+    let result = run_chat_loop_with_progress(&rpc_addr, config.max_tokens, Some(&mut progress));
+    progress.emit(
+        CHAT_LIFECYCLE_CHANNEL,
+        "shutdown",
+        "requested",
+        json!({"reason": "prompt_loop_exited", "ok": result.is_ok()}),
+    );
     orch.shutdown();
+    progress.emit(
+        CHAT_COMPONENT_CHANNEL,
+        "orchestrator_process",
+        "stopped",
+        json!({"reason": "shutdown_requested"}),
+    );
+    progress.archive_pending()?;
     result
 }
 
@@ -93,6 +206,174 @@ struct Config {
     pipeline_stages: u32,
     max_tokens: u32,
     skip_rebuild: bool,
+}
+
+struct ChatDatastream {
+    stream: StreamId,
+    endpoint: DatastreamEndpoint,
+    producer: DatastreamProducer,
+    channels: BTreeMap<String, ChannelId>,
+    channel_names: BTreeMap<ChannelId, String>,
+    archive_path: Option<PathBuf>,
+    pending: Vec<(String, StreamId, String, Frame)>,
+}
+
+impl ChatDatastream {
+    fn new(run_id: u64, archive_path: Option<PathBuf>) -> Result<Self, String> {
+        let stream = StreamId::new(NodeId::new("mvp-chat"), Lifetime(run_id));
+        let endpoint = DatastreamEndpoint::with_descriptor(
+            StreamDescriptor {
+                stream: stream.clone(),
+                label: Some("mvp chat".to_owned()),
+                origin: StreamOrigin::Orchestrator,
+            },
+            1024,
+            256,
+        );
+        let producer = endpoint.producer();
+        let mut out = Self {
+            stream,
+            endpoint,
+            producer,
+            channels: BTreeMap::new(),
+            channel_names: BTreeMap::new(),
+            archive_path,
+            pending: Vec::new(),
+        };
+        for name in [
+            CHAT_LIFECYCLE_CHANNEL,
+            CHAT_RUNTIME_CHANNEL,
+            CHAT_PROMPT_CHANNEL,
+            CHAT_COMPONENT_CHANNEL,
+        ] {
+            out.channel_by_name(name);
+        }
+        Ok(out)
+    }
+
+    fn channel_by_name(&mut self, name: &str) -> ChannelId {
+        if let Some(id) = self.channels.get(name).copied() {
+            return id;
+        }
+        let id = self.producer.register_channel(
+            name,
+            ChannelContent::JsonRecord {
+                schema: Some(name.to_owned()),
+            },
+        );
+        self.channels.insert(name.to_owned(), id);
+        self.channel_names.insert(id, name.to_owned());
+        id
+    }
+
+    fn emit(&mut self, channel: &str, phase: &str, status: &str, detail: Value) {
+        let id = self.channel_by_name(channel);
+        let payload = serde_json::to_vec(&json!({
+            "type": "ChatProgress",
+            "phase": phase,
+            "status": status,
+            "detail": detail,
+        }))
+        .expect("serialize mvp-chat progress event");
+        self.producer.submit_bytes(id, payload);
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        let stream = self.stream.clone();
+        for frame in self.endpoint.mux().drain() {
+            let channel = self
+                .channel_names
+                .get(&frame.channel)
+                .cloned()
+                .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
+            self.pending
+                .push(("mvp-chat".to_owned(), stream.clone(), channel, frame));
+        }
+    }
+
+    fn archive_pending(&mut self) -> Result<(), String> {
+        let Some(path) = self.archive_path.as_deref() else {
+            self.pending.clear();
+            return Ok(());
+        };
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let mut archive = ChatFrameArchive::open(path)?;
+        for (source, stream, channel, frame) in self.pending.drain(..) {
+            archive.record(&source, &stream, &channel, &frame)?;
+        }
+        Ok(())
+    }
+}
+
+struct ChatFrameArchive {
+    file: File,
+    next_seq: u64,
+}
+
+impl ChatFrameArchive {
+    fn open(path: &Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "create mvp-chat datastream frame log dir {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        let next_seq = match File::open(path) {
+            Ok(file) => BufReader::new(file).lines().count() as u64,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => {
+                return Err(format!(
+                    "read mvp-chat datastream frame log {}: {error}",
+                    path.display()
+                ));
+            }
+        };
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("open mvp-chat datastream frame log {}: {e}", path.display()))?;
+        Ok(Self { file, next_seq })
+    }
+
+    fn record(
+        &mut self,
+        source: &str,
+        stream: &StreamId,
+        channel: &str,
+        frame: &Frame,
+    ) -> Result<(), String> {
+        let payload = match std::str::from_utf8(&frame.payload) {
+            Ok(text) => json!({"encoding": "utf8", "value": text}),
+            Err(_) => json!({"encoding": "bytes", "value": frame.payload}),
+        };
+        let record = json!({
+            "arrival_seq": self.next_seq,
+            "source": source,
+            "stream": stream.to_string(),
+            "channel": channel,
+            "channel_id": frame.channel.0,
+            "position": frame.position.0,
+            "payload": payload,
+        });
+        self.next_seq += 1;
+        let mut line = serde_json::to_vec(&record)
+            .map_err(|e| format!("serialize mvp-chat frame log: {e}"))?;
+        line.push(b'\n');
+        self.file
+            .write_all(&line)
+            .map_err(|e| format!("write mvp-chat frame log: {e}"))?;
+        self.file
+            .flush()
+            .map_err(|e| format!("flush mvp-chat frame log: {e}"))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -255,6 +536,7 @@ impl Config {
             self.max_tokens.to_string(),
             "--pipeline-stages".to_owned(),
             self.pipeline_stages.to_string(),
+            "--no-dashboard".to_owned(),
         ];
         if self.provider == ProviderKind::Process {
             args.extend([
@@ -412,7 +694,7 @@ fn resolve_vastai_config(
     node_image: &str,
 ) -> Result<ResolvedVastAiConfig, String> {
     ResolvedVastAiConfig {
-        api_key: first_non_empty([env_optional("VAST_API_KEY")]).unwrap_or_default(),
+        api_key: first_non_empty([env_optional("VASTAI_API_KEY")]).unwrap_or_default(),
         relay_url: first_non_empty([file.relay_url.clone()]).unwrap_or_default(),
         image: node_image.to_owned(),
         bootstrap_command: first_non_empty([file.bootstrap_command.clone()]).unwrap_or_default(),
@@ -692,42 +974,70 @@ fn stdin_prompt_events() -> mpsc::Receiver<PromptInput> {
     rx
 }
 
-fn run_chat_loop(addr: &str, max_tokens: u32) -> Result<(), String> {
-    run_chat_loop_with_input(addr, max_tokens, stdin_prompt_events())
+fn run_chat_loop_with_progress(
+    addr: &str,
+    max_tokens: u32,
+    progress: Option<&mut ChatDatastream>,
+) -> Result<(), String> {
+    run_chat_loop_with_input_and_progress(addr, max_tokens, stdin_prompt_events(), progress)
 }
 
-fn run_chat_loop_with_input(
+fn run_chat_loop_with_input_and_progress(
     addr: &str,
     max_tokens: u32,
     input_rx: mpsc::Receiver<PromptInput>,
+    progress: Option<&mut ChatDatastream>,
 ) -> Result<(), String> {
-    let mut stream =
-        TcpStream::connect(addr).map_err(|e| format!("connect prompt RPC {addr}: {e}"))?;
-    let reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| format!("clone prompt RPC stream: {e}"))?,
+    let mut progress = progress;
+    emit_chat_progress(
+        &mut progress,
+        CHAT_RUNTIME_CHANNEL,
+        "prompt_rpc",
+        "connecting",
+        json!({"addr": addr}),
     );
-    run_chat_session(&mut stream, reader, input_rx, max_tokens)
+    let mut stream = match TcpStream::connect(addr) {
+        Ok(stream) => {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc",
+                "connected",
+                json!({"addr": addr}),
+            );
+            stream
+        }
+        Err(error) => {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc",
+                "failed",
+                json!({"addr": addr, "error": error.to_string()}),
+            );
+            return Err(format!("connect prompt RPC {addr}: {error}"));
+        }
+    };
+    let reader = match stream.try_clone() {
+        Ok(stream) => BufReader::new(stream),
+        Err(error) => {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc_clone",
+                "failed",
+                json!({"error": error.to_string()}),
+            );
+            return Err(format!("clone prompt RPC stream: {error}"));
+        }
+    };
+    run_chat_session_with_progress(&mut stream, reader, input_rx, max_tokens, progress)
 }
 
-fn run_chat_session<R, W>(
-    writer: &mut W,
-    reader: R,
-    input_rx: mpsc::Receiver<PromptInput>,
-    max_tokens: u32,
-) -> Result<(), String>
-where
-    R: BufRead,
-    W: Write,
-{
-    let mut output = io::stdout();
-    run_chat_session_with_output(writer, reader, input_rx, max_tokens, &mut output)
-}
-
+#[cfg(test)]
 fn run_chat_session_with_output<R, W, O>(
     writer: &mut W,
-    mut reader: R,
+    reader: R,
     input_rx: mpsc::Receiver<PromptInput>,
     max_tokens: u32,
     output: &mut O,
@@ -737,17 +1047,101 @@ where
     W: Write,
     O: Write,
 {
+    run_chat_session_with_output_and_progress(writer, reader, input_rx, max_tokens, output, None)
+}
+
+fn run_chat_session_with_progress<R, W>(
+    writer: &mut W,
+    reader: R,
+    input_rx: mpsc::Receiver<PromptInput>,
+    max_tokens: u32,
+    progress: Option<&mut ChatDatastream>,
+) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write,
+{
+    let mut output = io::stdout();
+    run_chat_session_with_output_and_progress(
+        writer,
+        reader,
+        input_rx,
+        max_tokens,
+        &mut output,
+        progress,
+    )
+}
+
+fn emit_chat_progress(
+    progress: &mut Option<&mut ChatDatastream>,
+    channel: &str,
+    phase: &str,
+    status: &str,
+    detail: Value,
+) {
+    if let Some(progress) = progress.as_deref_mut() {
+        progress.emit(channel, phase, status, detail);
+    }
+}
+
+fn run_chat_session_with_output_and_progress<R, W, O>(
+    writer: &mut W,
+    mut reader: R,
+    input_rx: mpsc::Receiver<PromptInput>,
+    max_tokens: u32,
+    output: &mut O,
+    progress: Option<&mut ChatDatastream>,
+) -> Result<(), String>
+where
+    R: BufRead,
+    W: Write,
+    O: Write,
+{
+    let mut progress = progress;
     let mut next_request_id = 1_u64;
 
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_PROMPT_CHANNEL,
+                "prompt_loop",
+                "exited",
+                json!({"reason": "stop_requested"}),
+            );
             return Ok(());
         }
+        emit_chat_progress(
+            &mut progress,
+            CHAT_PROMPT_CHANNEL,
+            "waiting_for_prompt",
+            "started",
+            json!({"next_request_id": next_request_id}),
+        );
         write!(output, "prompt:> ").map_err(|e| format!("write prompt: {e}"))?;
         output.flush().map_err(|e| format!("flush prompt: {e}"))?;
         let prompt = match input_rx.recv() {
             Ok(PromptInput::Line(line)) => line.trim_end().to_owned(),
-            Ok(PromptInput::Closed | PromptInput::StopRequested) | Err(_) => return Ok(()),
+            Ok(PromptInput::Closed) | Err(_) => {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_PROMPT_CHANNEL,
+                    "prompt_loop",
+                    "exited",
+                    json!({"reason": "input_closed"}),
+                );
+                return Ok(());
+            }
+            Ok(PromptInput::StopRequested) => {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_PROMPT_CHANNEL,
+                    "prompt_loop",
+                    "exited",
+                    json!({"reason": "stop_requested"}),
+                );
+                return Ok(());
+            }
         };
         if prompt.trim().is_empty() {
             continue;
@@ -755,6 +1149,13 @@ where
 
         let request_id = next_request_id;
         next_request_id = next_request_id.wrapping_add(1).max(1);
+        emit_chat_progress(
+            &mut progress,
+            CHAT_PROMPT_CHANNEL,
+            "prompt_submitted",
+            "ready",
+            json!({"request_id": request_id, "prompt_bytes": prompt.len(), "max_tokens": max_tokens}),
+        );
         write_json_line(
             writer,
             &SubmitPrompt {
@@ -764,22 +1165,72 @@ where
             },
         )?;
         writeln!(output, "decoding...").map_err(|e| format!("write decoding marker: {e}"))?;
+        emit_chat_progress(
+            &mut progress,
+            CHAT_PROMPT_CHANNEL,
+            "decoding",
+            "started",
+            json!({"request_id": request_id}),
+        );
         let mut response_started = false;
 
         loop {
             if STOP_REQUESTED.load(Ordering::SeqCst) {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_PROMPT_CHANNEL,
+                    "prompt_loop",
+                    "exited",
+                    json!({"reason": "stop_requested"}),
+                );
                 return Ok(());
             }
             let mut line = String::new();
             match reader.read_line(&mut line) {
-                Ok(0) => return Err("prompt RPC closed".to_owned()),
+                Ok(0) => {
+                    emit_chat_progress(
+                        &mut progress,
+                        CHAT_PROMPT_CHANNEL,
+                        "prompt_rpc",
+                        "failed",
+                        json!({"request_id": request_id, "error": "prompt RPC closed"}),
+                    );
+                    return Err("prompt RPC closed".to_owned());
+                }
                 Ok(_) => {}
-                Err(error) => return Err(format!("read prompt RPC event: {error}")),
+                Err(error) => {
+                    emit_chat_progress(
+                        &mut progress,
+                        CHAT_PROMPT_CHANNEL,
+                        "prompt_rpc",
+                        "failed",
+                        json!({"request_id": request_id, "error": error.to_string()}),
+                    );
+                    return Err(format!("read prompt RPC event: {error}"));
+                }
             }
-            let event = serde_json::from_str::<PromptEvent>(&line)
-                .map_err(|e| format!("parse prompt RPC event: {e}"))?;
+            let event = match serde_json::from_str::<PromptEvent>(&line) {
+                Ok(event) => event,
+                Err(error) => {
+                    emit_chat_progress(
+                        &mut progress,
+                        CHAT_PROMPT_CHANNEL,
+                        "prompt_event_parse",
+                        "failed",
+                        json!({"request_id": request_id, "error": error.to_string()}),
+                    );
+                    return Err(format!("parse prompt RPC event: {error}"));
+                }
+            };
             let seen = event.request_id();
             if seen != request_id {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_PROMPT_CHANNEL,
+                    "prompt_request_id",
+                    "failed",
+                    json!({"expected": request_id, "observed": seen}),
+                );
                 return Err(format!(
                     "prompt RPC protocol error: response request_id {seen} does not match active request_id {request_id}"
                 ));
@@ -795,6 +1246,13 @@ where
                     output
                         .flush()
                         .map_err(|e| format!("flush response text: {e}"))?;
+                    emit_chat_progress(
+                        &mut progress,
+                        CHAT_PROMPT_CHANNEL,
+                        "response_text",
+                        "observed",
+                        json!({"request_id": request_id, "text_bytes": text.len()}),
+                    );
                 }
                 PromptEvent::Done { .. } => {
                     if response_started {
@@ -803,11 +1261,25 @@ where
                         writeln!(output, "Response: ")
                             .map_err(|e| format!("write empty response: {e}"))?;
                     }
+                    emit_chat_progress(
+                        &mut progress,
+                        CHAT_PROMPT_CHANNEL,
+                        "request_completed",
+                        "ready",
+                        json!({"request_id": request_id, "response_started": response_started}),
+                    );
                     break;
                 }
                 PromptEvent::Fault { error, .. } => {
                     writeln!(output, "error: {error}")
                         .map_err(|e| format!("write prompt fault: {e}"))?;
+                    emit_chat_progress(
+                        &mut progress,
+                        CHAT_PROMPT_CHANNEL,
+                        "request_faulted",
+                        "ready",
+                        json!({"request_id": request_id, "error": error}),
+                    );
                     break;
                 }
             }
@@ -1061,8 +1533,11 @@ mod tests {
     static PROCESS_STATE_LOCK: Mutex<()> = Mutex::new(());
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
-    const PROCESS_ENV_KEYS: &[&str] =
-        &["VAST_API_KEY", "MVP_PIPELINE_STAGES", "MVP_RUNTIME_CONFIG"];
+    const PROCESS_ENV_KEYS: &[&str] = &[
+        "VASTAI_API_KEY",
+        "MVP_PIPELINE_STAGES",
+        "MVP_RUNTIME_CONFIG",
+    ];
 
     struct TempDir {
         path: PathBuf,
@@ -1521,7 +1996,7 @@ bootstrap_command = "boot"
 "#,
         );
         with_process_state(
-            &[("VAST_API_KEY", Some("secret"))],
+            &[("VASTAI_API_KEY", Some("secret"))],
             Some(missing_relay.path()),
             || {
                 let config_arg = missing_relay_config.to_string_lossy().into_owned();
@@ -1546,7 +2021,7 @@ bootstrap_command = "boot"
 "#,
         );
         with_process_state(
-            &[("VAST_API_KEY", Some("secret"))],
+            &[("VASTAI_API_KEY", Some("secret"))],
             Some(local_image.path()),
             || {
                 let config_arg = local_image_config.to_string_lossy().into_owned();
@@ -1571,7 +2046,7 @@ bootstrap_command = "boot"
 "#,
         );
         with_process_state(
-            &[("VAST_API_KEY", Some("secret"))],
+            &[("VASTAI_API_KEY", Some("secret"))],
             Some(valid.path()),
             || {
                 let config_arg = valid_config.to_string_lossy().into_owned();

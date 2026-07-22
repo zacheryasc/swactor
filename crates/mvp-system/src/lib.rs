@@ -5,6 +5,7 @@ pub mod actors;
 pub mod arena_manager;
 pub mod bootstrap_datastream;
 pub mod config;
+pub mod dashboard_view;
 pub mod device_bridge;
 pub mod distribution_stack;
 pub mod docker_cluster_provisioning;

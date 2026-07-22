@@ -1,4 +1,3 @@
 [alias]
 xtask = "run --package xtask --"
 mvp-chat = "run --package xtask -- mvp-chat"
-mvp-chat-test = "test -p mvp-system --features local-e2e --test one_node_chat_e2e -- --nocapture"
