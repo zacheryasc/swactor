@@ -21,6 +21,9 @@ use crate::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 #[cfg(feature = "dashboard")]
 use crate::dashboard_view::MvpClusterDashboardView;
 use crate::distribution_stack::DistributionRuntimeStack;
+use crate::endpoint_advertisement::{
+    EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
+};
 use crate::gpu_worker_ingress_parser as ingress;
 use crate::node_provisioning::ProviderKind;
 use crate::orchestrator_run_fsm::{RunConfig, RunId};
@@ -79,6 +82,7 @@ const DEFAULT_MAX_TOKENS: u32 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const RUNTIME_READY_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const MVP_ORCH_BOOTSTRAP: &str = "mvp.orch.bootstrap";
 const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
 const MVP_SWIM_MEMBERSHIP: &str = "mvp.swim.membership";
@@ -149,6 +153,7 @@ where
             "stage_index":config.stage_index,
             "legacy_layer_end_exclusive":config.layer_end_exclusive,
             "relay_mode":format!("{:?}", config.relay.mode),
+            "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
             "pipeline_stages":config.pipeline_stages,
             "provider_config":config.provider_datastream_detail(),
         }),
@@ -217,17 +222,7 @@ where
             additional_alpns: vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()],
         },
     ) {
-        Ok(driver) => {
-            orch_datastream.emit_bootstrap(
-                None,
-                config.run_id,
-                config.node_id,
-                "iroh_driver",
-                "ready",
-                json!({"relay_mode":format!("{:?}", config.relay.mode)}),
-            );
-            driver
-        }
+        Ok(driver) => driver,
         Err(error) => {
             orch_datastream.emit_bootstrap(
                 None,
@@ -240,6 +235,16 @@ where
             return Err(format!("create iroh driver: {error}"));
         }
     };
+    let coordinator_endpoint =
+        advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
+    orch_datastream.emit_bootstrap(
+        None,
+        config.run_id,
+        config.node_id,
+        "iroh_driver",
+        "ready",
+        json!({"endpoint":coordinator_endpoint.clone(),"has_relay":coordinator_endpoint.relay_urls().next().is_some(),"direct_addr_count":coordinator_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay.mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
+    );
     let stack = DistributionRuntimeStack::new_with_codecs(
         driver.node_id(),
         DistributedNodeConfig::default(),
@@ -425,7 +430,6 @@ where
     let sink = PluginSink::new(Arc::new(ChannelObservationSink {
         tx: Mutex::new(obs_tx),
     }));
-    let coordinator_endpoint = driver.endpoint_addr();
     let pipeline_coordinator_endpoint = coordinator_endpoint.clone();
     let (mut provisioned_nodes, ready) = start_and_provision_workers(
         provisioner,
@@ -860,6 +864,7 @@ struct Config {
     dashboard: bool,
     max_context: Option<u32>,
     relay: RelayRuntimeConfig,
+    endpoint_addr_mask: EndpointAddrMask,
     vastai: Option<VastAiRuntimeConfig>,
     cached_model: Option<CachedModelConfig>,
     datastream_frame_log: Option<PathBuf>,
@@ -889,6 +894,7 @@ struct ConfigBuilder {
     max_context: Option<u32>,
     relay_mode: Option<String>,
     relay_url: Option<String>,
+    endpoint_addr_mask: Option<String>,
     vastai_api_key: Option<String>,
     vastai_bootstrap_command: Option<String>,
     vastai_disk_gb: Option<u32>,
@@ -944,6 +950,7 @@ impl ConfigBuilder {
             max_context: None,
             relay_mode: None,
             relay_url: None,
+            endpoint_addr_mask: None,
             vastai_api_key: None,
             vastai_bootstrap_command: None,
             vastai_disk_gb: None,
@@ -1172,6 +1179,9 @@ impl ConfigBuilder {
         {
             self.relay_url = Some(url);
         }
+        if let Some(mask) = env_optional(MVP_IROH_ENDPOINT_ADDR_MASK_ENV) {
+            self.endpoint_addr_mask = Some(mask);
+        }
         if let Some(api_key) =
             env_optional("MVP_VASTAI_API_KEY").or_else(|| env_optional("VASTAI_API_KEY"))
         {
@@ -1283,6 +1293,9 @@ impl ConfigBuilder {
                 }
                 "--relay-mode" => self.relay_mode = Some(next_arg(&mut args, "--relay-mode")?),
                 "--relay-url" => self.relay_url = Some(next_arg(&mut args, "--relay-url")?),
+                "--endpoint-addr-mask" => {
+                    self.endpoint_addr_mask = Some(next_arg(&mut args, "--endpoint-addr-mask")?)
+                }
                 "--vastai-api-key" => {
                     self.vastai_api_key = Some(next_arg(&mut args, "--vastai-api-key")?)
                 }
@@ -1392,6 +1405,10 @@ impl ConfigBuilder {
             self.relay_mode.as_deref(),
             self.relay_url.as_deref(),
         )?;
+        let endpoint_addr_mask = match self.endpoint_addr_mask.as_deref() {
+            Some(mask) => EndpointAddrMask::parse(mask)?,
+            None => EndpointAddrMask::Full,
+        };
         let vastai = if provider == ProviderKind::VastAi {
             Some(VastAiRuntimeConfig::from_builder(&self)?)
         } else {
@@ -1418,6 +1435,7 @@ impl ConfigBuilder {
             dashboard: self.dashboard,
             max_context: self.max_context,
             relay,
+            endpoint_addr_mask,
             vastai,
             cached_model,
             worker_bin: self.worker_bin,
@@ -1736,6 +1754,7 @@ impl Config {
             "MVP_ORCHESTRATOR_ACTOR",
             "MVP_MODEL_ID",
             "MVP_IROH_RELAY_MODE",
+            MVP_IROH_ENDPOINT_ADDR_MASK_ENV,
             "MVP_PIPELINE_STAGES",
         ];
         if self.relay.url.is_some() {
@@ -1817,6 +1836,10 @@ impl Config {
             (
                 "MVP_PIPELINE_STAGES".to_owned(),
                 self.pipeline_stages.to_string(),
+            ),
+            (
+                MVP_IROH_ENDPOINT_ADDR_MASK_ENV.to_owned(),
+                self.endpoint_addr_mask.as_str().to_owned(),
             ),
             (
                 "MVP_NODE_PROVIDER".to_owned(),
@@ -1959,9 +1982,9 @@ fn enqueue_runtime_ready_ack(
 }
 
 fn enqueue_datastream_subscribe(
-    driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
     ready: &RuntimeReady,
+    collector: &EndpointAddr,
     run_id: u64,
     node_id: u64,
 ) -> Result<(), String> {
@@ -1973,7 +1996,7 @@ fn enqueue_datastream_subscribe(
         .send_to(
             ready.datastream_publisher,
             DatastreamPublisherMsg::Subscribe(DatastreamSubscribe {
-                collector: driver.endpoint_addr(),
+                collector: collector.clone(),
                 request: SubscriptionRequest::all(),
                 flow_id,
                 token: Vec::new(),
@@ -1998,6 +2021,7 @@ fn wait_for_runtime_ready_acks(
     orchestrator_node_id: u64,
     provider: ProviderKind,
     targets: &[RuntimeReadyAckTarget],
+    collector_endpoint: &EndpointAddr,
 ) -> Result<(), String> {
     let mut pending = targets
         .iter()
@@ -2098,9 +2122,9 @@ fn wait_for_runtime_ready_acks(
                 if stack.route_owner(target.ready.datastream_publisher)
                     == Some(target.ready.swim_node_id)
                     && let Err(error) = enqueue_datastream_subscribe(
-                        driver,
                         stack,
                         &target.ready,
+                        collector_endpoint,
                         run_id,
                         target.node_id,
                     )
@@ -2300,6 +2324,7 @@ fn start_and_provision_workers(
             "provider":config.provider.as_str(),
             "image":&config.image,
             "relay_mode":relay_mode_env_value(&config.relay.mode),
+            "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
             "docker_gpus":if config.provider == ProviderKind::Docker { Some(config.docker_gpus.as_str()) } else { None },
             "provider_config":config.provider_datastream_detail(),
             "env_keys":config.node_spec_env_keys(),
@@ -2481,6 +2506,7 @@ fn start_and_provision_workers(
         config.node_id,
         config.provider,
         &ack_targets,
+        &pipeline_coordinator,
     )?;
 
     orch_datastream.emit_bootstrap(
@@ -2797,6 +2823,7 @@ fn wait_for_runtime_readies(
 ) -> Result<BTreeMap<u64, RuntimeReady>, String> {
     let expected = expected_node_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut pending = BTreeMap::<u64, RuntimeReady>::new();
+    let started = Instant::now();
     loop {
         pump(driver, stack, frame_tx);
         emit_swim_transitions(
@@ -2864,6 +2891,21 @@ fn wait_for_runtime_readies(
                 .is_some_and(|ready| runtime_ready_barrier_met(stack, ready))
         }) {
             return Ok(pending);
+        }
+        if started.elapsed() >= RUNTIME_READY_TIMEOUT {
+            let pending_list = expected
+                .iter()
+                .filter(|node_id| {
+                    pending
+                        .get(node_id)
+                        .is_none_or(|ready| !runtime_ready_barrier_met(stack, ready))
+                })
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "runtime_ready timed out for node(s): {pending_list}"
+            ));
         }
         thread::sleep(PUMP_INTERVAL);
     }
@@ -3610,6 +3652,7 @@ fn wait_for_runtime_ready(
     let mut node_swim_started = false;
     let mut node_swim_ready = false;
     let mut node_route_started = false;
+    let started = Instant::now();
     loop {
         pump(driver, stack, frame_tx);
         drain_frames(frame_rx, dashboard, orch_datastream);
@@ -3705,6 +3748,18 @@ fn wait_for_runtime_ready(
                     node_route_started = true;
                 }
             }
+        }
+        if started.elapsed() >= RUNTIME_READY_TIMEOUT {
+            let detail = pending_ready.as_ref().map(|ready| {
+                json!({
+                    "readiness_id":ready.readiness_id,
+                    "swim_alive":stack.member_state(ready.swim_node_id) == Some(MemberState::Alive),
+                    "route_owner":stack.route_owner(ready.node_actor).map(|node| format!("{node:?}")),
+                })
+            });
+            return Err(format!(
+                "runtime_ready timed out for node {node_id}: {detail:?}"
+            ));
         }
         thread::sleep(PUMP_INTERVAL);
     }
