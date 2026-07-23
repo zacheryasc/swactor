@@ -4660,6 +4660,7 @@ fn stop_requested(stop_rx: &mpsc::Receiver<()>) -> bool {
 
 fn spawn_stop_listener() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel();
+    let stdin_tx = tx.clone();
     thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines().map_while(Result::ok) {
@@ -4668,11 +4669,29 @@ fn spawn_stop_listener() -> mpsc::Receiver<()> {
                 || trimmed.eq_ignore_ascii_case("shutdown")
                 || trimmed.eq_ignore_ascii_case("quit")
             {
-                let _ = tx.send(());
+                let _ = stdin_tx.send(());
                 break;
             }
         }
     });
+    #[cfg(target_os = "linux")]
+    {
+        thread::spawn(move || {
+            let Ok(mut signals) = signal_hook::iterator::Signals::new([
+                signal_hook::consts::signal::SIGINT,
+                signal_hook::consts::signal::SIGTERM,
+            ]) else {
+                return;
+            };
+            if signals.forever().next().is_some() {
+                let _ = tx.send(());
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        drop(tx);
+    }
     rx
 }
 
