@@ -29,6 +29,9 @@ device_objects: dict[int, dict[str, Any]] = {}
 next_handle = 42
 HEADER_LEN = 40
 WORKER_GENERATION = 1
+BENCHMARK_SCHEMA = 1
+_benchmark_start = time.monotonic()
+_benchmark_seq = 0
 
 
 class CpuLineSampler:
@@ -142,9 +145,37 @@ def env_flag(name: str, default: bool = True) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
+def benchmark_stamp() -> dict[str, Any]:
+    global _benchmark_seq
+    _benchmark_seq += 1
+    return {
+        "schema": BENCHMARK_SCHEMA,
+        "component": "tinygrad-worker",
+        "pid": os.getpid(),
+        "seq": _benchmark_seq,
+        "wall_unix_ms": time.time_ns() // 1_000_000,
+        "mono_ms": int((time.monotonic() - _benchmark_start) * 1000),
+    }
+
+
+def env_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 def control(**event: Any) -> None:
+    event.setdefault("benchmark", benchmark_stamp())
+    if (run_id := env_int("MVP_RUN_ID")) is not None:
+        event.setdefault("run_id", run_id)
+    if (node_id := env_int("MVP_LOGICAL_NODE_ID")) is not None:
+        event.setdefault("node_id", node_id)
+    if (stage_index := env_int("MVP_STAGE_INDEX")) is not None:
+        event.setdefault("stage_index", stage_index)
     print(json.dumps(event, separators=(",", ":")), flush=True)
 
 
@@ -157,8 +188,6 @@ def fatal(reason: str, **fields: Any) -> None:
     raise SystemExit(1)
 
 
-def test_mode() -> bool:
-    return os.environ.get("MVP_TINYGRAD_TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 def configure_tinygrad_cuda_compiler(device: str) -> None:
     if device.split(":", 1)[0].upper() != "CUDA":
@@ -170,31 +199,31 @@ def configure_tinygrad_cuda_compiler(device: str) -> None:
     os.environ["CUDA_PTX"] = "1"
     control(type="TinygradCudaCompilerSelected", requested_device=device, compiler="PTX", reason="nvcc_not_found")
 
+def select_tinygrad_device(device: str) -> str:
+    device_kind = device.split(":", 1)[0].upper()
+    if device_kind == "CPU" and ":" not in device and shutil.which("clang") is None:
+        selected = "CPU:X86"
+        os.environ["DEV"] = selected
+        control(type="TinygradCpuCompilerSelected", requested_device=device, selected_device=selected, compiler="X86", reason="clang_not_found")
+        return selected
+    os.environ["DEV"] = device
+    configure_tinygrad_cuda_compiler(device)
+    return device
+
 
 
 def initialize(cmd: dict[str, Any]) -> None:
     global Tensor, dtypes, arena
     if int(cmd.get("helper_abi_version", 1)) != 1:
         fatal("UnsupportedHelperAbi", helper_abi_version=cmd.get("helper_abi_version"))
-    device = str(cmd.get("backend", {}).get("device") or os.environ.get("DEV") or "CUDA")
-    os.environ["DEV"] = device
+    requested_device = str(cmd.get("backend", {}).get("device") or os.environ.get("DEV") or "CUDA")
+    device = select_tinygrad_device(requested_device)
     arena_fd = os.environ.get("MVP_ARENA_FD")
     if arena_fd is not None:
         arena_bytes = int(os.environ.get("MVP_ARENA_BYTES", "0") or "0")
         if arena_bytes > 0:
             arena = mmap.mmap(int(arena_fd), arena_bytes)
     started = time.monotonic()
-    if test_mode():
-        control(
-            type="WorkerReady",
-            pid=os.getpid(),
-            backend={"requested_device": device, "env_DEV": os.environ.get("DEV"), "test_mode": True},
-            cuda_probe=[],
-            test_mode=True,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-        )
-        return
-    configure_tinygrad_cuda_compiler(device)
     control(type="TinygradImportStarted", requested_device=device, env_DEV=os.environ.get("DEV"))
     from tinygrad import Tensor as TinyTensor, dtypes as tiny_dtypes
 
@@ -353,31 +382,42 @@ class PipelineStageTinygradModel:
         vocab_size: int,
         head_dim: int,
         rope_theta: float,
+        rope_dim: int,
+        v_head_dim: int,
         max_context: int,
         qk_norm: int,
         num_experts: int,
         num_experts_per_tok: int,
+        norm_topk_prob: bool,
+        qkv_bias: bool,
+        expert_bias: bool,
         first_stage: bool,
         final_stage: bool,
         nn_mod: Any,
+        config_cls: Any,
         block_cls: Any,
     ) -> None:
-        self.blk = [
-            block_cls(
-                dim,
-                hidden_dim,
-                n_heads,
-                n_kv_heads,
-                norm_eps,
-                head_dim,
-                rope_theta,
-                max_context,
-                qk_norm,
-                num_experts,
-                num_experts_per_tok,
-            )
-            for _ in range(block_count)
-        ]
+        block_config = config_cls(
+            num_blocks=block_count,
+            dim=dim,
+            hidden_dim=hidden_dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            norm_eps=norm_eps,
+            vocab_size=vocab_size,
+            head_dim=head_dim,
+            rope_theta=rope_theta,
+            rope_dim=rope_dim,
+            v_head_dim=v_head_dim,
+            max_context=max_context,
+            qk_norm=qk_norm,
+            num_experts=num_experts,
+            num_experts_per_tok=num_experts_per_tok,
+            norm_topk_prob=norm_topk_prob,
+            qkv_bias=qkv_bias,
+            expert_bias=expert_bias,
+        )
+        self.blk = [block_cls(block_config) for _ in range(block_count)]
         self.max_context = max_context
         self.hidden_dim = dim
         self.first_stage = first_stage
@@ -389,16 +429,18 @@ class PipelineStageTinygradModel:
             self.output = nn_mod.Linear(dim, vocab_size, bias=False)
 
     def token_hidden(self, tokens_tensor: Any) -> Any:
-        return self.token_embd(tokens_tensor)
+        return self.token_embd(tokens_tensor).float()
 
-    def forward_hidden(self, hidden: Any, start_pos: int) -> Any:
+    def forward_hidden(self, hidden: Any, start_pos: Any) -> Any:
         for block in self.blk:
             hidden = block(hidden, start_pos)
         return hidden.contiguous()
 
     def next_token(self, hidden: Any) -> Any:
-        return self.output(self.output_norm(hidden))[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+        return self.output(self.output_norm(hidden))[:, -1, :].argmax(-1, keepdim=True)
 
+    def __call__(self, tokens_tensor: Any, start_pos: Any) -> Any:
+        return self.next_token(self.forward_hidden(self.token_hidden(tokens_tensor), start_pos))
 
 def remap_stage_state_dict(
     state_dict: dict[str, Any],
@@ -436,42 +478,66 @@ def load_pipeline_stage_model(
 ) -> tuple[PipelineStageTinygradModel, dict[str, Any]]:
     TensorCls = require_tinygrad()
     from tinygrad import nn
-    from tinygrad.apps.llm import TransformerBlock
+    from tinygrad.llm.gguf import gguf_load
+    from tinygrad.llm.model import TransformerBlock, TransformerConfig
 
-    kv, state_dict = nn.state.gguf_load(TensorCls(path).to(None))
+    kv, state_dict = gguf_load(path)
     state_dict = {key: value.cast("float16") if env_flag("HALF", True) else value for key, value in state_dict.items()}
+    if "output.weight" not in state_dict and "token_embd.weight" in state_dict:
+        state_dict["output.weight"] = state_dict["token_embd.weight"]
     arch = kv["general.architecture"]
     max_context = min(max_context, int(kv[f"{arch}.context_length"]))
     n_heads = int(kv[f"{arch}.attention.head_count"])
     n_kv_heads = int(kv[f"{arch}.attention.head_count_kv"])
-    if arch == "llama":
-        for name in list(state_dict):
-            if "attn_q.weight" in name:
-                state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_heads, two=2)
-            if "attn_k.weight" in name:
-                state_dict[name] = state_dict[name].rearrange("(n h two) d -> (n two h) d", n=n_kv_heads, two=2)
-    total_layers = int(kv[f"{arch}.block_count"])
+    dim = int(kv[f"{arch}.embedding_length"])
+    kv_lora_rank = int(kv.get(f"{arch}.attention.kv_lora_rank", 0))
+    head_dim = int(kv.get(f"{arch}.attention.key_length_mla", kv.get(f"{arch}.attention.key_length", dim // n_heads)))
+    rope_dim = int(kv.get(f"{arch}.rope.dimension_count", head_dim))
+    for name in list(state_dict):
+        if ("attn_q.weight" in name or "attn_q_b.weight" in name) and (arch == "llama" or kv_lora_rank):
+            weight = state_dict[name].reshape(n_heads, state_dict[name].shape[0] // n_heads, -1)
+            prefix = head_dim - rope_dim
+            state_dict[name] = (
+                weight[:, :prefix]
+                .cat(weight[:, prefix:].rearrange("n (h two) d -> n (two h) d", two=2), dim=1)
+                .reshape(-1, weight.shape[-1])
+            )
+        elif arch == "llama" and "attn_k.weight" in name:
+            weight = state_dict[name].reshape(n_kv_heads, state_dict[name].shape[0] // n_kv_heads, -1)
+            state_dict[name] = weight.rearrange("n (h two) d -> n (two h) d", two=2).reshape(-1, weight.shape[-1])
+        elif kv_lora_rank and "attn_kv_a_mqa.weight" in name:
+            state_dict[name] = state_dict[name][:kv_lora_rank].cat(
+                state_dict[name][kv_lora_rank:].rearrange("(h two) d -> (two h) d", two=2),
+                dim=0,
+            )
+    total_layers = int(kv[f"{arch}.block_count"]) - int(kv.get(f"{arch}.nextn_predict_layers", 0))
     first_stage = layer_start == 0
     final_stage = layer_end_exclusive >= total_layers
     qk_key = f"blk.{layer_start}.attn_q_norm.weight"
     qk_norm = int(state_dict[qk_key].shape[0]) if qk_key in state_dict else 0
     stage_model = PipelineStageTinygradModel(
         block_count=layer_end_exclusive - layer_start,
-        dim=int(kv[f"{arch}.embedding_length"]),
-        hidden_dim=int(kv.get(f"{arch}.expert_feed_forward_length", kv[f"{arch}.feed_forward_length"])),
+        dim=dim,
+        hidden_dim=int(kv.get(f"{arch}.expert_feed_forward_length", kv.get(f"{arch}.feed_forward_length", 0))),
         n_heads=n_heads,
         n_kv_heads=n_kv_heads,
         norm_eps=float(kv[f"{arch}.attention.layer_norm_rms_epsilon"]),
         vocab_size=len(kv["tokenizer.ggml.tokens"]),
-        head_dim=int(kv.get(f"{arch}.attention.key_length", int(kv[f"{arch}.embedding_length"]) // n_heads)),
+        head_dim=head_dim,
         rope_theta=float(kv[f"{arch}.rope.freq_base"]),
+        rope_dim=rope_dim,
+        v_head_dim=int(kv.get(f"{arch}.attention.value_length_mla", kv.get(f"{arch}.attention.value_length", head_dim))),
         max_context=max_context,
         qk_norm=qk_norm,
         num_experts=int(kv.get(f"{arch}.expert_count", 0)),
         num_experts_per_tok=int(kv.get(f"{arch}.expert_used_count", 0)),
+        norm_topk_prob=bool(kv.get(f"{arch}.expert_weights_norm", arch in ("qwen3moe", "qwen35moe"))),
+        qkv_bias="blk.0.attn_q.bias" in state_dict,
+        expert_bias=f"blk.{int(kv.get(f'{arch}.leading_dense_block_count', 0))}.exp_probs_b.bias" in state_dict,
         first_stage=first_stage,
         final_stage=final_stage,
         nn_mod=nn,
+        config_cls=TransformerConfig,
         block_cls=TransformerBlock,
     )
     stage_state = remap_stage_state_dict(
@@ -501,24 +567,6 @@ def load_weights(cmd: dict[str, Any]) -> None:
         layer_start=int(cmd.get("layer_start", 0)),
         layer_end_exclusive=int(cmd.get("layer_end_exclusive", 0)),
     )
-    if test_mode():
-        model = {"test_mode": True}
-        tokenizer = {"test_mode": True}
-        loaded.clear()
-        loaded.update(
-            model_id=model_id,
-            path="mvp-tinygrad-test-mode",
-            layer_start=int(cmd.get("layer_start", 0)),
-            layer_end_exclusive=int(cmd.get("layer_end_exclusive", 0)),
-        )
-        control(
-            type="WeightsLoaded",
-            model_id=model_id,
-            path=loaded["path"],
-            test_mode=True,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-        )
-        return
     control(type="GgufResolveStarted", model_id=model_id, source_kind=source_kind(source))
     path = fetch_whole(source)
     model_bytes = path.stat().st_size
@@ -527,7 +575,7 @@ def load_weights(cmd: dict[str, Any]) -> None:
     layer_end_exclusive = int(cmd.get("layer_end_exclusive", 0))
     try:
         control(type="TinygradLlmImportStarted", model_id=model_id)
-        from tinygrad.apps.llm import SimpleTokenizer
+        from tinygrad.llm.cli import SimpleTokenizer
 
         control(type="TinygradLlmImportReady", model_id=model_id)
         max_context_raw = os.environ.get("MVP_MAX_CONTEXT", "512")
@@ -739,19 +787,6 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
         prompt_chars=len(prompt),
         max_tokens=max_tokens,
     )
-    if test_mode():
-        text = f"mvp-test response: {prompt}"
-        control(
-            type="PromptCompleted",
-            request_id=request_id,
-            model_id=loaded.get("model_id"),
-            prompt_tokens=[],
-            generated_tokens=list(range(min(max_tokens, 3))),
-            text=text,
-            test_mode=True,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-        )
-        return
     model_prompt, prompt_template = model_prompt_text(prompt)
     control(
         type="PromptEncodeStarted",
@@ -907,7 +942,7 @@ def object_start_pos(sequence: int, token_count: int) -> int:
 
 
 def materialize_object(payload: bytes, sequence: int) -> dict[str, Any]:
-    if test_mode() or not isinstance(model, PipelineStageTinygradModel):
+    if not isinstance(model, PipelineStageTinygradModel):
         return {
             "kind": "words",
             "words": payload_words(payload),
@@ -1013,7 +1048,7 @@ def execute_step(cmd: dict[str, Any]) -> None:
     if ring["direction"] != "egress":
         fatal("WrongRingDirection", ring_id=output_ring_id, direction=ring["direction"])
     final_stage = bool(cmd.get("final_stage"))
-    if test_mode() or not isinstance(model, PipelineStageTinygradModel):
+    if not isinstance(model, PipelineStageTinygradModel):
         if final_stage:
             base = sum(int(word) for word in obj["words"]) + int(role.get("stage_index", 0))
             token = 6 if base % 2 else 8
@@ -1067,7 +1102,7 @@ def release_device_object(cmd: dict[str, Any]) -> None:
 
 def encode_prompt(cmd: dict[str, Any]) -> None:
     prompt = str(cmd.get("prompt", ""))
-    if tokenizer is not None and not test_mode():
+    if tokenizer is not None:
         model_prompt, _ = model_prompt_text(prompt)
         tokens = [int(token) for token in tokenizer.encode(model_prompt)]
     else:
@@ -1077,7 +1112,7 @@ def encode_prompt(cmd: dict[str, Any]) -> None:
 
 def decode_tokens(cmd: dict[str, Any]) -> None:
     tokens = [int(token) for token in cmd.get("tokens", [])]
-    if tokenizer is not None and not test_mode():
+    if tokenizer is not None:
         text = strip_chat_stop_markers(tokenizer.decode(tokens))
     else:
         text = "".join(chr(token) if 32 <= token <= 126 else f"<tok:{token}>" for token in tokens)

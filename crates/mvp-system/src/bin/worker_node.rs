@@ -29,6 +29,7 @@ use mvp_system::actors::node_agent::{
 };
 use mvp_system::actors::register_mvp_actor_codecs;
 use mvp_system::arena_manager as arena;
+use mvp_system::benchmark_observability;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::driver_pumps as driver_model;
 use mvp_system::edge_establisher as edge;
@@ -72,8 +73,24 @@ fn node_event_payload(
         "run_id":config.run_id,
         "node_id":config.logical_node_id,
         "stage_index":config.stage_index,
+        "benchmark":benchmark_observability::stamp("mvp-worker-node"),
         "detail":detail,
     })
+}
+
+fn emit_stdio_datastream_frame(channel: &str, payload: &Value) -> Result<(), String> {
+    println!(
+        "{}",
+        json!({
+            "mvp_stdio_event":1,
+            "kind":"datastream_frame",
+            "channel":channel,
+            "payload":payload,
+        })
+    );
+    std::io::stdout()
+        .flush()
+        .map_err(|e| format!("flush stdio datastream frame: {e}"))
 }
 
 fn emit_stdio_node_event(
@@ -83,18 +100,8 @@ fn emit_stdio_node_event(
     status: &str,
     detail: Value,
 ) -> Result<(), String> {
-    println!(
-        "{}",
-        json!({
-            "mvp_stdio_event":1,
-            "kind":"datastream_frame",
-            "channel":channel,
-            "payload":node_event_payload(config, phase, status, detail),
-        })
-    );
-    std::io::stdout()
-        .flush()
-        .map_err(|e| format!("flush stdio node event: {e}"))
+    let payload = node_event_payload(config, phase, status, detail);
+    emit_stdio_datastream_frame(channel, &payload)
 }
 
 fn emit_node_event(
@@ -2956,6 +2963,12 @@ impl DeploymentConfig {
                     .into_owned(),
             ),
         };
+        let provider = env_string("MVP_NODE_PROVIDER", "process");
+        let default_device = if provider == "process" {
+            "CPU"
+        } else {
+            DEFAULT_DEVICE
+        };
         Ok(Self {
             run_id,
             logical_node_id,
@@ -2966,7 +2979,7 @@ impl DeploymentConfig {
             debug_join_socket,
             relay_mode: relay.mode,
             worker_script: env_string("MVP_TINYGRAD_WORKER", DEFAULT_WORKER_SCRIPT),
-            device: env_string("DEV", DEFAULT_DEVICE),
+            device: env_string("DEV", default_device),
             model_id: env_string("MVP_MODEL_ID", DEFAULT_MODEL_ID),
             gguf_source: gguf_source_from_env(),
             tokenizer: tokenizer_from_env(),
@@ -2991,6 +3004,9 @@ impl TinygradWorker {
         let mut child = Command::new("python3")
             .arg(&config.worker_script)
             .env("DEV", &config.device)
+            .env("MVP_RUN_ID", config.run_id.to_string())
+            .env("MVP_LOGICAL_NODE_ID", config.logical_node_id.to_string())
+            .env("MVP_STAGE_INDEX", config.stage_index.to_string())
             .env("MVP_ARENA_FD", arena_fd.to_string())
             .env("MVP_ARENA_BYTES", config.arena_bytes.to_string())
             .stdin(Stdio::piped())
@@ -3518,6 +3534,8 @@ impl TinygradWorker {
                 json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n,"worker_event_type":worker_event_type}),
             );
             datastream.submit_text(channel, value.to_string());
+            emit_stdio_datastream_frame(channel_name, &value)
+                .map_err(|e| format!("emit worker stdio datastream frame: {e}"))?;
             datastream.tick();
             pump();
             if worker_event_type == "WorkerFatal" {
@@ -3649,6 +3667,23 @@ mod tests {
 
     fn test_stack() -> DistributionRuntimeStack {
         DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default())
+    }
+
+    #[test]
+    fn benchmark_observability_node_event_payload_includes_stamp() {
+        let config = test_config(None);
+        let payload = node_event_payload(&config, "phase", "ready", json!({"ok": true}));
+
+        assert_eq!(payload.get("run_id").and_then(Value::as_u64), Some(7));
+        assert_eq!(payload.get("node_id").and_then(Value::as_u64), Some(11));
+        assert_eq!(payload.get("stage_index").and_then(Value::as_u64), Some(3));
+        assert_eq!(
+            payload
+                .get("benchmark")
+                .and_then(|benchmark| benchmark.get("schema"))
+                .and_then(Value::as_u64),
+            Some(1)
+        );
     }
 
     #[test]
