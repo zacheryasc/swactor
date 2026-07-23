@@ -25,6 +25,7 @@ use signal_hook::iterator::Signals;
 use mvp_system::benchmark_observability;
 use mvp_system::config as chat_config;
 use mvp_system::config::ResolvedVastAiConfig;
+use mvp_system::endpoint_advertisement::EndpointAddrMask;
 use mvp_system::node_image::{
     NodeImageProvider, NodeImageRequest, PreparedNodeImage, prepare_node_image,
 };
@@ -46,6 +47,9 @@ OPTIONS:
                                 Select the runtime provider
   --config <path>               Load config overlay
   --pipeline-stages <count>     Number of pipeline stages
+  --relay-mode <mode>           Relay mode: default or disabled
+  --relay-url <url>             Custom relay URL passed to mvp-orchestrator
+  --endpoint-addr-mask <mask>   Endpoint address mask: full or relay-only
   --cached-model[=<path>]       Use discovered or explicit cached GGUF model
   --dump-logs[=<path>]          Write datastream frame log
   --run-id <id>                 Override run id
@@ -331,6 +335,9 @@ struct Config {
     max_tokens: u32,
     skip_rebuild: bool,
     gpu_run: bool,
+    relay_mode: Option<String>,
+    relay_url: Option<String>,
+    endpoint_addr_mask: EndpointAddrMask,
 }
 
 struct ChatDatastream {
@@ -514,6 +521,7 @@ struct ChatTomlConfig {
     observability: ChatObservabilityConfig,
     image: ChatImageConfig,
     vastai: ChatVastAiConfig,
+    relay: ChatRelayConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -527,6 +535,14 @@ struct ChatProviderConfig {
 struct ChatRuntimeConfig {
     pipeline_stages: Option<u32>,
     max_tokens: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatRelayConfig {
+    mode: Option<String>,
+    url: Option<String>,
+    endpoint_addr_mask: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -612,6 +628,22 @@ impl Config {
             return Err("[runtime].max_tokens must be greater than 0".to_owned());
         }
         let gpu_run = args.gpu || env_flag(MVP_CHAT_GPU_RUN_ENV, false);
+        let endpoint_addr_mask = match first_non_empty([
+            args.endpoint_addr_mask.clone(),
+            toml.relay.endpoint_addr_mask.clone(),
+        ]) {
+            Some(mask) => EndpointAddrMask::parse(&mask)?,
+            None => EndpointAddrMask::Full,
+        };
+        let relay_mode = first_non_empty([args.relay_mode.clone(), toml.relay.mode.clone()]);
+        let mut relay_url = first_non_empty([args.relay_url.clone(), toml.relay.url.clone()]);
+        if endpoint_addr_mask.requires_relay() && relay_url.is_none() {
+            relay_url = first_non_empty([toml.vastai.relay_url.clone()]);
+        }
+        if endpoint_addr_mask.requires_relay() && relay_url.is_none() {
+            return Err("relay-only endpoint address mask requires [relay].url, --relay-url, or [vastai].relay_url".to_owned());
+        }
+        let relay_mode = relay_mode.or_else(|| relay_url.as_ref().map(|_| "default".to_owned()));
         let cached_model_source = match args.cached_model {
             Some(source) => Some(source),
             None if gpu_run && provider == ProviderKind::Process => {
@@ -658,6 +690,9 @@ impl Config {
             vastai,
             skip_rebuild: args.skip_rebuild,
             gpu_run,
+            relay_mode,
+            relay_url,
+            endpoint_addr_mask,
         })
     }
 
@@ -695,6 +730,18 @@ impl Config {
             args.extend([
                 "--datastream-frame-log".to_owned(),
                 path.to_string_lossy().to_string(),
+            ]);
+        }
+        if let Some(mode) = &self.relay_mode {
+            args.extend(["--relay-mode".to_owned(), mode.clone()]);
+        }
+        if let Some(url) = &self.relay_url {
+            args.extend(["--relay-url".to_owned(), url.clone()]);
+        }
+        if self.endpoint_addr_mask != EndpointAddrMask::Full {
+            args.extend([
+                "--endpoint-addr-mask".to_owned(),
+                self.endpoint_addr_mask.as_str().to_owned(),
             ]);
         }
         if let Some(vastai) = &self.vastai {
@@ -771,6 +818,9 @@ struct ParsedArgs {
     cached_model: Option<CachedModelSource>,
     help: bool,
     gpu: bool,
+    relay_mode: Option<String>,
+    relay_url: Option<String>,
+    endpoint_addr_mask: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -811,6 +861,11 @@ impl ParsedArgs {
                 "--pipeline-stages" => {
                     parsed.pipeline_stages =
                         Some(parse_pipeline_stages_value(&mut args, arg.as_str())?)
+                }
+                "--relay-mode" => parsed.relay_mode = Some(next_arg(&mut args, "--relay-mode")?),
+                "--relay-url" => parsed.relay_url = Some(next_arg(&mut args, "--relay-url")?),
+                "--endpoint-addr-mask" => {
+                    parsed.endpoint_addr_mask = Some(next_arg(&mut args, "--endpoint-addr-mask")?)
                 }
                 "--run-id" => {
                     let run_id: u64 = parse_next(&mut args, "--run-id")?;
@@ -2134,6 +2189,9 @@ mod tests {
             max_tokens: DEFAULT_MAX_TOKENS,
             skip_rebuild: true,
             gpu_run: false,
+            relay_mode: None,
+            relay_url: None,
+            endpoint_addr_mask: EndpointAddrMask::Full,
         }
     }
 
@@ -2644,6 +2702,76 @@ bootstrap_command = "boot"
                 assert_eq!(vastai.image, "docker.io/acme/node:latest");
             },
         );
+    }
+
+    #[test]
+    fn relay_only_endpoint_mask_requires_and_forwards_relay_url() {
+        let missing = TempDir::new("relay-mask-missing-url");
+        let missing_config = write_config(
+            &missing,
+            "chat.toml",
+            r#"
+[provider]
+kind = "docker"
+
+[image]
+node = "docker.io/acme/node:latest"
+"#,
+        );
+        with_process_state(&[], Some(missing.path()), || {
+            let config_arg = missing_config.to_string_lossy().into_owned();
+            let error = match Config::from_args(strings(&[
+                "--config",
+                config_arg.as_str(),
+                "--endpoint-addr-mask",
+                "relay-only",
+            ])) {
+                Ok(_) => panic!("relay-only mask without relay URL should fail"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains("requires [relay].url, --relay-url, or [vastai].relay_url"),
+                "{error}"
+            );
+        });
+
+        let fallback = TempDir::new("relay-mask-vastai-fallback");
+        let fallback_config = write_config(
+            &fallback,
+            "chat.toml",
+            r#"
+[provider]
+kind = "docker"
+
+[image]
+node = "docker.io/acme/node:latest"
+
+[relay]
+endpoint_addr_mask = "relay-only"
+
+[vastai]
+relay_url = "https://relay.example"
+"#,
+        );
+        with_process_state(&[], Some(fallback.path()), || {
+            let config_arg = fallback_config.to_string_lossy().into_owned();
+            let config = Config::from_args(strings(&["--config", config_arg.as_str()]))
+                .expect("relay-only mask uses Vast.ai relay fallback");
+
+            assert_eq!(config.provider, ProviderKind::Docker);
+            assert_eq!(config.relay_mode.as_deref(), Some("default"));
+            assert_eq!(config.relay_url.as_deref(), Some("https://relay.example"));
+            assert_eq!(config.endpoint_addr_mask, EndpointAddrMask::RelayOnly);
+            let args = config.orchestrator_cli_args("docker.io/acme/node:latest");
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--relay-url", "https://relay.example"])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--endpoint-addr-mask", "relay-only"])
+            );
+        });
     }
 
     struct MockApproval {

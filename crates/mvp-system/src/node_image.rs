@@ -175,7 +175,7 @@ pub fn prepare_node_image(request: NodeImageRequest) -> Result<PreparedNodeImage
         )?;
     }
 
-    let node_bin = request.node_bin.to_string_lossy().to_string();
+    let node_bin = docker_build_context_path(&root, &request.node_bin)?;
     let mut build_args = vec![
         "build".to_owned(),
         "-f".to_owned(),
@@ -347,6 +347,15 @@ fn relative_path(root: &Path, path: &Path) -> Result<PathBuf, String> {
             "."
         )
     })
+}
+
+fn docker_build_context_path(root: &Path, path: &Path) -> Result<String, String> {
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    relative_path(root, &full).map(|relative| relative.to_string_lossy().to_string())
 }
 
 fn display_workspace_path(root: &Path, path: &Path) -> String {
@@ -776,6 +785,29 @@ mod tests {
         assert_eq!(
             aliases.into_iter().collect::<Vec<_>>(),
             vec!["latest".to_owned(), "smoke".to_owned()]
+        );
+    }
+
+    #[test]
+    fn docker_build_context_path_makes_worker_binary_relative_to_workspace() {
+        let root = Path::new("/workspace/swactor");
+
+        assert_eq!(
+            docker_build_context_path(
+                root,
+                Path::new("/workspace/swactor/target/debug/mvp-worker-node")
+            )
+            .expect("absolute workspace path is valid"),
+            "target/debug/mvp-worker-node"
+        );
+        assert_eq!(
+            docker_build_context_path(root, Path::new("target/debug/mvp-worker-node"))
+                .expect("relative workspace path is valid"),
+            "target/debug/mvp-worker-node"
+        );
+        assert!(
+            docker_build_context_path(root, Path::new("/tmp/mvp-worker-node")).is_err(),
+            "Docker COPY inputs must stay inside the build context"
         );
     }
 }

@@ -73,6 +73,10 @@ General flags:
 - `--cached-model`
 - `--cached-model=<path>`
 - `--skip-rebuild`
+- `--gpu`
+- `--relay-mode <mode>`
+- `--relay-url <url>`
+- `--endpoint-addr-mask <mask>`
 
 Any process argument that is not one of the listed flags or a required or
 attached value for one of those flags is a configuration error.
@@ -84,6 +88,11 @@ If no provider selector is supplied, the provider is `process`.
 
 `--pipeline-stages <count>` accepts a positive integer. Zero and invalid values
 are configuration errors.
+
+`--relay-mode <mode>` accepts `default` or `disabled`.
+
+`--endpoint-addr-mask <mask>` accepts `full` or `relay-only`. `relay-only`
+requires a relay URL from `--relay-url`, `[relay].url`, or `[vastai].relay_url`.
 
 `--dump-logs` writes the consolidated log stream to the default file
 `mvp-chat.log` in the current working directory.
@@ -278,6 +287,19 @@ Additional provider/image inputs:
 - Docker daemon responses when checking local image availability;
 - registry responses when checking remote image availability;
 - registry responses when pushing images for remote providers.
+
+Additional relay inputs:
+
+- relay mode from `--relay-mode`, `[relay].mode`, or `MVP_IROH_RELAY_MODE`;
+- relay URL from `--relay-url`, `[relay].url`, `[vastai].relay_url`, or relay
+  environment fallbacks;
+- endpoint address mask from `--endpoint-addr-mask`, `[relay].endpoint_addr_mask`,
+  or `MVP_IROH_ENDPOINT_ADDR_MASK`.
+
+When the endpoint address mask is `relay-only`, orchestrator and worker
+advertisements must preserve relay URLs and strip direct socket addresses before
+passing endpoints across provider/runtime boundaries. A missing relay URL is a
+configuration or startup error.
 
 Prompt engine stream records are runtime-local prompt events:
 

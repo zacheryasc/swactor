@@ -12,6 +12,7 @@ pub mod distribution_stack;
 pub mod docker_cluster_provisioning;
 pub mod driver_pumps;
 pub mod edge_establisher;
+pub mod endpoint_advertisement;
 pub mod engine_builder;
 pub mod gguf_metadata;
 pub mod gpu_worker_ctl;

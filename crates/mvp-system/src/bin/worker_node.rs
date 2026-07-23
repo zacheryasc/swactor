@@ -33,6 +33,9 @@ use mvp_system::benchmark_observability;
 use mvp_system::distribution_stack::DistributionRuntimeStack;
 use mvp_system::driver_pumps as driver_model;
 use mvp_system::edge_establisher as edge;
+use mvp_system::endpoint_advertisement::{
+    EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
+};
 use mvp_system::gpu_worker_ingress_parser as ingress;
 use mvp_system::prompt_rpc::{PromptEvent, TokenizerEvent};
 use mvp_system::relay_provisioning::relay_runtime_config_from_env;
@@ -1326,16 +1329,7 @@ fn run() -> Result<(), String> {
             additional_alpns: vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()],
         },
     ) {
-        Ok(driver) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "iroh_driver",
-                "ready",
-                json!({"endpoint":driver.endpoint_addr(),"relay_mode":format!("{:?}", config.relay_mode)}),
-            )?;
-            driver
-        }
+        Ok(driver) => driver,
         Err(error) => {
             emit_stdio_node_event(
                 &config,
@@ -1347,6 +1341,15 @@ fn run() -> Result<(), String> {
             return Err(format!("create iroh driver: {error}"));
         }
     };
+    let advertised_self_endpoint =
+        advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
+    emit_stdio_node_event(
+        &config,
+        NODE_BOOTSTRAP_CHANNEL,
+        "iroh_driver",
+        "ready",
+        json!({"endpoint":advertised_self_endpoint.clone(),"has_relay":advertised_self_endpoint.relay_urls().next().is_some(),"direct_addr_count":advertised_self_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay_mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
+    )?;
     if let Some(coordinator) = &config.coordinator_endpoint {
         driver.join(std::slice::from_ref(coordinator));
         emit_stdio_node_event(
@@ -1354,7 +1357,7 @@ fn run() -> Result<(), String> {
             NODE_BOOTSTRAP_CHANNEL,
             "coordinator_join",
             "started",
-            json!({"endpoint":coordinator}),
+            json!({"endpoint":coordinator,"has_relay":coordinator.relay_urls().next().is_some(),"direct_addr_count":coordinator.ip_addrs().count()}),
         )?;
     } else {
         emit_stdio_node_event(
@@ -1651,7 +1654,7 @@ fn run() -> Result<(), String> {
     let mut edge_runtime = WorkerEdgeRuntime::new(config.logical_node_id);
     let mut pending_runtime_ready = PendingRuntimeReady::new(
         &config,
-        driver.endpoint_addr(),
+        advertised_self_endpoint.clone(),
         node_actor,
         datastream_publisher,
     );
@@ -1659,7 +1662,7 @@ fn run() -> Result<(), String> {
     let ready = json!({
         "type":"ready",
         "role":"node",
-        "endpoint": driver.endpoint_addr(),
+        "endpoint": advertised_self_endpoint.clone(),
         "node_actor": node_actor,
         "datastream_publisher": datastream_publisher,
         "logical_node_id": config.logical_node_id,
@@ -1671,7 +1674,7 @@ fn run() -> Result<(), String> {
         "runtime_ready_local",
         "ready",
         json!({
-            "endpoint":driver.endpoint_addr(),
+            "endpoint":advertised_self_endpoint.clone(),
             "node_actor":node_actor,
             "logical_node_id":config.logical_node_id,
             "stage_index":config.stage_index,
@@ -2934,6 +2937,7 @@ struct DeploymentConfig {
     datastream_frame_log: Option<String>,
     debug_join_socket: Option<String>,
     relay_mode: iroh::RelayMode,
+    endpoint_addr_mask: EndpointAddrMask,
     worker_script: String,
     device: String,
     model_id: String,
@@ -2978,6 +2982,11 @@ impl DeploymentConfig {
             datastream_frame_log: env_optional("MVP_DATASTREAM_FRAME_LOG"),
             debug_join_socket,
             relay_mode: relay.mode,
+            endpoint_addr_mask: env_optional(MVP_IROH_ENDPOINT_ADDR_MASK_ENV)
+                .as_deref()
+                .map(EndpointAddrMask::parse)
+                .transpose()?
+                .unwrap_or_default(),
             worker_script: env_string("MVP_TINYGRAD_WORKER", DEFAULT_WORKER_SCRIPT),
             device: env_string("DEV", default_device),
             model_id: env_string("MVP_MODEL_ID", DEFAULT_MODEL_ID),
@@ -3652,6 +3661,7 @@ mod tests {
             datastream_frame_log: None,
             debug_join_socket: None,
             relay_mode: iroh::RelayMode::Disabled,
+            endpoint_addr_mask: EndpointAddrMask::Full,
             worker_script: DEFAULT_WORKER_SCRIPT.to_owned(),
             device: DEFAULT_DEVICE.to_owned(),
             model_id: DEFAULT_MODEL_ID.to_owned(),
