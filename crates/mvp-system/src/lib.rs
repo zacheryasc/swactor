@@ -3,6 +3,7 @@ extern crate self as mvp_system;
 
 pub mod actors;
 pub mod arena_manager;
+pub mod benchmark_observability;
 pub mod bootstrap_datastream;
 pub mod config;
 pub mod dashboard_view;

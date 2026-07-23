@@ -22,6 +22,7 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(target_os = "linux")]
 use signal_hook::iterator::Signals;
 
+use mvp_system::benchmark_observability;
 use mvp_system::config as chat_config;
 use mvp_system::config::ResolvedVastAiConfig;
 use mvp_system::node_image::{
@@ -73,7 +74,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let config = Config::from_args(args)?;
-    let mut progress = ChatDatastream::new(1, config.datastream_frame_log.clone())?;
+    let mut progress = ChatDatastream::new(config.run_id, config.datastream_frame_log.clone())?;
     progress.emit(
         CHAT_LIFECYCLE_CHANNEL,
         "config",
@@ -87,29 +88,48 @@ where
         }),
     );
     confirm_vastai_if_needed(&config)?;
-    let image_ref = match prepare_runtime(&config) {
-        Ok(image_ref) => {
-            progress.emit(
-                CHAT_RUNTIME_CHANNEL,
-                "prepare_runtime",
-                "ready",
-                json!({"image_ref": image_ref}),
-            );
-            image_ref
-        }
-        Err(error) => {
-            progress.emit(
-                CHAT_RUNTIME_CHANNEL,
-                "prepare_runtime",
-                "failed",
-                json!({"error": error}),
-            );
-            progress.archive_pending()?;
-            return Err(error);
-        }
-    };
+    progress.emit(
+        CHAT_RUNTIME_CHANNEL,
+        "prepare_runtime",
+        "started",
+        json!({"provider": config.provider.as_str()}),
+    );
+    let image_ref =
+        match prepare_runtime_with_progress(&config, prepare_node_image, Some(&mut progress)) {
+            Ok(image_ref) => {
+                progress.emit(
+                    CHAT_RUNTIME_CHANNEL,
+                    "prepare_runtime",
+                    "ready",
+                    json!({"image_ref": image_ref}),
+                );
+                image_ref
+            }
+            Err(error) => {
+                progress.emit(
+                    CHAT_RUNTIME_CHANNEL,
+                    "prepare_runtime",
+                    "failed",
+                    json!({"error": error}),
+                );
+                progress.archive_pending()?;
+                return Err(error);
+            }
+        };
+    progress.emit(
+        CHAT_COMPONENT_CHANNEL,
+        "orchestrator_process_spawn",
+        "started",
+        json!({"binary": config.orch_bin.to_string_lossy()}),
+    );
     let mut orch = match OrchChild::spawn(&config, &image_ref) {
         Ok(orch) => {
+            progress.emit(
+                CHAT_COMPONENT_CHANNEL,
+                "orchestrator_process_spawn",
+                "ready",
+                json!({"binary": config.orch_bin.to_string_lossy(), "pid": orch.child.id()}),
+            );
             progress.emit(
                 CHAT_COMPONENT_CHANNEL,
                 "orchestrator_process",
@@ -121,6 +141,12 @@ where
         Err(error) => {
             progress.emit(
                 CHAT_COMPONENT_CHANNEL,
+                "orchestrator_process_spawn",
+                "failed",
+                json!({"binary": config.orch_bin.to_string_lossy(), "error": error}),
+            );
+            progress.emit(
+                CHAT_COMPONENT_CHANNEL,
                 "orchestrator_process",
                 "failed",
                 json!({"error": error}),
@@ -129,8 +155,20 @@ where
             return Err(error);
         }
     };
+    progress.emit(
+        CHAT_RUNTIME_CHANNEL,
+        "prompt_rpc_wait",
+        "started",
+        json!({"addr": config.rpc_addr}),
+    );
     let rpc_addr = match orch.wait_ready(config.rpc_addr.clone()) {
         Ok(addr) => {
+            progress.emit(
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc_wait",
+                "ready",
+                json!({"addr": addr}),
+            );
             progress.emit(
                 CHAT_RUNTIME_CHANNEL,
                 "prompt_rpc",
@@ -139,7 +177,13 @@ where
             );
             addr
         }
-        Err(_) if STOP_REQUESTED.load(Ordering::SeqCst) => {
+        Err(error) if STOP_REQUESTED.load(Ordering::SeqCst) => {
+            progress.emit(
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc_wait",
+                "failed",
+                json!({"addr": config.rpc_addr, "error": error}),
+            );
             progress.emit(
                 CHAT_LIFECYCLE_CHANNEL,
                 "shutdown",
@@ -157,6 +201,12 @@ where
             return Ok(());
         }
         Err(error) => {
+            progress.emit(
+                CHAT_RUNTIME_CHANNEL,
+                "prompt_rpc_wait",
+                "failed",
+                json!({"addr": config.rpc_addr, "error": error}),
+            );
             progress.emit(
                 CHAT_RUNTIME_CHANNEL,
                 "prompt_rpc",
@@ -201,6 +251,7 @@ struct Config {
     image_tag: Option<String>,
     cached_model: Option<CachedModelConfig>,
     datastream_frame_log: Option<PathBuf>,
+    run_id: u64,
     vastai_yes: bool,
     vastai: Option<ResolvedVastAiConfig>,
     pipeline_stages: u32,
@@ -210,6 +261,7 @@ struct Config {
 
 struct ChatDatastream {
     stream: StreamId,
+    run_id: u64,
     endpoint: DatastreamEndpoint,
     producer: DatastreamProducer,
     channels: BTreeMap<String, ChannelId>,
@@ -233,6 +285,7 @@ impl ChatDatastream {
         let producer = endpoint.producer();
         let mut out = Self {
             stream,
+            run_id,
             endpoint,
             producer,
             channels: BTreeMap::new(),
@@ -272,6 +325,8 @@ impl ChatDatastream {
             "type": "ChatProgress",
             "phase": phase,
             "status": status,
+            "run_id": self.run_id,
+            "benchmark": benchmark_observability::stamp("mvp-chat"),
             "detail": detail,
         }))
         .expect("serialize mvp-chat progress event");
@@ -356,6 +411,7 @@ impl ChatFrameArchive {
         };
         let record = json!({
             "arrival_seq": self.next_seq,
+            "arrival_unix_ms": benchmark_observability::unix_ms_now(),
             "source": source,
             "stream": stream.to_string(),
             "channel": channel,
@@ -514,6 +570,7 @@ impl Config {
             image_tag: first_non_empty([toml.image.tag.clone()]),
             cached_model,
             datastream_frame_log,
+            run_id: args.run_id.unwrap_or(1),
             vastai_yes: args.vastai_yes,
             pipeline_stages,
             max_tokens,
@@ -534,6 +591,8 @@ impl Config {
             self.rpc_addr.clone(),
             "--max-tokens".to_owned(),
             self.max_tokens.to_string(),
+            "--run-id".to_owned(),
+            self.run_id.to_string(),
             "--pipeline-stages".to_owned(),
             self.pipeline_stages.to_string(),
             "--no-dashboard".to_owned(),
@@ -617,6 +676,7 @@ struct ParsedArgs {
     pipeline_stages: Option<u32>,
     dump_logs: bool,
     dump_log_path: Option<PathBuf>,
+    run_id: Option<u64>,
     skip_rebuild: bool,
     cached_model: Option<CachedModelSource>,
 }
@@ -657,6 +717,13 @@ impl ParsedArgs {
                 "--pipeline-stages" => {
                     parsed.pipeline_stages =
                         Some(parse_pipeline_stages_value(&mut args, arg.as_str())?)
+                }
+                "--run-id" => {
+                    let run_id: u64 = parse_next(&mut args, "--run-id")?;
+                    if run_id == 0 {
+                        return Err("--run-id must be greater than 0".to_owned());
+                    }
+                    parsed.run_id = Some(run_id);
                 }
                 "--dump-logs" => {
                     parsed.dump_logs = true;
@@ -916,33 +983,193 @@ fn signal_orch_process_group(child: &Child, signal: libc::c_int) -> io::Result<(
 
 type PrepareNodeImageFn = fn(NodeImageRequest) -> Result<PreparedNodeImage, String>;
 
+#[allow(dead_code)]
 fn prepare_runtime(config: &Config) -> Result<String, String> {
     prepare_runtime_with(config, prepare_node_image)
 }
 
+#[allow(dead_code)]
 fn prepare_runtime_with(
     config: &Config,
     prepare_node_image_fn: PrepareNodeImageFn,
 ) -> Result<String, String> {
-    ensure_orch_binary(config)?;
+    prepare_runtime_with_progress(config, prepare_node_image_fn, None)
+}
+
+fn prepare_runtime_with_progress(
+    config: &Config,
+    prepare_node_image_fn: PrepareNodeImageFn,
+    progress: Option<&mut ChatDatastream>,
+) -> Result<String, String> {
+    let mut progress = progress;
+    let binary_mode = if config.skip_rebuild {
+        "existing_artifact"
+    } else {
+        "cargo_build"
+    };
+    emit_chat_progress(
+        &mut progress,
+        CHAT_RUNTIME_CHANNEL,
+        "ensure_orch_binary",
+        "started",
+        json!({"mode": binary_mode}),
+    );
+    match ensure_orch_binary(config) {
+        Ok(()) => emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "ensure_orch_binary",
+            "ready",
+            json!({"mode": binary_mode}),
+        ),
+        Err(error) => {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "ensure_orch_binary",
+                "failed",
+                json!({"mode": binary_mode, "error": error.as_str()}),
+            );
+            return Err(error);
+        }
+    }
+
     if config.provider == ProviderKind::Process {
-        ensure_worker_binary(config)?;
+        emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "ensure_worker_binary",
+            "started",
+            json!({"mode": binary_mode}),
+        );
+        match ensure_worker_binary(config) {
+            Ok(()) => emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "ensure_worker_binary",
+                "ready",
+                json!({"mode": binary_mode}),
+            ),
+            Err(error) => {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_RUNTIME_CHANNEL,
+                    "ensure_worker_binary",
+                    "failed",
+                    json!({"mode": binary_mode, "error": error.as_str()}),
+                );
+                return Err(error);
+            }
+        }
+        emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "prepare_node_image",
+            "skipped",
+            json!({"provider": config.provider.as_str(), "reason": "process_provider"}),
+        );
         return Ok(config.node_image.clone());
     }
+
     if config.skip_rebuild {
-        ensure_worker_binary(config)?;
+        emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "ensure_worker_binary",
+            "started",
+            json!({"mode": binary_mode}),
+        );
+        match ensure_worker_binary(config) {
+            Ok(()) => emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "ensure_worker_binary",
+                "ready",
+                json!({"mode": binary_mode}),
+            ),
+            Err(error) => {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_RUNTIME_CHANNEL,
+                    "ensure_worker_binary",
+                    "failed",
+                    json!({"mode": binary_mode, "error": error.as_str()}),
+                );
+                return Err(error);
+            }
+        }
+        emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "prepare_node_image",
+            "skipped",
+            json!({"provider": config.provider.as_str(), "reason": "skip_rebuild"}),
+        );
         return Ok(config.node_image.clone());
     }
-    let prepared = prepare_node_image_fn(NodeImageRequest {
+
+    emit_chat_progress(
+        &mut progress,
+        CHAT_RUNTIME_CHANNEL,
+        "prepare_node_image",
+        "started",
+        json!({"provider": config.provider.as_str()}),
+    );
+    let node_bin = match node_bin_for_current_profile() {
+        Ok(path) => path,
+        Err(error) => {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "prepare_node_image",
+                "failed",
+                json!({"provider": config.provider.as_str(), "error": error.as_str()}),
+            );
+            return Err(error);
+        }
+    };
+    let provider = match node_image_provider(config.provider) {
+        Ok(provider) => provider,
+        Err(error) => {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "prepare_node_image",
+                "failed",
+                json!({"provider": config.provider.as_str(), "error": error.as_str()}),
+            );
+            return Err(error);
+        }
+    };
+    let prepared = match prepare_node_image_fn(NodeImageRequest {
         requested_image: config.node_image.clone(),
         base_image: BASE_NODE_IMAGE.to_owned(),
-        node_bin: node_bin_for_current_profile()?,
-        provider: node_image_provider(config.provider)?,
+        node_bin,
+        provider,
         extra_tag: config.image_tag.clone(),
         push: false,
         force_refresh: false,
         enabled: true,
-    })?;
+    }) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "prepare_node_image",
+                "failed",
+                json!({"provider": config.provider.as_str(), "error": error.as_str()}),
+            );
+            return Err(error);
+        }
+    };
+    emit_chat_progress(
+        &mut progress,
+        CHAT_RUNTIME_CHANNEL,
+        "prepare_node_image",
+        "ready",
+        json!({"provider": config.provider.as_str(), "image_ref": prepared.image_ref}),
+    );
     Ok(prepared.image_ref)
 }
 
@@ -1254,7 +1481,12 @@ where
                         json!({"request_id": request_id, "text_bytes": text.len()}),
                     );
                 }
-                PromptEvent::Done { .. } => {
+                PromptEvent::Done {
+                    final_text,
+                    tokens_generated,
+                    elapsed_ms,
+                    ..
+                } => {
                     if response_started {
                         writeln!(output).map_err(|e| format!("write response terminator: {e}"))?;
                     } else {
@@ -1266,7 +1498,13 @@ where
                         CHAT_PROMPT_CHANNEL,
                         "request_completed",
                         "ready",
-                        json!({"request_id": request_id, "response_started": response_started}),
+                        json!({
+                            "request_id": request_id,
+                            "response_started": response_started,
+                            "tokens_generated": tokens_generated,
+                            "elapsed_ms": elapsed_ms,
+                            "final_text_bytes": final_text.len(),
+                        }),
                     );
                     break;
                 }
@@ -1642,6 +1880,7 @@ mod tests {
             image_tag: None,
             cached_model: None,
             datastream_frame_log: None,
+            run_id: 1,
             vastai_yes: false,
             vastai: None,
             pipeline_stages: 1,
@@ -1705,6 +1944,48 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_observability_chat_progress_records_include_run_id_and_stamp() {
+        let temp = TempDir::new("chat-progress-archive");
+        let archive_path = temp.path().join("frames.ndjson");
+        let mut progress = ChatDatastream::new(77, Some(archive_path.clone()))
+            .expect("chat datastream constructs");
+
+        progress.emit(
+            CHAT_RUNTIME_CHANNEL,
+            "unit_phase",
+            "ready",
+            serde_json::json!({"ok": true}),
+        );
+        progress.archive_pending().expect("archive pending frames");
+
+        let archive = fs::read_to_string(&archive_path).expect("read archive");
+        let line = archive.lines().next().expect("archive line");
+        let outer: serde_json::Value = serde_json::from_str(line).expect("outer archive JSON");
+        let inner_text = outer
+            .get("payload")
+            .and_then(|payload| payload.get("value"))
+            .and_then(serde_json::Value::as_str)
+            .expect("inner event text");
+        let inner: serde_json::Value = serde_json::from_str(inner_text).expect("inner event JSON");
+
+        assert_eq!(
+            inner.get("type").and_then(serde_json::Value::as_str),
+            Some("ChatProgress")
+        );
+        assert_eq!(
+            inner.get("run_id").and_then(serde_json::Value::as_u64),
+            Some(77)
+        );
+        assert_eq!(
+            inner
+                .get("benchmark")
+                .and_then(|benchmark| benchmark.get("schema"))
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn parsed_args_accepts_public_flags() {
         let parsed = ParsedArgs::parse(strings(&[
             "--docker",
@@ -1727,6 +2008,32 @@ mod tests {
         assert_eq!(parsed.dump_log_path, Some(PathBuf::from("logs.ndjson")));
         assert_eq!(parsed.cached_model, Some(CachedModelSource::Discover));
         assert!(parsed.skip_rebuild);
+    }
+
+    #[test]
+    fn benchmark_observability_parsed_args_accepts_run_id_and_forwards_to_orchestrator() {
+        let parsed = ParsedArgs::parse(strings(&["--run-id", "123"])).expect("run id parses");
+        assert_eq!(parsed.run_id, Some(123));
+
+        let temp = TempDir::new("run-id-config");
+        with_process_state(&[], Some(temp.path()), || {
+            let config =
+                Config::from_args(strings(&["--run-id", "123"])).expect("config resolves run id");
+            assert_eq!(config.run_id, 123);
+            let args = config.orchestrator_cli_args("resolved-image");
+            let run_id_arg = args
+                .windows(2)
+                .find(|pair| pair[0] == "--run-id")
+                .map(|pair| pair[1].as_str());
+            assert_eq!(run_id_arg, Some("123"), "{args:?}");
+        });
+    }
+
+    #[test]
+    fn benchmark_observability_parsed_args_rejects_zero_run_id() {
+        let error =
+            ParsedArgs::parse(strings(&["--run-id", "0"])).expect_err("zero run id should fail");
+        assert_eq!(error, "--run-id must be greater than 0");
     }
 
     #[test]
@@ -1795,6 +2102,7 @@ mod tests {
                 let defaults = Config::from_args(Vec::<String>::new()).expect("defaults resolve");
                 assert_eq!(defaults.provider, ProviderKind::Process);
                 assert_eq!(defaults.pipeline_stages, 1);
+                assert_eq!(defaults.run_id, 1);
                 assert!(defaults.datastream_frame_log.is_none());
                 assert!(defaults.cached_model.is_none());
                 assert!(defaults.vastai.is_none());

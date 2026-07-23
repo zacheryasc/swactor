@@ -27,6 +27,7 @@ use mvp_system::actors::node_agent::{
 };
 use mvp_system::actors::orchestrator::{OrchestratorActor, OrchestratorReport};
 use mvp_system::actors::register_mvp_actor_codecs;
+use mvp_system::benchmark_observability;
 use mvp_system::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 #[cfg(feature = "dashboard")]
 use mvp_system::dashboard_view::MvpClusterDashboardView;
@@ -414,6 +415,18 @@ fn run() -> Result<(), String> {
         pipeline_coordinator_endpoint,
         orchestrator_actor,
     )?;
+
+    orch_datastream.emit_bootstrap(
+        dashboard.as_ref(),
+        config.run_id,
+        config.node_id,
+        "prompt_rpc",
+        "started",
+        json!({
+            "bind":config.rpc_bind.to_string(),
+            "default_max_tokens":config.default_max_tokens,
+        }),
+    );
 
     let rpc_addr = match spawn_prompt_rpc(config.rpc_bind, work_tx, config.default_max_tokens) {
         Ok(addr) => {
@@ -1700,9 +1713,6 @@ impl Config {
         if self.provider == ProviderKind::Docker {
             keys.push("MVP_DOCKER_GPUS");
         }
-        if std::env::var_os("MVP_TINYGRAD_TEST_MODE").is_some() {
-            keys.push("MVP_TINYGRAD_TEST_MODE");
-        }
         if local_tinygrad_worker_env(self.provider).is_some() {
             keys.push("MVP_TINYGRAD_WORKER");
         }
@@ -1800,7 +1810,6 @@ impl Config {
         if self.provider == ProviderKind::Docker {
             env.push(("MVP_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
         }
-        env.extend(optional_env("MVP_TINYGRAD_TEST_MODE"));
         env.extend(local_tinygrad_worker_env(self.provider));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE"));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE_INTERVAL_MS"));
@@ -3132,6 +3141,7 @@ impl FrameArchive {
         };
         let record = json!({
             "arrival_seq":self.next_seq,
+            "arrival_unix_ms":benchmark_observability::unix_ms_now(),
             "source":source,
             "stream":stream.to_string(),
             "channel":channel,
@@ -3252,6 +3262,7 @@ impl OrchDatastream {
             "status":status,
             "run_id":run_id,
             "node_id":node_id,
+            "benchmark":benchmark_observability::stamp("mvp-orchestrator"),
             "detail":detail,
         }))
         .expect("serialize orch bootstrap event");
@@ -3275,6 +3286,7 @@ impl OrchDatastream {
             "run_id":run_id,
             "node_id":node_id,
             "request_id":request_id,
+            "benchmark":benchmark_observability::stamp("mvp-orchestrator"),
             "detail":detail,
         }))
         .expect("serialize orch prompt event");
@@ -4042,6 +4054,21 @@ impl PipelinePromptRuntime {
                 .unwrap_or(0);
             let final_text = self.final_text.clone();
             let tokens_generated = self.generated_tokens.len() as u32;
+            orch_datastream.emit_prompt(
+                dashboard,
+                run_id,
+                node_id,
+                request_id,
+                "prompt_complete",
+                "ready",
+                json!({
+                    "event":"Done",
+                    "terminal":true,
+                    "tokens_generated":tokens_generated,
+                    "elapsed_ms":elapsed_ms,
+                    "final_text_bytes":final_text.len(),
+                }),
+            );
             let _ = active.events.send(PromptEvent::Done {
                 request_id,
                 final_text,
@@ -4985,7 +5012,6 @@ mod tests {
         "MVP_PIPELINE_STAGES",
         "MVP_STAGE_INDEX",
         "MVP_TOKEN_PROGRESS_EVERY",
-        "MVP_TINYGRAD_TEST_MODE",
         "MVP_TINYGRAD_WORKER",
         "MVP_TOKENIZER_LOCAL_PATH",
         "MVP_VASTAI_API_KEY",
@@ -6070,28 +6096,37 @@ mod tests {
             .collect::<Vec<_>>();
         let _ = std::fs::remove_file(&path);
 
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["arrival_seq"], json!(0));
+        assert!(
+            records[0]["arrival_unix_ms"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert_eq!(records[0]["source"], json!("orchestrator"));
+        assert_eq!(records[0]["stream"], json!("test-node#42"));
+        assert_eq!(records[0]["channel"], json!("stdout"));
+        assert_eq!(records[0]["channel_id"], json!(1));
+        assert_eq!(records[0]["position"], json!(7));
         assert_eq!(
-            records,
-            vec![
-                json!({
-                    "arrival_seq":0,
-                    "source":"orchestrator",
-                    "stream":"test-node#42",
-                    "channel":"stdout",
-                    "channel_id":1,
-                    "position":7,
-                    "payload":{"encoding":"utf8","value":"hello λ"},
-                }),
-                json!({
-                    "arrival_seq":1,
-                    "source":"orchestrator",
-                    "stream":"test-node#42",
-                    "channel":"stderr",
-                    "channel_id":2,
-                    "position":8,
-                    "payload":{"encoding":"bytes","value":[255,0,65]},
-                }),
-            ]
+            records[0]["payload"],
+            json!({"encoding":"utf8","value":"hello λ"})
+        );
+
+        assert_eq!(records[1]["arrival_seq"], json!(1));
+        assert!(
+            records[1]["arrival_unix_ms"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert_eq!(records[1]["source"], json!("orchestrator"));
+        assert_eq!(records[1]["stream"], json!("test-node#42"));
+        assert_eq!(records[1]["channel"], json!("stderr"));
+        assert_eq!(records[1]["channel_id"], json!(2));
+        assert_eq!(records[1]["position"], json!(8));
+        assert_eq!(
+            records[1]["payload"],
+            json!({"encoding":"bytes","value":[255,0,65]})
         );
     }
 
