@@ -86,12 +86,6 @@ impl MvpChatCheckScenario {
             }
             Self::MultinodeDocker => {
                 args.push("--docker".to_owned());
-                args.extend([
-                    "--relay-mode".to_owned(),
-                    "default".to_owned(),
-                    "--endpoint-addr-mask".to_owned(),
-                    "relay-only".to_owned(),
-                ]);
             }
         }
         if matches!(self, Self::Multinode | Self::MultinodeDocker) {
@@ -1244,7 +1238,7 @@ fn assert_dump_log_facts(
         require_gpu_dump_log_facts(&facts)?;
     }
     if scenario == MvpChatCheckScenario::MultinodeDocker {
-        require_multinode_docker_relay_facts(&facts)?;
+        require_multinode_docker_network_facts(&facts)?;
     }
     Ok(events)
 }
@@ -1295,12 +1289,14 @@ fn build_benchmark_report(
             "ready",
         )?;
     }
-    facts.require_span(
-        "mvp.chat.runtime",
-        "ChatProgress",
-        "ensure_worker_binary",
-        "ready",
-    )?;
+    if scenario != MvpChatCheckScenario::MultinodeDocker {
+        facts.require_span(
+            "mvp.chat.runtime",
+            "ChatProgress",
+            "ensure_worker_binary",
+            "ready",
+        )?;
+    }
     facts.require_span(
         "mvp.orch.bootstrap",
         "OrchBootstrap",
@@ -1594,10 +1590,9 @@ struct DumpLogFacts {
     gpu_pipeline_tokenizer_decode_ready: BTreeSet<u64>,
     gpu_pipeline_tokens_decoded: BTreeSet<u64>,
     gpu_pipeline_real_worker_step_seen: bool,
-    relay_masked_orchestrator_ready: bool,
-    relay_masked_node_spec_worker_count: Option<u64>,
-    relay_masked_worker_iroh_ready: BTreeSet<u64>,
-    relay_masked_worker_coordinator_join: BTreeSet<u64>,
+    docker_node_spec_worker_count: Option<u64>,
+    docker_worker_iroh_ready: BTreeSet<u64>,
+    docker_worker_coordinator_join: BTreeSet<u64>,
     chat_config_ready: bool,
     prepare_runtime_ready: bool,
     prompt_rpc_ready: bool,
@@ -1643,31 +1638,23 @@ fn record_dump_log_event(
         }
         (_, Some("OrchBootstrap"), Some("iroh_driver"), Some("ready")) => {
             facts.orch_iroh_driver_ready = true;
-            if detail_relay_only_advertisement(event) {
-                facts.relay_masked_orchestrator_ready = true;
-            }
         }
         (_, Some("NodeEvent"), Some("iroh_driver"), Some("ready")) => {
             facts.node_iroh_driver_ready = true;
-            if detail_relay_only_advertisement(event)
-                && let Some(node_id) = event_node_id(event)
-            {
-                facts.relay_masked_worker_iroh_ready.insert(node_id);
+            if let Some(node_id) = event_node_id(event) {
+                facts.docker_worker_iroh_ready.insert(node_id);
             }
         }
         (_, Some("OrchBootstrap"), Some("node_spec"), Some("ready")) => {
-            if detail_str(event, "endpoint_addr_mask") == Some("relay-only")
-                && detail_str(event, "relay_mode") == Some("default")
-            {
-                facts.relay_masked_node_spec_worker_count = detail_u64(event, "worker_count");
+            if detail_str(event, "provider") == Some("docker") {
+                facts.docker_node_spec_worker_count = detail_u64(event, "worker_count");
             }
         }
         (_, Some("NodeEvent"), Some("coordinator_join"), Some("started")) => {
-            if detail_bool(event, "has_relay") == Some(true)
-                && detail_u64(event, "direct_addr_count") == Some(0)
+            if detail_u64(event, "direct_addr_count").is_some_and(|count| count > 0)
                 && let Some(node_id) = event_node_id(event)
             {
-                facts.relay_masked_worker_coordinator_join.insert(node_id);
+                facts.docker_worker_coordinator_join.insert(node_id);
             }
         }
         (_, Some("NodeEvent"), Some("worker_initialize"), Some("ready")) => {
@@ -1878,24 +1865,20 @@ fn require_gpu_dump_log_facts(facts: &DumpLogFacts) -> Result<(), String> {
     Ok(())
 }
 
-fn require_multinode_docker_relay_facts(facts: &DumpLogFacts) -> Result<(), String> {
-    require_dump_log_fact(
-        facts.relay_masked_orchestrator_ready,
-        "relay-masked orchestrator endpoint",
-    )?;
+fn require_multinode_docker_network_facts(facts: &DumpLogFacts) -> Result<(), String> {
     require_dump_log_fact(
         facts
-            .relay_masked_node_spec_worker_count
+            .docker_node_spec_worker_count
             .is_some_and(|count| count >= 2),
-        "relay-masked Docker node_spec with multiple workers",
+        "Docker node_spec with multiple workers",
     )?;
     require_dump_log_fact(
-        facts.relay_masked_worker_iroh_ready.len() >= 2,
-        "relay-masked worker iroh_driver ready for multiple nodes",
+        facts.docker_worker_iroh_ready.len() >= 2,
+        "Docker worker iroh_driver ready for multiple nodes",
     )?;
     require_dump_log_fact(
-        facts.relay_masked_worker_coordinator_join.len() >= 2,
-        "relay-masked worker coordinator_join for multiple nodes",
+        facts.docker_worker_coordinator_join.len() >= 2,
+        "Docker worker direct coordinator_join for multiple nodes",
     )
 }
 
@@ -1961,13 +1944,6 @@ fn event_node_id(event: &Value) -> Option<u64> {
     event.get("node_id").and_then(Value::as_u64)
 }
 
-fn detail_bool(event: &Value, key: &str) -> Option<bool> {
-    event
-        .get("detail")
-        .and_then(|detail| detail.get(key))
-        .and_then(Value::as_bool)
-}
-
 fn detail_u64(event: &Value, key: &str) -> Option<u64> {
     event
         .get("detail")
@@ -1980,12 +1956,6 @@ fn detail_str<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
         .get("detail")
         .and_then(|detail| detail.get(key))
         .and_then(Value::as_str)
-}
-
-fn detail_relay_only_advertisement(event: &Value) -> bool {
-    detail_str(event, "endpoint_addr_mask") == Some("relay-only")
-        && detail_bool(event, "has_relay") == Some(true)
-        && detail_u64(event, "direct_addr_count") == Some(0)
 }
 
 fn dump_log_request_id(event: &Value) -> Option<u64> {
@@ -2071,10 +2041,6 @@ mod tests {
             multinode_docker.mvp_chat_args(42, dump_log),
             strings(&[
                 "--docker",
-                "--relay-mode",
-                "default",
-                "--endpoint-addr-mask",
-                "relay-only",
                 "--pipeline-stages",
                 "2",
                 "--cached-model",
@@ -2826,22 +2792,13 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_observability_multinode_docker_dump_facts_require_relay_masked_events() {
+    fn benchmark_observability_multinode_docker_dump_facts_require_direct_network_events() {
         let mut events = dump_log_fact_events(false, false);
         events.extend([
             (
                 "mvp.orch.bootstrap",
                 stamped(
-                    json!({"type":"OrchBootstrap","phase":"iroh_driver","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","relay_mode":"Default","has_relay":true,"direct_addr_count":0}}),
-                    "mvp-orchestrator",
-                    1_070,
-                    70,
-                ),
-            ),
-            (
-                "mvp.orch.bootstrap",
-                stamped(
-                    json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","relay_mode":"default","worker_count":2}}),
+                    json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"full","provider":"docker","worker_count":2}}),
                     "mvp-orchestrator",
                     1_071,
                     71,
@@ -2850,7 +2807,7 @@ mod tests {
             (
                 "mvp.node.bootstrap",
                 stamped(
-                    json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"relay-only","has_relay":true,"direct_addr_count":0}}),
+                    json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"full","has_relay":false,"direct_addr_count":3}}),
                     "mvp-worker-node",
                     1_072,
                     72,
@@ -2859,7 +2816,7 @@ mod tests {
             (
                 "mvp.node.bootstrap",
                 stamped(
-                    json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"endpoint_addr_mask":"relay-only","has_relay":true,"direct_addr_count":0}}),
+                    json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"endpoint_addr_mask":"full","has_relay":false,"direct_addr_count":3}}),
                     "mvp-worker-node",
                     1_073,
                     73,
@@ -2868,7 +2825,7 @@ mod tests {
             (
                 "mvp.node.bootstrap",
                 stamped(
-                    json!({"type":"NodeEvent","phase":"coordinator_join","status":"started","run_id":9,"node_id":2,"stage_index":0,"detail":{"has_relay":true,"direct_addr_count":0}}),
+                    json!({"type":"NodeEvent","phase":"coordinator_join","status":"started","run_id":9,"node_id":2,"stage_index":0,"detail":{"has_relay":false,"direct_addr_count":4}}),
                     "mvp-worker-node",
                     1_074,
                     74,
@@ -2877,36 +2834,35 @@ mod tests {
             (
                 "mvp.node.bootstrap",
                 stamped(
-                    json!({"type":"NodeEvent","phase":"coordinator_join","status":"started","run_id":9,"node_id":3,"stage_index":1,"detail":{"has_relay":true,"direct_addr_count":0}}),
+                    json!({"type":"NodeEvent","phase":"coordinator_join","status":"started","run_id":9,"node_id":3,"stage_index":1,"detail":{"has_relay":false,"direct_addr_count":4}}),
                     "mvp-worker-node",
                     1_075,
                     75,
                 ),
             ),
         ]);
-        let path = write_synthetic_event_dump("multinode-docker-relay-mask", events);
+        let path = write_synthetic_event_dump("multinode-docker-direct-network", events);
         assert_dump_log_facts(&path, MvpChatCheckScenario::MultinodeDocker)
-            .expect("relay-masked multinode Docker facts pass");
+            .expect("direct-network multinode Docker facts pass");
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn benchmark_observability_multinode_docker_requires_relay_masked_workers() {
+    fn benchmark_observability_multinode_docker_requires_direct_network_workers() {
         let mut valid = DumpLogFacts {
-            relay_masked_orchestrator_ready: true,
-            relay_masked_node_spec_worker_count: Some(2),
+            docker_node_spec_worker_count: Some(2),
             ..DumpLogFacts::default()
         };
-        valid.relay_masked_worker_iroh_ready.extend([2, 3]);
-        valid.relay_masked_worker_coordinator_join.extend([2, 3]);
-        require_multinode_docker_relay_facts(&valid).expect("relay-masked Docker facts pass");
+        valid.docker_worker_iroh_ready.extend([2, 3]);
+        valid.docker_worker_coordinator_join.extend([2, 3]);
+        require_multinode_docker_network_facts(&valid).expect("direct-network Docker facts pass");
 
         let mut missing_worker = valid;
-        missing_worker.relay_masked_worker_iroh_ready.remove(&3);
-        let error = require_multinode_docker_relay_facts(&missing_worker)
-            .expect_err("single relay-masked worker should fail");
+        missing_worker.docker_worker_iroh_ready.remove(&3);
+        let error = require_multinode_docker_network_facts(&missing_worker)
+            .expect_err("single direct-network worker should fail");
         assert!(
-            error.contains("relay-masked worker iroh_driver ready for multiple nodes"),
+            error.contains("Docker worker iroh_driver ready for multiple nodes"),
             "unexpected error: {error}"
         );
     }

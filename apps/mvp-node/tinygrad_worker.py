@@ -395,30 +395,48 @@ class PipelineStageTinygradModel:
         first_stage: bool,
         final_stage: bool,
         nn_mod: Any,
-        config_cls: Any,
+        config_cls: Any | None,
         block_cls: Any,
     ) -> None:
-        block_config = config_cls(
-            num_blocks=block_count,
-            dim=dim,
-            hidden_dim=hidden_dim,
-            n_heads=n_heads,
-            n_kv_heads=n_kv_heads,
-            norm_eps=norm_eps,
-            vocab_size=vocab_size,
-            head_dim=head_dim,
-            rope_theta=rope_theta,
-            rope_dim=rope_dim,
-            v_head_dim=v_head_dim,
-            max_context=max_context,
-            qk_norm=qk_norm,
-            num_experts=num_experts,
-            num_experts_per_tok=num_experts_per_tok,
-            norm_topk_prob=norm_topk_prob,
-            qkv_bias=qkv_bias,
-            expert_bias=expert_bias,
-        )
-        self.blk = [block_cls(block_config) for _ in range(block_count)]
+        if config_cls is None:
+            self.blk = [
+                block_cls(
+                    dim,
+                    hidden_dim,
+                    n_heads,
+                    n_kv_heads,
+                    norm_eps,
+                    head_dim,
+                    rope_theta,
+                    max_context,
+                    qk_norm,
+                    num_experts,
+                    num_experts_per_tok,
+                )
+                for _ in range(block_count)
+            ]
+        else:
+            block_config = config_cls(
+                num_blocks=block_count,
+                dim=dim,
+                hidden_dim=hidden_dim,
+                n_heads=n_heads,
+                n_kv_heads=n_kv_heads,
+                norm_eps=norm_eps,
+                vocab_size=vocab_size,
+                head_dim=head_dim,
+                rope_theta=rope_theta,
+                rope_dim=rope_dim,
+                v_head_dim=v_head_dim,
+                max_context=max_context,
+                qk_norm=qk_norm,
+                num_experts=num_experts,
+                num_experts_per_tok=num_experts_per_tok,
+                norm_topk_prob=norm_topk_prob,
+                qkv_bias=qkv_bias,
+                expert_bias=expert_bias,
+            )
+            self.blk = [block_cls(block_config) for _ in range(block_count)]
         self.max_context = max_context
         self.hidden_dim = dim
         self.first_stage = first_stage
@@ -479,10 +497,22 @@ def load_pipeline_stage_model(
 ) -> tuple[PipelineStageTinygradModel, dict[str, Any]]:
     TensorCls = require_tinygrad()
     from tinygrad import nn
-    from tinygrad.llm.gguf import gguf_load
-    from tinygrad.llm.model import TransformerBlock, TransformerConfig
 
-    kv, state_dict = gguf_load(path)
+    try:
+        from tinygrad.llm.gguf import gguf_load
+        from tinygrad.llm.model import TransformerBlock, TransformerConfig
+
+        kv, state_dict = gguf_load(path)
+        block_cls = TransformerBlock
+        config_cls = TransformerConfig
+    except ModuleNotFoundError as exc:
+        if exc.name is not None and not exc.name.startswith("tinygrad.llm"):
+            raise
+        from tinygrad.apps.llm import TransformerBlock
+
+        kv, state_dict = nn.state.gguf_load(TensorCls(path).to(None))
+        block_cls = TransformerBlock
+        config_cls = None
     state_dict = {key: value.cast("float16") if env_flag("HALF", True) else value for key, value in state_dict.items()}
     if "output.weight" not in state_dict and "token_embd.weight" in state_dict:
         state_dict["output.weight"] = state_dict["token_embd.weight"]
@@ -538,8 +568,8 @@ def load_pipeline_stage_model(
         first_stage=first_stage,
         final_stage=final_stage,
         nn_mod=nn,
-        config_cls=TransformerConfig,
-        block_cls=TransformerBlock,
+        config_cls=config_cls,
+        block_cls=block_cls,
     )
     stage_state = remap_stage_state_dict(
         state_dict,
@@ -579,12 +609,11 @@ def load_weights(cmd: dict[str, Any]) -> None:
         try:
             from tinygrad.llm.cli import SimpleTokenizer
 
-            Transformer = None
             llm_backend = "tinygrad.llm"
         except ModuleNotFoundError as exc:
-            if exc.name != "tinygrad.llm":
+            if exc.name is not None and not exc.name.startswith("tinygrad.llm"):
                 raise
-            from tinygrad.apps.llm import SimpleTokenizer, Transformer
+            from tinygrad.apps.llm import SimpleTokenizer
 
             llm_backend = "tinygrad.apps.llm"
 
@@ -602,28 +631,12 @@ def load_weights(cmd: dict[str, Any]) -> None:
             requested_device=os.environ.get("DEV"),
             llm_backend=llm_backend,
         )
-        if Transformer is None:
-            model, kv = load_pipeline_stage_model(
-                path,
-                max_context=max_context,
-                layer_start=layer_start,
-                layer_end_exclusive=layer_end_exclusive,
-            )
-        else:
-            TensorCls = require_tinygrad()
-            model, kv = Transformer.from_gguf(TensorCls(path), max_context=max_context, realize=True)
-            total_layers = int(kv[f"{kv['general.architecture']}.block_count"]) - int(
-                kv.get(f"{kv['general.architecture']}.nextn_predict_layers", 0)
-            )
-            if layer_start != 0 or layer_end_exclusive < total_layers:
-                fatal(
-                    "TinygradAppsLlmPartialStageUnsupported",
-                    layer_start=layer_start,
-                    layer_end_exclusive=layer_end_exclusive,
-                    total_layers=total_layers,
-                )
-            model.first_stage = True
-            model.final_stage = True
+        model, kv = load_pipeline_stage_model(
+            path,
+            max_context=max_context,
+            layer_start=layer_start,
+            layer_end_exclusive=layer_end_exclusive,
+        )
         control(
             type="PipelineStageFromGgufReady",
             model_id=model_id,
