@@ -36,6 +36,22 @@ const BASE_NODE_IMAGE: &str = "swactor-mvp-node-base:cuda12.6";
 const REPO_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const ORCH_SHUTDOWN_GRACE_MS: u64 = 5_000;
+const MVP_CHAT_GPU_RUN_ENV: &str = "MVP_CHAT_GPU_RUN";
+const MVP_CHAT_USAGE: &str = "\
+USAGE: cargo mvp-chat [OPTIONS]
+
+OPTIONS:
+  --gpu                         Run the local GPU path: in-process orchestrator plus DEV=CUDA worker selection
+  --process | --docker | --vastai
+                                Select the runtime provider
+  --config <path>               Load config overlay
+  --pipeline-stages <count>     Number of pipeline stages
+  --cached-model[=<path>]       Use discovered or explicit cached GGUF model
+  --dump-logs[=<path>]          Write datastream frame log
+  --run-id <id>                 Override run id
+  --skip-rebuild                Reuse existing Cargo artifacts
+  --yes, -y                     Approve Vast.ai lease prompts
+  --help, -h                    Print this help";
 const ORCH_SHUTDOWN_POLL_MS: u64 = 50;
 const CHAT_LIFECYCLE_CHANNEL: &str = "mvp.chat.lifecycle";
 const CHAT_RUNTIME_CHANNEL: &str = "mvp.chat.runtime";
@@ -69,11 +85,54 @@ where
     }
 }
 
+fn print_usage() {
+    println!("{MVP_CHAT_USAGE}");
+}
+
+fn is_help_request(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
+}
+
+struct RuntimeEnvGuard {
+    name: &'static str,
+    original: Option<std::ffi::OsString>,
+}
+
+impl RuntimeEnvGuard {
+    fn apply_gpu_defaults(gpu_run: bool) -> Option<Self> {
+        if !gpu_run || std::env::var_os("DEV").is_some() {
+            return None;
+        }
+        let guard = Self {
+            name: "DEV",
+            original: None,
+        };
+        unsafe { std::env::set_var(guard.name, "CUDA") };
+        Some(guard)
+    }
+}
+
+impl Drop for RuntimeEnvGuard {
+    fn drop(&mut self) {
+        match &self.original {
+            Some(value) => unsafe { std::env::set_var(self.name, value) },
+            None => unsafe { std::env::remove_var(self.name) },
+        }
+    }
+}
+
 fn run<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
-    let config = Config::from_args(args)?;
+    let provided_args = args.into_iter().collect::<Vec<_>>();
+    if is_help_request(&provided_args) {
+        print_usage();
+        return Ok(());
+    }
+    let config = Config::from_args(provided_args)?;
+    let _gpu_env = RuntimeEnvGuard::apply_gpu_defaults(config.gpu_run);
     let mut progress = ChatDatastream::new(config.run_id, config.datastream_frame_log.clone())?;
     progress.emit(
         CHAT_LIFECYCLE_CHANNEL,
@@ -85,6 +144,7 @@ where
             "max_tokens": config.max_tokens,
             "cached_model": config.cached_model.as_ref().map(|model| model.host_path.to_string_lossy().to_string()),
             "dump_logs": config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "gpu_run": config.gpu_run,
         }),
     );
     confirm_vastai_if_needed(&config)?;
@@ -120,21 +180,30 @@ where
         CHAT_COMPONENT_CHANNEL,
         "orchestrator_process_spawn",
         "started",
-        json!({"binary": config.orch_bin.to_string_lossy()}),
+        json!({
+            "mode": config.orchestrator_launch_mode(),
+            "binary": config.orch_bin.to_string_lossy(),
+        }),
     );
-    let mut orch = match OrchChild::spawn(&config, &image_ref) {
+    let mut orch = match OrchHandle::spawn(&config, &image_ref) {
         Ok(orch) => {
             progress.emit(
                 CHAT_COMPONENT_CHANNEL,
                 "orchestrator_process_spawn",
                 "ready",
-                json!({"binary": config.orch_bin.to_string_lossy(), "pid": orch.child.id()}),
+                json!({
+                    "mode": config.orchestrator_launch_mode(),
+                    "binary": config.orch_bin.to_string_lossy(),
+                }),
             );
             progress.emit(
                 CHAT_COMPONENT_CHANNEL,
                 "orchestrator_process",
                 "started",
-                json!({"binary": config.orch_bin.to_string_lossy()}),
+                json!({
+                    "mode": config.orchestrator_launch_mode(),
+                    "binary": config.orch_bin.to_string_lossy(),
+                }),
             );
             orch
         }
@@ -143,13 +212,17 @@ where
                 CHAT_COMPONENT_CHANNEL,
                 "orchestrator_process_spawn",
                 "failed",
-                json!({"binary": config.orch_bin.to_string_lossy(), "error": error}),
+                json!({
+                    "mode": config.orchestrator_launch_mode(),
+                    "binary": config.orch_bin.to_string_lossy(),
+                    "error": error,
+                }),
             );
             progress.emit(
                 CHAT_COMPONENT_CHANNEL,
                 "orchestrator_process",
                 "failed",
-                json!({"error": error}),
+                json!({"mode": config.orchestrator_launch_mode(), "error": error}),
             );
             progress.archive_pending()?;
             return Err(error);
@@ -257,6 +330,7 @@ struct Config {
     pipeline_stages: u32,
     max_tokens: u32,
     skip_rebuild: bool,
+    gpu_run: bool,
 }
 
 struct ChatDatastream {
@@ -537,8 +611,15 @@ impl Config {
         if max_tokens == 0 {
             return Err("[runtime].max_tokens must be greater than 0".to_owned());
         }
-        let cached_model = args
-            .cached_model
+        let gpu_run = args.gpu || env_flag(MVP_CHAT_GPU_RUN_ENV, false);
+        let cached_model_source = match args.cached_model {
+            Some(source) => Some(source),
+            None if gpu_run && provider == ProviderKind::Process => {
+                Some(CachedModelSource::Discover)
+            }
+            None => None,
+        };
+        let cached_model = cached_model_source
             .map(CachedModelConfig::from_source)
             .transpose()?;
         let datastream_frame_log = if args.dump_logs {
@@ -576,6 +657,7 @@ impl Config {
             max_tokens,
             vastai,
             skip_rebuild: args.skip_rebuild,
+            gpu_run,
         })
     }
 
@@ -666,6 +748,14 @@ impl Config {
         }
         args
     }
+
+    fn orchestrator_launch_mode(&self) -> &'static str {
+        if self.gpu_run {
+            "in_process_actor"
+        } else {
+            "process_binary"
+        }
+    }
 }
 
 #[derive(Default, Debug)]
@@ -679,6 +769,8 @@ struct ParsedArgs {
     run_id: Option<u64>,
     skip_rebuild: bool,
     cached_model: Option<CachedModelSource>,
+    help: bool,
+    gpu: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -707,6 +799,8 @@ impl ParsedArgs {
         let mut args = provided_args.into_iter().peekable();
         while let Some(arg) = args.next() {
             match arg.as_str() {
+                "--help" | "-h" | "help" => parsed.help = true,
+                "--gpu" => parsed.gpu = true,
                 "--vastai" => parsed.set_provider_selector(ProviderKind::VastAi)?,
                 "--process" => parsed.set_provider_selector(ProviderKind::Process)?,
                 "--docker" => parsed.set_provider_selector(ProviderKind::Docker)?,
@@ -860,6 +954,130 @@ fn parse_approval(input: &str) -> bool {
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
+enum OrchHandle {
+    Process(OrchChild),
+    InProcess(InProcessOrch),
+}
+
+impl OrchHandle {
+    fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
+        if config.gpu_run {
+            InProcessOrch::spawn(config, image_ref).map(Self::InProcess)
+        } else {
+            OrchChild::spawn(config, image_ref).map(Self::Process)
+        }
+    }
+
+    fn wait_ready(&mut self, rpc_addr: String) -> Result<String, String> {
+        match self {
+            Self::Process(orch) => orch.wait_ready(rpc_addr),
+            Self::InProcess(orch) => orch.wait_ready(rpc_addr),
+        }
+    }
+
+    fn shutdown(&mut self) {
+        match self {
+            Self::Process(orch) => orch.shutdown(),
+            Self::InProcess(orch) => orch.shutdown(),
+        }
+    }
+}
+
+struct InProcessOrch {
+    stop_tx: Option<mpsc::Sender<()>>,
+    thread: Option<thread::JoinHandle<Result<(), String>>>,
+    cleaned: bool,
+}
+
+impl InProcessOrch {
+    fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
+        let args = config.orchestrator_cli_args(image_ref);
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            mvp_system::orchestrator_app::run_in_process_from_args(args, stop_rx)
+        });
+        Ok(Self {
+            stop_tx: Some(stop_tx),
+            thread: Some(thread),
+            cleaned: false,
+        })
+    }
+
+    fn wait_ready(&mut self, rpc_addr: String) -> Result<String, String> {
+        loop {
+            if STOP_REQUESTED.load(Ordering::SeqCst) {
+                return Err("interrupted before orchestrator became ready".to_owned());
+            }
+            match TcpStream::connect(&rpc_addr) {
+                Ok(stream) => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Ok(rpc_addr);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionRefused
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::AddrNotAvailable
+                    ) => {}
+                Err(error) => return Err(format!("connect prompt RPC {rpc_addr}: {error}")),
+            }
+            if let Some(result) = self.take_finished_result() {
+                return Err(format!(
+                    "in-process orchestrator exited before prompt RPC ready: {}",
+                    render_orch_thread_result(result)
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if self.cleaned {
+            return;
+        }
+        self.cleaned = true;
+        let _ = self.stop_tx.take().map(|tx| tx.send(()));
+        let grace = Duration::from_millis(ORCH_SHUTDOWN_GRACE_MS);
+        let poll = Duration::from_millis(ORCH_SHUTDOWN_POLL_MS);
+        let started = Instant::now();
+        while started.elapsed() < grace {
+            if self.take_finished_result().is_some() {
+                return;
+            }
+            thread::sleep(poll);
+        }
+    }
+
+    fn take_finished_result(&mut self) -> Option<Result<(), String>> {
+        if !self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            return None;
+        }
+        let thread = self.thread.take()?;
+        Some(match thread.join() {
+            Ok(result) => result,
+            Err(_) => Err("in-process orchestrator thread panicked".to_owned()),
+        })
+    }
+}
+
+impl Drop for InProcessOrch {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn render_orch_thread_result(result: Result<(), String>) -> String {
+    match result {
+        Ok(()) => "completed successfully".to_owned(),
+        Err(error) => error,
+    }
+}
+
 struct OrchChild {
     child: Child,
     cleaned: bool,
@@ -1007,30 +1225,47 @@ fn prepare_runtime_with_progress(
     } else {
         "cargo_build"
     };
-    emit_chat_progress(
-        &mut progress,
-        CHAT_RUNTIME_CHANNEL,
-        "ensure_orch_binary",
-        "started",
-        json!({"mode": binary_mode}),
-    );
-    match ensure_orch_binary(config) {
-        Ok(()) => emit_chat_progress(
+    if config.gpu_run {
+        emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "ensure_orchestrator_actor",
+            "started",
+            json!({"mode": config.orchestrator_launch_mode()}),
+        );
+        emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "ensure_orchestrator_actor",
+            "ready",
+            json!({"mode": config.orchestrator_launch_mode()}),
+        );
+    } else {
+        emit_chat_progress(
             &mut progress,
             CHAT_RUNTIME_CHANNEL,
             "ensure_orch_binary",
-            "ready",
+            "started",
             json!({"mode": binary_mode}),
-        ),
-        Err(error) => {
-            emit_chat_progress(
+        );
+        match ensure_orch_binary(config) {
+            Ok(()) => emit_chat_progress(
                 &mut progress,
                 CHAT_RUNTIME_CHANNEL,
                 "ensure_orch_binary",
-                "failed",
-                json!({"mode": binary_mode, "error": error.as_str()}),
-            );
-            return Err(error);
+                "ready",
+                json!({"mode": binary_mode}),
+            ),
+            Err(error) => {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_RUNTIME_CHANNEL,
+                    "ensure_orch_binary",
+                    "failed",
+                    json!({"mode": binary_mode, "error": error.as_str()}),
+                );
+                return Err(error);
+            }
         }
     }
 
@@ -1709,6 +1944,16 @@ fn provider_from_sources(
     Ok(ProviderKind::Process)
 }
 
+fn env_flag(name: &str, default: bool) -> bool {
+    match env_optional(name) {
+        Some(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => default,
+    }
+}
+
 fn env_optional(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -1775,6 +2020,8 @@ mod tests {
         "VASTAI_API_KEY",
         "MVP_PIPELINE_STAGES",
         "MVP_RUNTIME_CONFIG",
+        "MVP_CHAT_GPU_RUN",
+        "DEV",
     ];
 
     struct TempDir {
@@ -1886,6 +2133,7 @@ mod tests {
             pipeline_stages: 1,
             max_tokens: DEFAULT_MAX_TOKENS,
             skip_rebuild: true,
+            gpu_run: false,
         }
     }
 
@@ -1988,6 +2236,7 @@ mod tests {
     #[test]
     fn parsed_args_accepts_public_flags() {
         let parsed = ParsedArgs::parse(strings(&[
+            "--gpu",
             "--docker",
             "--yes",
             "--config",
@@ -2008,6 +2257,34 @@ mod tests {
         assert_eq!(parsed.dump_log_path, Some(PathBuf::from("logs.ndjson")));
         assert_eq!(parsed.cached_model, Some(CachedModelSource::Discover));
         assert!(parsed.skip_rebuild);
+        assert!(parsed.gpu);
+
+        let help = ParsedArgs::parse(strings(&["--help"])).expect("help parses");
+        assert!(help.help);
+        let short_help = ParsedArgs::parse(strings(&["-h"])).expect("short help parses");
+        assert!(short_help.help);
+    }
+
+    #[test]
+    fn config_gpu_flag_selects_in_process_gpu_run() {
+        let temp = TempDir::new("gpu-flag-config");
+        let cache = temp.path().join(REPO_MODEL_CACHE_DIR);
+        fs::create_dir_all(&cache).expect("create model cache");
+        let cached_path = cache.join("default.gguf");
+        fs::write(&cached_path, b"cached model").expect("write cached model");
+        with_process_state(&[], Some(temp.path()), || {
+            let config = Config::from_args(strings(&["--gpu", "--skip-rebuild"]))
+                .expect("gpu config resolves");
+            assert!(config.gpu_run);
+            assert_eq!(config.orchestrator_launch_mode(), "in_process_actor");
+            assert_eq!(
+                config
+                    .cached_model
+                    .as_ref()
+                    .map(|model| model.host_path.clone()),
+                Some(cached_path.canonicalize().expect("canonical cached model"))
+            );
+        });
     }
 
     #[test]

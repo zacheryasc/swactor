@@ -24,6 +24,7 @@ pub mod node_boot_lifecycle;
 pub mod node_image;
 pub mod node_provisioning;
 pub mod observability_surface;
+pub mod orchestrator_app;
 pub mod orchestrator_run_fsm;
 pub mod orchestrator_token_endpoint;
 pub mod prompt_rpc;

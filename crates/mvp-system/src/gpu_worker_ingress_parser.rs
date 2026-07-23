@@ -56,20 +56,25 @@ pub const OBJECT_MAGIC_BYTES: [u8; 4] = *b"MO01";
 pub const OBJECT_MAGIC: u32 = u32::from_le_bytes(OBJECT_MAGIC_BYTES);
 pub const OBJECT_VERSION: u16 = 1;
 pub const FLAG_END_OF_SEQUENCE: u32 = 1;
-pub const KNOWN_FLAGS_MASK: u32 = FLAG_END_OF_SEQUENCE;
+pub const FLAG_BEGIN_SEQUENCE: u32 = 1 << 1;
+pub const KNOWN_FLAGS_MASK: u32 = FLAG_END_OF_SEQUENCE | FLAG_BEGIN_SEQUENCE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct ObjectFlags {
     pub end_of_sequence: bool,
+    pub begin_sequence: bool,
 }
 
 impl ObjectFlags {
     pub fn bits(self) -> u32 {
+        let mut bits = 0;
         if self.end_of_sequence {
-            FLAG_END_OF_SEQUENCE
-        } else {
-            0
+            bits |= FLAG_END_OF_SEQUENCE;
         }
+        if self.begin_sequence {
+            bits |= FLAG_BEGIN_SEQUENCE;
+        }
+        bits
     }
 
     pub fn from_bits(bits: u32) -> Option<Self> {
@@ -78,6 +83,7 @@ impl ObjectFlags {
         }
         Some(Self {
             end_of_sequence: bits & FLAG_END_OF_SEQUENCE != 0,
+            begin_sequence: bits & FLAG_BEGIN_SEQUENCE != 0,
         })
     }
 }

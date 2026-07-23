@@ -52,6 +52,7 @@ fn flagged_record(sequence: u64, extent: u64) -> Vec<u8> {
         .extent(extent)
         .flags(ingress::ObjectFlags {
             end_of_sequence: true,
+            begin_sequence: true,
         })
         .payload(vec![7; extent as usize])
         .encode()
@@ -167,7 +168,8 @@ fn parser_decodes_and_propagates_object_header_flags() {
     assert_eq!(
         parsed.flags,
         ingress::ObjectFlags {
-            end_of_sequence: true
+            end_of_sequence: true,
+            begin_sequence: true,
         }
     );
 }
