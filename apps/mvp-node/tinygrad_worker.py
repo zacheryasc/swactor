@@ -28,6 +28,7 @@ rings: dict[int, dict[str, Any]] = {}
 device_objects: dict[int, dict[str, Any]] = {}
 next_handle = 42
 HEADER_LEN = 40
+FLAG_BEGIN_SEQUENCE = 1 << 1
 WORKER_GENERATION = 1
 BENCHMARK_SCHEMA = 1
 _benchmark_start = time.monotonic()
@@ -575,9 +576,19 @@ def load_weights(cmd: dict[str, Any]) -> None:
     layer_end_exclusive = int(cmd.get("layer_end_exclusive", 0))
     try:
         control(type="TinygradLlmImportStarted", model_id=model_id)
-        from tinygrad.llm.cli import SimpleTokenizer
+        try:
+            from tinygrad.llm.cli import SimpleTokenizer
 
-        control(type="TinygradLlmImportReady", model_id=model_id)
+            Transformer = None
+            llm_backend = "tinygrad.llm"
+        except ModuleNotFoundError as exc:
+            if exc.name != "tinygrad.llm":
+                raise
+            from tinygrad.apps.llm import SimpleTokenizer, Transformer
+
+            llm_backend = "tinygrad.apps.llm"
+
+        control(type="TinygradLlmImportReady", model_id=model_id, backend=llm_backend)
         max_context_raw = os.environ.get("MVP_MAX_CONTEXT", "512")
         max_context = int(max_context_raw) if max_context_raw else 512
         control(
@@ -589,13 +600,30 @@ def load_weights(cmd: dict[str, Any]) -> None:
             layer_start=layer_start,
             layer_end_exclusive=layer_end_exclusive,
             requested_device=os.environ.get("DEV"),
+            llm_backend=llm_backend,
         )
-        model, kv = load_pipeline_stage_model(
-            path,
-            max_context=max_context,
-            layer_start=layer_start,
-            layer_end_exclusive=layer_end_exclusive,
-        )
+        if Transformer is None:
+            model, kv = load_pipeline_stage_model(
+                path,
+                max_context=max_context,
+                layer_start=layer_start,
+                layer_end_exclusive=layer_end_exclusive,
+            )
+        else:
+            TensorCls = require_tinygrad()
+            model, kv = Transformer.from_gguf(TensorCls(path), max_context=max_context, realize=True)
+            total_layers = int(kv[f"{kv['general.architecture']}.block_count"]) - int(
+                kv.get(f"{kv['general.architecture']}.nextn_predict_layers", 0)
+            )
+            if layer_start != 0 or layer_end_exclusive < total_layers:
+                fatal(
+                    "TinygradAppsLlmPartialStageUnsupported",
+                    layer_start=layer_start,
+                    layer_end_exclusive=layer_end_exclusive,
+                    total_layers=total_layers,
+                )
+            model.first_stage = True
+            model.final_stage = True
         control(
             type="PipelineStageFromGgufReady",
             model_id=model_id,
@@ -607,10 +635,12 @@ def load_weights(cmd: dict[str, Any]) -> None:
             first_stage=model.first_stage,
             final_stage=model.final_stage,
             requested_device=os.environ.get("DEV"),
+            llm_backend=llm_backend,
         )
         tok_src = cmd.get("tokenizer", {"EmbeddedGguf": None})
         if "EmbeddedGguf" in tok_src:
-            if kv.get("tokenizer.ggml.pre") == "smollm":
+            tokenizer_pre = str(kv.get("tokenizer.ggml.pre", "")).lower()
+            if tokenizer_pre == "smollm":
                 kv = dict(kv)
                 kv["tokenizer.ggml.pre"] = "qwen2"
             control(type="TokenizerBuildStarted", model_id=model_id, source="EmbeddedGguf")
@@ -633,6 +663,7 @@ def load_weights(cmd: dict[str, Any]) -> None:
         hidden_dim=int(getattr(model, "hidden_dim", 0)),
         max_context=int(getattr(model, "max_context", 0)),
         eos_token_id=int(kv.get("tokenizer.ggml.eos_token_id", 0)),
+        tokenizer_pre=tokenizer_pre,
     )
     control(
         type="WeightsLoaded",
@@ -649,6 +680,11 @@ def prompt_template_name() -> str:
     explicit = os.environ.get("MVP_PROMPT_TEMPLATE")
     if explicit is not None:
         return explicit.strip().lower()
+    tokenizer_pre = str(loaded.get("tokenizer_pre", "")).lower()
+    if "smollm" in tokenizer_pre or tokenizer_pre == "qwen2":
+        return "smollm-chat"
+    if "llama" in tokenizer_pre:
+        return "llama3-chat"
     model_id = str(loaded.get("model_id", "")).lower()
     if "smollm" in model_id:
         return "smollm-chat"
@@ -934,20 +970,26 @@ def payload_words(payload: bytes) -> list[int]:
         return []
     return list(struct.unpack(f"<{len(payload) // 4}I", payload))
 
-def object_start_pos(sequence: int, token_count: int) -> int:
-    if sequence == 0:
+def object_start_pos(sequence: int, token_count: int, flags: int) -> int:
+    if flags & FLAG_BEGIN_SEQUENCE or sequence == 0:
         role["prompt_tokens"] = token_count
+        role["prompt_decode_index"] = 0
         return 0
-    return int(role.get("prompt_tokens", 1)) + sequence - 1
+    decode_index = int(role.get("prompt_decode_index", max(0, sequence - 1)))
+    role["prompt_decode_index"] = decode_index + 1
+    return int(role.get("prompt_tokens", token_count)) + decode_index
 
 
-def materialize_object(payload: bytes, sequence: int) -> dict[str, Any]:
+def materialize_object(payload: bytes, sequence: int, flags: int) -> dict[str, Any]:
     if not isinstance(model, PipelineStageTinygradModel):
+        TensorCls = require_tinygrad()
+        tokens = payload_words(payload)
+        token_count = len(tokens)
         return {
-            "kind": "words",
-            "words": payload_words(payload),
-            "payload": payload,
-            "start_pos": object_start_pos(sequence, max(1, len(payload) // 4)),
+            "kind": "tokens",
+            "tokens": tokens,
+            "tensor": TensorCls([tokens], dtype="int32").realize(),
+            "start_pos": object_start_pos(sequence, token_count, flags),
         }
     TensorCls = require_tinygrad()
     if bool(getattr(model, "first_stage", False)) and int(role.get("layer_start", 0)) == 0:
@@ -957,7 +999,7 @@ def materialize_object(payload: bytes, sequence: int) -> dict[str, Any]:
             "kind": "tokens",
             "tokens": tokens,
             "tensor": TensorCls([tokens], dtype="int32").realize(),
-            "start_pos": object_start_pos(sequence, token_count),
+            "start_pos": object_start_pos(sequence, token_count, flags),
         }
     import numpy as np
 
@@ -972,7 +1014,7 @@ def materialize_object(payload: bytes, sequence: int) -> dict[str, Any]:
     return {
         "kind": "activation",
         "tensor": TensorCls(array).realize(),
-        "start_pos": object_start_pos(sequence, token_count),
+        "start_pos": object_start_pos(sequence, token_count, flags),
     }
 
 
@@ -986,7 +1028,7 @@ def ring_readable(cmd: dict[str, Any]) -> None:
     object_id, sequence, extent, flags, payload = parse_record(ring)
     handle = next_handle
     next_handle += 1
-    materialized = materialize_object(payload, sequence)
+    materialized = materialize_object(payload, sequence, flags)
     materialized.update(
         object_id=object_id,
         sequence=sequence,
@@ -1048,19 +1090,19 @@ def execute_step(cmd: dict[str, Any]) -> None:
     if ring["direction"] != "egress":
         fatal("WrongRingDirection", ring_id=output_ring_id, direction=ring["direction"])
     final_stage = bool(cmd.get("final_stage"))
+    execution_backend = "pipeline_stage"
     if not isinstance(model, PipelineStageTinygradModel):
-        if final_stage:
-            base = sum(int(word) for word in obj["words"]) + int(role.get("stage_index", 0))
-            token = 6 if base % 2 else 8
-            payload = struct.pack("<I", token)
-            flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
-        else:
-            value = sum(int(word) for word in obj["words"])
-            value += int(role.get("layer_start", 0)) + int(role.get("layer_end_exclusive", 0)) + int(role.get("stage_index", 0))
-            if value <= 0:
-                value = 1
-            payload = struct.pack("<I", value)
-            flags = 0
+        execution_backend = "full_transformer"
+        if not final_stage:
+            fatal("FullTransformerNonFinalStageUnsupported", step_id=int(cmd["step_id"]))
+        if obj.get("kind") != "tokens":
+            fatal("FullTransformerInputUnsupported", step_id=int(cmd["step_id"]), kind=obj.get("kind"))
+        if int(obj.get("flags", 0)) & FLAG_BEGIN_SEQUENCE and hasattr(model, "forward_jit"):
+            model.forward_jit.reset()
+        token_array = model(obj["tensor"], int(obj.get("start_pos", 0))).realize().numpy().reshape(-1)
+        token = int(token_array[0])
+        payload = struct.pack("<I", token)
+        flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
     else:
         if final_stage != bool(getattr(model, "final_stage", False)):
             fatal("FinalStageMismatch", command_final_stage=final_stage, model_final_stage=bool(getattr(model, "final_stage", False)))
@@ -1091,6 +1133,7 @@ def execute_step(cmd: dict[str, Any]) -> None:
         object_id=int(cmd["output_object_id"]),
         sequence=int(cmd["output_sequence"]),
         committed_bytes=committed,
+        execution_backend=execution_backend,
     )
 
 

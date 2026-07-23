@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,6 +35,78 @@ struct MvpChatCheckOutput {
     stderr: String,
     timed_out: bool,
     stdin_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MvpChatCheckScenario {
+    ProcessBaseline,
+    Gpu,
+    Multinode,
+    MultinodeDocker,
+}
+
+impl MvpChatCheckScenario {
+    fn parse_args(args: Vec<String>) -> Result<Self, String> {
+        let mut scenario = Self::ProcessBaseline;
+        for arg in args {
+            let selected = match arg.as_str() {
+                "--gpu" => Self::Gpu,
+                "--multinode" => Self::Multinode,
+                "--multinode-docker" => Self::MultinodeDocker,
+                other => return Err(format!("unsupported mvp-chat-check argument {other:?}")),
+            };
+            if scenario != Self::ProcessBaseline {
+                return Err(
+                    "mvp-chat-check accepts at most one scenario flag: --gpu, --multinode, or --multinode-docker"
+                        .to_owned(),
+                );
+            }
+            scenario = selected;
+        }
+        Ok(scenario)
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ProcessBaseline => "process",
+            Self::Gpu => "gpu",
+            Self::Multinode => "multinode",
+            Self::MultinodeDocker => "multinode-docker",
+        }
+    }
+
+    fn mvp_chat_args(self, run_id: u64, dump_log: &Path) -> Vec<String> {
+        let mut args = Vec::new();
+        match self {
+            Self::ProcessBaseline | Self::Multinode => {
+                args.push("--process".to_owned());
+            }
+            Self::Gpu => {
+                args.extend(["--process".to_owned(), "--gpu".to_owned()]);
+            }
+            Self::MultinodeDocker => {
+                args.push("--docker".to_owned());
+            }
+        }
+        if matches!(self, Self::Multinode | Self::MultinodeDocker) {
+            args.extend(["--pipeline-stages".to_owned(), "2".to_owned()]);
+        }
+        if !matches!(self, Self::Gpu) {
+            args.push("--cached-model".to_owned());
+        }
+        args.extend([
+            "--run-id".to_owned(),
+            run_id.to_string(),
+            format!("--dump-logs={}", dump_log.display()),
+        ]);
+        args
+    }
+
+    fn env_overrides(self) -> &'static [(&'static str, &'static str)] {
+        match self {
+            Self::ProcessBaseline | Self::Gpu | Self::Multinode | Self::MultinodeDocker => &[],
+        }
+    }
 }
 
 const BASIC_TESTS: &[TestStep] = &[
@@ -92,11 +164,37 @@ fn print_usage() {
 USAGE: cargo xtask <command>
 
 COMMANDS:
-  mvp-chat [--process|--docker|--vastai] [--pipeline-stages n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
-  mvp-chat-check      Run real cargo mvp-chat acceptance check.
+  mvp-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
+  mvp-chat-check [--gpu|--multinode|--multinode-docker]
+                     Run real cargo mvp-chat acceptance check for one explicit scenario.
   test                Run the basic non-binding test barrier: root crate plus each
                       non-binding repository package with `cargo test -p`."
     );
+}
+
+const MVP_CHAT_USAGE: &str = "\
+USAGE: cargo mvp-chat [OPTIONS]
+
+OPTIONS:
+  --gpu                         Run the local GPU path: in-process orchestrator plus DEV=CUDA worker selection
+  --process | --docker | --vastai
+                                Select the runtime provider
+  --config <path>               Load config overlay
+  --pipeline-stages <count>     Number of pipeline stages
+  --cached-model[=<path>]       Use discovered or explicit cached GGUF model
+  --dump-logs[=<path>]          Write datastream frame log
+  --run-id <id>                 Override run id
+  --skip-rebuild                Reuse existing Cargo artifacts
+  --yes, -y                     Approve Vast.ai lease prompts
+  --help, -h                    Print this help";
+
+fn print_mvp_chat_usage() {
+    println!("{MVP_CHAT_USAGE}");
+}
+
+fn is_mvp_chat_help_request(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
 }
 
 fn run_step(step: &TestStep) -> bool {
@@ -115,7 +213,7 @@ fn run_step(step: &TestStep) -> bool {
 
 fn run_tests() -> ExitCode {
     let start = Instant::now();
-    let check = run_mvp_chat_check();
+    let check = run_mvp_chat_check(Vec::new());
     if check != ExitCode::SUCCESS {
         return check;
     }
@@ -139,13 +237,17 @@ fn run_tests() -> ExitCode {
 }
 
 fn run_mvp_chat(args: Vec<String>) -> ExitCode {
-    let mut command = Command::new(cargo_bin());
-    command.args(["run", "--package", "mvp-system", "--bin", "mvp-chat", "--"]);
     let forwarded = if args.first().is_some_and(|arg| arg == "--") {
         args[1..].to_vec()
     } else {
         args
     };
+    if is_mvp_chat_help_request(&forwarded) {
+        print_mvp_chat_usage();
+        return ExitCode::SUCCESS;
+    }
+    let mut command = Command::new(cargo_bin());
+    command.args(["run", "--package", "mvp-system", "--bin", "mvp-chat", "--"]);
     let dump_log_path = explicit_dump_log_path_from_mvp_chat_args(&forwarded);
     let run_id = run_id_from_mvp_chat_args(&forwarded);
     let benchmark_target = dump_log_path.as_deref().zip(run_id);
@@ -374,7 +476,15 @@ fn write_mvp_chat_check_paths(root: &Path) -> Result<MvpChatCheckPaths, String> 
     })
 }
 
-fn run_mvp_chat_check() -> ExitCode {
+fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
+    let scenario = match MvpChatCheckScenario::parse_args(args) {
+        Ok(scenario) => scenario,
+        Err(error) => {
+            eprintln!("mvp-chat-check: failed: {error}");
+            print_usage();
+            return ExitCode::from(1);
+        }
+    };
     let workspace = workspace_root();
     let temp_root = unique_temp_dir("mvp-chat-check");
     let paths = match write_mvp_chat_check_paths(&temp_root) {
@@ -389,8 +499,9 @@ fn run_mvp_chat_check() -> ExitCode {
         }
     };
     let run_id = mvp_chat_check_run_id();
+    println!("mvp-chat-check: scenario {}", scenario.name());
 
-    let output = match run_mvp_chat_check_process(&workspace, &paths, run_id) {
+    let output = match run_mvp_chat_check_process(&workspace, &paths, run_id, scenario) {
         Ok(output) => output,
         Err(error) => return fail_mvp_chat_check(&error, &paths, "", "", None),
     };
@@ -436,7 +547,7 @@ fn run_mvp_chat_check() -> ExitCode {
             );
         }
     };
-    let events = match assert_dump_log_facts(&paths.dump_log) {
+    let events = match assert_dump_log_facts(&paths.dump_log, scenario) {
         Ok(events) => events,
         Err(error) => {
             return fail_mvp_chat_check(
@@ -448,7 +559,7 @@ fn run_mvp_chat_check() -> ExitCode {
             );
         }
     };
-    let report = match build_benchmark_report(&events, output.child_elapsed_ms, run_id) {
+    let report = match build_benchmark_report(&events, output.child_elapsed_ms, run_id, scenario) {
         Ok(report) => report,
         Err(error) => {
             return fail_mvp_chat_check(
@@ -483,13 +594,17 @@ fn run_mvp_chat_check_process(
     workspace: &Path,
     paths: &MvpChatCheckPaths,
     run_id: u64,
+    scenario: MvpChatCheckScenario,
 ) -> Result<MvpChatCheckOutput, String> {
     let mut command = Command::new(cargo_bin());
+    command.current_dir(workspace).arg("mvp-chat").arg("--");
+    for arg in scenario.mvp_chat_args(run_id, &paths.dump_log) {
+        command.arg(arg);
+    }
+    for &(key, value) in scenario.env_overrides() {
+        command.env(key, value);
+    }
     command
-        .current_dir(workspace)
-        .args(["mvp-chat", "--", "--cached-model", "--run-id"])
-        .arg(run_id.to_string())
-        .arg(format!("--dump-logs={}", paths.dump_log.display()))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1086,7 +1201,10 @@ fn dump_log_inner_payload_text<'a>(
         })
 }
 
-fn assert_dump_log_facts(path: &Path) -> Result<Vec<DumpLogEvent>, String> {
+fn assert_dump_log_facts(
+    path: &Path,
+    scenario: MvpChatCheckScenario,
+) -> Result<Vec<DumpLogEvent>, String> {
     let events = parse_dump_log_events(path)?;
     let mut facts = DumpLogFacts::default();
     for record in &events {
@@ -1116,6 +1234,9 @@ fn assert_dump_log_facts(path: &Path) -> Result<Vec<DumpLogEvent>, String> {
     require_dump_log_fact(facts.request_completed_2, "request_completed request_id=2")?;
     require_dump_log_fact(facts.shutdown_requested, "shutdown requested")?;
     require_dump_log_fact(facts.orchestrator_stopped, "orchestrator_process stopped")?;
+    if scenario == MvpChatCheckScenario::Gpu {
+        require_gpu_dump_log_facts(&facts)?;
+    }
     Ok(events)
 }
 
@@ -1123,6 +1244,7 @@ fn build_benchmark_report(
     events: &[DumpLogEvent],
     child_elapsed_ms: u64,
     run_id: u64,
+    scenario: MvpChatCheckScenario,
 ) -> Result<BenchmarkReport, String> {
     let facts = BenchmarkFacts::from_events(events, run_id);
     facts.require_span(
@@ -1149,12 +1271,21 @@ fn build_benchmark_report(
         "prepare_runtime",
         "ready",
     )?;
-    facts.require_span(
-        "mvp.chat.runtime",
-        "ChatProgress",
-        "ensure_orch_binary",
-        "ready",
-    )?;
+    if scenario == MvpChatCheckScenario::Gpu {
+        facts.require_span(
+            "mvp.chat.runtime",
+            "ChatProgress",
+            "ensure_orchestrator_actor",
+            "ready",
+        )?;
+    } else {
+        facts.require_span(
+            "mvp.chat.runtime",
+            "ChatProgress",
+            "ensure_orch_binary",
+            "ready",
+        )?;
+    }
     facts.require_span(
         "mvp.chat.runtime",
         "ChatProgress",
@@ -1438,6 +1569,22 @@ fn missing_benchmark_event(event: String) -> String {
 
 #[derive(Default)]
 struct DumpLogFacts {
+    gpu_worker_device_requested: bool,
+    gpu_import_ready: bool,
+    gpu_probe_ready: bool,
+    gpu_worker_ready: bool,
+    gpu_cpu_fallback_seen: bool,
+    gpu_decode_started: BTreeSet<u64>,
+    gpu_first_token_ready: BTreeSet<u64>,
+    gpu_decode_ready: BTreeSet<u64>,
+    gpu_prompt_completed: BTreeSet<u64>,
+    gpu_pipeline_prompt_encoded: BTreeSet<u64>,
+    gpu_pipeline_prompt_begin: BTreeSet<u64>,
+    gpu_pipeline_token_in: BTreeSet<u64>,
+    gpu_pipeline_token_out: BTreeSet<u64>,
+    gpu_pipeline_tokenizer_decode_ready: BTreeSet<u64>,
+    gpu_pipeline_tokens_decoded: BTreeSet<u64>,
+    gpu_pipeline_real_worker_step_seen: bool,
     chat_config_ready: bool,
     prepare_runtime_ready: bool,
     prompt_rpc_ready: bool,
@@ -1458,6 +1605,7 @@ fn record_dump_log_event(
     event: &Value,
     facts: &mut DumpLogFacts,
 ) -> Result<(), String> {
+    record_gpu_dump_log_event(channel, event, facts);
     let event_type = event.get("type").and_then(Value::as_str);
     let phase = event.get("phase").and_then(Value::as_str);
     let status = event.get("status").and_then(Value::as_str);
@@ -1522,11 +1670,244 @@ fn record_dump_log_event(
     Ok(())
 }
 
+fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFacts) {
+    let event_type = event.get("type").and_then(Value::as_str);
+    let phase = event.get("phase").and_then(Value::as_str);
+    let status = event.get("status").and_then(Value::as_str);
+    if event_type == Some("TinygradCpuCompilerSelected") {
+        facts.gpu_cpu_fallback_seen = true;
+    }
+
+    match (channel, event_type) {
+        ("mvp.worker.initialize", Some("TinygradImportStarted"))
+            if event_requested_device_is_cuda(event) =>
+        {
+            facts.gpu_worker_device_requested = true;
+        }
+        ("mvp.worker.initialize", Some("TinygradImportReady"))
+            if event_requested_device_is_cuda(event) && event_env_dev_is_cuda(event) =>
+        {
+            facts.gpu_import_ready = true;
+        }
+        ("mvp.worker.initialize", Some("TinygradDeviceProbeReady"))
+            if event_requested_device_is_cuda(event) && event_probe_result_is_one(event) =>
+        {
+            facts.gpu_probe_ready = true;
+        }
+        ("mvp.worker.initialize", Some("WorkerReady")) if worker_ready_backend_is_cuda(event) => {
+            facts.gpu_worker_ready = true;
+        }
+        ("mvp.worker.prompt", Some("DecodeStarted"))
+            if event_positive_u64(event, "prompt_tokens")
+                && event_positive_u64(event, "max_tokens")
+                && event
+                    .get("decode_impl")
+                    .and_then(Value::as_str)
+                    .is_some_and(|decode_impl| !decode_impl.is_empty()) =>
+        {
+            if let Some(request_id) = event.get("request_id").and_then(Value::as_u64) {
+                facts.gpu_decode_started.insert(request_id);
+            }
+        }
+        ("mvp.worker.prompt", Some("FirstTokenReady"))
+            if event.get("token_index").and_then(Value::as_u64) == Some(1) =>
+        {
+            if let Some(request_id) = event.get("request_id").and_then(Value::as_u64) {
+                facts.gpu_first_token_ready.insert(request_id);
+            }
+        }
+        ("mvp.worker.prompt", Some("DecodeReady"))
+            if event_positive_u64(event, "tokens_generated") =>
+        {
+            if let Some(request_id) = event.get("request_id").and_then(Value::as_u64) {
+                facts.gpu_decode_ready.insert(request_id);
+            }
+        }
+        ("mvp.worker.prompt", Some("PromptCompleted"))
+            if event
+                .get("generated_tokens")
+                .and_then(Value::as_array)
+                .is_some_and(|tokens| !tokens.is_empty()) =>
+        {
+            if let Some(request_id) = event.get("request_id").and_then(Value::as_u64) {
+                facts.gpu_prompt_completed.insert(request_id);
+            }
+        }
+        ("mvp.worker.tokenizer", Some("PromptEncoded"))
+            if event
+                .get("tokens")
+                .and_then(Value::as_array)
+                .is_some_and(|tokens| !tokens.is_empty()) =>
+        {
+            if let Some(request_id) = event_request_id(event) {
+                facts.gpu_pipeline_prompt_encoded.insert(request_id);
+            }
+        }
+        ("mvp.worker.tokenizer", Some("TokensDecoded"))
+            if event
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| !text.is_empty()) =>
+        {
+            if let Some(request_id) = event_request_id(event) {
+                facts.gpu_pipeline_tokens_decoded.insert(request_id);
+            }
+        }
+        ("mvp.worker.step", Some("StepExecuted"))
+            if event_positive_u64(event, "committed_bytes") =>
+        {
+            let backend = event.get("execution_backend").and_then(Value::as_str);
+            if matches!(backend, Some("pipeline_stage" | "full_transformer")) {
+                facts.gpu_pipeline_real_worker_step_seen = true;
+            }
+        }
+        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+            if phase == Some("pipeline_token_in")
+                && status == Some("ready")
+                && event_request_id(event).is_some() =>
+        {
+            let request_id = event_request_id(event).expect("guarded request_id");
+            facts.gpu_pipeline_token_in.insert(request_id);
+            if event
+                .get("detail")
+                .and_then(|detail| detail.get("begin_sequence"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                facts.gpu_pipeline_prompt_begin.insert(request_id);
+            }
+        }
+        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+            if phase == Some("pipeline_token_out")
+                && status == Some("observed")
+                && event
+                    .get("detail")
+                    .and_then(|detail| detail.get("token_id"))
+                    .and_then(Value::as_u64)
+                    .is_some()
+                && event_request_id(event).is_some() =>
+        {
+            facts
+                .gpu_pipeline_token_out
+                .insert(event_request_id(event).expect("guarded request_id"));
+        }
+        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+            if phase == Some("pipeline_tokenizer_decode")
+                && status == Some("ready")
+                && event
+                    .get("detail")
+                    .and_then(|detail| detail.get("text_bytes"))
+                    .and_then(Value::as_u64)
+                    .is_some_and(|bytes| bytes > 0)
+                && event_request_id(event).is_some() =>
+        {
+            facts
+                .gpu_pipeline_tokenizer_decode_ready
+                .insert(event_request_id(event).expect("guarded request_id"));
+        }
+        _ => {}
+    }
+}
+
+fn require_gpu_dump_log_facts(facts: &DumpLogFacts) -> Result<(), String> {
+    if facts.gpu_cpu_fallback_seen {
+        return Err("mvp-chat-check: GPU run fell back to the tinygrad CPU compiler".to_owned());
+    }
+    require_dump_log_fact(
+        facts.gpu_worker_device_requested,
+        "TinygradImportStarted requested_device CUDA",
+    )?;
+    require_dump_log_fact(facts.gpu_import_ready, "TinygradImportReady env_DEV CUDA")?;
+    require_dump_log_fact(facts.gpu_probe_ready, "TinygradDeviceProbeReady CUDA probe")?;
+    require_dump_log_fact(facts.gpu_worker_ready, "WorkerReady CUDA backend")?;
+    for request_id in 1..=2 {
+        let direct_decode = facts.gpu_decode_started.contains(&request_id)
+            && facts.gpu_first_token_ready.contains(&request_id)
+            && facts.gpu_decode_ready.contains(&request_id)
+            && facts.gpu_prompt_completed.contains(&request_id);
+        let pipeline_decode = facts.gpu_pipeline_real_worker_step_seen
+            && facts.gpu_pipeline_prompt_encoded.contains(&request_id)
+            && facts.gpu_pipeline_prompt_begin.contains(&request_id)
+            && facts.gpu_pipeline_token_in.contains(&request_id)
+            && facts.gpu_pipeline_token_out.contains(&request_id)
+            && facts
+                .gpu_pipeline_tokenizer_decode_ready
+                .contains(&request_id)
+            && facts.gpu_pipeline_tokens_decoded.contains(&request_id);
+        require_dump_log_fact(
+            direct_decode || pipeline_decode,
+            &format!("GPU decode/token evidence request_id={request_id}"),
+        )?;
+    }
+    Ok(())
+}
+
+fn event_requested_device_is_cuda(event: &Value) -> bool {
+    event
+        .get("requested_device")
+        .and_then(Value::as_str)
+        .is_some_and(is_cuda_device)
+}
+
+fn event_env_dev_is_cuda(event: &Value) -> bool {
+    event
+        .get("env_DEV")
+        .and_then(Value::as_str)
+        .is_some_and(is_cuda_device)
+}
+
+fn event_probe_result_is_one(event: &Value) -> bool {
+    event
+        .get("probe_result")
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_i64() == Some(1)))
+}
+
+fn worker_ready_backend_is_cuda(event: &Value) -> bool {
+    let Some(backend) = event.get("backend") else {
+        return false;
+    };
+    backend
+        .get("requested_device")
+        .and_then(Value::as_str)
+        .is_some_and(is_cuda_device)
+        && backend
+            .get("env_DEV")
+            .and_then(Value::as_str)
+            .is_some_and(is_cuda_device)
+        && backend
+            .get("tinygrad_device")
+            .and_then(Value::as_str)
+            .is_some_and(is_cuda_device)
+        && event_probe_result_is_one_from_key(event, "cuda_probe")
+}
+
+fn event_probe_result_is_one_from_key(event: &Value, key: &str) -> bool {
+    event
+        .get(key)
+        .and_then(Value::as_array)
+        .is_some_and(|values| values.iter().any(|value| value.as_i64() == Some(1)))
+}
+
+fn event_positive_u64(event: &Value, key: &str) -> bool {
+    event
+        .get(key)
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > 0)
+}
+
+fn is_cuda_device(value: &str) -> bool {
+    value.to_ascii_uppercase().contains("CUDA")
+}
+
 fn dump_log_request_id(event: &Value) -> Option<u64> {
     event
         .get("detail")
         .and_then(|detail| detail.get("request_id"))
         .and_then(Value::as_u64)
+}
+fn event_request_id(event: &Value) -> Option<u64> {
+    event.get("request_id").and_then(Value::as_u64)
 }
 
 fn require_dump_log_fact(found: bool, fact: &str) -> Result<(), String> {
@@ -1545,6 +1926,85 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn scenario_flags_select_expected_launch_contract() {
+        let dump_log = Path::new("/tmp/mvp-chat-check.ndjson");
+
+        let baseline =
+            MvpChatCheckScenario::parse_args(Vec::new()).expect("default scenario parses");
+        assert_eq!(baseline, MvpChatCheckScenario::ProcessBaseline);
+        assert_eq!(
+            baseline.mvp_chat_args(42, dump_log),
+            strings(&[
+                "--process",
+                "--cached-model",
+                "--run-id",
+                "42",
+                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+            ])
+        );
+
+        let gpu = MvpChatCheckScenario::parse_args(strings(&["--gpu"])).expect("gpu parses");
+        assert_eq!(gpu, MvpChatCheckScenario::Gpu);
+        assert!(gpu.env_overrides().is_empty());
+        assert_eq!(
+            gpu.mvp_chat_args(42, dump_log),
+            strings(&[
+                "--process",
+                "--gpu",
+                "--run-id",
+                "42",
+                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+            ])
+        );
+
+        let multinode =
+            MvpChatCheckScenario::parse_args(strings(&["--multinode"])).expect("multinode parses");
+        assert_eq!(multinode, MvpChatCheckScenario::Multinode);
+        assert_eq!(
+            multinode.mvp_chat_args(42, dump_log),
+            strings(&[
+                "--process",
+                "--pipeline-stages",
+                "2",
+                "--cached-model",
+                "--run-id",
+                "42",
+                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+            ])
+        );
+
+        let multinode_docker = MvpChatCheckScenario::parse_args(strings(&["--multinode-docker"]))
+            .expect("multinode docker parses");
+        assert_eq!(multinode_docker, MvpChatCheckScenario::MultinodeDocker);
+        assert_eq!(
+            multinode_docker.mvp_chat_args(42, dump_log),
+            strings(&[
+                "--docker",
+                "--pipeline-stages",
+                "2",
+                "--cached-model",
+                "--run-id",
+                "42",
+                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+            ])
+        );
+    }
+
+    #[test]
+    fn scenario_flags_reject_unknown_or_ambiguous_invocations() {
+        assert!(
+            MvpChatCheckScenario::parse_args(strings(&["--docker"]))
+                .expect_err("unknown flag fails")
+                .contains("unsupported mvp-chat-check argument")
+        );
+        assert!(
+            MvpChatCheckScenario::parse_args(strings(&["--gpu", "--multinode"]))
+                .expect_err("multiple scenarios fail")
+                .contains("at most one scenario flag")
+        );
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -1583,6 +2043,13 @@ mod tests {
         label: &str,
         events: Vec<(&'static str, Value)>,
     ) -> Vec<DumpLogEvent> {
+        let path = write_synthetic_event_dump(label, events);
+        let parsed = parse_dump_log_events(&path).expect("parse synthetic dump log");
+        let _ = fs::remove_file(path);
+        parsed
+    }
+
+    fn write_synthetic_event_dump(label: &str, events: Vec<(&'static str, Value)>) -> PathBuf {
         let lines = events
             .into_iter()
             .enumerate()
@@ -1594,10 +2061,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let path = write_dump_log(label, lines);
-        let parsed = parse_dump_log_events(&path).expect("parse synthetic dump log");
-        let _ = fs::remove_file(path);
-        parsed
+        write_dump_log(label, lines)
     }
 
     fn benchmark(component: &str, wall_unix_ms: u64, mono_ms: u64) -> Value {
@@ -1680,11 +2144,23 @@ mod tests {
             wall_unix_ms,
             mono_ms,
         );
+        let object = event.as_object_mut().expect("event object");
+        match event_type {
+            "DecodeStarted" => {
+                object.insert("prompt_tokens".to_owned(), json!(4));
+                object.insert("max_tokens".to_owned(), json!(8));
+                object.insert("decode_impl".to_owned(), json!("device_resident_greedy"));
+            }
+            "FirstTokenReady" => {
+                object.insert("token_index".to_owned(), json!(1));
+            }
+            "DecodeReady" => {
+                object.insert("tokens_generated".to_owned(), json!(3));
+            }
+            _ => {}
+        }
         if event_type == "PromptCompleted" {
-            event
-                .as_object_mut()
-                .expect("event object")
-                .insert("generated_tokens".to_owned(), json!([1, 2, 3]));
+            object.insert("generated_tokens".to_owned(), json!([1, 2, 3]));
         }
         event
     }
@@ -1953,6 +2429,7 @@ mod tests {
                         "type": "OrchBootstrap",
                         "phase": "weights_loaded",
                         "status": "ready",
+
                         "run_id": 9,
                         "node_id": 1,
                         "detail": {},
@@ -1967,6 +2444,157 @@ mod tests {
                 chat_span("prompt_rpc", "ready", 1_120, 120),
             ),
         ]
+    }
+
+    fn dump_log_fact_events(
+        include_gpu: bool,
+        include_cpu_fallback: bool,
+    ) -> Vec<(&'static str, Value)> {
+        let mut events = vec![
+            ("mvp.chat.lifecycle", chat_span("config", "ready", 1_000, 0)),
+            (
+                "mvp.chat.runtime",
+                chat_span("prepare_runtime", "ready", 1_010, 10),
+            ),
+            (
+                "mvp.chat.runtime",
+                chat_span("prompt_rpc", "ready", 1_020, 20),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"iroh_driver","status":"ready","run_id":9,"node_id":1,"detail":{}}),
+                    "mvp-orchestrator",
+                    1_030,
+                    30,
+                ),
+            ),
+            (
+                "mvp.node.bootstrap",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{}}),
+                    "mvp-worker-node",
+                    1_040,
+                    40,
+                ),
+            ),
+            (
+                "mvp.node.worker",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"device":"CUDA"}}),
+                    "mvp-worker-node",
+                    1_050,
+                    50,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"weights_loaded","status":"ready","run_id":9,"node_id":1,"detail":{}}),
+                    "mvp-orchestrator",
+                    1_060,
+                    60,
+                ),
+            ),
+            (
+                "mvp.chat.prompt",
+                prompt_chat_span("response_text", "observed", 1, 1_200, 200),
+            ),
+            (
+                "mvp.chat.prompt",
+                prompt_chat_span("request_completed", "ready", 1, 1_210, 210),
+            ),
+            (
+                "mvp.chat.prompt",
+                prompt_chat_span("response_text", "observed", 2, 1_300, 300),
+            ),
+            (
+                "mvp.chat.prompt",
+                prompt_chat_span("request_completed", "ready", 2, 1_310, 310),
+            ),
+            (
+                "mvp.chat.lifecycle",
+                chat_span("shutdown", "requested", 1_400, 400),
+            ),
+            (
+                "mvp.chat.component",
+                chat_span("orchestrator_process", "stopped", 1_410, 410),
+            ),
+        ];
+
+        if include_gpu {
+            events.extend([
+                (
+                    "mvp.worker.initialize",
+                    stamped(
+                        json!({"type":"TinygradImportStarted","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","env_DEV":"CUDA"}),
+                        "tinygrad-worker",
+                        1_070,
+                        70,
+                    ),
+                ),
+                (
+                    "mvp.worker.initialize",
+                    stamped(
+                        json!({"type":"TinygradImportReady","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","env_DEV":"CUDA"}),
+                        "tinygrad-worker",
+                        1_080,
+                        80,
+                    ),
+                ),
+                (
+                    "mvp.worker.initialize",
+                    stamped(
+                        json!({"type":"TinygradDeviceProbeReady","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","probe_result":[1]}),
+                        "tinygrad-worker",
+                        1_090,
+                        90,
+                    ),
+                ),
+                (
+                    "mvp.worker.initialize",
+                    stamped(
+                        json!({"type":"WorkerReady","run_id":9,"node_id":3,"stage_index":1,"backend":{"requested_device":"CUDA","env_DEV":"CUDA","tinygrad_device":"CUDA"},"cuda_probe":[1]}),
+                        "tinygrad-worker",
+                        1_100,
+                        100,
+                    ),
+                ),
+            ]);
+            if include_cpu_fallback {
+                events.push((
+                    "mvp.worker.initialize",
+                    stamped(
+                        json!({"type":"TinygradCpuCompilerSelected","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","selected_device":"CPU:X86"}),
+                        "tinygrad-worker",
+                        1_105,
+                        105,
+                    ),
+                ));
+            }
+            for request_id in 1..=2 {
+                let base = 1_200 + request_id * 100;
+                events.extend([
+                    (
+                        "mvp.worker.prompt",
+                        worker_prompt_event("DecodeStarted", request_id, base + 20, base - 980),
+                    ),
+                    (
+                        "mvp.worker.prompt",
+                        worker_prompt_event("FirstTokenReady", request_id, base + 25, base - 975),
+                    ),
+                    (
+                        "mvp.worker.prompt",
+                        worker_prompt_event("DecodeReady", request_id, base + 40, base - 960),
+                    ),
+                    (
+                        "mvp.worker.prompt",
+                        worker_prompt_event("PromptCompleted", request_id, base + 50, base - 950),
+                    ),
+                ]);
+            }
+        }
+        events
     }
 
     #[test]
@@ -2043,11 +2671,90 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_observability_gpu_dump_facts_require_cuda_worker_and_decode_cycles() {
+        let path = write_synthetic_event_dump("gpu-dump-facts", dump_log_fact_events(true, false));
+
+        let events = assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu)
+            .expect("GPU dump log facts pass");
+        let _ = fs::remove_file(path);
+
+        assert!(events.iter().any(|event| {
+            event.channel == "mvp.worker.initialize"
+                && event.event.get("type").and_then(Value::as_str) == Some("WorkerReady")
+        }));
+    }
+
+    fn gpu_pipeline_only_facts(
+        real_worker_backend: bool,
+        prompt_begin_markers: bool,
+    ) -> DumpLogFacts {
+        let mut facts = DumpLogFacts {
+            gpu_worker_device_requested: true,
+            gpu_import_ready: true,
+            gpu_probe_ready: true,
+            gpu_worker_ready: true,
+            ..DumpLogFacts::default()
+        };
+        if real_worker_backend {
+            facts.gpu_pipeline_real_worker_step_seen = true;
+        }
+        for request_id in 1..=2 {
+            facts.gpu_pipeline_prompt_encoded.insert(request_id);
+            facts.gpu_pipeline_token_in.insert(request_id);
+            facts.gpu_pipeline_token_out.insert(request_id);
+            facts.gpu_pipeline_tokenizer_decode_ready.insert(request_id);
+            facts.gpu_pipeline_tokens_decoded.insert(request_id);
+            if prompt_begin_markers {
+                facts.gpu_pipeline_prompt_begin.insert(request_id);
+            }
+        }
+        facts
+    }
+
+    #[test]
+    fn benchmark_observability_gpu_pipeline_facts_require_real_steps_and_prompt_begin_markers() {
+        let valid = gpu_pipeline_only_facts(true, true);
+        require_gpu_dump_log_facts(&valid).expect("real pipeline facts pass");
+
+        let missing_real_backend = gpu_pipeline_only_facts(false, true);
+        let error = require_gpu_dump_log_facts(&missing_real_backend)
+            .expect_err("missing real worker backend should fail");
+        assert!(
+            error.contains("GPU decode/token evidence request_id=1"),
+            "unexpected error: {error}"
+        );
+
+        let missing_prompt_begin = gpu_pipeline_only_facts(true, false);
+        let error = require_gpu_dump_log_facts(&missing_prompt_begin)
+            .expect_err("missing prompt begin marker should fail");
+        assert!(
+            error.contains("GPU decode/token evidence request_id=1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn benchmark_observability_gpu_dump_facts_reject_cpu_fallback() {
+        let path = write_synthetic_event_dump("gpu-cpu-fallback", dump_log_fact_events(true, true));
+
+        let error = match assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu) {
+            Ok(_) => panic!("CPU fallback should fail GPU check"),
+            Err(error) => error,
+        };
+        let _ = fs::remove_file(path);
+
+        assert!(
+            error.contains("fell back to the tinygrad CPU compiler"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn benchmark_observability_report_requires_granular_decode_events() {
         let events = parse_synthetic_events("missing-first-token", benchmark_report_events(false));
 
-        let error =
-            build_benchmark_report(&events, 80, 9).expect_err("missing first token should fail");
+        let error = build_benchmark_report(&events, 80, 9, MvpChatCheckScenario::ProcessBaseline)
+            .expect_err("missing first token should fail");
 
         assert!(
             error.starts_with("mvp-chat-check: missing benchmark event "),
@@ -2064,7 +2771,8 @@ mod tests {
         let events =
             parse_synthetic_events("pipeline-report", pipeline_benchmark_report_events(true));
 
-        let report = build_benchmark_report(&events, 80, 9).expect("pipeline report builds");
+        let report = build_benchmark_report(&events, 80, 9, MvpChatCheckScenario::ProcessBaseline)
+            .expect("pipeline report builds");
 
         assert!(
             report
@@ -2089,7 +2797,7 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("test") if args.next().is_none() => run_tests(),
-        Some("mvp-chat-check") if args.next().is_none() => run_mvp_chat_check(),
+        Some("mvp-chat-check") => run_mvp_chat_check(args.collect()),
         Some("mvp-chat") => run_mvp_chat(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_usage();
