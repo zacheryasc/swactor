@@ -751,6 +751,7 @@ def decode_greedy_device_resident(
     request_id: int | None,
     model_id: str | None,
     progress_every: int,
+    decode_started_at: float,
 ) -> list[int]:
     if max_tokens <= 0:
         return []
@@ -797,6 +798,7 @@ def decode_greedy_device_resident(
                 model_id=model_id,
                 token_index=1,
                 prompt_tokens=len(prompt_tokens),
+                first_token_elapsed_ms=int((time.monotonic() - decode_started_at) * 1000),
             )
         elif progress_every > 0 and tokens_generated % progress_every == 0:
             control(
@@ -836,6 +838,7 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
         prompt_chars=len(prompt),
         max_tokens=max_tokens,
     )
+    encode_started = time.monotonic()
     model_prompt, prompt_template = model_prompt_text(prompt)
     control(
         type="PromptEncodeStarted",
@@ -852,8 +855,10 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
         model_prompt_bytes=len(model_prompt.encode("utf-8")),
         prompt_template=prompt_template,
         prompt_tokens=len(prompt_tokens),
+        elapsed_ms=int((time.monotonic() - encode_started) * 1000),
     )
     progress_every = int(os.environ.get("MVP_TOKEN_PROGRESS_EVERY", "16") or "16")
+    decode_started = time.monotonic()
     control(
         type="DecodeStarted",
         request_id=request_id,
@@ -874,6 +879,7 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
             request_id=request_id,
             model_id=loaded.get("model_id"),
             progress_every=progress_every,
+            decode_started_at=decode_started,
         )
     finally:
         stop_cpu_line_sampler(cpu_sampler)
@@ -883,7 +889,9 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
         model_id=loaded.get("model_id"),
         prompt_tokens=len(prompt_tokens),
         tokens_generated=len(generated),
+        elapsed_ms=int((time.monotonic() - decode_started) * 1000),
     )
+    text_decode_started = time.monotonic()
     control(type="TextDecodeStarted", request_id=request_id, model_id=loaded.get("model_id"), tokens_generated=len(generated))
     raw_text = tokenizer.decode(generated) if generated else ""
     text = strip_chat_stop_markers(raw_text)
@@ -893,6 +901,7 @@ def infer_prompt(cmd: dict[str, Any]) -> None:
         model_id=loaded.get("model_id"),
         tokens_generated=len(generated),
         text_bytes=len(text.encode("utf-8")),
+        elapsed_ms=int((time.monotonic() - text_decode_started) * 1000),
     )
     control(
         type="PromptCompleted",
@@ -1039,13 +1048,13 @@ def materialize_object(payload: bytes, sequence: int, flags: int) -> dict[str, A
     }
 
 
-
 def ring_readable(cmd: dict[str, Any]) -> None:
     global next_handle
     ring_id = int(cmd["ring_id"])
     ring = rings[ring_id]
     if ring["direction"] != "ingress":
         fatal("WrongRingDirection", ring_id=ring_id, direction=ring["direction"])
+    started = time.monotonic()
     object_id, sequence, extent, flags, payload = parse_record(ring)
     handle = next_handle
     next_handle += 1
@@ -1070,6 +1079,7 @@ def ring_readable(cmd: dict[str, Any]) -> None:
         token_count=materialized.get("token_count"),
         hidden_dim=materialized.get("hidden_dim"),
         start_pos=materialized.get("start_pos"),
+        elapsed_ms=int((time.monotonic() - started) * 1000),
     )
 
 
@@ -1103,6 +1113,7 @@ def write_record(ring: dict[str, Any], object_id: int, sequence: int, payload: b
 def execute_step(cmd: dict[str, Any]) -> None:
     if not role:
         fatal("RoleNotConfigured")
+    step_started = time.monotonic()
     handle = int(cmd["input_handle_id"])
     obj = device_objects.get(handle)
     if obj is None:
@@ -1148,6 +1159,7 @@ def execute_step(cmd: dict[str, Any]) -> None:
             payload = activation.tobytes()
             output_kind = "activation"
             flags = 0
+    compute_ready = time.monotonic()
     committed = write_record(
         ring,
         int(cmd["output_object_id"]),
@@ -1155,6 +1167,7 @@ def execute_step(cmd: dict[str, Any]) -> None:
         payload,
         flags,
     )
+    write_ready = time.monotonic()
     control(
         type="StepExecuted",
         step_id=int(cmd["step_id"]),
@@ -1169,6 +1182,9 @@ def execute_step(cmd: dict[str, Any]) -> None:
         output_kind=output_kind,
         payload_bytes=len(payload),
         record_bytes=committed,
+        stage_execution_ms=int((compute_ready - step_started) * 1000),
+        record_write_ms=int((write_ready - compute_ready) * 1000),
+        elapsed_ms=int((write_ready - step_started) * 1000),
     )
 
 
@@ -1179,22 +1195,39 @@ def release_device_object(cmd: dict[str, Any]) -> None:
 
 
 def encode_prompt(cmd: dict[str, Any]) -> None:
+    started = time.monotonic()
     prompt = str(cmd.get("prompt", ""))
     if tokenizer is not None:
         model_prompt, _ = model_prompt_text(prompt)
         tokens = [int(token) for token in tokenizer.encode(model_prompt)]
     else:
+        model_prompt = prompt
         tokens = [int(byte) for byte in prompt.encode("utf-8")] or [0]
-    control(type="PromptEncoded", request_id=cmd.get("request_id"), tokens=tokens)
+    control(
+        type="PromptEncoded",
+        request_id=cmd.get("request_id"),
+        tokens=tokens,
+        prompt_bytes=len(prompt.encode("utf-8")),
+        model_prompt_bytes=len(model_prompt.encode("utf-8")),
+        elapsed_ms=int((time.monotonic() - started) * 1000),
+    )
 
 
 def decode_tokens(cmd: dict[str, Any]) -> None:
+    started = time.monotonic()
     tokens = [int(token) for token in cmd.get("tokens", [])]
     if tokenizer is not None:
         text = strip_chat_stop_markers(tokenizer.decode(tokens))
     else:
         text = "".join(chr(token) if 32 <= token <= 126 else f"<tok:{token}>" for token in tokens)
-    control(type="TokensDecoded", request_id=cmd.get("request_id"), text=text)
+    control(
+        type="TokensDecoded",
+        request_id=cmd.get("request_id"),
+        text=text,
+        tokens=len(tokens),
+        text_bytes=len(text.encode("utf-8")),
+        elapsed_ms=int((time.monotonic() - started) * 1000),
+    )
 
 
 def shutdown_worker(_: dict[str, Any]) -> None:
