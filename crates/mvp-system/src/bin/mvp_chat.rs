@@ -61,6 +61,7 @@ const CHAT_LIFECYCLE_CHANNEL: &str = "mvp.chat.lifecycle";
 const CHAT_RUNTIME_CHANNEL: &str = "mvp.chat.runtime";
 const CHAT_PROMPT_CHANNEL: &str = "mvp.chat.prompt";
 const CHAT_COMPONENT_CHANNEL: &str = "mvp.chat.component";
+const CHAT_BENCHMARK_CHANNEL: &str = "mvp.chat.benchmark";
 
 #[derive(Debug)]
 enum PromptInput {
@@ -151,6 +152,7 @@ where
             "gpu_run": config.gpu_run,
         }),
     );
+    progress.emit_benchmark_envelope(&config);
     confirm_vastai_if_needed(&config)?;
     progress.emit(
         CHAT_RUNTIME_CHANNEL,
@@ -380,6 +382,7 @@ impl ChatDatastream {
             CHAT_RUNTIME_CHANNEL,
             CHAT_PROMPT_CHANNEL,
             CHAT_COMPONENT_CHANNEL,
+            CHAT_BENCHMARK_CHANNEL,
         ] {
             out.channel_by_name(name);
         }
@@ -412,6 +415,68 @@ impl ChatDatastream {
             "detail": detail,
         }))
         .expect("serialize mvp-chat progress event");
+        self.producer.submit_bytes(id, payload);
+        self.flush();
+    }
+
+    fn emit_benchmark_envelope(&mut self, config: &Config) {
+        let id = self.channel_by_name(CHAT_BENCHMARK_CHANNEL);
+        let payload = serde_json::to_vec(&json!({
+            "type": "BenchmarkRunEnvelope",
+            "phase": "run_envelope",
+            "status": "ready",
+            "run_id": self.run_id,
+            "benchmark": benchmark_observability::stamp("mvp-chat"),
+            "detail": {
+                "scenario": "mvp-chat",
+                "detail_level": "benchmark_observability_v1",
+                "workload": {
+                    "mode": "stdin_prompt_corpus",
+                    "max_tokens": config.max_tokens,
+                    "prompt_corpus": "external_or_stdin",
+                },
+                "model": {
+                    "id": config.model.id.as_deref(),
+                    "gguf_local_path": config.model.gguf_local_path.as_deref(),
+                    "gguf_repo": config.model.gguf_repo.as_deref(),
+                    "gguf_file": config.model.gguf_file.as_deref(),
+                    "gguf_revision": config.model.gguf_revision.as_deref(),
+                    "tokenizer_local_path": config.model.tokenizer_local_path.as_deref(),
+                    "max_context": config.model.max_context,
+                },
+                "runtime": {
+                    "provider": config.provider.as_str(),
+                    "pipeline_stages": config.pipeline_stages,
+                    "orchestrator_launch_mode": config.orchestrator_launch_mode(),
+                    "gpu_run": config.gpu_run,
+                    "relay_mode": config.relay_mode.as_deref(),
+                    "relay_configured": config.relay_url.is_some(),
+                    "endpoint_addr_mask": config.endpoint_addr_mask.as_str(),
+                },
+                "provider": {
+                    "kind": config.provider.as_str(),
+                    "node_image": &config.node_image,
+                    "image_tag": config.image_tag.as_deref(),
+                    "cached_model": config.cached_model.as_ref().map(|model| model.host_path.to_string_lossy().to_string()),
+                    "vastai": config.vastai.as_ref().map(|vastai| json!({
+                        "image": &vastai.image,
+                        "relay_configured": !vastai.relay_url.is_empty(),
+                        "bootstrap_command_configured": !vastai.bootstrap_command.is_empty(),
+                        "gpu_name": vastai.gpu_name.as_deref(),
+                        "min_gpu_ram_mb": vastai.min_gpu_ram_mb,
+                        "min_down_mbps": vastai.min_down_mbps,
+                        "min_up_mbps": vastai.min_up_mbps,
+                        "max_dph_total": vastai.max_dph_total,
+                        "min_reliability": vastai.min_reliability,
+                        "require_verified": vastai.require_verified,
+                        "disk_gb": vastai.disk_gb,
+                        "has_onstart": vastai.onstart.is_some(),
+                        "has_ssh_identity": vastai.ssh_identity.is_some(),
+                    })),
+                },
+            },
+        }))
+        .expect("serialize mvp-chat benchmark envelope");
         self.producer.submit_bytes(id, payload);
         self.flush();
     }
@@ -1662,6 +1727,10 @@ fn emit_chat_progress(
     }
 }
 
+fn prompt_hash_hex(prompt: &str) -> String {
+    blake3::hash(prompt.as_bytes()).to_hex().to_string()
+}
+
 fn run_chat_session_with_output_and_progress<R, W, O>(
     writer: &mut W,
     mut reader: R,
@@ -1677,6 +1746,7 @@ where
 {
     let mut progress = progress;
     let mut next_request_id = 1_u64;
+    let mut next_prompt_index = 1_u64;
 
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
@@ -1694,7 +1764,7 @@ where
             CHAT_PROMPT_CHANNEL,
             "waiting_for_prompt",
             "started",
-            json!({"next_request_id": next_request_id}),
+            json!({"next_request_id": next_request_id, "next_prompt_index": next_prompt_index}),
         );
         write!(output, "prompt:> ").map_err(|e| format!("write prompt: {e}"))?;
         output.flush().map_err(|e| format!("flush prompt: {e}"))?;
@@ -1727,12 +1797,15 @@ where
 
         let request_id = next_request_id;
         next_request_id = next_request_id.wrapping_add(1).max(1);
+        let prompt_index = next_prompt_index;
+        next_prompt_index = next_prompt_index.wrapping_add(1).max(1);
+        let prompt_hash = prompt_hash_hex(&prompt);
         emit_chat_progress(
             &mut progress,
             CHAT_PROMPT_CHANNEL,
             "prompt_submitted",
             "ready",
-            json!({"request_id": request_id, "prompt_bytes": prompt.len(), "max_tokens": max_tokens}),
+            json!({"request_id": request_id, "prompt_index": prompt_index, "prompt_hash": &prompt_hash, "prompt_bytes": prompt.len(), "max_tokens": max_tokens}),
         );
         write_json_line(
             writer,
@@ -1748,7 +1821,7 @@ where
             CHAT_PROMPT_CHANNEL,
             "decoding",
             "started",
-            json!({"request_id": request_id}),
+            json!({"request_id": request_id, "prompt_index": prompt_index, "prompt_hash": &prompt_hash}),
         );
         let mut response_started = false;
 
@@ -1829,7 +1902,7 @@ where
                         CHAT_PROMPT_CHANNEL,
                         "response_text",
                         "observed",
-                        json!({"request_id": request_id, "text_bytes": text.len()}),
+                        json!({"request_id": request_id, "prompt_index": prompt_index, "prompt_hash": &prompt_hash, "text_bytes": text.len()}),
                     );
                 }
                 PromptEvent::Done {
@@ -1851,6 +1924,8 @@ where
                         "ready",
                         json!({
                             "request_id": request_id,
+                            "prompt_index": prompt_index,
+                            "prompt_hash": &prompt_hash,
                             "response_started": response_started,
                             "tokens_generated": tokens_generated,
                             "elapsed_ms": elapsed_ms,
@@ -1867,7 +1942,7 @@ where
                         CHAT_PROMPT_CHANNEL,
                         "request_faulted",
                         "ready",
-                        json!({"request_id": request_id, "error": error}),
+                        json!({"request_id": request_id, "prompt_index": prompt_index, "prompt_hash": &prompt_hash, "error": error}),
                     );
                     break;
                 }

@@ -27,6 +27,11 @@ const DATA_PATH_MIN_PAYLOAD_BYTES: u64 = 512;
 struct MvpChatCheckPaths {
     root: PathBuf,
     dump_log: PathBuf,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    prompts: PathBuf,
+    redacted_config: PathBuf,
+    summary: PathBuf,
 }
 
 struct MvpChatCheckOutput {
@@ -185,7 +190,9 @@ USAGE: cargo xtask <command>
 COMMANDS:
   mvp-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
   mvp-chat-check [--gpu|--multinode|--multinode-docker|--vastai]
-                     Run real cargo mvp-chat acceptance check for one explicit scenario.
+                     Run real cargo mvp-chat acceptance check and write benchmark artifacts.
+  mvp-chat-compare <baseline-summary.json> <candidate-summary.json>
+                     Compare two benchmark summaries and report comparable deltas.
   test                Run the basic non-binding test barrier: root crate plus each
                       non-binding repository package with `cargo test -p`."
     );
@@ -316,6 +323,155 @@ fn run_mvp_chat(args: Vec<String>) -> ExitCode {
             eprintln!("Failed to execute cargo mvp-chat: {error}");
             ExitCode::from(1)
         }
+    }
+}
+
+fn run_mvp_chat_compare(args: Vec<String>) -> ExitCode {
+    if args.len() != 2 {
+        eprintln!(
+            "USAGE: cargo xtask mvp-chat-compare <baseline-summary.json> <candidate-summary.json>"
+        );
+        return ExitCode::from(1);
+    }
+    let baseline = match read_summary_json(Path::new(&args[0])) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let candidate = match read_summary_json(Path::new(&args[1])) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::from(1);
+        }
+    };
+    let comparable = summaries_comparable(&baseline, &candidate);
+    println!("mvp-chat-compare: comparable={comparable}");
+    for reason in summary_incomparability_reasons(&baseline, &candidate) {
+        println!("mvp-chat-compare: incomparable {reason}");
+    }
+    print_summary_metric_delta(
+        "total_child_ms",
+        summary_pointer_u64(&baseline, "/timings/total_child_ms"),
+        summary_pointer_u64(&candidate, "/timings/total_child_ms"),
+    );
+    print_summary_metric_delta(
+        "prepare_runtime_ms",
+        summary_pointer_u64(&baseline, "/timings/prepare_runtime_ms/value_ms"),
+        summary_pointer_u64(&candidate, "/timings/prepare_runtime_ms/value_ms"),
+    );
+    print_summary_metric_delta(
+        "standup_to_prompt_rpc_ms",
+        summary_pointer_u64(&baseline, "/timings/standup_to_prompt_rpc_ms/value_ms"),
+        summary_pointer_u64(&candidate, "/timings/standup_to_prompt_rpc_ms/value_ms"),
+    );
+    for request_id in 1..=2 {
+        for metric in [
+            "roundtrip_ms",
+            "first_token_ms",
+            "decode_ms",
+            "text_decode_ms",
+        ] {
+            print_summary_metric_delta(
+                &format!("prompt_{request_id}_{metric}"),
+                summary_prompt_metric(&baseline, request_id, metric),
+                summary_prompt_metric(&candidate, request_id, metric),
+            );
+        }
+    }
+    if comparable {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    }
+}
+
+fn read_summary_json(path: &Path) -> Result<Value, String> {
+    let content = fs::read_to_string(path)
+        .map_err(|e| format!("mvp-chat-compare: read summary {}: {e}", path.display()))?;
+    serde_json::from_str(&content)
+        .map_err(|e| format!("mvp-chat-compare: parse summary {}: {e}", path.display()))
+}
+
+fn summaries_comparable(baseline: &Value, candidate: &Value) -> bool {
+    summary_incomparability_reasons(baseline, candidate).is_empty()
+}
+
+fn summary_incomparability_reasons(baseline: &Value, candidate: &Value) -> Vec<String> {
+    let mut reasons = Vec::new();
+    for (label, pointer) in [
+        ("schema", "/schema"),
+        ("scenario", "/scenario"),
+        ("workload", "/workload/prompt_corpus_blake3"),
+        ("model", "/run_envelope/detail/model/id"),
+        ("provider", "/run_envelope/detail/provider/kind"),
+        (
+            "pipeline_stages",
+            "/run_envelope/detail/runtime/pipeline_stages",
+        ),
+        ("gpu_run", "/run_envelope/detail/runtime/gpu_run"),
+        ("node_image", "/run_envelope/detail/provider/node_image"),
+    ] {
+        let left = baseline.pointer(pointer);
+        let right = candidate.pointer(pointer);
+        if left != right {
+            reasons.push(format!(
+                "{label} baseline={} candidate={}",
+                render_summary_value(left),
+                render_summary_value(right)
+            ));
+        }
+    }
+    reasons
+}
+
+fn print_summary_metric_delta(name: &str, baseline: Option<u64>, candidate: Option<u64>) {
+    match (baseline, candidate) {
+        (Some(left), Some(right)) => {
+            let delta = right as i128 - left as i128;
+            let pct = if left == 0 {
+                "unavailable".to_owned()
+            } else {
+                format!("{:.2}", (delta as f64 / left as f64) * 100.0)
+            };
+            println!(
+                "mvp-chat-compare: {name} baseline={left} candidate={right} delta_ms={delta} delta_pct={pct}"
+            );
+        }
+        _ => println!(
+            "mvp-chat-compare: {name} baseline={} candidate={} delta_ms=unavailable",
+            baseline
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned()),
+            candidate
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_owned())
+        ),
+    }
+}
+
+fn summary_prompt_metric(summary: &Value, request_id: u64, metric: &str) -> Option<u64> {
+    summary
+        .pointer("/timings/prompts")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|prompt| prompt.get("request_id").and_then(Value::as_u64) == Some(request_id))?
+        .get(metric)?
+        .get("value_ms")
+        .and_then(Value::as_u64)
+}
+
+fn summary_pointer_u64(summary: &Value, pointer: &str) -> Option<u64> {
+    summary.pointer(pointer).and_then(Value::as_u64)
+}
+
+fn render_summary_value(value: Option<&Value>) -> String {
+    match value {
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Null) | None => "unavailable".to_owned(),
+        Some(value) => value.to_string(),
     }
 }
 
@@ -482,7 +638,7 @@ fn write_mvp_chat_check_paths(root: &Path) -> Result<MvpChatCheckPaths, String> 
             root.display()
         ));
     }
-    let dump_log = root.join("mvp-chat.ndjson");
+    let dump_log = root.join("datastream.ndjson");
     if dump_log.exists() {
         return Err(format!(
             "mvp-chat-check: dump log path already exists: {}",
@@ -492,6 +648,11 @@ fn write_mvp_chat_check_paths(root: &Path) -> Result<MvpChatCheckPaths, String> 
     Ok(MvpChatCheckPaths {
         root: root.to_path_buf(),
         dump_log,
+        stdout: root.join("stdout.txt"),
+        stderr: root.join("stderr.txt"),
+        prompts: root.join("prompts.txt"),
+        redacted_config: root.join("redacted-config.json"),
+        summary: root.join("summary.json"),
     })
 }
 
@@ -590,17 +751,33 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
             );
         }
     };
+    let summary =
+        match build_benchmark_summary(&events, output.child_elapsed_ms, run_id, scenario, &paths) {
+            Ok(summary) => summary,
+            Err(error) => {
+                return fail_mvp_chat_check(
+                    &error,
+                    &paths,
+                    &output.stdout,
+                    &output.stderr,
+                    Some(&output.status),
+                );
+            }
+        };
+    if let Err(error) = write_benchmark_artifacts(&paths, run_id, scenario, &output, &summary) {
+        return fail_mvp_chat_check(
+            &error,
+            &paths,
+            &output.stdout,
+            &output.stderr,
+            Some(&output.status),
+        );
+    }
     for line in &report.lines {
         println!("{line}");
     }
-
-    if let Err(error) = fs::remove_dir_all(&paths.root) {
-        eprintln!(
-            "mvp-chat-check: remove temp directory {}: {error}",
-            paths.root.display()
-        );
-        return ExitCode::from(1);
-    }
+    println!("mvp-chat-check: artifacts {}", paths.root.display());
+    println!("mvp-chat-check: summary {}", paths.summary.display());
 
     println!("mvp-chat-check: ok");
     for (index, response) in responses.iter().enumerate() {
@@ -1569,6 +1746,527 @@ fn duration_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn build_benchmark_summary(
+    events: &[DumpLogEvent],
+    child_elapsed_ms: u64,
+    run_id: u64,
+    scenario: MvpChatCheckScenario,
+    paths: &MvpChatCheckPaths,
+) -> Result<Value, String> {
+    let facts = BenchmarkFacts::from_events(events, run_id);
+    let mut dump_facts = DumpLogFacts::default();
+    for record in events {
+        record_dump_log_event(&record.channel, &record.event, &mut dump_facts)?;
+    }
+    let run_envelope = benchmark_run_envelope(events, run_id);
+    let channel_counts = benchmark_channel_counts(events);
+    let event_counts = benchmark_event_counts(events);
+    let prompt_summaries = facts
+        .prompts
+        .values()
+        .map(prompt_summary_json)
+        .collect::<Vec<_>>();
+    let summary = json!({
+        "schema": "swactor.mvp_chat.benchmark_summary.v1",
+        "source": "datastream",
+        "run_id": run_id,
+        "scenario": scenario.name(),
+        "created_unix_ms": unix_ms_now(),
+        "workload": {
+            "name": "mvp-chat-check",
+            "input_format": "stdin_prompt_corpus",
+            "prompt_count": 2,
+            "prompt_bytes": MVP_CHAT_CHECK_PROMPTS.len(),
+            "prompt_corpus_blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
+            "prompts": prompt_workload_summary(events, run_id),
+        },
+        "artifacts": {
+            "root": paths.root.display().to_string(),
+            "datastream": {
+                "path": paths.dump_log.display().to_string(),
+                "blake3": file_blake3_hex(&paths.dump_log)?,
+            },
+            "stdout": {
+                "path": paths.stdout.display().to_string(),
+            },
+            "stderr": {
+                "path": paths.stderr.display().to_string(),
+            },
+            "prompts": {
+                "path": paths.prompts.display().to_string(),
+                "blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
+            },
+            "redacted_config": {
+                "path": paths.redacted_config.display().to_string(),
+            },
+            "summary": {
+                "path": paths.summary.display().to_string(),
+            },
+        },
+        "run_envelope": run_envelope,
+        "event_counts": {
+            "total": events.len(),
+            "channels": channel_counts,
+            "types": event_counts,
+        },
+        "timings": {
+            "total_child_ms": child_elapsed_ms,
+            "cargo_run_mvp_chat_ms": benchmark_span_json(&facts, "mvp.xtask.benchmark", "XtaskBenchmark", "cargo_run_mvp_chat", "started", "ready"),
+            "prepare_runtime_ms": benchmark_span_json(&facts, "mvp.chat.runtime", "ChatProgress", "prepare_runtime", "started", "ready"),
+            "standup_to_weights_loaded_ms": duration_summary_json(duration_between(
+                facts.span_point("mvp.chat.runtime", "ChatProgress", "prepare_runtime", "ready"),
+                facts.span_point("mvp.orch.bootstrap", "OrchBootstrap", "weights_loaded", "ready"),
+            )),
+            "standup_to_prompt_rpc_ms": duration_summary_json(duration_between(
+                facts.span_point("mvp.chat.runtime", "ChatProgress", "prepare_runtime", "ready"),
+                facts.span_point("mvp.chat.runtime", "ChatProgress", "prompt_rpc", "ready"),
+            )),
+            "prompts": prompt_summaries,
+        },
+        "pipeline": pipeline_summary_json(events, &dump_facts),
+        "gpu": gpu_summary_json(events, &dump_facts),
+        "invariants": benchmark_invariants_json(&dump_facts, scenario),
+        "legacy_tolerance": legacy_tolerance_summary(events),
+    });
+    Ok(summary)
+}
+
+fn write_benchmark_artifacts(
+    paths: &MvpChatCheckPaths,
+    run_id: u64,
+    scenario: MvpChatCheckScenario,
+    output: &MvpChatCheckOutput,
+    summary: &Value,
+) -> Result<(), String> {
+    fs::write(&paths.stdout, &output.stdout).map_err(|e| {
+        format!(
+            "mvp-chat-check: write stdout artifact {}: {e}",
+            paths.stdout.display()
+        )
+    })?;
+    fs::write(&paths.stderr, &output.stderr).map_err(|e| {
+        format!(
+            "mvp-chat-check: write stderr artifact {}: {e}",
+            paths.stderr.display()
+        )
+    })?;
+    fs::write(&paths.prompts, MVP_CHAT_CHECK_PROMPTS).map_err(|e| {
+        format!(
+            "mvp-chat-check: write prompt corpus {}: {e}",
+            paths.prompts.display()
+        )
+    })?;
+    let redacted_config = benchmark_redacted_config(summary, run_id, scenario);
+    write_json_file(&paths.redacted_config, &redacted_config)?;
+    write_json_file(&paths.summary, summary)?;
+    Ok(())
+}
+
+fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec_pretty(value)
+        .map_err(|e| format!("serialize benchmark artifact {}: {e}", path.display()))?;
+    bytes.push(b'\n');
+    fs::write(path, bytes).map_err(|e| format!("write benchmark artifact {}: {e}", path.display()))
+}
+
+fn benchmark_redacted_config(
+    summary: &Value,
+    run_id: u64,
+    scenario: MvpChatCheckScenario,
+) -> Value {
+    let mut config = summary
+        .get("run_envelope")
+        .and_then(|value| value.get("detail"))
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    redact_sensitive_values(&mut config);
+    json!({
+        "schema": "swactor.mvp_chat.redacted_config.v1",
+        "run_id": run_id,
+        "scenario": scenario.name(),
+        "detail": config,
+    })
+}
+
+fn redact_sensitive_values(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (key, child) in object.iter_mut() {
+                let key_lower = key.to_ascii_lowercase();
+                if child.is_string()
+                    && (key_lower.contains("api_key")
+                        || key_lower.contains("token")
+                        || key_lower.contains("secret")
+                        || key_lower.contains("password")
+                        || key_lower.contains("ssh_identity")
+                        || key_lower.contains("private_key")
+                        || key_lower.contains("bootstrap_command"))
+                {
+                    *child = Value::String("<redacted>".to_owned());
+                } else {
+                    redact_sensitive_values(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                redact_sensitive_values(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn benchmark_run_envelope(events: &[DumpLogEvent], run_id: u64) -> Value {
+    events
+        .iter()
+        .find(|record| {
+            event_matches_run_id(&record.event, run_id)
+                && record.event.get("type").and_then(Value::as_str) == Some("BenchmarkRunEnvelope")
+        })
+        .map(|record| record.event.clone())
+        .unwrap_or_else(|| {
+            json!({
+                "type": "BenchmarkRunEnvelope",
+                "status": "unavailable",
+                "detail": {
+                    "reason": "event not present in datastream",
+                },
+            })
+        })
+}
+
+fn prompt_workload_summary(events: &[DumpLogEvent], run_id: u64) -> Vec<Value> {
+    let mut prompts = BTreeMap::new();
+    for record in events {
+        if !event_matches_run_id(&record.event, run_id)
+            || record.channel != "mvp.chat.prompt"
+            || record.event.get("type").and_then(Value::as_str) != Some("ChatProgress")
+            || record.event.get("phase").and_then(Value::as_str) != Some("prompt_submitted")
+            || record.event.get("status").and_then(Value::as_str) != Some("ready")
+        {
+            continue;
+        }
+        let Some(request_id) = dump_log_request_id(&record.event) else {
+            continue;
+        };
+        let detail = record.event.get("detail").unwrap_or(&Value::Null);
+        prompts.insert(
+            request_id,
+            json!({
+                "request_id": request_id,
+                "prompt_index": detail.get("prompt_index").and_then(Value::as_u64),
+                "prompt_hash": detail.get("prompt_hash").and_then(Value::as_str),
+                "prompt_bytes": detail.get("prompt_bytes").and_then(Value::as_u64),
+                "max_tokens": detail.get("max_tokens").and_then(Value::as_u64),
+            }),
+        );
+    }
+    prompts.into_values().collect()
+}
+
+fn prompt_summary_json(prompt: &PromptBenchmarkFacts) -> Value {
+    let roundtrip = duration_between(
+        prompt.chat_submitted.as_ref(),
+        prompt.chat_completed.as_ref(),
+    );
+    let worker_start = prompt
+        .worker_started
+        .as_ref()
+        .or(prompt.encode_started.as_ref());
+    let worker_end = prompt
+        .worker_completed
+        .as_ref()
+        .or(prompt.chat_completed.as_ref());
+    let worker_total = duration_between(worker_start, worker_end);
+    let encode = duration_between(prompt.encode_started.as_ref(), prompt.encode_ready.as_ref());
+    let first_token = duration_between(
+        prompt.decode_started.as_ref(),
+        prompt.first_token_ready.as_ref(),
+    );
+    let decode = duration_between(prompt.decode_started.as_ref(), prompt.decode_ready.as_ref());
+    let text_decode = duration_between(
+        prompt.text_decode_started.as_ref(),
+        prompt.text_decode_ready.as_ref(),
+    );
+    json!({
+        "request_id": prompt.request_id,
+        "roundtrip_ms": duration_summary_json(roundtrip),
+        "worker_total_ms": duration_summary_json(worker_total),
+        "tokenization_ms": duration_summary_json(encode),
+        "first_token_ms": duration_summary_json(first_token),
+        "decode_ms": duration_summary_json(decode),
+        "text_decode_ms": duration_summary_json(text_decode),
+        "tokens_generated": prompt.tokens_generated,
+        "tokens_per_sec": tokens_per_sec(prompt.tokens_generated, decode.value_ms),
+    })
+}
+
+fn benchmark_span_json(
+    facts: &BenchmarkFacts,
+    channel: &str,
+    event_type: &str,
+    phase: &str,
+    start_status: &str,
+    end_status: &str,
+) -> Value {
+    duration_summary_json(duration_between(
+        facts.span_point(channel, event_type, phase, start_status),
+        facts.span_point(channel, event_type, phase, end_status),
+    ))
+}
+
+fn duration_summary_json(duration: DurationRender) -> Value {
+    json!({
+        "value_ms": duration.value_ms,
+        "clock_skew": duration.clock_skew,
+    })
+}
+
+fn pipeline_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value {
+    let mut worker_steps = BenchmarkAggregate::default();
+    let mut object_loads = BenchmarkAggregate::default();
+    let mut ring_installs = BTreeMap::<String, u64>::new();
+    for record in events {
+        match (
+            record.channel.as_str(),
+            record.event.get("type").and_then(Value::as_str),
+        ) {
+            ("mvp.worker.step", Some("StepExecuted")) => {
+                worker_steps.count += 1;
+                worker_steps.elapsed_ms += event_u64(&record.event, "elapsed_ms").unwrap_or(0);
+                worker_steps.stage_execution_ms +=
+                    event_u64(&record.event, "stage_execution_ms").unwrap_or(0);
+                worker_steps.record_write_ms +=
+                    event_u64(&record.event, "record_write_ms").unwrap_or(0);
+                worker_steps.payload_bytes +=
+                    event_u64(&record.event, "payload_bytes").unwrap_or(0);
+                worker_steps.record_bytes += event_u64(&record.event, "record_bytes").unwrap_or(0);
+            }
+            ("mvp.worker.ingress", Some("ObjectLoaded")) => {
+                object_loads.count += 1;
+                object_loads.elapsed_ms += event_u64(&record.event, "elapsed_ms").unwrap_or(0);
+                object_loads.record_bytes += event_u64(&record.event, "extent").unwrap_or(0);
+            }
+            ("mvp.worker.ring", Some("RingInstalled")) => {
+                let direction = record
+                    .event
+                    .get("direction")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unavailable")
+                    .to_owned();
+                *ring_installs.entry(direction).or_default() += 1;
+            }
+            _ => {}
+        }
+    }
+    json!({
+        "worker_steps": worker_steps.to_json(),
+        "object_loads": object_loads.to_json(),
+        "ring_installs": ring_installs,
+        "data_path": {
+            "activation_object_loaded": facts.activation_object_loaded,
+            "activation_step_executed": facts.activation_step_executed,
+            "activation_egress_ring_read": facts.activation_egress_ring_read,
+            "activation_ingress_ring_write": facts.activation_ingress_ring_write,
+            "activation_iroh_edge_sent": facts.activation_iroh_edge_sent,
+            "activation_iroh_edge_read": facts.activation_iroh_edge_read,
+            "activation_interstage_handoff": facts.activation_interstage_handoff,
+            "activation_edge_ids": facts.activation_edge_ids,
+            "max_activation_record_bytes": facts.max_activation_record_bytes,
+            "max_worker_command_bytes": facts.max_worker_command_bytes,
+            "control_json_large_object_violation": facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES
+                && facts.max_worker_command_bytes >= facts.max_activation_record_bytes,
+        },
+    })
+}
+
+fn gpu_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value {
+    let mut cpu_profile_summaries = Vec::new();
+    for record in events {
+        if record.event.get("type").and_then(Value::as_str) == Some("CpuLineProfileSummary") {
+            cpu_profile_summaries.push(record.event.clone());
+        }
+    }
+    json!({
+        "worker_device_requested": facts.gpu_worker_device_requested,
+        "import_ready": facts.gpu_import_ready,
+        "probe_ready": facts.gpu_probe_ready,
+        "worker_ready": facts.gpu_worker_ready,
+        "cpu_fallback_seen": facts.gpu_cpu_fallback_seen,
+        "decode_started_request_ids": facts.gpu_decode_started,
+        "first_token_request_ids": facts.gpu_first_token_ready,
+        "decode_ready_request_ids": facts.gpu_decode_ready,
+        "prompt_completed_request_ids": facts.gpu_prompt_completed,
+        "pipeline_real_worker_step_seen": facts.gpu_pipeline_real_worker_step_seen,
+        "cpu_profile_summaries": cpu_profile_summaries,
+    })
+}
+
+#[derive(Default)]
+struct BenchmarkAggregate {
+    count: u64,
+    elapsed_ms: u64,
+    stage_execution_ms: u64,
+    record_write_ms: u64,
+    payload_bytes: u64,
+    record_bytes: u64,
+}
+
+impl BenchmarkAggregate {
+    fn to_json(&self) -> Value {
+        json!({
+            "count": self.count,
+            "elapsed_ms_sum": self.elapsed_ms,
+            "stage_execution_ms_sum": self.stage_execution_ms,
+            "record_write_ms_sum": self.record_write_ms,
+            "payload_bytes_sum": self.payload_bytes,
+            "record_bytes_sum": self.record_bytes,
+        })
+    }
+}
+
+fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MvpChatCheckScenario) -> Vec<Value> {
+    let mut invariants = vec![
+        invariant_json("chat_config_ready", facts.chat_config_ready),
+        invariant_json("prepare_runtime_ready", facts.prepare_runtime_ready),
+        invariant_json("prompt_rpc_ready", facts.prompt_rpc_ready),
+        invariant_json(
+            "orchestrator_weights_loaded",
+            facts.orch_weights_loaded_ready,
+        ),
+        invariant_json(
+            "two_prompt_responses",
+            facts.response_text_1 && facts.response_text_2,
+        ),
+        invariant_json(
+            "two_prompt_completions",
+            facts.request_completed_1 && facts.request_completed_2,
+        ),
+        invariant_json("shutdown_requested", facts.shutdown_requested),
+        invariant_json("orchestrator_stopped", facts.orchestrator_stopped),
+    ];
+    if matches!(
+        scenario,
+        MvpChatCheckScenario::Gpu | MvpChatCheckScenario::VastAi
+    ) {
+        invariants.extend([
+            invariant_json("gpu_no_cpu_fallback", !facts.gpu_cpu_fallback_seen),
+            invariant_json("gpu_worker_ready", facts.gpu_worker_ready),
+        ]);
+    }
+    if matches!(
+        scenario,
+        MvpChatCheckScenario::MultinodeDocker | MvpChatCheckScenario::VastAi
+    ) {
+        invariants.extend([
+            invariant_json(
+                "activation_large_object_loaded",
+                facts.activation_object_loaded,
+            ),
+            invariant_json(
+                "activation_large_object_step_executed",
+                facts.activation_step_executed,
+            ),
+            invariant_json(
+                "activation_large_object_iroh_sent",
+                facts.activation_iroh_edge_sent,
+            ),
+            invariant_json(
+                "activation_large_object_iroh_read",
+                facts.activation_iroh_edge_read,
+            ),
+        ]);
+    }
+    invariants
+}
+
+fn invariant_json(name: &str, passed: bool) -> Value {
+    json!({
+        "name": name,
+        "passed": passed,
+    })
+}
+
+fn legacy_tolerance_summary(events: &[DumpLogEvent]) -> Value {
+    let missing_benchmark_stamp = events
+        .iter()
+        .filter(|record| record.event.get("benchmark").is_none())
+        .count();
+    let missing_elapsed_fields = events
+        .iter()
+        .filter(|record| {
+            matches!(
+                record.event.get("type").and_then(Value::as_str),
+                Some(
+                    "PromptEncodeReady"
+                        | "DecodeReady"
+                        | "TextDecodeReady"
+                        | "StepExecuted"
+                        | "ObjectLoaded"
+                        | "PromptEncoded"
+                        | "TokensDecoded"
+                )
+            ) && record.event.get("elapsed_ms").is_none()
+        })
+        .count();
+    json!({
+        "accepted": true,
+        "missing_benchmark_stamp_events": missing_benchmark_stamp,
+        "missing_elapsed_field_events": missing_elapsed_fields,
+        "unavailable_fields_are_null": true,
+    })
+}
+
+fn benchmark_channel_counts(events: &[DumpLogEvent]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for record in events {
+        *counts.entry(record.channel.clone()).or_default() += 1;
+    }
+    counts
+}
+
+fn benchmark_event_counts(events: &[DumpLogEvent]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for record in events {
+        let key = format!(
+            "{}/{}/{}/{}",
+            record.channel,
+            record
+                .event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>"),
+            record
+                .event
+                .get("phase")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>"),
+            record
+                .event
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("<none>")
+        );
+        *counts.entry(key).or_default() += 1;
+    }
+    counts
+}
+
+fn event_u64(event: &Value, key: &str) -> Option<u64> {
+    event.get(key).and_then(Value::as_u64)
+}
+
+fn file_blake3_hex(path: &Path) -> Result<String, String> {
+    let bytes =
+        fs::read(path).map_err(|e| format!("read artifact for hash {}: {e}", path.display()))?;
+    Ok(bytes_blake3_hex(&bytes))
+}
+
+fn bytes_blake3_hex(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 fn event_matches_run_id(event: &Value, run_id: u64) -> bool {
     event
         .get("run_id")
@@ -2455,6 +3153,10 @@ mod tests {
                 "run_id": 9,
                 "detail": {
                     "request_id": request_id,
+                    "prompt_index": request_id,
+                    "prompt_hash": format!("hash-{request_id}"),
+                    "prompt_bytes": 4,
+                    "max_tokens": 8,
                     "tokens_generated": 3,
                     "elapsed_ms": 50,
                     "final_text_bytes": 5,
@@ -3286,6 +3988,80 @@ mod tests {
                 && line.contains("decode_ms=8")
         }));
     }
+
+    #[test]
+    fn benchmark_summary_preserves_workload_artifacts_and_prompt_timings() {
+        let mut event_pairs = benchmark_report_events(true);
+        event_pairs.push((
+            "mvp.chat.benchmark",
+            stamped(
+                json!({
+                    "type": "BenchmarkRunEnvelope",
+                    "phase": "run_envelope",
+                    "status": "ready",
+                    "run_id": 9,
+                    "detail": {
+                        "model": {"id": "unit-model"},
+                        "runtime": {"pipeline_stages": 1, "gpu_run": false},
+                        "provider": {"kind": "process", "node_image": "unit-image"},
+                    },
+                }),
+                "mvp-chat",
+                1_001,
+                1,
+            ),
+        ));
+        let path = write_synthetic_event_dump("summary-contract", event_pairs);
+        let events = parse_dump_log_events(&path).expect("parse summary events");
+        let paths = MvpChatCheckPaths {
+            root: std::env::temp_dir(),
+            dump_log: path.clone(),
+            stdout: temp_path("summary-stdout"),
+            stderr: temp_path("summary-stderr"),
+            prompts: temp_path("summary-prompts"),
+            redacted_config: temp_path("summary-config"),
+            summary: temp_path("summary-json"),
+        };
+
+        let summary = build_benchmark_summary(
+            &events,
+            80,
+            9,
+            MvpChatCheckScenario::ProcessBaseline,
+            &paths,
+        )
+        .expect("summary builds");
+        let _ = fs::remove_file(path);
+
+        assert_eq!(
+            summary.get("source").and_then(Value::as_str),
+            Some("datastream")
+        );
+        assert_eq!(
+            summary
+                .pointer("/run_envelope/detail/model/id")
+                .and_then(Value::as_str),
+            Some("unit-model")
+        );
+        assert_eq!(
+            summary
+                .pointer("/workload/prompts/0/prompt_hash")
+                .and_then(Value::as_str),
+            Some("hash-1")
+        );
+        assert_eq!(
+            summary
+                .pointer("/timings/prompts/0/first_token_ms/value_ms")
+                .and_then(Value::as_u64),
+            Some(5)
+        );
+        assert!(
+            summary
+                .pointer("/artifacts/datastream/blake3")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+    }
 }
 
 fn main() -> ExitCode {
@@ -3293,6 +4069,7 @@ fn main() -> ExitCode {
     match args.next().as_deref() {
         Some("test") if args.next().is_none() => run_tests(),
         Some("mvp-chat-check") => run_mvp_chat_check(args.collect()),
+        Some("mvp-chat-compare") => run_mvp_chat_compare(args.collect()),
         Some("mvp-chat") => run_mvp_chat(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_usage();

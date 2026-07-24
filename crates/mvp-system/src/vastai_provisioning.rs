@@ -797,6 +797,24 @@ where
                 instance.contract_id
             ),
         });
+        sink.observe(PluginObservation::ProviderLine {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            line: serde_json::json!({
+                "type": "VastAiLeaseReady",
+                "run_id": spec.run_id,
+                "node_id": spec.node_id,
+                "label": &label,
+                "image": &spec.image,
+                "contract_id": instance.contract_id,
+                "offer_id": instance.offer_id,
+                "host_id": instance.host_id,
+                "gpu_name": &instance.gpu_name,
+                "gpu_ram": instance.gpu_ram,
+                "dph_total": instance.dph_total,
+            })
+            .to_string(),
+        });
 
         let endpoint = match self.client.ssh_endpoint(
             instance.contract_id,
@@ -812,6 +830,20 @@ where
                 ));
             }
         };
+        sink.observe(PluginObservation::ProviderLine {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            line: serde_json::json!({
+                "type": "VastAiSshEndpointReady",
+                "run_id": spec.run_id,
+                "node_id": spec.node_id,
+                "contract_id": instance.contract_id,
+                "host": &endpoint.host,
+                "port": endpoint.port,
+                "user": &endpoint.user,
+            })
+            .to_string(),
+        });
 
         let bootstrap = match self.bootstrap.start_bootstrap(
             spec.clone(),
