@@ -636,6 +636,15 @@ impl VastAiRuntimeConfig {
         if let Some(min_down_mbps) = min_down_mbps {
             provisioning.selection.min_down_mbps = min_down_mbps;
         }
+        let max_dph_total = builder
+            .vastai_max_dph_total_raw
+            .as_ref()
+            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_MAX_DPH_TOTAL", value))
+            .transpose()?
+            .or(builder.vastai_max_dph_total);
+        if let Some(max_dph_total) = max_dph_total {
+            provisioning.selection.max_dph_total = Some(max_dph_total);
+        }
         let min_up_mbps = builder
             .vastai_min_up_mbps_raw
             .as_ref()
@@ -695,6 +704,7 @@ impl VastAiRuntimeConfig {
             "min_gpu_ram_mb": self.provisioning.selection.min_gpu_ram_mb,
             "min_down_mbps": self.provisioning.selection.min_down_mbps,
             "min_up_mbps": self.provisioning.selection.min_up_mbps,
+            "max_dph_total": self.provisioning.selection.max_dph_total,
             "min_reliability": self.provisioning.selection.min_reliability,
             "require_verified": self.provisioning.selection.require_verified,
             "confirm_lease": self.provisioning.confirm_lease,
@@ -910,6 +920,8 @@ struct ConfigBuilder {
     vastai_min_down_mbps: Option<f64>,
     vastai_min_down_mbps_raw: Option<String>,
     vastai_min_up_mbps: Option<f64>,
+    vastai_max_dph_total: Option<f64>,
+    vastai_max_dph_total_raw: Option<String>,
     vastai_min_up_mbps_raw: Option<String>,
     vastai_min_reliability: Option<f64>,
     vastai_min_reliability_raw: Option<String>,
@@ -965,6 +977,8 @@ impl ConfigBuilder {
             vastai_min_gpu_ram_mb_raw: None,
             vastai_min_down_mbps: None,
             vastai_min_down_mbps_raw: None,
+            vastai_max_dph_total: None,
+            vastai_max_dph_total_raw: None,
             vastai_min_up_mbps: None,
             vastai_min_up_mbps_raw: None,
             vastai_min_reliability: None,
@@ -1082,6 +1096,9 @@ impl ConfigBuilder {
         }
         if let Some(min_down_mbps) = overlay.vastai.min_down_mbps {
             self.vastai_min_down_mbps = Some(min_down_mbps);
+        }
+        if let Some(max_dph_total) = overlay.vastai.max_dph_total {
+            self.vastai_max_dph_total = Some(max_dph_total);
         }
         if let Some(min_up_mbps) = overlay.vastai.min_up_mbps {
             self.vastai_min_up_mbps = Some(min_up_mbps);
@@ -1215,6 +1232,9 @@ impl ConfigBuilder {
         if let Some(min_down_mbps) = env_optional("MVP_VASTAI_MIN_DOWN_MBPS") {
             self.vastai_min_down_mbps_raw = Some(min_down_mbps);
         }
+        if let Some(max_dph_total) = env_optional("MVP_VASTAI_MAX_DPH_TOTAL") {
+            self.vastai_max_dph_total_raw = Some(max_dph_total);
+        }
         if let Some(min_up_mbps) = env_optional("MVP_VASTAI_MIN_UP_MBPS") {
             self.vastai_min_up_mbps_raw = Some(min_up_mbps);
         }
@@ -1339,6 +1359,11 @@ impl ConfigBuilder {
                         Some(parse_next(&mut args, "--vastai-min-down-mbps")?);
                     self.vastai_min_down_mbps_raw = None;
                 }
+                "--vastai-max-dph-total" => {
+                    self.vastai_max_dph_total =
+                        Some(parse_next(&mut args, "--vastai-max-dph-total")?);
+                    self.vastai_max_dph_total_raw = None;
+                }
                 "--vastai-min-up-mbps" => {
                     self.vastai_min_up_mbps = Some(parse_next(&mut args, "--vastai-min-up-mbps")?);
                     self.vastai_min_up_mbps_raw = None;
@@ -1380,9 +1405,9 @@ impl ConfigBuilder {
         if self.pipeline_stages == 0 {
             return Err("--pipeline-stages must be greater than 0".to_owned());
         }
-        if provider == ProviderKind::VastAi && self.pipeline_stages > 1 {
+        if provider == ProviderKind::VastAi && self.pipeline_stages > 2 {
             return Err(
-                "pipeline stages greater than 1 are only supported with provider=docker; provider=vastai does not support pipelined provisioning yet".to_owned(),
+                "provider=vastai currently supports at most 2 pipeline stages for activation-path smoke checks".to_owned(),
             );
         }
         let mut cached_model_host_path = self.cached_model_host_path.clone();
@@ -1645,6 +1670,20 @@ impl Config {
                 } else {
                     Err(format!(
                         "local pipeline requires a locally inspectable GGUF before provisioning; {path:?} is not a host file, so use --cached-model-host-path"
+                    ))
+                }
+            }
+            GgufSource::HuggingFaceGguf { repo, file, .. }
+                if self.provider == ProviderKind::VastAi
+                    && gguf_source_matches_default_pipeline_cache(&self.gguf_source) =>
+            {
+                let host_path = default_pipeline_cached_model_path();
+                if host_path.is_file() {
+                    Ok(host_path)
+                } else {
+                    Err(format!(
+                        "VastAI pipeline planning requires local GGUF metadata at {}; selected remote source is {repo}/{file}",
+                        host_path.display()
                     ))
                 }
             }
@@ -6618,23 +6657,89 @@ kind = "docker"
     }
 
     #[test]
-    fn vastai_rejects_pipeline_stages_count_above_one() {
+    fn vastai_rejects_pipeline_stages_count_above_two() {
         let error = with_clean_env(&[], || {
             match Config::from_layers_with_path_and_args(
                 None,
-                ["--provider", "vastai", "--pipeline-stages", "2"]
+                ["--provider", "vastai", "--pipeline-stages", "3"]
                     .into_iter()
                     .map(str::to_owned),
             ) {
-                Ok(_) => panic!("VastAI cannot provision more than one pipeline stage yet"),
+                Ok(_) => panic!("VastAI smoke runs are capped at two pipeline stages"),
                 Err(error) => error,
             }
         });
 
         assert!(
-            error.contains("provider=vastai does not support pipelined provisioning yet"),
+            error.contains("provider=vastai currently supports at most 2 pipeline stages"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn vastai_two_stage_plan_uses_remote_gguf_and_no_mounts() {
+        let config = with_clean_env(&[], || {
+            Config::from_layers_with_path_and_args(
+                None,
+                [
+                    "--provider",
+                    "vastai",
+                    "--pipeline-stages",
+                    "2",
+                    "--model-id",
+                    "smollm2-135m-instruct-q4",
+                    "--gguf-repo",
+                    "QuantFactory/SmolLM2-135M-Instruct-GGUF",
+                    "--gguf-file",
+                    DEFAULT_PIPELINE_CACHED_MODEL_FILE,
+                    "--max-context",
+                    "256",
+                    "--relay-mode",
+                    "default",
+                    "--vastai-bootstrap-command",
+                    "boot",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            )
+            .expect("VastAI two-stage pipeline config parses")
+        });
+        let plan = config
+            .build_run_plan()
+            .expect("VastAI two-stage run plan uses local metadata only");
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[41; 32]).public());
+        let orchestrator_actor = ActorAddress([42; 32]);
+
+        let specs = stage_node_specs(&config, Some(&plan), coordinator, orchestrator_actor)
+            .expect("VastAI pipeline stage node specs build");
+
+        assert_eq!(config.provider, ProviderKind::VastAi);
+        assert!(
+            config.cached_model.is_none(),
+            "VastAI must not mount host caches"
+        );
+        assert_eq!(specs.len(), 2);
+        for (expected_stage_index, spec) in specs.iter().enumerate() {
+            let expected_stage_index =
+                u32::try_from(expected_stage_index).expect("fixture stage index fits u32");
+            let expected_node_id = config.node_id + 1 + u64::from(expected_stage_index);
+            assert_eq!(spec.node_id, expected_node_id);
+            assert_eq!(spec.stage_index, Some(expected_stage_index));
+            assert_eq!(env_value(&spec.env, "MVP_NODE_PROVIDER"), Some("vastai"));
+            assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("2"));
+            assert_eq!(
+                env_value(&spec.env, "MVP_GGUF_REPO"),
+                Some("QuantFactory/SmolLM2-135M-Instruct-GGUF")
+            );
+            assert_eq!(
+                env_value(&spec.env, "MVP_GGUF_FILE"),
+                Some(DEFAULT_PIPELINE_CACHED_MODEL_FILE)
+            );
+            assert_eq!(env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"), None);
+            assert_eq!(env_value(&spec.env, "MVP_MAX_CONTEXT"), Some("256"));
+            assert_eq!(spec.args, vec!["boot".to_owned()]);
+            assert!(spec.mounts.is_empty(), "VastAI stage specs must not mount");
+        }
     }
 
     #[test]

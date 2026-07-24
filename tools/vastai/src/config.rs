@@ -9,6 +9,7 @@ pub const ENV_MIN_INET_UP_MBPS: &str = "PP_MIN_INET_UP_MBPS";
 pub const ENV_MIN_RELIABILITY: &str = "PP_MIN_RELIABILITY";
 pub const ENV_REQUIRE_VERIFIED: &str = "PP_REQUIRE_VERIFIED";
 pub const ENV_DROP_CHEAP_FRAC: &str = "PP_DROP_CHEAP_FRAC";
+pub const ENV_MAX_DPH_TOTAL: &str = "PP_MAX_DPH_TOTAL";
 pub const ENV_LEASE_PACE_MS: &str = "PP_LEASE_PACE_MS";
 pub const ENV_BLACKLIST_HOSTS: &str = "PP_BLACKLIST_HOSTS";
 pub const ENV_ASSUME_YES: &str = "PP_ASSUME_YES";
@@ -55,6 +56,7 @@ impl SelectionPolicy {
             .unwrap_or(0.95);
         policy.require_verified = truthy_env(ENV_REQUIRE_VERIFIED);
         policy.min_up_mbps = env_optional_positive_f64(ENV_MIN_INET_UP_MBPS);
+        policy.max_dph_total = env_optional_positive_f64(ENV_MAX_DPH_TOTAL);
         policy.drop_cheap_frac = std::env::var(ENV_DROP_CHEAP_FRAC)
             .ok()
             .and_then(|s| s.trim().parse::<f64>().ok())

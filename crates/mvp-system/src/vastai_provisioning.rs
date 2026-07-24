@@ -843,14 +843,7 @@ where
         Ok(handle)
     }
 
-    fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
-        let Some(node) = self.nodes.get_mut(&handle.id) else {
-            return Ok(());
-        };
-        if let Some(mut bootstrap) = node.bootstrap.take() {
-            self.bootstrap
-                .stop_bootstrap(&mut bootstrap, BootstrapStopReason::RuntimeReady);
-        }
+    fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
         Ok(())
     }
 
@@ -937,6 +930,81 @@ mod tests {
         VastAiProvisioningPlugin::new(NoopLeaseClient, NoopBootstrapLauncher, config)
     }
 
+    #[derive(Clone, Default)]
+    struct ObservationSink {
+        observations: Arc<Mutex<Vec<PluginObservation>>>,
+    }
+
+    impl crate::provisioning::PluginObservationSink for ObservationSink {
+        fn observe(&self, observation: PluginObservation) {
+            self.observations.lock().push(observation);
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingLeaseClient {
+        destroyed_contracts: Arc<Mutex<Vec<u64>>>,
+    }
+
+    impl VastAiLeaseClient for RecordingLeaseClient {
+        fn provision_one(
+            &mut self,
+            _request: ProvisionRequest,
+        ) -> Result<ProvisionedInstance, String> {
+            Ok(ProvisionedInstance {
+                index: 0,
+                contract_id: 42,
+                offer_id: 7,
+                host_id: Some(99),
+                gpu_name: "RTX 4060".to_owned(),
+                gpu_ram: Some(8_192.0),
+                dph_total: 0.064,
+            })
+        }
+
+        fn ssh_endpoint(
+            &mut self,
+            _contract_id: u64,
+            _label: &str,
+            _lifecycle: &LifecyclePolicy,
+            ssh_user: &str,
+        ) -> Result<VastAiSshEndpoint, String> {
+            Ok(VastAiSshEndpoint {
+                host: "ssh5.vast.ai".to_owned(),
+                port: 22_017,
+                user: ssh_user.to_owned(),
+            })
+        }
+
+        fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
+            self.destroyed_contracts.lock().push(contract_id);
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingBootstrapLauncher {
+        stop_reasons: Arc<Mutex<Vec<BootstrapStopReason>>>,
+    }
+
+    impl VastAiBootstrapLauncher for RecordingBootstrapLauncher {
+        type Handle = u64;
+
+        fn start_bootstrap(
+            &mut self,
+            spec: NodeProvisionSpec,
+            _endpoint: VastAiSshEndpoint,
+            _sink: PluginSink,
+            _producer: Option<DatastreamProducer>,
+        ) -> Result<Self::Handle, String> {
+            Ok(spec.node_id)
+        }
+
+        fn stop_bootstrap(&mut self, _handle: &mut Self::Handle, reason: BootstrapStopReason) {
+            self.stop_reasons.lock().push(reason);
+        }
+    }
+
     #[test]
     fn vastai_provisioning_build_request_keeps_bootstrap_args_out_of_onstart() {
         let plugin = plugin_with_onstart(None);
@@ -955,6 +1023,38 @@ mod tests {
             plugin.build_request(&node_spec_with_bootstrap_args(), "test-label".to_owned());
 
         assert_eq!(request.onstart.as_deref(), Some("echo explicit setup"));
+    }
+
+    #[test]
+    fn vastai_complete_bootstrap_keeps_log_tail_until_node_stop() {
+        let destroyed_contracts = Arc::new(Mutex::new(Vec::new()));
+        let stop_reasons = Arc::new(Mutex::new(Vec::new()));
+        let sink = PluginSink::new(Arc::new(ObservationSink::default()));
+        let mut plugin = VastAiProvisioningPlugin::new(
+            RecordingLeaseClient {
+                destroyed_contracts: destroyed_contracts.clone(),
+            },
+            RecordingBootstrapLauncher {
+                stop_reasons: stop_reasons.clone(),
+            },
+            VastAiProvisioningConfig::default(),
+        );
+
+        let handle = plugin
+            .start_node(node_spec_with_bootstrap_args(), sink)
+            .expect("VastAI node starts");
+
+        plugin
+            .complete_bootstrap(&handle)
+            .expect("runtime-ready bootstrap completion succeeds");
+        assert!(
+            stop_reasons.lock().is_empty(),
+            "VastAI bootstrap SSH tail must remain alive for post-ready worker logs"
+        );
+
+        plugin.stop_node(&handle).expect("VastAI node stops");
+        assert_eq!(*stop_reasons.lock(), vec![BootstrapStopReason::NodeStop]);
+        assert_eq!(*destroyed_contracts.lock(), vec![42]);
     }
 
     #[test]

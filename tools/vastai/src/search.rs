@@ -47,6 +47,9 @@ pub async fn select_offer_pool_with_policy(
     if let Some(min_ram) = policy.min_gpu_ram_mb {
         query["gpu_ram"] = serde_json::json!({"gte": min_ram});
     }
+    if let Some(max_dph_total) = policy.max_dph_total {
+        query["dph_total"] = serde_json::json!({"lte": max_dph_total});
+    }
     if let Some(gpu_name) = policy.gpu_name.as_deref().filter(|s| !s.is_empty()) {
         query["gpu_name"] = serde_json::json!({"eq": gpu_name});
     }
@@ -78,14 +81,19 @@ pub async fn select_offer_pool_with_policy(
     let pool = rank_survivors(reachable, &cost, policy.drop_cheap_frac);
 
     if pool.is_empty() {
-        return Err(
-            "no offers available (after quality/geo/host-blacklist filters and cheap-tail drop)"
-                .to_string(),
-        );
+        let cap = policy
+            .max_dph_total
+            .map_or_else(|| "uncapped".to_owned(), |max| format!("max ${max:.3}/hr"));
+        return Err(format!(
+            "no offers available ({cap}, after quality/geo/host-blacklist filters and cheap-tail drop)"
+        ));
     }
+    let cap = policy
+        .max_dph_total
+        .map_or_else(|| "uncapped".to_owned(), |max| format!("max ${max:.3}/hr"));
     eprintln!(
         "select_offer_pool: {} survivor(s) for {target_count} instance(s) after \
-         per-model {:.0}% cheap-drop (cheapest ${:.3}/hr eff)",
+         per-model {:.0}% cheap-drop ({cap}, cheapest ${:.3}/hr eff)",
         pool.len(),
         policy.drop_cheap_frac * 100.0,
         cost.effective_price(&pool[0]),

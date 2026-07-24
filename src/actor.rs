@@ -681,7 +681,6 @@ impl<'a> Ctx<'a> {
         self.inner.extension()
     }
 
-
     /// Return system-level information (worker count, actor count, uptime).
     pub fn system_info(&self) -> SystemInfo {
         self.inner.system_info()

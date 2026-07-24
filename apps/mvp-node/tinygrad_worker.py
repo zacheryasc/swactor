@@ -930,7 +930,11 @@ def install_ring(cmd: dict[str, Any]) -> None:
         type="RingInstalled",
         ring_id=ring_id,
         edge_id=rings[ring_id]["edge_id"],
+        port=rings[ring_id]["port"],
         direction=rings[ring_id]["direction"],
+        data_capacity=rings[ring_id]["data_capacity"],
+        max_extent=rings[ring_id]["max_extent"],
+        alignment=rings[ring_id]["alignment"],
     )
 
 
@@ -1001,6 +1005,7 @@ def materialize_object(payload: bytes, sequence: int, flags: int) -> dict[str, A
         return {
             "kind": "tokens",
             "tokens": tokens,
+            "token_count": token_count,
             "tensor": TensorCls([tokens], dtype="int32").realize(),
             "start_pos": object_start_pos(sequence, token_count, flags),
         }
@@ -1011,6 +1016,7 @@ def materialize_object(payload: bytes, sequence: int, flags: int) -> dict[str, A
         return {
             "kind": "tokens",
             "tokens": tokens,
+            "token_count": token_count,
             "tensor": TensorCls([tokens], dtype="int32").realize(),
             "start_pos": object_start_pos(sequence, token_count, flags),
         }
@@ -1026,6 +1032,8 @@ def materialize_object(payload: bytes, sequence: int, flags: int) -> dict[str, A
     array = np.frombuffer(payload, dtype=np.float16).copy().reshape(1, token_count, hidden_dim)
     return {
         "kind": "activation",
+        "token_count": token_count,
+        "hidden_dim": hidden_dim,
         "tensor": TensorCls(array).realize(),
         "start_pos": object_start_pos(sequence, token_count, flags),
     }
@@ -1047,7 +1055,6 @@ def ring_readable(cmd: dict[str, Any]) -> None:
         sequence=sequence,
         extent=extent,
         flags=flags,
-        payload=payload,
     )
     device_objects[handle] = materialized
     control(
@@ -1059,6 +1066,10 @@ def ring_readable(cmd: dict[str, Any]) -> None:
         extent=extent,
         handle_generation=WORKER_GENERATION,
         handle_id=handle,
+        kind=materialized.get("kind"),
+        token_count=materialized.get("token_count"),
+        hidden_dim=materialized.get("hidden_dim"),
+        start_pos=materialized.get("start_pos"),
     )
 
 
@@ -1103,34 +1114,39 @@ def execute_step(cmd: dict[str, Any]) -> None:
     if ring["direction"] != "egress":
         fatal("WrongRingDirection", ring_id=output_ring_id, direction=ring["direction"])
     final_stage = bool(cmd.get("final_stage"))
+    input_kind = obj.get("kind")
+    input_extent = int(obj.get("extent", 0))
     execution_backend = "pipeline_stage"
     if not isinstance(model, PipelineStageTinygradModel):
         execution_backend = "full_transformer"
         if not final_stage:
             fatal("FullTransformerNonFinalStageUnsupported", step_id=int(cmd["step_id"]))
-        if obj.get("kind") != "tokens":
-            fatal("FullTransformerInputUnsupported", step_id=int(cmd["step_id"]), kind=obj.get("kind"))
+        if input_kind != "tokens":
+            fatal("FullTransformerInputUnsupported", step_id=int(cmd["step_id"]), kind=input_kind)
         if int(obj.get("flags", 0)) & FLAG_BEGIN_SEQUENCE and hasattr(model, "forward_jit"):
             model.forward_jit.reset()
         token_array = model(obj["tensor"], int(obj.get("start_pos", 0))).realize().numpy().reshape(-1)
         token = int(token_array[0])
         payload = struct.pack("<I", token)
+        output_kind = "token"
         flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
     else:
         if final_stage != bool(getattr(model, "final_stage", False)):
             fatal("FinalStageMismatch", command_final_stage=final_stage, model_final_stage=bool(getattr(model, "final_stage", False)))
-        input_tensor = model.token_hidden(obj["tensor"]) if obj.get("kind") == "tokens" else obj["tensor"]
+        input_tensor = model.token_hidden(obj["tensor"]) if input_kind == "tokens" else obj["tensor"]
         hidden = model.forward_hidden(input_tensor, int(obj.get("start_pos", 0)))
         if final_stage:
             token_array = model.next_token(hidden).realize().numpy().reshape(-1)
             token = int(token_array[0])
             payload = struct.pack("<I", token)
+            output_kind = "token"
             flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
         else:
             import numpy as np
 
             activation = hidden.realize().numpy().astype(np.float16, copy=False)
             payload = activation.tobytes()
+            output_kind = "activation"
             flags = 0
     committed = write_record(
         ring,
@@ -1147,6 +1163,12 @@ def execute_step(cmd: dict[str, Any]) -> None:
         sequence=int(cmd["output_sequence"]),
         committed_bytes=committed,
         execution_backend=execution_backend,
+        final_stage=final_stage,
+        input_kind=input_kind,
+        input_extent=input_extent,
+        output_kind=output_kind,
+        payload_bytes=len(payload),
+        record_bytes=committed,
     )
 
 

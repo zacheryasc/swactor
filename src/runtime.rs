@@ -598,7 +598,6 @@ impl Runtime {
         self.stats_hook = Some(hook);
     }
 
-
     /// Set the sink for non-local (remote) message delivery.
     ///
     /// The sink owns all codec/transport concerns; core only knows how to hand
