@@ -592,6 +592,14 @@ impl WorkerEdgeRuntime {
                             edge_id: driver_model::EdgeId(edge_id),
                             stream_id: driver_model::StreamId(stream_id),
                         });
+                    emit_node_event(
+                        datastream,
+                        config,
+                        NODE_STAGE_CHANNEL,
+                        "iroh_edge_stream_arrived",
+                        "observed",
+                        json!({"edge_id":edge_id,"stream_id":stream_id}),
+                    );
                     self.drive_edge_workflow(
                         stack,
                         node_actor,
@@ -608,6 +616,15 @@ impl WorkerEdgeRuntime {
                     bytes,
                     ..
                 } => {
+                    let byte_count = bytes.len();
+                    emit_node_event(
+                        datastream,
+                        config,
+                        NODE_STAGE_CHANNEL,
+                        "iroh_edge_bytes_read",
+                        "observed",
+                        json!({"edge_id":edge_id,"stream_id":stream_id,"bytes":byte_count}),
+                    );
                     self.ingest_stream_bytes(
                         edge_id,
                         stream_id,
@@ -792,6 +809,22 @@ impl WorkerEdgeRuntime {
                 .read_arena(lease.layout.data_offset, committed_bytes)
                 .map_err(|e| format!("read egress ring: {e}"))?
         };
+        let record_bytes = record.len();
+        emit_node_event(
+            datastream,
+            config,
+            NODE_STAGE_CHANNEL,
+            "egress_ring_read",
+            "ready",
+            json!({
+                "edge_id":outbound.edge_id,
+                "edge_kind":format!("{:?}", outbound.kind),
+                "ring_id":output_ring_id,
+                "record_bytes":record_bytes,
+                "committed_bytes":committed_bytes,
+                "final_stage":final_stage,
+            }),
+        );
         self.driver_model
             .observe(driver_model::DriverEvent::EgressBytesCommitted {
                 edge_id: driver_model::EdgeId(outbound.edge_id),
@@ -806,6 +839,19 @@ impl WorkerEdgeRuntime {
             .as_ref()
             .ok_or_else(|| "outbound edge sender missing".to_owned())?;
         sender.send(record)?;
+        emit_node_event(
+            datastream,
+            config,
+            NODE_STAGE_CHANNEL,
+            "iroh_edge_bytes_sent",
+            "ready",
+            json!({
+                "edge_id":outbound.edge_id,
+                "edge_kind":format!("{:?}", outbound.kind),
+                "bytes":record_bytes,
+                "record_bytes":record_bytes,
+            }),
+        );
         stack
             .runtime
             .send_to(node_actor, NodeAgentMsg::StepCompleted { step_id })
@@ -867,6 +913,19 @@ impl WorkerEdgeRuntime {
                     .write_arena(lease.layout.data_offset, &record)
                     .map_err(|e| format!("write ingress ring: {e}"))?;
             }
+            emit_node_event(
+                datastream,
+                config,
+                NODE_STAGE_CHANNEL,
+                "ingress_ring_write",
+                "ready",
+                json!({
+                    "edge_id":edge_id,
+                    "edge_kind":format!("{:?}", inbound.kind),
+                    "ring_id":ring_id,
+                    "record_bytes":record.len(),
+                }),
+            );
             let loaded = worker.ring_readable(
                 ring_id,
                 edge_id,

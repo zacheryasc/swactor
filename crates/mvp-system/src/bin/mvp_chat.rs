@@ -331,6 +331,7 @@ struct Config {
     run_id: u64,
     vastai_yes: bool,
     vastai: Option<ResolvedVastAiConfig>,
+    model: ChatModelConfig,
     pipeline_stages: u32,
     max_tokens: u32,
     skip_rebuild: bool,
@@ -521,6 +522,7 @@ struct ChatTomlConfig {
     observability: ChatObservabilityConfig,
     image: ChatImageConfig,
     vastai: ChatVastAiConfig,
+    model: ChatModelConfig,
     relay: ChatRelayConfig,
 }
 
@@ -568,11 +570,24 @@ struct ChatVastAiConfig {
     min_gpu_ram_mb: Option<u64>,
     min_down_mbps: Option<f64>,
     min_up_mbps: Option<f64>,
+    max_dph_total: Option<f64>,
     min_reliability: Option<f64>,
     require_verified: Option<bool>,
     disk_gb: Option<u32>,
     onstart: Option<String>,
     ssh_identity: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ChatModelConfig {
+    id: Option<String>,
+    gguf_local_path: Option<String>,
+    gguf_repo: Option<String>,
+    gguf_file: Option<String>,
+    gguf_revision: Option<String>,
+    tokenizer_local_path: Option<String>,
+    max_context: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -687,6 +702,7 @@ impl Config {
             vastai_yes: args.vastai_yes,
             pipeline_stages,
             max_tokens,
+            model: toml.model,
             vastai,
             skip_rebuild: args.skip_rebuild,
             gpu_run,
@@ -714,6 +730,27 @@ impl Config {
             self.pipeline_stages.to_string(),
             "--no-dashboard".to_owned(),
         ];
+        if let Some(model_id) = &self.model.id {
+            args.extend(["--model-id".to_owned(), model_id.clone()]);
+        }
+        if let Some(path) = &self.model.gguf_local_path {
+            args.extend(["--gguf-local-path".to_owned(), path.clone()]);
+        }
+        if let Some(repo) = &self.model.gguf_repo {
+            args.extend(["--gguf-repo".to_owned(), repo.clone()]);
+        }
+        if let Some(file) = &self.model.gguf_file {
+            args.extend(["--gguf-file".to_owned(), file.clone()]);
+        }
+        if let Some(revision) = &self.model.gguf_revision {
+            args.extend(["--gguf-revision".to_owned(), revision.clone()]);
+        }
+        if let Some(path) = &self.model.tokenizer_local_path {
+            args.extend(["--tokenizer-local-path".to_owned(), path.clone()]);
+        }
+        if let Some(max_context) = self.model.max_context {
+            args.extend(["--max-context".to_owned(), max_context.to_string()]);
+        }
         if self.provider == ProviderKind::Process {
             args.extend([
                 "--worker-bin".to_owned(),
@@ -772,6 +809,12 @@ impl Config {
             }
             if let Some(min_up_mbps) = vastai.min_up_mbps {
                 args.extend(["--vastai-min-up-mbps".to_owned(), min_up_mbps.to_string()]);
+            }
+            if let Some(max_dph_total) = vastai.max_dph_total {
+                args.extend([
+                    "--vastai-max-dph-total".to_owned(),
+                    max_dph_total.to_string(),
+                ]);
             }
             if let Some(min_reliability) = vastai.min_reliability {
                 args.extend([
@@ -919,6 +962,7 @@ fn resolve_vastai_config(
         min_gpu_ram_mb: file.min_gpu_ram_mb,
         min_down_mbps: file.min_down_mbps,
         min_up_mbps: file.min_up_mbps,
+        max_dph_total: file.max_dph_total,
         min_reliability: file.min_reliability,
         require_verified: file.require_verified,
         onstart: first_non_empty([file.onstart.clone()]),
@@ -1362,6 +1406,23 @@ fn prepare_runtime_with_progress(
     }
 
     if config.skip_rebuild {
+        if config.provider == ProviderKind::VastAi {
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "ensure_worker_binary",
+                "skipped",
+                json!({"mode": binary_mode, "reason": "vastai_remote_image"}),
+            );
+            emit_chat_progress(
+                &mut progress,
+                CHAT_RUNTIME_CHANNEL,
+                "prepare_node_image",
+                "skipped",
+                json!({"provider": config.provider.as_str(), "reason": "skip_rebuild"}),
+            );
+            return Ok(config.node_image.clone());
+        }
         emit_chat_progress(
             &mut progress,
             CHAT_RUNTIME_CHANNEL,
@@ -2185,6 +2246,7 @@ mod tests {
             run_id: 1,
             vastai_yes: false,
             vastai: None,
+            model: ChatModelConfig::default(),
             pipeline_stages: 1,
             max_tokens: DEFAULT_MAX_TOKENS,
             skip_rebuild: true,
@@ -2206,6 +2268,7 @@ mod tests {
             min_gpu_ram_mb: None,
             min_down_mbps: None,
             min_up_mbps: None,
+            max_dph_total: None,
             min_reliability: None,
             require_verified: None,
             onstart: None,
@@ -2931,6 +2994,25 @@ relay_url = "https://relay.example"
         fs::write(&worker_bin, b"worker").expect("write worker artifact");
         let image_ref = prepare_runtime_with(&config, panic_prepare_node_image)
             .expect("skip rebuild uses existing artifacts");
+        assert_eq!(image_ref, "docker.io/acme/node:latest");
+    }
+
+    #[test]
+    fn vastai_skip_rebuild_uses_remote_image_without_worker_artifact() {
+        let temp = TempDir::new("vastai-skip-rebuild");
+        let orch_bin = temp.path().join("mvp-orchestrator");
+        let worker_bin = temp.path().join("mvp-worker-node");
+        let mut config = base_config(ProviderKind::VastAi);
+        config.skip_rebuild = true;
+        config.orch_bin = orch_bin.clone();
+        config.worker_bin = worker_bin;
+        config.node_image = "docker.io/acme/node:latest".to_owned();
+
+        assert!(prepare_runtime_with(&config, panic_prepare_node_image).is_err());
+
+        fs::write(&orch_bin, b"orch").expect("write orchestrator artifact");
+        let image_ref = prepare_runtime_with(&config, panic_prepare_node_image)
+            .expect("VastAI skip rebuild reuses remote image");
         assert_eq!(image_ref, "docker.io/acme/node:latest");
     }
 

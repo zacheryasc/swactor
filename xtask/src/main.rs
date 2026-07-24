@@ -22,6 +22,7 @@ const MVP_CHAT_CHECK_TIMEOUT_SECS: u64 = 900;
 const MVP_CHAT_CHECK_POLL_MS: u64 = 100;
 const MVP_CHAT_CHECK_TERM_GRACE_MS: u64 = 2_000;
 const MVP_CHAT_CHECK_PROMPTS: &[u8] = b"ping\nsecond prompt\n";
+const DATA_PATH_MIN_PAYLOAD_BYTES: u64 = 512;
 
 struct MvpChatCheckPaths {
     root: PathBuf,
@@ -105,6 +106,7 @@ impl MvpChatCheckScenario {
                 "--yes".to_owned(),
                 "--endpoint-addr-mask".to_owned(),
                 "relay-only".to_owned(),
+                "--skip-rebuild".to_owned(),
             ]);
         }
         args.extend([
@@ -1258,7 +1260,9 @@ fn assert_dump_log_facts(
         require_multinode_docker_network_facts(&facts)?;
     }
     if scenario == MvpChatCheckScenario::VastAi {
+        require_gpu_dump_log_facts(&facts)?;
         require_vastai_network_facts(&facts)?;
+        require_vastai_data_path_facts(&facts)?;
     }
     Ok(events)
 }
@@ -1613,6 +1617,21 @@ struct DumpLogFacts {
     gpu_pipeline_tokenizer_decode_ready: BTreeSet<u64>,
     gpu_pipeline_tokens_decoded: BTreeSet<u64>,
     gpu_pipeline_real_worker_step_seen: bool,
+    ring_installed_ingress: bool,
+    ring_installed_egress: bool,
+    ring_installed_ingress_edge_ids: BTreeSet<u64>,
+    ring_installed_egress_edge_ids: BTreeSet<u64>,
+    activation_object_loaded: bool,
+    activation_step_executed: bool,
+    activation_egress_ring_read: bool,
+    activation_ingress_ring_write: bool,
+    activation_iroh_edge_sent: bool,
+    activation_iroh_edge_read: bool,
+    activation_interstage_handoff: bool,
+    activation_edge_ids: BTreeSet<u64>,
+    iroh_read_edge_ids: BTreeSet<u64>,
+    max_activation_record_bytes: u64,
+    max_worker_command_bytes: u64,
     docker_node_spec_worker_count: Option<u64>,
     worker_iroh_ready: BTreeSet<u64>,
     docker_worker_coordinator_join: BTreeSet<u64>,
@@ -1640,6 +1659,7 @@ fn record_dump_log_event(
 ) -> Result<(), String> {
     record_vastai_provision_dump_log_event(channel, event, facts);
     record_gpu_dump_log_event(channel, event, facts);
+    record_data_path_dump_log_event(channel, event, facts);
     let event_type = event.get("type").and_then(Value::as_str);
     let phase = event.get("phase").and_then(Value::as_str);
     let status = event.get("status").and_then(Value::as_str);
@@ -1743,6 +1763,146 @@ fn record_vastai_provision_dump_log_event(channel: &str, event: &Value, facts: &
         && let Some(node_id) = provision.get("node_id").and_then(Value::as_u64)
     {
         facts.vastai_provision_start_nodes.insert(node_id);
+    }
+}
+
+fn record_data_path_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFacts) {
+    let event_type = event.get("type").and_then(Value::as_str);
+    let phase = event.get("phase").and_then(Value::as_str);
+    let status = event.get("status").and_then(Value::as_str);
+    match (channel, event_type) {
+        ("mvp.worker.ring", Some("RingInstalled")) => {
+            let edge_id = event.get("edge_id").and_then(Value::as_u64);
+            match event.get("direction").and_then(Value::as_str) {
+                Some("ingress") => {
+                    facts.ring_installed_ingress = true;
+                    if let Some(edge_id) = edge_id {
+                        facts.ring_installed_ingress_edge_ids.insert(edge_id);
+                    }
+                }
+                Some("egress") => {
+                    facts.ring_installed_egress = true;
+                    if let Some(edge_id) = edge_id {
+                        facts.ring_installed_egress_edge_ids.insert(edge_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        ("mvp.worker.ingress", Some("ObjectLoaded")) => {
+            let extent = event.get("extent").and_then(Value::as_u64).unwrap_or(0);
+            if event.get("kind").and_then(Value::as_str) == Some("activation")
+                || extent >= DATA_PATH_MIN_PAYLOAD_BYTES
+            {
+                facts.activation_object_loaded = true;
+                facts.max_activation_record_bytes = facts.max_activation_record_bytes.max(extent);
+                if let Some(edge_id) = event.get("edge_id").and_then(Value::as_u64) {
+                    record_activation_edge_id(facts, edge_id);
+                    record_interstage_activation_handoff(
+                        facts,
+                        edge_id,
+                        event.get("stage_index").and_then(Value::as_u64),
+                    );
+                }
+            }
+        }
+        ("mvp.worker.step", Some("StepExecuted")) => {
+            let payload_bytes = event
+                .get("payload_bytes")
+                .or_else(|| event.get("committed_bytes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let output_kind = event.get("output_kind").and_then(Value::as_str);
+            let legacy_activation_sized_pipeline_output = output_kind.is_none()
+                && event.get("execution_backend").and_then(Value::as_str) == Some("pipeline_stage")
+                && payload_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
+            if (output_kind == Some("activation") || legacy_activation_sized_pipeline_output)
+                && payload_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES
+            {
+                facts.activation_step_executed = true;
+                facts.max_activation_record_bytes =
+                    facts.max_activation_record_bytes.max(payload_bytes);
+            }
+        }
+        (_, Some("NodeEvent")) => match (phase, status) {
+            (Some("worker_command_write"), Some("ready")) => {
+                if detail_str(event, "command_type").is_some_and(|command| {
+                    matches!(command, "InstallRing" | "RingReadable" | "ExecuteStep")
+                }) && let Some(command_bytes) = detail_u64(event, "command_bytes")
+                {
+                    facts.max_worker_command_bytes =
+                        facts.max_worker_command_bytes.max(command_bytes);
+                }
+            }
+            (Some("egress_ring_read"), Some("ready")) => {
+                if detail_str(event, "edge_kind") == Some("Activation")
+                    && let Some(record_bytes) = detail_u64(event, "record_bytes")
+                    && record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES
+                {
+                    facts.activation_egress_ring_read = true;
+                    facts.max_activation_record_bytes =
+                        facts.max_activation_record_bytes.max(record_bytes);
+                    if let Some(edge_id) = detail_u64(event, "edge_id") {
+                        record_activation_edge_id(facts, edge_id);
+                    }
+                }
+            }
+            (Some("ingress_ring_write"), Some("ready")) => {
+                if detail_str(event, "edge_kind") == Some("Activation")
+                    && let Some(record_bytes) = detail_u64(event, "record_bytes")
+                    && record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES
+                {
+                    facts.activation_ingress_ring_write = true;
+                    facts.max_activation_record_bytes =
+                        facts.max_activation_record_bytes.max(record_bytes);
+                    if let Some(edge_id) = detail_u64(event, "edge_id") {
+                        record_activation_edge_id(facts, edge_id);
+                    }
+                }
+            }
+            (Some("iroh_edge_bytes_sent"), Some("ready")) => {
+                if detail_str(event, "edge_kind") == Some("Activation")
+                    && detail_u64(event, "bytes").is_some_and(|bytes| bytes > 0)
+                {
+                    facts.activation_iroh_edge_sent = true;
+                    if let Some(edge_id) = detail_u64(event, "edge_id") {
+                        record_activation_edge_id(facts, edge_id);
+                    }
+                }
+            }
+            (Some("iroh_edge_bytes_read"), Some("observed")) => {
+                if detail_u64(event, "bytes").is_some_and(|bytes| bytes > 0)
+                    && let Some(edge_id) = detail_u64(event, "edge_id")
+                {
+                    facts.iroh_read_edge_ids.insert(edge_id);
+                    if facts.activation_edge_ids.contains(&edge_id) {
+                        facts.activation_iroh_edge_read = true;
+                    }
+                }
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn record_activation_edge_id(facts: &mut DumpLogFacts, edge_id: u64) {
+    facts.activation_edge_ids.insert(edge_id);
+    if facts.iroh_read_edge_ids.contains(&edge_id) {
+        facts.activation_iroh_edge_read = true;
+    }
+}
+
+fn record_interstage_activation_handoff(
+    facts: &mut DumpLogFacts,
+    edge_id: u64,
+    stage_index: Option<u64>,
+) {
+    if stage_index.is_some_and(|stage_index| stage_index > 0)
+        && facts.ring_installed_ingress_edge_ids.contains(&edge_id)
+        && facts.ring_installed_egress_edge_ids.contains(&edge_id)
+    {
+        facts.activation_interstage_handoff = true;
     }
 }
 
@@ -1939,8 +2099,8 @@ fn require_vastai_network_facts(facts: &DumpLogFacts) -> Result<(), String> {
     require_dump_log_fact(
         facts
             .vastai_node_spec_worker_count
-            .is_some_and(|count| count >= 1),
-        "VastAI node_spec with workers",
+            .is_some_and(|count| count >= 2),
+        "VastAI node_spec with multiple workers",
     )?;
     require_dump_log_fact(
         !facts.vastai_provision_start_nodes.is_empty(),
@@ -1951,8 +2111,40 @@ fn require_vastai_network_facts(facts: &DumpLogFacts) -> Result<(), String> {
         "VastAI provider_start",
     )?;
     require_dump_log_fact(
-        !facts.worker_iroh_ready.is_empty(),
-        "VastAI worker iroh_driver ready",
+        facts.worker_iroh_ready.len() >= 2,
+        "VastAI worker iroh_driver ready for multiple nodes",
+    )
+}
+
+fn require_vastai_data_path_facts(facts: &DumpLogFacts) -> Result<(), String> {
+    require_dump_log_fact(
+        facts.ring_installed_ingress,
+        "worker ingress ring installed",
+    )?;
+    require_dump_log_fact(facts.ring_installed_egress, "worker egress ring installed")?;
+    require_dump_log_fact(
+        facts.activation_object_loaded,
+        "activation object loaded from ingress ring",
+    )?;
+    require_dump_log_fact(
+        facts.activation_step_executed,
+        "activation-producing worker step executed",
+    )?;
+    let explicit_transport = facts.activation_egress_ring_read
+        && facts.activation_iroh_edge_sent
+        && facts.activation_iroh_edge_read
+        && facts.activation_ingress_ring_write;
+    require_dump_log_fact(
+        explicit_transport || facts.activation_interstage_handoff,
+        "activation inter-stage transport evidence",
+    )?;
+    let payload_outsizes_observed_command = facts.max_worker_command_bytes > 0
+        && facts.max_activation_record_bytes > facts.max_worker_command_bytes;
+    let activation_sized_interstage_handoff = facts.activation_interstage_handoff
+        && facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
+    require_dump_log_fact(
+        payload_outsizes_observed_command || activation_sized_interstage_handoff,
+        "activation payload not carried as worker JSON command",
     )
 }
 
@@ -2134,6 +2326,7 @@ mod tests {
                 "--yes",
                 "--endpoint-addr-mask",
                 "relay-only",
+                "--skip-rebuild",
                 "--run-id",
                 "42",
                 "--dump-logs=/tmp/mvp-chat-check.ndjson",
@@ -2939,12 +3132,12 @@ mod tests {
 
     #[test]
     fn benchmark_observability_vastai_dump_facts_require_remote_provider_events() {
-        let mut events = dump_log_fact_events(false, false);
+        let mut events = dump_log_fact_events(true, false);
         events.extend([
             (
                 "mvp.orch.bootstrap",
                 stamped(
-                    json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","provider":"vastai","worker_count":1}}),
+                    json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","provider":"vastai","worker_count":2}}),
                     "mvp-orchestrator",
                     1_071,
                     71,
@@ -2961,6 +3154,51 @@ mod tests {
                     "mvp-orchestrator",
                     1_073,
                     73,
+                ),
+            ),
+            (
+                "mvp.node.bootstrap",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"relay-only","has_relay":true,"direct_addr_count":0}}),
+                    "mvp-worker-node",
+                    1_074,
+                    74,
+                ),
+            ),
+            (
+                "mvp.worker.ring",
+                stamped(
+                    json!({"type":"RingInstalled","run_id":9,"node_id":2,"stage_index":0,"ring_id":1,"direction":"egress","edge_id":77,"kind":"activation","max_extent":4096}),
+                    "tinygrad-worker",
+                    1_075,
+                    75,
+                ),
+            ),
+            (
+                "mvp.worker.ring",
+                stamped(
+                    json!({"type":"RingInstalled","run_id":9,"node_id":3,"stage_index":1,"ring_id":2,"direction":"ingress","edge_id":77,"kind":"activation","max_extent":4096}),
+                    "tinygrad-worker",
+                    1_076,
+                    76,
+                ),
+            ),
+            (
+                "mvp.worker.step",
+                stamped(
+                    json!({"type":"StepExecuted","run_id":9,"node_id":2,"stage_index":0,"execution_backend":"pipeline_stage","committed_bytes":4096}),
+                    "tinygrad-worker",
+                    1_078,
+                    78,
+                ),
+            ),
+            (
+                "mvp.worker.ingress",
+                stamped(
+                    json!({"type":"ObjectLoaded","run_id":9,"node_id":3,"stage_index":1,"edge_id":77,"kind":"activation","extent":4056}),
+                    "tinygrad-worker",
+                    1_083,
+                    83,
                 ),
             ),
         ]);

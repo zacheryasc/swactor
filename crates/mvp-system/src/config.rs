@@ -106,6 +106,7 @@ pub struct VastAiConfig {
     pub min_gpu_ram_mb: Option<u64>,
     pub min_down_mbps: Option<f64>,
     pub min_up_mbps: Option<f64>,
+    pub max_dph_total: Option<f64>,
     pub min_reliability: Option<f64>,
     pub require_verified: Option<bool>,
     pub poll_interval_secs: Option<u64>,
@@ -130,6 +131,7 @@ pub struct ResolvedVastAiConfig {
     pub min_gpu_ram_mb: Option<u64>,
     pub min_down_mbps: Option<f64>,
     pub min_up_mbps: Option<f64>,
+    pub max_dph_total: Option<f64>,
     pub min_reliability: Option<f64>,
     pub require_verified: Option<bool>,
     pub onstart: Option<String>,
@@ -204,6 +206,9 @@ impl ResolvedVastAiConfig {
         if let Some(min_up_mbps) = self.min_up_mbps {
             policy.min_up_mbps = Some(min_up_mbps);
         }
+        if let Some(max_dph_total) = self.max_dph_total {
+            policy.max_dph_total = Some(max_dph_total);
+        }
         if let Some(min_reliability) = self.min_reliability {
             policy.min_reliability = min_reliability;
         }
@@ -259,6 +264,7 @@ mod tests {
             min_gpu_ram_mb: Some(16_000),
             min_down_mbps: Some(100.0),
             min_up_mbps: Some(25.0),
+            max_dph_total: Some(0.10),
             min_reliability: Some(0.98),
             require_verified: Some(true),
             onstart: None,
@@ -326,6 +332,7 @@ gpu_name = "RTX 4090"
 min_gpu_ram_mb = 24000
 min_down_mbps = 250.5
 min_up_mbps = 50.25
+max_dph_total = 0.10
 min_reliability = 0.99
 require_verified = true
 onstart = "echo preparing"
@@ -402,6 +409,7 @@ poll_interval_secs = 30
         assert_eq!(config.vastai.min_gpu_ram_mb, Some(24_000));
         assert_eq!(config.vastai.min_down_mbps, Some(250.5));
         assert_eq!(config.vastai.min_up_mbps, Some(50.25));
+        assert_eq!(config.vastai.max_dph_total, Some(0.10));
         assert_eq!(config.vastai.min_reliability, Some(0.99));
         assert_eq!(config.vastai.require_verified, Some(true));
         assert_eq!(config.vastai.poll_interval_secs, Some(30));
