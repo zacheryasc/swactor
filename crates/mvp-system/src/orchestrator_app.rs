@@ -1182,8 +1182,9 @@ impl ConfigBuilder {
         if let Some(mask) = env_optional(MVP_IROH_ENDPOINT_ADDR_MASK_ENV) {
             self.endpoint_addr_mask = Some(mask);
         }
-        if let Some(api_key) =
-            env_optional("MVP_VASTAI_API_KEY").or_else(|| env_optional("VASTAI_API_KEY"))
+        if let Some(api_key) = env_optional("VAST_API_KEY")
+            .or_else(|| env_optional("MVP_VASTAI_API_KEY"))
+            .or_else(|| env_optional("VASTAI_API_KEY"))
         {
             self.vastai_api_key = Some(api_key);
         }
@@ -1663,7 +1664,7 @@ impl Config {
             .as_ref()
             .and_then(|vastai| vastai.api_key.as_deref())
             .ok_or_else(|| {
-                "MVP_VASTAI_API_KEY or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
+                "VAST_API_KEY, MVP_VASTAI_API_KEY, or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
                     .to_owned()
             })?
             .to_owned();
@@ -1726,7 +1727,7 @@ impl Config {
                     );
                 }
                 let api_key = vastai.api_key.clone().ok_or_else(|| {
-                    "MVP_VASTAI_API_KEY or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
+                    "VAST_API_KEY, MVP_VASTAI_API_KEY, or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
                         .to_owned()
                 })?;
                 let ssh_identity = vastai

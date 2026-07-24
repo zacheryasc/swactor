@@ -910,7 +910,7 @@ fn resolve_vastai_config(
     node_image: &str,
 ) -> Result<ResolvedVastAiConfig, String> {
     ResolvedVastAiConfig {
-        api_key: first_non_empty([env_optional("VASTAI_API_KEY")]).unwrap_or_default(),
+        api_key: first_non_empty([env_optional("VAST_API_KEY")]).unwrap_or_default(),
         relay_url: first_non_empty([file.relay_url.clone()]).unwrap_or_default(),
         image: node_image.to_owned(),
         bootstrap_command: first_non_empty([file.bootstrap_command.clone()]).unwrap_or_default(),
@@ -2072,7 +2072,7 @@ mod tests {
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
     const PROCESS_ENV_KEYS: &[&str] = &[
-        "VASTAI_API_KEY",
+        "VAST_API_KEY",
         "MVP_PIPELINE_STAGES",
         "MVP_RUNTIME_CONFIG",
         "MVP_CHAT_GPU_RUN",
@@ -2639,7 +2639,7 @@ bootstrap_command = "boot"
 "#,
         );
         with_process_state(
-            &[("VASTAI_API_KEY", Some("secret"))],
+            &[("VAST_API_KEY", Some("secret"))],
             Some(missing_relay.path()),
             || {
                 let config_arg = missing_relay_config.to_string_lossy().into_owned();
@@ -2664,7 +2664,7 @@ bootstrap_command = "boot"
 "#,
         );
         with_process_state(
-            &[("VASTAI_API_KEY", Some("secret"))],
+            &[("VAST_API_KEY", Some("secret"))],
             Some(local_image.path()),
             || {
                 let config_arg = local_image_config.to_string_lossy().into_owned();
@@ -2689,7 +2689,7 @@ bootstrap_command = "boot"
 "#,
         );
         with_process_state(
-            &[("VASTAI_API_KEY", Some("secret"))],
+            &[("VAST_API_KEY", Some("secret"))],
             Some(valid.path()),
             || {
                 let config_arg = valid_config.to_string_lossy().into_owned();

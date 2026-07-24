@@ -43,6 +43,7 @@ enum MvpChatCheckScenario {
     Gpu,
     Multinode,
     MultinodeDocker,
+    VastAi,
 }
 
 impl MvpChatCheckScenario {
@@ -53,11 +54,12 @@ impl MvpChatCheckScenario {
                 "--gpu" => Self::Gpu,
                 "--multinode" => Self::Multinode,
                 "--multinode-docker" => Self::MultinodeDocker,
+                "--vastai" => Self::VastAi,
                 other => return Err(format!("unsupported mvp-chat-check argument {other:?}")),
             };
             if scenario != Self::ProcessBaseline {
                 return Err(
-                    "mvp-chat-check accepts at most one scenario flag: --gpu, --multinode, or --multinode-docker"
+                    "mvp-chat-check accepts at most one scenario flag: --gpu, --multinode, --multinode-docker, or --vastai"
                         .to_owned(),
                 );
             }
@@ -72,6 +74,7 @@ impl MvpChatCheckScenario {
             Self::Gpu => "gpu",
             Self::Multinode => "multinode",
             Self::MultinodeDocker => "multinode-docker",
+            Self::VastAi => "vastai",
         }
     }
 
@@ -87,12 +90,22 @@ impl MvpChatCheckScenario {
             Self::MultinodeDocker => {
                 args.push("--docker".to_owned());
             }
+            Self::VastAi => {
+                args.push("--vastai".to_owned());
+            }
         }
         if matches!(self, Self::Multinode | Self::MultinodeDocker) {
             args.extend(["--pipeline-stages".to_owned(), "2".to_owned()]);
         }
-        if !matches!(self, Self::Gpu) {
+        if !matches!(self, Self::Gpu | Self::VastAi) {
             args.push("--cached-model".to_owned());
+        }
+        if matches!(self, Self::VastAi) {
+            args.extend([
+                "--yes".to_owned(),
+                "--endpoint-addr-mask".to_owned(),
+                "relay-only".to_owned(),
+            ]);
         }
         args.extend([
             "--run-id".to_owned(),
@@ -104,7 +117,11 @@ impl MvpChatCheckScenario {
 
     fn env_overrides(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::ProcessBaseline | Self::Gpu | Self::Multinode | Self::MultinodeDocker => &[],
+            Self::ProcessBaseline
+            | Self::Gpu
+            | Self::Multinode
+            | Self::MultinodeDocker
+            | Self::VastAi => &[],
         }
     }
 }
@@ -165,7 +182,7 @@ USAGE: cargo xtask <command>
 
 COMMANDS:
   mvp-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
-  mvp-chat-check [--gpu|--multinode|--multinode-docker]
+  mvp-chat-check [--gpu|--multinode|--multinode-docker|--vastai]
                      Run real cargo mvp-chat acceptance check for one explicit scenario.
   test                Run the basic non-binding test barrier: root crate plus each
                       non-binding repository package with `cargo test -p`."
@@ -1240,6 +1257,9 @@ fn assert_dump_log_facts(
     if scenario == MvpChatCheckScenario::MultinodeDocker {
         require_multinode_docker_network_facts(&facts)?;
     }
+    if scenario == MvpChatCheckScenario::VastAi {
+        require_vastai_network_facts(&facts)?;
+    }
     Ok(events)
 }
 
@@ -1289,7 +1309,10 @@ fn build_benchmark_report(
             "ready",
         )?;
     }
-    if scenario != MvpChatCheckScenario::MultinodeDocker {
+    if !matches!(
+        scenario,
+        MvpChatCheckScenario::MultinodeDocker | MvpChatCheckScenario::VastAi
+    ) {
         facts.require_span(
             "mvp.chat.runtime",
             "ChatProgress",
@@ -1591,8 +1614,11 @@ struct DumpLogFacts {
     gpu_pipeline_tokens_decoded: BTreeSet<u64>,
     gpu_pipeline_real_worker_step_seen: bool,
     docker_node_spec_worker_count: Option<u64>,
-    docker_worker_iroh_ready: BTreeSet<u64>,
+    worker_iroh_ready: BTreeSet<u64>,
     docker_worker_coordinator_join: BTreeSet<u64>,
+    vastai_node_spec_worker_count: Option<u64>,
+    vastai_provision_start_nodes: BTreeSet<u64>,
+    vastai_provider_start_nodes: BTreeSet<u64>,
     chat_config_ready: bool,
     prepare_runtime_ready: bool,
     prompt_rpc_ready: bool,
@@ -1607,12 +1633,12 @@ struct DumpLogFacts {
     shutdown_requested: bool,
     orchestrator_stopped: bool,
 }
-
 fn record_dump_log_event(
     channel: &str,
     event: &Value,
     facts: &mut DumpLogFacts,
 ) -> Result<(), String> {
+    record_vastai_provision_dump_log_event(channel, event, facts);
     record_gpu_dump_log_event(channel, event, facts);
     let event_type = event.get("type").and_then(Value::as_str);
     let phase = event.get("phase").and_then(Value::as_str);
@@ -1642,12 +1668,18 @@ fn record_dump_log_event(
         (_, Some("NodeEvent"), Some("iroh_driver"), Some("ready")) => {
             facts.node_iroh_driver_ready = true;
             if let Some(node_id) = event_node_id(event) {
-                facts.docker_worker_iroh_ready.insert(node_id);
+                facts.worker_iroh_ready.insert(node_id);
             }
         }
         (_, Some("OrchBootstrap"), Some("node_spec"), Some("ready")) => {
-            if detail_str(event, "provider") == Some("docker") {
-                facts.docker_node_spec_worker_count = detail_u64(event, "worker_count");
+            match detail_str(event, "provider") {
+                Some("docker") => {
+                    facts.docker_node_spec_worker_count = detail_u64(event, "worker_count")
+                }
+                Some("vastai") => {
+                    facts.vastai_node_spec_worker_count = detail_u64(event, "worker_count")
+                }
+                _ => {}
             }
         }
         (_, Some("NodeEvent"), Some("coordinator_join"), Some("started")) => {
@@ -1655,6 +1687,13 @@ fn record_dump_log_event(
                 && let Some(node_id) = event_node_id(event)
             {
                 facts.docker_worker_coordinator_join.insert(node_id);
+            }
+        }
+        (_, Some("OrchBootstrap"), Some("provider_start"), Some("started")) => {
+            if detail_str(event, "provider") == Some("vastai")
+                && let Some(node_id) = detail_u64(event, "node_id")
+            {
+                facts.vastai_provider_start_nodes.insert(node_id);
             }
         }
         (_, Some("NodeEvent"), Some("worker_initialize"), Some("ready")) => {
@@ -1691,6 +1730,20 @@ fn record_dump_log_event(
         _ => {}
     }
     Ok(())
+}
+fn record_vastai_provision_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFacts) {
+    if channel != "mvp.provisioning.events" {
+        return;
+    }
+    let Some(provision) = event.get("event") else {
+        return;
+    };
+    if provision.get("kind").and_then(Value::as_str) == Some("ProvisionStart")
+        && provision.get("provider").and_then(Value::as_str) == Some("vastai")
+        && let Some(node_id) = provision.get("node_id").and_then(Value::as_u64)
+    {
+        facts.vastai_provision_start_nodes.insert(node_id);
+    }
 }
 
 fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFacts) {
@@ -1873,12 +1926,33 @@ fn require_multinode_docker_network_facts(facts: &DumpLogFacts) -> Result<(), St
         "Docker node_spec with multiple workers",
     )?;
     require_dump_log_fact(
-        facts.docker_worker_iroh_ready.len() >= 2,
+        facts.worker_iroh_ready.len() >= 2,
         "Docker worker iroh_driver ready for multiple nodes",
     )?;
     require_dump_log_fact(
         facts.docker_worker_coordinator_join.len() >= 2,
         "Docker worker direct coordinator_join for multiple nodes",
+    )
+}
+
+fn require_vastai_network_facts(facts: &DumpLogFacts) -> Result<(), String> {
+    require_dump_log_fact(
+        facts
+            .vastai_node_spec_worker_count
+            .is_some_and(|count| count >= 1),
+        "VastAI node_spec with workers",
+    )?;
+    require_dump_log_fact(
+        !facts.vastai_provision_start_nodes.is_empty(),
+        "VastAI ProvisionStart",
+    )?;
+    require_dump_log_fact(
+        !facts.vastai_provider_start_nodes.is_empty(),
+        "VastAI provider_start",
+    )?;
+    require_dump_log_fact(
+        !facts.worker_iroh_ready.is_empty(),
+        "VastAI worker iroh_driver ready",
     )
 }
 
@@ -2044,6 +2118,22 @@ mod tests {
                 "--pipeline-stages",
                 "2",
                 "--cached-model",
+                "--run-id",
+                "42",
+                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+            ])
+        );
+
+        let vastai =
+            MvpChatCheckScenario::parse_args(strings(&["--vastai"])).expect("vastai parses");
+        assert_eq!(vastai, MvpChatCheckScenario::VastAi);
+        assert_eq!(
+            vastai.mvp_chat_args(42, dump_log),
+            strings(&[
+                "--vastai",
+                "--yes",
+                "--endpoint-addr-mask",
+                "relay-only",
                 "--run-id",
                 "42",
                 "--dump-logs=/tmp/mvp-chat-check.ndjson",
@@ -2848,17 +2938,50 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_observability_vastai_dump_facts_require_remote_provider_events() {
+        let mut events = dump_log_fact_events(false, false);
+        events.extend([
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","provider":"vastai","worker_count":1}}),
+                    "mvp-orchestrator",
+                    1_071,
+                    71,
+                ),
+            ),
+            (
+                "mvp.provisioning.events",
+                json!({"event":{"run_id":9,"node_id":3,"kind":"ProvisionStart","provider":"vastai","message":"starting vastai image registry.example/mvp-node:latest"}}),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":3,"stage_index":0}}),
+                    "mvp-orchestrator",
+                    1_073,
+                    73,
+                ),
+            ),
+        ]);
+        let path = write_synthetic_event_dump("vastai-remote-provider", events);
+        assert_dump_log_facts(&path, MvpChatCheckScenario::VastAi)
+            .expect("VastAI remote provider facts pass");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn benchmark_observability_multinode_docker_requires_direct_network_workers() {
         let mut valid = DumpLogFacts {
             docker_node_spec_worker_count: Some(2),
             ..DumpLogFacts::default()
         };
-        valid.docker_worker_iroh_ready.extend([2, 3]);
+        valid.worker_iroh_ready.extend([2, 3]);
         valid.docker_worker_coordinator_join.extend([2, 3]);
         require_multinode_docker_network_facts(&valid).expect("direct-network Docker facts pass");
 
         let mut missing_worker = valid;
-        missing_worker.docker_worker_iroh_ready.remove(&3);
+        missing_worker.worker_iroh_ready.remove(&3);
         let error = require_multinode_docker_network_facts(&missing_worker)
             .expect_err("single direct-network worker should fail");
         assert!(
