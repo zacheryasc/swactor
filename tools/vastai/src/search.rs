@@ -47,6 +47,9 @@ pub async fn select_offer_pool_with_policy(
     if let Some(min_ram) = policy.min_gpu_ram_mb {
         query["gpu_ram"] = serde_json::json!({"gte": min_ram});
     }
+    if let Some(min_compute_cap) = policy.min_compute_cap {
+        query["compute_cap"] = serde_json::json!({"gte": min_compute_cap});
+    }
     if let Some(max_dph_total) = policy.max_dph_total {
         query["dph_total"] = serde_json::json!({"lte": max_dph_total});
     }

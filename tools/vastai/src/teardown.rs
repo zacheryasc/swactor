@@ -9,7 +9,10 @@ pub async fn destroy_instance(
     api_key: &str,
     contract_id: u64,
 ) -> Result<(), String> {
-    let url = format!("{base_url}/api/v0/instances/{contract_id}/");
+    let url = format!(
+        "{base_url}/api/v0/instances/{contract_id}/?api_key={}",
+        urlencoding::encode(api_key)
+    );
     let resp = client
         .delete(&url)
         .header("Authorization", format!("Bearer {api_key}"))

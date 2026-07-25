@@ -1061,6 +1061,7 @@ def ring_readable(cmd: dict[str, Any]) -> None:
     materialized = materialize_object(payload, sequence, flags)
     materialized.update(
         object_id=object_id,
+        edge_id=ring["edge_id"],
         sequence=sequence,
         extent=extent,
         flags=flags,
@@ -1127,6 +1128,11 @@ def execute_step(cmd: dict[str, Any]) -> None:
     final_stage = bool(cmd.get("final_stage"))
     input_kind = obj.get("kind")
     input_extent = int(obj.get("extent", 0))
+    validation_ready = time.monotonic()
+    input_prepare_ms = 0
+    forward_ms = 0
+    realize_ms = 0
+    payload_pack_ms = 0
     execution_backend = "pipeline_stage"
     if not isinstance(model, PipelineStageTinygradModel):
         execution_backend = "full_transformer"
@@ -1136,29 +1142,50 @@ def execute_step(cmd: dict[str, Any]) -> None:
             fatal("FullTransformerInputUnsupported", step_id=int(cmd["step_id"]), kind=input_kind)
         if int(obj.get("flags", 0)) & FLAG_BEGIN_SEQUENCE and hasattr(model, "forward_jit"):
             model.forward_jit.reset()
+        forward_started = time.monotonic()
         token_array = model(obj["tensor"], int(obj.get("start_pos", 0))).realize().numpy().reshape(-1)
+        forward_ready = time.monotonic()
+        forward_ms = int((forward_ready - forward_started) * 1000)
         token = int(token_array[0])
+        payload_started = time.monotonic()
         payload = struct.pack("<I", token)
         output_kind = "token"
         flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
+        payload_pack_ms = int((time.monotonic() - payload_started) * 1000)
     else:
         if final_stage != bool(getattr(model, "final_stage", False)):
             fatal("FinalStageMismatch", command_final_stage=final_stage, model_final_stage=bool(getattr(model, "final_stage", False)))
+        input_started = time.monotonic()
         input_tensor = model.token_hidden(obj["tensor"]) if input_kind == "tokens" else obj["tensor"]
+        input_ready = time.monotonic()
+        input_prepare_ms = int((input_ready - input_started) * 1000)
+        forward_started = time.monotonic()
         hidden = model.forward_hidden(input_tensor, int(obj.get("start_pos", 0)))
+        forward_ready = time.monotonic()
+        forward_ms = int((forward_ready - forward_started) * 1000)
         if final_stage:
+            realize_started = time.monotonic()
             token_array = model.next_token(hidden).realize().numpy().reshape(-1)
+            realize_ready = time.monotonic()
+            realize_ms = int((realize_ready - realize_started) * 1000)
             token = int(token_array[0])
+            payload_started = time.monotonic()
             payload = struct.pack("<I", token)
             output_kind = "token"
             flags = 1 if token == int(loaded.get("eos_token_id", 0)) else 0
+            payload_pack_ms = int((time.monotonic() - payload_started) * 1000)
         else:
             import numpy as np
 
+            realize_started = time.monotonic()
             activation = hidden.realize().numpy().astype(np.float16, copy=False)
+            realize_ready = time.monotonic()
+            realize_ms = int((realize_ready - realize_started) * 1000)
+            payload_started = time.monotonic()
             payload = activation.tobytes()
             output_kind = "activation"
             flags = 0
+            payload_pack_ms = int((time.monotonic() - payload_started) * 1000)
     compute_ready = time.monotonic()
     committed = write_record(
         ring,
@@ -1172,6 +1199,8 @@ def execute_step(cmd: dict[str, Any]) -> None:
         type="StepExecuted",
         step_id=int(cmd["step_id"]),
         ring_id=output_ring_id,
+        role_id=int(cmd["role_id"]),
+        stage_index=max(0, int(cmd["role_id"]) - 1),
         object_id=int(cmd["output_object_id"]),
         sequence=int(cmd["output_sequence"]),
         committed_bytes=committed,
@@ -1182,6 +1211,15 @@ def execute_step(cmd: dict[str, Any]) -> None:
         output_kind=output_kind,
         payload_bytes=len(payload),
         record_bytes=committed,
+        input_handle_id=handle,
+        input_object_id=int(cmd["input_object_id"]),
+        input_sequence=int(cmd["input_sequence"]),
+        input_edge_id=obj.get("edge_id"),
+        input_prepare_ms=input_prepare_ms,
+        model_forward_ms=forward_ms,
+        output_realize_ms=realize_ms,
+        payload_pack_ms=payload_pack_ms,
+        validation_ms=int((validation_ready - step_started) * 1000),
         stage_execution_ms=int((compute_ready - step_started) * 1000),
         record_write_ms=int((write_ready - compute_ready) * 1000),
         elapsed_ms=int((write_ready - step_started) * 1000),

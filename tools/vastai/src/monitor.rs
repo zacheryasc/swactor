@@ -92,6 +92,12 @@ pub async fn wait_for_running_with_policy(
                 msg.unwrap_or_default()
             ));
         }
+        if !policy.state_timeout.is_zero() && state_since.elapsed() >= policy.state_timeout {
+            return Err(format!(
+                "instance {contract_id} stuck in status {actual} for {}s",
+                policy.state_timeout.as_secs()
+            ));
+        }
 
         match actual {
             "running" => {
@@ -110,5 +116,53 @@ pub async fn wait_for_running_with_policy(
                 tokio::time::sleep(policy.poll_interval).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn stuck_loading_state_returns_error_instead_of_polling_forever() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/123/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "instances": {
+                    "actual_status": "loading",
+                    "intended_status": "running",
+                    "status_msg": "afad30e59d72: Already exists"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let policy = LifecyclePolicy {
+            poll_interval: Duration::from_millis(1),
+            state_timeout: Duration::from_millis(5),
+            ..LifecyclePolicy::default()
+        };
+
+        let error = wait_for_running_with_policy(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "secret",
+            123,
+            &policy,
+        )
+        .await
+        .expect_err("stuck loading should be replaceable");
+
+        assert!(
+            error.contains("stuck in status loading"),
+            "error should name stuck provider state: {error}"
+        );
     }
 }

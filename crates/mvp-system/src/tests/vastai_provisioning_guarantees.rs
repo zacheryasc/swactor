@@ -36,6 +36,7 @@ struct FakeLeaseClient {
     destroyed: Vec<u64>,
     destroy_result: Option<Result<(), String>>,
     next_contract_id: u64,
+    host_ids: VecDeque<Option<u64>>,
 }
 
 impl FakeLeaseClient {
@@ -50,11 +51,12 @@ impl VastAiLeaseClient for FakeLeaseClient {
         self.requests.push(request);
         let contract_id = self.next_contract_id;
         self.next_contract_id = self.next_contract_id.wrapping_add(1).max(1);
+        let host_id = self.host_ids.pop_front().unwrap_or(Some(77));
         Ok(ProvisionedInstance {
             index: 0,
             contract_id,
             offer_id: 55,
-            host_id: Some(77),
+            host_id,
             gpu_name: "RTX 4090".to_owned(),
             gpu_ram: Some(24_000.0),
             dph_total: 0.42,
@@ -239,6 +241,38 @@ fn vastai_plugin_omits_ssh_public_key_when_unconfigured() {
 }
 
 #[test]
+fn pipeline_starts_blacklist_hosts_already_leased_in_run() {
+    let mut client = FakeLeaseClient::default().with_contract(100);
+    client.host_ids.extend([Some(77), Some(88)]);
+    let mut plugin = VastAiProvisioningPlugin::new(client, FakeBootstrap::default(), config());
+    let first = spec();
+    let mut second = spec();
+    second.node_id = 12;
+    second.stage_index = Some(3);
+
+    let first_handle = plugin.start_node(first, sink()).unwrap();
+    let second_handle = plugin.start_node(second, sink()).unwrap();
+
+    let requests = &plugin.client().requests;
+    assert_eq!(requests.len(), 2);
+    assert!(
+        !requests[0].selection.blacklist_hosts.contains(&77),
+        "first node should not preemptively blacklist the host it has not leased"
+    );
+    assert!(
+        requests[1].selection.blacklist_hosts.contains(&77),
+        "second node should avoid the first node's Vast.ai host"
+    );
+    assert!(
+        requests[1].selection.blacklist_hosts.contains(&59017),
+        "existing operator blacklist must be preserved"
+    );
+
+    plugin.stop_node(&second_handle).unwrap();
+    plugin.stop_node(&first_handle).unwrap();
+}
+
+#[test]
 fn stop_destroys_known_vastai_contract_exactly_once() {
     let mut plugin = VastAiProvisioningPlugin::new(
         FakeLeaseClient::default().with_contract(100),
@@ -259,7 +293,7 @@ fn stop_destroys_known_vastai_contract_exactly_once() {
 }
 
 #[test]
-fn vastai_complete_bootstrap_stops_bootstrap_without_destroying_contract() {
+fn vastai_complete_bootstrap_keeps_log_tail_until_node_stop() {
     let mut plugin = VastAiProvisioningPlugin::new(
         FakeLeaseClient::default().with_contract(100),
         FakeBootstrap::default(),
@@ -269,9 +303,9 @@ fn vastai_complete_bootstrap_stops_bootstrap_without_destroying_contract() {
 
     plugin.complete_bootstrap(&handle).unwrap();
 
-    assert_eq!(
-        plugin.bootstrap().stops,
-        vec![(1, BootstrapStopReason::RuntimeReady)]
+    assert!(
+        plugin.bootstrap().stops.is_empty(),
+        "runtime-ready completion should keep the SSH log tail alive"
     );
     assert_eq!(plugin.client().destroyed, Vec::<u64>::new());
     assert_eq!(plugin.active_contract_count(), 1);
@@ -281,7 +315,7 @@ fn vastai_complete_bootstrap_stops_bootstrap_without_destroying_contract() {
     assert_eq!(plugin.client().destroyed, vec![100]);
     assert_eq!(
         plugin.bootstrap().stops,
-        vec![(1, BootstrapStopReason::RuntimeReady)]
+        vec![(1, BootstrapStopReason::NodeStop)]
     );
     assert_eq!(plugin.active_contract_count(), 0);
 }

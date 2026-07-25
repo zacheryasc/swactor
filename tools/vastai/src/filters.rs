@@ -14,6 +14,11 @@ pub(crate) fn reachable_offers(offers: Vec<Offer>, policy: &SelectionPolicy) -> 
         .filter(|o| o.host_id.map_or(true, |h| !blacklist.contains(&h)))
         .filter(|o| o.verification.as_deref() != Some("deverified"))
         .filter(|o| policy.max_dph_total.is_none_or(|max| o.dph_total <= max))
+        .filter(|o| {
+            policy
+                .min_compute_cap
+                .is_none_or(|min_compute_cap| o.compute_cap >= min_compute_cap)
+        })
         .collect()
 }
 
@@ -27,6 +32,7 @@ mod tests {
             gpu_name: "Tesla T4".to_owned(),
             dph_total,
             gpu_ram: Some(16_000.0),
+            compute_cap: 750,
             geolocation: Some("US".to_owned()),
             inet_down_cost_per_tb: 0.0,
             inet_up_cost_per_tb: 0.0,
@@ -46,5 +52,18 @@ mod tests {
 
         assert_eq!(reachable.len(), 1);
         assert_eq!(reachable[0].id, 1);
+    }
+
+    #[test]
+    fn minimum_compute_cap_keeps_only_modern_cuda_offers() {
+        let mut legacy = offer(1, 0.03);
+        legacy.compute_cap = 520;
+        let mut modern = offer(2, 0.04);
+        modern.compute_cap = 750;
+
+        let reachable = reachable_offers(vec![legacy, modern], &SelectionPolicy::default());
+
+        assert_eq!(reachable.len(), 1);
+        assert_eq!(reachable[0].id, 2);
     }
 }
