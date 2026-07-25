@@ -1,5 +1,5 @@
 use parking_lot::Mutex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -551,15 +551,14 @@ fn spawn_retrying_ssh_bootstrap(
 
                         match wait_result {
                             Some(Ok(status)) => {
-                                let line = if status.success() {
-                                    format!(
-                                        "VastAI SSH bootstrap exited before runtime ready: {status}; retrying"
-                                    )
+                                let readiness = if status.success() {
+                                    "exited before runtime ready"
                                 } else {
-                                    format!(
-                                        "VastAI SSH bootstrap failed before runtime ready: {status}; retrying"
-                                    )
+                                    "not ready before runtime ready"
                                 };
+                                let line = format!(
+                                    "VastAI SSH bootstrap {readiness} (attempt {attempt}, {status}); retrying"
+                                );
                                 sink.observe(PluginObservation::ProviderLine {
                                     run_id,
                                     node_id,
@@ -571,7 +570,9 @@ fn spawn_retrying_ssh_bootstrap(
                                 sink.observe(PluginObservation::ProviderLine {
                                     run_id,
                                     node_id,
-                                    line: format!("wait VastAI SSH bootstrap: {error}; retrying"),
+                                    line: format!(
+                                        "wait VastAI SSH bootstrap attempt {attempt}: {error}; retrying"
+                                    ),
                                 });
                                 break;
                             }
@@ -583,7 +584,9 @@ fn spawn_retrying_ssh_bootstrap(
                     sink.observe(PluginObservation::ProviderLine {
                         run_id,
                         node_id,
-                        line: format!("spawn VastAI SSH bootstrap failed: {error}; retrying"),
+                        line: format!(
+                            "spawn VastAI SSH bootstrap attempt {attempt} failed: {error}; retrying"
+                        ),
                     });
                 }
             }
@@ -594,7 +597,10 @@ fn spawn_retrying_ssh_bootstrap(
             sink.observe(PluginObservation::ProviderLine {
                 run_id,
                 node_id,
-                line: format!("VastAI SSH bootstrap retrying in {}s", backoff.as_secs()),
+                line: format!(
+                    "VastAI SSH bootstrap retrying in {}s after attempt {attempt}",
+                    backoff.as_secs()
+                ),
             });
             std::thread::sleep(backoff);
             backoff = next_ssh_backoff(backoff);
@@ -670,6 +676,7 @@ where
     bootstrap: B,
     config: VastAiProvisioningConfig,
     bootstrap_producer: Option<DatastreamProducer>,
+    leased_host_ids: BTreeSet<u64>,
     next_handle_id: u64,
     nodes: BTreeMap<u64, VastAiNode<B::Handle>>,
 }
@@ -677,6 +684,7 @@ where
 struct VastAiNode<H> {
     contract_id: u64,
     bootstrap: Option<H>,
+    host_id: Option<u64>,
 }
 
 impl<C, B> VastAiProvisioningPlugin<C, B>
@@ -691,6 +699,7 @@ where
             config,
             bootstrap_producer: None,
             next_handle_id: 1,
+            leased_host_ids: BTreeSet::new(),
             nodes: BTreeMap::new(),
         }
     }
@@ -741,6 +750,13 @@ where
         {
             env.insert("SSH_PUBLIC_KEY".to_owned(), key.to_owned());
         }
+        let mut selection = self.config.selection.clone();
+        for host_id in &self.leased_host_ids {
+            if !selection.blacklist_hosts.contains(host_id) {
+                selection.blacklist_hosts.push(*host_id);
+            }
+        }
+
         ProvisionRequest {
             count: 1,
             image: spec.image.clone(),
@@ -749,7 +765,7 @@ where
             env,
             per_instance_env: vec![BTreeMap::new()],
             onstart: self.config.onstart.clone(),
-            selection: self.config.selection.clone(),
+            selection,
             lifecycle: self.config.lifecycle.clone(),
             confirm_lease: self.config.confirm_lease,
         }
@@ -860,6 +876,11 @@ where
             }
         };
 
+        let host_id = instance.host_id;
+        if let Some(host_id) = host_id {
+            self.leased_host_ids.insert(host_id);
+        }
+
         let handle = PluginNodeHandle {
             id: self.next_handle_id,
             provider_process_id: None,
@@ -870,6 +891,7 @@ where
             VastAiNode {
                 contract_id: instance.contract_id,
                 bootstrap: Some(bootstrap),
+                host_id,
             },
         );
         Ok(handle)
@@ -883,6 +905,9 @@ where
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
+        if let Some(host_id) = node.host_id {
+            self.leased_host_ids.remove(&host_id);
+        }
         if let Some(mut bootstrap) = node.bootstrap.take() {
             self.bootstrap
                 .stop_bootstrap(&mut bootstrap, BootstrapStopReason::NodeStop);

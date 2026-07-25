@@ -17,6 +17,9 @@ pub struct Offer {
     pub dph_total: f64,
     #[serde(default)]
     pub gpu_ram: Option<f64>,
+    /// CUDA compute capability encoded as vast.ai reports it (`890` = 8.9).
+    #[serde(default)]
+    pub compute_cap: u64,
     #[serde(default)]
     pub geolocation: Option<String>,
     /// Inbound bandwidth price ($/TB). vast.ai bills Docker image pulls here.
@@ -58,6 +61,8 @@ pub struct LabeledInstance {
 pub struct SelectionPolicy {
     pub gpu_name: Option<String>,
     pub min_gpu_ram_mb: Option<u64>,
+    /// Minimum CUDA compute capability encoded as vast.ai reports it (`700` = 7.0).
+    pub min_compute_cap: Option<u64>,
     pub min_reliability: f64,
     pub require_verified: bool,
     pub min_down_mbps: f64,
@@ -73,6 +78,7 @@ impl Default for SelectionPolicy {
         Self {
             gpu_name: None,
             min_gpu_ram_mb: None,
+            min_compute_cap: Some(700),
             min_reliability: 0.95,
             require_verified: false,
             min_down_mbps: 100.0,
@@ -90,6 +96,8 @@ impl Default for SelectionPolicy {
 pub struct LifecyclePolicy {
     pub lease_pace: Duration,
     pub poll_interval: Duration,
+    /// Maximum time to stay in one non-running provider state before replacing the lease.
+    pub state_timeout: Duration,
 }
 
 impl Default for LifecyclePolicy {
@@ -97,6 +105,7 @@ impl Default for LifecyclePolicy {
         Self {
             lease_pace: Duration::from_millis(600),
             poll_interval: Duration::from_secs(10),
+            state_timeout: Duration::from_secs(300),
         }
     }
 }

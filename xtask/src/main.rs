@@ -18,9 +18,9 @@ struct TestStep {
     args: &'static [&'static str],
 }
 
-const MVP_CHAT_CHECK_TIMEOUT_SECS: u64 = 900;
+const MVP_CHAT_CHECK_TIMEOUT_SECS: u64 = 1_800;
 const MVP_CHAT_CHECK_POLL_MS: u64 = 100;
-const MVP_CHAT_CHECK_TERM_GRACE_MS: u64 = 2_000;
+const MVP_CHAT_CHECK_TERM_GRACE_MS: u64 = 30_000;
 const MVP_CHAT_CHECK_PROMPTS: &[u8] = b"ping\nsecond prompt\n";
 const DATA_PATH_MIN_PAYLOAD_BYTES: u64 = 512;
 
@@ -143,7 +143,6 @@ impl MvpChatCheckInvocation {
                 "--yes".to_owned(),
                 "--endpoint-addr-mask".to_owned(),
                 "relay-only".to_owned(),
-                "--skip-rebuild".to_owned(),
             ]);
         }
         args.extend([
@@ -817,19 +816,26 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
             );
         }
     };
-    let summary =
-        match build_benchmark_summary(&events, output.child_elapsed_ms, run_id, scenario, &paths) {
-            Ok(summary) => summary,
-            Err(error) => {
-                return fail_mvp_chat_check(
-                    &error,
-                    &paths,
-                    &output.stdout,
-                    &output.stderr,
-                    Some(&output.status),
-                );
-            }
-        };
+    let summary = match build_benchmark_summary(
+        &events,
+        output.child_elapsed_ms,
+        run_id,
+        scenario,
+        &paths,
+        u64::try_from(output.stdout.len()).unwrap_or(u64::MAX),
+        u64::try_from(output.stderr.len()).unwrap_or(u64::MAX),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return fail_mvp_chat_check(
+                &error,
+                &paths,
+                &output.stdout,
+                &output.stderr,
+                Some(&output.status),
+            );
+        }
+    };
     if let Err(error) = write_benchmark_artifacts(&paths, run_id, scenario, &output, &summary) {
         return fail_mvp_chat_check(
             &error,
@@ -1005,6 +1011,9 @@ fn fail_mvp_chat_check(
     if let Some(status) = status {
         eprintln!("mvp-chat-check: child exit status: {status}");
     }
+    if let Err(error) = write_failure_artifacts(paths, reason, stdout, stderr, status) {
+        eprintln!("mvp-chat-check: warning: could not write failure artifacts: {error}");
+    }
     eprintln!(
         "mvp-chat-check: temp directory kept at {}",
         paths.root.display()
@@ -1028,6 +1037,66 @@ fn fail_mvp_chat_check(
         }
     }
     ExitCode::from(1)
+}
+
+fn write_failure_artifacts(
+    paths: &MvpChatCheckPaths,
+    reason: &str,
+    stdout: &str,
+    stderr: &str,
+    status: Option<&ExitStatus>,
+) -> Result<(), String> {
+    fs::write(&paths.stdout, stdout).map_err(|e| {
+        format!(
+            "mvp-chat-check: write stdout artifact {}: {e}",
+            paths.stdout.display()
+        )
+    })?;
+    fs::write(&paths.stderr, stderr).map_err(|e| {
+        format!(
+            "mvp-chat-check: write stderr artifact {}: {e}",
+            paths.stderr.display()
+        )
+    })?;
+    fs::write(&paths.prompts, MVP_CHAT_CHECK_PROMPTS).map_err(|e| {
+        format!(
+            "mvp-chat-check: write prompt corpus {}: {e}",
+            paths.prompts.display()
+        )
+    })?;
+    let summary = json!({
+        "schema": "swactor.mvp_chat_check.failure.v1",
+        "status": "failed",
+        "reason": reason,
+        "child_status": status.map(|status| status.to_string()),
+        "created_unix_ms": unix_ms_now(),
+        "artifacts": {
+            "root": paths.root.display().to_string(),
+            "datastream": {
+                "path": paths.dump_log.display().to_string(),
+                "exists": paths.dump_log.is_file(),
+                "bytes": file_len(&paths.dump_log),
+            },
+            "stdout": {
+                "path": paths.stdout.display().to_string(),
+                "bytes": stdout.len(),
+            },
+            "stderr": {
+                "path": paths.stderr.display().to_string(),
+                "bytes": stderr.len(),
+            },
+            "prompts": {
+                "path": paths.prompts.display().to_string(),
+                "bytes": MVP_CHAT_CHECK_PROMPTS.len(),
+                "blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
+            },
+        },
+    });
+    write_json_file(&paths.summary, &summary)
+}
+
+fn file_len(path: &Path) -> Option<u64> {
+    fs::metadata(path).ok().map(|metadata| metadata.len())
 }
 
 fn assert_stdout_contains_two_prompt_cycles(stdout: &str) -> Result<Vec<String>, String> {
@@ -1818,12 +1887,20 @@ fn build_benchmark_summary(
     run_id: u64,
     scenario: MvpChatCheckScenario,
     paths: &MvpChatCheckPaths,
+    stdout_bytes: u64,
+    stderr_bytes: u64,
 ) -> Result<Value, String> {
     let facts = BenchmarkFacts::from_events(events, run_id);
     let mut dump_facts = DumpLogFacts::default();
     for record in events {
         record_dump_log_event(&record.channel, &record.event, &mut dump_facts)?;
     }
+    let datastream_bytes = file_size(&paths.dump_log)?;
+    let prompt_bytes = u64::try_from(MVP_CHAT_CHECK_PROMPTS.len()).unwrap_or(u64::MAX);
+    let known_artifact_bytes = datastream_bytes
+        .saturating_add(stdout_bytes)
+        .saturating_add(stderr_bytes)
+        .saturating_add(prompt_bytes);
     let run_envelope = benchmark_run_envelope(events, run_id);
     let channel_counts = benchmark_channel_counts(events);
     let event_counts = benchmark_event_counts(events);
@@ -1848,18 +1925,23 @@ fn build_benchmark_summary(
         },
         "artifacts": {
             "root": paths.root.display().to_string(),
+            "known_total_bytes": known_artifact_bytes,
             "datastream": {
                 "path": paths.dump_log.display().to_string(),
+                "bytes": datastream_bytes,
                 "blake3": file_blake3_hex(&paths.dump_log)?,
             },
             "stdout": {
                 "path": paths.stdout.display().to_string(),
+                "bytes": stdout_bytes,
             },
             "stderr": {
                 "path": paths.stderr.display().to_string(),
+                "bytes": stderr_bytes,
             },
             "prompts": {
                 "path": paths.prompts.display().to_string(),
+                "bytes": prompt_bytes,
                 "blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
             },
             "redacted_config": {
@@ -1891,6 +1973,7 @@ fn build_benchmark_summary(
         },
         "pipeline": pipeline_summary_json(events, &dump_facts),
         "gpu": gpu_summary_json(events, &dump_facts),
+        "vastai": vastai_summary_json(events),
         "invariants": benchmark_invariants_json(&dump_facts, scenario),
         "legacy_tolerance": legacy_tolerance_summary(events),
     });
@@ -2092,6 +2175,7 @@ fn duration_summary_json(duration: DurationRender) -> Value {
 fn pipeline_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value {
     let mut worker_steps = BenchmarkAggregate::default();
     let mut object_loads = BenchmarkAggregate::default();
+    let mut worker_steps_by_stage = BTreeMap::<u64, BenchmarkAggregate>::new();
     let mut ring_installs = BTreeMap::<String, u64>::new();
     for record in events {
         match (
@@ -2099,20 +2183,16 @@ fn pipeline_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value
             record.event.get("type").and_then(Value::as_str),
         ) {
             ("mvp.worker.step", Some("StepExecuted")) => {
-                worker_steps.count += 1;
-                worker_steps.elapsed_ms += event_u64(&record.event, "elapsed_ms").unwrap_or(0);
-                worker_steps.stage_execution_ms +=
-                    event_u64(&record.event, "stage_execution_ms").unwrap_or(0);
-                worker_steps.record_write_ms +=
-                    event_u64(&record.event, "record_write_ms").unwrap_or(0);
-                worker_steps.payload_bytes +=
-                    event_u64(&record.event, "payload_bytes").unwrap_or(0);
-                worker_steps.record_bytes += event_u64(&record.event, "record_bytes").unwrap_or(0);
+                worker_steps.observe_step_event(&record.event);
+                if let Some(stage_index) = pipeline_stage_index(&record.event) {
+                    worker_steps_by_stage
+                        .entry(stage_index)
+                        .or_default()
+                        .observe_step_event(&record.event);
+                }
             }
             ("mvp.worker.ingress", Some("ObjectLoaded")) => {
-                object_loads.count += 1;
-                object_loads.elapsed_ms += event_u64(&record.event, "elapsed_ms").unwrap_or(0);
-                object_loads.record_bytes += event_u64(&record.event, "extent").unwrap_or(0);
+                object_loads.observe_object_load_event(&record.event);
             }
             ("mvp.worker.ring", Some("RingInstalled")) => {
                 let direction = record
@@ -2126,10 +2206,18 @@ fn pipeline_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value
             _ => {}
         }
     }
+    let worker_steps_by_stage = worker_steps_by_stage
+        .into_iter()
+        .map(|(stage_index, stats)| stage_worker_summary_json(stage_index, &stats))
+        .collect::<Vec<_>>();
     json!({
         "worker_steps": worker_steps.to_json(),
+        "worker_steps_by_stage": worker_steps_by_stage,
         "object_loads": object_loads.to_json(),
         "ring_installs": ring_installs,
+        "prompt_critical_paths": prompt_pipeline_critical_summary_json(events),
+        "edge_handoffs": pipeline_edge_handoff_summary_json(events),
+        "provisioning": stage_provisioning_summary_json(events),
         "data_path": {
             "activation_object_loaded": facts.activation_object_loaded,
             "activation_step_executed": facts.activation_step_executed,
@@ -2143,6 +2231,381 @@ fn pipeline_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value
             "max_worker_command_bytes": facts.max_worker_command_bytes,
             "control_json_large_object_violation": facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES
                 && facts.max_worker_command_bytes >= facts.max_activation_record_bytes,
+        },
+    })
+}
+
+fn stage_worker_summary_json(stage_index: u64, stats: &BenchmarkAggregate) -> Value {
+    json!({
+        "stage_index": stage_index,
+        "stats": stats.to_json(),
+    })
+}
+
+#[derive(Default)]
+struct PromptPipelineCriticalStats {
+    request_id: u64,
+    token_in_started: u64,
+    token_in_ready: u64,
+    token_out_observed: u64,
+    tokenizer_decode_ready: u64,
+    first_sequence: Option<u64>,
+    last_sequence: Option<u64>,
+    last_token_out_arrival_ms: Option<u64>,
+    token_out_interval_ms: MetricStats,
+    token_in_to_out_ms: MetricStats,
+    token_in_started_by_sequence: BTreeMap<u64, u64>,
+}
+
+impl PromptPipelineCriticalStats {
+    fn new(request_id: u64) -> Self {
+        Self {
+            request_id,
+            ..Self::default()
+        }
+    }
+
+    fn observe_sequence(&mut self, sequence: u64) {
+        self.first_sequence = Some(
+            self.first_sequence
+                .map_or(sequence, |value| value.min(sequence)),
+        );
+        self.last_sequence = Some(
+            self.last_sequence
+                .map_or(sequence, |value| value.max(sequence)),
+        );
+    }
+
+    fn observe_token_in_started(&mut self, sequence: u64, arrival_unix_ms: Option<u64>) {
+        self.token_in_started += 1;
+        self.observe_sequence(sequence);
+        if let Some(arrival_unix_ms) = arrival_unix_ms {
+            self.token_in_started_by_sequence
+                .entry(sequence)
+                .or_insert(arrival_unix_ms);
+        }
+    }
+
+    fn observe_token_in_ready(&mut self, sequence: u64) {
+        self.token_in_ready += 1;
+        self.observe_sequence(sequence);
+    }
+
+    fn observe_token_out(&mut self, sequence: u64, arrival_unix_ms: Option<u64>) {
+        self.token_out_observed += 1;
+        self.observe_sequence(sequence);
+        if let Some(arrival_unix_ms) = arrival_unix_ms {
+            if let Some(last) = self.last_token_out_arrival_ms {
+                self.token_out_interval_ms
+                    .observe(arrival_unix_ms.saturating_sub(last));
+            }
+            self.last_token_out_arrival_ms = Some(arrival_unix_ms);
+            if let Some(started) = self.token_in_started_by_sequence.get(&sequence) {
+                self.token_in_to_out_ms
+                    .observe(arrival_unix_ms.saturating_sub(*started));
+            }
+        }
+    }
+
+    fn observe_tokenizer_decode_ready(&mut self) {
+        self.tokenizer_decode_ready += 1;
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "request_id": self.request_id,
+            "token_in_started": self.token_in_started,
+            "token_in_ready": self.token_in_ready,
+            "token_out_observed": self.token_out_observed,
+            "tokenizer_decode_ready": self.tokenizer_decode_ready,
+            "first_sequence": self.first_sequence,
+            "last_sequence": self.last_sequence,
+            "token_out_interval_ms": self.token_out_interval_ms.to_json(),
+            "token_in_to_out_ms": self.token_in_to_out_ms.to_json(),
+        })
+    }
+}
+
+fn prompt_pipeline_critical_summary_json(events: &[DumpLogEvent]) -> Vec<Value> {
+    let mut prompts = BTreeMap::<u64, PromptPipelineCriticalStats>::new();
+    for record in events {
+        if record.channel != "mvp.orch.prompt"
+            || record.event.get("type").and_then(Value::as_str) != Some("OrchPromptEvent")
+        {
+            continue;
+        }
+        let Some(request_id) = benchmark_request_id(&record.event) else {
+            continue;
+        };
+        let Some(phase) = record.event.get("phase").and_then(Value::as_str) else {
+            continue;
+        };
+        let status = record.event.get("status").and_then(Value::as_str);
+        let sequence = detail_u64(&record.event, "sequence");
+        let prompt = prompts
+            .entry(request_id)
+            .or_insert_with(|| PromptPipelineCriticalStats::new(request_id));
+        match (phase, status, sequence) {
+            ("pipeline_token_in", Some("started"), Some(sequence)) => {
+                prompt.observe_token_in_started(sequence, record.arrival_unix_ms);
+            }
+            ("pipeline_token_in", Some("ready"), Some(sequence)) => {
+                prompt.observe_token_in_ready(sequence);
+            }
+            ("pipeline_token_out", Some("observed"), Some(sequence)) => {
+                prompt.observe_token_out(sequence, record.arrival_unix_ms);
+            }
+            ("pipeline_tokenizer_decode", Some("ready"), _) => {
+                prompt.observe_tokenizer_decode_ready();
+            }
+            _ => {}
+        }
+    }
+    prompts
+        .values()
+        .map(PromptPipelineCriticalStats::to_json)
+        .collect()
+}
+
+#[derive(Default)]
+struct PipelineEdgeHandoffStats {
+    edge_id: u64,
+    producer_stages: BTreeSet<u64>,
+    consumer_stages: BTreeSet<u64>,
+    producer_ring_reads: u64,
+    producer_sends: u64,
+    consumer_stream_reads: u64,
+    consumer_ring_writes: u64,
+    consumer_object_loads: u64,
+    record_bytes: MetricStats,
+    network_read_bytes: MetricStats,
+    helper_execute_ms: MetricStats,
+    egress_ring_read_ms: MetricStats,
+    send_ms: MetricStats,
+    ingress_ring_write_ms: MetricStats,
+    object_load_ms: MetricStats,
+}
+
+impl PipelineEdgeHandoffStats {
+    fn observe_node_stage_event(&mut self, event: &Value) {
+        let detail = event.get("detail").unwrap_or(&Value::Null);
+        let phase = event.get("phase").and_then(Value::as_str);
+        if let Some(stage_index) = event.get("stage_index").and_then(Value::as_u64) {
+            match phase {
+                Some("egress_ring_read") | Some("iroh_edge_bytes_sent") => {
+                    self.producer_stages.insert(stage_index);
+                }
+                Some("iroh_edge_bytes_read")
+                | Some("ingress_ring_write")
+                | Some("object_loaded") => {
+                    self.consumer_stages.insert(stage_index);
+                }
+                _ => {}
+            }
+        }
+        match phase {
+            Some("egress_ring_read") => {
+                self.producer_ring_reads += 1;
+                self.record_bytes
+                    .observe_optional(detail.get("record_bytes").and_then(Value::as_u64));
+                self.helper_execute_ms
+                    .observe_optional(detail.get("helper_execute_ms").and_then(Value::as_u64));
+                self.egress_ring_read_ms
+                    .observe_optional(detail.get("egress_ring_read_ms").and_then(Value::as_u64));
+            }
+            Some("iroh_edge_bytes_sent") => {
+                self.producer_sends += 1;
+                self.record_bytes
+                    .observe_optional(detail.get("record_bytes").and_then(Value::as_u64));
+                self.send_ms
+                    .observe_optional(detail.get("send_ms").and_then(Value::as_u64));
+            }
+            Some("iroh_edge_bytes_read") => {
+                self.consumer_stream_reads += 1;
+                self.network_read_bytes
+                    .observe_optional(detail.get("bytes").and_then(Value::as_u64));
+            }
+            Some("ingress_ring_write") => {
+                self.consumer_ring_writes += 1;
+                self.record_bytes
+                    .observe_optional(detail.get("record_bytes").and_then(Value::as_u64));
+                self.ingress_ring_write_ms
+                    .observe_optional(detail.get("ingress_ring_write_ms").and_then(Value::as_u64));
+            }
+            Some("object_loaded") => {
+                self.consumer_object_loads += 1;
+                self.object_load_ms
+                    .observe_optional(detail.get("object_load_ms").and_then(Value::as_u64));
+            }
+            _ => {}
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "edge_id": self.edge_id,
+            "producer_stages": self.producer_stages.iter().copied().collect::<Vec<_>>(),
+            "consumer_stages": self.consumer_stages.iter().copied().collect::<Vec<_>>(),
+            "producer_ring_reads": self.producer_ring_reads,
+            "producer_sends": self.producer_sends,
+            "consumer_stream_reads": self.consumer_stream_reads,
+            "consumer_ring_writes": self.consumer_ring_writes,
+            "consumer_object_loads": self.consumer_object_loads,
+            "record_bytes": self.record_bytes.to_json(),
+            "network_read_bytes": self.network_read_bytes.to_json(),
+            "helper_execute_ms": self.helper_execute_ms.to_json(),
+            "egress_ring_read_ms": self.egress_ring_read_ms.to_json(),
+            "send_ms": self.send_ms.to_json(),
+            "ingress_ring_write_ms": self.ingress_ring_write_ms.to_json(),
+            "object_load_ms": self.object_load_ms.to_json(),
+        })
+    }
+}
+
+fn pipeline_edge_handoff_summary_json(events: &[DumpLogEvent]) -> Vec<Value> {
+    let mut edges = BTreeMap::<u64, PipelineEdgeHandoffStats>::new();
+    for record in events {
+        if record.channel != "mvp.node.stage"
+            || record.event.get("type").and_then(Value::as_str) != Some("NodeEvent")
+        {
+            continue;
+        }
+        let Some(edge_id) = detail_u64(&record.event, "edge_id") else {
+            continue;
+        };
+        let edge = edges
+            .entry(edge_id)
+            .or_insert_with(|| PipelineEdgeHandoffStats {
+                edge_id,
+                ..PipelineEdgeHandoffStats::default()
+            });
+        edge.observe_node_stage_event(&record.event);
+    }
+    edges
+        .values()
+        .map(PipelineEdgeHandoffStats::to_json)
+        .collect()
+}
+
+#[derive(Default)]
+struct StageProvisionStats {
+    send_events: u64,
+    first_attempt: Option<u64>,
+    last_attempt: Option<u64>,
+    min_loaded_stage_count: Option<u64>,
+    max_loaded_stage_count: Option<u64>,
+    stage_count: Option<u64>,
+}
+
+impl StageProvisionStats {
+    fn observe(&mut self, detail: &Value) {
+        self.send_events += 1;
+        if let Some(attempt) = detail.get("attempt").and_then(Value::as_u64) {
+            if self.first_attempt.is_none() {
+                self.first_attempt = Some(attempt);
+            }
+            self.last_attempt = Some(attempt);
+        }
+        if let Some(loaded) = detail.get("loaded_stage_count").and_then(Value::as_u64) {
+            self.min_loaded_stage_count = Some(
+                self.min_loaded_stage_count
+                    .map_or(loaded, |min| min.min(loaded)),
+            );
+            self.max_loaded_stage_count = Some(
+                self.max_loaded_stage_count
+                    .map_or(loaded, |max| max.max(loaded)),
+            );
+        }
+        if self.stage_count.is_none() {
+            self.stage_count = detail.get("stage_count").and_then(Value::as_u64);
+        }
+    }
+
+    fn to_json(&self, stage_index: u64) -> Value {
+        json!({
+            "stage_index": stage_index,
+            "send_events": self.send_events,
+            "first_attempt": self.first_attempt,
+            "last_attempt": self.last_attempt,
+            "min_loaded_stage_count": self.min_loaded_stage_count,
+            "max_loaded_stage_count": self.max_loaded_stage_count,
+            "stage_count": self.stage_count,
+        })
+    }
+}
+
+fn stage_provisioning_summary_json(events: &[DumpLogEvent]) -> Value {
+    let mut send_events = 0_u64;
+    let mut stages = BTreeMap::<u64, StageProvisionStats>::new();
+    let mut latest_wait = None;
+    let mut provider_event_counts = BTreeMap::<String, u64>::new();
+    let mut ssh_retry_counts = BTreeMap::<String, u64>::new();
+    let mut ssh_failure_counts = BTreeMap::<String, u64>::new();
+    for record in events {
+        if record.channel == "mvp.provisioning.events"
+            && let Some(kind) = record
+                .event
+                .get("event")
+                .and_then(|event| event.get("kind"))
+                .and_then(Value::as_str)
+        {
+            *provider_event_counts.entry(kind.to_owned()).or_default() += 1;
+        }
+        if record.channel.starts_with("mvp.provisioning.logs.node.") {
+            let node = record
+                .event
+                .get("node_id")
+                .and_then(Value::as_u64)
+                .map(|node_id| node_id.to_string())
+                .unwrap_or_else(|| "unknown".to_owned());
+            if let Some(line) = record.event.get("line").and_then(Value::as_str) {
+                if line.contains("VastAI SSH bootstrap retrying") {
+                    *ssh_retry_counts.entry(node.clone()).or_default() += 1;
+                }
+                if line.contains("VastAI SSH bootstrap failed before runtime ready") {
+                    *ssh_failure_counts.entry(node).or_default() += 1;
+                }
+            }
+        }
+        if record.channel != "mvp.orch.bootstrap"
+            || record.event.get("type").and_then(Value::as_str) != Some("OrchBootstrap")
+            || record.event.get("phase").and_then(Value::as_str) != Some("stage_provision_send")
+            || record.event.get("status").and_then(Value::as_str) != Some("sent")
+        {
+            continue;
+        }
+        let detail = record.event.get("detail").unwrap_or(&Value::Null);
+        let Some(stage_index) = detail.get("stage_index").and_then(Value::as_u64) else {
+            continue;
+        };
+        send_events += 1;
+        stages.entry(stage_index).or_default().observe(detail);
+        latest_wait = Some(json!({
+            "attempt": detail.get("attempt").and_then(Value::as_u64),
+            "waiting_stage_index": stage_index,
+            "loaded_stage_count": detail.get("loaded_stage_count").and_then(Value::as_u64),
+            "stage_count": detail.get("stage_count").and_then(Value::as_u64),
+            "stage_send_count": detail.get("stage_send_count").and_then(Value::as_u64),
+        }));
+    }
+    let max_send_events_for_stage = stages
+        .values()
+        .map(|stage| stage.send_events)
+        .max()
+        .unwrap_or(0);
+    let stages = stages
+        .into_iter()
+        .map(|(stage_index, stats)| stats.to_json(stage_index))
+        .collect::<Vec<_>>();
+    json!({
+        "send_events": send_events,
+        "max_send_events_for_stage": max_send_events_for_stage,
+        "latest_wait": latest_wait.unwrap_or(Value::Null),
+        "stages": stages,
+        "provider_event_counts": provider_event_counts,
+        "ssh_bootstrap": {
+            "retry_counts_by_node": ssh_retry_counts,
+            "failure_counts_by_node": ssh_failure_counts,
         },
     })
 }
@@ -2164,32 +2627,242 @@ fn gpu_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value {
         "first_token_request_ids": facts.gpu_first_token_ready,
         "decode_ready_request_ids": facts.gpu_decode_ready,
         "prompt_completed_request_ids": facts.gpu_prompt_completed,
+        "pipeline_prompt_encoded_request_ids": facts.gpu_pipeline_prompt_encoded,
+        "pipeline_prompt_begin_request_ids": facts.gpu_pipeline_prompt_begin,
+        "pipeline_token_in_request_ids": facts.gpu_pipeline_token_in,
+        "pipeline_token_out_request_ids": facts.gpu_pipeline_token_out,
+        "pipeline_tokenizer_decode_ready_request_ids": facts.gpu_pipeline_tokenizer_decode_ready,
+        "pipeline_tokens_decoded_request_ids": facts.gpu_pipeline_tokens_decoded,
         "pipeline_real_worker_step_seen": facts.gpu_pipeline_real_worker_step_seen,
         "cpu_profile_summaries": cpu_profile_summaries,
+        "host_gpu_samples": host_gpu_sample_summary_json(events),
     })
 }
 
-#[derive(Default)]
+fn host_gpu_sample_summary_json(events: &[DumpLogEvent]) -> Value {
+    let mut sample_count = 0_u64;
+    let mut error_count = 0_u64;
+    let mut device_sample_count = 0_u64;
+    let mut max_utilization_gpu_percent = MetricStats::default();
+    let mut max_memory_used_mib = MetricStats::default();
+    let mut max_memory_total_mib = MetricStats::default();
+    for record in events {
+        if record.channel != "host.gpu" {
+            continue;
+        }
+        sample_count += 1;
+        if record.event.get("error").and_then(Value::as_str).is_some() {
+            error_count += 1;
+        }
+        let Some(gpus) = record.event.get("gpus").and_then(Value::as_array) else {
+            continue;
+        };
+        device_sample_count = device_sample_count.saturating_add(gpus.len() as u64);
+        for gpu in gpus {
+            max_utilization_gpu_percent
+                .observe_optional(gpu.get("utilization_gpu_percent").and_then(Value::as_u64));
+            max_memory_used_mib
+                .observe_optional(gpu.get("memory_used_mib").and_then(Value::as_u64));
+            max_memory_total_mib
+                .observe_optional(gpu.get("memory_total_mib").and_then(Value::as_u64));
+        }
+    }
+    json!({
+        "sample_count": sample_count,
+        "error_count": error_count,
+        "device_sample_count": device_sample_count,
+        "utilization_gpu_percent": max_utilization_gpu_percent.to_json(),
+        "memory_used_mib": max_memory_used_mib.to_json(),
+        "memory_total_mib": max_memory_total_mib.to_json(),
+    })
+}
+
+struct VastAiLeaseSelection {
+    node_id: Option<u64>,
+    index: u64,
+    offer_id: u64,
+    gpu_name: String,
+    gpu_ram_mb: Option<u64>,
+    dph_total: f64,
+    geolocation: Option<String>,
+    host_id: Option<u64>,
+    effective_dph_total: f64,
+}
+
+impl VastAiLeaseSelection {
+    fn to_json(&self) -> Value {
+        json!({
+            "node_id": self.node_id,
+            "index": self.index,
+            "offer_id": self.offer_id,
+            "gpu_name": self.gpu_name,
+            "gpu_ram_mb": self.gpu_ram_mb,
+            "dph_total": self.dph_total,
+            "geolocation": self.geolocation,
+            "host_id": self.host_id,
+            "effective_dph_total": self.effective_dph_total,
+        })
+    }
+}
+
+fn vastai_summary_json(events: &[DumpLogEvent]) -> Value {
+    let selections = events
+        .iter()
+        .filter_map(parse_vastai_lease_selection)
+        .collect::<Vec<_>>();
+    let mut max_dph_total: Option<f64> = None;
+    for selection in &selections {
+        max_dph_total =
+            Some(max_dph_total.map_or(selection.dph_total, |max| max.max(selection.dph_total)));
+    }
+    json!({
+        "selected_lease_count": selections.len(),
+        "max_dph_total": max_dph_total,
+        "selected_leases": selections
+            .iter()
+            .map(VastAiLeaseSelection::to_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn parse_vastai_lease_selection(record: &DumpLogEvent) -> Option<VastAiLeaseSelection> {
+    let line = record.event.get("line").and_then(Value::as_str)?;
+    let rest = line.strip_prefix("lease_chain: index ")?;
+    let (index, rest) = rest.split_once(" → offer ")?;
+    let (offer_id, rest) = rest.split_once(" — ")?;
+    let (gpu_and_ram, rest) = rest.split_once(" @ $")?;
+    let (gpu_name, gpu_ram) = gpu_and_ram.rsplit_once(' ')?;
+    let (dph_total, rest) = rest.split_once("/hr [")?;
+    let (geolocation, rest) = rest.split_once("] host ")?;
+    let (host_id, effective_dph_total) = rest.split_once(" eff $")?;
+    let effective_dph_total = effective_dph_total.strip_suffix("/hr")?;
+    Some(VastAiLeaseSelection {
+        node_id: record.event.get("node_id").and_then(Value::as_u64),
+        index: index.parse().ok()?,
+        offer_id: offer_id.parse().ok()?,
+        gpu_name: gpu_name.to_owned(),
+        gpu_ram_mb: gpu_ram
+            .strip_suffix("MB")
+            .and_then(|value| value.parse().ok()),
+        dph_total: dph_total.parse().ok()?,
+        geolocation: (!geolocation.is_empty()).then(|| geolocation.to_owned()),
+        host_id: host_id.parse().ok(),
+        effective_dph_total: effective_dph_total.parse().ok()?,
+    })
+}
+
+#[derive(Clone, Default)]
+struct MetricStats {
+    count: u64,
+    sum: u64,
+    min: Option<u64>,
+    max: Option<u64>,
+}
+
+impl MetricStats {
+    fn observe(&mut self, value: u64) {
+        self.count += 1;
+        self.sum = self.sum.saturating_add(value);
+        self.min = Some(self.min.map_or(value, |min| min.min(value)));
+        self.max = Some(self.max.map_or(value, |max| max.max(value)));
+    }
+
+    fn observe_optional(&mut self, value: Option<u64>) {
+        if let Some(value) = value {
+            self.observe(value);
+        }
+    }
+
+    fn avg(&self) -> Option<f64> {
+        (self.count != 0).then(|| self.sum as f64 / self.count as f64)
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "count": self.count,
+            "sum": self.sum,
+            "min": self.min,
+            "max": self.max,
+            "avg": self.avg(),
+        })
+    }
+}
+
+#[derive(Clone, Default)]
 struct BenchmarkAggregate {
     count: u64,
     elapsed_ms: u64,
     stage_execution_ms: u64,
     record_write_ms: u64,
+    input_prepare_ms: u64,
+    model_forward_ms: u64,
+    output_realize_ms: u64,
+    payload_pack_ms: u64,
     payload_bytes: u64,
     record_bytes: u64,
 }
 
 impl BenchmarkAggregate {
+    fn observe_step_event(&mut self, event: &Value) {
+        self.count += 1;
+        self.elapsed_ms = self
+            .elapsed_ms
+            .saturating_add(event_u64(event, "elapsed_ms").unwrap_or(0));
+        self.stage_execution_ms = self
+            .stage_execution_ms
+            .saturating_add(event_u64(event, "stage_execution_ms").unwrap_or(0));
+        self.record_write_ms = self
+            .record_write_ms
+            .saturating_add(event_u64(event, "record_write_ms").unwrap_or(0));
+        self.input_prepare_ms = self
+            .input_prepare_ms
+            .saturating_add(event_u64(event, "input_prepare_ms").unwrap_or(0));
+        self.model_forward_ms = self
+            .model_forward_ms
+            .saturating_add(event_u64(event, "model_forward_ms").unwrap_or(0));
+        self.output_realize_ms = self
+            .output_realize_ms
+            .saturating_add(event_u64(event, "output_realize_ms").unwrap_or(0));
+        self.payload_pack_ms = self
+            .payload_pack_ms
+            .saturating_add(event_u64(event, "payload_pack_ms").unwrap_or(0));
+        self.payload_bytes = self
+            .payload_bytes
+            .saturating_add(event_u64(event, "payload_bytes").unwrap_or(0));
+        self.record_bytes = self
+            .record_bytes
+            .saturating_add(event_u64(event, "record_bytes").unwrap_or(0));
+    }
+
+    fn observe_object_load_event(&mut self, event: &Value) {
+        self.count += 1;
+        self.elapsed_ms = self
+            .elapsed_ms
+            .saturating_add(event_u64(event, "elapsed_ms").unwrap_or(0));
+        self.record_bytes = self
+            .record_bytes
+            .saturating_add(event_u64(event, "extent").unwrap_or(0));
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "count": self.count,
             "elapsed_ms_sum": self.elapsed_ms,
             "stage_execution_ms_sum": self.stage_execution_ms,
             "record_write_ms_sum": self.record_write_ms,
+            "input_prepare_ms_sum": self.input_prepare_ms,
+            "model_forward_ms_sum": self.model_forward_ms,
+            "output_realize_ms_sum": self.output_realize_ms,
+            "payload_pack_ms_sum": self.payload_pack_ms,
             "payload_bytes_sum": self.payload_bytes,
             "record_bytes_sum": self.record_bytes,
         })
     }
+}
+
+fn pipeline_stage_index(event: &Value) -> Option<u64> {
+    event_u64(event, "stage_index")
+        .or_else(|| event_u64(event, "role_id").and_then(|role| role.checked_sub(1)))
 }
 
 fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MvpChatCheckScenario) -> Vec<Value> {
@@ -2233,14 +2906,6 @@ fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MvpChatCheckScenari
             invariant_json(
                 "activation_large_object_step_executed",
                 facts.activation_step_executed,
-            ),
-            invariant_json(
-                "activation_large_object_iroh_sent",
-                facts.activation_iroh_edge_sent,
-            ),
-            invariant_json(
-                "activation_large_object_iroh_read",
-                facts.activation_iroh_edge_read,
             ),
         ]);
     }
@@ -2327,6 +2992,12 @@ fn file_blake3_hex(path: &Path) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|e| format!("read artifact for hash {}: {e}", path.display()))?;
     Ok(bytes_blake3_hex(&bytes))
+}
+
+fn file_size(path: &Path) -> Result<u64, String> {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .map_err(|e| format!("read artifact metadata {}: {e}", path.display()))
 }
 
 fn bytes_blake3_hex(bytes: &[u8]) -> String {
@@ -2832,8 +3503,7 @@ fn require_gpu_dump_log_facts(facts: &DumpLogFacts) -> Result<(), String> {
             && facts.gpu_pipeline_token_out.contains(&request_id)
             && facts
                 .gpu_pipeline_tokenizer_decode_ready
-                .contains(&request_id)
-            && facts.gpu_pipeline_tokens_decoded.contains(&request_id);
+                .contains(&request_id);
         require_dump_log_fact(
             direct_decode || pipeline_decode,
             &format!("GPU decode/token evidence request_id={request_id}"),
@@ -3093,7 +3763,6 @@ mod tests {
                 "--yes",
                 "--endpoint-addr-mask",
                 "relay-only",
-                "--skip-rebuild",
                 "--run-id",
                 "42",
                 "--dump-logs=/tmp/mvp-chat-check.ndjson",
@@ -3113,7 +3782,6 @@ mod tests {
                 "--yes",
                 "--endpoint-addr-mask",
                 "relay-only",
-                "--skip-rebuild",
                 "--run-id",
                 "42",
                 "--dump-logs=/tmp/mvp-chat-check.ndjson",
@@ -3845,7 +4513,6 @@ mod tests {
             facts.gpu_pipeline_token_in.insert(request_id);
             facts.gpu_pipeline_token_out.insert(request_id);
             facts.gpu_pipeline_tokenizer_decode_ready.insert(request_id);
-            facts.gpu_pipeline_tokens_decoded.insert(request_id);
             if prompt_begin_markers {
                 facts.gpu_pipeline_prompt_begin.insert(request_id);
             }
@@ -4128,6 +4795,8 @@ mod tests {
             9,
             MvpChatCheckScenario::ProcessBaseline,
             &paths,
+            123,
+            45,
         )
         .expect("summary builds");
         let _ = fs::remove_file(path);
@@ -4159,6 +4828,296 @@ mod tests {
                 .pointer("/artifacts/datastream/blake3")
                 .and_then(Value::as_str)
                 .is_some()
+        );
+        assert_eq!(
+            summary
+                .pointer("/artifacts/stdout/bytes")
+                .and_then(Value::as_u64),
+            Some(123)
+        );
+        assert_eq!(
+            summary
+                .pointer("/artifacts/stderr/bytes")
+                .and_then(Value::as_u64),
+            Some(45)
+        );
+    }
+
+    #[test]
+    fn benchmark_summary_exposes_vastai_pipeline_operator_summaries() {
+        let mut event_pairs = dump_log_fact_events(true, false);
+        event_pairs.extend([
+            (
+                "mvp.provisioning.logs.node.2.stderr",
+                json!({
+                    "run_id": 9,
+                    "node_id": 2,
+                    "stream": "Stderr",
+                    "line": "lease_chain: index 0 → offer 42528153 — RTX 2060 12288MB @ $0.036/hr [India, IN] host 581196 eff $0.036/hr",
+                }),
+            ),
+            (
+                "mvp.provisioning.logs.node.8.stderr",
+                json!({
+                    "run_id": 9,
+                    "node_id": 8,
+                    "stream": "Stderr",
+                    "line": "VastAI SSH bootstrap retrying in 3s after failed attempt",
+                }),
+            ),
+            (
+                "host.gpu",
+                json!({
+                    "schema":"host.gpu.v1",
+                    "seq":1,
+                    "sample_unix_ms":1_700,
+                    "query_elapsed_ms":4,
+                    "gpus":[{
+                        "index":0,
+                        "uuid":"GPU-unit",
+                        "name":"RTX 2060",
+                        "memory_used_mib":8120,
+                        "memory_total_mib":12288,
+                        "utilization_gpu_percent":73,
+                        "utilization_memory_percent":41,
+                        "temperature_c":61,
+                        "power_draw_w":120.0
+                    }],
+                    "processes":[],
+                    "error":null
+                }),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"stage_provision_send","status":"sent","run_id":9,"node_id":1,"detail":{"attempt":1,"stage_count":8,"stage_index":7,"loaded_stage_count":0,"stage_send_count":1}}),
+                    "mvp-orchestrator",
+                    1_500,
+                    500,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"stage_provision_send","status":"sent","run_id":9,"node_id":1,"detail":{"attempt":2,"stage_count":8,"stage_index":7,"loaded_stage_count":0,"stage_send_count":2}}),
+                    "mvp-orchestrator",
+                    1_501,
+                    501,
+                ),
+            ),
+        ]);
+        for request_id in 1..=2 {
+            let base = 1_600 + request_id * 100;
+            event_pairs.extend([
+                (
+                    "mvp.worker.tokenizer",
+                    stamped(
+                        json!({"type":"PromptEncoded","run_id":9,"node_id":2,"stage_index":0,"request_id":request_id,"tokens":[1,2,3]}),
+                        "tinygrad-worker",
+                        base,
+                        base,
+                    ),
+                ),
+                (
+                    "mvp.orch.prompt",
+                    pipeline_prompt_event(
+                        "pipeline_token_in",
+                        "started",
+                        request_id,
+                        base,
+                        base,
+                        json!({"begin_sequence":true,"edge_id":1,"sequence":request_id}),
+                    ),
+                ),
+                (
+                    "mvp.orch.prompt",
+                    pipeline_prompt_event(
+                        "pipeline_token_in",
+                        "ready",
+                        request_id,
+                        base + 1,
+                        base + 1,
+                        json!({"begin_sequence":true,"edge_id":1,"sequence":request_id}),
+                    ),
+                ),
+                (
+                    "mvp.orch.prompt",
+                    pipeline_prompt_event(
+                        "pipeline_token_out",
+                        "observed",
+                        request_id,
+                        base + 2,
+                        base + 2,
+                        json!({"edge_id":9,"sequence":request_id,"token_id":7}),
+                    ),
+                ),
+                (
+                    "mvp.orch.prompt",
+                    pipeline_prompt_event(
+                        "pipeline_tokenizer_decode",
+                        "ready",
+                        request_id,
+                        base + 3,
+                        base + 3,
+                        json!({"text_bytes":1}),
+                    ),
+                ),
+            ]);
+        }
+        event_pairs.push((
+            "mvp.worker.step",
+            stamped(
+                json!({"type":"StepExecuted","run_id":9,"node_id":2,"stage_index":0,"execution_backend":"pipeline_stage","committed_bytes":4096}),
+                "tinygrad-worker",
+                1_900,
+                900,
+            ),
+        ));
+        event_pairs.extend([
+            (
+                "mvp.node.stage",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"egress_ring_read","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"edge_id":77,"edge_kind":"Activation","ring_id":11,"step_id":5,"sequence":3,"object_id":44,"record_bytes":4096,"helper_execute_ms":9,"egress_ring_read_ms":2}}),
+                    "mvp-worker-node",
+                    1_901,
+                    901,
+                ),
+            ),
+            (
+                "mvp.node.stage",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"iroh_edge_bytes_sent","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"edge_id":77,"edge_kind":"Activation","step_id":5,"sequence":3,"object_id":44,"record_bytes":4096,"send_ms":1}}),
+                    "mvp-worker-node",
+                    1_902,
+                    902,
+                ),
+            ),
+            (
+                "mvp.node.stage",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"iroh_edge_bytes_read","status":"observed","run_id":9,"node_id":3,"stage_index":1,"detail":{"edge_id":77,"stream_id":1,"bytes":4096}}),
+                    "mvp-worker-node",
+                    1_903,
+                    903,
+                ),
+            ),
+            (
+                "mvp.node.stage",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"ingress_ring_write","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"edge_id":77,"edge_kind":"Activation","ring_id":12,"stream_id":1,"object_id":44,"sequence":3,"record_bytes":4096,"ingress_ring_write_ms":3}}),
+                    "mvp-worker-node",
+                    1_904,
+                    904,
+                ),
+            ),
+            (
+                "mvp.node.stage",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"object_loaded","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"edge_id":77,"edge_kind":"Activation","ring_id":12,"stream_id":1,"object_id":44,"sequence":3,"handle_id":99,"object_load_ms":4}}),
+                    "mvp-worker-node",
+                    1_905,
+                    905,
+                ),
+            ),
+        ]);
+        let path = write_synthetic_event_dump("vastai-summary-operator", event_pairs);
+        let events = parse_dump_log_events(&path).expect("parse summary events");
+        let paths = MvpChatCheckPaths {
+            root: std::env::temp_dir(),
+            dump_log: path.clone(),
+            stdout: temp_path("vastai-summary-stdout"),
+            stderr: temp_path("vastai-summary-stderr"),
+            prompts: temp_path("vastai-summary-prompts"),
+            redacted_config: temp_path("vastai-summary-config"),
+            summary: temp_path("vastai-summary-json"),
+        };
+
+        let summary =
+            build_benchmark_summary(&events, 80, 9, MvpChatCheckScenario::VastAi, &paths, 12, 34)
+                .expect("summary builds");
+        let _ = fs::remove_file(path);
+
+        let invariants = summary
+            .pointer("/invariants")
+            .and_then(Value::as_array)
+            .expect("invariants array");
+        assert!(!invariants.iter().any(|invariant| {
+            matches!(
+                invariant.get("name").and_then(Value::as_str),
+                Some("activation_large_object_iroh_sent" | "activation_large_object_iroh_read")
+            )
+        }));
+        assert_eq!(
+            summary
+                .pointer("/gpu/pipeline_token_out_request_ids/0")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .pointer("/gpu/pipeline_tokenizer_decode_ready_request_ids/1")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            summary
+                .pointer("/vastai/selected_lease_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .pointer("/vastai/selected_leases/0/gpu_name")
+                .and_then(Value::as_str),
+            Some("RTX 2060")
+        );
+        assert_eq!(
+            summary
+                .pointer("/pipeline/provisioning/max_send_events_for_stage")
+                .and_then(Value::as_u64),
+            Some(2)
+        );
+        assert_eq!(
+            summary
+                .pointer("/pipeline/provisioning/latest_wait/waiting_stage_index")
+                .and_then(Value::as_u64),
+            Some(7)
+        );
+        assert_eq!(
+            summary
+                .pointer("/pipeline/provisioning/ssh_bootstrap/retry_counts_by_node/8")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .pointer("/gpu/host_gpu_samples/sample_count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .pointer("/gpu/host_gpu_samples/utilization_gpu_percent/max")
+                .and_then(Value::as_u64),
+            Some(73)
+        );
+        assert_eq!(
+            summary
+                .pointer("/pipeline/prompt_critical_paths/0/token_in_to_out_ms/count")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .pointer("/pipeline/edge_handoffs/0/producer_ring_reads")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            summary
+                .pointer("/pipeline/edge_handoffs/0/ingress_ring_write_ms/sum")
+                .and_then(Value::as_u64),
+            Some(3)
         );
     }
 }

@@ -848,8 +848,6 @@ impl Config {
         }
         if let Some(vastai) = &self.vastai {
             args.extend([
-                "--vastai-api-key".to_owned(),
-                vastai.api_key.clone(),
                 "--vastai-bootstrap-command".to_owned(),
                 vastai.bootstrap_command.clone(),
                 "--no-vastai-confirm-lease".to_owned(),
@@ -1255,6 +1253,9 @@ impl OrchChild {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        if let Some(vastai) = &config.vastai {
+            command.env("VAST_API_KEY", &vastai.api_key);
+        }
         #[cfg(all(target_os = "linux", not(test)))]
         unsafe {
             command.pre_exec(|| {
@@ -2838,6 +2839,18 @@ bootstrap_command = "boot"
                 assert_eq!(vastai.relay_url, "https://relay.example");
                 assert_eq!(vastai.bootstrap_command, "boot");
                 assert_eq!(vastai.image, "docker.io/acme/node:latest");
+                let args = config.orchestrator_cli_args("docker.io/acme/node:latest");
+                assert!(
+                    !args
+                        .iter()
+                        .any(|arg| arg == "--vastai-api-key" || arg == "secret"),
+                    "Vast.ai API key must not be exposed in orchestrator argv: {args:?}"
+                );
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--vastai-bootstrap-command", "boot"]),
+                    "non-secret Vast.ai config should still be forwarded"
+                );
             },
         );
     }

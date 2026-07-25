@@ -784,6 +784,7 @@ impl WorkerEdgeRuntime {
             outbound.kind,
             mvp_system::actors::node_agent::StageEdgeKindWire::TokenOut
         );
+        let step_started = Instant::now();
         let mut pump = || pump_network(driver, stack);
         let committed_bytes = worker.execute_step(
             u64::from(config.stage_index) + 1,
@@ -800,6 +801,8 @@ impl WorkerEdgeRuntime {
             datastream,
             &mut pump,
         )?;
+        let helper_execute_ms = duration_ms_u64(step_started.elapsed());
+        let egress_read_started = Instant::now();
         let record = {
             let arena = arena_manager.lock();
             let lease = arena
@@ -809,6 +812,7 @@ impl WorkerEdgeRuntime {
                 .read_arena(lease.layout.data_offset, committed_bytes)
                 .map_err(|e| format!("read egress ring: {e}"))?
         };
+        let egress_read_ms = duration_ms_u64(egress_read_started.elapsed());
         let record_bytes = record.len();
         emit_node_event(
             datastream,
@@ -820,9 +824,17 @@ impl WorkerEdgeRuntime {
                 "edge_id":outbound.edge_id,
                 "edge_kind":format!("{:?}", outbound.kind),
                 "ring_id":output_ring_id,
+                "step_id":step_id,
+                "input_object_id":object_id,
+                "input_edge_id":input_edge_id,
+                "sequence":sequence,
+                "output_object_id":output_object_id,
+                "output_sequence":sequence,
                 "record_bytes":record_bytes,
                 "committed_bytes":committed_bytes,
                 "final_stage":final_stage,
+                "helper_execute_ms":helper_execute_ms,
+                "egress_ring_read_ms":egress_read_ms,
             }),
         );
         self.driver_model
@@ -838,7 +850,9 @@ impl WorkerEdgeRuntime {
             .outbound_sender
             .as_ref()
             .ok_or_else(|| "outbound edge sender missing".to_owned())?;
+        let edge_send_started = Instant::now();
         sender.send(record)?;
+        let edge_send_ms = duration_ms_u64(edge_send_started.elapsed());
         emit_node_event(
             datastream,
             config,
@@ -848,8 +862,12 @@ impl WorkerEdgeRuntime {
             json!({
                 "edge_id":outbound.edge_id,
                 "edge_kind":format!("{:?}", outbound.kind),
+                "step_id":step_id,
+                "object_id":output_object_id,
+                "sequence":sequence,
                 "bytes":record_bytes,
                 "record_bytes":record_bytes,
+                "send_ms":edge_send_ms,
             }),
         );
         stack
@@ -891,28 +909,31 @@ impl WorkerEdgeRuntime {
         if inbound.edge_id != edge_id {
             return Ok(());
         }
-        let records = {
+        let (records, buffered_bytes) = {
             let buffer = self.ingress_streams.entry(stream_id).or_default();
             buffer.extend_from_slice(&bytes);
+            let buffered_bytes = buffer.len();
             let mut records = Vec::new();
             while let Some(record) = take_complete_ingress_record(buffer, inbound.object_spec)? {
                 records.push(record);
             }
-            records
+            (records, buffered_bytes)
         };
         for record in records {
             let ring_id = self
                 .inbound_ring_id
                 .ok_or_else(|| "inbound ring missing".to_owned())?;
+            let ring_write_started = Instant::now();
             {
                 let arena = arena_manager.lock();
                 let lease = arena
                     .lookup_lease(arena::RingId(ring_id))
                     .ok_or_else(|| format!("inbound ring {ring_id} lease missing"))?;
                 arena
-                    .write_arena(lease.layout.data_offset, &record)
+                    .write_arena(lease.layout.data_offset, &record.bytes)
                     .map_err(|e| format!("write ingress ring: {e}"))?;
             }
+            let ingress_ring_write_ms = duration_ms_u64(ring_write_started.elapsed());
             emit_node_event(
                 datastream,
                 config,
@@ -923,9 +944,18 @@ impl WorkerEdgeRuntime {
                     "edge_id":edge_id,
                     "edge_kind":format!("{:?}", inbound.kind),
                     "ring_id":ring_id,
-                    "record_bytes":record.len(),
+                    "stream_id":stream_id,
+                    "object_id":record.object_id,
+                    "sequence":record.sequence,
+                    "extent":record.extent,
+                    "begin_sequence":record.begin_sequence,
+                    "end_of_sequence":record.end_of_sequence,
+                    "record_bytes":record.bytes.len(),
+                    "ingress_buffer_bytes":buffered_bytes,
+                    "ingress_ring_write_ms":ingress_ring_write_ms,
                 }),
             );
+            let object_load_started = Instant::now();
             let loaded = worker.ring_readable(
                 ring_id,
                 edge_id,
@@ -934,11 +964,30 @@ impl WorkerEdgeRuntime {
                 datastream,
                 &mut || {},
             )?;
+            let object_load_ms = duration_ms_u64(object_load_started.elapsed());
             let key = ObjectKey {
                 edge_id,
                 object_id: loaded.object_id,
             };
             self.object_handles.insert(key, loaded.clone());
+            emit_node_event(
+                datastream,
+                config,
+                NODE_STAGE_CHANNEL,
+                "object_loaded",
+                "ready",
+                json!({
+                    "edge_id":edge_id,
+                    "edge_kind":format!("{:?}", inbound.kind),
+                    "ring_id":ring_id,
+                    "stream_id":stream_id,
+                    "object_id":loaded.object_id,
+                    "sequence":loaded.sequence,
+                    "handle_generation":loaded.handle_generation,
+                    "handle_id":loaded.handle_id,
+                    "object_load_ms":object_load_ms,
+                }),
+            );
             stack
                 .runtime
                 .send_to(
@@ -1270,6 +1319,9 @@ impl WorkerEdgeRuntime {
     }
 }
 
+fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 fn edge_object_spec(spec: StageObjectSpecWire) -> edge::ObjectSpec {
     edge::ObjectSpec {
         kind: edge::ObjectKind::Activation,
@@ -1294,17 +1346,34 @@ fn ingress_object_spec(spec: StageObjectSpecWire) -> ingress::ObjectSpec {
     }
 }
 
+struct IngressRecordBytes {
+    bytes: Vec<u8>,
+    object_id: u64,
+    sequence: u64,
+    extent: u64,
+    begin_sequence: bool,
+    end_of_sequence: bool,
+}
+
 fn take_complete_ingress_record(
     buffer: &mut Vec<u8>,
     spec: StageObjectSpecWire,
-) -> Result<Option<Vec<u8>>, String> {
+) -> Result<Option<IngressRecordBytes>, String> {
     let record = match ingress::read_object_record(buffer, ingress_object_spec(spec), false)
         .map_err(|reason| format!("invalid object record: {reason:?}"))?
     {
         ingress::ObjectRecordRead::Incomplete => return Ok(None),
         ingress::ObjectRecordRead::Complete(record) => record,
     };
-    Ok(Some(buffer.drain(..record.total_len).collect()))
+    let bytes = buffer.drain(..record.total_len).collect();
+    Ok(Some(IngressRecordBytes {
+        bytes,
+        object_id: record.object_id.0,
+        sequence: record.sequence,
+        extent: record.extent,
+        begin_sequence: record.flags.begin_sequence,
+        end_of_sequence: record.flags.end_of_sequence,
+    }))
 }
 
 fn value_u64(value: &Value, field: &str) -> Result<u64, String> {

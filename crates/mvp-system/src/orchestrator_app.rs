@@ -702,11 +702,13 @@ impl VastAiRuntimeConfig {
             "ssh_user": &self.provisioning.ssh_user,
             "gpu_name": &self.provisioning.selection.gpu_name,
             "min_gpu_ram_mb": self.provisioning.selection.min_gpu_ram_mb,
+            "min_compute_cap": self.provisioning.selection.min_compute_cap,
             "min_down_mbps": self.provisioning.selection.min_down_mbps,
             "min_up_mbps": self.provisioning.selection.min_up_mbps,
             "max_dph_total": self.provisioning.selection.max_dph_total,
             "min_reliability": self.provisioning.selection.min_reliability,
             "require_verified": self.provisioning.selection.require_verified,
+            "state_timeout_secs": self.provisioning.lifecycle.state_timeout.as_secs(),
             "confirm_lease": self.provisioning.confirm_lease,
             "has_api_key": self.api_key.is_some(),
             "has_onstart": self.provisioning.onstart.is_some(),
@@ -2975,6 +2977,7 @@ fn wait_for_weights_loaded_count(
     let mut last_resend = Instant::now();
     let mut active_stage = None::<u32>;
     let mut resend_attempt = 0_u64;
+    let mut stage_resend_counts = BTreeMap::<u32, u64>::new();
     loop {
         pump(driver, stack, frame_tx);
         emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
@@ -3002,6 +3005,12 @@ fn wait_for_weights_loaded_count(
                 ));
             };
             let stage_node_id = stage.node_id.0;
+            let stage_send_count = {
+                let count = stage_resend_counts.entry(stage.stage_index).or_default();
+                *count += 1;
+                *count
+            };
+            let emit_wait_headline = stage_send_count == 1 || stage_send_count % 15 == 0;
             let ready = readies.get(&stage_node_id).ok_or_else(|| {
                 format!("missing runtime-ready node for stage {}", stage.stage_index)
             })?;
@@ -3015,6 +3024,7 @@ fn wait_for_weights_loaded_count(
                     "attempt":resend_attempt,
                     "stage_count":pipeline_plan.stages.len(),
                     "stage_index":stage.stage_index,
+                    "stage_send_count":stage_send_count,
                     "loaded_stage_count":loaded_stages.len()
                 }),
             );
@@ -3040,6 +3050,29 @@ fn wait_for_weights_loaded_count(
                     "route_matches_ready":route_owner == Some(ready.swim_node_id),
                 }),
             );
+            if emit_wait_headline {
+                orch_datastream.emit_bootstrap(
+                    dashboard,
+                    run_id,
+                    node_id,
+                    "stage_provision_wait",
+                    "observed",
+                    json!({
+                        "attempt":resend_attempt,
+                        "stage_count":pipeline_plan.stages.len(),
+                        "stage_index":stage.stage_index,
+                        "stage_node_id":stage_node_id,
+                        "stage_send_count":stage_send_count,
+                        "loaded_stage_count":loaded_stages.len(),
+                        "message":format!(
+                            "loaded {} of {}; waiting on stage {}",
+                            loaded_stages.len(),
+                            pipeline_plan.stages.len(),
+                            stage.stage_index
+                        )
+                    }),
+                );
+            }
             provision_stage_from_plan(
                 stack,
                 ready.node_actor,
@@ -3120,7 +3153,7 @@ fn next_pipeline_weight_load_stage<'a>(
         .stages
         .iter()
         .filter(|stage| !loaded_stages.contains(&stage.stage_index))
-        .min_by_key(|stage| stage.stage_index)
+        .max_by_key(|stage| stage.stage_index)
 }
 
 struct FailedProvisionPlugin;
@@ -4115,7 +4148,7 @@ impl PipelinePromptRuntime {
             request_id,
             "pipeline_token_in",
             "started",
-            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":tokens.len(),"begin_sequence":true}),
+            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":tokens.len(),"begin_sequence":true,"token_count":tokens.len(),"token_ids":&tokens}),
         );
         self.send_token_in(sequence, &tokens, true)?;
         orch_datastream.emit_prompt(
@@ -4125,7 +4158,7 @@ impl PipelinePromptRuntime {
             request_id,
             "pipeline_token_in",
             "ready",
-            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"begin_sequence":true}),
+            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"begin_sequence":true,"token_count":tokens.len()}),
         );
         Ok(())
     }
@@ -4200,7 +4233,26 @@ impl PipelinePromptRuntime {
             self.active = None;
             return Ok(());
         }
-        self.send_token_in(self.next_sequence, &[pending.token_id], false)?;
+        let sequence = self.next_sequence;
+        orch_datastream.emit_prompt(
+            dashboard,
+            run_id,
+            node_id,
+            request_id,
+            "pipeline_token_in",
+            "started",
+            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":1,"begin_sequence":false,"token_count":1,"token_id":pending.token_id}),
+        );
+        self.send_token_in(sequence, &[pending.token_id], false)?;
+        orch_datastream.emit_prompt(
+            dashboard,
+            run_id,
+            node_id,
+            request_id,
+            "pipeline_token_in",
+            "ready",
+            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"begin_sequence":false,"token_count":1,"token_id":pending.token_id}),
+        );
         Ok(())
     }
     fn send_token_in(
@@ -4317,7 +4369,7 @@ impl PipelinePromptRuntime {
                     request_id,
                     "pipeline_token_out",
                     "observed",
-                    json!({"edge_id":self.token_out_edge_id,"object_id":record.object_id,"sequence":record.sequence,"token_id":record.token_id,"eos":record.eos}),
+                    json!({"edge_id":self.token_out_edge_id,"object_id":record.object_id,"sequence":record.sequence,"token_id":record.token_id,"eos":record.eos,"generated_index":self.generated_tokens.len() + 1}),
                 );
                 self.generated_tokens.push(record.token_id);
                 let reached_limit = self.generated_tokens.len() as u32 >= active.request.max_tokens;
@@ -4328,7 +4380,7 @@ impl PipelinePromptRuntime {
                     request_id,
                     "pipeline_tokenizer_decode",
                     "started",
-                    json!({"node_actor":self.tokenizer_decode_actor,"reply_to":self.tokenizer_reply_to,"token_id":record.token_id}),
+                    json!({"node_actor":self.tokenizer_decode_actor,"reply_to":self.tokenizer_reply_to,"token_id":record.token_id,"sequence":record.sequence,"generated_index":self.generated_tokens.len()}),
                 );
                 self.request_decode(
                     runtime,
@@ -5325,13 +5377,13 @@ mod tests {
 
         let first =
             next_pipeline_weight_load_stage(&plan, &loaded, None).expect("first stage selected");
-        assert_eq!(first.stage_index, 0);
+        assert_eq!(first.stage_index, 6);
 
         let resent = next_pipeline_weight_load_stage(&plan, &loaded, Some(first.stage_index))
             .expect("active stage is resent before it loads");
-        assert_eq!(resent.stage_index, 0);
+        assert_eq!(resent.stage_index, 6);
 
-        for expected_stage in 0..7 {
+        for expected_stage in (0..7).rev() {
             let active = next_pipeline_weight_load_stage(&plan, &loaded, None)
                 .expect("next unloaded stage selected");
             assert_eq!(active.stage_index, expected_stage);

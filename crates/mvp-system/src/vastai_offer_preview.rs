@@ -57,6 +57,7 @@ mod tests {
             gpu_name: "RTX 4090".to_owned(),
             dph_total: 0.375,
             gpu_ram: Some(23.5),
+            compute_cap: 890,
             geolocation: Some("US".to_owned()),
             inet_down_cost_per_tb: 0.0,
             inet_up_cost_per_tb: 0.0,

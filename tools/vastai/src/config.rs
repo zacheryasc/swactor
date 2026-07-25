@@ -4,6 +4,7 @@ use crate::types::{LifecyclePolicy, SelectionPolicy};
 
 pub const ENV_IMAGE_SIZE_GB: &str = "PP_IMAGE_SIZE_GB";
 pub const ENV_GPU_MIN_RAM_MB: &str = "PP_GPU_MIN_RAM_MB";
+pub const ENV_MIN_COMPUTE_CAP: &str = "PP_MIN_COMPUTE_CAP";
 pub const ENV_MIN_INET_DOWN_MBPS: &str = "PP_MIN_INET_DOWN_MBPS";
 pub const ENV_MIN_INET_UP_MBPS: &str = "PP_MIN_INET_UP_MBPS";
 pub const ENV_MIN_RELIABILITY: &str = "PP_MIN_RELIABILITY";
@@ -11,6 +12,7 @@ pub const ENV_REQUIRE_VERIFIED: &str = "PP_REQUIRE_VERIFIED";
 pub const ENV_DROP_CHEAP_FRAC: &str = "PP_DROP_CHEAP_FRAC";
 pub const ENV_MAX_DPH_TOTAL: &str = "PP_MAX_DPH_TOTAL";
 pub const ENV_LEASE_PACE_MS: &str = "PP_LEASE_PACE_MS";
+pub const ENV_STATE_TIMEOUT_SECS: &str = "PP_STATE_TIMEOUT_SECS";
 pub const ENV_BLACKLIST_HOSTS: &str = "PP_BLACKLIST_HOSTS";
 pub const ENV_ASSUME_YES: &str = "PP_ASSUME_YES";
 
@@ -48,6 +50,9 @@ impl SelectionPolicy {
     pub fn from_env() -> Self {
         let mut policy = Self::default();
         policy.min_gpu_ram_mb = env_positive_u64(ENV_GPU_MIN_RAM_MB);
+        if let Some(min_compute_cap) = env_positive_u64(ENV_MIN_COMPUTE_CAP) {
+            policy.min_compute_cap = Some(min_compute_cap);
+        }
         policy.min_down_mbps = env_nonnegative_f64(ENV_MIN_INET_DOWN_MBPS, 100.0);
         policy.min_reliability = std::env::var(ENV_MIN_RELIABILITY)
             .ok()
@@ -84,6 +89,9 @@ impl LifecyclePolicy {
                 .unwrap_or(600),
         );
         policy.poll_interval = poll_interval;
+        if let Some(state_timeout_secs) = env_positive_u64(ENV_STATE_TIMEOUT_SECS) {
+            policy.state_timeout = Duration::from_secs(state_timeout_secs);
+        }
         policy
     }
 }
