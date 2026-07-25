@@ -4,6 +4,7 @@ fuzz/artifacts/**
 corpus
 .loop/
 .model-cache/
+.deployment-notes/
 
 # environment variables for deployment configurations
 .config/

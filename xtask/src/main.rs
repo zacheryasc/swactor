@@ -52,61 +52,93 @@ enum MvpChatCheckScenario {
     VastAi,
 }
 
-impl MvpChatCheckScenario {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MvpChatCheckInvocation {
+    scenario: MvpChatCheckScenario,
+    pipeline_stages: Option<u32>,
+}
+
+impl MvpChatCheckInvocation {
     fn parse_args(args: Vec<String>) -> Result<Self, String> {
-        let mut scenario = Self::ProcessBaseline;
-        for arg in args {
-            let selected = match arg.as_str() {
-                "--gpu" => Self::Gpu,
-                "--multinode" => Self::Multinode,
-                "--multinode-docker" => Self::MultinodeDocker,
-                "--vastai" => Self::VastAi,
-                other => return Err(format!("unsupported mvp-chat-check argument {other:?}")),
-            };
-            if scenario != Self::ProcessBaseline {
-                return Err(
-                    "mvp-chat-check accepts at most one scenario flag: --gpu, --multinode, --multinode-docker, or --vastai"
-                        .to_owned(),
-                );
+        let mut scenario = MvpChatCheckScenario::ProcessBaseline;
+        let mut pipeline_stages = None;
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            if let Some(selected) = MvpChatCheckScenario::from_flag(&arg) {
+                if scenario != MvpChatCheckScenario::ProcessBaseline {
+                    return Err(
+                        "mvp-chat-check accepts at most one scenario flag: --gpu, --multinode, --multinode-docker, or --vastai"
+                            .to_owned(),
+                    );
+                }
+                scenario = selected;
+                continue;
             }
-            scenario = selected;
+
+            match arg.as_str() {
+                "--pipeline-stages" => {
+                    if pipeline_stages.is_some() {
+                        return Err(
+                            "mvp-chat-check accepts at most one --pipeline-stages value".to_owned()
+                        );
+                    }
+                    let value = args
+                        .next()
+                        .ok_or_else(|| "--pipeline-stages requires a value".to_owned())?;
+                    let stages = value
+                        .parse::<u32>()
+                        .map_err(|error| format!("parse --pipeline-stages: {error}"))?;
+                    if stages == 0 {
+                        return Err("--pipeline-stages must be greater than 0".to_owned());
+                    }
+                    pipeline_stages = Some(stages);
+                }
+                other => return Err(format!("unsupported mvp-chat-check argument {other:?}")),
+            }
         }
-        Ok(scenario)
+        Ok(Self {
+            scenario,
+            pipeline_stages,
+        })
     }
 
-    fn name(self) -> &'static str {
-        match self {
-            Self::ProcessBaseline => "process",
-            Self::Gpu => "gpu",
-            Self::Multinode => "multinode",
-            Self::MultinodeDocker => "multinode-docker",
-            Self::VastAi => "vastai",
-        }
+    fn scenario(&self) -> MvpChatCheckScenario {
+        self.scenario
     }
 
-    fn mvp_chat_args(self, run_id: u64, dump_log: &Path) -> Vec<String> {
+    fn name(&self) -> &'static str {
+        self.scenario.name()
+    }
+
+    fn mvp_chat_args(&self, run_id: u64, dump_log: &Path) -> Vec<String> {
         let mut args = Vec::new();
-        match self {
-            Self::ProcessBaseline | Self::Multinode => {
+        match self.scenario {
+            MvpChatCheckScenario::ProcessBaseline | MvpChatCheckScenario::Multinode => {
                 args.push("--process".to_owned());
             }
-            Self::Gpu => {
+            MvpChatCheckScenario::Gpu => {
                 args.extend(["--process".to_owned(), "--gpu".to_owned()]);
             }
-            Self::MultinodeDocker => {
+            MvpChatCheckScenario::MultinodeDocker => {
                 args.push("--docker".to_owned());
             }
-            Self::VastAi => {
+            MvpChatCheckScenario::VastAi => {
                 args.push("--vastai".to_owned());
             }
         }
-        if matches!(self, Self::Multinode | Self::MultinodeDocker) {
-            args.extend(["--pipeline-stages".to_owned(), "2".to_owned()]);
+        if let Some(pipeline_stages) = self
+            .pipeline_stages
+            .or_else(|| self.scenario.default_pipeline_stages())
+        {
+            args.extend(["--pipeline-stages".to_owned(), pipeline_stages.to_string()]);
         }
-        if !matches!(self, Self::Gpu | Self::VastAi) {
+        if !matches!(
+            self.scenario,
+            MvpChatCheckScenario::Gpu | MvpChatCheckScenario::VastAi
+        ) {
             args.push("--cached-model".to_owned());
         }
-        if matches!(self, Self::VastAi) {
+        if matches!(self.scenario, MvpChatCheckScenario::VastAi) {
             args.extend([
                 "--yes".to_owned(),
                 "--endpoint-addr-mask".to_owned(),
@@ -120,6 +152,39 @@ impl MvpChatCheckScenario {
             format!("--dump-logs={}", dump_log.display()),
         ]);
         args
+    }
+
+    fn env_overrides(&self) -> &'static [(&'static str, &'static str)] {
+        self.scenario.env_overrides()
+    }
+}
+
+impl MvpChatCheckScenario {
+    fn from_flag(flag: &str) -> Option<Self> {
+        match flag {
+            "--gpu" => Some(Self::Gpu),
+            "--multinode" => Some(Self::Multinode),
+            "--multinode-docker" => Some(Self::MultinodeDocker),
+            "--vastai" => Some(Self::VastAi),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ProcessBaseline => "process",
+            Self::Gpu => "gpu",
+            Self::Multinode => "multinode",
+            Self::MultinodeDocker => "multinode-docker",
+            Self::VastAi => "vastai",
+        }
+    }
+
+    fn default_pipeline_stages(self) -> Option<u32> {
+        match self {
+            Self::Multinode | Self::MultinodeDocker => Some(2),
+            Self::ProcessBaseline | Self::Gpu | Self::VastAi => None,
+        }
     }
 
     fn env_overrides(self) -> &'static [(&'static str, &'static str)] {
@@ -189,7 +254,7 @@ USAGE: cargo xtask <command>
 
 COMMANDS:
   mvp-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
-  mvp-chat-check [--gpu|--multinode|--multinode-docker|--vastai]
+  mvp-chat-check [--gpu|--multinode|--multinode-docker|--vastai] [--pipeline-stages n]
                      Run real cargo mvp-chat acceptance check and write benchmark artifacts.
   mvp-chat-compare <baseline-summary.json> <candidate-summary.json>
                      Compare two benchmark summaries and report comparable deltas.
@@ -657,14 +722,15 @@ fn write_mvp_chat_check_paths(root: &Path) -> Result<MvpChatCheckPaths, String> 
 }
 
 fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
-    let scenario = match MvpChatCheckScenario::parse_args(args) {
-        Ok(scenario) => scenario,
+    let invocation = match MvpChatCheckInvocation::parse_args(args) {
+        Ok(invocation) => invocation,
         Err(error) => {
             eprintln!("mvp-chat-check: failed: {error}");
             print_usage();
             return ExitCode::from(1);
         }
     };
+    let scenario = invocation.scenario();
     let workspace = workspace_root();
     let temp_root = unique_temp_dir("mvp-chat-check");
     let paths = match write_mvp_chat_check_paths(&temp_root) {
@@ -679,9 +745,9 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
         }
     };
     let run_id = mvp_chat_check_run_id();
-    println!("mvp-chat-check: scenario {}", scenario.name());
+    println!("mvp-chat-check: scenario {}", invocation.name());
 
-    let output = match run_mvp_chat_check_process(&workspace, &paths, run_id, scenario) {
+    let output = match run_mvp_chat_check_process(&workspace, &paths, run_id, &invocation) {
         Ok(output) => output,
         Err(error) => return fail_mvp_chat_check(&error, &paths, "", "", None),
     };
@@ -790,14 +856,14 @@ fn run_mvp_chat_check_process(
     workspace: &Path,
     paths: &MvpChatCheckPaths,
     run_id: u64,
-    scenario: MvpChatCheckScenario,
+    invocation: &MvpChatCheckInvocation,
 ) -> Result<MvpChatCheckOutput, String> {
     let mut command = Command::new(cargo_bin());
     command.current_dir(workspace).arg("mvp-chat").arg("--");
-    for arg in scenario.mvp_chat_args(run_id, &paths.dump_log) {
+    for arg in invocation.mvp_chat_args(run_id, &paths.dump_log) {
         command.arg(arg);
     }
-    for &(key, value) in scenario.env_overrides() {
+    for &(key, value) in invocation.env_overrides() {
         command.env(key, value);
     }
     command
@@ -2955,8 +3021,8 @@ mod tests {
         let dump_log = Path::new("/tmp/mvp-chat-check.ndjson");
 
         let baseline =
-            MvpChatCheckScenario::parse_args(Vec::new()).expect("default scenario parses");
-        assert_eq!(baseline, MvpChatCheckScenario::ProcessBaseline);
+            MvpChatCheckInvocation::parse_args(Vec::new()).expect("default scenario parses");
+        assert_eq!(baseline.scenario(), MvpChatCheckScenario::ProcessBaseline);
         assert_eq!(
             baseline.mvp_chat_args(42, dump_log),
             strings(&[
@@ -2968,8 +3034,8 @@ mod tests {
             ])
         );
 
-        let gpu = MvpChatCheckScenario::parse_args(strings(&["--gpu"])).expect("gpu parses");
-        assert_eq!(gpu, MvpChatCheckScenario::Gpu);
+        let gpu = MvpChatCheckInvocation::parse_args(strings(&["--gpu"])).expect("gpu parses");
+        assert_eq!(gpu.scenario(), MvpChatCheckScenario::Gpu);
         assert!(gpu.env_overrides().is_empty());
         assert_eq!(
             gpu.mvp_chat_args(42, dump_log),
@@ -2982,9 +3048,9 @@ mod tests {
             ])
         );
 
-        let multinode =
-            MvpChatCheckScenario::parse_args(strings(&["--multinode"])).expect("multinode parses");
-        assert_eq!(multinode, MvpChatCheckScenario::Multinode);
+        let multinode = MvpChatCheckInvocation::parse_args(strings(&["--multinode"]))
+            .expect("multinode parses");
+        assert_eq!(multinode.scenario(), MvpChatCheckScenario::Multinode);
         assert_eq!(
             multinode.mvp_chat_args(42, dump_log),
             strings(&[
@@ -2998,9 +3064,12 @@ mod tests {
             ])
         );
 
-        let multinode_docker = MvpChatCheckScenario::parse_args(strings(&["--multinode-docker"]))
+        let multinode_docker = MvpChatCheckInvocation::parse_args(strings(&["--multinode-docker"]))
             .expect("multinode docker parses");
-        assert_eq!(multinode_docker, MvpChatCheckScenario::MultinodeDocker);
+        assert_eq!(
+            multinode_docker.scenario(),
+            MvpChatCheckScenario::MultinodeDocker
+        );
         assert_eq!(
             multinode_docker.mvp_chat_args(42, dump_log),
             strings(&[
@@ -3015,12 +3084,32 @@ mod tests {
         );
 
         let vastai =
-            MvpChatCheckScenario::parse_args(strings(&["--vastai"])).expect("vastai parses");
-        assert_eq!(vastai, MvpChatCheckScenario::VastAi);
+            MvpChatCheckInvocation::parse_args(strings(&["--vastai"])).expect("vastai parses");
+        assert_eq!(vastai.scenario(), MvpChatCheckScenario::VastAi);
         assert_eq!(
             vastai.mvp_chat_args(42, dump_log),
             strings(&[
                 "--vastai",
+                "--yes",
+                "--endpoint-addr-mask",
+                "relay-only",
+                "--skip-rebuild",
+                "--run-id",
+                "42",
+                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+            ])
+        );
+
+        let vastai_sweep =
+            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages", "8"]))
+                .expect("vastai sweep parses");
+        assert_eq!(vastai_sweep.scenario(), MvpChatCheckScenario::VastAi);
+        assert_eq!(
+            vastai_sweep.mvp_chat_args(42, dump_log),
+            strings(&[
+                "--vastai",
+                "--pipeline-stages",
+                "8",
                 "--yes",
                 "--endpoint-addr-mask",
                 "relay-only",
@@ -3035,14 +3124,24 @@ mod tests {
     #[test]
     fn scenario_flags_reject_unknown_or_ambiguous_invocations() {
         assert!(
-            MvpChatCheckScenario::parse_args(strings(&["--docker"]))
+            MvpChatCheckInvocation::parse_args(strings(&["--docker"]))
                 .expect_err("unknown flag fails")
                 .contains("unsupported mvp-chat-check argument")
         );
         assert!(
-            MvpChatCheckScenario::parse_args(strings(&["--gpu", "--multinode"]))
+            MvpChatCheckInvocation::parse_args(strings(&["--gpu", "--multinode"]))
                 .expect_err("multiple scenarios fail")
                 .contains("at most one scenario flag")
+        );
+        assert!(
+            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages", "0"]))
+                .expect_err("zero pipeline stages fail")
+                .contains("--pipeline-stages must be greater than 0")
+        );
+        assert!(
+            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages"]))
+                .expect_err("missing pipeline stages fail")
+                .contains("--pipeline-stages requires a value")
         );
     }
 
