@@ -1,6 +1,10 @@
 use std::time::Duration;
 
+use reqwest::StatusCode;
+
 use crate::types::{InstanceInfo, InstanceListResponse, LabeledInstance};
+
+const DESTROY_RETRY_ATTEMPTS: u64 = 10;
 
 /// Destroy one vast.ai instance by contract id.
 pub async fn destroy_instance(
@@ -19,6 +23,9 @@ pub async fn destroy_instance(
         .send()
         .await
         .map_err(|e| format!("destroy_instance request failed: {e}"))?;
+    if resp.status() == StatusCode::NOT_FOUND {
+        return Ok(());
+    }
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
@@ -50,15 +57,40 @@ pub async fn destroy_instance_with_retry(
     api_key: &str,
     contract_id: u64,
 ) -> Result<(), String> {
+    destroy_instance_with_retry_policy(
+        client,
+        base_url,
+        api_key,
+        contract_id,
+        DESTROY_RETRY_ATTEMPTS,
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn destroy_instance_with_retry_policy(
+    client: &reqwest::Client,
+    base_url: &str,
+    api_key: &str,
+    contract_id: u64,
+    max_attempts: u64,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+) -> Result<(), String> {
+    let max_attempts = max_attempts.max(1);
     let mut attempt = 1_u64;
     loop {
         match destroy_instance(client, base_url, api_key, contract_id).await {
             Ok(()) => return Ok(()),
+            Err(error) if attempt >= max_attempts => {
+                return Err(format!(
+                    "destroy_instance {contract_id} failed after {attempt} attempts: {error}"
+                ));
+            }
             Err(_) => {
-                let backoff = std::cmp::min(
-                    Duration::from_millis(500_u64.saturating_mul(attempt)),
-                    Duration::from_secs(30),
-                );
+                let backoff =
+                    std::cmp::min(initial_backoff.saturating_mul(attempt as u32), max_backoff);
                 tokio::time::sleep(backoff).await;
                 attempt = attempt.saturating_add(1);
             }
@@ -115,4 +147,56 @@ pub async fn list_instances_by_label(
         .collect();
     out.sort_by_key(|i| i.contract_id);
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn destroy_missing_contract_is_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v0/instances/123/"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+
+        destroy_instance(&reqwest::Client::new(), &server.uri(), "secret", 123)
+            .await
+            .expect("destroy should be idempotent when the contract is already gone");
+    }
+
+    #[tokio::test]
+    async fn destroy_retry_returns_last_error_after_policy_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/v0/instances/123/"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("try later"))
+            .mount(&server)
+            .await;
+
+        let error = destroy_instance_with_retry_policy(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "secret",
+            123,
+            3,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .expect_err("persistent destroy failure should not retry forever");
+
+        assert!(
+            error.contains("failed after 3 attempts"),
+            "error should report retry exhaustion: {error}"
+        );
+        assert!(
+            error.contains("HTTP 500"),
+            "error should preserve provider failure details: {error}"
+        );
+    }
 }

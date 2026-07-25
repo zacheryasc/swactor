@@ -17,6 +17,8 @@ use datastream::{
 };
 
 use distribution::node::DistributedNodeConfig;
+use distribution::swim::telemetry::ObservedProbeEvent;
+use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
@@ -1843,6 +1845,7 @@ fn run() -> Result<(), String> {
     );
     loop {
         pump_network(&mut driver, &stack);
+        emit_swim_telemetry(&mut datastream, &stack, "main_loop");
         drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut datastream);
         datastream.tick();
         worker.drain_stderr(&config, &mut datastream);
@@ -1999,6 +2002,85 @@ fn pump_network(driver: &mut IrohDriver, stack: &DistributionRuntimeStack) {
     driver.drain_outbox(&stack.outbox);
 }
 
+fn emit_swim_telemetry(
+    datastream: &mut NodeDatastream,
+    stack: &DistributionRuntimeStack,
+    local_phase: &str,
+) {
+    for transition in stack.drain_swim_transitions() {
+        let peer = format_dist_node_id(transition.peer);
+        let from = transition.from.map(|state| format!("{:?}", state));
+        let to = format!("{:?}", transition.to);
+        let member_state = stack
+            .member_state(transition.peer)
+            .map(|state| format!("{:?}", state));
+        let record = MembershipTransition {
+            peer,
+            from: from.unwrap_or_default(),
+            to,
+            reason: transition.reason.to_owned(),
+            last_ack_age_ms: transition.last_ack_age.map(duration_ms_u64),
+            consecutive_timeouts: transition.consecutive_timeouts,
+            recent_probe_targets: swim_recent_probe_targets(stack),
+            member_state,
+        };
+        datastream
+            .producer
+            .submit_record(datastream.channels.membership, &record);
+    }
+    for event in stack.drain_swim_probe_events() {
+        let record = swim_probe_event_record(stack, event, local_phase);
+        datastream
+            .producer
+            .submit_record(datastream.channels.swim_probes, &record);
+    }
+}
+
+fn swim_probe_event_record(
+    stack: &DistributionRuntimeStack,
+    event: ObservedProbeEvent,
+    local_phase: &str,
+) -> SwimProbeEvent {
+    let config = &stack.swim_config;
+    let budget_ms = event.budget_ms;
+    SwimProbeEvent {
+        event: event.event.to_owned(),
+        target: format_dist_node_id(event.target),
+        sequence: event.sequence,
+        kind: event.kind.to_owned(),
+        rtt_ms: event.rtt_ms,
+        budget_ms,
+        budget_ticks: budget_ms,
+        last_ack_age_ms: event.last_ack_age.map(duration_ms_u64),
+        consecutive_timeouts: event.consecutive_timeouts,
+        recent_probe_targets: swim_recent_probe_targets(stack),
+        member_state: stack
+            .member_state(event.target)
+            .map(|state| format!("{:?}", state)),
+        local_phase: local_phase.to_owned(),
+        probe_interval_ms: duration_ms_u64(config.probe_interval),
+        probe_timeout_ms: duration_ms_u64(config.probe_timeout),
+        indirect_probes: u32::try_from(config.indirect_probes).unwrap_or(u32::MAX),
+        suspicion_timeout_ms: duration_ms_u64(config.suspicion_timeout),
+        dead_reprobe_interval_ms: duration_ms_u64(config.dead_reprobe_interval),
+        probe_mode: format!("{:?}", config.probe_mode),
+        lifeguard_enabled: config.lifeguard.is_some(),
+    }
+}
+
+fn swim_recent_probe_targets(stack: &DistributionRuntimeStack) -> Vec<String> {
+    stack
+        .swim_telemetry
+        .recent_targets()
+        .into_iter()
+        .map(format_dist_node_id)
+        .collect()
+}
+
+fn format_dist_node_id(node_id: DistNodeId) -> String {
+    format!("{:?}", node_id)
+}
+
 fn node_datastream(config: &DeploymentConfig) -> NodeDatastream {
     NodeDatastream::new(config)
 }
@@ -2011,6 +2093,8 @@ struct DatastreamChannelSet {
     worker_stderr: ChannelId,
     host_cpu: ChannelId,
     host_gpu: ChannelId,
+    membership: ChannelId,
+    swim_probes: ChannelId,
     host_net: ChannelId,
     arena: ChannelId,
 }
@@ -2105,6 +2189,16 @@ impl NodeDatastream {
                 &mut by_id,
             ),
             arena: register_record_channel::<arena::ArenaSample>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
+            membership: register_record_channel::<MembershipTransition>(
+                &producer,
+                &mut by_name,
+                &mut by_id,
+            ),
+            swim_probes: register_record_channel::<SwimProbeEvent>(
                 &producer,
                 &mut by_name,
                 &mut by_id,
@@ -3773,6 +3867,7 @@ fn tokenizer_from_env() -> TokenizerSource {
 mod tests {
     use super::*;
     use distribution::swim::actor::MembershipChanged;
+    use distribution::swim::node::{SwimObservation, SwimObserver};
     use mvp_system::actors::orchestrator::OrchestratorMsg;
 
     fn endpoint(seed: u8) -> EndpointAddr {
@@ -3822,6 +3917,49 @@ mod tests {
                 .and_then(Value::as_u64),
             Some(1)
         );
+    }
+
+    #[test]
+    fn worker_swim_telemetry_emits_probe_records_to_datastream() {
+        let stack = test_stack();
+        let peer = DistNodeId([9; 32]);
+        stack.swim_telemetry.observe(SwimObservation::ProbeSent {
+            target: peer,
+            sequence: 41,
+            kind: "direct",
+        });
+        stack
+            .swim_telemetry
+            .observe(SwimObservation::ProbeTimedOut {
+                target: peer,
+                sequence: 41,
+                kind: "direct",
+                budget_ticks: 15_000,
+            });
+        let mut datastream = NodeDatastream::new(&test_config(None));
+
+        emit_swim_telemetry(&mut datastream, &stack, "unit_phase");
+
+        let frames = datastream.endpoint.mux().drain();
+        let probe_records = frames
+            .iter()
+            .filter(|frame| {
+                datastream
+                    .by_id
+                    .get(&frame.channel)
+                    .is_some_and(|channel| channel == SwimProbeEvent::CHANNEL)
+            })
+            .map(|frame| SwimProbeEvent::decode(&frame.payload).expect("probe record decodes"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(probe_records.len(), 2);
+        assert_eq!(probe_records[0].event, "sent");
+        assert_eq!(probe_records[0].sequence, 41);
+        assert_eq!(probe_records[0].local_phase, "unit_phase");
+        assert_eq!(probe_records[0].probe_timeout_ms, 15_000);
+        assert_eq!(probe_records[1].event, "timed_out");
+        assert_eq!(probe_records[1].budget_ms, Some(15_000));
+        assert_eq!(probe_records[1].consecutive_timeouts, 1);
     }
 
     #[test]

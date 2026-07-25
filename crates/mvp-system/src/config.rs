@@ -109,6 +109,7 @@ pub struct VastAiConfig {
     pub max_dph_total: Option<f64>,
     pub min_reliability: Option<f64>,
     pub require_verified: Option<bool>,
+    pub blacklist_hosts: Vec<u64>,
     pub poll_interval_secs: Option<u64>,
     pub onstart: Option<String>,
     pub ssh_identity: Option<String>,
@@ -134,6 +135,7 @@ pub struct ResolvedVastAiConfig {
     pub max_dph_total: Option<f64>,
     pub min_reliability: Option<f64>,
     pub require_verified: Option<bool>,
+    pub blacklist_hosts: Vec<u64>,
     pub onstart: Option<String>,
     pub ssh_identity: Option<String>,
 }
@@ -215,6 +217,11 @@ impl ResolvedVastAiConfig {
         if let Some(require_verified) = self.require_verified {
             policy.require_verified = require_verified;
         }
+        for host_id in &self.blacklist_hosts {
+            if !policy.blacklist_hosts.contains(host_id) {
+                policy.blacklist_hosts.push(*host_id);
+            }
+        }
         policy
     }
 }
@@ -267,6 +274,7 @@ mod tests {
             max_dph_total: Some(0.10),
             min_reliability: Some(0.98),
             require_verified: Some(true),
+            blacklist_hosts: vec![155385],
             onstart: None,
             ssh_identity: Some("~/.ssh/swactor_vastai_ed25519".to_owned()),
         }
@@ -335,6 +343,7 @@ min_up_mbps = 50.25
 max_dph_total = 0.10
 min_reliability = 0.99
 require_verified = true
+blacklist_hosts = [155385, 59017]
 onstart = "echo preparing"
 ssh_identity = "~/.ssh/swactor_vastai_ed25519"
 poll_interval_secs = 30
@@ -412,6 +421,7 @@ poll_interval_secs = 30
         assert_eq!(config.vastai.max_dph_total, Some(0.10));
         assert_eq!(config.vastai.min_reliability, Some(0.99));
         assert_eq!(config.vastai.require_verified, Some(true));
+        assert_eq!(config.vastai.blacklist_hosts, vec![155385, 59017]);
         assert_eq!(config.vastai.poll_interval_secs, Some(30));
         assert_eq!(config.vastai.onstart.as_deref(), Some("echo preparing"));
         assert_eq!(

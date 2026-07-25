@@ -638,6 +638,7 @@ struct ChatVastAiConfig {
     max_dph_total: Option<f64>,
     min_reliability: Option<f64>,
     require_verified: Option<bool>,
+    blacklist_hosts: Vec<u64>,
     disk_gb: Option<u32>,
     onstart: Option<String>,
     ssh_identity: Option<String>,
@@ -793,7 +794,7 @@ impl Config {
             self.run_id.to_string(),
             "--pipeline-stages".to_owned(),
             self.pipeline_stages.to_string(),
-            "--no-dashboard".to_owned(),
+            "--dashboard".to_owned(),
         ];
         if let Some(model_id) = &self.model.id {
             args.extend(["--model-id".to_owned(), model_id.clone()]);
@@ -1028,6 +1029,7 @@ fn resolve_vastai_config(
         max_dph_total: file.max_dph_total,
         min_reliability: file.min_reliability,
         require_verified: file.require_verified,
+        blacklist_hosts: file.blacklist_hosts.clone(),
         onstart: first_non_empty([file.onstart.clone()]),
         ssh_identity: first_non_empty([file.ssh_identity.clone()]),
     }
@@ -1964,20 +1966,26 @@ fn cargo_command() -> &'static str {
     "cargo"
 }
 
+fn mvp_orchestrator_build_args() -> &'static [&'static str] {
+    &[
+        "build",
+        "--quiet",
+        "-p",
+        "mvp-system",
+        "--features",
+        "dashboard",
+        "--bin",
+        "mvp-orchestrator",
+    ]
+}
+
 fn ensure_orch_binary(config: &Config) -> Result<(), String> {
     if config.skip_rebuild {
         return ensure_existing_artifact(&config.orch_bin, "mvp-orchestrator");
     }
     run_status(
         cargo_command(),
-        &[
-            "build",
-            "--quiet",
-            "-p",
-            "mvp-system",
-            "--bin",
-            "mvp-orchestrator",
-        ],
+        mvp_orchestrator_build_args(),
         "build mvp-orchestrator",
     )
 }
@@ -2333,6 +2341,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn observability_server_launch_contract_enables_orchestrator_dashboard() {
+        let build_args = mvp_orchestrator_build_args();
+        assert!(
+            build_args
+                .windows(2)
+                .any(|pair| pair[0] == "--features" && pair[1] == "dashboard"),
+            "{build_args:?}"
+        );
+
+        let config = base_config(ProviderKind::Process);
+        let args = config.orchestrator_cli_args("resolved-image");
+        assert!(args.iter().any(|arg| arg == "--dashboard"), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--no-dashboard"), "{args:?}");
+    }
+
     fn valid_vastai() -> ResolvedVastAiConfig {
         ResolvedVastAiConfig {
             api_key: "secret".to_owned(),
@@ -2347,6 +2371,7 @@ mod tests {
             max_dph_total: None,
             min_reliability: None,
             require_verified: None,
+            blacklist_hosts: Vec::new(),
             onstart: None,
             ssh_identity: None,
         }
