@@ -24,7 +24,8 @@ use distribution::node_metadata_actor::{MetadataActor, MetadataIn};
 use distribution::registry_actor::{RegistryActor, RegistryIn};
 use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
-use distribution::swim::telemetry::{ObservedTransition, SwimTelemetry};
+use distribution::swim::probe::SwimConfig;
+use distribution::swim::telemetry::{ObservedProbeEvent, ObservedTransition, SwimTelemetry};
 use distribution::transport_bridge::{
     Outbox, OutboxPeerDirectory, OutboxRouteBinder, RelayMirror, RouteView, RouteViewTransport,
 };
@@ -48,6 +49,7 @@ pub struct DistributionRuntimeStack {
     pub route_view: RouteView,
     pub membership_mirror: Arc<Mutex<MemberList>>,
     pub swim_telemetry: Arc<SwimTelemetry>,
+    pub swim_config: SwimConfig,
     pub actors: DistributionActorAddrs,
 }
 
@@ -80,13 +82,14 @@ impl DistributionRuntimeStack {
             Arc::clone(&transport_router),
             Arc::clone(&outbox),
         ));
+        let swim_config = config.swim.clone();
         let swim_telemetry = SwimTelemetry::new();
 
         let swim_addr = runtime
             .spawn(
                 SwimActor::new(
                     node_id,
-                    config.swim.clone(),
+                    swim_config.clone(),
                     Instant::now(),
                     peer_directory.clone(),
                 )
@@ -152,6 +155,7 @@ impl DistributionRuntimeStack {
             route_view,
             membership_mirror,
             swim_telemetry,
+            swim_config,
             actors: DistributionActorAddrs {
                 swim: swim_addr,
                 registry: registry_addr,
@@ -226,6 +230,10 @@ impl DistributionRuntimeStack {
 
     pub fn drain_swim_transitions(&self) -> Vec<ObservedTransition> {
         self.swim_telemetry.drain_transitions()
+    }
+
+    pub fn drain_swim_probe_events(&self) -> Vec<ObservedProbeEvent> {
+        self.swim_telemetry.drain_probe_events()
     }
 }
 

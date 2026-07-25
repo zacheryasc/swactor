@@ -16,7 +16,8 @@ mod datastream_records {
     use datastream::frame::{Lifetime, NodeId, StreamId};
     use datastream::{ChannelId, Mux, Position, Record};
     use distribution::telemetry::{
-        CacheEntryRec, DIST_STATE, DistributionState, MembershipTransition, RegistryEntryRec,
+        CacheEntryRec, DIST_STATE, DistributionState, MEMBERSHIP, MembershipTransition,
+        RegistryEntryRec, SWIM_PROBES, SwimProbeEvent, TRANSPORT_INTERNALS, TransportInternals,
     };
 
     #[test]
@@ -70,18 +71,67 @@ mod datastream_records {
     }
 
     #[test]
+    fn transport_internals_record_round_trips_probe_rtt() {
+        let internals = TransportInternals {
+            relay_connected: true,
+            direct_peers: 2,
+            relay_peers: 1,
+            rtt_ms_p50: 405,
+        };
+
+        assert_eq!(TransportInternals::CHANNEL, TRANSPORT_INTERNALS);
+        assert_eq!(
+            TransportInternals::decode(&internals.encode()).unwrap(),
+            internals
+        );
+    }
+
+    #[test]
     fn membership_transition_record_round_trips_from_owner_crate() {
         let transition = MembershipTransition {
             peer: "peer-a".into(),
             from: "alive".into(),
             to: "suspect".into(),
             reason: "probe timeout".into(),
+            last_ack_age_ms: Some(15_000),
+            consecutive_timeouts: 2,
+            recent_probe_targets: vec!["peer-a".into(), "peer-b".into()],
+            member_state: Some("Suspect".into()),
         };
 
+        assert_eq!(MembershipTransition::CHANNEL, MEMBERSHIP);
         assert_eq!(
             MembershipTransition::decode(&transition.encode()).unwrap(),
             transition
         );
+    }
+
+    #[test]
+    fn swim_probe_event_record_round_trips_from_owner_crate() {
+        let event = SwimProbeEvent {
+            event: "timed_out".into(),
+            target: "peer-a".into(),
+            sequence: 9,
+            kind: "direct".into(),
+            rtt_ms: None,
+            budget_ms: Some(15_000),
+            budget_ticks: Some(15_000),
+            last_ack_age_ms: Some(45_000),
+            consecutive_timeouts: 3,
+            recent_probe_targets: vec!["peer-a".into()],
+            member_state: Some("Suspect".into()),
+            local_phase: "weights_loaded_wait".into(),
+            probe_interval_ms: 200,
+            probe_timeout_ms: 15_000,
+            indirect_probes: 2,
+            suspicion_timeout_ms: 45_000,
+            dead_reprobe_interval_ms: 1_000,
+            probe_mode: "Periodic".into(),
+            lifeguard_enabled: false,
+        };
+
+        assert_eq!(SwimProbeEvent::CHANNEL, SWIM_PROBES);
+        assert_eq!(SwimProbeEvent::decode(&event.encode()).unwrap(), event);
     }
 }
 
@@ -93,6 +143,7 @@ mod snapshot_and_swim_telemetry {
     use distribution::swim::node::{SwimObservation, SwimObserver};
     use distribution::swim::telemetry::SwimTelemetry;
     use distribution::types::{MemberState, NodeId};
+    use std::time::Duration;
 
     fn id(byte: u8) -> NodeId {
         NodeId([byte; 32])
@@ -147,6 +198,66 @@ mod snapshot_and_swim_telemetry {
         assert_eq!(drained[0].from, Some(MemberState::Alive));
         assert_eq!(drained[0].to, MemberState::Suspect);
         assert_eq!(drained[0].reason, "probe-timeout");
+        assert_eq!(drained[0].consecutive_timeouts, 0);
+        assert!(drained[0].last_ack_age.is_none());
         assert!(telemetry.drain_transitions().is_empty());
+        assert_eq!(telemetry.recent_targets(), vec![peer]);
+    }
+
+    #[test]
+    fn swim_telemetry_keeps_recent_probe_targets_bounded_and_ordered() {
+        let telemetry = SwimTelemetry::new();
+
+        for byte in 0..17 {
+            telemetry.observe(SwimObservation::ProbeSent {
+                target: id(byte),
+                sequence: byte as u64,
+                kind: "direct",
+            });
+        }
+
+        let expected = (1..17).map(id).collect::<Vec<_>>();
+        assert_eq!(telemetry.recent_targets(), expected);
+    }
+
+    #[test]
+    fn swim_telemetry_records_probe_events_and_timeout_state_without_fabricating_rtt() {
+        let telemetry = SwimTelemetry::new();
+        let peer = id(8);
+
+        telemetry.observe(SwimObservation::ProbeSent {
+            target: peer,
+            sequence: 1,
+            kind: "direct",
+        });
+        std::thread::sleep(Duration::from_millis(1));
+        telemetry.observe(SwimObservation::ProbeAcked {
+            target: peer,
+            sequence: 1,
+            kind: "direct",
+        });
+        telemetry.observe(SwimObservation::ProbeSent {
+            target: peer,
+            sequence: 2,
+            kind: "direct",
+        });
+        telemetry.observe(SwimObservation::ProbeTimedOut {
+            target: peer,
+            sequence: 2,
+            kind: "direct",
+            budget_ticks: 15_000,
+        });
+
+        let events = telemetry.drain_probe_events();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].event, "sent");
+        assert_eq!(events[1].event, "acked");
+        assert!(events[1].rtt_ms.is_some());
+        assert_eq!(events[2].event, "sent");
+        assert_eq!(events[3].event, "timed_out");
+        assert_eq!(events[3].budget_ms, Some(15_000));
+        assert_eq!(events[3].rtt_ms, None);
+        assert_eq!(events[3].consecutive_timeouts, 1);
+        assert!(telemetry.drain_probe_events().is_empty());
     }
 }

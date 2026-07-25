@@ -28,19 +28,45 @@ const TARGET_RING: usize = 16;
 /// this without bound. Oldest are dropped first (a lost transition is a gap, not
 /// a renumber — the same tolerance as the mux).
 const TRANSITION_CAP: usize = 256;
+/// Cap on undrained probe events. Probe events are diagnostics; dropping old
+/// ones is better than letting a wedged consumer grow this queue forever.
+const PROBE_EVENT_CAP: usize = 512;
 /// In-flight probes older than this are pruned defensively. The probe state
 /// machine resolves every probe (ack or timeout), so this only guards against a
 /// dropped observation leaking an entry forever.
 const IN_FLIGHT_TTL: Duration = Duration::from_secs(30);
 
 /// One captured membership transition, carrying the real cause string the
-/// state-diff path could never know.
+/// state-diff path could never know, plus the probe state visible at the moment
+/// of transition.
 #[derive(Debug, Clone)]
 pub struct ObservedTransition {
     pub peer: NodeId,
     pub from: Option<MemberState>,
     pub to: MemberState,
     pub reason: &'static str,
+    pub last_ack_age: Option<Duration>,
+    pub consecutive_timeouts: u32,
+}
+
+/// One captured SWIM probe lifecycle event.
+#[derive(Debug, Clone)]
+pub struct ObservedProbeEvent {
+    pub event: &'static str,
+    pub target: NodeId,
+    pub sequence: u64,
+    pub kind: &'static str,
+    pub rtt_ms: Option<u32>,
+    pub budget_ms: Option<u64>,
+    pub last_ack_age: Option<Duration>,
+    pub consecutive_timeouts: u32,
+}
+
+/// Current probe state for one peer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PeerProbeState {
+    pub last_ack_age: Option<Duration>,
+    pub consecutive_timeouts: u32,
 }
 
 #[derive(Default)]
@@ -51,6 +77,12 @@ struct Inner {
     rtts: VecDeque<u32>,
     /// Recent probe targets, newest last.
     targets: VecDeque<NodeId>,
+    /// Last successful probe ack per peer.
+    last_ack: HashMap<NodeId, Instant>,
+    /// Consecutive direct/indirect timeouts per peer since the last ack.
+    consecutive_timeouts: HashMap<NodeId, u32>,
+    /// Probe events awaiting drain by telemetry consumers.
+    probe_events: VecDeque<ObservedProbeEvent>,
     /// Transitions awaiting drain by the node's telemetry tick.
     transitions: VecDeque<ObservedTransition>,
 }
@@ -104,6 +136,23 @@ impl SwimTelemetry {
             .collect()
     }
 
+    /// Take probe lifecycle events captured since the last call (FIFO, then
+    /// cleared).
+    pub fn drain_probe_events(&self) -> Vec<ObservedProbeEvent> {
+        self.inner
+            .lock()
+            .expect("swim telemetry poisoned")
+            .probe_events
+            .drain(..)
+            .collect()
+    }
+
+    /// Snapshot the probe state for one peer without draining events.
+    pub fn peer_probe_state(&self, peer: NodeId) -> PeerProbeState {
+        let inner = self.inner.lock().expect("swim telemetry poisoned");
+        Self::peer_probe_state_locked(&inner, peer)
+    }
+
     /// The most recent transition cause per peer, **without** draining the queue.
     /// A snapshot reader (e.g. the orchestrator's Distribution view) uses this to
     /// label each member with *why* it last changed state; draining stays
@@ -122,7 +171,9 @@ impl SwimTelemetry {
         let mut inner = self.inner.lock().expect("swim telemetry poisoned");
         match observation {
             SwimObservation::ProbeSent {
-                target, sequence, ..
+                target,
+                sequence,
+                kind,
             } => {
                 // Drop any leaked in-flight entries before tracking a new probe.
                 inner
@@ -133,23 +184,81 @@ impl SwimTelemetry {
                     inner.targets.pop_front();
                 }
                 inner.targets.push_back(target);
+                let state = Self::peer_probe_state_locked(&inner, target);
+                Self::push_probe_event(
+                    &mut inner,
+                    ObservedProbeEvent {
+                        event: "sent",
+                        target,
+                        sequence,
+                        kind,
+                        rtt_ms: None,
+                        budget_ms: None,
+                        last_ack_age: state.last_ack_age,
+                        consecutive_timeouts: state.consecutive_timeouts,
+                    },
+                );
             }
             SwimObservation::ProbeAcked {
-                target, sequence, ..
+                target,
+                sequence,
+                kind,
             } => {
-                if let Some(sent) = inner.in_flight.remove(&(target, sequence)) {
-                    let rtt = sent.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                let state = Self::peer_probe_state_locked(&inner, target);
+                let rtt_ms = inner
+                    .in_flight
+                    .remove(&(target, sequence))
+                    .map(|sent| sent.elapsed().as_millis().min(u32::MAX as u128) as u32);
+                if let Some(rtt) = rtt_ms {
                     if inner.rtts.len() >= RTT_RING {
                         inner.rtts.pop_front();
                     }
                     inner.rtts.push_back(rtt);
                 }
+                inner.last_ack.insert(target, Instant::now());
+                inner.consecutive_timeouts.remove(&target);
+                Self::push_probe_event(
+                    &mut inner,
+                    ObservedProbeEvent {
+                        event: "acked",
+                        target,
+                        sequence,
+                        kind,
+                        rtt_ms,
+                        budget_ms: None,
+                        last_ack_age: state.last_ack_age,
+                        consecutive_timeouts: state.consecutive_timeouts,
+                    },
+                );
             }
             SwimObservation::ProbeTimedOut {
-                target, sequence, ..
+                target,
+                sequence,
+                kind,
+                budget_ticks,
             } => {
                 // A timeout is not a round-trip — drop the in-flight entry, no sample.
                 inner.in_flight.remove(&(target, sequence));
+                let timeouts = inner
+                    .consecutive_timeouts
+                    .entry(target)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+                let consecutive_timeouts = *timeouts;
+                let last_ack_age = inner.last_ack.get(&target).map(Instant::elapsed);
+                Self::push_probe_event(
+                    &mut inner,
+                    ObservedProbeEvent {
+                        event: "timed_out",
+                        target,
+                        sequence,
+                        kind,
+                        rtt_ms: None,
+                        budget_ms: Some(budget_ticks),
+                        last_ack_age,
+                        consecutive_timeouts,
+                    },
+                );
             }
             SwimObservation::Transition {
                 peer,
@@ -160,14 +269,35 @@ impl SwimTelemetry {
                 if inner.transitions.len() >= TRANSITION_CAP {
                     inner.transitions.pop_front();
                 }
+                let state = Self::peer_probe_state_locked(&inner, peer);
                 inner.transitions.push_back(ObservedTransition {
                     peer,
                     from,
                     to,
                     reason,
+                    last_ack_age: state.last_ack_age,
+                    consecutive_timeouts: state.consecutive_timeouts,
                 });
             }
         }
+    }
+
+    fn peer_probe_state_locked(inner: &Inner, peer: NodeId) -> PeerProbeState {
+        PeerProbeState {
+            last_ack_age: inner.last_ack.get(&peer).map(Instant::elapsed),
+            consecutive_timeouts: inner
+                .consecutive_timeouts
+                .get(&peer)
+                .copied()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn push_probe_event(inner: &mut Inner, event: ObservedProbeEvent) {
+        if inner.probe_events.len() >= PROBE_EVENT_CAP {
+            inner.probe_events.pop_front();
+        }
+        inner.probe_events.push_back(event);
     }
 }
 

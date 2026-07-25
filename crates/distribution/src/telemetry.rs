@@ -9,6 +9,8 @@ pub const TRANSPORT_INTERNALS: &str = "transport.internals";
 pub const MEMBERSHIP: &str = "membership";
 /// Distribution-subsystem state: cache, directory, registry, probes, peer auth.
 pub const DIST_STATE: &str = "dist.state";
+/// Probe lifecycle events emitted by the SWIM observer.
+pub const SWIM_PROBES: &str = "swim.probes";
 
 /// Transport-internals record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -31,6 +33,57 @@ pub struct MembershipTransition {
     pub to: String,
     #[serde(default)]
     pub reason: String,
+    #[serde(default)]
+    pub last_ack_age_ms: Option<u64>,
+    #[serde(default)]
+    pub consecutive_timeouts: u32,
+    #[serde(default)]
+    pub recent_probe_targets: Vec<String>,
+    #[serde(default)]
+    pub member_state: Option<String>,
+}
+
+/// One SWIM probe lifecycle event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwimProbeEvent {
+    /// `"sent"`, `"acked"`, or `"timed_out"`.
+    pub event: String,
+    pub target: String,
+    pub sequence: u64,
+    /// `"direct"` or `"indirect"`.
+    pub kind: String,
+    #[serde(default)]
+    pub rtt_ms: Option<u32>,
+    #[serde(default)]
+    pub budget_ms: Option<u64>,
+    /// Retained for compatibility with the existing diagnostic field name. The
+    /// value is milliseconds in the wall-clock implementation.
+    #[serde(default)]
+    pub budget_ticks: Option<u64>,
+    #[serde(default)]
+    pub last_ack_age_ms: Option<u64>,
+    #[serde(default)]
+    pub consecutive_timeouts: u32,
+    #[serde(default)]
+    pub recent_probe_targets: Vec<String>,
+    #[serde(default)]
+    pub member_state: Option<String>,
+    #[serde(default)]
+    pub local_phase: String,
+    #[serde(default)]
+    pub probe_interval_ms: u64,
+    #[serde(default)]
+    pub probe_timeout_ms: u64,
+    #[serde(default)]
+    pub indirect_probes: u32,
+    #[serde(default)]
+    pub suspicion_timeout_ms: u64,
+    #[serde(default)]
+    pub dead_reprobe_interval_ms: u64,
+    #[serde(default)]
+    pub probe_mode: String,
+    #[serde(default)]
+    pub lifeguard_enabled: bool,
 }
 
 /// Consolidated distribution-subsystem state.
@@ -85,6 +138,9 @@ impl Record for TransportInternals {
 }
 impl Record for MembershipTransition {
     const CHANNEL: &'static str = MEMBERSHIP;
+}
+impl Record for SwimProbeEvent {
+    const CHANNEL: &'static str = SWIM_PROBES;
 }
 impl Record for DistributionState {
     const CHANNEL: &'static str = DIST_STATE;

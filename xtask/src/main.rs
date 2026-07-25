@@ -18,11 +18,21 @@ struct TestStep {
     args: &'static [&'static str],
 }
 
-const MVP_CHAT_CHECK_TIMEOUT_SECS: u64 = 1_800;
+const MVP_CHAT_CHECK_TIMEOUT_SECS: u64 = 3_600;
 const MVP_CHAT_CHECK_POLL_MS: u64 = 100;
 const MVP_CHAT_CHECK_TERM_GRACE_MS: u64 = 30_000;
 const MVP_CHAT_CHECK_PROMPTS: &[u8] = b"ping\nsecond prompt\n";
 const DATA_PATH_MIN_PAYLOAD_BYTES: u64 = 512;
+const MVP_CHAT_CARGO_RUN_ARGS: &[&str] = &[
+    "run",
+    "--package",
+    "mvp-system",
+    "--features",
+    "dashboard",
+    "--bin",
+    "mvp-chat",
+    "--",
+];
 
 struct MvpChatCheckPaths {
     root: PathBuf,
@@ -337,7 +347,7 @@ fn run_mvp_chat(args: Vec<String>) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let mut command = Command::new(cargo_bin());
-    command.args(["run", "--package", "mvp-system", "--bin", "mvp-chat", "--"]);
+    command.args(MVP_CHAT_CARGO_RUN_ARGS);
     let dump_log_path = explicit_dump_log_path_from_mvp_chat_args(&forwarded);
     let run_id = run_id_from_mvp_chat_args(&forwarded);
     let benchmark_target = dump_log_path.as_deref().zip(run_id);
@@ -347,7 +357,7 @@ fn run_mvp_chat(args: Vec<String>) -> ExitCode {
             "started",
             json!({
                 "program": "cargo",
-                "args": ["run", "--package", "mvp-system", "--bin", "mvp-chat", "--"],
+                "args": MVP_CHAT_CARGO_RUN_ARGS,
             }),
         );
         if let Err(error) =
@@ -3684,6 +3694,22 @@ mod tests {
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn mvp_chat_launcher_builds_dashboard_feature() {
+        assert!(
+            MVP_CHAT_CARGO_RUN_ARGS
+                .windows(2)
+                .any(|pair| pair[0] == "--features" && pair[1] == "dashboard"),
+            "{MVP_CHAT_CARGO_RUN_ARGS:?}"
+        );
+        assert!(
+            MVP_CHAT_CARGO_RUN_ARGS
+                .windows(2)
+                .any(|pair| pair[0] == "--bin" && pair[1] == "mvp-chat"),
+            "{MVP_CHAT_CARGO_RUN_ARGS:?}"
+        );
     }
 
     #[test]

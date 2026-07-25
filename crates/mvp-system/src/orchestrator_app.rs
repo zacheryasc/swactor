@@ -52,10 +52,12 @@ use crate::vastai_provisioning::{
 };
 use datastream::{
     ChannelContent, ChannelId, ChannelRef, DatastreamEndpoint, DatastreamEvent, DatastreamProducer,
-    DatastreamPublisherMsg, DatastreamSubscribe, Frame, Lifetime, NodeId, StreamDescriptor,
+    DatastreamPublisherMsg, DatastreamSubscribe, Frame, Lifetime, NodeId, Record, StreamDescriptor,
     StreamId, StreamOrigin, SubscriptionRequest,
 };
 use distribution::node::DistributedNodeConfig;
+use distribution::swim::telemetry::ObservedProbeEvent;
+use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
@@ -759,9 +761,12 @@ struct CachedModelConfig {
 
 impl CachedModelConfig {
     fn from_host_path(provider: ProviderKind, requested: PathBuf) -> Result<Self, String> {
-        if !matches!(provider, ProviderKind::Process | ProviderKind::Docker) {
+        if !matches!(
+            provider,
+            ProviderKind::Process | ProviderKind::Docker | ProviderKind::VastAi
+        ) {
             return Err(format!(
-                "{CACHED_MODEL_HOST_ENV} is a host-local cache path and is only supported by provider=process or provider=docker"
+                "{CACHED_MODEL_HOST_ENV} is a host-local cache path and is only supported by provider=process, provider=docker, or provider=vastai planning"
             ));
         }
         let host_path = requested.canonicalize().map_err(|e| {
@@ -1421,7 +1426,9 @@ impl ConfigBuilder {
             .transpose()?;
         let mut gguf_source = self.gguf_source.clone();
         if let Some(cached_model) = &cached_model {
-            gguf_source = GgufSource::LocalPath(cached_model.worker_path(provider));
+            if provider != ProviderKind::VastAi {
+                gguf_source = GgufSource::LocalPath(cached_model.worker_path(provider));
+            }
         }
         let relay = relay_runtime_config_from_settings(
             self.run_id,
@@ -2870,6 +2877,7 @@ fn wait_for_runtime_readies(
             expected_node_ids.first().copied().unwrap_or(0),
             stack,
         );
+        emit_swim_probe_events(orch_datastream, dashboard, stack, "runtime_ready_wait");
         drain_frames(frame_rx, dashboard, orch_datastream);
         drain_orch_stdio_capture(
             orch_stdio_rx,
@@ -2981,6 +2989,7 @@ fn wait_for_weights_loaded_count(
     loop {
         pump(driver, stack, frame_tx);
         emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
+        emit_swim_probe_events(orch_datastream, dashboard, stack, "weights_loaded_wait");
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for pipeline weights loaded".to_owned());
@@ -3029,7 +3038,9 @@ fn wait_for_weights_loaded_count(
                 }),
             );
             let route_owner = stack.route_owner(ready.node_actor);
+            let datastream_route_owner = stack.route_owner(ready.datastream_publisher);
             let member_state = stack.member_state(ready.swim_node_id);
+            let route_matches_ready = route_owner == Some(ready.swim_node_id);
             orch_datastream.emit_bootstrap_to_channel(
                 dashboard,
                 MVP_STAGE_ROUTE,
@@ -3046,10 +3057,36 @@ fn wait_for_weights_loaded_count(
                     "swim_node_id":format!("{:?}", ready.swim_node_id),
                     "member_state":member_state.map(|state| format!("{:?}", state)),
                     "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
-                    "datastream_route_owner":stack.route_owner(ready.datastream_publisher).map(|owner| format!("{:?}", owner)),
-                    "route_matches_ready":route_owner == Some(ready.swim_node_id),
+                    "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
+                    "route_matches_ready":route_matches_ready,
                 }),
             );
+            if member_state == Some(MemberState::Dead) {
+                let reason = format!(
+                    "stage {} node {} is dead while loading pipeline weights",
+                    stage.stage_index, stage_node_id
+                );
+                orch_datastream.emit_bootstrap(
+                    dashboard,
+                    run_id,
+                    node_id,
+                    "stage_provision_wait",
+                    "failed",
+                    json!({
+                        "attempt":resend_attempt,
+                        "stage_count":pipeline_plan.stages.len(),
+                        "stage_index":stage.stage_index,
+                        "stage_node_id":stage_node_id,
+                        "stage_send_count":stage_send_count,
+                        "loaded_stage_count":loaded_stages.len(),
+                        "member_state":"Dead",
+                        "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
+                        "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
+                        "reason":reason,
+                    }),
+                );
+                return Err(reason);
+            }
             if emit_wait_headline {
                 orch_datastream.emit_bootstrap(
                     dashboard,
@@ -3337,6 +3374,8 @@ impl OrchDatastream {
         ] {
             out.channel_by_name(name);
         }
+        out.record_channel::<MembershipTransition>();
+        out.record_channel::<SwimProbeEvent>();
         Ok(out)
     }
 
@@ -3352,6 +3391,16 @@ impl OrchDatastream {
         );
         self.channels.insert(name.to_owned(), id);
         self.channel_names.insert(id, name.to_owned());
+        id
+    }
+
+    fn record_channel<R: Record>(&mut self) -> ChannelId {
+        if let Some(id) = self.channels.get(R::CHANNEL).copied() {
+            return id;
+        }
+        let id = self.producer.register_record::<R>();
+        self.channels.insert(R::CHANNEL.to_owned(), id);
+        self.channel_names.insert(id, R::CHANNEL.to_owned());
         id
     }
 
@@ -3433,6 +3482,12 @@ impl OrchDatastream {
         }))
         .expect("serialize orch prompt event");
         self.emit_bytes(dashboard, MVP_ORCH_PROMPT, payload);
+    }
+
+    fn emit_record<R: Record>(&mut self, dashboard: Option<&DashboardSupport>, record: &R) {
+        let id = self.record_channel::<R>();
+        self.producer.submit_record(id, record);
+        self.flush(dashboard, "orchestrator");
     }
 
     fn emit_bytes(
@@ -4902,7 +4957,7 @@ fn drain_frames(
             &collected.frame,
         );
         orch_datastream.archive_frame(
-            "node_cluster",
+            "node",
             &collected.stream,
             &collected.channel_name,
             &collected.frame,
@@ -4929,6 +4984,15 @@ fn emit_swim_transitions(
     stack: &DistributionRuntimeStack,
 ) {
     for transition in stack.drain_swim_transitions() {
+        let peer = format_dist_node_id(transition.peer);
+        let from = transition.from.map(|state| format!("{:?}", state));
+        let to = format!("{:?}", transition.to);
+        let member_state = stack
+            .member_state(transition.peer)
+            .map(|state| format!("{:?}", state));
+        let last_ack_age_ms = transition.last_ack_age.map(duration_ms_u64);
+        let consecutive_timeouts = transition.consecutive_timeouts;
+        let recent_probe_targets = swim_recent_probe_targets(stack);
         orch_datastream.emit_bootstrap_to_channel(
             dashboard,
             MVP_SWIM_MEMBERSHIP,
@@ -4937,13 +5001,91 @@ fn emit_swim_transitions(
             "membership_transition",
             "observed",
             json!({
-                "peer":format!("{:?}", transition.peer),
-                "from":transition.from.map(|state| format!("{:?}", state)),
-                "to":format!("{:?}", transition.to),
+                "peer":peer.clone(),
+                "from":from.clone(),
+                "to":to.clone(),
                 "reason":transition.reason,
+                "last_ack_age_ms":last_ack_age_ms,
+                "consecutive_timeouts":consecutive_timeouts,
+                "recent_probe_targets":recent_probe_targets.clone(),
+                "member_state":member_state.clone(),
             }),
         );
+        orch_datastream.emit_record(
+            dashboard,
+            &MembershipTransition {
+                peer,
+                from: from.unwrap_or_default(),
+                to,
+                reason: transition.reason.to_owned(),
+                last_ack_age_ms,
+                consecutive_timeouts,
+                recent_probe_targets,
+                member_state,
+            },
+        );
     }
+}
+
+fn emit_swim_probe_events(
+    orch_datastream: &mut OrchDatastream,
+    dashboard: Option<&DashboardSupport>,
+    stack: &DistributionRuntimeStack,
+    local_phase: &str,
+) {
+    for event in stack.drain_swim_probe_events() {
+        let record = swim_probe_event_record(stack, event, local_phase);
+        orch_datastream.emit_record(dashboard, &record);
+    }
+}
+
+fn swim_probe_event_record(
+    stack: &DistributionRuntimeStack,
+    event: ObservedProbeEvent,
+    local_phase: &str,
+) -> SwimProbeEvent {
+    let config = &stack.swim_config;
+    let budget_ms = event.budget_ms;
+    SwimProbeEvent {
+        event: event.event.to_owned(),
+        target: format_dist_node_id(event.target),
+        sequence: event.sequence,
+        kind: event.kind.to_owned(),
+        rtt_ms: event.rtt_ms,
+        budget_ms,
+        budget_ticks: budget_ms,
+        last_ack_age_ms: event.last_ack_age.map(duration_ms_u64),
+        consecutive_timeouts: event.consecutive_timeouts,
+        recent_probe_targets: swim_recent_probe_targets(stack),
+        member_state: stack
+            .member_state(event.target)
+            .map(|state| format!("{:?}", state)),
+        local_phase: local_phase.to_owned(),
+        probe_interval_ms: duration_ms_u64(config.probe_interval),
+        probe_timeout_ms: duration_ms_u64(config.probe_timeout),
+        indirect_probes: u32::try_from(config.indirect_probes).unwrap_or(u32::MAX),
+        suspicion_timeout_ms: duration_ms_u64(config.suspicion_timeout),
+        dead_reprobe_interval_ms: duration_ms_u64(config.dead_reprobe_interval),
+        probe_mode: format!("{:?}", config.probe_mode),
+        lifeguard_enabled: config.lifeguard.is_some(),
+    }
+}
+
+fn swim_recent_probe_targets(stack: &DistributionRuntimeStack) -> Vec<String> {
+    stack
+        .swim_telemetry
+        .recent_targets()
+        .into_iter()
+        .map(format_dist_node_id)
+        .collect()
+}
+
+fn format_dist_node_id(node_id: DistNodeId) -> String {
+    format!("{:?}", node_id)
+}
+
+fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn pump(
@@ -5187,6 +5329,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use distribution::swim::node::{SwimObservation, SwimObserver};
     use std::{ffi::OsString, path::PathBuf};
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -6454,6 +6597,69 @@ mod tests {
     }
 
     #[test]
+    fn emit_swim_probe_events_archives_probe_lifecycle_once_with_config() {
+        static NEXT_TEMP_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        let suffix = NEXT_TEMP_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mvp-swim-probe-archive-test-{}-{suffix}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let stack =
+            DistributionRuntimeStack::new(DistNodeId([7; 32]), DistributedNodeConfig::default());
+        let peer = DistNodeId([8; 32]);
+        stack.swim_telemetry.observe(SwimObservation::ProbeSent {
+            target: peer,
+            sequence: 99,
+            kind: "direct",
+        });
+        stack
+            .swim_telemetry
+            .observe(SwimObservation::ProbeTimedOut {
+                target: peer,
+                sequence: 99,
+                kind: "direct",
+                budget_ticks: 15_000,
+            });
+        let mut datastream = OrchDatastream::new(77, Some(&path)).expect("datastream opens");
+
+        emit_swim_probe_events(&mut datastream, None, &stack, "weights_loaded_wait");
+        emit_swim_probe_events(&mut datastream, None, &stack, "weights_loaded_wait");
+        drop(datastream);
+
+        let contents = std::fs::read_to_string(&path).expect("read frame archive jsonl");
+        let records = contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("archive line is json"))
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_file(&path);
+        let probe_payloads = records
+            .iter()
+            .filter(|record| record["channel"] == json!(SwimProbeEvent::CHANNEL))
+            .map(|record| {
+                let value = record["payload"]["value"]
+                    .as_str()
+                    .expect("probe payload archived as utf8 json");
+                serde_json::from_str::<Value>(value).expect("probe payload parses")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(probe_payloads.len(), 2);
+        assert_eq!(probe_payloads[0]["event"], json!("sent"));
+        assert_eq!(probe_payloads[0]["sequence"], json!(99));
+        assert_eq!(
+            probe_payloads[0]["local_phase"],
+            json!("weights_loaded_wait")
+        );
+        assert_eq!(probe_payloads[0]["probe_timeout_ms"], json!(15_000));
+        assert_eq!(probe_payloads[1]["event"], json!("timed_out"));
+        assert_eq!(probe_payloads[1]["budget_ms"], json!(15_000));
+        assert_eq!(probe_payloads[1]["budget_ticks"], json!(15_000));
+        assert_eq!(probe_payloads[1]["consecutive_timeouts"], json!(1));
+    }
+
+    #[test]
     fn orchestrator_stdio_drain_archives_stdout_and_stderr_as_provision_logs() {
         static NEXT_TEMP_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -7466,34 +7672,91 @@ bootstrap_command = "/run"
     }
 
     #[test]
-    fn cached_model_with_deploy_provider_is_rejected_before_vastai_env_is_parsed() {
-        let model = TempModelFile::new("deploy-rejected.gguf");
-        let error = with_clean_env_os(
-            &[
-                ("MVP_RUNTIME_CONFIG", OsString::from("deploy")),
-                (CACHED_MODEL_HOST_ENV, model.raw_path.as_os_str().to_owned()),
-                (
-                    "MVP_VASTAI_CONFIRM_LEASE",
-                    OsString::from("definitely-not-a-bool"),
-                ),
-                ("MVP_VASTAI_DISK_GB", OsString::from("not-a-u32")),
-            ],
-            || match Config::from_layers_with_path_and_args(None, std::iter::empty::<String>()) {
-                Ok(_) => panic!("deploy cached model must be rejected"),
-                Err(error) => error,
+    fn vastai_cached_model_host_path_is_planning_only_and_keeps_remote_worker_source() {
+        let model = TempModelFile::with_metadata(
+            "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+            TestGgufMetadata {
+                num_layers: 28,
+                hidden_dim: 3584,
+                context_length: 32_768,
+                eos_token_id: 151_645,
             },
         );
 
-        assert!(
-            error.contains(
-                "MVP_CACHED_MODEL_HOST_PATH is a host-local cache path and is only supported by provider=process or provider=docker"
-            ),
-            "unexpected error: {error}"
+        let config = with_clean_env_os(
+            &[
+                ("MVP_RUNTIME_CONFIG", OsString::from("deploy")),
+                (CACHED_MODEL_HOST_ENV, model.raw_path.as_os_str().to_owned()),
+                ("MVP_VASTAI_API_KEY", OsString::from("test-key")),
+            ],
+            || {
+                Config::from_layers_with_path_and_args(
+                    None,
+                    [
+                        "--provider",
+                        "vastai",
+                        "--pipeline-stages",
+                        "4",
+                        "--model-id",
+                        "qwen2.5-7b-instruct-q4-k-m",
+                        "--gguf-repo",
+                        "bartowski/Qwen2.5-7B-Instruct-GGUF",
+                        "--gguf-file",
+                        "Qwen2.5-7B-Instruct-Q4_K_M.gguf",
+                        "--max-context",
+                        "512",
+                        "--vastai-bootstrap-command",
+                        "boot",
+                    ]
+                    .into_iter()
+                    .map(str::to_owned),
+                )
+                .expect("VastAI planning-cache config parses")
+            },
         );
-        assert!(
-            !error.contains("MVP_VASTAI_CONFIRM_LEASE") && !error.contains("MVP_VASTAI_DISK_GB"),
-            "cached-model rejection should not require valid VastAI env, got: {error}"
+
+        assert_eq!(config.provider, ProviderKind::VastAi);
+        assert_eq!(
+            config
+                .cached_model
+                .as_ref()
+                .expect("VastAI planning cache retained")
+                .host_path,
+            model.canonical_path
         );
+        assert_eq!(
+            config.gguf_source,
+            GgufSource::HuggingFaceGguf {
+                repo: "bartowski/Qwen2.5-7B-Instruct-GGUF".to_owned(),
+                file: "Qwen2.5-7B-Instruct-Q4_K_M.gguf".to_owned(),
+                revision: None,
+            }
+        );
+
+        let plan = config
+            .build_run_plan()
+            .expect("VastAI planning cache supplies local GGUF metadata");
+        assert_eq!(plan.model.num_layers, 28);
+        assert_eq!(plan.stages.len(), 4);
+
+        let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[55; 32]).public());
+        let orchestrator_actor = ActorAddress([56; 32]);
+        let specs = stage_node_specs(&config, Some(&plan), coordinator, orchestrator_actor)
+            .expect("VastAI stage specs build with planning cache");
+        assert_eq!(specs.len(), 4);
+        for spec in specs {
+            assert!(spec.mounts.is_empty(), "VastAI stage specs must not mount");
+            assert_eq!(
+                env_value(&spec.env, "MVP_GGUF_REPO"),
+                Some("bartowski/Qwen2.5-7B-Instruct-GGUF")
+            );
+            assert_eq!(
+                env_value(&spec.env, "MVP_GGUF_FILE"),
+                Some("Qwen2.5-7B-Instruct-Q4_K_M.gguf")
+            );
+            assert_eq!(env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"), None);
+            assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("4"));
+        }
     }
 
     #[derive(Default)]
