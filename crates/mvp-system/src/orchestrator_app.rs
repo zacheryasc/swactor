@@ -1405,11 +1405,6 @@ impl ConfigBuilder {
         if self.pipeline_stages == 0 {
             return Err("--pipeline-stages must be greater than 0".to_owned());
         }
-        if provider == ProviderKind::VastAi && self.pipeline_stages > 2 {
-            return Err(
-                "provider=vastai currently supports at most 2 pipeline stages for activation-path smoke checks".to_owned(),
-            );
-        }
         let mut cached_model_host_path = self.cached_model_host_path.clone();
         if matches!(provider, ProviderKind::Process | ProviderKind::Docker)
             && self.pipeline_stages > 1
@@ -6657,27 +6652,7 @@ kind = "docker"
     }
 
     #[test]
-    fn vastai_rejects_pipeline_stages_count_above_two() {
-        let error = with_clean_env(&[], || {
-            match Config::from_layers_with_path_and_args(
-                None,
-                ["--provider", "vastai", "--pipeline-stages", "3"]
-                    .into_iter()
-                    .map(str::to_owned),
-            ) {
-                Ok(_) => panic!("VastAI smoke runs are capped at two pipeline stages"),
-                Err(error) => error,
-            }
-        });
-
-        assert!(
-            error.contains("provider=vastai currently supports at most 2 pipeline stages"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn vastai_two_stage_plan_uses_remote_gguf_and_no_mounts() {
+    fn vastai_eight_stage_plan_uses_remote_gguf_and_no_mounts() {
         let config = with_clean_env(&[], || {
             Config::from_layers_with_path_and_args(
                 None,
@@ -6685,7 +6660,7 @@ kind = "docker"
                     "--provider",
                     "vastai",
                     "--pipeline-stages",
-                    "2",
+                    "8",
                     "--model-id",
                     "smollm2-135m-instruct-q4",
                     "--gguf-repo",
@@ -6702,11 +6677,11 @@ kind = "docker"
                 .into_iter()
                 .map(str::to_owned),
             )
-            .expect("VastAI two-stage pipeline config parses")
+            .expect("VastAI eight-stage pipeline config parses")
         });
         let plan = config
             .build_run_plan()
-            .expect("VastAI two-stage run plan uses local metadata only");
+            .expect("VastAI eight-stage run plan uses local metadata only");
         let coordinator = EndpointAddr::new(iroh::SecretKey::from_bytes(&[41; 32]).public());
         let orchestrator_actor = ActorAddress([42; 32]);
 
@@ -6718,7 +6693,7 @@ kind = "docker"
             config.cached_model.is_none(),
             "VastAI must not mount host caches"
         );
-        assert_eq!(specs.len(), 2);
+        assert_eq!(specs.len(), 8);
         for (expected_stage_index, spec) in specs.iter().enumerate() {
             let expected_stage_index =
                 u32::try_from(expected_stage_index).expect("fixture stage index fits u32");
@@ -6726,7 +6701,7 @@ kind = "docker"
             assert_eq!(spec.node_id, expected_node_id);
             assert_eq!(spec.stage_index, Some(expected_stage_index));
             assert_eq!(env_value(&spec.env, "MVP_NODE_PROVIDER"), Some("vastai"));
-            assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("2"));
+            assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("8"));
             assert_eq!(
                 env_value(&spec.env, "MVP_GGUF_REPO"),
                 Some("QuantFactory/SmolLM2-135M-Instruct-GGUF")
