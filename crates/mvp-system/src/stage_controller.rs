@@ -1,3 +1,4 @@
+use crate::gguf_shard::StageShardPlan;
 use crate::run_plan::{GgufSource, TokenizerSource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -97,6 +98,7 @@ pub struct ProvisionStage {
     pub inbound: EdgeProvision,
     pub outbound: EdgeProvision,
     pub weight_source: WeightSource,
+    pub shard_plan: Option<StageShardPlan>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,6 +225,7 @@ pub enum StageCommand {
     LoadWeights {
         source: WeightSource,
         range: LayerRange,
+        shard_plan: Option<StageShardPlan>,
     },
     RewireEdge {
         edge_id: EdgeId,
@@ -366,6 +369,7 @@ impl StageController {
         self.commands.push(StageCommand::LoadWeights {
             source: provision.weight_source.clone(),
             range: provision.layer_range,
+            shard_plan: provision.shard_plan.clone(),
         });
         self.provision = Some(provision);
     }

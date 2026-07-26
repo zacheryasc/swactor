@@ -58,6 +58,7 @@ fn provision_wire() -> StageProvisionWire {
         model_id: "smollm2-135m-q4".to_owned(),
         gguf_source: GgufSource::LocalPath("/models/smollm.gguf".to_owned()),
         tokenizer: TokenizerSource::EmbeddedGguf,
+        stage_shard_plan: None,
     }
 }
 
@@ -139,6 +140,7 @@ fn provision_wire_from_plan(plan: &run_plan::RunPlan, stage_index: u32) -> Stage
         model_id: provision.model.model_id,
         gguf_source: provision.gguf_source,
         tokenizer: provision.tokenizer,
+        stage_shard_plan: None,
     }
 }
 

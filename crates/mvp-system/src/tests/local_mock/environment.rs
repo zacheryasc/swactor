@@ -802,6 +802,7 @@ impl LocalMockCluster {
                 provision.gguf_source,
                 provision.tokenizer,
             ),
+            shard_plan: None,
         }
     }
 

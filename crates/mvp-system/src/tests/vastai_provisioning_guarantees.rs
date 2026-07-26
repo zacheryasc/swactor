@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mvp_system::node_provisioning as provision;
 use mvp_system::node_provisioning::ProviderPlugin;
@@ -10,7 +11,7 @@ use mvp_system::vastai_provisioning::{
     BootstrapStopReason, VastAiBootstrapLauncher, VastAiLeaseClient, VastAiProviderPlugin,
     VastAiProvisioningConfig, VastAiProvisioningPlugin, VastAiSshEndpoint,
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use swactor_vastai::{LifecyclePolicy, ProvisionRequest, ProvisionedInstance, SelectionPolicy};
 
 #[derive(Default)]
@@ -28,7 +29,7 @@ fn sink() -> PluginSink {
     PluginSink::new(Arc::new(RecordingSink::default()))
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct FakeLeaseClient {
     requests: Vec<ProvisionRequest>,
     endpoint_lookups: Vec<(u64, String, String)>,
@@ -37,6 +38,7 @@ struct FakeLeaseClient {
     destroy_result: Option<Result<(), String>>,
     next_contract_id: u64,
     host_ids: VecDeque<Option<u64>>,
+    first_wave_plan: Vec<Option<u64>>,
 }
 
 impl FakeLeaseClient {
@@ -61,6 +63,15 @@ impl VastAiLeaseClient for FakeLeaseClient {
             gpu_ram: Some(24_000.0),
             dph_total: 0.42,
         })
+    }
+
+    fn plan_first_wave_offers(
+        &mut self,
+        requests: &[ProvisionRequest],
+    ) -> Result<Vec<Option<u64>>, String> {
+        let mut plan = self.first_wave_plan.clone();
+        plan.resize(requests.len(), None);
+        Ok(plan)
     }
 
     fn ssh_endpoint(
@@ -115,6 +126,209 @@ impl VastAiBootstrapLauncher for FakeBootstrap {
 
     fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason) {
         self.stops.push((*handle, reason));
+    }
+}
+
+#[derive(Clone)]
+struct ParallelLeaseClient {
+    state: Arc<Mutex<ParallelLeaseState>>,
+    gate: Arc<ParallelLeaseGate>,
+}
+
+struct ParallelLeaseGate {
+    target: usize,
+    started: Mutex<usize>,
+    all_started: Condvar,
+}
+
+#[derive(Default)]
+struct ParallelLeaseState {
+    requests: Vec<ProvisionRequest>,
+    endpoint_lookups: Vec<u64>,
+    destroyed: Vec<u64>,
+    first_endpoint_request_count: Option<usize>,
+    next_contract_id: u64,
+    host_ids: VecDeque<Option<u64>>,
+    first_wave_plan_requests: usize,
+    first_wave_plan: Vec<Option<u64>>,
+}
+
+impl ParallelLeaseClient {
+    fn new(target: usize) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(ParallelLeaseState {
+                next_contract_id: 100,
+                host_ids: (0..target)
+                    .map(|index| Some(10_000 + u64::try_from(index).unwrap()))
+                    .collect(),
+                first_wave_plan: (0..target)
+                    .map(|index| Some(9_000 + u64::try_from(index).unwrap()))
+                    .collect(),
+                ..ParallelLeaseState::default()
+            })),
+            gate: Arc::new(ParallelLeaseGate {
+                target,
+                started: Mutex::new(0),
+                all_started: Condvar::new(),
+            }),
+        }
+    }
+}
+
+impl VastAiLeaseClient for ParallelLeaseClient {
+    fn plan_first_wave_offers(
+        &mut self,
+        requests: &[ProvisionRequest],
+    ) -> Result<Vec<Option<u64>>, String> {
+        let mut state = self.state.lock();
+        state.first_wave_plan_requests = requests.len();
+        let mut plan = state.first_wave_plan.clone();
+        plan.resize(requests.len(), None);
+        Ok(plan)
+    }
+
+    fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String> {
+        {
+            self.state.lock().requests.push(request);
+        }
+        let mut started = self.gate.started.lock();
+        *started += 1;
+        if *started < self.gate.target {
+            let wait = self
+                .gate
+                .all_started
+                .wait_for(&mut started, Duration::from_secs(2));
+            assert!(
+                !wait.timed_out(),
+                "all concurrent Vast.ai lease requests should start before any waits for SSH"
+            );
+        } else {
+            self.gate.all_started.notify_all();
+        }
+        drop(started);
+
+        let mut state = self.state.lock();
+        let contract_id = state.next_contract_id;
+        state.next_contract_id = state.next_contract_id.wrapping_add(1).max(1);
+        let host_id = state.host_ids.pop_front().unwrap_or(Some(77));
+        Ok(ProvisionedInstance {
+            index: 0,
+            contract_id,
+            offer_id: 55,
+            host_id,
+            gpu_name: "RTX 4090".to_owned(),
+            gpu_ram: Some(24_000.0),
+            dph_total: 0.42,
+        })
+    }
+
+    fn ssh_endpoint(
+        &mut self,
+        contract_id: u64,
+        _label: &str,
+        _lifecycle: &LifecyclePolicy,
+        ssh_user: &str,
+    ) -> Result<VastAiSshEndpoint, String> {
+        let mut state = self.state.lock();
+        let request_count = state.requests.len();
+        state
+            .first_endpoint_request_count
+            .get_or_insert(request_count);
+        state.endpoint_lookups.push(contract_id);
+        Ok(VastAiSshEndpoint {
+            host: "ssh5.vast.ai".to_owned(),
+            port: 22017,
+            user: ssh_user.to_owned(),
+        })
+    }
+
+    fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
+        self.state.lock().destroyed.push(contract_id);
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct OutOfOrderLeaseClient {
+    state: Arc<Mutex<OutOfOrderLeaseState>>,
+}
+
+#[derive(Default)]
+struct OutOfOrderLeaseState {
+    requests: Vec<u64>,
+    endpoint_lookups: Vec<u64>,
+    destroyed: Vec<u64>,
+    slow_node_ids: Vec<u64>,
+    endpoint_fail_node_ids: Vec<u64>,
+}
+
+impl OutOfOrderLeaseClient {
+    fn new(slow_node_ids: Vec<u64>, endpoint_fail_node_ids: Vec<u64>) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(OutOfOrderLeaseState {
+                slow_node_ids,
+                endpoint_fail_node_ids,
+                ..OutOfOrderLeaseState::default()
+            })),
+        }
+    }
+
+    fn node_id_from_label(label: Option<&str>) -> u64 {
+        label
+            .and_then(|label| label.rsplit('-').next())
+            .and_then(|node| node.parse::<u64>().ok())
+            .expect("test request labels include node id suffix")
+    }
+}
+
+impl VastAiLeaseClient for OutOfOrderLeaseClient {
+    fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String> {
+        let node_id = Self::node_id_from_label(request.label.as_deref());
+        let should_sleep = {
+            let mut state = self.state.lock();
+            state.requests.push(node_id);
+            state.slow_node_ids.contains(&node_id)
+        };
+        if should_sleep {
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        Ok(ProvisionedInstance {
+            index: 0,
+            contract_id: 1_000 + node_id,
+            offer_id: 55 + node_id,
+            host_id: Some(10_000 + node_id),
+            gpu_name: "RTX 4090".to_owned(),
+            gpu_ram: Some(24_000.0),
+            dph_total: 0.42,
+        })
+    }
+
+    fn ssh_endpoint(
+        &mut self,
+        contract_id: u64,
+        _label: &str,
+        _lifecycle: &LifecyclePolicy,
+        ssh_user: &str,
+    ) -> Result<VastAiSshEndpoint, String> {
+        let node_id = contract_id - 1_000;
+        let should_fail = {
+            let mut state = self.state.lock();
+            state.endpoint_lookups.push(node_id);
+            state.endpoint_fail_node_ids.contains(&node_id)
+        };
+        if should_fail {
+            return Err("connection refused".to_owned());
+        }
+        Ok(VastAiSshEndpoint {
+            host: "ssh5.vast.ai".to_owned(),
+            port: 22017,
+            user: ssh_user.to_owned(),
+        })
+    }
+
+    fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
+        self.state.lock().destroyed.push(contract_id);
+        Ok(())
     }
 }
 
@@ -273,6 +487,171 @@ fn pipeline_starts_blacklist_hosts_already_leased_in_run() {
 }
 
 #[test]
+fn failed_vastai_host_is_blacklisted_for_later_requests() {
+    let mut client = FakeLeaseClient::default().with_contract(100);
+    client.host_ids.extend([Some(77), Some(88)]);
+    client
+        .endpoint_results
+        .push_back(Err("connection refused".to_owned()));
+    let mut plugin = VastAiProvisioningPlugin::new(client, FakeBootstrap::default(), config());
+    let first_error = plugin.start_node(spec(), sink()).unwrap_err();
+    assert!(first_error.contains("connection refused"));
+
+    let mut second = spec();
+    second.node_id = 12;
+    second.stage_index = Some(3);
+    let second_handle = plugin.start_node(second, sink()).unwrap();
+
+    assert!(
+        plugin.client().requests[1]
+            .selection
+            .blacklist_hosts
+            .contains(&77),
+        "host that failed before runtime-ready must be excluded from later Vast.ai requests"
+    );
+    plugin.stop_node(&second_handle).unwrap();
+}
+
+#[test]
+fn vastai_start_nodes_starts_lease_requests_concurrently() {
+    let client = ParallelLeaseClient::new(4);
+    let state = client.state.clone();
+    let mut plugin = VastAiProvisioningPlugin::new(client, FakeBootstrap::default(), config());
+    let specs = (0..4)
+        .map(|index| {
+            let mut spec = spec();
+            spec.node_id = 11 + index;
+            spec.stage_index = Some(u32::try_from(index).unwrap());
+            spec
+        })
+        .collect::<Vec<_>>();
+
+    let results = plugin.start_nodes(specs, sink());
+
+    assert!(results.iter().all(|(_, result)| result.is_ok()));
+    assert_eq!(plugin.active_contract_count(), 4);
+    assert_eq!(plugin.bootstrap().starts.len(), 4);
+    let state = state.lock();
+    assert_eq!(state.requests.len(), 4);
+    assert_eq!(state.endpoint_lookups.len(), 4);
+    assert_eq!(
+        state.first_endpoint_request_count,
+        Some(4),
+        "SSH lookup must not begin before every lease request has started"
+    );
+}
+
+#[test]
+fn vastai_start_nodes_assigns_shared_first_wave_offer_plan() {
+    let client = ParallelLeaseClient::new(3);
+    let state = client.state.clone();
+    let mut plugin = VastAiProvisioningPlugin::new(client, FakeBootstrap::default(), config());
+    let specs = (0..3)
+        .map(|index| {
+            let mut spec = spec();
+            spec.node_id = 11 + index;
+            spec.stage_index = Some(u32::try_from(index).unwrap());
+            spec
+        })
+        .collect::<Vec<_>>();
+
+    let results = plugin.start_nodes(specs, sink());
+
+    assert!(results.iter().all(|(_, result)| result.is_ok()));
+    let state = state.lock();
+    assert_eq!(state.first_wave_plan_requests, 3);
+    let mut assigned = state
+        .requests
+        .iter()
+        .map(|request| {
+            (
+                request.label.clone().expect("request label"),
+                request.preferred_offer_id,
+            )
+        })
+        .collect::<Vec<_>>();
+    assigned.sort_by(|left, right| left.0.cmp(&right.0));
+    assert_eq!(
+        assigned
+            .into_iter()
+            .map(|(_, preferred)| preferred)
+            .collect::<Vec<_>>(),
+        vec![Some(9_000), Some(9_001), Some(9_002)],
+        "per-node requests should carry the coordinated first-wave offer plan"
+    );
+}
+
+#[test]
+fn vastai_start_nodes_bootstraps_fast_completion_before_earlier_slow_node() {
+    let client = OutOfOrderLeaseClient::new(vec![11], Vec::new());
+    let state = client.state.clone();
+    let mut plugin = VastAiProvisioningPlugin::new(client, FakeBootstrap::default(), config());
+    let mut slow = spec();
+    slow.node_id = 11;
+    slow.stage_index = Some(0);
+    let mut fast = spec();
+    fast.node_id = 12;
+    fast.stage_index = Some(1);
+
+    let results = plugin.start_nodes(vec![slow, fast], sink());
+
+    assert!(results.iter().all(|(_, result)| result.is_ok()));
+    assert_eq!(
+        plugin
+            .bootstrap()
+            .starts
+            .iter()
+            .map(|(spec, _)| spec.node_id)
+            .collect::<Vec<_>>(),
+        vec![12, 11],
+        "later fast completion should bootstrap before earlier slow completion"
+    );
+    assert_eq!(state.lock().endpoint_lookups.len(), 2);
+}
+
+#[test]
+fn vastai_start_nodes_one_failure_does_not_block_completed_node_bootstrap() {
+    let client = OutOfOrderLeaseClient::new(vec![11], vec![11]);
+    let state = client.state.clone();
+    let mut plugin = VastAiProvisioningPlugin::new(client, FakeBootstrap::default(), config());
+    let mut slow_failure = spec();
+    slow_failure.node_id = 11;
+    slow_failure.stage_index = Some(0);
+    let mut fast_success = spec();
+    fast_success.node_id = 12;
+    fast_success.stage_index = Some(1);
+
+    let results = plugin.start_nodes(vec![slow_failure, fast_success], sink());
+
+    assert!(
+        results[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("connection refused")
+    );
+    assert!(
+        results[0]
+            .1
+            .as_ref()
+            .unwrap_err()
+            .contains("class=connection_refused")
+    );
+    assert!(results[1].1.is_ok());
+    assert_eq!(
+        plugin
+            .bootstrap()
+            .starts
+            .iter()
+            .map(|(spec, _)| spec.node_id)
+            .collect::<Vec<_>>(),
+        vec![12],
+        "successful completed node should bootstrap even though another node fails"
+    );
+    assert_eq!(state.lock().destroyed.as_slice(), &[1_011]);
+}
+
+#[test]
 fn stop_destroys_known_vastai_contract_exactly_once() {
     let mut plugin = VastAiProvisioningPlugin::new(
         FakeLeaseClient::default().with_contract(100),
@@ -293,7 +672,7 @@ fn stop_destroys_known_vastai_contract_exactly_once() {
 }
 
 #[test]
-fn vastai_complete_bootstrap_keeps_log_tail_until_node_stop() {
+fn vastai_complete_bootstrap_stops_optional_log_tail_before_node_stop() {
     let mut plugin = VastAiProvisioningPlugin::new(
         FakeLeaseClient::default().with_contract(100),
         FakeBootstrap::default(),
@@ -303,9 +682,9 @@ fn vastai_complete_bootstrap_keeps_log_tail_until_node_stop() {
 
     plugin.complete_bootstrap(&handle).unwrap();
 
-    assert!(
-        plugin.bootstrap().stops.is_empty(),
-        "runtime-ready completion should keep the SSH log tail alive"
+    assert_eq!(
+        plugin.bootstrap().stops,
+        vec![(1, BootstrapStopReason::RuntimeReady)]
     );
     assert_eq!(plugin.client().destroyed, Vec::<u64>::new());
     assert_eq!(plugin.active_contract_count(), 1);
@@ -315,7 +694,7 @@ fn vastai_complete_bootstrap_keeps_log_tail_until_node_stop() {
     assert_eq!(plugin.client().destroyed, vec![100]);
     assert_eq!(
         plugin.bootstrap().stops,
-        vec![(1, BootstrapStopReason::NodeStop)]
+        vec![(1, BootstrapStopReason::RuntimeReady)]
     );
     assert_eq!(plugin.active_contract_count(), 0);
 }

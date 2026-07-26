@@ -133,6 +133,9 @@ pub struct ProvisionRequest {
     pub env: BTreeMap<String, String>,
     /// Per-index env overlays, merged after `env`.
     pub per_instance_env: Vec<BTreeMap<String, String>>,
+    /// Preferred offer for single-instance requests after an app-level shared
+    /// first-wave planner has already coordinated distinct hosts.
+    pub preferred_offer_id: Option<u64>,
     pub onstart: Option<String>,
     pub selection: SelectionPolicy,
     pub lifecycle: LifecyclePolicy,
@@ -156,6 +159,99 @@ pub struct ProvisionedInstance {
 pub struct ProvisionedFleet {
     pub label: Option<String>,
     pub instances: Vec<ProvisionedInstance>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VastAiFailureClass {
+    ConnectionRefused,
+    PublicKeyDenied,
+    EndpointMissing,
+    ProviderLoadingTimeout,
+    VanishedOffer,
+    Other,
+}
+
+impl VastAiFailureClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnectionRefused => "connection_refused",
+            Self::PublicKeyDenied => "publickey_denied",
+            Self::EndpointMissing => "endpoint_missing",
+            Self::ProviderLoadingTimeout => "provider_loading_timeout",
+            Self::VanishedOffer => "vanished_offer",
+            Self::Other => "other",
+        }
+    }
+}
+
+pub fn classify_vastai_error(raw: &str) -> VastAiFailureClass {
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("connection refused") || lower.contains("os error 111") {
+        return VastAiFailureClass::ConnectionRefused;
+    }
+    if lower.contains("permission denied (publickey")
+        || lower.contains("publickey denied")
+        || lower.contains("public key denied")
+        || lower.contains("no supported authentication methods")
+    {
+        return VastAiFailureClass::PublicKeyDenied;
+    }
+    if lower.contains("no ssh host")
+        || lower.contains("no ssh port")
+        || lower.contains("no ssh endpoint")
+        || lower.contains("endpoint missing")
+        || lower.contains("ssh missing")
+    {
+        return VastAiFailureClass::EndpointMissing;
+    }
+    if lower.contains("stuck in status loading")
+        || lower.contains("provider loading timeout")
+        || (lower.contains("status loading") && lower.contains("timeout"))
+    {
+        return VastAiFailureClass::ProviderLoadingTimeout;
+    }
+    if lower.contains("no_such_ask")
+        || lower.contains("no such ask")
+        || lower.contains("vanished offer")
+        || (lower.contains("404") && lower.contains("/asks/"))
+    {
+        return VastAiFailureClass::VanishedOffer;
+    }
+    VastAiFailureClass::Other
+}
+
+#[cfg(test)]
+mod failure_class_tests {
+    use super::*;
+
+    #[test]
+    fn representative_vastai_errors_classify_to_stable_failure_classes() {
+        for (raw, class) in [
+            (
+                "ssh: connect to host ssh5.vast.ai port 22017: Connection refused",
+                VastAiFailureClass::ConnectionRefused,
+            ),
+            (
+                "Permission denied (publickey).",
+                VastAiFailureClass::PublicKeyDenied,
+            ),
+            (
+                "vastai contract 123 has no SSH host",
+                VastAiFailureClass::EndpointMissing,
+            ),
+            (
+                "instance 123 stuck in status loading for 300s",
+                VastAiFailureClass::ProviderLoadingTimeout,
+            ),
+            (
+                "create_instance HTTP 400: {\"error\":\"no_such_ask\"}",
+                VastAiFailureClass::VanishedOffer,
+            ),
+        ] {
+            assert_eq!(classify_vastai_error(raw), class, "{raw}");
+            assert_ne!(class.as_str(), "other");
+        }
+    }
 }
 
 /// Generic held-fleet handle file.

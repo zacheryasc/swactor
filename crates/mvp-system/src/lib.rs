@@ -15,6 +15,7 @@ pub mod edge_establisher;
 pub mod endpoint_advertisement;
 pub mod engine_builder;
 pub mod gguf_metadata;
+pub mod gguf_shard;
 pub mod gpu_worker_ctl;
 pub mod gpu_worker_egress_producer;
 pub mod gpu_worker_ingress_parser;

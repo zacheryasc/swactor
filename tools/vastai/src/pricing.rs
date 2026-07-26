@@ -48,20 +48,3 @@ pub(crate) fn rank_survivors(offers: Vec<Offer>, cost: &CostModel, drop_frac: f6
     survivors.sort_by(&by_price);
     survivors
 }
-
-pub(crate) fn plan_picks(pool: &[Offer], num_instances: u32) -> Vec<&Offer> {
-    let mut picks = Vec::with_capacity(num_instances as usize);
-    let mut used = std::collections::HashSet::new();
-    for o in pool {
-        if picks.len() == num_instances as usize {
-            break;
-        }
-        if let Some(h) = o.host_id {
-            if !used.insert(h) {
-                continue;
-            }
-        }
-        picks.push(o);
-    }
-    picks
-}
