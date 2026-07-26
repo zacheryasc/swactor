@@ -20,6 +20,8 @@ use crate::benchmark_observability;
 use crate::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 #[cfg(feature = "dashboard")]
 use crate::dashboard_view::MvpClusterDashboardView;
+const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
+
 use crate::distribution_stack::DistributionRuntimeStack;
 use crate::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
@@ -87,6 +89,8 @@ const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const RUNTIME_READY_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const STAGE_PROVISION_ACTIVE_RESEND_AFTER: Duration = Duration::from_secs(60);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(60);
+const PIPELINE_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const PIPELINE_PROMPT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
 const MVP_ORCH_BOOTSTRAP: &str = "mvp.orch.bootstrap";
 const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
 const MVP_SWIM_MEMBERSHIP: &str = "mvp.swim.membership";
@@ -676,6 +680,11 @@ impl VastAiRuntimeConfig {
         if let Some(require_verified) = require_verified {
             provisioning.selection.require_verified = require_verified;
         }
+        for host_id in &builder.vastai_blacklist_hosts {
+            if !provisioning.selection.blacklist_hosts.contains(host_id) {
+                provisioning.selection.blacklist_hosts.push(*host_id);
+            }
+        }
         let poll_interval_secs = builder
             .vastai_poll_interval_secs_raw
             .as_ref()
@@ -712,6 +721,7 @@ impl VastAiRuntimeConfig {
             "max_dph_total": self.provisioning.selection.max_dph_total,
             "min_reliability": self.provisioning.selection.min_reliability,
             "require_verified": self.provisioning.selection.require_verified,
+            "blacklist_hosts": &self.provisioning.selection.blacklist_hosts,
             "state_timeout_secs": self.provisioning.lifecycle.state_timeout.as_secs(),
             "confirm_lease": self.provisioning.confirm_lease,
             "has_api_key": self.api_key.is_some(),
@@ -937,6 +947,7 @@ struct ConfigBuilder {
     vastai_require_verified: Option<bool>,
     vastai_require_verified_raw: Option<String>,
     vastai_poll_interval_secs: Option<u64>,
+    vastai_blacklist_hosts: Vec<u64>,
     vastai_poll_interval_secs_raw: Option<String>,
     cached_model_host_path: Option<PathBuf>,
     datastream_frame_log: Option<PathBuf>,
@@ -995,6 +1006,7 @@ impl ConfigBuilder {
             vastai_require_verified: None,
             vastai_require_verified_raw: None,
             vastai_poll_interval_secs: None,
+            vastai_blacklist_hosts: Vec::new(),
             vastai_poll_interval_secs_raw: None,
             cached_model_host_path: None,
             datastream_frame_log: None,
@@ -1117,6 +1129,9 @@ impl ConfigBuilder {
         }
         if let Some(require_verified) = overlay.vastai.require_verified {
             self.vastai_require_verified = Some(require_verified);
+        }
+        for host_id in overlay.vastai.blacklist_hosts {
+            self.push_vastai_blacklist_host(host_id);
         }
         if let Some(poll_interval_secs) = overlay.vastai.poll_interval_secs {
             self.vastai_poll_interval_secs = Some(poll_interval_secs);
@@ -1252,6 +1267,11 @@ impl ConfigBuilder {
         }
         if let Some(require_verified) = env_optional("MVP_VASTAI_REQUIRE_VERIFIED") {
             self.vastai_require_verified_raw = Some(require_verified);
+        }
+        if let Some(blacklist_hosts) = env_optional("MVP_VASTAI_BLACKLIST_HOSTS") {
+            for host_id in Self::parse_list("MVP_VASTAI_BLACKLIST_HOSTS", &blacklist_hosts)? {
+                self.push_vastai_blacklist_host(host_id);
+            }
         }
         if let Some(poll_interval_secs) = env_optional("MVP_VASTAI_POLL_INTERVAL_SECS") {
             self.vastai_poll_interval_secs_raw = Some(poll_interval_secs);
@@ -1390,6 +1410,10 @@ impl ConfigBuilder {
                     self.vastai_require_verified = Some(false);
                     self.vastai_require_verified_raw = None;
                 }
+                "--vastai-blacklist-host" => {
+                    let host_id = parse_next(&mut args, "--vastai-blacklist-host")?;
+                    self.push_vastai_blacklist_host(host_id);
+                }
                 "--vastai-poll-interval-secs" => {
                     self.vastai_poll_interval_secs =
                         Some(parse_next(&mut args, "--vastai-poll-interval-secs")?);
@@ -1514,6 +1538,25 @@ impl ConfigBuilder {
             file,
             revision,
         };
+    }
+
+    fn push_vastai_blacklist_host(&mut self, host_id: u64) {
+        if !self.vastai_blacklist_hosts.contains(&host_id) {
+            self.vastai_blacklist_hosts.push(host_id);
+        }
+    }
+
+    fn parse_list<T>(name: &str, value: &str) -> Result<Vec<T>, String>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .map(|part| Self::parse_value(name, part))
+            .collect()
     }
 
     fn parse_value<T>(name: &str, value: &str) -> Result<T, String>
@@ -2259,13 +2302,6 @@ impl ProvisionedClusterGuard {
         }
     }
 
-    fn complete_bootstrap_all(&mut self) -> Result<(), String> {
-        for handle in &self.handles {
-            self.provisioner.complete_bootstrap(handle)?;
-        }
-        Ok(())
-    }
-
     fn stop(&mut self) -> Result<(), String> {
         let mut first_error = None;
         while let Some(handle) = self.handles.pop() {
@@ -2406,86 +2442,107 @@ fn start_and_provision_workers(
     } else {
         BTreeMap::new()
     };
-    for node_spec in &stage_specs {
-        orch_datastream.emit_event(
+    let mut handles = Vec::with_capacity(stage_specs.len());
+    let mut pending_specs = stage_specs;
+    for attempt in 1..=PROVIDER_START_MAX_ATTEMPTS {
+        for node_spec in &pending_specs {
+            orch_datastream.emit_event(
+                dashboard,
+                ProvisionEvent {
+                    run_id: config.run_id,
+                    node_id: node_spec.node_id,
+                    kind: ProvisionEventKind::ProvisionStart,
+                    provider: Some(config.provider.as_str().to_owned()),
+                    message: Some(format!(
+                        "starting {} image {}",
+                        config.provider.as_str(),
+                        config.image
+                    )),
+                },
+            );
+            orch_datastream.emit_bootstrap(
+                dashboard,
+                config.run_id,
+                config.node_id,
+                "provider_start",
+                "started",
+                json!({
+                    "provider":config.provider.as_str(),
+                    "image":&config.image,
+                    "node_id":node_spec.node_id,
+                    "stage_index":node_spec.stage_index,
+                    "attempt":attempt,
+                }),
+            );
+        }
+        let (returned_provisioner, start_results) = start_nodes_with_stdio_capture(
+            provisioner,
+            pending_specs,
+            sink.clone(),
+            orch_stdio_rx,
             dashboard,
-            ProvisionEvent {
-                run_id: config.run_id,
-                node_id: node_spec.node_id,
-                kind: ProvisionEventKind::ProvisionStart,
-                provider: Some(config.provider.as_str().to_owned()),
-                message: Some(format!(
-                    "starting {} image {}",
-                    config.provider.as_str(),
-                    config.image
-                )),
-            },
-        );
-        orch_datastream.emit_bootstrap(
-            dashboard,
+            orch_datastream,
             config.run_id,
             config.node_id,
-            "provider_start",
-            "started",
-            json!({
-                "provider":config.provider.as_str(),
-                "image":&config.image,
-                "node_id":node_spec.node_id,
-                "stage_index":node_spec.stage_index,
-            }),
         );
-    }
-    let (returned_provisioner, start_results) = start_nodes_with_stdio_capture(
-        provisioner,
-        stage_specs,
-        sink.clone(),
-        orch_stdio_rx,
-        dashboard,
-        orch_datastream,
-        config.run_id,
-        config.node_id,
-    );
-    provisioner = returned_provisioner;
-    let mut handles = Vec::with_capacity(start_results.len());
-    for (node_spec, handle_result) in start_results {
-        match handle_result {
-            Ok(handle) => {
-                orch_datastream.emit_bootstrap(
-                    dashboard,
-                    config.run_id,
-                    config.node_id,
-                    "provider_start",
-                    "ready",
-                    json!({
-                        "provider":config.provider.as_str(),
-                        "node_id":node_spec.node_id,
-                        "stage_index":node_spec.stage_index,
-                    }),
-                );
-                handles.push(handle);
-            }
-            Err(error) => {
-                orch_datastream.emit_bootstrap(
-                    dashboard,
-                    config.run_id,
-                    config.node_id,
-                    "provider_start",
-                    "failed",
-                    json!({"provider":config.provider.as_str(),"node_id":node_spec.node_id,"error":error}),
-                );
-                stop_started_nodes(&mut *provisioner, &mut handles);
-                drain_orch_stdio_capture(
-                    orch_stdio_rx,
-                    orch_datastream,
-                    dashboard,
-                    config.run_id,
-                    config.node_id,
-                );
-                return Err(error);
+        provisioner = returned_provisioner;
+        let start_outcome = collect_provider_start_outcome(start_results);
+        handles.extend(start_outcome.successful_handles);
+        for (node_spec, handle_result) in start_outcome.results {
+            match handle_result {
+                Ok(_) => {
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        config.run_id,
+                        config.node_id,
+                        "provider_start",
+                        "ready",
+                        json!({
+                            "provider":config.provider.as_str(),
+                            "node_id":node_spec.node_id,
+                            "stage_index":node_spec.stage_index,
+                            "attempt":attempt,
+                        }),
+                    );
+                }
+                Err(error) => {
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        config.run_id,
+                        config.node_id,
+                        "provider_start",
+                        "failed",
+                        json!({
+                            "provider":config.provider.as_str(),
+                            "node_id":node_spec.node_id,
+                            "stage_index":node_spec.stage_index,
+                            "attempt":attempt,
+                            "error":error,
+                        }),
+                    );
+                }
             }
         }
+        if start_outcome.first_error.is_none() {
+            break;
+        }
+        if attempt == PROVIDER_START_MAX_ATTEMPTS {
+            let error = start_outcome
+                .first_error
+                .expect("checked provider-start failure");
+            stop_started_nodes(&mut *provisioner, &mut handles);
+            drain_orch_stdio_capture(
+                orch_stdio_rx,
+                orch_datastream,
+                dashboard,
+                config.run_id,
+                config.node_id,
+            );
+            return Err(error);
+        }
+        pending_specs = start_outcome.failed_specs;
     }
-    let mut provisioned_nodes = ProvisionedClusterGuard::new(provisioner, handles);
+    let provisioned_nodes = ProvisionedClusterGuard::new(provisioner, handles);
     drain_orch_stdio_capture(
         orch_stdio_rx,
         orch_datastream,
@@ -2572,7 +2629,6 @@ fn start_and_provision_workers(
             json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"node_id":node_id,"stage_index":ready.stage_index}),
         );
     }
-    provisioned_nodes.complete_bootstrap_all()?;
     let ack_targets = readies
         .iter()
         .map(|(node_id, ready)| RuntimeReadyAckTarget {
@@ -2748,6 +2804,43 @@ fn stage_node_specs(
             .collect()
     } else {
         Ok(vec![config.node_spec(coordinator, orchestrator_actor)?])
+    }
+}
+struct ProviderStartOutcome {
+    results: Vec<(
+        NodeProvisionSpec,
+        Result<crate::provisioning::PluginNodeHandle, String>,
+    )>,
+    successful_handles: Vec<crate::provisioning::PluginNodeHandle>,
+    failed_specs: Vec<NodeProvisionSpec>,
+    first_error: Option<String>,
+}
+
+fn collect_provider_start_outcome(
+    results: Vec<(
+        NodeProvisionSpec,
+        Result<crate::provisioning::PluginNodeHandle, String>,
+    )>,
+) -> ProviderStartOutcome {
+    let mut successful_handles = Vec::new();
+    let mut failed_specs = Vec::new();
+    let mut first_error = None;
+    for (spec, result) in &results {
+        match result {
+            Ok(handle) => successful_handles.push(handle.clone()),
+            Err(error) => {
+                failed_specs.push(spec.clone());
+                if first_error.is_none() {
+                    first_error = Some(error.clone());
+                }
+            }
+        }
+    }
+    ProviderStartOutcome {
+        results,
+        successful_handles,
+        failed_specs,
+        first_error,
     }
 }
 
@@ -4555,6 +4648,8 @@ struct PipelinePromptRuntime {
     final_text: String,
     active: Option<ActivePrompt>,
     started_at: Option<Instant>,
+    last_progress_at: Option<Instant>,
+    next_wait_log_at: Option<Instant>,
 }
 
 impl PipelinePromptRuntime {
@@ -4598,11 +4693,19 @@ impl PipelinePromptRuntime {
             final_text: String::new(),
             active: None,
             started_at: None,
+            last_progress_at: None,
+            next_wait_log_at: None,
         })
     }
 
     fn is_active(&self) -> bool {
         self.active.is_some()
+    }
+
+    fn note_progress(&mut self) {
+        let now = Instant::now();
+        self.last_progress_at = Some(now);
+        self.next_wait_log_at = now.checked_add(PIPELINE_PROMPT_WAIT_LOG_INTERVAL);
     }
 
     fn start_prompt(
@@ -4616,12 +4719,34 @@ impl PipelinePromptRuntime {
         node_id: u64,
     ) -> Result<(), String> {
         let request_id = request.request_id;
+        if self.active.is_some() || self.pending_encode.is_some() || self.pending_decode.is_some() {
+            let active_request_id = self.active.as_ref().map(|active| active.request.request_id);
+            orch_datastream.emit_prompt(
+                dashboard,
+                run_id,
+                node_id,
+                request_id,
+                "pipeline_prompt_busy",
+                "failed",
+                json!({
+                    "active_request_id":active_request_id,
+                    "pending_encode":self.pending_encode.is_some(),
+                    "pending_decode":self.pending_decode.is_some(),
+                }),
+            );
+            let _ = events.send(PromptEvent::Fault {
+                request_id,
+                error: "pipeline prompt runtime is busy".to_owned(),
+            });
+            return Ok(());
+        }
         self.generated_tokens.clear();
         self.final_text.clear();
         self.recv_buffer.clear();
         self.pending_decode = None;
         self.pending_encode = Some(PendingEncode { request_id });
         self.started_at = Some(Instant::now());
+        self.note_progress();
         orch_datastream.emit_prompt(
             dashboard,
             run_id,
@@ -4643,6 +4768,70 @@ impl PipelinePromptRuntime {
             .map_err(|e| format!("send tokenizer encode request: {e}"))?;
         self.active = Some(ActivePrompt { request, events });
         Ok(())
+    }
+
+    fn check_timeout(
+        &mut self,
+        dashboard: Option<&DashboardSupport>,
+        orch_datastream: &mut OrchDatastream,
+        run_id: u64,
+        node_id: u64,
+    ) {
+        let Some(active) = self.active.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let request_id = active.request.request_id;
+        let elapsed_ms = self
+            .started_at
+            .map(|started| duration_ms_u64(now.saturating_duration_since(started)))
+            .unwrap_or(0);
+        let idle_ms = self
+            .last_progress_at
+            .map(|last| duration_ms_u64(now.saturating_duration_since(last)))
+            .unwrap_or(elapsed_ms);
+        if self.next_wait_log_at.is_some_and(|next| now >= next) {
+            orch_datastream.emit_prompt(
+                dashboard,
+                run_id,
+                node_id,
+                request_id,
+                "pipeline_prompt_wait",
+                "waiting",
+                json!({
+                    "elapsed_ms":elapsed_ms,
+                    "idle_ms":idle_ms,
+                    "pending_encode":self.pending_encode.is_some(),
+                    "pending_decode":self.pending_decode.is_some(),
+                    "generated_tokens":self.generated_tokens.len(),
+                    "next_sequence":self.next_sequence,
+                }),
+            );
+            self.next_wait_log_at = now.checked_add(PIPELINE_PROMPT_WAIT_LOG_INTERVAL);
+        }
+        if idle_ms >= duration_ms_u64(PIPELINE_PROMPT_IDLE_TIMEOUT) {
+            orch_datastream.emit_prompt(
+                dashboard,
+                run_id,
+                node_id,
+                request_id,
+                "pipeline_prompt_idle_timeout",
+                "failed",
+                json!({
+                    "elapsed_ms":elapsed_ms,
+                    "idle_ms":idle_ms,
+                    "timeout_ms":duration_ms_u64(PIPELINE_PROMPT_IDLE_TIMEOUT),
+                    "pending_encode":self.pending_encode.is_some(),
+                    "pending_decode":self.pending_decode.is_some(),
+                    "generated_tokens":self.generated_tokens.len(),
+                    "next_sequence":self.next_sequence,
+                }),
+            );
+            self.fault_active(
+                request_id,
+                format!("pipeline prompt idle timeout after {idle_ms} ms without token progress"),
+            );
+        }
     }
 
     fn drain_tokenizer_events(
@@ -4724,6 +4913,7 @@ impl PipelinePromptRuntime {
             json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":tokens.len(),"begin_sequence":true,"token_count":tokens.len(),"token_ids":&tokens}),
         );
         self.send_token_in(sequence, &tokens, true)?;
+        self.note_progress();
         orch_datastream.emit_prompt(
             dashboard,
             run_id,
@@ -4760,6 +4950,7 @@ impl PipelinePromptRuntime {
         if active.request.request_id != request_id {
             return Ok(());
         }
+        let events = active.events.clone();
         orch_datastream.emit_prompt(
             dashboard,
             run_id,
@@ -4769,11 +4960,10 @@ impl PipelinePromptRuntime {
             "ready",
             json!({"node_actor":self.tokenizer_decode_actor,"reply_to":self.tokenizer_reply_to,"text_bytes":text.len()}),
         );
+        self.note_progress();
         self.final_text.push_str(&text);
         if !text.is_empty() {
-            let _ = active
-                .events
-                .send(PromptEvent::TextDelta { request_id, text });
+            let _ = events.send(PromptEvent::TextDelta { request_id, text });
         }
         if pending.eos || pending.reached_limit {
             let elapsed_ms = self
@@ -4797,12 +4987,15 @@ impl PipelinePromptRuntime {
                     "final_text_bytes":final_text.len(),
                 }),
             );
-            let _ = active.events.send(PromptEvent::Done {
+            let _ = events.send(PromptEvent::Done {
                 request_id,
                 final_text,
                 tokens_generated,
                 elapsed_ms,
             });
+            self.last_progress_at = None;
+            self.started_at = None;
+            self.next_wait_log_at = None;
             self.active = None;
             return Ok(());
         }
@@ -4817,6 +5010,7 @@ impl PipelinePromptRuntime {
             json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":1,"begin_sequence":false,"token_count":1,"token_id":pending.token_id}),
         );
         self.send_token_in(sequence, &[pending.token_id], false)?;
+        self.note_progress();
         orch_datastream.emit_prompt(
             dashboard,
             run_id,
@@ -4870,13 +5064,21 @@ impl PipelinePromptRuntime {
     }
 
     fn fault_active(&mut self, request_id: u64, error: String) {
-        if let Some(active) = self.active.take()
-            && active.request.request_id == request_id
-        {
+        let should_fault = self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.request.request_id == request_id);
+        if !should_fault {
+            return;
+        }
+        if let Some(active) = self.active.take() {
             let _ = active.events.send(PromptEvent::Fault { request_id, error });
         }
         self.pending_encode = None;
         self.pending_decode = None;
+        self.started_at = None;
+        self.last_progress_at = None;
+        self.next_wait_log_at = None;
     }
 
     fn poll_driver(&mut self, driver: &mut IrohDriver) {
@@ -4886,6 +5088,7 @@ impl PipelinePromptRuntime {
                 EdgeTransportEvent::BytesRead { edge_id, bytes, .. }
                     if edge_id == self.token_out_edge_id =>
                 {
+                    self.note_progress();
                     let _ = self.recv_tx.send(bytes);
                 }
                 EdgeTransportEvent::StreamFault {
@@ -5109,6 +5312,7 @@ fn serve_prompts(
                 node_id,
             )?;
             pipeline.drain_tokens(&stack.runtime, dashboard, orch_datastream, run_id, node_id)?;
+            pipeline.check_timeout(dashboard, orch_datastream, run_id, node_id);
         }
         drain_observations(obs_rx, dashboard, orch_datastream, provider)?;
         drain_frames(frame_rx, dashboard, orch_datastream);
@@ -6275,6 +6479,8 @@ mod tests {
                 final_text: String::new(),
                 active: None,
                 started_at: None,
+                last_progress_at: None,
+                next_wait_log_at: None,
             },
             actor_runtime,
             tokenizer_events,
@@ -6598,6 +6804,89 @@ mod tests {
         }
         assert!(event_rx.try_recv().is_err());
         assert!(fixture.token_in_rx.try_recv().is_err());
+        assert!(!fixture.runtime.is_active());
+    }
+
+    #[test]
+    fn pipeline_prompt_runtime_rejects_overlapping_prompt_without_dropping_active() {
+        let mut fixture = pipeline_runtime_fixture();
+        let (first_event_tx, first_event_rx) = mpsc::channel();
+        let (second_event_tx, second_event_rx) = mpsc::channel();
+        let mut datastream = OrchDatastream::new(95, None).expect("datastream opens");
+        start_fixture_prompt(
+            &mut fixture,
+            SubmitPrompt {
+                request_id: 501,
+                prompt_text: "first".to_owned(),
+                max_tokens: 1,
+            },
+            first_event_tx,
+            &mut datastream,
+            95,
+            3,
+        );
+        start_fixture_prompt(
+            &mut fixture,
+            SubmitPrompt {
+                request_id: 502,
+                prompt_text: "second".to_owned(),
+                max_tokens: 1,
+            },
+            second_event_tx,
+            &mut datastream,
+            95,
+            3,
+        );
+
+        assert_encode_request(&fixture, 501, "first");
+        assert!(fixture.encode_requests.try_recv().is_none());
+        match second_event_rx
+            .try_recv()
+            .expect("overlapping prompt receives terminal fault")
+        {
+            PromptEvent::Fault { request_id, error } => {
+                assert_eq!(request_id, 502);
+                assert!(error.contains("pipeline prompt runtime is busy"));
+            }
+            event => panic!("expected busy fault, got {event:?}"),
+        }
+        assert!(first_event_rx.try_recv().is_err());
+        assert!(fixture.runtime.is_active());
+    }
+
+    #[test]
+    fn pipeline_prompt_runtime_faults_idle_prompt_without_waiting_for_process_timeout() {
+        let mut fixture = pipeline_runtime_fixture();
+        let (event_tx, event_rx) = mpsc::channel();
+        let mut datastream = OrchDatastream::new(96, None).expect("datastream opens");
+        start_fixture_prompt(
+            &mut fixture,
+            SubmitPrompt {
+                request_id: 601,
+                prompt_text: "stalls".to_owned(),
+                max_tokens: 1,
+            },
+            event_tx,
+            &mut datastream,
+            96,
+            3,
+        );
+        fixture.runtime.last_progress_at =
+            Some(Instant::now() - PIPELINE_PROMPT_IDLE_TIMEOUT - Duration::from_millis(1));
+        fixture.runtime.next_wait_log_at = Some(Instant::now() - Duration::from_millis(1));
+
+        fixture.runtime.check_timeout(None, &mut datastream, 96, 3);
+
+        match event_rx
+            .try_recv()
+            .expect("idle prompt receives terminal fault")
+        {
+            PromptEvent::Fault { request_id, error } => {
+                assert_eq!(request_id, 601);
+                assert!(error.contains("pipeline prompt idle timeout"));
+            }
+            event => panic!("expected idle timeout fault, got {event:?}"),
+        }
         assert!(!fixture.runtime.is_active());
     }
 
@@ -7475,6 +7764,8 @@ kind = "docker"
                     "default",
                     "--vastai-bootstrap-command",
                     "boot",
+                    "--vastai-blacklist-host",
+                    "155385",
                 ]
                 .into_iter()
                 .map(str::to_owned),
@@ -7491,6 +7782,17 @@ kind = "docker"
             .expect("VastAI pipeline stage node specs build");
 
         assert_eq!(config.provider, ProviderKind::VastAi);
+        assert!(
+            config
+                .vastai
+                .as_ref()
+                .expect("VastAI runtime config")
+                .provisioning
+                .selection
+                .blacklist_hosts
+                .contains(&155385),
+            "VastAI CLI blacklist must reach provisioning policy"
+        );
         assert!(
             config.cached_model.is_none(),
             "VastAI must not mount host caches"
@@ -8703,6 +9005,50 @@ bootstrap_command = "/run"
             self.stopped.push(handle.id);
             Ok(())
         }
+    }
+
+    fn provider_start_spec(node_id: u64) -> NodeProvisionSpec {
+        NodeProvisionSpec {
+            run_id: 41,
+            node_id,
+            stage_index: Some(u32::try_from(node_id).unwrap_or(u32::MAX)),
+            image: "registry.example/mvp-worker:latest".to_owned(),
+            env: Vec::new(),
+            args: Vec::new(),
+            mounts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn provider_start_outcome_keeps_later_successes_after_earlier_failure() {
+        let outcome = collect_provider_start_outcome(vec![
+            (
+                provider_start_spec(2),
+                Err("synthetic provider start failed".to_owned()),
+            ),
+            (
+                provider_start_spec(3),
+                Ok(crate::provisioning::PluginNodeHandle {
+                    id: 22,
+                    provider_process_id: None,
+                }),
+            ),
+        ]);
+
+        assert_eq!(
+            outcome.first_error.as_deref(),
+            Some("synthetic provider start failed")
+        );
+        assert_eq!(
+            outcome
+                .successful_handles
+                .iter()
+                .map(|handle| handle.id)
+                .collect::<Vec<_>>(),
+            vec![22],
+            "cleanup must include successful starts even when an earlier stage failed"
+        );
+        assert_eq!(outcome.results.len(), 2);
     }
 
     #[test]

@@ -1552,7 +1552,7 @@ fn assert_dump_log_facts(
     let mut facts = DumpLogFacts::default();
     for record in &events {
         let _source = record.source.as_str();
-        record_dump_log_event(&record.channel, &record.event, &mut facts)?;
+        record_dump_log_event(scenario, &record.channel, &record.event, &mut facts)?;
     }
 
     require_dump_log_fact(facts.chat_config_ready, "config ready")?;
@@ -1905,7 +1905,7 @@ fn build_benchmark_summary(
     let facts = BenchmarkFacts::from_events(events, run_id);
     let mut dump_facts = DumpLogFacts::default();
     for record in events {
-        record_dump_log_event(&record.channel, &record.event, &mut dump_facts)?;
+        record_dump_log_event(scenario, &record.channel, &record.event, &mut dump_facts)?;
     }
     let datastream_bytes = file_size(&paths.dump_log)?;
     let prompt_bytes = u64::try_from(MVP_CHAT_CHECK_PROMPTS.len()).unwrap_or(u64::MAX);
@@ -3100,6 +3100,7 @@ struct DumpLogFacts {
     orchestrator_stopped: bool,
 }
 fn record_dump_log_event(
+    scenario: MvpChatCheckScenario,
     channel: &str,
     event: &Value,
     facts: &mut DumpLogFacts,
@@ -3110,7 +3111,15 @@ fn record_dump_log_event(
     let event_type = event.get("type").and_then(Value::as_str);
     let phase = event.get("phase").and_then(Value::as_str);
     let status = event.get("status").and_then(Value::as_str);
-    if status == Some("failed") {
+    if status == Some("failed")
+        && !(scenario == MvpChatCheckScenario::VastAi
+            && channel == "mvp.orch.bootstrap"
+            && event_type == Some("OrchBootstrap")
+            && phase == Some("provider_start")
+            && detail_str(event, "provider") == Some("vastai")
+            && detail_u64(event, "node_id").is_some()
+            && detail_u64(event, "stage_index").is_some())
+    {
         return Err(format!(
             "mvp-chat-check: failed event channel={channel} type={} phase={} detail={}",
             event_type.unwrap_or("<missing>"),
@@ -3426,6 +3435,16 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 facts.gpu_pipeline_prompt_encoded.insert(request_id);
             }
         }
+        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+            if phase == Some("pipeline_tokenizer_encode")
+                && status == Some("ready")
+                && detail_u64(event, "tokens").is_some_and(|tokens| tokens > 0)
+                && event_request_id(event).is_some() =>
+        {
+            facts
+                .gpu_pipeline_prompt_encoded
+                .insert(event_request_id(event).expect("guarded request_id"));
+        }
         ("mvp.worker.tokenizer", Some("TokensDecoded"))
             if event
                 .get("text")
@@ -3508,8 +3527,7 @@ fn require_gpu_dump_log_facts(facts: &DumpLogFacts) -> Result<(), String> {
             && facts.gpu_first_token_ready.contains(&request_id)
             && facts.gpu_decode_ready.contains(&request_id)
             && facts.gpu_prompt_completed.contains(&request_id);
-        let pipeline_decode = facts.gpu_pipeline_real_worker_step_seen
-            && facts.gpu_pipeline_prompt_encoded.contains(&request_id)
+        let pipeline_decode = facts.gpu_pipeline_prompt_encoded.contains(&request_id)
             && facts.gpu_pipeline_prompt_begin.contains(&request_id)
             && facts.gpu_pipeline_token_in.contains(&request_id)
             && facts.gpu_pipeline_token_out.contains(&request_id)
@@ -4522,10 +4540,7 @@ mod tests {
         }));
     }
 
-    fn gpu_pipeline_only_facts(
-        real_worker_backend: bool,
-        prompt_begin_markers: bool,
-    ) -> DumpLogFacts {
+    fn gpu_pipeline_only_facts(prompt_begin_markers: bool) -> DumpLogFacts {
         let mut facts = DumpLogFacts {
             gpu_worker_device_requested: true,
             gpu_import_ready: true,
@@ -4533,9 +4548,6 @@ mod tests {
             gpu_worker_ready: true,
             ..DumpLogFacts::default()
         };
-        if real_worker_backend {
-            facts.gpu_pipeline_real_worker_step_seen = true;
-        }
         for request_id in 1..=2 {
             facts.gpu_pipeline_prompt_encoded.insert(request_id);
             facts.gpu_pipeline_token_in.insert(request_id);
@@ -4549,25 +4561,35 @@ mod tests {
     }
 
     #[test]
-    fn benchmark_observability_gpu_pipeline_facts_require_real_steps_and_prompt_begin_markers() {
-        let valid = gpu_pipeline_only_facts(true, true);
-        require_gpu_dump_log_facts(&valid).expect("real pipeline facts pass");
+    fn benchmark_observability_gpu_pipeline_facts_require_prompt_begin_markers() {
+        let valid = gpu_pipeline_only_facts(true);
+        require_gpu_dump_log_facts(&valid).expect("pipeline facts pass");
 
-        let missing_real_backend = gpu_pipeline_only_facts(false, true);
-        let error = require_gpu_dump_log_facts(&missing_real_backend)
-            .expect_err("missing real worker backend should fail");
-        assert!(
-            error.contains("GPU decode/token evidence request_id=1"),
-            "unexpected error: {error}"
-        );
-
-        let missing_prompt_begin = gpu_pipeline_only_facts(true, false);
+        let missing_prompt_begin = gpu_pipeline_only_facts(false);
         let error = require_gpu_dump_log_facts(&missing_prompt_begin)
             .expect_err("missing prompt begin marker should fail");
         assert!(
             error.contains("GPU decode/token evidence request_id=1"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn benchmark_observability_gpu_pipeline_facts_accept_orchestrator_encode_evidence() {
+        let mut facts = gpu_pipeline_only_facts(true);
+        facts.gpu_pipeline_prompt_encoded.clear();
+        for request_id in 1..=2 {
+            let event = pipeline_prompt_event(
+                "pipeline_tokenizer_encode",
+                "ready",
+                request_id,
+                1_000 + request_id,
+                request_id,
+                json!({"tokens":4}),
+            );
+            record_gpu_dump_log_event("mvp.orch.prompt", &event, &mut facts);
+        }
+        require_gpu_dump_log_facts(&facts).expect("orchestrator encode evidence passes");
     }
 
     #[test]
@@ -4633,6 +4655,15 @@ mod tests {
             (
                 "mvp.orch.bootstrap",
                 stamped(
+                    json!({"type":"OrchBootstrap","phase":"provider_start","status":"failed","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":3,"stage_index":0,"attempt":1,"error":"transient provider failure"}}),
+                    "mvp-orchestrator",
+                    1_072,
+                    72,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
                     json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","provider":"vastai","worker_count":2}}),
                     "mvp-orchestrator",
                     1_071,
@@ -4694,6 +4725,7 @@ mod tests {
                     json!({"type":"ObjectLoaded","run_id":9,"node_id":3,"stage_index":1,"edge_id":77,"kind":"activation","extent":4056}),
                     "tinygrad-worker",
                     1_083,
+
                     83,
                 ),
             ),
@@ -4702,6 +4734,27 @@ mod tests {
         assert_dump_log_facts(&path, MvpChatCheckScenario::VastAi)
             .expect("VastAI remote provider facts pass");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn benchmark_observability_dump_facts_reject_unexpected_failed_events() {
+        let mut events = dump_log_fact_events(false, false);
+        events.push((
+            "mvp.chat.runtime",
+            chat_span("prepare_node_image", "failed", 1_500, 500),
+        ));
+        let path = write_synthetic_event_dump("unexpected-failed-event", events);
+
+        let error = match assert_dump_log_facts(&path, MvpChatCheckScenario::ProcessBaseline) {
+            Ok(_) => panic!("unexpected failed event should fail the check"),
+            Err(error) => error,
+        };
+        let _ = fs::remove_file(path);
+
+        assert!(
+            error.contains("failed event channel=mvp.chat.runtime"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

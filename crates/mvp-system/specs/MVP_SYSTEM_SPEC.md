@@ -653,19 +653,20 @@ The MVP allows one active `ExecuteStep` per stage.
 
 Weights are stage-local persistent state for the run.
 
-The StageController starts weight work from the assigned `GgufSource` and layer
-range. A stage may download:
+The orchestrator sends `ProvisionStage` to every runtime-ready pipeline stage
+without waiting for another stage's weights. Each provision carries enough
+weight-source planning information for that stage's assigned layer range: the
+source identity, selected artifact ranges or shard identifiers, required
+metadata, and cache key. The node materializes or locates the stage-local weight
+artifact from the assigned source; stages do not stream weights to one another.
 
-- a whole GGUF and load only its range
+The StageController starts weight work from the assigned weight source and layer
+range. A stage may acquire:
+
+- only the artifact ranges required for its stage-local shard
 - one or more physical shards containing its range
+- a whole artifact and load only its range when no shard plan is available
 - a cached artifact that already exists on the node
-
-The physical loading mechanism may be:
-
-- worker startup configuration
-- a `ConfigureRole` command
-- a local loader path owned by the StageController
-- weight objects moved through the same object/ring machinery
 
 The system-visible contract is `WeightsReady` before `StageReady`.
 

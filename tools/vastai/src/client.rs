@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::types::{
     LabeledInstance, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedFleet, RunningInstance,
 };
@@ -16,8 +18,12 @@ impl VastClient {
     }
 
     pub fn with_base_url(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(45))
+            .build()
+            .expect("valid Vast.ai HTTP client");
         Self {
-            http: reqwest::Client::new(),
+            http,
             base_url: base_url.into(),
             api_key: api_key.into(),
         }
