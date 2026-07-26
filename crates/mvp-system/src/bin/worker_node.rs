@@ -2,10 +2,10 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitCode, Stdio};
 use std::sync::{
     Arc,
-    mpsc::{self, Receiver},
+    mpsc::{self, Receiver, RecvTimeoutError, Sender},
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -38,6 +38,7 @@ use mvp_system::edge_establisher as edge;
 use mvp_system::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
+use mvp_system::gguf_shard::{StageShardPlan, materialize_stage_shard_http};
 use mvp_system::gpu_worker_ingress_parser as ingress;
 use mvp_system::prompt_rpc::{PromptEvent, TokenizerEvent};
 use mvp_system::relay_provisioning::relay_runtime_config_from_env;
@@ -64,6 +65,8 @@ const NODE_STAGE_CHANNEL: &str = "mvp.node.stage";
 const NODE_WORKER_CHANNEL: &str = "mvp.node.worker";
 const NODE_PROMPT_CHANNEL: &str = "mvp.node.prompt";
 const NODE_SHUTDOWN_CHANNEL: &str = "mvp.node.shutdown";
+const NODE_SAMPLER_CHANNEL: &str = "mvp.node.sampler";
+const WORKER_COMMAND_WAIT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 fn node_event_payload(
     config: &DeploymentConfig,
@@ -417,12 +420,136 @@ fn drain_debug_join_commands(
     }
 }
 
+#[derive(Clone, Copy)]
+struct SamplerHealthContext {
+    run_id: u64,
+    node_id: u64,
+    stage_index: u32,
+}
+
+impl SamplerHealthContext {
+    fn from_config(config: &DeploymentConfig) -> Self {
+        Self {
+            run_id: config.run_id,
+            node_id: config.logical_node_id,
+            stage_index: config.stage_index,
+        }
+    }
+}
+
+fn sampler_health_payload(
+    context: SamplerHealthContext,
+    sampler: &str,
+    sample_channel: &str,
+    status: &str,
+    detail: Value,
+) -> Value {
+    json!({
+        "type":"SamplerHealth",
+        "schema":"mvp.node.sampler.health.v1",
+        "run_id":context.run_id,
+        "node_id":context.node_id,
+        "stage_index":context.stage_index,
+        "phase":"host_sampler_health",
+        "status":status,
+        "sampler":sampler,
+        "sample_channel":sample_channel,
+        "detail":detail,
+        "benchmark":benchmark_observability::stamp("mvp-worker-node"),
+    })
+}
+
+fn submit_sampler_health(
+    producer: &DatastreamProducer,
+    channel: ChannelId,
+    context: SamplerHealthContext,
+    sampler: &str,
+    sample_channel: &str,
+    status: &str,
+    detail: Value,
+) {
+    producer.submit_text(
+        channel,
+        sampler_health_payload(context, sampler, sample_channel, status, detail).to_string(),
+    );
+}
+
+fn submit_sampler_started(
+    producer: &DatastreamProducer,
+    health_channel: ChannelId,
+    context: SamplerHealthContext,
+    sampler: &str,
+    sample_channel: &str,
+    interval: Duration,
+) {
+    submit_sampler_health(
+        producer,
+        health_channel,
+        context,
+        sampler,
+        sample_channel,
+        "started",
+        json!({"state":"started","sample_interval_ms":duration_ms_u64(interval)}),
+    );
+    submit_sampler_health(
+        producer,
+        health_channel,
+        context,
+        sampler,
+        sample_channel,
+        "waiting",
+        json!({"state":"no_sample_yet","sample_interval_ms":duration_ms_u64(interval)}),
+    );
+}
+
+fn submit_sampler_sample_health(
+    producer: &DatastreamProducer,
+    health_channel: ChannelId,
+    context: SamplerHealthContext,
+    sampler: &str,
+    sample_channel: &str,
+    seq: u64,
+    error: Option<&str>,
+) {
+    match error {
+        Some(error) => submit_sampler_health(
+            producer,
+            health_channel,
+            context,
+            sampler,
+            sample_channel,
+            "failed",
+            json!({"state":"error","sample_seq":seq,"error":error}),
+        ),
+        None => submit_sampler_health(
+            producer,
+            health_channel,
+            context,
+            sampler,
+            sample_channel,
+            "ready",
+            json!({"state":"sample_observed","sample_seq":seq}),
+        ),
+    }
+}
+
 fn spawn_host_gpu_sampler(
     handle: tokio::runtime::Handle,
     producer: DatastreamProducer,
     channel: ChannelId,
+    health_channel: ChannelId,
+    health_context: SamplerHealthContext,
 ) {
     handle.spawn(async move {
+        let sample_channel = datastream::hardware::gpu::HOST_GPU_CHANNEL;
+        submit_sampler_started(
+            &producer,
+            health_channel,
+            health_context,
+            "gpu",
+            sample_channel,
+            datastream::hardware::gpu::GPU_SAMPLE_INTERVAL,
+        );
         let mut seq = 0_u64;
         let mut interval = tokio::time::interval(datastream::hardware::gpu::GPU_SAMPLE_INTERVAL);
 
@@ -442,6 +569,15 @@ fn spawn_host_gpu_sampler(
                 ),
             };
 
+            submit_sampler_sample_health(
+                &producer,
+                health_channel,
+                health_context,
+                "gpu",
+                sample_channel,
+                sample_seq,
+                sample.error.as_deref(),
+            );
             seq = seq.saturating_add(1);
             producer.submit_record(channel, &sample);
         }
@@ -452,9 +588,20 @@ fn spawn_host_cpu_sampler(
     handle: tokio::runtime::Handle,
     producer: DatastreamProducer,
     channel: ChannelId,
+    health_channel: ChannelId,
+    health_context: SamplerHealthContext,
     watched_pids: Vec<u32>,
 ) {
     handle.spawn(async move {
+        let sample_channel = datastream::hardware::cpu::HOST_CPU_CHANNEL;
+        submit_sampler_started(
+            &producer,
+            health_channel,
+            health_context,
+            "cpu",
+            sample_channel,
+            datastream::hardware::cpu::CPU_SAMPLE_INTERVAL,
+        );
         let mut seq = 0_u64;
         let mut sampler = datastream::hardware::cpu::CpuSampler::new(watched_pids);
         let mut interval = tokio::time::interval(datastream::hardware::cpu::CPU_SAMPLE_INTERVAL);
@@ -463,6 +610,15 @@ fn spawn_host_cpu_sampler(
             interval.tick().await;
 
             let sample = sampler.sample(seq);
+            submit_sampler_sample_health(
+                &producer,
+                health_channel,
+                health_context,
+                "cpu",
+                sample_channel,
+                seq,
+                sample.error.as_deref(),
+            );
             seq = seq.saturating_add(1);
             producer.submit_record(channel, &sample);
         }
@@ -472,8 +628,19 @@ fn spawn_host_net_sampler(
     handle: tokio::runtime::Handle,
     producer: DatastreamProducer,
     channel: ChannelId,
+    health_channel: ChannelId,
+    health_context: SamplerHealthContext,
 ) {
     handle.spawn(async move {
+        let sample_channel = datastream::hardware::net::HOST_NET_CHANNEL;
+        submit_sampler_started(
+            &producer,
+            health_channel,
+            health_context,
+            "net",
+            sample_channel,
+            datastream::hardware::net::HOST_NET_SAMPLE_INTERVAL,
+        );
         let mut seq = 0_u64;
         let mut interval =
             tokio::time::interval(datastream::hardware::net::HOST_NET_SAMPLE_INTERVAL);
@@ -494,6 +661,15 @@ fn spawn_host_net_sampler(
                 ),
             };
 
+            submit_sampler_sample_health(
+                &producer,
+                health_channel,
+                health_context,
+                "net",
+                sample_channel,
+                sample_seq,
+                sample.error.as_deref(),
+            );
             seq = seq.saturating_add(1);
             producer.submit_record(channel, &sample);
         }
@@ -1391,6 +1567,9 @@ fn main() -> ExitCode {
         args.remove(0);
         return debug_join_client_main(args);
     }
+    if args.first().map(String::as_str) == Some("stage-shard-fetcher") {
+        return stage_shard_fetcher_main();
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -1398,6 +1577,36 @@ fn main() -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StageShardFetchRequest {
+    plan: StageShardPlan,
+    output_path: PathBuf,
+}
+
+fn stage_shard_fetcher_main() -> ExitCode {
+    match run_stage_shard_fetcher() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            let event = json!({"type":"StageShardFetchFailed","error":error});
+            println!("{event}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_stage_shard_fetcher() -> Result<(), String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| format!("read stage shard fetch request: {e}"))?;
+    let request: StageShardFetchRequest = serde_json::from_str(&input)
+        .map_err(|e| format!("parse stage shard fetch request: {e}"))?;
+    materialize_stage_shard_http(&request.plan, &request.output_path, |event| {
+        println!("{event}");
+        let _ = std::io::stdout().flush();
+    })
 }
 
 fn run() -> Result<(), String> {
@@ -1588,15 +1797,21 @@ fn run() -> Result<(), String> {
         }
     };
     stack.register_local_actor(driver.register_actor(datastream_publisher, 1));
+    let sampler_health_channel = datastream.channel_by_name(NODE_SAMPLER_CHANNEL);
+    let sampler_health_context = SamplerHealthContext::from_config(&config);
     spawn_host_gpu_sampler(
         tokio.handle().clone(),
         datastream.producer.clone(),
         datastream.channels.host_gpu,
+        sampler_health_channel,
+        sampler_health_context,
     );
     spawn_host_net_sampler(
         tokio.handle().clone(),
         datastream.producer.clone(),
         datastream.channels.host_net,
+        sampler_health_channel,
+        sampler_health_context,
     );
     spawn_arena_sampler(
         tokio.handle().clone(),
@@ -1752,6 +1967,8 @@ fn run() -> Result<(), String> {
         tokio.handle().clone(),
         datastream.producer.clone(),
         datastream.channels.host_cpu,
+        sampler_health_channel,
+        sampler_health_context,
         vec![std::process::id(), worker.pid()],
     );
     emit_stdio_node_event(
@@ -2134,6 +2351,7 @@ impl NodeDatastream {
             NODE_WORKER_CHANNEL,
             NODE_PROMPT_CHANNEL,
             NODE_SHUTDOWN_CHANNEL,
+            NODE_SAMPLER_CHANNEL,
             "mvp.worker.initialize",
             "mvp.worker.role",
             "mvp.worker.weights",
@@ -2806,6 +3024,189 @@ fn handle_decode_tokens_request(
         .map_err(|e| format!("send tokenizer decode response: {e}"))
 }
 
+#[derive(Clone, Copy)]
+enum StageShardProcessStream {
+    Stdout,
+    Stderr,
+}
+
+struct StageShardProcessLine {
+    stream: StageShardProcessStream,
+    line: String,
+}
+
+fn stage_shard_cache_path(plan: &StageShardPlan) -> PathBuf {
+    let root = std::env::var("MVP_MODEL_CACHE_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/cache/mvp-models"));
+    root.join(plan.cache_file_name())
+}
+
+fn spawn_stage_shard_reader<R: Read + Send + 'static>(
+    stream: StageShardProcessStream,
+    reader: R,
+    tx: mpsc::Sender<StageShardProcessLine>,
+) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let _ = tx.send(StageShardProcessLine {
+                        stream,
+                        line: line.trim_end_matches(['\r', '\n']).to_owned(),
+                    });
+                }
+                Err(error) => {
+                    let _ = tx.send(StageShardProcessLine {
+                        stream,
+                        line: format!("reader error: {error}"),
+                    });
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn publish_stage_shard_fetch_event(
+    datastream: &mut NodeDatastream,
+    config: &DeploymentConfig,
+    event: &Value,
+) -> Result<(), String> {
+    let channel = datastream.channel_by_name("mvp.worker.weights");
+    let payload = node_event_payload(config, "stage_shard_fetch", "event", event.clone());
+    datastream.submit_text(channel, payload.to_string());
+    emit_stdio_datastream_frame("mvp.worker.weights", &payload)
+        .map_err(|e| format!("emit stage shard fetch datastream frame: {e}"))?;
+    datastream.tick();
+    Ok(())
+}
+
+fn materialize_stage_shard_with_process(
+    plan: &StageShardPlan,
+    config: &DeploymentConfig,
+    datastream: &mut NodeDatastream,
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+) -> Result<PathBuf, String> {
+    let output_path = stage_shard_cache_path(plan);
+    if output_path.is_file() {
+        let event = json!({
+            "type":"StageShardCacheReady",
+            "stage_index":plan.stage_index,
+            "path":output_path,
+            "cache_hit":true,
+        });
+        publish_stage_shard_fetch_event(datastream, config, &event)?;
+        return Ok(output_path);
+    }
+
+    let request = StageShardFetchRequest {
+        plan: plan.clone(),
+        output_path: output_path.clone(),
+    };
+    let request_json = serde_json::to_vec(&request)
+        .map_err(|e| format!("serialize stage shard fetch request: {e}"))?;
+    let exe = std::env::current_exe().map_err(|e| format!("locate worker node executable: {e}"))?;
+    let mut child = Command::new(exe)
+        .arg("stage-shard-fetcher")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn stage shard fetcher: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&request_json)
+            .map_err(|e| format!("write stage shard fetch request: {e}"))?;
+    }
+    let (tx, rx) = mpsc::channel::<StageShardProcessLine>();
+    if let Some(stdout) = child.stdout.take() {
+        spawn_stage_shard_reader(StageShardProcessStream::Stdout, stdout, tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_stage_shard_reader(StageShardProcessStream::Stderr, stderr, tx);
+    }
+
+    let mut ready_path = None;
+
+    loop {
+        while let Ok(line) = rx.try_recv() {
+            if line.line.is_empty() {
+                continue;
+            }
+            let event = match line.stream {
+                StageShardProcessStream::Stdout => {
+                    match serde_json::from_str::<Value>(&line.line) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            json!({"type":"StageShardFetchOutputParseFailed","line":line.line,"error":error.to_string()})
+                        }
+                    }
+                }
+                StageShardProcessStream::Stderr => {
+                    json!({"type":"StageShardFetchStderr","line":line.line})
+                }
+            };
+            if event.get("type").and_then(Value::as_str) == Some("StageShardReady") {
+                ready_path = event
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .or_else(|| Some(output_path.clone()));
+            }
+            publish_stage_shard_fetch_event(datastream, config, &event)?;
+        }
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|e| format!("poll stage shard fetcher: {e}"))?
+        {
+            while let Ok(line) = rx.try_recv() {
+                if line.line.is_empty() {
+                    continue;
+                }
+                let event = match line.stream {
+                    StageShardProcessStream::Stdout => serde_json::from_str::<Value>(&line.line)
+                        .unwrap_or_else(|error| {
+                            json!({"type":"StageShardFetchOutputParseFailed","line":line.line,"error":error.to_string()})
+                        }),
+                    StageShardProcessStream::Stderr => {
+                        json!({"type":"StageShardFetchStderr","line":line.line})
+                    }
+                };
+                if event.get("type").and_then(Value::as_str) == Some("StageShardReady") {
+                    ready_path = event
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                        .or_else(|| Some(output_path.clone()));
+                }
+                publish_stage_shard_fetch_event(datastream, config, &event)?;
+            }
+            if status.success() {
+                let path = ready_path.unwrap_or_else(|| output_path.clone());
+                if path.is_file() {
+                    return Ok(path);
+                }
+                return Err(format!(
+                    "stage shard fetcher exited successfully but {} is missing",
+                    path.display()
+                ));
+            }
+            return Err(format!("stage shard fetcher exited with {status}"));
+        }
+        pump_network(driver, stack);
+        datastream.tick();
+        thread::sleep(PUMP_INTERVAL);
+    }
+}
+
 fn handle_stage_command(
     command: StageCommandWire,
     config: &DeploymentConfig,
@@ -2877,6 +3278,7 @@ fn handle_stage_command(
             tokenizer,
             layer_start,
             layer_end_exclusive,
+            stage_shard_plan,
         } => {
             let gguf_source_kind = match &gguf_source {
                 GgufSource::LocalPath(_) => "local_path",
@@ -2886,18 +3288,34 @@ fn handle_stage_command(
                 TokenizerSource::EmbeddedGguf => "gguf",
                 TokenizerSource::LocalPath(_) => "local_path",
             };
+            let (resolved_gguf_source, using_stage_shard) =
+                if let Some(stage_plan) = stage_shard_plan {
+                    let local_path = materialize_stage_shard_with_process(
+                        &stage_plan,
+                        config,
+                        datastream,
+                        driver,
+                        stack,
+                    )?;
+                    (
+                        GgufSource::LocalPath(local_path.to_string_lossy().into_owned()),
+                        true,
+                    )
+                } else {
+                    (gguf_source, false)
+                };
             emit_node_event(
                 datastream,
                 config,
                 NODE_STAGE_CHANNEL,
                 "load_weights",
                 "started",
-                json!({"model_id":&model_id,"gguf_source":gguf_source_kind,"tokenizer":tokenizer_kind,"layer_range":{"start":layer_start,"end_exclusive":layer_end_exclusive}}),
+                json!({"model_id":&model_id,"gguf_source":gguf_source_kind,"tokenizer":tokenizer_kind,"stage_shard":using_stage_shard,"layer_range":{"start":layer_start,"end_exclusive":layer_end_exclusive}}),
             );
             let mut pump = || pump_network(driver, stack);
             match worker.load_weights(
                 model_id.clone(),
-                gguf_source,
+                resolved_gguf_source,
                 tokenizer,
                 layer_start,
                 layer_end_exclusive,
@@ -3223,10 +3641,242 @@ impl DeploymentConfig {
     }
 }
 
+#[derive(Debug)]
+enum HelperStdoutEvent {
+    Line(String),
+    Closed,
+    ReadError(String),
+}
+
+#[derive(Clone, Copy)]
+struct HelperCommandWaitConfig {
+    poll_interval: Duration,
+    telemetry_interval: Duration,
+}
+
+impl HelperCommandWaitConfig {
+    fn production() -> Self {
+        Self {
+            poll_interval: PUMP_INTERVAL,
+            telemetry_interval: WORKER_COMMAND_WAIT_TELEMETRY_INTERVAL,
+        }
+    }
+}
+
+fn spawn_helper_stdout_reader<R: Read + Send + 'static>(reader: R, tx: Sender<HelperStdoutEvent>) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = tx.send(HelperStdoutEvent::Closed);
+                    break;
+                }
+                Ok(_) => {
+                    if tx.send(HelperStdoutEvent::Line(line)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(HelperStdoutEvent::ReadError(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn drain_worker_stderr(
+    stderr_rx: &Receiver<String>,
+    config: &DeploymentConfig,
+    datastream: &mut NodeDatastream,
+) {
+    let mut emitted = false;
+    while let Ok(line) = stderr_rx.try_recv() {
+        let payload = node_event_payload(config, "worker_stderr", "observed", json!({"line":line}));
+        datastream.submit_text(datastream.channels.worker_stderr, payload.to_string());
+        emitted = true;
+    }
+    if emitted {
+        datastream.tick();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_helper_event(
+    stdout_rx: &Receiver<HelperStdoutEvent>,
+    stderr_rx: Option<&Receiver<String>>,
+    expected: &str,
+    command_type: &str,
+    config: &DeploymentConfig,
+    datastream: &mut NodeDatastream,
+    channel: ChannelId,
+    channel_name: &str,
+    wait_config: HelperCommandWaitConfig,
+    pump: &mut dyn FnMut(),
+) -> Result<Value, String> {
+    emit_node_event(
+        datastream,
+        config,
+        NODE_WORKER_CHANNEL,
+        "worker_stdout_read",
+        "started",
+        json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name}),
+    );
+    let wait_started = Instant::now();
+    let mut wait_cycles = 0_u64;
+    let mut next_telemetry_at = wait_started;
+    loop {
+        match stdout_rx.recv_timeout(wait_config.poll_interval) {
+            Ok(HelperStdoutEvent::Line(line)) => {
+                if let Some(stderr_rx) = stderr_rx {
+                    drain_worker_stderr(stderr_rx, config, datastream);
+                }
+                let line_bytes = line.len();
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_WORKER_CHANNEL,
+                    "worker_stdout_read",
+                    "ready",
+                    json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes}),
+                );
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_WORKER_CHANNEL,
+                    "worker_stdout_parse",
+                    "started",
+                    json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes}),
+                );
+                let value: Value = match serde_json::from_str(&line) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        emit_node_event(
+                            datastream,
+                            config,
+                            NODE_WORKER_CHANNEL,
+                            "worker_stdout_parse",
+                            "failed",
+                            json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes,"error":error.to_string()}),
+                        );
+                        return Err(format!("parse helper stdout {line:?}: {error}"));
+                    }
+                };
+                let worker_event_type = value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_WORKER_CHANNEL,
+                    "worker_stdout_parse",
+                    "ready",
+                    json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes,"worker_event_type":worker_event_type}),
+                );
+                datastream.submit_text(channel, value.to_string());
+                emit_stdio_datastream_frame(channel_name, &value)
+                    .map_err(|e| format!("emit worker stdio datastream frame: {e}"))?;
+                datastream.tick();
+                pump();
+                if worker_event_type == "WorkerFatal" {
+                    return Err(format!("worker fatal: {value}"));
+                }
+                if value.get("type").and_then(Value::as_str) == Some(expected) {
+                    return Ok(value);
+                }
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_WORKER_CHANNEL,
+                    "worker_event",
+                    "observed",
+                    json!({"command_type":command_type,"command_waiting_for":expected,"worker_event_type":worker_event_type,"event":value}),
+                );
+            }
+            Ok(HelperStdoutEvent::Closed) => {
+                if let Some(stderr_rx) = stderr_rx {
+                    drain_worker_stderr(stderr_rx, config, datastream);
+                }
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_WORKER_CHANNEL,
+                    "worker_stdout_read",
+                    "failed",
+                    json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":0,"error":"stdout closed"}),
+                );
+                return Err(format!(
+                    "tinygrad helper stdout closed while waiting for {expected}"
+                ));
+            }
+            Ok(HelperStdoutEvent::ReadError(error)) => {
+                if let Some(stderr_rx) = stderr_rx {
+                    drain_worker_stderr(stderr_rx, config, datastream);
+                }
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_WORKER_CHANNEL,
+                    "worker_stdout_read",
+                    "failed",
+                    json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"error":error}),
+                );
+                return Err(format!("read helper stdout: {error}"));
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                wait_cycles = wait_cycles.saturating_add(1);
+                pump();
+                if let Some(stderr_rx) = stderr_rx {
+                    drain_worker_stderr(stderr_rx, config, datastream);
+                }
+                let now = Instant::now();
+                if now >= next_telemetry_at {
+                    emit_node_event(
+                        datastream,
+                        config,
+                        NODE_WORKER_CHANNEL,
+                        "worker_command_wait",
+                        "waiting",
+                        json!({
+                            "command_type":command_type,
+                            "expected_event_type":expected,
+                            "channel":channel_name,
+                            "state":"busy_waiting_for_helper_stdout",
+                            "elapsed_ms":duration_ms_u64(now.saturating_duration_since(wait_started)),
+                            "wait_cycles":wait_cycles,
+                            "poll_interval_ms":duration_ms_u64(wait_config.poll_interval),
+                        }),
+                    );
+                    next_telemetry_at = now
+                        .checked_add(wait_config.telemetry_interval)
+                        .unwrap_or(now);
+                }
+                datastream.tick();
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                emit_node_event(
+                    datastream,
+                    config,
+                    NODE_WORKER_CHANNEL,
+                    "worker_stdout_read",
+                    "failed",
+                    json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":0,"error":"stdout reader disconnected"}),
+                );
+                return Err(format!(
+                    "tinygrad helper stdout reader disconnected while waiting for {expected}"
+                ));
+            }
+        }
+    }
+}
+
 struct TinygradWorker {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout_rx: Receiver<HelperStdoutEvent>,
     stderr_rx: Receiver<String>,
 }
 
@@ -3257,6 +3907,8 @@ impl TinygradWorker {
             .stderr
             .take()
             .ok_or_else(|| "tinygrad helper stderr missing".to_owned())?;
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        spawn_helper_stdout_reader(stdout, stdout_tx);
         let (stderr_tx, stderr_rx) = mpsc::channel();
         thread::spawn(move || {
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -3268,7 +3920,7 @@ impl TinygradWorker {
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout_rx,
             stderr_rx,
         })
     }
@@ -3605,16 +4257,7 @@ impl TinygradWorker {
     }
 
     fn drain_stderr(&mut self, config: &DeploymentConfig, datastream: &mut NodeDatastream) {
-        let mut emitted = false;
-        while let Ok(line) = self.stderr_rx.try_recv() {
-            let payload =
-                node_event_payload(config, "worker_stderr", "observed", json!({"line":line}));
-            datastream.submit_text(datastream.channels.worker_stderr, payload.to_string());
-            emitted = true;
-        }
-        if emitted {
-            datastream.tick();
-        }
+        drain_worker_stderr(&self.stderr_rx, config, datastream);
     }
 
     fn command(
@@ -3672,118 +4315,39 @@ impl TinygradWorker {
             "ready",
             json!({"command_type":command_type.as_str(),"expected_event_type":expected,"command_bytes":command_bytes}),
         );
-        self.expect_event(expected, config, datastream, channel, channel_name, pump)
+        self.expect_event(
+            expected,
+            command_type.as_str(),
+            config,
+            datastream,
+            channel,
+            channel_name,
+            pump,
+        )
     }
 
     fn expect_event(
         &mut self,
         expected: &str,
+        command_type: &str,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
         channel: ChannelId,
         channel_name: &str,
         pump: &mut dyn FnMut(),
     ) -> Result<Value, String> {
-        loop {
-            let mut line = String::new();
-            emit_node_event(
-                datastream,
-                config,
-                NODE_WORKER_CHANNEL,
-                "worker_stdout_read",
-                "started",
-                json!({"expected_event_type":expected,"channel":channel_name}),
-            );
-            let n = match self.stdout.read_line(&mut line) {
-                Ok(n) => n,
-                Err(error) => {
-                    emit_node_event(
-                        datastream,
-                        config,
-                        NODE_WORKER_CHANNEL,
-                        "worker_stdout_read",
-                        "failed",
-                        json!({"expected_event_type":expected,"channel":channel_name,"error":error.to_string()}),
-                    );
-                    return Err(format!("read helper stdout: {error}"));
-                }
-            };
-            self.drain_stderr(config, datastream);
-            if n == 0 {
-                emit_node_event(
-                    datastream,
-                    config,
-                    NODE_WORKER_CHANNEL,
-                    "worker_stdout_read",
-                    "failed",
-                    json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":0,"error":"stdout closed"}),
-                );
-                return Err(format!(
-                    "tinygrad helper stdout closed while waiting for {expected}"
-                ));
-            }
-            emit_node_event(
-                datastream,
-                config,
-                NODE_WORKER_CHANNEL,
-                "worker_stdout_read",
-                "ready",
-                json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n}),
-            );
-            emit_node_event(
-                datastream,
-                config,
-                NODE_WORKER_CHANNEL,
-                "worker_stdout_parse",
-                "started",
-                json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n}),
-            );
-            let value: Value = match serde_json::from_str(&line) {
-                Ok(value) => value,
-                Err(error) => {
-                    emit_node_event(
-                        datastream,
-                        config,
-                        NODE_WORKER_CHANNEL,
-                        "worker_stdout_parse",
-                        "failed",
-                        json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n,"error":error.to_string()}),
-                    );
-                    return Err(format!("parse helper stdout {line:?}: {error}"));
-                }
-            };
-            let worker_event_type = value
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            emit_node_event(
-                datastream,
-                config,
-                NODE_WORKER_CHANNEL,
-                "worker_stdout_parse",
-                "ready",
-                json!({"expected_event_type":expected,"channel":channel_name,"line_bytes":n,"worker_event_type":worker_event_type}),
-            );
-            datastream.submit_text(channel, value.to_string());
-            emit_stdio_datastream_frame(channel_name, &value)
-                .map_err(|e| format!("emit worker stdio datastream frame: {e}"))?;
-            datastream.tick();
-            pump();
-            if worker_event_type == "WorkerFatal" {
-                return Err(format!("worker fatal: {value}"));
-            }
-            if value.get("type").and_then(Value::as_str) == Some(expected) {
-                return Ok(value);
-            }
-            emit_node_event(
-                datastream,
-                config,
-                NODE_WORKER_CHANNEL,
-                "worker_event",
-                "observed",
-                json!({"command_waiting_for":expected,"worker_event_type":worker_event_type,"event":value}),
-            );
-        }
+        wait_for_helper_event(
+            &self.stdout_rx,
+            Some(&self.stderr_rx),
+            expected,
+            command_type,
+            config,
+            datastream,
+            channel,
+            channel_name,
+            HelperCommandWaitConfig::production(),
+            pump,
+        )
     }
 }
 
@@ -4145,5 +4709,218 @@ mod tests {
             assert_eq!(pending.attempts, expected_attempts);
             assert!(pending.backoff <= RUNTIME_READY_RETRY_MAX);
         }
+    }
+
+    fn fast_helper_wait_config() -> HelperCommandWaitConfig {
+        HelperCommandWaitConfig {
+            poll_interval: Duration::from_millis(5),
+            telemetry_interval: Duration::from_millis(10),
+        }
+    }
+
+    fn drain_json_frames(
+        datastream: &NodeDatastream,
+        subscription: &DatastreamSubscription,
+    ) -> Vec<(String, Value)> {
+        datastream.endpoint.tick();
+        subscription
+            .drain_available()
+            .into_iter()
+            .filter_map(|event| {
+                let DatastreamEvent::Frame(frame) = event else {
+                    return None;
+                };
+                let channel = datastream.by_id.get(&frame.channel.channel)?.clone();
+                let value = serde_json::from_slice(&frame.payload).ok()?;
+                Some((channel, value))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn helper_wait_pumps_and_emits_busy_telemetry_during_quiet_stdout() {
+        let config = test_config(None);
+        let mut datastream = NodeDatastream::new(&config);
+        let channel = datastream.channel_by_name("mvp.worker.weights");
+        let subscription = datastream.endpoint.subscribe_all("helper-wait-test");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(35));
+            tx.send(HelperStdoutEvent::Line(
+                json!({"type":"WeightsLoaded","model_id":"fake"}).to_string() + "\n",
+            ))
+            .expect("send fake helper event");
+        });
+        let mut pump_count = 0_u32;
+
+        let event = wait_for_helper_event(
+            &rx,
+            None,
+            "WeightsLoaded",
+            "LoadWeights",
+            &config,
+            &mut datastream,
+            channel,
+            "mvp.worker.weights",
+            fast_helper_wait_config(),
+            &mut || {
+                pump_count = pump_count.saturating_add(1);
+            },
+        )
+        .expect("quiet helper eventually returns expected event");
+
+        assert_eq!(
+            event.get("type").and_then(Value::as_str),
+            Some("WeightsLoaded")
+        );
+        assert!(pump_count >= 2, "pump_count={pump_count}");
+        let frames = drain_json_frames(&datastream, &subscription);
+        assert!(frames.iter().any(|(channel, value)| {
+            channel == "mvp.worker.weights"
+                && value.get("type").and_then(Value::as_str) == Some("WeightsLoaded")
+        }));
+        assert!(frames.iter().any(|(channel, value)| {
+            channel == NODE_WORKER_CHANNEL
+                && value.get("phase").and_then(Value::as_str) == Some("worker_command_wait")
+                && value.get("status").and_then(Value::as_str) == Some("waiting")
+                && value
+                    .get("detail")
+                    .and_then(|detail| detail.get("state"))
+                    .and_then(Value::as_str)
+                    == Some("busy_waiting_for_helper_stdout")
+        }));
+    }
+
+    #[test]
+    fn helper_wait_errors_on_worker_fatal_event() {
+        let config = test_config(None);
+        let mut datastream = NodeDatastream::new(&config);
+        let channel = datastream.channel_by_name("mvp.worker.weights");
+        let (tx, rx) = mpsc::channel();
+        tx.send(HelperStdoutEvent::Line(
+            json!({"type":"WorkerFatal","error":"boom"}).to_string() + "\n",
+        ))
+        .expect("send fatal event");
+        let mut pump_count = 0_u32;
+
+        let error = wait_for_helper_event(
+            &rx,
+            None,
+            "WeightsLoaded",
+            "LoadWeights",
+            &config,
+            &mut datastream,
+            channel,
+            "mvp.worker.weights",
+            fast_helper_wait_config(),
+            &mut || {
+                pump_count = pump_count.saturating_add(1);
+            },
+        )
+        .expect_err("worker fatal must fail command wait");
+
+        assert!(error.contains("worker fatal"));
+        assert_eq!(pump_count, 1);
+    }
+
+    #[test]
+    fn helper_wait_errors_on_closed_stdout_event() {
+        let config = test_config(None);
+        let mut datastream = NodeDatastream::new(&config);
+        let channel = datastream.channel_by_name("mvp.worker.weights");
+        let (tx, rx) = mpsc::channel();
+        tx.send(HelperStdoutEvent::Closed)
+            .expect("send closed stdout event");
+        let mut pump_count = 0_u32;
+
+        let error = wait_for_helper_event(
+            &rx,
+            None,
+            "WeightsLoaded",
+            "LoadWeights",
+            &config,
+            &mut datastream,
+            channel,
+            "mvp.worker.weights",
+            fast_helper_wait_config(),
+            &mut || {
+                pump_count = pump_count.saturating_add(1);
+            },
+        )
+        .expect_err("closed stdout must fail command wait");
+
+        assert!(error.contains("stdout closed"));
+        assert_eq!(pump_count, 0);
+    }
+
+    #[test]
+    fn sampler_health_start_and_no_sample_records_are_json_events() {
+        let config = test_config(None);
+        let mut datastream = NodeDatastream::new(&config);
+        let health_channel = datastream.channel_by_name(NODE_SAMPLER_CHANNEL);
+        let subscription = datastream.endpoint.subscribe_all("sampler-health-test");
+        let context = SamplerHealthContext::from_config(&config);
+
+        for (sampler, sample_channel) in [
+            ("gpu", datastream::hardware::gpu::HOST_GPU_CHANNEL),
+            ("cpu", datastream::hardware::cpu::HOST_CPU_CHANNEL),
+            ("net", datastream::hardware::net::HOST_NET_CHANNEL),
+        ] {
+            submit_sampler_started(
+                &datastream.producer,
+                health_channel,
+                context,
+                sampler,
+                sample_channel,
+                Duration::from_secs(1),
+            );
+        }
+        submit_sampler_sample_health(
+            &datastream.producer,
+            health_channel,
+            context,
+            "gpu",
+            datastream::hardware::gpu::HOST_GPU_CHANNEL,
+            0,
+            Some("nvidia-smi unavailable"),
+        );
+
+        let frames = drain_json_frames(&datastream, &subscription);
+        let sampler_events = frames
+            .iter()
+            .filter(|(channel, _)| channel == NODE_SAMPLER_CHANNEL)
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>();
+        assert_eq!(sampler_events.len(), 7);
+        for sampler in ["gpu", "cpu", "net"] {
+            assert!(sampler_events.iter().any(|value| {
+                value.get("type").and_then(Value::as_str) == Some("SamplerHealth")
+                    && value.get("schema").and_then(Value::as_str)
+                        == Some("mvp.node.sampler.health.v1")
+                    && value.get("run_id").and_then(Value::as_u64) == Some(7)
+                    && value.get("node_id").and_then(Value::as_u64) == Some(11)
+                    && value.get("stage_index").and_then(Value::as_u64) == Some(3)
+                    && value.get("sampler").and_then(Value::as_str) == Some(sampler)
+                    && value.get("status").and_then(Value::as_str) == Some("started")
+            }));
+            assert!(sampler_events.iter().any(|value| {
+                value.get("sampler").and_then(Value::as_str) == Some(sampler)
+                    && value.get("status").and_then(Value::as_str) == Some("waiting")
+                    && value
+                        .get("detail")
+                        .and_then(|detail| detail.get("state"))
+                        .and_then(Value::as_str)
+                        == Some("no_sample_yet")
+            }));
+        }
+        assert!(sampler_events.iter().any(|value| {
+            value.get("sampler").and_then(Value::as_str) == Some("gpu")
+                && value.get("status").and_then(Value::as_str) == Some("failed")
+                && value
+                    .get("detail")
+                    .and_then(|detail| detail.get("error"))
+                    .and_then(Value::as_str)
+                    == Some("nvidia-smi unavailable")
+        }));
     }
 }

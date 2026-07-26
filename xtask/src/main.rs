@@ -755,6 +755,8 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     };
     let run_id = mvp_chat_check_run_id();
     println!("mvp-chat-check: scenario {}", invocation.name());
+    println!("mvp-chat-check: artifacts {}", paths.root.display());
+    println!("mvp-chat-check: datastream {}", paths.dump_log.display());
 
     let output = match run_mvp_chat_check_process(&workspace, &paths, run_id, &invocation) {
         Ok(output) => output,

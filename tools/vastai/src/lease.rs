@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use crate::config::{ENV_ASSUME_YES, truthy_env};
 use crate::monitor::wait_for_running_with_policy;
-use crate::pricing::{CostModel, plan_picks};
+use crate::pricing::CostModel;
 use crate::provision::create_instance;
-use crate::search::select_offer_pool_with_policy;
+use crate::search::{plan_distinct_host_first_wave, select_offer_pool_with_policy};
 use crate::teardown::{destroy_instance_with_retry, rollback};
 use crate::types::{
     CreateInstanceRequest, InstanceInfo, Offer, ProvisionRequest, ProvisionedFleet,
@@ -15,7 +15,7 @@ use crate::types::{
 
 /// Print the planned lease + hourly cost and, on TTY, require y/N confirmation.
 pub fn confirm_lease(pool: &[Offer], num_instances: u32, cost: &CostModel) -> Result<(), String> {
-    let picks = plan_picks(pool, num_instances);
+    let picks = plan_distinct_host_first_wave(pool, num_instances, &[], &[]);
     let total_dph: f64 = picks.iter().map(|o| o.dph_total).sum();
     let total_eff: f64 = picks.iter().map(|o| cost.effective_price(o)).sum();
 
@@ -80,9 +80,23 @@ fn next_eligible_offer<'a>(
     pool: &'a [Offer],
     tried_offer_ids: &[u64],
     used_host_ids: &HashSet<u64>,
+    failed_host_ids: &HashSet<u64>,
+    preferred_offer_id: Option<u64>,
 ) -> Option<&'a Offer> {
+    if let Some(offer_id) = preferred_offer_id {
+        if let Some(offer) = pool.iter().find(|o| o.id == offer_id) {
+            if !tried_offer_ids.contains(&offer.id)
+                && offer.host_id.is_none_or(|h| !failed_host_ids.contains(&h))
+            {
+                return Some(offer);
+            }
+        }
+    }
+
     pool.iter().find(|o| {
-        !tried_offer_ids.contains(&o.id) && o.host_id.map_or(true, |h| !used_host_ids.contains(&h))
+        !tried_offer_ids.contains(&o.id)
+            && o.host_id
+                .is_none_or(|h| !used_host_ids.contains(&h) && !failed_host_ids.contains(&h))
     })
 }
 
@@ -103,14 +117,22 @@ async fn provision_one(
     index: u32,
     tried_offer_ids: &mut Vec<u64>,
     used_host_ids: &mut HashSet<u64>,
+    failed_host_ids: &mut HashSet<u64>,
+    preferred_offer_id: Option<u64>,
 ) -> Result<ProvisionedInstance, String> {
     let mut attempt = 1_u64;
     loop {
-        let offer = match next_eligible_offer(pool, tried_offer_ids, used_host_ids) {
+        let offer = match next_eligible_offer(
+            pool,
+            tried_offer_ids,
+            used_host_ids,
+            failed_host_ids,
+            preferred_offer_id.filter(|offer_id| !tried_offer_ids.contains(offer_id)),
+        ) {
             Some(o) => o.clone(),
             None => {
                 return Err(format!(
-                    "pool exhausted for index {index} (no untried offer on an unused host)"
+                    "pool exhausted for index {index} (no untried offer outside failed hosts)"
                 ));
             }
         };
@@ -201,10 +223,12 @@ pub async fn provision_fleet(
         confirm_lease(&pool, req.count, &CostModel::from_policy(&req.selection))?;
     }
 
+    let first_wave =
+        plan_distinct_host_first_wave(&pool, req.count, &req.selection.blacklist_hosts, &[]);
     let mut tried_offer_ids = Vec::new();
     let mut created: Vec<ProvisionedInstance> = Vec::with_capacity(req.count as usize);
     let mut used_host_ids = HashSet::new();
-
+    let mut failed_host_ids = HashSet::new();
     for index in 0..req.count {
         match provision_one(
             client,
@@ -215,6 +239,10 @@ pub async fn provision_fleet(
             index,
             &mut tried_offer_ids,
             &mut used_host_ids,
+            &mut failed_host_ids,
+            req.preferred_offer_id
+                .filter(|_| req.count == 1)
+                .or_else(|| first_wave.get(index as usize).map(|offer| offer.id)),
         )
         .await
         {
@@ -237,6 +265,9 @@ pub async fn provision_fleet(
             {
                 Ok(_) => break,
                 Err(e) => {
+                    if let Some(host_id) = created[idx].host_id {
+                        failed_host_ids.insert(host_id);
+                    }
                     eprintln!(
                         "lease_chain: index {index} contract {cid} did not reach running: {e}"
                     );
@@ -257,6 +288,8 @@ pub async fn provision_fleet(
                         index,
                         &mut tried_offer_ids,
                         &mut used_host_ids,
+                        &mut failed_host_ids,
+                        None,
                     )
                     .await
                     {
@@ -285,4 +318,137 @@ pub async fn provision_fleet(
         label: req.label,
         instances: created,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::types::{LifecyclePolicy, SelectionPolicy};
+
+    fn offer(id: u64, host_id: u64) -> serde_json::Value {
+        json!({
+            "id": id,
+            "gpu_name": "RTX 4090",
+            "dph_total": id as f64 / 100.0,
+            "gpu_ram": 24_000.0,
+            "compute_cap": 890,
+            "geolocation": "US",
+            "internet_down_cost_per_tb": 0.0,
+            "internet_up_cost_per_tb": 0.0,
+            "host_id": host_id,
+            "verification": "verified"
+        })
+    }
+
+    fn request(count: u32) -> ProvisionRequest {
+        ProvisionRequest {
+            count,
+            image: "registry.example/mvp-worker:latest".to_owned(),
+            label: Some("lease-test".to_owned()),
+            disk_gb: 80,
+            env: BTreeMap::new(),
+            per_instance_env: Vec::new(),
+            preferred_offer_id: None,
+            onstart: None,
+            selection: SelectionPolicy {
+                drop_cheap_frac: 0.0,
+                ..SelectionPolicy::default()
+            },
+            lifecycle: LifecyclePolicy {
+                lease_pace: Duration::ZERO,
+                poll_interval: Duration::from_millis(1),
+                state_timeout: Duration::from_millis(5),
+            },
+            confirm_lease: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_excludes_failed_host_from_shared_offer_pool() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/bundles/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "offers": [
+                    offer(1, 10),
+                    offer(2, 20),
+                    offer(3, 10),
+                    offer(4, 30)
+                ]
+            })))
+            .mount(&server)
+            .await;
+        for (offer_id, contract_id) in [(1, 101), (2, 102), (4, 104)] {
+            Mock::given(method("PUT"))
+                .and(path(format!("/api/v0/asks/{offer_id}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "new_contract": contract_id
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/101/"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "instances": {
+                    "actual_status": "loading",
+                    "intended_status": "running",
+                    "status_msg": "still pulling"
+                }
+            })))
+            .mount(&server)
+            .await;
+        for contract_id in [102, 104] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v0/instances/{contract_id}/")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "instances": {
+                        "actual_status": "running",
+                        "intended_status": "running",
+                        "public_ipaddr": "127.0.0.1",
+                        "ssh_port": 22
+                    }
+                })))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("DELETE"))
+            .and(path("/api/v0/instances/101/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let fleet = provision_fleet(&reqwest::Client::new(), &server.uri(), "secret", request(2))
+            .await
+            .expect("replacement should use non-failed host");
+
+        assert_eq!(
+            fleet
+                .instances
+                .iter()
+                .map(|instance| (instance.index, instance.offer_id, instance.host_id))
+                .collect::<Vec<_>>(),
+            vec![(0, 4, Some(30)), (1, 2, Some(20))]
+        );
+        let requests = server.received_requests().await.expect("recorded requests");
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path() == "/api/v0/asks/4/"),
+            "replacement should rent an offer from a non-failed host"
+        );
+        assert!(
+            !requests
+                .iter()
+                .any(|request| request.url.path() == "/api/v0/asks/3/"),
+            "replacement must skip untried offers on the failed host"
+        );
+    }
 }

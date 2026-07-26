@@ -4,7 +4,7 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
-use crate::{run_plan, stage_controller as stage};
+use crate::{gguf_shard::StageShardPlan, run_plan, stage_controller as stage};
 
 use super::codec::JsonCodec;
 use super::orchestrator::OrchestratorMsg;
@@ -98,6 +98,7 @@ pub struct StageProvisionWire {
     pub model_id: String,
     pub gguf_source: run_plan::GgufSource,
     pub tokenizer: run_plan::TokenizerSource,
+    pub stage_shard_plan: Option<StageShardPlan>,
 }
 
 impl StageProvisionWire {
@@ -119,6 +120,7 @@ impl StageProvisionWire {
                 self.gguf_source.clone(),
                 self.tokenizer.clone(),
             ),
+            shard_plan: self.stage_shard_plan.clone(),
         }
     }
 }
@@ -228,6 +230,7 @@ pub enum StageCommandWire {
         tokenizer: run_plan::TokenizerSource,
         layer_start: u32,
         layer_end_exclusive: u32,
+        stage_shard_plan: Option<StageShardPlan>,
     },
     RewireEdge {
         edge_id: u64,
@@ -663,12 +666,17 @@ impl From<&stage::StageCommand> for StageCommandWire {
                 layer_start: layer_range.start,
                 layer_end_exclusive: layer_range.end_exclusive,
             },
-            stage::StageCommand::LoadWeights { source, range } => Self::LoadWeights {
+            stage::StageCommand::LoadWeights {
+                source,
+                range,
+                shard_plan,
+            } => Self::LoadWeights {
                 model_id: source.model_id.clone(),
                 gguf_source: source.gguf_source.clone(),
                 tokenizer: source.tokenizer.clone(),
                 layer_start: range.start,
                 layer_end_exclusive: range.end_exclusive,
+                stage_shard_plan: shard_plan.clone(),
             },
             stage::StageCommand::RewireEdge { edge_id } => Self::RewireEdge { edge_id: edge_id.0 },
             stage::StageCommand::ExecuteStep(step) => Self::ExecuteStep {

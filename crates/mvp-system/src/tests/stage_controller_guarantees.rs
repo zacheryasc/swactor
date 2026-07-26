@@ -27,6 +27,7 @@ fn valid_provision() -> stage::ProvisionStage {
         inbound: stage::EdgeProvision::inbound(stage::EdgeId(7001)),
         outbound: stage::EdgeProvision::outbound(stage::EdgeId(7002)),
         weight_source: stage::WeightSource::embedded_gguf("model", "model.gguf"),
+        shard_plan: None,
     }
 }
 

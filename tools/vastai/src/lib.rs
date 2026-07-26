@@ -23,12 +23,12 @@ pub use logs::{fetch_logs, request_logs};
 pub use monitor::{wait_for_running, wait_for_running_with_policy};
 pub use pricing::CostModel;
 pub use provision::create_instance;
-pub use search::{select_offer_pool, select_offer_pool_with_policy};
+pub use search::{plan_distinct_host_first_wave, select_offer_pool, select_offer_pool_with_policy};
 pub use teardown::{
     destroy_all_instances, destroy_instance, destroy_instance_with_retry, list_instances_by_label,
 };
 pub use types::{
     ContractRef, CreateInstanceRequest, FleetState, InstanceInfo, LabeledInstance, LifecyclePolicy,
     Offer, ProvisionRequest, ProvisionedFleet, ProvisionedInstance, RunningInstance,
-    SelectionPolicy,
+    SelectionPolicy, VastAiFailureClass, classify_vastai_error,
 };

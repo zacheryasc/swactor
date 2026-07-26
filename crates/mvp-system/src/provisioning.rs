@@ -138,6 +138,20 @@ pub trait ProvisionPlugin: Send {
         sink: PluginSink,
     ) -> Result<PluginNodeHandle, String>;
 
+    fn start_nodes(
+        &mut self,
+        specs: Vec<NodeProvisionSpec>,
+        sink: PluginSink,
+    ) -> Vec<(NodeProvisionSpec, Result<PluginNodeHandle, String>)> {
+        specs
+            .into_iter()
+            .map(|spec| {
+                let result = self.start_node(spec.clone(), sink.clone());
+                (spec, result)
+            })
+            .collect()
+    }
+
     fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
 
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;

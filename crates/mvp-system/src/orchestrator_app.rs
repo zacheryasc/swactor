@@ -24,6 +24,7 @@ use crate::distribution_stack::DistributionRuntimeStack;
 use crate::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
+use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
 use crate::gpu_worker_ingress_parser as ingress;
 use crate::node_provisioning::ProviderKind;
 use crate::orchestrator_run_fsm::{RunConfig, RunId};
@@ -84,6 +85,7 @@ const DEFAULT_MAX_TOKENS: u32 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const RUNTIME_READY_ACK_TIMEOUT: Duration = Duration::from_secs(60);
+const STAGE_PROVISION_ACTIVE_RESEND_AFTER: Duration = Duration::from_secs(60);
 const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(60);
 const MVP_ORCH_BOOTSTRAP: &str = "mvp.orch.bootstrap";
 const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
@@ -2286,9 +2288,9 @@ impl Drop for ProvisionedClusterGuard {
     }
 }
 
-fn start_node_with_stdio_capture(
+fn start_nodes_with_stdio_capture(
     provisioner: Box<dyn ProvisionPlugin>,
-    node_spec: NodeProvisionSpec,
+    node_specs: Vec<NodeProvisionSpec>,
     sink: PluginSink,
     orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     dashboard: Option<&DashboardSupport>,
@@ -2297,13 +2299,16 @@ fn start_node_with_stdio_capture(
     node_id: u64,
 ) -> (
     Box<dyn ProvisionPlugin>,
-    Result<crate::provisioning::PluginNodeHandle, String>,
+    Vec<(
+        NodeProvisionSpec,
+        Result<crate::provisioning::PluginNodeHandle, String>,
+    )>,
 ) {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut provisioner = provisioner;
-        let result = provisioner.start_node(node_spec, sink);
-        let _ = tx.send((provisioner, result));
+        let results = provisioner.start_nodes(node_specs, sink);
+        let _ = tx.send((provisioner, results));
     });
 
     loop {
@@ -2321,7 +2326,18 @@ fn start_node_with_stdio_capture(
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 return (
                     Box::new(FailedProvisionPlugin),
-                    Err("provider start worker disconnected".to_owned()),
+                    vec![(
+                        NodeProvisionSpec {
+                            run_id,
+                            node_id,
+                            stage_index: None,
+                            image: String::new(),
+                            env: Vec::new(),
+                            args: Vec::new(),
+                            mounts: Vec::new(),
+                        },
+                        Err("provider start worker disconnected".to_owned()),
+                    )],
                 );
             }
         }
@@ -2377,8 +2393,20 @@ fn start_and_provision_workers(
         }),
     );
 
-    let mut handles = Vec::with_capacity(stage_specs.len());
-    for node_spec in stage_specs {
+    let stage_shard_plans = if let Some(plan) = pipeline_plan {
+        let plans = pipeline_stage_shard_plans(config, plan)?;
+        emit_stage_shard_plan_summaries(
+            dashboard,
+            orch_datastream,
+            config.run_id,
+            config.node_id,
+            &plans,
+        );
+        plans
+    } else {
+        BTreeMap::new()
+    };
+    for node_spec in &stage_specs {
         orch_datastream.emit_event(
             dashboard,
             ProvisionEvent {
@@ -2406,19 +2434,36 @@ fn start_and_provision_workers(
                 "stage_index":node_spec.stage_index,
             }),
         );
-        let (returned_provisioner, handle_result) = start_node_with_stdio_capture(
-            provisioner,
-            node_spec.clone(),
-            sink.clone(),
-            orch_stdio_rx,
-            dashboard,
-            orch_datastream,
-            config.run_id,
-            node_spec.node_id,
-        );
-        provisioner = returned_provisioner;
+    }
+    let (returned_provisioner, start_results) = start_nodes_with_stdio_capture(
+        provisioner,
+        stage_specs,
+        sink.clone(),
+        orch_stdio_rx,
+        dashboard,
+        orch_datastream,
+        config.run_id,
+        config.node_id,
+    );
+    provisioner = returned_provisioner;
+    let mut handles = Vec::with_capacity(start_results.len());
+    for (node_spec, handle_result) in start_results {
         match handle_result {
-            Ok(handle) => handles.push(handle),
+            Ok(handle) => {
+                orch_datastream.emit_bootstrap(
+                    dashboard,
+                    config.run_id,
+                    config.node_id,
+                    "provider_start",
+                    "ready",
+                    json!({
+                        "provider":config.provider.as_str(),
+                        "node_id":node_spec.node_id,
+                        "stage_index":node_spec.stage_index,
+                    }),
+                );
+                handles.push(handle);
+            }
             Err(error) => {
                 orch_datastream.emit_bootstrap(
                     dashboard,
@@ -2592,9 +2637,11 @@ fn start_and_provision_workers(
             config.node_id,
             config.provider,
             expected_node_ids.len(),
+            config,
             pipeline_plan.expect("pipeline mode requires plan"),
             &readies,
             &pipeline_coordinator,
+            &stage_shard_plans,
         )
     } else {
         wait_for_weights_loaded(
@@ -2746,6 +2793,7 @@ fn stage_provision_wire_from_plan(
     stage_index: u32,
     readies: &BTreeMap<u64, RuntimeReady>,
     coordinator: &EndpointAddr,
+    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
 ) -> Result<StageProvisionWire, String> {
     let provision = run_plan::derive_stage_provision(plan, stage_index)
         .map_err(|e| format!("derive stage {stage_index} provision: {e:?}"))?;
@@ -2781,6 +2829,7 @@ fn stage_provision_wire_from_plan(
         model_id: provision.model.model_id,
         gguf_source: provision.gguf_source,
         tokenizer: provision.tokenizer,
+        stage_shard_plan: stage_shard_plans.get(&stage_index).cloned(),
     })
 }
 
@@ -2791,12 +2840,84 @@ fn provision_stage_from_plan(
     stage_index: u32,
     readies: &BTreeMap<u64, RuntimeReady>,
     coordinator: &EndpointAddr,
+    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
 ) -> Result<(), String> {
-    let provision = stage_provision_wire_from_plan(plan, stage_index, readies, coordinator)?;
+    let provision =
+        stage_provision_wire_from_plan(plan, stage_index, readies, coordinator, stage_shard_plans)?;
     stack
         .runtime
         .send_to(node_actor, NodeAgentMsg::ProvisionStage(provision))
         .map_err(|e| format!("send stage {stage_index} provision: {e}"))
+}
+
+fn pipeline_stage_shard_plans(
+    config: &Config,
+    plan: &run_plan::RunPlan,
+) -> Result<BTreeMap<u32, StageShardPlan>, String> {
+    if !matches!(config.gguf_source, GgufSource::HuggingFaceGguf { .. }) {
+        return Ok(BTreeMap::new());
+    }
+    let planning_gguf = config.local_planning_gguf_path()?;
+    let mut out = BTreeMap::new();
+    for stage in &plan.stages {
+        let shard_plan = plan_stage_shard(
+            &planning_gguf,
+            stage.gguf_source.clone(),
+            stage.stage_index,
+            stage.stage_count,
+            stage.layer_start,
+            stage.layer_end_exclusive,
+        )
+        .map_err(|error| {
+            format!(
+                "plan stage {} HF shard ranges from {}: {error}",
+                stage.stage_index,
+                planning_gguf.display()
+            )
+        })?;
+        out.insert(stage.stage_index, shard_plan);
+    }
+    Ok(out)
+}
+
+fn stage_shard_plan_summary_detail(plan: &StageShardPlan) -> Value {
+    let planned_fetch_bytes = plan.planned_fetch_bytes();
+    json!({
+        "stage_index":plan.stage_index,
+        "stage_count":plan.stage_count,
+        "layer_start":plan.layer_start,
+        "layer_end_exclusive":plan.layer_end_exclusive,
+        "planned_fetch_bytes":planned_fetch_bytes,
+        "source_total_bytes":plan.source_total_bytes,
+        "tensor_count":plan.tensors.len(),
+        "range_count":plan.planned_range_count(),
+        "tensor_range_count":plan.merged_tensor_ranges.len(),
+        "metadata_bytes":plan.metadata_end,
+        "planned_fraction":if plan.source_total_bytes == 0 {
+            Value::Null
+        } else {
+            json!(planned_fetch_bytes as f64 / plan.source_total_bytes as f64)
+        },
+    })
+}
+
+fn emit_stage_shard_plan_summaries(
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    run_id: u64,
+    node_id: u64,
+    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
+) {
+    for plan in stage_shard_plans.values() {
+        orch_datastream.emit_bootstrap(
+            dashboard,
+            run_id,
+            node_id,
+            "stage_shard_plan",
+            "ready",
+            stage_shard_plan_summary_detail(plan),
+        );
+    }
 }
 
 fn stage_consumer_endpoint(
@@ -2972,9 +3093,11 @@ fn wait_for_weights_loaded_count(
     node_id: u64,
     provider: ProviderKind,
     expected_count: usize,
+    _config: &Config,
     pipeline_plan: &run_plan::RunPlan,
     readies: &BTreeMap<u64, RuntimeReady>,
     pipeline_coordinator: &EndpointAddr,
+    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
 ) -> Result<(), String> {
     let expected_stages = pipeline_plan
         .stages
@@ -2982,10 +3105,11 @@ fn wait_for_weights_loaded_count(
         .map(|stage| stage.stage_index)
         .collect::<BTreeSet<_>>();
     let mut loaded_stages = BTreeSet::<u32>::new();
-    let mut last_resend = Instant::now();
-    let mut active_stage = None::<u32>;
+    let mut last_resend = Instant::now() - Duration::from_secs(15);
     let mut resend_attempt = 0_u64;
     let mut stage_resend_counts = BTreeMap::<u32, u64>::new();
+    let mut stage_last_sends = BTreeMap::<u32, Instant>::new();
+    let mut load_progress = BTreeMap::<u64, StageLoadProgress>::new();
     loop {
         pump(driver, stack, frame_tx);
         emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
@@ -2997,140 +3121,83 @@ fn wait_for_weights_loaded_count(
         if loaded_stages.len() >= expected_count {
             return Ok(());
         }
-        if active_stage.map_or(true, |stage_index| loaded_stages.contains(&stage_index)) {
-            active_stage =
-                next_pipeline_weight_load_stage(pipeline_plan, &loaded_stages, active_stage)
-                    .map(|stage| stage.stage_index);
-            last_resend = Instant::now() - Duration::from_secs(1);
-        }
-        if last_resend.elapsed() >= Duration::from_secs(1) {
+        if last_resend.elapsed() >= Duration::from_secs(15) {
             resend_attempt += 1;
-            let Some(stage) =
-                next_pipeline_weight_load_stage(pipeline_plan, &loaded_stages, active_stage)
-            else {
+            let pending = pending_pipeline_weight_load_stages(pipeline_plan, &loaded_stages);
+            if pending.is_empty() {
                 return Err(format!(
                     "missing unloaded pipeline weight stage; loaded {} of {expected_count}",
                     loaded_stages.len()
                 ));
-            };
-            let stage_node_id = stage.node_id.0;
-            let stage_send_count = {
-                let count = stage_resend_counts.entry(stage.stage_index).or_default();
-                *count += 1;
-                *count
-            };
-            let emit_wait_headline = stage_send_count == 1 || stage_send_count % 15 == 0;
-            let ready = readies.get(&stage_node_id).ok_or_else(|| {
-                format!("missing runtime-ready node for stage {}", stage.stage_index)
-            })?;
-            orch_datastream.emit_bootstrap(
-                dashboard,
-                run_id,
-                node_id,
-                "stage_provision_send",
-                "sent",
-                json!({
-                    "attempt":resend_attempt,
-                    "stage_count":pipeline_plan.stages.len(),
-                    "stage_index":stage.stage_index,
-                    "stage_send_count":stage_send_count,
-                    "loaded_stage_count":loaded_stages.len()
-                }),
-            );
-            let route_owner = stack.route_owner(ready.node_actor);
-            let datastream_route_owner = stack.route_owner(ready.datastream_publisher);
-            let member_state = stack.member_state(ready.swim_node_id);
-            let route_matches_ready = route_owner == Some(ready.swim_node_id);
-            orch_datastream.emit_bootstrap_to_channel(
-                dashboard,
-                MVP_STAGE_ROUTE,
-                run_id,
-                node_id,
-                "stage_route_check",
-                "observed",
-                json!({
-                    "attempt":resend_attempt,
-                    "stage_index":stage.stage_index,
-                    "stage_node_id":stage_node_id,
-                    "node_actor":ready.node_actor,
-                    "datastream_publisher":ready.datastream_publisher,
-                    "swim_node_id":format!("{:?}", ready.swim_node_id),
-                    "member_state":member_state.map(|state| format!("{:?}", state)),
-                    "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
-                    "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
-                    "route_matches_ready":route_matches_ready,
-                }),
-            );
-            if member_state == Some(MemberState::Dead) {
-                let reason = format!(
-                    "stage {} node {} is dead while loading pipeline weights",
-                    stage.stage_index, stage_node_id
-                );
-                orch_datastream.emit_bootstrap(
+            }
+            for stage in pending {
+                let _sent = send_pipeline_stage_provision(
+                    driver,
+                    stack,
+                    frame_tx,
                     dashboard,
+                    orch_datastream,
                     run_id,
                     node_id,
-                    "stage_provision_wait",
-                    "failed",
-                    json!({
-                        "attempt":resend_attempt,
-                        "stage_count":pipeline_plan.stages.len(),
-                        "stage_index":stage.stage_index,
-                        "stage_node_id":stage_node_id,
-                        "stage_send_count":stage_send_count,
-                        "loaded_stage_count":loaded_stages.len(),
-                        "member_state":"Dead",
-                        "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
-                        "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
-                        "reason":reason,
-                    }),
-                );
-                return Err(reason);
+                    pipeline_plan,
+                    stage,
+                    readies,
+                    pipeline_coordinator,
+                    &stage_shard_plans,
+                    &loaded_stages,
+                    &mut stage_resend_counts,
+                    &mut stage_last_sends,
+                    &load_progress,
+                    resend_attempt,
+                )?;
             }
-            if emit_wait_headline {
-                orch_datastream.emit_bootstrap(
-                    dashboard,
-                    run_id,
-                    node_id,
-                    "stage_provision_wait",
-                    "observed",
-                    json!({
-                        "attempt":resend_attempt,
-                        "stage_count":pipeline_plan.stages.len(),
-                        "stage_index":stage.stage_index,
-                        "stage_node_id":stage_node_id,
-                        "stage_send_count":stage_send_count,
-                        "loaded_stage_count":loaded_stages.len(),
-                        "message":format!(
-                            "loaded {} of {}; waiting on stage {}",
-                            loaded_stages.len(),
-                            pipeline_plan.stages.len(),
-                            stage.stage_index
-                        )
-                    }),
-                );
-            }
-            provision_stage_from_plan(
-                stack,
-                ready.node_actor,
-                pipeline_plan,
-                stage.stage_index,
-                readies,
-                pipeline_coordinator,
-            )?;
-            pump(driver, stack, frame_tx);
             last_resend = Instant::now();
         }
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
             match observation {
-                PluginObservation::Failed { reason, .. } => return Err(reason),
-                PluginObservation::Exited {
-                    node_id, status, ..
+                PluginObservation::Failed {
+                    reason,
+                    node_id: failed_node_id,
+                    ..
                 } => {
-                    return Err(format!(
-                        "node {node_id} exited while loading weights: {status:?}"
-                    ));
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        run_id,
+                        node_id,
+                        "stage_provision_wait",
+                        "failed",
+                        json!({
+                            "classification":"worker_process_failed",
+                            "stage_node_id":failed_node_id,
+                            "last_load_progress":load_progress.get(&failed_node_id).map(StageLoadProgress::to_json),
+                            "reason":reason,
+                        }),
+                    );
+                    return Err(reason);
+                }
+                PluginObservation::Exited {
+                    node_id: exited_node_id,
+                    status,
+                    ..
+                } => {
+                    let reason =
+                        format!("node {exited_node_id} exited while loading weights: {status:?}");
+                    orch_datastream.emit_bootstrap(
+                        dashboard,
+                        run_id,
+                        node_id,
+                        "stage_provision_wait",
+                        "failed",
+                        json!({
+                            "classification":"worker_process_exited",
+                            "stage_node_id":exited_node_id,
+                            "last_load_progress":load_progress.get(&exited_node_id).map(StageLoadProgress::to_json),
+                            "status":status,
+                            "reason":reason,
+                        }),
+                    );
+                    return Err(reason);
                 }
                 PluginObservation::DatastreamFrame { .. } => {}
                 PluginObservation::ProviderLine { .. }
@@ -3138,7 +3205,7 @@ fn wait_for_weights_loaded_count(
                 | PluginObservation::StderrLine { .. } => {}
             }
         }
-        drain_frames(frame_rx, dashboard, orch_datastream);
+        drain_frames_with_load_progress(frame_rx, dashboard, orch_datastream, &mut load_progress);
         while let Some(report) = orchestrator_reports.try_recv() {
             match report {
                 OrchestratorReport::WeightsReady {
@@ -3147,10 +3214,6 @@ fn wait_for_weights_loaded_count(
                     stage_index,
                 } if report_run_id == run_id && expected_stages.contains(&stage_index) => {
                     loaded_stages.insert(stage_index);
-                    if active_stage == Some(stage_index) {
-                        active_stage = None;
-                        last_resend = Instant::now() - Duration::from_secs(1);
-                    }
                     if loaded_stages.len() >= expected_count {
                         return Ok(());
                     }
@@ -3170,27 +3233,218 @@ fn wait_for_weights_loaded_count(
     }
 }
 
-fn next_pipeline_weight_load_stage<'a>(
+fn pending_pipeline_weight_load_stages<'a>(
     pipeline_plan: &'a run_plan::RunPlan,
     loaded_stages: &BTreeSet<u32>,
-    active_stage: Option<u32>,
-) -> Option<&'a run_plan::StagePlan> {
-    if let Some(stage_index) = active_stage {
-        if !loaded_stages.contains(&stage_index) {
-            if let Some(stage) = pipeline_plan
-                .stages
-                .iter()
-                .find(|stage| stage.stage_index == stage_index)
-            {
-                return Some(stage);
-            }
-        }
-    }
-    pipeline_plan
+) -> Vec<&'a run_plan::StagePlan> {
+    let mut pending = pipeline_plan
         .stages
         .iter()
         .filter(|stage| !loaded_stages.contains(&stage.stage_index))
-        .max_by_key(|stage| stage.stage_index)
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|stage| stage.stage_index);
+    pending
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_pipeline_stage_provision(
+    driver: &mut IrohDriver,
+    stack: &DistributionRuntimeStack,
+    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    run_id: u64,
+    node_id: u64,
+    pipeline_plan: &run_plan::RunPlan,
+    stage: &run_plan::StagePlan,
+    readies: &BTreeMap<u64, RuntimeReady>,
+    pipeline_coordinator: &EndpointAddr,
+    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
+    loaded_stages: &BTreeSet<u32>,
+    stage_resend_counts: &mut BTreeMap<u32, u64>,
+    stage_last_sends: &mut BTreeMap<u32, Instant>,
+    load_progress: &BTreeMap<u64, StageLoadProgress>,
+    attempt: u64,
+) -> Result<bool, String> {
+    let stage_node_id = stage.node_id.0;
+    let current_send_count = stage_resend_counts
+        .get(&stage.stage_index)
+        .copied()
+        .unwrap_or_default();
+    let now = Instant::now();
+    let ready = readies
+        .get(&stage_node_id)
+        .ok_or_else(|| format!("missing runtime-ready node for stage {}", stage.stage_index))?;
+    let route_owner = stack.route_owner(ready.node_actor);
+    let datastream_route_owner = stack.route_owner(ready.datastream_publisher);
+    let member_state = stack.member_state(ready.swim_node_id);
+    let route_matches_ready = route_owner == Some(ready.swim_node_id);
+    orch_datastream.emit_bootstrap_to_channel(
+        dashboard,
+        MVP_STAGE_ROUTE,
+        run_id,
+        node_id,
+        "stage_route_check",
+        "observed",
+        json!({
+            "attempt":attempt,
+            "stage_index":stage.stage_index,
+            "stage_node_id":stage_node_id,
+            "node_actor":ready.node_actor,
+            "datastream_publisher":ready.datastream_publisher,
+            "swim_node_id":format!("{:?}", ready.swim_node_id),
+            "member_state":member_state.map(|state| format!("{:?}", state)),
+            "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
+            "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
+            "route_matches_ready":route_matches_ready,
+        }),
+    );
+    if member_state == Some(MemberState::Dead) {
+        let reason = format!(
+            "stage {} node {} is dead while loading pipeline weights",
+            stage.stage_index, stage_node_id
+        );
+        let liveness = stage_load_liveness_detail(
+            load_progress.get(&stage_node_id),
+            stage.stage_index,
+            stage_node_id,
+            member_state,
+            route_owner,
+            datastream_route_owner,
+            route_matches_ready,
+            "heartbeat_missed",
+        );
+        orch_datastream.emit_bootstrap(
+            dashboard,
+            run_id,
+            node_id,
+            "stage_provision_wait",
+            "failed",
+            json!({
+                "attempt":attempt,
+                "stage_count":pipeline_plan.stages.len(),
+                "stage_index":stage.stage_index,
+                "stage_node_id":stage_node_id,
+                "stage_send_count":current_send_count,
+                "loaded_stage_count":loaded_stages.len(),
+                "member_state":"Dead",
+                "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
+                "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
+                "classification":"heartbeat_missed",
+                "liveness":liveness,
+                "reason":reason,
+            }),
+        );
+        return Err(reason);
+    }
+    let dispatch = stage_provision_dispatch(
+        load_progress.get(&stage_node_id),
+        current_send_count,
+        stage_last_sends.get(&stage.stage_index).copied(),
+        now,
+    );
+    if !dispatch.should_send() {
+        orch_datastream.emit_bootstrap(
+            dashboard,
+            run_id,
+            node_id,
+            "stage_provision_wait",
+            "observed",
+            json!({
+                "attempt":attempt,
+                "stage_count":pipeline_plan.stages.len(),
+                "stage_index":stage.stage_index,
+                "stage_node_id":stage_node_id,
+                "stage_send_count":current_send_count,
+                "loaded_stage_count":loaded_stages.len(),
+                "resend_suppressed":true,
+                "resend_reason":dispatch.reason(),
+                "liveness":stage_load_liveness_detail(
+                    load_progress.get(&stage_node_id),
+                    stage.stage_index,
+                    stage_node_id,
+                    member_state,
+                    route_owner,
+                    datastream_route_owner,
+                    route_matches_ready,
+                    "waiting",
+                ),
+                "message":format!(
+                    "loaded {} of {}; waiting on stage {}",
+                    loaded_stages.len(),
+                    pipeline_plan.stages.len(),
+                    stage.stage_index
+                )
+            }),
+        );
+        return Ok(false);
+    }
+    let stage_send_count = {
+        let count = stage_resend_counts.entry(stage.stage_index).or_default();
+        *count += 1;
+        *count
+    };
+    stage_last_sends.insert(stage.stage_index, now);
+    orch_datastream.emit_bootstrap(
+        dashboard,
+        run_id,
+        node_id,
+        "stage_provision_send",
+        "sent",
+        json!({
+            "attempt":attempt,
+            "stage_count":pipeline_plan.stages.len(),
+            "stage_index":stage.stage_index,
+            "stage_send_count":stage_send_count,
+            "loaded_stage_count":loaded_stages.len(),
+            "parallel_weight_acquisition":true,
+            "resend_reason":dispatch.reason(),
+        }),
+    );
+    if stage_send_count == 1 || stage_send_count % 15 == 0 {
+        orch_datastream.emit_bootstrap(
+            dashboard,
+            run_id,
+            node_id,
+            "stage_provision_wait",
+            "observed",
+            json!({
+                "attempt":attempt,
+                "stage_count":pipeline_plan.stages.len(),
+                "stage_index":stage.stage_index,
+                "stage_node_id":stage_node_id,
+                "stage_send_count":stage_send_count,
+                "loaded_stage_count":loaded_stages.len(),
+                "liveness":stage_load_liveness_detail(
+                    load_progress.get(&stage_node_id),
+                    stage.stage_index,
+                    stage_node_id,
+                    member_state,
+                    route_owner,
+                    datastream_route_owner,
+                    route_matches_ready,
+                    "waiting",
+                ),
+                "message":format!(
+                    "loaded {} of {}; waiting on stage {}",
+                    loaded_stages.len(),
+                    pipeline_plan.stages.len(),
+                    stage.stage_index
+                )
+            }),
+        );
+    }
+    provision_stage_from_plan(
+        stack,
+        ready.node_actor,
+        pipeline_plan,
+        stage.stage_index,
+        readies,
+        pipeline_coordinator,
+        stage_shard_plans,
+    )?;
+    pump(driver, stack, frame_tx);
+    Ok(true)
 }
 
 struct FailedProvisionPlugin;
@@ -3231,6 +3485,269 @@ struct CollectedDatastreamFrame {
     stream: StreamId,
     channel_name: String,
     frame: Frame,
+}
+
+#[derive(Clone, Debug, Default)]
+struct StageLoadProgress {
+    node_id: u64,
+    stage_index: Option<u32>,
+    phase: Option<String>,
+    bytes_done: Option<u64>,
+    bytes_total: Option<u64>,
+    last_progress: Option<Instant>,
+    last_worker_event: Option<String>,
+    failure_reason: Option<String>,
+    host_gpu_samples: u64,
+}
+
+impl StageLoadProgress {
+    fn to_json(&self) -> Value {
+        json!({
+            "node_id": self.node_id,
+            "stage_index": self.stage_index,
+            "phase": self.phase.as_deref().unwrap_or("unknown"),
+            "bytes_done": self.bytes_done,
+            "bytes_total": self.bytes_total,
+            "last_progress_age_ms": self.last_progress.map(|at| at.elapsed().as_millis()),
+            "last_worker_event": self.last_worker_event,
+            "failure_reason": self.failure_reason,
+            "host_gpu_samples": self.host_gpu_samples,
+            "host_gpu_missing": self.host_gpu_samples == 0,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StageProvisionDispatch {
+    Send(&'static str),
+    Suppress(&'static str),
+}
+
+impl StageProvisionDispatch {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Send(reason) | Self::Suppress(reason) => reason,
+        }
+    }
+
+    fn should_send(self) -> bool {
+        matches!(self, Self::Send(_))
+    }
+}
+
+fn stage_load_phase_is_active(phase: Option<&str>) -> bool {
+    matches!(
+        phase,
+        Some(
+            "loading_weights"
+                | "prefetching_model"
+                | "prefetching_stage_shard"
+                | "fetching_stage_shard"
+                | "stage_shard_cache_ready"
+                | "stage_shard_ready"
+                | "cache_ready"
+                | "constructing_stage"
+                | "stage_constructed"
+                | "building_tokenizer"
+                | "tokenizer_ready"
+        )
+    )
+}
+
+fn stage_provision_dispatch(
+    progress: Option<&StageLoadProgress>,
+    send_count: u64,
+    last_send: Option<Instant>,
+    now: Instant,
+) -> StageProvisionDispatch {
+    if send_count == 0 {
+        return StageProvisionDispatch::Send("initial");
+    }
+    let Some(progress) = progress else {
+        return StageProvisionDispatch::Send("no_progress_after_send");
+    };
+    if progress.failure_reason.is_some() || progress.phase.as_deref() == Some("failed") {
+        return StageProvisionDispatch::Suppress("worker_load_failed");
+    }
+    if progress.phase.as_deref() == Some("weights_loaded") {
+        return StageProvisionDispatch::Suppress("weights_loaded_report_pending");
+    }
+    if !stage_load_phase_is_active(progress.phase.as_deref()) {
+        return StageProvisionDispatch::Send("unknown_or_inactive_progress");
+    }
+    let Some(last_progress) = progress.last_progress else {
+        return StageProvisionDispatch::Send("active_phase_without_progress_time");
+    };
+    if now.duration_since(last_progress) < STAGE_PROVISION_ACTIVE_RESEND_AFTER {
+        return StageProvisionDispatch::Suppress("active_progress");
+    }
+    if let Some(last_send) = last_send {
+        if now.duration_since(last_send) < STAGE_PROVISION_ACTIVE_RESEND_AFTER {
+            return StageProvisionDispatch::Suppress("recent_stale_progress_resend");
+        }
+    }
+    StageProvisionDispatch::Send("stale_progress")
+}
+
+fn stage_load_liveness_detail(
+    progress: Option<&StageLoadProgress>,
+    stage_index: u32,
+    stage_node_id: u64,
+    member_state: Option<MemberState>,
+    route_owner: Option<DistNodeId>,
+    datastream_route_owner: Option<DistNodeId>,
+    route_matches_ready: bool,
+    classification: &str,
+) -> Value {
+    json!({
+        "classification": classification,
+        "stage_index": stage_index,
+        "stage_node_id": stage_node_id,
+        "member_state": member_state.map(|state| format!("{:?}", state)),
+        "route_owner": route_owner.map(|owner| format!("{:?}", owner)),
+        "datastream_route_owner": datastream_route_owner.map(|owner| format!("{:?}", owner)),
+        "route_matches_ready": route_matches_ready,
+        "load_progress": progress.map(StageLoadProgress::to_json),
+        "host_gpu_missing": progress.is_none_or(|progress| progress.host_gpu_samples == 0),
+    })
+}
+
+fn update_load_progress_from_frame(
+    progress: &mut BTreeMap<u64, StageLoadProgress>,
+    collected: &CollectedDatastreamFrame,
+    now: Instant,
+) {
+    let stream_node_id = collected.stream.node.as_str().parse::<u64>().ok();
+    if collected.channel_name == "host.gpu" {
+        if let Some(node_id) = stream_node_id {
+            let entry = progress
+                .entry(node_id)
+                .or_insert_with(|| StageLoadProgress {
+                    node_id,
+                    ..StageLoadProgress::default()
+                });
+            entry.host_gpu_samples = entry.host_gpu_samples.saturating_add(1);
+        }
+        return;
+    }
+
+    let Ok(value) = serde_json::from_slice::<Value>(&collected.frame.payload) else {
+        return;
+    };
+    if value.get("type").and_then(Value::as_str) == Some("NodeEvent") {
+        update_load_progress_from_node_event(progress, &value, now);
+        return;
+    }
+    if collected.channel_name == "mvp.worker.weights" {
+        let Some(node_id) = stream_node_id else {
+            return;
+        };
+        update_load_progress_from_worker_event(progress, node_id, None, &value, now);
+    }
+}
+
+fn update_load_progress_from_node_event(
+    progress: &mut BTreeMap<u64, StageLoadProgress>,
+    value: &Value,
+    now: Instant,
+) {
+    let Some(node_id) = numeric_json_field(value, "node_id") else {
+        return;
+    };
+    let stage_index =
+        numeric_json_field(value, "stage_index").and_then(|stage| u32::try_from(stage).ok());
+    let phase = value.get("phase").and_then(Value::as_str);
+    let status = value.get("status").and_then(Value::as_str);
+    let detail = value.get("detail").unwrap_or(&Value::Null);
+    if phase == Some("load_weights") {
+        let load_phase = match status {
+            Some("started") => Some("loading_weights"),
+            Some("ready") => Some("weights_loaded"),
+            Some("failed") => Some("failed"),
+            _ => None,
+        };
+        if let Some(load_phase) = load_phase {
+            let entry = progress
+                .entry(node_id)
+                .or_insert_with(|| StageLoadProgress {
+                    node_id,
+                    ..StageLoadProgress::default()
+                });
+            entry.stage_index = stage_index.or(entry.stage_index);
+            entry.phase = Some(load_phase.to_owned());
+            entry.last_progress = Some(now);
+            if status == Some("failed") {
+                entry.failure_reason = detail
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+        }
+    }
+    if let Some(worker_event) = detail.get("event") {
+        update_load_progress_from_worker_event(progress, node_id, stage_index, worker_event, now);
+    }
+}
+
+fn update_load_progress_from_worker_event(
+    progress: &mut BTreeMap<u64, StageLoadProgress>,
+    node_id: u64,
+    stage_index: Option<u32>,
+    event: &Value,
+    now: Instant,
+) {
+    let Some(event_type) = event.get("type").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(phase) = load_phase_for_worker_event(event_type) else {
+        return;
+    };
+    let entry = progress
+        .entry(node_id)
+        .or_insert_with(|| StageLoadProgress {
+            node_id,
+            ..StageLoadProgress::default()
+        });
+    entry.stage_index = stage_index.or(entry.stage_index);
+    entry.phase = Some(phase.to_owned());
+    entry.last_worker_event = Some(event_type.to_owned());
+    entry.last_progress = Some(now);
+    if let Some(bytes_done) =
+        numeric_json_field(event, "bytes_done").or_else(|| numeric_json_field(event, "bytes"))
+    {
+        entry.bytes_done = Some(bytes_done);
+    }
+    if let Some(bytes_total) = numeric_json_field(event, "bytes_total") {
+        entry.bytes_total = Some(bytes_total);
+    }
+}
+
+fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
+    value
+        .get(field)
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+}
+
+fn load_phase_for_worker_event(event_type: &str) -> Option<&'static str> {
+    match event_type {
+        "GgufDownloadStarted" | "GgufDownloadProgress" => Some("prefetching_model"),
+        "GgufCacheReady" => Some("cache_ready"),
+        "StageShardFetchStarted"
+        | "StageShardRangeFetchStarted"
+        | "StageShardRangeFetchReady"
+        | "StageShardTensorFetchStarted"
+        | "StageShardTensorFetchReady" => Some("fetching_stage_shard"),
+        "StageShardCacheReady" => Some("stage_shard_cache_ready"),
+        "StageShardReady" => Some("stage_shard_ready"),
+        "StageShardFetchFailed" => Some("failed"),
+        "PipelineStageFromGgufStarted" => Some("constructing_stage"),
+        "PipelineStageFromGgufReady" => Some("stage_constructed"),
+        "TokenizerBuildStarted" => Some("building_tokenizer"),
+        "TokenizerBuildReady" => Some("tokenizer_ready"),
+        "WeightsLoaded" => Some("weights_loaded"),
+        "WorkerFatal" => Some("failed"),
+        _ => None,
+    }
 }
 
 fn drain_datastream_connections(
@@ -3916,6 +4433,7 @@ fn provision_stage(
                     model_id: config.model_id.clone(),
                     gguf_source: config.gguf_source.clone(),
                     tokenizer: config.tokenizer.clone(),
+                    stage_shard_plan: None,
                 }
             }),
         )
@@ -4950,19 +5468,39 @@ fn drain_frames(
     orch_datastream: &mut OrchDatastream,
 ) {
     while let Ok(collected) = frame_rx.try_recv() {
-        ingest_dashboard_frame(
-            dashboard,
-            &collected.stream,
-            &collected.channel_name,
-            &collected.frame,
-        );
-        orch_datastream.archive_frame(
-            "node",
-            &collected.stream,
-            &collected.channel_name,
-            &collected.frame,
-        );
+        archive_collected_frame(collected, dashboard, orch_datastream);
     }
+}
+
+fn drain_frames_with_load_progress(
+    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+    progress: &mut BTreeMap<u64, StageLoadProgress>,
+) {
+    while let Ok(collected) = frame_rx.try_recv() {
+        update_load_progress_from_frame(progress, &collected, Instant::now());
+        archive_collected_frame(collected, dashboard, orch_datastream);
+    }
+}
+
+fn archive_collected_frame(
+    collected: CollectedDatastreamFrame,
+    dashboard: Option<&DashboardSupport>,
+    orch_datastream: &mut OrchDatastream,
+) {
+    ingest_dashboard_frame(
+        dashboard,
+        &collected.stream,
+        &collected.channel_name,
+        &collected.frame,
+    );
+    orch_datastream.archive_frame(
+        "node",
+        &collected.stream,
+        &collected.channel_name,
+        &collected.frame,
+    );
 }
 
 fn ingest_dashboard_frame(
@@ -5506,7 +6044,7 @@ mod tests {
             .collect()
     }
     #[test]
-    fn pipeline_weight_load_scheduler_keeps_one_active_stage() {
+    fn pipeline_weight_load_scheduler_keeps_all_unloaded_stages_pending() {
         let model = TempModelFile::with_metadata(
             "seven-stage-scheduler.gguf",
             TestGgufMetadata {
@@ -5518,24 +6056,30 @@ mod tests {
         let plan = config.build_run_plan().expect("seven-stage plan builds");
         let mut loaded = BTreeSet::new();
 
-        let first =
-            next_pipeline_weight_load_stage(&plan, &loaded, None).expect("first stage selected");
-        assert_eq!(first.stage_index, 6);
+        assert_eq!(
+            pending_pipeline_weight_load_stages(&plan, &loaded)
+                .iter()
+                .map(|stage| stage.stage_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6]
+        );
 
-        let resent = next_pipeline_weight_load_stage(&plan, &loaded, Some(first.stage_index))
-            .expect("active stage is resent before it loads");
-        assert_eq!(resent.stage_index, 6);
+        loaded.insert(0);
+        loaded.insert(3);
+        assert_eq!(
+            pending_pipeline_weight_load_stages(&plan, &loaded)
+                .iter()
+                .map(|stage| stage.stage_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 4, 5, 6]
+        );
 
-        for expected_stage in (0..7).rev() {
-            let active = next_pipeline_weight_load_stage(&plan, &loaded, None)
-                .expect("next unloaded stage selected");
-            assert_eq!(active.stage_index, expected_stage);
-            loaded.insert(expected_stage);
+        for stage_index in 0..7 {
+            loaded.insert(stage_index);
         }
-
         assert!(
-            next_pipeline_weight_load_stage(&plan, &loaded, None).is_none(),
-            "all stages loaded should leave no active load"
+            pending_pipeline_weight_load_stages(&plan, &loaded).is_empty(),
+            "all stages loaded should leave no pending load"
         );
     }
 
@@ -7631,12 +8175,15 @@ bootstrap_command = "/run"
                 })
                 .collect::<BTreeMap<_, _>>();
 
+            let stage_shard_plans = BTreeMap::new();
+
             for stage in &plan.stages {
                 let wire = stage_provision_wire_from_plan(
                     &plan,
                     stage.stage_index,
                     &readies,
                     &coordinator,
+                    &stage_shard_plans,
                 )
                 .expect("stage provision wire builds from plan");
                 let inbound = wire.inbound_edge.as_ref().expect("planned inbound edge");
@@ -7756,6 +8303,375 @@ bootstrap_command = "/run"
             );
             assert_eq!(env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"), None);
             assert_eq!(env_value(&spec.env, "MVP_PIPELINE_STAGES"), Some("4"));
+        }
+    }
+
+    #[test]
+    fn load_liveness_tracks_worker_progress_and_missing_gpu_samples() {
+        let mut progress = BTreeMap::new();
+        let frame = CollectedDatastreamFrame {
+            stream: StreamId::new(NodeId::new("2"), Lifetime(17)),
+            channel_name: "mvp.worker.weights".to_owned(),
+            frame: Frame::new(
+                ChannelId(1),
+                datastream::Position(1),
+                serde_json::to_vec(&json!({
+                    "type": "GgufDownloadProgress",
+                    "bytes_done": 4_218_u64,
+                    "bytes_total": 4_683_u64,
+                }))
+                .expect("serialize progress frame"),
+            ),
+        };
+
+        update_load_progress_from_frame(&mut progress, &frame, Instant::now());
+        let detail = stage_load_liveness_detail(
+            progress.get(&2),
+            0,
+            2,
+            Some(MemberState::Dead),
+            Some(DistNodeId([3; 32])),
+            None,
+            false,
+            "heartbeat_missed",
+        );
+
+        assert_eq!(
+            detail
+                .pointer("/load_progress/phase")
+                .and_then(Value::as_str),
+            Some("prefetching_model")
+        );
+        assert_eq!(
+            detail
+                .pointer("/load_progress/bytes_done")
+                .and_then(Value::as_u64),
+            Some(4_218)
+        );
+        assert_eq!(
+            detail
+                .pointer("/load_progress/bytes_total")
+                .and_then(Value::as_u64),
+            Some(4_683)
+        );
+        assert_eq!(
+            detail.pointer("/classification").and_then(Value::as_str),
+            Some("heartbeat_missed")
+        );
+        assert_eq!(
+            detail.pointer("/host_gpu_missing").and_then(Value::as_bool),
+            Some(true)
+        );
+
+        let gpu_frame = CollectedDatastreamFrame {
+            stream: StreamId::new(NodeId::new("2"), Lifetime(17)),
+            channel_name: "host.gpu".to_owned(),
+            frame: Frame::new(ChannelId(2), datastream::Position(2), b"{}".to_vec()),
+        };
+        update_load_progress_from_frame(&mut progress, &gpu_frame, Instant::now());
+        let detail = stage_load_liveness_detail(
+            progress.get(&2),
+            0,
+            2,
+            Some(MemberState::Alive),
+            Some(DistNodeId([3; 32])),
+            None,
+            true,
+            "waiting",
+        );
+        assert_eq!(
+            detail.pointer("/host_gpu_missing").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn stage_shard_events_update_load_progress_and_liveness_phase() {
+        let mut progress = BTreeMap::new();
+        let now = Instant::now();
+        let frame = CollectedDatastreamFrame {
+            stream: StreamId::new(NodeId::new("7"), Lifetime(17)),
+            channel_name: "mvp.worker.weights".to_owned(),
+            frame: Frame::new(
+                ChannelId(1),
+                datastream::Position(1),
+                serde_json::to_vec(&json!({
+                    "type":"NodeEvent",
+                    "phase":"stage_shard_fetch",
+                    "status":"event",
+                    "run_id":17,
+                    "node_id":7,
+                    "stage_index":3,
+                    "detail":{
+                        "event":{
+                            "type":"StageShardRangeFetchReady",
+                            "stage_index":3,
+                            "range_index":1,
+                            "range_count":4,
+                            "tensor_index":2,
+                            "tensor_count":9,
+                            "bytes_done":384_u64,
+                            "bytes_total":1024_u64
+                        }
+                    }
+                }))
+                .expect("serialize stage shard progress frame"),
+            ),
+        };
+
+        update_load_progress_from_frame(&mut progress, &frame, now);
+        let entry = progress.get(&7).expect("stage shard progress tracked");
+        assert_eq!(entry.stage_index, Some(3));
+        assert_eq!(entry.phase.as_deref(), Some("fetching_stage_shard"));
+        assert_eq!(
+            entry.last_worker_event.as_deref(),
+            Some("StageShardRangeFetchReady")
+        );
+        assert_eq!(entry.bytes_done, Some(384));
+        assert_eq!(entry.bytes_total, Some(1024));
+        assert_eq!(entry.last_progress, Some(now));
+
+        let ready_frame = CollectedDatastreamFrame {
+            stream: StreamId::new(NodeId::new("7"), Lifetime(17)),
+            channel_name: "mvp.worker.weights".to_owned(),
+            frame: Frame::new(
+                ChannelId(1),
+                datastream::Position(2),
+                serde_json::to_vec(&json!({
+                    "type":"NodeEvent",
+                    "phase":"stage_shard_fetch",
+                    "status":"event",
+                    "run_id":17,
+                    "node_id":7,
+                    "stage_index":3,
+                    "detail":{
+                        "event":{
+                            "type":"StageShardReady",
+                            "stage_index":3,
+                            "bytes_done":1024_u64,
+                            "bytes_total":1024_u64
+                        }
+                    }
+                }))
+                .expect("serialize stage shard ready frame"),
+            ),
+        };
+        update_load_progress_from_frame(&mut progress, &ready_frame, Instant::now());
+        let detail = stage_load_liveness_detail(
+            progress.get(&7),
+            3,
+            7,
+            Some(MemberState::Dead),
+            Some(DistNodeId([4; 32])),
+            None,
+            false,
+            "heartbeat_missed",
+        );
+        assert_eq!(
+            detail
+                .pointer("/load_progress/phase")
+                .and_then(Value::as_str),
+            Some("stage_shard_ready")
+        );
+        assert_eq!(
+            detail
+                .pointer("/load_progress/last_worker_event")
+                .and_then(Value::as_str),
+            Some("StageShardReady")
+        );
+        assert!(
+            detail
+                .pointer("/load_progress/last_progress_age_ms")
+                .and_then(Value::as_u64)
+                .is_some()
+        );
+
+        let cache_frame = CollectedDatastreamFrame {
+            stream: StreamId::new(NodeId::new("8"), Lifetime(17)),
+            channel_name: "mvp.worker.weights".to_owned(),
+            frame: Frame::new(
+                ChannelId(1),
+                datastream::Position(3),
+                serde_json::to_vec(&json!({
+                    "type":"NodeEvent",
+                    "phase":"stage_shard_fetch",
+                    "status":"event",
+                    "run_id":17,
+                    "node_id":8,
+                    "stage_index":4,
+                    "detail":{"event":{"type":"StageShardCacheReady","stage_index":4,"cache_hit":true}}
+                }))
+                .expect("serialize stage shard cache frame"),
+            ),
+        };
+        update_load_progress_from_frame(&mut progress, &cache_frame, Instant::now());
+        assert_eq!(
+            progress.get(&8).and_then(|entry| entry.phase.as_deref()),
+            Some("stage_shard_cache_ready")
+        );
+    }
+
+    #[test]
+    fn stage_shard_plan_summary_events_include_fetch_facts() {
+        static NEXT_TEMP_FILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let suffix = NEXT_TEMP_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mvp-stage-shard-plan-summary-{}-{suffix}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let plan0 = test_stage_shard_plan(0, 2_000, 100, vec![(800, 400), (1_600, 200)]);
+        let plan1 = test_stage_shard_plan(1, 2_000, 120, vec![(1_000, 300)]);
+        let plans = BTreeMap::from([(0, plan0.clone()), (1, plan1.clone())]);
+
+        let mut datastream = OrchDatastream::new(41, Some(&path)).expect("datastream opens");
+        emit_stage_shard_plan_summaries(None, &mut datastream, 41, 9, &plans);
+        drop(datastream);
+
+        let contents = std::fs::read_to_string(&path).expect("read summary archive");
+        let _ = std::fs::remove_file(&path);
+        let summaries = contents
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("archive line is json"))
+            .filter(|record| {
+                record.get("channel").and_then(Value::as_str) == Some(MVP_ORCH_BOOTSTRAP)
+            })
+            .map(|record| {
+                let payload = record
+                    .pointer("/payload/value")
+                    .and_then(Value::as_str)
+                    .expect("bootstrap payload is text");
+                serde_json::from_str::<Value>(payload).expect("bootstrap payload is json")
+            })
+            .filter(|event| event.get("phase").and_then(Value::as_str) == Some("stage_shard_plan"))
+            .collect::<Vec<_>>();
+        assert_eq!(summaries.len(), 2);
+
+        let first = summaries
+            .iter()
+            .find(|event| event.pointer("/detail/stage_index").and_then(Value::as_u64) == Some(0))
+            .expect("stage 0 summary emitted");
+        assert_eq!(
+            first
+                .pointer("/detail/planned_fetch_bytes")
+                .and_then(Value::as_u64),
+            Some(plan0.planned_fetch_bytes())
+        );
+        assert_eq!(
+            first
+                .pointer("/detail/source_total_bytes")
+                .and_then(Value::as_u64),
+            Some(plan0.source_total_bytes)
+        );
+        assert_eq!(
+            first
+                .pointer("/detail/tensor_count")
+                .and_then(Value::as_u64),
+            Some(plan0.tensors.len() as u64)
+        );
+        assert_eq!(
+            first.pointer("/detail/range_count").and_then(Value::as_u64),
+            Some(plan0.planned_range_count() as u64)
+        );
+        assert!(
+            first
+                .pointer("/detail/planned_fraction")
+                .and_then(Value::as_f64)
+                .expect("planned fraction is numeric")
+                < 1.0
+        );
+        assert!(
+            plan0.planned_fetch_bytes() < plan0.source_total_bytes,
+            "nontrivial stage shard fetches less than the source GGUF"
+        );
+    }
+
+    #[test]
+    fn stage_provision_dispatch_suppresses_active_progress_and_recovers_when_stale() {
+        let now = Instant::now();
+        assert_eq!(
+            stage_provision_dispatch(None, 0, None, now),
+            StageProvisionDispatch::Send("initial")
+        );
+        assert_eq!(
+            stage_provision_dispatch(None, 1, Some(now - Duration::from_secs(15)), now),
+            StageProvisionDispatch::Send("no_progress_after_send")
+        );
+
+        let active = StageLoadProgress {
+            node_id: 2,
+            stage_index: Some(0),
+            phase: Some("fetching_stage_shard".to_owned()),
+            last_progress: Some(now - Duration::from_secs(5)),
+            ..StageLoadProgress::default()
+        };
+        assert_eq!(
+            stage_provision_dispatch(Some(&active), 1, Some(now - Duration::from_secs(15)), now),
+            StageProvisionDispatch::Suppress("active_progress")
+        );
+
+        let stale = StageLoadProgress {
+            last_progress: Some(now - STAGE_PROVISION_ACTIVE_RESEND_AFTER - Duration::from_secs(1)),
+            ..active.clone()
+        };
+        assert_eq!(
+            stage_provision_dispatch(Some(&stale), 1, Some(now - Duration::from_secs(15)), now),
+            StageProvisionDispatch::Suppress("recent_stale_progress_resend")
+        );
+        assert_eq!(
+            stage_provision_dispatch(
+                Some(&stale),
+                1,
+                Some(now - STAGE_PROVISION_ACTIVE_RESEND_AFTER - Duration::from_secs(1)),
+                now,
+            ),
+            StageProvisionDispatch::Send("stale_progress")
+        );
+
+        let failed = StageLoadProgress {
+            phase: Some("failed".to_owned()),
+            failure_reason: Some("cache write failed".to_owned()),
+            ..active
+        };
+        assert_eq!(
+            stage_provision_dispatch(Some(&failed), 1, Some(now), now),
+            StageProvisionDispatch::Suppress("worker_load_failed")
+        );
+    }
+
+    fn test_stage_shard_plan(
+        stage_index: u32,
+        source_total_bytes: u64,
+        metadata_end: u64,
+        ranges: Vec<(u64, u64)>,
+    ) -> StageShardPlan {
+        StageShardPlan {
+            source: GgufSource::HuggingFaceGguf {
+                repo: "org/repo".to_owned(),
+                file: "model.gguf".to_owned(),
+                revision: None,
+            },
+            stage_index,
+            stage_count: 2,
+            layer_start: stage_index * 2,
+            layer_end_exclusive: stage_index * 2 + 2,
+            metadata_count: 1,
+            metadata_end,
+            data_start: 512,
+            alignment: 32,
+            source_total_bytes,
+            tensors: vec![crate::gguf_shard::StageShardTensor {
+                name: format!("blk.{stage_index}.attn_q.weight"),
+                dims: vec![2, 2],
+                ggml_type: 0,
+                source_offset: 0,
+                byte_len: 16,
+            }],
+            merged_tensor_ranges: ranges
+                .into_iter()
+                .map(|(start, len)| crate::gguf_shard::ByteRange { start, len })
+                .collect(),
+            cache_key: format!("test-stage-{stage_index}"),
         }
     }
 

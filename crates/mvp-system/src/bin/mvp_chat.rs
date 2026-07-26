@@ -27,7 +27,8 @@ use mvp_system::config as chat_config;
 use mvp_system::config::ResolvedVastAiConfig;
 use mvp_system::endpoint_advertisement::EndpointAddrMask;
 use mvp_system::node_image::{
-    NodeImageProvider, NodeImageRequest, PreparedNodeImage, prepare_node_image,
+    NodeImageProgressEvent, NodeImageProgressEventKind, NodeImageProgressSink, NodeImageProvider,
+    NodeImageRequest, PreparedNodeImage, prepare_node_image_with_progress,
 };
 use mvp_system::node_provisioning::ProviderKind;
 use mvp_system::prompt_rpc::{PromptEvent, SubmitPrompt, write_json_line};
@@ -154,34 +155,38 @@ where
     );
     progress.emit_benchmark_envelope(&config);
     confirm_vastai_if_needed(&config)?;
+    let prepare_runtime_started = Instant::now();
     progress.emit(
         CHAT_RUNTIME_CHANNEL,
         "prepare_runtime",
         "started",
         json!({"provider": config.provider.as_str()}),
     );
-    let image_ref =
-        match prepare_runtime_with_progress(&config, prepare_node_image, Some(&mut progress)) {
-            Ok(image_ref) => {
-                progress.emit(
+    let image_ref = match prepare_runtime_with_progress(
+        &config,
+        prepare_node_image_progress_adapter,
+        Some(&mut progress),
+    ) {
+        Ok(image_ref) => {
+            progress.emit(
                     CHAT_RUNTIME_CHANNEL,
                     "prepare_runtime",
                     "ready",
-                    json!({"image_ref": image_ref}),
+                    json!({"image_ref": image_ref, "elapsed_ms": prepare_runtime_started.elapsed().as_millis()}),
                 );
-                image_ref
-            }
-            Err(error) => {
-                progress.emit(
+            image_ref
+        }
+        Err(error) => {
+            progress.emit(
                     CHAT_RUNTIME_CHANNEL,
                     "prepare_runtime",
                     "failed",
-                    json!({"error": error}),
+                    json!({"error": error, "elapsed_ms": prepare_runtime_started.elapsed().as_millis()}),
                 );
-                progress.archive_pending()?;
-                return Err(error);
-            }
-        };
+            progress.archive_pending()?;
+            return Err(error);
+        }
+    };
     progress.emit(
         CHAT_COMPONENT_CHANNEL,
         "orchestrator_process_spawn",
@@ -507,6 +512,66 @@ impl ChatDatastream {
             archive.record(&source, &stream, &channel, &frame)?;
         }
         Ok(())
+    }
+}
+
+impl NodeImageProgressSink for ChatDatastream {
+    fn emit(&mut self, event: NodeImageProgressEvent) {
+        let mut detail = serde_json::Map::new();
+        if let Some(command_label) = event.command_label {
+            detail.insert("command_label".to_owned(), json!(command_label));
+        }
+        if let Some(image_ref) = event.image_ref {
+            detail.insert("image_ref".to_owned(), json!(image_ref));
+        }
+        if let Some(elapsed_ms) = event.elapsed_ms {
+            detail.insert("elapsed_ms".to_owned(), json!(elapsed_ms));
+        }
+
+        let (phase, status) = match event.kind {
+            NodeImageProgressEventKind::ImageReference { role, image_ref } => {
+                detail.insert("event".to_owned(), json!("image_ref"));
+                detail.insert("role".to_owned(), json!(role));
+                detail.insert("image_ref".to_owned(), json!(image_ref));
+                ("prepare_node_image", "image_ref")
+            }
+            NodeImageProgressEventKind::CommandStarted { program, args } => {
+                detail.insert("event".to_owned(), json!("command_start"));
+                detail.insert("program".to_owned(), json!(program));
+                detail.insert("args".to_owned(), json!(args));
+                ("node_image_command", "started")
+            }
+            NodeImageProgressEventKind::CommandStdout { line } => {
+                detail.insert("event".to_owned(), json!("stdout"));
+                detail.insert("stream".to_owned(), json!("stdout"));
+                detail.insert("line".to_owned(), json!(line));
+                ("node_image_command", "stdout")
+            }
+            NodeImageProgressEventKind::CommandStderr { line } => {
+                detail.insert("event".to_owned(), json!("stderr"));
+                detail.insert("stream".to_owned(), json!("stderr"));
+                detail.insert("line".to_owned(), json!(line));
+                ("node_image_command", "stderr")
+            }
+            NodeImageProgressEventKind::CommandExited {
+                status: command_status,
+                code,
+                success,
+            } => {
+                detail.insert("event".to_owned(), json!("command_exit"));
+                detail.insert("command_status".to_owned(), json!(command_status));
+                detail.insert("exit_code".to_owned(), json!(code));
+                detail.insert("success".to_owned(), json!(success));
+                if let Some(elapsed_ms) = detail.get("elapsed_ms").cloned() {
+                    detail.insert("duration_ms".to_owned(), elapsed_ms);
+                }
+                (
+                    "node_image_command",
+                    if success { "exited" } else { "failed" },
+                )
+            }
+        };
+        self.emit(CHAT_RUNTIME_CHANNEL, phase, status, Value::Object(detail));
     }
 }
 
@@ -1366,26 +1431,44 @@ fn signal_orch_process_group(child: &Child, signal: libc::c_int) -> io::Result<(
     }
 }
 
-type PrepareNodeImageFn = fn(NodeImageRequest) -> Result<PreparedNodeImage, String>;
+fn prepare_node_image_progress_adapter(
+    request: NodeImageRequest,
+    progress: Option<&mut dyn NodeImageProgressSink>,
+) -> Result<PreparedNodeImage, String> {
+    prepare_node_image_with_progress(request, progress)
+}
 
 #[allow(dead_code)]
 fn prepare_runtime(config: &Config) -> Result<String, String> {
-    prepare_runtime_with(config, prepare_node_image)
+    prepare_runtime_with(config, |request| {
+        prepare_node_image_with_progress(request, None)
+    })
 }
 
 #[allow(dead_code)]
-fn prepare_runtime_with(
-    config: &Config,
-    prepare_node_image_fn: PrepareNodeImageFn,
-) -> Result<String, String> {
-    prepare_runtime_with_progress(config, prepare_node_image_fn, None)
+fn prepare_runtime_with<F>(config: &Config, prepare_node_image_fn: F) -> Result<String, String>
+where
+    F: FnMut(NodeImageRequest) -> Result<PreparedNodeImage, String>,
+{
+    let mut prepare_node_image_fn = prepare_node_image_fn;
+    prepare_runtime_with_progress(
+        config,
+        move |request, _progress| prepare_node_image_fn(request),
+        None,
+    )
 }
 
-fn prepare_runtime_with_progress(
+fn prepare_runtime_with_progress<F>(
     config: &Config,
-    prepare_node_image_fn: PrepareNodeImageFn,
+    mut prepare_node_image_fn: F,
     progress: Option<&mut ChatDatastream>,
-) -> Result<String, String> {
+) -> Result<String, String>
+where
+    F: FnMut(
+        NodeImageRequest,
+        Option<&mut dyn NodeImageProgressSink>,
+    ) -> Result<PreparedNodeImage, String>,
+{
     let mut progress = progress;
     let binary_mode = if config.skip_rebuild {
         "existing_artifact"
@@ -1408,12 +1491,13 @@ fn prepare_runtime_with_progress(
             json!({"mode": config.orchestrator_launch_mode()}),
         );
     } else {
+        let ensure_orch_started = Instant::now();
         emit_chat_progress(
             &mut progress,
             CHAT_RUNTIME_CHANNEL,
             "ensure_orch_binary",
             "started",
-            json!({"mode": binary_mode}),
+            json!({"mode": binary_mode, "command_label": "ensure_orch_binary"}),
         );
         match ensure_orch_binary(config) {
             Ok(()) => emit_chat_progress(
@@ -1421,7 +1505,7 @@ fn prepare_runtime_with_progress(
                 CHAT_RUNTIME_CHANNEL,
                 "ensure_orch_binary",
                 "ready",
-                json!({"mode": binary_mode}),
+                json!({"mode": binary_mode, "command_label": "ensure_orch_binary", "elapsed_ms": ensure_orch_started.elapsed().as_millis()}),
             ),
             Err(error) => {
                 emit_chat_progress(
@@ -1429,7 +1513,7 @@ fn prepare_runtime_with_progress(
                     CHAT_RUNTIME_CHANNEL,
                     "ensure_orch_binary",
                     "failed",
-                    json!({"mode": binary_mode, "error": error.as_str()}),
+                    json!({"mode": binary_mode, "command_label": "ensure_orch_binary", "elapsed_ms": ensure_orch_started.elapsed().as_millis(), "error": error.as_str()}),
                 );
                 return Err(error);
             }
@@ -1468,7 +1552,7 @@ fn prepare_runtime_with_progress(
             CHAT_RUNTIME_CHANNEL,
             "prepare_node_image",
             "skipped",
-            json!({"provider": config.provider.as_str(), "reason": "process_provider"}),
+            json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "reason": "process_provider"}),
         );
         return Ok(config.node_image.clone());
     }
@@ -1480,23 +1564,24 @@ fn prepare_runtime_with_progress(
                 CHAT_RUNTIME_CHANNEL,
                 "ensure_worker_binary",
                 "skipped",
-                json!({"mode": binary_mode, "reason": "vastai_remote_image"}),
+                json!({"mode": binary_mode, "command_label": "ensure_worker_binary", "reason": "vastai_remote_image"}),
             );
             emit_chat_progress(
                 &mut progress,
                 CHAT_RUNTIME_CHANNEL,
                 "prepare_node_image",
                 "skipped",
-                json!({"provider": config.provider.as_str(), "reason": "skip_rebuild"}),
+                json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "reason": "skip_rebuild"}),
             );
             return Ok(config.node_image.clone());
         }
+        let ensure_worker_started = Instant::now();
         emit_chat_progress(
             &mut progress,
             CHAT_RUNTIME_CHANNEL,
             "ensure_worker_binary",
             "started",
-            json!({"mode": binary_mode}),
+            json!({"mode": binary_mode, "command_label": "ensure_worker_binary"}),
         );
         match ensure_worker_binary(config) {
             Ok(()) => emit_chat_progress(
@@ -1504,7 +1589,7 @@ fn prepare_runtime_with_progress(
                 CHAT_RUNTIME_CHANNEL,
                 "ensure_worker_binary",
                 "ready",
-                json!({"mode": binary_mode}),
+                json!({"mode": binary_mode, "command_label": "ensure_worker_binary", "elapsed_ms": ensure_worker_started.elapsed().as_millis()}),
             ),
             Err(error) => {
                 emit_chat_progress(
@@ -1512,7 +1597,7 @@ fn prepare_runtime_with_progress(
                     CHAT_RUNTIME_CHANNEL,
                     "ensure_worker_binary",
                     "failed",
-                    json!({"mode": binary_mode, "error": error.as_str()}),
+                    json!({"mode": binary_mode, "command_label": "ensure_worker_binary", "elapsed_ms": ensure_worker_started.elapsed().as_millis(), "error": error.as_str()}),
                 );
                 return Err(error);
             }
@@ -1522,17 +1607,18 @@ fn prepare_runtime_with_progress(
             CHAT_RUNTIME_CHANNEL,
             "prepare_node_image",
             "skipped",
-            json!({"provider": config.provider.as_str(), "reason": "skip_rebuild"}),
+            json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "reason": "skip_rebuild"}),
         );
         return Ok(config.node_image.clone());
     }
 
+    let prepare_node_image_started = Instant::now();
     emit_chat_progress(
         &mut progress,
         CHAT_RUNTIME_CHANNEL,
         "prepare_node_image",
         "started",
-        json!({"provider": config.provider.as_str()}),
+        json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "image_tag": config.image_tag.as_deref()}),
     );
     let node_bin = match node_bin_for_current_profile() {
         Ok(path) => path,
@@ -1542,7 +1628,7 @@ fn prepare_runtime_with_progress(
                 CHAT_RUNTIME_CHANNEL,
                 "prepare_node_image",
                 "failed",
-                json!({"provider": config.provider.as_str(), "error": error.as_str()}),
+                json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "elapsed_ms": prepare_node_image_started.elapsed().as_millis(), "error": error.as_str()}),
             );
             return Err(error);
         }
@@ -1555,31 +1641,39 @@ fn prepare_runtime_with_progress(
                 CHAT_RUNTIME_CHANNEL,
                 "prepare_node_image",
                 "failed",
-                json!({"provider": config.provider.as_str(), "error": error.as_str()}),
+                json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "elapsed_ms": prepare_node_image_started.elapsed().as_millis(), "error": error.as_str()}),
             );
             return Err(error);
         }
     };
-    let prepared = match prepare_node_image_fn(NodeImageRequest {
-        requested_image: config.node_image.clone(),
-        base_image: BASE_NODE_IMAGE.to_owned(),
-        node_bin,
-        provider,
-        extra_tag: config.image_tag.clone(),
-        push: false,
-        force_refresh: false,
-        enabled: true,
-    }) {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            emit_chat_progress(
-                &mut progress,
-                CHAT_RUNTIME_CHANNEL,
-                "prepare_node_image",
-                "failed",
-                json!({"provider": config.provider.as_str(), "error": error.as_str()}),
-            );
-            return Err(error);
+    let prepared = {
+        let command_progress = progress
+            .as_deref_mut()
+            .map(|sink| sink as &mut dyn NodeImageProgressSink);
+        match prepare_node_image_fn(
+            NodeImageRequest {
+                requested_image: config.node_image.clone(),
+                base_image: BASE_NODE_IMAGE.to_owned(),
+                node_bin,
+                provider,
+                extra_tag: config.image_tag.clone(),
+                push: false,
+                force_refresh: false,
+                enabled: true,
+            },
+            command_progress,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                emit_chat_progress(
+                    &mut progress,
+                    CHAT_RUNTIME_CHANNEL,
+                    "prepare_node_image",
+                    "failed",
+                    json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "elapsed_ms": prepare_node_image_started.elapsed().as_millis(), "error": error.as_str()}),
+                );
+                return Err(error);
+            }
         }
     };
     emit_chat_progress(
@@ -1587,7 +1681,7 @@ fn prepare_runtime_with_progress(
         CHAT_RUNTIME_CHANNEL,
         "prepare_node_image",
         "ready",
-        json!({"provider": config.provider.as_str(), "image_ref": prepared.image_ref}),
+        json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "image_ref": prepared.image_ref, "elapsed_ms": prepare_node_image_started.elapsed().as_millis()}),
     );
     Ok(prepared.image_ref)
 }
@@ -3088,6 +3182,112 @@ relay_url = "https://relay.example"
         panic!("image preparer must not be called when --skip-rebuild is set")
     }
 
+    fn panic_prepare_node_image_with_progress(
+        _request: NodeImageRequest,
+        _progress: Option<&mut dyn NodeImageProgressSink>,
+    ) -> Result<PreparedNodeImage, String> {
+        panic!("image preparer must not be called when --skip-rebuild is set")
+    }
+
+    fn runtime_events(path: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .expect("read progress archive")
+            .lines()
+            .filter_map(|line| {
+                let outer: serde_json::Value = serde_json::from_str(line).ok()?;
+                if outer.get("channel").and_then(serde_json::Value::as_str)
+                    != Some(CHAT_RUNTIME_CHANNEL)
+                {
+                    return None;
+                }
+                outer
+                    .get("payload")?
+                    .get("value")?
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+            })
+            .collect()
+    }
+
+    fn emit_fake_node_image_progress(
+        progress: Option<&mut dyn NodeImageProgressSink>,
+        success: bool,
+    ) {
+        let Some(sink) = progress else {
+            return;
+        };
+        sink.emit(NodeImageProgressEvent {
+            command_label: None,
+            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
+            elapsed_ms: None,
+            kind: NodeImageProgressEventKind::ImageReference {
+                role: "resolved".to_owned(),
+                image_ref: "docker.io/acme/node:prepared".to_owned(),
+            },
+        });
+        sink.emit(NodeImageProgressEvent {
+            command_label: Some("build mvp node image".to_owned()),
+            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
+            elapsed_ms: Some(0),
+            kind: NodeImageProgressEventKind::CommandStarted {
+                program: "fake-docker".to_owned(),
+                args: vec!["build".to_owned()],
+            },
+        });
+        sink.emit(NodeImageProgressEvent {
+            command_label: Some("build mvp node image".to_owned()),
+            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
+            elapsed_ms: Some(1),
+            kind: NodeImageProgressEventKind::CommandStdout {
+                line: "building layer".to_owned(),
+            },
+        });
+        sink.emit(NodeImageProgressEvent {
+            command_label: Some("build mvp node image".to_owned()),
+            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
+            elapsed_ms: Some(2),
+            kind: NodeImageProgressEventKind::CommandStderr {
+                line: "pushing metadata".to_owned(),
+            },
+        });
+        sink.emit(NodeImageProgressEvent {
+            command_label: Some("build mvp node image".to_owned()),
+            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
+            elapsed_ms: Some(3),
+            kind: NodeImageProgressEventKind::CommandExited {
+                status: if success {
+                    "exit status: 0".to_owned()
+                } else {
+                    "exit status: 42".to_owned()
+                },
+                code: Some(if success { 0 } else { 42 }),
+                success,
+            },
+        });
+    }
+
+    fn fake_prepare_node_image_with_progress(
+        _request: NodeImageRequest,
+        progress: Option<&mut dyn NodeImageProgressSink>,
+    ) -> Result<PreparedNodeImage, String> {
+        emit_fake_node_image_progress(progress, true);
+        Ok(PreparedNodeImage {
+            image_ref: "docker.io/acme/node:prepared".to_owned(),
+            tag: "prepared".to_owned(),
+            already_available: false,
+            built: true,
+            pushed: false,
+        })
+    }
+
+    fn failing_prepare_node_image_with_progress(
+        _request: NodeImageRequest,
+        progress: Option<&mut dyn NodeImageProgressSink>,
+    ) -> Result<PreparedNodeImage, String> {
+        emit_fake_node_image_progress(progress, false);
+        Err("build mvp node image failed with exit status: 42".to_owned())
+    }
+
     #[test]
     fn skip_rebuild_requires_existing_artifacts_and_skips_image_preparation() {
         let temp = TempDir::new("skip-rebuild");
@@ -3108,6 +3308,188 @@ relay_url = "https://relay.example"
         let image_ref = prepare_runtime_with(&config, panic_prepare_node_image)
             .expect("skip rebuild uses existing artifacts");
         assert_eq!(image_ref, "docker.io/acme/node:latest");
+    }
+
+    #[test]
+    fn prepare_runtime_progress_records_local_prep_details() {
+        let temp = TempDir::new("prep-progress");
+        let archive_path = temp.path().join("frames.ndjson");
+        let orch_bin = temp.path().join("mvp-orchestrator");
+        let worker_bin = temp.path().join("mvp-worker-node");
+        fs::write(&orch_bin, b"orch").expect("write orchestrator artifact");
+        fs::write(&worker_bin, b"worker").expect("write worker artifact");
+        let mut config = base_config(ProviderKind::Docker);
+        config.skip_rebuild = true;
+        config.orch_bin = orch_bin;
+        config.worker_bin = worker_bin;
+        config.node_image = "docker.io/acme/node:latest".to_owned();
+        let mut progress =
+            ChatDatastream::new(91, Some(archive_path.clone())).expect("datastream constructs");
+
+        prepare_runtime_with_progress(
+            &config,
+            panic_prepare_node_image_with_progress,
+            Some(&mut progress),
+        )
+        .expect("skip rebuild uses existing artifacts");
+        progress.archive_pending().expect("archive prep frames");
+
+        let events = fs::read_to_string(&archive_path).expect("read archive");
+        let inner_events = events
+            .lines()
+            .filter_map(|line| {
+                let outer: serde_json::Value = serde_json::from_str(line).ok()?;
+                if outer.get("channel").and_then(serde_json::Value::as_str)
+                    != Some(CHAT_RUNTIME_CHANNEL)
+                {
+                    return None;
+                }
+                let inner = outer
+                    .get("payload")?
+                    .get("value")?
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())?;
+                Some(inner)
+            })
+            .collect::<Vec<_>>();
+        let ensure_ready = inner_events
+            .iter()
+            .find(|event| {
+                event.get("phase").and_then(serde_json::Value::as_str) == Some("ensure_orch_binary")
+                    && event.get("status").and_then(serde_json::Value::as_str) == Some("ready")
+            })
+            .expect("ensure_orch_binary ready event");
+        assert_eq!(
+            ensure_ready
+                .pointer("/detail/command_label")
+                .and_then(serde_json::Value::as_str),
+            Some("ensure_orch_binary")
+        );
+        assert!(
+            ensure_ready
+                .pointer("/detail/elapsed_ms")
+                .and_then(serde_json::Value::as_u64)
+                .is_some()
+        );
+        let image_skip = inner_events
+            .iter()
+            .find(|event| {
+                event.get("phase").and_then(serde_json::Value::as_str) == Some("prepare_node_image")
+                    && event.get("status").and_then(serde_json::Value::as_str) == Some("skipped")
+            })
+            .expect("prepare_node_image skipped event");
+        assert_eq!(
+            image_skip
+                .pointer("/detail/reason")
+                .and_then(serde_json::Value::as_str),
+            Some("skip_rebuild")
+        );
+    }
+
+    #[test]
+    fn prepare_runtime_streams_node_image_command_progress() {
+        let temp = TempDir::new("node-image-command-progress");
+        let archive_path = temp.path().join("frames.ndjson");
+        let mut config = base_config(ProviderKind::Docker);
+        config.skip_rebuild = false;
+        config.gpu_run = true;
+        config.node_image = "docker.io/acme/node:latest".to_owned();
+        let mut progress =
+            ChatDatastream::new(92, Some(archive_path.clone())).expect("datastream constructs");
+
+        let image_ref = prepare_runtime_with_progress(
+            &config,
+            fake_prepare_node_image_with_progress,
+            Some(&mut progress),
+        )
+        .expect("fake image preparation succeeds");
+        progress.archive_pending().expect("archive prep frames");
+        assert_eq!(image_ref, "docker.io/acme/node:prepared");
+
+        let events = runtime_events(&archive_path);
+        assert!(events.iter().any(|event| {
+            event.get("phase").and_then(serde_json::Value::as_str) == Some("prepare_node_image")
+                && event.get("status").and_then(serde_json::Value::as_str) == Some("image_ref")
+                && event
+                    .pointer("/detail/image_ref")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("docker.io/acme/node:prepared")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("phase").and_then(serde_json::Value::as_str) == Some("node_image_command")
+                && event.get("status").and_then(serde_json::Value::as_str) == Some("started")
+                && event
+                    .pointer("/detail/command_label")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("build mvp node image")
+                && event
+                    .pointer("/detail/program")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("fake-docker")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("status").and_then(serde_json::Value::as_str) == Some("stdout")
+                && event
+                    .pointer("/detail/line")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("building layer")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("status").and_then(serde_json::Value::as_str) == Some("stderr")
+                && event
+                    .pointer("/detail/line")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("pushing metadata")
+        }));
+        assert!(events.iter().any(|event| {
+            event.get("status").and_then(serde_json::Value::as_str) == Some("exited")
+                && event
+                    .pointer("/detail/command_status")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("exit status: 0")
+                && event.pointer("/detail/duration_ms").is_some()
+        }));
+    }
+
+    #[test]
+    fn prepare_runtime_command_failure_preserves_label_and_status() {
+        let temp = TempDir::new("node-image-command-failure");
+        let archive_path = temp.path().join("frames.ndjson");
+        let mut config = base_config(ProviderKind::Docker);
+        config.skip_rebuild = false;
+        config.gpu_run = true;
+        let mut progress =
+            ChatDatastream::new(93, Some(archive_path.clone())).expect("datastream constructs");
+
+        let error = prepare_runtime_with_progress(
+            &config,
+            failing_prepare_node_image_with_progress,
+            Some(&mut progress),
+        )
+        .expect_err("fake image preparation failure propagates");
+        progress.archive_pending().expect("archive prep frames");
+        assert!(error.contains("build mvp node image"), "{error}");
+
+        let events = runtime_events(&archive_path);
+        let failure = events
+            .iter()
+            .find(|event| {
+                event.get("phase").and_then(serde_json::Value::as_str) == Some("node_image_command")
+                    && event.get("status").and_then(serde_json::Value::as_str) == Some("failed")
+            })
+            .expect("failed command progress event");
+        assert_eq!(
+            failure
+                .pointer("/detail/command_label")
+                .and_then(serde_json::Value::as_str),
+            Some("build mvp node image")
+        );
+        assert_eq!(
+            failure
+                .pointer("/detail/command_status")
+                .and_then(serde_json::Value::as_str),
+            Some("exit status: 42")
+        );
     }
 
     #[test]
