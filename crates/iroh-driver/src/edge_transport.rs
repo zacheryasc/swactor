@@ -5,6 +5,7 @@
 //! ring ownership, and stage semantics stay in the MVP/dataplane crates.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use distribution::types::NodeId;
 use iroh::endpoint::Connection;
@@ -72,28 +73,70 @@ pub(crate) fn spawn_edge_send_pump(
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     handle.spawn(async move {
         let result: Result<(), String> = async {
-            let conn = endpoint
-                .connect(peer, EDGE_ALPN)
-                .await
-                .map_err(|e| format!("connect edge {edge_id}: {e}"))?;
-            let mut send = conn
-                .open_uni()
-                .await
-                .map_err(|e| format!("open edge stream {edge_id}: {e}"))?;
-            send.write_all(&encode_edge_preamble(edge_id))
-                .await
-                .map_err(|e| format!("write edge preamble {edge_id}: {e}"))?;
-            send.flush()
-                .await
-                .map_err(|e| format!("flush edge preamble {edge_id}: {e}"))?;
+            macro_rules! open_edge_stream {
+                () => {{
+                    let conn = endpoint
+                        .connect(peer.clone(), EDGE_ALPN)
+                        .await
+                        .map_err(|e| format!("connect edge {edge_id}: {e}"))?;
+                    let mut send = conn
+                        .open_uni()
+                        .await
+                        .map_err(|e| format!("open edge stream {edge_id}: {e}"))?;
+                    send.write_all(&encode_edge_preamble(edge_id))
+                        .await
+                        .map_err(|e| format!("write edge preamble {edge_id}: {e}"))?;
+                    send.flush()
+                        .await
+                        .map_err(|e| format!("flush edge preamble {edge_id}: {e}"))?;
+                    send
+                }};
+            }
+
+            let mut send = open_edge_stream!();
             let _ = ready_tx.send(Ok(()));
             while let Some(record) = rx.recv().await {
-                send.write_all(&record)
+                let mut attempts = 0_u8;
+                loop {
+                    attempts = attempts.saturating_add(1);
+                    let write_result = tokio::time::timeout(Duration::from_secs(30), async {
+                        send.write_all(&record)
+                            .await
+                            .map_err(|e| format!("write edge record {edge_id}: {e}"))?;
+                        send.flush()
+                            .await
+                            .map_err(|e| format!("flush edge record {edge_id}: {e}"))
+                    })
                     .await
-                    .map_err(|e| format!("write edge record {edge_id}: {e}"))?;
-                send.flush()
-                    .await
-                    .map_err(|e| format!("flush edge record {edge_id}: {e}"))?;
+                    .map_err(|_| format!("write edge record {edge_id}: timed out"))?;
+
+                    match write_result {
+                        Ok(()) => break,
+                        Err(error) if attempts < 3 => {
+                            send = open_edge_stream!();
+                            let retry_result =
+                                tokio::time::timeout(Duration::from_secs(30), async {
+                                    send.write_all(&record).await.map_err(|e| {
+                                        format!("write edge record {edge_id} after reconnect: {e}")
+                                    })?;
+                                    send.flush().await.map_err(|e| {
+                                        format!("flush edge record {edge_id} after reconnect: {e}")
+                                    })
+                                })
+                                .await
+                                .map_err(|_| {
+                                    format!(
+                                        "write edge record {edge_id} after reconnect: timed out"
+                                    )
+                                })?;
+                            retry_result.map_err(|retry_error| {
+                                format!("{error}; reconnect write failed: {retry_error}")
+                            })?;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
             }
             send.finish()
                 .map_err(|e| format!("finish edge stream {edge_id}: {e}"))?;

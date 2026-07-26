@@ -41,6 +41,13 @@ pub async fn wait_for_running_with_policy(
             }
         };
 
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "instance {contract_id} not found while waiting for running: {}",
+                body.chars().take(80).collect::<String>(),
+            ));
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
@@ -163,6 +170,41 @@ mod tests {
         assert!(
             error.contains("stuck in status loading"),
             "error should name stuck provider state: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_instance_returns_error_instead_of_polling_forever() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v0/instances/456/"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(json!({
+                "success": false,
+                "error": "no_such_instance",
+                "msg": "Instance 456 not found."
+            })))
+            .mount(&server)
+            .await;
+
+        let policy = LifecyclePolicy {
+            poll_interval: Duration::from_secs(60),
+            state_timeout: Duration::from_secs(300),
+            ..LifecyclePolicy::default()
+        };
+
+        let error = wait_for_running_with_policy(
+            &reqwest::Client::new(),
+            &server.uri(),
+            "secret",
+            456,
+            &policy,
+        )
+        .await
+        .expect_err("missing instance should fail immediately");
+
+        assert!(
+            error.contains("not found while waiting for running"),
+            "error should name missing provider instance: {error}"
         );
     }
 }

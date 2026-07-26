@@ -474,6 +474,7 @@ impl ChatDatastream {
                         "max_dph_total": vastai.max_dph_total,
                         "min_reliability": vastai.min_reliability,
                         "require_verified": vastai.require_verified,
+                        "blacklist_hosts": &vastai.blacklist_hosts,
                         "disk_gb": vastai.disk_gb,
                         "has_onstart": vastai.onstart.is_some(),
                         "has_ssh_identity": vastai.ssh_identity.is_some(),
@@ -957,6 +958,9 @@ impl Config {
                 } else {
                     "--no-vastai-require-verified".to_owned()
                 });
+            }
+            for host_id in &vastai.blacklist_hosts {
+                args.extend(["--vastai-blacklist-host".to_owned(), host_id.to_string()]);
             }
             if let Some(onstart) = &vastai.onstart {
                 args.extend(["--vastai-onstart".to_owned(), onstart.clone()]);
@@ -2944,6 +2948,7 @@ node = "docker.io/acme/node:latest"
 [vastai]
 relay_url = "https://relay.example"
 bootstrap_command = "boot"
+blacklist_hosts = [155385, 546483]
 "#,
         );
         with_process_state(
@@ -2958,6 +2963,7 @@ bootstrap_command = "boot"
                 assert_eq!(vastai.relay_url, "https://relay.example");
                 assert_eq!(vastai.bootstrap_command, "boot");
                 assert_eq!(vastai.image, "docker.io/acme/node:latest");
+                assert_eq!(vastai.blacklist_hosts, vec![155385, 546483]);
                 let args = config.orchestrator_cli_args("docker.io/acme/node:latest");
                 assert!(
                     !args
@@ -2969,6 +2975,14 @@ bootstrap_command = "boot"
                     args.windows(2)
                         .any(|pair| pair == ["--vastai-bootstrap-command", "boot"]),
                     "non-secret Vast.ai config should still be forwarded"
+                );
+                assert!(
+                    args.windows(2)
+                        .any(|pair| pair == ["--vastai-blacklist-host", "155385"])
+                        && args
+                            .windows(2)
+                            .any(|pair| pair == ["--vastai-blacklist-host", "546483"]),
+                    "Vast.ai host blacklist must be forwarded to orchestrator argv: {args:?}"
                 );
             },
         );
