@@ -1,7 +1,8 @@
 use std::time::Duration;
 
 use crate::types::{
-    LabeledInstance, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedFleet, RunningInstance,
+    LabeledInstance, LifecyclePolicy, Offer, ProviderInstanceStatus, ProvisionRequest,
+    ProvisionedFleet, RunningInstance,
 };
 
 /// Small convenience wrapper around a reqwest client + vast.ai endpoint.
@@ -60,6 +61,18 @@ impl VastClient {
         crate::lease::provision_fleet(&self.http, &self.base_url, &self.api_key, req).await
     }
 
+    pub async fn instance_status(
+        &self,
+        contract_id: u64,
+    ) -> Result<ProviderInstanceStatus, String> {
+        crate::monitor::fetch_instance_status(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            contract_id,
+        )
+        .await
+    }
     pub async fn wait_for_running(
         &self,
         contract_id: u64,
@@ -70,6 +83,23 @@ impl VastClient {
             &self.base_url,
             &self.api_key,
             contract_id,
+            policy,
+        )
+        .await
+    }
+
+    pub async fn wait_for_ssh_endpoint(
+        &self,
+        contract_id: u64,
+        label: &str,
+        policy: &LifecyclePolicy,
+    ) -> Result<RunningInstance, String> {
+        crate::monitor::wait_for_ssh_endpoint_with_policy(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            contract_id,
+            label,
             policy,
         )
         .await

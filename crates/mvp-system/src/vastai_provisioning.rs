@@ -1,5 +1,6 @@
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
@@ -7,14 +8,16 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
-use std::time::Duration;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use datastream::DatastreamProducer;
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, Runtime};
 use swactor_vastai::{
-    LifecyclePolicy, ProvisionRequest, ProvisionedInstance, SelectionPolicy, classify_vastai_error,
+    CreateInstanceRequest, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedInstance,
+    SelectionPolicy, classify_vastai_error, create_instance,
 };
 
 use crate::bootstrap_datastream::{BootstrapDatastreamBridge, node_stream_id};
@@ -60,6 +63,33 @@ pub struct VastAiSshEndpoint {
     pub user: String,
 }
 
+pub struct VastAiProviderMonitor {
+    stopping: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl VastAiProviderMonitor {
+    fn new(stopping: Arc<AtomicBool>, join: JoinHandle<()>) -> Self {
+        Self {
+            stopping,
+            join: Some(join),
+        }
+    }
+
+    fn stop(&mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
+}
+
+impl Drop for VastAiProviderMonitor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub trait VastAiLeaseClient: Send {
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String>;
     fn plan_first_wave_offers(
@@ -76,6 +106,16 @@ pub trait VastAiLeaseClient: Send {
         lifecycle: &LifecyclePolicy,
         ssh_user: &str,
     ) -> Result<VastAiSshEndpoint, String>;
+    fn spawn_provider_monitor(
+        &mut self,
+        _contract_id: u64,
+        _label: String,
+        _lifecycle: LifecyclePolicy,
+        _spec: NodeProvisionSpec,
+        _sink: PluginSink,
+    ) -> Option<VastAiProviderMonitor> {
+        None
+    }
 
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String>;
 }
@@ -83,6 +123,8 @@ pub trait VastAiLeaseClient: Send {
 pub struct ToolsVastAiLeaseClient {
     client: swactor_vastai::VastClient,
     runtime: tokio::runtime::Runtime,
+    planned_offer_pool: Arc<Mutex<Vec<Offer>>>,
+    planned_offer_ids: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl ToolsVastAiLeaseClient {
@@ -91,7 +133,12 @@ impl ToolsVastAiLeaseClient {
             .enable_all()
             .build()
             .map_err(|e| format!("vastai tokio runtime: {e}"))?;
-        Ok(Self { client, runtime })
+        Ok(Self {
+            client,
+            runtime,
+            planned_offer_pool: Arc::new(Mutex::new(Vec::new())),
+            planned_offer_ids: Arc::new(Mutex::new(HashSet::new())),
+        })
     }
 
     pub fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
@@ -101,25 +148,269 @@ impl ToolsVastAiLeaseClient {
     pub fn client(&self) -> &swactor_vastai::VastClient {
         &self.client
     }
+
+    fn create_request_for_offer(
+        request: &ProvisionRequest,
+        offer_id: u64,
+    ) -> CreateInstanceRequest {
+        let mut env = request.env.clone();
+        if let Some(overlay) = request.per_instance_env.first() {
+            env.extend(
+                overlay
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        CreateInstanceRequest {
+            offer_id,
+            image: request.image.clone(),
+            disk_gb: request.disk_gb,
+            label: request.label.clone(),
+            env,
+            onstart: request.onstart.clone(),
+        }
+    }
+
+    fn candidate_pool(&mut self, request: &ProvisionRequest) -> Result<Vec<Offer>, String> {
+        let cached = self.planned_offer_pool.lock().clone();
+        if request
+            .preferred_offer_id
+            .is_some_and(|offer_id| cached.iter().any(|offer| offer.id == offer_id))
+        {
+            return Ok(cached);
+        }
+        self.runtime
+            .block_on(self.client.search_offers(&request.selection, 1))
+    }
+
+    fn create_from_offer(
+        &mut self,
+        request: &ProvisionRequest,
+        offer: &Offer,
+    ) -> Result<ProvisionedInstance, String> {
+        let create = Self::create_request_for_offer(request, offer.id);
+        let info = self.runtime.block_on(create_instance(
+            self.client.http(),
+            self.client.base_url(),
+            self.client.api_key(),
+            &create,
+        ))?;
+        Ok(ProvisionedInstance {
+            index: 0,
+            contract_id: info.contract_id,
+            offer_id: offer.id,
+            host_id: offer.host_id,
+            gpu_name: offer.gpu_name.clone(),
+            gpu_ram: offer.gpu_ram,
+            dph_total: offer.dph_total,
+        })
+    }
+
+    fn monitor_provider_status(
+        &mut self,
+        contract_id: u64,
+        label: String,
+        lifecycle: LifecyclePolicy,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+        stopping: Arc<AtomicBool>,
+    ) {
+        let mut last_state: Option<String> = None;
+        let mut state_since = Instant::now();
+        let mut poll = 0_u64;
+        while !stopping.load(Ordering::SeqCst) {
+            poll = poll.saturating_add(1);
+            let status = match self
+                .runtime
+                .block_on(self.client.instance_status(contract_id))
+            {
+                Ok(status) => status,
+                Err(error)
+                    if error.contains("not found while fetching provider status")
+                        || error.contains("parse failed") =>
+                {
+                    let reason = classified_start_error(format!(
+                        "vastai provider monitor node {} contract {contract_id}: {error}",
+                        spec.node_id
+                    ));
+                    sink.observe(PluginObservation::ProviderLine {
+                        run_id: spec.run_id,
+                        node_id: spec.node_id,
+                        line: serde_json::json!({
+                            "type": "VastAiProviderStatusFailure",
+                            "run_id": spec.run_id,
+                            "node_id": spec.node_id,
+                            "label": &label,
+                            "contract_id": contract_id,
+                            "poll": poll,
+                            "reason": &reason,
+                        })
+                        .to_string(),
+                    });
+                    sink.observe(PluginObservation::Failed {
+                        run_id: spec.run_id,
+                        node_id: spec.node_id,
+                        reason,
+                    });
+                    return;
+                }
+                Err(error) => {
+                    sink.observe(PluginObservation::ProviderLine {
+                        run_id: spec.run_id,
+                        node_id: spec.node_id,
+                        line: serde_json::json!({
+                            "type": "VastAiProviderStatusPollRetry",
+                            "run_id": spec.run_id,
+                            "node_id": spec.node_id,
+                            "label": &label,
+                            "contract_id": contract_id,
+                            "poll": poll,
+                            "reason": error,
+                        })
+                        .to_string(),
+                    });
+                    if !sleep_provider_monitor(lifecycle.poll_interval, &stopping) {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            let actual = status.actual_status.as_str();
+            if last_state.as_deref() != Some(actual) {
+                state_since = Instant::now();
+                last_state = Some(actual.to_owned());
+            }
+            let in_state_ms = state_since.elapsed().as_millis();
+            sink.observe(PluginObservation::ProviderLine {
+                run_id: spec.run_id,
+                node_id: spec.node_id,
+                line: serde_json::json!({
+                    "type": "VastAiProviderStatusObserved",
+                    "run_id": spec.run_id,
+                    "node_id": spec.node_id,
+                    "label": &label,
+                    "contract_id": contract_id,
+                    "poll": poll,
+                    "actual_status": &status.actual_status,
+                    "intended_status": &status.intended_status,
+                    "status_msg": &status.status_msg,
+                    "disk_usage": status.disk_usage,
+                    "in_state_ms": in_state_ms,
+                })
+                .to_string(),
+            });
+
+            if let Some(error) = provider_terminal_start_error(
+                contract_id,
+                &status.actual_status,
+                &status.intended_status,
+                status.status_msg.as_deref(),
+            ) {
+                let reason = classified_start_error(format!(
+                    "vastai provider monitor node {}: {error}",
+                    spec.node_id
+                ));
+                sink.observe(PluginObservation::ProviderLine {
+                    run_id: spec.run_id,
+                    node_id: spec.node_id,
+                    line: serde_json::json!({
+                        "type": "VastAiProviderTerminalBeforeRuntimeReady",
+                        "run_id": spec.run_id,
+                        "node_id": spec.node_id,
+                        "label": &label,
+                        "contract_id": contract_id,
+                        "reason": &reason,
+                    })
+                    .to_string(),
+                });
+                sink.observe(PluginObservation::Failed {
+                    run_id: spec.run_id,
+                    node_id: spec.node_id,
+                    reason,
+                });
+                return;
+            }
+
+            if !sleep_provider_monitor(lifecycle.poll_interval, &stopping) {
+                return;
+            }
+        }
+    }
 }
 
 impl Clone for ToolsVastAiLeaseClient {
     fn clone(&self) -> Self {
-        Self::new(self.client.clone()).expect("clone VastAI lease client runtime")
+        Self {
+            client: self.client.clone(),
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("clone VastAI lease client runtime"),
+            planned_offer_pool: Arc::clone(&self.planned_offer_pool),
+            planned_offer_ids: Arc::clone(&self.planned_offer_ids),
+        }
     }
 }
 
 impl VastAiLeaseClient for ToolsVastAiLeaseClient {
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String> {
-        let fleet = self.runtime.block_on(self.client.provision(request))?;
-        let mut instances = fleet.instances;
-        if instances.len() != 1 {
+        if request.count != 1 {
             return Err(format!(
-                "vastai provision expected one instance, got {}",
-                instances.len()
+                "vastai provision_one expected count=1, got {}",
+                request.count
             ));
         }
-        Ok(instances.remove(0))
+
+        let pool = self.candidate_pool(&request)?;
+        let planned_offer_ids = self.planned_offer_ids.lock().clone();
+        let blocked_hosts = request
+            .selection
+            .blacklist_hosts
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut failed_hosts = HashSet::new();
+        let mut tried_offer_ids = HashSet::new();
+        let mut ordered = Vec::with_capacity(pool.len());
+        if let Some(preferred_offer_id) = request.preferred_offer_id
+            && let Some(offer) = pool.iter().find(|offer| offer.id == preferred_offer_id)
+        {
+            ordered.push(offer.clone());
+        }
+        ordered.extend(pool.into_iter());
+
+        let mut last_error = None;
+        for offer in ordered {
+            if !tried_offer_ids.insert(offer.id) {
+                continue;
+            }
+            if request.preferred_offer_id != Some(offer.id) && planned_offer_ids.contains(&offer.id)
+            {
+                continue;
+            }
+            if offer.host_id.is_some_and(|host_id| {
+                blocked_hosts.contains(&host_id) || failed_hosts.contains(&host_id)
+            }) {
+                continue;
+            }
+            match self.create_from_offer(&request, &offer) {
+                Ok(instance) => return Ok(instance),
+                Err(error) => {
+                    if let Some(host_id) = offer.host_id {
+                        failed_hosts.insert(host_id);
+                    }
+                    last_error = Some(format!("offer {}: {error}", offer.id));
+                }
+            }
+        }
+
+        Err(format!(
+            "vastai provision node exhausted eligible offers{}",
+            last_error
+                .map(|error| format!(" after create failure ({error})"))
+                .unwrap_or_default()
+        ))
     }
 
     fn plan_first_wave_offers(
@@ -127,6 +418,8 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         requests: &[ProvisionRequest],
     ) -> Result<Vec<Option<u64>>, String> {
         let Some(first) = requests.first() else {
+            self.planned_offer_pool.lock().clear();
+            self.planned_offer_ids.lock().clear();
             return Ok(Vec::new());
         };
         let pool = self.runtime.block_on(
@@ -139,6 +432,9 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
             &first.selection.blacklist_hosts,
             &[],
         );
+        let planned_ids = planned.iter().map(|offer| offer.id).collect::<HashSet<_>>();
+        *self.planned_offer_pool.lock() = pool;
+        *self.planned_offer_ids.lock() = planned_ids;
         let mut out = planned
             .into_iter()
             .map(|offer| Some(offer.id))
@@ -154,23 +450,36 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         lifecycle: &LifecyclePolicy,
         ssh_user: &str,
     ) -> Result<VastAiSshEndpoint, String> {
-        self.runtime.block_on(async {
-            let instances = self.client.list_by_label(label).await?;
-            if let Some(instance) = instances
-                .into_iter()
-                .find(|instance| instance.contract_id == contract_id)
-            {
-                let host = if instance.ssh_host.is_empty() {
-                    instance.public_ipaddr
-                } else {
-                    instance.ssh_host
-                };
-                return endpoint_from_parts(contract_id, host, instance.ssh_port, ssh_user);
-            }
+        let endpoint = self.runtime.block_on(self.client.wait_for_ssh_endpoint(
+            contract_id,
+            label,
+            lifecycle,
+        ))?;
+        endpoint_from_parts(contract_id, endpoint.ip, endpoint.port, ssh_user)
+    }
 
-            let running = self.client.wait_for_running(contract_id, lifecycle).await?;
-            endpoint_from_parts(contract_id, running.ip, running.port, ssh_user)
-        })
+    fn spawn_provider_monitor(
+        &mut self,
+        contract_id: u64,
+        label: String,
+        lifecycle: LifecyclePolicy,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Option<VastAiProviderMonitor> {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let thread_stopping = Arc::clone(&stopping);
+        let mut client = self.clone();
+        let join = std::thread::spawn(move || {
+            client.monitor_provider_status(
+                contract_id,
+                label,
+                lifecycle,
+                spec,
+                sink,
+                thread_stopping,
+            );
+        });
+        Some(VastAiProviderMonitor::new(stopping, join))
     }
 
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
@@ -201,6 +510,44 @@ fn endpoint_from_parts(
         port,
         user: ssh_user.to_owned(),
     })
+}
+
+fn provider_terminal_start_error(
+    contract_id: u64,
+    actual: &str,
+    intended: &str,
+    msg: Option<&str>,
+) -> Option<String> {
+    if let Some(message) = msg {
+        let lower = message.to_ascii_lowercase();
+        if lower.contains("error") || lower.contains("failed") {
+            return Some(format!("instance {contract_id} error: {message}"));
+        }
+    }
+    if intended == "stopped" && actual != "running" {
+        return Some(format!(
+            "instance {contract_id} stopped: {}",
+            msg.unwrap_or_default()
+        ));
+    }
+    match actual {
+        "exited" | "error" | "stopped" => Some(format!(
+            "instance {contract_id} reached terminal status: {actual}"
+        )),
+        _ => None,
+    }
+}
+
+fn sleep_provider_monitor(duration: Duration, stopping: &AtomicBool) -> bool {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        if stopping.load(Ordering::SeqCst) {
+            return false;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        std::thread::sleep(std::cmp::min(remaining, Duration::from_millis(100)));
+    }
+    !stopping.load(Ordering::SeqCst)
 }
 
 #[derive(Clone, Debug)]
@@ -421,6 +768,7 @@ pub trait VastAiBootstrapLauncher: Send {
         endpoint: VastAiSshEndpoint,
         sink: PluginSink,
         producer: Option<DatastreamProducer>,
+        lifecycle: LifecyclePolicy,
     ) -> Result<Self::Handle, String>;
 
     fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason);
@@ -492,6 +840,7 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
         endpoint: VastAiSshEndpoint,
         sink: PluginSink,
         producer: Option<DatastreamProducer>,
+        lifecycle: LifecyclePolicy,
     ) -> Result<Self::Handle, String> {
         if spec.args.is_empty() {
             return Err(format!(
@@ -514,6 +863,7 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
             self.ssh_identity.clone(),
             child,
             stopping,
+            lifecycle.state_timeout,
         );
 
         Ok(SshCommandBootstrapHandle {
@@ -528,6 +878,70 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
     }
 }
 
+const POST_GRACE_BOOTSTRAP_FAILURE_LIMIT: u32 = 2;
+
+fn classify_ssh_observation(line: &str) -> Option<&'static str> {
+    let lower = line.to_ascii_lowercase();
+    if lower.contains("permission denied (publickey")
+        || lower.contains("publickey denied")
+        || lower.contains("public key denied")
+        || lower.contains("no supported authentication methods")
+    {
+        return Some("auth_denied");
+    }
+    if lower.contains("connection refused")
+        || lower.contains("connect to host") && lower.contains("refused")
+    {
+        return Some("refused");
+    }
+    if lower.contains("operation timed out")
+        || lower.contains("connection timed out")
+        || lower.contains("connect timed out")
+    {
+        return Some("timeout");
+    }
+    None
+}
+
+fn post_grace_terminal_bootstrap_class(class: &str) -> bool {
+    matches!(class, "auth_denied" | "refused" | "timeout")
+}
+
+fn spawn_classifying_stderr_reader<R>(
+    stderr: R,
+    bridge: BootstrapDatastreamBridge,
+    observed_class: Arc<Mutex<Option<&'static str>>>,
+) -> JoinHandle<()>
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for next in reader.lines() {
+            match next {
+                Ok(line) => {
+                    if let Some(class) = classify_ssh_observation(&line) {
+                        *observed_class.lock() = Some(class);
+                        bridge.observe_provider_line(
+                            serde_json::json!({
+                                "type": "VastAiBootstrapObservationClass",
+                                "run_id": bridge.spec().run_id,
+                                "node_id": bridge.spec().node_id,
+                                "class": class,
+                            })
+                            .to_string(),
+                        );
+                    }
+                    bridge.observe_stderr_line(line);
+                }
+                Err(error) => {
+                    bridge.observe_provider_line(format!("read VastAI SSH stderr: {error}"));
+                    break;
+                }
+            }
+        }
+    })
+}
 fn spawn_retrying_ssh_bootstrap(
     spec: NodeProvisionSpec,
     endpoint: VastAiSshEndpoint,
@@ -536,12 +950,15 @@ fn spawn_retrying_ssh_bootstrap(
     ssh_identity: Option<PathBuf>,
     child_slot: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
+    post_grace_failure_after: Duration,
 ) {
     std::thread::spawn(move || {
         let run_id = spec.run_id;
         let node_id = spec.node_id;
         let mut attempt = 1u64;
         let mut backoff = Duration::from_secs(1);
+        let bootstrap_started = Instant::now();
+        let mut post_grace_failures = 0_u32;
 
         while !stopping.load(Ordering::SeqCst) {
             sink.observe(PluginObservation::ProviderLine {
@@ -562,7 +979,12 @@ fn spawn_retrying_ssh_bootstrap(
                         producer.clone(),
                     );
                     bridge.spawn_stdout_reader(stdout);
-                    bridge.spawn_stderr_reader(stderr);
+                    let observed_class = Arc::new(Mutex::new(None));
+                    let mut stderr_reader = Some(spawn_classifying_stderr_reader(
+                        stderr,
+                        bridge.clone(),
+                        Arc::clone(&observed_class),
+                    ));
 
                     loop {
                         if stopping.load(Ordering::SeqCst) {
@@ -597,17 +1019,50 @@ fn spawn_retrying_ssh_bootstrap(
                                 } else {
                                     "not ready before runtime ready"
                                 };
-                                let line = format!(
-                                    "VastAI SSH bootstrap {readiness} (attempt {attempt}, {status}); retrying"
-                                );
+                                if let Some(reader) = stderr_reader.take() {
+                                    let _ = reader.join();
+                                }
+                                let observation_class =
+                                    (*observed_class.lock()).unwrap_or("process_exit");
                                 sink.observe(PluginObservation::ProviderLine {
                                     run_id,
                                     node_id,
-                                    line,
+                                    line: serde_json::json!({
+                                        "type": "VastAiBootstrapAttemptCompleted",
+                                        "run_id": run_id,
+                                        "node_id": node_id,
+                                        "attempt": attempt,
+                                        "status": status.to_string(),
+                                        "class": observation_class,
+                                        "classification": readiness,
+                                    })
+                                    .to_string(),
                                 });
+                                if !status.success()
+                                    && !post_grace_failure_after.is_zero()
+                                    && bootstrap_started.elapsed() >= post_grace_failure_after
+                                    && post_grace_terminal_bootstrap_class(observation_class)
+                                {
+                                    post_grace_failures = post_grace_failures.saturating_add(1);
+                                    if post_grace_failures >= POST_GRACE_BOOTSTRAP_FAILURE_LIMIT {
+                                        sink.observe(PluginObservation::Failed {
+                                            run_id,
+                                            node_id,
+                                            reason: format!(
+                                                "VastAI SSH bootstrap repeated post-grace {observation_class} failure before runtime ready"
+                                            ),
+                                        });
+                                        return;
+                                    }
+                                } else {
+                                    post_grace_failures = 0;
+                                }
                                 break;
                             }
                             Some(Err(error)) => {
+                                if let Some(reader) = stderr_reader.take() {
+                                    let _ = reader.join();
+                                }
                                 sink.observe(PluginObservation::ProviderLine {
                                     run_id,
                                     node_id,
@@ -740,7 +1195,12 @@ where
 struct VastAiNode<H> {
     contract_id: u64,
     bootstrap: Option<H>,
+    provider_monitor: Option<VastAiProviderMonitor>,
     host_id: Option<u64>,
+    run_id: u64,
+    node_id: u64,
+    label: String,
+    sink: PluginSink,
 }
 
 impl<C, B> VastAiProvisioningPlugin<C, B>
@@ -908,6 +1368,18 @@ where
             })
             .to_string(),
         });
+        sink.observe(PluginObservation::ProviderLine {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            line: serde_json::json!({
+                "type": "VastAiSshEndpointDiscoveryStarted",
+                "run_id": spec.run_id,
+                "node_id": spec.node_id,
+                "contract_id": instance.contract_id,
+                "label": &label,
+            })
+            .to_string(),
+        });
 
         let endpoint = match self.client.ssh_endpoint(
             instance.contract_id,
@@ -944,11 +1416,27 @@ where
             .to_string(),
         });
 
+        sink.observe(PluginObservation::ProviderLine {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            line: serde_json::json!({
+                "type": "VastAiBootstrapObservationStarted",
+                "run_id": spec.run_id,
+                "node_id": spec.node_id,
+                "contract_id": instance.contract_id,
+                "host": &endpoint.host,
+                "port": endpoint.port,
+                "user": &endpoint.user,
+            })
+            .to_string(),
+        });
+
         let bootstrap = match self.bootstrap.start_bootstrap(
             spec.clone(),
             endpoint,
-            sink,
+            sink.clone(),
             self.bootstrap_producer.clone(),
+            self.config.lifecycle.clone(),
         ) {
             Ok(handle) => handle,
             Err(error) => {
@@ -980,7 +1468,18 @@ where
             VastAiNode {
                 contract_id: instance.contract_id,
                 bootstrap: Some(bootstrap),
+                provider_monitor: self.client.spawn_provider_monitor(
+                    instance.contract_id,
+                    label.clone(),
+                    self.config.lifecycle.clone(),
+                    spec.clone(),
+                    sink.clone(),
+                ),
                 host_id,
+                run_id: spec.run_id,
+                node_id: spec.node_id,
+                label,
+                sink,
             },
         );
         Ok(handle)
@@ -1059,13 +1558,56 @@ where
                     })
                     .to_string(),
                 });
+            } else {
+                sink.observe(PluginObservation::ProviderLine {
+                    run_id: spec.run_id,
+                    node_id: spec.node_id,
+                    line: serde_json::json!({
+                        "type": "VastAiFirstWaveOfferPlanUnavailable",
+                        "run_id": spec.run_id,
+                        "node_id": spec.node_id,
+                        "label": &label,
+                    })
+                    .to_string(),
+                });
             }
             let mut client = self.client.clone();
             let config = self.config.clone();
             let worker_tx = completion_tx.clone();
+            let worker_sink = sink.clone();
             std::thread::spawn(move || {
                 let started = match client.provision_one(request) {
                     Ok(instance) => {
+                        worker_sink.observe(PluginObservation::ProviderLine {
+                            run_id: spec.run_id,
+                            node_id: spec.node_id,
+                            line: serde_json::json!({
+                                "type": "VastAiLeaseReady",
+                                "run_id": spec.run_id,
+                                "node_id": spec.node_id,
+                                "label": &label,
+                                "image": &spec.image,
+                                "contract_id": instance.contract_id,
+                                "offer_id": instance.offer_id,
+                                "host_id": instance.host_id,
+                                "gpu_name": &instance.gpu_name,
+                                "gpu_ram": instance.gpu_ram,
+                                "dph_total": instance.dph_total,
+                            })
+                            .to_string(),
+                        });
+                        worker_sink.observe(PluginObservation::ProviderLine {
+                            run_id: spec.run_id,
+                            node_id: spec.node_id,
+                            line: serde_json::json!({
+                                "type": "VastAiSshEndpointDiscoveryStarted",
+                                "run_id": spec.run_id,
+                                "node_id": spec.node_id,
+                                "contract_id": instance.contract_id,
+                                "label": &label,
+                            })
+                            .to_string(),
+                        });
                         match client.ssh_endpoint(
                             instance.contract_id,
                             &label,
@@ -1115,26 +1657,14 @@ where
                     sink.observe(PluginObservation::ProviderLine {
                         run_id: spec.run_id,
                         node_id: spec.node_id,
-                        line: format!(
-                            "vastai contract {} ready for SSH lookup",
-                            started.instance.contract_id
-                        ),
-                    });
-                    sink.observe(PluginObservation::ProviderLine {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
                         line: serde_json::json!({
-                            "type": "VastAiLeaseReady",
+                            "type": "VastAiSshEndpointReady",
                             "run_id": spec.run_id,
                             "node_id": spec.node_id,
-                            "label": &started.label,
-                            "image": &spec.image,
                             "contract_id": started.instance.contract_id,
-                            "offer_id": started.instance.offer_id,
-                            "host_id": started.instance.host_id,
-                            "gpu_name": &started.instance.gpu_name,
-                            "gpu_ram": started.instance.gpu_ram,
-                            "dph_total": started.instance.dph_total,
+                            "host": &started.endpoint.host,
+                            "port": started.endpoint.port,
+                            "user": &started.endpoint.user,
                         })
                         .to_string(),
                     });
@@ -1142,7 +1672,7 @@ where
                         run_id: spec.run_id,
                         node_id: spec.node_id,
                         line: serde_json::json!({
-                            "type": "VastAiSshEndpointReady",
+                            "type": "VastAiBootstrapObservationStarted",
                             "run_id": spec.run_id,
                             "node_id": spec.node_id,
                             "contract_id": started.instance.contract_id,
@@ -1158,6 +1688,7 @@ where
                         started.endpoint,
                         sink.clone(),
                         self.bootstrap_producer.clone(),
+                        self.config.lifecycle.clone(),
                     ) {
                         Ok(handle) => handle,
                         Err(error) => {
@@ -1192,7 +1723,18 @@ where
                         VastAiNode {
                             contract_id: started.instance.contract_id,
                             bootstrap: Some(bootstrap),
+                            provider_monitor: self.client.spawn_provider_monitor(
+                                started.instance.contract_id,
+                                started.label.clone(),
+                                self.config.lifecycle.clone(),
+                                spec.clone(),
+                                sink.clone(),
+                            ),
                             host_id,
+                            run_id: spec.run_id,
+                            node_id: spec.node_id,
+                            label: started.label,
+                            sink: sink.clone(),
                         },
                     );
                     results[index] = Some((spec, Ok(handle)));
@@ -1232,6 +1774,23 @@ where
         let Some(node) = self.nodes.get_mut(&handle.id) else {
             return Ok(());
         };
+        if let Some(monitor) = node.provider_monitor.as_mut() {
+            monitor.stop();
+        }
+        node.provider_monitor = None;
+        node.sink.observe(PluginObservation::ProviderLine {
+            run_id: node.run_id,
+            node_id: node.node_id,
+            line: serde_json::json!({
+                "type": "VastAiRuntimeReadyAccepted",
+                "run_id": node.run_id,
+                "node_id": node.node_id,
+                "label": &node.label,
+                "contract_id": node.contract_id,
+                "classification": "runtime_ready_over_provider_staleness",
+            })
+            .to_string(),
+        });
         if let Some(mut bootstrap) = node.bootstrap.take() {
             self.bootstrap
                 .stop_bootstrap(&mut bootstrap, BootstrapStopReason::RuntimeReady);
@@ -1243,6 +1802,9 @@ where
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
+        if let Some(mut monitor) = node.provider_monitor.take() {
+            monitor.stop();
+        }
         if let Some(host_id) = node.host_id {
             self.leased_host_ids.remove(&host_id);
         }
@@ -1250,7 +1812,22 @@ where
             self.bootstrap
                 .stop_bootstrap(&mut bootstrap, BootstrapStopReason::NodeStop);
         }
-        self.client.destroy_contract(node.contract_id)
+        let result = self.client.destroy_contract(node.contract_id);
+        node.sink.observe(PluginObservation::ProviderLine {
+            run_id: node.run_id,
+            node_id: node.node_id,
+            line: serde_json::json!({
+                "type": "VastAiContractCleanup",
+                "run_id": node.run_id,
+                "node_id": node.node_id,
+                "label": &node.label,
+                "contract_id": node.contract_id,
+                "result": if result.is_ok() { "ok" } else { "failed" },
+                "error": result.as_ref().err(),
+            })
+            .to_string(),
+        });
+        result
     }
 }
 
@@ -1294,6 +1871,7 @@ mod tests {
             _endpoint: VastAiSshEndpoint,
             _sink: PluginSink,
             _producer: Option<DatastreamProducer>,
+            _lifecycle: LifecyclePolicy,
         ) -> Result<Self::Handle, String> {
             panic!("build_request tests must not start SSH bootstrap")
         }
@@ -1391,6 +1969,7 @@ mod tests {
             _endpoint: VastAiSshEndpoint,
             _sink: PluginSink,
             _producer: Option<DatastreamProducer>,
+            _lifecycle: LifecyclePolicy,
         ) -> Result<Self::Handle, String> {
             Ok(spec.node_id)
         }
@@ -1468,6 +2047,21 @@ mod tests {
                 expected,
                 "backoff from {current:?}"
             );
+        }
+    }
+
+    #[test]
+    fn ssh_bootstrap_observation_classifies_auth_and_transport_failures() {
+        for (line, expected) in [
+            ("Permission denied (publickey).", Some("auth_denied")),
+            (
+                "ssh: connect to host ssh5.vast.ai port 22017: Connection refused",
+                Some("refused"),
+            ),
+            ("ssh: connect timed out", Some("timeout")),
+            ("debug1: permanently_set_uid", None),
+        ] {
+            assert_eq!(classify_ssh_observation(line), expected, "{line}");
         }
     }
 

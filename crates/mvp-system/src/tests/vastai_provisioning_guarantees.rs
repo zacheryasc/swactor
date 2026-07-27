@@ -115,6 +115,7 @@ impl VastAiBootstrapLauncher for FakeBootstrap {
         endpoint: VastAiSshEndpoint,
         _sink: PluginSink,
         _producer: Option<datastream::DatastreamProducer>,
+        _lifecycle: LifecyclePolicy,
     ) -> Result<Self::Handle, String> {
         if let Some(reason) = self.fail.clone() {
             return Err(reason);

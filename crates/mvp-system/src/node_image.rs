@@ -7,25 +7,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const IMAGE_SOURCE_INPUTS: &[&str] = &[
-    "Cargo.lock",
-    "Cargo.toml",
-    "src",
-    "crates/datastream/Cargo.toml",
-    "crates/datastream/src",
-    "crates/distribution/Cargo.toml",
-    "crates/distribution/src",
-    "crates/iroh-driver/Cargo.toml",
-    "crates/iroh-driver/src",
-    "crates/mvp-system/Cargo.toml",
-    "crates/mvp-system/src",
-    "crates/transport/Cargo.toml",
-    "crates/transport/src",
-    "tools/vastai/Cargo.toml",
-    "tools/vastai/src",
+const NODE_IMAGE_CONTENT_INPUTS: &[&str] = &[
     "apps/mvp-node/Dockerfile",
-    "apps/mvp-node/Dockerfile.base",
-    "apps/mvp-node/mvp_entrypoint.sh",
     "apps/mvp-node/tinygrad_worker.py",
 ];
 
@@ -192,13 +175,31 @@ fn prepare_node_image_inner(
         ));
     }
 
-    let tag = image_version_tag(&root)?;
+    run_status(
+        runner,
+        progress,
+        &root,
+        "cargo",
+        &[
+            "build",
+            "--quiet",
+            "-p",
+            "mvp-system",
+            "--bin",
+            "mvp-worker-node",
+        ],
+        "build mvp-worker-node",
+        None,
+    )?;
+
+    let base_hash = content_hash_for_inputs(&root, BASE_IMAGE_SOURCE_INPUTS)?;
+    let image_content_hash = node_image_content_hash(&root, &request.node_bin, &base_hash)?;
+    let tag = image_version_tag(&root, &image_content_hash)?;
     let image_ref = image.ref_for_tag(&tag);
     emit_image_reference(progress, "resolved", &image_ref);
-    let source_hash = source_content_hash(&root)?;
     let worker_hash = file_content_hash(&root, Path::new("apps/mvp-node/tinygrad_worker.py"))?;
-    let base_hash = content_hash_for_inputs(&root, BASE_IMAGE_SOURCE_INPUTS)?;
-    let expected_node_labels = node_image_labels(&tag, &source_hash, &worker_hash, &base_hash);
+    let expected_node_labels =
+        node_image_labels(&tag, &image_content_hash, &worker_hash, &base_hash);
     let expected_base_labels = base_image_labels(&base_hash);
     let alias_tags = alias_tags(&image, request.extra_tag.as_deref(), &tag)?;
     for alias in alias_refs(&image, &alias_tags) {
@@ -247,23 +248,6 @@ fn prepare_node_image_inner(
             pushed: false,
         });
     }
-
-    run_status(
-        runner,
-        progress,
-        &root,
-        "cargo",
-        &[
-            "build",
-            "--quiet",
-            "-p",
-            "mvp-system",
-            "--bin",
-            "mvp-worker-node",
-        ],
-        "build mvp-worker-node",
-        None,
-    )?;
     let base_image_matches =
         docker_image_labels_match(runner, &root, &request.base_image, &expected_base_labels)?;
     if !base_image_matches {
@@ -350,12 +334,12 @@ fn workspace_root() -> Result<PathBuf, String> {
     ))
 }
 
-fn image_version_tag(root: &Path) -> Result<String, String> {
+fn image_version_tag(root: &Path, image_content_hash: &str) -> Result<String, String> {
     if git_worktree_clean(root)? {
         let sha = git_capture(root, &["rev-parse", "--short=12", "HEAD"])?;
         Ok(format!("git-{}", sha.trim()))
     } else {
-        Ok(format!("dirty-{}", dirty_content_hash(root)?))
+        Ok(format!("dirty-{image_content_hash}"))
     }
 }
 
@@ -384,12 +368,25 @@ fn git_capture(root: &Path, args: &[&str]) -> Result<String, String> {
     }
 }
 
-fn dirty_content_hash(root: &Path) -> Result<String, String> {
-    source_content_hash(root)
-}
-
-fn source_content_hash(root: &Path) -> Result<String, String> {
-    content_hash_for_inputs(root, IMAGE_SOURCE_INPUTS)
+fn node_image_content_hash(
+    root: &Path,
+    node_bin: &Path,
+    base_hash: &str,
+) -> Result<String, String> {
+    let mut files = Vec::new();
+    for input in NODE_IMAGE_CONTENT_INPUTS {
+        let path = root.join(input);
+        collect_hash_inputs(root, &path, &mut files)?;
+    }
+    let node_bin = if node_bin.is_absolute() {
+        node_bin.to_path_buf()
+    } else {
+        root.join(node_bin)
+    };
+    files.push(relative_path(root, &node_bin)?);
+    files.sort();
+    files.dedup();
+    hash_relative_files_with_salts(root, files, &[("base", base_hash)])
 }
 
 fn content_hash_for_inputs(root: &Path, inputs: &[&str]) -> Result<String, String> {
@@ -408,7 +405,21 @@ fn file_content_hash(root: &Path, path: &Path) -> Result<String, String> {
 }
 
 fn hash_relative_files(root: &Path, files: Vec<PathBuf>) -> Result<String, String> {
+    hash_relative_files_with_salts(root, files, &[])
+}
+
+fn hash_relative_files_with_salts(
+    root: &Path,
+    files: Vec<PathBuf>,
+    salts: &[(&str, &str)],
+) -> Result<String, String> {
     let mut hasher = blake3::Hasher::new();
+    for (key, value) in salts {
+        hasher.update(key.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
     for relative in files {
         let full = root.join(&relative);
         hasher.update(relative.to_string_lossy().as_bytes());
@@ -1348,7 +1359,7 @@ mod tests {
 
     #[test]
     fn prepare_node_image_with_dry_runner_returns_expected_image_and_progress() {
-        let root = workspace_root().expect("workspace root resolves");
+        let node_bin = std::env::current_exe().expect("test binary path resolves");
         let mut runner = DryImageCommandRunner::default();
         let mut progress = CollectProgress::default();
         let mut sink: Option<&mut dyn NodeImageProgressSink> = Some(&mut progress);
@@ -1357,7 +1368,7 @@ mod tests {
             NodeImageRequest {
                 requested_image: "docker.io/acme/mvp-node:latest".to_owned(),
                 base_image: "swactor-mvp-node-base:cuda12.6".to_owned(),
-                node_bin: root.join("target/debug/mvp-worker-node"),
+                node_bin,
                 provider: NodeImageProvider::Docker,
                 extra_tag: Some("smoke".to_owned()),
                 push: false,
@@ -1389,6 +1400,35 @@ mod tests {
             NodeImageProgressEventKind::CommandStdout { line }
                 if line == "build mvp node image stdout"
         )));
+    }
+
+    #[test]
+    fn node_image_content_hash_tracks_node_payload_not_unrelated_files() {
+        let root = workspace_root().expect("workspace root resolves");
+        let scratch = root
+            .join("target/node-image-hash-test")
+            .join(std::process::id().to_string());
+        fs::create_dir_all(&scratch).expect("scratch dir is writable");
+        let node_bin = scratch.join("mvp-worker-node");
+        fs::write(&node_bin, b"worker binary v1").expect("node bin fixture is writable");
+
+        let initial =
+            node_image_content_hash(&root, &node_bin, "base-v1").expect("initial hash succeeds");
+        fs::write(scratch.join("unrelated.txt"), b"not part of the image")
+            .expect("unrelated fixture is writable");
+        let after_unrelated =
+            node_image_content_hash(&root, &node_bin, "base-v1").expect("unrelated hash succeeds");
+        fs::write(&node_bin, b"worker binary v2").expect("node bin fixture update is writable");
+        let after_node_bin =
+            node_image_content_hash(&root, &node_bin, "base-v1").expect("node bin hash succeeds");
+        let after_base =
+            node_image_content_hash(&root, &node_bin, "base-v2").expect("base hash succeeds");
+
+        let _ = fs::remove_dir_all(&scratch);
+
+        assert_eq!(initial, after_unrelated);
+        assert_ne!(initial, after_node_bin);
+        assert_ne!(after_node_bin, after_base);
     }
 
     #[test]
