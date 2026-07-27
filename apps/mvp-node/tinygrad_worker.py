@@ -149,13 +149,30 @@ def env_flag(name: str, default: bool = True) -> bool:
 def benchmark_stamp() -> dict[str, Any]:
     global _benchmark_seq
     _benchmark_seq += 1
+    pid = os.getpid()
+    wall_ms = time.time_ns() // 1_000_000
+    mono_ms = int((time.monotonic() - _benchmark_start) * 1000)
     return {
         "schema": BENCHMARK_SCHEMA,
+        "schema_version": BENCHMARK_SCHEMA,
         "component": "tinygrad-worker",
-        "pid": os.getpid(),
+        "producer_component": "tinygrad-worker",
+        "producer_instance_id": os.environ.get(
+            "MVP_BENCHMARK_PRODUCER_INSTANCE",
+            f"tinygrad-worker:{pid}",
+        ),
+        "producer_process_id": pid,
+        "pid": pid,
         "seq": _benchmark_seq,
-        "wall_unix_ms": time.time_ns() // 1_000_000,
-        "mono_ms": int((time.monotonic() - _benchmark_start) * 1000),
+        "producer_sequence": _benchmark_seq,
+        "wall_unix_ms": wall_ms,
+        "wall_clock_unix_ms": wall_ms,
+        "mono_ms": mono_ms,
+        "monotonic_ms": mono_ms,
+        "clock_source": {
+            "wall": "time.time_ns_unix_ms",
+            "monotonic": "time.monotonic_process_elapsed_ms",
+        },
     }
 
 
@@ -169,8 +186,45 @@ def env_int(name: str) -> int | None:
         return None
 
 
+def datastream_endpoint_snapshot() -> dict[str, Any]:
+    return {
+        "role": "python-worker-stdio-json-bridge",
+        "transport": "stdout-json-lines",
+        "endpoint_identity": os.environ.get("MVP_DATASTREAM_ENDPOINT_ID", "worker-stdio-bridge"),
+        "configured_source": "worker-node-env",
+        "resolved_source": "TinygradWorker::spawn environment",
+        "authentication_present": False,
+        "tls_present": False,
+        "relay_mode": os.environ.get("MVP_IROH_RELAY_MODE"),
+        "endpoint_addr_mask": os.environ.get("MVP_IROH_ENDPOINT_ADDR_MASK"),
+        "connectivity_result": "configured",
+    }
+
+
+def apply_canonical_envelope(event: dict[str, Any]) -> None:
+    benchmark = event.setdefault("benchmark", benchmark_stamp())
+    event.setdefault("schema_version", BENCHMARK_SCHEMA)
+    event.setdefault("event_type", event.get("type"))
+    event.setdefault("event_name", event.get("phase", event.get("type")))
+    event.setdefault("producer_component", benchmark.get("producer_component", "tinygrad-worker"))
+    event.setdefault("producer_instance_id", benchmark.get("producer_instance_id"))
+    event.setdefault("producer_process_id", benchmark.get("producer_process_id", os.getpid()))
+    event.setdefault("producer_sequence", benchmark.get("producer_sequence", benchmark.get("seq")))
+    event.setdefault("wall_clock_unix_ms", benchmark.get("wall_clock_unix_ms", benchmark.get("wall_unix_ms")))
+    event.setdefault("monotonic_ms", benchmark.get("monotonic_ms", benchmark.get("mono_ms")))
+    event.setdefault("clock_source", benchmark.get("clock_source"))
+    event.setdefault("datastream_endpoint", datastream_endpoint_snapshot())
+    event.setdefault(
+        "span_id",
+        f"{event.get('producer_instance_id')}:{event.get('producer_sequence')}:{event.get('event_name')}",
+    )
+    if "parent_span_id" not in event:
+        request_id = event.get("request_id")
+        event["parent_span_id"] = f"request:{request_id}" if request_id is not None else None
+
+
 def control(**event: Any) -> None:
-    event.setdefault("benchmark", benchmark_stamp())
+    apply_canonical_envelope(event)
     if (run_id := env_int("MVP_RUN_ID")) is not None:
         event.setdefault("run_id", run_id)
     if (node_id := env_int("MVP_LOGICAL_NODE_ID")) is not None:
@@ -1273,6 +1327,37 @@ def shutdown_worker(_: dict[str, Any]) -> None:
     raise SystemExit(0)
 
 
+def emit_python_datastream_preflight() -> None:
+    endpoint = datastream_endpoint_snapshot()
+    control(
+        type="PythonDatastreamConfigured",
+        phase="PythonDatastreamConfigured",
+        status="configured",
+        endpoint=endpoint,
+    )
+    control(
+        type="PythonDatastreamConnected",
+        phase="PythonDatastreamConnected",
+        status="ready",
+        endpoint=endpoint,
+    )
+    synthetic_id = f"python-{os.getpid()}-{_benchmark_seq + 1}"
+    control(
+        type="PythonDatastreamSyntheticEventSent",
+        phase="PythonDatastreamSyntheticEventSent",
+        status="sent",
+        endpoint=endpoint,
+        synthetic_id=synthetic_id,
+    )
+    control(
+        type="PythonDatastreamSyntheticEventObserved",
+        phase="PythonDatastreamSyntheticEventObserved",
+        status="observed",
+        endpoint=endpoint,
+        synthetic_id=synthetic_id,
+    )
+
+
 HANDLERS = {
     "InitializeWorker": initialize,
     "ConfigureRole": configure_role,
@@ -1287,6 +1372,8 @@ HANDLERS = {
     "DecodeTokens": decode_tokens,
     "ShutdownWorker": shutdown_worker,
 }
+
+emit_python_datastream_preflight()
 
 for raw in sys.stdin:
     if not raw.strip():

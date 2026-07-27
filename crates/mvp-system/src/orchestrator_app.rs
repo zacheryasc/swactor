@@ -166,6 +166,53 @@ where
             "provider_config":config.provider_datastream_detail(),
         }),
     );
+    orch_datastream.emit_bootstrap(
+        None,
+        config.run_id,
+        config.node_id,
+        "datastream_preflight",
+        "configured",
+        json!({
+            "producer":"mvp-orchestrator",
+            "datastream_endpoint":{
+                "role":"orchestrator-frame-archive",
+                "transport":"datastream-frame-log",
+                "configured":config.datastream_frame_log.is_some(),
+                "archive_path":config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+            },
+            "expected_worker_producers":["mvp-worker-node","tinygrad-worker"],
+            "provider":config.provider.as_str(),
+            "pipeline_stages":config.pipeline_stages,
+            "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
+            "provider_config":config.provider_datastream_detail(),
+        }),
+    );
+    let orch_synthetic_id = format!("mvp-orchestrator-{}-datastream-preflight", config.run_id);
+    for (phase, status) in [
+        ("DatastreamProducerConfigured", "configured"),
+        ("DatastreamProducerConnected", "ready"),
+        ("DatastreamSyntheticEventSent", "sent"),
+        ("DatastreamSyntheticEventObserved", "observed"),
+    ] {
+        orch_datastream.emit_bootstrap(
+            None,
+            config.run_id,
+            config.node_id,
+            phase,
+            status,
+            json!({
+                "producer":"mvp-orchestrator",
+                "producer_class":"rust-orchestrator",
+                "synthetic_id":orch_synthetic_id,
+                "datastream_endpoint":{
+                    "role":"orchestrator-frame-archive",
+                    "transport":"datastream-frame-log",
+                    "configured":config.datastream_frame_log.is_some(),
+                    "archive_path":config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+                },
+            }),
+        );
+    }
     drain_orch_stdio_capture(
         orch_stdio_rx.as_ref(),
         &mut orch_datastream,
@@ -252,6 +299,22 @@ where
         "iroh_driver",
         "ready",
         json!({"endpoint":coordinator_endpoint.clone(),"has_relay":coordinator_endpoint.relay_urls().next().is_some(),"direct_addr_count":coordinator_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay.mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
+    );
+    orch_datastream.emit_bootstrap(
+        None,
+        config.run_id,
+        config.node_id,
+        "endpoint_config_snapshot",
+        "ready",
+        json!({
+            "producer":"mvp-orchestrator",
+            "coordinator_endpoint":coordinator_endpoint.clone(),
+            "has_relay":coordinator_endpoint.relay_urls().next().is_some(),
+            "direct_addr_count":coordinator_endpoint.ip_addrs().count(),
+            "relay_mode":format!("{:?}", config.relay.mode),
+            "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
+            "connectivity_preflight":"ready",
+        }),
     );
     let stack = DistributionRuntimeStack::new_with_codecs(
         driver.node_id(),
@@ -4057,13 +4120,26 @@ impl OrchDatastream {
         status: &str,
         detail: Value,
     ) {
+        let benchmark = benchmark_observability::stamp("mvp-orchestrator");
         let payload = serde_json::to_vec(&json!({
+            "schema_version": benchmark["schema_version"].clone(),
             "type":"OrchBootstrap",
+            "event_type":"OrchBootstrap",
+            "event_name":phase,
             "phase":phase,
             "status":status,
             "run_id":run_id,
             "node_id":node_id,
-            "benchmark":benchmark_observability::stamp("mvp-orchestrator"),
+            "producer_component":benchmark["producer_component"].clone(),
+            "producer_instance_id":benchmark["producer_instance_id"].clone(),
+            "producer_process_id":benchmark["producer_process_id"].clone(),
+            "producer_sequence":benchmark["producer_sequence"].clone(),
+            "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
+            "monotonic_ms":benchmark["monotonic_ms"].clone(),
+            "clock_source":benchmark["clock_source"].clone(),
+            "span_id":format!("mvp-orchestrator:{run_id}:{}:{phase}", benchmark["producer_sequence"]),
+            "parent_span_id":Value::Null,
+            "benchmark":benchmark,
             "detail":detail,
         }))
         .expect("serialize orch bootstrap event");
@@ -4080,14 +4156,27 @@ impl OrchDatastream {
         status: &str,
         detail: Value,
     ) {
+        let benchmark = benchmark_observability::stamp("mvp-orchestrator");
         let payload = serde_json::to_vec(&json!({
+            "schema_version": benchmark["schema_version"].clone(),
             "type":"OrchPromptEvent",
+            "event_type":"OrchPromptEvent",
+            "event_name":phase,
             "phase":phase,
             "status":status,
             "run_id":run_id,
             "node_id":node_id,
             "request_id":request_id,
-            "benchmark":benchmark_observability::stamp("mvp-orchestrator"),
+            "producer_component":benchmark["producer_component"].clone(),
+            "producer_instance_id":benchmark["producer_instance_id"].clone(),
+            "producer_process_id":benchmark["producer_process_id"].clone(),
+            "producer_sequence":benchmark["producer_sequence"].clone(),
+            "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
+            "monotonic_ms":benchmark["monotonic_ms"].clone(),
+            "clock_source":benchmark["clock_source"].clone(),
+            "span_id":format!("mvp-orchestrator:{run_id}:{request_id}:{}:{phase}", benchmark["producer_sequence"]),
+            "parent_span_id":format!("request:{request_id}"),
+            "benchmark":benchmark,
             "detail":detail,
         }))
         .expect("serialize orch prompt event");

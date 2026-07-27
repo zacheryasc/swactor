@@ -21,12 +21,25 @@ pub fn stamp(component: &'static str) -> Value {
     let start = BENCHMARK_START.get_or_init(Instant::now);
     let mono_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
     let seq = BENCHMARK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let wall_ms = unix_ms_now();
     json!({
         "schema": BENCHMARK_SCHEMA,
+        "schema_version": BENCHMARK_SCHEMA,
         "component": component,
-        "pid": std::process::id(),
+        "producer_component": component,
+        "producer_instance_id": format!("{component}:{pid}"),
+        "producer_process_id": pid,
+        "pid": pid,
         "seq": seq,
-        "wall_unix_ms": unix_ms_now(),
+        "producer_sequence": seq,
+        "wall_unix_ms": wall_ms,
+        "wall_clock_unix_ms": wall_ms,
         "mono_ms": mono_ms,
+        "monotonic_ms": mono_ms,
+        "clock_source": {
+            "wall": "system_unix_ms",
+            "monotonic": "process_elapsed_ms"
+        },
     })
 }
