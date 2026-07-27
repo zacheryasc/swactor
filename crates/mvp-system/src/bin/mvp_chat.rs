@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
@@ -47,7 +49,7 @@ OPTIONS:
   --process | --docker | --vastai
                                 Select the runtime provider
   --config <path>               Load config overlay
-  --pipeline-stages <count>     Number of pipeline stages
+  --pipeline-stages|--pipeline-parallel <count>
   --relay-mode <mode>           Relay mode: default or disabled
   --relay-url <url>             Custom relay URL passed to mvp-orchestrator
   --endpoint-addr-mask <mask>   Endpoint address mask: full or relay-only
@@ -154,6 +156,7 @@ where
         }),
     );
     progress.emit_benchmark_envelope(&config);
+    progress.emit_endpoint_config_snapshot(&config);
     confirm_vastai_if_needed(&config)?;
     let prepare_runtime_started = Instant::now();
     progress.emit(
@@ -411,12 +414,25 @@ impl ChatDatastream {
 
     fn emit(&mut self, channel: &str, phase: &str, status: &str, detail: Value) {
         let id = self.channel_by_name(channel);
+        let benchmark = benchmark_observability::stamp("mvp-chat");
         let payload = serde_json::to_vec(&json!({
+            "schema_version": benchmark["schema_version"].clone(),
             "type": "ChatProgress",
+            "event_type": "ChatProgress",
+            "event_name": phase,
             "phase": phase,
             "status": status,
             "run_id": self.run_id,
-            "benchmark": benchmark_observability::stamp("mvp-chat"),
+            "producer_component": benchmark["producer_component"].clone(),
+            "producer_instance_id": benchmark["producer_instance_id"].clone(),
+            "producer_process_id": benchmark["producer_process_id"].clone(),
+            "producer_sequence": benchmark["producer_sequence"].clone(),
+            "wall_clock_unix_ms": benchmark["wall_clock_unix_ms"].clone(),
+            "monotonic_ms": benchmark["monotonic_ms"].clone(),
+            "clock_source": benchmark["clock_source"].clone(),
+            "span_id": format!("mvp-chat:{}:{}:{phase}", self.run_id, benchmark["producer_sequence"]),
+            "parent_span_id": Value::Null,
+            "benchmark": benchmark,
             "detail": detail,
         }))
         .expect("serialize mvp-chat progress event");
@@ -426,12 +442,25 @@ impl ChatDatastream {
 
     fn emit_benchmark_envelope(&mut self, config: &Config) {
         let id = self.channel_by_name(CHAT_BENCHMARK_CHANNEL);
+        let benchmark = benchmark_observability::stamp("mvp-chat");
         let payload = serde_json::to_vec(&json!({
+            "schema_version": benchmark["schema_version"].clone(),
             "type": "BenchmarkRunEnvelope",
+            "event_type": "BenchmarkRunEnvelope",
+            "event_name": "run_envelope",
             "phase": "run_envelope",
             "status": "ready",
             "run_id": self.run_id,
-            "benchmark": benchmark_observability::stamp("mvp-chat"),
+            "producer_component": benchmark["producer_component"].clone(),
+            "producer_instance_id": benchmark["producer_instance_id"].clone(),
+            "producer_process_id": benchmark["producer_process_id"].clone(),
+            "producer_sequence": benchmark["producer_sequence"].clone(),
+            "wall_clock_unix_ms": benchmark["wall_clock_unix_ms"].clone(),
+            "monotonic_ms": benchmark["monotonic_ms"].clone(),
+            "clock_source": benchmark["clock_source"].clone(),
+            "span_id": format!("mvp-chat:{}:{}:run_envelope", self.run_id, benchmark["producer_sequence"]),
+            "parent_span_id": Value::Null,
+            "benchmark": benchmark,
             "detail": {
                 "scenario": "mvp-chat",
                 "detail_level": "benchmark_observability_v1",
@@ -485,6 +514,56 @@ impl ChatDatastream {
         .expect("serialize mvp-chat benchmark envelope");
         self.producer.submit_bytes(id, payload);
         self.flush();
+    }
+
+    fn emit_endpoint_config_snapshot(&mut self, config: &Config) {
+        let endpoint = json!({
+            "role": "chat-frame-archive",
+            "transport": "datastream-frame-log",
+            "configured": config.datastream_frame_log.is_some(),
+            "archive_path": config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+        });
+        let runtime_endpoint = json!({
+            "provider": config.provider.as_str(),
+            "relay_mode": config.relay_mode.as_deref(),
+            "relay_configured": config.relay_url.is_some(),
+            "endpoint_addr_mask": config.endpoint_addr_mask.as_str(),
+        });
+        let synthetic_id = format!("mvp-chat-{}-datastream-preflight", self.run_id);
+        for (phase, status) in [
+            ("DatastreamProducerConfigured", "configured"),
+            ("DatastreamProducerConnected", "ready"),
+            ("DatastreamSyntheticEventSent", "sent"),
+            ("DatastreamSyntheticEventObserved", "observed"),
+        ] {
+            self.emit(
+                CHAT_BENCHMARK_CHANNEL,
+                phase,
+                status,
+                json!({
+                    "producer": "mvp-chat",
+                    "producer_class": "rust-chat",
+                    "synthetic_id": synthetic_id,
+                    "datastream_endpoint": endpoint,
+                    "runtime_endpoint": runtime_endpoint,
+                }),
+            );
+        }
+        self.emit(
+            CHAT_BENCHMARK_CHANNEL,
+            "endpoint_config_snapshot",
+            "ready",
+            json!({
+                "producer": "mvp-chat",
+                "expected_producers": ["mvp-chat", "mvp-orchestrator", "mvp-worker-node", "tinygrad-worker"],
+                "datastream_endpoint": endpoint,
+                "runtime_endpoint": runtime_endpoint,
+                "connectivity_preflight": {
+                    "status": "configured",
+                    "canonical_datastream_required": true,
+                },
+            }),
+        );
     }
 
     fn flush(&mut self) {
@@ -1034,7 +1113,10 @@ impl ParsedArgs {
                 "--config" => {
                     parsed.config_path = Some(PathBuf::from(next_arg(&mut args, "--config")?))
                 }
-                "--pipeline-stages" => {
+                "--pipeline-stages" | "--pipeline-parallel" => {
+                    if parsed.pipeline_stages.is_some() {
+                        return Err("pipeline stage count was provided more than once".to_owned());
+                    }
                     parsed.pipeline_stages =
                         Some(parse_pipeline_stages_value(&mut args, arg.as_str())?)
                 }
@@ -2583,6 +2665,11 @@ mod tests {
         assert!(help.help);
         let short_help = ParsedArgs::parse(strings(&["-h"])).expect("short help parses");
         assert!(short_help.help);
+
+        let alias = ParsedArgs::parse(strings(&["--vastai", "--pipeline-parallel", "4"]))
+            .expect("pipeline-parallel alias parses");
+        assert_eq!(alias.provider, Some(ProviderKind::VastAi));
+        assert_eq!(alias.pipeline_stages, Some(4));
     }
 
     #[test]

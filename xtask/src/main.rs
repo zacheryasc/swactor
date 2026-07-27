@@ -42,6 +42,8 @@ struct MvpChatCheckPaths {
     prompts: PathBuf,
     redacted_config: PathBuf,
     summary: PathBuf,
+    benchmark_evidence: PathBuf,
+    benchmark_gaps: PathBuf,
 }
 
 struct MvpChatCheckOutput {
@@ -86,20 +88,20 @@ impl MvpChatCheckInvocation {
             }
 
             match arg.as_str() {
-                "--pipeline-stages" => {
+                "--pipeline-stages" | "--pipeline-parallel" => {
                     if pipeline_stages.is_some() {
                         return Err(
-                            "mvp-chat-check accepts at most one --pipeline-stages value".to_owned()
+                            "mvp-chat-check accepts at most one pipeline stage count".to_owned()
                         );
                     }
                     let value = args
                         .next()
-                        .ok_or_else(|| "--pipeline-stages requires a value".to_owned())?;
+                        .ok_or_else(|| format!("{arg} requires a value"))?;
                     let stages = value
                         .parse::<u32>()
-                        .map_err(|error| format!("parse --pipeline-stages: {error}"))?;
+                        .map_err(|error| format!("parse {arg}: {error}"))?;
                     if stages == 0 {
-                        return Err("--pipeline-stages must be greater than 0".to_owned());
+                        return Err(format!("{arg} must be greater than 0"));
                     }
                     pipeline_stages = Some(stages);
                 }
@@ -262,8 +264,8 @@ fn print_usage() {
 USAGE: cargo xtask <command>
 
 COMMANDS:
-  mvp-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
-  mvp-chat-check [--gpu|--multinode|--multinode-docker|--vastai] [--pipeline-stages n]
+  mvp-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n|--pipeline-parallel n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
+  mvp-chat-check [--gpu|--multinode|--multinode-docker|--vastai] [--pipeline-stages n|--pipeline-parallel n]
                      Run real cargo mvp-chat acceptance check and write benchmark artifacts.
   mvp-chat-compare <baseline-summary.json> <candidate-summary.json>
                      Compare two benchmark summaries and report comparable deltas.
@@ -640,13 +642,50 @@ fn append_synthetic_benchmark_frame(
 }
 
 fn xtask_mvp_chat_benchmark_event(run_id: u64, status: &str, detail: Value) -> Value {
+    let benchmark = xtask_benchmark_stamp();
     json!({
+        "schema_version": benchmark["schema_version"].clone(),
         "type": "XtaskBenchmark",
+        "event_type": "XtaskBenchmark",
+        "event_name": "cargo_run_mvp_chat",
         "phase": "cargo_run_mvp_chat",
         "status": status,
         "run_id": run_id,
+        "producer_component": benchmark["producer_component"].clone(),
+        "producer_instance_id": benchmark["producer_instance_id"].clone(),
+        "producer_process_id": benchmark["producer_process_id"].clone(),
+        "producer_sequence": benchmark["producer_sequence"].clone(),
+        "wall_clock_unix_ms": benchmark["wall_clock_unix_ms"].clone(),
+        "monotonic_ms": benchmark["monotonic_ms"].clone(),
+        "clock_source": benchmark["clock_source"].clone(),
+        "span_id": format!("xtask:{run_id}:{}:cargo_run_mvp_chat", benchmark["producer_sequence"]),
+        "parent_span_id": Value::Null,
         "detail": detail,
-        "benchmark": xtask_benchmark_stamp(),
+        "benchmark": benchmark,
+    })
+}
+
+fn xtask_benchmark_summary_event(run_id: u64, status: &str, detail: Value) -> Value {
+    let benchmark = xtask_benchmark_stamp();
+    json!({
+        "schema_version": benchmark["schema_version"].clone(),
+        "type": "BenchmarkSummaryGenerated",
+        "event_type": "BenchmarkSummaryGenerated",
+        "event_name": "summary_generation",
+        "phase": "summary_generation",
+        "status": status,
+        "run_id": run_id,
+        "producer_component": benchmark["producer_component"].clone(),
+        "producer_instance_id": benchmark["producer_instance_id"].clone(),
+        "producer_process_id": benchmark["producer_process_id"].clone(),
+        "producer_sequence": benchmark["producer_sequence"].clone(),
+        "wall_clock_unix_ms": benchmark["wall_clock_unix_ms"].clone(),
+        "monotonic_ms": benchmark["monotonic_ms"].clone(),
+        "clock_source": benchmark["clock_source"].clone(),
+        "span_id": format!("xtask:{run_id}:{}:summary_generation", benchmark["producer_sequence"]),
+        "parent_span_id": Value::Null,
+        "detail": detail,
+        "benchmark": benchmark,
     })
 }
 
@@ -657,13 +696,26 @@ static XTASK_BENCHMARK_SEQ: AtomicU64 = AtomicU64::new(1);
 fn xtask_benchmark_stamp() -> Value {
     let mono_ms = u64::try_from(XTASK_BENCHMARK_START.elapsed().as_millis()).unwrap_or(u64::MAX);
     let seq = XTASK_BENCHMARK_SEQ.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let wall_ms = unix_ms_now();
     json!({
         "schema": XTASK_BENCHMARK_SCHEMA,
+        "schema_version": XTASK_BENCHMARK_SCHEMA,
         "component": "xtask",
-        "pid": std::process::id(),
+        "producer_component": "xtask",
+        "producer_instance_id": format!("xtask:{pid}"),
+        "producer_process_id": pid,
+        "pid": pid,
         "seq": seq,
-        "wall_unix_ms": unix_ms_now(),
+        "producer_sequence": seq,
+        "wall_unix_ms": wall_ms,
+        "wall_clock_unix_ms": wall_ms,
         "mono_ms": mono_ms,
+        "monotonic_ms": mono_ms,
+        "clock_source": {
+            "wall": "system_unix_ms",
+            "monotonic": "process_elapsed_ms"
+        },
     })
 }
 
@@ -727,6 +779,8 @@ fn write_mvp_chat_check_paths(root: &Path) -> Result<MvpChatCheckPaths, String> 
         prompts: root.join("prompts.txt"),
         redacted_config: root.join("redacted-config.json"),
         summary: root.join("summary.json"),
+        benchmark_evidence: root.join("benchmark-evidence.json"),
+        benchmark_gaps: root.join("benchmark-gaps.md"),
     })
 }
 
@@ -804,7 +858,12 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
             );
         }
     };
-    let events = match assert_dump_log_facts(&paths.dump_log, scenario) {
+    let events = match assert_dump_log_facts(
+        &paths.dump_log,
+        scenario,
+        run_id,
+        invocation.pipeline_stages,
+    ) {
         Ok(events) => events,
         Err(error) => {
             return fail_mvp_chat_check(
@@ -828,12 +887,13 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
             );
         }
     };
-    let summary = match build_benchmark_summary(
+    let preliminary_summary = match build_benchmark_summary(
         &events,
         output.child_elapsed_ms,
         run_id,
         scenario,
         &paths,
+        invocation.pipeline_stages,
         u64::try_from(output.stdout.len()).unwrap_or(u64::MAX),
         u64::try_from(output.stderr.len()).unwrap_or(u64::MAX),
     ) {
@@ -848,7 +908,71 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
             );
         }
     };
-    if let Err(error) = write_benchmark_artifacts(&paths, run_id, scenario, &output, &summary) {
+    if let Err(error) = append_synthetic_benchmark_frame(
+        &paths.dump_log,
+        "xtask",
+        "mvp.xtask.benchmark",
+        xtask_benchmark_summary_event(
+            run_id,
+            "ready",
+            json!({
+                "summary_path": paths.summary.display().to_string(),
+                "benchmark_evidence_path": paths.benchmark_evidence.display().to_string(),
+                "benchmark_gaps_path": paths.benchmark_gaps.display().to_string(),
+                "validator": preliminary_summary.get("validator").cloned().unwrap_or(Value::Null),
+            }),
+        ),
+    ) {
+        return fail_mvp_chat_check(
+            &error,
+            &paths,
+            &output.stdout,
+            &output.stderr,
+            Some(&output.status),
+        );
+    }
+    let events = match parse_dump_log_events(&paths.dump_log) {
+        Ok(events) => events,
+        Err(error) => {
+            return fail_mvp_chat_check(
+                &error,
+                &paths,
+                &output.stdout,
+                &output.stderr,
+                Some(&output.status),
+            );
+        }
+    };
+    let summary = match build_benchmark_summary(
+        &events,
+        output.child_elapsed_ms,
+        run_id,
+        scenario,
+        &paths,
+        invocation.pipeline_stages,
+        u64::try_from(output.stdout.len()).unwrap_or(u64::MAX),
+        u64::try_from(output.stderr.len()).unwrap_or(u64::MAX),
+    ) {
+        Ok(summary) => summary,
+        Err(error) => {
+            return fail_mvp_chat_check(
+                &error,
+                &paths,
+                &output.stdout,
+                &output.stderr,
+                Some(&output.status),
+            );
+        }
+    };
+    if let Err(error) = write_benchmark_artifacts(
+        &paths,
+        run_id,
+        scenario,
+        &events,
+        invocation.pipeline_stages,
+        &output,
+        &summary,
+    ) {
         return fail_mvp_chat_check(
             &error,
             &paths,
@@ -1076,6 +1200,48 @@ fn write_failure_artifacts(
             paths.prompts.display()
         )
     })?;
+    let evidence = json!({
+        "schema": "swactor.mvp_chat_check.failure_evidence.v1",
+        "status": "failed",
+        "reason": reason,
+        "child_status": status.map(|status| status.to_string()),
+        "datastream": {
+            "path": paths.dump_log.display().to_string(),
+            "exists": paths.dump_log.is_file(),
+            "bytes": file_len(&paths.dump_log),
+        },
+        "stdout": {
+            "path": paths.stdout.display().to_string(),
+            "bytes": stdout.len(),
+        },
+        "stderr": {
+            "path": paths.stderr.display().to_string(),
+            "bytes": stderr.len(),
+        },
+        "side_channel_audit": {
+            "status": "captured_not_authoritative",
+            "stdout_datastream_substitute": false,
+            "stderr_datastream_substitute": false,
+        },
+    });
+    write_json_file(&paths.benchmark_evidence, &evidence)?;
+    fs::write(
+        &paths.benchmark_gaps,
+        format!(
+            "# Benchmark observability gaps\n\n- status: failed\n- reason: {reason}\n- datastream: {} (exists: {}, bytes: {})\n- stdout: {} bytes; side-channel only, not benchmark evidence\n- stderr: {} bytes; side-channel only, not benchmark evidence\n- remediation: fix the failed child run, then rerun so benchmark summary generation can validate canonical datastream evidence.\n",
+            paths.dump_log.display(),
+            paths.dump_log.is_file(),
+            file_len(&paths.dump_log).unwrap_or(0),
+            stdout.len(),
+            stderr.len(),
+        ),
+    )
+    .map_err(|e| {
+        format!(
+            "mvp-chat-check: write benchmark gaps artifact {}: {e}",
+            paths.benchmark_gaps.display()
+        )
+    })?;
     let summary = json!({
         "schema": "swactor.mvp_chat_check.failure.v1",
         "status": "failed",
@@ -1101,6 +1267,16 @@ fn write_failure_artifacts(
                 "path": paths.prompts.display().to_string(),
                 "bytes": MVP_CHAT_CHECK_PROMPTS.len(),
                 "blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
+            },
+            "benchmark_evidence": {
+                "path": paths.benchmark_evidence.display().to_string(),
+                "exists": paths.benchmark_evidence.is_file(),
+                "bytes": file_len(&paths.benchmark_evidence),
+            },
+            "benchmark_gaps": {
+                "path": paths.benchmark_gaps.display().to_string(),
+                "exists": paths.benchmark_gaps.is_file(),
+                "bytes": file_len(&paths.benchmark_gaps),
             },
         },
     });
@@ -1174,8 +1350,14 @@ fn find_stdout_marker(
 
 #[derive(Clone)]
 struct DumpLogEvent {
+    line_number: usize,
+    arrival_seq: Option<u64>,
     source: String,
+    stream: String,
     channel: String,
+    channel_id: Option<u64>,
+    position: Option<u64>,
+    payload_encoding: Option<String>,
     arrival_unix_ms: Option<u64>,
     event: Value,
 }
@@ -1186,6 +1368,185 @@ struct BenchmarkPoint {
     wall_unix_ms: Option<u64>,
     mono_ms: Option<u64>,
     arrival_unix_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+struct ValidatorFinding {
+    severity: &'static str,
+    code: &'static str,
+    message: String,
+    channel: Option<String>,
+    event_type: Option<String>,
+    phase: Option<String>,
+    status: Option<String>,
+    request_id: Option<u64>,
+    stage_index: Option<u64>,
+    json_pointer: Option<String>,
+}
+impl ValidatorFinding {
+    fn error(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new("observability_gap", code, message)
+    }
+
+    fn fatal(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new("fatal", code, message)
+    }
+
+    #[allow(dead_code)]
+    fn profiling_gap(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new("profiling_gap", code, message)
+    }
+
+    fn warning(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new("warning", code, message)
+    }
+
+    fn new(severity: &'static str, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity,
+            code,
+            message: message.into(),
+            channel: None,
+            event_type: None,
+            phase: None,
+            status: None,
+            request_id: None,
+            stage_index: None,
+            json_pointer: None,
+        }
+    }
+
+    fn at_event(mut self, record: &DumpLogEvent) -> Self {
+        self.channel = Some(record.channel.clone());
+        self.event_type = record
+            .event
+            .get("type")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.phase = record
+            .event
+            .get("phase")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.status = record
+            .event
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        self.request_id = benchmark_request_id(&record.event);
+        self.stage_index = record
+            .event
+            .get("stage_index")
+            .and_then(Value::as_u64)
+            .or_else(|| detail_u64(&record.event, "stage_index"));
+        self
+    }
+
+    fn pointer(mut self, pointer: &'static str) -> Self {
+        self.json_pointer = Some(pointer.to_owned());
+        self
+    }
+
+    fn to_json(&self) -> Value {
+        json!({
+            "severity": self.severity,
+            "code": self.code,
+            "message": self.message,
+            "channel": self.channel,
+            "event_type": self.event_type,
+            "phase": self.phase,
+            "status": self.status,
+            "request_id": self.request_id,
+            "stage_index": self.stage_index,
+            "json_pointer": self.json_pointer,
+            "check_id": self.code,
+            "expected_evidence": self.message,
+            "observed_evidence": {
+                "channel": self.channel,
+                "event_type": self.event_type,
+                "phase": self.phase,
+                "status": self.status,
+            },
+            "missing_or_extra_evidence": self.message,
+            "affected": {
+                "request_id": self.request_id,
+                "stage_index": self.stage_index,
+            },
+            "source_event_ids": [],
+            "remediation_hint": format!("emit or repair datastream evidence for {}", self.code),
+        })
+    }
+}
+
+#[derive(Default)]
+struct BenchmarkValidation {
+    expected_pipeline_stages: Option<u32>,
+    findings: Vec<ValidatorFinding>,
+    producers: BTreeSet<String>,
+    stages_ready: BTreeSet<u64>,
+    stages_with_worker: BTreeSet<u64>,
+    stages_with_device: BTreeSet<u64>,
+    edges_with_producer: BTreeSet<u64>,
+    edges_with_consumer: BTreeSet<u64>,
+    requests_started: BTreeSet<u64>,
+    requests_completed: BTreeSet<u64>,
+    run_envelope_present: bool,
+    endpoint_snapshot_present: bool,
+    python_datastream_connected: bool,
+}
+
+impl BenchmarkValidation {
+    fn push(&mut self, finding: ValidatorFinding) {
+        self.findings.push(finding);
+    }
+
+    fn error_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.severity != "warning")
+            .count()
+    }
+
+    fn warning_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| finding.severity == "warning")
+            .count()
+    }
+
+    fn invalid_findings(&self) -> impl Iterator<Item = &ValidatorFinding> {
+        self.findings
+            .iter()
+            .filter(|finding| finding.severity != "warning")
+    }
+
+    fn status(&self) -> &'static str {
+        if self.error_count() == 0 {
+            "valid"
+        } else {
+            "invalid"
+        }
+    }
+
+    fn findings_json(&self) -> Vec<Value> {
+        self.findings
+            .iter()
+            .map(ValidatorFinding::to_json)
+            .collect()
+    }
+
+    fn summary_json(&self) -> Value {
+        json!({
+            "status": self.status(),
+            "error_count": self.error_count(),
+            "warning_count": self.warning_count(),
+            "producer_classes": self.producers.iter().cloned().collect::<Vec<_>>(),
+            "python_datastream_connected": self.python_datastream_connected,
+            "expected_pipeline_stages": self.expected_pipeline_stages,
+            "severity_policy": ["fatal", "benchmark_failure", "observability_gap", "profiling_gap", "warning"],
+            "findings": self.findings_json(),
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -1509,12 +1870,26 @@ fn parse_dump_log_events(path: &Path) -> Result<Vec<DumpLogEvent>, String> {
             )
         })?;
         events.push(DumpLogEvent {
+            line_number: line_index + 1,
+            arrival_seq: outer.get("arrival_seq").and_then(Value::as_u64),
             source: outer
                 .get("source")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_owned(),
+            stream: outer
+                .get("stream")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             channel,
+            channel_id: outer.get("channel_id").and_then(Value::as_u64),
+            position: outer.get("position").and_then(Value::as_u64),
+            payload_encoding: payload
+                .get("encoding")
+                .and_then(Value::as_str)
+                .or_else(|| payload.as_str().map(|_| "utf8"))
+                .map(str::to_owned),
             arrival_unix_ms: outer.get("arrival_unix_ms").and_then(Value::as_u64),
             event,
         });
@@ -1544,9 +1919,595 @@ fn dump_log_inner_payload_text<'a>(
         })
 }
 
+fn validate_benchmark_observability(
+    events: &[DumpLogEvent],
+    run_id: u64,
+    scenario: MvpChatCheckScenario,
+    expected_pipeline_stages: Option<u32>,
+) -> BenchmarkValidation {
+    let mut validation = BenchmarkValidation {
+        expected_pipeline_stages: expected_pipeline_stages
+            .or_else(|| scenario.default_pipeline_stages()),
+        ..BenchmarkValidation::default()
+    };
+    let mut provider_stages = BTreeSet::new();
+    let mut endpoint_mask = None::<String>;
+    let mut relay_only_direct_addr_events = Vec::new();
+    let mut relay_only_missing_relay_events = Vec::new();
+    let mut producer_sequences = BTreeMap::<String, u64>::new();
+
+    for record in events {
+        if record.arrival_seq.is_none() {
+            validation.push(
+                ValidatorFinding::error(
+                    "canonical.outer.arrival_seq.missing",
+                    format!(
+                        "dump log line {} is missing arrival_seq",
+                        record.line_number
+                    ),
+                )
+                .at_event(record)
+                .pointer("/arrival_seq"),
+            );
+        }
+        if record.stream.is_empty() {
+            validation.push(
+                ValidatorFinding::error(
+                    "canonical.outer.stream.missing",
+                    format!("dump log line {} is missing stream", record.line_number),
+                )
+                .at_event(record)
+                .pointer("/stream"),
+            );
+        }
+        if record.channel_id.is_none() {
+            validation.push(
+                ValidatorFinding::error(
+                    "canonical.outer.channel_id.missing",
+                    format!("dump log line {} is missing channel_id", record.line_number),
+                )
+                .at_event(record)
+                .pointer("/channel_id"),
+            );
+        }
+        if record.position.is_none() {
+            validation.push(
+                ValidatorFinding::error(
+                    "canonical.outer.position.missing",
+                    format!("dump log line {} is missing position", record.line_number),
+                )
+                .at_event(record)
+                .pointer("/position"),
+            );
+        }
+        if record.payload_encoding.as_deref() != Some("utf8") {
+            validation.push(
+                ValidatorFinding::error(
+                    "canonical.outer.payload_encoding.invalid",
+                    format!(
+                        "dump log line {} does not carry a utf8 JSON payload",
+                        record.line_number
+                    ),
+                )
+                .at_event(record)
+                .pointer("/payload/encoding"),
+            );
+        }
+
+        if let Some(event_run_id) = record.event.get("run_id").and_then(Value::as_u64)
+            && event_run_id != run_id
+        {
+            validation.push(
+                ValidatorFinding::fatal(
+                    "run_id.isolation.mismatch",
+                    format!("event run_id {event_run_id} does not match benchmark run_id {run_id}"),
+                )
+                .at_event(record)
+                .pointer("/run_id"),
+            );
+            continue;
+        }
+        if !event_matches_run_id(&record.event, run_id) {
+            continue;
+        }
+
+        let event_type = record.event.get("type").and_then(Value::as_str);
+        let phase = record.event.get("phase").and_then(Value::as_str);
+        let status = record.event.get("status").and_then(Value::as_str);
+
+        if canonical_benchmark_required(record) {
+            validate_event_canonical_stamp(record, &mut validation);
+        } else if record.channel.starts_with("mvp.") && event_type.is_some() {
+            validation.push(
+                ValidatorFinding::warning(
+                    "canonical.benchmark_stamp.not_required",
+                    "typed mvp datastream event was not part of the strict benchmark validator set",
+                )
+                .at_event(record),
+            );
+        }
+
+        if let Some(component) = record
+            .event
+            .get("benchmark")
+            .and_then(|benchmark| benchmark.get("producer_component"))
+            .or_else(|| {
+                record
+                    .event
+                    .get("benchmark")
+                    .and_then(|benchmark| benchmark.get("component"))
+            })
+            .and_then(Value::as_str)
+        {
+            validation.producers.insert(component.to_owned());
+        }
+        if let (Some(instance), Some(sequence)) = (
+            record
+                .event
+                .get("producer_instance_id")
+                .and_then(Value::as_str),
+            record
+                .event
+                .get("producer_sequence")
+                .and_then(Value::as_u64),
+        ) {
+            if producer_sequences
+                .insert(instance.to_owned(), sequence)
+                .is_some_and(|previous| sequence <= previous)
+            {
+                validation.push(
+                    ValidatorFinding::fatal(
+                        "producer_sequence.non_monotonic",
+                        format!("producer {instance} emitted non-monotonic sequence {sequence}"),
+                    )
+                    .at_event(record)
+                    .pointer("/producer_sequence"),
+                );
+            }
+        }
+
+        match (record.channel.as_str(), event_type, phase, status) {
+            (
+                "mvp.chat.benchmark",
+                Some("BenchmarkRunEnvelope"),
+                Some("run_envelope"),
+                Some("ready"),
+            ) => {
+                validation.run_envelope_present = true;
+                endpoint_mask = record
+                    .event
+                    .get("detail")
+                    .and_then(|detail| detail.get("runtime"))
+                    .and_then(|runtime| runtime.get("endpoint_addr_mask"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            (_, _, Some("endpoint_config_snapshot" | "datastream_preflight"), _) => {
+                validation.endpoint_snapshot_present = true;
+            }
+            (
+                "mvp.worker.initialize",
+                Some("PythonDatastreamConnected"),
+                Some("PythonDatastreamConnected"),
+                Some("ready"),
+            ) => {
+                validation.python_datastream_connected = true;
+            }
+            (_, Some("OrchBootstrap"), Some("provider_start"), Some("started")) => {
+                if detail_str(&record.event, "provider") == Some("vastai")
+                    && let Some(stage_index) = detail_u64(&record.event, "stage_index")
+                {
+                    provider_stages.insert(stage_index);
+                }
+            }
+            (_, Some("NodeEvent"), Some("iroh_driver"), Some("ready")) => {
+                if let Some(stage_index) = event_stage_index(&record.event) {
+                    validation.stages_ready.insert(stage_index);
+                }
+                if detail_str(&record.event, "endpoint_addr_mask") == Some("relay-only") {
+                    if detail_u64(&record.event, "direct_addr_count").unwrap_or(u64::MAX) != 0 {
+                        relay_only_direct_addr_events.push(record.line_number);
+                    }
+                    if record
+                        .event
+                        .get("detail")
+                        .and_then(|detail| detail.get("has_relay"))
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                    {
+                        relay_only_missing_relay_events.push(record.line_number);
+                    }
+                }
+            }
+            (_, Some("NodeEvent"), Some("worker_initialize"), Some("ready")) => {
+                if let Some(stage_index) = event_stage_index(&record.event) {
+                    validation.stages_with_worker.insert(stage_index);
+                }
+            }
+            (_, Some("WorkerReady"), _, _) | (_, Some("TinygradDeviceProbeReady"), _, _) => {
+                if let Some(stage_index) = event_stage_index(&record.event) {
+                    validation.stages_with_device.insert(stage_index);
+                }
+            }
+            (_, Some("NodeEvent"), Some("egress_ring_read" | "iroh_edge_bytes_sent"), _) => {
+                if let Some(edge_id) = event_edge_id(&record.event) {
+                    validation.edges_with_producer.insert(edge_id);
+                }
+            }
+            (_, Some("RingInstalled"), _, _) => {
+                if let Some(edge_id) = event_edge_id(&record.event) {
+                    match record.event.get("direction").and_then(Value::as_str) {
+                        Some("egress") => {
+                            validation.edges_with_producer.insert(edge_id);
+                        }
+                        Some("ingress") => {
+                            validation.edges_with_consumer.insert(edge_id);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            (_, Some("ObjectLoaded"), _, _) => {
+                if let Some(edge_id) = event_edge_id(&record.event) {
+                    validation.edges_with_consumer.insert(edge_id);
+                }
+            }
+            (_, Some("NodeEvent"), Some("ingress_ring_write" | "object_loaded"), _) => {
+                if let Some(edge_id) = event_edge_id(&record.event) {
+                    validation.edges_with_consumer.insert(edge_id);
+                }
+            }
+            ("mvp.chat.prompt", Some("ChatProgress"), Some("prompt_submitted"), Some("ready")) => {
+                if let Some(request_id) = benchmark_request_id(&record.event) {
+                    validation.requests_started.insert(request_id);
+                }
+            }
+            ("mvp.chat.prompt", Some("ChatProgress"), Some("request_completed"), Some("ready")) => {
+                if let Some(request_id) = benchmark_request_id(&record.event) {
+                    validation.requests_completed.insert(request_id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !validation.run_envelope_present {
+        validation.push(ValidatorFinding::error(
+            "run_envelope.missing",
+            "BenchmarkRunEnvelope ready event is required before a benchmark summary is valid",
+        ));
+    }
+    if !validation.endpoint_snapshot_present {
+        validation.push(ValidatorFinding::error(
+            "endpoint_config_snapshot.missing",
+            "endpoint/datastream configuration snapshot is required for benchmark attribution",
+        ));
+    }
+    for required in [
+        "mvp-chat",
+        "mvp-orchestrator",
+        "mvp-worker-node",
+        "tinygrad-worker",
+    ] {
+        if !validation.producers.contains(required) {
+            validation.push(ValidatorFinding::fatal(
+                "producer.connectivity.missing",
+                format!("required producer {required} did not emit canonical datastream evidence"),
+            ));
+        }
+    }
+    if !validation.python_datastream_connected {
+        validation.push(ValidatorFinding::error(
+            "python.datastream.connected.missing",
+            "Python worker did not emit PythonDatastreamConnected through the canonical datastream",
+        ));
+    }
+    for request_id in [1_u64, 2] {
+        if !validation.requests_completed.contains(&request_id) {
+            validation.push(ValidatorFinding {
+                request_id: Some(request_id),
+                ..ValidatorFinding::error(
+                    "request.terminal_event.missing",
+                    format!("request {request_id} is missing RequestCompleted evidence"),
+                )
+            });
+        }
+    }
+    for request_id in validation
+        .requests_started
+        .difference(&validation.requests_completed)
+        .copied()
+        .collect::<Vec<_>>()
+    {
+        validation.push(ValidatorFinding {
+            request_id: Some(request_id),
+            ..ValidatorFinding::error(
+                "request.started_without_terminal",
+                format!("request {request_id} started but has no terminal completion event"),
+            )
+        });
+    }
+
+    if scenario == MvpChatCheckScenario::VastAi {
+        if endpoint_mask.as_deref() != Some("relay-only") {
+            validation.push(ValidatorFinding::error(
+                "vastai.endpoint_mask.not_relay_only",
+                "VastAI benchmark checks must declare relay-only endpoint masking",
+            ));
+        }
+        for line_number in relay_only_direct_addr_events {
+            validation.push(ValidatorFinding::error(
+                "vastai.endpoint.direct_addrs_present",
+                format!("relay-only worker endpoint on dump log line {line_number} exposed direct addresses"),
+            ));
+        }
+        for line_number in relay_only_missing_relay_events {
+            validation.push(ValidatorFinding::error(
+                "vastai.endpoint.relay_missing",
+                format!(
+                    "relay-only worker endpoint on dump log line {line_number} had no relay URL"
+                ),
+            ));
+        }
+        if let Some(expected) = validation.expected_pipeline_stages {
+            for stage_index in 0..u64::from(expected) {
+                if !provider_stages.contains(&stage_index) {
+                    validation.push(ValidatorFinding {
+                        stage_index: Some(stage_index),
+                        ..ValidatorFinding::error(
+                            "vastai.stage.provider_start.missing",
+                            format!(
+                                "stage {stage_index} is missing VastAI provider_start evidence"
+                            ),
+                        )
+                    });
+                }
+                if !validation.stages_ready.contains(&stage_index) {
+                    validation.push(ValidatorFinding {
+                        stage_index: Some(stage_index),
+                        ..ValidatorFinding::error(
+                            "stage.iroh_ready.missing",
+                            format!(
+                                "stage {stage_index} is missing worker iroh_driver ready evidence"
+                            ),
+                        )
+                    });
+                }
+                if !validation.stages_with_worker.contains(&stage_index) {
+                    validation.push(ValidatorFinding {
+                        stage_index: Some(stage_index),
+                        ..ValidatorFinding::error(
+                            "stage.worker_initialize.missing",
+                            format!(
+                                "stage {stage_index} is missing worker_initialize ready evidence"
+                            ),
+                        )
+                    });
+                }
+                if !validation.stages_with_device.contains(&stage_index) {
+                    validation.push(ValidatorFinding {
+                        stage_index: Some(stage_index),
+                        ..ValidatorFinding::error(
+                            "stage.device_ready.missing",
+                            format!(
+                                "stage {stage_index} is missing Python device/WorkerReady evidence"
+                            ),
+                        )
+                    });
+                }
+            }
+            let expected_edges = expected.saturating_sub(1) as usize;
+            let complete_edges = validation
+                .edges_with_producer
+                .intersection(&validation.edges_with_consumer)
+                .count();
+            if complete_edges < expected_edges {
+                validation.push(ValidatorFinding::error(
+                    "pipeline.edge_handoff.incomplete",
+                    format!(
+                        "expected {expected_edges} complete inter-stage handoffs, observed {complete_edges}"
+                    ),
+                ));
+            }
+        }
+    }
+
+    validation
+}
+
+fn canonical_benchmark_required(record: &DumpLogEvent) -> bool {
+    let channel = record.channel.as_str();
+    channel.starts_with("mvp.chat.")
+        || channel.starts_with("mvp.orch.")
+        || channel.starts_with("mvp.worker.")
+        || channel.starts_with("mvp.node.")
+        || channel == "mvp.xtask.benchmark"
+}
+
+fn validate_event_canonical_stamp(record: &DumpLogEvent, validation: &mut BenchmarkValidation) {
+    for (key, pointer) in [
+        ("type", "/type"),
+        ("run_id", "/run_id"),
+        ("schema_version", "/schema_version"),
+        ("producer_component", "/producer_component"),
+        ("producer_instance_id", "/producer_instance_id"),
+        ("producer_process_id", "/producer_process_id"),
+        ("producer_sequence", "/producer_sequence"),
+        ("wall_clock_unix_ms", "/wall_clock_unix_ms"),
+        ("monotonic_ms", "/monotonic_ms"),
+        ("clock_source", "/clock_source"),
+        ("span_id", "/span_id"),
+    ] {
+        if record.event.get(key).is_none() {
+            validation.push(
+                ValidatorFinding::error(
+                    "canonical.event_field.missing",
+                    format!("canonical event field {key} is missing"),
+                )
+                .at_event(record)
+                .pointer(pointer),
+            );
+        }
+    }
+
+    let Some(benchmark) = record.event.get("benchmark") else {
+        validation.push(
+            ValidatorFinding::error(
+                "canonical.benchmark_stamp.missing",
+                "event is missing nested benchmark stamp",
+            )
+            .at_event(record)
+            .pointer("/benchmark"),
+        );
+        return;
+    };
+    for (key, pointer) in [
+        ("schema", "/benchmark/schema"),
+        ("schema_version", "/benchmark/schema_version"),
+        ("component", "/benchmark/component"),
+        ("producer_component", "/benchmark/producer_component"),
+        ("producer_instance_id", "/benchmark/producer_instance_id"),
+        ("producer_process_id", "/benchmark/producer_process_id"),
+        ("producer_sequence", "/benchmark/producer_sequence"),
+        ("wall_unix_ms", "/benchmark/wall_unix_ms"),
+        ("wall_clock_unix_ms", "/benchmark/wall_clock_unix_ms"),
+        ("mono_ms", "/benchmark/mono_ms"),
+        ("monotonic_ms", "/benchmark/monotonic_ms"),
+        ("clock_source", "/benchmark/clock_source"),
+    ] {
+        if benchmark.get(key).is_none() {
+            validation.push(
+                ValidatorFinding::error(
+                    "canonical.benchmark_stamp_field.missing",
+                    format!("benchmark stamp field {key} is missing"),
+                )
+                .at_event(record)
+                .pointer(pointer),
+            );
+        }
+    }
+}
+
+fn event_stage_index(event: &Value) -> Option<u64> {
+    event
+        .get("stage_index")
+        .and_then(Value::as_u64)
+        .or_else(|| detail_u64(event, "stage_index"))
+}
+
+fn event_edge_id(event: &Value) -> Option<u64> {
+    event
+        .get("edge_id")
+        .and_then(Value::as_u64)
+        .or_else(|| detail_u64(event, "edge_id"))
+}
+
+fn build_benchmark_evidence_json(
+    validation: &BenchmarkValidation,
+    events: &[DumpLogEvent],
+    run_id: u64,
+    scenario: MvpChatCheckScenario,
+    paths: &MvpChatCheckPaths,
+) -> Value {
+    json!({
+        "schema": "swactor.mvp_chat.benchmark_evidence.v1",
+        "source": "canonical_datastream",
+        "run_id": run_id,
+        "scenario": scenario.name(),
+        "created_unix_ms": unix_ms_now(),
+        "validator": validation.summary_json(),
+        "producers": validation.producers,
+        "coverage": {
+            "expected_pipeline_stages": validation.expected_pipeline_stages,
+            "stages_ready": validation.stages_ready,
+            "stages_with_worker": validation.stages_with_worker,
+            "stages_with_device": validation.stages_with_device,
+            "edges_with_producer": validation.edges_with_producer,
+            "edges_with_consumer": validation.edges_with_consumer,
+            "requests_started": validation.requests_started,
+            "requests_completed": validation.requests_completed,
+            "run_envelope_present": validation.run_envelope_present,
+            "endpoint_snapshot_present": validation.endpoint_snapshot_present,
+        },
+        "artifacts": {
+            "datastream": paths.dump_log.display().to_string(),
+            "summary": paths.summary.display().to_string(),
+            "gaps": paths.benchmark_gaps.display().to_string(),
+        },
+        "event_index": events.iter().map(|record| {
+            json!({
+                "line": record.line_number,
+                "arrival_seq": record.arrival_seq,
+                "source": record.source,
+                "stream": record.stream,
+                "channel": record.channel,
+                "channel_id": record.channel_id,
+                "position": record.position,
+                "type": record.event.get("type").and_then(Value::as_str),
+                "phase": record.event.get("phase").and_then(Value::as_str),
+                "status": record.event.get("status").and_then(Value::as_str),
+                "request_id": benchmark_request_id(&record.event),
+                "stage_index": event_stage_index(&record.event),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn build_benchmark_gaps_markdown(validation: &BenchmarkValidation) -> String {
+    let mut out = String::new();
+    out.push_str("# Benchmark observability gaps\n\n");
+    out.push_str(&format!(
+        "Status: {}. Errors: {}. Warnings: {}.\n\n",
+        validation.status(),
+        validation.error_count(),
+        validation.warning_count()
+    ));
+    if validation.findings.is_empty() {
+        out.push_str("No benchmark observability gaps detected.\n");
+        return out;
+    }
+    for severity in ["error", "warning"] {
+        let matching = validation
+            .findings
+            .iter()
+            .filter(|finding| finding.severity == severity)
+            .collect::<Vec<_>>();
+        if matching.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("## {severity}s\n\n"));
+        for finding in matching {
+            out.push_str(&format!("- `{}`: {}", finding.code, finding.message));
+            if let Some(channel) = &finding.channel {
+                out.push_str(&format!(" channel={channel}"));
+            }
+            if let Some(phase) = &finding.phase {
+                out.push_str(&format!(" phase={phase}"));
+            }
+            if let Some(status) = &finding.status {
+                out.push_str(&format!(" status={status}"));
+            }
+            if let Some(request_id) = finding.request_id {
+                out.push_str(&format!(" request_id={request_id}"));
+            }
+            if let Some(stage_index) = finding.stage_index {
+                out.push_str(&format!(" stage_index={stage_index}"));
+            }
+            if let Some(pointer) = &finding.json_pointer {
+                out.push_str(&format!(" pointer={pointer}"));
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out
+}
+
 fn assert_dump_log_facts(
     path: &Path,
     scenario: MvpChatCheckScenario,
+    run_id: u64,
+    expected_pipeline_stages: Option<u32>,
 ) -> Result<Vec<DumpLogEvent>, String> {
     let events = parse_dump_log_events(path)?;
     let mut facts = DumpLogFacts::default();
@@ -1587,6 +2548,14 @@ fn assert_dump_log_facts(
         require_gpu_dump_log_facts(&facts)?;
         require_vastai_network_facts(&facts)?;
         require_vastai_data_path_facts(&facts)?;
+    }
+    let validation =
+        validate_benchmark_observability(&events, run_id, scenario, expected_pipeline_stages);
+    if let Some(finding) = validation.invalid_findings().next() {
+        return Err(format!(
+            "mvp-chat-check: benchmark observability gap {}: {}",
+            finding.code, finding.message
+        ));
     }
     Ok(events)
 }
@@ -1899,6 +2868,7 @@ fn build_benchmark_summary(
     run_id: u64,
     scenario: MvpChatCheckScenario,
     paths: &MvpChatCheckPaths,
+    expected_pipeline_stages: Option<u32>,
     stdout_bytes: u64,
     stderr_bytes: u64,
 ) -> Result<Value, String> {
@@ -1921,6 +2891,8 @@ fn build_benchmark_summary(
         .values()
         .map(prompt_summary_json)
         .collect::<Vec<_>>();
+    let validation =
+        validate_benchmark_observability(events, run_id, scenario, expected_pipeline_stages);
     let summary = json!({
         "schema": "swactor.mvp_chat.benchmark_summary.v1",
         "source": "datastream",
@@ -1962,6 +2934,12 @@ fn build_benchmark_summary(
             "summary": {
                 "path": paths.summary.display().to_string(),
             },
+            "benchmark_evidence": {
+                "path": paths.benchmark_evidence.display().to_string(),
+            },
+            "benchmark_gaps": {
+                "path": paths.benchmark_gaps.display().to_string(),
+            },
         },
         "run_envelope": run_envelope,
         "event_counts": {
@@ -1986,7 +2964,27 @@ fn build_benchmark_summary(
         "pipeline": pipeline_summary_json(events, &dump_facts),
         "gpu": gpu_summary_json(events, &dump_facts),
         "vastai": vastai_summary_json(events),
+        "validator": validation.summary_json(),
         "invariants": benchmark_invariants_json(&dump_facts, scenario),
+        "side_channel_audit": {
+            "status": "captured_not_authoritative",
+            "entries": [
+                {
+                    "name": "stdout",
+                    "role": "functional smoke transcript",
+                    "datastream_substitute": false,
+                    "used_for_benchmark_metrics": false,
+                    "artifact": paths.stdout.display().to_string(),
+                },
+                {
+                    "name": "stderr",
+                    "role": "debug transcript",
+                    "datastream_substitute": false,
+                    "used_for_benchmark_metrics": false,
+                    "artifact": paths.stderr.display().to_string(),
+                }
+            ],
+        },
         "legacy_tolerance": legacy_tolerance_summary(events),
     });
     Ok(summary)
@@ -1996,6 +2994,8 @@ fn write_benchmark_artifacts(
     paths: &MvpChatCheckPaths,
     run_id: u64,
     scenario: MvpChatCheckScenario,
+    events: &[DumpLogEvent],
+    expected_pipeline_stages: Option<u32>,
     output: &MvpChatCheckOutput,
     summary: &Value,
 ) -> Result<(), String> {
@@ -2019,6 +3019,20 @@ fn write_benchmark_artifacts(
     })?;
     let redacted_config = benchmark_redacted_config(summary, run_id, scenario);
     write_json_file(&paths.redacted_config, &redacted_config)?;
+    let validation =
+        validate_benchmark_observability(events, run_id, scenario, expected_pipeline_stages);
+    let evidence = build_benchmark_evidence_json(&validation, events, run_id, scenario, paths);
+    write_json_file(&paths.benchmark_evidence, &evidence)?;
+    fs::write(
+        &paths.benchmark_gaps,
+        build_benchmark_gaps_markdown(&validation),
+    )
+    .map_err(|e| {
+        format!(
+            "mvp-chat-check: write benchmark gaps artifact {}: {e}",
+            paths.benchmark_gaps.display()
+        )
+    })?;
     write_json_file(&paths.summary, summary)?;
     Ok(())
 }
@@ -3833,6 +4847,23 @@ mod tests {
                 "--dump-logs=/tmp/mvp-chat-check.ndjson",
             ])
         );
+        let vastai_parallel =
+            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-parallel", "4"]))
+                .expect("vastai pipeline-parallel parses");
+        assert_eq!(
+            vastai_parallel.mvp_chat_args(42, dump_log),
+            strings(&[
+                "--vastai",
+                "--pipeline-stages",
+                "4",
+                "--yes",
+                "--endpoint-addr-mask",
+                "relay-only",
+                "--run-id",
+                "42",
+                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+            ])
+        );
     }
 
     #[test]
@@ -3857,6 +4888,17 @@ mod tests {
                 .expect_err("missing pipeline stages fail")
                 .contains("--pipeline-stages requires a value")
         );
+        assert!(
+            MvpChatCheckInvocation::parse_args(strings(&[
+                "--vastai",
+                "--pipeline-stages",
+                "4",
+                "--pipeline-parallel",
+                "4",
+            ]))
+            .expect_err("duplicate pipeline aliases fail")
+            .contains("pipeline stage count")
+        );
     }
 
     fn temp_path(label: &str) -> PathBuf {
@@ -3865,6 +4907,50 @@ mod tests {
             "xtask-benchmark-observability-{label}-{}-{id}.ndjson",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn failure_artifacts_include_gap_report_and_evidence_manifest() {
+        let root = unique_temp_dir("mvp-chat-check-failure-artifacts");
+        let paths = write_mvp_chat_check_paths(&root).expect("paths");
+        fs::write(&paths.dump_log, "synthetic datastream\n").expect("write datastream");
+
+        write_failure_artifacts(
+            &paths,
+            "child exited nonzero",
+            "",
+            "mvp-chat: missing required VAST_API_KEY\n",
+            None,
+        )
+        .expect("failure artifacts");
+
+        let summary: Value =
+            serde_json::from_str(&fs::read_to_string(&paths.summary).expect("summary artifact"))
+                .expect("summary json");
+        assert_eq!(
+            summary
+                .pointer("/artifacts/benchmark_evidence/exists")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            summary
+                .pointer("/artifacts/benchmark_gaps/exists")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let gaps = fs::read_to_string(&paths.benchmark_gaps).expect("gap report");
+        assert!(gaps.contains("side-channel only, not benchmark evidence"));
+        let evidence: Value = serde_json::from_str(
+            &fs::read_to_string(&paths.benchmark_evidence).expect("evidence artifact"),
+        )
+        .expect("evidence json");
+        assert_eq!(
+            evidence.pointer("/status").and_then(Value::as_str),
+            Some("failed")
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 
     fn benchmark_observability_archive_record(
@@ -3919,20 +5005,70 @@ mod tests {
     fn benchmark(component: &str, wall_unix_ms: u64, mono_ms: u64) -> Value {
         json!({
             "schema": 1,
+            "schema_version": 1,
             "component": component,
+            "producer_component": component,
+            "producer_instance_id": format!("{component}:test"),
+            "producer_process_id": 1,
             "pid": 1,
             "seq": wall_unix_ms,
+            "producer_sequence": wall_unix_ms,
             "wall_unix_ms": wall_unix_ms,
+            "wall_clock_unix_ms": wall_unix_ms,
             "mono_ms": mono_ms,
+            "monotonic_ms": mono_ms,
+            "clock_source": {
+                "wall": "unit_test_unix_ms",
+                "monotonic": "unit_test_elapsed_ms"
+            },
         })
     }
 
     fn stamped(mut event: Value, component: &str, wall_unix_ms: u64, mono_ms: u64) -> Value {
+        let stamp = benchmark(component, wall_unix_ms, mono_ms);
         let object = event.as_object_mut().expect("event object");
+        object.insert("schema_version".to_owned(), json!(1));
+        if let Some(event_type) = object.get("type").cloned() {
+            object.insert("event_type".to_owned(), event_type);
+        }
+        if let Some(phase) = object.get("phase").cloned() {
+            object.insert("event_name".to_owned(), phase);
+        }
         object.insert(
-            "benchmark".to_owned(),
-            benchmark(component, wall_unix_ms, mono_ms),
+            "producer_component".to_owned(),
+            stamp["producer_component"].clone(),
         );
+        object.insert(
+            "producer_instance_id".to_owned(),
+            stamp["producer_instance_id"].clone(),
+        );
+        object.insert(
+            "producer_process_id".to_owned(),
+            stamp["producer_process_id"].clone(),
+        );
+        object.insert(
+            "producer_sequence".to_owned(),
+            stamp["producer_sequence"].clone(),
+        );
+        object.insert(
+            "wall_clock_unix_ms".to_owned(),
+            stamp["wall_clock_unix_ms"].clone(),
+        );
+        object.insert("monotonic_ms".to_owned(), stamp["monotonic_ms"].clone());
+        object.insert("clock_source".to_owned(), stamp["clock_source"].clone());
+        object.insert(
+            "span_id".to_owned(),
+            json!(format!(
+                "{component}:test:{}:{}",
+                stamp["producer_sequence"],
+                object
+                    .get("event_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("event")
+            )),
+        );
+        object.insert("parent_span_id".to_owned(), Value::Null);
+        object.insert("benchmark".to_owned(), stamp);
         event
     }
 
@@ -4263,6 +5399,29 @@ mod tests {
                 ),
             ),
             (
+                "mvp.chat.benchmark",
+                stamped(
+                    json!({
+                        "type":"BenchmarkRunEnvelope",
+                        "phase":"run_envelope",
+                        "status":"ready",
+                        "run_id":9,
+                        "detail":{
+                            "runtime":{"pipeline_stages":1,"endpoint_addr_mask":"full","gpu_run":false},
+                            "provider":{"kind":"process","node_image":"unit"},
+                            "model":{"id":"unit-model"},
+                        },
+                    }),
+                    "mvp-chat",
+                    995,
+                    0,
+                ),
+            ),
+            (
+                "mvp.chat.benchmark",
+                chat_span("endpoint_config_snapshot", "ready", 998, 0),
+            ),
+            (
                 "mvp.chat.runtime",
                 chat_span("prepare_runtime", "started", 1_030, 30),
             ),
@@ -4296,6 +5455,24 @@ mod tests {
                 ),
             ),
             (
+                "mvp.node.worker",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":3,"stage_index":2,"detail":{"device":"CPU"}}),
+                    "mvp-worker-node",
+                    1_050,
+                    50,
+                ),
+            ),
+            (
+                "mvp.worker.initialize",
+                stamped(
+                    json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":3,"stage_index":2,"endpoint":{"transport":"stdout-json-lines"}}),
+                    "tinygrad-worker",
+                    1_060,
+                    60,
+                ),
+            ),
+            (
                 "mvp.chat.runtime",
                 chat_span("prompt_rpc", "ready", 1_120, 120),
             ),
@@ -4308,6 +5485,29 @@ mod tests {
     ) -> Vec<(&'static str, Value)> {
         let mut events = vec![
             ("mvp.chat.lifecycle", chat_span("config", "ready", 1_000, 0)),
+            (
+                "mvp.chat.benchmark",
+                stamped(
+                    json!({
+                        "type":"BenchmarkRunEnvelope",
+                        "phase":"run_envelope",
+                        "status":"ready",
+                        "run_id":9,
+                        "detail":{
+                            "runtime":{"pipeline_stages":1,"endpoint_addr_mask":if include_gpu { "relay-only" } else { "full" },"gpu_run":include_gpu},
+                            "provider":{"kind":"process","node_image":"unit"},
+                            "model":{"id":"unit"},
+                        },
+                    }),
+                    "mvp-chat",
+                    1_001,
+                    0,
+                ),
+            ),
+            (
+                "mvp.chat.benchmark",
+                chat_span("endpoint_config_snapshot", "ready", 1_002, 2),
+            ),
             (
                 "mvp.chat.runtime",
                 chat_span("prepare_runtime", "ready", 1_010, 10),
@@ -4341,6 +5541,24 @@ mod tests {
                     "mvp-worker-node",
                     1_050,
                     50,
+                ),
+            ),
+            (
+                "mvp.worker.initialize",
+                stamped(
+                    json!({"type":"PythonDatastreamConfigured","phase":"PythonDatastreamConfigured","status":"configured","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
+                    "tinygrad-worker",
+                    1_055,
+                    55,
+                ),
+            ),
+            (
+                "mvp.worker.initialize",
+                stamped(
+                    json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
+                    "tinygrad-worker",
+                    1_056,
+                    56,
                 ),
             ),
             (
@@ -4530,7 +5748,7 @@ mod tests {
     fn benchmark_observability_gpu_dump_facts_require_cuda_worker_and_decode_cycles() {
         let path = write_synthetic_event_dump("gpu-dump-facts", dump_log_fact_events(true, false));
 
-        let events = assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu)
+        let events = assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu, 9, None)
             .expect("GPU dump log facts pass");
         let _ = fs::remove_file(path);
 
@@ -4643,7 +5861,7 @@ mod tests {
             ),
         ]);
         let path = write_synthetic_event_dump("multinode-docker-direct-network", events);
-        assert_dump_log_facts(&path, MvpChatCheckScenario::MultinodeDocker)
+        assert_dump_log_facts(&path, MvpChatCheckScenario::MultinodeDocker, 9, None)
             .expect("direct-network multinode Docker facts pass");
         let _ = fs::remove_file(path);
     }
@@ -4666,8 +5884,8 @@ mod tests {
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","provider":"vastai","worker_count":2}}),
                     "mvp-orchestrator",
-                    1_071,
-                    71,
+                    9_071,
+                    9_071,
                 ),
             ),
             (
@@ -4679,8 +5897,8 @@ mod tests {
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":3,"stage_index":0}}),
                     "mvp-orchestrator",
-                    1_073,
-                    73,
+                    9_073,
+                    9_073,
                 ),
             ),
             (
@@ -4688,8 +5906,8 @@ mod tests {
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"relay-only","has_relay":true,"direct_addr_count":0}}),
                     "mvp-worker-node",
-                    1_074,
-                    74,
+                    9_074,
+                    9_074,
                 ),
             ),
             (
@@ -4697,8 +5915,8 @@ mod tests {
                 stamped(
                     json!({"type":"RingInstalled","run_id":9,"node_id":2,"stage_index":0,"ring_id":1,"direction":"egress","edge_id":77,"kind":"activation","max_extent":4096}),
                     "tinygrad-worker",
-                    1_075,
-                    75,
+                    9_075,
+                    9_075,
                 ),
             ),
             (
@@ -4706,8 +5924,8 @@ mod tests {
                 stamped(
                     json!({"type":"RingInstalled","run_id":9,"node_id":3,"stage_index":1,"ring_id":2,"direction":"ingress","edge_id":77,"kind":"activation","max_extent":4096}),
                     "tinygrad-worker",
-                    1_076,
-                    76,
+                    9_076,
+                    9_076,
                 ),
             ),
             (
@@ -4715,8 +5933,8 @@ mod tests {
                 stamped(
                     json!({"type":"StepExecuted","run_id":9,"node_id":2,"stage_index":0,"execution_backend":"pipeline_stage","committed_bytes":4096}),
                     "tinygrad-worker",
-                    1_078,
-                    78,
+                    9_078,
+                    9_078,
                 ),
             ),
             (
@@ -4724,14 +5942,41 @@ mod tests {
                 stamped(
                     json!({"type":"ObjectLoaded","run_id":9,"node_id":3,"stage_index":1,"edge_id":77,"kind":"activation","extent":4056}),
                     "tinygrad-worker",
-                    1_083,
+                    9_083,
 
-                    83,
+                    9_083,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":4,"stage_index":1}}),
+                    "mvp-orchestrator",
+                    9_084,
+                    9_084,
+                ),
+            ),
+            (
+                "mvp.node.worker",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"device":"CUDA"}}),
+                    "mvp-worker-node",
+                    9_085,
+                    9_085,
+                ),
+            ),
+            (
+                "mvp.worker.initialize",
+                stamped(
+                    json!({"type":"WorkerReady","run_id":9,"node_id":2,"stage_index":0,"backend":{"requested_device":"CUDA","env_DEV":"CUDA","tinygrad_device":"CUDA"},"cuda_probe":[1]}),
+                    "tinygrad-worker",
+                    9_086,
+                    9_086,
                 ),
             ),
         ]);
         let path = write_synthetic_event_dump("vastai-remote-provider", events);
-        assert_dump_log_facts(&path, MvpChatCheckScenario::VastAi)
+        assert_dump_log_facts(&path, MvpChatCheckScenario::VastAi, 9, Some(2))
             .expect("VastAI remote provider facts pass");
         let _ = fs::remove_file(path);
     }
@@ -4745,10 +5990,11 @@ mod tests {
         ));
         let path = write_synthetic_event_dump("unexpected-failed-event", events);
 
-        let error = match assert_dump_log_facts(&path, MvpChatCheckScenario::ProcessBaseline) {
-            Ok(_) => panic!("unexpected failed event should fail the check"),
-            Err(error) => error,
-        };
+        let error =
+            match assert_dump_log_facts(&path, MvpChatCheckScenario::ProcessBaseline, 9, None) {
+                Ok(_) => panic!("unexpected failed event should fail the check"),
+                Err(error) => error,
+            };
         let _ = fs::remove_file(path);
 
         assert!(
@@ -4778,10 +6024,32 @@ mod tests {
     }
 
     #[test]
+    fn validator_rejects_missing_python_datastream_connectivity() {
+        let mut events = dump_log_fact_events(false, false);
+        events.retain(|(channel, event)| {
+            !(*channel == "mvp.worker.initialize"
+                && event.get("type").and_then(Value::as_str) == Some("PythonDatastreamConnected"))
+        });
+        let parsed = parse_synthetic_events("missing-python-datastream", events);
+
+        let validation = validate_benchmark_observability(
+            &parsed,
+            9,
+            MvpChatCheckScenario::ProcessBaseline,
+            None,
+        );
+
+        assert!(validation.findings.iter().any(|finding| {
+            finding.severity == "observability_gap"
+                && finding.code == "python.datastream.connected.missing"
+        }));
+    }
+
+    #[test]
     fn benchmark_observability_gpu_dump_facts_reject_cpu_fallback() {
         let path = write_synthetic_event_dump("gpu-cpu-fallback", dump_log_fact_events(true, true));
 
-        let error = match assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu) {
+        let error = match assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu, 9, None) {
             Ok(_) => panic!("CPU fallback should fail GPU check"),
             Err(error) => error,
         };
@@ -4791,6 +6059,57 @@ mod tests {
             error.contains("fell back to the tinygrad CPU compiler"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn validator_rejects_wrong_run_id_as_fatal_gap() {
+        let mut events = dump_log_fact_events(false, false);
+        events.push((
+            "mvp.chat.runtime",
+            stamped(
+                json!({"type":"ChatProgress","phase":"prepare_runtime","status":"ready","run_id":99,"detail":{}}),
+                "mvp-chat",
+                9_999,
+                999,
+            ),
+        ));
+        let parsed = parse_synthetic_events("wrong-run-id", events);
+
+        let validation = validate_benchmark_observability(
+            &parsed,
+            9,
+            MvpChatCheckScenario::ProcessBaseline,
+            None,
+        );
+
+        assert!(validation.findings.iter().any(|finding| {
+            finding.severity == "fatal" && finding.code == "run_id.isolation.mismatch"
+        }));
+    }
+
+    #[test]
+    fn validator_rejects_missing_span_id_on_required_event() {
+        let mut event = chat_span("prepare_runtime", "ready", 1_010, 10);
+        event
+            .as_object_mut()
+            .expect("event object")
+            .remove("span_id");
+        let mut events = dump_log_fact_events(false, false);
+        events.push(("mvp.chat.runtime", event));
+        let parsed = parse_synthetic_events("missing-span-id", events);
+
+        let validation = validate_benchmark_observability(
+            &parsed,
+            9,
+            MvpChatCheckScenario::ProcessBaseline,
+            None,
+        );
+
+        assert!(validation.findings.iter().any(|finding| {
+            finding.severity == "observability_gap"
+                && finding.code == "canonical.event_field.missing"
+                && finding.json_pointer.as_deref() == Some("/span_id")
+        }));
     }
 
     #[test]
@@ -4854,7 +6173,7 @@ mod tests {
                     },
                 }),
                 "mvp-chat",
-                1_001,
+                2_001,
                 1,
             ),
         ));
@@ -4868,6 +6187,8 @@ mod tests {
             prompts: temp_path("summary-prompts"),
             redacted_config: temp_path("summary-config"),
             summary: temp_path("summary-json"),
+            benchmark_evidence: temp_path("summary-evidence"),
+            benchmark_gaps: temp_path("summary-gaps"),
         };
 
         let summary = build_benchmark_summary(
@@ -4876,6 +6197,7 @@ mod tests {
             9,
             MvpChatCheckScenario::ProcessBaseline,
             &paths,
+            None,
             123,
             45,
         )
@@ -4921,6 +6243,22 @@ mod tests {
                 .pointer("/artifacts/stderr/bytes")
                 .and_then(Value::as_u64),
             Some(45)
+        );
+        assert!(
+            summary
+                .pointer("/artifacts/benchmark_evidence/path")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        assert!(
+            summary
+                .pointer("/artifacts/benchmark_gaps/path")
+                .and_then(Value::as_str)
+                .is_some()
+        );
+        assert_eq!(
+            summary.pointer("/validator/status").and_then(Value::as_str),
+            Some("valid")
         );
     }
 
@@ -5111,11 +6449,21 @@ mod tests {
             prompts: temp_path("vastai-summary-prompts"),
             redacted_config: temp_path("vastai-summary-config"),
             summary: temp_path("vastai-summary-json"),
+            benchmark_evidence: temp_path("vastai-summary-evidence"),
+            benchmark_gaps: temp_path("vastai-summary-gaps"),
         };
 
-        let summary =
-            build_benchmark_summary(&events, 80, 9, MvpChatCheckScenario::VastAi, &paths, 12, 34)
-                .expect("summary builds");
+        let summary = build_benchmark_summary(
+            &events,
+            80,
+            9,
+            MvpChatCheckScenario::VastAi,
+            &paths,
+            Some(1),
+            12,
+            34,
+        )
+        .expect("summary builds");
         let _ = fs::remove_file(path);
 
         let invariants = summary

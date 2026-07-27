@@ -74,14 +74,27 @@ fn node_event_payload(
     status: &str,
     detail: Value,
 ) -> Value {
+    let benchmark = benchmark_observability::stamp("mvp-worker-node");
     json!({
+        "schema_version": benchmark["schema_version"].clone(),
         "type":"NodeEvent",
+        "event_type":"NodeEvent",
+        "event_name":phase,
         "phase":phase,
         "status":status,
         "run_id":config.run_id,
         "node_id":config.logical_node_id,
         "stage_index":config.stage_index,
-        "benchmark":benchmark_observability::stamp("mvp-worker-node"),
+        "producer_component":benchmark["producer_component"].clone(),
+        "producer_instance_id":benchmark["producer_instance_id"].clone(),
+        "producer_process_id":benchmark["producer_process_id"].clone(),
+        "producer_sequence":benchmark["producer_sequence"].clone(),
+        "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
+        "monotonic_ms":benchmark["monotonic_ms"].clone(),
+        "clock_source":benchmark["clock_source"].clone(),
+        "span_id":format!("mvp-worker-node:{}:{}:{}", config.run_id, benchmark["producer_sequence"], phase),
+        "parent_span_id":Value::Null,
+        "benchmark":benchmark,
         "detail":detail,
     })
 }
@@ -444,18 +457,31 @@ fn sampler_health_payload(
     status: &str,
     detail: Value,
 ) -> Value {
+    let benchmark = benchmark_observability::stamp("mvp-worker-node");
     json!({
+        "schema_version":benchmark["schema_version"].clone(),
         "type":"SamplerHealth",
+        "event_type":"SamplerHealth",
+        "event_name":"host_sampler_health",
         "schema":"mvp.node.sampler.health.v1",
         "run_id":context.run_id,
         "node_id":context.node_id,
         "stage_index":context.stage_index,
+        "producer_component":benchmark["producer_component"].clone(),
+        "producer_instance_id":benchmark["producer_instance_id"].clone(),
+        "producer_process_id":benchmark["producer_process_id"].clone(),
+        "producer_sequence":benchmark["producer_sequence"].clone(),
+        "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
+        "monotonic_ms":benchmark["monotonic_ms"].clone(),
+        "clock_source":benchmark["clock_source"].clone(),
+        "span_id":format!("mvp-worker-node:{}:{}:host_sampler_health", context.run_id, benchmark["producer_sequence"]),
+        "parent_span_id":Value::Null,
         "phase":"host_sampler_health",
         "status":status,
         "sampler":sampler,
         "sample_channel":sample_channel,
         "detail":detail,
-        "benchmark":benchmark_observability::stamp("mvp-worker-node"),
+        "benchmark":benchmark,
     })
 }
 
@@ -1827,6 +1853,35 @@ fn run() -> Result<(), String> {
         "ready",
         json!({"actor":datastream_publisher,"name":DATASTREAM_PUBLISHER_NAME,"subscription_transport":"iroh"}),
     );
+    let worker_synthetic_id = format!(
+        "mvp-worker-node-{}-{}-datastream-preflight",
+        config.logical_node_id, config.stage_index
+    );
+    for (phase, status) in [
+        ("DatastreamProducerConfigured", "configured"),
+        ("DatastreamProducerConnected", "ready"),
+        ("DatastreamSyntheticEventSent", "sent"),
+        ("DatastreamSyntheticEventObserved", "observed"),
+    ] {
+        emit_node_event(
+            &mut datastream,
+            &config,
+            NODE_BOOTSTRAP_CHANNEL,
+            phase,
+            status,
+            json!({
+                "producer":"mvp-worker-node",
+                "producer_class":"rust-worker-node",
+                "synthetic_id":worker_synthetic_id,
+                "datastream_endpoint":{
+                    "role":"worker-node-iroh-publisher",
+                    "transport":"iroh-datastream",
+                    "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
+                    "relay_mode":format!("{:?}", config.relay_mode),
+                },
+            }),
+        );
+    }
     let mut debug_join_rx = match &config.debug_join_socket {
         Some(path) => {
             match spawn_debug_join_listener(tokio.handle().clone(), PathBuf::from(path)) {
@@ -3890,6 +3945,25 @@ impl TinygradWorker {
             .env("MVP_STAGE_INDEX", config.stage_index.to_string())
             .env("MVP_ARENA_FD", arena_fd.to_string())
             .env("MVP_ARENA_BYTES", config.arena_bytes.to_string())
+            .env(
+                "MVP_DATASTREAM_ENDPOINT_ID",
+                format!(
+                    "worker-node-{}-stage-{}-stdio-bridge",
+                    config.logical_node_id, config.stage_index
+                ),
+            )
+            .env(
+                "MVP_BENCHMARK_PRODUCER_INSTANCE",
+                format!(
+                    "tinygrad-worker:{}:{}",
+                    config.logical_node_id, config.stage_index
+                ),
+            )
+            .env(
+                "MVP_IROH_ENDPOINT_ADDR_MASK",
+                config.endpoint_addr_mask.as_str(),
+            )
+            .env("MVP_IROH_RELAY_MODE", format!("{:?}", config.relay_mode))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
