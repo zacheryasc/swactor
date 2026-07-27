@@ -398,9 +398,9 @@ mod tests {
             .and(path("/api/v0/instances/101/"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "instances": {
-                    "actual_status": "loading",
+                    "actual_status": "error",
                     "intended_status": "running",
-                    "status_msg": "still pulling"
+                    "status_msg": "container failed before runtime readiness"
                 }
             })))
             .mount(&server)

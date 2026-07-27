@@ -20,7 +20,10 @@ pub mod types;
 pub use client::VastClient;
 pub use lease::{confirm_lease, provision_fleet};
 pub use logs::{fetch_logs, request_logs};
-pub use monitor::{wait_for_running, wait_for_running_with_policy};
+pub use monitor::{
+    fetch_instance_status, wait_for_running, wait_for_running_with_policy,
+    wait_for_ssh_endpoint_with_policy,
+};
 pub use pricing::CostModel;
 pub use provision::create_instance;
 pub use search::{plan_distinct_host_first_wave, select_offer_pool, select_offer_pool_with_policy};
@@ -29,6 +32,6 @@ pub use teardown::{
 };
 pub use types::{
     ContractRef, CreateInstanceRequest, FleetState, InstanceInfo, LabeledInstance, LifecyclePolicy,
-    Offer, ProvisionRequest, ProvisionedFleet, ProvisionedInstance, RunningInstance,
-    SelectionPolicy, VastAiFailureClass, classify_vastai_error,
+    Offer, ProviderInstanceStatus, ProvisionRequest, ProvisionedFleet, ProvisionedInstance,
+    RunningInstance, SelectionPolicy, VastAiFailureClass, classify_vastai_error,
 };

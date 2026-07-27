@@ -45,6 +45,31 @@ pub struct RunningInstance {
     pub port: u16,
 }
 
+/// Provider status snapshot for one Vast.ai contract.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderInstanceStatus {
+    pub actual_status: String,
+    pub intended_status: String,
+    pub status_msg: Option<String>,
+    pub public_ipaddr: Option<String>,
+    pub ssh_port: Option<u16>,
+    pub disk_usage: Option<f64>,
+}
+
+impl ProviderInstanceStatus {
+    pub fn ssh_endpoint(&self) -> Option<RunningInstance> {
+        let ip = self
+            .public_ipaddr
+            .as_deref()
+            .filter(|ip| !ip.trim().is_empty())?;
+        let port = self.ssh_port.filter(|port| *port > 0)?;
+        Some(RunningInstance {
+            ip: ip.to_owned(),
+            port,
+        })
+    }
+}
+
 /// SSH endpoint + identity of a held instance, discovered by label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabeledInstance {
@@ -298,6 +323,23 @@ pub(crate) struct InstanceStatus {
     pub ssh_port: Option<u16>,
     #[serde(default)]
     pub disk_usage: Option<f64>,
+}
+
+impl From<InstanceStatus> for ProviderInstanceStatus {
+    fn from(status: InstanceStatus) -> Self {
+        Self {
+            actual_status: status
+                .actual_status
+                .unwrap_or_else(|| "unknown".to_string()),
+            intended_status: status
+                .intended_status
+                .unwrap_or_else(|| "unknown".to_string()),
+            status_msg: status.status_msg,
+            public_ipaddr: status.public_ipaddr,
+            ssh_port: status.ssh_port,
+            disk_usage: status.disk_usage,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
