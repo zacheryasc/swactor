@@ -1,11 +1,9 @@
-mod arena_manager_guarantees;
 mod bootstrap_datastream_guarantees;
+mod data_plane_bridge_guarantees;
 mod device_bridge_guarantees;
 mod docker_cluster_provisioning_guarantees;
-mod edge_establisher_guarantees;
 mod engine_builder_guarantees;
 mod gpu_worker_ctl_guarantees;
-mod gpu_worker_egress_producer_guarantees;
 mod gpu_worker_ingress_parser_guarantees;
 mod gpu_worker_process_adapter_guarantees;
 mod local_mock;

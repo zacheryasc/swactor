@@ -1,9 +1,9 @@
+use data_plane::object_record as ingress;
 use mvp_system::node::actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageEdgeKindWire,
     StageInboundEdgeWire, StageObjectSpecWire, StageOutboundEdgeWire, StageProvisionWire,
     StageRingSpecWire,
 };
-use mvp_system::node_data::object as ingress;
 use mvp_system::orchestration::run_plan::{self, GgufSource, TokenizerSource};
 use mvp_system::staging as stage;
 use swactor::actor::ActorAddress;

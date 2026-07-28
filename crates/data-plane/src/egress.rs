@@ -7,7 +7,7 @@ pub struct EdgeId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortId(pub String);
 
-pub use data_plane::object_record::{
+pub use crate::object_record::{
     FLAG_BEGIN_SEQUENCE, FLAG_END_OF_SEQUENCE, HEADER_LEN, KNOWN_FLAGS_MASK, OBJECT_MAGIC,
     OBJECT_MAGIC_BYTES, OBJECT_VERSION, ObjectFlags, ObjectHeader, ObjectId, ObjectLayout,
     ObjectSpec,
@@ -127,7 +127,6 @@ pub enum WakeHint {
     RingWritable { ring_id: RingId },
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingStep {
     step_id: StepId,
@@ -135,7 +134,6 @@ struct PendingStep {
     role_state_updated: bool,
 }
 
-#[cfg(test)]
 pub struct EgressProducerHarness {
     generation: WorkerGeneration,
     rings: std::collections::BTreeMap<RingId, InstallRing>,
@@ -149,7 +147,6 @@ pub struct EgressProducerHarness {
     events: Vec<WorkerEgressOut>,
 }
 
-#[cfg(test)]
 impl EgressProducerHarness {
     pub fn new(generation: WorkerGeneration) -> Self {
         Self {
@@ -369,7 +366,6 @@ impl EgressProducerHarness {
     }
 }
 
-#[cfg(test)]
 fn encode_header(output: OutputBinding) -> Vec<u8> {
     ObjectHeader {
         object_id: output.object_id,

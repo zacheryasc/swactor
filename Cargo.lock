@@ -952,7 +952,10 @@ dependencies = [
 name = "data-plane"
 version = "0.1.0"
 dependencies = [
+ "datastream",
  "libc",
+ "serde",
+ "swactor",
 ]
 
 [[package]]

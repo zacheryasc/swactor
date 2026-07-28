@@ -22,7 +22,6 @@ use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 use crate::transport::codec_registry::register_mvp_actor_codecs;
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
-use crate::node_data::object as ingress;
 use crate::observability::telemetry::{
     MVP_PROVISIONING_EVENTS, MvpProvisionEventRecord, MvpProvisionLogRecord,
     mvp_provision_log_channel,
@@ -53,6 +52,7 @@ use crate::staging::gguf_shard::{StageShardPlan, plan_stage_shard};
 use crate::transport::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
+use data_plane::object_record as ingress;
 use datastream::{
     ChannelContent, ChannelId, ChannelRef, DatastreamEndpoint, DatastreamEvent, DatastreamProducer,
     DatastreamPublisherMsg, DatastreamSubscribe, Frame, Lifetime, NodeId, Record, StreamDescriptor,

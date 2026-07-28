@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/shared_ring_helper_abi_contract.md`.
 
-use mvp_system::node_data::ring;
+use data_plane::ring;
 
 // A small ring forces wraparound and full/empty transitions quickly. The helper
 // still owns the actual shared-memory atomics and process-local address math.

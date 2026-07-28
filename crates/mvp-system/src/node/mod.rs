@@ -5,5 +5,5 @@
 
 pub mod actor;
 pub mod boot_lifecycle;
-pub mod edge_lifecycle;
+pub mod data_plane_bridge;
 pub mod worker_node_runtime;

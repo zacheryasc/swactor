@@ -26,9 +26,6 @@ use crate::node::actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
     StageObjectSpecWire, StageOutboundEdgeWire, StageRingSpecWire,
 };
-use crate::node::edge_lifecycle as edge;
-use crate::node_data::arena;
-use crate::node_data::ingress;
 use crate::observability::benchmark;
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
@@ -41,6 +38,9 @@ use crate::transport::driver_pumps as driver_model;
 use crate::transport::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
+use data_plane::arena;
+use data_plane::edge_lifecycle as edge;
+use data_plane::ingress;
 use distribution::node::DistributedNodeConfig;
 use distribution::swim::telemetry::ObservedProbeEvent;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
@@ -737,7 +737,7 @@ fn spawn_arena_sampler(
         loop {
             interval.tick().await;
 
-            let sample = arena_manager.lock().sample(seq);
+            let sample: arena::ArenaSample = arena_manager.lock().sample(seq).into();
             seq = seq.saturating_add(1);
             producer.submit_record(channel, &sample);
         }

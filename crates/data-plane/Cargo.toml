@@ -5,6 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+datastream = { path = "../datastream" }
+serde = { version = "1", features = ["derive"] }
+swactor = { path = "../.." }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

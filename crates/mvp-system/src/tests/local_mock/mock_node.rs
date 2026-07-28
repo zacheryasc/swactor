@@ -1,4 +1,4 @@
-use mvp_system::node_data::edge_actor;
+use data_plane::edge_actor;
 use mvp_system::orchestration::run_plan as plan;
 use mvp_system::staging as stage;
 
