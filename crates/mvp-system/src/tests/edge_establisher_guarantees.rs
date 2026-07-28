@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/edge_establisher_contract.md`.
 
-use mvp_system::transport::edge_establisher as edge;
+use mvp_system::node::edge_lifecycle as edge;
 
 // A send provision carries the consumer node id because the driver must know
 // where to send. It deliberately carries no remote actor address.

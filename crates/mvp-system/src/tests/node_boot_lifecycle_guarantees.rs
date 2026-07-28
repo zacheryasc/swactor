@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/node_boot_lifecycle_contract.md`.
 
-use mvp_system::node::node_boot_lifecycle as boot;
+use mvp_system::node::boot_lifecycle as boot;
 
 // A complete boot config lets the tests focus on ordering and failure behavior.
 // The concrete process, transport, arena, worker, and SWIM implementations are

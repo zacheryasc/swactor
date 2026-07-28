@@ -22,7 +22,7 @@ pub use ::provisioning::plugin::{
     ProvisionPlugin,
 };
 
-use crate::transport::bootstrap_datastream::BootstrapDatastreamBridge;
+use crate::observability::provisioning_logs::BootstrapDatastreamBridge;
 
 pub struct LocalDockerPlugin {
     container_name_prefix: String,

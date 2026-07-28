@@ -7,12 +7,12 @@ use iroh::EndpointAddr;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
 use swactor::actor::ActorAddress;
 
-use crate::actors::node_agent::NodeAgentActor;
-use crate::actors::orchestrator::OrchestratorActor;
-use crate::actors::register_mvp_actor_codecs;
+use crate::node::actor::NodeAgentActor;
+use crate::orchestration::actor::OrchestratorActor;
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 use crate::orchestration::run_fsm as orchestrator_core;
 use crate::staging as stage_core;
+use crate::transport::codec_registry::register_mvp_actor_codecs;
 
 pub struct RuntimeNodeConfig {
     pub distributed: DistributedNodeConfig,

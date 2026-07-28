@@ -1,6 +1,6 @@
 use datastream::{ChannelId, ChannelKind, Frame, Lifetime, Record, StreamId};
 use mvp_system::observability::frame_archive::FrameArchive;
-use mvp_system::observability::observability_surface as obs;
+use mvp_system::observability::lifecycle as obs;
 use mvp_system::observability::telemetry::{
     self, MvpLifecycleRecord, MvpProvisionEventRecord, MvpProvisionLogRecord,
 };

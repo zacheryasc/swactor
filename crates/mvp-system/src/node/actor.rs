@@ -7,8 +7,8 @@ use swactor_transport::{CodecRegistry, NetworkMessage};
 use crate::orchestration::run_plan;
 use crate::staging::{self as stage, gguf_shard::StageShardPlan};
 
-use super::codec::JsonCodec;
-use super::orchestrator::OrchestratorMsg;
+use crate::orchestration::actor::OrchestratorMsg;
+use crate::transport::json_codec::JsonCodec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StageEdgeKindWire {

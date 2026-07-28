@@ -1,3 +1,5 @@
+pub mod config;
+
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read};
@@ -20,6 +22,7 @@ use swactor_vastai::{
     SelectionPolicy, classify_vastai_error, create_instance,
 };
 
+use crate::observability::provisioning_logs::{BootstrapDatastreamBridge, node_stream_id};
 use crate::orchestration::node_provisioning::{
     CreateLeaseRequest, CreateLeaseResult, DestroyHandle, LeaseFacts, LogicalNodeSpec,
     ProviderError, ProviderLeaseId, ProviderPlugin, SshEndpoint, provider_kind,
@@ -27,7 +30,6 @@ use crate::orchestration::node_provisioning::{
 use crate::orchestration::provisioning::{
     NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionPlugin,
 };
-use crate::transport::bootstrap_datastream::{BootstrapDatastreamBridge, node_stream_id};
 
 #[derive(Clone, Debug)]
 pub struct VastAiProvisioningConfig {

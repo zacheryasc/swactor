@@ -10,16 +10,16 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::actors::node_agent::{
+use crate::node::actor::{
     NodeAgentMsg, StageEdgeKindWire, StageInboundEdgeWire, StageObjectSpecWire,
     StageOutboundEdgeWire, StageProvisionWire, StageRingSpecWire,
 };
-use crate::actors::orchestrator::{OrchestratorActor, OrchestratorReport};
-use crate::actors::register_mvp_actor_codecs;
-use crate::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 #[cfg(feature = "dashboard")]
 use crate::observability::dashboard_view::MvpClusterDashboardView;
-use crate::observability::{benchmark_observability, frame_archive::FrameArchive};
+use crate::observability::{benchmark, frame_archive::FrameArchive};
+use crate::orchestration::actor::{OrchestratorActor, OrchestratorReport};
+use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
+use crate::transport::codec_registry::register_mvp_actor_codecs;
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
 use crate::node_data::object as ingress;
@@ -46,7 +46,7 @@ use crate::orchestration::provisioning::{
 };
 use crate::orchestration::run_fsm::{RunConfig, RunId};
 use crate::orchestration::run_plan::{self, GgufSource, TokenizerSource};
-use crate::prompt::prompt_rpc::{
+use crate::prompt::rpc::{
     PromptEvent, SubmitPrompt, TokenizerEvent, read_submit_prompt, write_json_line,
 };
 use crate::staging::gguf_shard::{StageShardPlan, plan_stage_shard};
@@ -4049,7 +4049,7 @@ impl OrchDatastream {
         status: &str,
         detail: Value,
     ) {
-        let benchmark = benchmark_observability::stamp("mvp-orchestrator");
+        let benchmark = benchmark::stamp("mvp-orchestrator");
         let payload = serde_json::to_vec(&json!({
             "schema_version": benchmark["schema_version"].clone(),
             "type":"OrchBootstrap",
@@ -4085,7 +4085,7 @@ impl OrchDatastream {
         status: &str,
         detail: Value,
     ) {
-        let benchmark = benchmark_observability::stamp("mvp-orchestrator");
+        let benchmark = benchmark::stamp("mvp-orchestrator");
         let payload = serde_json::to_vec(&json!({
             "schema_version": benchmark["schema_version"].clone(),
             "type":"OrchPromptEvent",
@@ -9139,8 +9139,8 @@ bootstrap_command = "/run"
 
     #[test]
     fn enqueue_runtime_ready_ack_reports_to_node_agent() {
-        use crate::actors::node_agent::{NodeAgentActor, NodeAgentReport};
-        use crate::actors::orchestrator::OrchestratorMsg;
+        use crate::node::actor::{NodeAgentActor, NodeAgentReport};
+        use crate::orchestration::actor::OrchestratorMsg;
         use crate::staging as stage;
 
         let stack =

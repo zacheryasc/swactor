@@ -8,7 +8,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/driver_pumps_contract.md`.
 
-use mvp_system::node_data::local_transport as driver;
+use mvp_system::transport::driver_pumps as driver;
 
 // A driver config names one endpoint and one ALPN. Tests do not expose tokio
 // tasks, connection internals, or stream futures to actors.
