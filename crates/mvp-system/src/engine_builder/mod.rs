@@ -17,7 +17,7 @@ pub mod roles;
 pub mod runtime_stack;
 pub mod workload;
 
-pub use crate::run_plan::{NodeId, RunId};
+pub use crate::orchestration::run_plan::{NodeId, RunId};
 pub use engine::{ClusterBuilder, ClusterHandle, NodeSummary};
 pub use error::{EngineBuildError, LaunchError, NodeControlError, PlanningError, PoolError};
 pub use events::EngineEvent;

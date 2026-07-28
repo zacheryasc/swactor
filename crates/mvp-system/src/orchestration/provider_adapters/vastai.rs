@@ -20,14 +20,14 @@ use swactor_vastai::{
     SelectionPolicy, classify_vastai_error, create_instance,
 };
 
-use crate::bootstrap_datastream::{BootstrapDatastreamBridge, node_stream_id};
-use crate::node_provisioning::{
+use crate::orchestration::node_provisioning::{
     CreateLeaseRequest, CreateLeaseResult, DestroyHandle, LeaseFacts, LogicalNodeSpec,
-    ProviderError, ProviderKind, ProviderLeaseId, ProviderPlugin, SshEndpoint,
+    ProviderError, ProviderLeaseId, ProviderPlugin, SshEndpoint, provider_kind,
 };
-use crate::provisioning::{
+use crate::orchestration::provisioning::{
     NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionPlugin,
 };
+use crate::transport::bootstrap_datastream::{BootstrapDatastreamBridge, node_stream_id};
 
 #[derive(Clone, Debug)]
 pub struct VastAiProvisioningConfig {
@@ -659,12 +659,12 @@ where
         }
 
         LeaseFacts {
-            provider: ProviderKind::VastAi,
+            provider: provider_kind::vastai(),
             lease_id: lease_id.clone(),
             provider_contract_id: contract_id.clone(),
             offer_id: provider_metadata.get("offer_id").cloned(),
             destroy_handle: DestroyHandle {
-                provider: ProviderKind::VastAi,
+                provider: provider_kind::vastai(),
                 lease_id,
                 provider_contract_id: contract_id,
             },
@@ -673,7 +673,7 @@ where
     }
 
     fn contract_id(lease: &LeaseFacts) -> Result<u64, ProviderError> {
-        if lease.provider != ProviderKind::VastAi {
+        if lease.provider != provider_kind::vastai() {
             return Err(ProviderError::new(
                 "vastai provider received non-vastai lease",
             ));
@@ -693,7 +693,7 @@ where
         &mut self,
         request: CreateLeaseRequest,
     ) -> Result<CreateLeaseResult, ProviderError> {
-        if request.spec.provider != ProviderKind::VastAi {
+        if request.spec.provider != provider_kind::vastai() {
             return Err(ProviderError::new(
                 "vastai provider received non-vastai node spec",
             ));
@@ -738,7 +738,7 @@ where
     }
 
     fn destroy_lease(&mut self, handle: &DestroyHandle) -> Result<(), ProviderError> {
-        if handle.provider != ProviderKind::VastAi {
+        if handle.provider != provider_kind::vastai() {
             return Err(ProviderError::new(
                 "vastai provider received non-vastai destroy handle",
             ));
@@ -840,7 +840,7 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
         endpoint: VastAiSshEndpoint,
         sink: PluginSink,
         producer: Option<DatastreamProducer>,
-        lifecycle: LifecyclePolicy,
+        _lifecycle: LifecyclePolicy,
     ) -> Result<Self::Handle, String> {
         if spec.args.is_empty() {
             return Err(format!(
@@ -863,7 +863,6 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
             self.ssh_identity.clone(),
             child,
             stopping,
-            lifecycle.state_timeout,
         );
 
         Ok(SshCommandBootstrapHandle {
@@ -877,8 +876,6 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
         handle.runtime.tick();
     }
 }
-
-const POST_GRACE_BOOTSTRAP_FAILURE_LIMIT: u32 = 2;
 
 fn classify_ssh_observation(line: &str) -> Option<&'static str> {
     let lower = line.to_ascii_lowercase();
@@ -901,10 +898,6 @@ fn classify_ssh_observation(line: &str) -> Option<&'static str> {
         return Some("timeout");
     }
     None
-}
-
-fn post_grace_terminal_bootstrap_class(class: &str) -> bool {
-    matches!(class, "auth_denied" | "refused" | "timeout")
 }
 
 fn spawn_classifying_stderr_reader<R>(
@@ -950,15 +943,12 @@ fn spawn_retrying_ssh_bootstrap(
     ssh_identity: Option<PathBuf>,
     child_slot: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
-    post_grace_failure_after: Duration,
 ) {
     std::thread::spawn(move || {
         let run_id = spec.run_id;
         let node_id = spec.node_id;
         let mut attempt = 1u64;
         let mut backoff = Duration::from_secs(1);
-        let bootstrap_started = Instant::now();
-        let mut post_grace_failures = 0_u32;
 
         while !stopping.load(Ordering::SeqCst) {
             sink.observe(PluginObservation::ProviderLine {
@@ -1038,25 +1028,6 @@ fn spawn_retrying_ssh_bootstrap(
                                     })
                                     .to_string(),
                                 });
-                                if !status.success()
-                                    && !post_grace_failure_after.is_zero()
-                                    && bootstrap_started.elapsed() >= post_grace_failure_after
-                                    && post_grace_terminal_bootstrap_class(observation_class)
-                                {
-                                    post_grace_failures = post_grace_failures.saturating_add(1);
-                                    if post_grace_failures >= POST_GRACE_BOOTSTRAP_FAILURE_LIMIT {
-                                        sink.observe(PluginObservation::Failed {
-                                            run_id,
-                                            node_id,
-                                            reason: format!(
-                                                "VastAI SSH bootstrap repeated post-grace {observation_class} failure before runtime ready"
-                                            ),
-                                        });
-                                        return;
-                                    }
-                                } else {
-                                    post_grace_failures = 0;
-                                }
                                 break;
                             }
                             Some(Err(error)) => {
@@ -1908,7 +1879,7 @@ mod tests {
         observations: Arc<Mutex<Vec<PluginObservation>>>,
     }
 
-    impl crate::provisioning::PluginObservationSink for ObservationSink {
+    impl crate::orchestration::provisioning::PluginObservationSink for ObservationSink {
         fn observe(&self, observation: PluginObservation) {
             self.observations.lock().push(observation);
         }

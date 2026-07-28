@@ -1,4 +1,4 @@
-use crate::run_plan::NodeId;
+use crate::orchestration::run_plan::NodeId;
 
 use super::roles::RoleKind;
 

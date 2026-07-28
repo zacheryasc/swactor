@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/membership_pool_readiness_contract.md`.
 
-use mvp_system::membership_pool_readiness as membership;
+use mvp_system::orchestration::membership_readiness as membership;
 
 // Three nodes are enough to prove all-node quantification without hiding behind
 // a single-node special case. The orchestrator owns this pool; SWIM only reports

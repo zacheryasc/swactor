@@ -1,4 +1,4 @@
-use mvp_system::run_plan as plan;
+use mvp_system::orchestration::run_plan as plan;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MockObjectKind {

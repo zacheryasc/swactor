@@ -4,8 +4,8 @@
 //! session. They prove the node-local FSM, bootstrap handoff, datastream log
 //! routing, and known-lease teardown without Vast.ai, Docker, or real SSH.
 
-use mvp_system::node_provisioning as provision;
-use mvp_system::node_provisioning::ProviderPlugin;
+use mvp_system::orchestration::node_provisioning as provision;
+use mvp_system::orchestration::node_provisioning::ProviderPlugin;
 
 fn group_spec(count: u32) -> provision::RunNodeGroupSpec {
     provision::RunNodeGroupSpec {
@@ -13,7 +13,7 @@ fn group_spec(count: u32) -> provision::RunNodeGroupSpec {
         group_id: provision::NodeGroupId("workers".into()),
         role: provision::RoleId("worker".into()),
         count,
-        provider: provision::ProviderKind::Mock,
+        provider: provision::provider_kind::mock(),
         shape: provision::DesiredNodeShape {
             image: "ghcr.io/acme/mvp-worker:test".into(),
             disk_gb: 80,

@@ -1,4 +1,4 @@
-use crate::run_plan::{self, NodeId};
+use crate::orchestration::run_plan::{self, NodeId};
 
 use super::model::ModelSpec;
 

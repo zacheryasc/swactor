@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use mvp_system::docker_cluster_provisioning as docker;
-use mvp_system::node_provisioning as provision;
+use mvp_system::orchestration::node_provisioning as provision;
+use mvp_system::orchestration::provider_adapters::docker_cluster as docker;
 use provision::ProviderPlugin;
 
 fn docker_group_spec(count: u32) -> provision::RunNodeGroupSpec {
@@ -10,7 +10,7 @@ fn docker_group_spec(count: u32) -> provision::RunNodeGroupSpec {
         group_id: provision::NodeGroupId("workers".into()),
         role: provision::RoleId("worker".into()),
         count,
-        provider: provision::ProviderKind::Docker,
+        provider: provision::provider_kind::docker(),
         shape: provision::DesiredNodeShape {
             image: "mvp-worker-test:latest".into(),
             disk_gb: 32,
@@ -221,7 +221,7 @@ fn docker_provider_maps_node_spec_to_container_lease_and_destroy_handle() {
     assert_eq!(run.env["MVP_ORCH_SWACTOR_ADDR"], "quic://orch.local:9443");
     assert_eq!(cli.inspect_requests, vec!["container-1"]);
 
-    assert_eq!(result.lease.provider, provision::ProviderKind::Docker);
+    assert_eq!(result.lease.provider, provision::provider_kind::docker());
     assert_eq!(
         result.lease.lease_id,
         provision::ProviderLeaseId("docker:container-1".into())
@@ -349,7 +349,7 @@ fn docker_node_provisioner_wires_provider_bootstrap_join_and_teardown() {
     assert!(record.ready);
     assert_eq!(
         record.lease.as_ref().unwrap().provider,
-        provision::ProviderKind::Docker
+        provision::provider_kind::docker()
     );
     assert!(node.bootstrap().expect("bootstrap exists").is_closed());
     assert!(node.bootstrap().unwrap().client().closed);

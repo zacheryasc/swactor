@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use datastream::{DatastreamEndpoint, Record};
 use iroh::{EndpointAddr, SecretKey};
-use mvp_system::bootstrap_datastream::{BootstrapDatastreamBridge, node_stream_id};
-use mvp_system::provisioning::{
+use mvp_system::observability::telemetry::MvpProvisionLogRecord;
+use mvp_system::orchestration::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink, ProvisionLogStream,
 };
-use mvp_system::telemetry::MvpProvisionLogRecord;
+use mvp_system::transport::bootstrap_datastream::{BootstrapDatastreamBridge, node_stream_id};
 use parking_lot::Mutex;
 use serde_json::json;
 

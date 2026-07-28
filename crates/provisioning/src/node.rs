@@ -1,5 +1,4 @@
-//! Node-local provisioning and bootstrap state machines for the MVP node
-//! provisioning spec.
+//! Provider-neutral node lease, bootstrap, and destroy state machines.
 //!
 //! The module is intentionally in-process and deterministic. `NodeManager` is the
 //! actor core: it owns one node record and emits commands for provider and
@@ -35,33 +34,16 @@ pub struct BootstrapSessionId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct DatastreamStreamId(pub String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub enum ProviderKind {
-    Mock,
-    Process,
-    Docker,
-    VastAi,
-}
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ProviderKind(pub String);
 
 impl ProviderKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Mock => "mock",
-            Self::Process => "process",
-            Self::Docker => "docker",
-            Self::VastAi => "vastai",
-        }
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 
-    pub fn parse_deploy(value: &str) -> Result<Self, String> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "process" | "local_process" | "local-process" => Ok(Self::Process),
-            "docker" | "local_docker" | "local-docker" => Ok(Self::Docker),
-            "vastai" | "vast_ai" | "vast-ai" => Ok(Self::VastAi),
-            other => Err(format!(
-                "unsupported provider {other:?}; use process, docker, or vastai"
-            )),
-        }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -133,7 +115,7 @@ pub fn expand_node_group(group: &RunNodeGroupSpec) -> Vec<LogicalNodeSpec> {
                 logical_node_id: logical_node_id.clone(),
                 group_id: group.group_id.clone(),
                 role: group.role.clone(),
-                provider: group.provider,
+                provider: group.provider.clone(),
                 shape: group.shape.clone(),
                 boot: group.boot.clone(),
                 swarm_join: SwarmJoinSpec {
@@ -911,12 +893,12 @@ impl MockProviderPlugin {
         let lease_id = ProviderLeaseId(format!("mock:{id}"));
         CreateLeaseResult {
             lease: LeaseFacts {
-                provider: ProviderKind::Mock,
+                provider: ProviderKind::new("mock"),
                 lease_id: lease_id.clone(),
                 provider_contract_id: id.to_string(),
                 offer_id: Some(format!("offer-{id}")),
                 destroy_handle: DestroyHandle {
-                    provider: ProviderKind::Mock,
+                    provider: ProviderKind::new("mock"),
                     lease_id,
                     provider_contract_id: id.to_string(),
                 },
@@ -980,42 +962,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_kind_parses_process_docker_and_vastai_aliases() {
-        for alias in ["process", "local_process", "local-process"] {
-            assert_eq!(
-                ProviderKind::parse_deploy(alias),
-                Ok(ProviderKind::Process),
-                "{alias} should select process provider"
-            );
-        }
-        for alias in ["docker", "local_docker", "local-docker"] {
-            assert_eq!(
-                ProviderKind::parse_deploy(alias),
-                Ok(ProviderKind::Docker),
-                "{alias} should select Docker provider"
-            );
-        }
-        for alias in ["vastai", "vast_ai", "vast-ai"] {
-            assert_eq!(
-                ProviderKind::parse_deploy(alias),
-                Ok(ProviderKind::VastAi),
-                "{alias} should select VastAI provider"
-            );
-        }
-    }
+    fn provider_kind_is_an_opaque_provider_identifier() {
+        let provider = ProviderKind::new("example-provider");
 
-    #[test]
-    fn provider_kind_process_stable_string_is_process() {
-        assert_eq!(ProviderKind::Process.as_str(), "process");
-    }
-
-    #[test]
-    fn invalid_provider_error_names_production_providers() {
-        let error = ProviderKind::parse_deploy("spaceship").expect_err("invalid provider fails");
-
-        assert!(
-            error.contains("use process, docker, or vastai"),
-            "unexpected provider error: {error}"
-        );
+        assert_eq!(provider.as_str(), "example-provider");
     }
 }

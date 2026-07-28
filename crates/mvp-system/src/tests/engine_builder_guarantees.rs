@@ -4,8 +4,8 @@
 //! pool, launches the same node image, waits for readiness/convergence, lets a
 //! planner assign roles, and stays agnostic to workload input semantics.
 
-use mvp_system::engine_builder as engine;
-use mvp_system::engine_builder::WorkloadAdapter;
+use mvp_system::orchestration::engine_builder as engine;
+use mvp_system::orchestration::engine_builder::WorkloadAdapter;
 
 fn model() -> engine::ModelSpec {
     engine::ModelSpec::mvp_tiny_open_llm_fixture()
@@ -182,8 +182,8 @@ fn runtime_node_builds_the_reusable_iroh_swactor_stack() {
 
     let orchestrator = node
         .spawn_orchestrator_actor(
-            mvp_system::orchestrator_run_fsm::RunConfig {
-                run_id: mvp_system::orchestrator_run_fsm::RunId(77),
+            mvp_system::orchestration::run_fsm::RunConfig {
+                run_id: mvp_system::orchestration::run_fsm::RunId(77),
                 max_tokens: 1,
                 prompt: vec![1, 2, 3],
             },
@@ -191,7 +191,7 @@ fn runtime_node_builds_the_reusable_iroh_swactor_stack() {
         )
         .expect("spawn orchestrator actor");
     let worker = node
-        .spawn_node_agent_actor(mvp_system::stage_controller::NodeId(11), orchestrator, None)
+        .spawn_node_agent_actor(mvp_system::staging::NodeId(11), orchestrator, None)
         .expect("spawn node agent actor");
 
     node.wait_for_routes(&[orchestrator, worker])

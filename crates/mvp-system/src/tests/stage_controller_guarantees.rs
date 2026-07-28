@@ -8,7 +8,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/stage_controller_contract.md`.
 
-use mvp_system::stage_controller as stage;
+use mvp_system::staging as stage;
 
 // This provision fixture represents a single middle stage. It has one inbound
 // and one outbound edge so tests can prove the controller uses assigned edges

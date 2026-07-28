@@ -1,7 +1,7 @@
-use crate::shard_fetch::{
+use crate::staging::shard_fetch::{
     FetchError, ShardCache, ShardFetchCoordinator, ShardFetchStatus, ShardFetcher, ShardLocation,
 };
-use crate::weight_shards::{ShardAssignment, ShardValidationError, ValidatedShard};
+use crate::staging::weight_shards::{ShardAssignment, ShardValidationError, ValidatedShard};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShardLifecycleState {
@@ -91,7 +91,7 @@ impl ShardWeightLifecycle {
             assignment: assignment.clone(),
         });
 
-        let location = crate::shard_fetch::ShardLocator::locate(&assignment);
+        let location = crate::staging::shard_fetch::ShardLocator::locate(&assignment);
         self.state = ShardLifecycleState::Located;
         self.events.push(ShardLifecycleEvent::Located {
             location: location.clone(),

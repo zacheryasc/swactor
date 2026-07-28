@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
@@ -16,42 +16,42 @@ use crate::actors::node_agent::{
 };
 use crate::actors::orchestrator::{OrchestratorActor, OrchestratorReport};
 use crate::actors::register_mvp_actor_codecs;
-use crate::benchmark_observability;
 use crate::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 #[cfg(feature = "dashboard")]
-use crate::dashboard_view::MvpClusterDashboardView;
+use crate::observability::dashboard_view::MvpClusterDashboardView;
+use crate::observability::{benchmark_observability, frame_archive::FrameArchive};
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
-use crate::distribution_stack::DistributionRuntimeStack;
-use crate::endpoint_advertisement::{
-    EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
+use crate::node_data::object as ingress;
+use crate::observability::telemetry::{
+    MVP_PROVISIONING_EVENTS, MvpProvisionEventRecord, MvpProvisionLogRecord,
+    mvp_provision_log_channel,
 };
-use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
-use crate::gpu_worker_ingress_parser as ingress;
-use crate::node_provisioning::ProviderKind;
-use crate::orchestrator_run_fsm::{RunConfig, RunId};
-use crate::prompt_rpc::{
-    PromptEvent, SubmitPrompt, TokenizerEvent, read_submit_prompt, write_json_line,
+use crate::orchestration::distribution_stack::DistributionRuntimeStack;
+use crate::orchestration::node_provisioning::{ProviderKind, provider_kind};
+#[cfg(test)]
+use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
+use crate::orchestration::provider_adapters::relay::{
+    MVP_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV, relay_mode_env_value,
+    relay_runtime_config_from_settings,
 };
-use crate::provisioning::{
+use crate::orchestration::provider_adapters::vastai::{
+    SshCommandBootstrapLauncher, ToolsVastAiLeaseClient, VastAiProvisioningConfig,
+    VastAiProvisioningPlugin,
+};
+use crate::orchestration::provisioning::{
     LocalDockerPlugin, LocalProcessPlugin, NodeProvisionSpec, PluginObservation,
     PluginObservationSink, PluginSink, ProviderMount, ProvisionEvent, ProvisionEventKind,
     ProvisionLogLine, ProvisionLogStream, ProvisionPlugin,
 };
-#[cfg(test)]
-use crate::relay_provisioning::relay_runtime_config_from_env;
-use crate::relay_provisioning::{
-    MVP_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV, relay_mode_env_value,
-    relay_runtime_config_from_settings,
+use crate::orchestration::run_fsm::{RunConfig, RunId};
+use crate::orchestration::run_plan::{self, GgufSource, TokenizerSource};
+use crate::prompt::prompt_rpc::{
+    PromptEvent, SubmitPrompt, TokenizerEvent, read_submit_prompt, write_json_line,
 };
-use crate::run_plan::{self, GgufSource, TokenizerSource};
-use crate::telemetry::{
-    MVP_PROVISIONING_EVENTS, MvpProvisionEventRecord, MvpProvisionLogRecord,
-    mvp_provision_log_channel,
-};
-use crate::vastai_provisioning::{
-    SshCommandBootstrapLauncher, ToolsVastAiLeaseClient, VastAiProvisioningConfig,
-    VastAiProvisioningPlugin,
+use crate::staging::gguf_shard::{StageShardPlan, plan_stage_shard};
+use crate::transport::endpoint_advertisement::{
+    EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
 use datastream::{
     ChannelContent, ChannelId, ChannelRef, DatastreamEndpoint, DatastreamEvent, DatastreamProducer,
@@ -86,10 +86,7 @@ const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
-const RUNTIME_READY_ACK_TIMEOUT: Duration = Duration::from_secs(60);
 const STAGE_PROVISION_ACTIVE_RESEND_AFTER: Duration = Duration::from_secs(60);
-const RUNTIME_READY_TIMEOUT: Duration = Duration::from_secs(60);
-const PIPELINE_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const PIPELINE_PROMPT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
 const MVP_ORCH_BOOTSTRAP: &str = "mvp.orch.bootstrap";
 const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
@@ -599,7 +596,7 @@ where
         ready.first_stage.node_actor,
         ready.final_stage.node_actor,
         tokenizer_reply_actor,
-        config.provider,
+        &config.provider,
         pipeline_plan.as_ref(),
         ready.first_stage.endpoint.clone(),
     );
@@ -822,8 +819,8 @@ impl RuntimeConfigProfile {
 
     fn default_provider(self) -> ProviderKind {
         match self {
-            Self::Local => ProviderKind::Process,
-            Self::Deploy => ProviderKind::VastAi,
+            Self::Local => provider_kind::process(),
+            Self::Deploy => provider_kind::vastai(),
         }
     }
 }
@@ -835,13 +832,13 @@ struct CachedModelConfig {
 }
 
 impl CachedModelConfig {
-    fn from_host_path(provider: ProviderKind, requested: PathBuf) -> Result<Self, String> {
-        if !matches!(
-            provider,
-            ProviderKind::Process | ProviderKind::Docker | ProviderKind::VastAi
-        ) {
+    fn from_host_path(provider: &ProviderKind, requested: PathBuf) -> Result<Self, String> {
+        if provider != &provider_kind::process()
+            && provider != &provider_kind::docker()
+            && provider != &provider_kind::vastai()
+        {
             return Err(format!(
-                "{CACHED_MODEL_HOST_ENV} is a host-local cache path and is only supported by provider=process, provider=docker, or provider=vastai planning"
+                "{CACHED_MODEL_HOST_ENV} is a host-local cache path and is only supported by provider=process, provider=docker, or vastai planning"
             ));
         }
         let host_path = requested.canonicalize().map_err(|e| {
@@ -863,12 +860,11 @@ impl CachedModelConfig {
         })
     }
 
-    fn worker_path(&self, provider: ProviderKind) -> String {
-        match provider {
-            ProviderKind::Process => self.host_path.to_string_lossy().to_string(),
-            ProviderKind::Docker | ProviderKind::VastAi | ProviderKind::Mock => {
-                self.container_path.clone()
-            }
+    fn worker_path(&self, provider: &ProviderKind) -> String {
+        if provider == &provider_kind::process() {
+            self.host_path.to_string_lossy().to_string()
+        } else {
+            self.container_path.clone()
         }
     }
 
@@ -1097,7 +1093,7 @@ impl ConfigBuilder {
             self.pipeline_stages = pipeline_stages;
         }
         if let Some(provider) = overlay.provider.kind {
-            self.provider = Some(ProviderKind::parse_deploy(&provider)?);
+            self.provider = Some(provider_kind::parse_deploy(&provider)?);
         }
         if let Some(image) = overlay.image.node {
             self.image = image;
@@ -1227,7 +1223,7 @@ impl ConfigBuilder {
         if let Some(provider) =
             env_optional("MVP_NODE_PROVIDER").or_else(|| env_optional("MVP_PROVIDER"))
         {
-            self.provider = Some(ProviderKind::parse_deploy(&provider)?);
+            self.provider = Some(provider_kind::parse_deploy(&provider)?);
         }
         if let Some(image) = env_optional("MVP_NODE_IMAGE") {
             self.set_process_image(image);
@@ -1351,7 +1347,7 @@ impl ConfigBuilder {
                         RuntimeConfigProfile::parse(&next_arg(&mut args, "--runtime-config")?)?
                 }
                 "--provider" => {
-                    self.provider = Some(ProviderKind::parse_deploy(&next_arg(
+                    self.provider = Some(provider_kind::parse_deploy(&next_arg(
                         &mut args,
                         "--provider",
                     )?)?)
@@ -1491,9 +1487,10 @@ impl ConfigBuilder {
     fn finalize(self) -> Result<Config, String> {
         let provider = self
             .provider
+            .clone()
             .unwrap_or_else(|| self.config_profile.default_provider());
         let mut image = self.image.clone();
-        if provider == ProviderKind::VastAi && !self.image_overridden_after_toml {
+        if provider == provider_kind::vastai() && !self.image_overridden_after_toml {
             if let Some(vastai_image) = &self.toml_vastai_image {
                 image = vastai_image.clone();
             }
@@ -1502,7 +1499,7 @@ impl ConfigBuilder {
             return Err("--pipeline-stages must be greater than 0".to_owned());
         }
         let mut cached_model_host_path = self.cached_model_host_path.clone();
-        if matches!(provider, ProviderKind::Process | ProviderKind::Docker)
+        if (provider == provider_kind::process() || provider == provider_kind::docker())
             && self.pipeline_stages > 1
             && cached_model_host_path.is_none()
             && (gguf_source_is_default_hf(&self.gguf_source)
@@ -1511,12 +1508,12 @@ impl ConfigBuilder {
             cached_model_host_path = Some(default_pipeline_cached_model_path());
         }
         let cached_model = cached_model_host_path
-            .map(|path| CachedModelConfig::from_host_path(provider, path))
+            .map(|path| CachedModelConfig::from_host_path(&provider, path))
             .transpose()?;
         let mut gguf_source = self.gguf_source.clone();
         if let Some(cached_model) = &cached_model {
-            if provider != ProviderKind::VastAi {
-                gguf_source = GgufSource::LocalPath(cached_model.worker_path(provider));
+            if provider != provider_kind::vastai() {
+                gguf_source = GgufSource::LocalPath(cached_model.worker_path(&provider));
             }
         }
         let relay = relay_runtime_config_from_settings(
@@ -1528,7 +1525,7 @@ impl ConfigBuilder {
             Some(mask) => EndpointAddrMask::parse(mask)?,
             None => EndpointAddrMask::Full,
         };
-        let vastai = if provider == ProviderKind::VastAi {
+        let vastai = if provider == provider_kind::vastai() {
             Some(VastAiRuntimeConfig::from_builder(&self)?)
         } else {
             None
@@ -1670,26 +1667,28 @@ impl Config {
     }
 
     fn provider_datastream_detail(&self) -> Value {
-        match self.provider {
-            ProviderKind::Process => json!({
+        if self.provider == provider_kind::process() {
+            json!({
                 "worker_bin": self.worker_bin.as_ref().map(|path| path.to_string_lossy().to_string()),
                 "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
-            }),
-            ProviderKind::Docker => json!({
+            })
+        } else if self.provider == provider_kind::docker() {
+            json!({
                 "docker_gpus": &self.docker_gpus,
                 "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
-            }),
-            ProviderKind::VastAi => self
-                .vastai
+            })
+        } else if self.provider == provider_kind::vastai() {
+            self.vastai
                 .as_ref()
-                .map_or_else(|| json!({}), VastAiRuntimeConfig::datastream_detail),
-            ProviderKind::Mock => json!({}),
+                .map_or_else(|| json!({}), VastAiRuntimeConfig::datastream_detail)
+        } else {
+            json!({})
         }
     }
 
     fn build_run_plan(&self) -> Result<run_plan::RunPlan, String> {
         let host_path = self.local_planning_gguf_path()?;
-        let metadata = crate::gguf_metadata::read_gguf_planning_metadata(&host_path)?;
+        let metadata = crate::staging::gguf_metadata::read_gguf_planning_metadata(&host_path)?;
         let model = metadata.to_model_facts(
             self.model_id.clone(),
             self.gguf_source.clone(),
@@ -1786,7 +1785,7 @@ impl Config {
                 }
             }
             GgufSource::HuggingFaceGguf { repo, file, .. }
-                if self.provider == ProviderKind::VastAi
+                if self.provider == provider_kind::vastai()
                     && gguf_source_matches_default_pipeline_cache(&self.gguf_source) =>
             {
                 let host_path = default_pipeline_cached_model_path();
@@ -1806,7 +1805,7 @@ impl Config {
     }
 
     fn prepare_vastai_ssh_key(&mut self) -> Result<(), String> {
-        if self.provider != ProviderKind::VastAi {
+        if self.provider != provider_kind::vastai() {
             return Ok(());
         }
 
@@ -1855,44 +1854,43 @@ impl Config {
         &self,
         bootstrap_runtime: Arc<swactor::runtime::Runtime>,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
-        match self.provider {
-            ProviderKind::Process => {
-                let worker_bin = self.worker_bin.clone().unwrap_or(default_worker_bin()?);
-                if !worker_bin.is_file() {
-                    return Err(format!(
-                        "local process worker binary does not exist: {}",
-                        worker_bin.display()
-                    ));
-                }
-                Ok(Box::new(LocalProcessPlugin::new(worker_bin)))
+        if self.provider == provider_kind::process() {
+            let worker_bin = self.worker_bin.clone().unwrap_or(default_worker_bin()?);
+            if !worker_bin.is_file() {
+                return Err(format!(
+                    "local process worker binary does not exist: {}",
+                    worker_bin.display()
+                ));
             }
-            ProviderKind::Docker => Ok(Box::new(LocalDockerPlugin::new(docker_container_prefix()))),
-            ProviderKind::VastAi => {
-                let vastai = self.vastai.as_ref().ok_or_else(|| {
-                    "VastAI config was not resolved for provider vastai".to_owned()
-                })?;
-                if vastai.bootstrap_command.is_none() {
-                    return Err(
-                        "MVP_VASTAI_BOOTSTRAP_COMMAND is required when MVP_NODE_PROVIDER=vastai"
-                            .to_owned(),
-                    );
-                }
-                let api_key = vastai.api_key.clone().ok_or_else(|| {
-                    "VAST_API_KEY, MVP_VASTAI_API_KEY, or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
-                        .to_owned()
-                })?;
-                let ssh_identity = vastai
-                    .ssh_identity
-                    .clone()
-                    .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
-                let client = ToolsVastAiLeaseClient::from_api_key(api_key)?;
-                Ok(Box::new(VastAiProvisioningPlugin::new(
-                    client,
-                    SshCommandBootstrapLauncher::new(Some(ssh_identity), bootstrap_runtime),
-                    vastai.provisioning.clone(),
-                )))
+            Ok(Box::new(LocalProcessPlugin::new(worker_bin)))
+        } else if self.provider == provider_kind::docker() {
+            Ok(Box::new(LocalDockerPlugin::new(docker_container_prefix())))
+        } else if self.provider == provider_kind::vastai() {
+            let vastai = self
+                .vastai
+                .as_ref()
+                .ok_or_else(|| "VastAI config was not resolved for provider vastai".to_owned())?;
+            if vastai.bootstrap_command.is_none() {
+                return Err(
+                    "MVP_VASTAI_BOOTSTRAP_COMMAND is required when MVP_NODE_PROVIDER=vastai"
+                        .to_owned(),
+                );
             }
-            ProviderKind::Mock => Err("mvp-orchestrator does not support mock provider".to_owned()),
+            let api_key = vastai.api_key.clone().ok_or_else(|| {
+                "VAST_API_KEY, MVP_VASTAI_API_KEY, or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
+                    .to_owned()
+            })?;
+            let ssh_identity = vastai
+                .ssh_identity
+                .clone()
+                .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
+            Ok(Box::new(VastAiProvisioningPlugin::new(
+                ToolsVastAiLeaseClient::from_api_key(api_key)?,
+                SshCommandBootstrapLauncher::new(Some(ssh_identity), bootstrap_runtime),
+                vastai.provisioning.clone(),
+            )))
+        } else {
+            Err("mock provider cannot build a runtime provisioner".to_owned())
         }
     }
 
@@ -1912,13 +1910,13 @@ impl Config {
         if self.relay.url.is_some() {
             keys.push(MVP_IROH_RELAY_URL_ENV);
         }
-        if self.provider == ProviderKind::Docker {
+        if self.provider == provider_kind::docker() {
             keys.push("MVP_DOCKER_GPUS");
         }
         if std::env::var_os("DEV").is_some() {
             keys.push("DEV");
         }
-        if local_tinygrad_worker_env(self.provider).is_some() {
+        if local_tinygrad_worker_env(&self.provider).is_some() {
             keys.push("MVP_TINYGRAD_WORKER");
         }
         if std::env::var_os("MVP_CPU_LINE_PROFILE").is_some() {
@@ -2016,11 +2014,11 @@ impl Config {
         if let Some(url) = &self.relay.url {
             env.push((MVP_IROH_RELAY_URL_ENV.to_owned(), url.clone()));
         }
-        if self.provider == ProviderKind::Docker {
+        if self.provider == provider_kind::docker() {
             env.push(("MVP_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
         }
         env.extend(optional_env("DEV"));
-        env.extend(local_tinygrad_worker_env(self.provider));
+        env.extend(local_tinygrad_worker_env(&self.provider));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE"));
         env.extend(optional_env("MVP_CPU_LINE_PROFILE_INTERVAL_MS"));
         env.extend(optional_env("MVP_TOKEN_PROGRESS_EVERY"));
@@ -2049,19 +2047,20 @@ impl Config {
         if let Some(max_context) = self.max_context {
             env.push(("MVP_MAX_CONTEXT".to_owned(), max_context.to_string()));
         }
-        let args = match self.provider {
-            ProviderKind::VastAi => self
-                .vastai
+        let args = if self.provider == provider_kind::vastai() {
+            self.vastai
                 .as_ref()
                 .and_then(|vastai| vastai.bootstrap_command.clone())
                 .into_iter()
-                .collect(),
-            ProviderKind::Process | ProviderKind::Docker => Vec::new(),
-            ProviderKind::Mock => {
-                return Err("mvp-orchestrator does not support mock provider".to_owned());
-            }
+                .collect()
+        } else if self.provider == provider_kind::process()
+            || self.provider == provider_kind::docker()
+        {
+            Vec::new()
+        } else {
+            return Err("mvp-orchestrator does not support mock provider".to_owned());
         };
-        let mounts = if self.provider == ProviderKind::Docker {
+        let mounts = if self.provider == provider_kind::docker() {
             self.cached_model
                 .as_ref()
                 .map(|cached_model| {
@@ -2171,7 +2170,7 @@ fn wait_for_runtime_ready_acks(
     orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     orchestrator_node_id: u64,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     targets: &[RuntimeReadyAckTarget],
     collector_endpoint: &EndpointAddr,
 ) -> Result<(), String> {
@@ -2190,7 +2189,6 @@ fn wait_for_runtime_ready_acks(
         })
         .collect::<BTreeMap<_, _>>();
     let mut attempts = BTreeMap::<(u64, u32, u64), u64>::new();
-    let started = Instant::now();
     let mut last_send = None::<Instant>;
 
     while !pending.is_empty() {
@@ -2257,18 +2255,6 @@ fn wait_for_runtime_ready_acks(
         if pending.is_empty() {
             return Ok(());
         }
-        if started.elapsed() >= RUNTIME_READY_ACK_TIMEOUT {
-            let pending_list = pending
-                .keys()
-                .map(|(node_id, stage_index, readiness_id)| {
-                    format!("{node_id}/{stage_index}/{readiness_id}")
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "runtime_ready_ack timed out for node(s): {pending_list}"
-            ));
-        }
         if last_send.is_none_or(|sent_at| sent_at.elapsed() >= RUNTIME_READY_ACK_RETRY_INTERVAL) {
             for (key, target) in &pending {
                 if stack.route_owner(target.ready.datastream_publisher)
@@ -2319,14 +2305,14 @@ fn wait_for_runtime_ready_acks(
 #[cfg(test)]
 struct ProvisionedNodeGuard<'a> {
     provisioner: &'a mut dyn ProvisionPlugin,
-    handle: Option<crate::provisioning::PluginNodeHandle>,
+    handle: Option<crate::orchestration::provisioning::PluginNodeHandle>,
 }
 
 #[cfg(test)]
 impl<'a> ProvisionedNodeGuard<'a> {
     fn new(
         provisioner: &'a mut dyn ProvisionPlugin,
-        handle: crate::provisioning::PluginNodeHandle,
+        handle: crate::orchestration::provisioning::PluginNodeHandle,
     ) -> Self {
         Self {
             provisioner,
@@ -2351,13 +2337,13 @@ impl Drop for ProvisionedNodeGuard<'_> {
 
 struct ProvisionedClusterGuard {
     provisioner: Box<dyn ProvisionPlugin>,
-    handles: Vec<crate::provisioning::PluginNodeHandle>,
+    handles: Vec<crate::orchestration::provisioning::PluginNodeHandle>,
 }
 
 impl ProvisionedClusterGuard {
     fn new(
         provisioner: Box<dyn ProvisionPlugin>,
-        handles: Vec<crate::provisioning::PluginNodeHandle>,
+        handles: Vec<crate::orchestration::provisioning::PluginNodeHandle>,
     ) -> Self {
         Self {
             provisioner,
@@ -2400,7 +2386,7 @@ fn start_nodes_with_stdio_capture(
     Box<dyn ProvisionPlugin>,
     Vec<(
         NodeProvisionSpec,
-        Result<crate::provisioning::PluginNodeHandle, String>,
+        Result<crate::orchestration::provisioning::PluginNodeHandle, String>,
     )>,
 ) {
     let (tx, rx) = mpsc::channel();
@@ -2484,7 +2470,7 @@ fn start_and_provision_workers(
             "image":&config.image,
             "relay_mode":relay_mode_env_value(&config.relay.mode),
             "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
-            "docker_gpus":if config.provider == ProviderKind::Docker { Some(config.docker_gpus.as_str()) } else { None },
+            "docker_gpus":if config.provider == provider_kind::docker() { Some(config.docker_gpus.as_str()) } else { None },
             "provider_config":config.provider_datastream_detail(),
             "env_keys":config.node_spec_env_keys(),
             "worker_count":stage_specs.len(),
@@ -2636,7 +2622,7 @@ fn start_and_provision_workers(
             orch_stdio_rx,
             config.run_id,
             &expected_node_ids,
-            config.provider,
+            &config.provider,
         ) {
             Ok(readies) => readies,
             Err(error) => {
@@ -2665,7 +2651,7 @@ fn start_and_provision_workers(
             orch_stdio_rx,
             config.run_id,
             config.node_id,
-            config.provider,
+            &config.provider,
         ) {
             Ok(ready) => ready,
             Err(error) => {
@@ -2712,7 +2698,7 @@ fn start_and_provision_workers(
         orch_stdio_rx,
         config.run_id,
         config.node_id,
-        config.provider,
+        &config.provider,
         &ack_targets,
         &pipeline_coordinator,
     )?;
@@ -2754,7 +2740,7 @@ fn start_and_provision_workers(
             orch_stdio_rx,
             config.run_id,
             config.node_id,
-            config.provider,
+            &config.provider,
             expected_node_ids.len(),
             config,
             pipeline_plan.expect("pipeline mode requires plan"),
@@ -2776,7 +2762,7 @@ fn start_and_provision_workers(
             orch_stdio_rx,
             config.run_id,
             config.node_id,
-            config.provider,
+            &config.provider,
             config.stage_index,
         )
     };
@@ -2872,9 +2858,9 @@ fn stage_node_specs(
 struct ProviderStartOutcome {
     results: Vec<(
         NodeProvisionSpec,
-        Result<crate::provisioning::PluginNodeHandle, String>,
+        Result<crate::orchestration::provisioning::PluginNodeHandle, String>,
     )>,
-    successful_handles: Vec<crate::provisioning::PluginNodeHandle>,
+    successful_handles: Vec<crate::orchestration::provisioning::PluginNodeHandle>,
     failed_specs: Vec<NodeProvisionSpec>,
     first_error: Option<String>,
 }
@@ -2882,7 +2868,7 @@ struct ProviderStartOutcome {
 fn collect_provider_start_outcome(
     results: Vec<(
         NodeProvisionSpec,
-        Result<crate::provisioning::PluginNodeHandle, String>,
+        Result<crate::orchestration::provisioning::PluginNodeHandle, String>,
     )>,
 ) -> ProviderStartOutcome {
     let mut successful_handles = Vec::new();
@@ -2909,7 +2895,7 @@ fn collect_provider_start_outcome(
 
 fn stop_started_nodes(
     provisioner: &mut dyn ProvisionPlugin,
-    handles: &mut Vec<crate::provisioning::PluginNodeHandle>,
+    handles: &mut Vec<crate::orchestration::provisioning::PluginNodeHandle>,
 ) {
     while let Some(handle) = handles.pop() {
         let _ = provisioner.stop_node(&handle);
@@ -3140,11 +3126,10 @@ fn wait_for_runtime_readies(
     orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     expected_node_ids: &[u64],
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) -> Result<BTreeMap<u64, RuntimeReady>, String> {
     let expected = expected_node_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut pending = BTreeMap::<u64, RuntimeReady>::new();
-    let started = Instant::now();
     loop {
         pump(driver, stack, frame_tx);
         emit_swim_transitions(
@@ -3214,21 +3199,6 @@ fn wait_for_runtime_readies(
         }) {
             return Ok(pending);
         }
-        if started.elapsed() >= RUNTIME_READY_TIMEOUT {
-            let pending_list = expected
-                .iter()
-                .filter(|node_id| {
-                    pending
-                        .get(node_id)
-                        .is_none_or(|ready| !runtime_ready_barrier_met(stack, ready))
-                })
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "runtime_ready timed out for node(s): {pending_list}"
-            ));
-        }
         thread::sleep(PUMP_INTERVAL);
     }
 }
@@ -3247,7 +3217,7 @@ fn wait_for_weights_loaded_count(
     orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     node_id: u64,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     expected_count: usize,
     _config: &Config,
     pipeline_plan: &run_plan::RunPlan,
@@ -3610,18 +3580,21 @@ impl ProvisionPlugin for FailedProvisionPlugin {
         &mut self,
         _spec: NodeProvisionSpec,
         _sink: PluginSink,
-    ) -> Result<crate::provisioning::PluginNodeHandle, String> {
+    ) -> Result<crate::orchestration::provisioning::PluginNodeHandle, String> {
         Err("provider start worker disconnected".to_owned())
     }
 
     fn complete_bootstrap(
         &mut self,
-        _handle: &crate::provisioning::PluginNodeHandle,
+        _handle: &crate::orchestration::provisioning::PluginNodeHandle,
     ) -> Result<(), String> {
         Ok(())
     }
 
-    fn stop_node(&mut self, _handle: &crate::provisioning::PluginNodeHandle) -> Result<(), String> {
+    fn stop_node(
+        &mut self,
+        _handle: &crate::orchestration::provisioning::PluginNodeHandle,
+    ) -> Result<(), String> {
         Ok(())
     }
 }
@@ -3964,50 +3937,6 @@ fn drain_datastream_connections(
     }
 }
 
-struct FrameArchive {
-    file: File,
-    next_seq: u64,
-}
-
-impl FrameArchive {
-    fn open(path: &Path) -> Result<Self, String> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                format!("create datastream frame log dir {}: {e}", parent.display())
-            })?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| format!("open datastream frame log {}: {e}", path.display()))?;
-        Ok(Self { file, next_seq: 0 })
-    }
-
-    fn record(&mut self, source: &str, stream: &StreamId, channel: &str, frame: &Frame) {
-        let payload = match std::str::from_utf8(&frame.payload) {
-            Ok(text) => json!({"encoding":"utf8","value":text}),
-            Err(_) => json!({"encoding":"bytes","value":frame.payload}),
-        };
-        let record = json!({
-            "arrival_seq":self.next_seq,
-            "arrival_unix_ms":benchmark_observability::unix_ms_now(),
-            "source":source,
-            "stream":stream.to_string(),
-            "channel":channel,
-            "channel_id":frame.channel.0,
-            "position":frame.position.0,
-            "payload":payload,
-        });
-        self.next_seq += 1;
-        let _ = serde_json::to_writer(&mut self.file, &record);
-        let _ = writeln!(self.file);
-        let _ = self.file.flush();
-    }
-}
-
 struct OrchDatastream {
     stream: StreamId,
     endpoint: DatastreamEndpoint,
@@ -4225,7 +4154,7 @@ impl OrchDatastream {
 
     fn archive_frame(&mut self, source: &str, stream: &StreamId, channel: &str, frame: &Frame) {
         if let Some(archive) = &mut self.archive {
-            archive.record(source, stream, channel, frame);
+            let _ = archive.record(source, stream, channel, frame);
         }
     }
 }
@@ -4468,13 +4397,12 @@ fn wait_for_runtime_ready(
     orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     node_id: u64,
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) -> Result<RuntimeReady, String> {
     let mut pending_ready: Option<RuntimeReady> = None;
     let mut node_swim_started = false;
     let mut node_swim_ready = false;
     let mut node_route_started = false;
-    let started = Instant::now();
     loop {
         pump(driver, stack, frame_tx);
         drain_frames(frame_rx, dashboard, orch_datastream);
@@ -4571,18 +4499,6 @@ fn wait_for_runtime_ready(
                 }
             }
         }
-        if started.elapsed() >= RUNTIME_READY_TIMEOUT {
-            let detail = pending_ready.as_ref().map(|ready| {
-                json!({
-                    "readiness_id":ready.readiness_id,
-                    "swim_alive":stack.member_state(ready.swim_node_id) == Some(MemberState::Alive),
-                    "route_owner":stack.route_owner(ready.node_actor).map(|node| format!("{node:?}")),
-                })
-            });
-            return Err(format!(
-                "runtime_ready timed out for node {node_id}: {detail:?}"
-            ));
-        }
         thread::sleep(PUMP_INTERVAL);
     }
 }
@@ -4635,7 +4551,7 @@ fn wait_for_weights_loaded(
     orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     node_id: u64,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     stage_index: u32,
 ) -> Result<(), String> {
     loop {
@@ -4859,7 +4775,7 @@ impl PipelinePromptRuntime {
         Ok(())
     }
 
-    fn check_timeout(
+    fn emit_wait_progress(
         &mut self,
         dashboard: Option<&DashboardSupport>,
         orch_datastream: &mut OrchDatastream,
@@ -4897,29 +4813,6 @@ impl PipelinePromptRuntime {
                 }),
             );
             self.next_wait_log_at = now.checked_add(PIPELINE_PROMPT_WAIT_LOG_INTERVAL);
-        }
-        if idle_ms >= duration_ms_u64(PIPELINE_PROMPT_IDLE_TIMEOUT) {
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
-                request_id,
-                "pipeline_prompt_idle_timeout",
-                "failed",
-                json!({
-                    "elapsed_ms":elapsed_ms,
-                    "idle_ms":idle_ms,
-                    "timeout_ms":duration_ms_u64(PIPELINE_PROMPT_IDLE_TIMEOUT),
-                    "pending_encode":self.pending_encode.is_some(),
-                    "pending_decode":self.pending_decode.is_some(),
-                    "generated_tokens":self.generated_tokens.len(),
-                    "next_sequence":self.next_sequence,
-                }),
-            );
-            self.fault_active(
-                request_id,
-                format!("pipeline prompt idle timeout after {idle_ms} ms without token progress"),
-            );
         }
     }
 
@@ -5372,7 +5265,7 @@ fn serve_prompts(
     tokenizer_encode_actor: ActorAddress,
     tokenizer_decode_actor: ActorAddress,
     tokenizer_reply_to: ActorAddress,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     pipeline_plan: Option<&run_plan::RunPlan>,
     prompt_endpoint: EndpointAddr,
 ) -> Result<(), String> {
@@ -5401,9 +5294,9 @@ fn serve_prompts(
                 node_id,
             )?;
             pipeline.drain_tokens(&stack.runtime, dashboard, orch_datastream, run_id, node_id)?;
-            pipeline.check_timeout(dashboard, orch_datastream, run_id, node_id);
+            pipeline.emit_wait_progress(dashboard, orch_datastream, run_id, node_id);
         }
-        drain_observations(obs_rx, dashboard, orch_datastream, provider)?;
+        drain_observations(obs_rx, dashboard, orch_datastream, &provider)?;
         drain_frames(frame_rx, dashboard, orch_datastream);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_rx.try_recv().is_ok() {
@@ -5652,7 +5545,7 @@ fn drain_observations(
     obs_rx: &mpsc::Receiver<PluginObservation>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
-    provider: ProviderKind,
+    provider: &ProviderKind,
 ) -> Result<(), String> {
     while let Ok(observation) = obs_rx.try_recv() {
         emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
@@ -5673,7 +5566,7 @@ fn drain_observations(
 fn emit_plugin_observation(
     orch_datastream: &mut OrchDatastream,
     dashboard: Option<&DashboardSupport>,
-    provider: ProviderKind,
+    provider: &ProviderKind,
     observation: &PluginObservation,
 ) {
     match observation {
@@ -5947,9 +5840,9 @@ fn optional_env(name: &str) -> Option<(String, String)> {
     env_optional(name).map(|value| (name.to_owned(), value))
 }
 
-fn local_tinygrad_worker_env(provider: ProviderKind) -> Option<(String, String)> {
+fn local_tinygrad_worker_env(provider: &ProviderKind) -> Option<(String, String)> {
     optional_env("MVP_TINYGRAD_WORKER").or_else(|| {
-        if provider != ProviderKind::Process {
+        if provider != &provider_kind::process() {
             return None;
         }
         default_local_tinygrad_worker_path().map(|path| {
@@ -6944,7 +6837,7 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_prompt_runtime_faults_idle_prompt_without_waiting_for_process_timeout() {
+    fn pipeline_prompt_runtime_keeps_idle_prompt_active_while_reporting_wait_progress() {
         let mut fixture = pipeline_runtime_fixture();
         let (event_tx, event_rx) = mpsc::channel();
         let mut datastream = OrchDatastream::new(96, None).expect("datastream opens");
@@ -6960,23 +6853,18 @@ mod tests {
             96,
             3,
         );
-        fixture.runtime.last_progress_at =
-            Some(Instant::now() - PIPELINE_PROMPT_IDLE_TIMEOUT - Duration::from_millis(1));
+        fixture.runtime.last_progress_at = Some(Instant::now() - Duration::from_secs(3_600));
         fixture.runtime.next_wait_log_at = Some(Instant::now() - Duration::from_millis(1));
 
-        fixture.runtime.check_timeout(None, &mut datastream, 96, 3);
+        fixture
+            .runtime
+            .emit_wait_progress(None, &mut datastream, 96, 3);
 
-        match event_rx
-            .try_recv()
-            .expect("idle prompt receives terminal fault")
-        {
-            PromptEvent::Fault { request_id, error } => {
-                assert_eq!(request_id, 601);
-                assert!(error.contains("pipeline prompt idle timeout"));
-            }
-            event => panic!("expected idle timeout fault, got {event:?}"),
-        }
-        assert!(!fixture.runtime.is_active());
+        assert!(
+            event_rx.try_recv().is_err(),
+            "idle prompt should not receive a terminal timeout fault"
+        );
+        assert!(fixture.runtime.is_active());
     }
 
     #[test]
@@ -7455,26 +7343,30 @@ mod tests {
 
         let stream = StreamId::new("test-node", Lifetime(42));
         let mut archive = FrameArchive::open(&path).expect("frame archive opens");
-        archive.record(
-            "orchestrator",
-            &stream,
-            "stdout",
-            &Frame::new(
-                ChannelId(1),
-                datastream::Position(7),
-                b"hello \xce\xbb".to_vec(),
-            ),
-        );
-        archive.record(
-            "orchestrator",
-            &stream,
-            "stderr",
-            &Frame::new(
-                ChannelId(2),
-                datastream::Position(8),
-                vec![0xff, 0x00, b'A'],
-            ),
-        );
+        archive
+            .record(
+                "orchestrator",
+                &stream,
+                "stdout",
+                &Frame::new(
+                    ChannelId(1),
+                    datastream::Position(7),
+                    b"hello \xce\xbb".to_vec(),
+                ),
+            )
+            .expect("text frame archives");
+        archive
+            .record(
+                "orchestrator",
+                &stream,
+                "stderr",
+                &Frame::new(
+                    ChannelId(2),
+                    datastream::Position(8),
+                    vec![0xff, 0x00, b'A'],
+                ),
+            )
+            .expect("binary frame archives");
         drop(archive);
 
         let contents = std::fs::read_to_string(&path).expect("read frame archive jsonl");
@@ -7717,7 +7609,7 @@ mode = "disabled"
             },
         );
 
-        assert_eq!(config.provider, ProviderKind::Docker);
+        assert_eq!(config.provider, provider_kind::docker());
         assert_eq!(config.image, "docker.io/example/from-cli:latest");
         assert_eq!(config.default_max_tokens, 31);
         assert_eq!(config.model_id, "cli-model");
@@ -7870,7 +7762,7 @@ kind = "docker"
         let specs = stage_node_specs(&config, Some(&plan), coordinator, orchestrator_actor)
             .expect("VastAI pipeline stage node specs build");
 
-        assert_eq!(config.provider, ProviderKind::VastAi);
+        assert_eq!(config.provider, provider_kind::vastai());
         assert!(
             config
                 .vastai
@@ -7937,7 +7829,7 @@ gguf_file = "SmolLM2-135M-Instruct.Q4_0.gguf"
             .expect("matching TOML SmolLM2 pipeline source should resolve the default cache");
 
         assert_eq!(config.pipeline_stages, 3);
-        assert_eq!(config.provider, ProviderKind::Process);
+        assert_eq!(config.provider, provider_kind::process());
         assert_eq!(cached_model.host_path, expected_cached_host_path);
         assert_eq!(
             cached_model.container_path,
@@ -8122,7 +8014,7 @@ bootstrap_command = "/run"
                 .expect("VastAI TOML config parses")
         });
 
-        assert_eq!(config.provider, ProviderKind::VastAi);
+        assert_eq!(config.provider, provider_kind::vastai());
         assert_eq!(config.image, "docker.io/example/vastai:toml");
     }
 
@@ -8143,7 +8035,7 @@ bootstrap_command = "/run"
             .expect("missing optional TOML config uses defaults")
         });
 
-        assert_eq!(config.provider, ProviderKind::Process);
+        assert_eq!(config.provider, provider_kind::process());
         assert_eq!(config.image, DEFAULT_IMAGE);
         assert_eq!(config.model_id, DEFAULT_MODEL_ID);
         assert_eq!(config.default_max_tokens, DEFAULT_MAX_TOKENS);
@@ -8173,18 +8065,18 @@ bootstrap_command = "/run"
     fn runtime_profile_selects_provider_and_node_provider_takes_precedence() {
         assert_eq!(
             selected_provider(&[("MVP_RUNTIME_CONFIG", "local")]),
-            ProviderKind::Process
+            provider_kind::process()
         );
         assert_eq!(
             selected_provider(&[("MVP_RUNTIME_CONFIG", "deploy")]),
-            ProviderKind::VastAi
+            provider_kind::vastai()
         );
         assert_eq!(
             selected_provider(&[
                 ("MVP_RUNTIME_CONFIG", "deploy"),
                 ("MVP_NODE_PROVIDER", "docker"),
             ]),
-            ProviderKind::Docker
+            provider_kind::docker()
         );
     }
 
@@ -8270,7 +8162,7 @@ bootstrap_command = "/run"
             },
         );
 
-        assert_eq!(config.provider, ProviderKind::Docker);
+        assert_eq!(config.provider, provider_kind::docker());
         assert!(config.vastai.is_none());
     }
 
@@ -8330,7 +8222,7 @@ bootstrap_command = "/run"
             .expect("process cached model node spec builds");
         let host_path = model.canonical_path.to_string_lossy().to_string();
 
-        assert_eq!(config.provider, ProviderKind::Process);
+        assert_eq!(config.provider, provider_kind::process());
         assert_eq!(env_value(&spec.env, "MVP_NODE_PROVIDER"), Some("process"));
         assert_eq!(
             env_value(&spec.env, "MVP_GGUF_LOCAL_PATH"),
@@ -8451,7 +8343,7 @@ bootstrap_command = "/run"
         let specs = stage_node_specs(&config, Some(&plan), coordinator, orchestrator_actor)
             .expect("process pipeline stage node specs build");
 
-        assert_eq!(config.provider, ProviderKind::Process);
+        assert_eq!(config.provider, provider_kind::process());
         assert_eq!(specs.len(), 3);
         for (expected_stage_index, spec) in specs.iter().enumerate() {
             let expected_stage_index =
@@ -8653,7 +8545,7 @@ bootstrap_command = "/run"
             },
         );
 
-        assert_eq!(config.provider, ProviderKind::VastAi);
+        assert_eq!(config.provider, provider_kind::vastai());
         assert_eq!(
             config
                 .cached_model
@@ -9051,7 +8943,7 @@ bootstrap_command = "/run"
             data_start: 512,
             alignment: 32,
             source_total_bytes,
-            tensors: vec![crate::gguf_shard::StageShardTensor {
+            tensors: vec![crate::staging::gguf_shard::StageShardTensor {
                 name: format!("blk.{stage_index}.attn_q.weight"),
                 dims: vec![2, 2],
                 ggml_type: 0,
@@ -9060,7 +8952,7 @@ bootstrap_command = "/run"
             }],
             merged_tensor_ranges: ranges
                 .into_iter()
-                .map(|(start, len)| crate::gguf_shard::ByteRange { start, len })
+                .map(|(start, len)| crate::staging::gguf_shard::ByteRange { start, len })
                 .collect(),
             cache_key: format!("test-stage-{stage_index}"),
         }
@@ -9076,20 +8968,20 @@ bootstrap_command = "/run"
             &mut self,
             _spec: NodeProvisionSpec,
             _sink: PluginSink,
-        ) -> Result<crate::provisioning::PluginNodeHandle, String> {
+        ) -> Result<crate::orchestration::provisioning::PluginNodeHandle, String> {
             unreachable!("guard tests construct handles directly")
         }
 
         fn complete_bootstrap(
             &mut self,
-            _handle: &crate::provisioning::PluginNodeHandle,
+            _handle: &crate::orchestration::provisioning::PluginNodeHandle,
         ) -> Result<(), String> {
             Ok(())
         }
 
         fn stop_node(
             &mut self,
-            handle: &crate::provisioning::PluginNodeHandle,
+            handle: &crate::orchestration::provisioning::PluginNodeHandle,
         ) -> Result<(), String> {
             self.stopped.push(handle.id);
             Ok(())
@@ -9117,7 +9009,7 @@ bootstrap_command = "/run"
             ),
             (
                 provider_start_spec(3),
-                Ok(crate::provisioning::PluginNodeHandle {
+                Ok(crate::orchestration::provisioning::PluginNodeHandle {
                     id: 22,
                     provider_process_id: None,
                 }),
@@ -9146,7 +9038,7 @@ bootstrap_command = "/run"
         {
             let _guard = ProvisionedNodeGuard::new(
                 &mut plugin,
-                crate::provisioning::PluginNodeHandle {
+                crate::orchestration::provisioning::PluginNodeHandle {
                     id: 7,
                     provider_process_id: Some(99),
                 },
@@ -9161,7 +9053,7 @@ bootstrap_command = "/run"
         {
             let mut guard = ProvisionedNodeGuard::new(
                 &mut plugin,
-                crate::provisioning::PluginNodeHandle {
+                crate::orchestration::provisioning::PluginNodeHandle {
                     id: 8,
                     provider_process_id: None,
                 },
@@ -9249,7 +9141,7 @@ bootstrap_command = "/run"
     fn enqueue_runtime_ready_ack_reports_to_node_agent() {
         use crate::actors::node_agent::{NodeAgentActor, NodeAgentReport};
         use crate::actors::orchestrator::OrchestratorMsg;
-        use crate::stage_controller as stage;
+        use crate::staging as stage;
 
         let stack =
             DistributionRuntimeStack::new(DistNodeId([1; 32]), DistributedNodeConfig::default());

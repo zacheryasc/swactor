@@ -11,11 +11,14 @@ dashboard = []
 
 [dependencies]
 datastream = { path = "../datastream" }
+data-plane = { path = "../data-plane" }
+provisioning = { path = "../provisioning" }
 dashboard = { path = "../dashboard" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 swactor = { path = "../..", features = ["serde", "transport"] }
 swactor-transport = { path = "../transport" }
+swactor-process = { path = "../process" }
 distribution = { path = "../distribution" }
 iroh-driver = { path = "../iroh-driver" }
 iroh = "0.98"

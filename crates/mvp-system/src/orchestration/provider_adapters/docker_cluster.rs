@@ -9,12 +9,12 @@
 use std::collections::BTreeMap;
 use std::time::SystemTime;
 
-use crate::node_provisioning::{
+use crate::orchestration::node_provisioning::{
     BootstrapDatastreamSink, BootstrapLogRecord, BootstrapLogSource, BootstrapLogStream,
     BootstrapObservation, BootstrapSessionEvent, BootstrapSessionSpec, BootstrapStage,
     CreateLeaseRequest, CreateLeaseResult, DesiredNodeShape, DestroyHandle, LeaseFacts,
     LogicalNodeId, NodeManager, NodeManagerCommand, NodeManagerMsg, NodeRecord, ProviderError,
-    ProviderKind, ProviderLeaseId, ProviderPlugin, RunId, SshEndpoint, SwactorId, SwarmJoinSpec,
+    ProviderLeaseId, ProviderPlugin, RunId, SshEndpoint, SwactorId, SwarmJoinSpec, provider_kind,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,12 +131,12 @@ impl<C: DockerCli> DockerProvider<C> {
         }
 
         LeaseFacts {
-            provider: ProviderKind::Docker,
+            provider: provider_kind::docker(),
             lease_id: lease_id.clone(),
             provider_contract_id: container_id.clone(),
             offer_id: None,
             destroy_handle: DestroyHandle {
-                provider: ProviderKind::Docker,
+                provider: provider_kind::docker(),
                 lease_id,
                 provider_contract_id: container_id,
             },
@@ -150,7 +150,7 @@ impl<C: DockerCli> ProviderPlugin for DockerProvider<C> {
         &mut self,
         request: CreateLeaseRequest,
     ) -> Result<CreateLeaseResult, ProviderError> {
-        if request.spec.provider != ProviderKind::Docker {
+        if request.spec.provider != provider_kind::docker() {
             return Err(ProviderError::new(
                 "docker provider received non-docker node spec",
             ));
@@ -183,7 +183,7 @@ impl<C: DockerCli> ProviderPlugin for DockerProvider<C> {
     }
 
     fn destroy_lease(&mut self, handle: &DestroyHandle) -> Result<(), ProviderError> {
-        if handle.provider != ProviderKind::Docker {
+        if handle.provider != provider_kind::docker() {
             return Err(ProviderError::new(
                 "docker provider received non-docker destroy handle",
             ));
@@ -468,7 +468,7 @@ where
 
     pub fn start(
         &mut self,
-        spec: crate::node_provisioning::LogicalNodeSpec,
+        spec: crate::orchestration::node_provisioning::LogicalNodeSpec,
     ) -> Result<(), DockerNodeProvisionError> {
         let commands = self
             .manager

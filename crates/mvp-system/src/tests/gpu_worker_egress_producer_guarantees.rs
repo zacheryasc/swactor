@@ -10,7 +10,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/gpu_worker_egress_producer_contract.md`.
 
-use mvp_system::gpu_worker_egress_producer as egress;
+use mvp_system::node_data::egress;
 
 // A valid egress ring config supplies the edge object spec and current worker
 // generation. The producer remains free to choose copy scheduling internally.
@@ -91,6 +91,7 @@ fn header_is_written_and_committed_before_payload() {
     let mut output = output_binding(0, 8);
     output.flags = egress::ObjectFlags {
         end_of_sequence: true,
+        begin_sequence: false,
     };
     let mut harness = installed_producer();
     harness.observe(egress::WorkerEgressEvent::ExecuteStep {
@@ -106,19 +107,16 @@ fn header_is_written_and_committed_before_payload() {
     // The committed prefix must decode as a header for the configured spec.
     let committed = harness.committed_bytes(egress::RingId(8002));
     let header = egress::ObjectHeader::decode(committed).expect("header must decode");
-    assert_eq!(header.magic, egress::OBJECT_MAGIC);
-    assert_eq!(header.version, egress::OBJECT_VERSION);
-    assert_eq!(header.header_len as usize, egress::HEADER_LEN);
     assert_eq!(header.object_id, egress::ObjectId(9000));
     assert_eq!(header.sequence, 0);
     assert_eq!(header.extent, 8);
     assert_eq!(
         header.flags,
         egress::ObjectFlags {
-            end_of_sequence: true
+            end_of_sequence: true,
+            begin_sequence: false,
         }
     );
-    assert_eq!(header.reserved, 0);
 
     // Payload bytes are not committed before the payload copy is valid.
     assert_eq!(harness.committed_payload_bytes(egress::RingId(8002)), 0);

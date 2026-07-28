@@ -1,7 +1,7 @@
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 
-use crate::stage_controller as core;
+use crate::staging::control as core;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StageControllerMsg {

@@ -9,7 +9,7 @@
 //! The planner implementation, placement heuristic, helper APIs, internal graph
 //! representation, and allocation strategy are not observable here.
 
-use mvp_system::run_plan as plan;
+use mvp_system::orchestration::run_plan as plan;
 
 // Local aliases keep the test prose readable while the file imports only the
 // public planning module. The aliases do not grant access to planner internals.

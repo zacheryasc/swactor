@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/arena_manager_contract.md`.
 
-use mvp_system::arena_manager as arena;
+use mvp_system::node_data::arena;
 
 // A small deterministic arena makes overlap, alignment, queueing, and reuse
 // proofs easy to inspect. The concrete mmap strategy remains outside the test.

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::run_plan::RunId;
+use crate::orchestration::run_plan::RunId;
 
 use super::error::EngineBuildError;
 use super::events::EngineEvent;
@@ -242,7 +242,7 @@ impl ClusterHandle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeSummary {
-    pub node_id: crate::run_plan::NodeId,
+    pub node_id: crate::orchestration::run_plan::NodeId,
     pub roles: Vec<RoleKind>,
     pub facts: NodeFacts,
 }

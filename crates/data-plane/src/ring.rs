@@ -1,3 +1,5 @@
+//! Reusable bounded ring cursor, wake, and process-local view contracts.
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u64);
 
@@ -105,7 +107,6 @@ pub enum PythonOperation {
     DirectWrapArithmetic { ring_id: RingId },
 }
 
-#[cfg(test)]
 pub struct RingHelperHarness {
     identity: RingIdentity,
     buffer: Vec<u8>,
@@ -117,7 +118,6 @@ pub struct RingHelperHarness {
     scheduler_state: SchedulerState,
 }
 
-#[cfg(test)]
 impl RingHelperHarness {
     pub fn create(config: RingConfig) -> Self {
         Self::with_generation(config.ring_id, config.capacity, 1)

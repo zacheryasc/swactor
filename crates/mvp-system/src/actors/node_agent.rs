@@ -4,7 +4,8 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
-use crate::{gguf_shard::StageShardPlan, run_plan, stage_controller as stage};
+use crate::orchestration::run_plan;
+use crate::staging::{self as stage, gguf_shard::StageShardPlan};
 
 use super::codec::JsonCodec;
 use super::orchestrator::OrchestratorMsg;
