@@ -7,7 +7,7 @@ pub struct EdgeId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortId(pub String);
 
-pub use data_plane::object_record::{
+pub use crate::object_record::{
     FLAG_BEGIN_SEQUENCE, FLAG_END_OF_SEQUENCE, HEADER_LEN, KNOWN_FLAGS_MASK, OBJECT_MAGIC,
     OBJECT_MAGIC_BYTES, OBJECT_VERSION, ObjectFailureReason, ObjectFlags, ObjectHeader, ObjectId,
     ObjectLayout, ObjectRecord, ObjectRecordBuilder, ObjectRecordRead, ObjectSpec,
@@ -106,7 +106,6 @@ pub struct DeviceCopyLog {
     pub byte_count: u64,
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingObject {
     record: ObjectRecord,
@@ -114,7 +113,6 @@ struct PendingObject {
     handle: Option<DeviceHandle>,
 }
 
-#[cfg(test)]
 pub struct IngressParserHarness {
     generation: WorkerGeneration,
     install: Option<InstallRing>,
@@ -128,7 +126,6 @@ pub struct IngressParserHarness {
     events: Vec<WorkerIngressOut>,
 }
 
-#[cfg(test)]
 impl IngressParserHarness {
     pub fn new(generation: WorkerGeneration) -> Self {
         Self {
@@ -300,7 +297,6 @@ impl IngressParserHarness {
     }
 }
 
-#[cfg(test)]
 fn object_failure_metadata(
     bytes: &[u8],
     reason: ObjectFailureReason,

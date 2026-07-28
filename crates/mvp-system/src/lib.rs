@@ -5,7 +5,6 @@ extern crate self as mvp_system;
 
 pub mod chat;
 pub mod node;
-pub mod node_data;
 pub mod observability;
 pub mod orchestration;
 pub mod prompt;

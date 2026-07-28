@@ -1,4 +1,4 @@
-//! Black-box contract tests for MVP edge establishment.
+//! Black-box contract tests for data-plane edge establishment.
 //!
 //! These tests intentionally know only the public EdgeEstablisher surface:
 //!
@@ -7,9 +7,9 @@
 //! - arena, worker/token, driver, ready, fault, and release commands out
 //!
 //! They assert the guarantees in
-//! `specs/mvp_system/edge_establisher_contract.md`.
+//! the reusable data-plane edge lifecycle contract.
 
-use mvp_system::node::edge_lifecycle as edge;
+use data_plane::edge_lifecycle as edge;
 
 // A send provision carries the consumer node id because the driver must know
 // where to send. It deliberately carries no remote actor address.

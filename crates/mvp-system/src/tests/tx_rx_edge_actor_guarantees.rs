@@ -8,7 +8,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/tx_rx_edge_actor_contract.md`.
 
-use mvp_system::node_data::edge_actor;
+use data_plane::edge_actor;
 
 // The edge id fixture gives both actors a shared identity while keeping Tx and
 // Rx lifecycle tests independent from driver and ring internals.

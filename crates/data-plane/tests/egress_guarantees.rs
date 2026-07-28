@@ -1,16 +1,15 @@
-//! Black-box contract tests for MVP GPU worker egress production.
+//! Black-box contract tests for data-plane GPU worker egress production.
 //!
-//! These tests intentionally know only the public worker egress surface:
+//! These tests intentionally know only the public data-plane egress surface:
 //!
 //! - `InstallRing`, `ExecuteStep` output bindings, device-copy outcomes,
 //!   backpressure, and shutdown events in
 //! - committed ring bytes, cursor publication, `ObjectProduced`,
 //!   `StepCompleted`, and step failures out
 //!
-//! They assert the guarantees in
-//! `specs/mvp_system/gpu_worker_egress_producer_contract.md`.
+//! They assert the reusable data-plane egress producer contract.
 
-use mvp_system::node_data::egress;
+use data_plane::egress;
 
 // A valid egress ring config supplies the edge object spec and current worker
 // generation. The producer remains free to choose copy scheduling internally.

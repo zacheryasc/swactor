@@ -2,7 +2,6 @@
 
 pub mod control;
 pub mod device_bridge;
-pub mod egress;
 pub mod process_adapter;
 
 pub mod process {

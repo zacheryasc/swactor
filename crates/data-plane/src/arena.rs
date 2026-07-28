@@ -1,7 +1,10 @@
 //! Reusable arena-backed ring allocation contracts.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use datastream::Record;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArenaSnapshot {
@@ -15,6 +18,44 @@ pub struct ArenaSnapshot {
     pub largest_free_range_bytes: u64,
     pub allocation_failures_total: u64,
     pub release_failures_total: u64,
+}
+
+pub const ARENA_SAMPLE_CHANNEL: &str = "mvp.arena";
+pub const ARENA_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArenaSample {
+    pub seq: u64,
+    pub sample_unix_ms: u64,
+    pub capacity_bytes: u64,
+    pub live_bytes: u64,
+    pub free_bytes: u64,
+    pub active_leases: u64,
+    pub pending_leases: u64,
+    pub largest_free_range_bytes: u64,
+    pub allocation_failures_total: u64,
+    pub release_failures_total: u64,
+}
+
+impl Record for ArenaSample {
+    const CHANNEL: &'static str = ARENA_SAMPLE_CHANNEL;
+}
+
+impl From<ArenaSnapshot> for ArenaSample {
+    fn from(snapshot: ArenaSnapshot) -> Self {
+        Self {
+            seq: snapshot.seq,
+            sample_unix_ms: snapshot.sample_unix_ms,
+            capacity_bytes: snapshot.capacity_bytes,
+            live_bytes: snapshot.live_bytes,
+            free_bytes: snapshot.free_bytes,
+            active_leases: snapshot.active_leases,
+            pending_leases: snapshot.pending_leases,
+            largest_free_range_bytes: snapshot.largest_free_range_bytes,
+            allocation_failures_total: snapshot.allocation_failures_total,
+            release_failures_total: snapshot.release_failures_total,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

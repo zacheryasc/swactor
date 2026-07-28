@@ -3,9 +3,8 @@
 //! These tests assert only the observable public-path contract: target modules
 //! expose existing behavior without introducing copied type definitions.
 
-use mvp_system::{
-    chat, node, node_data, observability, orchestration, prompt, staging, transport, worker,
-};
+use data_plane::{arena as data_arena, edge_lifecycle as data_edge};
+use mvp_system::{chat, node, observability, orchestration, prompt, staging, transport, worker};
 
 #[test]
 fn target_modules_offer_new_paths_to_existing_public_contracts() {
@@ -15,14 +14,14 @@ fn target_modules_offer_new_paths_to_existing_public_contracts() {
     let boot_node_id: node::boot_lifecycle::NodeId = node::boot_lifecycle::NodeId(11);
     assert_eq!(boot_node_id, node::boot_lifecycle::NodeId(11));
 
-    let arena_ring_id: node_data::arena::RingId = node_data::arena::RingId(3);
-    assert_eq!(arena_ring_id, node_data::arena::RingId(3));
+    let arena_ring_id: data_arena::RingId = data_arena::RingId(3);
+    assert_eq!(arena_ring_id, data_arena::RingId(3));
 
     let stage_edge_id: staging::EdgeId = staging::EdgeId(7001);
     assert_eq!(stage_edge_id, staging::EdgeId(7001));
 
-    let transport_edge_id: node::edge_lifecycle::EdgeId = node::edge_lifecycle::EdgeId(7002);
-    assert_eq!(transport_edge_id, node::edge_lifecycle::EdgeId(7002));
+    let transport_edge_id: data_edge::EdgeId = data_edge::EdgeId(7002);
+    assert_eq!(transport_edge_id, data_edge::EdgeId(7002));
 
     let worker_generation: worker::WorkerGeneration = worker::WorkerGeneration(2);
     assert_eq!(worker_generation, worker::WorkerGeneration(2));

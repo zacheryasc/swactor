@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use mvp_system::node_data::edge_actor;
+use data_plane::edge_actor;
 use mvp_system::observability::lifecycle as obs;
 use mvp_system::orchestration::engine_builder as engine;
 use mvp_system::orchestration::run_fsm as fsm;

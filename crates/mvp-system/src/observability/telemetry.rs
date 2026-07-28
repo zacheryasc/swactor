@@ -4,9 +4,9 @@ use datastream::hardware::net::HostNetSample;
 use datastream::{ChannelRegistry, Record};
 use serde::{Deserialize, Serialize};
 
-use crate::node_data::arena::ArenaSample;
 use crate::observability::lifecycle as obs;
 use crate::orchestration::provisioning::{self, ProvisionLogStream};
+use data_plane::arena::ArenaSample;
 
 /// Structured MVP lifecycle facts: run, node, stage, edge, ring, object, step, and worker events.
 pub const MVP_LIFECYCLE: &str = "mvp.lifecycle";
