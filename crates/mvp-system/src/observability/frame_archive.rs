@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use datastream::{Frame, StreamId};
 use serde_json::json;
 
-use crate::observability::benchmark_observability;
+use crate::observability::benchmark;
 
 /// JSONL archive for MVP-owned datastream frames.
 ///
@@ -61,7 +61,7 @@ impl FrameArchive {
         };
         let record = json!({
             "arrival_seq": self.next_seq,
-            "arrival_unix_ms": benchmark_observability::unix_ms_now(),
+            "arrival_unix_ms": benchmark::unix_ms_now(),
             "source": source,
             "stream": stream.to_string(),
             "channel": channel,

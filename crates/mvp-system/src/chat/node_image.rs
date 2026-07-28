@@ -319,6 +319,7 @@ fn prepare_node_image_inner(
 fn workspace_root() -> Result<PathBuf, String> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
         .stdin(Stdio::null())
         .output()
         .map_err(|e| format!("locate repository root with git: {e}"))?;

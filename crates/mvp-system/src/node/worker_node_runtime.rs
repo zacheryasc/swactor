@@ -22,22 +22,22 @@ use datastream::{
     Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
 };
 
-use crate::actors::register_mvp_actor_codecs;
 use crate::node::actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
     StageObjectSpecWire, StageOutboundEdgeWire, StageRingSpecWire,
 };
+use crate::node::edge_lifecycle as edge;
 use crate::node_data::arena;
 use crate::node_data::ingress;
-use crate::node_data::local_transport as driver_model;
-use crate::observability::benchmark_observability;
+use crate::observability::benchmark;
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
 use crate::orchestration::run_plan::{GgufSource, TokenizerSource};
-use crate::prompt::prompt_rpc::{PromptEvent, TokenizerEvent};
+use crate::prompt::rpc::{PromptEvent, TokenizerEvent};
 use crate::staging::control as stage;
 use crate::staging::gguf_shard::{StageShardPlan, materialize_stage_shard_http};
-use crate::transport::edge_establisher as edge;
+use crate::transport::codec_registry::register_mvp_actor_codecs;
+use crate::transport::driver_pumps as driver_model;
 use crate::transport::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
@@ -75,7 +75,7 @@ const NODE_SAMPLER_CHANNEL: &str = "mvp.node.sampler";
 const WORKER_COMMAND_WAIT_TELEMETRY_INTERVAL: Duration = Duration::from_secs(1);
 
 fn worker_benchmark_stamp(run_id: u64, node_id: u64) -> Value {
-    let mut benchmark = benchmark_observability::stamp("mvp-worker-node");
+    let mut benchmark = benchmark::stamp("mvp-worker-node");
     let pid = benchmark
         .get("producer_process_id")
         .and_then(Value::as_u64)

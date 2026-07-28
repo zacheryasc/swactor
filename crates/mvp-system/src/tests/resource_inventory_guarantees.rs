@@ -10,7 +10,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/resource_inventory_contract.md`.
 
-use mvp_system::node::resource_inventory as inventory;
+use mvp_system::orchestration::resource_inventory as inventory;
 
 // The inventory fixture has more nodes than the placement needs. That proves
 // the planner may choose among known inventory entries but may not invent hidden

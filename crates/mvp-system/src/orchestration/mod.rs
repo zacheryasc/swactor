@@ -5,21 +5,18 @@
 //! adapters live in `provider_adapters` so provider-neutral orchestration logic
 //! stays separate from local/Docker/VastAI implementation details.
 
-pub mod actor {
-    pub use crate::actors::orchestrator::*;
-}
-
+pub mod actor;
 pub mod app;
+pub mod config;
 pub mod distribution_stack;
+pub mod engine_builder;
 pub mod membership_readiness;
 pub mod node_provisioning;
 pub mod provisioning;
+pub mod resource_inventory;
 pub mod run_fsm;
 pub mod run_plan;
 pub mod token_endpoint;
-pub mod engine_builder {
-    pub use crate::engine_builder::*;
-}
 
 pub mod provider_adapters {
     pub mod docker_cluster;

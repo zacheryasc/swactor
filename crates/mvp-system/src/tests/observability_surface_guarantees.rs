@@ -8,7 +8,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/observability_surface_contract.md`.
 
-use mvp_system::observability::observability_surface as obs;
+use mvp_system::observability::lifecycle as obs;
 
 // The trace fixture contains one successful run from boot through teardown.
 // Tests use structured events only; logs, transport, storage, and batching stay

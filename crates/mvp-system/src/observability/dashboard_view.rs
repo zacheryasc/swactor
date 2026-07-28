@@ -10,7 +10,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::RwLock;
 
-use crate::observability::observability_surface as obs;
+use crate::observability::lifecycle as obs;
 use crate::observability::telemetry::{
     MVP_LIFECYCLE, MVP_PROVISIONING_EVENTS, MVP_PROVISIONING_LOGS, MvpLifecycleRecord,
     MvpProvisionEventRecord, MvpProvisionLogRecord,

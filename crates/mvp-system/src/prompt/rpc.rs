@@ -3,7 +3,7 @@ use std::io::{BufRead, Write};
 use serde::{Deserialize, Serialize};
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
-use crate::actors::codec::JsonCodec;
+use crate::transport::json_codec::JsonCodec;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitPrompt {

@@ -22,15 +22,15 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(target_os = "linux")]
 use signal_hook::iterator::Signals;
 
-use crate::config as chat_config;
-use crate::config::ResolvedVastAiConfig;
-use crate::node_image::{
+use crate::chat::config as chat_config;
+use crate::chat::node_image::{
     NodeImageProgressEvent, NodeImageProgressEventKind, NodeImageProgressSink, NodeImageProvider,
     NodeImageRequest, PreparedNodeImage, prepare_node_image_with_progress,
 };
-use crate::observability::{benchmark_observability, frame_archive::FrameArchive};
+use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::node_provisioning::{ProviderKind, provider_kind};
-use crate::prompt::prompt_rpc::{PromptEvent, SubmitPrompt, write_json_line};
+use crate::orchestration::provider_adapters::vastai::config::ResolvedVastAiConfig;
+use crate::prompt::rpc::{PromptEvent, SubmitPrompt, write_json_line};
 use crate::transport::endpoint_advertisement::EndpointAddrMask;
 
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:19777";
@@ -417,7 +417,7 @@ impl ChatDatastream {
 
     fn emit(&mut self, channel: &str, phase: &str, status: &str, detail: Value) {
         let id = self.channel_by_name(channel);
-        let benchmark = benchmark_observability::stamp("mvp-chat");
+        let benchmark = benchmark::stamp("mvp-chat");
         let payload = serde_json::to_vec(&json!({
             "schema_version": benchmark["schema_version"].clone(),
             "type": "ChatProgress",
@@ -445,7 +445,7 @@ impl ChatDatastream {
 
     fn emit_benchmark_envelope(&mut self, config: &Config) {
         let id = self.channel_by_name(CHAT_BENCHMARK_CHANNEL);
-        let benchmark = benchmark_observability::stamp("mvp-chat");
+        let benchmark = benchmark::stamp("mvp-chat");
         let payload = serde_json::to_vec(&json!({
             "schema_version": benchmark["schema_version"].clone(),
             "type": "BenchmarkRunEnvelope",
