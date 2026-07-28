@@ -2,14 +2,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mvp_system::node_provisioning as provision;
-use mvp_system::node_provisioning::ProviderPlugin;
-use mvp_system::provisioning::{
-    NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink, ProvisionPlugin,
-};
-use mvp_system::vastai_provisioning::{
+use mvp_system::orchestration::node_provisioning as provision;
+use mvp_system::orchestration::node_provisioning::ProviderPlugin;
+use mvp_system::orchestration::provider_adapters::vastai::{
     BootstrapStopReason, VastAiBootstrapLauncher, VastAiLeaseClient, VastAiProviderPlugin,
     VastAiProvisioningConfig, VastAiProvisioningPlugin, VastAiSshEndpoint,
+};
+use mvp_system::orchestration::provisioning::{
+    NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink, ProvisionPlugin,
 };
 use parking_lot::{Condvar, Mutex};
 use swactor_vastai::{LifecyclePolicy, ProvisionRequest, ProvisionedInstance, SelectionPolicy};
@@ -365,7 +365,7 @@ fn logical_spec() -> provision::LogicalNodeSpec {
         logical_node_id: logical_node_id.clone(),
         group_id: provision::NodeGroupId("workers".into()),
         role: provision::RoleId("worker".into()),
-        provider: provision::ProviderKind::VastAi,
+        provider: provision::provider_kind::vastai(),
         shape: provision::DesiredNodeShape {
             image: "registry.example/mvp-worker:latest".to_owned(),
             disk_gb: 80,
@@ -743,7 +743,7 @@ fn vastai_provider_plugin_maps_contracts_into_node_manager_lease_model() {
         .expect("vastai lease succeeds");
 
     assert_eq!(result.endpoint, None);
-    assert_eq!(result.lease.provider, provision::ProviderKind::VastAi);
+    assert_eq!(result.lease.provider, provision::provider_kind::vastai());
     assert_eq!(
         result.lease.lease_id,
         provision::ProviderLeaseId("vastai:100".into())
@@ -752,7 +752,7 @@ fn vastai_provider_plugin_maps_contracts_into_node_manager_lease_model() {
     assert_eq!(
         result.lease.destroy_handle,
         provision::DestroyHandle {
-            provider: provision::ProviderKind::VastAi,
+            provider: provision::provider_kind::vastai(),
             lease_id: provision::ProviderLeaseId("vastai:100".into()),
             provider_contract_id: "100".into(),
         }

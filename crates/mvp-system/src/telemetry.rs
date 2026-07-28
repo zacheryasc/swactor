@@ -5,8 +5,8 @@ use datastream::{ChannelRegistry, Record};
 use serde::{Deserialize, Serialize};
 
 use crate::arena_manager::ArenaSample;
-use crate::observability_surface as obs;
-use crate::provisioning::{self, ProvisionLogStream};
+use crate::observability::observability_surface as obs;
+use crate::orchestration::provisioning::{self, ProvisionLogStream};
 
 /// Structured MVP lifecycle facts: run, node, stage, edge, ring, object, step, and worker events.
 pub const MVP_LIFECYCLE: &str = "mvp.lifecycle";

@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/device_bridge_contract.md`.
 
-use mvp_system::device_bridge as device;
+use mvp_system::worker::device_bridge as device;
 
 // The object spec is small and aligned so exact range checks are readable. The
 // bridge remains free to choose backend-specific allocation details.

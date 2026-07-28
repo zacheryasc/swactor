@@ -1,4 +1,4 @@
-use mvp_system::weight_shards as shards;
+use mvp_system::staging::weight_shards as shards;
 
 fn model_ref() -> shards::ModelArtifactRef {
     shards::ModelArtifactRef::parse("hf://org/repo@abcdef123456/model.gguf").unwrap()

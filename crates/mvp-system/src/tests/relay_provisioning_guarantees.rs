@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::sync::Mutex;
 
 use iroh::{RelayMode, RelayUrl};
-use mvp_system::relay_provisioning::{
+use mvp_system::orchestration::provider_adapters::relay::{
     LocalShimRelayProvider, MVP_IROH_RELAY_MODE_ENV, MVP_IROH_RELAY_URL_ENV, RelayProvider,
     RelayProviderKind, RelayProvisionRequest, RelayPurpose, SWACTOR_IROH_RELAY_URL_ENV,
     StaticRelayProvider, relay_runtime_config_from_env,

@@ -949,6 +949,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-plane"
+version = "0.1.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "datastream"
 version = "0.1.0"
 dependencies = [
@@ -2512,16 +2519,19 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "dashboard",
+ "data-plane",
  "datastream",
  "distribution",
  "iroh",
  "iroh-driver",
  "libc",
  "parking_lot",
+ "provisioning",
  "serde",
  "serde_json",
  "signal-hook",
  "swactor",
+ "swactor-process",
  "swactor-transport",
  "swactor-vastai",
  "tokio",
@@ -3340,6 +3350,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e943d140e09d07740fb496487c51fb8eb31c70389ac4a2e9dcd8a0d9fdf228d4"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "provisioning"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

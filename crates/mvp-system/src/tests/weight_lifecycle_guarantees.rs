@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/weight_lifecycle_contract.md`.
 
-use mvp_system::weight_lifecycle as weights;
+use mvp_system::staging::weight_lifecycle as weights;
 
 // A valid assignment gives the stage exactly one layer range and one source.
 // Tests vary only source or failure outcome so the assignment contract remains

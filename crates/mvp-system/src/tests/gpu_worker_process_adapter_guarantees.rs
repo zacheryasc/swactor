@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/gpu_worker_process_adapter_contract.md`.
 
-use mvp_system::gpu_worker_process_adapter as adapter;
+use mvp_system::worker::process_adapter as adapter;
 
 // The adapter config supplies arena environment variables and an ABI version.
 // Tests do not assume how Python maps the arena or initializes tinygrad.

@@ -6,8 +6,12 @@ pub struct RingId(pub u64);
 pub struct EdgeId(pub u64);
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PortId(pub String);
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObjectId(pub u64);
+
+pub use data_plane::object_record::{
+    FLAG_BEGIN_SEQUENCE, FLAG_END_OF_SEQUENCE, HEADER_LEN, KNOWN_FLAGS_MASK, OBJECT_MAGIC,
+    OBJECT_MAGIC_BYTES, OBJECT_VERSION, ObjectFlags, ObjectHeader, ObjectId, ObjectLayout,
+    ObjectSpec,
+};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ObjectKey {
     pub edge_id: EdgeId,
@@ -40,25 +44,6 @@ pub enum RingDirection {
     Egress,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ObjectLayout {
-    Token,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObjectSpec {
-    pub max_extent: u64,
-    pub alignment: u64,
-    pub layout: ObjectLayout,
-}
-
-pub const HEADER_LEN: usize = 40;
-pub const OBJECT_MAGIC_BYTES: [u8; 4] = *b"MO01";
-pub const OBJECT_MAGIC: u32 = u32::from_le_bytes(OBJECT_MAGIC_BYTES);
-pub const OBJECT_VERSION: u16 = 1;
-pub const FLAG_END_OF_SEQUENCE: u32 = 1;
-pub const KNOWN_FLAGS_MASK: u32 = FLAG_END_OF_SEQUENCE;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallRing {
     pub ring_id: RingId,
@@ -67,30 +52,6 @@ pub struct InstallRing {
     pub direction: RingDirection,
     pub object_spec: ObjectSpec,
     pub generation: WorkerGeneration,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct ObjectFlags {
-    pub end_of_sequence: bool,
-}
-
-impl ObjectFlags {
-    pub fn bits(self) -> u32 {
-        if self.end_of_sequence {
-            FLAG_END_OF_SEQUENCE
-        } else {
-            0
-        }
-    }
-
-    pub fn from_bits(bits: u32) -> Option<Self> {
-        if bits & !KNOWN_FLAGS_MASK != 0 {
-            return None;
-        }
-        Some(Self {
-            end_of_sequence: bits & FLAG_END_OF_SEQUENCE != 0,
-        })
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -165,80 +126,6 @@ pub enum WakeHint {
     RingReadable { ring_id: RingId },
     RingWritable { ring_id: RingId },
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObjectHeader {
-    pub magic: u32,
-    pub version: u16,
-    pub header_len: u16,
-    pub object_id: ObjectId,
-    pub sequence: u64,
-    pub extent: u64,
-    pub flags: ObjectFlags,
-    pub reserved: u32,
-}
-
-impl ObjectHeader {
-    pub fn new(output: OutputBinding) -> Self {
-        Self {
-            magic: OBJECT_MAGIC,
-            version: OBJECT_VERSION,
-            header_len: HEADER_LEN as u16,
-            object_id: output.object_id,
-            sequence: output.sequence,
-            extent: output.extent,
-            flags: output.flags,
-            reserved: 0,
-        }
-    }
-
-    pub fn encode(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN);
-        out.extend_from_slice(&self.magic.to_le_bytes());
-        out.extend_from_slice(&self.version.to_le_bytes());
-        out.extend_from_slice(&self.header_len.to_le_bytes());
-        out.extend_from_slice(&self.object_id.0.to_le_bytes());
-        out.extend_from_slice(&self.sequence.to_le_bytes());
-        out.extend_from_slice(&self.extent.to_le_bytes());
-        out.extend_from_slice(&self.flags.bits().to_le_bytes());
-        out.extend_from_slice(&self.reserved.to_le_bytes());
-        out
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<Self, HeaderDecodeError> {
-        if bytes.len() < HEADER_LEN {
-            return Err(HeaderDecodeError);
-        }
-        let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
-        let version = u16::from_le_bytes(bytes[4..6].try_into().unwrap());
-        let header_len = u16::from_le_bytes(bytes[6..8].try_into().unwrap());
-        let flags = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
-        let Some(flags) = ObjectFlags::from_bits(flags) else {
-            return Err(HeaderDecodeError);
-        };
-        let reserved = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
-        if magic != OBJECT_MAGIC
-            || version != OBJECT_VERSION
-            || header_len as usize != HEADER_LEN
-            || reserved != 0
-        {
-            return Err(HeaderDecodeError);
-        }
-        Ok(Self {
-            magic,
-            version,
-            header_len,
-            object_id: ObjectId(u64::from_le_bytes(bytes[8..16].try_into().unwrap())),
-            sequence: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            extent: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-            flags,
-            reserved,
-        })
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HeaderDecodeError;
 
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -484,5 +371,11 @@ impl EgressProducerHarness {
 
 #[cfg(test)]
 fn encode_header(output: OutputBinding) -> Vec<u8> {
-    ObjectHeader::new(output).encode()
+    ObjectHeader {
+        object_id: output.object_id,
+        sequence: output.sequence,
+        extent: output.extent,
+        flags: output.flags,
+    }
+    .encode()
 }

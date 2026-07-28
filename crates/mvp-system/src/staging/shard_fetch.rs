@@ -1,4 +1,4 @@
-use crate::weight_shards::{ShardAssignment, ShardManifest};
+use crate::staging::weight_shards::{ShardAssignment, ShardManifest};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardLocation {

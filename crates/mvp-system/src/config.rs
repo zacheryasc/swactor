@@ -1,8 +1,7 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use serde::Deserialize;
-use swactor_vastai::SelectionPolicy;
 
 pub const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
 
@@ -116,12 +115,6 @@ pub struct VastAiConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct LoadedTomlConfigOverlay {
-    pub path: Option<PathBuf>,
-    pub overlay: TomlConfigOverlay,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedVastAiConfig {
     pub api_key: String,
     pub relay_url: String,
@@ -141,22 +134,6 @@ pub struct ResolvedVastAiConfig {
 }
 
 impl TomlConfigOverlay {
-    pub fn load(path: Option<&Path>) -> Result<LoadedTomlConfigOverlay, String> {
-        match path {
-            Some(path) => Self::load_required(path).map(|overlay| LoadedTomlConfigOverlay {
-                path: Some(path.to_path_buf()),
-                overlay,
-            }),
-            None => {
-                let default = Path::new(DEFAULT_CONFIG_PATH);
-                Self::load_optional(default).map(|overlay| LoadedTomlConfigOverlay {
-                    path: overlay.as_ref().map(|_| default.to_path_buf()),
-                    overlay: overlay.unwrap_or_default(),
-                })
-            }
-        }
-    }
-
     pub fn load_optional(path: &Path) -> Result<Option<Self>, String> {
         if path.is_file() {
             Self::load_required(path).map(Some)
@@ -192,37 +169,6 @@ impl ResolvedVastAiConfig {
             ));
         }
         Ok(self)
-    }
-
-    pub fn selection_policy(&self) -> SelectionPolicy {
-        let mut policy = SelectionPolicy::default();
-        if let Some(gpu_name) = self.gpu_name.as_deref().filter(|value| !value.is_empty()) {
-            policy.gpu_name = Some(gpu_name.to_owned());
-        }
-        if let Some(min_gpu_ram_mb) = self.min_gpu_ram_mb {
-            policy.min_gpu_ram_mb = Some(min_gpu_ram_mb);
-        }
-        if let Some(min_down_mbps) = self.min_down_mbps {
-            policy.min_down_mbps = min_down_mbps;
-        }
-        if let Some(min_up_mbps) = self.min_up_mbps {
-            policy.min_up_mbps = Some(min_up_mbps);
-        }
-        if let Some(max_dph_total) = self.max_dph_total {
-            policy.max_dph_total = Some(max_dph_total);
-        }
-        if let Some(min_reliability) = self.min_reliability {
-            policy.min_reliability = min_reliability;
-        }
-        if let Some(require_verified) = self.require_verified {
-            policy.require_verified = require_verified;
-        }
-        for host_id in &self.blacklist_hosts {
-            if !policy.blacklist_hosts.contains(host_id) {
-                policy.blacklist_hosts.push(*host_id);
-            }
-        }
-        policy
     }
 }
 
@@ -455,8 +401,8 @@ pipeline_stages = "many"
         ));
         let _ = fs::remove_file(&path);
 
-        let error =
-            TomlConfigOverlay::load(Some(&path)).expect_err("missing explicit config path errors");
+        let error = TomlConfigOverlay::load_required(&path)
+            .expect_err("missing explicit config path errors");
 
         assert!(
             error.contains(&path.display().to_string()),

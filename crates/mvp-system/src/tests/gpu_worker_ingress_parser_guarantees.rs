@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/gpu_worker_ingress_parser_contract.md`.
 
-use mvp_system::gpu_worker_ingress_parser as ingress;
+use mvp_system::node_data::ingress;
 
 // A valid ingress ring config supplies the edge object spec and current worker
 // generation. The parser remains a black box behind ring helper operations.

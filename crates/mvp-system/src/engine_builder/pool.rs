@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::run_plan::NodeId;
+use crate::orchestration::run_plan::NodeId;
 
 use super::error::PoolError;
 use super::node_image::NodeImageSpec;

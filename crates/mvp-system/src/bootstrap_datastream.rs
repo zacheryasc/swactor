@@ -5,10 +5,12 @@ use datastream::{ChannelContent, DatastreamProducer, Lifetime, NodeId, StreamId}
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::provisioning::{
+use crate::observability::telemetry::{
+    MVP_PROVISIONING_LOGS, MvpProvisionLogRecord, mvp_provision_log_channel,
+};
+use crate::orchestration::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
 };
-use crate::telemetry::{MVP_PROVISIONING_LOGS, MvpProvisionLogRecord, mvp_provision_log_channel};
 
 pub fn node_datastream_id(node_id: u64) -> String {
     node_id.to_string()

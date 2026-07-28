@@ -1,11 +1,11 @@
-use mvp_system::actors::node_agent::{
+use mvp_system::node::actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageEdgeKindWire,
     StageInboundEdgeWire, StageObjectSpecWire, StageOutboundEdgeWire, StageProvisionWire,
     StageRingSpecWire,
 };
-use mvp_system::gpu_worker_ingress_parser as ingress;
-use mvp_system::run_plan::{self, GgufSource, TokenizerSource};
-use mvp_system::stage_controller as stage;
+use mvp_system::node_data::object as ingress;
+use mvp_system::orchestration::run_plan::{self, GgufSource, TokenizerSource};
+use mvp_system::staging as stage;
 use swactor::actor::ActorAddress;
 use swactor::config::RuntimeConfig;
 use swactor::runtime::Runtime;

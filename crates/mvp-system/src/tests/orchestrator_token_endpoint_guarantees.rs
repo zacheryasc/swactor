@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/orchestrator_token_endpoint_contract.md`.
 
-use mvp_system::orchestrator_token_endpoint as token;
+use mvp_system::orchestration::token_endpoint as token;
 
 // The endpoint plan names the orchestrator and both token edges. Tests use the
 // committed plan as input and do not assume how endpoints allocate local rings

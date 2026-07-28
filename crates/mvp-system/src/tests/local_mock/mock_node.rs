@@ -1,6 +1,6 @@
-use mvp_system::run_plan as plan;
-use mvp_system::stage_controller as stage;
-use mvp_system::tx_rx_edge_actor as edge_actor;
+use mvp_system::node_data::edge_actor;
+use mvp_system::orchestration::run_plan as plan;
+use mvp_system::staging as stage;
 
 use super::mock_transport::MockObject;
 use super::mock_worker::MockWorker;

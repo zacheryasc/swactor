@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::run_plan::GgufSource;
+use crate::orchestration::run_plan::GgufSource;
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const SUPPORTED_GGUF_VERSION: u32 = 3;

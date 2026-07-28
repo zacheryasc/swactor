@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
-use mvp_system::shard_fetch as fetch;
-use mvp_system::shard_weight_lifecycle as lifecycle;
-use mvp_system::weight_shards as shards;
+use mvp_system::staging::shard_fetch as fetch;
+use mvp_system::staging::shard_weight_lifecycle as lifecycle;
+use mvp_system::staging::weight_shards as shards;
 
 fn assignment() -> shards::ShardAssignment {
     let model_ref =

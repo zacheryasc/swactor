@@ -9,7 +9,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/gpu_worker_ctl_contract.md`.
 
-use mvp_system::gpu_worker_ctl as ctl;
+use mvp_system::worker as ctl;
 
 // A test controller config names one worker process boundary. It does not grant
 // tests access to child-process internals or Python implementation details.

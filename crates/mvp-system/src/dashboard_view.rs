@@ -10,12 +10,12 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::RwLock;
 
-use crate::observability_surface as obs;
-use crate::provisioning::{ProvisionEventKind, ProvisionLogStream};
-use crate::telemetry::{
+use crate::observability::observability_surface as obs;
+use crate::observability::telemetry::{
     MVP_LIFECYCLE, MVP_PROVISIONING_EVENTS, MVP_PROVISIONING_LOGS, MvpLifecycleRecord,
     MvpProvisionEventRecord, MvpProvisionLogRecord,
 };
+use crate::orchestration::provisioning::{ProvisionEventKind, ProvisionLogStream};
 
 const CHANNELS: &[&str] = &[];
 const PROVISIONING_LOG_PREFIX: &str = "mvp.provisioning.logs.node.";

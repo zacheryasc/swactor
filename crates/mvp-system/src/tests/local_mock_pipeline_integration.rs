@@ -5,8 +5,8 @@
 //! and CUDA while still driving the run through planning, provisioning,
 //! readiness, prompt injection, stage execution, completion, and teardown.
 
-use mvp_system::engine_builder as engine;
-use mvp_system::observability_surface as obs;
+use mvp_system::observability::observability_surface as obs;
+use mvp_system::orchestration::engine_builder as engine;
 
 use super::local_mock::{
     LocalMockCluster, LocalMockConfig, LocalMockOutcome, assert_happy_path_lifecycle,

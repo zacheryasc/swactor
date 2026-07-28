@@ -1,4 +1,4 @@
-use mvp_system::observability_surface as obs;
+use mvp_system::observability::observability_surface as obs;
 
 use super::mock_transport::MockObjectKind;
 

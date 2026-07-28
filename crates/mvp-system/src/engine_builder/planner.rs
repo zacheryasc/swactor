@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::run_plan::{self, NodeId, RunId};
+use crate::orchestration::run_plan::{self, NodeId, RunId};
 
 use super::error::PlanningError;
 use super::launcher::NodeFacts;

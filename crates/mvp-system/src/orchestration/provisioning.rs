@@ -1,7 +1,8 @@
-//! Minimal provisioning model and local Docker plugin for the MVP system.
+//! MVP-local provisioning provider plugins.
 //!
-//! Swactor actors own provisioning control. Plugins only perform concrete I/O and
-//! report observations back to the provisioner actor through [`PluginSink`].
+//! Provider-neutral lifecycle contracts live in the reusable `provisioning`
+//! crate. This module keeps MVP-local process/Docker plugin implementations
+//! that know about bootstrap datastream plumbing and local runtime execution.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -15,147 +16,13 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
 
-use serde::{Deserialize, Serialize};
+pub use ::provisioning::plugin::{
+    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
+    ProviderMount, ProvisionEvent, ProvisionEventKind, ProvisionLogLine, ProvisionLogStream,
+    ProvisionPlugin,
+};
 
-use crate::bootstrap_datastream::BootstrapDatastreamBridge;
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NodeProvisionSpec {
-    pub run_id: u64,
-    pub node_id: u64,
-    pub stage_index: Option<u32>,
-    pub image: String,
-    pub env: Vec<(String, String)>,
-    pub args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mounts: Vec<ProviderMount>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProviderMount {
-    pub host_path: String,
-    pub container_path: String,
-    pub readonly: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProvisionEvent {
-    pub run_id: u64,
-    pub node_id: u64,
-    pub kind: ProvisionEventKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
-    pub message: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProvisionEventKind {
-    ProvisionStart,
-    NodeLive,
-    ProvisionFailed,
-    NodeStopped,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProvisionLogLine {
-    pub run_id: u64,
-    pub node_id: u64,
-    pub stream: ProvisionLogStream,
-    pub line: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ProvisionLogStream {
-    Stdout,
-    Stderr,
-    Provider,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PluginObservation {
-    StdoutLine {
-        run_id: u64,
-        node_id: u64,
-        line: String,
-    },
-    StderrLine {
-        run_id: u64,
-        node_id: u64,
-        line: String,
-    },
-    DatastreamFrame {
-        run_id: u64,
-        node_id: u64,
-        channel: String,
-        payload: String,
-    },
-    ProviderLine {
-        run_id: u64,
-        node_id: u64,
-        line: String,
-    },
-    Exited {
-        run_id: u64,
-        node_id: u64,
-        status: Option<i32>,
-    },
-    Failed {
-        run_id: u64,
-        node_id: u64,
-        reason: String,
-    },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PluginNodeHandle {
-    pub id: u64,
-    pub provider_process_id: Option<u32>,
-}
-
-pub trait PluginObservationSink: Send + Sync {
-    fn observe(&self, observation: PluginObservation);
-}
-
-#[derive(Clone)]
-pub struct PluginSink {
-    inner: Arc<dyn PluginObservationSink>,
-}
-
-impl PluginSink {
-    pub fn new(inner: Arc<dyn PluginObservationSink>) -> Self {
-        Self { inner }
-    }
-
-    pub fn observe(&self, observation: PluginObservation) {
-        self.inner.observe(observation);
-    }
-}
-
-pub trait ProvisionPlugin: Send {
-    fn start_node(
-        &mut self,
-        spec: NodeProvisionSpec,
-        sink: PluginSink,
-    ) -> Result<PluginNodeHandle, String>;
-
-    fn start_nodes(
-        &mut self,
-        specs: Vec<NodeProvisionSpec>,
-        sink: PluginSink,
-    ) -> Vec<(NodeProvisionSpec, Result<PluginNodeHandle, String>)> {
-        specs
-            .into_iter()
-            .map(|spec| {
-                let result = self.start_node(spec.clone(), sink.clone());
-                (spec, result)
-            })
-            .collect()
-    }
-
-    fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
-
-    fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
-}
+use crate::transport::bootstrap_datastream::BootstrapDatastreamBridge;
 
 pub struct LocalDockerPlugin {
     container_name_prefix: String,

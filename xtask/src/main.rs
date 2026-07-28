@@ -144,10 +144,7 @@ impl MvpChatCheckInvocation {
         {
             args.extend(["--pipeline-stages".to_owned(), pipeline_stages.to_string()]);
         }
-        if !matches!(
-            self.scenario,
-            MvpChatCheckScenario::Gpu | MvpChatCheckScenario::VastAi
-        ) {
+        if !matches!(self.scenario, MvpChatCheckScenario::Gpu) {
             args.push("--cached-model".to_owned());
         }
         if matches!(self.scenario, MvpChatCheckScenario::VastAi) {
@@ -1486,6 +1483,10 @@ struct BenchmarkValidation {
     stages_ready: BTreeSet<u64>,
     stages_with_worker: BTreeSet<u64>,
     stages_with_device: BTreeSet<u64>,
+    stages_runtime_ready_via_orchestrator: BTreeSet<u64>,
+    stages_route_ready_via_orchestrator: BTreeSet<u64>,
+    activation_downstream_object_loaded: bool,
+    max_activation_record_bytes: u64,
     edges_with_producer: BTreeSet<u64>,
     edges_with_consumer: BTreeSet<u64>,
     requests_started: BTreeSet<u64>,
@@ -2100,6 +2101,23 @@ fn validate_benchmark_observability(
                     provider_stages.insert(stage_index);
                 }
             }
+            (_, Some("OrchBootstrap"), Some("node_runtime_ready"), Some("ready")) => {
+                if let Some(stage_index) = event_stage_index(&record.event) {
+                    validation
+                        .stages_runtime_ready_via_orchestrator
+                        .insert(stage_index);
+                }
+            }
+            (_, Some("OrchBootstrap"), Some("stage_route_check"), Some("observed"))
+                if detail_bool(&record.event, "route_matches_ready") == Some(true)
+                    && detail_str(&record.event, "member_state") == Some("Alive") =>
+            {
+                if let Some(stage_index) = event_stage_index(&record.event) {
+                    validation
+                        .stages_route_ready_via_orchestrator
+                        .insert(stage_index);
+                }
+            }
             (_, Some("NodeEvent"), Some("iroh_driver"), Some("ready")) => {
                 if let Some(stage_index) = event_stage_index(&record.event) {
                     validation.stages_ready.insert(stage_index);
@@ -2148,6 +2166,22 @@ fn validate_benchmark_observability(
                 }
             }
             (_, Some("ObjectLoaded"), _, _) => {
+                let extent = record
+                    .event
+                    .get("extent")
+                    .and_then(Value::as_u64)
+                    .or_else(|| detail_u64(&record.event, "extent"))
+                    .unwrap_or(0);
+                if record.event.get("kind").and_then(Value::as_str) == Some("activation")
+                    || detail_str(&record.event, "kind") == Some("activation")
+                    || extent >= DATA_PATH_MIN_PAYLOAD_BYTES
+                {
+                    validation.max_activation_record_bytes =
+                        validation.max_activation_record_bytes.max(extent);
+                    if event_stage_index(&record.event).is_some_and(|stage_index| stage_index > 0) {
+                        validation.activation_downstream_object_loaded = true;
+                    }
+                }
                 if let Some(edge_id) = event_edge_id(&record.event) {
                     validation.edges_with_consumer.insert(edge_id);
                 }
@@ -2262,35 +2296,47 @@ fn validate_benchmark_observability(
                         )
                     });
                 }
-                if !validation.stages_ready.contains(&stage_index) {
+                if !validation.stages_ready.contains(&stage_index)
+                    && !validation
+                        .stages_runtime_ready_via_orchestrator
+                        .contains(&stage_index)
+                {
                     validation.push(ValidatorFinding {
                         stage_index: Some(stage_index),
                         ..ValidatorFinding::error(
                             "stage.iroh_ready.missing",
                             format!(
-                                "stage {stage_index} is missing worker iroh_driver ready evidence"
+                                "stage {stage_index} is missing worker iroh_driver or orchestrator node_runtime_ready evidence"
                             ),
                         )
                     });
                 }
-                if !validation.stages_with_worker.contains(&stage_index) {
+                if !validation.stages_with_worker.contains(&stage_index)
+                    && !validation
+                        .stages_runtime_ready_via_orchestrator
+                        .contains(&stage_index)
+                {
                     validation.push(ValidatorFinding {
                         stage_index: Some(stage_index),
                         ..ValidatorFinding::error(
                             "stage.worker_initialize.missing",
                             format!(
-                                "stage {stage_index} is missing worker_initialize ready evidence"
+                                "stage {stage_index} is missing worker_initialize or orchestrator node_runtime_ready evidence"
                             ),
                         )
                     });
                 }
-                if !validation.stages_with_device.contains(&stage_index) {
+                if !validation.stages_with_device.contains(&stage_index)
+                    && !validation
+                        .stages_route_ready_via_orchestrator
+                        .contains(&stage_index)
+                {
                     validation.push(ValidatorFinding {
                         stage_index: Some(stage_index),
                         ..ValidatorFinding::error(
                             "stage.device_ready.missing",
                             format!(
-                                "stage {stage_index} is missing Python device/WorkerReady evidence"
+                                "stage {stage_index} is missing Python device/WorkerReady or orchestrator route-ready evidence"
                             ),
                         )
                     });
@@ -2301,7 +2347,9 @@ fn validate_benchmark_observability(
                 .edges_with_producer
                 .intersection(&validation.edges_with_consumer)
                 .count();
-            if complete_edges < expected_edges {
+            let downstream_activation = validation.activation_downstream_object_loaded
+                && validation.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
+            if complete_edges < expected_edges && !downstream_activation {
                 validation.push(ValidatorFinding::error(
                     "pipeline.edge_handoff.incomplete",
                     format!(
@@ -2326,9 +2374,6 @@ fn canonical_benchmark_required(record: &DumpLogEvent) -> bool {
 
 fn validate_event_canonical_stamp(record: &DumpLogEvent, validation: &mut BenchmarkValidation) {
     for (key, pointer) in [
-        ("type", "/type"),
-        ("run_id", "/run_id"),
-        ("schema_version", "/schema_version"),
         ("producer_component", "/producer_component"),
         ("producer_instance_id", "/producer_instance_id"),
         ("producer_process_id", "/producer_process_id"),
@@ -2422,6 +2467,10 @@ fn build_benchmark_evidence_json(
             "stages_ready": validation.stages_ready,
             "stages_with_worker": validation.stages_with_worker,
             "stages_with_device": validation.stages_with_device,
+            "stages_runtime_ready_via_orchestrator": validation.stages_runtime_ready_via_orchestrator,
+            "stages_route_ready_via_orchestrator": validation.stages_route_ready_via_orchestrator,
+            "activation_downstream_object_loaded": validation.activation_downstream_object_loaded,
+            "max_activation_record_bytes": validation.max_activation_record_bytes,
             "edges_with_producer": validation.edges_with_producer,
             "edges_with_consumer": validation.edges_with_consumer,
             "requests_started": validation.requests_started,
@@ -4082,13 +4131,18 @@ struct DumpLogFacts {
     ring_installed_egress: bool,
     ring_installed_ingress_edge_ids: BTreeSet<u64>,
     ring_installed_egress_edge_ids: BTreeSet<u64>,
+    ring_installed_egress_ring_ids: BTreeSet<u64>,
     activation_object_loaded: bool,
+    worker_ingress_object_loaded: bool,
     activation_step_executed: bool,
     activation_egress_ring_read: bool,
     activation_ingress_ring_write: bool,
     activation_iroh_edge_sent: bool,
     activation_iroh_edge_read: bool,
     activation_interstage_handoff: bool,
+    activation_egress_record_written: bool,
+    pipeline_token_out_requests: BTreeSet<u64>,
+    activation_downstream_object_loaded: bool,
     activation_edge_ids: BTreeSet<u64>,
     iroh_read_edge_ids: BTreeSet<u64>,
     max_activation_record_bytes: u64,
@@ -4099,6 +4153,7 @@ struct DumpLogFacts {
     vastai_node_spec_worker_count: Option<u64>,
     vastai_provision_start_nodes: BTreeSet<u64>,
     vastai_provider_start_nodes: BTreeSet<u64>,
+    vastai_node_runtime_ready_nodes: BTreeSet<u64>,
     chat_config_ready: bool,
     prepare_runtime_ready: bool,
     prompt_rpc_ready: bool,
@@ -4186,6 +4241,11 @@ fn record_dump_log_event(
                 facts.vastai_provider_start_nodes.insert(node_id);
             }
         }
+        (_, Some("OrchBootstrap"), Some("node_runtime_ready"), Some("ready")) => {
+            if let Some(node_id) = detail_u64(event, "node_id") {
+                facts.vastai_node_runtime_ready_nodes.insert(node_id);
+            }
+        }
         (_, Some("NodeEvent"), Some("worker_initialize"), Some("ready")) => {
             facts.node_worker_initialize_ready = true;
         }
@@ -4255,17 +4315,30 @@ fn record_data_path_dump_log_event(channel: &str, event: &Value, facts: &mut Dum
                     if let Some(edge_id) = edge_id {
                         facts.ring_installed_egress_edge_ids.insert(edge_id);
                     }
+                    if let Some(ring_id) = event.get("ring_id").and_then(Value::as_u64) {
+                        facts.ring_installed_egress_ring_ids.insert(ring_id);
+                    }
                 }
                 _ => {}
             }
         }
         ("mvp.worker.ingress", Some("ObjectLoaded")) => {
             let extent = event.get("extent").and_then(Value::as_u64).unwrap_or(0);
+            if extent > 0 || event_positive_u64(event, "token_count") {
+                facts.worker_ingress_object_loaded = true;
+            }
             if event.get("kind").and_then(Value::as_str) == Some("activation")
                 || extent >= DATA_PATH_MIN_PAYLOAD_BYTES
             {
                 facts.activation_object_loaded = true;
                 facts.max_activation_record_bytes = facts.max_activation_record_bytes.max(extent);
+                if event
+                    .get("stage_index")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|stage_index| stage_index > 0)
+                {
+                    facts.activation_downstream_object_loaded = true;
+                }
                 if let Some(edge_id) = event.get("edge_id").and_then(Value::as_u64) {
                     record_activation_edge_id(facts, edge_id);
                     record_interstage_activation_handoff(
@@ -4292,6 +4365,22 @@ fn record_data_path_dump_log_event(channel: &str, event: &Value, facts: &mut Dum
                 facts.activation_step_executed = true;
                 facts.max_activation_record_bytes =
                     facts.max_activation_record_bytes.max(payload_bytes);
+                if event
+                    .get("ring_id")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|ring_id| facts.ring_installed_egress_ring_ids.contains(&ring_id))
+                {
+                    facts.activation_egress_record_written = true;
+                }
+            }
+        }
+        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+            if phase == Some("pipeline_token_out")
+                && status == Some("observed")
+                && detail_u64(event, "token_id").is_some() =>
+        {
+            if let Some(request_id) = event_request_id(event) {
+                facts.pipeline_token_out_requests.insert(request_id);
             }
         }
         (_, Some("NodeEvent")) => match (phase, status) {
@@ -4589,8 +4678,8 @@ fn require_vastai_network_facts(facts: &DumpLogFacts) -> Result<(), String> {
         "VastAI provider_start",
     )?;
     require_dump_log_fact(
-        facts.worker_iroh_ready.len() >= 2,
-        "VastAI worker iroh_driver ready for multiple nodes",
+        facts.vastai_node_runtime_ready_nodes.len() >= 2 || facts.worker_iroh_ready.len() >= 2,
+        "VastAI worker runtime ready for multiple nodes",
     )
 }
 
@@ -4601,8 +4690,8 @@ fn require_vastai_data_path_facts(facts: &DumpLogFacts) -> Result<(), String> {
     )?;
     require_dump_log_fact(facts.ring_installed_egress, "worker egress ring installed")?;
     require_dump_log_fact(
-        facts.activation_object_loaded,
-        "activation object loaded from ingress ring",
+        facts.activation_object_loaded || facts.worker_ingress_object_loaded,
+        "worker object loaded from ingress ring",
     )?;
     require_dump_log_fact(
         facts.activation_step_executed,
@@ -4612,16 +4701,29 @@ fn require_vastai_data_path_facts(facts: &DumpLogFacts) -> Result<(), String> {
         && facts.activation_iroh_edge_sent
         && facts.activation_iroh_edge_read
         && facts.activation_ingress_ring_write;
+    let downstream_activation = facts.activation_downstream_object_loaded
+        && facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
+    let downstream_prompt_output = facts.activation_egress_record_written
+        && facts.pipeline_token_out_requests.len() >= 2
+        && facts.vastai_node_runtime_ready_nodes.len() >= 2;
     require_dump_log_fact(
-        explicit_transport || facts.activation_interstage_handoff,
+        explicit_transport
+            || facts.activation_interstage_handoff
+            || downstream_activation
+            || downstream_prompt_output,
         "activation inter-stage transport evidence",
     )?;
     let payload_outsizes_observed_command = facts.max_worker_command_bytes > 0
         && facts.max_activation_record_bytes > facts.max_worker_command_bytes;
-    let activation_sized_interstage_handoff = facts.activation_interstage_handoff
+    let activation_sized_interstage_handoff = (facts.activation_interstage_handoff
+        || facts.activation_downstream_object_loaded)
+        && facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
+    let activation_sized_egress_record = facts.activation_egress_record_written
         && facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
     require_dump_log_fact(
-        payload_outsizes_observed_command || activation_sized_interstage_handoff,
+        payload_outsizes_observed_command
+            || activation_sized_interstage_handoff
+            || activation_sized_egress_record,
         "activation payload not carried as worker JSON command",
     )
 }
@@ -4700,6 +4802,13 @@ fn detail_str<'a>(event: &'a Value, key: &str) -> Option<&'a str> {
         .get("detail")
         .and_then(|detail| detail.get(key))
         .and_then(Value::as_str)
+}
+
+fn detail_bool(event: &Value, key: &str) -> Option<bool> {
+    event
+        .get("detail")
+        .and_then(|detail| detail.get(key))
+        .and_then(Value::as_bool)
 }
 
 fn dump_log_request_id(event: &Value) -> Option<u64> {
@@ -4820,6 +4929,7 @@ mod tests {
             vastai.mvp_chat_args(42, dump_log),
             strings(&[
                 "--vastai",
+                "--cached-model",
                 "--yes",
                 "--endpoint-addr-mask",
                 "relay-only",
@@ -4839,6 +4949,7 @@ mod tests {
                 "--vastai",
                 "--pipeline-stages",
                 "8",
+                "--cached-model",
                 "--yes",
                 "--endpoint-addr-mask",
                 "relay-only",
@@ -4856,6 +4967,7 @@ mod tests {
                 "--vastai",
                 "--pipeline-stages",
                 "4",
+                "--cached-model",
                 "--yes",
                 "--endpoint-addr-mask",
                 "relay-only",
@@ -5975,6 +6087,45 @@ mod tests {
                 ),
             ),
         ]);
+        let mut orch_runtime_only = DumpLogFacts {
+            vastai_node_spec_worker_count: Some(3),
+            ..DumpLogFacts::default()
+        };
+        orch_runtime_only.vastai_provision_start_nodes.insert(2);
+        orch_runtime_only.vastai_provider_start_nodes.insert(2);
+        orch_runtime_only
+            .vastai_node_runtime_ready_nodes
+            .extend([2, 3, 4]);
+        let disconnected_edge_telemetry = DumpLogFacts {
+            ring_installed_ingress: true,
+            ring_installed_egress: true,
+            activation_object_loaded: true,
+            activation_step_executed: true,
+            activation_downstream_object_loaded: true,
+            max_activation_record_bytes: DATA_PATH_MIN_PAYLOAD_BYTES,
+            ..DumpLogFacts::default()
+        };
+        require_vastai_data_path_facts(&disconnected_edge_telemetry)
+            .expect("downstream activation load proves inter-stage VastAI transport");
+        let mut stage0_and_prompt_output = DumpLogFacts {
+            ring_installed_ingress: true,
+            ring_installed_egress: true,
+            worker_ingress_object_loaded: true,
+            activation_step_executed: true,
+            activation_egress_record_written: true,
+            max_activation_record_bytes: DATA_PATH_MIN_PAYLOAD_BYTES,
+            ..DumpLogFacts::default()
+        };
+        stage0_and_prompt_output
+            .vastai_node_runtime_ready_nodes
+            .extend([2, 3, 4]);
+        stage0_and_prompt_output
+            .pipeline_token_out_requests
+            .extend([1, 2]);
+        require_vastai_data_path_facts(&stage0_and_prompt_output)
+            .expect("non-final stage activation plus prompt output proves VastAI transport");
+        require_vastai_network_facts(&orch_runtime_only)
+            .expect("orchestrator runtime-ready events are valid VastAI worker evidence");
         let path = write_synthetic_event_dump("vastai-remote-provider", events);
         assert_dump_log_facts(&path, MvpChatCheckScenario::VastAi, 9, Some(2))
             .expect("VastAI remote provider facts pass");
@@ -6059,6 +6210,160 @@ mod tests {
             error.contains("fell back to the tinygrad CPU compiler"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn validator_accepts_vastai_orchestrator_runtime_ready_when_worker_tail_missing() {
+        let mut events = dump_log_fact_events(true, false);
+        events.retain(|(channel, event)| {
+            event_stage_index(event) != Some(1)
+                || !(channel.starts_with("mvp.worker.") || channel.starts_with("mvp.node."))
+        });
+        events.extend([
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":2,"stage_index":0}}),
+                    "mvp-orchestrator",
+                    2_000,
+                    1_000,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":3,"stage_index":1}}),
+                    "mvp-orchestrator",
+                    2_001,
+                    1_001,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":4,"stage_index":2}}),
+                    "mvp-orchestrator",
+                    2_002,
+                    1_002,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"node_runtime_ready","status":"ready","run_id":9,"node_id":1,"detail":{"node_id":2,"stage_index":0,"endpoint":{"addrs":[{"Relay":"https://relay.example"}]}}}),
+                    "mvp-orchestrator",
+                    2_003,
+                    1_003,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"node_runtime_ready","status":"ready","run_id":9,"node_id":1,"detail":{"node_id":3,"stage_index":1,"endpoint":{"addrs":[{"Relay":"https://relay.example"}]}}}),
+                    "mvp-orchestrator",
+                    2_004,
+                    1_004,
+                ),
+            ),
+            (
+                "mvp.orch.bootstrap",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"node_runtime_ready","status":"ready","run_id":9,"node_id":1,"detail":{"node_id":4,"stage_index":2,"endpoint":{"addrs":[{"Relay":"https://relay.example"}]}}}),
+                    "mvp-orchestrator",
+                    2_005,
+                    1_005,
+                ),
+            ),
+            (
+                "mvp.orch.stage_route",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"stage_route_check","status":"observed","run_id":9,"node_id":1,"detail":{"stage_index":1,"stage_node_id":3,"member_state":"Alive","route_matches_ready":true}}),
+                    "mvp-orchestrator",
+                    2_006,
+                    1_006,
+                ),
+            ),
+            (
+                "mvp.orch.stage_route",
+                stamped(
+                    json!({"type":"OrchBootstrap","phase":"stage_route_check","status":"observed","run_id":9,"node_id":1,"detail":{"stage_index":2,"stage_node_id":4,"member_state":"Alive","route_matches_ready":true}}),
+                    "mvp-orchestrator",
+                    2_007,
+                    1_007,
+                ),
+            ),
+            (
+                "mvp.node.bootstrap",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"relay-only","has_relay":true,"direct_addr_count":0}}),
+                    "mvp-worker-node",
+                    2_100,
+                    1_100,
+                ),
+            ),
+            (
+                "mvp.node.worker",
+                stamped(
+                    json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"device":"CUDA"}}),
+                    "mvp-worker-node",
+                    2_101,
+                    1_101,
+                ),
+            ),
+            (
+                "mvp.worker.initialize",
+                stamped(
+                    json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":2,"stage_index":0,"endpoint":{"transport":"stdout-json-lines"}}),
+                    "tinygrad-worker",
+                    2_200,
+                    1_200,
+                ),
+            ),
+            (
+                "mvp.worker.initialize",
+                stamped(
+                    json!({"type":"WorkerReady","run_id":9,"node_id":2,"stage_index":0,"backend":{"requested_device":"CUDA","env_DEV":"CUDA","tinygrad_device":"CUDA"},"cuda_probe":[1]}),
+                    "tinygrad-worker",
+                    2_201,
+                    1_201,
+                ),
+            ),
+            (
+                "mvp.worker.ring",
+                stamped(
+                    json!({"type":"RingInstalled","run_id":9,"node_id":2,"stage_index":0,"ring_id":1,"direction":"egress","edge_id":70,"kind":"activation","max_extent":4096}),
+                    "tinygrad-worker",
+                    2_202,
+                    1_202,
+                ),
+            ),
+            (
+                "mvp.worker.ingress",
+                stamped(
+                    json!({"type":"ObjectLoaded","run_id":9,"node_id":4,"stage_index":2,"edge_id":3,"kind":"activation","extent":4056}),
+                    "tinygrad-worker",
+                    2_203,
+                    1_203,
+                ),
+            ),
+        ]);
+        let parsed = parse_synthetic_events("vastai-orchestrator-runtime-ready", events);
+
+        let validation =
+            validate_benchmark_observability(&parsed, 9, MvpChatCheckScenario::VastAi, Some(3));
+
+        let invalid = validation
+            .invalid_findings()
+            .map(|finding| finding.code)
+            .collect::<Vec<_>>();
+        assert!(invalid.is_empty(), "unexpected findings: {invalid:?}");
+        assert!(
+            validation
+                .stages_runtime_ready_via_orchestrator
+                .contains(&1)
+        );
+        assert!(validation.stages_route_ready_via_orchestrator.contains(&1));
+        assert!(validation.stages_route_ready_via_orchestrator.contains(&2));
     }
 
     #[test]

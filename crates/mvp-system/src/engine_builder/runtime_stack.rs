@@ -10,9 +10,9 @@ use swactor::actor::ActorAddress;
 use crate::actors::node_agent::NodeAgentActor;
 use crate::actors::orchestrator::OrchestratorActor;
 use crate::actors::register_mvp_actor_codecs;
-use crate::distribution_stack::DistributionRuntimeStack;
-use crate::orchestrator_run_fsm as orchestrator_core;
-use crate::stage_controller as stage_core;
+use crate::orchestration::distribution_stack::DistributionRuntimeStack;
+use crate::orchestration::run_fsm as orchestrator_core;
+use crate::staging as stage_core;
 
 pub struct RuntimeNodeConfig {
     pub distributed: DistributedNodeConfig,
