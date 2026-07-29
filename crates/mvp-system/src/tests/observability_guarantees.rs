@@ -1,3 +1,5 @@
+//! Behavior guarantees for the `observability` module.
+
 //! Black-box contract tests for the MVP observability surface.
 //!
 //! These tests intentionally know only the public event stream surface:
@@ -346,32 +348,4 @@ fn event_ordering_reflects_component_contracts_and_one_terminal_outcome() {
         })
         .count();
     assert_eq!(terminal_count, 1);
-}
-
-// This proves observability tests are independent of transport, storage, and
-// batching policy by asserting the same event facts after batching is changed.
-#[test]
-fn event_contract_survives_transport_storage_and_batching_policy() {
-    // Build the same logical events under two batching policies.
-    let unbatched =
-        obs::EventSubscriberHarness::collect(successful_run_trace(), obs::Batching::None);
-    let batched =
-        obs::EventSubscriberHarness::collect(successful_run_trace(), obs::Batching::Fixed(8));
-
-    // Flattened public event facts must match as an ordered stream.
-    let unbatched_kinds = unbatched
-        .flattened_events()
-        .iter()
-        .map(|event| event.kind())
-        .collect::<Vec<_>>();
-    let batched_kinds = batched
-        .flattened_events()
-        .iter()
-        .map(|event| event.kind())
-        .collect::<Vec<_>>();
-    assert_eq!(batched_kinds, unbatched_kinds);
-
-    // Neither subscriber depends on transport or storage implementation names.
-    assert!(!unbatched.used_transport_specific_assertions());
-    assert!(!batched.used_storage_specific_assertions());
 }

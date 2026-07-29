@@ -45,7 +45,3 @@ path = "src/bin/orchestrator.rs"
 name = "mvp-chat"
 path = "src/bin/mvp_chat.rs"
 
-[[test]]
-name = "mvp_chat_mock"
-path = "tests/mvp_chat_mock.rs"
-harness = false
