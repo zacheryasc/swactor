@@ -77,7 +77,11 @@ const MVP_RUNTIME_CONFIG_ENV: &str = "MVP_RUNTIME_CONFIG";
 const CACHED_MODEL_HOST_ENV: &str = "MVP_CACHED_MODEL_HOST_PATH";
 const MVP_WORKER_BIN_ENV: &str = "MVP_WORKER_BIN";
 const CACHED_MODEL_CONTAINER_DIR: &str = "/models/cached";
-const DEFAULT_PIPELINE_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
+pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
+pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_REPO: &str =
+    "QuantFactory/SmolLM2-135M-Instruct-GGUF";
+pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_ID: &str = "smollm2-135m-instruct-q4";
+pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT: u32 = 256;
 const DEFAULT_PIPELINE_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_RPC_BIND: &str = "127.0.0.1:19777";
 const DEFAULT_HF_REPO: &str = "bartowski/Llama-3.2-1B-Instruct-GGUF";
@@ -2365,6 +2369,21 @@ impl ProvisionedClusterGuard {
             None => Ok(()),
         }
     }
+
+    fn complete_bootstrap(&mut self) -> Result<(), String> {
+        let mut first_error = None;
+        for handle in &self.handles {
+            if let Err(error) = self.provisioner.complete_bootstrap(handle)
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
 }
 
 impl Drop for ProvisionedClusterGuard {
@@ -2591,7 +2610,7 @@ fn start_and_provision_workers(
         }
         pending_specs = start_outcome.failed_specs;
     }
-    let provisioned_nodes = ProvisionedClusterGuard::new(provisioner, handles);
+    let mut provisioned_nodes = ProvisionedClusterGuard::new(provisioner, handles);
     drain_orch_stdio_capture(
         orch_stdio_rx,
         orch_datastream,
@@ -2702,6 +2721,9 @@ fn start_and_provision_workers(
         &ack_targets,
         &pipeline_coordinator,
     )?;
+    provisioned_nodes
+        .complete_bootstrap()
+        .map_err(|e| format!("complete provider bootstrap after runtime-ready: {e}"))?;
 
     orch_datastream.emit_bootstrap(
         dashboard,
@@ -3347,10 +3369,15 @@ fn wait_for_weights_loaded_count(
                 OrchestratorReport::StageFault {
                     run_id: report_run_id,
                     stage_index,
+                    reason,
                 } if report_run_id == run_id && expected_stages.contains(&stage_index) => {
-                    return Err(format!(
-                        "stage {stage_index} faulted while loading pipeline weights"
-                    ));
+                    let mut error =
+                        format!("stage {stage_index} faulted while loading pipeline weights");
+                    if let Some(reason) = reason {
+                        error.push_str(": ");
+                        error.push_str(&reason);
+                    }
+                    return Err(error);
                 }
                 _ => {}
             }
@@ -4586,10 +4613,15 @@ fn wait_for_weights_loaded(
                 OrchestratorReport::StageFault {
                     run_id: report_run_id,
                     stage_index: report_stage_index,
+                    reason,
                 } if report_run_id == run_id && report_stage_index == stage_index => {
-                    return Err(format!(
-                        "stage {report_stage_index} faulted while loading weights"
-                    ));
+                    let mut error =
+                        format!("stage {report_stage_index} faulted while loading weights");
+                    if let Some(reason) = reason {
+                        error.push_str(": ");
+                        error.push_str(&reason);
+                    }
+                    return Err(error);
                 }
                 _ => {}
             }
@@ -8959,8 +8991,15 @@ bootstrap_command = "/run"
     }
 
     #[derive(Default)]
+    struct FakeProvisionState {
+        stopped: Vec<u64>,
+        completed: Vec<u64>,
+    }
+
+    #[derive(Default)]
     struct FakeProvisionPlugin {
         stopped: Vec<u64>,
+        shared: Option<Arc<std::sync::Mutex<FakeProvisionState>>>,
     }
 
     impl ProvisionPlugin for FakeProvisionPlugin {
@@ -8974,8 +9013,15 @@ bootstrap_command = "/run"
 
         fn complete_bootstrap(
             &mut self,
-            _handle: &crate::orchestration::provisioning::PluginNodeHandle,
+            handle: &crate::orchestration::provisioning::PluginNodeHandle,
         ) -> Result<(), String> {
+            if let Some(shared) = &self.shared {
+                shared
+                    .lock()
+                    .expect("fake provision state")
+                    .completed
+                    .push(handle.id);
+            }
             Ok(())
         }
 
@@ -8984,6 +9030,13 @@ bootstrap_command = "/run"
             handle: &crate::orchestration::provisioning::PluginNodeHandle,
         ) -> Result<(), String> {
             self.stopped.push(handle.id);
+            if let Some(shared) = &self.shared {
+                shared
+                    .lock()
+                    .expect("fake provision state")
+                    .stopped
+                    .push(handle.id);
+            }
             Ok(())
         }
     }
@@ -9030,6 +9083,55 @@ bootstrap_command = "/run"
             "cleanup must include successful starts even when an earlier stage failed"
         );
         assert_eq!(outcome.results.len(), 2);
+    }
+
+    #[test]
+    fn provisioned_cluster_guard_completes_bootstrap_without_dropping_stop_handles() {
+        let state = Arc::new(std::sync::Mutex::new(FakeProvisionState::default()));
+        let plugin = FakeProvisionPlugin {
+            shared: Some(Arc::clone(&state)),
+            ..FakeProvisionPlugin::default()
+        };
+        let mut guard = ProvisionedClusterGuard::new(
+            Box::new(plugin),
+            vec![
+                crate::orchestration::provisioning::PluginNodeHandle {
+                    id: 7,
+                    provider_process_id: None,
+                },
+                crate::orchestration::provisioning::PluginNodeHandle {
+                    id: 8,
+                    provider_process_id: None,
+                },
+            ],
+        );
+
+        guard
+            .complete_bootstrap()
+            .expect("runtime-ready bootstrap completion succeeds");
+        assert_eq!(
+            state
+                .lock()
+                .expect("fake provision state")
+                .completed
+                .clone(),
+            vec![7, 8]
+        );
+        assert!(
+            state
+                .lock()
+                .expect("fake provision state")
+                .stopped
+                .is_empty()
+        );
+
+        guard
+            .stop()
+            .expect("node stop still succeeds after completion");
+        assert_eq!(
+            state.lock().expect("fake provision state").stopped.clone(),
+            vec![8, 7]
+        );
     }
 
     #[test]

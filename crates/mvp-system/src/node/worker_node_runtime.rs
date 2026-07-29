@@ -32,7 +32,9 @@ use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_en
 use crate::orchestration::run_plan::{GgufSource, TokenizerSource};
 use crate::prompt::rpc::{PromptEvent, TokenizerEvent};
 use crate::staging::control as stage;
-use crate::staging::gguf_shard::{StageShardPlan, materialize_stage_shard_http};
+use crate::staging::gguf_shard::{
+    StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache,
+};
 use crate::transport::codec_registry::register_mvp_actor_codecs;
 use crate::transport::driver_pumps as driver_model;
 use crate::transport::endpoint_advertisement::{
@@ -52,7 +54,8 @@ use iroh_driver::{
 };
 use parking_lot::Mutex;
 use serde_json::{Value, json};
-use swactor::actor::ActorAddress;
+use swactor::actor::{ActorAddress, ActorInterface};
+use swactor::runtime::{Ctx, ExternalSender};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/mvp/tinygrad_worker.py";
@@ -1530,7 +1533,12 @@ impl WorkerEdgeRuntime {
                     edge::EdgeLifecycleEvent::EdgeFaulted { edge_id, reason } => {
                         stack
                             .runtime
-                            .send_to(node_actor, NodeAgentMsg::WorkerCrashed)
+                            .send_to(
+                                node_actor,
+                                NodeAgentMsg::WorkerCrashed {
+                                    reason: Some(format!("edge {} faulted: {reason:?}", edge_id.0)),
+                                },
+                            )
                             .map_err(|e| format!("mark worker crashed after edge fault: {e}"))?;
                         return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
                     }
@@ -2279,9 +2287,12 @@ fn run() -> Result<(), String> {
                 "failed",
                 json!({"exit_status":status.to_string()}),
             );
-            let _ = stack
-                .runtime
-                .send_to(node_actor, NodeAgentMsg::WorkerCrashed);
+            let _ = stack.runtime.send_to(
+                node_actor,
+                NodeAgentMsg::WorkerCrashed {
+                    reason: Some(format!("tinygrad helper exited with {status}")),
+                },
+            );
             pump_network(&mut driver, &stack);
             return Err(format!("tinygrad helper exited with {status}"));
         }
@@ -3101,15 +3112,290 @@ fn handle_decode_tokens_request(
         .map_err(|e| format!("send tokenizer decode response: {e}"))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StageShardProcessStream {
     Stdout,
     Stderr,
 }
 
-struct StageShardProcessLine {
-    stream: StageShardProcessStream,
-    line: String,
+#[derive(Clone)]
+enum StageShardFetchMsg {
+    Start,
+    PollChild,
+    ProcessLine {
+        stream: StageShardProcessStream,
+        line: String,
+    },
+    ReaderError {
+        stream: StageShardProcessStream,
+        error: String,
+    },
+    ReaderClosed {
+        stream: StageShardProcessStream,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum StageShardFetchReport {
+    Progress(Value),
+    Done(PathBuf),
+    Failed(String),
+}
+
+struct StageShardFetchActor {
+    request_json: Vec<u8>,
+    output_path: PathBuf,
+    report_to: ActorAddress,
+    sender: ExternalSender,
+    child: Option<Child>,
+    stdout_reader: Option<thread::JoinHandle<()>>,
+    stderr_reader: Option<thread::JoinHandle<()>>,
+    stdout_closed: bool,
+    stderr_closed: bool,
+    ready_path: Option<PathBuf>,
+    exit_status: Option<std::process::ExitStatus>,
+    finished: bool,
+}
+
+impl StageShardFetchActor {
+    fn new(
+        request_json: Vec<u8>,
+        output_path: PathBuf,
+        report_to: ActorAddress,
+        sender: ExternalSender,
+    ) -> Self {
+        Self {
+            request_json,
+            output_path,
+            report_to,
+            sender,
+            child: None,
+            stdout_reader: None,
+            stderr_reader: None,
+            stdout_closed: true,
+            stderr_closed: true,
+            ready_path: None,
+            exit_status: None,
+            finished: false,
+        }
+    }
+
+    fn start_fetch(&mut self, ctx: &Ctx) {
+        if self.finished {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => {
+                self.fail(ctx, format!("locate worker node executable: {error}"));
+                return;
+            }
+        };
+        let mut child = match Command::new(exe)
+            .arg("stage-shard-fetcher")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                self.fail(ctx, format!("spawn stage shard fetcher: {error}"));
+                return;
+            }
+        };
+        match child.stdin.take() {
+            Some(mut stdin) => {
+                if let Err(error) = stdin.write_all(&self.request_json) {
+                    let mut child = Some(child);
+                    stop_stage_shard_child(&mut child);
+                    self.fail(ctx, format!("write stage shard fetch request: {error}"));
+                    return;
+                }
+            }
+            None => {
+                let mut child = Some(child);
+                stop_stage_shard_child(&mut child);
+                self.fail(ctx, "stage shard fetcher stdin missing".to_owned());
+                return;
+            }
+        }
+
+        self.stdout_closed = false;
+        self.stderr_closed = false;
+        self.ready_path = None;
+        self.exit_status = None;
+        if let Some(stdout) = child.stdout.take() {
+            self.stdout_reader = Some(spawn_stage_shard_reader(
+                StageShardProcessStream::Stdout,
+                stdout,
+                self.sender.clone(),
+                ctx.self_addr(),
+            ));
+        } else {
+            self.stdout_closed = true;
+        }
+        if let Some(stderr) = child.stderr.take() {
+            self.stderr_reader = Some(spawn_stage_shard_reader(
+                StageShardProcessStream::Stderr,
+                stderr,
+                self.sender.clone(),
+                ctx.self_addr(),
+            ));
+        } else {
+            self.stderr_closed = true;
+        }
+        self.child = Some(child);
+        schedule_stage_shard_message(
+            self.sender.clone(),
+            ctx.self_addr(),
+            StageShardFetchMsg::PollChild,
+            PUMP_INTERVAL,
+        );
+    }
+
+    fn poll_child(&mut self, ctx: &Ctx) {
+        if self.finished {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.child = None;
+                self.exit_status = Some(status);
+                self.maybe_finish(ctx);
+            }
+            Ok(None) => schedule_stage_shard_message(
+                self.sender.clone(),
+                ctx.self_addr(),
+                StageShardFetchMsg::PollChild,
+                PUMP_INTERVAL,
+            ),
+            Err(error) => {
+                self.child = None;
+                self.fail(ctx, format!("poll stage shard fetcher: {error}"));
+            }
+        }
+    }
+
+    fn handle_line(&mut self, ctx: &Ctx, stream: StageShardProcessStream, line: String) {
+        if line.is_empty() || self.finished {
+            return;
+        }
+        let event = match stream {
+            StageShardProcessStream::Stdout => match serde_json::from_str::<Value>(&line) {
+                Ok(value) => value,
+                Err(error) => {
+                    json!({"type":"StageShardFetchOutputParseFailed","line":line,"error":error.to_string()})
+                }
+            },
+            StageShardProcessStream::Stderr => json!({"type":"StageShardFetchStderr","line":line}),
+        };
+        if event.get("type").and_then(Value::as_str) == Some("StageShardReady") {
+            self.ready_path = event
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .or_else(|| Some(self.output_path.clone()));
+        }
+        let _ = ctx.send(self.report_to, StageShardFetchReport::Progress(event));
+    }
+
+    fn handle_reader_error(&mut self, ctx: &Ctx, stream: StageShardProcessStream, error: String) {
+        self.handle_line(ctx, stream, format!("reader error: {error}"));
+    }
+
+    fn handle_reader_closed(&mut self, ctx: &Ctx, stream: StageShardProcessStream) {
+        match stream {
+            StageShardProcessStream::Stdout => self.stdout_closed = true,
+            StageShardProcessStream::Stderr => self.stderr_closed = true,
+        }
+        self.maybe_finish(ctx);
+    }
+
+    fn maybe_finish(&mut self, ctx: &Ctx) {
+        if self.finished || self.exit_status.is_none() || !self.stdout_closed || !self.stderr_closed
+        {
+            return;
+        }
+        self.join_readers();
+        let status = self.exit_status.take().expect("exit status checked");
+        if status.success() {
+            let path = self
+                .ready_path
+                .clone()
+                .unwrap_or_else(|| self.output_path.clone());
+            if path.is_file() {
+                self.finished = true;
+                let _ = ctx.send(self.report_to, StageShardFetchReport::Done(path));
+                ctx.stop_self();
+                return;
+            }
+            self.fail(
+                ctx,
+                format!(
+                    "stage shard fetcher exited successfully but {} is missing",
+                    path.display()
+                ),
+            );
+            return;
+        }
+        self.fail(ctx, format!("stage shard fetcher exited with {status}"));
+    }
+
+    fn fail(&mut self, ctx: &Ctx, error: String) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        stop_stage_shard_child(&mut self.child);
+        self.join_readers();
+        let _ = ctx.send(self.report_to, StageShardFetchReport::Failed(error));
+        ctx.stop_self();
+    }
+
+    fn join_readers(&mut self) {
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        self.stdout_closed = true;
+        self.stderr_closed = true;
+    }
+}
+
+impl ActorInterface for StageShardFetchActor {
+    type Incoming = StageShardFetchMsg;
+    type Response = ();
+
+    fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
+        match msg {
+            StageShardFetchMsg::Start => self.start_fetch(ctx),
+            StageShardFetchMsg::PollChild => self.poll_child(ctx),
+            StageShardFetchMsg::ProcessLine { stream, line } => self.handle_line(ctx, stream, line),
+            StageShardFetchMsg::ReaderError { stream, error } => {
+                self.handle_reader_error(ctx, stream, error)
+            }
+            StageShardFetchMsg::ReaderClosed { stream } => self.handle_reader_closed(ctx, stream),
+        }
+    }
+
+    fn on_stop(&mut self, _ctx: &Ctx) {
+        stop_stage_shard_child(&mut self.child);
+        self.join_readers();
+    }
+}
+
+fn stop_stage_shard_child(child: &mut Option<Child>) {
+    let Some(mut child) = child.take() else {
+        return;
+    };
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn stage_shard_cache_path(plan: &StageShardPlan) -> PathBuf {
@@ -3124,8 +3410,9 @@ fn stage_shard_cache_path(plan: &StageShardPlan) -> PathBuf {
 fn spawn_stage_shard_reader<R: Read + Send + 'static>(
     stream: StageShardProcessStream,
     reader: R,
-    tx: mpsc::Sender<StageShardProcessLine>,
-) {
+    sender: ExternalSender,
+    actor: ActorAddress,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
@@ -3134,20 +3421,39 @@ fn spawn_stage_shard_reader<R: Read + Send + 'static>(
             match reader.read_line(&mut line) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let _ = tx.send(StageShardProcessLine {
-                        stream,
-                        line: line.trim_end_matches(['\r', '\n']).to_owned(),
-                    });
+                    let _ = sender.send_to(
+                        actor,
+                        StageShardFetchMsg::ProcessLine {
+                            stream,
+                            line: line.trim_end_matches(['\r', '\n']).to_owned(),
+                        },
+                    );
                 }
                 Err(error) => {
-                    let _ = tx.send(StageShardProcessLine {
-                        stream,
-                        line: format!("reader error: {error}"),
-                    });
+                    let _ = sender.send_to(
+                        actor,
+                        StageShardFetchMsg::ReaderError {
+                            stream,
+                            error: error.to_string(),
+                        },
+                    );
                     break;
                 }
             }
         }
+        let _ = sender.send_to(actor, StageShardFetchMsg::ReaderClosed { stream });
+    })
+}
+
+fn schedule_stage_shard_message(
+    sender: ExternalSender,
+    actor: ActorAddress,
+    msg: StageShardFetchMsg,
+    delay: Duration,
+) {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        let _ = sender.send_to(actor, msg);
     });
 }
 
@@ -3174,14 +3480,34 @@ fn materialize_stage_shard_with_process(
 ) -> Result<PathBuf, String> {
     let output_path = stage_shard_cache_path(plan);
     if output_path.is_file() {
-        let event = json!({
-            "type":"StageShardCacheReady",
-            "stage_index":plan.stage_index,
-            "path":output_path,
-            "cache_hit":true,
-        });
-        publish_stage_shard_fetch_event(datastream, config, &event)?;
-        return Ok(output_path);
+        match validate_stage_shard_cache(&output_path, plan) {
+            Ok(()) => {
+                let event = json!({
+                    "type":"StageShardCacheReady",
+                    "stage_index":plan.stage_index,
+                    "path":output_path,
+                    "cache_hit":true,
+                });
+                publish_stage_shard_fetch_event(datastream, config, &event)?;
+                return Ok(output_path);
+            }
+            Err(error) => {
+                let event = json!({
+                    "type":"StageShardCacheInvalid",
+                    "stage_index":plan.stage_index,
+                    "path":output_path,
+                    "cache_hit":false,
+                    "error":error,
+                });
+                publish_stage_shard_fetch_event(datastream, config, &event)?;
+                std::fs::remove_file(&output_path).map_err(|remove_error| {
+                    format!(
+                        "remove invalid stage shard cache {}: {remove_error}",
+                        output_path.display()
+                    )
+                })?;
+            }
+        }
     }
 
     let request = StageShardFetchRequest {
@@ -3190,95 +3516,39 @@ fn materialize_stage_shard_with_process(
     };
     let request_json = serde_json::to_vec(&request)
         .map_err(|e| format!("serialize stage shard fetch request: {e}"))?;
-    let exe = std::env::current_exe().map_err(|e| format!("locate worker node executable: {e}"))?;
-    let mut child = Command::new(exe)
-        .arg("stage-shard-fetcher")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn stage shard fetcher: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&request_json)
-            .map_err(|e| format!("write stage shard fetch request: {e}"))?;
-    }
-    let (tx, rx) = mpsc::channel::<StageShardProcessLine>();
-    if let Some(stdout) = child.stdout.take() {
-        spawn_stage_shard_reader(StageShardProcessStream::Stdout, stdout, tx.clone());
-    }
-    if let Some(stderr) = child.stderr.take() {
-        spawn_stage_shard_reader(StageShardProcessStream::Stderr, stderr, tx);
-    }
-
-    let mut ready_path = None;
+    let reports = stack
+        .runtime
+        .new_inbox::<StageShardFetchReport>()
+        .map_err(|e| format!("stage shard fetch report inbox: {e}"))?;
+    let actor = stack
+        .runtime
+        .spawn(StageShardFetchActor::new(
+            request_json,
+            output_path,
+            *reports.addr(),
+            stack.runtime.create_sender(),
+        ))
+        .map_err(|e| format!("spawn stage shard fetch actor: {e}"))?;
+    stack
+        .runtime
+        .send_to(actor, StageShardFetchMsg::Start)
+        .map_err(|e| format!("start stage shard fetch actor: {e}"))?;
 
     loop {
-        while let Ok(line) = rx.try_recv() {
-            if line.line.is_empty() {
-                continue;
-            }
-            let event = match line.stream {
-                StageShardProcessStream::Stdout => {
-                    match serde_json::from_str::<Value>(&line.line) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            json!({"type":"StageShardFetchOutputParseFailed","line":line.line,"error":error.to_string()})
-                        }
-                    }
-                }
-                StageShardProcessStream::Stderr => {
-                    json!({"type":"StageShardFetchStderr","line":line.line})
-                }
-            };
-            if event.get("type").and_then(Value::as_str) == Some("StageShardReady") {
-                ready_path = event
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .map(PathBuf::from)
-                    .or_else(|| Some(output_path.clone()));
-            }
-            publish_stage_shard_fetch_event(datastream, config, &event)?;
-        }
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|e| format!("poll stage shard fetcher: {e}"))?
-        {
-            while let Ok(line) = rx.try_recv() {
-                if line.line.is_empty() {
-                    continue;
-                }
-                let event = match line.stream {
-                    StageShardProcessStream::Stdout => serde_json::from_str::<Value>(&line.line)
-                        .unwrap_or_else(|error| {
-                            json!({"type":"StageShardFetchOutputParseFailed","line":line.line,"error":error.to_string()})
-                        }),
-                    StageShardProcessStream::Stderr => {
-                        json!({"type":"StageShardFetchStderr","line":line.line})
-                    }
-                };
-                if event.get("type").and_then(Value::as_str) == Some("StageShardReady") {
-                    ready_path = event
-                        .get("path")
-                        .and_then(Value::as_str)
-                        .map(PathBuf::from)
-                        .or_else(|| Some(output_path.clone()));
-                }
-                publish_stage_shard_fetch_event(datastream, config, &event)?;
-            }
-            if status.success() {
-                let path = ready_path.unwrap_or_else(|| output_path.clone());
-                if path.is_file() {
-                    return Ok(path);
-                }
-                return Err(format!(
-                    "stage shard fetcher exited successfully but {} is missing",
-                    path.display()
-                ));
-            }
-            return Err(format!("stage shard fetcher exited with {status}"));
-        }
         pump_network(driver, stack);
+        while let Some(report) = reports.try_recv() {
+            match report {
+                StageShardFetchReport::Progress(event) => {
+                    if let Err(error) = publish_stage_shard_fetch_event(datastream, config, &event)
+                    {
+                        let _ = stack.runtime.stop_actor(actor);
+                        return Err(error);
+                    }
+                }
+                StageShardFetchReport::Done(path) => return Ok(path),
+                StageShardFetchReport::Failed(error) => return Err(error),
+            }
+        }
         datastream.tick();
         thread::sleep(PUMP_INTERVAL);
     }
@@ -3337,9 +3607,12 @@ fn handle_stage_command(
                         "failed",
                         json!({"error":error}),
                     );
-                    let _ = stack
-                        .runtime
-                        .send_to(node_actor, NodeAgentMsg::WorkerCrashed);
+                    let _ = stack.runtime.send_to(
+                        node_actor,
+                        NodeAgentMsg::WorkerCrashed {
+                            reason: Some(error.clone()),
+                        },
+                    );
                     pump();
                     return Err(error);
                 }
@@ -3367,17 +3640,36 @@ fn handle_stage_command(
             };
             let (resolved_gguf_source, using_stage_shard) =
                 if let Some(stage_plan) = stage_shard_plan {
-                    let local_path = materialize_stage_shard_with_process(
+                    match materialize_stage_shard_with_process(
                         &stage_plan,
                         config,
                         datastream,
                         driver,
                         stack,
-                    )?;
-                    (
-                        GgufSource::LocalPath(local_path.to_string_lossy().into_owned()),
-                        true,
-                    )
+                    ) {
+                        Ok(local_path) => (
+                            GgufSource::LocalPath(local_path.to_string_lossy().into_owned()),
+                            true,
+                        ),
+                        Err(error) => {
+                            emit_node_event(
+                                datastream,
+                                config,
+                                NODE_STAGE_CHANNEL,
+                                "load_weights",
+                                "failed",
+                                json!({"error":error,"stage_shard":true}),
+                            );
+                            let _ = stack.runtime.send_to(
+                                node_actor,
+                                NodeAgentMsg::WorkerCrashed {
+                                    reason: Some(error.clone()),
+                                },
+                            );
+                            pump_network(driver, stack);
+                            return Err(error);
+                        }
+                    }
                 } else {
                     (gguf_source, false)
                 };
@@ -3417,9 +3709,12 @@ fn handle_stage_command(
                         "failed",
                         json!({"error":error}),
                     );
-                    let _ = stack
-                        .runtime
-                        .send_to(node_actor, NodeAgentMsg::WorkerCrashed);
+                    let _ = stack.runtime.send_to(
+                        node_actor,
+                        NodeAgentMsg::WorkerCrashed {
+                            reason: Some(error.clone()),
+                        },
+                    );
                     pump();
                     return Err(error);
                 }

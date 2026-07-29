@@ -166,7 +166,9 @@ pub enum NodeAgentMsg {
     StepCompleted {
         step_id: u64,
     },
-    WorkerCrashed,
+    WorkerCrashed {
+        reason: Option<String>,
+    },
     StopRun {
         run_id: u64,
     },
@@ -323,6 +325,7 @@ pub struct NodeAgentActor {
     outbound_edge: Option<StageOutboundEdgeWire>,
     command_cursor: usize,
     event_cursor: usize,
+    last_worker_crash: Option<String>,
 }
 
 impl NodeAgentActor {
@@ -339,6 +342,7 @@ impl NodeAgentActor {
             outbound_edge: None,
             command_cursor: 0,
             event_cursor: 0,
+            last_worker_crash: None,
         }
     }
 
@@ -448,7 +452,10 @@ impl NodeAgentActor {
                     step_id: stage::StepId(step_id),
                 })
             }
-            NodeAgentMsg::WorkerCrashed => self.core.observe(stage::StageEvent::WorkerCrashed),
+            NodeAgentMsg::WorkerCrashed { reason } => {
+                self.last_worker_crash = reason;
+                self.core.observe(stage::StageEvent::WorkerCrashed)
+            }
             NodeAgentMsg::StopRun { run_id } => self.core.observe(stage::StageEvent::StopRun {
                 run_id: stage::RunId(run_id),
             }),
@@ -584,6 +591,7 @@ impl NodeAgentActor {
                         OrchestratorMsg::ObserveStageFault {
                             run_id: run_id.0,
                             stage_index: *stage_index,
+                            reason: self.last_worker_crash.clone(),
                         },
                     );
                 }

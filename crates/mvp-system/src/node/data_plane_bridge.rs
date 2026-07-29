@@ -55,7 +55,12 @@ impl ActorInterface for MvpDataPlaneReportSinkActor {
             dp::DataPlaneReportMsg::ObjectProduced { .. } => {}
             dp::DataPlaneReportMsg::EdgeFaulted { .. }
             | dp::DataPlaneReportMsg::WorkerDataPlaneFaulted { .. } => {
-                let _ = ctx.send(self.node_agent, NodeAgentMsg::WorkerCrashed);
+                let _ = ctx.send(
+                    self.node_agent,
+                    NodeAgentMsg::WorkerCrashed {
+                        reason: Some("data plane faulted".to_owned()),
+                    },
+                );
             }
             dp::DataPlaneReportMsg::EdgeStopped { .. } => {}
             dp::DataPlaneReportMsg::LocalEdgesStopped { run_id } => {

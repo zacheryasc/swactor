@@ -30,6 +30,10 @@ use crate::chat::node_image::{
 use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::node_provisioning::{ProviderKind, provider_kind};
 use crate::orchestration::provider_adapters::vastai::config::ResolvedVastAiConfig;
+use crate::orchestration::{
+    DEFAULT_PIPELINE_CACHED_MODEL_FILE, DEFAULT_PIPELINE_CACHED_MODEL_ID,
+    DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT, DEFAULT_PIPELINE_CACHED_MODEL_REPO,
+};
 use crate::prompt::rpc::{PromptEvent, SubmitPrompt, write_json_line};
 use crate::transport::endpoint_advertisement::EndpointAddrMask;
 
@@ -814,6 +818,16 @@ impl Config {
         let cached_model = cached_model_source
             .map(CachedModelConfig::from_source)
             .transpose()?;
+        let model = if provider == provider_kind::vastai() {
+            match &cached_model {
+                Some(cached_model) => {
+                    vastai_model_config_for_cached_model(toml.model.clone(), cached_model)?
+                }
+                None => toml.model.clone(),
+            }
+        } else {
+            toml.model.clone()
+        };
         let datastream_frame_log = if args.dump_logs {
             Some(
                 args.dump_log_path
@@ -847,7 +861,7 @@ impl Config {
             vastai_yes: args.vastai_yes,
             pipeline_stages,
             max_tokens,
-            model: toml.model,
+            model,
             vastai,
             skip_rebuild: args.skip_rebuild,
             gpu_run,
@@ -1095,6 +1109,40 @@ impl ParsedArgs {
         }
         Ok(parsed)
     }
+}
+
+fn vastai_model_config_for_cached_model(
+    mut model: ChatModelConfig,
+    cached_model: &CachedModelConfig,
+) -> Result<ChatModelConfig, String> {
+    let file_name = cached_model
+        .host_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "cached model path {} does not have a UTF-8 file name",
+                cached_model.host_path.display()
+            )
+        })?;
+    if file_name == DEFAULT_PIPELINE_CACHED_MODEL_FILE {
+        model.id = Some(DEFAULT_PIPELINE_CACHED_MODEL_ID.to_owned());
+        model.gguf_local_path = None;
+        model.gguf_repo = Some(DEFAULT_PIPELINE_CACHED_MODEL_REPO.to_owned());
+        model.gguf_file = Some(DEFAULT_PIPELINE_CACHED_MODEL_FILE.to_owned());
+        model.gguf_revision = None;
+        model.max_context = Some(DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT);
+        return Ok(model);
+    }
+    if model.gguf_file.as_deref() == Some(file_name) {
+        model.gguf_local_path = None;
+        return Ok(model);
+    }
+    Err(format!(
+        "VastAI cached model {} does not match configured remote GGUF {}; use --cached-model=<matching .gguf> or configure [model].gguf_repo and [model].gguf_file for that cache",
+        cached_model.host_path.display(),
+        model.gguf_file.as_deref().unwrap_or("<unset>")
+    ))
 }
 
 fn resolve_vastai_config(
@@ -3219,6 +3267,72 @@ relay_url = "https://relay.example"
             let upper = CachedModelConfig::from_path(upper_model)
                 .expect("uppercase cached model extension resolves");
             assert_eq!(upper.host_path.file_name(), Some(OsStr::new("upper.GGUF")));
+        });
+    }
+
+    #[test]
+    fn vastai_cached_pipeline_model_selects_matching_remote_gguf() {
+        let temp = TempDir::new("vastai-cached-pipeline-model");
+        let cached_path = temp.path().join(DEFAULT_PIPELINE_CACHED_MODEL_FILE);
+        fs::write(&cached_path, b"cached model").expect("write cached model");
+        let config_path = write_config(
+            &temp,
+            "chat.toml",
+            r#"
+[provider]
+kind = "vastai"
+
+[image]
+node = "docker.io/acme/node:latest"
+
+[model]
+id = "qwen2.5-7b-instruct-q4-k-m"
+gguf_repo = "bartowski/Qwen2.5-7B-Instruct-GGUF"
+gguf_file = "Qwen2.5-7B-Instruct-Q4_K_M.gguf"
+max_context = 512
+
+[vastai]
+relay_url = "https://relay.example"
+bootstrap_command = "boot"
+"#,
+        );
+
+        let cached_arg = format!("--cached-model={}", cached_path.display());
+        with_process_state(&[("VAST_API_KEY", Some("secret"))], None, || {
+            let config_arg = config_path.to_string_lossy().into_owned();
+            let config = Config::from_args(strings(&[
+                "--config",
+                config_arg.as_str(),
+                cached_arg.as_str(),
+                "--yes",
+            ]))
+            .expect("VastAI cached pipeline model resolves");
+            let args = config.orchestrator_cli_args("docker.io/acme/node:prepared");
+
+            assert_eq!(
+                config
+                    .cached_model
+                    .as_ref()
+                    .and_then(|model| model.host_path.file_name()),
+                Some(OsStr::new(DEFAULT_PIPELINE_CACHED_MODEL_FILE))
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--model-id", DEFAULT_PIPELINE_CACHED_MODEL_ID])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--gguf-repo", DEFAULT_PIPELINE_CACHED_MODEL_REPO])
+            );
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--gguf-file", DEFAULT_PIPELINE_CACHED_MODEL_FILE])
+            );
+            let expected_context = DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT.to_string();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["--max-context", expected_context.as_str()])
+            );
         });
     }
 
