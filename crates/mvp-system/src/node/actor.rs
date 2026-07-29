@@ -347,7 +347,89 @@ impl NodeAgentActor {
         }
     }
 
+    fn forward_prompt_or_snapshot(&mut self, ctx: &Ctx, msg: NodeAgentMsg) -> Option<NodeAgentMsg> {
+        match msg {
+            NodeAgentMsg::InferPrompt {
+                request_id,
+                prompt,
+                max_tokens,
+                reply_to,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        NodeAgentReport::PromptRequested {
+                            request_id,
+                            prompt,
+                            max_tokens,
+                            reply_to,
+                        },
+                    );
+                }
+                None
+            }
+            NodeAgentMsg::EncodePrompt {
+                request_id,
+                prompt,
+                reply_to,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        NodeAgentReport::EncodePromptRequested {
+                            request_id,
+                            prompt,
+                            reply_to,
+                        },
+                    );
+                }
+                None
+            }
+            NodeAgentMsg::DecodeTokens {
+                request_id,
+                tokens,
+                reply_to,
+            } => {
+                if let Some(report_to) = self.report_to {
+                    let _ = ctx.send(
+                        report_to,
+                        NodeAgentReport::DecodeTokensRequested {
+                            request_id,
+                            tokens,
+                            reply_to,
+                        },
+                    );
+                }
+                None
+            }
+            NodeAgentMsg::Snapshot { reply_to } => {
+                let _ = ctx.send(
+                    reply_to,
+                    NodeAgentReport::Snapshot {
+                        commands: self
+                            .core
+                            .commands()
+                            .iter()
+                            .map(StageCommandWire::from)
+                            .collect(),
+                        events: self
+                            .core
+                            .events()
+                            .iter()
+                            .map(StageLifecycleWire::from)
+                            .collect(),
+                    },
+                );
+                None
+            }
+            other => Some(other),
+        }
+    }
+
     fn observe(&mut self, ctx: &Ctx, msg: NodeAgentMsg) {
+        let Some(msg) = self.forward_prompt_or_snapshot(ctx, msg) else {
+            return;
+        };
         match msg {
             NodeAgentMsg::ProvisionStage(provision) => {
                 self.core.observe(stage::StageEvent::ProvisionStage {
@@ -480,79 +562,10 @@ impl NodeAgentActor {
                     run_id: stage::RunId(run_id),
                 })
             }
-            NodeAgentMsg::InferPrompt {
-                request_id,
-                prompt,
-                max_tokens,
-                reply_to,
-            } => {
-                if let Some(report_to) = self.report_to {
-                    let _ = ctx.send(
-                        report_to,
-                        NodeAgentReport::PromptRequested {
-                            request_id,
-                            prompt,
-                            max_tokens,
-                            reply_to,
-                        },
-                    );
-                }
-                return;
-            }
-            NodeAgentMsg::EncodePrompt {
-                request_id,
-                prompt,
-                reply_to,
-            } => {
-                if let Some(report_to) = self.report_to {
-                    let _ = ctx.send(
-                        report_to,
-                        NodeAgentReport::EncodePromptRequested {
-                            request_id,
-                            prompt,
-                            reply_to,
-                        },
-                    );
-                }
-                return;
-            }
-            NodeAgentMsg::DecodeTokens {
-                request_id,
-                tokens,
-                reply_to,
-            } => {
-                if let Some(report_to) = self.report_to {
-                    let _ = ctx.send(
-                        report_to,
-                        NodeAgentReport::DecodeTokensRequested {
-                            request_id,
-                            tokens,
-                            reply_to,
-                        },
-                    );
-                }
-                return;
-            }
-            NodeAgentMsg::Snapshot { reply_to } => {
-                let _ = ctx.send(
-                    reply_to,
-                    NodeAgentReport::Snapshot {
-                        commands: self
-                            .core
-                            .commands()
-                            .iter()
-                            .map(StageCommandWire::from)
-                            .collect(),
-                        events: self
-                            .core
-                            .events()
-                            .iter()
-                            .map(StageLifecycleWire::from)
-                            .collect(),
-                    },
-                );
-                return;
-            }
+            NodeAgentMsg::InferPrompt { .. }
+            | NodeAgentMsg::EncodePrompt { .. }
+            | NodeAgentMsg::DecodeTokens { .. }
+            | NodeAgentMsg::Snapshot { .. } => unreachable!("prompt messages returned early"),
         }
         self.drain_outputs(ctx);
     }

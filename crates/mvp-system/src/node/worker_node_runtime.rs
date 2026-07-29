@@ -1252,302 +1252,329 @@ impl WorkerEdgeRuntime {
         driver: &mut IrohDriver,
     ) -> Result<(), String> {
         loop {
-            let mut progressed = false;
-            while self.edge_command_cursor < self.establisher.commands().len() {
-                let command = self.establisher.commands()[self.edge_command_cursor].clone();
-                self.edge_command_cursor += 1;
-                progressed = true;
-                match command {
-                    edge::EdgeCommand::LeaseRing {
-                        request_id,
-                        ring_spec,
-                        ..
-                    } => {
-                        let events = arena_manager.lock().request(arena::ArenaRequest::LeaseRing(
-                            arena::LeaseRing {
-                                request_id: arena::LeaseRequestId(request_id.0),
-                                ring_spec: arena::RingSpec {
-                                    header_bytes: ring_spec.header_bytes,
-                                    data_bytes: ring_spec.data_bytes,
-                                    alignment: ring_spec.alignment,
-                                },
-                            },
-                        ));
-                        for event in events {
-                            match event {
-                                arena::ArenaEvent::RingLeased { lease } => {
-                                    self.establisher.observe(edge::EdgeEvent::RingLeased {
-                                        request_id: edge::LeaseRequestId(lease.request_id.0),
-                                        ring_id: edge::RingId(lease.ring_id.0),
-                                        layout: edge::RingLayout {
-                                            start_offset: lease.layout.start_offset,
-                                            header_offset: lease.layout.header_offset,
-                                            data_offset: lease.layout.data_offset,
-                                            end_offset: lease.layout.end_offset,
-                                            data_bytes: lease.layout.data_bytes,
-                                            alignment: lease.layout.alignment,
-                                        },
-                                    });
-                                }
-                                arena::ArenaEvent::RingLeaseRejected { request_id, reason } => {
-                                    let reason = match reason {
-                                        arena::RingLeaseRejection::CannotFitWithinCeiling => {
-                                            edge::RingLeaseRejection::CannotFit
-                                        }
-                                        arena::RingLeaseRejection::ArenaShuttingDown => {
-                                            edge::RingLeaseRejection::ArenaShuttingDown
-                                        }
-                                    };
-                                    self.establisher
-                                        .observe(edge::EdgeEvent::RingLeaseRejected {
-                                            request_id: edge::LeaseRequestId(request_id.0),
-                                            reason,
-                                        });
-                                }
-                                arena::ArenaEvent::RingLeaseQueued { .. }
-                                | arena::ArenaEvent::RingReleased { .. }
-                                | arena::ArenaEvent::RingReleaseRejected { .. }
-                                | arena::ArenaEvent::CancelledFreshLeaseReleased { .. } => {}
-                            }
-                        }
-                    }
-                    edge::EdgeCommand::InstallWorkerRing {
-                        edge_id,
-                        ring_id,
-                        direction,
-                        object_spec,
-                        ..
-                    } => {
-                        let lease = arena_manager
-                            .lock()
-                            .lookup_lease(arena::RingId(ring_id.0))
-                            .ok_or_else(|| format!("ring {} lease missing", ring_id.0))?
-                            .clone();
-                        let (port, direction_name, wire_spec) = match direction {
-                            edge::RingDirection::Ingress => {
-                                self.inbound_ring_id = Some(ring_id.0);
-                                let spec = self
-                                    .inbound_edge
-                                    .as_ref()
-                                    .map(|edge| edge.object_spec)
-                                    .unwrap_or(StageObjectSpecWire {
-                                        max_extent: object_spec.max_extent_bytes,
-                                        alignment: 4,
-                                    });
-                                ("input", "ingress", spec)
-                            }
-                            edge::RingDirection::Egress => {
-                                self.outbound_ring_id = Some(ring_id.0);
-                                let spec = self
-                                    .outbound_edge
-                                    .as_ref()
-                                    .map(|edge| edge.object_spec)
-                                    .unwrap_or(StageObjectSpecWire {
-                                        max_extent: object_spec.max_extent_bytes,
-                                        alignment: 4,
-                                    });
-                                ("output", "egress", spec)
-                            }
-                        };
-                        worker.install_ring(
-                            ring_id.0,
-                            edge_id.0,
-                            port,
-                            direction_name,
-                            lease.layout,
-                            wire_spec,
-                            config,
-                            datastream,
-                            &mut || {},
-                        )?;
-                        self.establisher
-                            .observe(edge::EdgeEvent::RingInstalled { edge_id, ring_id });
-                    }
-                    edge::EdgeCommand::EstablishSend {
-                        edge_id,
-                        consumer_node_id,
-                        ..
-                    } => {
-                        let outbound = self
-                            .outbound_edge
-                            .as_ref()
-                            .ok_or_else(|| "outbound edge missing".to_owned())?;
-                        let peer = outbound
-                            .consumer_endpoint
-                            .clone()
-                            .ok_or_else(|| "outbound consumer endpoint missing".to_owned())?;
-                        let record = self
-                            .establisher
-                            .local_record(edge_id)
-                            .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
-                        let ring_id = record
-                            .ring_id
-                            .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
-                        let ring_capacity = outbound.ring_spec.data_capacity as usize;
-                        self.driver_model
-                            .observe(driver_model::DriverEvent::EstablishSend(
-                                driver_model::EstablishSend {
-                                    edge_id: driver_model::EdgeId(edge_id.0),
-                                    peer_node_id: driver_model::NodeId(consumer_node_id.0),
-                                    layout: driver_model::RingLayout {
-                                        ring_id: driver_model::RingId(ring_id.0),
-                                        byte_capacity: ring_capacity,
-                                        direction: driver_model::RingDirection::Egress,
-                                    },
-                                },
-                            ));
-                        self.outbound_sender = Some(driver.spawn_edge_send_pump(peer, edge_id.0)?);
-                    }
-                    edge::EdgeCommand::EstablishRecv { edge_id, .. } => {
-                        let record = self
-                            .establisher
-                            .local_record(edge_id)
-                            .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
-                        let ring_id = record
-                            .ring_id
-                            .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
-                        let ring_capacity = self
-                            .inbound_edge
-                            .as_ref()
-                            .map(|edge| edge.ring_spec.data_capacity as usize)
-                            .unwrap_or(4096);
-                        self.driver_model
-                            .observe(driver_model::DriverEvent::EstablishRecv(
-                                driver_model::EstablishRecv {
-                                    edge_id: driver_model::EdgeId(edge_id.0),
-                                    layout: driver_model::RingLayout {
-                                        ring_id: driver_model::RingId(ring_id.0),
-                                        byte_capacity: ring_capacity,
-                                        direction: driver_model::RingDirection::Ingress,
-                                    },
-                                },
-                            ));
-                    }
-                    edge::EdgeCommand::CancelQueuedLease { request_id, .. } => {
-                        let _ = arena_manager
-                            .lock()
-                            .request(arena::ArenaRequest::CancelLease {
-                                request_id: arena::LeaseRequestId(request_id.0),
-                            });
-                    }
-                    edge::EdgeCommand::StopPump { edge_id, .. } => {
-                        self.driver_model
-                            .observe(driver_model::DriverEvent::StopEdge {
-                                edge_id: driver_model::EdgeId(edge_id.0),
-                            });
-                    }
-                    edge::EdgeCommand::UninstallWorkerRing { ring_id, .. } => {
-                        let mut pump = || {};
-                        worker.uninstall_ring(ring_id.0, config, datastream, &mut pump)?;
-                        self.establisher
-                            .observe(edge::EdgeEvent::RingQuiesced { ring_id });
-                    }
-                    edge::EdgeCommand::ReleaseArenaLease { ring_id, proof } => {
-                        let proof = if proof == edge::QuiescenceProof::verified() {
-                            arena::QuiescenceProof::verified()
-                        } else {
-                            arena::QuiescenceProof::missing()
-                        };
-                        let _ = arena_manager
-                            .lock()
-                            .request(arena::ArenaRequest::ReleaseRing {
-                                ring_id: arena::RingId(ring_id.0),
-                                proof,
-                            });
-                    }
-                }
-            }
-
-            while self.driver_event_cursor < self.driver_model.events().len() {
-                let event = self.driver_model.events()[self.driver_event_cursor].clone();
-                self.driver_event_cursor += 1;
-                progressed = true;
-                match event {
-                    driver_model::DriverEventOut::DriverEdgeReady { edge_id } => {
-                        self.establisher.observe(edge::EdgeEvent::DriverEdgeReady {
-                            edge_id: edge::EdgeId(edge_id.0),
-                        });
-                    }
-                    driver_model::DriverEventOut::StreamFault { edge_id, reason } => {
-                        let reason = match reason {
-                            driver_model::StreamFaultReason::ReadError => {
-                                edge::StreamFaultReason::ReadError
-                            }
-                            driver_model::StreamFaultReason::WriteError => {
-                                edge::StreamFaultReason::WriteError
-                            }
-                            driver_model::StreamFaultReason::ProtocolError => {
-                                edge::StreamFaultReason::ProtocolError
-                            }
-                        };
-                        self.establisher.observe(edge::EdgeEvent::StreamFault {
-                            edge_id: edge::EdgeId(edge_id.0),
-                            reason,
-                        });
-                    }
-                    driver_model::DriverEventOut::PumpStopped { edge_id, ring_id } => {
-                        self.establisher.observe(edge::EdgeEvent::PumpStopped {
-                            edge_id: edge::EdgeId(edge_id.0),
-                            ring_id: edge::RingId(ring_id.0),
-                        });
-                    }
-                    driver_model::DriverEventOut::StreamClosed { .. } => {}
-                }
-            }
-
-            while self.edge_event_cursor < self.establisher.events().len() {
-                let event = self.establisher.events()[self.edge_event_cursor].clone();
-                self.edge_event_cursor += 1;
-                progressed = true;
-                match event {
-                    edge::EdgeLifecycleEvent::EdgeReady { edge_id, .. } => {
-                        if self
-                            .inbound_edge
-                            .as_ref()
-                            .is_some_and(|edge| edge.edge_id == edge_id.0)
-                        {
-                            stack
-                                .runtime
-                                .send_to(
-                                    node_actor,
-                                    NodeAgentMsg::MarkInboundEdgeReady { edge_id: edge_id.0 },
-                                )
-                                .map_err(|e| format!("mark inbound ready: {e}"))?;
-                        }
-                        if self
-                            .outbound_edge
-                            .as_ref()
-                            .is_some_and(|edge| edge.edge_id == edge_id.0)
-                        {
-                            stack
-                                .runtime
-                                .send_to(
-                                    node_actor,
-                                    NodeAgentMsg::MarkOutboundEdgeReady { edge_id: edge_id.0 },
-                                )
-                                .map_err(|e| format!("mark outbound ready: {e}"))?;
-                        }
-                    }
-                    edge::EdgeLifecycleEvent::EdgeFaulted { edge_id, reason } => {
-                        stack
-                            .runtime
-                            .send_to(
-                                node_actor,
-                                NodeAgentMsg::WorkerCrashed {
-                                    reason: Some(format!("edge {} faulted: {reason:?}", edge_id.0)),
-                                },
-                            )
-                            .map_err(|e| format!("mark worker crashed after edge fault: {e}"))?;
-                        return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
-                    }
-                    edge::EdgeLifecycleEvent::EdgeStopped { .. } => {}
-                }
-            }
+            let progressed =
+                self.drain_edge_commands(worker, arena_manager, config, datastream, driver)?
+                    || self.drain_driver_events()
+                    || self.drain_edge_events(stack, node_actor)?;
             if !progressed {
                 break;
             }
         }
         Ok(())
+    }
+
+    fn drain_edge_commands(
+        &mut self,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        datastream: &mut NodeDatastream,
+        driver: &mut IrohDriver,
+    ) -> Result<bool, String> {
+        let mut progressed = false;
+        while self.edge_command_cursor < self.establisher.commands().len() {
+            let command = self.establisher.commands()[self.edge_command_cursor].clone();
+            self.edge_command_cursor += 1;
+            progressed = true;
+            match command {
+                edge::EdgeCommand::LeaseRing {
+                    request_id,
+                    ring_spec,
+                    ..
+                } => {
+                    let events = arena_manager.lock().request(arena::ArenaRequest::LeaseRing(
+                        arena::LeaseRing {
+                            request_id: arena::LeaseRequestId(request_id.0),
+                            ring_spec: arena::RingSpec {
+                                header_bytes: ring_spec.header_bytes,
+                                data_bytes: ring_spec.data_bytes,
+                                alignment: ring_spec.alignment,
+                            },
+                        },
+                    ));
+                    for event in events {
+                        match event {
+                            arena::ArenaEvent::RingLeased { lease } => {
+                                self.establisher.observe(edge::EdgeEvent::RingLeased {
+                                    request_id: edge::LeaseRequestId(lease.request_id.0),
+                                    ring_id: edge::RingId(lease.ring_id.0),
+                                    layout: edge::RingLayout {
+                                        start_offset: lease.layout.start_offset,
+                                        header_offset: lease.layout.header_offset,
+                                        data_offset: lease.layout.data_offset,
+                                        end_offset: lease.layout.end_offset,
+                                        data_bytes: lease.layout.data_bytes,
+                                        alignment: lease.layout.alignment,
+                                    },
+                                });
+                            }
+                            arena::ArenaEvent::RingLeaseRejected { request_id, reason } => {
+                                let reason = match reason {
+                                    arena::RingLeaseRejection::CannotFitWithinCeiling => {
+                                        edge::RingLeaseRejection::CannotFit
+                                    }
+                                    arena::RingLeaseRejection::ArenaShuttingDown => {
+                                        edge::RingLeaseRejection::ArenaShuttingDown
+                                    }
+                                };
+                                self.establisher
+                                    .observe(edge::EdgeEvent::RingLeaseRejected {
+                                        request_id: edge::LeaseRequestId(request_id.0),
+                                        reason,
+                                    });
+                            }
+                            arena::ArenaEvent::RingLeaseQueued { .. }
+                            | arena::ArenaEvent::RingReleased { .. }
+                            | arena::ArenaEvent::RingReleaseRejected { .. }
+                            | arena::ArenaEvent::CancelledFreshLeaseReleased { .. } => {}
+                        }
+                    }
+                }
+                edge::EdgeCommand::InstallWorkerRing {
+                    edge_id,
+                    ring_id,
+                    direction,
+                    object_spec,
+                    ..
+                } => {
+                    let lease = arena_manager
+                        .lock()
+                        .lookup_lease(arena::RingId(ring_id.0))
+                        .ok_or_else(|| format!("ring {} lease missing", ring_id.0))?
+                        .clone();
+                    let (port, direction_name, wire_spec) = match direction {
+                        edge::RingDirection::Ingress => {
+                            self.inbound_ring_id = Some(ring_id.0);
+                            let spec = self
+                                .inbound_edge
+                                .as_ref()
+                                .map(|edge| edge.object_spec)
+                                .unwrap_or(StageObjectSpecWire {
+                                    max_extent: object_spec.max_extent_bytes,
+                                    alignment: 4,
+                                });
+                            ("input", "ingress", spec)
+                        }
+                        edge::RingDirection::Egress => {
+                            self.outbound_ring_id = Some(ring_id.0);
+                            let spec = self
+                                .outbound_edge
+                                .as_ref()
+                                .map(|edge| edge.object_spec)
+                                .unwrap_or(StageObjectSpecWire {
+                                    max_extent: object_spec.max_extent_bytes,
+                                    alignment: 4,
+                                });
+                            ("output", "egress", spec)
+                        }
+                    };
+                    worker.install_ring(
+                        ring_id.0,
+                        edge_id.0,
+                        port,
+                        direction_name,
+                        lease.layout,
+                        wire_spec,
+                        config,
+                        datastream,
+                        &mut || {},
+                    )?;
+                    self.establisher
+                        .observe(edge::EdgeEvent::RingInstalled { edge_id, ring_id });
+                }
+                edge::EdgeCommand::EstablishSend {
+                    edge_id,
+                    consumer_node_id,
+                    ..
+                } => {
+                    let outbound = self
+                        .outbound_edge
+                        .as_ref()
+                        .ok_or_else(|| "outbound edge missing".to_owned())?;
+                    let peer = outbound
+                        .consumer_endpoint
+                        .clone()
+                        .ok_or_else(|| "outbound consumer endpoint missing".to_owned())?;
+                    let record = self
+                        .establisher
+                        .local_record(edge_id)
+                        .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
+                    let ring_id = record
+                        .ring_id
+                        .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
+                    let ring_capacity = outbound.ring_spec.data_capacity as usize;
+                    self.driver_model
+                        .observe(driver_model::DriverEvent::EstablishSend(
+                            driver_model::EstablishSend {
+                                edge_id: driver_model::EdgeId(edge_id.0),
+                                peer_node_id: driver_model::NodeId(consumer_node_id.0),
+                                layout: driver_model::RingLayout {
+                                    ring_id: driver_model::RingId(ring_id.0),
+                                    byte_capacity: ring_capacity,
+                                    direction: driver_model::RingDirection::Egress,
+                                },
+                            },
+                        ));
+                    self.outbound_sender = Some(driver.spawn_edge_send_pump(peer, edge_id.0)?);
+                }
+                edge::EdgeCommand::EstablishRecv { edge_id, .. } => {
+                    let record = self
+                        .establisher
+                        .local_record(edge_id)
+                        .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
+                    let ring_id = record
+                        .ring_id
+                        .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
+                    let ring_capacity = self
+                        .inbound_edge
+                        .as_ref()
+                        .map(|edge| edge.ring_spec.data_capacity as usize)
+                        .unwrap_or(4096);
+                    self.driver_model
+                        .observe(driver_model::DriverEvent::EstablishRecv(
+                            driver_model::EstablishRecv {
+                                edge_id: driver_model::EdgeId(edge_id.0),
+                                layout: driver_model::RingLayout {
+                                    ring_id: driver_model::RingId(ring_id.0),
+                                    byte_capacity: ring_capacity,
+                                    direction: driver_model::RingDirection::Ingress,
+                                },
+                            },
+                        ));
+                }
+                edge::EdgeCommand::CancelQueuedLease { request_id, .. } => {
+                    let _ = arena_manager
+                        .lock()
+                        .request(arena::ArenaRequest::CancelLease {
+                            request_id: arena::LeaseRequestId(request_id.0),
+                        });
+                }
+                edge::EdgeCommand::StopPump { edge_id, .. } => {
+                    self.driver_model
+                        .observe(driver_model::DriverEvent::StopEdge {
+                            edge_id: driver_model::EdgeId(edge_id.0),
+                        });
+                }
+                edge::EdgeCommand::UninstallWorkerRing { ring_id, .. } => {
+                    let mut pump = || {};
+                    worker.uninstall_ring(ring_id.0, config, datastream, &mut pump)?;
+                    self.establisher
+                        .observe(edge::EdgeEvent::RingQuiesced { ring_id });
+                }
+                edge::EdgeCommand::ReleaseArenaLease { ring_id, proof } => {
+                    let proof = if proof == edge::QuiescenceProof::verified() {
+                        arena::QuiescenceProof::verified()
+                    } else {
+                        arena::QuiescenceProof::missing()
+                    };
+                    let _ = arena_manager
+                        .lock()
+                        .request(arena::ArenaRequest::ReleaseRing {
+                            ring_id: arena::RingId(ring_id.0),
+                            proof,
+                        });
+                }
+            }
+        }
+        Ok(progressed)
+    }
+
+    fn drain_driver_events(&mut self) -> bool {
+        let mut progressed = false;
+        while self.driver_event_cursor < self.driver_model.events().len() {
+            let event = self.driver_model.events()[self.driver_event_cursor].clone();
+            self.driver_event_cursor += 1;
+            progressed = true;
+            match event {
+                driver_model::DriverEventOut::DriverEdgeReady { edge_id } => {
+                    self.establisher.observe(edge::EdgeEvent::DriverEdgeReady {
+                        edge_id: edge::EdgeId(edge_id.0),
+                    });
+                }
+                driver_model::DriverEventOut::StreamFault { edge_id, reason } => {
+                    let reason = match reason {
+                        driver_model::StreamFaultReason::ReadError => {
+                            edge::StreamFaultReason::ReadError
+                        }
+                        driver_model::StreamFaultReason::WriteError => {
+                            edge::StreamFaultReason::WriteError
+                        }
+                        driver_model::StreamFaultReason::ProtocolError => {
+                            edge::StreamFaultReason::ProtocolError
+                        }
+                    };
+                    self.establisher.observe(edge::EdgeEvent::StreamFault {
+                        edge_id: edge::EdgeId(edge_id.0),
+                        reason,
+                    });
+                }
+                driver_model::DriverEventOut::PumpStopped { edge_id, ring_id } => {
+                    self.establisher.observe(edge::EdgeEvent::PumpStopped {
+                        edge_id: edge::EdgeId(edge_id.0),
+                        ring_id: edge::RingId(ring_id.0),
+                    });
+                }
+                driver_model::DriverEventOut::StreamClosed { .. } => {}
+            }
+        }
+        progressed
+    }
+
+    fn drain_edge_events(
+        &mut self,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+    ) -> Result<bool, String> {
+        let mut progressed = false;
+        while self.edge_event_cursor < self.establisher.events().len() {
+            let event = self.establisher.events()[self.edge_event_cursor].clone();
+            self.edge_event_cursor += 1;
+            progressed = true;
+            match event {
+                edge::EdgeLifecycleEvent::EdgeReady { edge_id, .. } => {
+                    if self
+                        .inbound_edge
+                        .as_ref()
+                        .is_some_and(|edge| edge.edge_id == edge_id.0)
+                    {
+                        stack
+                            .runtime
+                            .send_to(
+                                node_actor,
+                                NodeAgentMsg::MarkInboundEdgeReady { edge_id: edge_id.0 },
+                            )
+                            .map_err(|e| format!("mark inbound ready: {e}"))?;
+                    }
+                    if self
+                        .outbound_edge
+                        .as_ref()
+                        .is_some_and(|edge| edge.edge_id == edge_id.0)
+                    {
+                        stack
+                            .runtime
+                            .send_to(
+                                node_actor,
+                                NodeAgentMsg::MarkOutboundEdgeReady { edge_id: edge_id.0 },
+                            )
+                            .map_err(|e| format!("mark outbound ready: {e}"))?;
+                    }
+                }
+                edge::EdgeLifecycleEvent::EdgeFaulted { edge_id, reason } => {
+                    stack
+                        .runtime
+                        .send_to(
+                            node_actor,
+                            NodeAgentMsg::WorkerCrashed {
+                                reason: Some(format!("edge {} faulted: {reason:?}", edge_id.0)),
+                            },
+                        )
+                        .map_err(|e| format!("mark worker crashed after edge fault: {e}"))?;
+                    return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
+                }
+                edge::EdgeLifecycleEvent::EdgeStopped { .. } => {}
+            }
+        }
+        Ok(progressed)
     }
 }
 

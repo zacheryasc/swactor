@@ -49,16 +49,6 @@ pub(super) struct NodeImageRequest {
     pub(super) enabled: bool,
 }
 
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-pub(super) struct PreparedNodeImage {
-    pub(super) image_ref: String,
-    pub(super) tag: String,
-    pub(super) already_available: bool,
-    pub(super) built: bool,
-    pub(super) pushed: bool,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NodeImageProgressEventKind {
     ImageReference {
@@ -140,7 +130,7 @@ struct RealImageCommandRunner;
 pub(super) fn prepare_node_image_with_progress(
     request: NodeImageRequest,
     progress: Option<&mut dyn NodeImageProgressSink>,
-) -> Result<PreparedNodeImage, String> {
+) -> Result<String, String> {
     let mut progress = progress;
     let mut runner = RealImageCommandRunner;
     prepare_node_image_inner(request, &mut progress, &mut runner)
@@ -150,16 +140,10 @@ fn prepare_node_image_inner(
     request: NodeImageRequest,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     runner: &mut dyn ImageCommandRunner,
-) -> Result<PreparedNodeImage, String> {
+) -> Result<String, String> {
     emit_image_reference(progress, "requested", &request.requested_image);
     if !request.enabled {
-        return Ok(PreparedNodeImage {
-            image_ref: request.requested_image,
-            tag: String::new(),
-            already_available: false,
-            built: false,
-            pushed: false,
-        });
+        return Ok(request.requested_image);
     }
 
     emit_image_reference(progress, "base", &request.base_image);
@@ -208,16 +192,9 @@ fn prepare_node_image_inner(
         docker_image_labels_match(runner, &root, &image_ref, &expected_node_labels)?;
     let remote_available = remote_required && runner.docker_manifest_exists(&root, &image_ref);
     if !request.force_refresh && remote_required && remote_available {
-        let pushed =
-            ensure_aliases_for_remote(runner, progress, &root, &image_ref, &image, &alias_tags)?;
+        ensure_aliases_for_remote(runner, progress, &root, &image_ref, &image, &alias_tags)?;
         prune_old_dirty_images(runner, &root, &image, &tag);
-        return Ok(PreparedNodeImage {
-            image_ref,
-            tag,
-            already_available: true,
-            built: false,
-            pushed,
-        });
+        return Ok(image_ref);
     }
     if !request.force_refresh && remote_required && local_image_matches {
         ensure_aliases_local(runner, progress, &root, &image_ref, &image, &alias_tags)?;
@@ -226,24 +203,12 @@ fn prepare_node_image_inner(
             push_image(runner, progress, &root, &alias)?;
         }
         prune_old_dirty_images(runner, &root, &image, &tag);
-        return Ok(PreparedNodeImage {
-            image_ref,
-            tag,
-            already_available: true,
-            built: false,
-            pushed: true,
-        });
+        return Ok(image_ref);
     }
     if !request.force_refresh && !remote_required && local_image_matches {
         ensure_aliases_local(runner, progress, &root, &image_ref, &image, &alias_tags)?;
         prune_old_dirty_images(runner, &root, &image, &tag);
-        return Ok(PreparedNodeImage {
-            image_ref,
-            tag,
-            already_available: true,
-            built: false,
-            pushed: false,
-        });
+        return Ok(image_ref);
     }
     let base_image_matches =
         docker_image_labels_match(runner, &root, &request.base_image, &expected_base_labels)?;
@@ -294,23 +259,15 @@ fn prepare_node_image_inner(
     )?;
     ensure_aliases_local(runner, progress, &root, &image_ref, &image, &alias_tags)?;
 
-    let mut pushed = false;
     if remote_required {
         push_image(runner, progress, &root, &image_ref)?;
-        pushed = true;
         for alias in alias_refs(&image, &alias_tags) {
             push_image(runner, progress, &root, &alias)?;
         }
     }
 
     prune_old_dirty_images(runner, &root, &image, &tag);
-    Ok(PreparedNodeImage {
-        image_ref,
-        tag,
-        already_available: false,
-        built: true,
-        pushed,
-    })
+    Ok(image_ref)
 }
 
 fn workspace_root() -> Result<PathBuf, String> {

@@ -230,14 +230,7 @@ impl OrchestratorRun {
             RunEvent::StageReady {
                 run_id,
                 stage_index,
-            } => {
-                if run_id != self.config.run_id || !self.plan_has_stage(stage_index) {
-                    self.fault(RunFaultReason::UnknownStageReady { stage_index });
-                    return;
-                }
-                self.ready_stages.insert(stage_index);
-                self.maybe_inject_initial();
-            }
+            } => self.stage_ready(run_id, stage_index),
             RunEvent::TokenInEndpointReady => {
                 self.token_in_ready = true;
                 self.maybe_inject_initial();
@@ -250,45 +243,31 @@ impl OrchestratorRun {
                 sequence,
                 token_id,
                 eos,
-            } => {
-                if self.terminal {
-                    return;
-                }
-                if sequence != self.expected_token_sequence {
-                    return;
-                }
-                self.expected_token_sequence += 1;
-                if eos {
-                    self.complete();
-                } else if (self.injected_sequences.len() as u64) < self.config.max_tokens {
-                    self.inject_decode(sequence + 1, token_id, sequence);
-                } else {
-                    self.complete();
-                }
-            }
+            } => self.token_received(sequence, token_id, eos),
+            RunEvent::StageFault { run_id, .. }
+            | RunEvent::EndpointFault { run_id, .. }
+            | RunEvent::OperatorStop { run_id }
+            | RunEvent::MembershipLost { run_id, .. }
+            | RunEvent::StageStopped { run_id, .. }
+                if run_id != self.config.run_id => {}
             RunEvent::StageFault {
-                run_id,
                 stage_index,
                 reason,
-            } if run_id == self.config.run_id => {
+                ..
+            } => {
                 self.fault(RunFaultReason::StageFault {
                     stage_index,
                     reason,
                 });
             }
-            RunEvent::EndpointFault { run_id, endpoint } if run_id == self.config.run_id => {
+            RunEvent::EndpointFault { endpoint, .. } => {
                 self.fault(RunFaultReason::EndpointFault { endpoint });
             }
-            RunEvent::OperatorStop { run_id } if run_id == self.config.run_id => {
-                self.operator_stop();
-            }
-            RunEvent::MembershipLost { run_id, node_id } if run_id == self.config.run_id => {
+            RunEvent::OperatorStop { .. } => self.operator_stop(),
+            RunEvent::MembershipLost { node_id, .. } => {
                 self.fault(RunFaultReason::MembershipLost { node_id });
             }
-            RunEvent::StageStopped {
-                run_id,
-                stage_index,
-            } if run_id == self.config.run_id => {
+            RunEvent::StageStopped { stage_index, .. } => {
                 self.stopped_stages.insert(stage_index);
                 self.maybe_torn_down();
             }
@@ -296,11 +275,29 @@ impl OrchestratorRun {
                 self.token_endpoints_stopped = true;
                 self.maybe_torn_down();
             }
-            RunEvent::StageFault { .. }
-            | RunEvent::EndpointFault { .. }
-            | RunEvent::OperatorStop { .. }
-            | RunEvent::MembershipLost { .. }
-            | RunEvent::StageStopped { .. } => {}
+        }
+    }
+
+    fn stage_ready(&mut self, run_id: RunId, stage_index: u32) {
+        if run_id != self.config.run_id || !self.plan_has_stage(stage_index) {
+            self.fault(RunFaultReason::UnknownStageReady { stage_index });
+            return;
+        }
+        self.ready_stages.insert(stage_index);
+        self.maybe_inject_initial();
+    }
+
+    fn token_received(&mut self, sequence: u64, token_id: u32, eos: bool) {
+        if self.terminal || sequence != self.expected_token_sequence {
+            return;
+        }
+        self.expected_token_sequence += 1;
+        if eos {
+            self.complete();
+        } else if (self.injected_sequences.len() as u64) < self.config.max_tokens {
+            self.inject_decode(sequence + 1, token_id, sequence);
+        } else {
+            self.complete();
         }
     }
 

@@ -30,8 +30,6 @@ use crate::observability::telemetry::{
     mvp_provision_log_channel,
 };
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
-#[cfg(test)]
-use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
 use crate::orchestration::provider_adapters::relay::{
     MVP_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV, relay_mode_env_value,
     relay_runtime_config_from_settings,
@@ -70,8 +68,6 @@ use iroh_driver::{
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
-#[cfg(test)]
-use tokio::sync::mpsc as tokio_mpsc;
 
 const DEFAULT_IMAGE: &str = "swactor-mvp-node:latest";
 const MVP_RUNTIME_CONFIG_ENV: &str = "MVP_RUNTIME_CONFIG";
@@ -506,16 +502,21 @@ where
         provisioner,
         &config,
         pipeline_plan.as_ref(),
-        &mut driver,
-        &stack,
-        &obs_rx,
-        &frame_rx,
-        &frame_tx,
-        &orchestrator_reports,
-        &stop_rx,
-        dashboard.as_ref(),
-        &mut orch_datastream,
-        orch_stdio_rx.as_ref(),
+        RuntimeReadyAckLoop {
+            driver: &mut driver,
+            stack: &stack,
+            obs_rx: &obs_rx,
+            frame_rx: &frame_rx,
+            frame_tx: &frame_tx,
+            orchestrator_reports: &orchestrator_reports,
+            stop_rx: &stop_rx,
+            dashboard: dashboard.as_ref(),
+            orch_datastream: &mut orch_datastream,
+            orch_stdio_rx: orch_stdio_rx.as_ref(),
+            run_id: config.run_id,
+            orchestrator_node_id: config.node_id,
+            provider: &config.provider,
+        },
         sink,
         coordinator_endpoint,
         pipeline_coordinator_endpoint,
@@ -580,26 +581,29 @@ where
         json!({"mode":"single_active_prompt","poll_interval_ms":PUMP_INTERVAL.as_millis()}),
     );
     let result = serve_prompts(
-        &mut driver,
-        &stack,
-        &obs_rx,
-        &frame_rx,
-        &frame_tx,
+        RuntimeReadyAckLoop {
+            driver: &mut driver,
+            stack: &stack,
+            obs_rx: &obs_rx,
+            frame_rx: &frame_rx,
+            frame_tx: &frame_tx,
+            orchestrator_reports: &orchestrator_reports,
+            stop_rx: &stop_rx,
+            dashboard: dashboard.as_ref(),
+            orch_datastream: &mut orch_datastream,
+            orch_stdio_rx: orch_stdio_rx.as_ref(),
+            run_id: config.run_id,
+            orchestrator_node_id: config.node_id,
+            provider: &config.provider,
+        },
         &work_rx,
         &prompt_events,
-        &stop_rx,
-        dashboard.as_ref(),
-        &mut orch_datastream,
-        orch_stdio_rx.as_ref(),
-        config.run_id,
-        config.node_id,
         ready.first_stage.node_actor,
         prompt_reply_actor,
         &tokenizer_events,
         ready.first_stage.node_actor,
         ready.final_stage.node_actor,
         tokenizer_reply_actor,
-        &config.provider,
         pipeline_plan.as_ref(),
         ready.first_stage.endpoint.clone(),
     );
@@ -659,7 +663,6 @@ struct VastAiRuntimeConfig {
     provisioning: VastAiProvisioningConfig,
     bootstrap_command: Option<String>,
     ssh_identity: Option<PathBuf>,
-    ssh_public_key: Option<String>,
     ssh_public_fingerprint: Option<String>,
 }
 
@@ -767,7 +770,6 @@ impl VastAiRuntimeConfig {
             provisioning,
             bootstrap_command: builder.vastai_bootstrap_command.clone(),
             ssh_identity,
-            ssh_public_key: None,
             ssh_public_fingerprint: None,
         })
     }
@@ -1077,412 +1079,440 @@ impl ConfigBuilder {
     }
 
     fn overlay_toml(mut self, overlay: TomlConfigOverlay) -> Result<Self, String> {
-        if let Some(profile) = overlay.runtime.profile {
+        macro_rules! apply {
+            ($option:expr, |$value:ident| $body:block) => {
+                if let Some($value) = $option $body
+            };
+        }
+
+        apply!(overlay.runtime.profile, |profile| {
             self.config_profile = RuntimeConfigProfile::parse(&profile)?;
-        }
-        if let Some(run_id) = overlay.runtime.run_id {
-            self.run_id = run_id;
-        }
-        if let Some(node_id) = overlay.runtime.node_id {
-            self.node_id = node_id;
-        }
-        if let Some(stage_index) = overlay.runtime.stage_index {
-            self.stage_index = stage_index;
-        }
-        if let Some(layer_end_exclusive) = overlay.runtime.layer_end_exclusive {
-            self.layer_end_exclusive = Some(layer_end_exclusive);
-        }
-        if let Some(pipeline_stages) = overlay.runtime.pipeline_stages {
-            self.pipeline_stages = pipeline_stages;
-        }
-        if let Some(provider) = overlay.provider.kind {
+        });
+        apply!(overlay.runtime.run_id, |run_id| { self.run_id = run_id });
+        apply!(overlay.runtime.node_id, |node_id| {
+            self.node_id = node_id
+        });
+        apply!(overlay.runtime.stage_index, |stage_index| {
+            self.stage_index = stage_index
+        });
+        apply!(overlay.runtime.layer_end_exclusive, |layer_end_exclusive| {
+            self.layer_end_exclusive = Some(layer_end_exclusive)
+        });
+        apply!(overlay.runtime.pipeline_stages, |pipeline_stages| {
+            self.pipeline_stages = pipeline_stages
+        });
+        apply!(overlay.provider.kind, |provider| {
             self.provider = Some(provider_kind::parse_deploy(&provider)?);
-        }
-        if let Some(image) = overlay.image.node {
-            self.image = image;
-        }
-        if let Some(mode) = overlay.relay.mode {
-            self.relay_mode = Some(mode);
-        }
-        if let Some(url) = overlay.relay.url {
-            self.relay_url = Some(url);
-        }
-        if let Some(rpc_bind) = overlay.prompt.rpc_addr {
+        });
+        apply!(overlay.image.node, |image| { self.image = image });
+        apply!(overlay.relay.mode, |mode| { self.relay_mode = Some(mode) });
+        apply!(overlay.relay.url, |url| { self.relay_url = Some(url) });
+        apply!(overlay.prompt.rpc_addr, |rpc_bind| {
             self.rpc_bind = rpc_bind;
             self.rpc_bind_label = "[prompt].rpc_addr";
-        }
-        if let Some(max_tokens) = overlay.prompt.max_tokens {
-            self.default_max_tokens = max_tokens;
-        }
-        if let Some(dashboard) = overlay.prompt.dashboard {
-            self.dashboard = dashboard;
-        }
-        if let Some(model_id) = overlay.model.id {
-            self.model_id = model_id;
-        }
-        if let Some(path) = overlay.model.gguf_local_path {
-            self.gguf_source = GgufSource::LocalPath(path);
-        }
-        if let Some(repo) = overlay.model.gguf_repo {
-            self.set_gguf_repo(repo);
-        }
-        if let Some(file) = overlay.model.gguf_file {
-            self.set_gguf_file(file);
-        }
-        if let Some(revision) = overlay.model.gguf_revision {
-            self.set_gguf_revision(Some(revision));
-        }
-        if let Some(path) = overlay.model.tokenizer_local_path {
-            self.tokenizer = TokenizerSource::LocalPath(path);
-        }
-        if let Some(max_context) = overlay.model.max_context {
-            self.max_context = Some(max_context);
-        }
-        if let Some(gpus) = overlay.docker.gpus {
-            self.docker_gpus = gpus;
-        }
-        if let Some(path) = overlay.docker.cached_model_host_path {
-            self.cached_model_host_path = Some(PathBuf::from(path));
-        }
-        if let Some(path) = overlay.observability.datastream_frame_log {
-            self.datastream_frame_log = Some(PathBuf::from(path));
-        }
-        if let Some(image) = overlay.vastai.image {
-            self.toml_vastai_image = Some(image);
-        }
-        if let Some(api_key) = overlay.vastai.api_key {
-            self.vastai_api_key = Some(api_key);
-        }
-        if let Some(command) = overlay.vastai.bootstrap_command {
-            self.vastai_bootstrap_command = Some(command);
-        }
-        if let Some(disk_gb) = overlay.vastai.disk_gb {
-            self.vastai_disk_gb = Some(disk_gb);
-        }
-        if let Some(ssh_user) = overlay.vastai.ssh_user {
-            self.vastai_ssh_user = Some(ssh_user);
-        }
-        if let Some(confirm_lease) = overlay.vastai.confirm_lease {
-            self.vastai_confirm_lease = Some(confirm_lease);
-        }
-        if let Some(onstart) = overlay.vastai.onstart {
-            self.vastai_onstart = Some(onstart);
-        }
-        if let Some(identity) = overlay.vastai.ssh_identity {
-            self.vastai_ssh_identity_raw = Some(identity);
-        }
-        if let Some(gpu_name) = overlay.vastai.gpu_name {
-            self.vastai_gpu_name = Some(gpu_name);
-        }
-        if let Some(min_gpu_ram_mb) = overlay.vastai.min_gpu_ram_mb {
-            self.vastai_min_gpu_ram_mb = Some(min_gpu_ram_mb);
-        }
-        if let Some(min_down_mbps) = overlay.vastai.min_down_mbps {
-            self.vastai_min_down_mbps = Some(min_down_mbps);
-        }
-        if let Some(max_dph_total) = overlay.vastai.max_dph_total {
-            self.vastai_max_dph_total = Some(max_dph_total);
-        }
-        if let Some(min_up_mbps) = overlay.vastai.min_up_mbps {
-            self.vastai_min_up_mbps = Some(min_up_mbps);
-        }
-        if let Some(min_reliability) = overlay.vastai.min_reliability {
-            self.vastai_min_reliability = Some(min_reliability);
-        }
-        if let Some(require_verified) = overlay.vastai.require_verified {
-            self.vastai_require_verified = Some(require_verified);
-        }
+        });
+        apply!(overlay.prompt.max_tokens, |max_tokens| {
+            self.default_max_tokens = max_tokens
+        });
+        apply!(overlay.prompt.dashboard, |dashboard| {
+            self.dashboard = dashboard
+        });
+        apply!(overlay.model.id, |model_id| { self.model_id = model_id });
+        apply!(overlay.model.gguf_local_path, |path| {
+            self.gguf_source = GgufSource::LocalPath(path)
+        });
+        apply!(overlay.model.gguf_repo, |repo| { self.set_gguf_repo(repo) });
+        apply!(overlay.model.gguf_file, |file| { self.set_gguf_file(file) });
+        apply!(overlay.model.gguf_revision, |revision| {
+            self.set_gguf_revision(Some(revision))
+        });
+        apply!(overlay.model.tokenizer_local_path, |path| {
+            self.tokenizer = TokenizerSource::LocalPath(path)
+        });
+        apply!(overlay.model.max_context, |max_context| {
+            self.max_context = Some(max_context)
+        });
+        apply!(overlay.docker.gpus, |gpus| { self.docker_gpus = gpus });
+        apply!(overlay.docker.cached_model_host_path, |path| {
+            self.cached_model_host_path = Some(PathBuf::from(path))
+        });
+        apply!(overlay.observability.datastream_frame_log, |path| {
+            self.datastream_frame_log = Some(PathBuf::from(path))
+        });
+        apply!(overlay.vastai.image, |image| {
+            self.toml_vastai_image = Some(image)
+        });
+        apply!(overlay.vastai.api_key, |api_key| {
+            self.vastai_api_key = Some(api_key)
+        });
+        apply!(overlay.vastai.bootstrap_command, |command| {
+            self.vastai_bootstrap_command = Some(command)
+        });
+        apply!(overlay.vastai.disk_gb, |disk_gb| {
+            self.vastai_disk_gb = Some(disk_gb)
+        });
+        apply!(overlay.vastai.ssh_user, |ssh_user| {
+            self.vastai_ssh_user = Some(ssh_user)
+        });
+        apply!(overlay.vastai.confirm_lease, |confirm_lease| {
+            self.vastai_confirm_lease = Some(confirm_lease)
+        });
+        apply!(overlay.vastai.onstart, |onstart| {
+            self.vastai_onstart = Some(onstart)
+        });
+        apply!(overlay.vastai.ssh_identity, |identity| {
+            self.vastai_ssh_identity_raw = Some(identity)
+        });
+        apply!(overlay.vastai.gpu_name, |gpu_name| {
+            self.vastai_gpu_name = Some(gpu_name)
+        });
+        apply!(overlay.vastai.min_gpu_ram_mb, |min_gpu_ram_mb| {
+            self.vastai_min_gpu_ram_mb = Some(min_gpu_ram_mb)
+        });
+        apply!(overlay.vastai.min_down_mbps, |min_down_mbps| {
+            self.vastai_min_down_mbps = Some(min_down_mbps)
+        });
+        apply!(overlay.vastai.max_dph_total, |max_dph_total| {
+            self.vastai_max_dph_total = Some(max_dph_total)
+        });
+        apply!(overlay.vastai.min_up_mbps, |min_up_mbps| {
+            self.vastai_min_up_mbps = Some(min_up_mbps)
+        });
+        apply!(overlay.vastai.min_reliability, |min_reliability| {
+            self.vastai_min_reliability = Some(min_reliability)
+        });
+        apply!(overlay.vastai.require_verified, |require_verified| {
+            self.vastai_require_verified = Some(require_verified)
+        });
         for host_id in overlay.vastai.blacklist_hosts {
             self.push_vastai_blacklist_host(host_id);
         }
-        if let Some(poll_interval_secs) = overlay.vastai.poll_interval_secs {
-            self.vastai_poll_interval_secs = Some(poll_interval_secs);
-        }
+        apply!(overlay.vastai.poll_interval_secs, |poll_interval_secs| {
+            self.vastai_poll_interval_secs = Some(poll_interval_secs)
+        });
         Ok(self)
     }
 
     fn overlay_env(mut self) -> Result<Self, String> {
-        if let Some(profile) = env_optional(MVP_RUNTIME_CONFIG_ENV) {
+        macro_rules! apply {
+            ($option:expr, |$value:ident| $body:block) => {
+                if let Some($value) = $option $body
+            };
+        }
+        macro_rules! env_apply {
+            ($name:expr, |$value:ident| $body:block) => {
+                apply!(env_optional($name), |$value| $body)
+            };
+        }
+        macro_rules! env_parse {
+            ($name:expr, |$value:ident| $body:block) => {
+                env_apply!($name, |raw| {
+                    let $value = Self::parse_value($name, &raw)?;
+                    $body
+                })
+            };
+        }
+
+        env_apply!(MVP_RUNTIME_CONFIG_ENV, |profile| {
             self.config_profile = RuntimeConfigProfile::parse(&profile)?;
-        }
-        if let Some(run_id) = env_optional("MVP_RUN_ID") {
-            self.run_id = Self::parse_value("MVP_RUN_ID", &run_id)?;
-        }
-        if let Some(node_id) = env_optional("MVP_LOGICAL_NODE_ID") {
-            self.node_id = Self::parse_value("MVP_LOGICAL_NODE_ID", &node_id)?;
-        }
-        if let Some(stage_index) = env_optional("MVP_STAGE_INDEX") {
-            self.stage_index = Self::parse_value("MVP_STAGE_INDEX", &stage_index)?;
-        }
-        if let Some(layer_end_exclusive) = env_optional("MVP_LAYER_END_EXCLUSIVE") {
-            self.layer_end_exclusive = Some(Self::parse_value(
-                "MVP_LAYER_END_EXCLUSIVE",
-                &layer_end_exclusive,
-            )?);
-        }
-        if let Some(pipeline_stages) = env_optional("MVP_PIPELINE_STAGES") {
-            self.pipeline_stages = Self::parse_value("MVP_PIPELINE_STAGES", &pipeline_stages)?;
-        }
-        if let Some(provider) =
-            env_optional("MVP_NODE_PROVIDER").or_else(|| env_optional("MVP_PROVIDER"))
-        {
-            self.provider = Some(provider_kind::parse_deploy(&provider)?);
-        }
-        if let Some(image) = env_optional("MVP_NODE_IMAGE") {
-            self.set_process_image(image);
-        }
-        if let Some(gpus) = env_optional("MVP_DOCKER_GPUS") {
-            self.docker_gpus = gpus;
-        }
-        if let Some(path) = env_optional(CACHED_MODEL_HOST_ENV) {
-            self.cached_model_host_path = Some(PathBuf::from(path));
-        }
-        if let Some(path) = env_optional(MVP_WORKER_BIN_ENV) {
-            self.worker_bin = Some(PathBuf::from(path));
-        }
-        if let Some(rpc_bind) = env_optional("MVP_PROMPT_RPC_BIND") {
+        });
+        env_parse!("MVP_RUN_ID", |run_id| { self.run_id = run_id });
+        env_parse!("MVP_LOGICAL_NODE_ID", |node_id| { self.node_id = node_id });
+        env_parse!("MVP_STAGE_INDEX", |stage_index| {
+            self.stage_index = stage_index
+        });
+        env_parse!("MVP_LAYER_END_EXCLUSIVE", |layer_end_exclusive| {
+            self.layer_end_exclusive = Some(layer_end_exclusive)
+        });
+        env_parse!("MVP_PIPELINE_STAGES", |pipeline_stages| {
+            self.pipeline_stages = pipeline_stages
+        });
+        apply!(
+            env_optional("MVP_NODE_PROVIDER").or_else(|| env_optional("MVP_PROVIDER")),
+            |provider| {
+                self.provider = Some(provider_kind::parse_deploy(&provider)?);
+            }
+        );
+        env_apply!("MVP_NODE_IMAGE", |image| { self.set_process_image(image) });
+        env_apply!("MVP_DOCKER_GPUS", |gpus| { self.docker_gpus = gpus });
+        env_apply!(CACHED_MODEL_HOST_ENV, |path| {
+            self.cached_model_host_path = Some(PathBuf::from(path))
+        });
+        env_apply!(MVP_WORKER_BIN_ENV, |path| {
+            self.worker_bin = Some(PathBuf::from(path))
+        });
+        env_apply!("MVP_PROMPT_RPC_BIND", |rpc_bind| {
             self.rpc_bind = rpc_bind;
             self.rpc_bind_label = "MVP_PROMPT_RPC_BIND";
-        }
-        if let Some(max_tokens) = env_optional("MVP_PROMPT_MAX_TOKENS") {
-            self.default_max_tokens = Self::parse_value("MVP_PROMPT_MAX_TOKENS", &max_tokens)?;
-        }
-        if let Some(dashboard) = env_optional("MVP_DASHBOARD") {
+        });
+        env_parse!("MVP_PROMPT_MAX_TOKENS", |max_tokens| {
+            self.default_max_tokens = max_tokens
+        });
+        env_apply!("MVP_DASHBOARD", |dashboard| {
             self.dashboard = Self::parse_bool("MVP_DASHBOARD", &dashboard)?;
-        }
-        if let Some(path) = env_optional(DATASTREAM_FRAME_LOG_ENV) {
-            self.datastream_frame_log = Some(PathBuf::from(path));
-        }
-        if let Some(model_id) = env_optional("MVP_MODEL_ID") {
-            self.model_id = model_id;
-        }
-        if let Some(path) = env_optional("MVP_GGUF_LOCAL_PATH") {
-            self.gguf_source = GgufSource::LocalPath(path);
-        }
-        if let Some(repo) = env_optional("MVP_GGUF_REPO") {
-            self.set_gguf_repo(repo);
-        }
-        if let Some(file) = env_optional("MVP_GGUF_FILE") {
-            self.set_gguf_file(file);
-        }
-        if let Some(revision) = env_optional("MVP_GGUF_REVISION") {
-            self.set_gguf_revision(Some(revision));
-        }
-        if let Some(path) = env_optional("MVP_TOKENIZER_LOCAL_PATH") {
-            self.tokenizer = TokenizerSource::LocalPath(path);
-        }
-        if let Some(max_context) = env_optional("MVP_MAX_CONTEXT") {
-            self.max_context = Some(Self::parse_value("MVP_MAX_CONTEXT", &max_context)?);
-        }
-        if let Some(mode) = env_optional("MVP_IROH_RELAY_MODE") {
-            self.relay_mode = Some(mode.to_ascii_lowercase());
-        }
-        if let Some(url) = env_optional(MVP_IROH_RELAY_URL_ENV)
-            .or_else(|| env_optional(SWACTOR_IROH_RELAY_URL_ENV))
-        {
-            self.relay_url = Some(url);
-        }
-        if let Some(mask) = env_optional(MVP_IROH_ENDPOINT_ADDR_MASK_ENV) {
-            self.endpoint_addr_mask = Some(mask);
-        }
-        if let Some(api_key) = env_optional("VAST_API_KEY")
-            .or_else(|| env_optional("MVP_VASTAI_API_KEY"))
-            .or_else(|| env_optional("VASTAI_API_KEY"))
-        {
-            self.vastai_api_key = Some(api_key);
-        }
-        if let Some(command) = env_optional("MVP_VASTAI_BOOTSTRAP_COMMAND") {
-            self.vastai_bootstrap_command = Some(command);
-        }
-        if let Some(identity) = env_optional("MVP_VASTAI_SSH_IDENTITY") {
-            self.vastai_ssh_identity_raw = Some(identity);
-        }
-        if let Some(disk_gb) = env_optional("MVP_VASTAI_DISK_GB") {
-            self.vastai_disk_gb_raw = Some(disk_gb);
-        }
-        if let Some(ssh_user) = env_optional("MVP_VASTAI_SSH_USER") {
-            self.vastai_ssh_user = Some(ssh_user);
-        }
-        if let Some(confirm_lease) = env_optional("MVP_VASTAI_CONFIRM_LEASE") {
-            self.vastai_confirm_lease_raw = Some(confirm_lease);
-        }
-        if let Some(onstart) = env_optional("MVP_VASTAI_ONSTART") {
-            self.vastai_onstart = Some(onstart);
-        }
-        if let Some(gpu_name) = env_optional("MVP_VASTAI_GPU_NAME") {
-            self.vastai_gpu_name = Some(gpu_name);
-        }
-        if let Some(min_gpu_ram_mb) = env_optional("MVP_VASTAI_MIN_GPU_RAM_MB") {
-            self.vastai_min_gpu_ram_mb_raw = Some(min_gpu_ram_mb);
-        }
-        if let Some(min_down_mbps) = env_optional("MVP_VASTAI_MIN_DOWN_MBPS") {
-            self.vastai_min_down_mbps_raw = Some(min_down_mbps);
-        }
-        if let Some(max_dph_total) = env_optional("MVP_VASTAI_MAX_DPH_TOTAL") {
-            self.vastai_max_dph_total_raw = Some(max_dph_total);
-        }
-        if let Some(min_up_mbps) = env_optional("MVP_VASTAI_MIN_UP_MBPS") {
-            self.vastai_min_up_mbps_raw = Some(min_up_mbps);
-        }
-        if let Some(min_reliability) = env_optional("MVP_VASTAI_MIN_RELIABILITY") {
-            self.vastai_min_reliability_raw = Some(min_reliability);
-        }
-        if let Some(require_verified) = env_optional("MVP_VASTAI_REQUIRE_VERIFIED") {
-            self.vastai_require_verified_raw = Some(require_verified);
-        }
-        if let Some(blacklist_hosts) = env_optional("MVP_VASTAI_BLACKLIST_HOSTS") {
+        });
+        env_apply!(DATASTREAM_FRAME_LOG_ENV, |path| {
+            self.datastream_frame_log = Some(PathBuf::from(path))
+        });
+        env_apply!("MVP_MODEL_ID", |model_id| { self.model_id = model_id });
+        env_apply!("MVP_GGUF_LOCAL_PATH", |path| {
+            self.gguf_source = GgufSource::LocalPath(path)
+        });
+        env_apply!("MVP_GGUF_REPO", |repo| { self.set_gguf_repo(repo) });
+        env_apply!("MVP_GGUF_FILE", |file| { self.set_gguf_file(file) });
+        env_apply!("MVP_GGUF_REVISION", |revision| {
+            self.set_gguf_revision(Some(revision))
+        });
+        env_apply!("MVP_TOKENIZER_LOCAL_PATH", |path| {
+            self.tokenizer = TokenizerSource::LocalPath(path)
+        });
+        env_parse!("MVP_MAX_CONTEXT", |max_context| {
+            self.max_context = Some(max_context)
+        });
+        env_apply!("MVP_IROH_RELAY_MODE", |mode| {
+            self.relay_mode = Some(mode.to_ascii_lowercase())
+        });
+        apply!(
+            env_optional(MVP_IROH_RELAY_URL_ENV)
+                .or_else(|| env_optional(SWACTOR_IROH_RELAY_URL_ENV)),
+            |url| {
+                self.relay_url = Some(url);
+            }
+        );
+        env_apply!(MVP_IROH_ENDPOINT_ADDR_MASK_ENV, |mask| {
+            self.endpoint_addr_mask = Some(mask)
+        });
+        apply!(
+            env_optional("VAST_API_KEY")
+                .or_else(|| env_optional("MVP_VASTAI_API_KEY"))
+                .or_else(|| env_optional("VASTAI_API_KEY")),
+            |api_key| {
+                self.vastai_api_key = Some(api_key);
+            }
+        );
+        env_apply!("MVP_VASTAI_BOOTSTRAP_COMMAND", |command| {
+            self.vastai_bootstrap_command = Some(command)
+        });
+        env_apply!("MVP_VASTAI_SSH_IDENTITY", |identity| {
+            self.vastai_ssh_identity_raw = Some(identity)
+        });
+        env_apply!("MVP_VASTAI_DISK_GB", |disk_gb| {
+            self.vastai_disk_gb_raw = Some(disk_gb)
+        });
+        env_apply!("MVP_VASTAI_SSH_USER", |ssh_user| {
+            self.vastai_ssh_user = Some(ssh_user)
+        });
+        env_apply!("MVP_VASTAI_CONFIRM_LEASE", |confirm_lease| {
+            self.vastai_confirm_lease_raw = Some(confirm_lease)
+        });
+        env_apply!("MVP_VASTAI_ONSTART", |onstart| {
+            self.vastai_onstart = Some(onstart)
+        });
+        env_apply!("MVP_VASTAI_GPU_NAME", |gpu_name| {
+            self.vastai_gpu_name = Some(gpu_name)
+        });
+        env_apply!("MVP_VASTAI_MIN_GPU_RAM_MB", |min_gpu_ram_mb| {
+            self.vastai_min_gpu_ram_mb_raw = Some(min_gpu_ram_mb)
+        });
+        env_apply!("MVP_VASTAI_MIN_DOWN_MBPS", |min_down_mbps| {
+            self.vastai_min_down_mbps_raw = Some(min_down_mbps)
+        });
+        env_apply!("MVP_VASTAI_MAX_DPH_TOTAL", |max_dph_total| {
+            self.vastai_max_dph_total_raw = Some(max_dph_total)
+        });
+        env_apply!("MVP_VASTAI_MIN_UP_MBPS", |min_up_mbps| {
+            self.vastai_min_up_mbps_raw = Some(min_up_mbps)
+        });
+        env_apply!("MVP_VASTAI_MIN_RELIABILITY", |min_reliability| {
+            self.vastai_min_reliability_raw = Some(min_reliability)
+        });
+        env_apply!("MVP_VASTAI_REQUIRE_VERIFIED", |require_verified| {
+            self.vastai_require_verified_raw = Some(require_verified)
+        });
+        env_apply!("MVP_VASTAI_BLACKLIST_HOSTS", |blacklist_hosts| {
             for host_id in Self::parse_list("MVP_VASTAI_BLACKLIST_HOSTS", &blacklist_hosts)? {
                 self.push_vastai_blacklist_host(host_id);
             }
-        }
-        if let Some(poll_interval_secs) = env_optional("MVP_VASTAI_POLL_INTERVAL_SECS") {
-            self.vastai_poll_interval_secs_raw = Some(poll_interval_secs);
-        }
+        });
+        env_apply!("MVP_VASTAI_POLL_INTERVAL_SECS", |poll_interval_secs| {
+            self.vastai_poll_interval_secs_raw = Some(poll_interval_secs)
+        });
         Ok(self)
+    }
+
+    fn apply_core_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
+    where
+        I: Iterator<Item = String>,
+    {
+        match arg {
+            "--runtime-config" => {
+                self.config_profile =
+                    RuntimeConfigProfile::parse(&next_arg(args, "--runtime-config")?)?
+            }
+            "--provider" => {
+                self.provider = Some(provider_kind::parse_deploy(&next_arg(args, "--provider")?)?)
+            }
+            "--worker-bin" => {
+                self.worker_bin = Some(PathBuf::from(next_arg(args, "--worker-bin")?))
+            }
+            "--image" => self.set_process_image(next_arg(args, "--image")?),
+            "--gpus" => self.docker_gpus = next_arg(args, "--gpus")?,
+            "--rpc-bind" => {
+                self.rpc_bind = next_arg(args, "--rpc-bind")?;
+                self.rpc_bind_label = "--rpc-bind";
+            }
+            "--run-id" => self.run_id = parse_next(args, "--run-id")?,
+            "--node-id" => self.node_id = parse_next(args, "--node-id")?,
+            "--stage-index" => self.stage_index = parse_next(args, "--stage-index")?,
+            "--layer-end-exclusive" => {
+                self.layer_end_exclusive = Some(parse_next(args, "--layer-end-exclusive")?)
+            }
+            "-N" | "--pipeline-stages" => self.pipeline_stages = parse_next(args, arg)?,
+            "--max-tokens" => self.default_max_tokens = parse_next(args, "--max-tokens")?,
+            "--dashboard" => self.dashboard = true,
+            "--no-dashboard" => self.dashboard = false,
+            "--datastream-frame-log" => {
+                self.datastream_frame_log =
+                    Some(PathBuf::from(next_arg(args, "--datastream-frame-log")?));
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_model_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
+    where
+        I: Iterator<Item = String>,
+    {
+        match arg {
+            "--model-id" => self.model_id = next_arg(args, "--model-id")?,
+            "--gguf-local-path" => {
+                self.gguf_source = GgufSource::LocalPath(next_arg(args, "--gguf-local-path")?)
+            }
+            "--gguf-repo" => self.set_gguf_repo(next_arg(args, "--gguf-repo")?),
+            "--gguf-file" => self.set_gguf_file(next_arg(args, "--gguf-file")?),
+            "--gguf-revision" => self.set_gguf_revision(Some(next_arg(args, "--gguf-revision")?)),
+            "--tokenizer-local-path" => {
+                self.tokenizer =
+                    TokenizerSource::LocalPath(next_arg(args, "--tokenizer-local-path")?)
+            }
+            "--max-context" => self.max_context = Some(parse_next(args, "--max-context")?),
+            "--cached-model-host-path" => {
+                self.cached_model_host_path =
+                    Some(PathBuf::from(next_arg(args, "--cached-model-host-path")?));
+            }
+            "--relay-mode" => self.relay_mode = Some(next_arg(args, "--relay-mode")?),
+            "--relay-url" => self.relay_url = Some(next_arg(args, "--relay-url")?),
+            "--endpoint-addr-mask" => {
+                self.endpoint_addr_mask = Some(next_arg(args, "--endpoint-addr-mask")?)
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_vastai_string_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
+    where
+        I: Iterator<Item = String>,
+    {
+        match arg {
+            "--vastai-api-key" => self.vastai_api_key = Some(next_arg(args, "--vastai-api-key")?),
+            "--vastai-bootstrap-command" => {
+                self.vastai_bootstrap_command = Some(next_arg(args, "--vastai-bootstrap-command")?)
+            }
+            "--vastai-ssh-identity" => {
+                self.vastai_ssh_identity_raw = Some(next_arg(args, "--vastai-ssh-identity")?);
+            }
+            "--vastai-ssh-user" => {
+                self.vastai_ssh_user = Some(next_arg(args, "--vastai-ssh-user")?)
+            }
+            "--vastai-onstart" => self.vastai_onstart = Some(next_arg(args, "--vastai-onstart")?),
+            "--vastai-gpu-name" => {
+                self.vastai_gpu_name = Some(next_arg(args, "--vastai-gpu-name")?)
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_vastai_numeric_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
+    where
+        I: Iterator<Item = String>,
+    {
+        match arg {
+            "--vastai-disk-gb" => {
+                self.vastai_disk_gb = Some(parse_next(args, "--vastai-disk-gb")?);
+                self.vastai_disk_gb_raw = None;
+            }
+            "--vastai-min-gpu-ram-mb" => {
+                self.vastai_min_gpu_ram_mb = Some(parse_next(args, "--vastai-min-gpu-ram-mb")?);
+                self.vastai_min_gpu_ram_mb_raw = None;
+            }
+            "--vastai-min-down-mbps" => {
+                self.vastai_min_down_mbps = Some(parse_next(args, "--vastai-min-down-mbps")?);
+                self.vastai_min_down_mbps_raw = None;
+            }
+            "--vastai-max-dph-total" => {
+                self.vastai_max_dph_total = Some(parse_next(args, "--vastai-max-dph-total")?);
+                self.vastai_max_dph_total_raw = None;
+            }
+            "--vastai-min-up-mbps" => {
+                self.vastai_min_up_mbps = Some(parse_next(args, "--vastai-min-up-mbps")?);
+                self.vastai_min_up_mbps_raw = None;
+            }
+            "--vastai-min-reliability" => {
+                self.vastai_min_reliability = Some(parse_next(args, "--vastai-min-reliability")?);
+                self.vastai_min_reliability_raw = None;
+            }
+            "--vastai-blacklist-host" => {
+                let host_id = parse_next(args, "--vastai-blacklist-host")?;
+                self.push_vastai_blacklist_host(host_id);
+            }
+            "--vastai-poll-interval-secs" => {
+                self.vastai_poll_interval_secs =
+                    Some(parse_next(args, "--vastai-poll-interval-secs")?);
+                self.vastai_poll_interval_secs_raw = None;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_vastai_bool_cli_arg(&mut self, arg: &str) -> bool {
+        match arg {
+            "--vastai-confirm-lease" => {
+                self.vastai_confirm_lease = Some(true);
+                self.vastai_confirm_lease_raw = None;
+            }
+            "--no-vastai-confirm-lease" => {
+                self.vastai_confirm_lease = Some(false);
+                self.vastai_confirm_lease_raw = None;
+            }
+            "--vastai-require-verified" => {
+                self.vastai_require_verified = Some(true);
+                self.vastai_require_verified_raw = None;
+            }
+            "--no-vastai-require-verified" => {
+                self.vastai_require_verified = Some(false);
+                self.vastai_require_verified_raw = None;
+            }
+            _ => return false,
+        }
+        true
     }
 
     fn overlay_cli(mut self, args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--runtime-config" => {
-                    self.config_profile =
-                        RuntimeConfigProfile::parse(&next_arg(&mut args, "--runtime-config")?)?
-                }
-                "--provider" => {
-                    self.provider = Some(provider_kind::parse_deploy(&next_arg(
-                        &mut args,
-                        "--provider",
-                    )?)?)
-                }
-                "--worker-bin" => {
-                    self.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
-                }
-                "--image" => self.set_process_image(next_arg(&mut args, "--image")?),
-                "--gpus" => self.docker_gpus = next_arg(&mut args, "--gpus")?,
-                "--rpc-bind" => {
-                    self.rpc_bind = next_arg(&mut args, "--rpc-bind")?;
-                    self.rpc_bind_label = "--rpc-bind";
-                }
-                "--run-id" => self.run_id = parse_next(&mut args, "--run-id")?,
-                "--node-id" => self.node_id = parse_next(&mut args, "--node-id")?,
-                "--stage-index" => self.stage_index = parse_next(&mut args, "--stage-index")?,
-                "--layer-end-exclusive" => {
-                    self.layer_end_exclusive = Some(parse_next(&mut args, "--layer-end-exclusive")?)
-                }
-                "-N" | "--pipeline-stages" => {
-                    self.pipeline_stages = parse_next(&mut args, arg.as_str())?
-                }
-                "--max-tokens" => self.default_max_tokens = parse_next(&mut args, "--max-tokens")?,
-                "--dashboard" => self.dashboard = true,
-                "--no-dashboard" => self.dashboard = false,
-                "--datastream-frame-log" => {
-                    self.datastream_frame_log = Some(PathBuf::from(next_arg(
-                        &mut args,
-                        "--datastream-frame-log",
-                    )?));
-                }
-                "--model-id" => self.model_id = next_arg(&mut args, "--model-id")?,
-                "--gguf-local-path" => {
-                    self.gguf_source =
-                        GgufSource::LocalPath(next_arg(&mut args, "--gguf-local-path")?)
-                }
-                "--gguf-repo" => self.set_gguf_repo(next_arg(&mut args, "--gguf-repo")?),
-                "--gguf-file" => self.set_gguf_file(next_arg(&mut args, "--gguf-file")?),
-                "--gguf-revision" => {
-                    self.set_gguf_revision(Some(next_arg(&mut args, "--gguf-revision")?))
-                }
-                "--tokenizer-local-path" => {
-                    self.tokenizer =
-                        TokenizerSource::LocalPath(next_arg(&mut args, "--tokenizer-local-path")?)
-                }
-                "--max-context" => self.max_context = Some(parse_next(&mut args, "--max-context")?),
-                "--cached-model-host-path" => {
-                    self.cached_model_host_path = Some(PathBuf::from(next_arg(
-                        &mut args,
-                        "--cached-model-host-path",
-                    )?));
-                }
-                "--relay-mode" => self.relay_mode = Some(next_arg(&mut args, "--relay-mode")?),
-                "--relay-url" => self.relay_url = Some(next_arg(&mut args, "--relay-url")?),
-                "--endpoint-addr-mask" => {
-                    self.endpoint_addr_mask = Some(next_arg(&mut args, "--endpoint-addr-mask")?)
-                }
-                "--vastai-api-key" => {
-                    self.vastai_api_key = Some(next_arg(&mut args, "--vastai-api-key")?)
-                }
-                "--vastai-bootstrap-command" => {
-                    self.vastai_bootstrap_command =
-                        Some(next_arg(&mut args, "--vastai-bootstrap-command")?)
-                }
-                "--vastai-ssh-identity" => {
-                    self.vastai_ssh_identity_raw =
-                        Some(next_arg(&mut args, "--vastai-ssh-identity")?);
-                }
-                "--vastai-disk-gb" => {
-                    self.vastai_disk_gb = Some(parse_next(&mut args, "--vastai-disk-gb")?);
-                    self.vastai_disk_gb_raw = None;
-                }
-                "--vastai-ssh-user" => {
-                    self.vastai_ssh_user = Some(next_arg(&mut args, "--vastai-ssh-user")?)
-                }
-                "--vastai-confirm-lease" => {
-                    self.vastai_confirm_lease = Some(true);
-                    self.vastai_confirm_lease_raw = None;
-                }
-                "--no-vastai-confirm-lease" => {
-                    self.vastai_confirm_lease = Some(false);
-                    self.vastai_confirm_lease_raw = None;
-                }
-                "--vastai-onstart" => {
-                    self.vastai_onstart = Some(next_arg(&mut args, "--vastai-onstart")?)
-                }
-                "--vastai-gpu-name" => {
-                    self.vastai_gpu_name = Some(next_arg(&mut args, "--vastai-gpu-name")?)
-                }
-                "--vastai-min-gpu-ram-mb" => {
-                    self.vastai_min_gpu_ram_mb =
-                        Some(parse_next(&mut args, "--vastai-min-gpu-ram-mb")?);
-                    self.vastai_min_gpu_ram_mb_raw = None;
-                }
-                "--vastai-min-down-mbps" => {
-                    self.vastai_min_down_mbps =
-                        Some(parse_next(&mut args, "--vastai-min-down-mbps")?);
-                    self.vastai_min_down_mbps_raw = None;
-                }
-                "--vastai-max-dph-total" => {
-                    self.vastai_max_dph_total =
-                        Some(parse_next(&mut args, "--vastai-max-dph-total")?);
-                    self.vastai_max_dph_total_raw = None;
-                }
-                "--vastai-min-up-mbps" => {
-                    self.vastai_min_up_mbps = Some(parse_next(&mut args, "--vastai-min-up-mbps")?);
-                    self.vastai_min_up_mbps_raw = None;
-                }
-                "--vastai-min-reliability" => {
-                    self.vastai_min_reliability =
-                        Some(parse_next(&mut args, "--vastai-min-reliability")?);
-                    self.vastai_min_reliability_raw = None;
-                }
-                "--vastai-require-verified" => {
-                    self.vastai_require_verified = Some(true);
-                    self.vastai_require_verified_raw = None;
-                }
-                "--no-vastai-require-verified" => {
-                    self.vastai_require_verified = Some(false);
-                    self.vastai_require_verified_raw = None;
-                }
-                "--vastai-blacklist-host" => {
-                    let host_id = parse_next(&mut args, "--vastai-blacklist-host")?;
-                    self.push_vastai_blacklist_host(host_id);
-                }
-                "--vastai-poll-interval-secs" => {
-                    self.vastai_poll_interval_secs =
-                        Some(parse_next(&mut args, "--vastai-poll-interval-secs")?);
-                    self.vastai_poll_interval_secs_raw = None;
-                }
-                other => return Err(format!("unknown argument {other:?}")),
+            if self.apply_core_cli_arg(&arg, &mut args)?
+                || self.apply_model_cli_arg(&arg, &mut args)?
+                || self.apply_vastai_string_cli_arg(&arg, &mut args)?
+                || self.apply_vastai_numeric_cli_arg(&arg, &mut args)?
+                || self.apply_vastai_bool_cli_arg(&arg)
+            {
+                continue;
             }
+            return Err(format!("unknown argument {arg:?}"));
         }
         Ok(self)
     }
@@ -1847,8 +1877,7 @@ impl Config {
             .as_mut()
             .expect("VastAI config exists when provider is vastai");
         vastai.ssh_identity = Some(identity);
-        vastai.provisioning.ssh_public_key = Some(public_key.clone());
-        vastai.ssh_public_key = Some(public_key);
+        vastai.provisioning.ssh_public_key = Some(public_key);
         vastai.ssh_public_fingerprint = Some(fingerprint);
         Ok(())
     }
@@ -1922,23 +1951,17 @@ impl Config {
         if local_tinygrad_worker_env(&self.provider).is_some() {
             keys.push("MVP_TINYGRAD_WORKER");
         }
-        if std::env::var_os("MVP_CPU_LINE_PROFILE").is_some() {
-            keys.push("MVP_CPU_LINE_PROFILE");
-        }
-        if std::env::var_os("MVP_CPU_LINE_PROFILE_INTERVAL_MS").is_some() {
-            keys.push("MVP_CPU_LINE_PROFILE_INTERVAL_MS");
-        }
-        if std::env::var_os("MVP_TOKEN_PROGRESS_EVERY").is_some() {
-            keys.push("MVP_TOKEN_PROGRESS_EVERY");
-        }
-        if std::env::var_os("CUDA_DEVICE_SCHEDULE").is_some() {
-            keys.push("CUDA_DEVICE_SCHEDULE");
-        }
-        if std::env::var_os("MVP_MODEL_CACHE_DIR").is_some() {
-            keys.push("MVP_MODEL_CACHE_DIR");
-        }
-        if std::env::var_os("HF_TOKEN").is_some() {
-            keys.push("HF_TOKEN");
+        for key in [
+            "MVP_CPU_LINE_PROFILE",
+            "MVP_CPU_LINE_PROFILE_INTERVAL_MS",
+            "MVP_TOKEN_PROGRESS_EVERY",
+            "CUDA_DEVICE_SCHEDULE",
+            "MVP_MODEL_CACHE_DIR",
+            "HF_TOKEN",
+        ] {
+            if std::env::var_os(key).is_some() {
+                keys.push(key);
+            }
         }
         match &self.gguf_source {
             GgufSource::LocalPath(_) => keys.push("MVP_GGUF_LOCAL_PATH"),
@@ -1957,19 +1980,6 @@ impl Config {
             keys.push("MVP_MAX_CONTEXT");
         }
         keys
-    }
-
-    fn node_spec(
-        &self,
-        coordinator: EndpointAddr,
-        orchestrator_actor: ActorAddress,
-    ) -> Result<NodeProvisionSpec, String> {
-        self.node_spec_for_stage(
-            coordinator,
-            orchestrator_actor,
-            self.node_id,
-            self.stage_index,
-        )
     }
 
     fn node_spec_for_stage(
@@ -2159,24 +2169,42 @@ fn enqueue_datastream_subscribe(
         .map_err(|e| format!("send datastream subscribe: {e}"))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn wait_for_runtime_ready_acks(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &mpsc::Receiver<()>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+struct RuntimeReadyAckLoop<'a> {
+    driver: &'a mut IrohDriver,
+    stack: &'a DistributionRuntimeStack,
+    obs_rx: &'a mpsc::Receiver<PluginObservation>,
+    frame_rx: &'a mpsc::Receiver<CollectedDatastreamFrame>,
+    frame_tx: &'a mpsc::Sender<CollectedDatastreamFrame>,
+    orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
+    stop_rx: &'a mpsc::Receiver<()>,
+    dashboard: Option<&'a DashboardSupport>,
+    orch_datastream: &'a mut OrchDatastream,
+    orch_stdio_rx: Option<&'a mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     orchestrator_node_id: u64,
-    provider: &ProviderKind,
+    provider: &'a ProviderKind,
+}
+
+fn wait_for_runtime_ready_acks(
+    ctx: RuntimeReadyAckLoop<'_>,
     targets: &[RuntimeReadyAckTarget],
     collector_endpoint: &EndpointAddr,
 ) -> Result<(), String> {
+    let RuntimeReadyAckLoop {
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        orchestrator_reports,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        run_id,
+        orchestrator_node_id,
+        provider,
+    } = ctx;
     let mut pending = targets
         .iter()
         .cloned()
@@ -2208,21 +2236,13 @@ fn wait_for_runtime_ready_acks(
                 "shutdown requested while waiting for runtime-ready acknowledgements".to_owned(),
             );
         }
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
-            match observation {
-                PluginObservation::DatastreamFrame { .. } => {}
-                PluginObservation::ProviderLine { .. }
-                | PluginObservation::StdoutLine { .. }
-                | PluginObservation::StderrLine { .. } => {}
-                PluginObservation::Failed { reason, .. } => return Err(reason),
-                PluginObservation::Exited {
-                    status, node_id, ..
-                } => {
-                    return Err(format!("node {node_id} exited before ready: {status:?}"));
-                }
-            }
-        }
+        drain_observations_with_exit(
+            obs_rx,
+            dashboard,
+            orch_datastream,
+            provider,
+            |node_id, status| format!("node {node_id} exited before ready: {status:?}"),
+        )?;
         drain_frames(frame_rx, dashboard, orch_datastream);
         while let Some(report) = orchestrator_reports.try_recv() {
             let OrchestratorReport::NodeRuntimeReadyAck {
@@ -2305,39 +2325,6 @@ fn wait_for_runtime_ready_acks(
     Ok(())
 }
 
-#[cfg(test)]
-struct ProvisionedNodeGuard<'a> {
-    provisioner: &'a mut dyn ProvisionPlugin,
-    handle: Option<crate::provisioning::PluginNodeHandle>,
-}
-
-#[cfg(test)]
-impl<'a> ProvisionedNodeGuard<'a> {
-    fn new(
-        provisioner: &'a mut dyn ProvisionPlugin,
-        handle: crate::provisioning::PluginNodeHandle,
-    ) -> Self {
-        Self {
-            provisioner,
-            handle: Some(handle),
-        }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        let Some(handle) = self.handle.take() else {
-            return Ok(());
-        };
-        self.provisioner.stop_node(&handle)
-    }
-}
-
-#[cfg(test)]
-impl Drop for ProvisionedNodeGuard<'_> {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
 struct ProvisionedClusterGuard {
     provisioner: Box<dyn ProvisionPlugin>,
     handles: Vec<crate::provisioning::PluginNodeHandle>,
@@ -2391,6 +2378,11 @@ impl Drop for ProvisionedClusterGuard {
     }
 }
 
+type ProviderStartResults = Vec<(
+    NodeProvisionSpec,
+    Result<crate::provisioning::PluginNodeHandle, String>,
+)>;
+
 fn start_nodes_with_stdio_capture(
     provisioner: Box<dyn ProvisionPlugin>,
     node_specs: Vec<NodeProvisionSpec>,
@@ -2400,13 +2392,7 @@ fn start_nodes_with_stdio_capture(
     orch_datastream: &mut OrchDatastream,
     run_id: u64,
     node_id: u64,
-) -> (
-    Box<dyn ProvisionPlugin>,
-    Vec<(
-        NodeProvisionSpec,
-        Result<crate::provisioning::PluginNodeHandle, String>,
-    )>,
-) {
+) -> (Box<dyn ProvisionPlugin>, ProviderStartResults) {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut provisioner = provisioner;
@@ -2447,26 +2433,29 @@ fn start_nodes_with_stdio_capture(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn start_and_provision_workers(
     mut provisioner: Box<dyn ProvisionPlugin>,
     config: &Config,
     pipeline_plan: Option<&run_plan::RunPlan>,
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &mpsc::Receiver<()>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
+    ctx: RuntimeReadyAckLoop<'_>,
     sink: PluginSink,
     coordinator: EndpointAddr,
     pipeline_coordinator: EndpointAddr,
     orchestrator_actor: ActorAddress,
 ) -> Result<(ProvisionedClusterGuard, PromptRuntimeReady), String> {
+    let RuntimeReadyAckLoop {
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        orchestrator_reports,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        ..
+    } = ctx;
     let stage_specs = stage_node_specs(
         config,
         pipeline_plan,
@@ -2628,19 +2617,22 @@ fn start_and_provision_workers(
     );
     let readies = if pipeline_plan.is_some() {
         match wait_for_runtime_readies(
-            driver,
-            stack,
-            obs_rx,
-            frame_rx,
-            frame_tx,
-            orchestrator_reports,
-            stop_rx,
-            dashboard,
-            orch_datastream,
-            orch_stdio_rx,
-            config.run_id,
+            RuntimeReadyAckLoop {
+                driver,
+                stack,
+                obs_rx,
+                frame_rx,
+                frame_tx,
+                orchestrator_reports,
+                stop_rx,
+                dashboard,
+                orch_datastream,
+                orch_stdio_rx,
+                run_id: config.run_id,
+                orchestrator_node_id: config.node_id,
+                provider: &config.provider,
+            },
             &expected_node_ids,
-            &config.provider,
         ) {
             Ok(readies) => readies,
             Err(error) => {
@@ -2656,7 +2648,7 @@ fn start_and_provision_workers(
             }
         }
     } else {
-        let ready = match wait_for_runtime_ready(
+        let ready = match wait_for_runtime_ready(RuntimeReadyAckLoop {
             driver,
             stack,
             obs_rx,
@@ -2667,10 +2659,10 @@ fn start_and_provision_workers(
             dashboard,
             orch_datastream,
             orch_stdio_rx,
-            config.run_id,
-            config.node_id,
-            &config.provider,
-        ) {
+            run_id: config.run_id,
+            orchestrator_node_id: config.node_id,
+            provider: &config.provider,
+        }) {
             Ok(ready) => ready,
             Err(error) => {
                 orch_datastream.emit_bootstrap(
@@ -2704,19 +2696,21 @@ fn start_and_provision_workers(
         })
         .collect::<Vec<_>>();
     wait_for_runtime_ready_acks(
-        driver,
-        stack,
-        obs_rx,
-        frame_rx,
-        frame_tx,
-        orchestrator_reports,
-        stop_rx,
-        dashboard,
-        orch_datastream,
-        orch_stdio_rx,
-        config.run_id,
-        config.node_id,
-        &config.provider,
+        RuntimeReadyAckLoop {
+            driver,
+            stack,
+            obs_rx,
+            frame_rx,
+            frame_tx,
+            orchestrator_reports,
+            stop_rx,
+            dashboard,
+            orch_datastream,
+            orch_stdio_rx,
+            run_id: config.run_id,
+            orchestrator_node_id: config.node_id,
+            provider: &config.provider,
+        },
         &ack_targets,
         &pipeline_coordinator,
     )?;
@@ -2749,21 +2743,22 @@ fn start_and_provision_workers(
     );
     let weights_result = if pipeline_plan.is_some() {
         wait_for_weights_loaded_count(
-            driver,
-            stack,
-            obs_rx,
-            frame_rx,
-            frame_tx,
-            orchestrator_reports,
-            stop_rx,
-            dashboard,
-            orch_datastream,
-            orch_stdio_rx,
-            config.run_id,
-            config.node_id,
-            &config.provider,
+            RuntimeReadyAckLoop {
+                driver,
+                stack,
+                obs_rx,
+                frame_rx,
+                frame_tx,
+                orchestrator_reports,
+                stop_rx,
+                dashboard,
+                orch_datastream,
+                orch_stdio_rx,
+                run_id: config.run_id,
+                orchestrator_node_id: config.node_id,
+                provider: &config.provider,
+            },
             expected_node_ids.len(),
-            config,
             pipeline_plan.expect("pipeline mode requires plan"),
             &readies,
             &pipeline_coordinator,
@@ -2771,19 +2766,21 @@ fn start_and_provision_workers(
         )
     } else {
         wait_for_weights_loaded(
-            driver,
-            stack,
-            obs_rx,
-            frame_rx,
-            frame_tx,
-            orchestrator_reports,
-            stop_rx,
-            dashboard,
-            orch_datastream,
-            orch_stdio_rx,
-            config.run_id,
-            config.node_id,
-            &config.provider,
+            RuntimeReadyAckLoop {
+                driver,
+                stack,
+                obs_rx,
+                frame_rx,
+                frame_tx,
+                orchestrator_reports,
+                stop_rx,
+                dashboard,
+                orch_datastream,
+                orch_stdio_rx,
+                run_id: config.run_id,
+                orchestrator_node_id: config.node_id,
+                provider: &config.provider,
+            },
             config.stage_index,
         )
     };
@@ -2873,25 +2870,22 @@ fn stage_node_specs(
             })
             .collect()
     } else {
-        Ok(vec![config.node_spec(coordinator, orchestrator_actor)?])
+        Ok(vec![config.node_spec_for_stage(
+            coordinator,
+            orchestrator_actor,
+            config.node_id,
+            config.stage_index,
+        )?])
     }
 }
 struct ProviderStartOutcome {
-    results: Vec<(
-        NodeProvisionSpec,
-        Result<crate::provisioning::PluginNodeHandle, String>,
-    )>,
+    results: ProviderStartResults,
     successful_handles: Vec<crate::provisioning::PluginNodeHandle>,
     failed_specs: Vec<NodeProvisionSpec>,
     first_error: Option<String>,
 }
 
-fn collect_provider_start_outcome(
-    results: Vec<(
-        NodeProvisionSpec,
-        Result<crate::provisioning::PluginNodeHandle, String>,
-    )>,
-) -> ProviderStartOutcome {
+fn collect_provider_start_outcome(results: ProviderStartResults) -> ProviderStartOutcome {
     let mut successful_handles = Vec::new();
     let mut failed_specs = Vec::new();
     let mut first_error = None;
@@ -3133,22 +3127,25 @@ fn stage_ring_spec_wire(spec: run_plan::RingSpec) -> StageRingSpecWire {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn wait_for_runtime_readies(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &mpsc::Receiver<()>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    run_id: u64,
+    ctx: RuntimeReadyAckLoop<'_>,
     expected_node_ids: &[u64],
-    provider: &ProviderKind,
 ) -> Result<BTreeMap<u64, RuntimeReady>, String> {
+    let RuntimeReadyAckLoop {
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        orchestrator_reports,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        run_id,
+        provider,
+        ..
+    } = ctx;
     let expected = expected_node_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut pending = BTreeMap::<u64, RuntimeReady>::new();
     loop {
@@ -3224,28 +3221,29 @@ fn wait_for_runtime_readies(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn wait_for_weights_loaded_count(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &mpsc::Receiver<()>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    run_id: u64,
-    node_id: u64,
-    provider: &ProviderKind,
+    ctx: RuntimeReadyAckLoop<'_>,
     expected_count: usize,
-    _config: &Config,
     pipeline_plan: &run_plan::RunPlan,
     readies: &BTreeMap<u64, RuntimeReady>,
     pipeline_coordinator: &EndpointAddr,
     stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
 ) -> Result<(), String> {
+    let RuntimeReadyAckLoop {
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        orchestrator_reports,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        run_id,
+        orchestrator_node_id: node_id,
+        provider,
+    } = ctx;
     let expected_stages = pipeline_plan
         .stages
         .iter()
@@ -3278,7 +3276,7 @@ fn wait_for_weights_loaded_count(
                 ));
             }
             for stage in pending {
-                let _sent = send_pipeline_stage_provision(
+                send_pipeline_stage_provision(
                     driver,
                     stack,
                     frame_tx,
@@ -3417,7 +3415,7 @@ fn send_pipeline_stage_provision(
     stage_last_sends: &mut BTreeMap<u32, Instant>,
     load_progress: &BTreeMap<u64, StageLoadProgress>,
     attempt: u64,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     let stage_node_id = stage.node_id.0;
     let current_send_count = stage_resend_counts
         .get(&stage.stage_index)
@@ -3489,13 +3487,13 @@ fn send_pipeline_stage_provision(
         );
         return Err(reason);
     }
-    let dispatch = stage_provision_dispatch(
+    let (should_send, dispatch_reason) = stage_provision_dispatch(
         load_progress.get(&stage_node_id),
         current_send_count,
         stage_last_sends.get(&stage.stage_index).copied(),
         now,
     );
-    if !dispatch.should_send() {
+    if !should_send {
         orch_datastream.emit_bootstrap(
             dashboard,
             run_id,
@@ -3510,7 +3508,7 @@ fn send_pipeline_stage_provision(
                 "stage_send_count":current_send_count,
                 "loaded_stage_count":loaded_stages.len(),
                 "resend_suppressed":true,
-                "resend_reason":dispatch.reason(),
+                "resend_reason":dispatch_reason,
                 "liveness":stage_load_liveness_detail(
                     load_progress.get(&stage_node_id),
                     stage.stage_index,
@@ -3529,7 +3527,7 @@ fn send_pipeline_stage_provision(
                 )
             }),
         );
-        return Ok(false);
+        return Ok(());
     }
     let stage_send_count = {
         let count = stage_resend_counts.entry(stage.stage_index).or_default();
@@ -3550,7 +3548,7 @@ fn send_pipeline_stage_provision(
             "stage_send_count":stage_send_count,
             "loaded_stage_count":loaded_stages.len(),
             "parallel_weight_acquisition":true,
-            "resend_reason":dispatch.reason(),
+            "resend_reason":dispatch_reason,
         }),
     );
     if stage_send_count == 1 || stage_send_count % 15 == 0 {
@@ -3596,7 +3594,7 @@ fn send_pipeline_stage_provision(
         stage_shard_plans,
     )?;
     pump(driver, stack, frame_tx);
-    Ok(true)
+    Ok(())
 }
 
 struct FailedProvisionPlugin;
@@ -3669,24 +3667,6 @@ impl StageLoadProgress {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StageProvisionDispatch {
-    Send(&'static str),
-    Suppress(&'static str),
-}
-
-impl StageProvisionDispatch {
-    fn reason(self) -> &'static str {
-        match self {
-            Self::Send(reason) | Self::Suppress(reason) => reason,
-        }
-    }
-
-    fn should_send(self) -> bool {
-        matches!(self, Self::Send(_))
-    }
-}
-
 fn stage_load_phase_is_active(phase: Option<&str>) -> bool {
     matches!(
         phase,
@@ -3711,34 +3691,34 @@ fn stage_provision_dispatch(
     send_count: u64,
     last_send: Option<Instant>,
     now: Instant,
-) -> StageProvisionDispatch {
+) -> (bool, &'static str) {
     if send_count == 0 {
-        return StageProvisionDispatch::Send("initial");
+        return (true, "initial");
     }
     let Some(progress) = progress else {
-        return StageProvisionDispatch::Send("no_progress_after_send");
+        return (true, "no_progress_after_send");
     };
     if progress.failure_reason.is_some() || progress.phase.as_deref() == Some("failed") {
-        return StageProvisionDispatch::Suppress("worker_load_failed");
+        return (false, "worker_load_failed");
     }
     if progress.phase.as_deref() == Some("weights_loaded") {
-        return StageProvisionDispatch::Suppress("weights_loaded_report_pending");
+        return (false, "weights_loaded_report_pending");
     }
     if !stage_load_phase_is_active(progress.phase.as_deref()) {
-        return StageProvisionDispatch::Send("unknown_or_inactive_progress");
+        return (true, "unknown_or_inactive_progress");
     }
     let Some(last_progress) = progress.last_progress else {
-        return StageProvisionDispatch::Send("active_phase_without_progress_time");
+        return (true, "active_phase_without_progress_time");
     };
     if now.duration_since(last_progress) < STAGE_PROVISION_ACTIVE_RESEND_AFTER {
-        return StageProvisionDispatch::Suppress("active_progress");
+        return (false, "active_progress");
     }
-    if let Some(last_send) = last_send {
-        if now.duration_since(last_send) < STAGE_PROVISION_ACTIVE_RESEND_AFTER {
-            return StageProvisionDispatch::Suppress("recent_stale_progress_resend");
-        }
+    if let Some(last_send) = last_send
+        && now.duration_since(last_send) < STAGE_PROVISION_ACTIVE_RESEND_AFTER
+    {
+        return (false, "recent_stale_progress_resend");
     }
-    StageProvisionDispatch::Send("stale_progress")
+    (true, "stale_progress")
 }
 
 fn stage_load_liveness_detail(
@@ -4407,21 +4387,22 @@ fn handle_prompt_connection(
     Ok(())
 }
 
-fn wait_for_runtime_ready(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &mpsc::Receiver<()>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    run_id: u64,
-    node_id: u64,
-    provider: &ProviderKind,
-) -> Result<RuntimeReady, String> {
+fn wait_for_runtime_ready(ctx: RuntimeReadyAckLoop<'_>) -> Result<RuntimeReady, String> {
+    let RuntimeReadyAckLoop {
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        orchestrator_reports,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        run_id,
+        orchestrator_node_id: node_id,
+        provider,
+    } = ctx;
     let mut pending_ready: Option<RuntimeReady> = None;
     let mut node_swim_started = false;
     let mut node_swim_ready = false;
@@ -4433,19 +4414,9 @@ fn wait_for_runtime_ready(
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for node ready".to_owned());
         }
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
-            match observation {
-                PluginObservation::DatastreamFrame { .. } => {}
-                PluginObservation::ProviderLine { .. }
-                | PluginObservation::StdoutLine { .. }
-                | PluginObservation::StderrLine { .. } => {}
-                PluginObservation::Failed { reason, .. } => return Err(reason),
-                PluginObservation::Exited { status, .. } => {
-                    return Err(format!("node exited before ready: {status:?}"));
-                }
-            }
-        }
+        drain_observations_with_exit(obs_rx, dashboard, orch_datastream, provider, |_, status| {
+            format!("node exited before ready: {status:?}")
+        })?;
         while let Some(report) = orchestrator_reports.try_recv() {
             if let OrchestratorReport::NodeRuntimeReady {
                 run_id: report_run_id,
@@ -4561,41 +4532,31 @@ fn provision_stage(
         .map_err(|e| format!("send stage provision: {e}"))
 }
 
-fn wait_for_weights_loaded(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-    orchestrator_reports: &swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &mpsc::Receiver<()>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    run_id: u64,
-    node_id: u64,
-    provider: &ProviderKind,
-    stage_index: u32,
-) -> Result<(), String> {
+fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Result<(), String> {
+    let RuntimeReadyAckLoop {
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        orchestrator_reports,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        run_id,
+        orchestrator_node_id: node_id,
+        provider,
+    } = ctx;
     loop {
         pump(driver, stack, frame_tx);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for weights loaded".to_owned());
         }
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
-            match observation {
-                PluginObservation::Failed { reason, .. } => return Err(reason),
-                PluginObservation::Exited { status, .. } => {
-                    return Err(format!("node exited while loading weights: {status:?}"));
-                }
-                PluginObservation::DatastreamFrame { .. } => {}
-                PluginObservation::ProviderLine { .. }
-                | PluginObservation::StdoutLine { .. }
-                | PluginObservation::StderrLine { .. } => {}
-            }
-        }
+        drain_observations_with_exit(obs_rx, dashboard, orch_datastream, provider, |_, status| {
+            format!("node exited while loading weights: {status:?}")
+        })?;
         drain_frames(frame_rx, dashboard, orch_datastream);
         while let Some(report) = orchestrator_reports.try_recv() {
             match report {
@@ -4634,23 +4595,7 @@ struct PipelineTokenRecord {
     eos: bool,
 }
 
-enum PipelineSendHandle {
-    Driver(EdgeSendHandle),
-    #[cfg(test)]
-    Channel(tokio_mpsc::UnboundedSender<Vec<u8>>),
-}
-
-impl PipelineSendHandle {
-    fn send(&self, bytes: Vec<u8>) -> Result<(), String> {
-        match self {
-            Self::Driver(handle) => handle.send(bytes),
-            #[cfg(test)]
-            Self::Channel(tx) => tx
-                .send(bytes)
-                .map_err(|_| "pipeline token-in sender stopped".to_owned()),
-        }
-    }
-}
+type PipelineSendHandle = EdgeSendHandle;
 struct PendingEncode {
     request_id: u64,
 }
@@ -4710,9 +4655,8 @@ impl PipelinePromptRuntime {
             token_out_edge_id: token_out_edge.edge_id.0,
             token_spec: token_in_edge.object_spec,
             token_out_spec: token_out_edge.object_spec,
-            token_in_sender: PipelineSendHandle::Driver(
-                driver.spawn_edge_send_pump(first_stage_endpoint, token_in_edge.edge_id.0)?,
-            ),
+            token_in_sender: driver
+                .spawn_edge_send_pump(first_stage_endpoint, token_in_edge.edge_id.0)?,
             recv_rx,
             recv_tx,
             tokenizer_encode_actor,
@@ -5181,17 +5125,6 @@ impl PipelinePromptRuntime {
     }
 }
 
-#[cfg(test)]
-fn encode_token_record(
-    spec: run_plan::ObjectSpec,
-    _edge_id: u64,
-    sequence: u64,
-    tokens: &[u32],
-    eos: bool,
-) -> Result<Vec<u8>, String> {
-    encode_token_record_with_flags(spec, sequence, tokens, eos, false)
-}
-
 fn encode_token_record_with_flags(
     spec: run_plan::ObjectSpec,
     sequence: u64,
@@ -5274,29 +5207,33 @@ fn prompt_runtime_mode(pipeline_plan: Option<&run_plan::RunPlan>) -> PromptRunti
 }
 
 fn serve_prompts(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    obs_rx: &mpsc::Receiver<PluginObservation>,
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    ctx: RuntimeReadyAckLoop<'_>,
     work_rx: &mpsc::Receiver<PromptWork>,
     prompt_events: &swactor::runtime::Inbox<PromptEvent>,
-    stop_rx: &mpsc::Receiver<()>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    run_id: u64,
-    node_id: u64,
     node_actor: ActorAddress,
     reply_to: ActorAddress,
     tokenizer_events: &swactor::runtime::Inbox<TokenizerEvent>,
     tokenizer_encode_actor: ActorAddress,
     tokenizer_decode_actor: ActorAddress,
     tokenizer_reply_to: ActorAddress,
-    provider: &ProviderKind,
     pipeline_plan: Option<&run_plan::RunPlan>,
     prompt_endpoint: EndpointAddr,
 ) -> Result<(), String> {
+    let RuntimeReadyAckLoop {
+        driver,
+        stack,
+        obs_rx,
+        frame_rx,
+        frame_tx,
+        stop_rx,
+        dashboard,
+        orch_datastream,
+        orch_stdio_rx,
+        run_id,
+        orchestrator_node_id: node_id,
+        provider,
+        ..
+    } = ctx;
     let mut pipeline_runtime = match prompt_runtime_mode(pipeline_plan) {
         PromptRuntimeMode::PipelineTokenEdges => Some(PipelinePromptRuntime::new(
             driver,
@@ -5324,7 +5261,13 @@ fn serve_prompts(
             pipeline.drain_tokens(&stack.runtime, dashboard, orch_datastream, run_id, node_id)?;
             pipeline.emit_wait_progress(dashboard, orch_datastream, run_id, node_id);
         }
-        drain_observations(obs_rx, dashboard, orch_datastream, &provider)?;
+        drain_observations_with_exit(
+            obs_rx,
+            dashboard,
+            orch_datastream,
+            &provider,
+            |_, status| format!("node exited: {status:?}"),
+        )?;
         drain_frames(frame_rx, dashboard, orch_datastream);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_rx.try_recv().is_ok() {
@@ -5569,19 +5512,20 @@ fn spawn_stop_listener() -> mpsc::Receiver<()> {
     rx
 }
 
-fn drain_observations(
+fn drain_observations_with_exit(
     obs_rx: &mpsc::Receiver<PluginObservation>,
     dashboard: Option<&DashboardSupport>,
     orch_datastream: &mut OrchDatastream,
     provider: &ProviderKind,
+    exit_message: impl Fn(u64, Option<i32>) -> String,
 ) -> Result<(), String> {
     while let Ok(observation) = obs_rx.try_recv() {
         emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
         match observation {
             PluginObservation::Failed { reason, .. } => return Err(reason),
-            PluginObservation::Exited { status, .. } => {
-                return Err(format!("node exited: {status:?}"));
-            }
+            PluginObservation::Exited {
+                node_id, status, ..
+            } => return Err(exit_message(node_id, status)),
             PluginObservation::DatastreamFrame { .. } => {}
             PluginObservation::ProviderLine { .. }
             | PluginObservation::StdoutLine { .. }
@@ -6055,11 +5999,6 @@ fn command_output_failure_detail(output: &std::process::Output, secret: Option<&
         detail = detail.replace(secret, "<redacted>");
     }
     detail
-}
-
-#[cfg(test)]
-fn relay_mode_from_env() -> Result<iroh::RelayMode, String> {
-    relay_runtime_config_from_env(1).map(|relay| relay.mode)
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {
