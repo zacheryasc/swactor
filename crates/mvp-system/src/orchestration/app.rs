@@ -89,54 +89,26 @@ const MVP_ORCH_PROMPT: &str = "mvp.orch.prompt";
 const MVP_SWIM_MEMBERSHIP: &str = "mvp.swim.membership";
 const MVP_STAGE_ROUTE: &str = "mvp.orch.stage_route";
 const DATASTREAM_FRAME_LOG_ENV: &str = "MVP_DATASTREAM_FRAME_LOG";
-const DEFAULT_DOCKER_CONTAINER_PREFIX: &str = "mvp-orchestrator";
-const MVP_DOCKER_CONTAINER_PREFIX_ENV: &str = "MVP_DOCKER_CONTAINER_PREFIX";
 
-struct OrchestratorRunOptions {
+pub(crate) fn run_with_options<I>(
+    args: I,
     capture_stdio: bool,
     stop_rx: Option<mpsc::Receiver<()>>,
-}
-
-impl Default for OrchestratorRunOptions {
-    fn default() -> Self {
-        Self {
-            capture_stdio: true,
-            stop_rx: None,
-        }
-    }
-}
-
-pub(super) fn run_from_args<I>(args: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = String>,
-{
-    run_with_options(args, OrchestratorRunOptions::default())
-}
-
-pub(super) fn run_in_process_from_args<I>(
-    args: I,
-    stop_rx: mpsc::Receiver<()>,
 ) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
-    run_with_options(
-        args,
-        OrchestratorRunOptions {
-            capture_stdio: false,
-            stop_rx: Some(stop_rx),
-        },
-    )
-}
-
-fn run_with_options<I>(args: I, options: OrchestratorRunOptions) -> Result<(), String>
-where
-    I: IntoIterator<Item = String>,
-{
-    let mut config = Config::from_defaults_toml_env_args(args)?;
+    let mut config_builder = ConfigBuilder::hardcoded_defaults();
+    if let Some(overlay) = TomlConfigOverlay::load_optional(Path::new(DEFAULT_CONFIG_PATH))? {
+        config_builder = config_builder.overlay_toml(overlay)?;
+    }
+    let mut config = config_builder
+        .overlay_env()?
+        .overlay_cli(args)?
+        .finalize()?;
     config.prepare_vastai_ssh_key()?;
-    let orch_stdio_rx = if options.capture_stdio {
-        install_orch_stdio_capture()?
+    let orch_stdio_rx = if capture_stdio {
+        OrchStdioCapture::install()?
     } else {
         None
     };
@@ -149,7 +121,10 @@ where
         "config",
         "ready",
         json!({
-            "config_profile":config.config_profile.as_str(),
+            "config_profile":match config.config_profile {
+                RuntimeConfigProfile::Local => "local",
+                RuntimeConfigProfile::Deploy => "deploy",
+            },
             "image":&config.image,
             "provider":config.provider.as_str(),
             "rpc_bind":config.rpc_bind.to_string(),
@@ -237,7 +212,6 @@ where
     } else {
         None
     };
-    let _ = &pipeline_plan;
 
     let tokio = match tokio::runtime::Runtime::new() {
         Ok(runtime) => {
@@ -478,7 +452,7 @@ where
     );
 
     let (work_tx, work_rx) = mpsc::channel::<PromptWork>();
-    let stop_rx = options.stop_rx.unwrap_or_else(spawn_stop_listener);
+    let stop_rx = stop_rx.unwrap_or_else(spawn_stop_listener);
 
     let provisioner = config.build_provisioner(Arc::clone(&stack.runtime))?;
     orch_datastream.emit_bootstrap(
@@ -814,20 +788,6 @@ impl RuntimeConfigProfile {
             )),
         }
     }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Deploy => "deploy",
-        }
-    }
-
-    fn default_provider(self) -> ProviderKind {
-        match self {
-            Self::Local => provider_kind::process(),
-            Self::Deploy => provider_kind::vastai(),
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -858,19 +818,21 @@ impl CachedModelConfig {
                 host_path.display()
             ));
         }
-        let container_path = cached_model_container_path(&host_path)?;
+        let file_name = host_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| {
+                format!(
+                    "cached model path has no file name: {}",
+                    host_path.display()
+                )
+            })?;
+        let container_path = format!("{CACHED_MODEL_CONTAINER_DIR}/{file_name}");
         Ok(Self {
             host_path,
             container_path,
         })
-    }
-
-    fn worker_path(&self, provider: &ProviderKind) -> String {
-        if provider == &provider_kind::process() {
-            self.host_path.to_string_lossy().to_string()
-        } else {
-            self.container_path.clone()
-        }
     }
 
     fn datastream_detail(&self) -> Value {
@@ -880,26 +842,6 @@ impl CachedModelConfig {
             "container_path": &self.container_path,
         })
     }
-}
-
-fn cached_model_container_path(host_path: &Path) -> Result<String, String> {
-    let file_name = host_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .ok_or_else(|| {
-            format!(
-                "cached model path has no file name: {}",
-                host_path.display()
-            )
-        })?;
-    Ok(format!("{CACHED_MODEL_CONTAINER_DIR}/{file_name}"))
-}
-
-fn default_worker_bin() -> Result<PathBuf, String> {
-    let mut path = std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-    path.set_file_name("mvp-worker-node");
-    Ok(path)
 }
 
 fn default_pipeline_cached_model_path() -> PathBuf {
@@ -914,28 +856,6 @@ fn default_pipeline_cached_model_path() -> PathBuf {
         .join("..")
         .join(DEFAULT_PIPELINE_MODEL_CACHE_DIR)
         .join(DEFAULT_PIPELINE_CACHED_MODEL_FILE)
-}
-
-fn gguf_source_is_default_hf(source: &GgufSource) -> bool {
-    matches!(
-        source,
-        GgufSource::HuggingFaceGguf {
-            repo,
-            file,
-            revision: None,
-        } if repo == DEFAULT_HF_REPO && file == DEFAULT_HF_FILE
-    )
-}
-
-fn gguf_source_matches_default_pipeline_cache(source: &GgufSource) -> bool {
-    matches!(
-        source,
-        GgufSource::HuggingFaceGguf {
-            file,
-            revision: None,
-            ..
-        } if file == DEFAULT_PIPELINE_CACHED_MODEL_FILE
-    )
 }
 
 #[derive(Clone)]
@@ -1121,10 +1041,14 @@ impl ConfigBuilder {
         apply!(overlay.model.gguf_local_path, |path| {
             self.gguf_source = GgufSource::LocalPath(path)
         });
-        apply!(overlay.model.gguf_repo, |repo| { self.set_gguf_repo(repo) });
-        apply!(overlay.model.gguf_file, |file| { self.set_gguf_file(file) });
+        apply!(overlay.model.gguf_repo, |repo| {
+            self.set_hf_source(Some(repo), None, None)
+        });
+        apply!(overlay.model.gguf_file, |file| {
+            self.set_hf_source(None, Some(file), None)
+        });
         apply!(overlay.model.gguf_revision, |revision| {
-            self.set_gguf_revision(Some(revision))
+            self.set_hf_source(None, None, Some(Some(revision)))
         });
         apply!(overlay.model.tokenizer_local_path, |path| {
             self.tokenizer = TokenizerSource::LocalPath(path)
@@ -1233,7 +1157,10 @@ impl ConfigBuilder {
                 self.provider = Some(provider_kind::parse_deploy(&provider)?);
             }
         );
-        env_apply!("MVP_NODE_IMAGE", |image| { self.set_process_image(image) });
+        env_apply!("MVP_NODE_IMAGE", |image| {
+            self.image = image;
+            self.image_overridden_after_toml = true;
+        });
         env_apply!("MVP_DOCKER_GPUS", |gpus| { self.docker_gpus = gpus });
         env_apply!(CACHED_MODEL_HOST_ENV, |path| {
             self.cached_model_host_path = Some(PathBuf::from(path))
@@ -1258,10 +1185,14 @@ impl ConfigBuilder {
         env_apply!("MVP_GGUF_LOCAL_PATH", |path| {
             self.gguf_source = GgufSource::LocalPath(path)
         });
-        env_apply!("MVP_GGUF_REPO", |repo| { self.set_gguf_repo(repo) });
-        env_apply!("MVP_GGUF_FILE", |file| { self.set_gguf_file(file) });
+        env_apply!("MVP_GGUF_REPO", |repo| {
+            self.set_hf_source(Some(repo), None, None)
+        });
+        env_apply!("MVP_GGUF_FILE", |file| {
+            self.set_hf_source(None, Some(file), None)
+        });
         env_apply!("MVP_GGUF_REVISION", |revision| {
-            self.set_gguf_revision(Some(revision))
+            self.set_hf_source(None, None, Some(Some(revision)))
         });
         env_apply!("MVP_TOKENIZER_LOCAL_PATH", |path| {
             self.tokenizer = TokenizerSource::LocalPath(path)
@@ -1340,179 +1271,155 @@ impl ConfigBuilder {
         Ok(self)
     }
 
-    fn apply_core_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
-    where
-        I: Iterator<Item = String>,
-    {
-        match arg {
-            "--runtime-config" => {
-                self.config_profile =
-                    RuntimeConfigProfile::parse(&next_arg(args, "--runtime-config")?)?
-            }
-            "--provider" => {
-                self.provider = Some(provider_kind::parse_deploy(&next_arg(args, "--provider")?)?)
-            }
-            "--worker-bin" => {
-                self.worker_bin = Some(PathBuf::from(next_arg(args, "--worker-bin")?))
-            }
-            "--image" => self.set_process_image(next_arg(args, "--image")?),
-            "--gpus" => self.docker_gpus = next_arg(args, "--gpus")?,
-            "--rpc-bind" => {
-                self.rpc_bind = next_arg(args, "--rpc-bind")?;
-                self.rpc_bind_label = "--rpc-bind";
-            }
-            "--run-id" => self.run_id = parse_next(args, "--run-id")?,
-            "--node-id" => self.node_id = parse_next(args, "--node-id")?,
-            "--stage-index" => self.stage_index = parse_next(args, "--stage-index")?,
-            "--layer-end-exclusive" => {
-                self.layer_end_exclusive = Some(parse_next(args, "--layer-end-exclusive")?)
-            }
-            "-N" | "--pipeline-stages" => self.pipeline_stages = parse_next(args, arg)?,
-            "--max-tokens" => self.default_max_tokens = parse_next(args, "--max-tokens")?,
-            "--dashboard" => self.dashboard = true,
-            "--no-dashboard" => self.dashboard = false,
-            "--datastream-frame-log" => {
-                self.datastream_frame_log =
-                    Some(PathBuf::from(next_arg(args, "--datastream-frame-log")?));
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    fn apply_model_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
-    where
-        I: Iterator<Item = String>,
-    {
-        match arg {
-            "--model-id" => self.model_id = next_arg(args, "--model-id")?,
-            "--gguf-local-path" => {
-                self.gguf_source = GgufSource::LocalPath(next_arg(args, "--gguf-local-path")?)
-            }
-            "--gguf-repo" => self.set_gguf_repo(next_arg(args, "--gguf-repo")?),
-            "--gguf-file" => self.set_gguf_file(next_arg(args, "--gguf-file")?),
-            "--gguf-revision" => self.set_gguf_revision(Some(next_arg(args, "--gguf-revision")?)),
-            "--tokenizer-local-path" => {
-                self.tokenizer =
-                    TokenizerSource::LocalPath(next_arg(args, "--tokenizer-local-path")?)
-            }
-            "--max-context" => self.max_context = Some(parse_next(args, "--max-context")?),
-            "--cached-model-host-path" => {
-                self.cached_model_host_path =
-                    Some(PathBuf::from(next_arg(args, "--cached-model-host-path")?));
-            }
-            "--relay-mode" => self.relay_mode = Some(next_arg(args, "--relay-mode")?),
-            "--relay-url" => self.relay_url = Some(next_arg(args, "--relay-url")?),
-            "--endpoint-addr-mask" => {
-                self.endpoint_addr_mask = Some(next_arg(args, "--endpoint-addr-mask")?)
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    fn apply_vastai_string_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
-    where
-        I: Iterator<Item = String>,
-    {
-        match arg {
-            "--vastai-api-key" => self.vastai_api_key = Some(next_arg(args, "--vastai-api-key")?),
-            "--vastai-bootstrap-command" => {
-                self.vastai_bootstrap_command = Some(next_arg(args, "--vastai-bootstrap-command")?)
-            }
-            "--vastai-ssh-identity" => {
-                self.vastai_ssh_identity_raw = Some(next_arg(args, "--vastai-ssh-identity")?);
-            }
-            "--vastai-ssh-user" => {
-                self.vastai_ssh_user = Some(next_arg(args, "--vastai-ssh-user")?)
-            }
-            "--vastai-onstart" => self.vastai_onstart = Some(next_arg(args, "--vastai-onstart")?),
-            "--vastai-gpu-name" => {
-                self.vastai_gpu_name = Some(next_arg(args, "--vastai-gpu-name")?)
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    fn apply_vastai_numeric_cli_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
-    where
-        I: Iterator<Item = String>,
-    {
-        match arg {
-            "--vastai-disk-gb" => {
-                self.vastai_disk_gb = Some(parse_next(args, "--vastai-disk-gb")?);
-                self.vastai_disk_gb_raw = None;
-            }
-            "--vastai-min-gpu-ram-mb" => {
-                self.vastai_min_gpu_ram_mb = Some(parse_next(args, "--vastai-min-gpu-ram-mb")?);
-                self.vastai_min_gpu_ram_mb_raw = None;
-            }
-            "--vastai-min-down-mbps" => {
-                self.vastai_min_down_mbps = Some(parse_next(args, "--vastai-min-down-mbps")?);
-                self.vastai_min_down_mbps_raw = None;
-            }
-            "--vastai-max-dph-total" => {
-                self.vastai_max_dph_total = Some(parse_next(args, "--vastai-max-dph-total")?);
-                self.vastai_max_dph_total_raw = None;
-            }
-            "--vastai-min-up-mbps" => {
-                self.vastai_min_up_mbps = Some(parse_next(args, "--vastai-min-up-mbps")?);
-                self.vastai_min_up_mbps_raw = None;
-            }
-            "--vastai-min-reliability" => {
-                self.vastai_min_reliability = Some(parse_next(args, "--vastai-min-reliability")?);
-                self.vastai_min_reliability_raw = None;
-            }
-            "--vastai-blacklist-host" => {
-                let host_id = parse_next(args, "--vastai-blacklist-host")?;
-                self.push_vastai_blacklist_host(host_id);
-            }
-            "--vastai-poll-interval-secs" => {
-                self.vastai_poll_interval_secs =
-                    Some(parse_next(args, "--vastai-poll-interval-secs")?);
-                self.vastai_poll_interval_secs_raw = None;
-            }
-            _ => return Ok(false),
-        }
-        Ok(true)
-    }
-
-    fn apply_vastai_bool_cli_arg(&mut self, arg: &str) -> bool {
-        match arg {
-            "--vastai-confirm-lease" => {
-                self.vastai_confirm_lease = Some(true);
-                self.vastai_confirm_lease_raw = None;
-            }
-            "--no-vastai-confirm-lease" => {
-                self.vastai_confirm_lease = Some(false);
-                self.vastai_confirm_lease_raw = None;
-            }
-            "--vastai-require-verified" => {
-                self.vastai_require_verified = Some(true);
-                self.vastai_require_verified_raw = None;
-            }
-            "--no-vastai-require-verified" => {
-                self.vastai_require_verified = Some(false);
-                self.vastai_require_verified_raw = None;
-            }
-            _ => return false,
-        }
-        true
-    }
-
     fn overlay_cli(mut self, args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
-            if self.apply_core_cli_arg(&arg, &mut args)?
-                || self.apply_model_cli_arg(&arg, &mut args)?
-                || self.apply_vastai_string_cli_arg(&arg, &mut args)?
-                || self.apply_vastai_numeric_cli_arg(&arg, &mut args)?
-                || self.apply_vastai_bool_cli_arg(&arg)
-            {
-                continue;
+            match arg.as_str() {
+                "--runtime-config" => {
+                    self.config_profile =
+                        RuntimeConfigProfile::parse(&next_arg(&mut args, "--runtime-config")?)?
+                }
+                "--provider" => {
+                    self.provider = Some(provider_kind::parse_deploy(&next_arg(
+                        &mut args,
+                        "--provider",
+                    )?)?)
+                }
+                "--worker-bin" => {
+                    self.worker_bin = Some(PathBuf::from(next_arg(&mut args, "--worker-bin")?))
+                }
+                "--image" => {
+                    self.image = next_arg(&mut args, "--image")?;
+                    self.image_overridden_after_toml = true;
+                }
+                "--gpus" => self.docker_gpus = next_arg(&mut args, "--gpus")?,
+                "--rpc-bind" => {
+                    self.rpc_bind = next_arg(&mut args, "--rpc-bind")?;
+                    self.rpc_bind_label = "--rpc-bind";
+                }
+                "--run-id" => self.run_id = parse_next(&mut args, "--run-id")?,
+                "--node-id" => self.node_id = parse_next(&mut args, "--node-id")?,
+                "--stage-index" => self.stage_index = parse_next(&mut args, "--stage-index")?,
+                "--layer-end-exclusive" => {
+                    self.layer_end_exclusive = Some(parse_next(&mut args, "--layer-end-exclusive")?)
+                }
+                "-N" | "--pipeline-stages" => self.pipeline_stages = parse_next(&mut args, &arg)?,
+                "--max-tokens" => self.default_max_tokens = parse_next(&mut args, "--max-tokens")?,
+                "--dashboard" => self.dashboard = true,
+                "--no-dashboard" => self.dashboard = false,
+                "--datastream-frame-log" => {
+                    self.datastream_frame_log = Some(PathBuf::from(next_arg(
+                        &mut args,
+                        "--datastream-frame-log",
+                    )?));
+                }
+                "--model-id" => self.model_id = next_arg(&mut args, "--model-id")?,
+                "--gguf-local-path" => {
+                    self.gguf_source =
+                        GgufSource::LocalPath(next_arg(&mut args, "--gguf-local-path")?)
+                }
+                "--gguf-repo" => {
+                    self.set_hf_source(Some(next_arg(&mut args, "--gguf-repo")?), None, None)
+                }
+                "--gguf-file" => {
+                    self.set_hf_source(None, Some(next_arg(&mut args, "--gguf-file")?), None)
+                }
+                "--gguf-revision" => self.set_hf_source(
+                    None,
+                    None,
+                    Some(Some(next_arg(&mut args, "--gguf-revision")?)),
+                ),
+                "--tokenizer-local-path" => {
+                    self.tokenizer =
+                        TokenizerSource::LocalPath(next_arg(&mut args, "--tokenizer-local-path")?)
+                }
+                "--max-context" => self.max_context = Some(parse_next(&mut args, "--max-context")?),
+                "--cached-model-host-path" => {
+                    self.cached_model_host_path = Some(PathBuf::from(next_arg(
+                        &mut args,
+                        "--cached-model-host-path",
+                    )?));
+                }
+                "--relay-mode" => self.relay_mode = Some(next_arg(&mut args, "--relay-mode")?),
+                "--relay-url" => self.relay_url = Some(next_arg(&mut args, "--relay-url")?),
+                "--endpoint-addr-mask" => {
+                    self.endpoint_addr_mask = Some(next_arg(&mut args, "--endpoint-addr-mask")?)
+                }
+                "--vastai-disk-gb" => {
+                    self.vastai_disk_gb = Some(parse_next(&mut args, "--vastai-disk-gb")?);
+                    self.vastai_disk_gb_raw = None;
+                }
+                "--vastai-min-gpu-ram-mb" => {
+                    self.vastai_min_gpu_ram_mb =
+                        Some(parse_next(&mut args, "--vastai-min-gpu-ram-mb")?);
+                    self.vastai_min_gpu_ram_mb_raw = None;
+                }
+                "--vastai-min-down-mbps" => {
+                    self.vastai_min_down_mbps =
+                        Some(parse_next(&mut args, "--vastai-min-down-mbps")?);
+                    self.vastai_min_down_mbps_raw = None;
+                }
+                "--vastai-max-dph-total" => {
+                    self.vastai_max_dph_total =
+                        Some(parse_next(&mut args, "--vastai-max-dph-total")?);
+                    self.vastai_max_dph_total_raw = None;
+                }
+                "--vastai-min-up-mbps" => {
+                    self.vastai_min_up_mbps = Some(parse_next(&mut args, "--vastai-min-up-mbps")?);
+                    self.vastai_min_up_mbps_raw = None;
+                }
+                "--vastai-min-reliability" => {
+                    self.vastai_min_reliability =
+                        Some(parse_next(&mut args, "--vastai-min-reliability")?);
+                    self.vastai_min_reliability_raw = None;
+                }
+                "--vastai-blacklist-host" => {
+                    let host_id = parse_next(&mut args, "--vastai-blacklist-host")?;
+                    self.push_vastai_blacklist_host(host_id);
+                }
+                "--vastai-poll-interval-secs" => {
+                    self.vastai_poll_interval_secs =
+                        Some(parse_next(&mut args, "--vastai-poll-interval-secs")?);
+                    self.vastai_poll_interval_secs_raw = None;
+                }
+                "--vastai-api-key" => {
+                    self.vastai_api_key = Some(next_arg(&mut args, "--vastai-api-key")?)
+                }
+                "--vastai-bootstrap-command" => {
+                    self.vastai_bootstrap_command =
+                        Some(next_arg(&mut args, "--vastai-bootstrap-command")?)
+                }
+                "--vastai-ssh-identity" => {
+                    self.vastai_ssh_identity_raw =
+                        Some(next_arg(&mut args, "--vastai-ssh-identity")?);
+                }
+                "--vastai-ssh-user" => {
+                    self.vastai_ssh_user = Some(next_arg(&mut args, "--vastai-ssh-user")?)
+                }
+                "--vastai-onstart" => {
+                    self.vastai_onstart = Some(next_arg(&mut args, "--vastai-onstart")?)
+                }
+                "--vastai-gpu-name" => {
+                    self.vastai_gpu_name = Some(next_arg(&mut args, "--vastai-gpu-name")?)
+                }
+                "--vastai-confirm-lease" => {
+                    self.vastai_confirm_lease = Some(true);
+                    self.vastai_confirm_lease_raw = None;
+                }
+                "--no-vastai-confirm-lease" => {
+                    self.vastai_confirm_lease = Some(false);
+                    self.vastai_confirm_lease_raw = None;
+                }
+                "--vastai-require-verified" => {
+                    self.vastai_require_verified = Some(true);
+                    self.vastai_require_verified_raw = None;
+                }
+                "--no-vastai-require-verified" => {
+                    self.vastai_require_verified = Some(false);
+                    self.vastai_require_verified_raw = None;
+                }
+                _ => return Err(format!("unknown argument {arg:?}")),
             }
-            return Err(format!("unknown argument {arg:?}"));
         }
         Ok(self)
     }
@@ -1521,7 +1428,10 @@ impl ConfigBuilder {
         let provider = self
             .provider
             .clone()
-            .unwrap_or_else(|| self.config_profile.default_provider());
+            .unwrap_or_else(|| match self.config_profile {
+                RuntimeConfigProfile::Local => provider_kind::process(),
+                RuntimeConfigProfile::Deploy => provider_kind::vastai(),
+            });
         let mut image = self.image.clone();
         if provider == provider_kind::vastai() && !self.image_overridden_after_toml {
             if let Some(vastai_image) = &self.toml_vastai_image {
@@ -1535,8 +1445,21 @@ impl ConfigBuilder {
         if (provider == provider_kind::process() || provider == provider_kind::docker())
             && self.pipeline_stages > 1
             && cached_model_host_path.is_none()
-            && (gguf_source_is_default_hf(&self.gguf_source)
-                || gguf_source_matches_default_pipeline_cache(&self.gguf_source))
+            && (matches!(
+                &self.gguf_source,
+                GgufSource::HuggingFaceGguf {
+                    repo,
+                    file,
+                    revision: None,
+                } if repo == DEFAULT_HF_REPO && file == DEFAULT_HF_FILE
+            ) || matches!(
+                &self.gguf_source,
+                GgufSource::HuggingFaceGguf {
+                    file,
+                    revision: None,
+                    ..
+                } if file == DEFAULT_PIPELINE_CACHED_MODEL_FILE
+            ))
         {
             cached_model_host_path = Some(default_pipeline_cached_model_path());
         }
@@ -1546,7 +1469,11 @@ impl ConfigBuilder {
         let mut gguf_source = self.gguf_source.clone();
         if let Some(cached_model) = &cached_model {
             if provider != provider_kind::vastai() {
-                gguf_source = GgufSource::LocalPath(cached_model.worker_path(&provider));
+                gguf_source = GgufSource::LocalPath(if provider == provider_kind::process() {
+                    cached_model.host_path.to_string_lossy().to_string()
+                } else {
+                    cached_model.container_path.clone()
+                });
             }
         }
         let relay = relay_runtime_config_from_settings(
@@ -1592,44 +1519,26 @@ impl ConfigBuilder {
         })
     }
 
-    fn set_process_image(&mut self, image: String) {
-        self.image = image;
-        self.image_overridden_after_toml = true;
-    }
-
-    fn set_gguf_repo(&mut self, repo: String) {
-        let (file, revision) = match &self.gguf_source {
-            GgufSource::HuggingFaceGguf { file, revision, .. } => (file.clone(), revision.clone()),
-            GgufSource::LocalPath(_) => (DEFAULT_HF_FILE.to_owned(), None),
+    fn set_hf_source(
+        &mut self,
+        repo: Option<String>,
+        file: Option<String>,
+        revision: Option<Option<String>>,
+    ) {
+        let (current_repo, current_file, current_revision) = match &self.gguf_source {
+            GgufSource::HuggingFaceGguf {
+                repo,
+                file,
+                revision,
+            } => (repo.clone(), file.clone(), revision.clone()),
+            GgufSource::LocalPath(_) => {
+                (DEFAULT_HF_REPO.to_owned(), DEFAULT_HF_FILE.to_owned(), None)
+            }
         };
         self.gguf_source = GgufSource::HuggingFaceGguf {
-            repo,
-            file,
-            revision,
-        };
-    }
-
-    fn set_gguf_file(&mut self, file: String) {
-        let (repo, revision) = match &self.gguf_source {
-            GgufSource::HuggingFaceGguf { repo, revision, .. } => (repo.clone(), revision.clone()),
-            GgufSource::LocalPath(_) => (DEFAULT_HF_REPO.to_owned(), None),
-        };
-        self.gguf_source = GgufSource::HuggingFaceGguf {
-            repo,
-            file,
-            revision,
-        };
-    }
-
-    fn set_gguf_revision(&mut self, revision: Option<String>) {
-        let (repo, file) = match &self.gguf_source {
-            GgufSource::HuggingFaceGguf { repo, file, .. } => (repo.clone(), file.clone()),
-            GgufSource::LocalPath(_) => (DEFAULT_HF_REPO.to_owned(), DEFAULT_HF_FILE.to_owned()),
-        };
-        self.gguf_source = GgufSource::HuggingFaceGguf {
-            repo,
-            file,
-            revision,
+            repo: repo.unwrap_or(current_repo),
+            file: file.unwrap_or(current_file),
+            revision: revision.unwrap_or(current_revision),
         };
     }
 
@@ -1674,27 +1583,6 @@ impl ConfigBuilder {
 }
 
 impl Config {
-    fn from_defaults_toml_env_args(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
-        Self::from_layers_with_path_and_args(Some(Path::new(DEFAULT_CONFIG_PATH)), args)
-    }
-
-    fn from_layers_with_path_and_args(
-        path: Option<&Path>,
-        args: impl IntoIterator<Item = String>,
-    ) -> Result<Self, String> {
-        let mut builder = Self::hardcoded_defaults();
-        if let Some(path) = path {
-            if let Some(overlay) = TomlConfigOverlay::load_optional(path)? {
-                builder = builder.overlay_toml(overlay)?;
-            }
-        }
-        builder.overlay_env()?.overlay_cli(args)?.finalize()
-    }
-
-    fn hardcoded_defaults() -> ConfigBuilder {
-        ConfigBuilder::hardcoded_defaults()
-    }
-
     fn uses_planned_execution(&self) -> bool {
         self.cached_model.is_some() || self.pipeline_stages > 1
     }
@@ -1817,9 +1705,12 @@ impl Config {
                     ))
                 }
             }
-            GgufSource::HuggingFaceGguf { repo, file, .. }
-                if self.provider == provider_kind::vastai()
-                    && gguf_source_matches_default_pipeline_cache(&self.gguf_source) =>
+            GgufSource::HuggingFaceGguf {
+                repo,
+                file,
+                revision: None,
+            } if self.provider == provider_kind::vastai()
+                && file == DEFAULT_PIPELINE_CACHED_MODEL_FILE =>
             {
                 let host_path = default_pipeline_cached_model_path();
                 if host_path.is_file() {
@@ -1887,7 +1778,15 @@ impl Config {
         bootstrap_runtime: Arc<swactor::runtime::Runtime>,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
         if self.provider == provider_kind::process() {
-            let worker_bin = self.worker_bin.clone().unwrap_or(default_worker_bin()?);
+            let worker_bin = match &self.worker_bin {
+                Some(worker_bin) => worker_bin.clone(),
+                None => {
+                    let mut path =
+                        std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+                    path.set_file_name("mvp-worker-node");
+                    path
+                }
+            };
             if !worker_bin.is_file() {
                 return Err(format!(
                     "local process worker binary does not exist: {}",
@@ -1896,7 +1795,10 @@ impl Config {
             }
             Ok(Box::new(LocalProcessPlugin::new(worker_bin)))
         } else if self.provider == provider_kind::docker() {
-            Ok(Box::new(LocalDockerPlugin::new(docker_container_prefix())))
+            Ok(Box::new(LocalDockerPlugin::new(
+                env_optional("MVP_DOCKER_CONTAINER_PREFIX")
+                    .unwrap_or_else(|| "mvp-orchestrator".to_owned()),
+            )))
         } else if self.provider == provider_kind::vastai() {
             let vastai = self
                 .vastai
@@ -2030,14 +1932,22 @@ impl Config {
         if self.provider == provider_kind::docker() {
             env.push(("MVP_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
         }
-        env.extend(optional_env("DEV"));
+        if let Some(value) = env_optional("DEV") {
+            env.push(("DEV".to_owned(), value));
+        }
         env.extend(local_tinygrad_worker_env(&self.provider));
-        env.extend(optional_env("MVP_CPU_LINE_PROFILE"));
-        env.extend(optional_env("MVP_CPU_LINE_PROFILE_INTERVAL_MS"));
-        env.extend(optional_env("MVP_TOKEN_PROGRESS_EVERY"));
-        env.extend(optional_env("CUDA_DEVICE_SCHEDULE"));
-        env.extend(optional_env("MVP_MODEL_CACHE_DIR"));
-        env.extend(optional_env("HF_TOKEN"));
+        for name in [
+            "MVP_CPU_LINE_PROFILE",
+            "MVP_CPU_LINE_PROFILE_INTERVAL_MS",
+            "MVP_TOKEN_PROGRESS_EVERY",
+            "CUDA_DEVICE_SCHEDULE",
+            "MVP_MODEL_CACHE_DIR",
+            "HF_TOKEN",
+        ] {
+            if let Some(value) = env_optional(name) {
+                env.push((name.to_owned(), value));
+            }
+        }
         match &self.gguf_source {
             GgufSource::LocalPath(path) => {
                 env.push(("MVP_GGUF_LOCAL_PATH".to_owned(), path.clone()))
@@ -2378,61 +2288,6 @@ impl Drop for ProvisionedClusterGuard {
     }
 }
 
-type ProviderStartResults = Vec<(
-    NodeProvisionSpec,
-    Result<crate::provisioning::PluginNodeHandle, String>,
-)>;
-
-fn start_nodes_with_stdio_capture(
-    provisioner: Box<dyn ProvisionPlugin>,
-    node_specs: Vec<NodeProvisionSpec>,
-    sink: PluginSink,
-    orch_stdio_rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    run_id: u64,
-    node_id: u64,
-) -> (Box<dyn ProvisionPlugin>, ProviderStartResults) {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut provisioner = provisioner;
-        let results = provisioner.start_nodes(node_specs, sink);
-        let _ = tx.send((provisioner, results));
-    });
-
-    loop {
-        match rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(result) => return result,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                drain_orch_stdio_capture(
-                    orch_stdio_rx,
-                    orch_datastream,
-                    dashboard,
-                    run_id,
-                    node_id,
-                );
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return (
-                    Box::new(FailedProvisionPlugin),
-                    vec![(
-                        NodeProvisionSpec {
-                            run_id,
-                            node_id,
-                            stage_index: None,
-                            image: String::new(),
-                            env: Vec::new(),
-                            args: Vec::new(),
-                            mounts: Vec::new(),
-                        },
-                        Err("provider start worker disconnected".to_owned()),
-                    )],
-                );
-            }
-        }
-    }
-}
-
 fn start_and_provision_workers(
     mut provisioner: Box<dyn ProvisionPlugin>,
     config: &Config,
@@ -2531,22 +2386,40 @@ fn start_and_provision_workers(
                 }),
             );
         }
-        let (returned_provisioner, start_results) = start_nodes_with_stdio_capture(
-            provisioner,
-            pending_specs,
-            sink.clone(),
-            orch_stdio_rx,
-            dashboard,
-            orch_datastream,
-            config.run_id,
-            config.node_id,
-        );
-        provisioner = returned_provisioner;
-        let start_outcome = collect_provider_start_outcome(start_results);
-        handles.extend(start_outcome.successful_handles);
-        for (node_spec, handle_result) in start_outcome.results {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn({
+            let sink = sink.clone();
+            move || {
+                let mut provisioner = provisioner;
+                let results = provisioner.start_nodes(pending_specs, sink);
+                let _ = tx.send((provisioner, results));
+            }
+        });
+        let start_results = loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok((returned_provisioner, start_results)) => {
+                    provisioner = returned_provisioner;
+                    break start_results;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    drain_orch_stdio_capture(
+                        orch_stdio_rx,
+                        orch_datastream,
+                        dashboard,
+                        config.run_id,
+                        config.node_id,
+                    );
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("provider start worker disconnected".to_owned());
+                }
+            }
+        };
+        let mut failed_specs = Vec::new();
+        let mut first_error = None;
+        for (node_spec, handle_result) in start_results {
             match handle_result {
-                Ok(_) => {
+                Ok(handle) => {
                     orch_datastream.emit_bootstrap(
                         dashboard,
                         config.run_id,
@@ -2560,6 +2433,7 @@ fn start_and_provision_workers(
                             "attempt":attempt,
                         }),
                     );
+                    handles.push(handle);
                 }
                 Err(error) => {
                     orch_datastream.emit_bootstrap(
@@ -2576,17 +2450,21 @@ fn start_and_provision_workers(
                             "error":error,
                         }),
                     );
+                    failed_specs.push(node_spec);
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
                 }
             }
         }
-        if start_outcome.first_error.is_none() {
+        if first_error.is_none() {
             break;
         }
         if attempt == PROVIDER_START_MAX_ATTEMPTS {
-            let error = start_outcome
-                .first_error
-                .expect("checked provider-start failure");
-            stop_started_nodes(&mut *provisioner, &mut handles);
+            let error = first_error.expect("checked provider-start failure");
+            while let Some(handle) = handles.pop() {
+                let _ = provisioner.stop_node(&handle);
+            }
             drain_orch_stdio_capture(
                 orch_stdio_rx,
                 orch_datastream,
@@ -2596,7 +2474,7 @@ fn start_and_provision_workers(
             );
             return Err(error);
         }
-        pending_specs = start_outcome.failed_specs;
+        pending_specs = failed_specs;
     }
     let mut provisioned_nodes = ProvisionedClusterGuard::new(provisioner, handles);
     drain_orch_stdio_capture(
@@ -2876,44 +2754,6 @@ fn stage_node_specs(
             config.node_id,
             config.stage_index,
         )?])
-    }
-}
-struct ProviderStartOutcome {
-    results: ProviderStartResults,
-    successful_handles: Vec<crate::provisioning::PluginNodeHandle>,
-    failed_specs: Vec<NodeProvisionSpec>,
-    first_error: Option<String>,
-}
-
-fn collect_provider_start_outcome(results: ProviderStartResults) -> ProviderStartOutcome {
-    let mut successful_handles = Vec::new();
-    let mut failed_specs = Vec::new();
-    let mut first_error = None;
-    for (spec, result) in &results {
-        match result {
-            Ok(handle) => successful_handles.push(handle.clone()),
-            Err(error) => {
-                failed_specs.push(spec.clone());
-                if first_error.is_none() {
-                    first_error = Some(error.clone());
-                }
-            }
-        }
-    }
-    ProviderStartOutcome {
-        results,
-        successful_handles,
-        failed_specs,
-        first_error,
-    }
-}
-
-fn stop_started_nodes(
-    provisioner: &mut dyn ProvisionPlugin,
-    handles: &mut Vec<crate::provisioning::PluginNodeHandle>,
-) {
-    while let Some(handle) = handles.pop() {
-        let _ = provisioner.stop_node(&handle);
     }
 }
 
@@ -3276,25 +3116,24 @@ fn wait_for_weights_loaded_count(
                 ));
             }
             for stage in pending {
-                send_pipeline_stage_provision(
-                    driver,
+                let mut provision = PipelineStageProvision {
+                    driver: &mut *driver,
                     stack,
                     frame_tx,
                     dashboard,
-                    orch_datastream,
+                    orch_datastream: &mut *orch_datastream,
                     run_id,
                     node_id,
                     pipeline_plan,
-                    stage,
                     readies,
                     pipeline_coordinator,
-                    &stage_shard_plans,
-                    &loaded_stages,
-                    &mut stage_resend_counts,
-                    &mut stage_last_sends,
-                    &load_progress,
-                    resend_attempt,
-                )?;
+                    stage_shard_plans,
+                    loaded_stages: &loaded_stages,
+                    stage_resend_counts: &mut stage_resend_counts,
+                    stage_last_sends: &mut stage_last_sends,
+                    load_progress: &load_progress,
+                };
+                send_pipeline_stage_provision(&mut provision, stage, resend_attempt)?;
             }
             last_resend = Instant::now();
         }
@@ -3396,44 +3235,49 @@ fn pending_pipeline_weight_load_stages<'a>(
     pending
 }
 
-#[allow(clippy::too_many_arguments)]
-fn send_pipeline_stage_provision(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
+struct PipelineStageProvision<'a> {
+    driver: &'a mut IrohDriver,
+    stack: &'a DistributionRuntimeStack,
+    frame_tx: &'a mpsc::Sender<CollectedDatastreamFrame>,
+    dashboard: Option<&'a DashboardSupport>,
+    orch_datastream: &'a mut OrchDatastream,
     run_id: u64,
     node_id: u64,
-    pipeline_plan: &run_plan::RunPlan,
+    pipeline_plan: &'a run_plan::RunPlan,
+    readies: &'a BTreeMap<u64, RuntimeReady>,
+    pipeline_coordinator: &'a EndpointAddr,
+    stage_shard_plans: &'a BTreeMap<u32, StageShardPlan>,
+    loaded_stages: &'a BTreeSet<u32>,
+    stage_resend_counts: &'a mut BTreeMap<u32, u64>,
+    stage_last_sends: &'a mut BTreeMap<u32, Instant>,
+    load_progress: &'a BTreeMap<u64, StageLoadProgress>,
+}
+
+fn send_pipeline_stage_provision(
+    ctx: &mut PipelineStageProvision<'_>,
     stage: &run_plan::StagePlan,
-    readies: &BTreeMap<u64, RuntimeReady>,
-    pipeline_coordinator: &EndpointAddr,
-    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
-    loaded_stages: &BTreeSet<u32>,
-    stage_resend_counts: &mut BTreeMap<u32, u64>,
-    stage_last_sends: &mut BTreeMap<u32, Instant>,
-    load_progress: &BTreeMap<u64, StageLoadProgress>,
     attempt: u64,
 ) -> Result<(), String> {
     let stage_node_id = stage.node_id.0;
-    let current_send_count = stage_resend_counts
+    let current_send_count = ctx
+        .stage_resend_counts
         .get(&stage.stage_index)
         .copied()
         .unwrap_or_default();
     let now = Instant::now();
-    let ready = readies
+    let ready = ctx
+        .readies
         .get(&stage_node_id)
         .ok_or_else(|| format!("missing runtime-ready node for stage {}", stage.stage_index))?;
-    let route_owner = stack.route_owner(ready.node_actor);
-    let datastream_route_owner = stack.route_owner(ready.datastream_publisher);
-    let member_state = stack.member_state(ready.swim_node_id);
+    let route_owner = ctx.stack.route_owner(ready.node_actor);
+    let datastream_route_owner = ctx.stack.route_owner(ready.datastream_publisher);
+    let member_state = ctx.stack.member_state(ready.swim_node_id);
     let route_matches_ready = route_owner == Some(ready.swim_node_id);
-    orch_datastream.emit_bootstrap_to_channel(
-        dashboard,
+    ctx.orch_datastream.emit_bootstrap_to_channel(
+        ctx.dashboard,
         MVP_STAGE_ROUTE,
-        run_id,
-        node_id,
+        ctx.run_id,
+        ctx.node_id,
         "stage_route_check",
         "observed",
         json!({
@@ -3455,7 +3299,7 @@ fn send_pipeline_stage_provision(
             stage.stage_index, stage_node_id
         );
         let liveness = stage_load_liveness_detail(
-            load_progress.get(&stage_node_id),
+            ctx.load_progress.get(&stage_node_id),
             stage.stage_index,
             stage_node_id,
             member_state,
@@ -3464,19 +3308,19 @@ fn send_pipeline_stage_provision(
             route_matches_ready,
             "heartbeat_missed",
         );
-        orch_datastream.emit_bootstrap(
-            dashboard,
-            run_id,
-            node_id,
+        ctx.orch_datastream.emit_bootstrap(
+            ctx.dashboard,
+            ctx.run_id,
+            ctx.node_id,
             "stage_provision_wait",
             "failed",
             json!({
                 "attempt":attempt,
-                "stage_count":pipeline_plan.stages.len(),
+                "stage_count":ctx.pipeline_plan.stages.len(),
                 "stage_index":stage.stage_index,
                 "stage_node_id":stage_node_id,
                 "stage_send_count":current_send_count,
-                "loaded_stage_count":loaded_stages.len(),
+                "loaded_stage_count":ctx.loaded_stages.len(),
                 "member_state":"Dead",
                 "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
                 "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
@@ -3488,29 +3332,29 @@ fn send_pipeline_stage_provision(
         return Err(reason);
     }
     let (should_send, dispatch_reason) = stage_provision_dispatch(
-        load_progress.get(&stage_node_id),
+        ctx.load_progress.get(&stage_node_id),
         current_send_count,
-        stage_last_sends.get(&stage.stage_index).copied(),
+        ctx.stage_last_sends.get(&stage.stage_index).copied(),
         now,
     );
     if !should_send {
-        orch_datastream.emit_bootstrap(
-            dashboard,
-            run_id,
-            node_id,
+        ctx.orch_datastream.emit_bootstrap(
+            ctx.dashboard,
+            ctx.run_id,
+            ctx.node_id,
             "stage_provision_wait",
             "observed",
             json!({
                 "attempt":attempt,
-                "stage_count":pipeline_plan.stages.len(),
+                "stage_count":ctx.pipeline_plan.stages.len(),
                 "stage_index":stage.stage_index,
                 "stage_node_id":stage_node_id,
                 "stage_send_count":current_send_count,
-                "loaded_stage_count":loaded_stages.len(),
+                "loaded_stage_count":ctx.loaded_stages.len(),
                 "resend_suppressed":true,
                 "resend_reason":dispatch_reason,
                 "liveness":stage_load_liveness_detail(
-                    load_progress.get(&stage_node_id),
+                    ctx.load_progress.get(&stage_node_id),
                     stage.stage_index,
                     stage_node_id,
                     member_state,
@@ -3521,8 +3365,8 @@ fn send_pipeline_stage_provision(
                 ),
                 "message":format!(
                     "loaded {} of {}; waiting on stage {}",
-                    loaded_stages.len(),
-                    pipeline_plan.stages.len(),
+                    ctx.loaded_stages.len(),
+                    ctx.pipeline_plan.stages.len(),
                     stage.stage_index
                 )
             }),
@@ -3530,43 +3374,46 @@ fn send_pipeline_stage_provision(
         return Ok(());
     }
     let stage_send_count = {
-        let count = stage_resend_counts.entry(stage.stage_index).or_default();
+        let count = ctx
+            .stage_resend_counts
+            .entry(stage.stage_index)
+            .or_default();
         *count += 1;
         *count
     };
-    stage_last_sends.insert(stage.stage_index, now);
-    orch_datastream.emit_bootstrap(
-        dashboard,
-        run_id,
-        node_id,
+    ctx.stage_last_sends.insert(stage.stage_index, now);
+    ctx.orch_datastream.emit_bootstrap(
+        ctx.dashboard,
+        ctx.run_id,
+        ctx.node_id,
         "stage_provision_send",
         "sent",
         json!({
             "attempt":attempt,
-            "stage_count":pipeline_plan.stages.len(),
+            "stage_count":ctx.pipeline_plan.stages.len(),
             "stage_index":stage.stage_index,
             "stage_send_count":stage_send_count,
-            "loaded_stage_count":loaded_stages.len(),
+            "loaded_stage_count":ctx.loaded_stages.len(),
             "parallel_weight_acquisition":true,
             "resend_reason":dispatch_reason,
         }),
     );
     if stage_send_count == 1 || stage_send_count % 15 == 0 {
-        orch_datastream.emit_bootstrap(
-            dashboard,
-            run_id,
-            node_id,
+        ctx.orch_datastream.emit_bootstrap(
+            ctx.dashboard,
+            ctx.run_id,
+            ctx.node_id,
             "stage_provision_wait",
             "observed",
             json!({
                 "attempt":attempt,
-                "stage_count":pipeline_plan.stages.len(),
+                "stage_count":ctx.pipeline_plan.stages.len(),
                 "stage_index":stage.stage_index,
                 "stage_node_id":stage_node_id,
                 "stage_send_count":stage_send_count,
-                "loaded_stage_count":loaded_stages.len(),
+                "loaded_stage_count":ctx.loaded_stages.len(),
                 "liveness":stage_load_liveness_detail(
-                    load_progress.get(&stage_node_id),
+                    ctx.load_progress.get(&stage_node_id),
                     stage.stage_index,
                     stage_node_id,
                     member_state,
@@ -3577,47 +3424,24 @@ fn send_pipeline_stage_provision(
                 ),
                 "message":format!(
                     "loaded {} of {}; waiting on stage {}",
-                    loaded_stages.len(),
-                    pipeline_plan.stages.len(),
+                    ctx.loaded_stages.len(),
+                    ctx.pipeline_plan.stages.len(),
                     stage.stage_index
                 )
             }),
         );
     }
     provision_stage_from_plan(
-        stack,
+        ctx.stack,
         ready.node_actor,
-        pipeline_plan,
+        ctx.pipeline_plan,
         stage.stage_index,
-        readies,
-        pipeline_coordinator,
-        stage_shard_plans,
+        ctx.readies,
+        ctx.pipeline_coordinator,
+        ctx.stage_shard_plans,
     )?;
-    pump(driver, stack, frame_tx);
+    pump(ctx.driver, ctx.stack, ctx.frame_tx);
     Ok(())
-}
-
-struct FailedProvisionPlugin;
-
-impl ProvisionPlugin for FailedProvisionPlugin {
-    fn start_node(
-        &mut self,
-        _spec: NodeProvisionSpec,
-        _sink: PluginSink,
-    ) -> Result<crate::provisioning::PluginNodeHandle, String> {
-        Err("provider start worker disconnected".to_owned())
-    }
-
-    fn complete_bootstrap(
-        &mut self,
-        _handle: &crate::provisioning::PluginNodeHandle,
-    ) -> Result<(), String> {
-        Ok(())
-    }
-
-    fn stop_node(&mut self, _handle: &crate::provisioning::PluginNodeHandle) -> Result<(), String> {
-        Ok(())
-    }
 }
 
 struct PromptWork {
@@ -4226,10 +4050,6 @@ impl OrchStdioCapture {
     fn install() -> Result<Option<mpsc::Receiver<OrchStdioLine>>, String> {
         Ok(None)
     }
-}
-
-fn install_orch_stdio_capture() -> Result<Option<mpsc::Receiver<OrchStdioLine>>, String> {
-    OrchStdioCapture::install()
 }
 
 fn drain_orch_stdio_capture(
@@ -4982,13 +4802,20 @@ impl PipelinePromptRuntime {
         tokens: &[u32],
         begin_sequence: bool,
     ) -> Result<(), String> {
-        self.token_in_sender.send(encode_token_record_with_flags(
-            self.token_spec,
-            sequence,
-            tokens,
-            false,
-            begin_sequence,
-        )?)
+        let payload = tokens
+            .iter()
+            .flat_map(|token| token.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut flags = ingress::ObjectFlags::default();
+        flags.begin_sequence = begin_sequence;
+        self.token_in_sender.send(
+            ingress::ObjectRecordBuilder::new(ingress_object_spec_from_plan(self.token_spec))
+                .object_id(ingress::ObjectId(9000_u64.saturating_add(sequence)))
+                .sequence(sequence)
+                .payload(payload)
+                .flags(flags)
+                .encode(),
+        )
     }
 
     fn request_decode(
@@ -5125,30 +4952,6 @@ impl PipelinePromptRuntime {
     }
 }
 
-fn encode_token_record_with_flags(
-    spec: run_plan::ObjectSpec,
-    sequence: u64,
-    tokens: &[u32],
-    eos: bool,
-    begin_sequence: bool,
-) -> Result<Vec<u8>, String> {
-    let payload = tokens
-        .iter()
-        .flat_map(|token| token.to_le_bytes())
-        .collect::<Vec<_>>();
-    let mut flags = ingress::ObjectFlags::default();
-    flags.end_of_sequence = eos;
-    flags.begin_sequence = begin_sequence;
-    Ok(
-        ingress::ObjectRecordBuilder::new(ingress_object_spec_from_plan(spec))
-            .object_id(ingress::ObjectId(9000_u64.saturating_add(sequence)))
-            .sequence(sequence)
-            .payload(payload)
-            .flags(flags)
-            .encode(),
-    )
-}
-
 fn ingress_object_spec_from_plan(spec: run_plan::ObjectSpec) -> ingress::ObjectSpec {
     let extent_alignment = match spec.kind {
         run_plan::ObjectKind::Token => u64::from(spec.dtype_width_bytes),
@@ -5192,20 +4995,6 @@ fn take_pipeline_token_record(
     Ok(Some(out))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PromptRuntimeMode {
-    DirectInferPrompt,
-    PipelineTokenEdges,
-}
-
-fn prompt_runtime_mode(pipeline_plan: Option<&run_plan::RunPlan>) -> PromptRuntimeMode {
-    if pipeline_plan.is_some() {
-        PromptRuntimeMode::PipelineTokenEdges
-    } else {
-        PromptRuntimeMode::DirectInferPrompt
-    }
-}
-
 fn serve_prompts(
     ctx: RuntimeReadyAckLoop<'_>,
     work_rx: &mpsc::Receiver<PromptWork>,
@@ -5234,16 +5023,16 @@ fn serve_prompts(
         provider,
         ..
     } = ctx;
-    let mut pipeline_runtime = match prompt_runtime_mode(pipeline_plan) {
-        PromptRuntimeMode::PipelineTokenEdges => Some(PipelinePromptRuntime::new(
+    let mut pipeline_runtime = match pipeline_plan {
+        Some(plan) => Some(PipelinePromptRuntime::new(
             driver,
-            pipeline_plan.expect("pipeline mode requires plan"),
+            plan,
             prompt_endpoint,
             tokenizer_encode_actor,
             tokenizer_decode_actor,
             tokenizer_reply_to,
         )?),
-        PromptRuntimeMode::DirectInferPrompt => None,
+        None => None,
     };
     let mut active: Option<ActivePrompt> = None;
     loop {
@@ -5393,9 +5182,13 @@ fn serve_prompts(
                 continue;
             }
 
-            let terminal = event.is_terminal();
-            let completion_status = prompt_completion_status(&event);
-            let completion_detail = prompt_completion_detail(&event);
+            let completion = match &event {
+                PromptEvent::Done { .. } => Some(("ready", json!({"event":"Done"}))),
+                PromptEvent::Fault { error, .. } => {
+                    Some(("failed", json!({"event":"Fault","error":error})))
+                }
+                PromptEvent::TextDelta { .. } => None,
+            };
             orch_datastream.emit_prompt(
                 dashboard,
                 run_id,
@@ -5406,15 +5199,15 @@ fn serve_prompts(
                 prompt_event_detail(&event),
             );
             let _ = current.events.send(event);
-            if terminal {
+            if let Some((status, detail)) = completion {
                 orch_datastream.emit_prompt(
                     dashboard,
                     run_id,
                     node_id,
                     request_id,
                     "prompt_complete",
-                    completion_status,
-                    completion_detail,
+                    status,
+                    detail,
                 );
                 active = None;
             }
@@ -5455,42 +5248,12 @@ fn prompt_event_detail(event: &PromptEvent) -> Value {
     }
 }
 
-fn prompt_completion_status(event: &PromptEvent) -> &'static str {
-    match event {
-        PromptEvent::Done { .. } => "ready",
-        PromptEvent::Fault { .. } => "failed",
-        PromptEvent::TextDelta { .. } => "observed",
-    }
-}
-
-fn prompt_completion_detail(event: &PromptEvent) -> Value {
-    match event {
-        PromptEvent::Done { .. } => json!({"event":"Done"}),
-        PromptEvent::Fault { error, .. } => json!({"event":"Fault","error":error}),
-        PromptEvent::TextDelta { .. } => json!({"event":"TextDelta"}),
-    }
-}
-
 fn stop_requested(stop_rx: &mpsc::Receiver<()>) -> bool {
     stop_rx.try_recv().is_ok()
 }
 
 fn spawn_stop_listener() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel();
-    let stdin_tx = tx.clone();
-    thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines().map_while(Result::ok) {
-            let trimmed = line.trim();
-            if trimmed.eq_ignore_ascii_case("stop")
-                || trimmed.eq_ignore_ascii_case("shutdown")
-                || trimmed.eq_ignore_ascii_case("quit")
-            {
-                let _ = stdin_tx.send(());
-                break;
-            }
-        }
-    });
     #[cfg(target_os = "linux")]
     {
         thread::spawn(move || {
@@ -5680,7 +5443,7 @@ fn emit_swim_transitions(
     stack: &DistributionRuntimeStack,
 ) {
     for transition in stack.drain_swim_transitions() {
-        let peer = format_dist_node_id(transition.peer);
+        let peer = format!("{:?}", transition.peer);
         let from = transition.from.map(|state| format!("{:?}", state));
         let to = format!("{:?}", transition.to);
         let member_state = stack
@@ -5744,7 +5507,7 @@ fn swim_probe_event_record(
     let budget_ms = event.budget_ms;
     SwimProbeEvent {
         event: event.event.to_owned(),
-        target: format_dist_node_id(event.target),
+        target: format!("{:?}", event.target),
         sequence: event.sequence,
         kind: event.kind.to_owned(),
         rtt_ms: event.rtt_ms,
@@ -5772,12 +5535,8 @@ fn swim_recent_probe_targets(stack: &DistributionRuntimeStack) -> Vec<String> {
         .swim_telemetry
         .recent_targets()
         .into_iter()
-        .map(format_dist_node_id)
+        .map(|node_id| format!("{:?}", node_id))
         .collect()
-}
-
-fn format_dist_node_id(node_id: DistNodeId) -> String {
-    format!("{:?}", node_id)
 }
 
 fn duration_ms_u64(duration: Duration) -> u64 {
@@ -5803,48 +5562,41 @@ fn env_optional(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn docker_container_prefix() -> String {
-    env_optional(MVP_DOCKER_CONTAINER_PREFIX_ENV)
-        .unwrap_or_else(|| DEFAULT_DOCKER_CONTAINER_PREFIX.to_owned())
-}
-
-fn optional_env(name: &str) -> Option<(String, String)> {
-    env_optional(name).map(|value| (name.to_owned(), value))
-}
-
 fn local_tinygrad_worker_env(provider: &ProviderKind) -> Option<(String, String)> {
-    optional_env("MVP_TINYGRAD_WORKER").or_else(|| {
-        if provider != &provider_kind::process() {
-            return None;
-        }
-        default_local_tinygrad_worker_path().map(|path| {
-            (
-                "MVP_TINYGRAD_WORKER".to_owned(),
-                path.to_string_lossy().to_string(),
-            )
+    env_optional("MVP_TINYGRAD_WORKER")
+        .map(|value| ("MVP_TINYGRAD_WORKER".to_owned(), value))
+        .or_else(|| {
+            if provider != &provider_kind::process() {
+                return None;
+            }
+            default_local_tinygrad_worker_path().map(|path| {
+                (
+                    "MVP_TINYGRAD_WORKER".to_owned(),
+                    path.to_string_lossy().to_string(),
+                )
+            })
         })
-    })
 }
 
 fn default_local_tinygrad_worker_path() -> Option<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join("apps").join("mvp-node").join("tinygrad_worker.py"));
+    let cwd_candidate = std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join("apps").join("mvp-node").join("tinygrad_worker.py"));
+    if let Some(candidate) = cwd_candidate.filter(|path| path.is_file()) {
+        return Some(candidate.canonicalize().unwrap_or(candidate));
     }
-    candidates.push(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..")
-            .join("apps")
-            .join("mvp-node")
-            .join("tinygrad_worker.py"),
-    );
-    for candidate in candidates {
-        if candidate.is_file() {
-            return Some(candidate.canonicalize().unwrap_or(candidate));
-        }
-    }
-    None
+
+    let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("apps")
+        .join("mvp-node")
+        .join("tinygrad_worker.py");
+    manifest_candidate.is_file().then(|| {
+        manifest_candidate
+            .canonicalize()
+            .unwrap_or(manifest_candidate)
+    })
 }
 
 fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {

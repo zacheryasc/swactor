@@ -12,28 +12,18 @@ pub fn run_chat_from_args<I>(args: I) -> std::process::ExitCode
 where
     I: IntoIterator<Item = String>,
 {
-    chat::run_from_args(args)
+    chat::runtime::run_from_args(args)
 }
 
 pub fn run_orchestrator_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
-    orchestration::run_from_args(args)
+    orchestration::app::run_with_options(args, true, None)
 }
 
 pub fn run_worker_node_from_env() -> std::process::ExitCode {
-    node::run_worker_node_from_env()
-}
-
-fn run_orchestrator_in_process_from_args<I>(
-    args: I,
-    stop_rx: std::sync::mpsc::Receiver<()>,
-) -> Result<(), String>
-where
-    I: IntoIterator<Item = String>,
-{
-    orchestration::run_in_process_from_args(args, stop_rx)
+    node::worker_node_runtime::run_from_env()
 }
 
 #[path = "transport/driver_pumps.rs"]

@@ -1,19 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use crate::run_plan::NodeId;
 
-use super::error::{LaunchError, NodeControlError};
-use super::node_image::NodeImageSpec;
-use super::pool::{NodeCapability, NodeLease, ResourceFacts};
+use super::error::NodeControlError;
+use super::pool::{NodeCapability, NodeLease};
 use super::roles::RoleAssignment;
-
-pub trait NodeLauncher: Send + Sync {
-    fn launch_node(
-        &self,
-        lease: &NodeLease,
-        spec: NodeLaunchSpec,
-    ) -> Result<LaunchedNode, LaunchError>;
-}
 
 pub trait NodeControl: Send {
     fn wait_boot_ready(&mut self) -> Result<NodeFacts, NodeControlError>;
@@ -23,33 +14,18 @@ pub trait NodeControl: Send {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeLaunchSpec {
-    pub cluster_id: String,
-    pub image: NodeImageSpec,
-    pub coordinator: Option<CoordinatorJoinSpec>,
-    pub is_coordinator: bool,
-    pub env: BTreeMap<String, String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CoordinatorJoinSpec {
-    pub endpoint: String,
-}
+pub struct NodeLaunchSpec;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeFacts {
     pub node_id: NodeId,
-    pub coordinator_endpoint: Option<String>,
-    pub resources: ResourceFacts,
     pub capabilities: BTreeSet<NodeCapability>,
 }
 
 impl NodeFacts {
-    pub fn from_lease(lease: &NodeLease, coordinator_endpoint: Option<String>) -> Self {
+    pub fn from_lease(lease: &NodeLease) -> Self {
         Self {
             node_id: lease.logical_node_id,
-            coordinator_endpoint,
-            resources: lease.expected_resources.clone(),
             capabilities: lease.capabilities.clone(),
         }
     }
@@ -63,18 +39,10 @@ pub struct LaunchedNode {
 #[derive(Clone, Debug, Default)]
 pub struct StaticNodeLauncher;
 
-impl NodeLauncher for StaticNodeLauncher {
-    fn launch_node(
-        &self,
-        lease: &NodeLease,
-        spec: NodeLaunchSpec,
-    ) -> Result<LaunchedNode, LaunchError> {
-        let endpoint = format!(
-            "static://{}/node/{}",
-            spec.cluster_id, lease.logical_node_id.0
-        );
-        let facts = NodeFacts::from_lease(lease, Some(endpoint));
-        Ok(LaunchedNode {
+impl StaticNodeLauncher {
+    pub fn launch_node(&self, lease: &NodeLease, _spec: NodeLaunchSpec) -> LaunchedNode {
+        let facts = NodeFacts::from_lease(lease);
+        LaunchedNode {
             lease: lease.clone(),
             control: Box::new(StaticNodeControl {
                 facts,
@@ -82,7 +50,7 @@ impl NodeLauncher for StaticNodeLauncher {
                 stopped: false,
                 assigned_roles: Vec::new(),
             }),
-        })
+        }
     }
 }
 
@@ -123,7 +91,7 @@ impl NodeControl for StaticNodeControl {
         }
         if expected_alive == 0 {
             return Err(NodeControlError::Backend(
-                "expected_alive must be greater than zero".to_owned(),
+                "expected_alive must be greater than zero",
             ));
         }
         Ok(())

@@ -1,17 +1,12 @@
 use crate::run_plan::{self, NodeId};
 
-use super::model::ModelSpec;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CoordinatorAssignment {
-    pub cluster_id: String,
     pub node_id: NodeId,
-    pub model: ModelSpec,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageAssignment {
-    pub cluster_id: String,
     pub provision: run_plan::ProvisionStage,
 }
 

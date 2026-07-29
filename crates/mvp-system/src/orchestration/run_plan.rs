@@ -137,14 +137,6 @@ impl RuntimeConfig {
             token_output_policy: TokenOutputPolicy::EmitAll,
         }
     }
-
-    fn plan(&self) -> RuntimePlan {
-        RuntimePlan {
-            prompt: self.prompt.clone(),
-            sampling: self.sampling,
-            token_output_policy: self.token_output_policy,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -389,7 +381,11 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
     validate_global_input(&input)?;
     let placements = validated_placements(&input)?;
     let model = model_plan(&input.model)?;
-    let runtime = input.runtime.plan();
+    let runtime = RuntimePlan {
+        prompt: input.runtime.prompt.clone(),
+        sampling: input.runtime.sampling,
+        token_output_policy: input.runtime.token_output_policy,
+    };
     let max_tokens = input.runtime.max_tokens;
     let gguf_source = model.gguf_source.clone();
     let hidden_dim = model.hidden_dim;

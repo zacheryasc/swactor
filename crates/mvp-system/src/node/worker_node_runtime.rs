@@ -26,7 +26,7 @@ use crate::driver_pumps as driver_model;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
 use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
-    StageObjectSpecWire, StageOutboundEdgeWire, StageRingSpecWire,
+    StageObjectSpecWire, StageOutboundEdgeWire,
 };
 use crate::observability::benchmark;
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
@@ -908,8 +908,16 @@ impl WorkerEdgeRuntime {
                 run_id: edge::RunId(config.run_id),
                 edge_id: edge::EdgeId(edge.edge_id),
                 local_node_id: edge::NodeId(config.logical_node_id),
-                object_spec: edge_object_spec(edge.object_spec),
-                ring_spec: edge_ring_spec(edge.ring_spec),
+                object_spec: edge::ObjectSpec {
+                    kind: edge::ObjectKind::Activation,
+                    dtype: edge::DType::F16,
+                    max_extent_bytes: edge.object_spec.max_extent,
+                },
+                ring_spec: edge::RingSpec {
+                    header_bytes: 0,
+                    data_bytes: edge.ring_spec.data_capacity,
+                    alignment: u64::from(edge.ring_spec.alignment),
+                },
             }));
         self.drive_edge_workflow(
             stack,
@@ -954,8 +962,16 @@ impl WorkerEdgeRuntime {
                 edge_id: edge::EdgeId(edge.edge_id),
                 local_node_id: edge::NodeId(config.logical_node_id),
                 consumer_node_id: edge::NodeId(edge.consumer_node_id),
-                object_spec: edge_object_spec(edge.object_spec),
-                ring_spec: edge_ring_spec(edge.ring_spec),
+                object_spec: edge::ObjectSpec {
+                    kind: edge::ObjectKind::Activation,
+                    dtype: edge::DType::F16,
+                    max_extent_bytes: edge.object_spec.max_extent,
+                },
+                ring_spec: edge::RingSpec {
+                    header_bytes: 0,
+                    data_bytes: edge.ring_spec.data_capacity,
+                    alignment: u64::from(edge.ring_spec.alignment),
+                },
             }));
         self.drive_edge_workflow(
             stack,
@@ -1581,29 +1597,6 @@ impl WorkerEdgeRuntime {
 fn duration_ms_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
-fn edge_object_spec(spec: StageObjectSpecWire) -> edge::ObjectSpec {
-    edge::ObjectSpec {
-        kind: edge::ObjectKind::Activation,
-        dtype: edge::DType::F16,
-        max_extent_bytes: spec.max_extent,
-    }
-}
-
-fn edge_ring_spec(spec: StageRingSpecWire) -> edge::RingSpec {
-    edge::RingSpec {
-        header_bytes: 0,
-        data_bytes: spec.data_capacity,
-        alignment: u64::from(spec.alignment),
-    }
-}
-
-fn ingress_object_spec(spec: StageObjectSpecWire) -> ingress::ObjectSpec {
-    ingress::ObjectSpec {
-        max_extent: spec.max_extent,
-        alignment: u64::from(spec.alignment),
-        layout: ingress::ObjectLayout::Token,
-    }
-}
 
 struct IngressRecordBytes {
     bytes: Vec<u8>,
@@ -1618,8 +1611,16 @@ fn take_complete_ingress_record(
     buffer: &mut Vec<u8>,
     spec: StageObjectSpecWire,
 ) -> Result<Option<IngressRecordBytes>, String> {
-    let record = match ingress::read_object_record(buffer, ingress_object_spec(spec), false)
-        .map_err(|reason| format!("invalid object record: {reason:?}"))?
+    let record = match ingress::read_object_record(
+        buffer,
+        ingress::ObjectSpec {
+            max_extent: spec.max_extent,
+            alignment: u64::from(spec.alignment),
+            layout: ingress::ObjectLayout::Token,
+        },
+        false,
+    )
+    .map_err(|reason| format!("invalid object record: {reason:?}"))?
     {
         ingress::ObjectRecordRead::Incomplete => return Ok(None),
         ingress::ObjectRecordRead::Complete(record) => record,
@@ -1642,21 +1643,25 @@ fn value_u64(value: &Value, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("helper event missing numeric {field}: {value}"))
 }
 
-pub(super) fn run_from_env() -> ExitCode {
-    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    if args.first().map(String::as_str) == Some("debug-join") {
-        args.remove(0);
-        return debug_join_client_main(args);
-    }
-    if args.first().map(String::as_str) == Some("stage-shard-fetcher") {
-        return stage_shard_fetcher_main();
-    }
-    match run() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("mvp-worker-node: {error}");
-            ExitCode::from(1)
-        }
+pub(crate) fn run_from_env() -> ExitCode {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("debug-join") => debug_join_client_main(args.collect()),
+        Some("stage-shard-fetcher") => match run_stage_shard_fetcher() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let event = json!({"type":"StageShardFetchFailed","error":error});
+                println!("{event}");
+                ExitCode::from(1)
+            }
+        },
+        _ => match run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("mvp-worker-node: {error}");
+                ExitCode::from(1)
+            }
+        },
     }
 }
 
@@ -1664,17 +1669,6 @@ pub(super) fn run_from_env() -> ExitCode {
 struct StageShardFetchRequest {
     plan: StageShardPlan,
     output_path: PathBuf,
-}
-
-fn stage_shard_fetcher_main() -> ExitCode {
-    match run_stage_shard_fetcher() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            let event = json!({"type":"StageShardFetchFailed","error":error});
-            println!("{event}");
-            ExitCode::from(1)
-        }
-    }
 }
 
 fn run_stage_shard_fetcher() -> Result<(), String> {
@@ -1858,7 +1852,7 @@ fn run() -> Result<(), String> {
     };
     let arena_fd = arena_manager.lock().arena_fd();
 
-    let mut datastream = node_datastream(&config);
+    let mut datastream = NodeDatastream::new(&config);
     let datastream_transport = driver.datastream_publish_handle();
     let datastream_publisher = match stack
         .runtime
@@ -2338,7 +2332,7 @@ fn emit_swim_telemetry(
     local_phase: &str,
 ) {
     for transition in stack.drain_swim_transitions() {
-        let peer = format_dist_node_id(transition.peer);
+        let peer = format!("{:?}", transition.peer);
         let from = transition.from.map(|state| format!("{:?}", state));
         let to = format!("{:?}", transition.to);
         let member_state = stack
@@ -2375,7 +2369,7 @@ fn swim_probe_event_record(
     let budget_ms = event.budget_ms;
     SwimProbeEvent {
         event: event.event.to_owned(),
-        target: format_dist_node_id(event.target),
+        target: format!("{:?}", event.target),
         sequence: event.sequence,
         kind: event.kind.to_owned(),
         rtt_ms: event.rtt_ms,
@@ -2403,16 +2397,8 @@ fn swim_recent_probe_targets(stack: &DistributionRuntimeStack) -> Vec<String> {
         .swim_telemetry
         .recent_targets()
         .into_iter()
-        .map(format_dist_node_id)
+        .map(|node_id| format!("{:?}", node_id))
         .collect()
-}
-
-fn format_dist_node_id(node_id: DistNodeId) -> String {
-    format!("{:?}", node_id)
-}
-
-fn node_datastream(config: &DeploymentConfig) -> NodeDatastream {
-    NodeDatastream::new(config)
 }
 
 #[derive(Clone, Copy)]
@@ -3989,8 +3975,18 @@ struct DeploymentConfig {
 
 impl DeploymentConfig {
     fn from_env() -> Result<Self, String> {
-        let run_id = env_u64("MVP_RUN_ID", 1)?;
-        let logical_node_id = env_u64("MVP_LOGICAL_NODE_ID", 1)?;
+        macro_rules! env_parse {
+            ($name:expr, $default:expr) => {
+                match env_optional($name) {
+                    Some(value) => value
+                        .parse()
+                        .map_err(|e| format!("invalid {}={value:?}: {e}", $name)),
+                    None => Ok($default),
+                }
+            };
+        }
+        let run_id = env_parse!("MVP_RUN_ID", 1)?;
+        let logical_node_id = env_parse!("MVP_LOGICAL_NODE_ID", 1)?;
         let relay = relay_runtime_config_from_env(run_id)?;
         let debug_join_socket = match env_optional("MVP_DEBUG_JOIN_SOCKET").as_deref() {
             Some("disabled") => None,
@@ -4004,7 +4000,7 @@ impl DeploymentConfig {
                     .into_owned(),
             ),
         };
-        let provider = env_string("MVP_NODE_PROVIDER", "process");
+        let provider = env_optional("MVP_NODE_PROVIDER").unwrap_or_else(|| "process".to_owned());
         let default_device = if provider == "process" {
             "CPU"
         } else {
@@ -4013,9 +4009,19 @@ impl DeploymentConfig {
         Ok(Self {
             run_id,
             logical_node_id,
-            stage_index: env_u32("MVP_STAGE_INDEX", 0)?,
-            coordinator_endpoint: env_json("MVP_COORDINATOR_ENDPOINT")?,
-            orchestrator_actor: env_json("MVP_ORCHESTRATOR_ACTOR")?,
+            stage_index: env_parse!("MVP_STAGE_INDEX", 0)?,
+            coordinator_endpoint: env_optional("MVP_COORDINATOR_ENDPOINT")
+                .map(|value| {
+                    serde_json::from_str::<EndpointAddr>(&value)
+                        .map_err(|e| format!("invalid MVP_COORDINATOR_ENDPOINT JSON: {e}"))
+                })
+                .transpose()?,
+            orchestrator_actor: env_optional("MVP_ORCHESTRATOR_ACTOR")
+                .map(|value| {
+                    serde_json::from_str::<ActorAddress>(&value)
+                        .map_err(|e| format!("invalid MVP_ORCHESTRATOR_ACTOR JSON: {e}"))
+                })
+                .transpose()?,
             datastream_frame_log: env_optional("MVP_DATASTREAM_FRAME_LOG"),
             debug_join_socket,
             relay_mode: relay.mode,
@@ -4024,16 +4030,29 @@ impl DeploymentConfig {
                 .map(EndpointAddrMask::parse)
                 .transpose()?
                 .unwrap_or_default(),
-            worker_script: env_string("MVP_TINYGRAD_WORKER", DEFAULT_WORKER_SCRIPT),
-            device: env_string("DEV", default_device),
-            model_id: env_string("MVP_MODEL_ID", DEFAULT_MODEL_ID),
-            gguf_source: gguf_source_from_env(),
-            tokenizer: tokenizer_from_env(),
+            worker_script: env_optional("MVP_TINYGRAD_WORKER")
+                .unwrap_or_else(|| DEFAULT_WORKER_SCRIPT.to_owned()),
+            device: env_optional("DEV").unwrap_or_else(|| default_device.to_owned()),
+            model_id: env_optional("MVP_MODEL_ID").unwrap_or_else(|| DEFAULT_MODEL_ID.to_owned()),
+            gguf_source: if let Some(path) = env_optional("MVP_GGUF_LOCAL_PATH") {
+                GgufSource::LocalPath(path)
+            } else {
+                GgufSource::HuggingFaceGguf {
+                    repo: env_optional("MVP_GGUF_REPO")
+                        .unwrap_or_else(|| DEFAULT_HF_REPO.to_owned()),
+                    file: env_optional("MVP_GGUF_FILE")
+                        .unwrap_or_else(|| DEFAULT_HF_FILE.to_owned()),
+                    revision: env_optional("MVP_GGUF_REVISION"),
+                }
+            },
+            tokenizer: env_optional("MVP_TOKENIZER_LOCAL_PATH")
+                .map(TokenizerSource::LocalPath)
+                .unwrap_or(TokenizerSource::EmbeddedGguf),
             self_test_prompt: env_optional("MVP_NODE_SELF_TEST_PROMPT"),
-            self_test_layer_end: env_u32("MVP_SELF_TEST_LAYER_END", 16)?,
-            self_test_max_tokens: env_u32("MVP_SELF_TEST_MAX_TOKENS", 1)?,
-            arena_bytes: env_u64("MVP_ARENA_BYTES", DEFAULT_ARENA_BYTES)?,
-            arena_alignment: env_u64("MVP_ARENA_ALIGNMENT", DEFAULT_ARENA_ALIGNMENT)?,
+            self_test_layer_end: env_parse!("MVP_SELF_TEST_LAYER_END", 16)?,
+            self_test_max_tokens: env_parse!("MVP_SELF_TEST_MAX_TOKENS", 1)?,
+            arena_bytes: env_parse!("MVP_ARENA_BYTES", DEFAULT_ARENA_BYTES)?,
+            arena_alignment: env_parse!("MVP_ARENA_ALIGNMENT", DEFAULT_ARENA_ALIGNMENT)?,
         })
     }
 }
@@ -4788,57 +4807,9 @@ fn spawn_stdin_shutdown_listener() -> Receiver<()> {
     rx
 }
 
-fn env_string(name: &str, default: &str) -> String {
-    env_optional(name).unwrap_or_else(|| default.to_owned())
-}
-
 fn env_optional(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-}
-
-fn env_u64(name: &str, default: u64) -> Result<u64, String> {
-    match env_optional(name) {
-        Some(value) => value
-            .parse::<u64>()
-            .map_err(|e| format!("invalid {name}={value:?}: {e}")),
-        None => Ok(default),
-    }
-}
-
-fn env_u32(name: &str, default: u32) -> Result<u32, String> {
-    match env_optional(name) {
-        Some(value) => value
-            .parse::<u32>()
-            .map_err(|e| format!("invalid {name}={value:?}: {e}")),
-        None => Ok(default),
-    }
-}
-
-fn env_json<T>(name: &str) -> Result<Option<T>, String>
-where
-    T: serde::de::DeserializeOwned,
-{
-    env_optional(name)
-        .map(|value| serde_json::from_str(&value).map_err(|e| format!("invalid {name} JSON: {e}")))
-        .transpose()
-}
-
-fn gguf_source_from_env() -> GgufSource {
-    if let Some(path) = env_optional("MVP_GGUF_LOCAL_PATH") {
-        return GgufSource::LocalPath(path);
-    }
-    GgufSource::HuggingFaceGguf {
-        repo: env_string("MVP_GGUF_REPO", DEFAULT_HF_REPO),
-        file: env_string("MVP_GGUF_FILE", DEFAULT_HF_FILE),
-        revision: env_optional("MVP_GGUF_REVISION"),
-    }
-}
-
-fn tokenizer_from_env() -> TokenizerSource {
-    env_optional("MVP_TOKENIZER_LOCAL_PATH")
-        .map(TokenizerSource::LocalPath)
-        .unwrap_or(TokenizerSource::EmbeddedGguf)
 }

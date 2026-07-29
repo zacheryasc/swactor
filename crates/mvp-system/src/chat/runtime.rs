@@ -22,10 +22,9 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 #[cfg(target_os = "linux")]
 use signal_hook::iterator::Signals;
 
-use crate::chat::config as chat_config;
 use crate::chat::node_image::{
-    NodeImageProgressEvent, NodeImageProgressEventKind, NodeImageProgressSink, NodeImageProvider,
-    NodeImageRequest, prepare_node_image_with_progress,
+    NodeImageProgressEvent, NodeImageProgressEventKind, NodeImageProgressSink, NodeImageRequest,
+    prepare_node_image_with_progress,
 };
 use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::observability::{benchmark, frame_archive::FrameArchive};
@@ -37,6 +36,7 @@ use crate::{
     DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT, DEFAULT_PIPELINE_CACHED_MODEL_REPO,
 };
 
+const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:19777";
 const BASE_NODE_IMAGE: &str = "swactor-mvp-node-base:cuda12.6";
 const REPO_MODEL_CACHE_DIR: &str = ".model-cache";
@@ -79,34 +79,17 @@ enum PromptInput {
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PROMPT_STOP_TX: Mutex<Option<mpsc::Sender<PromptInput>>> = Mutex::new(None);
 
-pub(super) fn run_from_args<I>(args: I) -> ExitCode
+pub(crate) fn run_from_args<I>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = String>,
 {
-    match run_from_args_result(args) {
+    match install_signal_handlers().and_then(|()| run(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("mvp-chat: {error}");
             ExitCode::from(1)
         }
     }
-}
-
-fn run_from_args_result<I>(args: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = String>,
-{
-    install_signal_handlers()?;
-    run(args)
-}
-
-fn print_usage() {
-    println!("{MVP_CHAT_USAGE}");
-}
-
-fn is_help_request(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
 }
 
 struct RuntimeEnvGuard {
@@ -142,8 +125,11 @@ where
     I: IntoIterator<Item = String>,
 {
     let provided_args = args.into_iter().collect::<Vec<_>>();
-    if is_help_request(&provided_args) {
-        print_usage();
+    if provided_args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
+    {
+        println!("{MVP_CHAT_USAGE}");
         return Ok(());
     }
     let config = Config::from_args(provided_args)?;
@@ -164,7 +150,8 @@ where
     );
     progress.emit_benchmark_envelope(&config);
     progress.emit_endpoint_config_snapshot(&config);
-    confirm_vastai_if_needed(&config)?;
+    let mut approval = StdinVastAiApproval;
+    confirm_vastai_if_needed_with_approval(&config, &mut approval)?;
     let prepare_runtime_started = Instant::now();
     progress.emit(
         CHAT_RUNTIME_CHANNEL,
@@ -174,7 +161,7 @@ where
     );
     let image_ref = match prepare_runtime_with_progress(
         &config,
-        prepare_node_image_progress_adapter,
+        prepare_node_image_with_progress,
         Some(&mut progress),
     ) {
         Ok(image_ref) => {
@@ -318,7 +305,36 @@ where
             return Err(error);
         }
     };
-    let result = run_chat_loop_with_progress(&rpc_addr, config.max_tokens, Some(&mut progress));
+    let (prompt_tx, input_rx) = mpsc::channel();
+    if STOP_REQUESTED.load(Ordering::SeqCst) {
+        let _ = prompt_tx.send(PromptInput::StopRequested);
+    }
+    if let Ok(mut stop_tx) = PROMPT_STOP_TX.lock() {
+        *stop_tx = Some(prompt_tx.clone());
+    }
+    thread::spawn(move || {
+        let stdin = io::stdin();
+        for line in stdin.lock().lines() {
+            match line {
+                Ok(line) => {
+                    if prompt_tx.send(PromptInput::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(_) => {
+                    let _ = prompt_tx.send(PromptInput::Closed);
+                    return;
+                }
+            }
+        }
+        let _ = prompt_tx.send(PromptInput::Closed);
+    });
+    let result = run_chat_loop_with_input_and_progress(
+        &rpc_addr,
+        config.max_tokens,
+        input_rx,
+        Some(&mut progress),
+    );
     progress.emit(
         CHAT_LIFECYCLE_CHANNEL,
         "shutdown",
@@ -739,13 +755,8 @@ struct ChatModelConfig {
     max_context: Option<u32>,
 }
 
-#[derive(Clone, Debug)]
-struct LoadedChatTomlConfig {
-    overlay: ChatTomlConfig,
-}
-
-fn load_chat_config(path: Option<&Path>) -> Result<LoadedChatTomlConfig, String> {
-    let overlay = match path {
+fn load_chat_config(path: Option<&Path>) -> Result<ChatTomlConfig, String> {
+    Ok(match path {
         Some(path) => {
             let text = fs::read_to_string(path)
                 .map_err(|e| format!("read config {}: {e}", path.display()))?;
@@ -753,7 +764,7 @@ fn load_chat_config(path: Option<&Path>) -> Result<LoadedChatTomlConfig, String>
                 .map_err(|e| format!("parse config {}: {e}", path.display()))?
         }
         None => {
-            let default = Path::new(chat_config::DEFAULT_CONFIG_PATH);
+            let default = Path::new(DEFAULT_CONFIG_PATH);
             if !default.is_file() {
                 ChatTomlConfig::default()
             } else {
@@ -763,8 +774,7 @@ fn load_chat_config(path: Option<&Path>) -> Result<LoadedChatTomlConfig, String>
                     .map_err(|e| format!("parse config {}: {e}", default.display()))?
             }
         }
-    };
-    Ok(LoadedChatTomlConfig { overlay })
+    })
 }
 
 impl Config {
@@ -773,8 +783,7 @@ impl Config {
         I: IntoIterator<Item = String>,
     {
         let args = ParsedArgs::parse(provided_args)?;
-        let loaded = load_chat_config(args.config_path.as_deref())?;
-        let toml = loaded.overlay;
+        let toml = load_chat_config(args.config_path.as_deref())?;
         let provider = provider_from_sources(args.provider.clone(), toml.provider.kind.as_deref())?;
         let node_image = first_non_empty([toml.image.node.clone()]).unwrap_or_default();
         if provider != provider_kind::process() && node_image.is_empty() {
@@ -797,8 +806,8 @@ impl Config {
         };
 
         Ok(Self {
-            orch_bin: default_orch_bin()?,
-            worker_bin: node_bin_for_current_profile()?,
+            orch_bin: artifact_root().join("target/debug/mvp-orchestrator"),
+            worker_bin: default_worker_bin(),
             rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
             node_image,
             provider,
@@ -1248,12 +1257,11 @@ fn resolve_vastai_config(
 }
 
 fn first_non_empty<const N: usize>(values: [Option<String>; N]) -> Option<String> {
-    values.into_iter().find_map(chat_config::normalize_optional)
-}
-
-fn confirm_vastai_if_needed(config: &Config) -> Result<(), String> {
-    let mut approval = StdinVastAiApproval;
-    confirm_vastai_if_needed_with_approval(config, &mut approval)
+    values
+        .into_iter()
+        .flatten()
+        .map(|value| value.trim().to_owned())
+        .find(|value| !value.is_empty())
 }
 
 trait VastAiApproval {
@@ -1322,11 +1330,10 @@ where
     input
         .read_line(&mut line)
         .map_err(|e| format!("read Vast.ai approval: {e}"))?;
-    Ok(parse_approval(&line))
-}
-
-fn parse_approval(input: &str) -> bool {
-    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 enum OrchHandle {
@@ -1368,8 +1375,9 @@ impl InProcessOrch {
     fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
         let args = config.orchestrator_cli_args(image_ref);
         let (stop_tx, stop_rx) = mpsc::channel();
-        let thread =
-            thread::spawn(move || crate::run_orchestrator_in_process_from_args(args, stop_rx));
+        let thread = thread::spawn(move || {
+            crate::orchestration::app::run_with_options(args, false, Some(stop_rx))
+        });
         Ok(Self {
             stop_tx: Some(stop_tx),
             thread: Some(thread),
@@ -1397,9 +1405,12 @@ impl InProcessOrch {
                 Err(error) => return Err(format!("connect prompt RPC {rpc_addr}: {error}")),
             }
             if let Some(result) = self.take_finished_result() {
+                let reason = match result {
+                    Ok(()) => "completed successfully".to_owned(),
+                    Err(error) => error,
+                };
                 return Err(format!(
-                    "in-process orchestrator exited before prompt RPC ready: {}",
-                    render_orch_thread_result(result)
+                    "in-process orchestrator exited before prompt RPC ready: {reason}"
                 ));
             }
             thread::sleep(Duration::from_millis(100));
@@ -1445,21 +1456,6 @@ impl Drop for InProcessOrch {
     }
 }
 
-fn render_orch_thread_result(result: Result<(), String>) -> String {
-    match result {
-        Ok(()) => "completed successfully".to_owned(),
-        Err(error) => error,
-    }
-}
-
-fn orchestrator_shutdown_grace(provider: &ProviderKind) -> Duration {
-    if provider == &provider_kind::vastai() {
-        Duration::from_millis(VASTAI_ORCH_SHUTDOWN_GRACE_MS)
-    } else {
-        Duration::from_millis(ORCH_SHUTDOWN_GRACE_MS)
-    }
-}
-
 struct OrchChild {
     child: Child,
     cleaned: bool,
@@ -1493,7 +1489,11 @@ impl OrchChild {
         Ok(Self {
             child,
             cleaned: false,
-            shutdown_grace: orchestrator_shutdown_grace(&config.provider),
+            shutdown_grace: if config.provider == provider_kind::vastai() {
+                Duration::from_millis(VASTAI_ORCH_SHUTDOWN_GRACE_MS)
+            } else {
+                Duration::from_millis(ORCH_SHUTDOWN_GRACE_MS)
+            },
         })
     }
 
@@ -1586,33 +1586,6 @@ fn signal_orch_process_group(child: &Child, signal: libc::c_int) -> io::Result<(
     }
 }
 
-fn prepare_node_image_progress_adapter(
-    request: NodeImageRequest,
-    progress: Option<&mut dyn NodeImageProgressSink>,
-) -> Result<String, String> {
-    prepare_node_image_with_progress(request, progress)
-}
-
-#[allow(dead_code)]
-fn prepare_runtime(config: &Config) -> Result<String, String> {
-    prepare_runtime_with(config, |request| {
-        prepare_node_image_with_progress(request, None)
-    })
-}
-
-#[allow(dead_code)]
-fn prepare_runtime_with<F>(config: &Config, prepare_node_image_fn: F) -> Result<String, String>
-where
-    F: FnMut(NodeImageRequest) -> Result<String, String>,
-{
-    let mut prepare_node_image_fn = prepare_node_image_fn;
-    prepare_runtime_with_progress(
-        config,
-        move |request, _progress| prepare_node_image_fn(request),
-        None,
-    )
-}
-
 fn prepare_runtime_with_progress<F>(
     config: &Config,
     mut prepare_node_image_fn: F,
@@ -1651,7 +1624,21 @@ where
             "started",
             json!({"mode": binary_mode, "command_label": "ensure_orch_binary"}),
         );
-        match ensure_orch_binary(config) {
+        match ensure_runtime_binary(
+            config.skip_rebuild,
+            &config.orch_bin,
+            "mvp-orchestrator",
+            &[
+                "build",
+                "--quiet",
+                "-p",
+                "mvp-system",
+                "--features",
+                "dashboard",
+                "--bin",
+                "mvp-orchestrator",
+            ],
+        ) {
             Ok(()) => emit_chat_progress(
                 &mut progress,
                 CHAT_RUNTIME_CHANNEL,
@@ -1680,7 +1667,19 @@ where
             "started",
             json!({"mode": binary_mode}),
         );
-        match ensure_worker_binary(config) {
+        match ensure_runtime_binary(
+            config.skip_rebuild,
+            &config.worker_bin,
+            "mvp-worker-node",
+            &[
+                "build",
+                "--quiet",
+                "-p",
+                "mvp-system",
+                "--bin",
+                "mvp-worker-node",
+            ],
+        ) {
             Ok(()) => emit_chat_progress(
                 &mut progress,
                 CHAT_RUNTIME_CHANNEL,
@@ -1735,7 +1734,19 @@ where
             "started",
             json!({"mode": binary_mode, "command_label": "ensure_worker_binary"}),
         );
-        match ensure_worker_binary(config) {
+        match ensure_runtime_binary(
+            config.skip_rebuild,
+            &config.worker_bin,
+            "mvp-worker-node",
+            &[
+                "build",
+                "--quiet",
+                "-p",
+                "mvp-system",
+                "--bin",
+                "mvp-worker-node",
+            ],
+        ) {
             Ok(()) => emit_chat_progress(
                 &mut progress,
                 CHAT_RUNTIME_CHANNEL,
@@ -1772,31 +1783,25 @@ where
         "started",
         json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "image_tag": config.image_tag.as_deref()}),
     );
-    let node_bin = match node_bin_for_current_profile() {
-        Ok(path) => path,
-        Err(error) => {
-            emit_chat_progress(
-                &mut progress,
-                CHAT_RUNTIME_CHANNEL,
-                "prepare_node_image",
-                "failed",
-                json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "elapsed_ms": prepare_node_image_started.elapsed().as_millis(), "error": error.as_str()}),
-            );
-            return Err(error);
-        }
-    };
-    let provider = match node_image_provider(&config.provider) {
-        Ok(provider) => provider,
-        Err(error) => {
-            emit_chat_progress(
-                &mut progress,
-                CHAT_RUNTIME_CHANNEL,
-                "prepare_node_image",
-                "failed",
-                json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "elapsed_ms": prepare_node_image_started.elapsed().as_millis(), "error": error.as_str()}),
-            );
-            return Err(error);
-        }
+    let node_bin = default_worker_bin();
+    let requires_registry_image = if config.provider == provider_kind::docker() {
+        false
+    } else if config.provider == provider_kind::vastai() {
+        true
+    } else {
+        let error = if config.provider == provider_kind::process() {
+            "process provider does not use node images"
+        } else {
+            "mvp-chat does not support mock provider"
+        };
+        emit_chat_progress(
+            &mut progress,
+            CHAT_RUNTIME_CHANNEL,
+            "prepare_node_image",
+            "failed",
+            json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "elapsed_ms": prepare_node_image_started.elapsed().as_millis(), "error": error}),
+        );
+        return Err(error.to_owned());
     };
     let prepared = {
         let command_progress = progress
@@ -1807,9 +1812,8 @@ where
                 requested_image: config.node_image.clone(),
                 base_image: BASE_NODE_IMAGE.to_owned(),
                 node_bin,
-                provider,
+                requires_registry_image,
                 extra_tag: config.image_tag.clone(),
-                push: false,
                 force_refresh: false,
                 enabled: true,
             },
@@ -1836,42 +1840,6 @@ where
         json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "image_ref": &prepared, "elapsed_ms": prepare_node_image_started.elapsed().as_millis()}),
     );
     Ok(prepared)
-}
-
-fn stdin_prompt_events() -> mpsc::Receiver<PromptInput> {
-    let (tx, rx) = mpsc::channel();
-    if STOP_REQUESTED.load(Ordering::SeqCst) {
-        let _ = tx.send(PromptInput::StopRequested);
-    }
-    if let Ok(mut stop_tx) = PROMPT_STOP_TX.lock() {
-        *stop_tx = Some(tx.clone());
-    }
-    thread::spawn(move || {
-        let stdin = io::stdin();
-        for line in stdin.lock().lines() {
-            match line {
-                Ok(line) => {
-                    if tx.send(PromptInput::Line(line)).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => {
-                    let _ = tx.send(PromptInput::Closed);
-                    return;
-                }
-            }
-        }
-        let _ = tx.send(PromptInput::Closed);
-    });
-    rx
-}
-
-fn run_chat_loop_with_progress(
-    addr: &str,
-    max_tokens: u32,
-    progress: Option<&mut ChatDatastream>,
-) -> Result<(), String> {
-    run_chat_loop_with_input_and_progress(addr, max_tokens, stdin_prompt_events(), progress)
 }
 
 fn run_chat_loop_with_input_and_progress(
@@ -1923,7 +1891,15 @@ fn run_chat_loop_with_input_and_progress(
             return Err(format!("clone prompt RPC stream: {error}"));
         }
     };
-    run_chat_session_with_progress(&mut stream, reader, input_rx, max_tokens, progress)
+    let mut output = io::stdout();
+    run_chat_session_with_output_and_progress(
+        &mut stream,
+        reader,
+        input_rx,
+        max_tokens,
+        &mut output,
+        progress,
+    )
 }
 
 #[cfg(test)]
@@ -1935,24 +1911,6 @@ fn run_chat_session_with_output(
     output: &mut impl Write,
 ) -> Result<(), String> {
     run_chat_session_with_output_and_progress(writer, reader, input_rx, max_tokens, output, None)
-}
-
-fn run_chat_session_with_progress(
-    writer: &mut impl Write,
-    reader: impl BufRead,
-    input_rx: mpsc::Receiver<PromptInput>,
-    max_tokens: u32,
-    progress: Option<&mut ChatDatastream>,
-) -> Result<(), String> {
-    let mut output = io::stdout();
-    run_chat_session_with_output_and_progress(
-        writer,
-        reader,
-        input_rx,
-        max_tokens,
-        &mut output,
-        progress,
-    )
 }
 
 fn emit_chat_progress(
@@ -2186,84 +2144,39 @@ fn run_chat_session_with_output_and_progress(
     }
 }
 
-fn default_orch_bin() -> Result<PathBuf, String> {
-    Ok(artifact_root().join("target/debug/mvp-orchestrator"))
+fn default_worker_bin() -> PathBuf {
+    artifact_root().join("target/debug/mvp-worker-node")
 }
 
-fn node_bin_for_current_profile() -> Result<PathBuf, String> {
-    Ok(artifact_root().join("target/debug/mvp-worker-node"))
-}
-
-fn cargo_command() -> &'static str {
-    "cargo"
-}
-
-fn mvp_orchestrator_build_args() -> &'static [&'static str] {
-    &[
-        "build",
-        "--quiet",
-        "-p",
-        "mvp-system",
-        "--features",
-        "dashboard",
-        "--bin",
-        "mvp-orchestrator",
-    ]
-}
-
-fn ensure_orch_binary(config: &Config) -> Result<(), String> {
-    if config.skip_rebuild {
-        return ensure_existing_artifact(&config.orch_bin, "mvp-orchestrator");
+fn ensure_runtime_binary(
+    skip_rebuild: bool,
+    path: &Path,
+    label: &str,
+    cargo_args: &[&str],
+) -> Result<(), String> {
+    if skip_rebuild {
+        let metadata = fs::metadata(path)
+            .map_err(|e| format!("missing required {label} artifact {}: {e}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!(
+                "missing required {label} artifact {}; not a file",
+                path.display()
+            ));
+        }
+        return Ok(());
     }
-    run_status(
-        cargo_command(),
-        mvp_orchestrator_build_args(),
-        "build mvp-orchestrator",
-    )
-}
 
-fn ensure_worker_binary(config: &Config) -> Result<(), String> {
-    if config.skip_rebuild {
-        return ensure_existing_artifact(&config.worker_bin, "mvp-worker-node");
-    }
-    run_status(
-        cargo_command(),
-        &[
-            "build",
-            "--quiet",
-            "-p",
-            "mvp-system",
-            "--bin",
-            "mvp-worker-node",
-        ],
-        "build mvp-worker-node",
-    )
-}
-
-fn ensure_existing_artifact(path: &PathBuf, label: &str) -> Result<(), String> {
-    let metadata = fs::metadata(path)
-        .map_err(|e| format!("missing required {label} artifact {}: {e}", path.display()))?;
-    if !metadata.is_file() {
-        return Err(format!(
-            "missing required {label} artifact {}; not a file",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn run_status(program: &str, args: &[&str], label: &str) -> Result<(), String> {
-    let status = Command::new(program)
-        .args(args)
+    let status = Command::new("cargo")
+        .args(cargo_args)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .map_err(|e| format!("run {label}: {e}"))?;
+        .map_err(|e| format!("run build {label}: {e}"))?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("{label} failed with {status}"))
+        Err(format!("build {label} failed with {status}"))
     }
 }
 
@@ -2391,18 +2304,6 @@ fn env_optional(name: &str) -> Option<String> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-}
-
-fn node_image_provider(provider: &ProviderKind) -> Result<NodeImageProvider, String> {
-    if provider == &provider_kind::docker() {
-        Ok(NodeImageProvider::Docker)
-    } else if provider == &provider_kind::vastai() {
-        Ok(NodeImageProvider::VastAi)
-    } else if provider == &provider_kind::process() {
-        Err("process provider does not use node images".to_owned())
-    } else {
-        Err("mvp-chat does not support mock provider".to_owned())
-    }
 }
 
 fn next_arg(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, String> {

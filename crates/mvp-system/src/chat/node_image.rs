@@ -21,30 +21,13 @@ const NODE_IMAGE_SOURCE_HASH_LABEL: &str = "org.swactor.mvp.node.source-hash";
 const NODE_IMAGE_WORKER_HASH_LABEL: &str = "org.swactor.mvp.node.worker-hash";
 const NODE_IMAGE_BASE_HASH_LABEL: &str = "org.swactor.mvp.node.base-hash";
 const BASE_IMAGE_SOURCE_HASH_LABEL: &str = "org.swactor.mvp.base.source-hash";
-const NODE_IMAGE_PRUNE_ENV: &str = "MVP_NODE_IMAGE_PRUNE";
-const NODE_IMAGE_PRUNE_KEEP_ENV: &str = "MVP_NODE_IMAGE_PRUNE_KEEP";
-const DEFAULT_DIRTY_IMAGE_KEEP: usize = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum NodeImageProvider {
-    Docker,
-    VastAi,
-}
-
-impl NodeImageProvider {
-    fn requires_remote_image(self) -> bool {
-        matches!(self, Self::VastAi)
-    }
-}
-
-#[derive(Clone, Debug)]
 pub(super) struct NodeImageRequest {
     pub(super) requested_image: String,
     pub(super) base_image: String,
     pub(super) node_bin: PathBuf,
-    pub(super) provider: NodeImageProvider,
+    pub(super) requires_registry_image: bool,
     pub(super) extra_tag: Option<String>,
-    pub(super) push: bool,
     pub(super) force_refresh: bool,
     pub(super) enabled: bool,
 }
@@ -84,62 +67,17 @@ pub(super) trait NodeImageProgressSink {
     fn emit(&mut self, event: NodeImageProgressEvent);
 }
 
-impl<F> NodeImageProgressSink for F
-where
-    F: FnMut(NodeImageProgressEvent),
-{
-    fn emit(&mut self, event: NodeImageProgressEvent) {
-        self(event);
-    }
-}
-
-trait ImageCommandRunner {
-    fn run_status(
-        &mut self,
-        root: &Path,
-        program: &str,
-        args: &[String],
-        label: &str,
-        image_ref: Option<&str>,
-        progress: &mut Option<&mut dyn NodeImageProgressSink>,
-    ) -> Result<(), String>;
-
-    fn docker_image_exists(&mut self, root: &Path, image_ref: &str) -> bool;
-
-    fn docker_image_labels(
-        &mut self,
-        root: &Path,
-        image_ref: &str,
-    ) -> Result<Option<BTreeMap<String, String>>, String>;
-
-    fn docker_manifest_exists(&mut self, root: &Path, image_ref: &str) -> bool;
-
-    fn docker_image_has_container(&mut self, root: &Path, image_ref: &str) -> bool;
-
-    fn docker_image_tags(
-        &mut self,
-        root: &Path,
-        repository: &str,
-    ) -> Result<Vec<(String, String)>, String>;
-
-    fn docker_image_remove(&mut self, root: &Path, image_ref: &str) -> Result<(), String>;
-}
-
-struct RealImageCommandRunner;
-
 pub(super) fn prepare_node_image_with_progress(
     request: NodeImageRequest,
     progress: Option<&mut dyn NodeImageProgressSink>,
 ) -> Result<String, String> {
     let mut progress = progress;
-    let mut runner = RealImageCommandRunner;
-    prepare_node_image_inner(request, &mut progress, &mut runner)
+    prepare_node_image_inner(request, &mut progress)
 }
 
 fn prepare_node_image_inner(
     request: NodeImageRequest,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
-    runner: &mut dyn ImageCommandRunner,
 ) -> Result<String, String> {
     emit_image_reference(progress, "requested", &request.requested_image);
     if !request.enabled {
@@ -149,7 +87,16 @@ fn prepare_node_image_inner(
     emit_image_reference(progress, "base", &request.base_image);
     let root = workspace_root()?;
     let image = ImageName::parse(&request.requested_image)?;
-    if request.provider.requires_remote_image() && !looks_registry_reachable(&image.repository) {
+    let first_repository_component = image
+        .repository
+        .split('/')
+        .next()
+        .unwrap_or(&image.repository);
+    let registry_reachable = image.repository.contains('/')
+        || first_repository_component.contains('.')
+        || first_repository_component.contains(':')
+        || first_repository_component == "localhost";
+    if request.requires_registry_image && !registry_reachable {
         return Err(format!(
             "VastAI node image {:?} must include a registry namespace",
             image.repository
@@ -157,7 +104,6 @@ fn prepare_node_image_inner(
     }
 
     run_status(
-        runner,
         progress,
         &root,
         "cargo",
@@ -178,47 +124,54 @@ fn prepare_node_image_inner(
     let tag = image_version_tag(&root, &image_content_hash)?;
     let image_ref = image.ref_for_tag(&tag);
     emit_image_reference(progress, "resolved", &image_ref);
-    let worker_hash = file_content_hash(&root, Path::new("apps/mvp-node/tinygrad_worker.py"))?;
-    let expected_node_labels =
-        node_image_labels(&tag, &image_content_hash, &worker_hash, &base_hash);
-    let expected_base_labels = base_image_labels(&base_hash);
+    let worker_hash = hash_relative_files(
+        &root,
+        vec![relative_path(
+            &root,
+            &root.join("apps/mvp-node/tinygrad_worker.py"),
+        )?],
+    )?;
+    let expected_node_labels = vec![
+        (NODE_IMAGE_TAG_LABEL, tag.as_str()),
+        (NODE_IMAGE_SOURCE_HASH_LABEL, image_content_hash.as_str()),
+        (NODE_IMAGE_WORKER_HASH_LABEL, worker_hash.as_str()),
+        (NODE_IMAGE_BASE_HASH_LABEL, base_hash.as_str()),
+    ];
+    let expected_base_labels = vec![(BASE_IMAGE_SOURCE_HASH_LABEL, base_hash.as_str())];
     let alias_tags = alias_tags(&image, request.extra_tag.as_deref(), &tag)?;
     for alias in alias_refs(&image, &alias_tags) {
         emit_image_reference(progress, "alias", &alias);
     }
-    let remote_required = request.provider.requires_remote_image() || request.push;
+    let remote_required = request.requires_registry_image;
 
-    let local_image_matches =
-        docker_image_labels_match(runner, &root, &image_ref, &expected_node_labels)?;
-    let remote_available = remote_required && runner.docker_manifest_exists(&root, &image_ref);
+    let local_image_matches = docker_image_labels_match(&root, &image_ref, &expected_node_labels)?;
+    let remote_available = remote_required && docker_manifest_exists(&root, &image_ref);
     if !request.force_refresh && remote_required && remote_available {
-        ensure_aliases_for_remote(runner, progress, &root, &image_ref, &image, &alias_tags)?;
-        prune_old_dirty_images(runner, &root, &image, &tag);
+        ensure_aliases_for_remote(progress, &root, &image_ref, &image, &alias_tags)?;
+        prune_old_dirty_images(&root, &image, &tag);
         return Ok(image_ref);
     }
     if !request.force_refresh && remote_required && local_image_matches {
-        ensure_aliases_local(runner, progress, &root, &image_ref, &image, &alias_tags)?;
-        push_image(runner, progress, &root, &image_ref)?;
+        ensure_aliases_local(progress, &root, &image_ref, &image, &alias_tags)?;
+        push_image(progress, &root, &image_ref)?;
         for alias in alias_refs(&image, &alias_tags) {
-            push_image(runner, progress, &root, &alias)?;
+            push_image(progress, &root, &alias)?;
         }
-        prune_old_dirty_images(runner, &root, &image, &tag);
+        prune_old_dirty_images(&root, &image, &tag);
         return Ok(image_ref);
     }
     if !request.force_refresh && !remote_required && local_image_matches {
-        ensure_aliases_local(runner, progress, &root, &image_ref, &image, &alias_tags)?;
-        prune_old_dirty_images(runner, &root, &image, &tag);
+        ensure_aliases_local(progress, &root, &image_ref, &image, &alias_tags)?;
+        prune_old_dirty_images(&root, &image, &tag);
         return Ok(image_ref);
     }
     let base_image_matches =
-        docker_image_labels_match(runner, &root, &request.base_image, &expected_base_labels)?;
+        docker_image_labels_match(&root, &request.base_image, &expected_base_labels)?;
     if !base_image_matches {
-        run_status_vec(
-            runner,
-            progress,
+        run_status_command(
             &root,
             "docker",
-            vec![
+            &vec![
                 "build".to_owned(),
                 "-f".to_owned(),
                 "apps/mvp-node/Dockerfile.base".to_owned(),
@@ -230,6 +183,7 @@ fn prepare_node_image_inner(
             ],
             "build mvp node base image",
             Some(&request.base_image),
+            progress,
         )?;
     }
 
@@ -248,25 +202,24 @@ fn prepare_node_image_inner(
         build_args.push(format!("{key}={value}"));
     }
     build_args.extend(["-t".to_owned(), image_ref.clone(), ".".to_owned()]);
-    run_status_vec(
-        runner,
-        progress,
+    run_status_command(
         &root,
         "docker",
-        build_args,
+        &build_args,
         "build mvp node image",
         Some(&image_ref),
+        progress,
     )?;
-    ensure_aliases_local(runner, progress, &root, &image_ref, &image, &alias_tags)?;
+    ensure_aliases_local(progress, &root, &image_ref, &image, &alias_tags)?;
 
     if remote_required {
-        push_image(runner, progress, &root, &image_ref)?;
+        push_image(progress, &root, &image_ref)?;
         for alias in alias_refs(&image, &alias_tags) {
-            push_image(runner, progress, &root, &alias)?;
+            push_image(progress, &root, &alias)?;
         }
     }
 
-    prune_old_dirty_images(runner, &root, &image, &tag);
+    prune_old_dirty_images(&root, &image, &tag);
     Ok(image_ref)
 }
 
@@ -290,18 +243,15 @@ fn workspace_root() -> Result<PathBuf, String> {
 }
 
 fn image_version_tag(root: &Path, image_content_hash: &str) -> Result<String, String> {
-    if git_worktree_clean(root)? {
+    if git_capture(root, &["status", "--porcelain"])?
+        .trim()
+        .is_empty()
+    {
         let sha = git_capture(root, &["rev-parse", "--short=12", "HEAD"])?;
         Ok(format!("git-{}", sha.trim()))
     } else {
         Ok(format!("dirty-{image_content_hash}"))
     }
-}
-
-fn git_worktree_clean(root: &Path) -> Result<bool, String> {
-    Ok(git_capture(root, &["status", "--porcelain"])?
-        .trim()
-        .is_empty())
 }
 
 fn git_capture(root: &Path, args: &[&str]) -> Result<String, String> {
@@ -355,10 +305,6 @@ fn content_hash_for_inputs(root: &Path, inputs: &[&str]) -> Result<String, Strin
     hash_relative_files(root, files)
 }
 
-fn file_content_hash(root: &Path, path: &Path) -> Result<String, String> {
-    hash_relative_files(root, vec![relative_path(root, &root.join(path))?])
-}
-
 fn hash_relative_files(root: &Path, files: Vec<PathBuf>) -> Result<String, String> {
     hash_relative_files_with_salts(root, files, &[])
 }
@@ -409,7 +355,7 @@ fn collect_hash_inputs(root: &Path, path: &Path, out: &mut Vec<PathBuf>) -> Resu
     let display = display_workspace_path(root, path);
     let metadata = fs::metadata(path).map_err(|e| format!("stat {display}: {e}"))?;
     if metadata.is_file() {
-        if !skip_file(path) {
+        if !matches!(path.extension().and_then(|ext| ext.to_str()), Some("pyc")) {
             out.push(relative_path(root, path)?);
         }
         return Ok(());
@@ -459,10 +405,6 @@ fn skip_dir(path: &Path) -> bool {
     )
 }
 
-fn skip_file(path: &Path) -> bool {
-    matches!(path.extension().and_then(|ext| ext.to_str()), Some("pyc"))
-}
-
 fn alias_tags(
     image: &ImageName,
     extra_tag: Option<&str>,
@@ -493,26 +435,7 @@ fn insert_alias_tag(
     Ok(())
 }
 
-fn node_image_labels<'a>(
-    tag: &'a str,
-    source_hash: &'a str,
-    worker_hash: &'a str,
-    base_hash: &'a str,
-) -> Vec<(&'static str, &'a str)> {
-    vec![
-        (NODE_IMAGE_TAG_LABEL, tag),
-        (NODE_IMAGE_SOURCE_HASH_LABEL, source_hash),
-        (NODE_IMAGE_WORKER_HASH_LABEL, worker_hash),
-        (NODE_IMAGE_BASE_HASH_LABEL, base_hash),
-    ]
-}
-
-fn base_image_labels<'a>(base_hash: &'a str) -> Vec<(&'static str, &'a str)> {
-    vec![(BASE_IMAGE_SOURCE_HASH_LABEL, base_hash)]
-}
-
 fn ensure_aliases_local(
-    runner: &mut dyn ImageCommandRunner,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     root: &Path,
     source_ref: &str,
@@ -522,7 +445,6 @@ fn ensure_aliases_local(
     for alias in alias_refs(image, alias_tags) {
         if alias != source_ref {
             run_status(
-                runner,
                 progress,
                 root,
                 "docker",
@@ -536,7 +458,6 @@ fn ensure_aliases_local(
 }
 
 fn ensure_aliases_for_remote(
-    runner: &mut dyn ImageCommandRunner,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     root: &Path,
     source_ref: &str,
@@ -546,9 +467,8 @@ fn ensure_aliases_for_remote(
     if alias_tags.is_empty() {
         return Ok(false);
     }
-    if !runner.docker_image_exists(root, source_ref) {
+    if !docker_image_exists(root, source_ref) {
         run_status(
-            runner,
             progress,
             root,
             "docker",
@@ -557,9 +477,9 @@ fn ensure_aliases_for_remote(
             Some(source_ref),
         )?;
     }
-    ensure_aliases_local(runner, progress, root, source_ref, image, alias_tags)?;
+    ensure_aliases_local(progress, root, source_ref, image, alias_tags)?;
     for alias in alias_refs(image, alias_tags) {
-        push_image(runner, progress, root, &alias)?;
+        push_image(progress, root, &alias)?;
     }
     Ok(true)
 }
@@ -572,13 +492,11 @@ fn alias_refs(image: &ImageName, alias_tags: &BTreeSet<String>) -> Vec<String> {
 }
 
 fn push_image(
-    runner: &mut dyn ImageCommandRunner,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     root: &Path,
     image_ref: &str,
 ) -> Result<(), String> {
     run_status(
-        runner,
         progress,
         root,
         "docker",
@@ -588,25 +506,12 @@ fn push_image(
     )
 }
 
-fn docker_image_exists(root: &Path, image_ref: &str) -> bool {
-    Command::new("docker")
-        .current_dir(root)
-        .args(["image", "inspect", image_ref])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
 fn docker_image_labels_match(
-    runner: &mut dyn ImageCommandRunner,
     root: &Path,
     image_ref: &str,
     expected: &[(&str, &str)],
 ) -> Result<bool, String> {
-    let Some(labels) = runner.docker_image_labels(root, image_ref)? else {
+    let Some(labels) = docker_image_labels(root, image_ref)? else {
         return Ok(false);
     };
     Ok(expected
@@ -614,54 +519,18 @@ fn docker_image_labels_match(
         .all(|(key, value)| labels.get(*key).map(String::as_str) == Some(*value)))
 }
 
-fn docker_image_labels(
-    root: &Path,
-    image_ref: &str,
-) -> Result<Option<BTreeMap<String, String>>, String> {
-    let output = Command::new("docker")
-        .current_dir(root)
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{ json .Config.Labels }}",
-            image_ref,
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("inspect docker image {image_ref}: {e}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let labels: Option<BTreeMap<String, String>> = serde_json::from_str(stdout.trim())
-        .map_err(|e| format!("parse docker labels for {image_ref}: {e}"))?;
-    Ok(Some(labels.unwrap_or_default()))
-}
-
-fn docker_manifest_exists(root: &Path, image_ref: &str) -> bool {
-    Command::new("docker")
-        .current_dir(root)
-        .args(["manifest", "inspect", image_ref])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-}
-
-fn prune_old_dirty_images(
-    runner: &mut dyn ImageCommandRunner,
-    root: &Path,
-    image: &ImageName,
-    keep_tag: &str,
-) {
-    if !dirty_image_prune_enabled() {
+fn prune_old_dirty_images(root: &Path, image: &ImageName, keep_tag: &str) {
+    let prune_enabled = std::env::var("MVP_NODE_IMAGE_PRUNE")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true);
+    if !prune_enabled {
         return;
     }
 
-    let tags = match runner.docker_image_tags(root, &image.repository) {
+    let tags = match docker_image_tags(root, &image.repository) {
         Ok(tags) => tags,
         Err(error) => {
             eprintln!("mvp-node-image: prune old dirty images skipped: {error}");
@@ -669,7 +538,10 @@ fn prune_old_dirty_images(
         }
     };
 
-    let keep_old = dirty_image_prune_keep();
+    let keep_old = std::env::var("MVP_NODE_IMAGE_PRUNE_KEEP")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(3);
     let mut retained_old = 0_usize;
     for (repository, tag) in tags {
         if repository != image.repository
@@ -681,7 +553,7 @@ fn prune_old_dirty_images(
         }
 
         let image_ref = image.ref_for_tag(&tag);
-        let Ok(Some(labels)) = runner.docker_image_labels(root, &image_ref) else {
+        let Ok(Some(labels)) = docker_image_labels(root, &image_ref) else {
             continue;
         };
         if labels.get(NODE_IMAGE_TAG_LABEL).map(String::as_str) != Some(tag.as_str())
@@ -691,7 +563,7 @@ fn prune_old_dirty_images(
         {
             continue;
         }
-        if runner.docker_image_has_container(root, &image_ref) {
+        if docker_image_has_container(root, &image_ref) {
             eprintln!(
                 "mvp-node-image: prune old dirty image {image_ref} skipped: container exists"
             );
@@ -703,47 +575,13 @@ fn prune_old_dirty_images(
         }
 
         eprintln!("mvp-node-image: prune old dirty image {image_ref}");
-        if let Err(error) = runner.docker_image_remove(root, &image_ref) {
+        if let Err(error) = docker_image_remove(root, &image_ref) {
             eprintln!("mvp-node-image: prune old dirty image {image_ref} skipped: {error}");
         }
     }
 }
 
-fn dirty_image_prune_enabled() -> bool {
-    std::env::var(NODE_IMAGE_PRUNE_ENV)
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !matches!(value.as_str(), "0" | "false" | "no" | "off")
-        })
-        .unwrap_or(true)
-}
-
-fn dirty_image_prune_keep() -> usize {
-    std::env::var(NODE_IMAGE_PRUNE_KEEP_ENV)
-        .ok()
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .unwrap_or(DEFAULT_DIRTY_IMAGE_KEEP)
-}
-
-fn docker_image_has_container(root: &Path, image_ref: &str) -> bool {
-    Command::new("docker")
-        .current_dir(root)
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("ancestor={image_ref}"),
-            "--format",
-            "{{.ID}}",
-        ])
-        .stdin(Stdio::null())
-        .output()
-        .map(|output| output.status.success() && !output.stdout.is_empty())
-        .unwrap_or(true)
-}
-
 fn run_status(
-    runner: &mut dyn ImageCommandRunner,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
     root: &Path,
     program: &str,
@@ -752,19 +590,7 @@ fn run_status(
     image_ref: Option<&str>,
 ) -> Result<(), String> {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    runner.run_status(root, program, &args, label, image_ref, progress)
-}
-
-fn run_status_vec(
-    runner: &mut dyn ImageCommandRunner,
-    progress: &mut Option<&mut dyn NodeImageProgressSink>,
-    root: &Path,
-    program: &str,
-    args: Vec<String>,
-    label: &str,
-    image_ref: Option<&str>,
-) -> Result<(), String> {
-    runner.run_status(root, program, &args, label, image_ref, progress)
+    run_status_command(root, program, &args, label, image_ref, progress)
 }
 
 fn emit_image_reference(
@@ -857,205 +683,239 @@ fn drain_command_lines(
     }
 }
 
-impl ImageCommandRunner for RealImageCommandRunner {
-    fn run_status(
-        &mut self,
-        root: &Path,
-        program: &str,
-        args: &[String],
-        label: &str,
-        image_ref: Option<&str>,
-        progress: &mut Option<&mut dyn NodeImageProgressSink>,
-    ) -> Result<(), String> {
-        eprintln!("mvp-node-image: {label}");
-        if progress.is_none() {
-            let status = Command::new(program)
-                .current_dir(root)
-                .args(args)
-                .stdin(Stdio::null())
-                .stdout(Stdio::inherit())
-                .stderr(Stdio::inherit())
-                .status()
-                .map_err(|e| format!("run {label}: {e}"))?;
-            return if status.success() {
-                Ok(())
-            } else {
-                Err(format!("{label} failed with {status}"))
-            };
-        }
-
-        let started = Instant::now();
-        emit_command_progress(
-            progress,
-            label,
-            image_ref,
-            0,
-            NodeImageProgressEventKind::CommandStarted {
-                program: program.to_owned(),
-                args: args.to_vec(),
-            },
-        );
-        let mut child = match Command::new(program)
+fn run_status_command(
+    root: &Path,
+    program: &str,
+    args: &[String],
+    label: &str,
+    image_ref: Option<&str>,
+    progress: &mut Option<&mut dyn NodeImageProgressSink>,
+) -> Result<(), String> {
+    eprintln!("mvp-node-image: {label}");
+    if progress.is_none() {
+        let status = Command::new(program)
             .current_dir(root)
             .args(args)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|e| format!("run {label}: {e}"))?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!("{label} failed with {status}"))
+        };
+    }
+
+    let started = Instant::now();
+    emit_command_progress(
+        progress,
+        label,
+        image_ref,
+        0,
+        NodeImageProgressEventKind::CommandStarted {
+            program: program.to_owned(),
+            args: args.to_vec(),
+        },
+    );
+    let mut child = match Command::new(program)
+        .current_dir(root)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => {
+            emit_command_progress(
+                progress,
+                label,
+                image_ref,
+                started.elapsed().as_millis(),
+                NodeImageProgressEventKind::CommandExited {
+                    status: format!("spawn error: {error}"),
+                    code: None,
+                    success: false,
+                },
+            );
+            return Err(format!("run {label}: {error}"));
+        }
+    };
+
+    let (tx, rx) = mpsc::channel();
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_line_reader(
+            stdout,
+            CommandOutputLine::Stdout,
+            tx.clone(),
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_line_reader(
+            stderr,
+            CommandOutputLine::Stderr,
+            tx.clone(),
+        ));
+    }
+    drop(tx);
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                drain_command_lines(&rx, progress, label, image_ref, started);
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(error) => {
+                drain_command_lines(&rx, progress, label, image_ref, started);
                 emit_command_progress(
                     progress,
                     label,
                     image_ref,
                     started.elapsed().as_millis(),
                     NodeImageProgressEventKind::CommandExited {
-                        status: format!("spawn error: {error}"),
+                        status: format!("wait error: {error}"),
                         code: None,
                         success: false,
                     },
                 );
                 return Err(format!("run {label}: {error}"));
             }
-        };
-
-        let (tx, rx) = mpsc::channel();
-        let mut readers = Vec::new();
-        if let Some(stdout) = child.stdout.take() {
-            readers.push(spawn_line_reader(
-                stdout,
-                CommandOutputLine::Stdout,
-                tx.clone(),
-            ));
         }
-        if let Some(stderr) = child.stderr.take() {
-            readers.push(spawn_line_reader(
-                stderr,
-                CommandOutputLine::Stderr,
-                tx.clone(),
-            ));
-        }
-        drop(tx);
-
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) => {
-                    drain_command_lines(&rx, progress, label, image_ref, started);
-                    thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => {
-                    drain_command_lines(&rx, progress, label, image_ref, started);
-                    emit_command_progress(
-                        progress,
-                        label,
-                        image_ref,
-                        started.elapsed().as_millis(),
-                        NodeImageProgressEventKind::CommandExited {
-                            status: format!("wait error: {error}"),
-                            code: None,
-                            success: false,
-                        },
-                    );
-                    return Err(format!("run {label}: {error}"));
-                }
-            }
-        };
-        for reader in readers {
-            let _ = reader.join();
-        }
-        drain_command_lines(&rx, progress, label, image_ref, started);
-        let status_text = status.to_string();
-        let success = status.success();
-        emit_command_progress(
-            progress,
-            label,
-            image_ref,
-            started.elapsed().as_millis(),
-            NodeImageProgressEventKind::CommandExited {
-                status: status_text.clone(),
-                code: status.code(),
-                success,
-            },
-        );
-        if success {
-            Ok(())
-        } else {
-            Err(format!("{label} failed with {status_text}"))
-        }
+    };
+    for reader in readers {
+        let _ = reader.join();
     }
-
-    fn docker_image_exists(&mut self, root: &Path, image_ref: &str) -> bool {
-        docker_image_exists(root, image_ref)
-    }
-
-    fn docker_image_labels(
-        &mut self,
-        root: &Path,
-        image_ref: &str,
-    ) -> Result<Option<BTreeMap<String, String>>, String> {
-        docker_image_labels(root, image_ref)
-    }
-
-    fn docker_manifest_exists(&mut self, root: &Path, image_ref: &str) -> bool {
-        docker_manifest_exists(root, image_ref)
-    }
-
-    fn docker_image_has_container(&mut self, root: &Path, image_ref: &str) -> bool {
-        docker_image_has_container(root, image_ref)
-    }
-
-    fn docker_image_tags(
-        &mut self,
-        root: &Path,
-        repository: &str,
-    ) -> Result<Vec<(String, String)>, String> {
-        let output = Command::new("docker")
-            .current_dir(root)
-            .args([
-                "image",
-                "ls",
-                "--format",
-                "{{.Repository}}\t{{.Tag}}",
-                repository,
-            ])
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|error| format!("docker image ls failed: {error}"))?;
-        if !output.status.success() {
-            return Err(format!("docker image ls failed with {}", output.status));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(stdout
-            .lines()
-            .filter_map(|line| {
-                let (repository, tag) = line.split_once('\t')?;
-                Some((repository.to_owned(), tag.to_owned()))
-            })
-            .collect())
-    }
-
-    fn docker_image_remove(&mut self, root: &Path, image_ref: &str) -> Result<(), String> {
-        let status = Command::new("docker")
-            .current_dir(root)
-            .args(["image", "rm", image_ref])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| format!("docker image rm failed: {error}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("docker image rm failed with {status}"))
-        }
+    drain_command_lines(&rx, progress, label, image_ref, started);
+    let status_text = status.to_string();
+    let success = status.success();
+    emit_command_progress(
+        progress,
+        label,
+        image_ref,
+        started.elapsed().as_millis(),
+        NodeImageProgressEventKind::CommandExited {
+            status: status_text.clone(),
+            code: status.code(),
+            success,
+        },
+    );
+    if success {
+        Ok(())
+    } else {
+        Err(format!("{label} failed with {status_text}"))
     }
 }
 
-fn looks_registry_reachable(repository: &str) -> bool {
-    let first = repository.split('/').next().unwrap_or(repository);
-    repository.contains('/') || first.contains('.') || first.contains(':') || first == "localhost"
+fn docker_image_exists(root: &Path, image_ref: &str) -> bool {
+    Command::new("docker")
+        .current_dir(root)
+        .args(["image", "inspect", image_ref])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn docker_image_labels(
+    root: &Path,
+    image_ref: &str,
+) -> Result<Option<BTreeMap<String, String>>, String> {
+    let output = Command::new("docker")
+        .current_dir(root)
+        .args([
+            "image",
+            "inspect",
+            "--format",
+            "{{ json .Config.Labels }}",
+            image_ref,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("inspect docker image {image_ref}: {e}"))?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let labels: Option<BTreeMap<String, String>> = serde_json::from_str(stdout.trim())
+        .map_err(|e| format!("parse docker labels for {image_ref}: {e}"))?;
+    Ok(Some(labels.unwrap_or_default()))
+}
+
+fn docker_manifest_exists(root: &Path, image_ref: &str) -> bool {
+    Command::new("docker")
+        .current_dir(root)
+        .args(["manifest", "inspect", image_ref])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn docker_image_has_container(root: &Path, image_ref: &str) -> bool {
+    Command::new("docker")
+        .current_dir(root)
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("ancestor={image_ref}"),
+            "--format",
+            "{{.ID}}",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map(|output| output.status.success() && !output.stdout.is_empty())
+        .unwrap_or(true)
+}
+
+fn docker_image_tags(root: &Path, repository: &str) -> Result<Vec<(String, String)>, String> {
+    let output = Command::new("docker")
+        .current_dir(root)
+        .args([
+            "image",
+            "ls",
+            "--format",
+            "{{.Repository}}\t{{.Tag}}",
+            repository,
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("docker image ls failed: {error}"))?;
+    if !output.status.success() {
+        return Err(format!("docker image ls failed with {}", output.status));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(stdout
+        .lines()
+        .filter_map(|line| {
+            let (repository, tag) = line.split_once('\t')?;
+            Some((repository.to_owned(), tag.to_owned()))
+        })
+        .collect())
+}
+
+fn docker_image_remove(root: &Path, image_ref: &str) -> Result<(), String> {
+    let status = Command::new("docker")
+        .current_dir(root)
+        .args(["image", "rm", image_ref])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("docker image rm failed: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("docker image rm failed with {status}"))
+    }
 }
 
 #[derive(Clone, Debug)]
