@@ -8,14 +8,8 @@ use super::model::ModelSpec;
 use super::pool::NodeCapability;
 use super::roles::{CoordinatorAssignment, StageAssignment};
 
-pub trait RolePlanner: Send + Sync {
-    fn required_node_count(&self) -> usize;
-    fn plan(&self, input: RolePlannerInput) -> Result<RoleAssignmentPlan, PlanningError>;
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RolePlannerInput {
-    pub cluster_id: String,
     pub run_id: RunId,
     pub model: ModelSpec,
     pub nodes: Vec<NodeFacts>,
@@ -52,12 +46,12 @@ impl FixedLinearPipelinePlanner {
     }
 }
 
-impl RolePlanner for FixedLinearPipelinePlanner {
-    fn required_node_count(&self) -> usize {
+impl FixedLinearPipelinePlanner {
+    pub fn required_node_count(&self) -> usize {
         self.stage_count as usize + 1
     }
 
-    fn plan(&self, input: RolePlannerInput) -> Result<RoleAssignmentPlan, PlanningError> {
+    pub fn plan(&self, input: RolePlannerInput) -> Result<RoleAssignmentPlan, PlanningError> {
         reject_duplicate_nodes(&input.nodes)?;
         let coordinator = input
             .nodes
@@ -107,17 +101,12 @@ impl RolePlanner for FixedLinearPipelinePlanner {
         for stage_index in 0..self.stage_count {
             let provision = run_plan::derive_stage_provision(&run_plan, stage_index)
                 .map_err(PlanningError::StageProjection)?;
-            stages.push(StageAssignment {
-                cluster_id: input.cluster_id.clone(),
-                provision,
-            });
+            stages.push(StageAssignment { provision });
         }
 
         Ok(RoleAssignmentPlan {
             coordinator: CoordinatorAssignment {
-                cluster_id: input.cluster_id,
                 node_id: coordinator.node_id,
-                model: input.model,
             },
             stages,
             run_plan,

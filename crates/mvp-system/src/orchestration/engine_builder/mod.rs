@@ -16,15 +16,14 @@ pub mod node_image;
 pub mod planner;
 pub mod pool;
 pub mod roles;
-pub mod runtime_stack;
-pub mod workload;
 
-pub use crate::run_plan::NodeId;
+pub use crate::run_plan::{DTypeFamily, NodeId};
 pub use engine::ClusterBuilder;
 pub use events::EngineEvent;
 pub use launcher::StaticNodeLauncher;
-pub use model::{DTypeFamily, ModelArtifact, ModelSpec};
-pub use node_image::{NodeImageSpec, WorkerRuntimeSpec};
+pub use model::{ModelArtifact, ModelSpec};
 pub use planner::FixedLinearPipelinePlanner;
 pub use pool::{NodeCapability, NodeLease, ResourceFacts, StaticPoolProvider};
 pub use roles::RoleKind;
+
+pub use node_image::{NodeImageSpec, WorkerRuntimeSpec};
