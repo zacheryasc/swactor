@@ -24,7 +24,7 @@ pub use ::provisioning::plugin::{
 
 use crate::observability::provisioning_logs::BootstrapDatastreamBridge;
 
-pub struct LocalDockerPlugin {
+pub(crate) struct LocalDockerPlugin {
     container_name_prefix: String,
     next_handle_id: u64,
     nodes: BTreeMap<u64, LocalDockerNode>,
@@ -35,7 +35,7 @@ struct LocalDockerNode {
     stdin: ChildStdin,
 }
 
-pub struct LocalProcessPlugin {
+pub(crate) struct LocalProcessPlugin {
     program: PathBuf,
     next_handle_id: u64,
     nodes: BTreeMap<u64, LocalProcessNode>,
@@ -49,7 +49,7 @@ struct LocalProcessNode {
 }
 
 impl LocalProcessPlugin {
-    pub fn new(program: impl Into<PathBuf>) -> Self {
+    pub(crate) fn new(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
             next_handle_id: 1,
@@ -59,7 +59,7 @@ impl LocalProcessPlugin {
 }
 
 impl LocalDockerPlugin {
-    pub fn new(container_name_prefix: impl Into<String>) -> Self {
+    pub(crate) fn new(container_name_prefix: impl Into<String>) -> Self {
         Self {
             container_name_prefix: container_name_prefix.into(),
             next_handle_id: 1,

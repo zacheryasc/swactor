@@ -34,10 +34,10 @@ use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_en
 use crate::prompt::rpc::{PromptEvent, TokenizerEvent};
 use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::control as stage;
-use crate::transport::codec_registry::register_mvp_actor_codecs;
 use crate::transport::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
+use crate::transport::register_mvp_actor_codecs;
 use data_plane::arena;
 use data_plane::edge_lifecycle as edge;
 use data_plane::ingress;
@@ -779,10 +779,7 @@ impl WorkerEdgeRuntime {
     fn new(local_node_id: u64) -> Self {
         Self {
             establisher: edge::EdgeEstablisher::new(edge::NodeId(local_node_id)),
-            driver_model: driver_model::Driver::new(driver_model::DriverConfig {
-                local_node_id: driver_model::NodeId(local_node_id),
-                alpn: driver_model::Alpn(String::from_utf8_lossy(EDGE_ALPN).into_owned()),
-            }),
+            driver_model: driver_model::Driver::new(),
             edge_command_cursor: 0,
             edge_event_cursor: 0,
             driver_event_cursor: 0,
@@ -814,11 +811,10 @@ impl WorkerEdgeRuntime {
                 EdgeTransportEvent::StreamArrived {
                     edge_id, stream_id, ..
                 } => {
-                    self.driver_model
-                        .observe(driver_model::DriverEvent::IncomingUniStream {
-                            edge_id: driver_model::EdgeId(edge_id),
-                            stream_id: driver_model::StreamId(stream_id),
-                        });
+                    self.driver_model.incoming_uni_stream(
+                        driver_model::EdgeId(edge_id),
+                        driver_model::StreamId(stream_id),
+                    );
                     emit_node_event(
                         datastream,
                         config,
@@ -870,10 +866,7 @@ impl WorkerEdgeRuntime {
                     edge_id: Some(edge_id),
                     ..
                 } => {
-                    self.driver_model
-                        .observe(driver_model::DriverEvent::ReadError {
-                            edge_id: driver_model::EdgeId(edge_id),
-                        });
+                    self.driver_model.read_error(driver_model::EdgeId(edge_id));
                     self.drive_edge_workflow(
                         stack,
                         node_actor,
@@ -1080,15 +1073,6 @@ impl WorkerEdgeRuntime {
                 "egress_ring_read_ms":egress_read_ms,
             }),
         );
-        self.driver_model
-            .observe(driver_model::DriverEvent::EgressBytesCommitted {
-                edge_id: driver_model::EdgeId(outbound.edge_id),
-                bytes: record.clone(),
-            });
-        self.driver_model
-            .observe(driver_model::DriverEvent::RingReadable {
-                ring_id: driver_model::RingId(output_ring_id),
-            });
         let sender = self
             .outbound_sender
             .as_ref()
@@ -1398,11 +1382,7 @@ impl WorkerEdgeRuntime {
                     self.establisher
                         .observe(edge::EdgeEvent::RingInstalled { edge_id, ring_id });
                 }
-                edge::EdgeCommand::EstablishSend {
-                    edge_id,
-                    consumer_node_id,
-                    ..
-                } => {
+                edge::EdgeCommand::EstablishSend { edge_id, .. } => {
                     let outbound = self
                         .outbound_edge
                         .as_ref()
@@ -1418,19 +1398,10 @@ impl WorkerEdgeRuntime {
                     let ring_id = record
                         .ring_id
                         .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
-                    let ring_capacity = outbound.ring_spec.data_capacity as usize;
-                    self.driver_model
-                        .observe(driver_model::DriverEvent::EstablishSend(
-                            driver_model::EstablishSend {
-                                edge_id: driver_model::EdgeId(edge_id.0),
-                                peer_node_id: driver_model::NodeId(consumer_node_id.0),
-                                layout: driver_model::RingLayout {
-                                    ring_id: driver_model::RingId(ring_id.0),
-                                    byte_capacity: ring_capacity,
-                                    direction: driver_model::RingDirection::Egress,
-                                },
-                            },
-                        ));
+                    self.driver_model.establish_send(
+                        driver_model::EdgeId(edge_id.0),
+                        driver_model::RingId(ring_id.0),
+                    );
                     self.outbound_sender = Some(driver.spawn_edge_send_pump(peer, edge_id.0)?);
                 }
                 edge::EdgeCommand::EstablishRecv { edge_id, .. } => {
@@ -1441,22 +1412,10 @@ impl WorkerEdgeRuntime {
                     let ring_id = record
                         .ring_id
                         .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
-                    let ring_capacity = self
-                        .inbound_edge
-                        .as_ref()
-                        .map(|edge| edge.ring_spec.data_capacity as usize)
-                        .unwrap_or(4096);
-                    self.driver_model
-                        .observe(driver_model::DriverEvent::EstablishRecv(
-                            driver_model::EstablishRecv {
-                                edge_id: driver_model::EdgeId(edge_id.0),
-                                layout: driver_model::RingLayout {
-                                    ring_id: driver_model::RingId(ring_id.0),
-                                    byte_capacity: ring_capacity,
-                                    direction: driver_model::RingDirection::Ingress,
-                                },
-                            },
-                        ));
+                    self.driver_model.establish_recv(
+                        driver_model::EdgeId(edge_id.0),
+                        driver_model::RingId(ring_id.0),
+                    );
                 }
                 edge::EdgeCommand::CancelQueuedLease { request_id, .. } => {
                     let _ = arena_manager
@@ -1466,10 +1425,7 @@ impl WorkerEdgeRuntime {
                         });
                 }
                 edge::EdgeCommand::StopPump { edge_id, .. } => {
-                    self.driver_model
-                        .observe(driver_model::DriverEvent::StopEdge {
-                            edge_id: driver_model::EdgeId(edge_id.0),
-                        });
+                    self.driver_model.stop_edge(driver_model::EdgeId(edge_id.0));
                 }
                 edge::EdgeCommand::UninstallWorkerRing { ring_id, .. } => {
                     let mut pump = || {};
@@ -1507,21 +1463,10 @@ impl WorkerEdgeRuntime {
                         edge_id: edge::EdgeId(edge_id.0),
                     });
                 }
-                driver_model::DriverEventOut::StreamFault { edge_id, reason } => {
-                    let reason = match reason {
-                        driver_model::StreamFaultReason::ReadError => {
-                            edge::StreamFaultReason::ReadError
-                        }
-                        driver_model::StreamFaultReason::WriteError => {
-                            edge::StreamFaultReason::WriteError
-                        }
-                        driver_model::StreamFaultReason::ProtocolError => {
-                            edge::StreamFaultReason::ProtocolError
-                        }
-                    };
+                driver_model::DriverEventOut::StreamFault { edge_id } => {
                     self.establisher.observe(edge::EdgeEvent::StreamFault {
                         edge_id: edge::EdgeId(edge_id.0),
-                        reason,
+                        reason: edge::StreamFaultReason::ReadError,
                     });
                 }
                 driver_model::DriverEventOut::PumpStopped { edge_id, ring_id } => {
@@ -1530,7 +1475,6 @@ impl WorkerEdgeRuntime {
                         ring_id: edge::RingId(ring_id.0),
                     });
                 }
-                driver_model::DriverEventOut::StreamClosed { .. } => {}
             }
         }
         progressed

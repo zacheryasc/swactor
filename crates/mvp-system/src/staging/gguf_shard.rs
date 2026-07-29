@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use crate::gguf_common::{GgufValueType, read_integer_value, read_u32, read_u64};
 use serde::{Deserialize, Serialize};
 
 use crate::run_plan::GgufSource;
@@ -13,19 +14,19 @@ const MAX_STRING_BYTES: u64 = 64 * 1024 * 1024;
 const STAGE_SHARD_CACHE_FORMAT_VERSION: &str = "stage-shard-cache-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ByteRange {
+pub(crate) struct ByteRange {
     pub start: u64,
     pub len: u64,
 }
 
 impl ByteRange {
-    pub fn end_exclusive(self) -> Option<u64> {
+    pub(crate) fn end_exclusive(self) -> Option<u64> {
         self.start.checked_add(self.len)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageShardTensor {
+pub(crate) struct StageShardTensor {
     pub name: String,
     pub dims: Vec<u64>,
     pub ggml_type: u32,
@@ -38,7 +39,7 @@ pub struct StageShardTensor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageShardPlan {
+pub(crate) struct StageShardPlan {
     pub source: GgufSource,
     pub stage_index: u32,
     pub stage_count: u32,
@@ -60,27 +61,27 @@ pub struct StageShardPlan {
 }
 
 impl StageShardPlan {
-    pub fn cache_file_name(&self) -> String {
+    pub(crate) fn cache_file_name(&self) -> String {
         format!("{}.stage-{:05}.gguf", self.cache_key, self.stage_index)
     }
 
-    pub fn source_url(&self) -> Result<String, String> {
+    pub(crate) fn source_url(&self) -> Result<String, String> {
         source_url(&self.source)
     }
 
-    pub fn planned_tensor_fetch_bytes(&self) -> u64 {
+    pub(crate) fn planned_tensor_fetch_bytes(&self) -> u64 {
         self.merged_tensor_ranges
             .iter()
             .map(|range| range.len)
             .sum()
     }
 
-    pub fn planned_fetch_bytes(&self) -> u64 {
+    pub(crate) fn planned_fetch_bytes(&self) -> u64 {
         self.metadata_end
             .saturating_add(self.planned_tensor_fetch_bytes())
     }
 
-    pub fn planned_range_count(&self) -> usize {
+    pub(crate) fn planned_range_count(&self) -> usize {
         self.merged_tensor_ranges.len() + if self.metadata_end > 0 { 1 } else { 0 }
     }
 }
@@ -104,7 +105,7 @@ struct GgufDirectory {
     tensors: Vec<GgufTensorEntry>,
 }
 
-pub fn plan_stage_shard(
+pub(crate) fn plan_stage_shard(
     planning_gguf: &Path,
     source: GgufSource,
     stage_index: u32,
@@ -167,7 +168,7 @@ pub fn plan_stage_shard(
     })
 }
 
-pub fn validate_stage_shard_cache(path: &Path, plan: &StageShardPlan) -> Result<(), String> {
+pub(crate) fn validate_stage_shard_cache(path: &Path, plan: &StageShardPlan) -> Result<(), String> {
     let directory = read_gguf_directory(path)
         .map_err(|error| format!("invalid cached stage shard {}: {error}", path.display()))?;
     if directory.tensors.len() != plan.tensors.len() {
@@ -206,7 +207,7 @@ pub fn validate_stage_shard_cache(path: &Path, plan: &StageShardPlan) -> Result<
     Ok(())
 }
 
-pub fn source_url(source: &GgufSource) -> Result<String, String> {
+pub(crate) fn source_url(source: &GgufSource) -> Result<String, String> {
     match source {
         GgufSource::HuggingFaceGguf {
             repo,
@@ -266,9 +267,14 @@ fn read_gguf_directory(path: &Path) -> Result<GgufDirectory, String> {
 
     for _ in 0..metadata_count {
         let key = read_gguf_string(&mut file, MAX_STRING_BYTES)?;
-        let value_type = GgufValueType::read(&mut file)?;
+        let value_type = GgufValueType::read(&mut file, "GGUF value type")?;
         if key == "general.alignment" && value_type.is_integer() {
-            alignment = read_integer_value(&mut file, value_type)?;
+            alignment = read_integer_value(
+                &mut file,
+                value_type,
+                |other| format!("GGUF value type {other:?} is not integer"),
+                |value| format!("negative GGUF integer {value}"),
+            )?;
         } else {
             skip_value(&mut file, value_type)?;
         }
@@ -463,7 +469,7 @@ fn shard_cache_key(
     hasher.finalize().to_hex()[..24].to_owned()
 }
 
-pub fn materialize_stage_shard_http<F>(
+pub(crate) fn materialize_stage_shard_http<F>(
     plan: &StageShardPlan,
     output_path: &Path,
     emit: F,
@@ -475,7 +481,7 @@ where
     materialize_stage_shard_from_url(plan, &url, output_path, emit)
 }
 
-pub fn materialize_stage_shard_from_url<F>(
+pub(crate) fn materialize_stage_shard_from_url<F>(
     plan: &StageShardPlan,
     url: &str,
     output_path: &Path,
@@ -793,72 +799,6 @@ fn pad_writer_to_alignment<W: Write + Seek>(writer: &mut W, alignment: u64) -> R
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GgufValueType {
-    Uint8,
-    Int8,
-    Uint16,
-    Int16,
-    Uint32,
-    Int32,
-    Float32,
-    Bool,
-    String,
-    Array,
-    Uint64,
-    Int64,
-    Float64,
-}
-
-impl GgufValueType {
-    fn read<R: Read>(reader: &mut R) -> Result<Self, String> {
-        const VALUE_TYPES: [GgufValueType; 13] = [
-            GgufValueType::Uint8,
-            GgufValueType::Int8,
-            GgufValueType::Uint16,
-            GgufValueType::Int16,
-            GgufValueType::Uint32,
-            GgufValueType::Int32,
-            GgufValueType::Float32,
-            GgufValueType::Bool,
-            GgufValueType::String,
-            GgufValueType::Array,
-            GgufValueType::Uint64,
-            GgufValueType::Int64,
-            GgufValueType::Float64,
-        ];
-        let raw = read_u32(reader)?;
-        VALUE_TYPES
-            .get(raw as usize)
-            .copied()
-            .ok_or_else(|| format!("unsupported GGUF value type {raw}"))
-    }
-
-    fn fixed_width(self) -> Option<u64> {
-        match self {
-            Self::Uint8 | Self::Int8 | Self::Bool => Some(1),
-            Self::Uint16 | Self::Int16 => Some(2),
-            Self::Uint32 | Self::Int32 | Self::Float32 => Some(4),
-            Self::Uint64 | Self::Int64 | Self::Float64 => Some(8),
-            Self::String | Self::Array => None,
-        }
-    }
-
-    fn is_integer(self) -> bool {
-        matches!(
-            self,
-            Self::Uint8
-                | Self::Int8
-                | Self::Uint16
-                | Self::Int16
-                | Self::Uint32
-                | Self::Int32
-                | Self::Uint64
-                | Self::Int64
-        )
-    }
-}
-
 fn skip_value<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Result<(), String> {
     match value_type {
         GgufValueType::String => skip_gguf_string(reader),
@@ -868,7 +808,7 @@ fn skip_value<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Resu
 }
 
 fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
-    let element_type = GgufValueType::read(reader)?;
+    let element_type = GgufValueType::read(reader, "GGUF value type")?;
     let len = read_u64(reader)?;
     match element_type {
         GgufValueType::String => {
@@ -891,28 +831,6 @@ fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
             skip_bytes(reader, bytes)
         }
     }
-}
-
-fn read_integer_value<R: Read>(reader: &mut R, value_type: GgufValueType) -> Result<u64, String> {
-    match value_type {
-        GgufValueType::Uint8 => read_u8(reader).map(u64::from),
-        GgufValueType::Int8 => read_i8(reader).and_then(non_negative_i64_to_u64),
-        GgufValueType::Uint16 => read_u16(reader).map(u64::from),
-        GgufValueType::Int16 => {
-            read_i16(reader).and_then(|v| non_negative_i64_to_u64(i64::from(v)))
-        }
-        GgufValueType::Uint32 => read_u32(reader).map(u64::from),
-        GgufValueType::Int32 => {
-            read_i32(reader).and_then(|v| non_negative_i64_to_u64(i64::from(v)))
-        }
-        GgufValueType::Uint64 => read_u64(reader),
-        GgufValueType::Int64 => read_i64(reader).and_then(non_negative_i64_to_u64),
-        other => Err(format!("GGUF value type {other:?} is not integer")),
-    }
-}
-
-fn non_negative_i64_to_u64(value: i64) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("negative GGUF integer {value}"))
 }
 
 fn read_gguf_string<R: Read>(reader: &mut R, max_len: u64) -> Result<String, String> {
@@ -953,64 +871,4 @@ fn align_to(value: u64, alignment: u64) -> Result<u64, String> {
             .checked_add(alignment - remainder)
             .ok_or_else(|| format!("align {value} to {alignment} overflows"))
     }
-}
-
-fn read_u8<R: Read>(reader: &mut R) -> Result<u8, String> {
-    let mut bytes = [0; 1];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u8: {e}"))?;
-    Ok(bytes[0])
-}
-
-fn read_i8<R: Read>(reader: &mut R) -> Result<i64, String> {
-    read_u8(reader).map(|value| i8::from_le_bytes([value]) as i64)
-}
-
-fn read_u16<R: Read>(reader: &mut R) -> Result<u16, String> {
-    let mut bytes = [0; 2];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u16: {e}"))?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_i16<R: Read>(reader: &mut R) -> Result<i16, String> {
-    let mut bytes = [0; 2];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read i16: {e}"))?;
-    Ok(i16::from_le_bytes(bytes))
-}
-
-fn read_u32<R: Read>(reader: &mut R) -> Result<u32, String> {
-    let mut bytes = [0; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u32: {e}"))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_i32<R: Read>(reader: &mut R) -> Result<i32, String> {
-    let mut bytes = [0; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read i32: {e}"))?;
-    Ok(i32::from_le_bytes(bytes))
-}
-
-fn read_u64<R: Read>(reader: &mut R) -> Result<u64, String> {
-    let mut bytes = [0; 8];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u64: {e}"))?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_i64<R: Read>(reader: &mut R) -> Result<i64, String> {
-    let mut bytes = [0; 8];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read i64: {e}"))?;
-    Ok(i64::from_le_bytes(bytes))
 }

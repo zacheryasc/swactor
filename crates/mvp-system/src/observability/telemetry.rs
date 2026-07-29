@@ -11,25 +11,25 @@ use crate::provisioning::{self, ProvisionLogStream};
 use data_plane::arena::ArenaSample;
 
 /// Structured MVP lifecycle facts: run, node, stage, edge, ring, object, step, and worker events.
-pub const MVP_LIFECYCLE: &str = "mvp.lifecycle";
+pub(crate) const MVP_LIFECYCLE: &str = "mvp.lifecycle";
 /// Structured node provisioning milestones emitted before a remote swactor runtime is live.
-pub const MVP_PROVISIONING_EVENTS: &str = "mvp.provisioning.events";
+pub(crate) const MVP_PROVISIONING_EVENTS: &str = "mvp.provisioning.events";
 
 /// Raw provider/process stream lines captured during provisioning.
-pub const MVP_PROVISIONING_LOGS: &str = "mvp.provisioning.logs";
+pub(crate) const MVP_PROVISIONING_LOGS: &str = "mvp.provisioning.logs";
 
 /// Datastream payload for the MVP lifecycle channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MvpLifecycleRecord {
+pub(crate) struct MvpLifecycleRecord {
     pub event: obs::Event,
 }
 
 impl MvpLifecycleRecord {
-    pub fn new(event: obs::Event) -> Self {
+    pub(crate) fn new(event: obs::Event) -> Self {
         Self { event }
     }
 
-    pub fn kind(&self) -> obs::EventKind {
+    pub(crate) fn kind(&self) -> obs::EventKind {
         self.event.kind()
     }
 }
@@ -45,12 +45,12 @@ impl Record for MvpLifecycleRecord {
 }
 /// Datastream payload for provisioning lifecycle events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MvpProvisionEventRecord {
+pub(crate) struct MvpProvisionEventRecord {
     pub event: provisioning::ProvisionEvent,
 }
 
 impl MvpProvisionEventRecord {
-    pub fn new(event: provisioning::ProvisionEvent) -> Self {
+    pub(crate) fn new(event: provisioning::ProvisionEvent) -> Self {
         Self { event }
     }
 }
@@ -61,17 +61,17 @@ impl Record for MvpProvisionEventRecord {
 
 /// Datastream payload for provisioning stdout/stderr/provider lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MvpProvisionLogRecord {
+pub(crate) struct MvpProvisionLogRecord {
     pub line: provisioning::ProvisionLogLine,
 }
 
 impl MvpProvisionLogRecord {
-    pub fn new(line: provisioning::ProvisionLogLine) -> Self {
+    pub(crate) fn new(line: provisioning::ProvisionLogLine) -> Self {
         Self { line }
     }
 }
 
-pub fn mvp_provision_log_channel(node_id: u64, stream: ProvisionLogStream) -> String {
+pub(crate) fn mvp_provision_log_channel(node_id: u64, stream: ProvisionLogStream) -> String {
     let stream = match stream {
         ProvisionLogStream::Stdout => "stdout",
         ProvisionLogStream::Stderr => "stderr",
@@ -85,7 +85,7 @@ impl Record for MvpProvisionLogRecord {
 }
 
 /// Registry fragment for consumers that want typed MVP datastream decoding.
-pub fn channel_registry() -> ChannelRegistry {
+pub(crate) fn channel_registry() -> ChannelRegistry {
     let registry = ChannelRegistry::new()
         .with_record::<MvpLifecycleRecord>()
         .with_record::<MvpProvisionEventRecord>()

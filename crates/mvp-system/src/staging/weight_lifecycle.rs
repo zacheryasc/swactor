@@ -1,23 +1,23 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RunId(pub u64);
+pub(crate) struct RunId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub u64);
+pub(crate) struct NodeId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LayerRange {
+pub(crate) struct LayerRange {
     pub start: u32,
     pub end_exclusive: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WeightSource {
+pub(crate) enum WeightSource {
     WholeGguf { uri: String },
     ShardSet { uris: Vec<String> },
     CachedArtifact { cache_key: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WeightAssignment {
+pub(crate) struct WeightAssignment {
     pub run_id: RunId,
     pub stage_index: u32,
     pub plan_layer_range: LayerRange,
@@ -26,12 +26,12 @@ pub struct WeightAssignment {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ArtifactBytes {
+pub(crate) enum ArtifactBytes {
     Local,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WeightEvent {
+pub(crate) enum WeightEvent {
     Provisioned(WeightAssignment),
     ArtifactAvailable { bytes: ArtifactBytes },
     LayerRangeValidated,
@@ -45,7 +45,7 @@ pub enum WeightEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StageFaultReason {
+pub(crate) enum StageFaultReason {
     WeightDownloadFailed,
     WeightParseFailed,
     DeviceAllocationFailed,
@@ -54,7 +54,7 @@ pub enum StageFaultReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WeightLifecycleEvent {
+pub(crate) enum WeightLifecycleEvent {
     WeightsReady {
         run_id: RunId,
         stage_index: u32,
@@ -71,7 +71,7 @@ pub enum WeightLifecycleEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WeightCommand {
+pub(crate) enum WeightCommand {
     LoadOrBindRange {
         source: WeightSource,
         range: LayerRange,
@@ -82,7 +82,7 @@ pub enum WeightCommand {
 }
 
 #[cfg(test)]
-pub struct WeightLifecycleHarness {
+pub(crate) struct WeightLifecycleHarness {
     _node_id: NodeId,
     assignment: Option<WeightAssignment>,
     artifact: bool,
@@ -97,7 +97,7 @@ pub struct WeightLifecycleHarness {
 
 #[cfg(test)]
 impl WeightLifecycleHarness {
-    pub fn new(node_id: NodeId) -> Self {
+    pub(crate) fn new(node_id: NodeId) -> Self {
         Self {
             _node_id: node_id,
             assignment: None,
@@ -112,7 +112,7 @@ impl WeightLifecycleHarness {
         }
     }
 
-    pub fn observe(&mut self, event: WeightEvent) {
+    pub(crate) fn observe(&mut self, event: WeightEvent) {
         match event {
             WeightEvent::Provisioned(assignment) => {
                 self.commands.push(WeightCommand::LoadOrBindRange {
@@ -145,11 +145,11 @@ impl WeightLifecycleHarness {
         self.maybe_stage_ready();
     }
 
-    pub fn commands(&self) -> &[WeightCommand] {
+    pub(crate) fn commands(&self) -> &[WeightCommand] {
         &self.commands
     }
 
-    pub fn events(&self) -> &[WeightLifecycleEvent] {
+    pub(crate) fn events(&self) -> &[WeightLifecycleEvent] {
         &self.events
     }
 

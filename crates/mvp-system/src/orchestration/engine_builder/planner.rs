@@ -2,28 +2,74 @@ use std::collections::BTreeSet;
 
 use crate::run_plan::{self, NodeId, RunId};
 
-use super::error::PlanningError;
-use super::launcher::NodeFacts;
-use super::model::ModelSpec;
-use super::pool::NodeCapability;
-use super::roles::{CoordinatorAssignment, StageAssignment};
+use super::error::EngineBuildError;
+use super::pool::{ModelSpec, NodeCapability, NodeFacts};
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CoordinatorAssignment {
+    pub node_id: NodeId,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RolePlannerInput {
+pub(crate) struct StageAssignment {
+    pub provision: run_plan::ProvisionStage,
+}
+
+impl StageAssignment {
+    pub(crate) fn node_id(&self) -> NodeId {
+        self.provision.node_id
+    }
+
+    pub(crate) fn stage_index(&self) -> u32 {
+        self.provision.stage_index
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RoleAssignment {
+    Coordinator(CoordinatorAssignment),
+    StageWorker(StageAssignment),
+}
+
+impl RoleAssignment {
+    pub(crate) fn node_id(&self) -> NodeId {
+        match self {
+            Self::Coordinator(assignment) => assignment.node_id,
+            Self::StageWorker(assignment) => assignment.node_id(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> RoleKind {
+        match self {
+            Self::Coordinator(_) => RoleKind::Coordinator,
+            Self::StageWorker(assignment) => RoleKind::StageWorker {
+                stage_index: assignment.stage_index(),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoleKind {
+    Coordinator,
+    StageWorker { stage_index: u32 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RolePlannerInput {
     pub run_id: RunId,
     pub model: ModelSpec,
     pub nodes: Vec<NodeFacts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoleAssignmentPlan {
+pub(crate) struct RoleAssignmentPlan {
     pub coordinator: CoordinatorAssignment,
     pub stages: Vec<StageAssignment>,
     pub run_plan: run_plan::RunPlan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FixedLinearPipelinePlanner {
+pub(crate) struct FixedLinearPipelinePlanner {
     pub stage_count: u32,
     pub runtime: run_plan::RuntimeConfig,
     pub activation_ring: run_plan::RingSpec,
@@ -31,33 +77,54 @@ pub struct FixedLinearPipelinePlanner {
 }
 
 impl FixedLinearPipelinePlanner {
-    pub fn new(stage_count: u32) -> Self {
+    pub(crate) fn new(stage_count: u32) -> Self {
         Self {
             stage_count,
-            runtime: run_plan::RuntimeConfig::test_default(),
-            activation_ring: run_plan::RingSpec::test_default_activation(),
-            token_ring: run_plan::RingSpec::test_default_token(),
+            runtime: run_plan::RuntimeConfig {
+                max_tokens: 4,
+                sampling: run_plan::SamplingPolicy {
+                    temperature_millis: 0,
+                    top_k: 1,
+                },
+            },
+            activation_ring: run_plan::RingSpec {
+                data_capacity: 1 << 20,
+                alignment: 64,
+                direction: run_plan::RingDirection::Egress,
+                host_pinning: run_plan::HostPinning::Pageable,
+                wake_coalescing: run_plan::WakeCoalescing::PendingBit,
+            },
+            token_ring: run_plan::RingSpec {
+                data_capacity: 4096,
+                alignment: 8,
+                direction: run_plan::RingDirection::Egress,
+                host_pinning: run_plan::HostPinning::Pageable,
+                wake_coalescing: run_plan::WakeCoalescing::PendingBit,
+            },
         }
     }
 
-    pub fn runtime(mut self, runtime: run_plan::RuntimeConfig) -> Self {
+    pub(crate) fn runtime(mut self, runtime: run_plan::RuntimeConfig) -> Self {
         self.runtime = runtime;
         self
     }
 }
 
 impl FixedLinearPipelinePlanner {
-    pub fn required_node_count(&self) -> usize {
+    pub(crate) fn required_node_count(&self) -> usize {
         self.stage_count as usize + 1
     }
 
-    pub fn plan(&self, input: RolePlannerInput) -> Result<RoleAssignmentPlan, PlanningError> {
+    pub(crate) fn plan(
+        &self,
+        input: RolePlannerInput,
+    ) -> Result<RoleAssignmentPlan, EngineBuildError> {
         reject_duplicate_nodes(&input.nodes)?;
         let coordinator = input
             .nodes
             .iter()
             .find(|node| node.capabilities.contains(&NodeCapability::Coordinator))
-            .ok_or(PlanningError::NoCoordinatorCandidate)?;
+            .ok_or(EngineBuildError::NoCoordinatorCandidate)?;
         let workers = input
             .nodes
             .iter()
@@ -68,7 +135,7 @@ impl FixedLinearPipelinePlanner {
             .collect::<Vec<_>>();
         let required = self.stage_count as usize;
         if workers.len() < required {
-            return Err(PlanningError::InsufficientWorkers {
+            return Err(EngineBuildError::InsufficientWorkers {
                 required,
                 available: workers.len(),
             });
@@ -95,12 +162,12 @@ impl FixedLinearPipelinePlanner {
             activation_ring: self.activation_ring,
             token_ring: self.token_ring,
         })
-        .map_err(|err| PlanningError::ModelRejected(err.kind()))?;
+        .map_err(|err| EngineBuildError::ModelRejected(err.kind()))?;
 
         let mut stages = Vec::with_capacity(self.stage_count as usize);
         for stage_index in 0..self.stage_count {
             let provision = run_plan::derive_stage_provision(&run_plan, stage_index)
-                .map_err(PlanningError::StageProjection)?;
+                .map_err(EngineBuildError::StageProjection)?;
             stages.push(StageAssignment { provision });
         }
 
@@ -114,11 +181,11 @@ impl FixedLinearPipelinePlanner {
     }
 }
 
-fn reject_duplicate_nodes(nodes: &[NodeFacts]) -> Result<(), PlanningError> {
+fn reject_duplicate_nodes(nodes: &[NodeFacts]) -> Result<(), EngineBuildError> {
     let mut seen = BTreeSet::<NodeId>::new();
     for node in nodes {
         if !seen.insert(node.node_id) {
-            return Err(PlanningError::DuplicateNodeId {
+            return Err(EngineBuildError::DuplicateNodeId {
                 node_id: node.node_id.0,
             });
         }

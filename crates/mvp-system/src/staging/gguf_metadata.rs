@@ -3,6 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::gguf_common::{GgufValueType, read_integer_value, read_u32, read_u64};
 use crate::run_plan::{self, DTypeFamily, GgufSource, TokenizerSource};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -12,7 +13,7 @@ const MAX_METADATA_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_METADATA_KEY_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GgufPlanningMetadata {
+pub(crate) struct GgufPlanningMetadata {
     pub version: u32,
     pub architecture: String,
     pub name: Option<String>,
@@ -23,7 +24,7 @@ pub struct GgufPlanningMetadata {
 }
 
 impl GgufPlanningMetadata {
-    pub fn to_model_facts(
+    pub(crate) fn to_model_facts(
         &self,
         model_id: impl Into<String>,
         gguf_source: GgufSource,
@@ -54,7 +55,7 @@ impl GgufPlanningMetadata {
     }
 }
 
-pub fn read_gguf_planning_metadata(path: &Path) -> Result<GgufPlanningMetadata, String> {
+pub(crate) fn read_gguf_planning_metadata(path: &Path) -> Result<GgufPlanningMetadata, String> {
     let file =
         File::open(path).map_err(|e| format!("open GGUF metadata {}: {e}", path.display()))?;
     read_gguf_planning_metadata_from_reader(file)
@@ -86,7 +87,7 @@ where
 
     for _ in 0..metadata_count {
         let key = read_gguf_string(&mut reader, MAX_METADATA_KEY_BYTES)?;
-        let value_type = GgufValueType::read(&mut reader)?;
+        let value_type = GgufValueType::read(&mut reader, "GGUF metadata value type")?;
         match value_type {
             GgufValueType::String if key == "general.architecture" || key == "general.name" => {
                 strings.insert(
@@ -98,7 +99,12 @@ where
                 skip_gguf_string(&mut reader)?;
             }
             value_type if value_type.is_integer() => {
-                let value = read_integer_value(&mut reader, value_type)?;
+                let value = read_integer_value(
+                    &mut reader,
+                    value_type,
+                    |other| format!("GGUF value type {other:?} is not an integer"),
+                    |value| format!("negative integer metadata value {value}"),
+                )?;
                 if key.ends_with(".block_count")
                     || key.ends_with(".embedding_length")
                     || key.ends_with(".context_length")
@@ -155,94 +161,6 @@ fn required_u32(map: &BTreeMap<String, u64>, key: &str, label: &str) -> Result<u
     u32::try_from(value).map_err(|_| format!("GGUF metadata {label} key {key} exceeds u32"))
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GgufValueType {
-    Uint8,
-    Int8,
-    Uint16,
-    Int16,
-    Uint32,
-    Int32,
-    Float32,
-    Bool,
-    String,
-    Array,
-    Uint64,
-    Int64,
-    Float64,
-}
-
-impl GgufValueType {
-    fn read<R: Read>(reader: &mut R) -> Result<Self, String> {
-        const VALUE_TYPES: [GgufValueType; 13] = [
-            GgufValueType::Uint8,
-            GgufValueType::Int8,
-            GgufValueType::Uint16,
-            GgufValueType::Int16,
-            GgufValueType::Uint32,
-            GgufValueType::Int32,
-            GgufValueType::Float32,
-            GgufValueType::Bool,
-            GgufValueType::String,
-            GgufValueType::Array,
-            GgufValueType::Uint64,
-            GgufValueType::Int64,
-            GgufValueType::Float64,
-        ];
-        let raw = read_u32(reader)?;
-        VALUE_TYPES
-            .get(raw as usize)
-            .copied()
-            .ok_or_else(|| format!("unsupported GGUF metadata value type {raw}"))
-    }
-
-    fn is_integer(self) -> bool {
-        matches!(
-            self,
-            Self::Uint8
-                | Self::Int8
-                | Self::Uint16
-                | Self::Int16
-                | Self::Uint32
-                | Self::Int32
-                | Self::Uint64
-                | Self::Int64
-        )
-    }
-
-    fn fixed_width(self) -> Option<u64> {
-        match self {
-            Self::Uint8 | Self::Int8 | Self::Bool => Some(1),
-            Self::Uint16 | Self::Int16 => Some(2),
-            Self::Uint32 | Self::Int32 | Self::Float32 => Some(4),
-            Self::Uint64 | Self::Int64 | Self::Float64 => Some(8),
-            Self::String | Self::Array => None,
-        }
-    }
-}
-
-fn read_integer_value<R: Read>(reader: &mut R, value_type: GgufValueType) -> Result<u64, String> {
-    match value_type {
-        GgufValueType::Uint8 => read_u8(reader).map(u64::from),
-        GgufValueType::Int8 => read_i8(reader).and_then(non_negative_i64_to_u64),
-        GgufValueType::Uint16 => read_u16(reader).map(u64::from),
-        GgufValueType::Int16 => {
-            read_i16(reader).and_then(|v| non_negative_i64_to_u64(i64::from(v)))
-        }
-        GgufValueType::Uint32 => read_u32(reader).map(u64::from),
-        GgufValueType::Int32 => {
-            read_i32(reader).and_then(|v| non_negative_i64_to_u64(i64::from(v)))
-        }
-        GgufValueType::Uint64 => read_u64(reader),
-        GgufValueType::Int64 => read_i64(reader).and_then(non_negative_i64_to_u64),
-        other => Err(format!("GGUF value type {other:?} is not an integer")),
-    }
-}
-
-fn non_negative_i64_to_u64(value: i64) -> Result<u64, String> {
-    u64::try_from(value).map_err(|_| format!("negative integer metadata value {value}"))
-}
-
 fn skip_scalar<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Result<(), String> {
     match value_type {
         GgufValueType::String => skip_gguf_string(reader),
@@ -252,7 +170,7 @@ fn skip_scalar<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Res
 }
 
 fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
-    let element_type = GgufValueType::read(reader)?;
+    let element_type = GgufValueType::read(reader, "GGUF metadata value type")?;
     let len = read_u64(reader)?;
     match element_type {
         GgufValueType::String => {
@@ -307,64 +225,4 @@ fn skip_bytes<R: Seek>(reader: &mut R, mut bytes: u64) -> Result<(), String> {
         bytes -= chunk;
     }
     Ok(())
-}
-
-fn read_u8<R: Read>(reader: &mut R) -> Result<u8, String> {
-    let mut bytes = [0; 1];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u8: {e}"))?;
-    Ok(bytes[0])
-}
-
-fn read_i8<R: Read>(reader: &mut R) -> Result<i64, String> {
-    read_u8(reader).map(|value| i8::from_le_bytes([value]) as i64)
-}
-
-fn read_u16<R: Read>(reader: &mut R) -> Result<u16, String> {
-    let mut bytes = [0; 2];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u16: {e}"))?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_i16<R: Read>(reader: &mut R) -> Result<i16, String> {
-    let mut bytes = [0; 2];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read i16: {e}"))?;
-    Ok(i16::from_le_bytes(bytes))
-}
-
-fn read_u32<R: Read>(reader: &mut R) -> Result<u32, String> {
-    let mut bytes = [0; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u32: {e}"))?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
-fn read_i32<R: Read>(reader: &mut R) -> Result<i32, String> {
-    let mut bytes = [0; 4];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read i32: {e}"))?;
-    Ok(i32::from_le_bytes(bytes))
-}
-
-fn read_u64<R: Read>(reader: &mut R) -> Result<u64, String> {
-    let mut bytes = [0; 8];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read u64: {e}"))?;
-    Ok(u64::from_le_bytes(bytes))
-}
-
-fn read_i64<R: Read>(reader: &mut R) -> Result<i64, String> {
-    let mut bytes = [0; 8];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read i64: {e}"))?;
-    Ok(i64::from_le_bytes(bytes))
 }

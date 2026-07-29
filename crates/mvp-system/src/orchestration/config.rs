@@ -3,11 +3,11 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-pub const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
+pub(crate) const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct VastAiConfig {
+pub(crate) struct VastAiConfig {
     pub api_key: Option<String>,
     pub image: Option<String>,
     pub relay_url: Option<String>,
@@ -29,7 +29,7 @@ pub struct VastAiConfig {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ResolvedVastAiConfig {
+pub(crate) struct ResolvedVastAiConfig {
     pub api_key: String,
     pub relay_url: String,
     pub image: String,
@@ -48,7 +48,7 @@ pub struct ResolvedVastAiConfig {
 }
 
 impl ResolvedVastAiConfig {
-    pub fn validate(self) -> Result<Self, String> {
+    pub(crate) fn validate(self) -> Result<Self, String> {
         require_non_empty("VAST_API_KEY", &self.api_key)?;
         require_non_empty("relay.url", &self.relay_url)?;
         require_non_empty("vastai.image", &self.image)?;
@@ -74,7 +74,7 @@ fn require_non_empty(label: &str, value: &str) -> Result<(), String> {
     }
 }
 
-pub fn looks_remote_image(image: &str) -> bool {
+pub(crate) fn looks_remote_image(image: &str) -> bool {
     let repository = image.split('@').next().unwrap_or(image);
     let last_slash = repository.rfind('/');
     let tag_separator = repository
@@ -92,7 +92,7 @@ pub fn looks_remote_image(image: &str) -> bool {
 /// bin-local strict config loader instead.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct TomlConfigOverlay {
+pub(crate) struct TomlConfigOverlay {
     pub runtime: RuntimeConfigOverlay,
     pub provider: ProviderConfigOverlay,
     pub image: ImageConfig,
@@ -106,7 +106,7 @@ pub struct TomlConfigOverlay {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct RuntimeConfigOverlay {
+pub(crate) struct RuntimeConfigOverlay {
     pub profile: Option<String>,
     pub run_id: Option<u64>,
     pub node_id: Option<u64>,
@@ -117,13 +117,13 @@ pub struct RuntimeConfigOverlay {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ProviderConfigOverlay {
+pub(crate) struct ProviderConfigOverlay {
     pub kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ImageConfig {
+pub(crate) struct ImageConfig {
     pub node: Option<String>,
     pub tag: Option<String>,
     pub build: Option<bool>,
@@ -133,14 +133,14 @@ pub struct ImageConfig {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct RelayConfig {
+pub(crate) struct RelayConfig {
     pub mode: Option<String>,
     pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct PromptConfig {
+pub(crate) struct PromptConfig {
     pub rpc_addr: Option<String>,
     pub max_tokens: Option<u32>,
     pub dashboard: Option<bool>,
@@ -148,7 +148,7 @@ pub struct PromptConfig {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ModelConfig {
+pub(crate) struct ModelConfig {
     pub id: Option<String>,
     pub gguf_local_path: Option<String>,
     pub gguf_repo: Option<String>,
@@ -160,21 +160,21 @@ pub struct ModelConfig {
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct DockerConfigOverlay {
+pub(crate) struct DockerConfigOverlay {
     pub gpus: Option<String>,
     pub cached_model_host_path: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct ObservabilityConfigOverlay {
+pub(crate) struct ObservabilityConfigOverlay {
     pub dump_logs: Option<bool>,
     pub dump_log_path: Option<String>,
     pub datastream_frame_log: Option<String>,
 }
 
 impl TomlConfigOverlay {
-    pub fn load_optional(path: &Path) -> Result<Option<Self>, String> {
+    pub(crate) fn load_optional(path: &Path) -> Result<Option<Self>, String> {
         if path.is_file() {
             Self::load_required(path).map(Some)
         } else {
@@ -182,13 +182,13 @@ impl TomlConfigOverlay {
         }
     }
 
-    pub fn load_required(path: &Path) -> Result<Self, String> {
+    pub(crate) fn load_required(path: &Path) -> Result<Self, String> {
         let text =
             fs::read_to_string(path).map_err(|e| format!("read config {}: {e}", path.display()))?;
         Self::from_str(&text).map_err(|e| format!("parse config {}: {e}", path.display()))
     }
 
-    pub fn from_str(text: &str) -> Result<Self, toml::de::Error> {
+    pub(crate) fn from_str(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
     }
 }

@@ -174,21 +174,21 @@ fn assert_engine_builder_surface(outcome: &LocalMockOutcome) {
         outcome
             .engine_events
             .iter()
-            .any(|event| matches!(event, engine::EngineEvent::PoolAcquired { .. })),
+            .any(|event| matches!(event, engine::EngineEvent::PoolAcquired)),
         "local mock integration must be built from a neutral engine pool"
     );
     assert!(
         outcome
             .engine_events
             .iter()
-            .any(|event| matches!(event, engine::EngineEvent::ClusterConverged { .. })),
+            .any(|event| matches!(event, engine::EngineEvent::ClusterConverged)),
         "local mock integration must pass through the builder convergence barrier"
     );
     assert!(
         outcome
             .engine_events
             .iter()
-            .any(|event| matches!(event, engine::EngineEvent::EngineReady { .. })),
+            .any(|event| matches!(event, engine::EngineEvent::EngineReady)),
         "local mock integration must return an engine-ready handle before workload IO"
     );
     let assigned_stages = outcome
@@ -197,10 +197,7 @@ fn assert_engine_builder_surface(outcome: &LocalMockOutcome) {
         .filter(|event| {
             matches!(
                 event,
-                engine::EngineEvent::RoleAssigned {
-                    role: engine::RoleKind::StageWorker { .. },
-                    ..
-                }
+                engine::EngineEvent::RoleAssigned(engine::RoleKind::StageWorker { .. })
             )
         })
         .count();

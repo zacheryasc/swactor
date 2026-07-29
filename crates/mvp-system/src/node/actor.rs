@@ -12,26 +12,26 @@ use crate::orchestration::actor::OrchestratorMsg;
 use crate::transport::json_codec::JsonCodec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StageEdgeKindWire {
+pub(crate) enum StageEdgeKindWire {
     TokenIn,
     Activation,
     TokenOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageObjectSpecWire {
+pub(crate) struct StageObjectSpecWire {
     pub max_extent: u64,
     pub alignment: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageRingSpecWire {
+pub(crate) struct StageRingSpecWire {
     pub data_capacity: u64,
     pub alignment: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageInboundEdgeWire {
+pub(crate) struct StageInboundEdgeWire {
     pub edge_id: u64,
     pub kind: StageEdgeKindWire,
     pub object_spec: StageObjectSpecWire,
@@ -39,7 +39,7 @@ pub struct StageInboundEdgeWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageOutboundEdgeWire {
+pub(crate) struct StageOutboundEdgeWire {
     pub edge_id: u64,
     pub kind: StageEdgeKindWire,
     pub consumer_node_id: u64,
@@ -85,7 +85,7 @@ impl StageOutboundEdgeWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageProvisionWire {
+pub(crate) struct StageProvisionWire {
     pub run_id: u64,
     pub authorized_orchestrator: u64,
     pub node_id: u64,
@@ -128,7 +128,7 @@ impl StageProvisionWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NodeAgentMsg {
+pub(crate) enum NodeAgentMsg {
     ProvisionStage(StageProvisionWire),
     MarkWorkerReady,
     RuntimeLoaded {
@@ -213,7 +213,7 @@ impl NetworkMessage for NodeAgentMsg {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StageCommandWire {
+pub(crate) enum StageCommandWire {
     EstablishInboundEdge {
         edge_id: u64,
         edge: StageInboundEdgeWire,
@@ -260,7 +260,7 @@ pub enum StageCommandWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StageLifecycleWire {
+pub(crate) enum StageLifecycleWire {
     StageReady {
         run_id: u64,
         stage_index: u32,
@@ -281,7 +281,7 @@ pub enum StageLifecycleWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NodeAgentReport {
+pub(crate) enum NodeAgentReport {
     Command(StageCommandWire),
     Lifecycle(StageLifecycleWire),
     PromptRequested {
@@ -318,7 +318,7 @@ impl NetworkMessage for NodeAgentReport {
     }
 }
 
-pub struct NodeAgentActor {
+pub(crate) struct NodeAgentActor {
     core: stage::StageController,
     orchestrator: ActorAddress,
     report_to: Option<ActorAddress>,
@@ -330,7 +330,7 @@ pub struct NodeAgentActor {
 }
 
 impl NodeAgentActor {
-    pub fn new(
+    pub(crate) fn new(
         local_node_id: stage::NodeId,
         orchestrator: ActorAddress,
         report_to: Option<ActorAddress>,
@@ -355,17 +355,15 @@ impl NodeAgentActor {
                 max_tokens,
                 reply_to,
             } => {
-                if let Some(report_to) = self.report_to {
-                    let _ = ctx.send(
-                        report_to,
-                        NodeAgentReport::PromptRequested {
-                            request_id,
-                            prompt,
-                            max_tokens,
-                            reply_to,
-                        },
-                    );
-                }
+                self.report(
+                    ctx,
+                    NodeAgentReport::PromptRequested {
+                        request_id,
+                        prompt,
+                        max_tokens,
+                        reply_to,
+                    },
+                );
                 None
             }
             NodeAgentMsg::EncodePrompt {
@@ -373,16 +371,14 @@ impl NodeAgentActor {
                 prompt,
                 reply_to,
             } => {
-                if let Some(report_to) = self.report_to {
-                    let _ = ctx.send(
-                        report_to,
-                        NodeAgentReport::EncodePromptRequested {
-                            request_id,
-                            prompt,
-                            reply_to,
-                        },
-                    );
-                }
+                self.report(
+                    ctx,
+                    NodeAgentReport::EncodePromptRequested {
+                        request_id,
+                        prompt,
+                        reply_to,
+                    },
+                );
                 None
             }
             NodeAgentMsg::DecodeTokens {
@@ -390,16 +386,14 @@ impl NodeAgentActor {
                 tokens,
                 reply_to,
             } => {
-                if let Some(report_to) = self.report_to {
-                    let _ = ctx.send(
-                        report_to,
-                        NodeAgentReport::DecodeTokensRequested {
-                            request_id,
-                            tokens,
-                            reply_to,
-                        },
-                    );
-                }
+                self.report(
+                    ctx,
+                    NodeAgentReport::DecodeTokensRequested {
+                        request_id,
+                        tokens,
+                        reply_to,
+                    },
+                );
                 None
             }
             NodeAgentMsg::Snapshot { reply_to } => {
@@ -478,17 +472,15 @@ impl NodeAgentActor {
                         readiness_id,
                     },
                 );
-                if let Some(report_to) = self.report_to {
-                    let _ = ctx.send(
-                        report_to,
-                        NodeAgentReport::RuntimeReadyAck {
-                            run_id,
-                            node_id,
-                            stage_index,
-                            readiness_id,
-                        },
-                    );
-                }
+                self.report(
+                    ctx,
+                    NodeAgentReport::RuntimeReadyAck {
+                        run_id,
+                        node_id,
+                        stage_index,
+                        readiness_id,
+                    },
+                );
             }
             NodeAgentMsg::MarkWeightsReady {
                 run_id,
@@ -572,12 +564,7 @@ impl NodeAgentActor {
 
     fn drain_outputs(&mut self, ctx: &Ctx) {
         for command in &self.core.commands()[self.command_cursor..] {
-            if let Some(report_to) = self.report_to {
-                let _ = ctx.send(
-                    report_to,
-                    NodeAgentReport::Command(self.command_wire(command)),
-                );
-            }
+            self.report(ctx, NodeAgentReport::Command(self.command_wire(command)));
         }
         self.command_cursor = self.core.commands().len();
 
@@ -623,11 +610,15 @@ impl NodeAgentActor {
                 }
                 stage::StageLifecycleEvent::StepAccepted { .. } => {}
             }
-            if let Some(report_to) = self.report_to {
-                let _ = ctx.send(report_to, NodeAgentReport::Lifecycle(event.into()));
-            }
+            self.report(ctx, NodeAgentReport::Lifecycle(event.into()));
         }
         self.event_cursor = self.core.events().len();
+    }
+
+    fn report(&self, ctx: &Ctx, report: NodeAgentReport) {
+        if let Some(report_to) = self.report_to {
+            let _ = ctx.send(report_to, report);
+        }
     }
 
     fn command_wire(&self, command: &stage::StageCommand) -> StageCommandWire {
@@ -764,7 +755,7 @@ impl From<&stage::StageLifecycleEvent> for StageLifecycleWire {
     }
 }
 
-pub fn register_codecs(registry: &mut CodecRegistry) {
+pub(crate) fn register_codecs(registry: &mut CodecRegistry) {
     registry.register::<NodeAgentMsg, _>(JsonCodec::<NodeAgentMsg>::default());
     registry.register::<NodeAgentReport, _>(JsonCodec::<NodeAgentReport>::default());
 }

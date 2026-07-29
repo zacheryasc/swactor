@@ -6,14 +6,14 @@ use swactor_transport::{CodecRegistry, NetworkMessage};
 use crate::transport::json_codec::JsonCodec;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubmitPrompt {
+pub(crate) struct SubmitPrompt {
     pub request_id: u64,
     pub prompt_text: String,
     pub max_tokens: u32,
 }
 
 impl SubmitPrompt {
-    pub fn with_defaults(mut self, max_tokens: u32) -> Self {
+    pub(crate) fn with_defaults(mut self, max_tokens: u32) -> Self {
         if self.max_tokens == 0 {
             self.max_tokens = max_tokens;
         }
@@ -23,7 +23,7 @@ impl SubmitPrompt {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum PromptEvent {
+pub(crate) enum PromptEvent {
     TextDelta {
         request_id: u64,
         text: String,
@@ -41,7 +41,7 @@ pub enum PromptEvent {
 }
 
 impl PromptEvent {
-    pub fn request_id(&self) -> u64 {
+    pub(crate) fn request_id(&self) -> u64 {
         match self {
             Self::TextDelta { request_id, .. }
             | Self::Done { request_id, .. }
@@ -49,7 +49,7 @@ impl PromptEvent {
         }
     }
 
-    pub fn is_terminal(&self) -> bool {
+    pub(crate) fn is_terminal(&self) -> bool {
         matches!(self, Self::Done { .. } | Self::Fault { .. })
     }
 }
@@ -61,7 +61,7 @@ impl NetworkMessage for PromptEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TokenizerEvent {
+pub(crate) enum TokenizerEvent {
     PromptEncoded { request_id: u64, tokens: Vec<u32> },
     TokensDecoded { request_id: u64, text: String },
     Fault { request_id: u64, error: String },
@@ -73,12 +73,15 @@ impl NetworkMessage for TokenizerEvent {
     }
 }
 
-pub fn register_codecs(registry: &mut CodecRegistry) {
+pub(crate) fn register_codecs(registry: &mut CodecRegistry) {
     registry.register::<PromptEvent, _>(JsonCodec::<PromptEvent>::default());
     registry.register::<TokenizerEvent, _>(JsonCodec::<TokenizerEvent>::default());
 }
 
-pub fn write_json_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Result<(), String> {
+pub(crate) fn write_json_line<T: Serialize>(
+    writer: &mut impl Write,
+    value: &T,
+) -> Result<(), String> {
     serde_json::to_writer(&mut *writer, value).map_err(|e| format!("serialize JSON line: {e}"))?;
     writer
         .write_all(b"\n")
@@ -86,7 +89,9 @@ pub fn write_json_line<T: Serialize>(writer: &mut impl Write, value: &T) -> Resu
     writer.flush().map_err(|e| format!("flush JSON line: {e}"))
 }
 
-pub fn read_submit_prompt(reader: &mut impl BufRead) -> Result<Option<SubmitPrompt>, String> {
+pub(crate) fn read_submit_prompt(
+    reader: &mut impl BufRead,
+) -> Result<Option<SubmitPrompt>, String> {
     let mut line = String::new();
     let n = reader
         .read_line(&mut line)

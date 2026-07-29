@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 use swactor::Error;
 use swactor_transport::Codec;
 
-pub struct JsonCodec<M>(PhantomData<M>);
+pub(crate) struct JsonCodec<M>(PhantomData<M>);
 
 impl<M> Default for JsonCodec<M> {
     fn default() -> Self {

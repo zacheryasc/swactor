@@ -4,43 +4,43 @@ use crate::gguf_shard::StageShardPlan;
 use crate::run_plan::{GgufSource, TokenizerSource};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RunId(pub u64);
+pub(crate) struct RunId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub u64);
+pub(crate) struct NodeId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EdgeId(pub u64);
+pub(crate) struct EdgeId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ObjectId(pub u64);
+pub(crate) struct ObjectId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StepId(pub u64);
+pub(crate) struct StepId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DeviceHandle {
+pub(crate) struct DeviceHandle {
     pub generation: u64,
     pub id: u64,
 }
 
 impl DeviceHandle {
-    pub fn new_current(id: u64) -> Self {
+    pub(crate) fn new_current(id: u64) -> Self {
         Self { generation: 1, id }
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LayerRange {
+pub(crate) struct LayerRange {
     pub start: u32,
     pub end_exclusive: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WeightSource {
+pub(crate) struct WeightSource {
     pub model_id: String,
     pub gguf_source: GgufSource,
     pub tokenizer: TokenizerSource,
 }
 
 impl WeightSource {
-    pub fn new(
+    pub(crate) fn new(
         model_id: impl Into<String>,
         gguf_source: GgufSource,
         tokenizer: TokenizerSource,
@@ -52,7 +52,7 @@ impl WeightSource {
         }
     }
 
-    pub fn embedded_gguf(model_id: impl Into<String>, path: impl Into<String>) -> Self {
+    pub(crate) fn embedded_gguf(model_id: impl Into<String>, path: impl Into<String>) -> Self {
         Self::new(
             model_id,
             GgufSource::LocalPath(path.into()),
@@ -62,26 +62,26 @@ impl WeightSource {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EdgeDirection {
+pub(crate) enum EdgeDirection {
     Inbound,
     Outbound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EdgeProvision {
+pub(crate) struct EdgeProvision {
     pub edge_id: EdgeId,
     pub direction: EdgeDirection,
 }
 
 impl EdgeProvision {
-    pub fn inbound(edge_id: EdgeId) -> Self {
+    pub(crate) fn inbound(edge_id: EdgeId) -> Self {
         Self {
             edge_id,
             direction: EdgeDirection::Inbound,
         }
     }
 
-    pub fn outbound(edge_id: EdgeId) -> Self {
+    pub(crate) fn outbound(edge_id: EdgeId) -> Self {
         Self {
             edge_id,
             direction: EdgeDirection::Outbound,
@@ -90,7 +90,7 @@ impl EdgeProvision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProvisionStage {
+pub(crate) struct ProvisionStage {
     pub run_id: RunId,
     pub authorized_orchestrator: NodeId,
     pub node_id: NodeId,
@@ -104,7 +104,7 @@ pub struct ProvisionStage {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StageEvent {
+pub(crate) enum StageEvent {
     ProvisionStage {
         from: NodeId,
         provision: ProvisionStage,
@@ -158,7 +158,7 @@ pub enum StageEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StageFaultReason {
+pub(crate) enum StageFaultReason {
     UnauthorizedProvision,
     SequenceViolation,
     WorkerCrashed,
@@ -169,7 +169,7 @@ pub enum StageFaultReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StageLifecycleEvent {
+pub(crate) enum StageLifecycleEvent {
     StageReady {
         run_id: RunId,
         stage_index: u32,
@@ -191,7 +191,7 @@ pub enum StageLifecycleEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StepInput {
+pub(crate) struct StepInput {
     pub edge_id: EdgeId,
     pub object_id: ObjectId,
     pub sequence: u64,
@@ -199,20 +199,20 @@ pub struct StepInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutputBinding {
+pub(crate) struct OutputBinding {
     pub edge_id: EdgeId,
     pub sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecuteStep {
+pub(crate) struct ExecuteStep {
     pub step_id: StepId,
     pub input: StepInput,
     pub outputs: Vec<OutputBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StageCommand {
+pub(crate) enum StageCommand {
     EstablishInboundEdge {
         edge_id: EdgeId,
     },
@@ -247,7 +247,7 @@ pub enum StageCommand {
 
 pub type StageControllerHarness = StageController;
 
-pub struct StageController {
+pub(crate) struct StageController {
     local_node_id: NodeId,
     provision: Option<ProvisionStage>,
     worker_ready: bool,
@@ -271,7 +271,7 @@ pub struct StageController {
 }
 
 impl StageController {
-    pub fn new(local_node_id: NodeId) -> Self {
+    pub(crate) fn new(local_node_id: NodeId) -> Self {
         Self {
             local_node_id,
             provision: None,
@@ -296,7 +296,7 @@ impl StageController {
         }
     }
 
-    pub fn observe(&mut self, event: StageEvent) {
+    pub(crate) fn observe(&mut self, event: StageEvent) {
         match event {
             StageEvent::ProvisionStage { from, provision } => self.provision(from, provision),
             StageEvent::WorkerReady => self.worker_ready = true,
@@ -343,11 +343,11 @@ impl StageController {
         }
     }
 
-    pub fn commands(&self) -> &[StageCommand] {
+    pub(crate) fn commands(&self) -> &[StageCommand] {
         &self.commands
     }
 
-    pub fn events(&self) -> &[StageLifecycleEvent] {
+    pub(crate) fn events(&self) -> &[StageLifecycleEvent] {
         &self.events
     }
 

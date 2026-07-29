@@ -9,13 +9,13 @@ use crate::run_fsm as core;
 use crate::transport::json_codec::JsonCodec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StageRefWire {
+pub(crate) struct StageRefWire {
     pub stage_index: u32,
     pub node_id: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OrchestratorMsg {
+pub(crate) enum OrchestratorMsg {
     ObservePoolReady {
         nodes: Vec<u64>,
     },
@@ -81,18 +81,18 @@ impl NetworkMessage for OrchestratorMsg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum EndpointKindWire {
+pub(crate) enum EndpointKindWire {
     TokenIn,
     TokenOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SamplingDataWire {
+pub(crate) struct SamplingDataWire {
     pub source_sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TokenObjectPayloadWire {
+pub(crate) enum TokenObjectPayloadWire {
     Prompt {
         tokens: Vec<u32>,
     },
@@ -103,7 +103,7 @@ pub enum TokenObjectPayloadWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RunCommandWire {
+pub(crate) enum RunCommandWire {
     ProvisionStage {
         run_id: u64,
         stage_index: u32,
@@ -130,7 +130,7 @@ pub enum RunCommandWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LifecycleEventWire {
+pub(crate) enum LifecycleEventWire {
     RunRejected { run_id: u64 },
     RunFaulted { run_id: u64 },
     RunCompleted { run_id: u64 },
@@ -139,7 +139,7 @@ pub enum LifecycleEventWire {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OrchestratorReport {
+pub(crate) enum OrchestratorReport {
     Command(RunCommandWire),
     Lifecycle(LifecycleEventWire),
     NodeRuntimeReady {
@@ -184,7 +184,7 @@ impl NetworkMessage for OrchestratorReport {
     }
 }
 
-pub struct OrchestratorActor {
+pub(crate) struct OrchestratorActor {
     core: core::OrchestratorRun,
     report_to: Option<ActorAddress>,
     command_cursor: usize,
@@ -192,7 +192,7 @@ pub struct OrchestratorActor {
 }
 
 impl OrchestratorActor {
-    pub fn new(config: core::RunConfig, report_to: Option<ActorAddress>) -> Self {
+    pub(crate) fn new(config: core::RunConfig, report_to: Option<ActorAddress>) -> Self {
         Self {
             core: core::OrchestratorRun::new(config),
             report_to,
@@ -469,7 +469,7 @@ impl From<&core::LifecycleEvent> for LifecycleEventWire {
     }
 }
 
-pub fn register_codecs(registry: &mut CodecRegistry) {
+pub(crate) fn register_codecs(registry: &mut CodecRegistry) {
     registry.register::<OrchestratorMsg, _>(JsonCodec::<OrchestratorMsg>::default());
     registry.register::<OrchestratorReport, _>(JsonCodec::<OrchestratorReport>::default());
 }

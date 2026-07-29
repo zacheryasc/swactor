@@ -14,23 +14,23 @@ use crate::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
 };
 
-pub fn node_datastream_id(node_id: u64) -> String {
+pub(crate) fn node_datastream_id(node_id: u64) -> String {
     node_id.to_string()
 }
 
-pub fn node_stream_id(run_id: u64, node_id: u64) -> StreamId {
+pub(crate) fn node_stream_id(run_id: u64, node_id: u64) -> StreamId {
     StreamId::new(NodeId::new(&node_datastream_id(node_id)), Lifetime(run_id))
 }
 
 #[derive(Clone)]
-pub struct BootstrapDatastreamBridge {
+pub(crate) struct BootstrapDatastreamBridge {
     spec: NodeProvisionSpec,
     sink: PluginSink,
     producer: Option<DatastreamProducer>,
 }
 
 impl BootstrapDatastreamBridge {
-    pub fn new(
+    pub(crate) fn new(
         spec: NodeProvisionSpec,
         sink: PluginSink,
         producer: Option<DatastreamProducer>,
@@ -42,15 +42,15 @@ impl BootstrapDatastreamBridge {
         }
     }
 
-    pub fn spec(&self) -> &NodeProvisionSpec {
+    pub(crate) fn spec(&self) -> &NodeProvisionSpec {
         &self.spec
     }
 
-    pub fn stream_id(&self) -> StreamId {
+    pub(crate) fn stream_id(&self) -> StreamId {
         node_stream_id(self.spec.run_id, self.spec.node_id)
     }
 
-    pub fn observe_stdout_line(&self, line: impl Into<String>) {
+    pub(crate) fn observe_stdout_line(&self, line: impl Into<String>) {
         let line = line.into();
         if let Some(frame) = parse_stdio_datastream_frame(&self.spec, &line) {
             self.sink.observe(frame);
@@ -64,7 +64,7 @@ impl BootstrapDatastreamBridge {
         });
     }
 
-    pub fn observe_stderr_line(&self, line: impl Into<String>) {
+    pub(crate) fn observe_stderr_line(&self, line: impl Into<String>) {
         let line = line.into();
         self.submit_log(ProvisionLogStream::Stderr, &line);
         self.sink.observe(PluginObservation::StderrLine {
@@ -74,7 +74,7 @@ impl BootstrapDatastreamBridge {
         });
     }
 
-    pub fn observe_provider_line(&self, line: impl Into<String>) {
+    pub(crate) fn observe_provider_line(&self, line: impl Into<String>) {
         let line = line.into();
         self.submit_log(ProvisionLogStream::Provider, &line);
         self.sink.observe(PluginObservation::ProviderLine {
@@ -84,7 +84,7 @@ impl BootstrapDatastreamBridge {
         });
     }
 
-    pub fn spawn_stdout_reader<R>(&self, stdout: R) -> JoinHandle<()>
+    pub(crate) fn spawn_stdout_reader<R>(&self, stdout: R) -> JoinHandle<()>
     where
         R: Read + Send + 'static,
     {
@@ -92,7 +92,7 @@ impl BootstrapDatastreamBridge {
         thread::spawn(move || bridge.read_stdout(stdout))
     }
 
-    pub fn spawn_stderr_reader<R>(&self, stderr: R) -> JoinHandle<()>
+    pub(crate) fn spawn_stderr_reader<R>(&self, stderr: R) -> JoinHandle<()>
     where
         R: Read + Send + 'static,
     {
@@ -169,7 +169,7 @@ struct StdioDatastreamFrame {
     payload: Value,
 }
 
-pub fn parse_stdio_datastream_frame(
+pub(crate) fn parse_stdio_datastream_frame(
     spec: &NodeProvisionSpec,
     line: &str,
 ) -> Option<PluginObservation> {
@@ -185,6 +185,6 @@ pub fn parse_stdio_datastream_frame(
     })
 }
 
-pub fn bootstrap_log_channel(node_id: u64, stream: ProvisionLogStream) -> String {
+pub(crate) fn bootstrap_log_channel(node_id: u64, stream: ProvisionLogStream) -> String {
     mvp_provision_log_channel(node_id, stream)
 }

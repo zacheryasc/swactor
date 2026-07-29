@@ -23,12 +23,12 @@ const EVENT_LOG_CAP: usize = 256;
 const LOG_TAIL_CAP: usize = 128;
 
 #[derive(Default)]
-pub struct MvpClusterDashboardView {
+pub(crate) struct MvpClusterDashboardView {
     state: RwLock<MvpClusterDashboardState>,
 }
 
 impl MvpClusterDashboardView {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 }

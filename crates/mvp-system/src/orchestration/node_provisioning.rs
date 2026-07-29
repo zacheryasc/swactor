@@ -6,22 +6,22 @@
 
 pub use ::provisioning::ProviderKind;
 
-pub mod provider_kind {
+pub(crate) mod provider_kind {
     use super::ProviderKind;
 
-    pub fn process() -> ProviderKind {
+    pub(crate) fn process() -> ProviderKind {
         ProviderKind::new("process")
     }
 
-    pub fn docker() -> ProviderKind {
+    pub(crate) fn docker() -> ProviderKind {
         ProviderKind::new("docker")
     }
 
-    pub fn vastai() -> ProviderKind {
+    pub(crate) fn vastai() -> ProviderKind {
         ProviderKind::new("vastai")
     }
 
-    pub fn parse_deploy(value: &str) -> Result<ProviderKind, String> {
+    pub(crate) fn parse_deploy(value: &str) -> Result<ProviderKind, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "process" | "local_process" | "local-process" => Ok(process()),
             "docker" | "local_docker" | "local-docker" => Ok(docker()),
