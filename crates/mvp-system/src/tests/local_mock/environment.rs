@@ -104,26 +104,18 @@ impl ResourceTracker {
 }
 
 fn mock_pool(orchestrator_node_id: plan::NodeId, stage_count: u32) -> engine::StaticPoolProvider {
-    let mut leases = Vec::with_capacity(stage_count as usize + 1);
-    leases.push(
-        engine::NodeLease::new(
-            "mock-coordinator",
-            engine::NodeId(orchestrator_node_id.0),
-            [engine::NodeCapability::Coordinator],
-        )
-        .resources(engine::ResourceFacts::cpu_only(2, 2 << 30)),
-    );
+    let mut nodes = Vec::with_capacity(stage_count as usize + 1);
+    nodes.push(engine::NodeFacts {
+        node_id: engine::NodeId(orchestrator_node_id.0),
+        capabilities: vec![engine::NodeCapability::Coordinator],
+    });
     for stage_index in 0..stage_count {
-        leases.push(
-            engine::NodeLease::new(
-                format!("mock-worker-{stage_index}"),
-                engine::NodeId(11 + u64::from(stage_index)),
-                [engine::NodeCapability::Worker],
-            )
-            .resources(engine::ResourceFacts::cpu_only(2, 2 << 30)),
-        );
+        nodes.push(engine::NodeFacts {
+            node_id: engine::NodeId(11 + u64::from(stage_index)),
+            capabilities: vec![engine::NodeCapability::Worker],
+        });
     }
-    engine::StaticPoolProvider::new(leases)
+    engine::StaticPoolProvider::new(nodes)
 }
 
 impl LocalMockCluster {
@@ -144,9 +136,7 @@ impl LocalMockCluster {
             "local-mock",
             engine::ModelSpec::pipelined_causal_llm(
                 "mock-gguf",
-                engine::ModelArtifact::TestTinyLlm {
-                    path: "local-mock://mock-gguf".to_owned(),
-                },
+                plan::GgufSource::LocalPath("local-mock://mock-gguf".to_owned()),
                 config.stage_count * 2,
                 8,
                 engine::DTypeFamily::BFloat,
@@ -157,22 +147,15 @@ impl LocalMockCluster {
             ),
         )
         .run_id(run_id.0)
-        .image(
-            engine::NodeImageSpec::new("local-mock-node")
-                .worker_runtime(engine::WorkerRuntimeSpec::DumbProcess),
-        )
         .pool_provider(mock_pool(orchestrator_node_id, config.stage_count))
-        .launcher(engine::StaticNodeLauncher)
         .planner(
             engine::FixedLinearPipelinePlanner::new(config.stage_count).runtime(
                 plan::RuntimeConfig {
                     max_tokens: config.max_tokens,
-                    prompt: plan::PromptSource::Inline("local mock prompt".to_owned()),
                     sampling: plan::SamplingPolicy {
                         temperature_millis: 0,
                         top_k: 1,
                     },
-                    token_output_policy: plan::TokenOutputPolicy::EmitAll,
                 },
             ),
         )

@@ -2,17 +2,17 @@ use std::fmt;
 
 use iroh::EndpointAddr;
 
-pub const MVP_IROH_ENDPOINT_ADDR_MASK_ENV: &str = "MVP_IROH_ENDPOINT_ADDR_MASK";
+pub(crate) const MVP_IROH_ENDPOINT_ADDR_MASK_ENV: &str = "MVP_IROH_ENDPOINT_ADDR_MASK";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum EndpointAddrMask {
+pub(crate) enum EndpointAddrMask {
     #[default]
     Full,
     RelayOnly,
 }
 
 impl EndpointAddrMask {
-    pub fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "full" | "none" => Ok(Self::Full),
             "relay-only" | "relay_only" | "relay" => Ok(Self::RelayOnly),
@@ -22,14 +22,14 @@ impl EndpointAddrMask {
         }
     }
 
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
             Self::RelayOnly => "relay-only",
         }
     }
 
-    pub fn requires_relay(self) -> bool {
+    pub(crate) fn requires_relay(self) -> bool {
         matches!(self, Self::RelayOnly)
     }
 }
@@ -40,7 +40,7 @@ impl fmt::Display for EndpointAddrMask {
     }
 }
 
-pub fn advertised_endpoint(
+pub(crate) fn advertised_endpoint(
     endpoint: EndpointAddr,
     mask: EndpointAddrMask,
 ) -> Result<EndpointAddr, String> {

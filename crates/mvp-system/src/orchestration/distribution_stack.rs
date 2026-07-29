@@ -34,7 +34,7 @@ use distribution::transport_bridge::{
 use distribution::types::{DirectoryEntry, MemberState, NodeId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DistributionActorAddrs {
+pub(crate) struct DistributionActorAddrs {
     pub swim: ActorAddress,
     pub registry: ActorAddress,
     pub metadata: ActorAddress,
@@ -42,7 +42,7 @@ pub struct DistributionActorAddrs {
     pub membership_fanout: ActorAddress,
 }
 
-pub struct DistributionRuntimeStack {
+pub(crate) struct DistributionRuntimeStack {
     pub node_id: NodeId,
     pub runtime: Arc<Runtime>,
     pub codec: Arc<CodecRegistry>,
@@ -56,11 +56,11 @@ pub struct DistributionRuntimeStack {
 }
 
 impl DistributionRuntimeStack {
-    pub fn new(node_id: NodeId, config: DistributedNodeConfig) -> Self {
+    pub(crate) fn new(node_id: NodeId, config: DistributedNodeConfig) -> Self {
         Self::new_with_codecs(node_id, config, |_| {})
     }
 
-    pub fn new_with_codecs(
+    pub(crate) fn new_with_codecs(
         node_id: NodeId,
         config: DistributedNodeConfig,
         extend_codecs: impl FnOnce(&mut CodecRegistry),
@@ -168,7 +168,7 @@ impl DistributionRuntimeStack {
         }
     }
 
-    pub fn actor_bridge_routes(&self) -> HashMap<String, ActorAddress> {
+    pub(crate) fn actor_bridge_routes(&self) -> HashMap<String, ActorAddress> {
         let mut routes = HashMap::new();
         for tag in [
             "swactor_dist::Ping",
@@ -189,7 +189,7 @@ impl DistributionRuntimeStack {
         routes
     }
 
-    pub fn tick_protocol_actors(&self, now: Instant) {
+    pub(crate) fn tick_protocol_actors(&self, now: Instant) {
         let _ = self.runtime.send_to(self.actors.swim, SwimIn::Tick { now });
         let _ = self.runtime.send_to(self.actors.registry, RegistryIn::Tick);
         let _ = self.runtime.send_to(self.actors.metadata, MetadataIn::Tick);
@@ -198,17 +198,17 @@ impl DistributionRuntimeStack {
             .send_to(self.actors.directory, DirectoryIn::Tick);
     }
 
-    pub fn pump_runtime_once(&self) {
+    pub(crate) fn pump_runtime_once(&self) {
         self.runtime.tick();
     }
 
-    pub fn register_local_actor(&self, entry: DirectoryEntry) {
+    pub(crate) fn register_local_actor(&self, entry: DirectoryEntry) {
         let _ = self
             .runtime
             .send_to(self.actors.directory, DirectoryIn::Register(entry));
     }
 
-    pub fn alive_count(&self) -> usize {
+    pub(crate) fn alive_count(&self) -> usize {
         self.membership_mirror
             .lock()
             .expect("membership mirror poisoned")
@@ -218,7 +218,7 @@ impl DistributionRuntimeStack {
             .count()
     }
 
-    pub fn member_state(&self, node_id: NodeId) -> Option<MemberState> {
+    pub(crate) fn member_state(&self, node_id: NodeId) -> Option<MemberState> {
         self.membership_mirror
             .lock()
             .ok()?
@@ -226,15 +226,15 @@ impl DistributionRuntimeStack {
             .map(|entry| entry.state)
     }
 
-    pub fn route_owner(&self, actor: ActorAddress) -> Option<NodeId> {
+    pub(crate) fn route_owner(&self, actor: ActorAddress) -> Option<NodeId> {
         self.route_view.read().ok()?.get(&actor).copied()
     }
 
-    pub fn drain_swim_transitions(&self) -> Vec<ObservedTransition> {
+    pub(crate) fn drain_swim_transitions(&self) -> Vec<ObservedTransition> {
         self.swim_telemetry.drain_transitions()
     }
 
-    pub fn drain_swim_probe_events(&self) -> Vec<ObservedProbeEvent> {
+    pub(crate) fn drain_swim_probe_events(&self) -> Vec<ObservedProbeEvent> {
         self.swim_telemetry.drain_probe_events()
     }
 }

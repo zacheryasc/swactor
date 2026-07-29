@@ -11,7 +11,7 @@ use crate::observability::benchmark;
 ///
 /// The datastream crate owns frame transport; this helper owns the MVP archive
 /// record shape used as benchmark and contract evidence.
-pub struct FrameArchive {
+pub(crate) struct FrameArchive {
     file: File,
     next_seq: u64,
     path: PathBuf,
@@ -19,11 +19,11 @@ pub struct FrameArchive {
 }
 
 impl FrameArchive {
-    pub fn open(path: &Path) -> Result<Self, String> {
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
         Self::open_with_label(path, "datastream frame log")
     }
 
-    pub fn open_with_label(path: &Path, label: &'static str) -> Result<Self, String> {
+    pub(crate) fn open_with_label(path: &Path, label: &'static str) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -48,7 +48,7 @@ impl FrameArchive {
         })
     }
 
-    pub fn record(
+    pub(crate) fn record(
         &mut self,
         source: &str,
         stream: &StreamId,

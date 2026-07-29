@@ -20,7 +20,7 @@ use crate::observability::dashboard_view::MvpClusterDashboardView;
 use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::actor::{OrchestratorActor, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
-use crate::transport::codec_registry::register_mvp_actor_codecs;
+use crate::transport::register_mvp_actor_codecs;
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
 use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
@@ -643,81 +643,81 @@ struct VastAiRuntimeConfig {
 impl VastAiRuntimeConfig {
     fn from_builder(builder: &ConfigBuilder) -> Result<Self, String> {
         let mut provisioning = VastAiProvisioningConfig::default();
-        let disk_gb = builder
-            .vastai_disk_gb_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_DISK_GB", value))
-            .transpose()?
-            .or(builder.vastai_disk_gb);
-        if let Some(disk_gb) = disk_gb {
+        macro_rules! raw_config {
+            ($parser:ident, $env:literal, $raw:expr, $value:expr) => {
+                $raw.as_ref()
+                    .map(|value| ConfigBuilder::$parser($env, value))
+                    .transpose()?
+                    .or($value)
+            };
+        }
+        if let Some(disk_gb) = raw_config!(
+            parse_value,
+            "MVP_VASTAI_DISK_GB",
+            builder.vastai_disk_gb_raw,
+            builder.vastai_disk_gb
+        ) {
             provisioning.disk_gb = disk_gb;
         }
         if let Some(ssh_user) = &builder.vastai_ssh_user {
             provisioning.ssh_user = ssh_user.clone();
         }
-        let confirm_lease = builder
-            .vastai_confirm_lease_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_bool("MVP_VASTAI_CONFIRM_LEASE", value))
-            .transpose()?
-            .or(builder.vastai_confirm_lease);
-        if let Some(confirm_lease) = confirm_lease {
+        if let Some(confirm_lease) = raw_config!(
+            parse_bool,
+            "MVP_VASTAI_CONFIRM_LEASE",
+            builder.vastai_confirm_lease_raw,
+            builder.vastai_confirm_lease
+        ) {
             provisioning.confirm_lease = confirm_lease;
         }
         provisioning.onstart = builder.vastai_onstart.clone();
         provisioning.selection.gpu_name = builder.vastai_gpu_name.clone();
-        let min_gpu_ram_mb = builder
-            .vastai_min_gpu_ram_mb_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_MIN_GPU_RAM_MB", value))
-            .transpose()?
-            .or(builder.vastai_min_gpu_ram_mb);
-        if let Some(min_gpu_ram_mb) = min_gpu_ram_mb {
+        if let Some(min_gpu_ram_mb) = raw_config!(
+            parse_value,
+            "MVP_VASTAI_MIN_GPU_RAM_MB",
+            builder.vastai_min_gpu_ram_mb_raw,
+            builder.vastai_min_gpu_ram_mb
+        ) {
             provisioning.selection.min_gpu_ram_mb = Some(min_gpu_ram_mb);
         }
-        let min_down_mbps = builder
-            .vastai_min_down_mbps_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_MIN_DOWN_MBPS", value))
-            .transpose()?
-            .or(builder.vastai_min_down_mbps);
-        if let Some(min_down_mbps) = min_down_mbps {
+        if let Some(min_down_mbps) = raw_config!(
+            parse_value,
+            "MVP_VASTAI_MIN_DOWN_MBPS",
+            builder.vastai_min_down_mbps_raw,
+            builder.vastai_min_down_mbps
+        ) {
             provisioning.selection.min_down_mbps = min_down_mbps;
         }
-        let max_dph_total = builder
-            .vastai_max_dph_total_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_MAX_DPH_TOTAL", value))
-            .transpose()?
-            .or(builder.vastai_max_dph_total);
-        if let Some(max_dph_total) = max_dph_total {
+        if let Some(max_dph_total) = raw_config!(
+            parse_value,
+            "MVP_VASTAI_MAX_DPH_TOTAL",
+            builder.vastai_max_dph_total_raw,
+            builder.vastai_max_dph_total
+        ) {
             provisioning.selection.max_dph_total = Some(max_dph_total);
         }
-        let min_up_mbps = builder
-            .vastai_min_up_mbps_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_MIN_UP_MBPS", value))
-            .transpose()?
-            .or(builder.vastai_min_up_mbps);
-        if let Some(min_up_mbps) = min_up_mbps {
+        if let Some(min_up_mbps) = raw_config!(
+            parse_value,
+            "MVP_VASTAI_MIN_UP_MBPS",
+            builder.vastai_min_up_mbps_raw,
+            builder.vastai_min_up_mbps
+        ) {
             provisioning.selection.min_up_mbps = Some(min_up_mbps);
         }
-        let min_reliability = builder
-            .vastai_min_reliability_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_MIN_RELIABILITY", value))
-            .transpose()?
-            .or(builder.vastai_min_reliability);
-        if let Some(min_reliability) = min_reliability {
+        if let Some(min_reliability) = raw_config!(
+            parse_value,
+            "MVP_VASTAI_MIN_RELIABILITY",
+            builder.vastai_min_reliability_raw,
+            builder.vastai_min_reliability
+        ) {
             provisioning.selection.min_reliability = min_reliability;
         }
-        let require_verified = builder
-            .vastai_require_verified_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_bool("MVP_VASTAI_REQUIRE_VERIFIED", value))
-            .transpose()?
-            .or(builder.vastai_require_verified);
-        if let Some(require_verified) = require_verified {
+        if let Some(require_verified) = raw_config!(
+            parse_bool,
+            "MVP_VASTAI_REQUIRE_VERIFIED",
+            builder.vastai_require_verified_raw,
+            builder.vastai_require_verified
+        ) {
             provisioning.selection.require_verified = require_verified;
         }
         for host_id in &builder.vastai_blacklist_hosts {
@@ -725,13 +725,12 @@ impl VastAiRuntimeConfig {
                 provisioning.selection.blacklist_hosts.push(*host_id);
             }
         }
-        let poll_interval_secs = builder
-            .vastai_poll_interval_secs_raw
-            .as_ref()
-            .map(|value| ConfigBuilder::parse_value("MVP_VASTAI_POLL_INTERVAL_SECS", value))
-            .transpose()?
-            .or(builder.vastai_poll_interval_secs);
-        if let Some(poll_interval_secs) = poll_interval_secs {
+        if let Some(poll_interval_secs) = raw_config!(
+            parse_value,
+            "MVP_VASTAI_POLL_INTERVAL_SECS",
+            builder.vastai_poll_interval_secs_raw,
+            builder.vastai_poll_interval_secs
+        ) {
             provisioning.lifecycle.poll_interval = Duration::from_secs(poll_interval_secs);
         }
         let ssh_identity = builder
@@ -797,11 +796,8 @@ struct CachedModelConfig {
 }
 
 impl CachedModelConfig {
-    fn from_host_path(provider: &ProviderKind, requested: PathBuf) -> Result<Self, String> {
-        if provider != &provider_kind::process()
-            && provider != &provider_kind::docker()
-            && provider != &provider_kind::vastai()
-        {
+    fn from_host_path(provider: &str, requested: PathBuf) -> Result<Self, String> {
+        if !matches!(provider, "process" | "docker" | "vastai") {
             return Err(format!(
                 "{CACHED_MODEL_HOST_ENV} is a host-local cache path and is only supported by provider=process, provider=docker, or vastai planning"
             ));
@@ -1432,8 +1428,9 @@ impl ConfigBuilder {
                 RuntimeConfigProfile::Local => provider_kind::process(),
                 RuntimeConfigProfile::Deploy => provider_kind::vastai(),
             });
+        let provider_name = provider.as_str();
         let mut image = self.image.clone();
-        if provider == provider_kind::vastai() && !self.image_overridden_after_toml {
+        if provider_name == "vastai" && !self.image_overridden_after_toml {
             if let Some(vastai_image) = &self.toml_vastai_image {
                 image = vastai_image.clone();
             }
@@ -1442,7 +1439,7 @@ impl ConfigBuilder {
             return Err("--pipeline-stages must be greater than 0".to_owned());
         }
         let mut cached_model_host_path = self.cached_model_host_path.clone();
-        if (provider == provider_kind::process() || provider == provider_kind::docker())
+        if matches!(provider_name, "process" | "docker")
             && self.pipeline_stages > 1
             && cached_model_host_path.is_none()
             && (matches!(
@@ -1464,12 +1461,12 @@ impl ConfigBuilder {
             cached_model_host_path = Some(default_pipeline_cached_model_path());
         }
         let cached_model = cached_model_host_path
-            .map(|path| CachedModelConfig::from_host_path(&provider, path))
+            .map(|path| CachedModelConfig::from_host_path(provider_name, path))
             .transpose()?;
         let mut gguf_source = self.gguf_source.clone();
         if let Some(cached_model) = &cached_model {
-            if provider != provider_kind::vastai() {
-                gguf_source = GgufSource::LocalPath(if provider == provider_kind::process() {
+            if provider_name != "vastai" {
+                gguf_source = GgufSource::LocalPath(if provider_name == "process" {
                     cached_model.host_path.to_string_lossy().to_string()
                 } else {
                     cached_model.container_path.clone()
@@ -1485,11 +1482,9 @@ impl ConfigBuilder {
             Some(mask) => EndpointAddrMask::parse(mask)?,
             None => EndpointAddrMask::Full,
         };
-        let vastai = if provider == provider_kind::vastai() {
-            Some(VastAiRuntimeConfig::from_builder(&self)?)
-        } else {
-            None
-        };
+        let vastai = (provider_name == "vastai")
+            .then(|| VastAiRuntimeConfig::from_builder(&self))
+            .transpose()?;
         Ok(Config {
             config_profile: self.config_profile,
             image,
@@ -1588,22 +1583,20 @@ impl Config {
     }
 
     fn provider_datastream_detail(&self) -> Value {
-        if self.provider == provider_kind::process() {
-            json!({
+        match self.provider.as_str() {
+            "process" => json!({
                 "worker_bin": self.worker_bin.as_ref().map(|path| path.to_string_lossy().to_string()),
                 "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
-            })
-        } else if self.provider == provider_kind::docker() {
-            json!({
+            }),
+            "docker" => json!({
                 "docker_gpus": &self.docker_gpus,
                 "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
-            })
-        } else if self.provider == provider_kind::vastai() {
-            self.vastai
+            }),
+            "vastai" => self
+                .vastai
                 .as_ref()
-                .map_or_else(|| json!({}), VastAiRuntimeConfig::datastream_detail)
-        } else {
-            json!({})
+                .map_or_else(|| json!({}), VastAiRuntimeConfig::datastream_detail),
+            _ => json!({}),
         }
     }
 
@@ -1662,12 +1655,10 @@ impl Config {
             model,
             runtime: run_plan::RuntimeConfig {
                 max_tokens: self.default_max_tokens,
-                prompt: run_plan::PromptSource::Inline(String::new()),
                 sampling: run_plan::SamplingPolicy {
                     temperature_millis: 0,
                     top_k: 1,
                 },
-                token_output_policy: run_plan::TokenOutputPolicy::EmitAll,
             },
             candidate_pool,
             stage_count: self.pipeline_stages,
@@ -1709,7 +1700,7 @@ impl Config {
                 repo,
                 file,
                 revision: None,
-            } if self.provider == provider_kind::vastai()
+            } if self.provider.as_str() == "vastai"
                 && file == DEFAULT_PIPELINE_CACHED_MODEL_FILE =>
             {
                 let host_path = default_pipeline_cached_model_path();
@@ -1729,7 +1720,7 @@ impl Config {
     }
 
     fn prepare_vastai_ssh_key(&mut self) -> Result<(), String> {
-        if self.provider != provider_kind::vastai() {
+        if self.provider.as_str() != "vastai" {
             return Ok(());
         }
 
@@ -1777,54 +1768,54 @@ impl Config {
         &self,
         bootstrap_runtime: Arc<swactor::runtime::Runtime>,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
-        if self.provider == provider_kind::process() {
-            let worker_bin = match &self.worker_bin {
-                Some(worker_bin) => worker_bin.clone(),
-                None => {
-                    let mut path =
-                        std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-                    path.set_file_name("mvp-worker-node");
-                    path
+        match self.provider.as_str() {
+            "process" => {
+                let worker_bin = match &self.worker_bin {
+                    Some(worker_bin) => worker_bin.clone(),
+                    None => {
+                        let mut path =
+                            std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
+                        path.set_file_name("mvp-worker-node");
+                        path
+                    }
+                };
+                if !worker_bin.is_file() {
+                    return Err(format!(
+                        "local process worker binary does not exist: {}",
+                        worker_bin.display()
+                    ));
                 }
-            };
-            if !worker_bin.is_file() {
-                return Err(format!(
-                    "local process worker binary does not exist: {}",
-                    worker_bin.display()
-                ));
+                Ok(Box::new(LocalProcessPlugin::new(worker_bin)))
             }
-            Ok(Box::new(LocalProcessPlugin::new(worker_bin)))
-        } else if self.provider == provider_kind::docker() {
-            Ok(Box::new(LocalDockerPlugin::new(
+            "docker" => Ok(Box::new(LocalDockerPlugin::new(
                 env_optional("MVP_DOCKER_CONTAINER_PREFIX")
                     .unwrap_or_else(|| "mvp-orchestrator".to_owned()),
-            )))
-        } else if self.provider == provider_kind::vastai() {
-            let vastai = self
-                .vastai
-                .as_ref()
-                .ok_or_else(|| "VastAI config was not resolved for provider vastai".to_owned())?;
-            if vastai.bootstrap_command.is_none() {
-                return Err(
-                    "MVP_VASTAI_BOOTSTRAP_COMMAND is required when MVP_NODE_PROVIDER=vastai"
-                        .to_owned(),
-                );
+            ))),
+            "vastai" => {
+                let vastai = self.vastai.as_ref().ok_or_else(|| {
+                    "VastAI config was not resolved for provider vastai".to_owned()
+                })?;
+                if vastai.bootstrap_command.is_none() {
+                    return Err(
+                        "MVP_VASTAI_BOOTSTRAP_COMMAND is required when MVP_NODE_PROVIDER=vastai"
+                            .to_owned(),
+                    );
+                }
+                let api_key = vastai.api_key.clone().ok_or_else(|| {
+                    "VAST_API_KEY, MVP_VASTAI_API_KEY, or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
+                        .to_owned()
+                })?;
+                let ssh_identity = vastai
+                    .ssh_identity
+                    .clone()
+                    .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
+                Ok(Box::new(VastAiProvisioningPlugin::new(
+                    ToolsVastAiLeaseClient::from_api_key(api_key)?,
+                    SshCommandBootstrapLauncher::new(Some(ssh_identity), bootstrap_runtime),
+                    vastai.provisioning.clone(),
+                )))
             }
-            let api_key = vastai.api_key.clone().ok_or_else(|| {
-                "VAST_API_KEY, MVP_VASTAI_API_KEY, or VASTAI_API_KEY is required when MVP_NODE_PROVIDER=vastai"
-                    .to_owned()
-            })?;
-            let ssh_identity = vastai
-                .ssh_identity
-                .clone()
-                .ok_or_else(|| "VastAI SSH identity was not prepared".to_owned())?;
-            Ok(Box::new(VastAiProvisioningPlugin::new(
-                ToolsVastAiLeaseClient::from_api_key(api_key)?,
-                SshCommandBootstrapLauncher::new(Some(ssh_identity), bootstrap_runtime),
-                vastai.provisioning.clone(),
-            )))
-        } else {
-            Err("mock provider cannot build a runtime provisioner".to_owned())
+            _ => Err("mock provider cannot build a runtime provisioner".to_owned()),
         }
     }
 
@@ -1844,13 +1835,13 @@ impl Config {
         if self.relay.url.is_some() {
             keys.push(MVP_IROH_RELAY_URL_ENV);
         }
-        if self.provider == provider_kind::docker() {
+        if self.provider.as_str() == "docker" {
             keys.push("MVP_DOCKER_GPUS");
         }
         if std::env::var_os("DEV").is_some() {
             keys.push("DEV");
         }
-        if local_tinygrad_worker_env(&self.provider).is_some() {
+        if local_tinygrad_worker_env(self.provider.as_str()).is_some() {
             keys.push("MVP_TINYGRAD_WORKER");
         }
         for key in [
@@ -1891,6 +1882,7 @@ impl Config {
         logical_node_id: u64,
         stage_index: u32,
     ) -> Result<NodeProvisionSpec, String> {
+        let provider_name = self.provider.as_str();
         let mut env = vec![
             ("MVP_RUN_ID".to_owned(), self.run_id.to_string()),
             (
@@ -1906,10 +1898,7 @@ impl Config {
                 MVP_IROH_ENDPOINT_ADDR_MASK_ENV.to_owned(),
                 self.endpoint_addr_mask.as_str().to_owned(),
             ),
-            (
-                "MVP_NODE_PROVIDER".to_owned(),
-                self.provider.as_str().to_owned(),
-            ),
+            ("MVP_NODE_PROVIDER".to_owned(), provider_name.to_owned()),
             (
                 "MVP_COORDINATOR_ENDPOINT".to_owned(),
                 serde_json::to_string(&coordinator)
@@ -1929,13 +1918,13 @@ impl Config {
         if let Some(url) = &self.relay.url {
             env.push((MVP_IROH_RELAY_URL_ENV.to_owned(), url.clone()));
         }
-        if self.provider == provider_kind::docker() {
+        if provider_name == "docker" {
             env.push(("MVP_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
         }
         if let Some(value) = env_optional("DEV") {
             env.push(("DEV".to_owned(), value));
         }
-        env.extend(local_tinygrad_worker_env(&self.provider));
+        env.extend(local_tinygrad_worker_env(provider_name));
         for name in [
             "MVP_CPU_LINE_PROFILE",
             "MVP_CPU_LINE_PROFILE_INTERVAL_MS",
@@ -1970,20 +1959,17 @@ impl Config {
         if let Some(max_context) = self.max_context {
             env.push(("MVP_MAX_CONTEXT".to_owned(), max_context.to_string()));
         }
-        let args = if self.provider == provider_kind::vastai() {
-            self.vastai
+        let args = match provider_name {
+            "vastai" => self
+                .vastai
                 .as_ref()
                 .and_then(|vastai| vastai.bootstrap_command.clone())
                 .into_iter()
-                .collect()
-        } else if self.provider == provider_kind::process()
-            || self.provider == provider_kind::docker()
-        {
-            Vec::new()
-        } else {
-            return Err("mvp-orchestrator does not support mock provider".to_owned());
+                .collect(),
+            "process" | "docker" => Vec::new(),
+            _ => return Err("mvp-orchestrator does not support mock provider".to_owned()),
         };
-        let mounts = if self.provider == provider_kind::docker() {
+        let mounts = if provider_name == "docker" {
             self.cached_model
                 .as_ref()
                 .map(|cached_model| {
@@ -2332,7 +2318,7 @@ fn start_and_provision_workers(
             "image":&config.image,
             "relay_mode":relay_mode_env_value(&config.relay.mode),
             "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
-            "docker_gpus":if config.provider == provider_kind::docker() { Some(config.docker_gpus.as_str()) } else { None },
+            "docker_gpus":if config.provider.as_str() == "docker" { Some(config.docker_gpus.as_str()) } else { None },
             "provider_config":config.provider_datastream_detail(),
             "env_keys":config.node_spec_env_keys(),
             "worker_count":stage_specs.len(),
@@ -5562,19 +5548,19 @@ fn env_optional(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn local_tinygrad_worker_env(provider: &ProviderKind) -> Option<(String, String)> {
+fn local_tinygrad_worker_env(provider: &str) -> Option<(String, String)> {
     env_optional("MVP_TINYGRAD_WORKER")
         .map(|value| ("MVP_TINYGRAD_WORKER".to_owned(), value))
         .or_else(|| {
-            if provider != &provider_kind::process() {
-                return None;
-            }
-            default_local_tinygrad_worker_path().map(|path| {
-                (
-                    "MVP_TINYGRAD_WORKER".to_owned(),
-                    path.to_string_lossy().to_string(),
-                )
-            })
+            (provider == "process")
+                .then(default_local_tinygrad_worker_path)
+                .flatten()
+                .map(|path| {
+                    (
+                        "MVP_TINYGRAD_WORKER".to_owned(),
+                        path.to_string_lossy().to_string(),
+                    )
+                })
         })
 }
 
@@ -5650,28 +5636,30 @@ fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
 }
 
 fn ssh_public_key_fingerprint(public_key: &str) -> String {
+    const UNAVAILABLE: &str = "unavailable";
+
     let path = std::env::temp_dir().join(format!("mvp-vastai-ssh-key-{}.pub", std::process::id()));
     if std::fs::write(&path, format!("{public_key}\n")).is_err() {
-        return "unavailable".to_owned();
+        return UNAVAILABLE.to_owned();
     }
     let output = Command::new("ssh-keygen")
         .arg("-l")
         .arg("-f")
         .arg(&path)
-        .output();
+        .output()
+        .ok();
     let _ = std::fs::remove_file(&path);
-    let Ok(output) = output else {
-        return "unavailable".to_owned();
+    let Some(output) = output.filter(|output| output.status.success()) else {
+        return UNAVAILABLE.to_owned();
     };
-    if !output.status.success() {
-        return "unavailable".to_owned();
-    }
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut fields = stdout.split_whitespace();
-    match (fields.next(), fields.next()) {
-        (Some(bits), Some(fingerprint)) => format!("{bits} {fingerprint}"),
-        _ => "unavailable".to_owned(),
-    }
+    fields
+        .next()
+        .zip(fields.next())
+        .map(|(bits, fingerprint)| format!("{bits} {fingerprint}"))
+        .unwrap_or_else(|| UNAVAILABLE.to_owned())
 }
 
 fn vastai_account_has_ssh_key(api_key: &str, public_key: &str) -> Result<bool, String> {
@@ -5721,16 +5709,12 @@ fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), 
 
 fn account_ssh_keys_output_contains_public_key(output: &str, public_key: &str) -> bool {
     let public_key = public_key.trim();
-    if public_key.is_empty() {
-        return false;
-    }
-    if output.contains(public_key) {
-        return true;
-    }
-    public_key
-        .split_whitespace()
-        .nth(1)
-        .is_some_and(|body| !body.is_empty() && output.contains(body))
+    !public_key.is_empty()
+        && (output.contains(public_key)
+            || public_key
+                .split_whitespace()
+                .nth(1)
+                .is_some_and(|body| !body.is_empty() && output.contains(body)))
 }
 
 fn vastai_cli_error(error: std::io::Error) -> String {
@@ -5743,10 +5727,11 @@ fn vastai_cli_error(error: std::io::Error) -> String {
 }
 
 fn command_output_failure_detail(output: &std::process::Output, secret: Option<&str>) -> String {
-    let mut detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    if detail.is_empty() {
-        detail = output.status.to_string();
-    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut detail = match stderr.trim() {
+        "" => output.status.to_string(),
+        detail => detail.to_owned(),
+    };
     if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
         detail = detail.replace(secret, "<redacted>");
     }

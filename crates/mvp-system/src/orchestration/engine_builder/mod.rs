@@ -7,23 +7,12 @@
 //! model onto discovered nodes, assign roles, and return a live cluster handle.
 //! Workload semantics stay outside this module; see [`WorkloadAdapter`].
 
-pub mod engine;
-pub mod error;
-pub mod events;
-pub mod launcher;
-pub mod model;
-pub mod node_image;
-pub mod planner;
-pub mod pool;
-pub mod roles;
+pub(crate) mod engine;
+pub(crate) mod error;
+pub(crate) mod planner;
+pub(crate) mod pool;
 
-pub use crate::run_plan::{DTypeFamily, NodeId};
-pub use engine::ClusterBuilder;
-pub use events::EngineEvent;
-pub use launcher::StaticNodeLauncher;
-pub use model::{ModelArtifact, ModelSpec};
-pub use planner::FixedLinearPipelinePlanner;
-pub use pool::{NodeCapability, NodeLease, ResourceFacts, StaticPoolProvider};
-pub use roles::RoleKind;
-
-pub use node_image::{NodeImageSpec, WorkerRuntimeSpec};
+pub(crate) use crate::run_plan::{DTypeFamily, NodeId};
+pub(crate) use engine::{ClusterBuilder, EngineEvent};
+pub(crate) use planner::{FixedLinearPipelinePlanner, RoleKind};
+pub(crate) use pool::{ModelSpec, NodeCapability, NodeFacts, StaticPoolProvider};

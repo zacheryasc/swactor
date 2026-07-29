@@ -10,49 +10,49 @@
 use iroh::{RelayMode, RelayUrl};
 use serde::{Deserialize, Serialize};
 
-pub const MVP_IROH_RELAY_MODE_ENV: &str = "MVP_IROH_RELAY_MODE";
-pub const MVP_IROH_RELAY_URL_ENV: &str = "MVP_IROH_RELAY_URL";
-pub const SWACTOR_IROH_RELAY_URL_ENV: &str = "SWACTOR_IROH_RELAY_URL";
+pub(crate) const MVP_IROH_RELAY_MODE_ENV: &str = "MVP_IROH_RELAY_MODE";
+pub(crate) const MVP_IROH_RELAY_URL_ENV: &str = "MVP_IROH_RELAY_URL";
+pub(crate) const SWACTOR_IROH_RELAY_URL_ENV: &str = "SWACTOR_IROH_RELAY_URL";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RelayPurpose {
+pub(crate) enum RelayPurpose {
     Combined,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelayProvisionRequest {
+pub(crate) struct RelayProvisionRequest {
     pub run_id: u64,
     pub purpose: RelayPurpose,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelayLeaseId(pub String);
+pub(crate) struct RelayLeaseId(pub(crate) String);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RelayProviderKind {
+pub(crate) enum RelayProviderKind {
     LocalShim,
     Static,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelayEndpoint {
+pub(crate) struct RelayEndpoint {
     pub url: String,
     pub provider: RelayProviderKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RelayLease {
+pub(crate) struct RelayLease {
     pub id: RelayLeaseId,
     pub endpoints: Vec<RelayEndpoint>,
 }
 
 #[derive(Clone, Debug)]
-pub struct RelayRuntimeConfig {
+pub(crate) struct RelayRuntimeConfig {
     pub mode: RelayMode,
     pub url: Option<String>,
 }
 
-pub trait RelayProvider: Send {
+pub(crate) trait RelayProvider: Send {
     fn provision_relay(&mut self, request: RelayProvisionRequest) -> Result<RelayLease, String>;
 
     fn relay_mode(&self, lease: &RelayLease) -> Result<RelayMode, String>;
@@ -63,7 +63,7 @@ pub trait RelayProvider: Send {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub struct LocalShimRelayProvider;
+pub(crate) struct LocalShimRelayProvider;
 
 impl RelayProvider for LocalShimRelayProvider {
     fn provision_relay(&mut self, request: RelayProvisionRequest) -> Result<RelayLease, String> {
@@ -79,26 +79,26 @@ impl RelayProvider for LocalShimRelayProvider {
 }
 
 #[derive(Clone, Debug)]
-pub struct StaticRelayProvider {
+pub(crate) struct StaticRelayProvider {
     url: RelayUrl,
 }
 
 impl StaticRelayProvider {
-    pub fn new(url: RelayUrl) -> Self {
+    pub(crate) fn new(url: RelayUrl) -> Self {
         Self { url }
     }
 
-    pub fn from_url_str(raw: &str) -> Result<Self, String> {
+    pub(crate) fn from_url_str(raw: &str) -> Result<Self, String> {
         parse_relay_url(raw).map(Self::new)
     }
 
-    pub fn from_env() -> Result<Option<Self>, String> {
+    pub(crate) fn from_env() -> Result<Option<Self>, String> {
         selected_relay_url_from_env()
             .map(|url| Self::from_url_str(&url).map(Some))
             .unwrap_or(Ok(None))
     }
 
-    pub fn url(&self) -> String {
+    pub(crate) fn url(&self) -> String {
         self.url.to_string()
     }
 }
@@ -127,13 +127,13 @@ impl RelayProvider for StaticRelayProvider {
     }
 }
 
-pub fn relay_runtime_config_from_env(run_id: u64) -> Result<RelayRuntimeConfig, String> {
+pub(crate) fn relay_runtime_config_from_env(run_id: u64) -> Result<RelayRuntimeConfig, String> {
     let mode = relay_mode_setting_from_env();
     let url = selected_relay_url_from_env();
     relay_runtime_config_from_settings(run_id, mode.as_deref(), url.as_deref())
 }
 
-pub fn relay_runtime_config_from_settings(
+pub(crate) fn relay_runtime_config_from_settings(
     run_id: u64,
     mode: Option<&str>,
     url: Option<&str>,
@@ -150,14 +150,14 @@ pub fn relay_runtime_config_from_settings(
     }
 }
 
-pub fn relay_mode_env_value(mode: &RelayMode) -> &'static str {
+pub(crate) fn relay_mode_env_value(mode: &RelayMode) -> &'static str {
     match mode {
         RelayMode::Disabled => "disabled",
         _ => "default",
     }
 }
 
-pub fn selected_relay_url_from_env() -> Option<String> {
+pub(crate) fn selected_relay_url_from_env() -> Option<String> {
     env_optional(MVP_IROH_RELAY_URL_ENV).or_else(|| env_optional(SWACTOR_IROH_RELAY_URL_ENV))
 }
 

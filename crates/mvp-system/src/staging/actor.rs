@@ -4,13 +4,13 @@ use swactor::runtime::Ctx;
 use crate::staging::control as core;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StageControllerMsg {
+pub(crate) enum StageControllerMsg {
     Observe(core::StageEvent),
     Snapshot { reply_to: ActorAddress },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StageControllerReport {
+pub(crate) enum StageControllerReport {
     Command(core::StageCommand),
     Lifecycle(core::StageLifecycleEvent),
     Snapshot {
@@ -19,7 +19,7 @@ pub enum StageControllerReport {
     },
 }
 
-pub struct StageControllerActor {
+pub(crate) struct StageControllerActor {
     core: core::StageController,
     report_to: Option<ActorAddress>,
     command_cursor: usize,
@@ -27,7 +27,7 @@ pub struct StageControllerActor {
 }
 
 impl StageControllerActor {
-    pub fn new(local_node_id: core::NodeId, report_to: Option<ActorAddress>) -> Self {
+    pub(crate) fn new(local_node_id: core::NodeId, report_to: Option<ActorAddress>) -> Self {
         Self {
             core: core::StageController::new(local_node_id),
             report_to,

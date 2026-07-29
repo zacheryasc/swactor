@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-pub const MO01_HEADER_BYTES: u64 = 40;
+pub(crate) const MO01_HEADER_BYTES: u64 = 40;
 const TOKEN_ID_WIDTH_BYTES: u32 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RunId(pub u64);
+pub(crate) struct RunId(pub(crate) u64);
 
 impl From<u64> for RunId {
     fn from(value: u64) -> Self {
@@ -13,22 +13,22 @@ impl From<u64> for RunId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub u64);
+pub(crate) struct NodeId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EdgeId(pub u64);
+pub(crate) struct EdgeId(pub(crate) u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EdgeAllocator {
+pub(crate) struct EdgeAllocator {
     next: u64,
 }
 
 impl EdgeAllocator {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { next: 1 }
     }
 
-    pub fn alloc(&mut self) -> EdgeId {
+    pub(crate) fn alloc(&mut self) -> EdgeId {
         let edge_id = EdgeId(self.next);
         self.next += 1;
         edge_id
@@ -42,12 +42,12 @@ impl Default for EdgeAllocator {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DTypeFamily {
+pub(crate) enum DTypeFamily {
     BFloat,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModelFacts {
+pub(crate) struct ModelFacts {
     pub model_id: String,
     pub gguf_source: GgufSource,
     pub num_layers: u32,
@@ -60,7 +60,7 @@ pub struct ModelFacts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum GgufSource {
+pub(crate) enum GgufSource {
     LocalPath(String),
     HuggingFaceGguf {
         repo: String,
@@ -70,35 +70,25 @@ pub enum GgufSource {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TokenizerSource {
+pub(crate) enum TokenizerSource {
     EmbeddedGguf,
     LocalPath(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PromptSource {
-    Inline(String),
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SamplingPolicy {
+pub(crate) struct SamplingPolicy {
     pub temperature_millis: u32,
     pub top_k: u32,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TokenOutputPolicy {
-    EmitAll,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RoleId(pub u64);
+pub(crate) struct RoleId(pub(crate) u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct PortId(pub String);
+pub(crate) struct PortId(pub(crate) String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GgufModelPlan {
+pub(crate) struct GgufModelPlan {
     pub model_id: String,
     pub gguf_source: GgufSource,
     pub num_layers: u32,
@@ -111,65 +101,42 @@ pub struct GgufModelPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimePlan {
-    pub prompt: PromptSource,
-    pub sampling: SamplingPolicy,
-    pub token_output_policy: TokenOutputPolicy,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeConfig {
+pub(crate) struct RuntimeConfig {
     pub max_tokens: u32,
-    pub prompt: PromptSource,
     pub sampling: SamplingPolicy,
-    pub token_output_policy: TokenOutputPolicy,
-}
-
-impl RuntimeConfig {
-    pub fn test_default() -> Self {
-        Self {
-            max_tokens: 4,
-            prompt: PromptSource::Inline("test prompt".to_owned()),
-            sampling: SamplingPolicy {
-                temperature_millis: 0,
-                top_k: 1,
-            },
-            token_output_policy: TokenOutputPolicy::EmitAll,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StagePlacement {
+pub(crate) struct StagePlacement {
     pub stage_index: u32,
     pub node_id: NodeId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PlacementInput {
+pub(crate) enum PlacementInput {
     FixedLinear(Vec<StagePlacement>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RingDirection {
+pub(crate) enum RingDirection {
     Ingress,
     Egress,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HostPinning {
+pub(crate) enum HostPinning {
     Pageable,
     PinnedRequired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WakeCoalescing {
+pub(crate) enum WakeCoalescing {
     PendingBit,
     ReadySet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RingSpec {
+pub(crate) struct RingSpec {
     pub data_capacity: u64,
     pub alignment: u32,
     pub direction: RingDirection,
@@ -177,30 +144,8 @@ pub struct RingSpec {
     pub wake_coalescing: WakeCoalescing,
 }
 
-impl RingSpec {
-    pub fn test_default_activation() -> Self {
-        Self {
-            data_capacity: 1 << 20,
-            alignment: 64,
-            direction: RingDirection::Egress,
-            host_pinning: HostPinning::Pageable,
-            wake_coalescing: WakeCoalescing::PendingBit,
-        }
-    }
-
-    pub fn test_default_token() -> Self {
-        Self {
-            data_capacity: 4096,
-            alignment: 8,
-            direction: RingDirection::Egress,
-            host_pinning: HostPinning::Pageable,
-            wake_coalescing: WakeCoalescing::PendingBit,
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlannerInput {
+pub(crate) struct PlannerInput {
     pub run_id: RunId,
     pub orchestrator_node_id: NodeId,
     pub model: ModelFacts,
@@ -213,14 +158,14 @@ pub struct PlannerInput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EdgeKind {
+pub(crate) enum EdgeKind {
     TokenIn,
     Activation,
     TokenOut,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ObjectKind {
+pub(crate) enum ObjectKind {
     Token,
     Activation,
     Weight,
@@ -228,7 +173,7 @@ pub enum ObjectKind {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ShapeRule {
+pub(crate) enum ShapeRule {
     TokenIds,
     ActivationRows { max_seq_len: u32, hidden_dim: u32 },
     WeightTensor,
@@ -236,17 +181,17 @@ pub enum ShapeRule {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LayoutRule {
+pub(crate) enum LayoutRule {
     Contiguous,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SequencePolicy {
+pub(crate) enum SequencePolicy {
     Ordered,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObjectSpec {
+pub(crate) struct ObjectSpec {
     pub kind: ObjectKind,
     pub max_extent: u64,
     pub dtype_family: DTypeFamily,
@@ -258,13 +203,13 @@ pub struct ObjectSpec {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EdgeEndpoint {
+pub(crate) enum EdgeEndpoint {
     Orchestrator { node_id: NodeId },
     Stage { node_id: NodeId, stage_index: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EdgePlan {
+pub(crate) struct EdgePlan {
     pub run_id: RunId,
     pub edge_id: EdgeId,
     pub kind: EdgeKind,
@@ -275,7 +220,7 @@ pub struct EdgePlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StagePlan {
+pub(crate) struct StagePlan {
     pub run_id: RunId,
     pub stage_index: u32,
     pub stage_count: u32,
@@ -288,17 +233,17 @@ pub struct StagePlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunPlan {
+pub(crate) struct RunPlan {
     pub run_id: RunId,
     pub model: GgufModelPlan,
-    pub runtime: RuntimePlan,
+    pub sampling: SamplingPolicy,
     pub stages: Vec<StagePlan>,
     pub edges: Vec<EdgePlan>,
     pub max_tokens: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InboundEdgeProvision {
+pub(crate) struct InboundEdgeProvision {
     pub edge_id: EdgeId,
     pub kind: EdgeKind,
     pub object_spec: ObjectSpec,
@@ -306,7 +251,7 @@ pub struct InboundEdgeProvision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OutboundEdgeProvision {
+pub(crate) struct OutboundEdgeProvision {
     pub edge_id: EdgeId,
     pub kind: EdgeKind,
     pub consumer_node_id: NodeId,
@@ -315,7 +260,7 @@ pub struct OutboundEdgeProvision {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StageModelFacts {
+pub(crate) struct StageModelFacts {
     pub model_id: String,
     pub hidden_dim: u32,
     pub dtype_family: DTypeFamily,
@@ -324,7 +269,7 @@ pub struct StageModelFacts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StageRuntimeFacts {
+pub(crate) struct StageRuntimeFacts {
     pub role_id: RoleId,
     pub input_port: PortId,
     pub output_port: PortId,
@@ -332,7 +277,7 @@ pub struct StageRuntimeFacts {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProvisionStage {
+pub(crate) struct ProvisionStage {
     pub run_id: RunId,
     pub node_id: NodeId,
     pub stage_index: u32,
@@ -348,7 +293,7 @@ pub struct ProvisionStage {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PlanRejectionKind {
+pub(crate) enum PlanRejectionKind {
     UnknownNode,
     DuplicateStageAssignment,
     MissingStage,
@@ -361,31 +306,26 @@ pub enum PlanRejectionKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlanRejection {
+pub(crate) struct PlanRejection {
     kind: PlanRejectionKind,
 }
 
 impl PlanRejection {
-    pub fn kind(&self) -> PlanRejectionKind {
+    pub(crate) fn kind(&self) -> PlanRejectionKind {
         self.kind
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ProjectionRejection {
+pub(crate) enum ProjectionRejection {
     UnknownStage,
     MissingEdge,
 }
 
-pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
+pub(crate) fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
     validate_global_input(&input)?;
     let placements = validated_placements(&input)?;
     let model = model_plan(&input.model)?;
-    let runtime = RuntimePlan {
-        prompt: input.runtime.prompt.clone(),
-        sampling: input.runtime.sampling,
-        token_output_policy: input.runtime.token_output_policy,
-    };
     let max_tokens = input.runtime.max_tokens;
     let gguf_source = model.gguf_source.clone();
     let hidden_dim = model.hidden_dim;
@@ -526,14 +466,14 @@ pub fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
     Ok(RunPlan {
         run_id: input.run_id,
         model,
-        runtime,
+        sampling: input.runtime.sampling,
         stages,
         edges,
         max_tokens,
     })
 }
 
-pub fn derive_stage_provision(
+pub(crate) fn derive_stage_provision(
     plan: &RunPlan,
     stage_index: u32,
 ) -> Result<ProvisionStage, ProjectionRejection> {
@@ -586,7 +526,7 @@ pub fn derive_stage_provision(
             input_port: PortId("input".to_owned()),
             output_port: PortId("output".to_owned()),
             sampling: if stage.stage_index + 1 == stage.stage_count {
-                Some(plan.runtime.sampling)
+                Some(plan.sampling)
             } else {
                 None
             },

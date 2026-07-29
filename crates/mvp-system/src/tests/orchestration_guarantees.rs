@@ -14,36 +14,22 @@ mod run_plan {
 
     use crate::run_plan as plan;
 
-    // Local aliases keep the test prose readable while the file imports only the
-    // public planning module. The aliases do not grant access to planner internals.
+    // Local aliases keep the test prose readable while importing only the public
+    // planning module. The aliases do not grant access to planner internals.
     type DTypeFamily = plan::DTypeFamily;
     type EdgeEndpoint = plan::EdgeEndpoint;
-    type EdgeId = plan::EdgeId;
     type EdgeKind = plan::EdgeKind;
-    type EdgePlan = plan::EdgePlan;
     type GgufSource = plan::GgufSource;
-    type HostPinning = plan::HostPinning;
-    type InboundEdgeProvision = plan::InboundEdgeProvision;
     type ModelFacts = plan::ModelFacts;
     use plan::NodeId;
-    type LayoutRule = plan::LayoutRule;
-    type ObjectKind = plan::ObjectKind;
-    type OutboundEdgeProvision = plan::OutboundEdgeProvision;
-    type PromptSource = plan::PromptSource;
     type PlacementInput = plan::PlacementInput;
     type PlanRejectionKind = plan::PlanRejectionKind;
     type PlannerInput = plan::PlannerInput;
     type RingSpec = plan::RingSpec;
-    type RingDirection = plan::RingDirection;
-    type RunPlan = plan::RunPlan;
     type RuntimeConfig = plan::RuntimeConfig;
     type SamplingPolicy = plan::SamplingPolicy;
-    type SequencePolicy = plan::SequencePolicy;
-    type ShapeRule = plan::ShapeRule;
     type StagePlacement = plan::StagePlacement;
-    type TokenOutputPolicy = plan::TokenOutputPolicy;
     type TokenizerSource = plan::TokenizerSource;
-    type WakeCoalescing = plan::WakeCoalescing;
 
     // Keep test node ids small and readable. The concrete identity mechanism is
     // outside this contract; these ids exist only so assertions can name topology
@@ -93,29 +79,29 @@ mod run_plan {
             },
             runtime: RuntimeConfig {
                 max_tokens: 4,
-                prompt: PromptSource::Inline("hello from planner input".into()),
                 sampling: SamplingPolicy {
                     temperature_millis: 125,
                     top_k: 7,
                 },
-                token_output_policy: TokenOutputPolicy::EmitAll,
             },
             candidate_pool: valid_nodes(),
             stage_count,
             placement: linear_placement(stage_count),
-            activation_ring: RingSpec::test_default_activation(),
-            token_ring: RingSpec::test_default_token(),
+            activation_ring: RingSpec {
+                data_capacity: 1 << 20,
+                alignment: 64,
+                direction: plan::RingDirection::Egress,
+                host_pinning: plan::HostPinning::Pageable,
+                wake_coalescing: plan::WakeCoalescing::PendingBit,
+            },
+            token_ring: RingSpec {
+                data_capacity: 4096,
+                alignment: 8,
+                direction: plan::RingDirection::Egress,
+                host_pinning: plan::HostPinning::Pageable,
+                wake_coalescing: plan::WakeCoalescing::PendingBit,
+            },
         }
-    }
-
-    // Tests frequently need to compare a provisioned edge id back to the canonical
-    // edge record in the RunPlan. This helper makes that lookup explicit without
-    // giving tests access to any planner-private index.
-    fn plan_edges_by_id(plan: &RunPlan) -> std::collections::BTreeMap<EdgeId, &EdgePlan> {
-        plan.edges
-            .iter()
-            .map(|edge| (edge.edge_id, edge))
-            .collect::<std::collections::BTreeMap<_, _>>()
     }
 
     // Edge endpoints can be orchestrator or stage endpoints. Tests use this helper
@@ -125,16 +111,6 @@ mod run_plan {
         match endpoint {
             EdgeEndpoint::Orchestrator { .. } => None,
             EdgeEndpoint::Stage { stage_index, .. } => Some(*stage_index),
-        }
-    }
-
-    // Provisioning sends concrete node ids across the data-flow boundary. This
-    // helper extracts the observable node id from either endpoint shape so tests
-    // can compare projection output to plan topology.
-    fn edge_node_id(endpoint: &EdgeEndpoint) -> NodeId {
-        match endpoint {
-            EdgeEndpoint::Orchestrator { node_id } => *node_id,
-            EdgeEndpoint::Stage { node_id, .. } => *node_id,
         }
     }
 
@@ -170,17 +146,12 @@ mod run_plan {
             TokenizerSource::LocalPath("/tokenizers/test-gguf.json".into())
         );
         assert_eq!(
-            plan.runtime.sampling,
+            plan.sampling,
             SamplingPolicy {
                 temperature_millis: 125,
                 top_k: 7,
             }
         );
-        assert_eq!(
-            plan.runtime.prompt,
-            PromptSource::Inline("hello from planner input".into())
-        );
-        assert_eq!(plan.runtime.token_output_policy, TokenOutputPolicy::EmitAll);
 
         // Every stage must be bound to this run and know the run's stage count.
         for stage in &plan.stages {
@@ -374,7 +345,7 @@ mod run_plan {
             assert_eq!(first.runtime.input_port, plan::PortId("input".into()));
             assert_eq!(first.runtime.output_port, plan::PortId("output".into()));
             let expected_sampling = if stage_index + 1 == stage.stage_count {
-                Some(plan.runtime.sampling)
+                Some(plan.sampling)
             } else {
                 None
             };
@@ -515,39 +486,6 @@ mod run_plan {
     fn invalid_model_stage_layout() -> PlannerInput {
         let mut input = valid_input(4, 3);
         input.placement = linear_placement(4);
-        input
-    }
-
-    // Zero sequence length makes activation capacity zero. The planner must reject
-    // before creating edges whose object specs cannot carry an activation.
-    fn invalid_zero_activation_extent() -> PlannerInput {
-        let mut input = valid_input(3, 36);
-        input.model.max_seq_len = 0;
-        input
-    }
-
-    // Dtype width participates directly in activation extent and object layout.
-    // A zero width is not a valid dtype fact and must reject before planning.
-    fn invalid_dtype_width() -> PlannerInput {
-        let mut input = valid_input(3, 36);
-        input.model.dtype_width_bytes = 0;
-        input
-    }
-
-    // Hidden dimension participates directly in activation shape. A zero hidden
-    // dimension represents an unsupported shape/layout fact for the MVP contract.
-    fn invalid_unsupported_shape_or_layout() -> PlannerInput {
-        let mut input = valid_input(3, 36);
-        input.model.hidden_dim = 0;
-        input
-    }
-
-    // Ring alignment must be a usable alignment contract for shared memory and
-    // device copy boundaries. A non-power-of-two alignment makes the ring spec
-    // invalid before any edge can be provisioned.
-    fn invalid_ring_alignment() -> PlannerInput {
-        let mut input = valid_input(3, 36);
-        input.activation_ring.alignment = 3;
         input
     }
 }

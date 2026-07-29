@@ -5,14 +5,14 @@
 //! adapters live in `provider_adapters` so provider-neutral orchestration logic
 //! stays separate from local/Docker/VastAI implementation details.
 
-pub mod actor;
+pub(crate) mod actor;
 pub(crate) mod app;
-pub mod config;
-pub mod distribution_stack;
+pub(crate) mod config;
+pub(crate) mod distribution_stack;
 #[cfg(test)]
-pub mod engine_builder;
+pub(crate) mod engine_builder;
 
-pub mod provider_adapters {
-    pub mod relay;
+pub(crate) mod provider_adapters {
+    pub(crate) mod relay;
     pub(super) mod vastai;
 }

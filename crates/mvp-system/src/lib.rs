@@ -28,6 +28,8 @@ pub fn run_worker_node_from_env() -> std::process::ExitCode {
 
 #[path = "transport/driver_pumps.rs"]
 mod driver_pumps;
+#[path = "staging/gguf_common.rs"]
+mod gguf_common;
 #[path = "staging/gguf_shard.rs"]
 mod gguf_shard;
 #[path = "node/actor.rs"]

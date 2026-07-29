@@ -1,71 +1,91 @@
-use std::collections::BTreeSet;
+use crate::run_plan::{self, NodeId};
 
-use crate::run_plan::NodeId;
-
-use super::error::PoolError;
+use super::error::EngineBuildError;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolRequest {
-    pub min_nodes: usize,
+pub(crate) struct NodeFacts {
+    pub node_id: NodeId,
+    pub capabilities: Vec<NodeCapability>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeLease {
-    pub logical_node_id: NodeId,
-    pub capabilities: BTreeSet<NodeCapability>,
-}
-
-impl NodeLease {
-    pub fn new(
-        _lease_id: impl Into<String>,
-        logical_node_id: NodeId,
-        capabilities: impl IntoIterator<Item = NodeCapability>,
-    ) -> Self {
-        Self {
-            logical_node_id,
-            capabilities: capabilities.into_iter().collect(),
-        }
-    }
-
-    pub fn resources(self, _expected_resources: ResourceFacts) -> Self {
-        self
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NodeCapability {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeCapability {
     Coordinator,
     Worker,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ResourceFacts;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StaticPoolProvider {
+    nodes: Vec<NodeFacts>,
+}
 
-impl ResourceFacts {
-    pub fn cpu_only(_cpu_cores: u32, _ram_bytes: u64) -> Self {
-        Self
+impl StaticPoolProvider {
+    pub(crate) fn new(nodes: Vec<NodeFacts>) -> Self {
+        Self { nodes }
+    }
+    pub(crate) fn acquire_pool(
+        &self,
+        min_nodes: usize,
+    ) -> Result<Vec<NodeFacts>, EngineBuildError> {
+        if self.nodes.len() < min_nodes {
+            return Err(EngineBuildError::InsufficientNodes {
+                requested: min_nodes,
+                available: self.nodes.len(),
+            });
+        }
+        Ok(self.nodes.clone())
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StaticPoolProvider {
-    leases: Vec<NodeLease>,
+pub(crate) struct ModelSpec {
+    pub model_id: String,
+    pub gguf_source: run_plan::GgufSource,
+    pub tokenizer: run_plan::TokenizerSource,
+    pub num_layers: u32,
+    pub hidden_dim: u64,
+    pub dtype_family: run_plan::DTypeFamily,
+    pub dtype_width_bytes: u64,
+    pub max_seq_len: u64,
+    pub eos_token_id: u32,
 }
 
-impl StaticPoolProvider {
-    pub fn new(leases: Vec<NodeLease>) -> Self {
-        Self { leases }
-    }
-}
-
-impl StaticPoolProvider {
-    pub fn acquire_pool(&self, request: PoolRequest) -> Result<Vec<NodeLease>, PoolError> {
-        if self.leases.len() < request.min_nodes {
-            return Err(PoolError::InsufficientNodes {
-                requested: request.min_nodes,
-                available: self.leases.len(),
-            });
+impl ModelSpec {
+    pub(crate) fn pipelined_causal_llm(
+        model_id: impl Into<String>,
+        gguf_source: run_plan::GgufSource,
+        num_layers: u32,
+        hidden_dim: u64,
+        dtype_family: run_plan::DTypeFamily,
+        dtype_width_bytes: u64,
+        max_seq_len: u64,
+        eos_token_id: u32,
+        tokenizer: run_plan::TokenizerSource,
+    ) -> Self {
+        Self {
+            model_id: model_id.into(),
+            gguf_source,
+            tokenizer,
+            num_layers,
+            hidden_dim,
+            dtype_family,
+            dtype_width_bytes,
+            max_seq_len,
+            eos_token_id,
         }
-        Ok(self.leases.clone())
+    }
+
+    pub(crate) fn to_run_plan_facts(&self) -> run_plan::ModelFacts {
+        run_plan::ModelFacts {
+            model_id: self.model_id.clone(),
+            gguf_source: self.gguf_source.clone(),
+            num_layers: self.num_layers,
+            hidden_dim: self.hidden_dim,
+            dtype_family: self.dtype_family,
+            dtype_width_bytes: self.dtype_width_bytes,
+            max_seq_len: self.max_seq_len,
+            eos_token_id: self.eos_token_id,
+            tokenizer: self.tokenizer.clone(),
+        }
     }
 }

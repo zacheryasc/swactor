@@ -1,9 +1,9 @@
 //! MVP observability public surface.
 
-pub mod benchmark;
+pub(crate) mod benchmark;
 #[cfg(feature = "dashboard")]
-pub mod dashboard_view;
-pub mod frame_archive;
-pub mod lifecycle;
-pub mod provisioning_logs;
-pub mod telemetry;
+pub(crate) mod dashboard_view;
+pub(crate) mod frame_archive;
+pub(crate) mod lifecycle;
+pub(crate) mod provisioning_logs;
+pub(crate) mod telemetry;

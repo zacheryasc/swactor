@@ -1,46 +1,46 @@
 #![allow(dead_code)]
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RunId(pub u64);
+pub(crate) struct RunId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub u64);
+pub(crate) struct NodeId(pub(crate) u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StageRef {
+pub(crate) struct StageRef {
     pub stage_index: u32,
     pub node_id: NodeId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunPlan {
+pub(crate) struct RunPlan {
     pub run_id: RunId,
     pub stages: Vec<StageRef>,
 }
 
 impl RunPlan {
-    pub fn test_linear(run_id: RunId, stages: Vec<StageRef>) -> Self {
+    pub(crate) fn test_linear(run_id: RunId, stages: Vec<StageRef>) -> Self {
         Self { run_id, stages }
     }
 
-    pub fn stage_nodes(&self) -> Vec<NodeId> {
+    pub(crate) fn stage_nodes(&self) -> Vec<NodeId> {
         self.stages.iter().map(|stage| stage.node_id).collect()
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RunConfig {
+pub(crate) struct RunConfig {
     pub run_id: RunId,
     pub max_tokens: u64,
     pub prompt: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SamplingData {
+pub(crate) struct SamplingData {
     pub source_sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TokenObjectPayload {
+pub(crate) enum TokenObjectPayload {
     Prompt {
         tokens: Vec<u32>,
     },
@@ -51,24 +51,24 @@ pub enum TokenObjectPayload {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TokenObjectInjection {
+pub(crate) struct TokenObjectInjection {
     pub sequence: u64,
     pub payload: TokenObjectPayload,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StageFaultReason {
+pub(crate) enum StageFaultReason {
     WorkerCrashed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EndpointKind {
+pub(crate) enum EndpointKind {
     TokenIn,
     TokenOut,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RunEvent {
+pub(crate) enum RunEvent {
     PoolReady {
         nodes: Vec<NodeId>,
     },
@@ -108,7 +108,7 @@ pub enum RunEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RunFaultReason {
+pub(crate) enum RunFaultReason {
     StageFault {
         stage_index: u32,
         reason: StageFaultReason,
@@ -125,7 +125,7 @@ pub enum RunFaultReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LifecycleEvent {
+pub(crate) enum LifecycleEvent {
     RunRejected {
         run_id: RunId,
         reason: RunFaultReason,
@@ -146,14 +146,14 @@ pub enum LifecycleEvent {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StageProvision {
+pub(crate) struct StageProvision {
     pub run_id: RunId,
     pub stage_index: u32,
     pub node_id: NodeId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RunCommand {
+pub(crate) enum RunCommand {
     ProvisionStage {
         provision: StageProvision,
     },
@@ -178,7 +178,7 @@ pub enum RunCommand {
 
 pub type OrchestratorHarness = OrchestratorRun;
 
-pub struct OrchestratorRun {
+pub(crate) struct OrchestratorRun {
     config: RunConfig,
     plan: Option<RunPlan>,
     pool_ready: bool,
@@ -197,7 +197,7 @@ pub struct OrchestratorRun {
 }
 
 impl OrchestratorRun {
-    pub fn new(config: RunConfig) -> Self {
+    pub(crate) fn new(config: RunConfig) -> Self {
         Self {
             config,
             plan: None,
@@ -217,7 +217,7 @@ impl OrchestratorRun {
         }
     }
 
-    pub fn observe(&mut self, event: RunEvent) {
+    pub(crate) fn observe(&mut self, event: RunEvent) {
         match event {
             RunEvent::PoolReady { .. } => {
                 self.pool_ready = true;
@@ -301,17 +301,17 @@ impl OrchestratorRun {
         }
     }
 
-    pub fn advance_time_ms(&mut self, _delta: u64) {}
+    pub(crate) fn advance_time_ms(&mut self, _delta: u64) {}
 
-    pub fn commands(&self) -> &[RunCommand] {
+    pub(crate) fn commands(&self) -> &[RunCommand] {
         &self.commands
     }
 
-    pub fn events(&self) -> &[LifecycleEvent] {
+    pub(crate) fn events(&self) -> &[LifecycleEvent] {
         &self.events
     }
 
-    pub fn injected_sequences(&self) -> Vec<u64> {
+    pub(crate) fn injected_sequences(&self) -> Vec<u64> {
         self.injected_sequences.clone()
     }
 

@@ -22,7 +22,7 @@ use crate::provisioning::{
 };
 
 #[derive(Clone, Debug)]
-pub struct VastAiProvisioningConfig {
+pub(crate) struct VastAiProvisioningConfig {
     pub label_prefix: String,
     pub disk_gb: u32,
     pub ssh_user: String,
@@ -49,13 +49,13 @@ impl Default for VastAiProvisioningConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VastAiSshEndpoint {
+pub(crate) struct VastAiSshEndpoint {
     pub host: String,
     pub port: u16,
     pub user: String,
 }
 
-pub struct VastAiProviderMonitor {
+pub(crate) struct VastAiProviderMonitor {
     runtime: Option<RuntimeHandle>,
     actor: ActorAddress,
 }
@@ -86,7 +86,7 @@ impl Drop for VastAiProviderMonitor {
     }
 }
 
-pub trait VastAiLeaseClient: Send {
+pub(crate) trait VastAiLeaseClient: Send {
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String>;
     fn plan_first_wave_offers(
         &mut self,
@@ -116,7 +116,7 @@ pub trait VastAiLeaseClient: Send {
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String>;
 }
 
-pub struct ToolsVastAiLeaseClient {
+pub(crate) struct ToolsVastAiLeaseClient {
     client: swactor_vastai::VastClient,
     runtime: tokio::runtime::Runtime,
     planned_offer_pool: Arc<Mutex<Vec<Offer>>>,
@@ -124,7 +124,7 @@ pub struct ToolsVastAiLeaseClient {
 }
 
 impl ToolsVastAiLeaseClient {
-    pub fn new(client: swactor_vastai::VastClient) -> Result<Self, String> {
+    pub(crate) fn new(client: swactor_vastai::VastClient) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -137,7 +137,7 @@ impl ToolsVastAiLeaseClient {
         })
     }
 
-    pub fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
+    pub(crate) fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
         Self::new(swactor_vastai::VastClient::new(api_key))
     }
 
@@ -612,12 +612,12 @@ fn provider_status_message_has_terminal_failure(message: &str) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BootstrapStopReason {
+pub(crate) enum BootstrapStopReason {
     RuntimeReady,
     NodeStop,
 }
 
-pub trait VastAiBootstrapLauncher: Send {
+pub(crate) trait VastAiBootstrapLauncher: Send {
     type Handle: Send;
 
     fn start_bootstrap(
@@ -942,17 +942,17 @@ fn stop_ssh_child(child: &mut Option<Child>) {
 }
 
 #[derive(Clone)]
-pub struct SshCommandBootstrapLauncher {
+pub(crate) struct SshCommandBootstrapLauncher {
     ssh_identity: Option<PathBuf>,
     runtime: Arc<Runtime>,
 }
-pub struct SshCommandBootstrapHandle {
+pub(crate) struct SshCommandBootstrapHandle {
     actor: ActorAddress,
     runtime: Arc<Runtime>,
 }
 
 impl SshCommandBootstrapLauncher {
-    pub fn new(ssh_identity: Option<PathBuf>, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(ssh_identity: Option<PathBuf>, runtime: Arc<Runtime>) -> Self {
         Self {
             ssh_identity,
             runtime,
@@ -1127,7 +1127,7 @@ fn next_ssh_backoff(current: Duration) -> Duration {
     std::cmp::min(current.saturating_mul(2), Duration::from_secs(30))
 }
 
-pub struct VastAiProvisioningPlugin<C, B>
+pub(crate) struct VastAiProvisioningPlugin<C, B>
 where
     C: VastAiLeaseClient,
     B: VastAiBootstrapLauncher,
@@ -1158,7 +1158,7 @@ where
     C: VastAiLeaseClient,
     B: VastAiBootstrapLauncher,
 {
-    pub fn new(client: C, bootstrap: B, config: VastAiProvisioningConfig) -> Self {
+    pub(crate) fn new(client: C, bootstrap: B, config: VastAiProvisioningConfig) -> Self {
         Self {
             client,
             bootstrap,

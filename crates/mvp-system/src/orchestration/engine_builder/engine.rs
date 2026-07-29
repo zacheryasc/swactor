@@ -1,108 +1,163 @@
 use crate::run_plan::RunId;
 
 use super::error::EngineBuildError;
-use super::events::EngineEvent;
-use super::launcher::{LaunchedNode, NodeControl, NodeFacts, NodeLaunchSpec, StaticNodeLauncher};
-use super::model::ModelSpec;
-use super::node_image::NodeImageSpec;
-use super::planner::{FixedLinearPipelinePlanner, RoleAssignmentPlan, RolePlannerInput};
-use super::pool::{PoolRequest, StaticPoolProvider};
-use super::roles::RoleAssignment;
+use super::planner::{
+    FixedLinearPipelinePlanner, RoleAssignment, RoleAssignmentPlan, RoleKind, RolePlannerInput,
+};
+use super::pool::{ModelSpec, NodeFacts, StaticPoolProvider};
 
-pub struct ClusterBuilder {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum EngineEvent {
+    PoolAcquired,
+    ClusterConverged,
+    RoleAssigned(RoleKind),
+    EngineReady,
+}
+
+fn launch_node(facts: &NodeFacts) -> StaticNodeControl {
+    StaticNodeControl {
+        facts: facts.clone(),
+        booted: false,
+        stopped: false,
+        assigned_roles: Vec::new(),
+    }
+}
+
+struct StaticNodeControl {
+    facts: NodeFacts,
+    booted: bool,
+    stopped: bool,
+    assigned_roles: Vec<RoleAssignment>,
+}
+
+impl StaticNodeControl {
+    fn node_id(&self) -> u64 {
+        self.facts.node_id.0
+    }
+}
+
+impl StaticNodeControl {
+    fn wait_boot_ready(&mut self) -> Result<NodeFacts, EngineBuildError> {
+        if self.stopped {
+            return Err(EngineBuildError::Stopped {
+                node_id: self.node_id(),
+            });
+        }
+        self.booted = true;
+        Ok(self.facts.clone())
+    }
+
+    fn wait_cluster_converged(&mut self, expected_alive: usize) -> Result<(), EngineBuildError> {
+        if self.stopped {
+            return Err(EngineBuildError::Stopped {
+                node_id: self.node_id(),
+            });
+        }
+        if !self.booted {
+            return Err(EngineBuildError::NotBooted {
+                node_id: self.node_id(),
+            });
+        }
+        if expected_alive == 0 {
+            return Err(EngineBuildError::Backend(
+                "expected_alive must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+
+    fn assign_role(&mut self, assignment: RoleAssignment) -> Result<(), EngineBuildError> {
+        if self.stopped {
+            return Err(EngineBuildError::Stopped {
+                node_id: self.node_id(),
+            });
+        }
+        if !self.booted {
+            return Err(EngineBuildError::NotBooted {
+                node_id: self.node_id(),
+            });
+        }
+        let role_node_id = assignment.node_id().0;
+        if role_node_id != self.node_id() {
+            return Err(EngineBuildError::RoleNodeMismatch {
+                node_id: self.node_id(),
+                role_node_id,
+            });
+        }
+        self.assigned_roles.push(assignment);
+        Ok(())
+    }
+
+    fn shutdown(&mut self) -> Result<(), EngineBuildError> {
+        if self.stopped {
+            return Ok(());
+        }
+        self.stopped = true;
+        Ok(())
+    }
+}
+
+pub(crate) struct ClusterBuilder {
     cluster_id: String,
     run_id: RunId,
     model: ModelSpec,
     pool_provider: Option<StaticPoolProvider>,
-    launcher: Option<StaticNodeLauncher>,
     planner: Option<FixedLinearPipelinePlanner>,
 }
 
 impl ClusterBuilder {
-    pub fn new(cluster_id: impl Into<String>, model: ModelSpec) -> Self {
+    pub(crate) fn new(cluster_id: impl Into<String>, model: ModelSpec) -> Self {
         Self {
             cluster_id: cluster_id.into(),
             run_id: RunId(1),
             model,
             pool_provider: None,
-            launcher: None,
             planner: None,
         }
     }
 
-    pub fn run_id(mut self, run_id: impl Into<RunId>) -> Self {
+    pub(crate) fn run_id(mut self, run_id: impl Into<RunId>) -> Self {
         self.run_id = run_id.into();
         self
     }
 
-    pub fn image(self, _image: NodeImageSpec) -> Self {
-        self
-    }
-
-    pub fn pool_provider(mut self, provider: StaticPoolProvider) -> Self {
+    pub(crate) fn pool_provider(mut self, provider: StaticPoolProvider) -> Self {
         self.pool_provider = Some(provider);
         self
     }
 
-    pub fn launcher(mut self, launcher: StaticNodeLauncher) -> Self {
-        self.launcher = Some(launcher);
-        self
-    }
-
-    pub fn planner(mut self, planner: FixedLinearPipelinePlanner) -> Self {
+    pub(crate) fn planner(mut self, planner: FixedLinearPipelinePlanner) -> Self {
         self.planner = Some(planner);
         self
     }
 
-    pub fn launch(mut self) -> Result<ClusterHandle, EngineBuildError> {
+    pub(crate) fn launch(mut self) -> Result<ClusterHandle, EngineBuildError> {
         let pool_provider = self
             .pool_provider
             .take()
             .ok_or(EngineBuildError::MissingComponent("pool_provider"))?;
-        let launcher = self
-            .launcher
-            .take()
-            .ok_or(EngineBuildError::MissingComponent("launcher"))?;
         let planner = self
             .planner
             .take()
             .ok_or(EngineBuildError::MissingComponent("planner"))?;
 
         let mut events = Vec::new();
-        let leases = pool_provider.acquire_pool(PoolRequest {
-            min_nodes: planner.required_node_count(),
-        })?;
+        let leases = pool_provider.acquire_pool(planner.required_node_count())?;
         if leases.is_empty() {
             return Err(EngineBuildError::EmptyPool);
         }
-        events.push(EngineEvent::PoolAcquired {
-            node_count: leases.len(),
-        });
+        events.push(EngineEvent::PoolAcquired);
 
         let mut nodes = Vec::with_capacity(leases.len());
         let mut iter = leases.into_iter();
         let coordinator_lease = iter.next().ok_or(EngineBuildError::EmptyPool)?;
-        let mut coordinator = launcher.launch_node(&coordinator_lease, NodeLaunchSpec);
-        events.push(EngineEvent::NodeLaunched {
-            node_id: coordinator.lease.logical_node_id,
-            coordinator: true,
-        });
-        let coordinator_facts = coordinator.control.wait_boot_ready()?;
-        events.push(EngineEvent::NodeBootReady {
-            node_id: coordinator_facts.node_id,
-        });
+        let mut coordinator = launch_node(&coordinator_lease);
+        let coordinator_facts = coordinator.wait_boot_ready()?;
         nodes.push(EngineNode::new(coordinator, coordinator_facts));
 
         for lease in iter {
-            let mut node = launcher.launch_node(&lease, NodeLaunchSpec);
-            events.push(EngineEvent::NodeLaunched {
-                node_id: node.lease.logical_node_id,
-                coordinator: false,
-            });
-            let facts = node.control.wait_boot_ready()?;
-            events.push(EngineEvent::NodeBootReady {
-                node_id: facts.node_id,
-            });
+            let mut node = launch_node(&lease);
+            let facts = node.wait_boot_ready()?;
             nodes.push(EngineNode::new(node, facts));
         }
 
@@ -110,18 +165,13 @@ impl ClusterBuilder {
         for node in &mut nodes {
             node.control.wait_cluster_converged(expected_alive)?;
         }
-        events.push(EngineEvent::ClusterConverged {
-            node_count: expected_alive,
-        });
+        events.push(EngineEvent::ClusterConverged);
 
         let plan = planner.plan(RolePlannerInput {
             run_id: self.run_id,
             model: self.model,
             nodes: nodes.iter().map(|node| node.facts.clone()).collect(),
         })?;
-        events.push(EngineEvent::RolesPlanned {
-            stage_count: plan.stages.len(),
-        });
 
         assign_role(
             &mut nodes,
@@ -135,12 +185,9 @@ impl ClusterBuilder {
                 &mut events,
             )?;
         }
-        events.push(EngineEvent::EngineReady {
-            cluster_id: self.cluster_id.clone(),
-        });
+        events.push(EngineEvent::EngineReady);
 
         Ok(ClusterHandle {
-            cluster_id: self.cluster_id,
             nodes,
             plan,
             events,
@@ -148,47 +195,40 @@ impl ClusterBuilder {
     }
 }
 
-pub struct ClusterHandle {
-    cluster_id: String,
+pub(crate) struct ClusterHandle {
     nodes: Vec<EngineNode>,
     plan: RoleAssignmentPlan,
     events: Vec<EngineEvent>,
 }
 
 impl ClusterHandle {
-    pub fn role_plan(&self) -> &RoleAssignmentPlan {
+    pub(crate) fn role_plan(&self) -> &RoleAssignmentPlan {
         &self.plan
     }
 
-    pub fn events(&self) -> &[EngineEvent] {
+    pub(crate) fn events(&self) -> &[EngineEvent] {
         &self.events
     }
 
-    pub fn shutdown(mut self) -> Result<Vec<EngineEvent>, EngineBuildError> {
+    pub(crate) fn shutdown(mut self) -> Result<(), EngineBuildError> {
         for node in &mut self.nodes {
             node.control.shutdown()?;
-            self.events.push(EngineEvent::NodeStopped {
-                node_id: node.facts.node_id,
-            });
         }
-        self.events.push(EngineEvent::ShutdownComplete {
-            cluster_id: self.cluster_id,
-        });
-        Ok(self.events)
+        Ok(())
     }
 }
 struct EngineNode {
     facts: NodeFacts,
     roles: Vec<RoleAssignment>,
-    control: Box<dyn NodeControl>,
+    control: StaticNodeControl,
 }
 
 impl EngineNode {
-    fn new(launched: LaunchedNode, facts: NodeFacts) -> Self {
+    fn new(control: StaticNodeControl, facts: NodeFacts) -> Self {
         Self {
             facts,
             roles: Vec::new(),
-            control: launched.control,
+            control,
         }
     }
 }
@@ -206,6 +246,6 @@ fn assign_role(
     node.control.assign_role(assignment.clone())?;
     let role = assignment.kind();
     node.roles.push(assignment);
-    events.push(EngineEvent::RoleAssigned { node_id, role });
+    events.push(EngineEvent::RoleAssigned(role));
     Ok(())
 }
