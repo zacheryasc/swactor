@@ -57,6 +57,7 @@ pub enum OrchestratorMsg {
     ObserveStageFault {
         run_id: u64,
         stage_index: u32,
+        reason: Option<String>,
     },
     ObserveEndpointFault {
         run_id: u64,
@@ -168,6 +169,7 @@ pub enum OrchestratorReport {
     StageFault {
         run_id: u64,
         stage_index: u32,
+        reason: Option<String>,
     },
     Snapshot {
         commands: Vec<RunCommandWire>,
@@ -247,6 +249,7 @@ impl OrchestratorActor {
             OrchestratorMsg::ObserveStageFault {
                 run_id,
                 stage_index,
+                reason: _,
             } => self.core.observe(core::RunEvent::StageFault {
                 run_id: core::RunId(run_id),
                 stage_index,
@@ -396,9 +399,11 @@ impl ActorInterface for OrchestratorActor {
             OrchestratorMsg::ObserveStageFault {
                 run_id,
                 stage_index,
+                reason,
             } => Some(OrchestratorReport::StageFault {
                 run_id,
                 stage_index,
+                reason,
             }),
             _ => None,
         };

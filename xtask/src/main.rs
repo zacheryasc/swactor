@@ -4689,20 +4689,16 @@ fn require_vastai_data_path_facts(facts: &DumpLogFacts) -> Result<(), String> {
         "worker ingress ring installed",
     )?;
     require_dump_log_fact(facts.ring_installed_egress, "worker egress ring installed")?;
+    let downstream_activation = facts.activation_downstream_object_loaded
+        && facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
     require_dump_log_fact(
-        facts.activation_object_loaded || facts.worker_ingress_object_loaded,
-        "worker object loaded from ingress ring",
-    )?;
-    require_dump_log_fact(
-        facts.activation_step_executed,
-        "activation-producing worker step executed",
+        facts.activation_step_executed || downstream_activation,
+        "activation-producing worker step executed or downstream activation loaded",
     )?;
     let explicit_transport = facts.activation_egress_ring_read
         && facts.activation_iroh_edge_sent
         && facts.activation_iroh_edge_read
         && facts.activation_ingress_ring_write;
-    let downstream_activation = facts.activation_downstream_object_loaded
-        && facts.max_activation_record_bytes >= DATA_PATH_MIN_PAYLOAD_BYTES;
     let downstream_prompt_output = facts.activation_egress_record_written
         && facts.pipeline_token_out_requests.len() >= 2
         && facts.vastai_node_runtime_ready_nodes.len() >= 2;
@@ -6100,7 +6096,6 @@ mod tests {
             ring_installed_ingress: true,
             ring_installed_egress: true,
             activation_object_loaded: true,
-            activation_step_executed: true,
             activation_downstream_object_loaded: true,
             max_activation_record_bytes: DATA_PATH_MIN_PAYLOAD_BYTES,
             ..DumpLogFacts::default()

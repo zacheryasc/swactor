@@ -5,18 +5,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-    mpsc,
-};
-use std::thread::JoinHandle;
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use datastream::DatastreamProducer;
 use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::runtime::{Ctx, Runtime};
+use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeHandle};
 use swactor_vastai::{
     CreateInstanceRequest, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedInstance,
     SelectionPolicy, classify_vastai_error, create_instance,
@@ -66,23 +62,27 @@ pub struct VastAiSshEndpoint {
 }
 
 pub struct VastAiProviderMonitor {
-    stopping: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
+    runtime: Option<RuntimeHandle>,
+    actor: ActorAddress,
 }
 
 impl VastAiProviderMonitor {
-    fn new(stopping: Arc<AtomicBool>, join: JoinHandle<()>) -> Self {
+    fn new(runtime: RuntimeHandle, actor: ActorAddress) -> Self {
         Self {
-            stopping,
-            join: Some(join),
+            runtime: Some(runtime),
+            actor,
         }
     }
 
     fn stop(&mut self) {
-        self.stopping.store(true, Ordering::SeqCst);
-        if let Some(join) = self.join.take() {
-            let _ = join.join();
-        }
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        let _ = runtime
+            .runtime
+            .send_to(self.actor, VastAiProviderMonitorMsg::Stop);
+        runtime.shutdown();
+        runtime.join();
     }
 }
 
@@ -207,138 +207,208 @@ impl ToolsVastAiLeaseClient {
             dph_total: offer.dph_total,
         })
     }
+}
 
-    fn monitor_provider_status(
-        &mut self,
+#[derive(Clone)]
+enum VastAiProviderMonitorMsg {
+    Poll,
+    Stop,
+}
+
+struct VastAiProviderMonitorActor {
+    client: ToolsVastAiLeaseClient,
+    contract_id: u64,
+    label: String,
+    lifecycle: LifecyclePolicy,
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+    sender: ExternalSender,
+    last_state: Option<String>,
+    state_since: Instant,
+    poll: u64,
+    stopped: bool,
+}
+
+impl VastAiProviderMonitorActor {
+    fn new(
+        client: ToolsVastAiLeaseClient,
         contract_id: u64,
         label: String,
         lifecycle: LifecyclePolicy,
         spec: NodeProvisionSpec,
         sink: PluginSink,
-        stopping: Arc<AtomicBool>,
-    ) {
-        let mut last_state: Option<String> = None;
-        let mut state_since = Instant::now();
-        let mut poll = 0_u64;
-        while !stopping.load(Ordering::SeqCst) {
-            poll = poll.saturating_add(1);
-            let status = match self
-                .runtime
-                .block_on(self.client.instance_status(contract_id))
+        sender: ExternalSender,
+    ) -> Self {
+        Self {
+            client,
+            contract_id,
+            label,
+            lifecycle,
+            spec,
+            sink,
+            sender,
+            last_state: None,
+            state_since: Instant::now(),
+            poll: 0,
+            stopped: false,
+        }
+    }
+
+    fn observe_provider_line(&self, line: impl Into<String>) {
+        self.sink.observe(PluginObservation::ProviderLine {
+            run_id: self.spec.run_id,
+            node_id: self.spec.node_id,
+            line: line.into(),
+        });
+    }
+
+    fn observe_failed(&self, reason: String) {
+        self.sink.observe(PluginObservation::Failed {
+            run_id: self.spec.run_id,
+            node_id: self.spec.node_id,
+            reason,
+        });
+    }
+
+    fn schedule_next_poll(&self, ctx: &Ctx) {
+        schedule_provider_monitor_poll(
+            self.sender.clone(),
+            ctx.self_addr(),
+            self.lifecycle.poll_interval,
+        );
+    }
+
+    fn poll_provider(&mut self, ctx: &Ctx) {
+        if self.stopped {
+            return;
+        }
+        self.poll = self.poll.saturating_add(1);
+        let poll = self.poll;
+        let status = match self
+            .client
+            .runtime
+            .block_on(self.client.client.instance_status(self.contract_id))
+        {
+            Ok(status) => status,
+            Err(error)
+                if error.contains("not found while fetching provider status")
+                    || error.contains("parse failed") =>
             {
-                Ok(status) => status,
-                Err(error)
-                    if error.contains("not found while fetching provider status")
-                        || error.contains("parse failed") =>
-                {
-                    let reason = classified_start_error(format!(
-                        "vastai provider monitor node {} contract {contract_id}: {error}",
-                        spec.node_id
-                    ));
-                    sink.observe(PluginObservation::ProviderLine {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        line: serde_json::json!({
-                            "type": "VastAiProviderStatusFailure",
-                            "run_id": spec.run_id,
-                            "node_id": spec.node_id,
-                            "label": &label,
-                            "contract_id": contract_id,
-                            "poll": poll,
-                            "reason": &reason,
-                        })
-                        .to_string(),
-                    });
-                    sink.observe(PluginObservation::Failed {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        reason,
-                    });
-                    return;
-                }
-                Err(error) => {
-                    sink.observe(PluginObservation::ProviderLine {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        line: serde_json::json!({
-                            "type": "VastAiProviderStatusPollRetry",
-                            "run_id": spec.run_id,
-                            "node_id": spec.node_id,
-                            "label": &label,
-                            "contract_id": contract_id,
-                            "poll": poll,
-                            "reason": error,
-                        })
-                        .to_string(),
-                    });
-                    if !sleep_provider_monitor(lifecycle.poll_interval, &stopping) {
-                        return;
-                    }
-                    continue;
-                }
-            };
-
-            let actual = status.actual_status.as_str();
-            if last_state.as_deref() != Some(actual) {
-                state_since = Instant::now();
-                last_state = Some(actual.to_owned());
-            }
-            let in_state_ms = state_since.elapsed().as_millis();
-            sink.observe(PluginObservation::ProviderLine {
-                run_id: spec.run_id,
-                node_id: spec.node_id,
-                line: serde_json::json!({
-                    "type": "VastAiProviderStatusObserved",
-                    "run_id": spec.run_id,
-                    "node_id": spec.node_id,
-                    "label": &label,
-                    "contract_id": contract_id,
-                    "poll": poll,
-                    "actual_status": &status.actual_status,
-                    "intended_status": &status.intended_status,
-                    "status_msg": &status.status_msg,
-                    "disk_usage": status.disk_usage,
-                    "in_state_ms": in_state_ms,
-                })
-                .to_string(),
-            });
-
-            if let Some(error) = provider_terminal_start_error(
-                contract_id,
-                &status.actual_status,
-                &status.intended_status,
-                status.status_msg.as_deref(),
-            ) {
                 let reason = classified_start_error(format!(
-                    "vastai provider monitor node {}: {error}",
-                    spec.node_id
+                    "vastai provider monitor node {} contract {}: {error}",
+                    self.spec.node_id, self.contract_id
                 ));
-                sink.observe(PluginObservation::ProviderLine {
-                    run_id: spec.run_id,
-                    node_id: spec.node_id,
-                    line: serde_json::json!({
-                        "type": "VastAiProviderTerminalBeforeRuntimeReady",
-                        "run_id": spec.run_id,
-                        "node_id": spec.node_id,
-                        "label": &label,
-                        "contract_id": contract_id,
+                self.observe_provider_line(
+                    serde_json::json!({
+                        "type": "VastAiProviderStatusFailure",
+                        "run_id": self.spec.run_id,
+                        "node_id": self.spec.node_id,
+                        "label": &self.label,
+                        "contract_id": self.contract_id,
+                        "poll": poll,
                         "reason": &reason,
                     })
                     .to_string(),
-                });
-                sink.observe(PluginObservation::Failed {
-                    run_id: spec.run_id,
-                    node_id: spec.node_id,
-                    reason,
-                });
+                );
+                self.observe_failed(reason);
+                ctx.stop_self();
                 return;
             }
-
-            if !sleep_provider_monitor(lifecycle.poll_interval, &stopping) {
+            Err(error) => {
+                self.observe_provider_line(
+                    serde_json::json!({
+                        "type": "VastAiProviderStatusPollRetry",
+                        "run_id": self.spec.run_id,
+                        "node_id": self.spec.node_id,
+                        "label": &self.label,
+                        "contract_id": self.contract_id,
+                        "poll": poll,
+                        "reason": error,
+                    })
+                    .to_string(),
+                );
+                self.schedule_next_poll(ctx);
                 return;
+            }
+        };
+
+        let actual = status.actual_status.as_str();
+        if self.last_state.as_deref() != Some(actual) {
+            self.state_since = Instant::now();
+            self.last_state = Some(actual.to_owned());
+        }
+        let in_state_ms = self.state_since.elapsed().as_millis();
+        self.observe_provider_line(
+            serde_json::json!({
+                "type": "VastAiProviderStatusObserved",
+                "run_id": self.spec.run_id,
+                "node_id": self.spec.node_id,
+                "label": &self.label,
+                "contract_id": self.contract_id,
+                "poll": poll,
+                "actual_status": &status.actual_status,
+                "intended_status": &status.intended_status,
+                "status_msg": &status.status_msg,
+                "disk_usage": status.disk_usage,
+                "in_state_ms": in_state_ms,
+            })
+            .to_string(),
+        );
+
+        if let Some(error) = provider_terminal_start_error(
+            self.contract_id,
+            &status.actual_status,
+            &status.intended_status,
+            status.status_msg.as_deref(),
+        ) {
+            let reason = classified_start_error(format!(
+                "vastai provider monitor node {}: {error}",
+                self.spec.node_id
+            ));
+            self.observe_provider_line(
+                serde_json::json!({
+                    "type": "VastAiProviderTerminalBeforeRuntimeReady",
+                    "run_id": self.spec.run_id,
+                    "node_id": self.spec.node_id,
+                    "label": &self.label,
+                    "contract_id": self.contract_id,
+                    "reason": &reason,
+                })
+                .to_string(),
+            );
+            self.observe_failed(reason);
+            ctx.stop_self();
+            return;
+        }
+
+        self.schedule_next_poll(ctx);
+    }
+}
+
+impl ActorInterface for VastAiProviderMonitorActor {
+    type Incoming = VastAiProviderMonitorMsg;
+    type Response = ();
+
+    fn on_start(&mut self, ctx: &Ctx) {
+        let _ = ctx.send(ctx.self_addr(), VastAiProviderMonitorMsg::Poll);
+    }
+
+    fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
+        match msg {
+            VastAiProviderMonitorMsg::Poll => self.poll_provider(ctx),
+            VastAiProviderMonitorMsg::Stop => {
+                self.stopped = true;
+                ctx.stop_self();
             }
         }
     }
+}
+
+fn schedule_provider_monitor_poll(sender: ExternalSender, actor: ActorAddress, delay: Duration) {
+    thread::spawn(move || {
+        thread::sleep(delay);
+        let _ = sender.send_to(actor, VastAiProviderMonitorMsg::Poll);
+    });
 }
 
 impl Clone for ToolsVastAiLeaseClient {
@@ -468,20 +538,21 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Option<VastAiProviderMonitor> {
-        let stopping = Arc::new(AtomicBool::new(false));
-        let thread_stopping = Arc::clone(&stopping);
-        let mut client = self.clone();
-        let join = std::thread::spawn(move || {
-            client.monitor_provider_status(
+        let runtime = Runtime::new(RuntimeConfig::default());
+        let sender = runtime.create_sender();
+        let actor = runtime
+            .spawn(VastAiProviderMonitorActor::new(
+                self.clone(),
                 contract_id,
                 label,
                 lifecycle,
                 spec,
                 sink,
-                thread_stopping,
-            );
-        });
-        Some(VastAiProviderMonitor::new(stopping, join))
+                sender,
+            ))
+            .ok()?;
+        let runtime = runtime.run().ok()?;
+        Some(VastAiProviderMonitor::new(runtime, actor))
     }
 
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
@@ -520,11 +591,10 @@ fn provider_terminal_start_error(
     intended: &str,
     msg: Option<&str>,
 ) -> Option<String> {
-    if let Some(message) = msg {
-        let lower = message.to_ascii_lowercase();
-        if lower.contains("error") || lower.contains("failed") {
-            return Some(format!("instance {contract_id} error: {message}"));
-        }
+    if let Some(message) = msg
+        && provider_status_message_has_terminal_failure(message)
+    {
+        return Some(format!("instance {contract_id} error: {message}"));
     }
     if intended == "stopped" && actual != "running" {
         return Some(format!(
@@ -540,16 +610,15 @@ fn provider_terminal_start_error(
     }
 }
 
-fn sleep_provider_monitor(duration: Duration, stopping: &AtomicBool) -> bool {
-    let deadline = Instant::now() + duration;
-    while Instant::now() < deadline {
-        if stopping.load(Ordering::SeqCst) {
-            return false;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        std::thread::sleep(std::cmp::min(remaining, Duration::from_millis(100)));
-    }
-    !stopping.load(Ordering::SeqCst)
+fn provider_status_message_has_terminal_failure(message: &str) -> bool {
+    message
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .any(|token| {
+            token.eq_ignore_ascii_case("error")
+                || token.eq_ignore_ascii_case("failed")
+                || token.eq_ignore_ascii_case("failure")
+                || token.eq_ignore_ascii_case("fatal")
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -776,19 +845,271 @@ pub trait VastAiBootstrapLauncher: Send {
     fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshBootstrapStream {
+    Stdout,
+    Stderr,
+}
+
 #[derive(Clone)]
 enum SshBootstrapMsg {
+    StartAttempt,
+    PollChild,
+    OutputLine {
+        stream: SshBootstrapStream,
+        line: String,
+    },
+    ReaderError {
+        stream: SshBootstrapStream,
+        error: String,
+    },
+    ReaderClosed {
+        stream: SshBootstrapStream,
+    },
     Stop,
 }
 
 struct SshBootstrapActor {
-    child: Arc<Mutex<Option<Child>>>,
-    stopping: Arc<AtomicBool>,
+    bridge: BootstrapDatastreamBridge,
+    endpoint: VastAiSshEndpoint,
+    ssh_identity: Option<PathBuf>,
+    sender: ExternalSender,
+    child: Option<Child>,
+    stdout_reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
+    stdout_closed: bool,
+    stderr_closed: bool,
+    pending_status: Option<std::process::ExitStatus>,
+    pending_wait_error: Option<String>,
+    attempt: u64,
+    backoff: Duration,
+    observation_class: Option<&'static str>,
+    stopped: bool,
+    start_on_boot: bool,
 }
 
 impl SshBootstrapActor {
-    fn new(child: Arc<Mutex<Option<Child>>>, stopping: Arc<AtomicBool>) -> Self {
-        Self { child, stopping }
+    fn new(
+        bridge: BootstrapDatastreamBridge,
+        endpoint: VastAiSshEndpoint,
+        ssh_identity: Option<PathBuf>,
+        sender: ExternalSender,
+    ) -> Self {
+        Self {
+            bridge,
+            endpoint,
+            ssh_identity,
+            sender,
+            child: None,
+            stdout_reader: None,
+            stderr_reader: None,
+            stdout_closed: true,
+            stderr_closed: true,
+            pending_status: None,
+            pending_wait_error: None,
+            attempt: 1,
+            backoff: Duration::from_secs(1),
+            observation_class: None,
+            stopped: false,
+            start_on_boot: true,
+        }
+    }
+
+    fn run_id(&self) -> u64 {
+        self.bridge.spec().run_id
+    }
+
+    fn node_id(&self) -> u64 {
+        self.bridge.spec().node_id
+    }
+
+    fn start_attempt(&mut self, ctx: &Ctx) {
+        if self.stopped {
+            return;
+        }
+        self.bridge.observe_provider_line(format!(
+            "VastAI SSH bootstrap attempt {} to {}@{}:{}",
+            self.attempt, self.endpoint.user, self.endpoint.host, self.endpoint.port
+        ));
+
+        match spawn_ssh_bootstrap_attempt(
+            self.bridge.spec(),
+            &self.endpoint,
+            self.ssh_identity.as_deref(),
+        ) {
+            Ok((child, stdout, stderr)) => {
+                self.child = Some(child);
+                self.stdout_closed = false;
+                self.stderr_closed = false;
+                self.observation_class = None;
+                self.pending_status = None;
+                self.pending_wait_error = None;
+                self.stdout_reader = Some(spawn_ssh_output_reader(
+                    SshBootstrapStream::Stdout,
+                    stdout,
+                    self.sender.clone(),
+                    ctx.self_addr(),
+                ));
+                self.stderr_reader = Some(spawn_ssh_output_reader(
+                    SshBootstrapStream::Stderr,
+                    stderr,
+                    self.sender.clone(),
+                    ctx.self_addr(),
+                ));
+                schedule_ssh_message(
+                    self.sender.clone(),
+                    ctx.self_addr(),
+                    SshBootstrapMsg::PollChild,
+                    Duration::from_millis(100),
+                );
+            }
+            Err(error) => {
+                self.bridge.observe_provider_line(format!(
+                    "spawn VastAI SSH bootstrap attempt {} failed: {error}; retrying",
+                    self.attempt
+                ));
+                self.schedule_retry(ctx);
+            }
+        }
+    }
+
+    fn poll_child(&mut self, ctx: &Ctx) {
+        if self.stopped {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                self.child = None;
+                self.pending_status = Some(status);
+                self.maybe_finish_attempt(ctx);
+            }
+            Ok(None) => schedule_ssh_message(
+                self.sender.clone(),
+                ctx.self_addr(),
+                SshBootstrapMsg::PollChild,
+                Duration::from_millis(100),
+            ),
+            Err(error) => {
+                self.child = None;
+                self.pending_wait_error = Some(error.to_string());
+                self.maybe_finish_attempt(ctx);
+            }
+        }
+    }
+
+    fn handle_output_line(&mut self, stream: SshBootstrapStream, line: String) {
+        match stream {
+            SshBootstrapStream::Stdout => self.bridge.observe_stdout_line(line),
+            SshBootstrapStream::Stderr => {
+                if let Some(class) = classify_ssh_observation(&line) {
+                    self.observation_class = Some(class);
+                    self.bridge.observe_provider_line(
+                        serde_json::json!({
+                            "type": "VastAiBootstrapObservationClass",
+                            "run_id": self.run_id(),
+                            "node_id": self.node_id(),
+                            "class": class,
+                        })
+                        .to_string(),
+                    );
+                }
+                self.bridge.observe_stderr_line(line);
+            }
+        }
+    }
+
+    fn handle_reader_error(&self, stream: SshBootstrapStream, error: String) {
+        let stream = match stream {
+            SshBootstrapStream::Stdout => "stdout",
+            SshBootstrapStream::Stderr => "stderr",
+        };
+        self.bridge
+            .observe_provider_line(format!("read VastAI SSH {stream}: {error}"));
+    }
+
+    fn handle_reader_closed(&mut self, ctx: &Ctx, stream: SshBootstrapStream) {
+        match stream {
+            SshBootstrapStream::Stdout => self.stdout_closed = true,
+            SshBootstrapStream::Stderr => self.stderr_closed = true,
+        }
+        self.maybe_finish_attempt(ctx);
+    }
+
+    fn maybe_finish_attempt(&mut self, ctx: &Ctx) {
+        if self.stopped || !self.stdout_closed || !self.stderr_closed {
+            return;
+        }
+        if let Some(error) = self.pending_wait_error.take() {
+            self.join_readers();
+            self.bridge.observe_provider_line(format!(
+                "wait VastAI SSH bootstrap attempt {}: {error}; retrying",
+                self.attempt
+            ));
+            self.schedule_retry(ctx);
+            return;
+        }
+        let Some(status) = self.pending_status.take() else {
+            return;
+        };
+        self.join_readers();
+        let readiness = if status.success() {
+            "exited before runtime ready"
+        } else {
+            "not ready before runtime ready"
+        };
+        let observation_class = self.observation_class.unwrap_or("process_exit");
+        self.bridge.observe_provider_line(
+            serde_json::json!({
+                "type": "VastAiBootstrapAttemptCompleted",
+                "run_id": self.run_id(),
+                "node_id": self.node_id(),
+                "attempt": self.attempt,
+                "status": status.to_string(),
+                "class": observation_class,
+                "classification": readiness,
+            })
+            .to_string(),
+        );
+        self.schedule_retry(ctx);
+    }
+
+    fn schedule_retry(&mut self, ctx: &Ctx) {
+        if self.stopped {
+            return;
+        }
+        let delay = self.backoff;
+        self.bridge.observe_provider_line(format!(
+            "VastAI SSH bootstrap retrying in {}s after attempt {}",
+            delay.as_secs(),
+            self.attempt
+        ));
+        self.backoff = next_ssh_backoff(self.backoff);
+        self.attempt = self.attempt.saturating_add(1);
+        schedule_ssh_message(
+            self.sender.clone(),
+            ctx.self_addr(),
+            SshBootstrapMsg::StartAttempt,
+            delay,
+        );
+    }
+
+    fn join_readers(&mut self) {
+        if let Some(reader) = self.stdout_reader.take() {
+            let _ = reader.join();
+        }
+        if let Some(reader) = self.stderr_reader.take() {
+            let _ = reader.join();
+        }
+        self.stdout_closed = true;
+        self.stderr_closed = true;
+    }
+
+    fn stop_child(&mut self) {
+        stop_ssh_child(&mut self.child);
+        self.join_readers();
     }
 }
 
@@ -796,18 +1117,37 @@ impl ActorInterface for SshBootstrapActor {
     type Incoming = SshBootstrapMsg;
     type Response = ();
 
-    fn handle(&mut self, _ctx: &Ctx, msg: Self::Incoming) {
+    fn on_start(&mut self, ctx: &Ctx) {
+        if self.start_on_boot {
+            let _ = ctx.send(ctx.self_addr(), SshBootstrapMsg::StartAttempt);
+        }
+    }
+
+    fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
         match msg {
+            SshBootstrapMsg::StartAttempt => self.start_attempt(ctx),
+            SshBootstrapMsg::PollChild => self.poll_child(ctx),
+            SshBootstrapMsg::OutputLine { stream, line } => self.handle_output_line(stream, line),
+            SshBootstrapMsg::ReaderError { stream, error } => {
+                self.handle_reader_error(stream, error)
+            }
+            SshBootstrapMsg::ReaderClosed { stream } => self.handle_reader_closed(ctx, stream),
             SshBootstrapMsg::Stop => {
-                self.stopping.store(true, Ordering::SeqCst);
-                stop_ssh_child(&self.child);
+                self.stopped = true;
+                self.stop_child();
+                ctx.stop_self();
             }
         }
     }
+
+    fn on_stop(&mut self, _ctx: &Ctx) {
+        self.stopped = true;
+        self.stop_child();
+    }
 }
 
-fn stop_ssh_child(child_slot: &Arc<Mutex<Option<Child>>>) {
-    let Some(mut child) = child_slot.lock().take() else {
+fn stop_ssh_child(child: &mut Option<Child>) {
+    let Some(mut child) = child.take() else {
         return;
     };
     let _ = child.kill();
@@ -851,21 +1191,17 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
             ));
         }
 
-        let child = Arc::new(Mutex::new(None));
-        let stopping = Arc::new(AtomicBool::new(false));
+        let sender = self.runtime.create_sender();
+        let bridge = BootstrapDatastreamBridge::new(spec, sink, producer);
         let actor = self
             .runtime
-            .spawn(SshBootstrapActor::new(child.clone(), stopping.clone()))
+            .spawn(SshBootstrapActor::new(
+                bridge,
+                endpoint,
+                self.ssh_identity.clone(),
+                sender,
+            ))
             .map_err(|e| format!("spawn VastAI SSH bootstrap actor: {e}"))?;
-        spawn_retrying_ssh_bootstrap(
-            spec,
-            endpoint,
-            sink,
-            producer,
-            self.ssh_identity.clone(),
-            child,
-            stopping,
-        );
 
         Ok(SshCommandBootstrapHandle {
             actor,
@@ -902,194 +1238,48 @@ fn classify_ssh_observation(line: &str) -> Option<&'static str> {
     None
 }
 
-fn spawn_classifying_stderr_reader<R>(
-    stderr: R,
-    bridge: BootstrapDatastreamBridge,
-    observed_class: Arc<Mutex<Option<&'static str>>>,
+fn spawn_ssh_output_reader<R>(
+    stream: SshBootstrapStream,
+    reader: R,
+    sender: ExternalSender,
+    actor: ActorAddress,
 ) -> JoinHandle<()>
 where
     R: Read + Send + 'static,
 {
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
+    thread::spawn(move || {
+        let reader = BufReader::new(reader);
         for next in reader.lines() {
             match next {
                 Ok(line) => {
-                    if let Some(class) = classify_ssh_observation(&line) {
-                        *observed_class.lock() = Some(class);
-                        bridge.observe_provider_line(
-                            serde_json::json!({
-                                "type": "VastAiBootstrapObservationClass",
-                                "run_id": bridge.spec().run_id,
-                                "node_id": bridge.spec().node_id,
-                                "class": class,
-                            })
-                            .to_string(),
-                        );
-                    }
-                    bridge.observe_stderr_line(line);
+                    let _ = sender.send_to(actor, SshBootstrapMsg::OutputLine { stream, line });
                 }
                 Err(error) => {
-                    bridge.observe_provider_line(format!("read VastAI SSH stderr: {error}"));
+                    let _ = sender.send_to(
+                        actor,
+                        SshBootstrapMsg::ReaderError {
+                            stream,
+                            error: error.to_string(),
+                        },
+                    );
                     break;
                 }
             }
         }
+        let _ = sender.send_to(actor, SshBootstrapMsg::ReaderClosed { stream });
     })
 }
-fn spawn_retrying_ssh_bootstrap(
-    spec: NodeProvisionSpec,
-    endpoint: VastAiSshEndpoint,
-    sink: PluginSink,
-    producer: Option<DatastreamProducer>,
-    ssh_identity: Option<PathBuf>,
-    child_slot: Arc<Mutex<Option<Child>>>,
-    stopping: Arc<AtomicBool>,
+
+fn schedule_ssh_message(
+    sender: ExternalSender,
+    actor: ActorAddress,
+    msg: SshBootstrapMsg,
+    delay: Duration,
 ) {
-    std::thread::spawn(move || {
-        let run_id = spec.run_id;
-        let node_id = spec.node_id;
-        let mut attempt = 1u64;
-        let mut backoff = Duration::from_secs(1);
-
-        while !stopping.load(Ordering::SeqCst) {
-            sink.observe(PluginObservation::ProviderLine {
-                run_id,
-                node_id,
-                line: format!(
-                    "VastAI SSH bootstrap attempt {attempt} to {}@{}:{}",
-                    endpoint.user, endpoint.host, endpoint.port
-                ),
-            });
-
-            match spawn_ssh_bootstrap_attempt(&spec, &endpoint, ssh_identity.as_deref()) {
-                Ok((child, stdout, stderr)) => {
-                    *child_slot.lock() = Some(child);
-                    let bridge = BootstrapDatastreamBridge::new(
-                        spec.clone(),
-                        sink.clone(),
-                        producer.clone(),
-                    );
-                    bridge.spawn_stdout_reader(stdout);
-                    let observed_class = Arc::new(Mutex::new(None));
-                    let mut stderr_reader = Some(spawn_classifying_stderr_reader(
-                        stderr,
-                        bridge.clone(),
-                        Arc::clone(&observed_class),
-                    ));
-
-                    loop {
-                        if stopping.load(Ordering::SeqCst) {
-                            return;
-                        }
-
-                        let wait_result = {
-                            let mut guard = child_slot.lock();
-                            match guard.as_mut() {
-                                Some(child) => match child.try_wait() {
-                                    Ok(Some(status)) => {
-                                        *guard = None;
-                                        Some(Ok(status))
-                                    }
-                                    Ok(None) => None,
-                                    Err(error) => {
-                                        *guard = None;
-                                        Some(Err(error))
-                                    }
-                                },
-                                None => Some(Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    "ssh child missing",
-                                ))),
-                            }
-                        };
-
-                        match wait_result {
-                            Some(Ok(status)) => {
-                                let readiness = if status.success() {
-                                    "exited before runtime ready"
-                                } else {
-                                    "not ready before runtime ready"
-                                };
-                                if let Some(reader) = stderr_reader.take() {
-                                    let _ = reader.join();
-                                }
-                                let observation_class =
-                                    (*observed_class.lock()).unwrap_or("process_exit");
-                                sink.observe(PluginObservation::ProviderLine {
-                                    run_id,
-                                    node_id,
-                                    line: serde_json::json!({
-                                        "type": "VastAiBootstrapAttemptCompleted",
-                                        "run_id": run_id,
-                                        "node_id": node_id,
-                                        "attempt": attempt,
-                                        "status": status.to_string(),
-                                        "class": observation_class,
-                                        "classification": readiness,
-                                    })
-                                    .to_string(),
-                                });
-                                break;
-                            }
-                            Some(Err(error)) => {
-                                if let Some(reader) = stderr_reader.take() {
-                                    let _ = reader.join();
-                                }
-                                sink.observe(PluginObservation::ProviderLine {
-                                    run_id,
-                                    node_id,
-                                    line: format!(
-                                        "wait VastAI SSH bootstrap attempt {attempt}: {error}; retrying"
-                                    ),
-                                });
-                                break;
-                            }
-                            None => std::thread::sleep(Duration::from_millis(100)),
-                        }
-                    }
-                }
-                Err(error) => {
-                    sink.observe(PluginObservation::ProviderLine {
-                        run_id,
-                        node_id,
-                        line: format!(
-                            "spawn VastAI SSH bootstrap attempt {attempt} failed: {error}; retrying"
-                        ),
-                    });
-                }
-            }
-
-            if stopping.load(Ordering::SeqCst) {
-                return;
-            }
-            sink.observe(PluginObservation::ProviderLine {
-                run_id,
-                node_id,
-                line: format!(
-                    "VastAI SSH bootstrap retrying in {}s after attempt {attempt}",
-                    backoff.as_secs()
-                ),
-            });
-            if !sleep_ssh_backoff(backoff, &stopping) {
-                return;
-            }
-            backoff = next_ssh_backoff(backoff);
-            attempt += 1;
-        }
+    thread::spawn(move || {
+        thread::sleep(delay);
+        let _ = sender.send_to(actor, msg);
     });
-}
-
-fn sleep_ssh_backoff(backoff: Duration, stopping: &AtomicBool) -> bool {
-    let deadline = std::time::Instant::now() + backoff;
-    while std::time::Instant::now() < deadline {
-        if stopping.load(Ordering::SeqCst) {
-            return false;
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        std::thread::sleep(std::cmp::min(remaining, Duration::from_millis(50)));
-    }
-    !stopping.load(Ordering::SeqCst)
 }
 
 fn spawn_ssh_bootstrap_attempt(
@@ -1747,10 +1937,6 @@ where
         let Some(node) = self.nodes.get_mut(&handle.id) else {
             return Ok(());
         };
-        if let Some(monitor) = node.provider_monitor.as_mut() {
-            monitor.stop();
-        }
-        node.provider_monitor = None;
         node.sink.observe(PluginObservation::ProviderLine {
             run_id: node.run_id,
             node_id: node.node_id,
@@ -1764,10 +1950,6 @@ where
             })
             .to_string(),
         });
-        if let Some(mut bootstrap) = node.bootstrap.take() {
-            self.bootstrap
-                .stop_bootstrap(&mut bootstrap, BootstrapStopReason::RuntimeReady);
-        }
         Ok(())
     }
 
@@ -1973,7 +2155,7 @@ mod tests {
     }
 
     #[test]
-    fn vastai_complete_bootstrap_stops_optional_log_tail_before_node_stop() {
+    fn vastai_complete_bootstrap_keeps_optional_log_tail_until_node_stop() {
         let destroyed_contracts = Arc::new(Mutex::new(Vec::new()));
         let stop_reasons = Arc::new(Mutex::new(Vec::new()));
         let sink = PluginSink::new(Arc::new(ObservationSink::default()));
@@ -1994,16 +2176,13 @@ mod tests {
         plugin
             .complete_bootstrap(&handle)
             .expect("runtime-ready bootstrap completion succeeds");
-        assert_eq!(
-            *stop_reasons.lock(),
-            vec![BootstrapStopReason::RuntimeReady]
+        assert!(
+            stop_reasons.lock().is_empty(),
+            "runtime-ready keeps the SSH log tail alive for post-bootstrap diagnostics"
         );
 
         plugin.stop_node(&handle).expect("VastAI node stops");
-        assert_eq!(
-            *stop_reasons.lock(),
-            vec![BootstrapStopReason::RuntimeReady]
-        );
+        assert_eq!(*stop_reasons.lock(), vec![BootstrapStopReason::NodeStop]);
         assert_eq!(*destroyed_contracts.lock(), vec![42]);
     }
 
@@ -2098,14 +2277,25 @@ mod tests {
     }
 
     #[test]
-    fn ssh_bootstrap_backoff_sleep_observes_stop_without_waiting_full_backoff() {
-        let stopping = AtomicBool::new(true);
-        let started = std::time::Instant::now();
+    fn provider_terminal_start_error_ignores_package_names_while_loading() {
+        let package_log = "#7 1.745 libevent-core-2.1-7t64 liberror-perl libglib2.0-data";
 
-        assert!(!sleep_ssh_backoff(Duration::from_secs(5), &stopping));
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "stopped bootstrap backoff should not wait for the full retry delay"
+        assert_eq!(
+            provider_terminal_start_error(46132050, "loading", "running", Some(package_log)),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_terminal_start_error_reports_standalone_failure_words() {
+        assert_eq!(
+            provider_terminal_start_error(
+                46132050,
+                "loading",
+                "running",
+                Some("ERROR: build failed")
+            ),
+            Some("instance 46132050 error: ERROR: build failed".to_owned())
         );
     }
 
@@ -2119,19 +2309,40 @@ mod tests {
             .spawn()
             .expect("spawn sleep child");
         let pid = child.id();
-        let child_slot = Arc::new(Mutex::new(Some(child)));
-        let stopping = Arc::new(AtomicBool::new(false));
+        let bridge = BootstrapDatastreamBridge::new(
+            node_spec_with_bootstrap_args(),
+            PluginSink::new(Arc::new(ObservationSink::default())),
+            None,
+        );
         let actor = runtime
-            .spawn(SshBootstrapActor::new(child_slot.clone(), stopping.clone()))
+            .spawn(SshBootstrapActor {
+                bridge,
+                endpoint: VastAiSshEndpoint {
+                    host: "127.0.0.1".to_owned(),
+                    port: 22,
+                    user: "ubuntu".to_owned(),
+                },
+                ssh_identity: None,
+                sender: runtime.create_sender(),
+                child: Some(child),
+                stdout_reader: None,
+                stderr_reader: None,
+                stdout_closed: true,
+                stderr_closed: true,
+                pending_status: None,
+                pending_wait_error: None,
+                attempt: 1,
+                backoff: Duration::from_secs(1),
+                observation_class: None,
+                stopped: false,
+                start_on_boot: false,
+            })
             .expect("spawn ssh bootstrap actor");
 
         runtime
             .send_to(actor, SshBootstrapMsg::Stop)
             .expect("send stop");
         runtime.tick();
-
-        assert!(stopping.load(Ordering::SeqCst));
-        assert!(child_slot.lock().is_none());
         #[cfg(target_os = "linux")]
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),

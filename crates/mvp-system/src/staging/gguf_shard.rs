@@ -10,6 +10,7 @@ const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const SUPPORTED_GGUF_VERSION: u32 = 3;
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_STRING_BYTES: u64 = 64 * 1024 * 1024;
+const STAGE_SHARD_CACHE_FORMAT_VERSION: &str = "stage-shard-cache-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ByteRange {
@@ -164,6 +165,45 @@ pub fn plan_stage_shard(
         merged_tensor_ranges,
         cache_key,
     })
+}
+
+pub fn validate_stage_shard_cache(path: &Path, plan: &StageShardPlan) -> Result<(), String> {
+    let directory = read_gguf_directory(path)
+        .map_err(|error| format!("invalid cached stage shard {}: {error}", path.display()))?;
+    if directory.tensors.len() != plan.tensors.len() {
+        return Err(format!(
+            "cached stage shard {} has {} tensors; expected {}",
+            path.display(),
+            directory.tensors.len(),
+            plan.tensors.len()
+        ));
+    }
+    if directory.alignment != plan.alignment {
+        return Err(format!(
+            "cached stage shard {} has alignment {}; expected {}",
+            path.display(),
+            directory.alignment,
+            plan.alignment
+        ));
+    }
+    for (index, (actual, expected)) in directory.tensors.iter().zip(&plan.tensors).enumerate() {
+        if actual.name != expected.name
+            || actual.dims != expected.dims
+            || actual.ggml_type != expected.ggml_type
+        {
+            return Err(format!(
+                "cached stage shard {} tensor {index} is {} {:?} type {}; expected {} {:?} type {}",
+                path.display(),
+                actual.name,
+                actual.dims,
+                actual.ggml_type,
+                expected.name,
+                expected.dims,
+                expected.ggml_type
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn source_url(source: &GgufSource) -> Result<String, String> {
@@ -405,6 +445,7 @@ fn shard_cache_key(
     tensors: &[GgufTensorEntry],
 ) -> String {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(format!("format:{STAGE_SHARD_CACHE_FORMAT_VERSION}\n").as_bytes());
     hasher.update(format!("source:{source:?}\n").as_bytes());
     hasher.update(
         format!("stage:{stage_index}/{stage_count}:{layer_start}-{layer_end_exclusive}\n")
@@ -1128,6 +1169,24 @@ mod tests {
             .sum::<u64>();
         assert_eq!(total_requested, plan.planned_fetch_bytes());
         assert!(total_requested < fixture.bytes_len);
+        validate_stage_shard_cache(&output_path, &plan).unwrap();
+    }
+
+    #[test]
+    fn corrupted_stage_shard_cache_is_rejected_before_reuse() {
+        let fixture = SyntheticGguf::new(4);
+        let source = GgufSource::HuggingFaceGguf {
+            repo: "org/repo".to_owned(),
+            file: "model.gguf".to_owned(),
+            revision: None,
+        };
+        let plan = plan_stage_shard(&fixture.path, source, 1, 2, 2, 4).unwrap();
+        let output_path = fixture.path.with_file_name(plan.cache_file_name());
+
+        std::fs::write(&output_path, b"not a gguf").unwrap();
+
+        let error = validate_stage_shard_cache(&output_path, &plan).unwrap_err();
+        assert!(error.contains("invalid cached stage shard"));
     }
 
     fn names(plan: &StageShardPlan) -> Vec<&str> {

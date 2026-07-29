@@ -673,7 +673,7 @@ fn stop_destroys_known_vastai_contract_exactly_once() {
 }
 
 #[test]
-fn vastai_complete_bootstrap_stops_optional_log_tail_before_node_stop() {
+fn vastai_complete_bootstrap_keeps_optional_log_tail_until_node_stop() {
     let mut plugin = VastAiProvisioningPlugin::new(
         FakeLeaseClient::default().with_contract(100),
         FakeBootstrap::default(),
@@ -683,10 +683,7 @@ fn vastai_complete_bootstrap_stops_optional_log_tail_before_node_stop() {
 
     plugin.complete_bootstrap(&handle).unwrap();
 
-    assert_eq!(
-        plugin.bootstrap().stops,
-        vec![(1, BootstrapStopReason::RuntimeReady)]
-    );
+    assert!(plugin.bootstrap().stops.is_empty());
     assert_eq!(plugin.client().destroyed, Vec::<u64>::new());
     assert_eq!(plugin.active_contract_count(), 1);
 
@@ -695,7 +692,7 @@ fn vastai_complete_bootstrap_stops_optional_log_tail_before_node_stop() {
     assert_eq!(plugin.client().destroyed, vec![100]);
     assert_eq!(
         plugin.bootstrap().stops,
-        vec![(1, BootstrapStopReason::RuntimeReady)]
+        vec![(1, BootstrapStopReason::NodeStop)]
     );
     assert_eq!(plugin.active_contract_count(), 0);
 }

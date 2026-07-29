@@ -88,7 +88,12 @@ fn data_plane_fault_and_stop_reports_map_to_mvp_lifecycle_messages() {
         .expect("send stopped");
     runtime.tick();
 
-    assert_eq!(node_messages.try_recv(), Some(NodeAgentMsg::WorkerCrashed));
+    assert_eq!(
+        node_messages.try_recv(),
+        Some(NodeAgentMsg::WorkerCrashed {
+            reason: Some("data plane faulted".to_owned())
+        })
+    );
     assert_eq!(
         node_messages.try_recv(),
         Some(NodeAgentMsg::LocalEdgesStopped { run_id: 55 })
