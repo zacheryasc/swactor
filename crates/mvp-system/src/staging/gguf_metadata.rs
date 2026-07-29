@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::orchestration::run_plan::{self, DTypeFamily, GgufSource, TokenizerSource};
+use crate::run_plan::{self, DTypeFamily, GgufSource, TokenizerSource};
 
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const SUPPORTED_GGUF_VERSION: u32 = 3;

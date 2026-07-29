@@ -182,8 +182,8 @@ fn runtime_node_builds_the_reusable_iroh_swactor_stack() {
 
     let orchestrator = node
         .spawn_orchestrator_actor(
-            mvp_system::orchestration::run_fsm::RunConfig {
-                run_id: mvp_system::orchestration::run_fsm::RunId(77),
+            crate::run_fsm::RunConfig {
+                run_id: crate::run_fsm::RunId(77),
                 max_tokens: 1,
                 prompt: vec![1, 2, 3],
             },

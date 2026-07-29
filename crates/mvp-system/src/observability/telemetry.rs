@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! MVP-system-owned datastream channel records.
 
 use datastream::hardware::net::HostNetSample;
@@ -5,7 +7,7 @@ use datastream::{ChannelRegistry, Record};
 use serde::{Deserialize, Serialize};
 
 use crate::observability::lifecycle as obs;
-use crate::orchestration::provisioning::{self, ProvisionLogStream};
+use crate::provisioning::{self, ProvisionLogStream};
 use data_plane::arena::ArenaSample;
 
 /// Structured MVP lifecycle facts: run, node, stage, edge, ring, object, step, and worker events.

@@ -1,4 +1,4 @@
-use mvp_system::orchestration::run_plan as plan;
+use crate::run_plan as plan;
 use mvp_system::staging as stage;
 
 use super::mock_transport::{MockObject, MockObjectKind};

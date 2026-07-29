@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const MO01_HEADER_BYTES: u64 = 40;
 const TOKEN_ID_WIDTH_BYTES: u32 = 4;
 
@@ -154,10 +156,6 @@ pub struct StagePlacement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlacementInput {
     FixedLinear(Vec<StagePlacement>),
-    FixedLinearWithEdgeOverride {
-        stages: Vec<StagePlacement>,
-        forced_activation_edges: Vec<(u32, u32)>,
-    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -620,20 +618,7 @@ fn validate_global_input(input: &PlannerInput) -> Result<(), PlanRejection> {
 }
 
 fn validated_placements(input: &PlannerInput) -> Result<Vec<StagePlacement>, PlanRejection> {
-    let (stages, forced_edges) = match &input.placement {
-        PlacementInput::FixedLinear(stages) => (stages.as_slice(), &[][..]),
-        PlacementInput::FixedLinearWithEdgeOverride {
-            stages,
-            forced_activation_edges,
-        } => (stages.as_slice(), forced_activation_edges.as_slice()),
-    };
-
-    if forced_edges
-        .iter()
-        .any(|(producer, consumer)| *consumer != producer.saturating_add(1))
-    {
-        return Err(reject(PlanRejectionKind::EdgeEndpointMismatch));
-    }
+    let PlacementInput::FixedLinear(stages) = &input.placement;
 
     let candidate_nodes = input
         .candidate_pool

@@ -9,7 +9,7 @@
 //! The planner implementation, placement heuristic, helper APIs, internal graph
 //! representation, and allocation strategy are not observable here.
 
-use mvp_system::orchestration::run_plan as plan;
+use crate::run_plan as plan;
 
 // Local aliases keep the test prose readable while the file imports only the
 // public planning module. The aliases do not grant access to planner internals.
@@ -658,11 +658,6 @@ fn invalid_authority_and_topology_inputs_reject_without_plan() {
             "invalid stage count",
         ),
         (
-            invalid_edge_endpoint_mismatch(),
-            PlanRejectionKind::EdgeEndpointMismatch,
-            "edge endpoint mismatch",
-        ),
-        (
             invalid_model_stage_layout(),
             PlanRejectionKind::ModelStageLayoutMismatch,
             "model/stage layout mismatch",
@@ -781,31 +776,6 @@ fn invalid_missing_stage_assignment() -> PlannerInput {
 // stage-count path without adding any other contradictory facts.
 fn invalid_zero_stage_count() -> PlannerInput {
     valid_input(0, 36)
-}
-
-// Endpoint mismatch rejection needs an input that tries to override the linear
-// edge contract. The planner must reject a skipped-stage activation edge rather
-// than accepting a non-MVP topology.
-fn invalid_edge_endpoint_mismatch() -> PlannerInput {
-    let mut input = valid_input(3, 36);
-    input.placement = PlacementInput::FixedLinearWithEdgeOverride {
-        stages: vec![
-            StagePlacement {
-                stage_index: 0,
-                node_id: node(10),
-            },
-            StagePlacement {
-                stage_index: 1,
-                node_id: node(11),
-            },
-            StagePlacement {
-                stage_index: 2,
-                node_id: node(12),
-            },
-        ],
-        forced_activation_edges: vec![(0, 2)],
-    };
-    input
 }
 
 // The current contract requires one non-empty layer range per stage. Fewer

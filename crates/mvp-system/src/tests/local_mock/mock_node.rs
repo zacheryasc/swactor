@@ -1,5 +1,5 @@
+use crate::run_plan as plan;
 use data_plane::edge_actor;
-use mvp_system::orchestration::run_plan as plan;
 use mvp_system::staging as stage;
 
 use super::mock_transport::MockObject;

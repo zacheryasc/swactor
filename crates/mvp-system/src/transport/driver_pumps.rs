@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
