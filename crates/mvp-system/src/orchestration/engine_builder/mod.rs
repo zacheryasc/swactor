@@ -20,8 +20,7 @@ pub mod runtime_stack;
 pub mod workload;
 
 pub use crate::run_plan::NodeId;
-pub use engine::{ClusterBuilder, ClusterHandle};
-pub use error::{EngineBuildError, PlanningError};
+pub use engine::ClusterBuilder;
 pub use events::EngineEvent;
 pub use launcher::StaticNodeLauncher;
 pub use model::{DTypeFamily, ModelArtifact, ModelSpec};
@@ -29,5 +28,3 @@ pub use node_image::{NodeImageSpec, WorkerRuntimeSpec};
 pub use planner::FixedLinearPipelinePlanner;
 pub use pool::{NodeCapability, NodeLease, ResourceFacts, StaticPoolProvider};
 pub use roles::RoleKind;
-pub use runtime_stack::RuntimeNode;
-pub use workload::WorkloadAdapter;

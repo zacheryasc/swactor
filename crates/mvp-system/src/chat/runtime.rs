@@ -25,7 +25,7 @@ use signal_hook::iterator::Signals;
 use crate::chat::config as chat_config;
 use crate::chat::node_image::{
     NodeImageProgressEvent, NodeImageProgressEventKind, NodeImageProgressSink, NodeImageProvider,
-    NodeImageRequest, PreparedNodeImage, prepare_node_image_with_progress,
+    NodeImageRequest, prepare_node_image_with_progress,
 };
 use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::observability::{benchmark, frame_archive::FrameArchive};
@@ -775,73 +775,21 @@ impl Config {
         let args = ParsedArgs::parse(provided_args)?;
         let loaded = load_chat_config(args.config_path.as_deref())?;
         let toml = loaded.overlay;
-        let provider = provider_from_sources(args.provider, toml.provider.kind.as_deref())?;
+        let provider = provider_from_sources(args.provider.clone(), toml.provider.kind.as_deref())?;
         let node_image = first_non_empty([toml.image.node.clone()]).unwrap_or_default();
         if provider != provider_kind::process() && node_image.is_empty() {
             return Err("node image is required for docker or vastai provider".to_owned());
         }
-        let pipeline_stages = args
-            .pipeline_stages
-            .or(toml.runtime.pipeline_stages)
-            .unwrap_or(1);
-        if pipeline_stages == 0 {
-            return Err("--pipeline-stages must be greater than 0".to_owned());
-        }
-        let max_tokens = toml.runtime.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        if max_tokens == 0 {
-            return Err("[runtime].max_tokens must be greater than 0".to_owned());
-        }
+        let pipeline_stages = Self::pipeline_stages(&args, &toml)?;
+        let max_tokens = Self::max_tokens(&toml)?;
         let gpu_run = args.gpu || env_flag(MVP_CHAT_GPU_RUN_ENV, false);
-        let endpoint_addr_mask = match first_non_empty([
-            args.endpoint_addr_mask.clone(),
-            toml.relay.endpoint_addr_mask.clone(),
-        ]) {
-            Some(mask) => EndpointAddrMask::parse(&mask)?,
-            None => EndpointAddrMask::Full,
-        };
-        let relay_mode = first_non_empty([args.relay_mode.clone(), toml.relay.mode.clone()]);
-        let mut relay_url = first_non_empty([args.relay_url.clone(), toml.relay.url.clone()]);
-        if endpoint_addr_mask.requires_relay() && relay_url.is_none() {
-            relay_url = first_non_empty([toml.vastai.relay_url.clone()]);
-        }
-        if endpoint_addr_mask.requires_relay() && relay_url.is_none() {
-            return Err("relay-only endpoint address mask requires [relay].url, --relay-url, or [vastai].relay_url".to_owned());
-        }
-        let relay_mode = relay_mode.or_else(|| relay_url.as_ref().map(|_| "default".to_owned()));
-        let cached_model_source = match args.cached_model {
-            Some(source) => Some(source),
-            None if gpu_run && provider == provider_kind::process() => {
-                Some(CachedModelSource::Discover)
-            }
-            None => None,
-        };
-        let cached_model = cached_model_source
+        let endpoint_addr_mask = Self::endpoint_addr_mask(&args, &toml)?;
+        let (relay_mode, relay_url) = Self::relay_settings(&args, &toml, endpoint_addr_mask)?;
+        let cached_model = Self::cached_model_source(&args, gpu_run, &provider)
             .map(CachedModelConfig::from_source)
             .transpose()?;
-        let model = if provider == provider_kind::vastai() {
-            match &cached_model {
-                Some(cached_model) => {
-                    vastai_model_config_for_cached_model(toml.model.clone(), cached_model)?
-                }
-                None => toml.model.clone(),
-            }
-        } else {
-            toml.model.clone()
-        };
-        let datastream_frame_log = if args.dump_logs {
-            Some(
-                args.dump_log_path
-                    .unwrap_or_else(|| PathBuf::from("mvp-chat.log")),
-            )
-        } else if toml.observability.dump_logs.unwrap_or(false) {
-            Some(
-                first_non_empty([toml.observability.dump_log_path.clone()])
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from("mvp-chat.log")),
-            )
-        } else {
-            None
-        };
+        let model = Self::model_config(&provider, &toml, cached_model.as_ref())?;
+        let datastream_frame_log = Self::datastream_frame_log(&args, &toml);
         let vastai = if provider == provider_kind::vastai() {
             Some(resolve_vastai_config(&toml.vastai, &node_image)?)
         } else {
@@ -871,9 +819,114 @@ impl Config {
         })
     }
 
+    fn pipeline_stages(args: &ParsedArgs, toml: &ChatTomlConfig) -> Result<u32, String> {
+        let pipeline_stages = args
+            .pipeline_stages
+            .or(toml.runtime.pipeline_stages)
+            .unwrap_or(1);
+        if pipeline_stages == 0 {
+            return Err("--pipeline-stages must be greater than 0".to_owned());
+        }
+        Ok(pipeline_stages)
+    }
+
+    fn max_tokens(toml: &ChatTomlConfig) -> Result<u32, String> {
+        let max_tokens = toml.runtime.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        if max_tokens == 0 {
+            return Err("[runtime].max_tokens must be greater than 0".to_owned());
+        }
+        Ok(max_tokens)
+    }
+
+    fn endpoint_addr_mask(
+        args: &ParsedArgs,
+        toml: &ChatTomlConfig,
+    ) -> Result<EndpointAddrMask, String> {
+        match first_non_empty([
+            args.endpoint_addr_mask.clone(),
+            toml.relay.endpoint_addr_mask.clone(),
+        ]) {
+            Some(mask) => EndpointAddrMask::parse(&mask),
+            None => Ok(EndpointAddrMask::Full),
+        }
+    }
+
+    fn relay_settings(
+        args: &ParsedArgs,
+        toml: &ChatTomlConfig,
+        endpoint_addr_mask: EndpointAddrMask,
+    ) -> Result<(Option<String>, Option<String>), String> {
+        let relay_mode = first_non_empty([args.relay_mode.clone(), toml.relay.mode.clone()]);
+        let mut relay_url = first_non_empty([args.relay_url.clone(), toml.relay.url.clone()]);
+        if endpoint_addr_mask.requires_relay() && relay_url.is_none() {
+            relay_url = first_non_empty([toml.vastai.relay_url.clone()]);
+        }
+        if endpoint_addr_mask.requires_relay() && relay_url.is_none() {
+            return Err("relay-only endpoint address mask requires [relay].url, --relay-url, or [vastai].relay_url".to_owned());
+        }
+        let relay_mode = relay_mode.or_else(|| relay_url.as_ref().map(|_| "default".to_owned()));
+        Ok((relay_mode, relay_url))
+    }
+
+    fn cached_model_source(
+        args: &ParsedArgs,
+        gpu_run: bool,
+        provider: &ProviderKind,
+    ) -> Option<CachedModelSource> {
+        match &args.cached_model {
+            Some(source) => Some(source.clone()),
+            None if gpu_run && provider == &provider_kind::process() => {
+                Some(CachedModelSource::Discover)
+            }
+            None => None,
+        }
+    }
+
+    fn model_config(
+        provider: &ProviderKind,
+        toml: &ChatTomlConfig,
+        cached_model: Option<&CachedModelConfig>,
+    ) -> Result<ChatModelConfig, String> {
+        if provider != &provider_kind::vastai() {
+            return Ok(toml.model.clone());
+        }
+        match cached_model {
+            Some(cached_model) => {
+                vastai_model_config_for_cached_model(toml.model.clone(), cached_model)
+            }
+            None => Ok(toml.model.clone()),
+        }
+    }
+
+    fn datastream_frame_log(args: &ParsedArgs, toml: &ChatTomlConfig) -> Option<PathBuf> {
+        if args.dump_logs {
+            return Some(
+                args.dump_log_path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("mvp-chat.log")),
+            );
+        }
+        if !toml.observability.dump_logs.unwrap_or(false) {
+            return None;
+        }
+        Some(
+            first_non_empty([toml.observability.dump_log_path.clone()])
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("mvp-chat.log")),
+        )
+    }
+
     // The orchestrator launch spec is still pending. These flags are the current adapter;
     // adjust this mapping when the approved orchestrator launch contract is finalized.
     fn orchestrator_cli_args(&self, image_ref: &str) -> Vec<String> {
+        macro_rules! push_opt {
+            ($args:ident, $option:expr, $flag:expr, |$value:ident| $arg:expr) => {
+                if let Some($value) = $option {
+                    $args.extend([$flag.to_owned(), $arg]);
+                }
+            };
+        }
+
         let mut args = vec![
             "--provider".to_owned(),
             self.provider.as_str().to_owned(),
@@ -889,27 +942,36 @@ impl Config {
             self.pipeline_stages.to_string(),
             "--dashboard".to_owned(),
         ];
-        if let Some(model_id) = &self.model.id {
-            args.extend(["--model-id".to_owned(), model_id.clone()]);
-        }
-        if let Some(path) = &self.model.gguf_local_path {
-            args.extend(["--gguf-local-path".to_owned(), path.clone()]);
-        }
-        if let Some(repo) = &self.model.gguf_repo {
-            args.extend(["--gguf-repo".to_owned(), repo.clone()]);
-        }
-        if let Some(file) = &self.model.gguf_file {
-            args.extend(["--gguf-file".to_owned(), file.clone()]);
-        }
-        if let Some(revision) = &self.model.gguf_revision {
-            args.extend(["--gguf-revision".to_owned(), revision.clone()]);
-        }
-        if let Some(path) = &self.model.tokenizer_local_path {
-            args.extend(["--tokenizer-local-path".to_owned(), path.clone()]);
-        }
-        if let Some(max_context) = self.model.max_context {
-            args.extend(["--max-context".to_owned(), max_context.to_string()]);
-        }
+        push_opt!(args, &self.model.id, "--model-id", |model_id| model_id
+            .clone());
+        push_opt!(
+            args,
+            &self.model.gguf_local_path,
+            "--gguf-local-path",
+            |path| path.clone()
+        );
+        push_opt!(args, &self.model.gguf_repo, "--gguf-repo", |repo| repo
+            .clone());
+        push_opt!(args, &self.model.gguf_file, "--gguf-file", |file| file
+            .clone());
+        push_opt!(
+            args,
+            &self.model.gguf_revision,
+            "--gguf-revision",
+            |revision| { revision.clone() }
+        );
+        push_opt!(
+            args,
+            &self.model.tokenizer_local_path,
+            "--tokenizer-local-path",
+            |path| path.clone()
+        );
+        push_opt!(
+            args,
+            self.model.max_context,
+            "--max-context",
+            |max_context| { max_context.to_string() }
+        );
         if self.provider == provider_kind::process() {
             args.extend([
                 "--worker-bin".to_owned(),
@@ -922,18 +984,14 @@ impl Config {
                 cached_model.host_path.to_string_lossy().to_string(),
             ]);
         }
-        if let Some(path) = &self.datastream_frame_log {
-            args.extend([
-                "--datastream-frame-log".to_owned(),
-                path.to_string_lossy().to_string(),
-            ]);
-        }
-        if let Some(mode) = &self.relay_mode {
-            args.extend(["--relay-mode".to_owned(), mode.clone()]);
-        }
-        if let Some(url) = &self.relay_url {
-            args.extend(["--relay-url".to_owned(), url.clone()]);
-        }
+        push_opt!(
+            args,
+            &self.datastream_frame_log,
+            "--datastream-frame-log",
+            |path| { path.to_string_lossy().to_string() }
+        );
+        push_opt!(args, &self.relay_mode, "--relay-mode", |mode| mode.clone());
+        push_opt!(args, &self.relay_url, "--relay-url", |url| url.clone());
         if self.endpoint_addr_mask != EndpointAddrMask::Full {
             args.extend([
                 "--endpoint-addr-mask".to_owned(),
@@ -946,39 +1004,41 @@ impl Config {
                 vastai.bootstrap_command.clone(),
                 "--no-vastai-confirm-lease".to_owned(),
             ]);
-            if let Some(disk_gb) = vastai.disk_gb {
-                args.extend(["--vastai-disk-gb".to_owned(), disk_gb.to_string()]);
-            }
-            if let Some(gpu_name) = &vastai.gpu_name {
-                args.extend(["--vastai-gpu-name".to_owned(), gpu_name.clone()]);
-            }
-            if let Some(min_gpu_ram_mb) = vastai.min_gpu_ram_mb {
-                args.extend([
-                    "--vastai-min-gpu-ram-mb".to_owned(),
-                    min_gpu_ram_mb.to_string(),
-                ]);
-            }
-            if let Some(min_down_mbps) = vastai.min_down_mbps {
-                args.extend([
-                    "--vastai-min-down-mbps".to_owned(),
-                    min_down_mbps.to_string(),
-                ]);
-            }
-            if let Some(min_up_mbps) = vastai.min_up_mbps {
-                args.extend(["--vastai-min-up-mbps".to_owned(), min_up_mbps.to_string()]);
-            }
-            if let Some(max_dph_total) = vastai.max_dph_total {
-                args.extend([
-                    "--vastai-max-dph-total".to_owned(),
-                    max_dph_total.to_string(),
-                ]);
-            }
-            if let Some(min_reliability) = vastai.min_reliability {
-                args.extend([
-                    "--vastai-min-reliability".to_owned(),
-                    min_reliability.to_string(),
-                ]);
-            }
+            push_opt!(args, vastai.disk_gb, "--vastai-disk-gb", |disk_gb| disk_gb
+                .to_string());
+            push_opt!(args, &vastai.gpu_name, "--vastai-gpu-name", |gpu_name| {
+                gpu_name.clone()
+            });
+            push_opt!(
+                args,
+                vastai.min_gpu_ram_mb,
+                "--vastai-min-gpu-ram-mb",
+                |min_gpu_ram_mb| min_gpu_ram_mb.to_string()
+            );
+            push_opt!(
+                args,
+                vastai.min_down_mbps,
+                "--vastai-min-down-mbps",
+                |min_down_mbps| min_down_mbps.to_string()
+            );
+            push_opt!(
+                args,
+                vastai.min_up_mbps,
+                "--vastai-min-up-mbps",
+                |min_up_mbps| { min_up_mbps.to_string() }
+            );
+            push_opt!(
+                args,
+                vastai.max_dph_total,
+                "--vastai-max-dph-total",
+                |max_dph_total| { max_dph_total.to_string() }
+            );
+            push_opt!(
+                args,
+                vastai.min_reliability,
+                "--vastai-min-reliability",
+                |min_reliability| min_reliability.to_string()
+            );
             if let Some(require_verified) = vastai.require_verified {
                 args.push(if require_verified {
                     "--vastai-require-verified".to_owned()
@@ -989,12 +1049,14 @@ impl Config {
             for host_id in &vastai.blacklist_hosts {
                 args.extend(["--vastai-blacklist-host".to_owned(), host_id.to_string()]);
             }
-            if let Some(onstart) = &vastai.onstart {
-                args.extend(["--vastai-onstart".to_owned(), onstart.clone()]);
-            }
-            if let Some(ssh_identity) = &vastai.ssh_identity {
-                args.extend(["--vastai-ssh-identity".to_owned(), ssh_identity.clone()]);
-            }
+            push_opt!(args, &vastai.onstart, "--vastai-onstart", |onstart| onstart
+                .clone());
+            push_opt!(
+                args,
+                &vastai.ssh_identity,
+                "--vastai-ssh-identity",
+                |ssh_identity| { ssh_identity.clone() }
+            );
         }
         args
     }
@@ -1044,6 +1106,70 @@ impl ParsedArgs {
         Ok(())
     }
 
+    fn apply_provider_arg(&mut self, arg: &str) -> Result<bool, String> {
+        match arg {
+            "--help" | "-h" | "help" => self.help = true,
+            "--gpu" => self.gpu = true,
+            "--vastai" => self.set_provider_selector(provider_kind::vastai())?,
+            "--process" => self.set_provider_selector(provider_kind::process())?,
+            "--docker" => self.set_provider_selector(provider_kind::docker())?,
+            "--yes" | "-y" => self.vastai_yes = true,
+            "--dump-logs" => self.dump_logs = true,
+            "--cached-model" => self.cached_model = Some(CachedModelSource::Discover),
+            "--skip-rebuild" => self.skip_rebuild = true,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_config_arg<I>(&mut self, arg: &str, args: &mut I) -> Result<bool, String>
+    where
+        I: Iterator<Item = String>,
+    {
+        match arg {
+            "--config" => self.config_path = Some(PathBuf::from(next_arg(args, "--config")?)),
+            "--pipeline-stages" | "--pipeline-parallel" => {
+                if self.pipeline_stages.is_some() {
+                    return Err("pipeline stage count was provided more than once".to_owned());
+                }
+                self.pipeline_stages = Some(parse_pipeline_stages_value(args, arg)?);
+            }
+            "--relay-mode" => self.relay_mode = Some(next_arg(args, "--relay-mode")?),
+            "--relay-url" => self.relay_url = Some(next_arg(args, "--relay-url")?),
+            "--endpoint-addr-mask" => {
+                self.endpoint_addr_mask = Some(next_arg(args, "--endpoint-addr-mask")?)
+            }
+            "--run-id" => {
+                let run_id: u64 = parse_next(args, "--run-id")?;
+                if run_id == 0 {
+                    return Err("--run-id must be greater than 0".to_owned());
+                }
+                self.run_id = Some(run_id);
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn apply_assignment_arg(&mut self, arg: &str) -> Result<bool, String> {
+        if let Some(path) = arg.strip_prefix("--dump-logs=") {
+            if path.is_empty() {
+                return Err("--dump-logs path must not be empty".to_owned());
+            }
+            self.dump_logs = true;
+            self.dump_log_path = Some(PathBuf::from(path));
+            return Ok(true);
+        }
+        if let Some(path) = arg.strip_prefix("--cached-model=") {
+            if path.is_empty() {
+                return Err("--cached-model path must not be empty".to_owned());
+            }
+            self.cached_model = Some(CachedModelSource::Path(PathBuf::from(path)));
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     fn parse<I>(provided_args: I) -> Result<Self, String>
     where
         I: IntoIterator<Item = String>,
@@ -1051,61 +1177,13 @@ impl ParsedArgs {
         let mut parsed = Self::default();
         let mut args = provided_args.into_iter().peekable();
         while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--help" | "-h" | "help" => parsed.help = true,
-                "--gpu" => parsed.gpu = true,
-                "--vastai" => parsed.set_provider_selector(provider_kind::vastai())?,
-                "--process" => parsed.set_provider_selector(provider_kind::process())?,
-                "--docker" => parsed.set_provider_selector(provider_kind::docker())?,
-                "--yes" | "-y" => parsed.vastai_yes = true,
-                "--config" => {
-                    parsed.config_path = Some(PathBuf::from(next_arg(&mut args, "--config")?))
-                }
-                "--pipeline-stages" | "--pipeline-parallel" => {
-                    if parsed.pipeline_stages.is_some() {
-                        return Err("pipeline stage count was provided more than once".to_owned());
-                    }
-                    parsed.pipeline_stages =
-                        Some(parse_pipeline_stages_value(&mut args, arg.as_str())?)
-                }
-                "--relay-mode" => parsed.relay_mode = Some(next_arg(&mut args, "--relay-mode")?),
-                "--relay-url" => parsed.relay_url = Some(next_arg(&mut args, "--relay-url")?),
-                "--endpoint-addr-mask" => {
-                    parsed.endpoint_addr_mask = Some(next_arg(&mut args, "--endpoint-addr-mask")?)
-                }
-                "--run-id" => {
-                    let run_id: u64 = parse_next(&mut args, "--run-id")?;
-                    if run_id == 0 {
-                        return Err("--run-id must be greater than 0".to_owned());
-                    }
-                    parsed.run_id = Some(run_id);
-                }
-                "--dump-logs" => {
-                    parsed.dump_logs = true;
-                }
-                value if value.starts_with("--dump-logs=") => {
-                    let path = value.strip_prefix("--dump-logs=").expect("prefix checked");
-                    if path.is_empty() {
-                        return Err("--dump-logs path must not be empty".to_owned());
-                    }
-                    parsed.dump_logs = true;
-                    parsed.dump_log_path = Some(PathBuf::from(path));
-                }
-                "--cached-model" => {
-                    parsed.cached_model = Some(CachedModelSource::Discover);
-                }
-                value if value.starts_with("--cached-model=") => {
-                    let path = value
-                        .strip_prefix("--cached-model=")
-                        .expect("prefix checked");
-                    if path.is_empty() {
-                        return Err("--cached-model path must not be empty".to_owned());
-                    }
-                    parsed.cached_model = Some(CachedModelSource::Path(PathBuf::from(path)));
-                }
-                "--skip-rebuild" => parsed.skip_rebuild = true,
-                other => return Err(format!("unsupported mvp-chat argument {other:?}")),
+            if parsed.apply_provider_arg(&arg)?
+                || parsed.apply_config_arg(&arg, &mut args)?
+                || parsed.apply_assignment_arg(&arg)?
+            {
+                continue;
             }
+            return Err(format!("unsupported mvp-chat argument {arg:?}"));
         }
         Ok(parsed)
     }
@@ -1511,7 +1589,7 @@ fn signal_orch_process_group(child: &Child, signal: libc::c_int) -> io::Result<(
 fn prepare_node_image_progress_adapter(
     request: NodeImageRequest,
     progress: Option<&mut dyn NodeImageProgressSink>,
-) -> Result<PreparedNodeImage, String> {
+) -> Result<String, String> {
     prepare_node_image_with_progress(request, progress)
 }
 
@@ -1525,7 +1603,7 @@ fn prepare_runtime(config: &Config) -> Result<String, String> {
 #[allow(dead_code)]
 fn prepare_runtime_with<F>(config: &Config, prepare_node_image_fn: F) -> Result<String, String>
 where
-    F: FnMut(NodeImageRequest) -> Result<PreparedNodeImage, String>,
+    F: FnMut(NodeImageRequest) -> Result<String, String>,
 {
     let mut prepare_node_image_fn = prepare_node_image_fn;
     prepare_runtime_with_progress(
@@ -1541,10 +1619,7 @@ fn prepare_runtime_with_progress<F>(
     progress: Option<&mut ChatDatastream>,
 ) -> Result<String, String>
 where
-    F: FnMut(
-        NodeImageRequest,
-        Option<&mut dyn NodeImageProgressSink>,
-    ) -> Result<PreparedNodeImage, String>,
+    F: FnMut(NodeImageRequest, Option<&mut dyn NodeImageProgressSink>) -> Result<String, String>,
 {
     let mut progress = progress;
     let binary_mode = if config.skip_rebuild {
@@ -1758,9 +1833,9 @@ where
         CHAT_RUNTIME_CHANNEL,
         "prepare_node_image",
         "ready",
-        json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "image_ref": prepared.image_ref, "elapsed_ms": prepare_node_image_started.elapsed().as_millis()}),
+        json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "image_ref": &prepared, "elapsed_ms": prepare_node_image_started.elapsed().as_millis()}),
     );
-    Ok(prepared.image_ref)
+    Ok(prepared)
 }
 
 fn stdin_prompt_events() -> mpsc::Receiver<PromptInput> {
@@ -1852,32 +1927,23 @@ fn run_chat_loop_with_input_and_progress(
 }
 
 #[cfg(test)]
-fn run_chat_session_with_output<R, W, O>(
-    writer: &mut W,
-    reader: R,
+fn run_chat_session_with_output(
+    writer: &mut impl Write,
+    reader: impl BufRead,
     input_rx: mpsc::Receiver<PromptInput>,
     max_tokens: u32,
-    output: &mut O,
-) -> Result<(), String>
-where
-    R: BufRead,
-    W: Write,
-    O: Write,
-{
+    output: &mut impl Write,
+) -> Result<(), String> {
     run_chat_session_with_output_and_progress(writer, reader, input_rx, max_tokens, output, None)
 }
 
-fn run_chat_session_with_progress<R, W>(
-    writer: &mut W,
-    reader: R,
+fn run_chat_session_with_progress(
+    writer: &mut impl Write,
+    reader: impl BufRead,
     input_rx: mpsc::Receiver<PromptInput>,
     max_tokens: u32,
     progress: Option<&mut ChatDatastream>,
-) -> Result<(), String>
-where
-    R: BufRead,
-    W: Write,
-{
+) -> Result<(), String> {
     let mut output = io::stdout();
     run_chat_session_with_output_and_progress(
         writer,
@@ -1905,19 +1971,14 @@ fn prompt_hash_hex(prompt: &str) -> String {
     blake3::hash(prompt.as_bytes()).to_hex().to_string()
 }
 
-fn run_chat_session_with_output_and_progress<R, W, O>(
-    writer: &mut W,
-    mut reader: R,
+fn run_chat_session_with_output_and_progress(
+    writer: &mut impl Write,
+    mut reader: impl BufRead,
     input_rx: mpsc::Receiver<PromptInput>,
     max_tokens: u32,
-    output: &mut O,
+    output: &mut impl Write,
     progress: Option<&mut ChatDatastream>,
-) -> Result<(), String>
-where
-    R: BufRead,
-    W: Write,
-    O: Write,
-{
+) -> Result<(), String> {
     let mut progress = progress;
     let mut next_request_id = 1_u64;
     let mut next_prompt_index = 1_u64;
@@ -2375,10 +2436,8 @@ fn parse_pipeline_stages_value(
 mod tests {
     use super::*;
 
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsString;
     use std::io::{Cursor, Read};
-    #[cfg(target_os = "linux")]
-    use std::os::unix::process::CommandExt;
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -2485,50 +2544,6 @@ mod tests {
         }
         fs::write(&path, text).expect("write config");
         path
-    }
-
-    fn base_config(provider: ProviderKind) -> Config {
-        Config {
-            orch_bin: PathBuf::from("/tmp/mvp-orchestrator"),
-            worker_bin: PathBuf::from("/tmp/mvp-worker-node"),
-            rpc_addr: DEFAULT_RPC_ADDR.to_owned(),
-            node_image: "docker.io/acme/node:latest".to_owned(),
-            provider,
-            image_tag: None,
-            cached_model: None,
-            datastream_frame_log: None,
-            run_id: 1,
-            vastai_yes: false,
-            vastai: None,
-            model: ChatModelConfig::default(),
-            pipeline_stages: 1,
-            max_tokens: DEFAULT_MAX_TOKENS,
-            skip_rebuild: true,
-            gpu_run: false,
-            relay_mode: None,
-            relay_url: None,
-            endpoint_addr_mask: EndpointAddrMask::Full,
-        }
-    }
-
-    fn valid_vastai() -> ResolvedVastAiConfig {
-        ResolvedVastAiConfig {
-            api_key: "secret".to_owned(),
-            relay_url: "https://relay.example".to_owned(),
-            image: "docker.io/acme/node:latest".to_owned(),
-            bootstrap_command: "boot".to_owned(),
-            disk_gb: None,
-            gpu_name: None,
-            min_gpu_ram_mb: None,
-            min_down_mbps: None,
-            min_up_mbps: None,
-            max_dph_total: None,
-            min_reliability: None,
-            require_verified: None,
-            blacklist_hosts: Vec::new(),
-            onstart: None,
-            ssh_identity: None,
-        }
     }
 
     fn channel_lines(lines: &[&str]) -> mpsc::Receiver<PromptInput> {
@@ -2800,131 +2815,6 @@ kind = "mock"
             assert!(Config::from_args(strings(&["--docker"])).is_err());
             assert!(Config::from_args(strings(&["--vastai"])).is_err());
         });
-    }
-
-    struct MockApproval {
-        terminal: bool,
-        answer: Result<bool, String>,
-    }
-
-    impl VastAiApproval for MockApproval {
-        fn stdin_is_terminal(&self) -> bool {
-            self.terminal
-        }
-
-        fn ask(&mut self) -> Result<bool, String> {
-            self.answer.clone()
-        }
-    }
-
-    fn panic_prepare_node_image(_: NodeImageRequest) -> Result<PreparedNodeImage, String> {
-        panic!("image preparer must not be called when --skip-rebuild is set")
-    }
-
-    fn panic_prepare_node_image_with_progress(
-        _request: NodeImageRequest,
-        _progress: Option<&mut dyn NodeImageProgressSink>,
-    ) -> Result<PreparedNodeImage, String> {
-        panic!("image preparer must not be called when --skip-rebuild is set")
-    }
-
-    fn runtime_events(path: &Path) -> Vec<serde_json::Value> {
-        fs::read_to_string(path)
-            .expect("read progress archive")
-            .lines()
-            .filter_map(|line| {
-                let outer: serde_json::Value = serde_json::from_str(line).ok()?;
-                if outer.get("channel").and_then(serde_json::Value::as_str)
-                    != Some(CHAT_RUNTIME_CHANNEL)
-                {
-                    return None;
-                }
-                outer
-                    .get("payload")?
-                    .get("value")?
-                    .as_str()
-                    .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
-            })
-            .collect()
-    }
-
-    fn emit_fake_node_image_progress(
-        progress: Option<&mut dyn NodeImageProgressSink>,
-        success: bool,
-    ) {
-        let Some(sink) = progress else {
-            return;
-        };
-        sink.emit(NodeImageProgressEvent {
-            command_label: None,
-            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
-            elapsed_ms: None,
-            kind: NodeImageProgressEventKind::ImageReference {
-                role: "resolved".to_owned(),
-                image_ref: "docker.io/acme/node:prepared".to_owned(),
-            },
-        });
-        sink.emit(NodeImageProgressEvent {
-            command_label: Some("build mvp node image".to_owned()),
-            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
-            elapsed_ms: Some(0),
-            kind: NodeImageProgressEventKind::CommandStarted {
-                program: "fake-docker".to_owned(),
-                args: vec!["build".to_owned()],
-            },
-        });
-        sink.emit(NodeImageProgressEvent {
-            command_label: Some("build mvp node image".to_owned()),
-            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
-            elapsed_ms: Some(1),
-            kind: NodeImageProgressEventKind::CommandStdout {
-                line: "building layer".to_owned(),
-            },
-        });
-        sink.emit(NodeImageProgressEvent {
-            command_label: Some("build mvp node image".to_owned()),
-            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
-            elapsed_ms: Some(2),
-            kind: NodeImageProgressEventKind::CommandStderr {
-                line: "pushing metadata".to_owned(),
-            },
-        });
-        sink.emit(NodeImageProgressEvent {
-            command_label: Some("build mvp node image".to_owned()),
-            image_ref: Some("docker.io/acme/node:prepared".to_owned()),
-            elapsed_ms: Some(3),
-            kind: NodeImageProgressEventKind::CommandExited {
-                status: if success {
-                    "exit status: 0".to_owned()
-                } else {
-                    "exit status: 42".to_owned()
-                },
-                code: Some(if success { 0 } else { 42 }),
-                success,
-            },
-        });
-    }
-
-    fn fake_prepare_node_image_with_progress(
-        _request: NodeImageRequest,
-        progress: Option<&mut dyn NodeImageProgressSink>,
-    ) -> Result<PreparedNodeImage, String> {
-        emit_fake_node_image_progress(progress, true);
-        Ok(PreparedNodeImage {
-            image_ref: "docker.io/acme/node:prepared".to_owned(),
-            tag: "prepared".to_owned(),
-            already_available: false,
-            built: true,
-            pushed: false,
-        })
-    }
-
-    fn failing_prepare_node_image_with_progress(
-        _request: NodeImageRequest,
-        progress: Option<&mut dyn NodeImageProgressSink>,
-    ) -> Result<PreparedNodeImage, String> {
-        emit_fake_node_image_progress(progress, false);
-        Err("build mvp node image failed with exit status: 42".to_owned())
     }
 
     #[test]

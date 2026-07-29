@@ -302,22 +302,10 @@ impl StageController {
             StageEvent::WorkerReady => self.worker_ready = true,
             StageEvent::WeightsReady => self.weights_ready = true,
             StageEvent::InboundEdgeReady { edge_id } => {
-                if self
-                    .provision
-                    .as_ref()
-                    .is_some_and(|p| p.inbound.edge_id == edge_id)
-                {
-                    self.inbound_ready = true;
-                }
+                self.edge_ready(edge_id, EdgeDirection::Inbound)
             }
             StageEvent::OutboundEdgeReady { edge_id } => {
-                if self
-                    .provision
-                    .as_ref()
-                    .is_some_and(|p| p.outbound.edge_id == edge_id)
-                {
-                    self.outbound_ready = true;
-                }
+                self.edge_ready(edge_id, EdgeDirection::Outbound)
             }
             StageEvent::ObjectLoaded {
                 edge_id,
@@ -338,6 +326,21 @@ impl StageController {
             StageEvent::WorkerRoleReset { run_id } => self.worker_role_reset(run_id),
         }
         self.maybe_stage_ready();
+    }
+
+    fn edge_ready(&mut self, edge_id: EdgeId, direction: EdgeDirection) {
+        let Some(provision) = &self.provision else {
+            return;
+        };
+        match direction {
+            EdgeDirection::Inbound if provision.inbound.edge_id == edge_id => {
+                self.inbound_ready = true
+            }
+            EdgeDirection::Outbound if provision.outbound.edge_id == edge_id => {
+                self.outbound_ready = true
+            }
+            _ => {}
+        }
     }
 
     pub fn commands(&self) -> &[StageCommand] {
@@ -380,15 +383,17 @@ impl StageController {
         if self.stage_ready_emitted || self.faulted || self.stopped || self.stopping_run.is_some() {
             return;
         }
-        if self.worker_ready && self.weights_ready && self.inbound_ready && self.outbound_ready {
-            if let Some(provision) = &self.provision {
-                self.stage_ready_emitted = true;
-                self.events.push(StageLifecycleEvent::StageReady {
-                    run_id: provision.run_id,
-                    stage_index: provision.stage_index,
-                });
-            }
+        if !(self.worker_ready && self.weights_ready && self.inbound_ready && self.outbound_ready) {
+            return;
         }
+        let Some(provision) = &self.provision else {
+            return;
+        };
+        self.stage_ready_emitted = true;
+        self.events.push(StageLifecycleEvent::StageReady {
+            run_id: provision.run_id,
+            stage_index: provision.stage_index,
+        });
     }
 
     fn object_loaded(

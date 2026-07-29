@@ -1,6 +1,6 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -537,54 +537,16 @@ where
     }
     let metadata_body = &metadata_prefix[24..];
     let alignment = u64::from(plan.alignment.max(1));
-    let mut data_offsets = Vec::with_capacity(plan.tensors.len());
-    let mut data_cursor = 0_u64;
-    for tensor in &plan.tensors {
-        data_cursor = align_to(data_cursor, alignment)?;
-        data_offsets.push(data_cursor);
-        data_cursor = data_cursor
-            .checked_add(tensor.byte_len)
-            .ok_or_else(|| format!("stage shard data size overflow at tensor {}", tensor.name))?;
-    }
+    let data_offsets = stage_shard_data_offsets(plan, alignment)?;
 
-    let partial_path = output_path.with_extension(format!(
-        "{}partial",
-        output_path
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|ext| format!("{ext}."))
-            .unwrap_or_default()
-    ));
+    let partial_path = partial_stage_shard_path(output_path);
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("create stage shard cache dir {}: {e}", parent.display()))?;
     }
     let mut out = File::create(&partial_path)
         .map_err(|e| format!("create stage shard {}: {e}", partial_path.display()))?;
-    out.write_all(GGUF_MAGIC)
-        .map_err(|e| format!("write stage shard magic: {e}"))?;
-    out.write_all(&SUPPORTED_GGUF_VERSION.to_le_bytes())
-        .map_err(|e| format!("write stage shard version: {e}"))?;
-    out.write_all(&(plan.tensors.len() as u64).to_le_bytes())
-        .map_err(|e| format!("write stage shard tensor count: {e}"))?;
-    out.write_all(&plan.metadata_count.to_le_bytes())
-        .map_err(|e| format!("write stage shard metadata count: {e}"))?;
-    out.write_all(metadata_body)
-        .map_err(|e| format!("write stage shard metadata: {e}"))?;
-    for (tensor, data_offset) in plan.tensors.iter().zip(data_offsets.iter().copied()) {
-        write_gguf_string(&mut out, &tensor.name)?;
-        out.write_all(&(tensor.dims.len() as u32).to_le_bytes())
-            .map_err(|e| format!("write tensor dim count for {}: {e}", tensor.name))?;
-        for dim in &tensor.dims {
-            out.write_all(&dim.to_le_bytes())
-                .map_err(|e| format!("write tensor dim for {}: {e}", tensor.name))?;
-        }
-        out.write_all(&tensor.ggml_type.to_le_bytes())
-            .map_err(|e| format!("write tensor type for {}: {e}", tensor.name))?;
-        out.write_all(&data_offset.to_le_bytes())
-            .map_err(|e| format!("write tensor offset for {}: {e}", tensor.name))?;
-    }
-    pad_writer_to_alignment(&mut out, alignment)?;
+    write_stage_shard_header(&mut out, plan, metadata_body, &data_offsets, alignment)?;
     let mut written_data = 0_u64;
     let mut tensor_index = 0_usize;
     for range in &plan.merged_tensor_ranges {
@@ -712,6 +674,63 @@ where
     Ok(())
 }
 
+fn stage_shard_data_offsets(plan: &StageShardPlan, alignment: u64) -> Result<Vec<u64>, String> {
+    let mut offsets = Vec::with_capacity(plan.tensors.len());
+    let mut cursor = 0_u64;
+    for tensor in &plan.tensors {
+        cursor = align_to(cursor, alignment)?;
+        offsets.push(cursor);
+        cursor = cursor
+            .checked_add(tensor.byte_len)
+            .ok_or_else(|| format!("stage shard data size overflow at tensor {}", tensor.name))?;
+    }
+    Ok(offsets)
+}
+
+fn partial_stage_shard_path(output_path: &Path) -> PathBuf {
+    output_path.with_extension(format!(
+        "{}partial",
+        output_path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(|ext| format!("{ext}."))
+            .unwrap_or_default()
+    ))
+}
+
+fn write_stage_shard_header(
+    out: &mut File,
+    plan: &StageShardPlan,
+    metadata_body: &[u8],
+    data_offsets: &[u64],
+    alignment: u64,
+) -> Result<(), String> {
+    out.write_all(GGUF_MAGIC)
+        .map_err(|e| format!("write stage shard magic: {e}"))?;
+    out.write_all(&SUPPORTED_GGUF_VERSION.to_le_bytes())
+        .map_err(|e| format!("write stage shard version: {e}"))?;
+    out.write_all(&(plan.tensors.len() as u64).to_le_bytes())
+        .map_err(|e| format!("write stage shard tensor count: {e}"))?;
+    out.write_all(&plan.metadata_count.to_le_bytes())
+        .map_err(|e| format!("write stage shard metadata count: {e}"))?;
+    out.write_all(metadata_body)
+        .map_err(|e| format!("write stage shard metadata: {e}"))?;
+    for (tensor, data_offset) in plan.tensors.iter().zip(data_offsets.iter().copied()) {
+        write_gguf_string(out, &tensor.name)?;
+        out.write_all(&(tensor.dims.len() as u32).to_le_bytes())
+            .map_err(|e| format!("write tensor dim count for {}: {e}", tensor.name))?;
+        for dim in &tensor.dims {
+            out.write_all(&dim.to_le_bytes())
+                .map_err(|e| format!("write tensor dim for {}: {e}", tensor.name))?;
+        }
+        out.write_all(&tensor.ggml_type.to_le_bytes())
+            .map_err(|e| format!("write tensor type for {}: {e}", tensor.name))?;
+        out.write_all(&data_offset.to_le_bytes())
+            .map_err(|e| format!("write tensor offset for {}: {e}", tensor.name))?;
+    }
+    pad_writer_to_alignment(out, alignment)
+}
+
 fn fetch_http_range(url: &str, start: u64, len: u64) -> Result<Vec<u8>, String> {
     if len == 0 {
         return Ok(Vec::new());
@@ -793,22 +812,26 @@ enum GgufValueType {
 
 impl GgufValueType {
     fn read<R: Read>(reader: &mut R) -> Result<Self, String> {
-        match read_u32(reader)? {
-            0 => Ok(Self::Uint8),
-            1 => Ok(Self::Int8),
-            2 => Ok(Self::Uint16),
-            3 => Ok(Self::Int16),
-            4 => Ok(Self::Uint32),
-            5 => Ok(Self::Int32),
-            6 => Ok(Self::Float32),
-            7 => Ok(Self::Bool),
-            8 => Ok(Self::String),
-            9 => Ok(Self::Array),
-            10 => Ok(Self::Uint64),
-            11 => Ok(Self::Int64),
-            12 => Ok(Self::Float64),
-            other => Err(format!("unsupported GGUF value type {other}")),
-        }
+        const VALUE_TYPES: [GgufValueType; 13] = [
+            GgufValueType::Uint8,
+            GgufValueType::Int8,
+            GgufValueType::Uint16,
+            GgufValueType::Int16,
+            GgufValueType::Uint32,
+            GgufValueType::Int32,
+            GgufValueType::Float32,
+            GgufValueType::Bool,
+            GgufValueType::String,
+            GgufValueType::Array,
+            GgufValueType::Uint64,
+            GgufValueType::Int64,
+            GgufValueType::Float64,
+        ];
+        let raw = read_u32(reader)?;
+        VALUE_TYPES
+            .get(raw as usize)
+            .copied()
+            .ok_or_else(|| format!("unsupported GGUF value type {raw}"))
     }
 
     fn fixed_width(self) -> Option<u64> {

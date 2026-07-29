@@ -174,23 +174,26 @@ enum GgufValueType {
 
 impl GgufValueType {
     fn read<R: Read>(reader: &mut R) -> Result<Self, String> {
+        const VALUE_TYPES: [GgufValueType; 13] = [
+            GgufValueType::Uint8,
+            GgufValueType::Int8,
+            GgufValueType::Uint16,
+            GgufValueType::Int16,
+            GgufValueType::Uint32,
+            GgufValueType::Int32,
+            GgufValueType::Float32,
+            GgufValueType::Bool,
+            GgufValueType::String,
+            GgufValueType::Array,
+            GgufValueType::Uint64,
+            GgufValueType::Int64,
+            GgufValueType::Float64,
+        ];
         let raw = read_u32(reader)?;
-        match raw {
-            0 => Ok(Self::Uint8),
-            1 => Ok(Self::Int8),
-            2 => Ok(Self::Uint16),
-            3 => Ok(Self::Int16),
-            4 => Ok(Self::Uint32),
-            5 => Ok(Self::Int32),
-            6 => Ok(Self::Float32),
-            7 => Ok(Self::Bool),
-            8 => Ok(Self::String),
-            9 => Ok(Self::Array),
-            10 => Ok(Self::Uint64),
-            11 => Ok(Self::Int64),
-            12 => Ok(Self::Float64),
-            other => Err(format!("unsupported GGUF metadata value type {other}")),
-        }
+        VALUE_TYPES
+            .get(raw as usize)
+            .copied()
+            .ok_or_else(|| format!("unsupported GGUF metadata value type {raw}"))
     }
 
     fn is_integer(self) -> bool {
