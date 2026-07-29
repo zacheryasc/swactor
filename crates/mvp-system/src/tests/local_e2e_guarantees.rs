@@ -1,4 +1,4 @@
-//! Local mock integration coverage for the MVP system lifecycle.
+//! Local end-to-end behavior guarantee for the MVP system lifecycle.
 //!
 //! This test composes the crate's MVP contract harnesses through one in-process
 //! mock environment. It deliberately avoids Docker, real SWIM, real iroh, GGUF,

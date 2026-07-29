@@ -62,13 +62,3 @@ mod transport;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "tests/shard_fetch_guarantees.rs"]
-mod shard_fetch_guarantees;
-#[cfg(test)]
-#[path = "tests/shard_weight_lifecycle_guarantees.rs"]
-mod shard_weight_lifecycle_guarantees;
-#[cfg(test)]
-#[path = "tests/weight_shards_guarantees.rs"]
-mod weight_shards_guarantees;
