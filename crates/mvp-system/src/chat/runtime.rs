@@ -27,15 +27,15 @@ use crate::chat::node_image::{
     NodeImageProgressEvent, NodeImageProgressEventKind, NodeImageProgressSink, NodeImageProvider,
     NodeImageRequest, PreparedNodeImage, prepare_node_image_with_progress,
 };
+use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::observability::{benchmark, frame_archive::FrameArchive};
-use crate::orchestration::node_provisioning::{ProviderKind, provider_kind};
-use crate::orchestration::provider_adapters::vastai::config::ResolvedVastAiConfig;
-use crate::orchestration::{
+use crate::orchestration::config::ResolvedVastAiConfig;
+use crate::prompt::rpc::{PromptEvent, SubmitPrompt, write_json_line};
+use crate::transport::endpoint_advertisement::EndpointAddrMask;
+use crate::{
     DEFAULT_PIPELINE_CACHED_MODEL_FILE, DEFAULT_PIPELINE_CACHED_MODEL_ID,
     DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT, DEFAULT_PIPELINE_CACHED_MODEL_REPO,
 };
-use crate::prompt::rpc::{PromptEvent, SubmitPrompt, write_json_line};
-use crate::transport::endpoint_advertisement::EndpointAddrMask;
 
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:19777";
 const BASE_NODE_IMAGE: &str = "swactor-mvp-node-base:cuda12.6";
@@ -79,7 +79,7 @@ enum PromptInput {
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static PROMPT_STOP_TX: Mutex<Option<mpsc::Sender<PromptInput>>> = Mutex::new(None);
 
-pub fn run_from_args<I>(args: I) -> ExitCode
+pub(super) fn run_from_args<I>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = String>,
 {
@@ -1290,9 +1290,8 @@ impl InProcessOrch {
     fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
         let args = config.orchestrator_cli_args(image_ref);
         let (stop_tx, stop_rx) = mpsc::channel();
-        let thread = thread::spawn(move || {
-            crate::orchestration::app::run_in_process_from_args(args, stop_rx)
-        });
+        let thread =
+            thread::spawn(move || crate::run_orchestrator_in_process_from_args(args, stop_rx));
         Ok(Self {
             stop_tx: Some(stop_tx),
             thread: Some(thread),

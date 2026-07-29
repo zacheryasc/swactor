@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Pool-based engine/node builder primitives.
 //!
 //! This module owns topology construction: acquire a role-neutral node pool,
@@ -17,21 +19,15 @@ pub mod roles;
 pub mod runtime_stack;
 pub mod workload;
 
-pub use crate::orchestration::run_plan::{NodeId, RunId};
-pub use engine::{ClusterBuilder, ClusterHandle, NodeSummary};
-pub use error::{EngineBuildError, LaunchError, NodeControlError, PlanningError, PoolError};
+pub use crate::run_plan::NodeId;
+pub use engine::{ClusterBuilder, ClusterHandle};
+pub use error::{EngineBuildError, PlanningError};
 pub use events::EngineEvent;
-pub use launcher::{
-    CoordinatorJoinSpec, LaunchedNode, NodeControl, NodeFacts, NodeLaunchSpec, NodeLauncher,
-    StaticNodeLauncher,
-};
-pub use model::{DTypeFamily, ModelArchitecture, ModelArtifact, ModelSpec};
+pub use launcher::StaticNodeLauncher;
+pub use model::{DTypeFamily, ModelArtifact, ModelSpec};
 pub use node_image::{NodeImageSpec, WorkerRuntimeSpec};
-pub use planner::{FixedLinearPipelinePlanner, RoleAssignmentPlan, RolePlanner, RolePlannerInput};
-pub use pool::{
-    LaunchTarget, NodeCapability, NodeLease, PoolProvider, PoolRequest, ResourceFacts,
-    ResourceRequest, StaticPoolProvider,
-};
-pub use roles::{CoordinatorAssignment, RoleAssignment, RoleKind, StageAssignment};
-pub use runtime_stack::{RuntimeNode, RuntimeNodeConfig, RuntimeNodeError};
+pub use planner::FixedLinearPipelinePlanner;
+pub use pool::{NodeCapability, NodeLease, ResourceFacts, StaticPoolProvider};
+pub use roles::RoleKind;
+pub use runtime_stack::RuntimeNode;
 pub use workload::WorkloadAdapter;

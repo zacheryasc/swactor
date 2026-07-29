@@ -3,5 +3,5 @@ fn main() -> std::process::ExitCode {
     if args.is_empty() {
         return std::process::ExitCode::SUCCESS;
     }
-    mvp_system::chat::run_from_args(args)
+    mvp_system::run_chat_from_args(args)
 }

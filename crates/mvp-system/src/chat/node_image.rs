@@ -26,7 +26,7 @@ const NODE_IMAGE_PRUNE_KEEP_ENV: &str = "MVP_NODE_IMAGE_PRUNE_KEEP";
 const DEFAULT_DIRTY_IMAGE_KEEP: usize = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NodeImageProvider {
+pub(super) enum NodeImageProvider {
     Docker,
     VastAi,
 }
@@ -38,28 +38,29 @@ impl NodeImageProvider {
 }
 
 #[derive(Clone, Debug)]
-pub struct NodeImageRequest {
-    pub requested_image: String,
-    pub base_image: String,
-    pub node_bin: PathBuf,
-    pub provider: NodeImageProvider,
-    pub extra_tag: Option<String>,
-    pub push: bool,
-    pub force_refresh: bool,
-    pub enabled: bool,
+pub(super) struct NodeImageRequest {
+    pub(super) requested_image: String,
+    pub(super) base_image: String,
+    pub(super) node_bin: PathBuf,
+    pub(super) provider: NodeImageProvider,
+    pub(super) extra_tag: Option<String>,
+    pub(super) push: bool,
+    pub(super) force_refresh: bool,
+    pub(super) enabled: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
-pub struct PreparedNodeImage {
-    pub image_ref: String,
-    pub tag: String,
-    pub already_available: bool,
-    pub built: bool,
-    pub pushed: bool,
+pub(super) struct PreparedNodeImage {
+    pub(super) image_ref: String,
+    pub(super) tag: String,
+    pub(super) already_available: bool,
+    pub(super) built: bool,
+    pub(super) pushed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NodeImageProgressEventKind {
+pub(super) enum NodeImageProgressEventKind {
     ImageReference {
         role: String,
         image_ref: String,
@@ -82,14 +83,14 @@ pub enum NodeImageProgressEventKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NodeImageProgressEvent {
-    pub command_label: Option<String>,
-    pub image_ref: Option<String>,
-    pub elapsed_ms: Option<u128>,
-    pub kind: NodeImageProgressEventKind,
+pub(super) struct NodeImageProgressEvent {
+    pub(super) command_label: Option<String>,
+    pub(super) image_ref: Option<String>,
+    pub(super) elapsed_ms: Option<u128>,
+    pub(super) kind: NodeImageProgressEventKind,
 }
 
-pub trait NodeImageProgressSink {
+pub(super) trait NodeImageProgressSink {
     fn emit(&mut self, event: NodeImageProgressEvent);
 }
 
@@ -136,11 +137,7 @@ trait ImageCommandRunner {
 
 struct RealImageCommandRunner;
 
-pub fn prepare_node_image(request: NodeImageRequest) -> Result<PreparedNodeImage, String> {
-    prepare_node_image_with_progress(request, None)
-}
-
-pub fn prepare_node_image_with_progress(
+pub(super) fn prepare_node_image_with_progress(
     request: NodeImageRequest,
     progress: Option<&mut dyn NodeImageProgressSink>,
 ) -> Result<PreparedNodeImage, String> {

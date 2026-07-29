@@ -4,14 +4,10 @@
 //! lives here so the reusable contracts do not know about process, Docker, or
 //! VastAI runtime choices.
 
-pub use ::provisioning::*;
+pub use ::provisioning::ProviderKind;
 
 pub mod provider_kind {
     use super::ProviderKind;
-
-    pub fn mock() -> ProviderKind {
-        ProviderKind::new("mock")
-    }
 
     pub fn process() -> ProviderKind {
         ProviderKind::new("process")

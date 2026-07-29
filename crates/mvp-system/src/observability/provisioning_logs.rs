@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::io::{BufRead, BufReader, Read};
 use std::thread::{self, JoinHandle};
 
@@ -8,7 +10,7 @@ use serde_json::Value;
 use crate::observability::telemetry::{
     MVP_PROVISIONING_LOGS, MvpProvisionLogRecord, mvp_provision_log_channel,
 };
-use crate::orchestration::provisioning::{
+use crate::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
 };
 

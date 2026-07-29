@@ -6,25 +6,30 @@
 //! stays separate from local/Docker/VastAI implementation details.
 
 pub mod actor;
-pub mod app;
+mod app;
 pub mod config;
 pub mod distribution_stack;
+#[cfg(test)]
 pub mod engine_builder;
-pub mod membership_readiness;
-pub mod node_provisioning;
-pub mod provisioning;
-pub mod resource_inventory;
-pub mod run_fsm;
-pub mod run_plan;
-pub mod token_endpoint;
 
 pub mod provider_adapters {
-    pub mod docker_cluster;
     pub mod relay;
-    pub mod vastai;
+    pub(super) mod vastai;
 }
 
-pub use app::*;
-pub use node_provisioning::{ProviderKind, ProviderPlugin};
-pub use run_fsm::{OrchestratorRun, RunConfig, RunId};
-pub use run_plan::{GgufSource, TokenizerSource};
+pub(super) fn run_from_args<I>(args: I) -> Result<(), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    app::run_from_args(args)
+}
+
+pub(super) fn run_in_process_from_args<I>(
+    args: I,
+    stop_rx: std::sync::mpsc::Receiver<()>,
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = String>,
+{
+    app::run_in_process_from_args(args, stop_rx)
+}

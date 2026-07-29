@@ -8,7 +8,7 @@
 //! They assert the guarantees in
 //! `specs/mvp_system/orchestrator_run_fsm_contract.md`.
 
-use mvp_system::orchestration::run_fsm as fsm;
+use crate::run_fsm as fsm;
 
 // A three-stage plan proves multi-stage provisioning and readiness without
 // making tests depend on any placement heuristic. The plan is already valid;

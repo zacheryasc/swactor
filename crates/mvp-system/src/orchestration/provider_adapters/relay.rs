@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Relay provisioning shims for MVP runtimes.
 //!
 //! The current implementations are deliberately small: local tests get the same

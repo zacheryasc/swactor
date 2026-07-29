@@ -1,5 +1,3 @@
-pub mod config;
-
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read};
@@ -19,11 +17,7 @@ use swactor_vastai::{
 };
 
 use crate::observability::provisioning_logs::{BootstrapDatastreamBridge, node_stream_id};
-use crate::orchestration::node_provisioning::{
-    CreateLeaseRequest, CreateLeaseResult, DestroyHandle, LeaseFacts, LogicalNodeSpec,
-    ProviderError, ProviderLeaseId, ProviderPlugin, SshEndpoint, provider_kind,
-};
-use crate::orchestration::provisioning::{
+use crate::provisioning::{
     NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionPlugin,
 };
 
@@ -145,10 +139,6 @@ impl ToolsVastAiLeaseClient {
 
     pub fn from_api_key(api_key: impl Into<String>) -> Result<Self, String> {
         Self::new(swactor_vastai::VastClient::new(api_key))
-    }
-
-    pub fn client(&self) -> &swactor_vastai::VastClient {
-        &self.client
     }
 
     fn create_request_for_offer(
@@ -619,209 +609,6 @@ fn provider_status_message_has_terminal_failure(message: &str) -> bool {
                 || token.eq_ignore_ascii_case("failure")
                 || token.eq_ignore_ascii_case("fatal")
         })
-}
-
-#[derive(Clone, Debug)]
-pub struct VastAiProviderPlugin<C>
-where
-    C: VastAiLeaseClient,
-{
-    client: C,
-    config: VastAiProvisioningConfig,
-}
-
-impl<C> VastAiProviderPlugin<C>
-where
-    C: VastAiLeaseClient,
-{
-    pub fn new(client: C, config: VastAiProvisioningConfig) -> Self {
-        Self { client, config }
-    }
-
-    pub fn client(&self) -> &C {
-        &self.client
-    }
-
-    pub fn client_mut(&mut self) -> &mut C {
-        &mut self.client
-    }
-
-    pub fn config(&self) -> &VastAiProvisioningConfig {
-        &self.config
-    }
-
-    fn label_for(&self, spec: &LogicalNodeSpec) -> String {
-        format!(
-            "{}-{}-{}",
-            self.config.label_prefix, spec.run_id.0, spec.logical_node_id.0
-        )
-    }
-
-    fn selection_for(&self, spec: &LogicalNodeSpec) -> SelectionPolicy {
-        let mut selection = self.config.selection.clone();
-        if let Some(gpu_name) = &spec.shape.gpu_name {
-            selection.gpu_name = Some(gpu_name.clone());
-        }
-        if let Some(min_gpu_ram_mb) = spec.shape.min_gpu_ram_mb {
-            selection.min_gpu_ram_mb = Some(min_gpu_ram_mb);
-        }
-        if let Some(min_down_mbps) = spec.shape.min_down_mbps {
-            selection.min_down_mbps = min_down_mbps;
-        }
-        if let Some(min_up_mbps) = spec.shape.min_up_mbps {
-            selection.min_up_mbps = Some(min_up_mbps);
-        }
-        if let Some(min_reliability) = spec.shape.min_reliability {
-            selection.min_reliability = min_reliability;
-        }
-        selection.require_verified = spec.shape.require_verified;
-        selection
-    }
-
-    fn build_request(&self, spec: &LogicalNodeSpec, label: String) -> ProvisionRequest {
-        let mut env = BTreeMap::new();
-        env.insert("MVP_RUN_ID".into(), spec.run_id.0.to_string());
-        env.insert("MVP_LOGICAL_NODE_ID".into(), spec.logical_node_id.0.clone());
-        env.insert(
-            "MVP_ORCH_SWACTOR_ADDR".into(),
-            spec.swarm_join.orch_swactor_addr.clone(),
-        );
-        env.insert(
-            "MVP_JOIN_TOKEN_REF".into(),
-            spec.swarm_join.join_token_ref.clone(),
-        );
-
-        ProvisionRequest {
-            count: 1,
-            image: spec.shape.image.clone(),
-            label: Some(label),
-            disk_gb: spec.shape.disk_gb,
-            env,
-            per_instance_env: vec![BTreeMap::new()],
-            preferred_offer_id: None,
-            onstart: self.config.onstart.clone(),
-            selection: self.selection_for(spec),
-            lifecycle: self.config.lifecycle.clone(),
-            confirm_lease: self.config.confirm_lease,
-        }
-    }
-
-    fn lease_from_instance(
-        spec: &LogicalNodeSpec,
-        label: &str,
-        instance: ProvisionedInstance,
-    ) -> LeaseFacts {
-        let contract_id = instance.contract_id.to_string();
-        let lease_id = ProviderLeaseId(format!("vastai:{contract_id}"));
-        let mut provider_metadata = BTreeMap::new();
-        provider_metadata.insert("contract_id".into(), contract_id.clone());
-        provider_metadata.insert("label".into(), label.to_owned());
-        provider_metadata.insert("image".into(), spec.shape.image.clone());
-        provider_metadata.insert("logical_node_id".into(), spec.logical_node_id.0.clone());
-        provider_metadata.insert("ssh_user".into(), spec.boot.ssh_user.clone());
-        provider_metadata.insert("offer_id".into(), instance.offer_id.to_string());
-        provider_metadata.insert("gpu_name".into(), instance.gpu_name);
-        provider_metadata.insert("dph_total".into(), instance.dph_total.to_string());
-        if let Some(host_id) = instance.host_id {
-            provider_metadata.insert("host_id".into(), host_id.to_string());
-        }
-        if let Some(gpu_ram) = instance.gpu_ram {
-            provider_metadata.insert("gpu_ram".into(), gpu_ram.to_string());
-        }
-
-        LeaseFacts {
-            provider: provider_kind::vastai(),
-            lease_id: lease_id.clone(),
-            provider_contract_id: contract_id.clone(),
-            offer_id: provider_metadata.get("offer_id").cloned(),
-            destroy_handle: DestroyHandle {
-                provider: provider_kind::vastai(),
-                lease_id,
-                provider_contract_id: contract_id,
-            },
-            provider_metadata,
-        }
-    }
-
-    fn contract_id(lease: &LeaseFacts) -> Result<u64, ProviderError> {
-        if lease.provider != provider_kind::vastai() {
-            return Err(ProviderError::new(
-                "vastai provider received non-vastai lease",
-            ));
-        }
-        lease
-            .provider_contract_id
-            .parse::<u64>()
-            .map_err(|e| ProviderError::new(format!("invalid vastai contract id: {e}")))
-    }
-}
-
-impl<C> ProviderPlugin for VastAiProviderPlugin<C>
-where
-    C: VastAiLeaseClient,
-{
-    fn create_lease(
-        &mut self,
-        request: CreateLeaseRequest,
-    ) -> Result<CreateLeaseResult, ProviderError> {
-        if request.spec.provider != provider_kind::vastai() {
-            return Err(ProviderError::new(
-                "vastai provider received non-vastai node spec",
-            ));
-        }
-        let label = self.label_for(&request.spec);
-        let provision_request = self.build_request(&request.spec, label.clone());
-        let instance = self
-            .client
-            .provision_one(provision_request)
-            .map_err(ProviderError::new)?;
-        let lease = Self::lease_from_instance(&request.spec, &label, instance);
-        Ok(CreateLeaseResult {
-            lease,
-            endpoint: None,
-        })
-    }
-
-    fn lookup_endpoint(
-        &mut self,
-        lease: &LeaseFacts,
-    ) -> Result<Option<SshEndpoint>, ProviderError> {
-        let contract_id = Self::contract_id(lease)?;
-        let label = lease
-            .provider_metadata
-            .get("label")
-            .ok_or_else(|| ProviderError::new("vastai lease missing label"))?;
-        let ssh_user = lease
-            .provider_metadata
-            .get("ssh_user")
-            .map(String::as_str)
-            .unwrap_or(&self.config.ssh_user);
-        let endpoint = self
-            .client
-            .ssh_endpoint(contract_id, label, &self.config.lifecycle, ssh_user)
-            .map_err(ProviderError::new)?;
-        Ok(Some(SshEndpoint {
-            host: endpoint.host,
-            port: endpoint.port,
-            user: endpoint.user,
-            auth_ref: format!("vastai:{contract_id}:ssh"),
-        }))
-    }
-
-    fn destroy_lease(&mut self, handle: &DestroyHandle) -> Result<(), ProviderError> {
-        if handle.provider != provider_kind::vastai() {
-            return Err(ProviderError::new(
-                "vastai provider received non-vastai destroy handle",
-            ));
-        }
-        let contract_id = handle
-            .provider_contract_id
-            .parse::<u64>()
-            .map_err(|e| ProviderError::new(format!("invalid vastai contract id: {e}")))?;
-        self.client
-            .destroy_contract(contract_id)
-            .map_err(ProviderError::new)
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1382,35 +1169,6 @@ where
             failed_host_ids: BTreeSet::new(),
             nodes: BTreeMap::new(),
         }
-    }
-
-    pub fn with_bootstrap_producer(mut self, producer: DatastreamProducer) -> Self {
-        self.bootstrap_producer = Some(producer);
-        self
-    }
-
-    pub fn client(&self) -> &C {
-        &self.client
-    }
-
-    pub fn client_mut(&mut self) -> &mut C {
-        &mut self.client
-    }
-
-    pub fn bootstrap(&self) -> &B {
-        &self.bootstrap
-    }
-
-    pub fn bootstrap_mut(&mut self) -> &mut B {
-        &mut self.bootstrap
-    }
-
-    pub fn config(&self) -> &VastAiProvisioningConfig {
-        &self.config
-    }
-
-    pub fn active_contract_count(&self) -> usize {
-        self.nodes.len()
     }
 
     fn label_for(&self, spec: &NodeProvisionSpec) -> String {
@@ -2063,7 +1821,7 @@ mod tests {
         observations: Arc<Mutex<Vec<PluginObservation>>>,
     }
 
-    impl crate::orchestration::provisioning::PluginObservationSink for ObservationSink {
+    impl crate::provisioning::PluginObservationSink for ObservationSink {
         fn observe(&self, observation: PluginObservation) {
             self.observations.lock().push(observation);
         }

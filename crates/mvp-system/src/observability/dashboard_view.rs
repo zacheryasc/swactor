@@ -15,7 +15,7 @@ use crate::observability::telemetry::{
     MVP_LIFECYCLE, MVP_PROVISIONING_EVENTS, MVP_PROVISIONING_LOGS, MvpLifecycleRecord,
     MvpProvisionEventRecord, MvpProvisionLogRecord,
 };
-use crate::orchestration::provisioning::{ProvisionEventKind, ProvisionLogStream};
+use crate::provisioning::{ProvisionEventKind, ProvisionLogStream};
 
 const CHANNELS: &[&str] = &[];
 const PROVISIONING_LOG_PREFIX: &str = "mvp.provisioning.logs.node.";

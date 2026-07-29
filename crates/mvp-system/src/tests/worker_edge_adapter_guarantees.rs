@@ -1,10 +1,10 @@
-use data_plane::object_record as ingress;
-use mvp_system::node::actor::{
+use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageEdgeKindWire,
     StageInboundEdgeWire, StageObjectSpecWire, StageOutboundEdgeWire, StageProvisionWire,
     StageRingSpecWire,
 };
-use mvp_system::orchestration::run_plan::{self, GgufSource, TokenizerSource};
+use crate::run_plan::{self, GgufSource, TokenizerSource};
+use data_plane::object_record as ingress;
 use mvp_system::staging as stage;
 use swactor::actor::ActorAddress;
 use swactor::config::RuntimeConfig;

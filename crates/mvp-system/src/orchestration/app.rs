@@ -10,7 +10,8 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::node::actor::{
+use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
+use crate::node_actor::{
     NodeAgentMsg, StageEdgeKindWire, StageInboundEdgeWire, StageObjectSpecWire,
     StageOutboundEdgeWire, StageProvisionWire, StageRingSpecWire,
 };
@@ -22,12 +23,13 @@ use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 use crate::transport::codec_registry::register_mvp_actor_codecs;
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
+use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
+use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::observability::telemetry::{
     MVP_PROVISIONING_EVENTS, MvpProvisionEventRecord, MvpProvisionLogRecord,
     mvp_provision_log_channel,
 };
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
-use crate::orchestration::node_provisioning::{ProviderKind, provider_kind};
 #[cfg(test)]
 use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
 use crate::orchestration::provider_adapters::relay::{
@@ -38,17 +40,16 @@ use crate::orchestration::provider_adapters::vastai::{
     SshCommandBootstrapLauncher, ToolsVastAiLeaseClient, VastAiProvisioningConfig,
     VastAiProvisioningPlugin,
 };
-use crate::orchestration::provisioning::{
+use crate::prompt::rpc::{
+    PromptEvent, SubmitPrompt, TokenizerEvent, read_submit_prompt, write_json_line,
+};
+use crate::provisioning::{
     LocalDockerPlugin, LocalProcessPlugin, NodeProvisionSpec, PluginObservation,
     PluginObservationSink, PluginSink, ProviderMount, ProvisionEvent, ProvisionEventKind,
     ProvisionLogLine, ProvisionLogStream, ProvisionPlugin,
 };
-use crate::orchestration::run_fsm::{RunConfig, RunId};
-use crate::orchestration::run_plan::{self, GgufSource, TokenizerSource};
-use crate::prompt::rpc::{
-    PromptEvent, SubmitPrompt, TokenizerEvent, read_submit_prompt, write_json_line,
-};
-use crate::staging::gguf_shard::{StageShardPlan, plan_stage_shard};
+use crate::run_fsm::{RunConfig, RunId};
+use crate::run_plan::{self, GgufSource, TokenizerSource};
 use crate::transport::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
@@ -77,11 +78,6 @@ const MVP_RUNTIME_CONFIG_ENV: &str = "MVP_RUNTIME_CONFIG";
 const CACHED_MODEL_HOST_ENV: &str = "MVP_CACHED_MODEL_HOST_PATH";
 const MVP_WORKER_BIN_ENV: &str = "MVP_WORKER_BIN";
 const CACHED_MODEL_CONTAINER_DIR: &str = "/models/cached";
-pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_FILE: &str = "SmolLM2-135M-Instruct.Q4_0.gguf";
-pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_REPO: &str =
-    "QuantFactory/SmolLM2-135M-Instruct-GGUF";
-pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_ID: &str = "smollm2-135m-instruct-q4";
-pub(crate) const DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT: u32 = 256;
 const DEFAULT_PIPELINE_MODEL_CACHE_DIR: &str = ".model-cache";
 const DEFAULT_RPC_BIND: &str = "127.0.0.1:19777";
 const DEFAULT_HF_REPO: &str = "bartowski/Llama-3.2-1B-Instruct-GGUF";
@@ -100,9 +96,9 @@ const DATASTREAM_FRAME_LOG_ENV: &str = "MVP_DATASTREAM_FRAME_LOG";
 const DEFAULT_DOCKER_CONTAINER_PREFIX: &str = "mvp-orchestrator";
 const MVP_DOCKER_CONTAINER_PREFIX_ENV: &str = "MVP_DOCKER_CONTAINER_PREFIX";
 
-pub struct OrchestratorRunOptions {
-    pub capture_stdio: bool,
-    pub stop_rx: Option<mpsc::Receiver<()>>,
+struct OrchestratorRunOptions {
+    capture_stdio: bool,
+    stop_rx: Option<mpsc::Receiver<()>>,
 }
 
 impl Default for OrchestratorRunOptions {
@@ -114,14 +110,17 @@ impl Default for OrchestratorRunOptions {
     }
 }
 
-pub fn run_from_args<I>(args: I) -> Result<(), String>
+pub(super) fn run_from_args<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
     run_with_options(args, OrchestratorRunOptions::default())
 }
 
-pub fn run_in_process_from_args<I>(args: I, stop_rx: mpsc::Receiver<()>) -> Result<(), String>
+pub(super) fn run_in_process_from_args<I>(
+    args: I,
+    stop_rx: mpsc::Receiver<()>,
+) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -134,7 +133,7 @@ where
     )
 }
 
-pub fn run_with_options<I>(args: I, options: OrchestratorRunOptions) -> Result<(), String>
+fn run_with_options<I>(args: I, options: OrchestratorRunOptions) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
 {
@@ -2309,14 +2308,14 @@ fn wait_for_runtime_ready_acks(
 #[cfg(test)]
 struct ProvisionedNodeGuard<'a> {
     provisioner: &'a mut dyn ProvisionPlugin,
-    handle: Option<crate::orchestration::provisioning::PluginNodeHandle>,
+    handle: Option<crate::provisioning::PluginNodeHandle>,
 }
 
 #[cfg(test)]
 impl<'a> ProvisionedNodeGuard<'a> {
     fn new(
         provisioner: &'a mut dyn ProvisionPlugin,
-        handle: crate::orchestration::provisioning::PluginNodeHandle,
+        handle: crate::provisioning::PluginNodeHandle,
     ) -> Self {
         Self {
             provisioner,
@@ -2341,13 +2340,13 @@ impl Drop for ProvisionedNodeGuard<'_> {
 
 struct ProvisionedClusterGuard {
     provisioner: Box<dyn ProvisionPlugin>,
-    handles: Vec<crate::orchestration::provisioning::PluginNodeHandle>,
+    handles: Vec<crate::provisioning::PluginNodeHandle>,
 }
 
 impl ProvisionedClusterGuard {
     fn new(
         provisioner: Box<dyn ProvisionPlugin>,
-        handles: Vec<crate::orchestration::provisioning::PluginNodeHandle>,
+        handles: Vec<crate::provisioning::PluginNodeHandle>,
     ) -> Self {
         Self {
             provisioner,
@@ -2405,7 +2404,7 @@ fn start_nodes_with_stdio_capture(
     Box<dyn ProvisionPlugin>,
     Vec<(
         NodeProvisionSpec,
-        Result<crate::orchestration::provisioning::PluginNodeHandle, String>,
+        Result<crate::provisioning::PluginNodeHandle, String>,
     )>,
 ) {
     let (tx, rx) = mpsc::channel();
@@ -2880,9 +2879,9 @@ fn stage_node_specs(
 struct ProviderStartOutcome {
     results: Vec<(
         NodeProvisionSpec,
-        Result<crate::orchestration::provisioning::PluginNodeHandle, String>,
+        Result<crate::provisioning::PluginNodeHandle, String>,
     )>,
-    successful_handles: Vec<crate::orchestration::provisioning::PluginNodeHandle>,
+    successful_handles: Vec<crate::provisioning::PluginNodeHandle>,
     failed_specs: Vec<NodeProvisionSpec>,
     first_error: Option<String>,
 }
@@ -2890,7 +2889,7 @@ struct ProviderStartOutcome {
 fn collect_provider_start_outcome(
     results: Vec<(
         NodeProvisionSpec,
-        Result<crate::orchestration::provisioning::PluginNodeHandle, String>,
+        Result<crate::provisioning::PluginNodeHandle, String>,
     )>,
 ) -> ProviderStartOutcome {
     let mut successful_handles = Vec::new();
@@ -2917,7 +2916,7 @@ fn collect_provider_start_outcome(
 
 fn stop_started_nodes(
     provisioner: &mut dyn ProvisionPlugin,
-    handles: &mut Vec<crate::orchestration::provisioning::PluginNodeHandle>,
+    handles: &mut Vec<crate::provisioning::PluginNodeHandle>,
 ) {
     while let Some(handle) = handles.pop() {
         let _ = provisioner.stop_node(&handle);
@@ -3607,21 +3606,18 @@ impl ProvisionPlugin for FailedProvisionPlugin {
         &mut self,
         _spec: NodeProvisionSpec,
         _sink: PluginSink,
-    ) -> Result<crate::orchestration::provisioning::PluginNodeHandle, String> {
+    ) -> Result<crate::provisioning::PluginNodeHandle, String> {
         Err("provider start worker disconnected".to_owned())
     }
 
     fn complete_bootstrap(
         &mut self,
-        _handle: &crate::orchestration::provisioning::PluginNodeHandle,
+        _handle: &crate::provisioning::PluginNodeHandle,
     ) -> Result<(), String> {
         Ok(())
     }
 
-    fn stop_node(
-        &mut self,
-        _handle: &crate::orchestration::provisioning::PluginNodeHandle,
-    ) -> Result<(), String> {
+    fn stop_node(&mut self, _handle: &crate::provisioning::PluginNodeHandle) -> Result<(), String> {
         Ok(())
     }
 }
@@ -8975,7 +8971,7 @@ bootstrap_command = "/run"
             data_start: 512,
             alignment: 32,
             source_total_bytes,
-            tensors: vec![crate::staging::gguf_shard::StageShardTensor {
+            tensors: vec![crate::gguf_shard::StageShardTensor {
                 name: format!("blk.{stage_index}.attn_q.weight"),
                 dims: vec![2, 2],
                 ggml_type: 0,
@@ -8984,7 +8980,7 @@ bootstrap_command = "/run"
             }],
             merged_tensor_ranges: ranges
                 .into_iter()
-                .map(|(start, len)| crate::staging::gguf_shard::ByteRange { start, len })
+                .map(|(start, len)| crate::gguf_shard::ByteRange { start, len })
                 .collect(),
             cache_key: format!("test-stage-{stage_index}"),
         }
@@ -9007,13 +9003,13 @@ bootstrap_command = "/run"
             &mut self,
             _spec: NodeProvisionSpec,
             _sink: PluginSink,
-        ) -> Result<crate::orchestration::provisioning::PluginNodeHandle, String> {
+        ) -> Result<crate::provisioning::PluginNodeHandle, String> {
             unreachable!("guard tests construct handles directly")
         }
 
         fn complete_bootstrap(
             &mut self,
-            handle: &crate::orchestration::provisioning::PluginNodeHandle,
+            handle: &crate::provisioning::PluginNodeHandle,
         ) -> Result<(), String> {
             if let Some(shared) = &self.shared {
                 shared
@@ -9027,7 +9023,7 @@ bootstrap_command = "/run"
 
         fn stop_node(
             &mut self,
-            handle: &crate::orchestration::provisioning::PluginNodeHandle,
+            handle: &crate::provisioning::PluginNodeHandle,
         ) -> Result<(), String> {
             self.stopped.push(handle.id);
             if let Some(shared) = &self.shared {
@@ -9062,7 +9058,7 @@ bootstrap_command = "/run"
             ),
             (
                 provider_start_spec(3),
-                Ok(crate::orchestration::provisioning::PluginNodeHandle {
+                Ok(crate::provisioning::PluginNodeHandle {
                     id: 22,
                     provider_process_id: None,
                 }),
@@ -9095,11 +9091,11 @@ bootstrap_command = "/run"
         let mut guard = ProvisionedClusterGuard::new(
             Box::new(plugin),
             vec![
-                crate::orchestration::provisioning::PluginNodeHandle {
+                crate::provisioning::PluginNodeHandle {
                     id: 7,
                     provider_process_id: None,
                 },
-                crate::orchestration::provisioning::PluginNodeHandle {
+                crate::provisioning::PluginNodeHandle {
                     id: 8,
                     provider_process_id: None,
                 },
@@ -9140,7 +9136,7 @@ bootstrap_command = "/run"
         {
             let _guard = ProvisionedNodeGuard::new(
                 &mut plugin,
-                crate::orchestration::provisioning::PluginNodeHandle {
+                crate::provisioning::PluginNodeHandle {
                     id: 7,
                     provider_process_id: Some(99),
                 },
@@ -9155,7 +9151,7 @@ bootstrap_command = "/run"
         {
             let mut guard = ProvisionedNodeGuard::new(
                 &mut plugin,
-                crate::orchestration::provisioning::PluginNodeHandle {
+                crate::provisioning::PluginNodeHandle {
                     id: 8,
                     provider_process_id: None,
                 },
@@ -9241,7 +9237,7 @@ bootstrap_command = "/run"
 
     #[test]
     fn enqueue_runtime_ready_ack_reports_to_node_agent() {
-        use crate::node::actor::{NodeAgentActor, NodeAgentReport};
+        use crate::node_actor::{NodeAgentActor, NodeAgentReport};
         use crate::orchestration::actor::OrchestratorMsg;
         use crate::staging as stage;
 

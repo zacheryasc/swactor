@@ -22,21 +22,19 @@ use datastream::{
     Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
 };
 
-use crate::node::actor::{
+use crate::driver_pumps as driver_model;
+use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
+use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
     StageObjectSpecWire, StageOutboundEdgeWire, StageRingSpecWire,
 };
 use crate::observability::benchmark;
 use crate::orchestration::distribution_stack::DistributionRuntimeStack;
 use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
-use crate::orchestration::run_plan::{GgufSource, TokenizerSource};
 use crate::prompt::rpc::{PromptEvent, TokenizerEvent};
+use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::control as stage;
-use crate::staging::gguf_shard::{
-    StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache,
-};
 use crate::transport::codec_registry::register_mvp_actor_codecs;
-use crate::transport::driver_pumps as driver_model;
 use crate::transport::endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
@@ -1011,7 +1009,7 @@ impl WorkerEdgeRuntime {
         self.next_output_object_id = self.next_output_object_id.saturating_add(1);
         let final_stage = matches!(
             outbound.kind,
-            crate::node::actor::StageEdgeKindWire::TokenOut
+            crate::node_actor::StageEdgeKindWire::TokenOut
         );
         let step_started = Instant::now();
         let mut pump = || pump_network(driver, stack);
@@ -1617,7 +1615,7 @@ fn value_u64(value: &Value, field: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("helper event missing numeric {field}: {value}"))
 }
 
-pub fn run_from_env() -> ExitCode {
+pub(super) fn run_from_env() -> ExitCode {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().map(String::as_str) == Some("debug-join") {
         args.remove(0);

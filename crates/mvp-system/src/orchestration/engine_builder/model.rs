@@ -1,4 +1,4 @@
-use crate::orchestration::run_plan;
+use crate::run_plan;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelSpec {

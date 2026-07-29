@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
+use crate::provisioning::{
+    NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink, ProvisionLogStream,
+};
 use datastream::{DatastreamEndpoint, Record};
 use iroh::{EndpointAddr, SecretKey};
 use mvp_system::observability::provisioning_logs::{BootstrapDatastreamBridge, node_stream_id};
 use mvp_system::observability::telemetry::MvpProvisionLogRecord;
-use mvp_system::orchestration::provisioning::{
-    NodeProvisionSpec, PluginObservation, PluginObservationSink, PluginSink, ProvisionLogStream,
-};
 use parking_lot::Mutex;
 use serde_json::json;
 

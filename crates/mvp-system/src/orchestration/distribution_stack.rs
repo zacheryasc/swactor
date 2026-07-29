@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! MVP-system swactor distribution runtime wiring.
 //!
 //! This is the production version of the actor-stack setup that integration

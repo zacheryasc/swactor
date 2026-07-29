@@ -4,7 +4,7 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
-use crate::orchestration::run_fsm as core;
+use crate::run_fsm as core;
 
 use crate::transport::json_codec::JsonCodec;
 
