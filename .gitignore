@@ -5,6 +5,7 @@ corpus
 .loop/
 .model-cache/
 .deployment-notes/
+.omp/
 
 # environment variables for deployment configurations
 .config/

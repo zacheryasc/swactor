@@ -9,7 +9,7 @@ use crate::run_plan;
 use crate::staging as stage;
 
 use crate::orchestration::actor::OrchestratorMsg;
-use crate::transport::json_codec::JsonCodec;
+use swactor_transport::JsonCodec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum StageEdgeKindWire {

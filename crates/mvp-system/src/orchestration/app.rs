@@ -20,7 +20,7 @@ use crate::observability::dashboard_view::MvpClusterDashboardView;
 use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::actor::{OrchestratorActor, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
-use crate::transport::register_mvp_actor_codecs;
+use crate::codecs::register_mvp_actor_codecs;
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
 use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
@@ -48,7 +48,7 @@ use crate::provisioning::{
 };
 use crate::run_fsm::{RunConfig, RunId};
 use crate::run_plan::{self, GgufSource, TokenizerSource};
-use crate::transport::endpoint_advertisement::{
+use iroh_driver::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
 use data_plane::object_record as ingress;

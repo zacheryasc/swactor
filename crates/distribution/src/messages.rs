@@ -1,9 +1,9 @@
 //! Protocol messages for SWIM membership and the standalone gossip frames
-//! (registry, node metadata, directory), plus their JSON codec.
+//! (registry, node metadata, directory), plus codec registration.
 
 use serde::{Deserialize, Serialize};
 use swactor::Error;
-use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
+use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
 use crate::node_metadata::NodeMetadataEntry;
 use crate::registry::RegistryEntry;
@@ -164,52 +164,21 @@ impl NetworkMessage for DirectoryGossip {
     }
 }
 
-// ─── JSON Codec ─────────────────────────────────────────────────────────────
-
-/// JSON codec for distribution protocol messages.
-///
-/// Using JSON for simplicity and debuggability. Can be swapped for
-/// bincode/msgpack in production via the Codec trait.
-pub struct JsonCodec;
-
-macro_rules! impl_json_codec {
-    ($ty:ty) => {
-        impl Codec<$ty> for JsonCodec {
-            fn encode(&self, msg: &$ty) -> Result<Vec<u8>, Error> {
-                serde_json::to_vec(msg).map_err(|e| Error::from(format!("encode: {e}")))
-            }
-            fn decode(&self, bytes: &[u8]) -> Result<$ty, Error> {
-                serde_json::from_slice(bytes).map_err(|e| Error::from(format!("decode: {e}")))
-            }
-        }
-    };
-}
-
-impl_json_codec!(Ping);
-impl_json_codec!(Ack);
-impl_json_codec!(PingReq);
-impl_json_codec!(IndirectAck);
-impl_json_codec!(JoinRequest);
-impl_json_codec!(JoinResponse);
-impl_json_codec!(RegistryGossip);
-impl_json_codec!(MetadataGossip);
-impl_json_codec!(DirectoryGossip);
-
 /// Build a `CodecRegistry` with all distribution protocol messages registered.
 pub fn distribution_codec_registry() -> CodecRegistry {
     let mut cr = CodecRegistry::new();
-    cr.register::<Ping, _>(JsonCodec);
-    cr.register::<Ack, _>(JsonCodec);
-    cr.register::<PingReq, _>(JsonCodec);
+    cr.register::<Ping, _>(JsonCodec::<Ping>::default());
+    cr.register::<Ack, _>(JsonCodec::<Ack>::default());
+    cr.register::<PingReq, _>(JsonCodec::<PingReq>::default());
     // §6.1 / §14.5: `IndirectAck` is folded into the shared registry so all six
     // SWIM message types decode through one uniform path; concrete drivers no
     // longer need to hand-dispatch it by tag.
-    cr.register::<IndirectAck, _>(JsonCodec);
-    cr.register::<JoinRequest, _>(JsonCodec);
-    cr.register::<JoinResponse, _>(JsonCodec);
-    cr.register::<RegistryGossip, _>(JsonCodec);
-    cr.register::<MetadataGossip, _>(JsonCodec);
-    cr.register::<DirectoryGossip, _>(JsonCodec);
+    cr.register::<IndirectAck, _>(JsonCodec::<IndirectAck>::default());
+    cr.register::<JoinRequest, _>(JsonCodec::<JoinRequest>::default());
+    cr.register::<JoinResponse, _>(JsonCodec::<JoinResponse>::default());
+    cr.register::<RegistryGossip, _>(JsonCodec::<RegistryGossip>::default());
+    cr.register::<MetadataGossip, _>(JsonCodec::<MetadataGossip>::default());
+    cr.register::<DirectoryGossip, _>(JsonCodec::<DirectoryGossip>::default());
     cr
 }
 

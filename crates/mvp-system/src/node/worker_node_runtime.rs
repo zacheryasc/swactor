@@ -22,7 +22,7 @@ use datastream::{
     Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
 };
 
-use crate::driver_pumps as driver_model;
+use iroh_driver::driver_pumps as driver_model;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
 use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
@@ -34,10 +34,10 @@ use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_en
 use crate::prompt::rpc::{PromptEvent, TokenizerEvent};
 use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::control as stage;
-use crate::transport::endpoint_advertisement::{
+use iroh_driver::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
-use crate::transport::register_mvp_actor_codecs;
+use crate::codecs::register_mvp_actor_codecs;
 use data_plane::arena;
 use data_plane::edge_lifecycle as edge;
 use data_plane::ingress;
@@ -1630,50 +1630,32 @@ fn run_stage_shard_fetcher() -> Result<(), String> {
 
 fn run() -> Result<(), String> {
     let config = DeploymentConfig::from_env()?;
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "config",
-        "ready",
-        json!({
-            "worker_script":&config.worker_script,
-            "device":&config.device,
-            "model_id":&config.model_id,
-            "has_coordinator_endpoint":config.coordinator_endpoint.is_some(),
-            "has_orchestrator_actor":config.orchestrator_actor.is_some(),
-            "self_test_enabled":config.self_test_prompt.is_some(),
-            "arena_bytes":config.arena_bytes,
-            "arena_alignment":config.arena_alignment,
-            "debug_join_socket":config.debug_join_socket.as_deref().unwrap_or("disabled"),
-        }),
-    )?;
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "process",
-        "started",
-        json!({"binary":"mvp-worker-node","pid":std::process::id()}),
-    )?;
+    let boot = |phase: &str, status: &str, detail: Value| {
+        emit_stdio_node_event(&config, NODE_BOOTSTRAP_CHANNEL, phase, status, detail)
+    };
+    let worker_evt = |phase: &str, status: &str, detail: Value| {
+        emit_stdio_node_event(&config, NODE_WORKER_CHANNEL, phase, status, detail)
+    };
+    boot("config", "ready", json!({
+        "worker_script":&config.worker_script,
+        "device":&config.device,
+        "model_id":&config.model_id,
+        "has_coordinator_endpoint":config.coordinator_endpoint.is_some(),
+        "has_orchestrator_actor":config.orchestrator_actor.is_some(),
+        "self_test_enabled":config.self_test_prompt.is_some(),
+        "arena_bytes":config.arena_bytes,
+        "arena_alignment":config.arena_alignment,
+        "debug_join_socket":config.debug_join_socket.as_deref().unwrap_or("disabled"),
+    }))?;
+    boot("process", "started", json!({"binary":"mvp-worker-node","pid":std::process::id()}))?;
 
     let tokio = match tokio::runtime::Runtime::new() {
         Ok(runtime) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "tokio_runtime",
-                "ready",
-                json!({"runtime":"tokio"}),
-            )?;
+            boot("tokio_runtime", "ready", json!({"runtime":"tokio"}))?;
             runtime
         }
         Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "tokio_runtime",
-                "failed",
-                json!({"error":error.to_string()}),
-            )?;
+            boot("tokio_runtime", "failed", json!({"error":error.to_string()}))?;
             return Err(format!("tokio runtime: {error}"));
         }
     };
@@ -1689,42 +1671,18 @@ fn run() -> Result<(), String> {
     ) {
         Ok(driver) => driver,
         Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "iroh_driver",
-                "failed",
-                json!({"error":error.to_string()}),
-            )?;
+            boot("iroh_driver", "failed", json!({"error":error.to_string()}))?;
             return Err(format!("create iroh driver: {error}"));
         }
     };
     let advertised_self_endpoint =
         advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "iroh_driver",
-        "ready",
-        json!({"endpoint":advertised_self_endpoint.clone(),"has_relay":advertised_self_endpoint.relay_urls().next().is_some(),"direct_addr_count":advertised_self_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay_mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
-    )?;
+    boot("iroh_driver", "ready", json!({"endpoint":advertised_self_endpoint.clone(),"has_relay":advertised_self_endpoint.relay_urls().next().is_some(),"direct_addr_count":advertised_self_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay_mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}))?;
     if let Some(coordinator) = &config.coordinator_endpoint {
         driver.join(std::slice::from_ref(coordinator));
-        emit_stdio_node_event(
-            &config,
-            NODE_BOOTSTRAP_CHANNEL,
-            "coordinator_join",
-            "started",
-            json!({"endpoint":coordinator,"has_relay":coordinator.relay_urls().next().is_some(),"direct_addr_count":coordinator.ip_addrs().count()}),
-        )?;
+        boot("coordinator_join", "started", json!({"endpoint":coordinator,"has_relay":coordinator.relay_urls().next().is_some(),"direct_addr_count":coordinator.ip_addrs().count()}))?;
     } else {
-        emit_stdio_node_event(
-            &config,
-            NODE_BOOTSTRAP_CHANNEL,
-            "coordinator_join",
-            "skipped",
-            json!({"reason":"MVP_COORDINATOR_ENDPOINT not set","mode":"standalone"}),
-        )?;
+        boot("coordinator_join", "skipped", json!({"reason":"MVP_COORDINATOR_ENDPOINT not set","mode":"standalone"}))?;
     }
 
     let stack = DistributionRuntimeStack::new_with_codecs(
@@ -1735,20 +1693,8 @@ fn run() -> Result<(), String> {
             datastream::wire::register_datastream_codec(registry);
         },
     );
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "distribution_stack",
-        "ready",
-        json!({"actors":"initialized","route_view":"initialized","swim":"initialized","outbox":"initialized"}),
-    )?;
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "codecs",
-        "ready",
-        json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","datastream"]}),
-    )?;
+    boot("distribution_stack", "ready", json!({"actors":"initialized","route_view":"initialized","swim":"initialized","outbox":"initialized"}))?;
+    boot("codecs", "ready", json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","datastream"]}))?;
     driver.enable_actor_bridge(
         stack.runtime.clone(),
         stack.codec.clone(),
@@ -1757,13 +1703,7 @@ fn run() -> Result<(), String> {
         stack.relay_mirror.clone(),
         stack.route_view.clone(),
     );
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "actor_bridge",
-        "ready",
-        json!({"transport":"iroh","routes":"attached"}),
-    )?;
+    boot("actor_bridge", "ready", json!({"transport":"iroh","routes":"attached"}))?;
 
     let arena_manager = match arena::ArenaManager::boot(arena::ArenaConfig {
         node_id: arena::NodeId(config.logical_node_id),
@@ -1771,26 +1711,14 @@ fn run() -> Result<(), String> {
         base_alignment: config.arena_alignment,
     }) {
         Ok(manager) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "arena_manager",
-                "ready",
-                json!({
-                    "arena_bytes":config.arena_bytes,
-                    "arena_alignment":config.arena_alignment,
-                }),
-            )?;
+            boot("arena_manager", "ready", json!({
+                "arena_bytes":config.arena_bytes,
+                "arena_alignment":config.arena_alignment,
+            }))?;
             Arc::new(Mutex::new(manager))
         }
         Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "arena_manager",
-                "failed",
-                json!({"error":format!("{error:?}")}),
-            )?;
+            boot("arena_manager", "failed", json!({"error":format!("{error:?}")}))?;
             return Err(format!("boot arena manager: {error:?}"));
         }
     };
@@ -1917,23 +1845,11 @@ fn run() -> Result<(), String> {
 
     let reports = match stack.runtime.new_inbox::<NodeAgentReport>() {
         Ok(inbox) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "node_report_inbox",
-                "ready",
-                json!({"actor":inbox.addr()}),
-            )?;
+            boot("node_report_inbox", "ready", json!({"actor":inbox.addr()}))?;
             inbox
         }
         Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "node_report_inbox",
-                "failed",
-                json!({"error":error.to_string()}),
-            )?;
+            boot("node_report_inbox", "failed", json!({"error":error.to_string()}))?;
             return Err(format!("node report inbox: {error}"));
         }
     };
@@ -1941,13 +1857,7 @@ fn run() -> Result<(), String> {
         "MVP_ORCHESTRATOR_ACTOR is required for runtime readiness signaling".to_owned()
     })?;
     let orchestrator_source = "env";
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "orchestrator_actor",
-        "ready",
-        json!({"actor":orchestrator,"source":orchestrator_source}),
-    )?;
+    boot("orchestrator_actor", "ready", json!({"actor":orchestrator,"source":orchestrator_source}))?;
     let node_agent = NodeAgentActor::new(
         stage::NodeId(config.logical_node_id),
         orchestrator,
@@ -1955,59 +1865,29 @@ fn run() -> Result<(), String> {
     );
     let node_actor = match stack.runtime.spawn(node_agent) {
         Ok(actor) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "node_agent",
-                "ready",
-                json!({"node_actor":actor,"source":"generated"}),
-            )?;
+            boot("node_agent", "ready", json!({"node_actor":actor,"source":"generated"}))?;
             actor
         }
         Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_BOOTSTRAP_CHANNEL,
-                "node_agent",
-                "failed",
-                json!({"error":error.to_string(),"source":"generated"}),
-            )?;
+            boot("node_agent", "failed", json!({"error":error.to_string(),"source":"generated"}))?;
             return Err(format!("spawn node agent: {error}"));
         }
     };
     stack.register_local_actor(driver.register_actor(node_actor, 1));
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "node_actor_registration",
-        "ready",
-        json!({"node_actor":node_actor,"network_reachable":true}),
-    )?;
+    boot("node_actor_registration", "ready", json!({"node_actor":node_actor,"network_reachable":true}))?;
 
-    emit_stdio_node_event(
-        &config,
-        NODE_WORKER_CHANNEL,
-        "worker_process",
-        "started",
-        json!({
-            "program":"python3",
-            "script":&config.worker_script,
-            "device":&config.device,
-            "stdin":"piped",
-            "stdout":"piped",
-            "stderr":"piped",
-        }),
-    )?;
+    worker_evt("worker_process", "started", json!({
+        "program":"python3",
+        "script":&config.worker_script,
+        "device":&config.device,
+        "stdin":"piped",
+        "stdout":"piped",
+        "stderr":"piped",
+    }))?;
     let mut worker = match TinygradWorker::spawn(&config, arena_fd) {
         Ok(worker) => worker,
         Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_WORKER_CHANNEL,
-                "worker_process",
-                "failed",
-                json!({"error":error}),
-            )?;
+            worker_evt("worker_process", "failed", json!({"error":error}))?;
             return Err(error);
         }
     };
@@ -2019,30 +1899,12 @@ fn run() -> Result<(), String> {
         sampler_health_context,
         vec![std::process::id(), worker.pid()],
     );
-    emit_stdio_node_event(
-        &config,
-        NODE_WORKER_CHANNEL,
-        "worker_initialize",
-        "started",
-        json!({"command":"InitializeWorker","helper_abi_version":1,"device":&config.device}),
-    )?;
+    worker_evt("worker_initialize", "started", json!({"command":"InitializeWorker","helper_abi_version":1,"device":&config.device}))?;
     let mut initial_pump = || {};
     match worker.initialize(&config.device, &config, &mut datastream, &mut initial_pump) {
-        Ok(()) => emit_stdio_node_event(
-            &config,
-            NODE_WORKER_CHANNEL,
-            "worker_initialize",
-            "ready",
-            json!({"worker_event_type":"WorkerReady"}),
-        )?,
+        Ok(()) => worker_evt("worker_initialize", "ready", json!({"worker_event_type":"WorkerReady"}))?,
         Err(error) => {
-            emit_stdio_node_event(
-                &config,
-                NODE_WORKER_CHANNEL,
-                "worker_initialize",
-                "failed",
-                json!({"error":error}),
-            )?;
+            worker_evt("worker_initialize", "failed", json!({"error":error}))?;
             return Err(error);
         }
     }
@@ -2063,19 +1925,13 @@ fn run() -> Result<(), String> {
         "logical_node_id": config.logical_node_id,
         "stage_index": config.stage_index,
     });
-    emit_stdio_node_event(
-        &config,
-        NODE_BOOTSTRAP_CHANNEL,
-        "runtime_ready_local",
-        "ready",
-        json!({
-            "endpoint":advertised_self_endpoint.clone(),
-            "node_actor":node_actor,
-            "logical_node_id":config.logical_node_id,
-            "stage_index":config.stage_index,
-            "readiness_id":pending_runtime_ready.readiness_id,
-        }),
-    )?;
+    boot("runtime_ready_local", "ready", json!({
+        "endpoint":advertised_self_endpoint.clone(),
+        "node_actor":node_actor,
+        "logical_node_id":config.logical_node_id,
+        "stage_index":config.stage_index,
+        "readiness_id":pending_runtime_ready.readiness_id,
+    }))?;
 
     if let Some(prompt) = &config.self_test_prompt {
         run_self_test(

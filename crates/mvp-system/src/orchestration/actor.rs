@@ -6,7 +6,7 @@ use swactor_transport::{CodecRegistry, NetworkMessage};
 
 use crate::run_fsm as core;
 
-use crate::transport::json_codec::JsonCodec;
+use swactor_transport::JsonCodec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct StageRefWire {

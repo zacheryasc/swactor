@@ -1,8 +1,8 @@
-//! Behavior guarantees for the `transport` module.
+//! Behavior guarantees for endpoint advertisement masking.
 
 use std::net::{Ipv4Addr, SocketAddr};
 
-use mvp_system::transport::endpoint_advertisement::{EndpointAddrMask, advertised_endpoint};
+use iroh_driver::{EndpointAddrMask, advertised_endpoint};
 
 #[test]
 fn relay_only_mask_preserves_relay_urls_and_removes_direct_addresses() {
