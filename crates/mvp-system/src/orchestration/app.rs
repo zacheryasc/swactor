@@ -11,6 +11,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
+use crate::codecs::register_mvp_actor_codecs;
 use crate::node_actor::{
     NodeAgentMsg, StageEdgeKindWire, StageInboundEdgeWire, StageObjectSpecWire,
     StageOutboundEdgeWire, StageProvisionWire, StageRingSpecWire,
@@ -20,7 +21,6 @@ use crate::observability::dashboard_view::MvpClusterDashboardView;
 use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::actor::{OrchestratorActor, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
-use crate::codecs::register_mvp_actor_codecs;
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
 use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
@@ -29,7 +29,7 @@ use crate::observability::telemetry::{
     MVP_PROVISIONING_EVENTS, MvpProvisionEventRecord, MvpProvisionLogRecord,
     mvp_provision_log_channel,
 };
-use crate::orchestration::distribution_stack::DistributionRuntimeStack;
+use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
 use crate::orchestration::provider_adapters::relay::{
     MVP_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV, relay_mode_env_value,
     relay_runtime_config_from_settings,
@@ -48,9 +48,6 @@ use crate::provisioning::{
 };
 use crate::run_fsm::{RunConfig, RunId};
 use crate::run_plan::{self, GgufSource, TokenizerSource};
-use iroh_driver::{
-    EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
-};
 use data_plane::object_record as ingress;
 use datastream::{
     ChannelContent, ChannelId, ChannelRef, DatastreamEndpoint, DatastreamEvent, DatastreamProducer,
@@ -58,13 +55,13 @@ use datastream::{
     StreamId, StreamOrigin, SubscriptionRequest,
 };
 use distribution::node::DistributedNodeConfig;
-use distribution::swim::telemetry::ObservedProbeEvent;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
     DATASTREAM_ALPN, EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, IrohDriver, IrohDriverConfig,
 };
+use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
@@ -114,10 +111,18 @@ where
     };
     let mut orch_datastream =
         OrchDatastream::new(config.run_id, config.datastream_frame_log.as_deref())?;
-    orch_datastream.emit_bootstrap(
+    let run_id = config.run_id;
+    let node_id = config.node_id;
+    let bootstrap = |ds: &mut OrchDatastream,
+                     dash: Option<&DashboardSupport>,
+                     phase: &str,
+                     status: &str,
+                     detail: Value| {
+        ds.emit_bootstrap(dash, run_id, node_id, phase, status, detail);
+    };
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "config",
         "ready",
         json!({
@@ -137,10 +142,9 @@ where
             "provider_config":config.provider_datastream_detail(),
         }),
     );
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "datastream_preflight",
         "configured",
         json!({
@@ -165,10 +169,9 @@ where
         ("DatastreamSyntheticEventSent", "sent"),
         ("DatastreamSyntheticEventObserved", "observed"),
     ] {
-        orch_datastream.emit_bootstrap(
+        bootstrap(
+            &mut orch_datastream,
             None,
-            config.run_id,
-            config.node_id,
             phase,
             status,
             json!({
@@ -193,10 +196,9 @@ where
     );
     let pipeline_plan = if config.uses_planned_execution() {
         let plan = config.build_run_plan()?;
-        orch_datastream.emit_bootstrap(
+        bootstrap(
+            &mut orch_datastream,
             None,
-            config.run_id,
-            config.node_id,
             "run_plan",
             "ready",
             json!({
@@ -215,10 +217,9 @@ where
 
     let tokio = match tokio::runtime::Runtime::new() {
         Ok(runtime) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 None,
-                config.run_id,
-                config.node_id,
                 "tokio_runtime",
                 "ready",
                 json!({"runtime":"tokio"}),
@@ -226,10 +227,9 @@ where
             runtime
         }
         Err(error) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 None,
-                config.run_id,
-                config.node_id,
                 "tokio_runtime",
                 "failed",
                 json!({"error":error.to_string()}),
@@ -249,10 +249,9 @@ where
     ) {
         Ok(driver) => driver,
         Err(error) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 None,
-                config.run_id,
-                config.node_id,
                 "iroh_driver",
                 "failed",
                 json!({"error":error.to_string()}),
@@ -262,18 +261,16 @@ where
     };
     let coordinator_endpoint =
         advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "iroh_driver",
         "ready",
         json!({"endpoint":coordinator_endpoint.clone(),"has_relay":coordinator_endpoint.relay_urls().next().is_some(),"direct_addr_count":coordinator_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay.mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
     );
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "endpoint_config_snapshot",
         "ready",
         json!({
@@ -294,18 +291,16 @@ where
             datastream::wire::register_datastream_codec(registry);
         },
     );
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "distribution_stack",
         "ready",
         json!({"actors":"initialized","route_view":"initialized","swim":"initialized"}),
     );
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "codecs",
         "ready",
         json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","datastream"]}),
@@ -318,29 +313,26 @@ where
         stack.relay_mirror.clone(),
         stack.route_view.clone(),
     );
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "actor_bridge",
         "ready",
         json!({"transport":"iroh","routes":"attached"}),
     );
 
     let (frame_tx, frame_rx) = mpsc::channel::<CollectedDatastreamFrame>();
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         None,
-        config.run_id,
-        config.node_id,
         "datastream_collector",
         "ready",
         json!({"alpn":String::from_utf8_lossy(DATASTREAM_ALPN)}),
     );
     let dashboard = DashboardSupport::start(config.dashboard)?;
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "dashboard",
         "ready",
         json!({"enabled":dashboard.is_some()}),
@@ -349,10 +341,9 @@ where
     let orchestrator_reports = match stack.runtime.new_inbox::<OrchestratorReport>() {
         Ok(inbox) => inbox,
         Err(error) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
                 "orchestrator_report_actor",
                 "failed",
                 json!({"error":error.to_string()}),
@@ -362,10 +353,9 @@ where
     };
     let orchestrator_report_actor = *orchestrator_reports.addr();
     stack.register_local_actor(driver.register_actor(orchestrator_report_actor, 1));
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "orchestrator_report_actor",
         "ready",
         json!({"actor":orchestrator_report_actor}),
@@ -380,10 +370,9 @@ where
     )) {
         Ok(actor) => actor,
         Err(error) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
                 "orchestrator_actor",
                 "failed",
                 json!({"error":error.to_string()}),
@@ -392,10 +381,9 @@ where
         }
     };
     stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "orchestrator_actor",
         "ready",
         json!({"actor":orchestrator_actor}),
@@ -404,10 +392,9 @@ where
     let prompt_events = match stack.runtime.new_inbox::<PromptEvent>() {
         Ok(inbox) => inbox,
         Err(error) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
                 "prompt_reply_actor",
                 "failed",
                 json!({"error":error.to_string()}),
@@ -417,10 +404,9 @@ where
     };
     let prompt_reply_actor = *prompt_events.addr();
     stack.register_local_actor(driver.register_actor(prompt_reply_actor, 1));
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "prompt_reply_actor",
         "ready",
         json!({"actor":prompt_reply_actor}),
@@ -429,10 +415,9 @@ where
     let tokenizer_events = match stack.runtime.new_inbox::<TokenizerEvent>() {
         Ok(inbox) => inbox,
         Err(error) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
                 "tokenizer_reply_actor",
                 "failed",
                 json!({"error":error.to_string()}),
@@ -442,10 +427,9 @@ where
     };
     let tokenizer_reply_actor = *tokenizer_events.addr();
     stack.register_local_actor(driver.register_actor(tokenizer_reply_actor, 1));
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "tokenizer_reply_actor",
         "ready",
         json!({"actor":tokenizer_reply_actor}),
@@ -455,10 +439,9 @@ where
     let stop_rx = stop_rx.unwrap_or_else(spawn_stop_listener);
 
     let provisioner = config.build_provisioner(Arc::clone(&stack.runtime))?;
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "node_provisioner",
         "ready",
         json!({
@@ -497,10 +480,9 @@ where
         orchestrator_actor,
     )?;
 
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "prompt_rpc",
         "started",
         json!({
@@ -511,10 +493,9 @@ where
 
     let rpc_addr = match spawn_prompt_rpc(config.rpc_bind, work_tx, config.default_max_tokens) {
         Ok(addr) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
                 "prompt_rpc",
                 "ready",
                 json!({
@@ -525,10 +506,9 @@ where
             addr
         }
         Err(error) => {
-            orch_datastream.emit_bootstrap(
+            bootstrap(
+                &mut orch_datastream,
                 dashboard.as_ref(),
-                config.run_id,
-                config.node_id,
                 "prompt_rpc",
                 "failed",
                 json!({"error":error}),
@@ -537,19 +517,17 @@ where
         }
     };
 
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "prompt_loop",
         "ready",
         json!({"addr":rpc_addr.to_string(),"node_actor":ready.first_stage.node_actor}),
     );
 
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "serve_prompts",
         "started",
         json!({"mode":"single_active_prompt","poll_interval_ms":PUMP_INTERVAL.as_millis()}),
@@ -582,47 +560,42 @@ where
         ready.first_stage.endpoint.clone(),
     );
     if let Err(error) = &result {
-        orch_datastream.emit_bootstrap(
+        bootstrap(
+            &mut orch_datastream,
             dashboard.as_ref(),
-            config.run_id,
-            config.node_id,
             "serve_prompts",
             "failed",
             json!({"error":error}),
         );
     }
-    orch_datastream.emit_bootstrap(
+    bootstrap(
+        &mut orch_datastream,
         dashboard.as_ref(),
-        config.run_id,
-        config.node_id,
         "provider_stop",
         "started",
         json!({"provider":config.provider.as_str(),"node_id":config.node_id}),
     );
     let stop_result = provisioned_nodes.stop();
     match &stop_result {
-        Ok(()) => orch_datastream.emit_bootstrap(
+        Ok(()) => bootstrap(
+            &mut orch_datastream,
             dashboard.as_ref(),
-            config.run_id,
-            config.node_id,
             "provider_stop",
             "ready",
             json!({"provider":config.provider.as_str(),"node_id":config.node_id}),
         ),
-        Err(error) => orch_datastream.emit_bootstrap(
+        Err(error) => bootstrap(
+            &mut orch_datastream,
             dashboard.as_ref(),
-            config.run_id,
-            config.node_id,
             "provider_stop",
             "failed",
             json!({"provider":config.provider.as_str(),"node_id":config.node_id,"error":error}),
         ),
     }
     if result.is_ok() && stop_result.is_ok() {
-        orch_datastream.emit_bootstrap(
+        bootstrap(
+            &mut orch_datastream,
             dashboard.as_ref(),
-            config.run_id,
-            config.node_id,
             "orch_exit",
             "ready",
             json!({"result":"ok"}),
@@ -2101,6 +2074,16 @@ fn wait_for_runtime_ready_acks(
         orchestrator_node_id,
         provider,
     } = ctx;
+    let bootstrap = |ds: &mut OrchDatastream, phase: &str, status: &str, detail: Value| {
+        ds.emit_bootstrap(
+            dashboard,
+            run_id,
+            orchestrator_node_id,
+            phase,
+            status,
+            detail,
+        );
+    };
     let mut pending = targets
         .iter()
         .cloned()
@@ -2157,10 +2140,8 @@ fn wait_for_runtime_ready_acks(
             let Some(target) = pending.remove(&key) else {
                 continue;
             };
-            orch_datastream.emit_bootstrap(
-                dashboard,
-                run_id,
-                orchestrator_node_id,
+            bootstrap(
+                orch_datastream,
                 "runtime_ready_ack",
                 "ready",
                 json!({
@@ -2186,10 +2167,8 @@ fn wait_for_runtime_ready_acks(
                         target.node_id,
                     )
                 {
-                    orch_datastream.emit_bootstrap(
-                        dashboard,
-                        run_id,
-                        orchestrator_node_id,
+                    bootstrap(
+                        orch_datastream,
                         "datastream_subscribe",
                         "failed",
                         json!({"node_id":target.node_id,"error":error}),
@@ -2199,10 +2178,8 @@ fn wait_for_runtime_ready_acks(
                 let attempt = attempts.entry(*key).or_default();
                 *attempt += 1;
                 let attempt = *attempt;
-                orch_datastream.emit_bootstrap(
-                    dashboard,
-                    run_id,
-                    orchestrator_node_id,
+                bootstrap(
+                    orch_datastream,
                     "runtime_ready_ack",
                     "sent",
                     json!({
@@ -2297,6 +2274,11 @@ fn start_and_provision_workers(
         orch_stdio_rx,
         ..
     } = ctx;
+    let run_id = config.run_id;
+    let node_id = config.node_id;
+    let bootstrap = |ds: &mut OrchDatastream, phase: &str, status: &str, detail: Value| {
+        ds.emit_bootstrap(dashboard, run_id, node_id, phase, status, detail);
+    };
     let stage_specs = stage_node_specs(
         config,
         pipeline_plan,
@@ -2307,10 +2289,8 @@ fn start_and_provision_workers(
         .iter()
         .map(|spec| spec.node_id)
         .collect::<Vec<_>>();
-    orch_datastream.emit_bootstrap(
-        dashboard,
-        config.run_id,
-        config.node_id,
+    bootstrap(
+        orch_datastream,
         "node_spec",
         "ready",
         json!({
@@ -2357,10 +2337,8 @@ fn start_and_provision_workers(
                     )),
                 },
             );
-            orch_datastream.emit_bootstrap(
-                dashboard,
-                config.run_id,
-                config.node_id,
+            bootstrap(
+                orch_datastream,
                 "provider_start",
                 "started",
                 json!({
@@ -2406,10 +2384,8 @@ fn start_and_provision_workers(
         for (node_spec, handle_result) in start_results {
             match handle_result {
                 Ok(handle) => {
-                    orch_datastream.emit_bootstrap(
-                        dashboard,
-                        config.run_id,
-                        config.node_id,
+                    bootstrap(
+                        orch_datastream,
                         "provider_start",
                         "ready",
                         json!({
@@ -2422,10 +2398,8 @@ fn start_and_provision_workers(
                     handles.push(handle);
                 }
                 Err(error) => {
-                    orch_datastream.emit_bootstrap(
-                        dashboard,
-                        config.run_id,
-                        config.node_id,
+                    bootstrap(
+                        orch_datastream,
                         "provider_start",
                         "failed",
                         json!({
@@ -2471,10 +2445,8 @@ fn start_and_provision_workers(
         config.node_id,
     );
 
-    orch_datastream.emit_bootstrap(
-        dashboard,
-        config.run_id,
-        config.node_id,
+    bootstrap(
+        orch_datastream,
         "node_runtime_ready",
         "started",
         json!({"worker_count":expected_node_ids.len(),"node_ids":expected_node_ids}),
@@ -2500,10 +2472,8 @@ fn start_and_provision_workers(
         ) {
             Ok(readies) => readies,
             Err(error) => {
-                orch_datastream.emit_bootstrap(
-                    dashboard,
-                    config.run_id,
-                    config.node_id,
+                bootstrap(
+                    orch_datastream,
                     "node_runtime_ready",
                     "failed",
                     json!({"error":error}),
@@ -2529,10 +2499,8 @@ fn start_and_provision_workers(
         }) {
             Ok(ready) => ready,
             Err(error) => {
-                orch_datastream.emit_bootstrap(
-                    dashboard,
-                    config.run_id,
-                    config.node_id,
+                bootstrap(
+                    orch_datastream,
                     "node_runtime_ready",
                     "failed",
                     json!({"error":error}),
@@ -2543,10 +2511,8 @@ fn start_and_provision_workers(
         BTreeMap::from([(config.node_id, ready)])
     };
     for (node_id, ready) in &readies {
-        orch_datastream.emit_bootstrap(
-            dashboard,
-            config.run_id,
-            config.node_id,
+        bootstrap(
+            orch_datastream,
             "node_runtime_ready",
             "ready",
             json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"node_id":node_id,"stage_index":ready.stage_index}),
@@ -2582,10 +2548,8 @@ fn start_and_provision_workers(
         .complete_bootstrap()
         .map_err(|e| format!("complete provider bootstrap after runtime-ready: {e}"))?;
 
-    orch_datastream.emit_bootstrap(
-        dashboard,
-        config.run_id,
-        config.node_id,
+    bootstrap(
+        orch_datastream,
         "stage_provision",
         "started",
         stage_provision_detail(config, pipeline_plan),
@@ -2597,10 +2561,8 @@ fn start_and_provision_workers(
         provision_stage(stack, ready.node_actor, config)?;
     }
 
-    orch_datastream.emit_bootstrap(
-        dashboard,
-        config.run_id,
-        config.node_id,
+    bootstrap(
+        orch_datastream,
         "weights_loaded",
         "started",
         json!({"model_id":&config.model_id,"expected":expected_node_ids.len()}),
@@ -2649,19 +2611,15 @@ fn start_and_provision_workers(
         )
     };
     match weights_result {
-        Ok(()) => orch_datastream.emit_bootstrap(
-            dashboard,
-            config.run_id,
-            config.node_id,
+        Ok(()) => bootstrap(
+            orch_datastream,
             "weights_loaded",
             "ready",
             json!({"source":"actor_stage_ready","model_id":&config.model_id,"expected":expected_node_ids.len()}),
         ),
         Err(error) => {
-            orch_datastream.emit_bootstrap(
-                dashboard,
-                config.run_id,
-                config.node_id,
+            bootstrap(
+                orch_datastream,
                 "weights_loaded",
                 "failed",
                 json!({"error":error}),
@@ -3259,6 +3217,10 @@ fn send_pipeline_stage_provision(
     let datastream_route_owner = ctx.stack.route_owner(ready.datastream_publisher);
     let member_state = ctx.stack.member_state(ready.swim_node_id);
     let route_matches_ready = route_owner == Some(ready.swim_node_id);
+    let (dashboard, run_id, node_id) = (ctx.dashboard, ctx.run_id, ctx.node_id);
+    let bootstrap = |ds: &mut OrchDatastream, phase: &str, status: &str, detail: Value| {
+        ds.emit_bootstrap(dashboard, run_id, node_id, phase, status, detail);
+    };
     ctx.orch_datastream.emit_bootstrap_to_channel(
         ctx.dashboard,
         MVP_STAGE_ROUTE,
@@ -3294,10 +3256,8 @@ fn send_pipeline_stage_provision(
             route_matches_ready,
             "heartbeat_missed",
         );
-        ctx.orch_datastream.emit_bootstrap(
-            ctx.dashboard,
-            ctx.run_id,
-            ctx.node_id,
+        bootstrap(
+            ctx.orch_datastream,
             "stage_provision_wait",
             "failed",
             json!({
@@ -3324,10 +3284,8 @@ fn send_pipeline_stage_provision(
         now,
     );
     if !should_send {
-        ctx.orch_datastream.emit_bootstrap(
-            ctx.dashboard,
-            ctx.run_id,
-            ctx.node_id,
+        bootstrap(
+            ctx.orch_datastream,
             "stage_provision_wait",
             "observed",
             json!({
@@ -3368,10 +3326,8 @@ fn send_pipeline_stage_provision(
         *count
     };
     ctx.stage_last_sends.insert(stage.stage_index, now);
-    ctx.orch_datastream.emit_bootstrap(
-        ctx.dashboard,
-        ctx.run_id,
-        ctx.node_id,
+    bootstrap(
+        ctx.orch_datastream,
         "stage_provision_send",
         "sent",
         json!({
@@ -3385,10 +3341,8 @@ fn send_pipeline_stage_provision(
         }),
     );
     if stage_send_count == 1 || stage_send_count % 15 == 0 {
-        ctx.orch_datastream.emit_bootstrap(
-            ctx.dashboard,
-            ctx.run_id,
-            ctx.node_id,
+        bootstrap(
+            ctx.orch_datastream,
             "stage_provision_wait",
             "observed",
             json!({
@@ -4501,13 +4455,17 @@ impl PipelinePromptRuntime {
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
+        let emit_prompt_evt =
+            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+                ds.emit_prompt(
+                    dashboard, run_id, node_id, request_id, phase, status, detail,
+                )
+            };
         let request_id = request.request_id;
         if self.active.is_some() || self.pending_encode.is_some() || self.pending_decode.is_some() {
             let active_request_id = self.active.as_ref().map(|active| active.request.request_id);
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
+            emit_prompt_evt(
+                orch_datastream,
                 request_id,
                 "pipeline_prompt_busy",
                 "failed",
@@ -4530,10 +4488,8 @@ impl PipelinePromptRuntime {
         self.pending_encode = Some(PendingEncode { request_id });
         self.started_at = Some(Instant::now());
         self.note_progress();
-        orch_datastream.emit_prompt(
-            dashboard,
-            run_id,
-            node_id,
+        emit_prompt_evt(
+            orch_datastream,
             request_id,
             "pipeline_tokenizer_encode",
             "started",
@@ -4560,6 +4516,12 @@ impl PipelinePromptRuntime {
         run_id: u64,
         node_id: u64,
     ) {
+        let emit_prompt_evt =
+            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+                ds.emit_prompt(
+                    dashboard, run_id, node_id, request_id, phase, status, detail,
+                )
+            };
         let Some(active) = self.active.as_ref() else {
             return;
         };
@@ -4574,10 +4536,8 @@ impl PipelinePromptRuntime {
             .map(|last| duration_ms_u64(now.saturating_duration_since(last)))
             .unwrap_or(elapsed_ms);
         if self.next_wait_log_at.is_some_and(|next| now >= next) {
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
+            emit_prompt_evt(
+                orch_datastream,
                 request_id,
                 "pipeline_prompt_wait",
                 "waiting",
@@ -4640,6 +4600,12 @@ impl PipelinePromptRuntime {
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
+        let emit_prompt_evt =
+            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+                ds.emit_prompt(
+                    dashboard, run_id, node_id, request_id, phase, status, detail,
+                )
+            };
         let Some(pending) = self.pending_encode.take() else {
             return Ok(());
         };
@@ -4653,20 +4619,16 @@ impl PipelinePromptRuntime {
         if active.request.request_id != request_id {
             return Ok(());
         }
-        orch_datastream.emit_prompt(
-            dashboard,
-            run_id,
-            node_id,
+        emit_prompt_evt(
+            orch_datastream,
             request_id,
             "pipeline_tokenizer_encode",
             "ready",
             json!({"node_actor":self.tokenizer_encode_actor,"reply_to":self.tokenizer_reply_to,"tokens":tokens.len()}),
         );
         let sequence = self.next_sequence;
-        orch_datastream.emit_prompt(
-            dashboard,
-            run_id,
-            node_id,
+        emit_prompt_evt(
+            orch_datastream,
             request_id,
             "pipeline_token_in",
             "started",
@@ -4674,10 +4636,8 @@ impl PipelinePromptRuntime {
         );
         self.send_token_in(sequence, &tokens, true)?;
         self.note_progress();
-        orch_datastream.emit_prompt(
-            dashboard,
-            run_id,
-            node_id,
+        emit_prompt_evt(
+            orch_datastream,
             request_id,
             "pipeline_token_in",
             "ready",
@@ -4697,6 +4657,12 @@ impl PipelinePromptRuntime {
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
+        let emit_prompt_evt =
+            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+                ds.emit_prompt(
+                    dashboard, run_id, node_id, request_id, phase, status, detail,
+                )
+            };
         let Some(pending) = self.pending_decode.take() else {
             return Ok(());
         };
@@ -4711,10 +4677,8 @@ impl PipelinePromptRuntime {
             return Ok(());
         }
         let events = active.events.clone();
-        orch_datastream.emit_prompt(
-            dashboard,
-            run_id,
-            node_id,
+        emit_prompt_evt(
+            orch_datastream,
             request_id,
             "pipeline_tokenizer_decode",
             "ready",
@@ -4732,10 +4696,8 @@ impl PipelinePromptRuntime {
                 .unwrap_or(0);
             let final_text = self.final_text.clone();
             let tokens_generated = self.generated_tokens.len() as u32;
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
+            emit_prompt_evt(
+                orch_datastream,
                 request_id,
                 "prompt_complete",
                 "ready",
@@ -4760,10 +4722,8 @@ impl PipelinePromptRuntime {
             return Ok(());
         }
         let sequence = self.next_sequence;
-        orch_datastream.emit_prompt(
-            dashboard,
-            run_id,
-            node_id,
+        emit_prompt_evt(
+            orch_datastream,
             request_id,
             "pipeline_token_in",
             "started",
@@ -4771,10 +4731,8 @@ impl PipelinePromptRuntime {
         );
         self.send_token_in(sequence, &[pending.token_id], false)?;
         self.note_progress();
-        orch_datastream.emit_prompt(
-            dashboard,
-            run_id,
-            node_id,
+        emit_prompt_evt(
+            orch_datastream,
             request_id,
             "pipeline_token_in",
             "ready",
@@ -4885,6 +4843,12 @@ impl PipelinePromptRuntime {
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
+        let emit_prompt_evt =
+            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+                ds.emit_prompt(
+                    dashboard, run_id, node_id, request_id, phase, status, detail,
+                )
+            };
         if self.pending_decode.is_some() {
             return Ok(());
         }
@@ -4905,10 +4869,8 @@ impl PipelinePromptRuntime {
                     continue;
                 };
                 let request_id = active.request.request_id;
-                orch_datastream.emit_prompt(
-                    dashboard,
-                    run_id,
-                    node_id,
+                emit_prompt_evt(
+                    orch_datastream,
                     request_id,
                     "pipeline_token_out",
                     "observed",
@@ -4916,10 +4878,8 @@ impl PipelinePromptRuntime {
                 );
                 self.generated_tokens.push(record.token_id);
                 let reached_limit = self.generated_tokens.len() as u32 >= active.request.max_tokens;
-                orch_datastream.emit_prompt(
-                    dashboard,
-                    run_id,
-                    node_id,
+                emit_prompt_evt(
+                    orch_datastream,
                     request_id,
                     "pipeline_tokenizer_decode",
                     "started",
@@ -5009,6 +4969,12 @@ fn serve_prompts(
         provider,
         ..
     } = ctx;
+    let emit_prompt_evt =
+        |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+            ds.emit_prompt(
+                dashboard, run_id, node_id, request_id, phase, status, detail,
+            )
+        };
     let mut pipeline_runtime = match pipeline_plan {
         Some(plan) => Some(PipelinePromptRuntime::new(
             driver,
@@ -5065,10 +5031,8 @@ fn serve_prompts(
         {
             let request = work.request;
             let request_id = request.request_id;
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
+            emit_prompt_evt(
+                orch_datastream,
                 request_id,
                 "prompt_work",
                 "observed",
@@ -5089,10 +5053,8 @@ fn serve_prompts(
                 )?;
                 continue;
             }
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
+            emit_prompt_evt(
+                orch_datastream,
                 request_id,
                 "node_prompt_send",
                 "started",
@@ -5108,10 +5070,8 @@ fn serve_prompts(
                 },
             ) {
                 Ok(()) => {
-                    orch_datastream.emit_prompt(
-                        dashboard,
-                        run_id,
-                        node_id,
+                    emit_prompt_evt(
+                        orch_datastream,
                         request_id,
                         "node_prompt_send",
                         "ready",
@@ -5123,10 +5083,8 @@ fn serve_prompts(
                     });
                 }
                 Err(error) => {
-                    orch_datastream.emit_prompt(
-                        dashboard,
-                        run_id,
-                        node_id,
+                    emit_prompt_evt(
+                        orch_datastream,
                         request_id,
                         "node_prompt_send",
                         "failed",
@@ -5140,10 +5098,8 @@ fn serve_prompts(
         while let Some(event) = prompt_events.try_recv() {
             let request_id = event.request_id();
             let Some(current) = active.as_ref() else {
-                orch_datastream.emit_prompt(
-                    dashboard,
-                    run_id,
-                    node_id,
+                emit_prompt_evt(
+                    orch_datastream,
                     request_id,
                     "node_prompt_event",
                     "dropped",
@@ -5152,10 +5108,8 @@ fn serve_prompts(
                 continue;
             };
             if request_id != current.request.request_id {
-                orch_datastream.emit_prompt(
-                    dashboard,
-                    run_id,
-                    node_id,
+                emit_prompt_evt(
+                    orch_datastream,
                     request_id,
                     "node_prompt_event",
                     "dropped",
@@ -5175,10 +5129,8 @@ fn serve_prompts(
                 }
                 PromptEvent::TextDelta { .. } => None,
             };
-            orch_datastream.emit_prompt(
-                dashboard,
-                run_id,
-                node_id,
+            emit_prompt_evt(
+                orch_datastream,
                 request_id,
                 "node_prompt_event",
                 "observed",
@@ -5186,10 +5138,8 @@ fn serve_prompts(
             );
             let _ = current.events.send(event);
             if let Some((status, detail)) = completion {
-                orch_datastream.emit_prompt(
-                    dashboard,
-                    run_id,
-                    node_id,
+                emit_prompt_evt(
+                    orch_datastream,
                     request_id,
                     "prompt_complete",
                     status,
@@ -5437,7 +5387,7 @@ fn emit_swim_transitions(
             .map(|state| format!("{:?}", state));
         let last_ack_age_ms = transition.last_ack_age.map(duration_ms_u64);
         let consecutive_timeouts = transition.consecutive_timeouts;
-        let recent_probe_targets = swim_recent_probe_targets(stack);
+        let recent_probe_targets = stack.swim_recent_probe_targets();
         orch_datastream.emit_bootstrap_to_channel(
             dashboard,
             MVP_SWIM_MEMBERSHIP,
@@ -5456,19 +5406,7 @@ fn emit_swim_transitions(
                 "member_state":member_state.clone(),
             }),
         );
-        orch_datastream.emit_record(
-            dashboard,
-            &MembershipTransition {
-                peer,
-                from: from.unwrap_or_default(),
-                to,
-                reason: transition.reason.to_owned(),
-                last_ack_age_ms,
-                consecutive_timeouts,
-                recent_probe_targets,
-                member_state,
-            },
-        );
+        orch_datastream.emit_record(dashboard, &stack.membership_transition(&transition));
     }
 }
 
@@ -5479,54 +5417,9 @@ fn emit_swim_probe_events(
     local_phase: &str,
 ) {
     for event in stack.drain_swim_probe_events() {
-        let record = swim_probe_event_record(stack, event, local_phase);
+        let record = stack.swim_probe_event_record(event, local_phase);
         orch_datastream.emit_record(dashboard, &record);
     }
-}
-
-fn swim_probe_event_record(
-    stack: &DistributionRuntimeStack,
-    event: ObservedProbeEvent,
-    local_phase: &str,
-) -> SwimProbeEvent {
-    let config = &stack.swim_config;
-    let budget_ms = event.budget_ms;
-    SwimProbeEvent {
-        event: event.event.to_owned(),
-        target: format!("{:?}", event.target),
-        sequence: event.sequence,
-        kind: event.kind.to_owned(),
-        rtt_ms: event.rtt_ms,
-        budget_ms,
-        budget_ticks: budget_ms,
-        last_ack_age_ms: event.last_ack_age.map(duration_ms_u64),
-        consecutive_timeouts: event.consecutive_timeouts,
-        recent_probe_targets: swim_recent_probe_targets(stack),
-        member_state: stack
-            .member_state(event.target)
-            .map(|state| format!("{:?}", state)),
-        local_phase: local_phase.to_owned(),
-        probe_interval_ms: duration_ms_u64(config.probe_interval),
-        probe_timeout_ms: duration_ms_u64(config.probe_timeout),
-        indirect_probes: u32::try_from(config.indirect_probes).unwrap_or(u32::MAX),
-        suspicion_timeout_ms: duration_ms_u64(config.suspicion_timeout),
-        dead_reprobe_interval_ms: duration_ms_u64(config.dead_reprobe_interval),
-        probe_mode: format!("{:?}", config.probe_mode),
-        lifeguard_enabled: config.lifeguard.is_some(),
-    }
-}
-
-fn swim_recent_probe_targets(stack: &DistributionRuntimeStack) -> Vec<String> {
-    stack
-        .swim_telemetry
-        .recent_targets()
-        .into_iter()
-        .map(|node_id| format!("{:?}", node_id))
-        .collect()
-}
-
-fn duration_ms_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn pump(
@@ -5700,10 +5593,7 @@ fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), 
     if vastai_account_has_ssh_key(api_key, public_key)? {
         Ok(())
     } else {
-        Err(
-            "VastAI SSH key registration did not make the selected key visible in vastai show ssh-keys"
-                .to_owned(),
-        )
+        Err("VastAI SSH key registration did not make the selected key visible in vastai show ssh-keys".to_owned())
     }
 }
 
@@ -5719,8 +5609,7 @@ fn account_ssh_keys_output_contains_public_key(output: &str, public_key: &str) -
 
 fn vastai_cli_error(error: std::io::Error) -> String {
     if error.kind() == std::io::ErrorKind::NotFound {
-        "vastai CLI is required to verify/register MVP_VASTAI_SSH_IDENTITY; install with pip install vastai"
-            .to_owned()
+        "vastai CLI is required to verify/register MVP_VASTAI_SSH_IDENTITY; install with pip install vastai".to_owned()
     } else {
         format!("run vastai CLI: {error}")
     }

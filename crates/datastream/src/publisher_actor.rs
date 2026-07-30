@@ -76,7 +76,5 @@ impl ActorInterface for DatastreamPublisherActor {
 
 /// Register JSON encoding for remote datastream publisher messages.
 pub fn register_datastream_publisher_codec(registry: &mut CodecRegistry) {
-    registry.register::<DatastreamPublisherMsg, _>(
-        JsonCodec::<DatastreamPublisherMsg>::default(),
-    );
+    registry.register::<DatastreamPublisherMsg, _>(JsonCodec::<DatastreamPublisherMsg>::default());
 }

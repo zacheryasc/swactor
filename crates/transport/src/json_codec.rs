@@ -6,8 +6,8 @@
 
 use std::marker::PhantomData;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use swactor::Error;
 
 use crate::codec::Codec;

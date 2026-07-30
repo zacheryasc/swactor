@@ -10,12 +10,12 @@ pub mod edge_transport;
 pub mod endpoint_advertisement;
 pub mod iroh_driver;
 
+pub use endpoint_advertisement::{
+    EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
+};
 pub use iroh_driver::{
     ConnType, DatastreamPublishHandle, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus,
     conn_type_of, discover_lan_ips,
-};
-pub use endpoint_advertisement::{
-    MVP_IROH_ENDPOINT_ADDR_MASK_ENV, EndpointAddrMask, advertised_endpoint,
 };
 
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, EdgeTransportFault};
