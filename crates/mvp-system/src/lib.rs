@@ -26,8 +26,6 @@ pub fn run_worker_node_from_env() -> std::process::ExitCode {
     node::worker_node_runtime::run_from_env()
 }
 
-#[path = "transport/driver_pumps.rs"]
-mod driver_pumps;
 #[path = "staging/gguf_common.rs"]
 mod gguf_common;
 #[path = "staging/gguf_shard.rs"]
@@ -50,7 +48,7 @@ mod observability;
 mod orchestration;
 mod prompt;
 mod staging;
-mod transport;
+mod codecs;
 
 #[cfg(test)]
 mod tests;

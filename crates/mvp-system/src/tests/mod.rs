@@ -5,4 +5,3 @@ mod observability_guarantees;
 mod orchestration_guarantees;
 mod prompt_guarantees;
 mod staging_guarantees;
-mod transport_guarantees;

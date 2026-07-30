@@ -5,17 +5,13 @@
 //! injected by the runtime crate so the datastream core does not depend on the
 //! concrete QUIC writer implementation.
 
-use std::marker::PhantomData;
 use std::sync::Arc;
 
 use iroh::EndpointAddr;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize as DeriveSerialize};
-use swactor::Error;
 use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;
-use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
+use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
 use crate::{DatastreamEndpoint, DatastreamSubscription, SubscriptionRequest};
 
@@ -80,22 +76,7 @@ impl ActorInterface for DatastreamPublisherActor {
 
 /// Register JSON encoding for remote datastream publisher messages.
 pub fn register_datastream_publisher_codec(registry: &mut CodecRegistry) {
-    registry.register::<DatastreamPublisherMsg, JsonCodec<DatastreamPublisherMsg>>(JsonCodec(
-        PhantomData,
-    ));
-}
-
-struct JsonCodec<M>(PhantomData<M>);
-
-impl<M> Codec<M> for JsonCodec<M>
-where
-    M: Serialize + DeserializeOwned + Clone + Send + Sync + 'static,
-{
-    fn encode(&self, msg: &M) -> Result<Vec<u8>, Error> {
-        serde_json::to_vec(msg).map_err(|e| Error::from(format!("encode: {e}")))
-    }
-
-    fn decode(&self, bytes: &[u8]) -> Result<M, Error> {
-        serde_json::from_slice(bytes).map_err(|e| Error::from(format!("decode: {e}")))
-    }
+    registry.register::<DatastreamPublisherMsg, _>(
+        JsonCodec::<DatastreamPublisherMsg>::default(),
+    );
 }

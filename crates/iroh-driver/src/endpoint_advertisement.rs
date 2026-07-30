@@ -1,18 +1,29 @@
+//! Endpoint advertisement masking.
+//!
+//! Controls how much of an iroh [`EndpointAddr`] a node advertises to peers.
+//! `relay-only` strips direct IP/socket addresses so peers can only reach the
+//! node via its relay URL — useful for NAT-egress-only or hidden nodes.
+
 use std::fmt;
 
 use iroh::EndpointAddr;
 
-pub(crate) const MVP_IROH_ENDPOINT_ADDR_MASK_ENV: &str = "MVP_IROH_ENDPOINT_ADDR_MASK";
+/// Environment variable selecting the advertised endpoint address mask.
+///
+/// Recognized values: `full` (default) and `relay-only`.
+pub const MVP_IROH_ENDPOINT_ADDR_MASK_ENV: &str = "MVP_IROH_ENDPOINT_ADDR_MASK";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum EndpointAddrMask {
+pub enum EndpointAddrMask {
+    /// Advertise the full endpoint address: relays and direct addresses.
     #[default]
     Full,
+    /// Advertise relay URLs only, omitting direct socket addresses.
     RelayOnly,
 }
 
 impl EndpointAddrMask {
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
+    pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
             "" | "full" | "none" => Ok(Self::Full),
             "relay-only" | "relay_only" | "relay" => Ok(Self::RelayOnly),
@@ -22,14 +33,14 @@ impl EndpointAddrMask {
         }
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Full => "full",
             Self::RelayOnly => "relay-only",
         }
     }
 
-    pub(crate) fn requires_relay(self) -> bool {
+    pub fn requires_relay(self) -> bool {
         matches!(self, Self::RelayOnly)
     }
 }
@@ -40,7 +51,8 @@ impl fmt::Display for EndpointAddrMask {
     }
 }
 
-pub(crate) fn advertised_endpoint(
+/// Apply `mask` to `endpoint`, returning the address to advertise to peers.
+pub fn advertised_endpoint(
     endpoint: EndpointAddr,
     mask: EndpointAddrMask,
 ) -> Result<EndpointAddr, String> {

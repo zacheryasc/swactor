@@ -30,7 +30,7 @@ use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::config::ResolvedVastAiConfig;
 use crate::prompt::rpc::{PromptEvent, SubmitPrompt, write_json_line};
-use crate::transport::endpoint_advertisement::EndpointAddrMask;
+use iroh_driver::EndpointAddrMask;
 use crate::{
     DEFAULT_PIPELINE_CACHED_MODEL_FILE, DEFAULT_PIPELINE_CACHED_MODEL_ID,
     DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT, DEFAULT_PIPELINE_CACHED_MODEL_REPO,
