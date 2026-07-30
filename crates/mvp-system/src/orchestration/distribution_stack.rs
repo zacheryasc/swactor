@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
@@ -28,6 +28,8 @@ use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::probe::SwimConfig;
 use distribution::swim::telemetry::{ObservedProbeEvent, ObservedTransition, SwimTelemetry};
+use distribution::telemetry::MembershipTransition;
+use distribution::telemetry::SwimProbeEvent;
 use distribution::transport_bridge::{
     Outbox, OutboxPeerDirectory, OutboxRouteBinder, RelayMirror, RouteView, RouteViewTransport,
 };
@@ -237,6 +239,70 @@ impl DistributionRuntimeStack {
     pub(crate) fn drain_swim_probe_events(&self) -> Vec<ObservedProbeEvent> {
         self.swim_telemetry.drain_probe_events()
     }
+
+    pub(crate) fn swim_recent_probe_targets(&self) -> Vec<String> {
+        self.swim_telemetry
+            .recent_targets()
+            .into_iter()
+            .map(|node_id| format!("{:?}", node_id))
+            .collect()
+    }
+
+    pub(crate) fn swim_probe_event_record(
+        &self,
+        event: ObservedProbeEvent,
+        local_phase: &str,
+    ) -> SwimProbeEvent {
+        let config = &self.swim_config;
+        let budget_ms = event.budget_ms;
+        SwimProbeEvent {
+            event: event.event.to_owned(),
+            target: format!("{:?}", event.target),
+            sequence: event.sequence,
+            kind: event.kind.to_owned(),
+            rtt_ms: event.rtt_ms,
+            budget_ms,
+            budget_ticks: budget_ms,
+            last_ack_age_ms: event.last_ack_age.map(duration_ms_u64),
+            consecutive_timeouts: event.consecutive_timeouts,
+            recent_probe_targets: self.swim_recent_probe_targets(),
+            member_state: self
+                .member_state(event.target)
+                .map(|state| format!("{:?}", state)),
+            local_phase: local_phase.to_owned(),
+            probe_interval_ms: duration_ms_u64(config.probe_interval),
+            probe_timeout_ms: duration_ms_u64(config.probe_timeout),
+            indirect_probes: u32::try_from(config.indirect_probes).unwrap_or(u32::MAX),
+            suspicion_timeout_ms: duration_ms_u64(config.suspicion_timeout),
+            dead_reprobe_interval_ms: duration_ms_u64(config.dead_reprobe_interval),
+            probe_mode: format!("{:?}", config.probe_mode),
+            lifeguard_enabled: config.lifeguard.is_some(),
+        }
+    }
+    pub(crate) fn membership_transition(
+        &self,
+        transition: &ObservedTransition,
+    ) -> MembershipTransition {
+        MembershipTransition {
+            peer: format!("{:?}", transition.peer),
+            from: transition
+                .from
+                .map(|state| format!("{:?}", state))
+                .unwrap_or_default(),
+            to: format!("{:?}", transition.to),
+            reason: transition.reason.to_owned(),
+            last_ack_age_ms: transition.last_ack_age.map(duration_ms_u64),
+            consecutive_timeouts: transition.consecutive_timeouts,
+            recent_probe_targets: self.swim_recent_probe_targets(),
+            member_state: self
+                .member_state(transition.peer)
+                .map(|state| format!("{:?}", state)),
+        }
+    }
+}
+
+pub(crate) fn duration_ms_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 struct MembershipFanout {

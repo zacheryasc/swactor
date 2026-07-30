@@ -30,11 +30,11 @@ use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::config::ResolvedVastAiConfig;
 use crate::prompt::rpc::{PromptEvent, SubmitPrompt, write_json_line};
-use iroh_driver::EndpointAddrMask;
 use crate::{
     DEFAULT_PIPELINE_CACHED_MODEL_FILE, DEFAULT_PIPELINE_CACHED_MODEL_ID,
     DEFAULT_PIPELINE_CACHED_MODEL_MAX_CONTEXT, DEFAULT_PIPELINE_CACHED_MODEL_REPO,
 };
+use iroh_driver::EndpointAddrMask;
 
 const DEFAULT_CONFIG_PATH: &str = ".config/config.toml";
 const DEFAULT_RPC_ADDR: &str = "127.0.0.1:19777";
@@ -150,8 +150,7 @@ where
     );
     progress.emit_benchmark_envelope(&config);
     progress.emit_endpoint_config_snapshot(&config);
-    let mut approval = StdinVastAiApproval;
-    confirm_vastai_if_needed_with_approval(&config, &mut approval)?;
+    confirm_vastai_if_needed(&config)?;
     let prepare_runtime_started = Instant::now();
     progress.emit(
         CHAT_RUNTIME_CHANNEL,
@@ -1264,55 +1263,36 @@ fn first_non_empty<const N: usize>(values: [Option<String>; N]) -> Option<String
         .find(|value| !value.is_empty())
 }
 
-trait VastAiApproval {
-    fn stdin_is_terminal(&self) -> bool;
-    fn ask(&mut self) -> Result<bool, String>;
-}
-
-struct StdinVastAiApproval;
-
-impl VastAiApproval for StdinVastAiApproval {
-    fn stdin_is_terminal(&self) -> bool {
-        io::stdin().is_terminal()
-    }
-
-    fn ask(&mut self) -> Result<bool, String> {
-        #[cfg(test)]
-        {
-            let mut input = std::io::Cursor::new(Vec::<u8>::new());
-            let mut output = io::sink();
-            ask_vastai_approval(&mut input, &mut output)
-        }
-        #[cfg(not(test))]
-        {
-            let stdin = io::stdin();
-            let mut input = stdin.lock();
-            let mut output = io::stdout();
-            ask_vastai_approval(&mut input, &mut output)
-        }
-    }
-}
-
-fn confirm_vastai_if_needed_with_approval<A>(
-    config: &Config,
-    approval: &mut A,
-) -> Result<(), String>
-where
-    A: VastAiApproval,
-{
+fn confirm_vastai_if_needed(config: &Config) -> Result<(), String> {
     if config.vastai.is_none() {
         return Ok(());
     }
     if config.vastai_yes {
         return Ok(());
     }
-    if !approval.stdin_is_terminal() {
+    if !io::stdin().is_terminal() {
         return Err("Vast.ai rental requires --yes when stdin is not a terminal".to_owned());
     }
-    if approval.ask()? {
+    if prompt_vastai_approval()? {
         Ok(())
     } else {
         Err("Vast.ai rental declined".to_owned())
+    }
+}
+
+fn prompt_vastai_approval() -> Result<bool, String> {
+    #[cfg(test)]
+    {
+        let mut input = std::io::Cursor::new(Vec::<u8>::new());
+        let mut output = io::sink();
+        ask_vastai_approval(&mut input, &mut output)
+    }
+    #[cfg(not(test))]
+    {
+        let stdin = io::stdin();
+        let mut input = stdin.lock();
+        let mut output = io::stdout();
+        ask_vastai_approval(&mut input, &mut output)
     }
 }
 

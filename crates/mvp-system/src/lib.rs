@@ -43,12 +43,12 @@ mod run_fsm;
 mod run_plan;
 
 mod chat;
+mod codecs;
 mod node;
 mod observability;
 mod orchestration;
 mod prompt;
 mod staging;
-mod codecs;
 
 #[cfg(test)]
 mod tests;
