@@ -103,8 +103,7 @@ fn prepare_node_image_inner(
         ));
     }
 
-    run_status(
-        progress,
+    run_status_command(
         &root,
         "cargo",
         &[
@@ -117,6 +116,7 @@ fn prepare_node_image_inner(
         ],
         "build mvp-worker-node",
         None,
+        progress,
     )?;
 
     let base_hash = content_hash_for_inputs(&root, BASE_IMAGE_SOURCE_INPUTS)?;
@@ -124,12 +124,13 @@ fn prepare_node_image_inner(
     let tag = image_version_tag(&root, &image_content_hash)?;
     let image_ref = image.ref_for_tag(&tag);
     emit_image_reference(progress, "resolved", &image_ref);
-    let worker_hash = hash_relative_files(
+    let worker_hash = hash_relative_files_with_salts(
         &root,
         vec![relative_path(
             &root,
             &root.join("apps/mvp-node/tinygrad_worker.py"),
         )?],
+        &[],
     )?;
     let expected_node_labels = vec![
         (NODE_IMAGE_TAG_LABEL, tag.as_str()),
@@ -168,18 +169,19 @@ fn prepare_node_image_inner(
     let base_image_matches =
         docker_image_labels_match(&root, &request.base_image, &expected_base_labels)?;
     if !base_image_matches {
+        let base_source_hash_label = format!("{BASE_IMAGE_SOURCE_HASH_LABEL}={base_hash}");
         run_status_command(
             &root,
             "docker",
-            &vec![
-                "build".to_owned(),
-                "-f".to_owned(),
-                "apps/mvp-node/Dockerfile.base".to_owned(),
-                "--label".to_owned(),
-                format!("{BASE_IMAGE_SOURCE_HASH_LABEL}={base_hash}"),
-                "-t".to_owned(),
-                request.base_image.clone(),
-                ".".to_owned(),
+            &[
+                "build",
+                "-f",
+                "apps/mvp-node/Dockerfile.base",
+                "--label",
+                base_source_hash_label.as_str(),
+                "-t",
+                request.base_image.as_str(),
+                ".",
             ],
             "build mvp node base image",
             Some(&request.base_image),
@@ -187,7 +189,14 @@ fn prepare_node_image_inner(
         )?;
     }
 
-    let node_bin = docker_build_context_path(&root, &request.node_bin)?;
+    let node_bin = {
+        let full = if request.node_bin.is_absolute() {
+            request.node_bin.to_path_buf()
+        } else {
+            root.join(&request.node_bin)
+        };
+        relative_path(&root, &full).map(|relative| relative.to_string_lossy().to_string())
+    }?;
     let mut build_args = vec![
         "build".to_owned(),
         "-f".to_owned(),
@@ -205,7 +214,7 @@ fn prepare_node_image_inner(
     run_status_command(
         &root,
         "docker",
-        &build_args,
+        &build_args.iter().map(String::as_str).collect::<Vec<_>>(),
         "build mvp node image",
         Some(&image_ref),
         progress,
@@ -302,10 +311,6 @@ fn content_hash_for_inputs(root: &Path, inputs: &[&str]) -> Result<String, Strin
     }
     files.sort();
     files.dedup();
-    hash_relative_files(root, files)
-}
-
-fn hash_relative_files(root: &Path, files: Vec<PathBuf>) -> Result<String, String> {
     hash_relative_files_with_salts(root, files, &[])
 }
 
@@ -360,7 +365,7 @@ fn collect_hash_inputs(root: &Path, path: &Path, out: &mut Vec<PathBuf>) -> Resu
         }
         return Ok(());
     }
-    if !metadata.is_dir() || skip_dir(path) {
+    if !metadata.is_dir() || matches!(path.file_name().and_then(|name| name.to_str()), Some(".git" | "target" | "__pycache__")) {
         return Ok(());
     }
     let entries = fs::read_dir(path).map_err(|e| format!("read dir {display}: {e}"))?;
@@ -381,28 +386,12 @@ fn relative_path(root: &Path, path: &Path) -> Result<PathBuf, String> {
     })
 }
 
-fn docker_build_context_path(root: &Path, path: &Path) -> Result<String, String> {
-    let full = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
-    relative_path(root, &full).map(|relative| relative.to_string_lossy().to_string())
-}
-
 fn display_workspace_path(root: &Path, path: &Path) -> String {
     match path.strip_prefix(root) {
         Ok(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
         Ok(relative) => format!("./{}", relative.display()),
         Err(_) => path.display().to_string(),
     }
-}
-
-fn skip_dir(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | "target" | "__pycache__")
-    )
 }
 
 fn alias_tags(
@@ -444,13 +433,13 @@ fn ensure_aliases_local(
 ) -> Result<(), String> {
     for alias in alias_refs(image, alias_tags) {
         if alias != source_ref {
-            run_status(
-                progress,
+            run_status_command(
                 root,
                 "docker",
                 &["tag", source_ref, &alias],
                 "tag mvp node image",
                 Some(&alias),
+                progress,
             )?;
         }
     }
@@ -468,13 +457,13 @@ fn ensure_aliases_for_remote(
         return Ok(false);
     }
     if !docker_image_exists(root, source_ref) {
-        run_status(
-            progress,
+        run_status_command(
             root,
             "docker",
             &["pull", source_ref],
             "pull mvp node image",
             Some(source_ref),
+            progress,
         )?;
     }
     ensure_aliases_local(progress, root, source_ref, image, alias_tags)?;
@@ -496,13 +485,13 @@ fn push_image(
     root: &Path,
     image_ref: &str,
 ) -> Result<(), String> {
-    run_status(
-        progress,
+    run_status_command(
         root,
         "docker",
         &["push", image_ref],
         "push mvp node image",
         Some(image_ref),
+        progress,
     )
 }
 
@@ -579,18 +568,6 @@ fn prune_old_dirty_images(root: &Path, image: &ImageName, keep_tag: &str) {
             eprintln!("mvp-node-image: prune old dirty image {image_ref} skipped: {error}");
         }
     }
-}
-
-fn run_status(
-    progress: &mut Option<&mut dyn NodeImageProgressSink>,
-    root: &Path,
-    program: &str,
-    args: &[&str],
-    label: &str,
-    image_ref: Option<&str>,
-) -> Result<(), String> {
-    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    run_status_command(root, program, &args, label, image_ref, progress)
 }
 
 fn emit_image_reference(
@@ -686,16 +663,17 @@ fn drain_command_lines(
 fn run_status_command(
     root: &Path,
     program: &str,
-    args: &[String],
+    args: &[&str],
     label: &str,
     image_ref: Option<&str>,
     progress: &mut Option<&mut dyn NodeImageProgressSink>,
 ) -> Result<(), String> {
+    let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
     eprintln!("mvp-node-image: {label}");
     if progress.is_none() {
         let status = Command::new(program)
             .current_dir(root)
-            .args(args)
+            .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -721,7 +699,7 @@ fn run_status_command(
     );
     let mut child = match Command::new(program)
         .current_dir(root)
-        .args(args)
+            .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

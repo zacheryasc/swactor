@@ -19,10 +19,6 @@ pub(crate) struct FrameArchive {
 }
 
 impl FrameArchive {
-    pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        Self::open_with_label(path, "datastream frame log")
-    }
-
     pub(crate) fn open_with_label(path: &Path, label: &'static str) -> Result<Self, String> {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()

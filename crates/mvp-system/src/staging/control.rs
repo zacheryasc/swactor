@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use crate::gguf_shard::StageShardPlan;
 use crate::run_plan::{GgufSource, TokenizerSource};

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 
@@ -179,11 +178,13 @@ impl Event {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct TraceBuilder {
     run_id: RunId,
     events: Vec<Event>,
 }
 
+#[cfg(test)]
 impl TraceBuilder {
     pub(crate) fn new(run_id: RunId) -> Self {
         Self {
@@ -473,6 +474,7 @@ impl TraceBuilder {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn requires_log_scraping(_events: &[Event]) -> bool {
     false
 }

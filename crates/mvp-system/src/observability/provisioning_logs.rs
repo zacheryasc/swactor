@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read};
 use std::thread::{self, JoinHandle};
@@ -14,12 +13,8 @@ use crate::provisioning::{
     NodeProvisionSpec, PluginObservation, PluginSink, ProvisionLogLine, ProvisionLogStream,
 };
 
-pub(crate) fn node_datastream_id(node_id: u64) -> String {
-    node_id.to_string()
-}
-
 pub(crate) fn node_stream_id(run_id: u64, node_id: u64) -> StreamId {
-    StreamId::new(NodeId::new(&node_datastream_id(node_id)), Lifetime(run_id))
+    StreamId::new(NodeId::new(&node_id.to_string()), Lifetime(run_id))
 }
 
 #[derive(Clone)]
@@ -44,10 +39,6 @@ impl BootstrapDatastreamBridge {
 
     pub(crate) fn spec(&self) -> &NodeProvisionSpec {
         &self.spec
-    }
-
-    pub(crate) fn stream_id(&self) -> StreamId {
-        node_stream_id(self.spec.run_id, self.spec.node_id)
     }
 
     pub(crate) fn observe_stdout_line(&self, line: impl Into<String>) {
@@ -185,6 +176,3 @@ pub(crate) fn parse_stdio_datastream_frame(
     })
 }
 
-pub(crate) fn bootstrap_log_channel(node_id: u64, stream: ProvisionLogStream) -> String {
-    mvp_provision_log_channel(node_id, stream)
-}

@@ -1792,8 +1792,8 @@ impl Config {
         }
     }
 
-    fn node_spec_env_keys(&self) -> Vec<&'static str> {
-        let mut keys = vec![
+    fn node_spec_env_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = vec![
             "MVP_RUN_ID",
             "MVP_LOGICAL_NODE_ID",
             "MVP_NODE_PROVIDER",
@@ -1804,90 +1804,18 @@ impl Config {
             "MVP_IROH_RELAY_MODE",
             MVP_IROH_ENDPOINT_ADDR_MASK_ENV,
             "MVP_PIPELINE_STAGES",
-        ];
-        if self.relay.url.is_some() {
-            keys.push(MVP_IROH_RELAY_URL_ENV);
-        }
-        if self.provider.as_str() == "docker" {
-            keys.push("MVP_DOCKER_GPUS");
-        }
-        if std::env::var_os("DEV").is_some() {
-            keys.push("DEV");
-        }
-        if local_tinygrad_worker_env(self.provider.as_str()).is_some() {
-            keys.push("MVP_TINYGRAD_WORKER");
-        }
-        for key in [
-            "MVP_CPU_LINE_PROFILE",
-            "MVP_CPU_LINE_PROFILE_INTERVAL_MS",
-            "MVP_TOKEN_PROGRESS_EVERY",
-            "CUDA_DEVICE_SCHEDULE",
-            "MVP_MODEL_CACHE_DIR",
-            "HF_TOKEN",
-        ] {
-            if std::env::var_os(key).is_some() {
-                keys.push(key);
-            }
-        }
-        match &self.gguf_source {
-            GgufSource::LocalPath(_) => keys.push("MVP_GGUF_LOCAL_PATH"),
-            GgufSource::HuggingFaceGguf { revision, .. } => {
-                keys.push("MVP_GGUF_REPO");
-                keys.push("MVP_GGUF_FILE");
-                if revision.is_some() {
-                    keys.push("MVP_GGUF_REVISION");
-                }
-            }
-        }
-        if matches!(self.tokenizer, TokenizerSource::LocalPath(_)) {
-            keys.push("MVP_TOKENIZER_LOCAL_PATH");
-        }
-        if self.max_context.is_some() {
-            keys.push("MVP_MAX_CONTEXT");
-        }
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        keys.extend(self.extra_worker_env().into_iter().map(|(k, _)| k));
         keys
     }
 
-    fn node_spec_for_stage(
-        &self,
-        coordinator: EndpointAddr,
-        orchestrator_actor: ActorAddress,
-        logical_node_id: u64,
-        stage_index: u32,
-    ) -> Result<NodeProvisionSpec, String> {
+    /// Conditional worker env pairs shared by `node_spec_env_keys` and `node_spec_for_stage`.
+    fn extra_worker_env(&self) -> Vec<(String, String)> {
         let provider_name = self.provider.as_str();
-        let mut env = vec![
-            ("MVP_RUN_ID".to_owned(), self.run_id.to_string()),
-            (
-                "MVP_LOGICAL_NODE_ID".to_owned(),
-                logical_node_id.to_string(),
-            ),
-            ("MVP_STAGE_INDEX".to_owned(), stage_index.to_string()),
-            (
-                "MVP_PIPELINE_STAGES".to_owned(),
-                self.pipeline_stages.to_string(),
-            ),
-            (
-                MVP_IROH_ENDPOINT_ADDR_MASK_ENV.to_owned(),
-                self.endpoint_addr_mask.as_str().to_owned(),
-            ),
-            ("MVP_NODE_PROVIDER".to_owned(), provider_name.to_owned()),
-            (
-                "MVP_COORDINATOR_ENDPOINT".to_owned(),
-                serde_json::to_string(&coordinator)
-                    .map_err(|e| format!("serialize coordinator endpoint: {e}"))?,
-            ),
-            (
-                "MVP_ORCHESTRATOR_ACTOR".to_owned(),
-                serde_json::to_string(&orchestrator_actor)
-                    .map_err(|e| format!("serialize orchestrator actor: {e}"))?,
-            ),
-            ("MVP_MODEL_ID".to_owned(), self.model_id.clone()),
-            (
-                "MVP_IROH_RELAY_MODE".to_owned(),
-                relay_mode_env_value(&self.relay.mode).to_owned(),
-            ),
-        ];
+        let mut env = Vec::new();
         if let Some(url) = &self.relay.url {
             env.push((MVP_IROH_RELAY_URL_ENV.to_owned(), url.clone()));
         }
@@ -1932,6 +1860,50 @@ impl Config {
         if let Some(max_context) = self.max_context {
             env.push(("MVP_MAX_CONTEXT".to_owned(), max_context.to_string()));
         }
+        env
+    }
+
+    fn node_spec_for_stage(
+        &self,
+        coordinator: EndpointAddr,
+        orchestrator_actor: ActorAddress,
+        logical_node_id: u64,
+        stage_index: u32,
+    ) -> Result<NodeProvisionSpec, String> {
+        let provider_name = self.provider.as_str();
+        let mut env = vec![
+            ("MVP_RUN_ID".to_owned(), self.run_id.to_string()),
+            (
+                "MVP_LOGICAL_NODE_ID".to_owned(),
+                logical_node_id.to_string(),
+            ),
+            ("MVP_STAGE_INDEX".to_owned(), stage_index.to_string()),
+            (
+                "MVP_PIPELINE_STAGES".to_owned(),
+                self.pipeline_stages.to_string(),
+            ),
+            (
+                MVP_IROH_ENDPOINT_ADDR_MASK_ENV.to_owned(),
+                self.endpoint_addr_mask.as_str().to_owned(),
+            ),
+            ("MVP_NODE_PROVIDER".to_owned(), provider_name.to_owned()),
+            (
+                "MVP_COORDINATOR_ENDPOINT".to_owned(),
+                serde_json::to_string(&coordinator)
+                    .map_err(|e| format!("serialize coordinator endpoint: {e}"))?,
+            ),
+            (
+                "MVP_ORCHESTRATOR_ACTOR".to_owned(),
+                serde_json::to_string(&orchestrator_actor)
+                    .map_err(|e| format!("serialize orchestrator actor: {e}"))?,
+            ),
+            ("MVP_MODEL_ID".to_owned(), self.model_id.clone()),
+            (
+                "MVP_IROH_RELAY_MODE".to_owned(),
+                relay_mode_env_value(&self.relay.mode).to_owned(),
+            ),
+        ];
+        env.extend(self.extra_worker_env());
         let args = match provider_name {
             "vastai" => self
                 .vastai
@@ -2956,8 +2928,8 @@ fn wait_for_runtime_readies(
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
             match observation {
-                PluginObservation::DatastreamFrame { .. } => {}
-                PluginObservation::ProviderLine { .. }
+                PluginObservation::DatastreamFrame { .. }
+                | PluginObservation::ProviderLine { .. }
                 | PluginObservation::StdoutLine { .. }
                 | PluginObservation::StderrLine { .. } => {}
                 PluginObservation::Failed { reason, .. } => return Err(reason),
@@ -3052,7 +3024,12 @@ fn wait_for_weights_loaded_count(
         }
         if last_resend.elapsed() >= Duration::from_secs(15) {
             resend_attempt += 1;
-            let pending = pending_pipeline_weight_load_stages(pipeline_plan, &loaded_stages);
+            let mut pending: Vec<&run_plan::StagePlan> = pipeline_plan
+                .stages
+                .iter()
+                .filter(|stage| !loaded_stages.contains(&stage.stage_index))
+                .collect();
+            pending.sort_by_key(|stage| stage.stage_index);
             if pending.is_empty() {
                 return Err(format!(
                     "missing unloaded pipeline weight stage; loaded {} of {expected_count}",
@@ -3127,8 +3104,8 @@ fn wait_for_weights_loaded_count(
                     );
                     return Err(reason);
                 }
-                PluginObservation::DatastreamFrame { .. } => {}
-                PluginObservation::ProviderLine { .. }
+                PluginObservation::DatastreamFrame { .. }
+                | PluginObservation::ProviderLine { .. }
                 | PluginObservation::StdoutLine { .. }
                 | PluginObservation::StderrLine { .. } => {}
             }
@@ -3164,19 +3141,6 @@ fn wait_for_weights_loaded_count(
         }
         thread::sleep(PUMP_INTERVAL);
     }
-}
-
-fn pending_pipeline_weight_load_stages<'a>(
-    pipeline_plan: &'a run_plan::RunPlan,
-    loaded_stages: &BTreeSet<u32>,
-) -> Vec<&'a run_plan::StagePlan> {
-    let mut pending = pipeline_plan
-        .stages
-        .iter()
-        .filter(|stage| !loaded_stages.contains(&stage.stage_index))
-        .collect::<Vec<_>>();
-    pending.sort_by_key(|stage| stage.stage_index);
-    pending
 }
 
 struct PipelineStageProvision<'a> {
@@ -3732,7 +3696,7 @@ impl OrchDatastream {
             producer,
             channels: BTreeMap::new(),
             channel_names: BTreeMap::new(),
-            archive: frame_log.map(FrameArchive::open).transpose()?,
+            archive: frame_log.map(|p| FrameArchive::open_with_label(p, "datastream frame log")).transpose()?
         };
         for name in [
             MVP_PROVISIONING_EVENTS,
@@ -4435,10 +4399,6 @@ impl PipelinePromptRuntime {
         })
     }
 
-    fn is_active(&self) -> bool {
-        self.active.is_some()
-    }
-
     fn note_progress(&mut self) {
         let now = Instant::now();
         self.last_progress_at = Some(now);
@@ -5026,7 +4986,7 @@ fn serve_prompts(
         if active.is_none()
             && pipeline_runtime
                 .as_ref()
-                .is_none_or(|pipeline| !pipeline.is_active())
+                .is_none_or(|pipeline| pipeline.active.is_none())
             && let Ok(work) = work_rx.try_recv()
         {
             let request = work.request;
@@ -5225,8 +5185,8 @@ fn drain_observations_with_exit(
             PluginObservation::Exited {
                 node_id, status, ..
             } => return Err(exit_message(node_id, status)),
-            PluginObservation::DatastreamFrame { .. } => {}
-            PluginObservation::ProviderLine { .. }
+            PluginObservation::DatastreamFrame { .. }
+            | PluginObservation::ProviderLine { .. }
             | PluginObservation::StdoutLine { .. }
             | PluginObservation::StderrLine { .. } => {}
         }

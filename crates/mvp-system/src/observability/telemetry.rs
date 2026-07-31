@@ -1,14 +1,11 @@
-#![allow(dead_code)]
 
 //! MVP-system-owned datastream channel records.
 
-use datastream::hardware::net::HostNetSample;
-use datastream::{ChannelRegistry, Record};
+use datastream::Record;
 use serde::{Deserialize, Serialize};
 
 use crate::observability::lifecycle as obs;
 use crate::provisioning::{self, ProvisionLogStream};
-use data_plane::arena::ArenaSample;
 
 /// Structured MVP lifecycle facts: run, node, stage, edge, ring, object, step, and worker events.
 pub(crate) const MVP_LIFECYCLE: &str = "mvp.lifecycle";
@@ -22,22 +19,6 @@ pub(crate) const MVP_PROVISIONING_LOGS: &str = "mvp.provisioning.logs";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MvpLifecycleRecord {
     pub event: obs::Event,
-}
-
-impl MvpLifecycleRecord {
-    pub(crate) fn new(event: obs::Event) -> Self {
-        Self { event }
-    }
-
-    pub(crate) fn kind(&self) -> obs::EventKind {
-        self.event.kind()
-    }
-}
-
-impl From<obs::Event> for MvpLifecycleRecord {
-    fn from(event: obs::Event) -> Self {
-        Self::new(event)
-    }
 }
 
 impl Record for MvpLifecycleRecord {
@@ -84,13 +65,3 @@ impl Record for MvpProvisionLogRecord {
     const CHANNEL: &'static str = MVP_PROVISIONING_LOGS;
 }
 
-/// Registry fragment for consumers that want typed MVP datastream decoding.
-pub(crate) fn channel_registry() -> ChannelRegistry {
-    let registry = ChannelRegistry::new()
-        .with_record::<MvpLifecycleRecord>()
-        .with_record::<MvpProvisionEventRecord>()
-        .with_record::<MvpProvisionLogRecord>()
-        .with_record::<HostNetSample>()
-        .with_record::<ArenaSample>();
-    registry
-}

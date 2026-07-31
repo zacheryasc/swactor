@@ -557,26 +557,75 @@ fn submit_sampler_sample_health(
     seq: u64,
     error: Option<&str>,
 ) {
-    match error {
-        Some(error) => submit_sampler_health(
-            producer,
-            health_channel,
-            context,
-            sampler,
-            sample_channel,
+    let (status, detail) = match error {
+        Some(error) => (
             "failed",
             json!({"state":"error","sample_seq":seq,"error":error}),
         ),
-        None => submit_sampler_health(
-            producer,
-            health_channel,
-            context,
-            sampler,
-            sample_channel,
+        None => (
             "ready",
             json!({"state":"sample_observed","sample_seq":seq}),
         ),
-    }
+    };
+    submit_sampler_health(
+        producer,
+        health_channel,
+        context,
+        sampler,
+        sample_channel,
+        status,
+        detail,
+    );
+}
+
+fn spawn_blocking_sampler<S: Record + Send + 'static>(
+    handle: tokio::runtime::Handle,
+    producer: DatastreamProducer,
+    channel: ChannelId,
+    health_channel: ChannelId,
+    health_context: SamplerHealthContext,
+    sampler: &'static str,
+    sample_channel: &'static str,
+    interval: Duration,
+    error_label: &'static str,
+    sample_fn: fn(u64) -> S,
+    error_fn: fn(u64, String) -> S,
+    error_of: fn(&S) -> Option<&str>,
+) {
+    handle.spawn(async move {
+        submit_sampler_started(
+            &producer,
+            health_channel,
+            health_context,
+            sampler,
+            sample_channel,
+            interval,
+        );
+        let mut seq = 0_u64;
+        let mut interval = tokio::time::interval(interval);
+
+        loop {
+            interval.tick().await;
+
+            let sample_seq = seq;
+            let sample = match tokio::task::spawn_blocking(move || sample_fn(sample_seq)).await {
+                Ok(sample) => sample,
+                Err(error) => error_fn(sample_seq, format!("{error_label}: {error}")),
+            };
+
+            submit_sampler_sample_health(
+                &producer,
+                health_channel,
+                health_context,
+                sampler,
+                sample_channel,
+                sample_seq,
+                error_of(&sample),
+            );
+            seq = seq.saturating_add(1);
+            producer.submit_record(channel, &sample);
+        }
+    });
 }
 
 fn spawn_host_gpu_sampler(
@@ -586,48 +635,20 @@ fn spawn_host_gpu_sampler(
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
 ) {
-    handle.spawn(async move {
-        let sample_channel = datastream::hardware::gpu::HOST_GPU_CHANNEL;
-        submit_sampler_started(
-            &producer,
-            health_channel,
-            health_context,
-            "gpu",
-            sample_channel,
-            datastream::hardware::gpu::GPU_SAMPLE_INTERVAL,
-        );
-        let mut seq = 0_u64;
-        let mut interval = tokio::time::interval(datastream::hardware::gpu::GPU_SAMPLE_INTERVAL);
-
-        loop {
-            interval.tick().await;
-
-            let sample_seq = seq;
-            let sample = match tokio::task::spawn_blocking(move || {
-                datastream::hardware::gpu::sample(sample_seq)
-            })
-            .await
-            {
-                Ok(sample) => sample,
-                Err(error) => datastream::hardware::gpu::HostGpuSample::error(
-                    sample_seq,
-                    format!("gpu sampler task failed: {error}"),
-                ),
-            };
-
-            submit_sampler_sample_health(
-                &producer,
-                health_channel,
-                health_context,
-                "gpu",
-                sample_channel,
-                sample_seq,
-                sample.error.as_deref(),
-            );
-            seq = seq.saturating_add(1);
-            producer.submit_record(channel, &sample);
-        }
-    });
+    spawn_blocking_sampler(
+        handle,
+        producer,
+        channel,
+        health_channel,
+        health_context,
+        "gpu",
+        datastream::hardware::gpu::HOST_GPU_CHANNEL,
+        datastream::hardware::gpu::GPU_SAMPLE_INTERVAL,
+        "gpu sampler task failed",
+        datastream::hardware::gpu::sample,
+        datastream::hardware::gpu::HostGpuSample::error,
+        |s| s.error.as_deref(),
+    );
 }
 
 fn spawn_host_cpu_sampler(
@@ -677,49 +698,20 @@ fn spawn_host_net_sampler(
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
 ) {
-    handle.spawn(async move {
-        let sample_channel = datastream::hardware::net::HOST_NET_CHANNEL;
-        submit_sampler_started(
-            &producer,
-            health_channel,
-            health_context,
-            "net",
-            sample_channel,
-            datastream::hardware::net::HOST_NET_SAMPLE_INTERVAL,
-        );
-        let mut seq = 0_u64;
-        let mut interval =
-            tokio::time::interval(datastream::hardware::net::HOST_NET_SAMPLE_INTERVAL);
-
-        loop {
-            interval.tick().await;
-
-            let sample_seq = seq;
-            let sample = match tokio::task::spawn_blocking(move || {
-                datastream::hardware::net::sample(sample_seq)
-            })
-            .await
-            {
-                Ok(sample) => sample,
-                Err(error) => datastream::hardware::net::HostNetSample::error(
-                    sample_seq,
-                    format!("network sampler task failed: {error}"),
-                ),
-            };
-
-            submit_sampler_sample_health(
-                &producer,
-                health_channel,
-                health_context,
-                "net",
-                sample_channel,
-                sample_seq,
-                sample.error.as_deref(),
-            );
-            seq = seq.saturating_add(1);
-            producer.submit_record(channel, &sample);
-        }
-    });
+    spawn_blocking_sampler(
+        handle,
+        producer,
+        channel,
+        health_channel,
+        health_context,
+        "net",
+        datastream::hardware::net::HOST_NET_CHANNEL,
+        datastream::hardware::net::HOST_NET_SAMPLE_INTERVAL,
+        "network sampler task failed",
+        datastream::hardware::net::sample,
+        datastream::hardware::net::HostNetSample::error,
+        |s| s.error.as_deref(),
+    );
 }
 
 fn spawn_arena_sampler(
@@ -857,7 +849,6 @@ impl WorkerEdgeRuntime {
                         driver,
                     )?;
                 }
-                EdgeTransportEvent::StreamEnded { .. } => {}
                 EdgeTransportEvent::StreamFault {
                     edge_id: Some(edge_id),
                     ..
@@ -873,7 +864,8 @@ impl WorkerEdgeRuntime {
                         driver,
                     )?;
                 }
-                EdgeTransportEvent::StreamFault { edge_id: None, .. } => {}
+                EdgeTransportEvent::StreamEnded { .. }
+                | EdgeTransportEvent::StreamFault { edge_id: None, .. } => {}
             }
         }
         Ok(())
@@ -1952,7 +1944,7 @@ fn run() -> Result<(), String> {
         datastream.channels.host_cpu,
         sampler_health_channel,
         sampler_health_context,
-        vec![std::process::id(), worker.pid()],
+        vec![std::process::id(), worker.child.id()],
     );
     worker_evt(
         "worker_initialize",
@@ -2032,7 +2024,7 @@ fn run() -> Result<(), String> {
         emit_swim_telemetry(&mut datastream, &stack, "main_loop");
         drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut datastream);
         datastream.tick();
-        worker.drain_stderr(&config, &mut datastream);
+        drain_worker_stderr(&worker.stderr_rx, &config, &mut datastream);
         edge_runtime.poll_iroh(
             &mut driver,
             &stack,
@@ -3171,15 +3163,6 @@ fn stop_stage_shard_child(child: &mut Option<Child>) {
     let _ = child.wait();
 }
 
-fn stage_shard_cache_path(plan: &StageShardPlan) -> PathBuf {
-    let root = std::env::var("MVP_MODEL_CACHE_DIR")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/var/cache/mvp-models"));
-    root.join(plan.cache_file_name())
-}
-
 fn spawn_stage_shard_reader<R: Read + Send + 'static>(
     stream: StageShardProcessStream,
     reader: R,
@@ -3251,7 +3234,12 @@ fn materialize_stage_shard_with_process(
     driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
 ) -> Result<PathBuf, String> {
-    let output_path = stage_shard_cache_path(plan);
+    let output_path = std::env::var("MVP_MODEL_CACHE_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/var/cache/mvp-models"))
+        .join(plan.cache_file_name());
     if output_path.is_file() {
         match validate_stage_shard_cache(&output_path, plan) {
             Ok(()) => {
@@ -3678,6 +3666,13 @@ fn run_self_test(
     Ok(())
 }
 
+fn env_optional(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Clone)]
 struct DeploymentConfig {
     run_id: u64,
@@ -4071,10 +4066,6 @@ impl TinygradWorker {
         })
     }
 
-    fn pid(&self) -> u32 {
-        self.child.id()
-    }
-
     fn initialize(
         &mut self,
         device: &str,
@@ -4402,10 +4393,6 @@ impl TinygradWorker {
             .map_err(|e| format!("poll tinygrad helper: {e}"))
     }
 
-    fn drain_stderr(&mut self, config: &DeploymentConfig, datastream: &mut NodeDatastream) {
-        drain_worker_stderr(&self.stderr_rx, config, datastream);
-    }
-
     fn command(
         &mut self,
         command: Value,
@@ -4511,11 +4498,4 @@ fn spawn_stdin_shutdown_listener() -> Receiver<()> {
         }
     });
     rx
-}
-
-fn env_optional(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
 }

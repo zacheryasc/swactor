@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 //! Relay provisioning shims for MVP runtimes.
 //!
@@ -56,27 +55,8 @@ pub(crate) trait RelayProvider: Send {
     fn provision_relay(&mut self, request: RelayProvisionRequest) -> Result<RelayLease, String>;
 
     fn relay_mode(&self, lease: &RelayLease) -> Result<RelayMode, String>;
-
-    fn release_relay(&mut self, _lease: RelayLease) -> Result<(), String> {
-        Ok(())
-    }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct LocalShimRelayProvider;
-
-impl RelayProvider for LocalShimRelayProvider {
-    fn provision_relay(&mut self, request: RelayProvisionRequest) -> Result<RelayLease, String> {
-        Ok(RelayLease {
-            id: RelayLeaseId(format!("local-shim:{}", request.run_id)),
-            endpoints: Vec::new(),
-        })
-    }
-
-    fn relay_mode(&self, _lease: &RelayLease) -> Result<RelayMode, String> {
-        Ok(RelayMode::Disabled)
-    }
-}
 
 #[derive(Clone, Debug)]
 pub(crate) struct StaticRelayProvider {
@@ -128,7 +108,7 @@ impl RelayProvider for StaticRelayProvider {
 }
 
 pub(crate) fn relay_runtime_config_from_env(run_id: u64) -> Result<RelayRuntimeConfig, String> {
-    let mode = relay_mode_setting_from_env();
+    let mode = env_optional(MVP_IROH_RELAY_MODE_ENV).map(|value| value.to_ascii_lowercase());
     let url = selected_relay_url_from_env();
     relay_runtime_config_from_settings(run_id, mode.as_deref(), url.as_deref())
 }
@@ -181,10 +161,6 @@ fn relay_runtime_config_from_optional_static_provider(
         mode,
         url: Some(provider.url()),
     })
-}
-
-fn relay_mode_setting_from_env() -> Option<String> {
-    env_optional(MVP_IROH_RELAY_MODE_ENV).map(|value| value.to_ascii_lowercase())
 }
 
 fn env_optional(name: &str) -> Option<String> {

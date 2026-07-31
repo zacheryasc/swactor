@@ -8,7 +8,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use datastream::DatastreamProducer;
-use serde::{Deserialize, Serialize};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeHandle};
 use swactor_vastai::{
@@ -517,7 +516,19 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
             label,
             lifecycle,
         ))?;
-        endpoint_from_parts(contract_id, endpoint.ip, endpoint.port, ssh_user)
+        let host = endpoint.ip;
+        let port = endpoint.port;
+        if host.is_empty() || host == "unknown" {
+            return Err(format!("vastai contract {contract_id} has no SSH host"));
+        }
+        if port == 0 {
+            return Err(format!("vastai contract {contract_id} has no SSH port"));
+        }
+        Ok(VastAiSshEndpoint {
+            host,
+            port,
+            user: ssh_user.to_owned(),
+        })
     }
 
     fn spawn_provider_monitor(
@@ -556,25 +567,6 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
     }
 }
 
-fn endpoint_from_parts(
-    contract_id: u64,
-    host: String,
-    port: u16,
-    ssh_user: &str,
-) -> Result<VastAiSshEndpoint, String> {
-    if host.is_empty() || host == "unknown" {
-        return Err(format!("vastai contract {contract_id} has no SSH host"));
-    }
-    if port == 0 {
-        return Err(format!("vastai contract {contract_id} has no SSH port"));
-    }
-    Ok(VastAiSshEndpoint {
-        host,
-        port,
-        user: ssh_user.to_owned(),
-    })
-}
-
 fn provider_terminal_start_error(
     contract_id: u64,
     actual: &str,
@@ -611,12 +603,6 @@ fn provider_status_message_has_terminal_failure(message: &str) -> bool {
         })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum BootstrapStopReason {
-    RuntimeReady,
-    NodeStop,
-}
-
 pub(crate) trait VastAiBootstrapLauncher: Send {
     type Handle: Send;
 
@@ -629,7 +615,7 @@ pub(crate) trait VastAiBootstrapLauncher: Send {
         lifecycle: LifecyclePolicy,
     ) -> Result<Self::Handle, String>;
 
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle, reason: BootstrapStopReason);
+    fn stop_bootstrap(&mut self, handle: &mut Self::Handle);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -672,7 +658,6 @@ struct SshBootstrapActor {
     backoff: Duration,
     observation_class: Option<&'static str>,
     stopped: bool,
-    start_on_boot: bool,
 }
 
 impl SshBootstrapActor {
@@ -698,7 +683,6 @@ impl SshBootstrapActor {
             backoff: Duration::from_secs(1),
             observation_class: None,
             stopped: false,
-            start_on_boot: true,
         }
     }
 
@@ -873,7 +857,7 @@ impl SshBootstrapActor {
             delay.as_secs(),
             self.attempt
         ));
-        self.backoff = next_ssh_backoff(self.backoff);
+        self.backoff = std::cmp::min(self.backoff.saturating_mul(2), Duration::from_secs(30));
         self.attempt = self.attempt.saturating_add(1);
         schedule_ssh_message(
             self.sender.clone(),
@@ -905,9 +889,7 @@ impl ActorInterface for SshBootstrapActor {
     type Response = ();
 
     fn on_start(&mut self, ctx: &Ctx) {
-        if self.start_on_boot {
-            let _ = ctx.send(ctx.self_addr(), SshBootstrapMsg::StartAttempt);
-        }
+        let _ = ctx.send(ctx.self_addr(), SshBootstrapMsg::StartAttempt);
     }
 
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
@@ -996,7 +978,7 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
         })
     }
 
-    fn stop_bootstrap(&mut self, handle: &mut Self::Handle, _reason: BootstrapStopReason) {
+    fn stop_bootstrap(&mut self, handle: &mut Self::Handle) {
         let _ = handle.runtime.send_to(handle.actor, SshBootstrapMsg::Stop);
         handle.runtime.tick();
     }
@@ -1123,8 +1105,12 @@ fn ssh_bootstrap_args(
     args
 }
 
-fn next_ssh_backoff(current: Duration) -> Duration {
-    std::cmp::min(current.saturating_mul(2), Duration::from_secs(30))
+fn emit_node_line(sink: &PluginSink, run_id: u64, node_id: u64, line: impl Into<String>) {
+    sink.observe(PluginObservation::ProviderLine {
+        run_id,
+        node_id,
+        line: line.into(),
+    });
 }
 
 pub(crate) struct VastAiProvisioningPlugin<C, B>
@@ -1253,54 +1239,33 @@ where
         }
         let stream_id = node_stream_id(spec.run_id, spec.node_id);
         let label = self.label_for(&spec);
-        sink.observe(PluginObservation::ProviderLine {
-            run_id: spec.run_id,
-            node_id: spec.node_id,
-            line: format!("vastai provisioning label={label} stream={stream_id}"),
-        });
+        emit_node_line(&sink, spec.run_id, spec.node_id, format!("vastai provisioning label={label} stream={stream_id}"));
 
         let request = self.build_request(&spec, label.clone());
         let instance = self.client.provision_one(request).map_err(|e| {
             classified_start_error(format!("vastai provision node {}: {e}", spec.node_id))
         })?;
-        sink.observe(PluginObservation::ProviderLine {
-            run_id: spec.run_id,
-            node_id: spec.node_id,
-            line: format!(
-                "vastai contract {} ready for SSH lookup",
-                instance.contract_id
-            ),
-        });
-        sink.observe(PluginObservation::ProviderLine {
-            run_id: spec.run_id,
-            node_id: spec.node_id,
-            line: serde_json::json!({
-                "type": "VastAiLeaseReady",
-                "run_id": spec.run_id,
-                "node_id": spec.node_id,
-                "label": &label,
-                "image": &spec.image,
-                "contract_id": instance.contract_id,
-                "offer_id": instance.offer_id,
-                "host_id": instance.host_id,
-                "gpu_name": &instance.gpu_name,
-                "gpu_ram": instance.gpu_ram,
-                "dph_total": instance.dph_total,
-            })
-            .to_string(),
-        });
-        sink.observe(PluginObservation::ProviderLine {
-            run_id: spec.run_id,
-            node_id: spec.node_id,
-            line: serde_json::json!({
-                "type": "VastAiSshEndpointDiscoveryStarted",
-                "run_id": spec.run_id,
-                "node_id": spec.node_id,
-                "contract_id": instance.contract_id,
-                "label": &label,
-            })
-            .to_string(),
-        });
+        emit_node_line(&sink, spec.run_id, spec.node_id, format!("vastai contract {} ready for SSH lookup", instance.contract_id));
+        emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+            "type": "VastAiLeaseReady",
+            "run_id": spec.run_id,
+            "node_id": spec.node_id,
+            "label": &label,
+            "image": &spec.image,
+            "contract_id": instance.contract_id,
+            "offer_id": instance.offer_id,
+            "host_id": instance.host_id,
+            "gpu_name": &instance.gpu_name,
+            "gpu_ram": instance.gpu_ram,
+            "dph_total": instance.dph_total,
+        }).to_string());
+        emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+            "type": "VastAiSshEndpointDiscoveryStarted",
+            "run_id": spec.run_id,
+            "node_id": spec.node_id,
+            "contract_id": instance.contract_id,
+            "label": &label,
+        }).to_string());
 
         let endpoint = match self.client.ssh_endpoint(
             instance.contract_id,
@@ -1322,35 +1287,25 @@ where
                 ));
             }
         };
-        sink.observe(PluginObservation::ProviderLine {
-            run_id: spec.run_id,
-            node_id: spec.node_id,
-            line: serde_json::json!({
-                "type": "VastAiSshEndpointReady",
-                "run_id": spec.run_id,
-                "node_id": spec.node_id,
-                "contract_id": instance.contract_id,
-                "host": &endpoint.host,
-                "port": endpoint.port,
-                "user": &endpoint.user,
-            })
-            .to_string(),
-        });
+        emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+            "type": "VastAiSshEndpointReady",
+            "run_id": spec.run_id,
+            "node_id": spec.node_id,
+            "contract_id": instance.contract_id,
+            "host": &endpoint.host,
+            "port": endpoint.port,
+            "user": &endpoint.user,
+        }).to_string());
 
-        sink.observe(PluginObservation::ProviderLine {
-            run_id: spec.run_id,
-            node_id: spec.node_id,
-            line: serde_json::json!({
-                "type": "VastAiBootstrapObservationStarted",
-                "run_id": spec.run_id,
-                "node_id": spec.node_id,
-                "contract_id": instance.contract_id,
-                "host": &endpoint.host,
-                "port": endpoint.port,
-                "user": &endpoint.user,
-            })
-            .to_string(),
-        });
+        emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+            "type": "VastAiBootstrapObservationStarted",
+            "run_id": spec.run_id,
+            "node_id": spec.node_id,
+            "contract_id": instance.contract_id,
+            "host": &endpoint.host,
+            "port": endpoint.port,
+            "user": &endpoint.user,
+        }).to_string());
 
         let bootstrap = match self.bootstrap.start_bootstrap(
             spec.clone(),
@@ -1433,11 +1388,7 @@ where
             }
             let stream_id = node_stream_id(spec.run_id, spec.node_id);
             let label = self.label_for(&spec);
-            sink.observe(PluginObservation::ProviderLine {
-                run_id: spec.run_id,
-                node_id: spec.node_id,
-                line: format!("vastai provisioning label={label} stream={stream_id}"),
-            });
+            emit_node_line(&sink, spec.run_id, spec.node_id, format!("vastai provisioning label={label} stream={stream_id}"));
             let request = self.build_request(&spec, label.clone());
             start_inputs.push((index, spec, label, request));
         }
@@ -1450,13 +1401,7 @@ where
             Ok(plan) => plan,
             Err(error) => {
                 for (_, spec, _, _) in &start_inputs {
-                    sink.observe(PluginObservation::ProviderLine {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        line: format!(
-                            "vastai first-wave offer planning failed; falling back to per-node selection: {error}"
-                        ),
-                    });
+                    emit_node_line(&sink, spec.run_id, spec.node_id, format!("vastai first-wave offer planning failed; falling back to per-node selection: {error}"));
                 }
                 vec![None; start_inputs.len()]
             }
@@ -1467,30 +1412,20 @@ where
         {
             request.preferred_offer_id = offer_plan.get(plan_index).copied().flatten();
             if let Some(offer_id) = request.preferred_offer_id {
-                sink.observe(PluginObservation::ProviderLine {
-                    run_id: spec.run_id,
-                    node_id: spec.node_id,
-                    line: serde_json::json!({
-                        "type": "VastAiFirstWaveOfferPlanned",
-                        "run_id": spec.run_id,
-                        "node_id": spec.node_id,
-                        "label": &label,
-                        "offer_id": offer_id,
-                    })
-                    .to_string(),
-                });
+                emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+                    "type": "VastAiFirstWaveOfferPlanned",
+                    "run_id": spec.run_id,
+                    "node_id": spec.node_id,
+                    "label": &label,
+                    "offer_id": offer_id,
+                }).to_string());
             } else {
-                sink.observe(PluginObservation::ProviderLine {
-                    run_id: spec.run_id,
-                    node_id: spec.node_id,
-                    line: serde_json::json!({
-                        "type": "VastAiFirstWaveOfferPlanUnavailable",
-                        "run_id": spec.run_id,
-                        "node_id": spec.node_id,
-                        "label": &label,
-                    })
-                    .to_string(),
-                });
+                emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+                    "type": "VastAiFirstWaveOfferPlanUnavailable",
+                    "run_id": spec.run_id,
+                    "node_id": spec.node_id,
+                    "label": &label,
+                }).to_string());
             }
             let mut client = self.client.clone();
             let config = self.config.clone();
@@ -1499,36 +1434,26 @@ where
             std::thread::spawn(move || {
                 let started = match client.provision_one(request) {
                     Ok(instance) => {
-                        worker_sink.observe(PluginObservation::ProviderLine {
-                            run_id: spec.run_id,
-                            node_id: spec.node_id,
-                            line: serde_json::json!({
-                                "type": "VastAiLeaseReady",
-                                "run_id": spec.run_id,
-                                "node_id": spec.node_id,
-                                "label": &label,
-                                "image": &spec.image,
-                                "contract_id": instance.contract_id,
-                                "offer_id": instance.offer_id,
-                                "host_id": instance.host_id,
-                                "gpu_name": &instance.gpu_name,
-                                "gpu_ram": instance.gpu_ram,
-                                "dph_total": instance.dph_total,
-                            })
-                            .to_string(),
-                        });
-                        worker_sink.observe(PluginObservation::ProviderLine {
-                            run_id: spec.run_id,
-                            node_id: spec.node_id,
-                            line: serde_json::json!({
-                                "type": "VastAiSshEndpointDiscoveryStarted",
-                                "run_id": spec.run_id,
-                                "node_id": spec.node_id,
-                                "contract_id": instance.contract_id,
-                                "label": &label,
-                            })
-                            .to_string(),
-                        });
+                        emit_node_line(&worker_sink, spec.run_id, spec.node_id, serde_json::json!({
+                            "type": "VastAiLeaseReady",
+                            "run_id": spec.run_id,
+                            "node_id": spec.node_id,
+                            "label": &label,
+                            "image": &spec.image,
+                            "contract_id": instance.contract_id,
+                            "offer_id": instance.offer_id,
+                            "host_id": instance.host_id,
+                            "gpu_name": &instance.gpu_name,
+                            "gpu_ram": instance.gpu_ram,
+                            "dph_total": instance.dph_total,
+                        }).to_string());
+                        emit_node_line(&worker_sink, spec.run_id, spec.node_id, serde_json::json!({
+                            "type": "VastAiSshEndpointDiscoveryStarted",
+                            "run_id": spec.run_id,
+                            "node_id": spec.node_id,
+                            "contract_id": instance.contract_id,
+                            "label": &label,
+                        }).to_string());
                         match client.ssh_endpoint(
                             instance.contract_id,
                             &label,
@@ -1575,34 +1500,24 @@ where
         for (index, spec, started) in completion_rx {
             match started {
                 Ok(started) => {
-                    sink.observe(PluginObservation::ProviderLine {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        line: serde_json::json!({
-                            "type": "VastAiSshEndpointReady",
-                            "run_id": spec.run_id,
-                            "node_id": spec.node_id,
-                            "contract_id": started.instance.contract_id,
-                            "host": &started.endpoint.host,
-                            "port": started.endpoint.port,
-                            "user": &started.endpoint.user,
-                        })
-                        .to_string(),
-                    });
-                    sink.observe(PluginObservation::ProviderLine {
-                        run_id: spec.run_id,
-                        node_id: spec.node_id,
-                        line: serde_json::json!({
-                            "type": "VastAiBootstrapObservationStarted",
-                            "run_id": spec.run_id,
-                            "node_id": spec.node_id,
-                            "contract_id": started.instance.contract_id,
-                            "host": &started.endpoint.host,
-                            "port": started.endpoint.port,
-                            "user": &started.endpoint.user,
-                        })
-                        .to_string(),
-                    });
+                    emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+                        "type": "VastAiSshEndpointReady",
+                        "run_id": spec.run_id,
+                        "node_id": spec.node_id,
+                        "contract_id": started.instance.contract_id,
+                        "host": &started.endpoint.host,
+                        "port": started.endpoint.port,
+                        "user": &started.endpoint.user,
+                    }).to_string());
+                    emit_node_line(&sink, spec.run_id, spec.node_id, serde_json::json!({
+                        "type": "VastAiBootstrapObservationStarted",
+                        "run_id": spec.run_id,
+                        "node_id": spec.node_id,
+                        "contract_id": started.instance.contract_id,
+                        "host": &started.endpoint.host,
+                        "port": started.endpoint.port,
+                        "user": &started.endpoint.user,
+                    }).to_string());
 
                     let bootstrap = match self.bootstrap.start_bootstrap(
                         spec.clone(),
@@ -1695,19 +1610,14 @@ where
         let Some(node) = self.nodes.get_mut(&handle.id) else {
             return Ok(());
         };
-        node.sink.observe(PluginObservation::ProviderLine {
-            run_id: node.run_id,
-            node_id: node.node_id,
-            line: serde_json::json!({
-                "type": "VastAiRuntimeReadyAccepted",
-                "run_id": node.run_id,
-                "node_id": node.node_id,
-                "label": &node.label,
-                "contract_id": node.contract_id,
-                "classification": "runtime_ready_over_provider_staleness",
-            })
-            .to_string(),
-        });
+        emit_node_line(&node.sink, node.run_id, node.node_id, serde_json::json!({
+            "type": "VastAiRuntimeReadyAccepted",
+            "run_id": node.run_id,
+            "node_id": node.node_id,
+            "label": &node.label,
+            "contract_id": node.contract_id,
+            "classification": "runtime_ready_over_provider_staleness",
+        }).to_string());
         Ok(())
     }
 
@@ -1722,24 +1632,18 @@ where
             self.leased_host_ids.remove(&host_id);
         }
         if let Some(mut bootstrap) = node.bootstrap.take() {
-            self.bootstrap
-                .stop_bootstrap(&mut bootstrap, BootstrapStopReason::NodeStop);
+            self.bootstrap.stop_bootstrap(&mut bootstrap);
         }
         let result = self.client.destroy_contract(node.contract_id);
-        node.sink.observe(PluginObservation::ProviderLine {
-            run_id: node.run_id,
-            node_id: node.node_id,
-            line: serde_json::json!({
-                "type": "VastAiContractCleanup",
-                "run_id": node.run_id,
-                "node_id": node.node_id,
-                "label": &node.label,
-                "contract_id": node.contract_id,
-                "result": if result.is_ok() { "ok" } else { "failed" },
-                "error": result.as_ref().err(),
-            })
-            .to_string(),
-        });
+        emit_node_line(&node.sink, node.run_id, node.node_id, serde_json::json!({
+            "type": "VastAiContractCleanup",
+            "run_id": node.run_id,
+            "node_id": node.node_id,
+            "label": &node.label,
+            "contract_id": node.contract_id,
+            "result": if result.is_ok() { "ok" } else { "failed" },
+            "error": result.as_ref().err(),
+        }).to_string());
         result
     }
 }
