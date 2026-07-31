@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 pub(crate) const MO01_HEADER_BYTES: u64 = 40;
 const TOKEN_ID_WIDTH_BYTES: u32 = 4;
@@ -126,13 +125,11 @@ pub(crate) enum RingDirection {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HostPinning {
     Pageable,
-    PinnedRequired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WakeCoalescing {
     PendingBit,
-    ReadySet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -169,15 +166,12 @@ pub(crate) enum ObjectKind {
     Token,
     Activation,
     Weight,
-    ModelShard,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShapeRule {
     TokenIds,
     ActivationRows { max_seq_len: u32, hidden_dim: u32 },
-    WeightTensor,
-    ModelShardBytes,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -298,7 +292,6 @@ pub(crate) enum PlanRejectionKind {
     DuplicateStageAssignment,
     MissingStage,
     InvalidStageCount,
-    EdgeEndpointMismatch,
     ModelStageLayoutMismatch,
     InvalidObjectSpec,
     UnsupportedShapeOrLayout,
@@ -439,7 +432,8 @@ pub(crate) fn plan_run(input: PlannerInput) -> Result<RunPlan, PlanRejection> {
     let mut stages = Vec::with_capacity(input.stage_count as usize);
     for placement in &placements {
         let stage_index = placement.stage_index;
-        let (start, end) = layer_range(input.model.num_layers, input.stage_count, stage_index);
+        let start = (u64::from(input.model.num_layers) * u64::from(stage_index) / u64::from(input.stage_count)) as u32;
+        let end = (u64::from(input.model.num_layers) * u64::from(stage_index + 1) / u64::from(input.stage_count)) as u32;
         let inbound_edge = if stage_index == 0 {
             token_in_edge
         } else {
@@ -510,7 +504,11 @@ pub(crate) fn derive_stage_provision(
         outbound: OutboundEdgeProvision {
             edge_id: outbound.edge_id,
             kind: outbound.kind,
-            consumer_node_id: endpoint_node_id(&outbound.consumer),
+            consumer_node_id: match &outbound.consumer {
+                EdgeEndpoint::Orchestrator { node_id } | EdgeEndpoint::Stage { node_id, .. } => {
+                    *node_id
+                }
+            },
             object_spec: outbound.object_spec,
             ring_spec: ring_spec_for_direction(outbound.ring_spec, RingDirection::Egress),
         },
@@ -605,18 +603,6 @@ fn model_plan(model: &ModelFacts) -> Result<GgufModelPlan, PlanRejection> {
 fn ring_spec_for_direction(mut spec: RingSpec, direction: RingDirection) -> RingSpec {
     spec.direction = direction;
     spec
-}
-
-fn layer_range(num_layers: u32, stage_count: u32, stage_index: u32) -> (u32, u32) {
-    let start = (u64::from(num_layers) * u64::from(stage_index) / u64::from(stage_count)) as u32;
-    let end = (u64::from(num_layers) * u64::from(stage_index + 1) / u64::from(stage_count)) as u32;
-    (start, end)
-}
-
-fn endpoint_node_id(endpoint: &EdgeEndpoint) -> NodeId {
-    match endpoint {
-        EdgeEndpoint::Orchestrator { node_id } | EdgeEndpoint::Stage { node_id, .. } => *node_id,
-    }
 }
 
 fn valid_ring(spec: RingSpec) -> bool {

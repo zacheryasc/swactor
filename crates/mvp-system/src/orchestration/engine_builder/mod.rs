@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 //! Pool-based engine/node builder primitives.
 //!

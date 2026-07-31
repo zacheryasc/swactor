@@ -6,8 +6,8 @@ use std::path::Path;
 use crate::gguf_common::{GgufValueType, read_integer_value, read_u32, read_u64};
 use crate::run_plan::{self, DTypeFamily, GgufSource, TokenizerSource};
 
-const GGUF_MAGIC: &[u8; 4] = b"GGUF";
-const SUPPORTED_GGUF_VERSION: u32 = 3;
+pub(crate) const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+pub(crate) const SUPPORTED_GGUF_VERSION: u32 = 3;
 const DEFAULT_EFFECTIVE_CONTEXT: u64 = 512;
 const MAX_METADATA_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_METADATA_KEY_BYTES: u64 = 1024 * 1024;
@@ -161,7 +161,7 @@ fn required_u32(map: &BTreeMap<String, u64>, key: &str, label: &str) -> Result<u
     u32::try_from(value).map_err(|_| format!("GGUF metadata {label} key {key} exceeds u32"))
 }
 
-fn skip_scalar<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Result<(), String> {
+pub(crate) fn skip_scalar<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Result<(), String> {
     match value_type {
         GgufValueType::String => skip_gguf_string(reader),
         GgufValueType::Array => skip_array(reader),
@@ -169,7 +169,7 @@ fn skip_scalar<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Res
     }
 }
 
-fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
+pub(crate) fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
     let element_type = GgufValueType::read(reader, "GGUF metadata value type")?;
     let len = read_u64(reader)?;
     match element_type {
@@ -195,7 +195,7 @@ fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
     }
 }
 
-fn read_gguf_string<R: Read + Seek>(reader: &mut R, max_len: u64) -> Result<String, String> {
+pub(crate) fn read_gguf_string<R: Read + Seek>(reader: &mut R, max_len: u64) -> Result<String, String> {
     let len = read_u64(reader)?;
     if len > max_len {
         return Err(format!(
@@ -211,12 +211,12 @@ fn read_gguf_string<R: Read + Seek>(reader: &mut R, max_len: u64) -> Result<Stri
     String::from_utf8(bytes).map_err(|e| format!("GGUF metadata string is not UTF-8: {e}"))
 }
 
-fn skip_gguf_string<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
+pub(crate) fn skip_gguf_string<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
     let len = read_u64(reader)?;
     skip_bytes(reader, len)
 }
 
-fn skip_bytes<R: Seek>(reader: &mut R, mut bytes: u64) -> Result<(), String> {
+pub(crate) fn skip_bytes<R: Seek>(reader: &mut R, mut bytes: u64) -> Result<(), String> {
     while bytes > 0 {
         let chunk = bytes.min(i64::MAX as u64);
         reader

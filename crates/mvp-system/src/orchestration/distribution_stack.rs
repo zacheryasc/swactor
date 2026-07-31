@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 //! MVP-system swactor distribution runtime wiring.
 //!
@@ -58,10 +57,6 @@ pub(crate) struct DistributionRuntimeStack {
 }
 
 impl DistributionRuntimeStack {
-    pub(crate) fn new(node_id: NodeId, config: DistributedNodeConfig) -> Self {
-        Self::new_with_codecs(node_id, config, |_| {})
-    }
-
     pub(crate) fn new_with_codecs(
         node_id: NodeId,
         config: DistributedNodeConfig,
@@ -208,16 +203,6 @@ impl DistributionRuntimeStack {
         let _ = self
             .runtime
             .send_to(self.actors.directory, DirectoryIn::Register(entry));
-    }
-
-    pub(crate) fn alive_count(&self) -> usize {
-        self.membership_mirror
-            .lock()
-            .expect("membership mirror poisoned")
-            .all_members()
-            .iter()
-            .filter(|entry| entry.state == MemberState::Alive)
-            .count()
     }
 
     pub(crate) fn member_state(&self, node_id: NodeId) -> Option<MemberState> {

@@ -228,9 +228,7 @@ impl OrchestratorActor {
                 run_id: core::RunId(run_id),
                 stage_index,
             }),
-            OrchestratorMsg::ObserveNodeRuntimeReady { .. } => {}
-            OrchestratorMsg::ObserveNodeRuntimeReadyAck { .. } => {}
-            OrchestratorMsg::ObserveWeightsReady { .. } => {}
+            OrchestratorMsg::ObserveNodeRuntimeReady { .. } | OrchestratorMsg::ObserveNodeRuntimeReadyAck { .. } | OrchestratorMsg::ObserveWeightsReady { .. } | OrchestratorMsg::Snapshot { .. } => {}
             OrchestratorMsg::ObserveTokenInEndpointReady => {
                 self.core.observe(core::RunEvent::TokenInEndpointReady)
             }
@@ -275,7 +273,6 @@ impl OrchestratorActor {
                 self.core.observe(core::RunEvent::TokenEndpointsStopped)
             }
             OrchestratorMsg::AdvanceTimeMs(delta) => self.core.advance_time_ms(delta),
-            OrchestratorMsg::Snapshot { .. } => {}
         }
     }
 

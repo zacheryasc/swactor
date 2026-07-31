@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RunId(pub(crate) u64);
@@ -279,7 +278,13 @@ impl OrchestratorRun {
     }
 
     fn stage_ready(&mut self, run_id: RunId, stage_index: u32) {
-        if run_id != self.config.run_id || !self.plan_has_stage(stage_index) {
+        if run_id != self.config.run_id
+            || !self.plan.as_ref().is_some_and(|plan| {
+                plan.stages
+                    .iter()
+                    .any(|stage| stage.stage_index == stage_index)
+            })
+        {
             self.fault(RunFaultReason::UnknownStageReady { stage_index });
             return;
         }
@@ -295,7 +300,13 @@ impl OrchestratorRun {
         if eos {
             self.complete();
         } else if (self.injected_sequences.len() as u64) < self.config.max_tokens {
-            self.inject_decode(sequence + 1, token_id, sequence);
+            self.inject(TokenObjectInjection {
+                sequence: sequence + 1,
+                payload: TokenObjectPayload::Decode {
+                    token_id,
+                    sampling: SamplingData { source_sequence: sequence },
+                },
+            });
         } else {
             self.complete();
         }
@@ -344,28 +355,21 @@ impl OrchestratorRun {
         if self.terminal || !self.provisioned || !self.injected_sequences.is_empty() {
             return;
         }
-        if self.token_in_ready && self.token_out_ready && self.all_stages_ready() {
-            self.inject_prompt(0);
+        if self.token_in_ready
+            && self.token_out_ready
+            && self.plan.as_ref().is_some_and(|plan| {
+                plan.stages
+                    .iter()
+                    .all(|stage| self.ready_stages.contains(&stage.stage_index))
+            })
+        {
+            self.inject(TokenObjectInjection {
+                sequence: 0,
+                payload: TokenObjectPayload::Prompt {
+                    tokens: self.config.prompt.clone(),
+                },
+            });
         }
-    }
-
-    fn inject_prompt(&mut self, sequence: u64) {
-        self.inject(TokenObjectInjection {
-            sequence,
-            payload: TokenObjectPayload::Prompt {
-                tokens: self.config.prompt.clone(),
-            },
-        });
-    }
-
-    fn inject_decode(&mut self, sequence: u64, token_id: u32, source_sequence: u64) {
-        self.inject(TokenObjectInjection {
-            sequence,
-            payload: TokenObjectPayload::Decode {
-                token_id,
-                sampling: SamplingData { source_sequence },
-            },
-        });
     }
 
     fn inject(&mut self, object: TokenObjectInjection) {
@@ -434,7 +438,11 @@ impl OrchestratorRun {
         if !self.teardown_started || !self.token_endpoints_stopped {
             return;
         }
-        if !self.all_stages_stopped() {
+        if !self.plan.as_ref().is_some_and(|plan| {
+            plan.stages
+                .iter()
+                .all(|stage| self.stopped_stages.contains(&stage.stage_index))
+        }) {
             return;
         }
         self.mark_torn_down();
@@ -450,29 +458,5 @@ impl OrchestratorRun {
                 run_id: self.config.run_id,
             });
         }
-    }
-
-    fn plan_has_stage(&self, stage_index: u32) -> bool {
-        self.plan.as_ref().is_some_and(|plan| {
-            plan.stages
-                .iter()
-                .any(|stage| stage.stage_index == stage_index)
-        })
-    }
-
-    fn all_stages_ready(&self) -> bool {
-        self.plan.as_ref().is_some_and(|plan| {
-            plan.stages
-                .iter()
-                .all(|stage| self.ready_stages.contains(&stage.stage_index))
-        })
-    }
-
-    fn all_stages_stopped(&self) -> bool {
-        self.plan.as_ref().is_some_and(|plan| {
-            plan.stages
-                .iter()
-                .all(|stage| self.stopped_stages.contains(&stage.stage_index))
-        })
     }
 }

@@ -1351,6 +1351,33 @@ struct InProcessOrch {
     cleaned: bool,
 }
 
+fn wait_for_rpc_ready(
+    rpc_addr: &str,
+    mut check_dead: impl FnMut() -> Result<(), String>,
+) -> Result<String, String> {
+    loop {
+        if STOP_REQUESTED.load(Ordering::SeqCst) {
+            return Err("interrupted before orchestrator became ready".to_owned());
+        }
+        match TcpStream::connect(rpc_addr) {
+            Ok(stream) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                return Ok(rpc_addr.to_owned());
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::AddrNotAvailable
+                ) => {}
+            Err(error) => return Err(format!("connect prompt RPC {rpc_addr}: {error}")),
+        }
+        check_dead()?;
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
 impl InProcessOrch {
     fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
         let args = config.orchestrator_cli_args(image_ref);
@@ -1366,24 +1393,7 @@ impl InProcessOrch {
     }
 
     fn wait_ready(&mut self, rpc_addr: String) -> Result<String, String> {
-        loop {
-            if STOP_REQUESTED.load(Ordering::SeqCst) {
-                return Err("interrupted before orchestrator became ready".to_owned());
-            }
-            match TcpStream::connect(&rpc_addr) {
-                Ok(stream) => {
-                    let _ = stream.shutdown(Shutdown::Both);
-                    return Ok(rpc_addr);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::AddrNotAvailable
-                    ) => {}
-                Err(error) => return Err(format!("connect prompt RPC {rpc_addr}: {error}")),
-            }
+        wait_for_rpc_ready(&rpc_addr, || {
             if let Some(result) = self.take_finished_result() {
                 let reason = match result {
                     Ok(()) => "completed successfully".to_owned(),
@@ -1393,8 +1403,8 @@ impl InProcessOrch {
                     "in-process orchestrator exited before prompt RPC ready: {reason}"
                 ));
             }
-            thread::sleep(Duration::from_millis(100));
-        }
+            Ok(())
+        })
     }
 
     fn shutdown(&mut self) {
@@ -1478,24 +1488,7 @@ impl OrchChild {
     }
 
     fn wait_ready(&mut self, rpc_addr: String) -> Result<String, String> {
-        loop {
-            if STOP_REQUESTED.load(Ordering::SeqCst) {
-                return Err("interrupted before orchestrator became ready".to_owned());
-            }
-            match TcpStream::connect(&rpc_addr) {
-                Ok(stream) => {
-                    let _ = stream.shutdown(Shutdown::Both);
-                    return Ok(rpc_addr);
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::ConnectionRefused
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::AddrNotAvailable
-                    ) => {}
-                Err(error) => return Err(format!("connect prompt RPC {rpc_addr}: {error}")),
-            }
+        wait_for_rpc_ready(&rpc_addr, || {
             if let Some(status) = self
                 .child
                 .try_wait()
@@ -1505,8 +1498,8 @@ impl OrchChild {
                     "orchestrator exited before prompt RPC ready: {status}"
                 ));
             }
-            thread::sleep(Duration::from_millis(100));
-        }
+            Ok(())
+        })
     }
 
     // The orchestrator shutdown spec is still pending. Replace this with the approved
@@ -1566,6 +1559,60 @@ fn signal_orch_process_group(child: &Child, signal: libc::c_int) -> io::Result<(
     }
 }
 
+fn ensure_binary_with_progress(
+    progress: &mut Option<&mut ChatDatastream>,
+    phase: &str,
+    mode: &str,
+    verbose: bool,
+    skip_rebuild: bool,
+    bin: &Path,
+    label: &str,
+    cargo_args: &[&str],
+) -> Result<(), String> {
+    let started = Instant::now();
+    emit_chat_progress(
+        progress,
+        CHAT_RUNTIME_CHANNEL,
+        phase,
+        "started",
+        if verbose {
+            json!({"mode": mode, "command_label": phase})
+        } else {
+            json!({"mode": mode})
+        },
+    );
+    match ensure_runtime_binary(skip_rebuild, bin, label, cargo_args) {
+        Ok(()) => {
+            emit_chat_progress(
+                progress,
+                CHAT_RUNTIME_CHANNEL,
+                phase,
+                "ready",
+                if verbose {
+                    json!({"mode": mode, "command_label": phase, "elapsed_ms": started.elapsed().as_millis()})
+                } else {
+                    json!({"mode": mode})
+                },
+            );
+            Ok(())
+        }
+        Err(error) => {
+            emit_chat_progress(
+                progress,
+                CHAT_RUNTIME_CHANNEL,
+                phase,
+                "failed",
+                if verbose {
+                    json!({"mode": mode, "command_label": phase, "elapsed_ms": started.elapsed().as_millis(), "error": error.as_str()})
+                } else {
+                    json!({"mode": mode, "error": error.as_str()})
+                },
+            );
+            Err(error)
+        }
+    }
+}
+
 fn prepare_runtime_with_progress<F>(
     config: &Config,
     mut prepare_node_image_fn: F,
@@ -1596,15 +1643,11 @@ where
             json!({"mode": config.orchestrator_launch_mode()}),
         );
     } else {
-        let ensure_orch_started = Instant::now();
-        emit_chat_progress(
+        ensure_binary_with_progress(
             &mut progress,
-            CHAT_RUNTIME_CHANNEL,
             "ensure_orch_binary",
-            "started",
-            json!({"mode": binary_mode, "command_label": "ensure_orch_binary"}),
-        );
-        match ensure_runtime_binary(
+            binary_mode,
+            true,
             config.skip_rebuild,
             &config.orch_bin,
             "mvp-orchestrator",
@@ -1618,36 +1661,15 @@ where
                 "--bin",
                 "mvp-orchestrator",
             ],
-        ) {
-            Ok(()) => emit_chat_progress(
-                &mut progress,
-                CHAT_RUNTIME_CHANNEL,
-                "ensure_orch_binary",
-                "ready",
-                json!({"mode": binary_mode, "command_label": "ensure_orch_binary", "elapsed_ms": ensure_orch_started.elapsed().as_millis()}),
-            ),
-            Err(error) => {
-                emit_chat_progress(
-                    &mut progress,
-                    CHAT_RUNTIME_CHANNEL,
-                    "ensure_orch_binary",
-                    "failed",
-                    json!({"mode": binary_mode, "command_label": "ensure_orch_binary", "elapsed_ms": ensure_orch_started.elapsed().as_millis(), "error": error.as_str()}),
-                );
-                return Err(error);
-            }
-        }
+        )?;
     }
 
     if config.provider == provider_kind::process() {
-        emit_chat_progress(
+        ensure_binary_with_progress(
             &mut progress,
-            CHAT_RUNTIME_CHANNEL,
             "ensure_worker_binary",
-            "started",
-            json!({"mode": binary_mode}),
-        );
-        match ensure_runtime_binary(
+            binary_mode,
+            false,
             config.skip_rebuild,
             &config.worker_bin,
             "mvp-worker-node",
@@ -1659,25 +1681,7 @@ where
                 "--bin",
                 "mvp-worker-node",
             ],
-        ) {
-            Ok(()) => emit_chat_progress(
-                &mut progress,
-                CHAT_RUNTIME_CHANNEL,
-                "ensure_worker_binary",
-                "ready",
-                json!({"mode": binary_mode}),
-            ),
-            Err(error) => {
-                emit_chat_progress(
-                    &mut progress,
-                    CHAT_RUNTIME_CHANNEL,
-                    "ensure_worker_binary",
-                    "failed",
-                    json!({"mode": binary_mode, "error": error.as_str()}),
-                );
-                return Err(error);
-            }
-        }
+        )?;
         emit_chat_progress(
             &mut progress,
             CHAT_RUNTIME_CHANNEL,
@@ -1706,15 +1710,11 @@ where
             );
             return Ok(config.node_image.clone());
         }
-        let ensure_worker_started = Instant::now();
-        emit_chat_progress(
+        ensure_binary_with_progress(
             &mut progress,
-            CHAT_RUNTIME_CHANNEL,
             "ensure_worker_binary",
-            "started",
-            json!({"mode": binary_mode, "command_label": "ensure_worker_binary"}),
-        );
-        match ensure_runtime_binary(
+            binary_mode,
+            true,
             config.skip_rebuild,
             &config.worker_bin,
             "mvp-worker-node",
@@ -1726,25 +1726,7 @@ where
                 "--bin",
                 "mvp-worker-node",
             ],
-        ) {
-            Ok(()) => emit_chat_progress(
-                &mut progress,
-                CHAT_RUNTIME_CHANNEL,
-                "ensure_worker_binary",
-                "ready",
-                json!({"mode": binary_mode, "command_label": "ensure_worker_binary", "elapsed_ms": ensure_worker_started.elapsed().as_millis()}),
-            ),
-            Err(error) => {
-                emit_chat_progress(
-                    &mut progress,
-                    CHAT_RUNTIME_CHANNEL,
-                    "ensure_worker_binary",
-                    "failed",
-                    json!({"mode": binary_mode, "command_label": "ensure_worker_binary", "elapsed_ms": ensure_worker_started.elapsed().as_millis(), "error": error.as_str()}),
-                );
-                return Err(error);
-            }
-        }
+        )?;
         emit_chat_progress(
             &mut progress,
             CHAT_RUNTIME_CHANNEL,
@@ -1764,25 +1746,7 @@ where
         json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "image_tag": config.image_tag.as_deref()}),
     );
     let node_bin = default_worker_bin();
-    let requires_registry_image = if config.provider == provider_kind::docker() {
-        false
-    } else if config.provider == provider_kind::vastai() {
-        true
-    } else {
-        let error = if config.provider == provider_kind::process() {
-            "process provider does not use node images"
-        } else {
-            "mvp-chat does not support mock provider"
-        };
-        emit_chat_progress(
-            &mut progress,
-            CHAT_RUNTIME_CHANNEL,
-            "prepare_node_image",
-            "failed",
-            json!({"provider": config.provider.as_str(), "command_label": "prepare_node_image", "elapsed_ms": prepare_node_image_started.elapsed().as_millis(), "error": error}),
-        );
-        return Err(error.to_owned());
-    };
+    let requires_registry_image = config.provider == provider_kind::vastai();
     let prepared = {
         let command_progress = progress
             .as_deref_mut()
@@ -1905,10 +1869,6 @@ fn emit_chat_progress(
     }
 }
 
-fn prompt_hash_hex(prompt: &str) -> String {
-    blake3::hash(prompt.as_bytes()).to_hex().to_string()
-}
-
 fn run_chat_session_with_output_and_progress(
     writer: &mut impl Write,
     mut reader: impl BufRead,
@@ -1920,16 +1880,11 @@ fn run_chat_session_with_output_and_progress(
     let mut progress = progress;
     let mut next_request_id = 1_u64;
     let mut next_prompt_index = 1_u64;
+    let prompt_exited = |progress: &mut Option<&mut ChatDatastream>, reason: &str| emit_chat_progress(progress, CHAT_PROMPT_CHANNEL, "prompt_loop", "exited", json!({"reason": reason}));
 
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {
-            emit_chat_progress(
-                &mut progress,
-                CHAT_PROMPT_CHANNEL,
-                "prompt_loop",
-                "exited",
-                json!({"reason": "stop_requested"}),
-            );
+            prompt_exited(&mut progress, "stop_requested");
             return Ok(());
         }
         emit_chat_progress(
@@ -1944,23 +1899,11 @@ fn run_chat_session_with_output_and_progress(
         let prompt = match input_rx.recv() {
             Ok(PromptInput::Line(line)) => line.trim_end().to_owned(),
             Ok(PromptInput::Closed) | Err(_) => {
-                emit_chat_progress(
-                    &mut progress,
-                    CHAT_PROMPT_CHANNEL,
-                    "prompt_loop",
-                    "exited",
-                    json!({"reason": "input_closed"}),
-                );
+                prompt_exited(&mut progress, "input_closed");
                 return Ok(());
             }
             Ok(PromptInput::StopRequested) => {
-                emit_chat_progress(
-                    &mut progress,
-                    CHAT_PROMPT_CHANNEL,
-                    "prompt_loop",
-                    "exited",
-                    json!({"reason": "stop_requested"}),
-                );
+                prompt_exited(&mut progress, "stop_requested");
                 return Ok(());
             }
         };
@@ -1972,7 +1915,7 @@ fn run_chat_session_with_output_and_progress(
         next_request_id = next_request_id.wrapping_add(1).max(1);
         let prompt_index = next_prompt_index;
         next_prompt_index = next_prompt_index.wrapping_add(1).max(1);
-        let prompt_hash = prompt_hash_hex(&prompt);
+        let prompt_hash = blake3::hash(prompt.as_bytes()).to_hex().to_string();
         emit_chat_progress(
             &mut progress,
             CHAT_PROMPT_CHANNEL,
@@ -2000,13 +1943,7 @@ fn run_chat_session_with_output_and_progress(
 
         loop {
             if STOP_REQUESTED.load(Ordering::SeqCst) {
-                emit_chat_progress(
-                    &mut progress,
-                    CHAT_PROMPT_CHANNEL,
-                    "prompt_loop",
-                    "exited",
-                    json!({"reason": "stop_requested"}),
-                );
+                prompt_exited(&mut progress, "stop_requested");
                 return Ok(());
             }
             let mut line = String::new();
@@ -2269,16 +2206,6 @@ fn provider_from_sources(
     Ok(provider_kind::process())
 }
 
-fn env_flag(name: &str, default: bool) -> bool {
-    match env_optional(name) {
-        Some(value) => !matches!(
-            value.to_ascii_lowercase().as_str(),
-            "0" | "false" | "no" | "off"
-        ),
-        None => default,
-    }
-}
-
 fn env_optional(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -2300,6 +2227,16 @@ where
     value
         .parse::<T>()
         .map_err(|e| format!("invalid {name}={value:?}: {e}"))
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match env_optional(name) {
+        Some(value) => !matches!(
+            value.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        None => default,
+    }
 }
 
 fn parse_pipeline_stages_value(

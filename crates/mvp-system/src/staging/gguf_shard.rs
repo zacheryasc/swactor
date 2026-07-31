@@ -1,14 +1,13 @@
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::gguf_common::{GgufValueType, read_integer_value, read_u32, read_u64};
 use serde::{Deserialize, Serialize};
 
 use crate::run_plan::GgufSource;
+use crate::staging::gguf_metadata::{skip_scalar as skip_value, read_gguf_string, GGUF_MAGIC, SUPPORTED_GGUF_VERSION};
 
-const GGUF_MAGIC: &[u8; 4] = b"GGUF";
-const SUPPORTED_GGUF_VERSION: u32 = 3;
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_STRING_BYTES: u64 = 64 * 1024 * 1024;
 const STAGE_SHARD_CACHE_FORMAT_VERSION: &str = "stage-shard-cache-v2";
@@ -65,20 +64,9 @@ impl StageShardPlan {
         format!("{}.stage-{:05}.gguf", self.cache_key, self.stage_index)
     }
 
-    pub(crate) fn source_url(&self) -> Result<String, String> {
-        source_url(&self.source)
-    }
-
-    pub(crate) fn planned_tensor_fetch_bytes(&self) -> u64 {
-        self.merged_tensor_ranges
-            .iter()
-            .map(|range| range.len)
-            .sum()
-    }
-
     pub(crate) fn planned_fetch_bytes(&self) -> u64 {
         self.metadata_end
-            .saturating_add(self.planned_tensor_fetch_bytes())
+            .saturating_add(self.merged_tensor_ranges.iter().map(|r| r.len).sum())
     }
 
     pub(crate) fn planned_range_count(&self) -> usize {
@@ -216,19 +204,12 @@ pub(crate) fn source_url(source: &GgufSource) -> Result<String, String> {
         } => Ok(format!(
             "https://huggingface.co/{repo}/resolve/{}/{}",
             revision.as_deref().unwrap_or("main"),
-            encode_hf_path(file)
+            file.split('/').map(percent_encode_path_segment).collect::<Vec<_>>().join("/")
         )),
         GgufSource::LocalPath(path) => Err(format!(
             "stage shard range fetching requires a remote Hugging Face source; got local path {path:?}"
         )),
     }
-}
-
-fn encode_hf_path(path: &str) -> String {
-    path.split('/')
-        .map(percent_encode_path_segment)
-        .collect::<Vec<_>>()
-        .join("/")
 }
 
 fn percent_encode_path_segment(segment: &str) -> String {
@@ -477,7 +458,7 @@ pub(crate) fn materialize_stage_shard_http<F>(
 where
     F: FnMut(serde_json::Value),
 {
-    let url = plan.source_url()?;
+    let url = source_url(&plan.source)?;
     materialize_stage_shard_from_url(plan, &url, output_path, emit)
 }
 
@@ -796,66 +777,6 @@ fn pad_writer_to_alignment<W: Write + Seek>(writer: &mut W, alignment: u64) -> R
             .write_all(&[0])
             .map_err(|e| format!("write alignment padding: {e}"))?;
     }
-    Ok(())
-}
-
-fn skip_value<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Result<(), String> {
-    match value_type {
-        GgufValueType::String => skip_gguf_string(reader),
-        GgufValueType::Array => skip_array(reader),
-        scalar => skip_bytes(reader, scalar.fixed_width().expect("scalar width")),
-    }
-}
-
-fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
-    let element_type = GgufValueType::read(reader, "GGUF value type")?;
-    let len = read_u64(reader)?;
-    match element_type {
-        GgufValueType::String => {
-            for _ in 0..len {
-                skip_gguf_string(reader)?;
-            }
-            Ok(())
-        }
-        GgufValueType::Array => {
-            for _ in 0..len {
-                skip_array(reader)?;
-            }
-            Ok(())
-        }
-        scalar => {
-            let width = scalar.fixed_width().expect("scalar array width");
-            let bytes = width
-                .checked_mul(len)
-                .ok_or_else(|| "GGUF array byte count overflow".to_owned())?;
-            skip_bytes(reader, bytes)
-        }
-    }
-}
-
-fn read_gguf_string<R: Read>(reader: &mut R, max_len: u64) -> Result<String, String> {
-    let len = read_u64(reader)?;
-    if len > max_len {
-        return Err(format!("GGUF string length {len} exceeds {max_len}"));
-    }
-    let len = usize::try_from(len).map_err(|_| "GGUF string length exceeds usize".to_owned())?;
-    let mut bytes = vec![0_u8; len];
-    reader
-        .read_exact(&mut bytes)
-        .map_err(|e| format!("read GGUF string: {e}"))?;
-    String::from_utf8(bytes).map_err(|e| format!("GGUF string is not UTF-8: {e}"))
-}
-
-fn skip_gguf_string<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
-    let len = read_u64(reader)?;
-    skip_bytes(reader, len)
-}
-
-fn skip_bytes<R: Seek>(reader: &mut R, bytes: u64) -> Result<(), String> {
-    let offset = i64::try_from(bytes).map_err(|_| format!("cannot seek over {bytes} bytes"))?;
-    reader
-        .seek(SeekFrom::Current(offset))
-        .map_err(|e| format!("skip bytes: {e}"))?;
     Ok(())
 }
 
