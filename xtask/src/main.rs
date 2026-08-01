@@ -18,23 +18,23 @@ struct TestStep {
     args: &'static [&'static str],
 }
 
-const MVP_CHAT_CHECK_TIMEOUT_SECS: u64 = 3_600;
-const MVP_CHAT_CHECK_POLL_MS: u64 = 100;
-const MVP_CHAT_CHECK_TERM_GRACE_MS: u64 = 30_000;
-const MVP_CHAT_CHECK_PROMPTS: &[u8] = b"ping\nsecond prompt\n";
+const MYELIN_CHAT_CHECK_TIMEOUT_SECS: u64 = 3_600;
+const MYELIN_CHAT_CHECK_POLL_MS: u64 = 100;
+const MYELIN_CHAT_CHECK_TERM_GRACE_MS: u64 = 30_000;
+const MYELIN_CHAT_CHECK_PROMPTS: &[u8] = b"ping\nsecond prompt\n";
 const DATA_PATH_MIN_PAYLOAD_BYTES: u64 = 512;
-const MVP_CHAT_CARGO_RUN_ARGS: &[&str] = &[
+const MYELIN_CHAT_CARGO_RUN_ARGS: &[&str] = &[
     "run",
     "--package",
-    "mvp-system",
+    "myelin",
     "--features",
     "dashboard",
     "--bin",
-    "mvp-chat",
+    "myelin-chat",
     "--",
 ];
 
-struct MvpChatCheckPaths {
+struct MyelinChatCheckPaths {
     root: PathBuf,
     dump_log: PathBuf,
     stdout: PathBuf,
@@ -46,7 +46,7 @@ struct MvpChatCheckPaths {
     benchmark_gaps: PathBuf,
 }
 
-struct MvpChatCheckOutput {
+struct MyelinChatCheckOutput {
     status: ExitStatus,
     child_elapsed_ms: u64,
     stdout: String,
@@ -56,7 +56,7 @@ struct MvpChatCheckOutput {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MvpChatCheckScenario {
+enum MyelinChatCheckScenario {
     ProcessBaseline,
     Gpu,
     Multinode,
@@ -65,21 +65,21 @@ enum MvpChatCheckScenario {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct MvpChatCheckInvocation {
-    scenario: MvpChatCheckScenario,
+struct MyelinChatCheckInvocation {
+    scenario: MyelinChatCheckScenario,
     pipeline_stages: Option<u32>,
 }
 
-impl MvpChatCheckInvocation {
+impl MyelinChatCheckInvocation {
     fn parse_args(args: Vec<String>) -> Result<Self, String> {
-        let mut scenario = MvpChatCheckScenario::ProcessBaseline;
+        let mut scenario = MyelinChatCheckScenario::ProcessBaseline;
         let mut pipeline_stages = None;
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
-            if let Some(selected) = MvpChatCheckScenario::from_flag(&arg) {
-                if scenario != MvpChatCheckScenario::ProcessBaseline {
+            if let Some(selected) = MyelinChatCheckScenario::from_flag(&arg) {
+                if scenario != MyelinChatCheckScenario::ProcessBaseline {
                     return Err(
-                        "mvp-chat-check accepts at most one scenario flag: --gpu, --multinode, --multinode-docker, or --vastai"
+                        "myelin-chat-check accepts at most one scenario flag: --gpu, --multinode, --multinode-docker, or --vastai"
                             .to_owned(),
                     );
                 }
@@ -91,7 +91,7 @@ impl MvpChatCheckInvocation {
                 "--pipeline-stages" | "--pipeline-parallel" => {
                     if pipeline_stages.is_some() {
                         return Err(
-                            "mvp-chat-check accepts at most one pipeline stage count".to_owned()
+                            "myelin-chat-check accepts at most one pipeline stage count".to_owned()
                         );
                     }
                     let value = args
@@ -105,7 +105,7 @@ impl MvpChatCheckInvocation {
                     }
                     pipeline_stages = Some(stages);
                 }
-                other => return Err(format!("unsupported mvp-chat-check argument {other:?}")),
+                other => return Err(format!("unsupported myelin-chat-check argument {other:?}")),
             }
         }
         Ok(Self {
@@ -114,7 +114,7 @@ impl MvpChatCheckInvocation {
         })
     }
 
-    fn scenario(&self) -> MvpChatCheckScenario {
+    fn scenario(&self) -> MyelinChatCheckScenario {
         self.scenario
     }
 
@@ -122,19 +122,19 @@ impl MvpChatCheckInvocation {
         self.scenario.name()
     }
 
-    fn mvp_chat_args(&self, run_id: u64, dump_log: &Path) -> Vec<String> {
+    fn myelin_chat_args(&self, run_id: u64, dump_log: &Path) -> Vec<String> {
         let mut args = Vec::new();
         match self.scenario {
-            MvpChatCheckScenario::ProcessBaseline | MvpChatCheckScenario::Multinode => {
+            MyelinChatCheckScenario::ProcessBaseline | MyelinChatCheckScenario::Multinode => {
                 args.push("--process".to_owned());
             }
-            MvpChatCheckScenario::Gpu => {
+            MyelinChatCheckScenario::Gpu => {
                 args.extend(["--process".to_owned(), "--gpu".to_owned()]);
             }
-            MvpChatCheckScenario::MultinodeDocker => {
+            MyelinChatCheckScenario::MultinodeDocker => {
                 args.push("--docker".to_owned());
             }
-            MvpChatCheckScenario::VastAi => {
+            MyelinChatCheckScenario::VastAi => {
                 args.push("--vastai".to_owned());
             }
         }
@@ -144,10 +144,10 @@ impl MvpChatCheckInvocation {
         {
             args.extend(["--pipeline-stages".to_owned(), pipeline_stages.to_string()]);
         }
-        if !matches!(self.scenario, MvpChatCheckScenario::Gpu) {
+        if !matches!(self.scenario, MyelinChatCheckScenario::Gpu) {
             args.push("--cached-model".to_owned());
         }
-        if matches!(self.scenario, MvpChatCheckScenario::VastAi) {
+        if matches!(self.scenario, MyelinChatCheckScenario::VastAi) {
             args.extend([
                 "--yes".to_owned(),
                 "--endpoint-addr-mask".to_owned(),
@@ -167,7 +167,7 @@ impl MvpChatCheckInvocation {
     }
 }
 
-impl MvpChatCheckScenario {
+impl MyelinChatCheckScenario {
     fn from_flag(flag: &str) -> Option<Self> {
         match flag {
             "--gpu" => Some(Self::Gpu),
@@ -224,8 +224,8 @@ const BASIC_TESTS: &[TestStep] = &[
         args: &["test", "-p", "iroh-driver"],
     },
     TestStep {
-        label: "mvp-system",
-        args: &["test", "-p", "mvp-system"],
+        label: "myelin",
+        args: &["test", "-p", "myelin"],
     },
     TestStep {
         label: "swactor-process",
@@ -261,18 +261,18 @@ fn print_usage() {
 USAGE: cargo xtask <command>
 
 COMMANDS:
-  mvp-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n|--pipeline-parallel n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
-  mvp-chat-check [--gpu|--multinode|--multinode-docker|--vastai] [--pipeline-stages n|--pipeline-parallel n]
-                     Run real cargo mvp-chat acceptance check and write benchmark artifacts.
-  mvp-chat-compare <baseline-summary.json> <candidate-summary.json>
+  myelin-chat [--gpu] [--process|--docker|--vastai] [--pipeline-stages n|--pipeline-parallel n] [--cached-model] [-- args...]  Run the human chat wrapper against the real orchestrator/worker bins.
+  myelin-chat-check [--gpu|--multinode|--multinode-docker|--vastai] [--pipeline-stages n|--pipeline-parallel n]
+                     Run real cargo myelin-chat acceptance check and write benchmark artifacts.
+  myelin-chat-compare <baseline-summary.json> <candidate-summary.json>
                      Compare two benchmark summaries and report comparable deltas.
   test                Run the basic non-binding test barrier: root crate plus each
                       non-binding repository package with `cargo test -p`."
     );
 }
 
-const MVP_CHAT_USAGE: &str = "\
-USAGE: cargo mvp-chat [OPTIONS]
+const MYELIN_CHAT_USAGE: &str = "\
+USAGE: cargo myelin-chat [OPTIONS]
 
 OPTIONS:
   --gpu                         Run the local GPU path: in-process orchestrator plus DEV=CUDA worker selection
@@ -287,11 +287,11 @@ OPTIONS:
   --yes, -y                     Approve Vast.ai lease prompts
   --help, -h                    Print this help";
 
-fn print_mvp_chat_usage() {
-    println!("{MVP_CHAT_USAGE}");
+fn print_myelin_chat_usage() {
+    println!("{MYELIN_CHAT_USAGE}");
 }
 
-fn is_mvp_chat_help_request(args: &[String]) -> bool {
+fn is_myelin_chat_help_request(args: &[String]) -> bool {
     args.iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h" | "help"))
 }
@@ -312,7 +312,7 @@ fn run_step(step: &TestStep) -> bool {
 
 fn run_tests() -> ExitCode {
     let start = Instant::now();
-    let check = run_mvp_chat_check(Vec::new());
+    let check = run_myelin_chat_check(Vec::new());
     if check != ExitCode::SUCCESS {
         return check;
     }
@@ -335,34 +335,34 @@ fn run_tests() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn run_mvp_chat(args: Vec<String>) -> ExitCode {
+fn run_myelin_chat(args: Vec<String>) -> ExitCode {
     let forwarded = if args.first().is_some_and(|arg| arg == "--") {
         args[1..].to_vec()
     } else {
         args
     };
-    if is_mvp_chat_help_request(&forwarded) {
-        print_mvp_chat_usage();
+    if is_myelin_chat_help_request(&forwarded) {
+        print_myelin_chat_usage();
         return ExitCode::SUCCESS;
     }
     let mut command = Command::new(cargo_bin());
-    command.args(MVP_CHAT_CARGO_RUN_ARGS);
-    let dump_log_path = explicit_dump_log_path_from_mvp_chat_args(&forwarded);
-    let run_id = run_id_from_mvp_chat_args(&forwarded);
+    command.args(MYELIN_CHAT_CARGO_RUN_ARGS);
+    let dump_log_path = explicit_dump_log_path_from_myelin_chat_args(&forwarded);
+    let run_id = run_id_from_myelin_chat_args(&forwarded);
     let benchmark_target = dump_log_path.as_deref().zip(run_id);
     if let Some((path, run_id)) = benchmark_target {
-        let event = xtask_mvp_chat_benchmark_event(
+        let event = xtask_myelin_chat_benchmark_event(
             run_id,
             "started",
             json!({
                 "program": "cargo",
-                "args": MVP_CHAT_CARGO_RUN_ARGS,
+                "args": MYELIN_CHAT_CARGO_RUN_ARGS,
             }),
         );
         if let Err(error) =
-            append_synthetic_benchmark_frame(path, "xtask-mvp-chat", "mvp.xtask.benchmark", event)
+            append_synthetic_benchmark_frame(path, "xtask-myelin-chat", "myelin.xtask.benchmark", event)
         {
-            eprintln!("Failed to write mvp-chat benchmark frame: {error}");
+            eprintln!("Failed to write myelin-chat benchmark frame: {error}");
             return ExitCode::from(1);
         }
     }
@@ -375,11 +375,11 @@ fn run_mvp_chat(args: Vec<String>) -> ExitCode {
             Ok(status) => ("failed", json!({"exit_status": status.to_string()})),
             Err(error) => ("failed", json!({"error": error.to_string()})),
         };
-        let event = xtask_mvp_chat_benchmark_event(run_id, status, detail);
+        let event = xtask_myelin_chat_benchmark_event(run_id, status, detail);
         if let Err(error) =
-            append_synthetic_benchmark_frame(path, "xtask-mvp-chat", "mvp.xtask.benchmark", event)
+            append_synthetic_benchmark_frame(path, "xtask-myelin-chat", "myelin.xtask.benchmark", event)
         {
-            eprintln!("Failed to write mvp-chat benchmark frame: {error}");
+            eprintln!("Failed to write myelin-chat benchmark frame: {error}");
             return ExitCode::from(1);
         }
     }
@@ -393,16 +393,16 @@ fn run_mvp_chat(args: Vec<String>) -> ExitCode {
                 .unwrap_or(1),
         ),
         Err(error) => {
-            eprintln!("Failed to execute cargo mvp-chat: {error}");
+            eprintln!("Failed to execute cargo myelin-chat: {error}");
             ExitCode::from(1)
         }
     }
 }
 
-fn run_mvp_chat_compare(args: Vec<String>) -> ExitCode {
+fn run_myelin_chat_compare(args: Vec<String>) -> ExitCode {
     if args.len() != 2 {
         eprintln!(
-            "USAGE: cargo xtask mvp-chat-compare <baseline-summary.json> <candidate-summary.json>"
+            "USAGE: cargo xtask myelin-chat-compare <baseline-summary.json> <candidate-summary.json>"
         );
         return ExitCode::from(1);
     }
@@ -421,9 +421,9 @@ fn run_mvp_chat_compare(args: Vec<String>) -> ExitCode {
         }
     };
     let comparable = summaries_comparable(&baseline, &candidate);
-    println!("mvp-chat-compare: comparable={comparable}");
+    println!("myelin-chat-compare: comparable={comparable}");
     for reason in summary_incomparability_reasons(&baseline, &candidate) {
-        println!("mvp-chat-compare: incomparable {reason}");
+        println!("myelin-chat-compare: incomparable {reason}");
     }
     print_summary_metric_delta(
         "total_child_ms",
@@ -463,9 +463,9 @@ fn run_mvp_chat_compare(args: Vec<String>) -> ExitCode {
 
 fn read_summary_json(path: &Path) -> Result<Value, String> {
     let content = fs::read_to_string(path)
-        .map_err(|e| format!("mvp-chat-compare: read summary {}: {e}", path.display()))?;
+        .map_err(|e| format!("myelin-chat-compare: read summary {}: {e}", path.display()))?;
     serde_json::from_str(&content)
-        .map_err(|e| format!("mvp-chat-compare: parse summary {}: {e}", path.display()))
+        .map_err(|e| format!("myelin-chat-compare: parse summary {}: {e}", path.display()))
 }
 
 fn summaries_comparable(baseline: &Value, candidate: &Value) -> bool {
@@ -510,11 +510,11 @@ fn print_summary_metric_delta(name: &str, baseline: Option<u64>, candidate: Opti
                 format!("{:.2}", (delta as f64 / left as f64) * 100.0)
             };
             println!(
-                "mvp-chat-compare: {name} baseline={left} candidate={right} delta_ms={delta} delta_pct={pct}"
+                "myelin-chat-compare: {name} baseline={left} candidate={right} delta_ms={delta} delta_pct={pct}"
             );
         }
         _ => println!(
-            "mvp-chat-compare: {name} baseline={} candidate={} delta_ms=unavailable",
+            "myelin-chat-compare: {name} baseline={} candidate={} delta_ms=unavailable",
             baseline
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "unavailable".to_owned()),
@@ -548,7 +548,7 @@ fn render_summary_value(value: Option<&Value>) -> String {
     }
 }
 
-fn explicit_dump_log_path_from_mvp_chat_args(args: &[String]) -> Option<PathBuf> {
+fn explicit_dump_log_path_from_myelin_chat_args(args: &[String]) -> Option<PathBuf> {
     let args = strip_leading_double_dash(args);
     let mut index = 0;
     while index < args.len() {
@@ -569,7 +569,7 @@ fn explicit_dump_log_path_from_mvp_chat_args(args: &[String]) -> Option<PathBuf>
     None
 }
 
-fn run_id_from_mvp_chat_args(args: &[String]) -> Option<u64> {
+fn run_id_from_myelin_chat_args(args: &[String]) -> Option<u64> {
     let args = strip_leading_double_dash(args);
     let mut index = 0;
     while index < args.len() {
@@ -638,14 +638,14 @@ fn append_synthetic_benchmark_frame(
         .map_err(|e| format!("flush synthetic benchmark frame {}: {e}", path.display()))
 }
 
-fn xtask_mvp_chat_benchmark_event(run_id: u64, status: &str, detail: Value) -> Value {
+fn xtask_myelin_chat_benchmark_event(run_id: u64, status: &str, detail: Value) -> Value {
     let benchmark = xtask_benchmark_stamp();
     json!({
         "schema_version": benchmark["schema_version"].clone(),
         "type": "XtaskBenchmark",
         "event_type": "XtaskBenchmark",
-        "event_name": "cargo_run_mvp_chat",
-        "phase": "cargo_run_mvp_chat",
+        "event_name": "cargo_run_myelin_chat",
+        "phase": "cargo_run_myelin_chat",
         "status": status,
         "run_id": run_id,
         "producer_component": benchmark["producer_component"].clone(),
@@ -655,7 +655,7 @@ fn xtask_mvp_chat_benchmark_event(run_id: u64, status: &str, detail: Value) -> V
         "wall_clock_unix_ms": benchmark["wall_clock_unix_ms"].clone(),
         "monotonic_ms": benchmark["monotonic_ms"].clone(),
         "clock_source": benchmark["clock_source"].clone(),
-        "span_id": format!("xtask:{run_id}:{}:cargo_run_mvp_chat", benchmark["producer_sequence"]),
+        "span_id": format!("xtask:{run_id}:{}:cargo_run_myelin_chat", benchmark["producer_sequence"]),
         "parent_span_id": Value::Null,
         "detail": detail,
         "benchmark": benchmark,
@@ -735,12 +735,12 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
             Ok(()) => return root,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => panic!(
-                "mvp-chat-check: create temp dir {}: {error}",
+                "myelin-chat-check: create temp dir {}: {error}",
                 root.display()
             ),
         }
     }
-    panic!("mvp-chat-check: could not allocate unique temp dir for prefix {prefix}");
+    panic!("myelin-chat-check: could not allocate unique temp dir for prefix {prefix}");
 }
 fn unix_ms_now() -> u64 {
     let millis = SystemTime::now()
@@ -750,25 +750,25 @@ fn unix_ms_now() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-fn mvp_chat_check_run_id() -> u64 {
+fn myelin_chat_check_run_id() -> u64 {
     unix_ms_now().max(1)
 }
 
-fn write_mvp_chat_check_paths(root: &Path) -> Result<MvpChatCheckPaths, String> {
+fn write_myelin_chat_check_paths(root: &Path) -> Result<MyelinChatCheckPaths, String> {
     if !root.is_dir() {
         return Err(format!(
-            "mvp-chat-check: temp root {} is not a directory",
+            "myelin-chat-check: temp root {} is not a directory",
             root.display()
         ));
     }
     let dump_log = root.join("datastream.ndjson");
     if dump_log.exists() {
         return Err(format!(
-            "mvp-chat-check: dump log path already exists: {}",
+            "myelin-chat-check: dump log path already exists: {}",
             dump_log.display()
         ));
     }
-    Ok(MvpChatCheckPaths {
+    Ok(MyelinChatCheckPaths {
         root: root.to_path_buf(),
         dump_log,
         stdout: root.join("stdout.txt"),
@@ -781,41 +781,41 @@ fn write_mvp_chat_check_paths(root: &Path) -> Result<MvpChatCheckPaths, String> 
     })
 }
 
-fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
-    let invocation = match MvpChatCheckInvocation::parse_args(args) {
+fn run_myelin_chat_check(args: Vec<String>) -> ExitCode {
+    let invocation = match MyelinChatCheckInvocation::parse_args(args) {
         Ok(invocation) => invocation,
         Err(error) => {
-            eprintln!("mvp-chat-check: failed: {error}");
+            eprintln!("myelin-chat-check: failed: {error}");
             print_usage();
             return ExitCode::from(1);
         }
     };
     let scenario = invocation.scenario();
     let workspace = workspace_root();
-    let temp_root = unique_temp_dir("mvp-chat-check");
-    let paths = match write_mvp_chat_check_paths(&temp_root) {
+    let temp_root = unique_temp_dir("myelin-chat-check");
+    let paths = match write_myelin_chat_check_paths(&temp_root) {
         Ok(paths) => paths,
         Err(error) => {
             eprintln!("{error}");
             eprintln!(
-                "mvp-chat-check: temp directory kept at {}",
+                "myelin-chat-check: temp directory kept at {}",
                 temp_root.display()
             );
             return ExitCode::from(1);
         }
     };
-    let run_id = mvp_chat_check_run_id();
-    println!("mvp-chat-check: scenario {}", invocation.name());
-    println!("mvp-chat-check: artifacts {}", paths.root.display());
-    println!("mvp-chat-check: datastream {}", paths.dump_log.display());
+    let run_id = myelin_chat_check_run_id();
+    println!("myelin-chat-check: scenario {}", invocation.name());
+    println!("myelin-chat-check: artifacts {}", paths.root.display());
+    println!("myelin-chat-check: datastream {}", paths.dump_log.display());
 
-    let output = match run_mvp_chat_check_process(&workspace, &paths, run_id, &invocation) {
+    let output = match run_myelin_chat_check_process(&workspace, &paths, run_id, &invocation) {
         Ok(output) => output,
-        Err(error) => return fail_mvp_chat_check(&error, &paths, "", "", None),
+        Err(error) => return fail_myelin_chat_check(&error, &paths, "", "", None),
     };
 
     if let Some(error) = &output.stdin_error {
-        return fail_mvp_chat_check(
+        return fail_myelin_chat_check(
             error,
             &paths,
             &output.stdout,
@@ -824,8 +824,8 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
         );
     }
     if output.timed_out {
-        let reason = format!("timeout after {MVP_CHAT_CHECK_TIMEOUT_SECS} seconds");
-        return fail_mvp_chat_check(
+        let reason = format!("timeout after {MYELIN_CHAT_CHECK_TIMEOUT_SECS} seconds");
+        return fail_myelin_chat_check(
             &reason,
             &paths,
             &output.stdout,
@@ -834,7 +834,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
         );
     }
     if !output.status.success() {
-        return fail_mvp_chat_check(
+        return fail_myelin_chat_check(
             "child exited nonzero",
             &paths,
             &output.stdout,
@@ -846,7 +846,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     let responses = match assert_stdout_contains_two_prompt_cycles(&output.stdout) {
         Ok(responses) => responses,
         Err(error) => {
-            return fail_mvp_chat_check(
+            return fail_myelin_chat_check(
                 &error,
                 &paths,
                 &output.stdout,
@@ -863,7 +863,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     ) {
         Ok(events) => events,
         Err(error) => {
-            return fail_mvp_chat_check(
+            return fail_myelin_chat_check(
                 &error,
                 &paths,
                 &output.stdout,
@@ -875,7 +875,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     let report = match build_benchmark_report(&events, output.child_elapsed_ms, run_id, scenario) {
         Ok(report) => report,
         Err(error) => {
-            return fail_mvp_chat_check(
+            return fail_myelin_chat_check(
                 &error,
                 &paths,
                 &output.stdout,
@@ -896,7 +896,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     ) {
         Ok(summary) => summary,
         Err(error) => {
-            return fail_mvp_chat_check(
+            return fail_myelin_chat_check(
                 &error,
                 &paths,
                 &output.stdout,
@@ -908,7 +908,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     if let Err(error) = append_synthetic_benchmark_frame(
         &paths.dump_log,
         "xtask",
-        "mvp.xtask.benchmark",
+        "myelin.xtask.benchmark",
         xtask_benchmark_summary_event(
             run_id,
             "ready",
@@ -920,7 +920,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
             }),
         ),
     ) {
-        return fail_mvp_chat_check(
+        return fail_myelin_chat_check(
             &error,
             &paths,
             &output.stdout,
@@ -931,7 +931,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     let events = match parse_dump_log_events(&paths.dump_log) {
         Ok(events) => events,
         Err(error) => {
-            return fail_mvp_chat_check(
+            return fail_myelin_chat_check(
                 &error,
                 &paths,
                 &output.stdout,
@@ -952,7 +952,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     ) {
         Ok(summary) => summary,
         Err(error) => {
-            return fail_mvp_chat_check(
+            return fail_myelin_chat_check(
                 &error,
                 &paths,
                 &output.stdout,
@@ -970,7 +970,7 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
         &output,
         &summary,
     ) {
-        return fail_mvp_chat_check(
+        return fail_myelin_chat_check(
             &error,
             &paths,
             &output.stdout,
@@ -981,25 +981,25 @@ fn run_mvp_chat_check(args: Vec<String>) -> ExitCode {
     for line in &report.lines {
         println!("{line}");
     }
-    println!("mvp-chat-check: artifacts {}", paths.root.display());
-    println!("mvp-chat-check: summary {}", paths.summary.display());
+    println!("myelin-chat-check: artifacts {}", paths.root.display());
+    println!("myelin-chat-check: summary {}", paths.summary.display());
 
-    println!("mvp-chat-check: ok");
+    println!("myelin-chat-check: ok");
     for (index, response) in responses.iter().enumerate() {
-        println!("mvp-chat-check: response {}: {}", index + 1, response);
+        println!("myelin-chat-check: response {}: {}", index + 1, response);
     }
     ExitCode::SUCCESS
 }
 
-fn run_mvp_chat_check_process(
+fn run_myelin_chat_check_process(
     workspace: &Path,
-    paths: &MvpChatCheckPaths,
+    paths: &MyelinChatCheckPaths,
     run_id: u64,
-    invocation: &MvpChatCheckInvocation,
-) -> Result<MvpChatCheckOutput, String> {
+    invocation: &MyelinChatCheckInvocation,
+) -> Result<MyelinChatCheckOutput, String> {
     let mut command = Command::new(cargo_bin());
-    command.current_dir(workspace).arg("mvp-chat").arg("--");
-    for arg in invocation.mvp_chat_args(run_id, &paths.dump_log) {
+    command.current_dir(workspace).arg("myelin-chat").arg("--");
+    for arg in invocation.myelin_chat_args(run_id, &paths.dump_log) {
         command.arg(arg);
     }
     for &(key, value) in invocation.env_overrides() {
@@ -1025,39 +1025,39 @@ fn run_mvp_chat_check_process(
     let child_started = Instant::now();
     let mut child = command
         .spawn()
-        .map_err(|e| format!("mvp-chat-check: spawn cargo mvp-chat: {e}"))?;
+        .map_err(|e| format!("myelin-chat-check: spawn cargo myelin-chat: {e}"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "mvp-chat-check: child stdout was not piped".to_owned())?;
+        .ok_or_else(|| "myelin-chat-check: child stdout was not piped".to_owned())?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "mvp-chat-check: child stderr was not piped".to_owned())?;
+        .ok_or_else(|| "myelin-chat-check: child stderr was not piped".to_owned())?;
     let stdout_reader = thread::spawn(move || read_pipe_to_string(stdout, "stdout"));
     let stderr_reader = thread::spawn(move || read_pipe_to_string(stderr, "stderr"));
 
     let stdin_error = match child.stdin.take() {
         Some(mut stdin) => {
-            let result = stdin.write_all(MVP_CHAT_CHECK_PROMPTS);
+            let result = stdin.write_all(MYELIN_CHAT_CHECK_PROMPTS);
             drop(stdin);
             result
                 .err()
-                .map(|error| format!("mvp-chat-check: write child stdin: {error}"))
+                .map(|error| format!("myelin-chat-check: write child stdin: {error}"))
         }
-        None => Some("mvp-chat-check: child stdin was not piped".to_owned()),
+        None => Some("myelin-chat-check: child stdin was not piped".to_owned()),
     };
 
     let (status, timed_out) = if stdin_error.is_some() {
-        (terminate_mvp_chat_child(&mut child)?, false)
+        (terminate_myelin_chat_child(&mut child)?, false)
     } else {
-        wait_mvp_chat_check_child(&mut child)?
+        wait_myelin_chat_check_child(&mut child)?
     };
     let child_elapsed_ms = duration_ms_u64(child_started.elapsed());
 
     let stdout = join_reader(stdout_reader, "stdout")?;
     let stderr = join_reader(stderr_reader, "stderr")?;
-    Ok(MvpChatCheckOutput {
+    Ok(MyelinChatCheckOutput {
         child_elapsed_ms,
         status,
         stdout,
@@ -1067,37 +1067,37 @@ fn run_mvp_chat_check_process(
     })
 }
 
-fn wait_mvp_chat_check_child(child: &mut Child) -> Result<(ExitStatus, bool), String> {
-    let timeout = Duration::from_secs(MVP_CHAT_CHECK_TIMEOUT_SECS);
-    let poll = Duration::from_millis(MVP_CHAT_CHECK_POLL_MS);
+fn wait_myelin_chat_check_child(child: &mut Child) -> Result<(ExitStatus, bool), String> {
+    let timeout = Duration::from_secs(MYELIN_CHAT_CHECK_TIMEOUT_SECS);
+    let poll = Duration::from_millis(MYELIN_CHAT_CHECK_POLL_MS);
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok((status, false)),
             Ok(None) if Instant::now() >= deadline => {
-                return terminate_mvp_chat_child(child).map(|status| (status, true));
+                return terminate_myelin_chat_child(child).map(|status| (status, true));
             }
             Ok(None) => thread::sleep(poll),
-            Err(error) => return Err(format!("mvp-chat-check: poll child status: {error}")),
+            Err(error) => return Err(format!("myelin-chat-check: poll child status: {error}")),
         }
     }
 }
 
-fn terminate_mvp_chat_child(child: &mut Child) -> Result<ExitStatus, String> {
+fn terminate_myelin_chat_child(child: &mut Child) -> Result<ExitStatus, String> {
     #[cfg(target_os = "linux")]
     {
-        signal_mvp_chat_process_group(child, libc::SIGTERM);
-        let grace_polls = MVP_CHAT_CHECK_TERM_GRACE_MS / MVP_CHAT_CHECK_POLL_MS;
+        signal_myelin_chat_process_group(child, libc::SIGTERM);
+        let grace_polls = MYELIN_CHAT_CHECK_TERM_GRACE_MS / MYELIN_CHAT_CHECK_POLL_MS;
         for _ in 0..grace_polls {
             match child.try_wait() {
                 Ok(Some(status)) => return Ok(status),
-                Ok(None) => thread::sleep(Duration::from_millis(MVP_CHAT_CHECK_POLL_MS)),
+                Ok(None) => thread::sleep(Duration::from_millis(MYELIN_CHAT_CHECK_POLL_MS)),
                 Err(error) => {
-                    return Err(format!("mvp-chat-check: poll child after SIGTERM: {error}"));
+                    return Err(format!("myelin-chat-check: poll child after SIGTERM: {error}"));
                 }
             }
         }
-        signal_mvp_chat_process_group(child, libc::SIGKILL);
+        signal_myelin_chat_process_group(child, libc::SIGKILL);
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -1107,11 +1107,11 @@ fn terminate_mvp_chat_child(child: &mut Child) -> Result<ExitStatus, String> {
 
     child
         .wait()
-        .map_err(|e| format!("mvp-chat-check: wait for terminated child: {e}"))
+        .map_err(|e| format!("myelin-chat-check: wait for terminated child: {e}"))
 }
 
 #[cfg(target_os = "linux")]
-fn signal_mvp_chat_process_group(child: &Child, signal: libc::c_int) {
+fn signal_myelin_chat_process_group(child: &Child, signal: libc::c_int) {
     let process_group = -(child.id() as libc::pid_t);
     let _ = unsafe { libc::kill(process_group, signal) };
 }
@@ -1120,7 +1120,7 @@ fn read_pipe_to_string<R: Read>(mut reader: R, label: &'static str) -> Result<St
     let mut text = String::new();
     reader
         .read_to_string(&mut text)
-        .map_err(|e| format!("mvp-chat-check: read child {label}: {e}"))?;
+        .map_err(|e| format!("myelin-chat-check: read child {label}: {e}"))?;
     Ok(text)
 }
 
@@ -1130,25 +1130,25 @@ fn join_reader(
 ) -> Result<String, String> {
     handle
         .join()
-        .map_err(|_| format!("mvp-chat-check: child {label} reader panicked"))?
+        .map_err(|_| format!("myelin-chat-check: child {label} reader panicked"))?
 }
 
-fn fail_mvp_chat_check(
+fn fail_myelin_chat_check(
     reason: &str,
-    paths: &MvpChatCheckPaths,
+    paths: &MyelinChatCheckPaths,
     stdout: &str,
     stderr: &str,
     status: Option<&ExitStatus>,
 ) -> ExitCode {
-    eprintln!("mvp-chat-check: failed: {reason}");
+    eprintln!("myelin-chat-check: failed: {reason}");
     if let Some(status) = status {
-        eprintln!("mvp-chat-check: child exit status: {status}");
+        eprintln!("myelin-chat-check: child exit status: {status}");
     }
     if let Err(error) = write_failure_artifacts(paths, reason, stdout, stderr, status) {
-        eprintln!("mvp-chat-check: warning: could not write failure artifacts: {error}");
+        eprintln!("myelin-chat-check: warning: could not write failure artifacts: {error}");
     }
     eprintln!(
-        "mvp-chat-check: temp directory kept at {}",
+        "myelin-chat-check: temp directory kept at {}",
         paths.root.display()
     );
     eprintln!("--- captured stdout ---");
@@ -1173,7 +1173,7 @@ fn fail_mvp_chat_check(
 }
 
 fn write_failure_artifacts(
-    paths: &MvpChatCheckPaths,
+    paths: &MyelinChatCheckPaths,
     reason: &str,
     stdout: &str,
     stderr: &str,
@@ -1181,24 +1181,24 @@ fn write_failure_artifacts(
 ) -> Result<(), String> {
     fs::write(&paths.stdout, stdout).map_err(|e| {
         format!(
-            "mvp-chat-check: write stdout artifact {}: {e}",
+            "myelin-chat-check: write stdout artifact {}: {e}",
             paths.stdout.display()
         )
     })?;
     fs::write(&paths.stderr, stderr).map_err(|e| {
         format!(
-            "mvp-chat-check: write stderr artifact {}: {e}",
+            "myelin-chat-check: write stderr artifact {}: {e}",
             paths.stderr.display()
         )
     })?;
-    fs::write(&paths.prompts, MVP_CHAT_CHECK_PROMPTS).map_err(|e| {
+    fs::write(&paths.prompts, MYELIN_CHAT_CHECK_PROMPTS).map_err(|e| {
         format!(
-            "mvp-chat-check: write prompt corpus {}: {e}",
+            "myelin-chat-check: write prompt corpus {}: {e}",
             paths.prompts.display()
         )
     })?;
     let evidence = json!({
-        "schema": "swactor.mvp_chat_check.failure_evidence.v1",
+        "schema": "swactor.myelin_chat_check.failure_evidence.v1",
         "status": "failed",
         "reason": reason,
         "child_status": status.map(|status| status.to_string()),
@@ -1235,12 +1235,12 @@ fn write_failure_artifacts(
     )
     .map_err(|e| {
         format!(
-            "mvp-chat-check: write benchmark gaps artifact {}: {e}",
+            "myelin-chat-check: write benchmark gaps artifact {}: {e}",
             paths.benchmark_gaps.display()
         )
     })?;
     let summary = json!({
-        "schema": "swactor.mvp_chat_check.failure.v1",
+        "schema": "swactor.myelin_chat_check.failure.v1",
         "status": "failed",
         "reason": reason,
         "child_status": status.map(|status| status.to_string()),
@@ -1262,8 +1262,8 @@ fn write_failure_artifacts(
             },
             "prompts": {
                 "path": paths.prompts.display().to_string(),
-                "bytes": MVP_CHAT_CHECK_PROMPTS.len(),
-                "blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
+                "bytes": MYELIN_CHAT_CHECK_PROMPTS.len(),
+                "blake3": bytes_blake3_hex(MYELIN_CHAT_CHECK_PROMPTS),
             },
             "benchmark_evidence": {
                 "path": paths.benchmark_evidence.display().to_string(),
@@ -1288,13 +1288,13 @@ fn assert_stdout_contains_two_prompt_cycles(stdout: &str) -> Result<Vec<String>,
     let decoding_count = stdout.matches("decoding...").count();
     if decoding_count < 2 {
         return Err(format!(
-            "mvp-chat-check: expected at least two decoding... markers, found {decoding_count}"
+            "myelin-chat-check: expected at least two decoding... markers, found {decoding_count}"
         ));
     }
     let response_count = stdout.matches("Response: ").count();
     if response_count < 2 {
         return Err(format!(
-            "mvp-chat-check: expected at least two Response: prefixes, found {response_count}"
+            "myelin-chat-check: expected at least two Response: prefixes, found {response_count}"
         ));
     }
 
@@ -1323,7 +1323,7 @@ fn assert_stdout_contains_two_prompt_cycles(stdout: &str) -> Result<Vec<String>,
         let response = &stdout[response_start..response_end];
         if !response.chars().any(|ch| !ch.is_whitespace()) {
             return Err(format!(
-                "mvp-chat-check: empty Response text for prompt cycle {cycle}"
+                "myelin-chat-check: empty Response text for prompt cycle {cycle}"
             ));
         }
         responses.push(response.to_owned());
@@ -1342,7 +1342,7 @@ fn find_stdout_marker(
     stdout[start..]
         .find(marker)
         .map(|offset| start + offset)
-        .ok_or_else(|| format!("mvp-chat-check: missing {label} marker for prompt cycle {cycle}"))
+        .ok_or_else(|| format!("myelin-chat-check: missing {label} marker for prompt cycle {cycle}"))
 }
 
 #[derive(Clone)]
@@ -1612,7 +1612,7 @@ impl BenchmarkFacts {
 
             match (record.channel.as_str(), event_type, phase, status) {
                 (
-                    "mvp.chat.prompt",
+                    "myelin.chat.prompt",
                     Some("ChatProgress"),
                     Some("prompt_submitted"),
                     Some("ready"),
@@ -1622,7 +1622,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.chat.prompt",
+                    "myelin.chat.prompt",
                     Some("ChatProgress"),
                     Some("request_completed"),
                     Some("ready"),
@@ -1639,7 +1639,7 @@ impl BenchmarkFacts {
                         }
                     }
                 }
-                ("mvp.worker.prompt", Some(worker_type), _, _) => {
+                ("myelin.worker.prompt", Some(worker_type), _, _) => {
                     let Some(request_id) = benchmark_request_id(&record.event) else {
                         continue;
                     };
@@ -1667,7 +1667,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     Some("OrchPromptEvent"),
                     Some("pipeline_tokenizer_encode"),
                     Some("started"),
@@ -1680,7 +1680,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     Some("OrchPromptEvent"),
                     Some("pipeline_tokenizer_encode"),
                     Some("ready"),
@@ -1690,7 +1690,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     Some("OrchPromptEvent"),
                     Some("pipeline_token_in"),
                     Some("started"),
@@ -1703,7 +1703,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     Some("OrchPromptEvent"),
                     Some("pipeline_token_out"),
                     Some("observed"),
@@ -1719,7 +1719,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     Some("OrchPromptEvent"),
                     Some("pipeline_tokenizer_decode"),
                     Some("started"),
@@ -1732,7 +1732,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     Some("OrchPromptEvent"),
                     Some("pipeline_tokenizer_decode"),
                     Some("ready"),
@@ -1742,7 +1742,7 @@ impl BenchmarkFacts {
                     }
                 }
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     Some("OrchPromptEvent"),
                     Some("prompt_complete"),
                     Some("ready"),
@@ -1825,10 +1825,10 @@ struct DurationRender {
 
 fn parse_dump_log_events(path: &Path) -> Result<Vec<DumpLogEvent>, String> {
     let content = fs::read_to_string(path)
-        .map_err(|e| format!("mvp-chat-check: read dump log {}: {e}", path.display()))?;
+        .map_err(|e| format!("myelin-chat-check: read dump log {}: {e}", path.display()))?;
     if content.lines().next().is_none() {
         return Err(format!(
-            "mvp-chat-check: dump log {} is empty",
+            "myelin-chat-check: dump log {} is empty",
             path.display()
         ));
     }
@@ -1840,7 +1840,7 @@ fn parse_dump_log_events(path: &Path) -> Result<Vec<DumpLogEvent>, String> {
         }
         let outer: Value = serde_json::from_str(line).map_err(|e| {
             format!(
-                "mvp-chat-check: parse dump log {} line {}: {e}",
+                "myelin-chat-check: parse dump log {} line {}: {e}",
                 path.display(),
                 line_index + 1
             )
@@ -1850,14 +1850,14 @@ fn parse_dump_log_events(path: &Path) -> Result<Vec<DumpLogEvent>, String> {
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 format!(
-                    "mvp-chat-check: dump log line {} missing channel",
+                    "myelin-chat-check: dump log line {} missing channel",
                     line_index + 1
                 )
             })?
             .to_owned();
         let payload = outer.get("payload").ok_or_else(|| {
             format!(
-                "mvp-chat-check: dump log line {} missing payload",
+                "myelin-chat-check: dump log line {} missing payload",
                 line_index + 1
             )
         })?;
@@ -1866,7 +1866,7 @@ fn parse_dump_log_events(path: &Path) -> Result<Vec<DumpLogEvent>, String> {
         };
         let event: Value = serde_json::from_str(inner_text).map_err(|e| {
             format!(
-                "mvp-chat-check: parse inner event on dump log line {}: {e}",
+                "myelin-chat-check: parse inner event on dump log line {}: {e}",
                 line_index + 1
             )
         })?;
@@ -1914,7 +1914,7 @@ fn dump_log_inner_payload_text<'a>(
         .map(Some)
         .ok_or_else(|| {
             format!(
-                "mvp-chat-check: dump log line {} missing utf8 payload value",
+                "myelin-chat-check: dump log line {} missing utf8 payload value",
                 line_index + 1
             )
         })
@@ -1923,7 +1923,7 @@ fn dump_log_inner_payload_text<'a>(
 fn validate_benchmark_observability(
     events: &[DumpLogEvent],
     run_id: u64,
-    scenario: MvpChatCheckScenario,
+    scenario: MyelinChatCheckScenario,
     expected_pipeline_stages: Option<u32>,
 ) -> BenchmarkValidation {
     let mut validation = BenchmarkValidation {
@@ -2018,11 +2018,11 @@ fn validate_benchmark_observability(
 
         if canonical_benchmark_required(record) {
             validate_event_canonical_stamp(record, &mut validation);
-        } else if record.channel.starts_with("mvp.") && event_type.is_some() {
+        } else if record.channel.starts_with("myelin.") && event_type.is_some() {
             validation.push(
                 ValidatorFinding::warning(
                     "canonical.benchmark_stamp.not_required",
-                    "typed mvp datastream event was not part of the strict benchmark validator set",
+                    "typed myelin datastream event was not part of the strict benchmark validator set",
                 )
                 .at_event(record),
             );
@@ -2069,7 +2069,7 @@ fn validate_benchmark_observability(
 
         match (record.channel.as_str(), event_type, phase, status) {
             (
-                "mvp.chat.benchmark",
+                "myelin.chat.benchmark",
                 Some("BenchmarkRunEnvelope"),
                 Some("run_envelope"),
                 Some("ready"),
@@ -2087,7 +2087,7 @@ fn validate_benchmark_observability(
                 validation.endpoint_snapshot_present = true;
             }
             (
-                "mvp.worker.initialize",
+                "myelin.worker.initialize",
                 Some("PythonDatastreamConnected"),
                 Some("PythonDatastreamConnected"),
                 Some("ready"),
@@ -2191,12 +2191,12 @@ fn validate_benchmark_observability(
                     validation.edges_with_consumer.insert(edge_id);
                 }
             }
-            ("mvp.chat.prompt", Some("ChatProgress"), Some("prompt_submitted"), Some("ready")) => {
+            ("myelin.chat.prompt", Some("ChatProgress"), Some("prompt_submitted"), Some("ready")) => {
                 if let Some(request_id) = benchmark_request_id(&record.event) {
                     validation.requests_started.insert(request_id);
                 }
             }
-            ("mvp.chat.prompt", Some("ChatProgress"), Some("request_completed"), Some("ready")) => {
+            ("myelin.chat.prompt", Some("ChatProgress"), Some("request_completed"), Some("ready")) => {
                 if let Some(request_id) = benchmark_request_id(&record.event) {
                     validation.requests_completed.insert(request_id);
                 }
@@ -2218,9 +2218,9 @@ fn validate_benchmark_observability(
         ));
     }
     for required in [
-        "mvp-chat",
-        "mvp-orchestrator",
-        "mvp-worker-node",
+        "myelin-chat",
+        "myelin-orchestrator",
+        "myelin-worker",
         "tinygrad-worker",
     ] {
         if !validation.producers.contains(required) {
@@ -2262,7 +2262,7 @@ fn validate_benchmark_observability(
         });
     }
 
-    if scenario == MvpChatCheckScenario::VastAi {
+    if scenario == MyelinChatCheckScenario::VastAi {
         if endpoint_mask.as_deref() != Some("relay-only") {
             validation.push(ValidatorFinding::error(
                 "vastai.endpoint_mask.not_relay_only",
@@ -2365,11 +2365,11 @@ fn validate_benchmark_observability(
 
 fn canonical_benchmark_required(record: &DumpLogEvent) -> bool {
     let channel = record.channel.as_str();
-    channel.starts_with("mvp.chat.")
-        || channel.starts_with("mvp.orch.")
-        || channel.starts_with("mvp.worker.")
-        || channel.starts_with("mvp.node.")
-        || channel == "mvp.xtask.benchmark"
+    channel.starts_with("myelin.chat.")
+        || channel.starts_with("myelin.orch.")
+        || channel.starts_with("myelin.worker.")
+        || channel.starts_with("myelin.node.")
+        || channel == "myelin.xtask.benchmark"
 }
 
 fn validate_event_canonical_stamp(record: &DumpLogEvent, validation: &mut BenchmarkValidation) {
@@ -2451,11 +2451,11 @@ fn build_benchmark_evidence_json(
     validation: &BenchmarkValidation,
     events: &[DumpLogEvent],
     run_id: u64,
-    scenario: MvpChatCheckScenario,
-    paths: &MvpChatCheckPaths,
+    scenario: MyelinChatCheckScenario,
+    paths: &MyelinChatCheckPaths,
 ) -> Value {
     json!({
-        "schema": "swactor.mvp_chat.benchmark_evidence.v1",
+        "schema": "swactor.myelin_chat.benchmark_evidence.v1",
         "source": "canonical_datastream",
         "run_id": run_id,
         "scenario": scenario.name(),
@@ -2554,7 +2554,7 @@ fn build_benchmark_gaps_markdown(validation: &BenchmarkValidation) -> String {
 
 fn assert_dump_log_facts(
     path: &Path,
-    scenario: MvpChatCheckScenario,
+    scenario: MyelinChatCheckScenario,
     run_id: u64,
     expected_pipeline_stages: Option<u32>,
 ) -> Result<Vec<DumpLogEvent>, String> {
@@ -2587,13 +2587,13 @@ fn assert_dump_log_facts(
     require_dump_log_fact(facts.request_completed_2, "request_completed request_id=2")?;
     require_dump_log_fact(facts.shutdown_requested, "shutdown requested")?;
     require_dump_log_fact(facts.orchestrator_stopped, "orchestrator_process stopped")?;
-    if scenario == MvpChatCheckScenario::Gpu {
+    if scenario == MyelinChatCheckScenario::Gpu {
         require_gpu_dump_log_facts(&facts)?;
     }
-    if scenario == MvpChatCheckScenario::MultinodeDocker {
+    if scenario == MyelinChatCheckScenario::MultinodeDocker {
         require_multinode_docker_network_facts(&facts)?;
     }
-    if scenario == MvpChatCheckScenario::VastAi {
+    if scenario == MyelinChatCheckScenario::VastAi {
         require_gpu_dump_log_facts(&facts)?;
         require_vastai_network_facts(&facts)?;
         require_vastai_data_path_facts(&facts)?;
@@ -2602,7 +2602,7 @@ fn assert_dump_log_facts(
         validate_benchmark_observability(&events, run_id, scenario, expected_pipeline_stages);
     if let Some(finding) = validation.invalid_findings().next() {
         return Err(format!(
-            "mvp-chat-check: benchmark observability gap {}: {}",
+            "myelin-chat-check: benchmark observability gap {}: {}",
             finding.code, finding.message
         ));
     }
@@ -2613,43 +2613,43 @@ fn build_benchmark_report(
     events: &[DumpLogEvent],
     child_elapsed_ms: u64,
     run_id: u64,
-    scenario: MvpChatCheckScenario,
+    scenario: MyelinChatCheckScenario,
 ) -> Result<BenchmarkReport, String> {
     let facts = BenchmarkFacts::from_events(events, run_id);
     facts.require_span(
-        "mvp.xtask.benchmark",
+        "myelin.xtask.benchmark",
         "XtaskBenchmark",
-        "cargo_run_mvp_chat",
+        "cargo_run_myelin_chat",
         "started",
     )?;
     facts.require_span(
-        "mvp.xtask.benchmark",
+        "myelin.xtask.benchmark",
         "XtaskBenchmark",
-        "cargo_run_mvp_chat",
+        "cargo_run_myelin_chat",
         "ready",
     )?;
     facts.require_span(
-        "mvp.chat.runtime",
+        "myelin.chat.runtime",
         "ChatProgress",
         "prepare_runtime",
         "started",
     )?;
     facts.require_span(
-        "mvp.chat.runtime",
+        "myelin.chat.runtime",
         "ChatProgress",
         "prepare_runtime",
         "ready",
     )?;
-    if scenario == MvpChatCheckScenario::Gpu {
+    if scenario == MyelinChatCheckScenario::Gpu {
         facts.require_span(
-            "mvp.chat.runtime",
+            "myelin.chat.runtime",
             "ChatProgress",
             "ensure_orchestrator_actor",
             "ready",
         )?;
     } else {
         facts.require_span(
-            "mvp.chat.runtime",
+            "myelin.chat.runtime",
             "ChatProgress",
             "ensure_orch_binary",
             "ready",
@@ -2657,109 +2657,109 @@ fn build_benchmark_report(
     }
     if !matches!(
         scenario,
-        MvpChatCheckScenario::MultinodeDocker | MvpChatCheckScenario::VastAi
+        MyelinChatCheckScenario::MultinodeDocker | MyelinChatCheckScenario::VastAi
     ) {
         facts.require_span(
-            "mvp.chat.runtime",
+            "myelin.chat.runtime",
             "ChatProgress",
             "ensure_worker_binary",
             "ready",
         )?;
     }
     facts.require_span(
-        "mvp.orch.bootstrap",
+        "myelin.orch.bootstrap",
         "OrchBootstrap",
         "weights_loaded",
         "ready",
     )?;
-    facts.require_span("mvp.chat.runtime", "ChatProgress", "prompt_rpc", "ready")?;
+    facts.require_span("myelin.chat.runtime", "ChatProgress", "prompt_rpc", "ready")?;
 
     for request_id in 1..=2 {
         let prompt = facts.prompts.get(&request_id).ok_or_else(|| {
             missing_benchmark_event(format!(
-                "mvp.chat.prompt/ChatProgress/request_completed/ready request_id={request_id}"
+                "myelin.chat.prompt/ChatProgress/request_completed/ready request_id={request_id}"
             ))
         })?;
         require_prompt_point(
             prompt.chat_completed.is_some(),
-            "mvp.chat.prompt/ChatProgress/request_completed/ready",
+            "myelin.chat.prompt/ChatProgress/request_completed/ready",
             request_id,
         )?;
         require_prompt_point(
             prompt.encode_ready.is_some(),
-            "mvp.worker.prompt/PromptEncodeReady or mvp.orch.prompt/pipeline_tokenizer_encode/ready",
+            "myelin.worker.prompt/PromptEncodeReady or myelin.orch.prompt/pipeline_tokenizer_encode/ready",
             request_id,
         )?;
         require_prompt_point(
             prompt.decode_started.is_some(),
-            "mvp.worker.prompt/DecodeStarted or mvp.orch.prompt/pipeline_token_in/started",
+            "myelin.worker.prompt/DecodeStarted or myelin.orch.prompt/pipeline_token_in/started",
             request_id,
         )?;
         require_prompt_point(
             prompt.first_token_ready.is_some(),
-            "mvp.worker.prompt/FirstTokenReady or mvp.orch.prompt/pipeline_token_out/observed",
+            "myelin.worker.prompt/FirstTokenReady or myelin.orch.prompt/pipeline_token_out/observed",
             request_id,
         )?;
         require_prompt_point(
             prompt.decode_ready.is_some(),
-            "mvp.worker.prompt/DecodeReady or mvp.orch.prompt/pipeline_token_out/observed",
+            "myelin.worker.prompt/DecodeReady or myelin.orch.prompt/pipeline_token_out/observed",
             request_id,
         )?;
         require_prompt_point(
             prompt.text_decode_ready.is_some(),
-            "mvp.worker.prompt/TextDecodeReady or mvp.orch.prompt/pipeline_tokenizer_decode/ready",
+            "myelin.worker.prompt/TextDecodeReady or myelin.orch.prompt/pipeline_tokenizer_decode/ready",
             request_id,
         )?;
     }
 
     let cargo_run = duration_between(
         facts.span_point(
-            "mvp.xtask.benchmark",
+            "myelin.xtask.benchmark",
             "XtaskBenchmark",
-            "cargo_run_mvp_chat",
+            "cargo_run_myelin_chat",
             "started",
         ),
         facts.span_point(
-            "mvp.xtask.benchmark",
+            "myelin.xtask.benchmark",
             "XtaskBenchmark",
-            "cargo_run_mvp_chat",
+            "cargo_run_myelin_chat",
             "ready",
         ),
     );
     let prepare_runtime = duration_between(
         facts.span_point(
-            "mvp.chat.runtime",
+            "myelin.chat.runtime",
             "ChatProgress",
             "prepare_runtime",
             "started",
         ),
         facts.span_point(
-            "mvp.chat.runtime",
+            "myelin.chat.runtime",
             "ChatProgress",
             "prepare_runtime",
             "ready",
         ),
     );
     let standup_start = facts.span_point(
-        "mvp.chat.runtime",
+        "myelin.chat.runtime",
         "ChatProgress",
         "prepare_runtime",
         "ready",
     );
     let weights_loaded = facts.span_point(
-        "mvp.orch.bootstrap",
+        "myelin.orch.bootstrap",
         "OrchBootstrap",
         "weights_loaded",
         "ready",
     );
-    let prompt_rpc = facts.span_point("mvp.chat.runtime", "ChatProgress", "prompt_rpc", "ready");
+    let prompt_rpc = facts.span_point("myelin.chat.runtime", "ChatProgress", "prompt_rpc", "ready");
     let standup_to_weights = duration_between(standup_start, weights_loaded);
     let standup_to_prompt_rpc = duration_between(standup_start, prompt_rpc);
 
     let mut lines = vec![
-        format!("mvp-chat-check: benchmark: run_id={run_id}"),
-        format!("mvp-chat-check: benchmark total_child_ms={child_elapsed_ms}"),
-        benchmark_span_line("cargo_run_mvp_chat_ms", cargo_run),
+        format!("myelin-chat-check: benchmark: run_id={run_id}"),
+        format!("myelin-chat-check: benchmark total_child_ms={child_elapsed_ms}"),
+        benchmark_span_line("cargo_run_myelin_chat_ms", cargo_run),
         benchmark_span_line("prepare_runtime_ms", prepare_runtime),
         benchmark_span_line("standup_to_weights_loaded_ms", standup_to_weights),
         benchmark_span_line("standup_to_prompt_rpc_ms", standup_to_prompt_rpc),
@@ -2776,7 +2776,7 @@ fn build_benchmark_report(
 
 fn benchmark_span_line(name: &str, duration: DurationRender) -> String {
     let mut line = format!(
-        "mvp-chat-check: benchmark {name}={}",
+        "myelin-chat-check: benchmark {name}={}",
         render_duration_value(duration)
     );
     if duration.clock_skew {
@@ -2842,7 +2842,7 @@ fn prompt_benchmark_line(prompt: &PromptBenchmarkFacts) -> String {
         fields.push("clock_skew=true".to_owned());
     }
     format!(
-        "mvp-chat-check: benchmark prompt {} {}",
+        "myelin-chat-check: benchmark prompt {} {}",
         prompt.request_id,
         fields.join(" ")
     )
@@ -2915,8 +2915,8 @@ fn build_benchmark_summary(
     events: &[DumpLogEvent],
     child_elapsed_ms: u64,
     run_id: u64,
-    scenario: MvpChatCheckScenario,
-    paths: &MvpChatCheckPaths,
+    scenario: MyelinChatCheckScenario,
+    paths: &MyelinChatCheckPaths,
     expected_pipeline_stages: Option<u32>,
     stdout_bytes: u64,
     stderr_bytes: u64,
@@ -2927,7 +2927,7 @@ fn build_benchmark_summary(
         record_dump_log_event(scenario, &record.channel, &record.event, &mut dump_facts)?;
     }
     let datastream_bytes = file_size(&paths.dump_log)?;
-    let prompt_bytes = u64::try_from(MVP_CHAT_CHECK_PROMPTS.len()).unwrap_or(u64::MAX);
+    let prompt_bytes = u64::try_from(MYELIN_CHAT_CHECK_PROMPTS.len()).unwrap_or(u64::MAX);
     let known_artifact_bytes = datastream_bytes
         .saturating_add(stdout_bytes)
         .saturating_add(stderr_bytes)
@@ -2943,17 +2943,17 @@ fn build_benchmark_summary(
     let validation =
         validate_benchmark_observability(events, run_id, scenario, expected_pipeline_stages);
     let summary = json!({
-        "schema": "swactor.mvp_chat.benchmark_summary.v1",
+        "schema": "swactor.myelin_chat.benchmark_summary.v1",
         "source": "datastream",
         "run_id": run_id,
         "scenario": scenario.name(),
         "created_unix_ms": unix_ms_now(),
         "workload": {
-            "name": "mvp-chat-check",
+            "name": "myelin-chat-check",
             "input_format": "stdin_prompt_corpus",
             "prompt_count": 2,
-            "prompt_bytes": MVP_CHAT_CHECK_PROMPTS.len(),
-            "prompt_corpus_blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
+            "prompt_bytes": MYELIN_CHAT_CHECK_PROMPTS.len(),
+            "prompt_corpus_blake3": bytes_blake3_hex(MYELIN_CHAT_CHECK_PROMPTS),
             "prompts": prompt_workload_summary(events, run_id),
         },
         "artifacts": {
@@ -2975,7 +2975,7 @@ fn build_benchmark_summary(
             "prompts": {
                 "path": paths.prompts.display().to_string(),
                 "bytes": prompt_bytes,
-                "blake3": bytes_blake3_hex(MVP_CHAT_CHECK_PROMPTS),
+                "blake3": bytes_blake3_hex(MYELIN_CHAT_CHECK_PROMPTS),
             },
             "redacted_config": {
                 "path": paths.redacted_config.display().to_string(),
@@ -2998,15 +2998,15 @@ fn build_benchmark_summary(
         },
         "timings": {
             "total_child_ms": child_elapsed_ms,
-            "cargo_run_mvp_chat_ms": benchmark_span_json(&facts, "mvp.xtask.benchmark", "XtaskBenchmark", "cargo_run_mvp_chat", "started", "ready"),
-            "prepare_runtime_ms": benchmark_span_json(&facts, "mvp.chat.runtime", "ChatProgress", "prepare_runtime", "started", "ready"),
+            "cargo_run_myelin_chat_ms": benchmark_span_json(&facts, "myelin.xtask.benchmark", "XtaskBenchmark", "cargo_run_myelin_chat", "started", "ready"),
+            "prepare_runtime_ms": benchmark_span_json(&facts, "myelin.chat.runtime", "ChatProgress", "prepare_runtime", "started", "ready"),
             "standup_to_weights_loaded_ms": duration_summary_json(duration_between(
-                facts.span_point("mvp.chat.runtime", "ChatProgress", "prepare_runtime", "ready"),
-                facts.span_point("mvp.orch.bootstrap", "OrchBootstrap", "weights_loaded", "ready"),
+                facts.span_point("myelin.chat.runtime", "ChatProgress", "prepare_runtime", "ready"),
+                facts.span_point("myelin.orch.bootstrap", "OrchBootstrap", "weights_loaded", "ready"),
             )),
             "standup_to_prompt_rpc_ms": duration_summary_json(duration_between(
-                facts.span_point("mvp.chat.runtime", "ChatProgress", "prepare_runtime", "ready"),
-                facts.span_point("mvp.chat.runtime", "ChatProgress", "prompt_rpc", "ready"),
+                facts.span_point("myelin.chat.runtime", "ChatProgress", "prepare_runtime", "ready"),
+                facts.span_point("myelin.chat.runtime", "ChatProgress", "prompt_rpc", "ready"),
             )),
             "prompts": prompt_summaries,
         },
@@ -3040,29 +3040,29 @@ fn build_benchmark_summary(
 }
 
 fn write_benchmark_artifacts(
-    paths: &MvpChatCheckPaths,
+    paths: &MyelinChatCheckPaths,
     run_id: u64,
-    scenario: MvpChatCheckScenario,
+    scenario: MyelinChatCheckScenario,
     events: &[DumpLogEvent],
     expected_pipeline_stages: Option<u32>,
-    output: &MvpChatCheckOutput,
+    output: &MyelinChatCheckOutput,
     summary: &Value,
 ) -> Result<(), String> {
     fs::write(&paths.stdout, &output.stdout).map_err(|e| {
         format!(
-            "mvp-chat-check: write stdout artifact {}: {e}",
+            "myelin-chat-check: write stdout artifact {}: {e}",
             paths.stdout.display()
         )
     })?;
     fs::write(&paths.stderr, &output.stderr).map_err(|e| {
         format!(
-            "mvp-chat-check: write stderr artifact {}: {e}",
+            "myelin-chat-check: write stderr artifact {}: {e}",
             paths.stderr.display()
         )
     })?;
-    fs::write(&paths.prompts, MVP_CHAT_CHECK_PROMPTS).map_err(|e| {
+    fs::write(&paths.prompts, MYELIN_CHAT_CHECK_PROMPTS).map_err(|e| {
         format!(
-            "mvp-chat-check: write prompt corpus {}: {e}",
+            "myelin-chat-check: write prompt corpus {}: {e}",
             paths.prompts.display()
         )
     })?;
@@ -3078,7 +3078,7 @@ fn write_benchmark_artifacts(
     )
     .map_err(|e| {
         format!(
-            "mvp-chat-check: write benchmark gaps artifact {}: {e}",
+            "myelin-chat-check: write benchmark gaps artifact {}: {e}",
             paths.benchmark_gaps.display()
         )
     })?;
@@ -3096,7 +3096,7 @@ fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
 fn benchmark_redacted_config(
     summary: &Value,
     run_id: u64,
-    scenario: MvpChatCheckScenario,
+    scenario: MyelinChatCheckScenario,
 ) -> Value {
     let mut config = summary
         .get("run_envelope")
@@ -3105,7 +3105,7 @@ fn benchmark_redacted_config(
         .unwrap_or_else(|| json!({}));
     redact_sensitive_values(&mut config);
     json!({
-        "schema": "swactor.mvp_chat.redacted_config.v1",
+        "schema": "swactor.myelin_chat.redacted_config.v1",
         "run_id": run_id,
         "scenario": scenario.name(),
         "detail": config,
@@ -3164,7 +3164,7 @@ fn prompt_workload_summary(events: &[DumpLogEvent], run_id: u64) -> Vec<Value> {
     let mut prompts = BTreeMap::new();
     for record in events {
         if !event_matches_run_id(&record.event, run_id)
-            || record.channel != "mvp.chat.prompt"
+            || record.channel != "myelin.chat.prompt"
             || record.event.get("type").and_then(Value::as_str) != Some("ChatProgress")
             || record.event.get("phase").and_then(Value::as_str) != Some("prompt_submitted")
             || record.event.get("status").and_then(Value::as_str) != Some("ready")
@@ -3257,7 +3257,7 @@ fn pipeline_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value
             record.channel.as_str(),
             record.event.get("type").and_then(Value::as_str),
         ) {
-            ("mvp.worker.step", Some("StepExecuted")) => {
+            ("myelin.worker.step", Some("StepExecuted")) => {
                 worker_steps.observe_step_event(&record.event);
                 if let Some(stage_index) = pipeline_stage_index(&record.event) {
                     worker_steps_by_stage
@@ -3266,10 +3266,10 @@ fn pipeline_summary_json(events: &[DumpLogEvent], facts: &DumpLogFacts) -> Value
                         .observe_step_event(&record.event);
                 }
             }
-            ("mvp.worker.ingress", Some("ObjectLoaded")) => {
+            ("myelin.worker.ingress", Some("ObjectLoaded")) => {
                 object_loads.observe_object_load_event(&record.event);
             }
-            ("mvp.worker.ring", Some("RingInstalled")) => {
+            ("myelin.worker.ring", Some("RingInstalled")) => {
                 let direction = record
                     .event
                     .get("direction")
@@ -3404,7 +3404,7 @@ impl PromptPipelineCriticalStats {
 fn prompt_pipeline_critical_summary_json(events: &[DumpLogEvent]) -> Vec<Value> {
     let mut prompts = BTreeMap::<u64, PromptPipelineCriticalStats>::new();
     for record in events {
-        if record.channel != "mvp.orch.prompt"
+        if record.channel != "myelin.orch.prompt"
             || record.event.get("type").and_then(Value::as_str) != Some("OrchPromptEvent")
         {
             continue;
@@ -3540,7 +3540,7 @@ impl PipelineEdgeHandoffStats {
 fn pipeline_edge_handoff_summary_json(events: &[DumpLogEvent]) -> Vec<Value> {
     let mut edges = BTreeMap::<u64, PipelineEdgeHandoffStats>::new();
     for record in events {
-        if record.channel != "mvp.node.stage"
+        if record.channel != "myelin.node.stage"
             || record.event.get("type").and_then(Value::as_str) != Some("NodeEvent")
         {
             continue;
@@ -3617,7 +3617,7 @@ fn stage_provisioning_summary_json(events: &[DumpLogEvent]) -> Value {
     let mut ssh_retry_counts = BTreeMap::<String, u64>::new();
     let mut ssh_failure_counts = BTreeMap::<String, u64>::new();
     for record in events {
-        if record.channel == "mvp.provisioning.events"
+        if record.channel == "myelin.provisioning.events"
             && let Some(kind) = record
                 .event
                 .get("event")
@@ -3626,7 +3626,7 @@ fn stage_provisioning_summary_json(events: &[DumpLogEvent]) -> Value {
         {
             *provider_event_counts.entry(kind.to_owned()).or_default() += 1;
         }
-        if record.channel.starts_with("mvp.provisioning.logs.node.") {
+        if record.channel.starts_with("myelin.provisioning.logs.node.") {
             let node = record
                 .event
                 .get("node_id")
@@ -3642,7 +3642,7 @@ fn stage_provisioning_summary_json(events: &[DumpLogEvent]) -> Value {
                 }
             }
         }
-        if record.channel != "mvp.orch.bootstrap"
+        if record.channel != "myelin.orch.bootstrap"
             || record.event.get("type").and_then(Value::as_str) != Some("OrchBootstrap")
             || record.event.get("phase").and_then(Value::as_str) != Some("stage_provision_send")
             || record.event.get("status").and_then(Value::as_str) != Some("sent")
@@ -3940,7 +3940,7 @@ fn pipeline_stage_index(event: &Value) -> Option<u64> {
         .or_else(|| event_u64(event, "role_id").and_then(|role| role.checked_sub(1)))
 }
 
-fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MvpChatCheckScenario) -> Vec<Value> {
+fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MyelinChatCheckScenario) -> Vec<Value> {
     let mut invariants = vec![
         invariant_json("chat_config_ready", facts.chat_config_ready),
         invariant_json("prepare_runtime_ready", facts.prepare_runtime_ready),
@@ -3962,7 +3962,7 @@ fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MvpChatCheckScenari
     ];
     if matches!(
         scenario,
-        MvpChatCheckScenario::Gpu | MvpChatCheckScenario::VastAi
+        MyelinChatCheckScenario::Gpu | MyelinChatCheckScenario::VastAi
     ) {
         invariants.extend([
             invariant_json("gpu_no_cpu_fallback", !facts.gpu_cpu_fallback_seen),
@@ -3971,7 +3971,7 @@ fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MvpChatCheckScenari
     }
     if matches!(
         scenario,
-        MvpChatCheckScenario::MultinodeDocker | MvpChatCheckScenario::VastAi
+        MyelinChatCheckScenario::MultinodeDocker | MyelinChatCheckScenario::VastAi
     ) {
         invariants.extend([
             invariant_json(
@@ -4106,7 +4106,7 @@ fn require_prompt_point(found: bool, event: &str, request_id: u64) -> Result<(),
 }
 
 fn missing_benchmark_event(event: String) -> String {
-    format!("mvp-chat-check: missing benchmark event {event}")
+    format!("myelin-chat-check: missing benchmark event {event}")
 }
 
 #[derive(Default)]
@@ -4169,7 +4169,7 @@ struct DumpLogFacts {
     orchestrator_stopped: bool,
 }
 fn record_dump_log_event(
-    scenario: MvpChatCheckScenario,
+    scenario: MyelinChatCheckScenario,
     channel: &str,
     event: &Value,
     facts: &mut DumpLogFacts,
@@ -4181,8 +4181,8 @@ fn record_dump_log_event(
     let phase = event.get("phase").and_then(Value::as_str);
     let status = event.get("status").and_then(Value::as_str);
     if status == Some("failed")
-        && !(scenario == MvpChatCheckScenario::VastAi
-            && channel == "mvp.orch.bootstrap"
+        && !(scenario == MyelinChatCheckScenario::VastAi
+            && channel == "myelin.orch.bootstrap"
             && event_type == Some("OrchBootstrap")
             && phase == Some("provider_start")
             && detail_str(event, "provider") == Some("vastai")
@@ -4190,7 +4190,7 @@ fn record_dump_log_event(
             && detail_u64(event, "stage_index").is_some())
     {
         return Err(format!(
-            "mvp-chat-check: failed event channel={channel} type={} phase={} detail={}",
+            "myelin-chat-check: failed event channel={channel} type={} phase={} detail={}",
             event_type.unwrap_or("<missing>"),
             phase.unwrap_or("<missing>"),
             event.get("detail").unwrap_or(&Value::Null)
@@ -4198,13 +4198,13 @@ fn record_dump_log_event(
     }
 
     match (channel, event_type, phase, status) {
-        ("mvp.chat.lifecycle", Some("ChatProgress"), Some("config"), Some("ready")) => {
+        ("myelin.chat.lifecycle", Some("ChatProgress"), Some("config"), Some("ready")) => {
             facts.chat_config_ready = true;
         }
-        ("mvp.chat.runtime", Some("ChatProgress"), Some("prepare_runtime"), Some("ready")) => {
+        ("myelin.chat.runtime", Some("ChatProgress"), Some("prepare_runtime"), Some("ready")) => {
             facts.prepare_runtime_ready = true;
         }
-        ("mvp.chat.runtime", Some("ChatProgress"), Some("prompt_rpc"), Some("ready")) => {
+        ("myelin.chat.runtime", Some("ChatProgress"), Some("prompt_rpc"), Some("ready")) => {
             facts.prompt_rpc_ready = true;
         }
         (_, Some("OrchBootstrap"), Some("iroh_driver"), Some("ready")) => {
@@ -4252,25 +4252,25 @@ fn record_dump_log_event(
         (_, Some("OrchBootstrap"), Some("weights_loaded"), Some("ready")) => {
             facts.orch_weights_loaded_ready = true;
         }
-        ("mvp.chat.prompt", Some("ChatProgress"), Some("response_text"), Some("observed")) => {
+        ("myelin.chat.prompt", Some("ChatProgress"), Some("response_text"), Some("observed")) => {
             match dump_log_request_id(event) {
                 Some(1) => facts.response_text_1 = true,
                 Some(2) => facts.response_text_2 = true,
                 _ => {}
             }
         }
-        ("mvp.chat.prompt", Some("ChatProgress"), Some("request_completed"), Some("ready")) => {
+        ("myelin.chat.prompt", Some("ChatProgress"), Some("request_completed"), Some("ready")) => {
             match dump_log_request_id(event) {
                 Some(1) => facts.request_completed_1 = true,
                 Some(2) => facts.request_completed_2 = true,
                 _ => {}
             }
         }
-        ("mvp.chat.lifecycle", Some("ChatProgress"), Some("shutdown"), Some("requested")) => {
+        ("myelin.chat.lifecycle", Some("ChatProgress"), Some("shutdown"), Some("requested")) => {
             facts.shutdown_requested = true;
         }
         (
-            "mvp.chat.component",
+            "myelin.chat.component",
             Some("ChatProgress"),
             Some("orchestrator_process"),
             Some("stopped"),
@@ -4282,7 +4282,7 @@ fn record_dump_log_event(
     Ok(())
 }
 fn record_vastai_provision_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFacts) {
-    if channel != "mvp.provisioning.events" {
+    if channel != "myelin.provisioning.events" {
         return;
     }
     let Some(provision) = event.get("event") else {
@@ -4301,7 +4301,7 @@ fn record_data_path_dump_log_event(channel: &str, event: &Value, facts: &mut Dum
     let phase = event.get("phase").and_then(Value::as_str);
     let status = event.get("status").and_then(Value::as_str);
     match (channel, event_type) {
-        ("mvp.worker.ring", Some("RingInstalled")) => {
+        ("myelin.worker.ring", Some("RingInstalled")) => {
             let edge_id = event.get("edge_id").and_then(Value::as_u64);
             match event.get("direction").and_then(Value::as_str) {
                 Some("ingress") => {
@@ -4322,7 +4322,7 @@ fn record_data_path_dump_log_event(channel: &str, event: &Value, facts: &mut Dum
                 _ => {}
             }
         }
-        ("mvp.worker.ingress", Some("ObjectLoaded")) => {
+        ("myelin.worker.ingress", Some("ObjectLoaded")) => {
             let extent = event.get("extent").and_then(Value::as_u64).unwrap_or(0);
             if extent > 0 || event_positive_u64(event, "token_count") {
                 facts.worker_ingress_object_loaded = true;
@@ -4349,7 +4349,7 @@ fn record_data_path_dump_log_event(channel: &str, event: &Value, facts: &mut Dum
                 }
             }
         }
-        ("mvp.worker.step", Some("StepExecuted")) => {
+        ("myelin.worker.step", Some("StepExecuted")) => {
             let payload_bytes = event
                 .get("payload_bytes")
                 .or_else(|| event.get("committed_bytes"))
@@ -4374,7 +4374,7 @@ fn record_data_path_dump_log_event(channel: &str, event: &Value, facts: &mut Dum
                 }
             }
         }
-        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+        ("myelin.orch.prompt", Some("OrchPromptEvent"))
             if phase == Some("pipeline_token_out")
                 && status == Some("observed")
                 && detail_u64(event, "token_id").is_some() =>
@@ -4474,25 +4474,25 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
     }
 
     match (channel, event_type) {
-        ("mvp.worker.initialize", Some("TinygradImportStarted"))
+        ("myelin.worker.initialize", Some("TinygradImportStarted"))
             if event_requested_device_is_cuda(event) =>
         {
             facts.gpu_worker_device_requested = true;
         }
-        ("mvp.worker.initialize", Some("TinygradImportReady"))
+        ("myelin.worker.initialize", Some("TinygradImportReady"))
             if event_requested_device_is_cuda(event) && event_env_dev_is_cuda(event) =>
         {
             facts.gpu_import_ready = true;
         }
-        ("mvp.worker.initialize", Some("TinygradDeviceProbeReady"))
+        ("myelin.worker.initialize", Some("TinygradDeviceProbeReady"))
             if event_requested_device_is_cuda(event) && event_probe_result_is_one(event) =>
         {
             facts.gpu_probe_ready = true;
         }
-        ("mvp.worker.initialize", Some("WorkerReady")) if worker_ready_backend_is_cuda(event) => {
+        ("myelin.worker.initialize", Some("WorkerReady")) if worker_ready_backend_is_cuda(event) => {
             facts.gpu_worker_ready = true;
         }
-        ("mvp.worker.prompt", Some("DecodeStarted"))
+        ("myelin.worker.prompt", Some("DecodeStarted"))
             if event_positive_u64(event, "prompt_tokens")
                 && event_positive_u64(event, "max_tokens")
                 && event
@@ -4504,21 +4504,21 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 facts.gpu_decode_started.insert(request_id);
             }
         }
-        ("mvp.worker.prompt", Some("FirstTokenReady"))
+        ("myelin.worker.prompt", Some("FirstTokenReady"))
             if event.get("token_index").and_then(Value::as_u64) == Some(1) =>
         {
             if let Some(request_id) = event.get("request_id").and_then(Value::as_u64) {
                 facts.gpu_first_token_ready.insert(request_id);
             }
         }
-        ("mvp.worker.prompt", Some("DecodeReady"))
+        ("myelin.worker.prompt", Some("DecodeReady"))
             if event_positive_u64(event, "tokens_generated") =>
         {
             if let Some(request_id) = event.get("request_id").and_then(Value::as_u64) {
                 facts.gpu_decode_ready.insert(request_id);
             }
         }
-        ("mvp.worker.prompt", Some("PromptCompleted"))
+        ("myelin.worker.prompt", Some("PromptCompleted"))
             if event
                 .get("generated_tokens")
                 .and_then(Value::as_array)
@@ -4528,7 +4528,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 facts.gpu_prompt_completed.insert(request_id);
             }
         }
-        ("mvp.worker.tokenizer", Some("PromptEncoded"))
+        ("myelin.worker.tokenizer", Some("PromptEncoded"))
             if event
                 .get("tokens")
                 .and_then(Value::as_array)
@@ -4538,7 +4538,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 facts.gpu_pipeline_prompt_encoded.insert(request_id);
             }
         }
-        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+        ("myelin.orch.prompt", Some("OrchPromptEvent"))
             if phase == Some("pipeline_tokenizer_encode")
                 && status == Some("ready")
                 && detail_u64(event, "tokens").is_some_and(|tokens| tokens > 0)
@@ -4548,7 +4548,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 .gpu_pipeline_prompt_encoded
                 .insert(event_request_id(event).expect("guarded request_id"));
         }
-        ("mvp.worker.tokenizer", Some("TokensDecoded"))
+        ("myelin.worker.tokenizer", Some("TokensDecoded"))
             if event
                 .get("text")
                 .and_then(Value::as_str)
@@ -4558,7 +4558,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 facts.gpu_pipeline_tokens_decoded.insert(request_id);
             }
         }
-        ("mvp.worker.step", Some("StepExecuted"))
+        ("myelin.worker.step", Some("StepExecuted"))
             if event_positive_u64(event, "committed_bytes") =>
         {
             let backend = event.get("execution_backend").and_then(Value::as_str);
@@ -4566,7 +4566,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 facts.gpu_pipeline_real_worker_step_seen = true;
             }
         }
-        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+        ("myelin.orch.prompt", Some("OrchPromptEvent"))
             if phase == Some("pipeline_token_in")
                 && status == Some("ready")
                 && event_request_id(event).is_some() =>
@@ -4582,7 +4582,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 facts.gpu_pipeline_prompt_begin.insert(request_id);
             }
         }
-        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+        ("myelin.orch.prompt", Some("OrchPromptEvent"))
             if phase == Some("pipeline_token_out")
                 && status == Some("observed")
                 && event
@@ -4596,7 +4596,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
                 .gpu_pipeline_token_out
                 .insert(event_request_id(event).expect("guarded request_id"));
         }
-        ("mvp.orch.prompt", Some("OrchPromptEvent"))
+        ("myelin.orch.prompt", Some("OrchPromptEvent"))
             if phase == Some("pipeline_tokenizer_decode")
                 && status == Some("ready")
                 && event
@@ -4616,7 +4616,7 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
 
 fn require_gpu_dump_log_facts(facts: &DumpLogFacts) -> Result<(), String> {
     if facts.gpu_cpu_fallback_seen {
-        return Err("mvp-chat-check: GPU run fell back to the tinygrad CPU compiler".to_owned());
+        return Err("myelin-chat-check: GPU run fell back to the tinygrad CPU compiler".to_owned());
     }
     require_dump_log_fact(
         facts.gpu_worker_device_requested,
@@ -4821,7 +4821,7 @@ fn require_dump_log_fact(found: bool, fact: &str) -> Result<(), String> {
     if found {
         Ok(())
     } else {
-        Err(format!("mvp-chat-check: missing {fact}"))
+        Err(format!("myelin-chat-check: missing {fact}"))
     }
 }
 
@@ -4836,58 +4836,58 @@ mod tests {
     }
 
     #[test]
-    fn mvp_chat_launcher_builds_dashboard_feature() {
+    fn myelin_chat_launcher_builds_dashboard_feature() {
         assert!(
-            MVP_CHAT_CARGO_RUN_ARGS
+            MYELIN_CHAT_CARGO_RUN_ARGS
                 .windows(2)
                 .any(|pair| pair[0] == "--features" && pair[1] == "dashboard"),
-            "{MVP_CHAT_CARGO_RUN_ARGS:?}"
+            "{MYELIN_CHAT_CARGO_RUN_ARGS:?}"
         );
         assert!(
-            MVP_CHAT_CARGO_RUN_ARGS
+            MYELIN_CHAT_CARGO_RUN_ARGS
                 .windows(2)
-                .any(|pair| pair[0] == "--bin" && pair[1] == "mvp-chat"),
-            "{MVP_CHAT_CARGO_RUN_ARGS:?}"
+                .any(|pair| pair[0] == "--bin" && pair[1] == "myelin-chat"),
+            "{MYELIN_CHAT_CARGO_RUN_ARGS:?}"
         );
     }
 
     #[test]
     fn scenario_flags_select_expected_launch_contract() {
-        let dump_log = Path::new("/tmp/mvp-chat-check.ndjson");
+        let dump_log = Path::new("/tmp/myelin-chat-check.ndjson");
 
         let baseline =
-            MvpChatCheckInvocation::parse_args(Vec::new()).expect("default scenario parses");
-        assert_eq!(baseline.scenario(), MvpChatCheckScenario::ProcessBaseline);
+            MyelinChatCheckInvocation::parse_args(Vec::new()).expect("default scenario parses");
+        assert_eq!(baseline.scenario(), MyelinChatCheckScenario::ProcessBaseline);
         assert_eq!(
-            baseline.mvp_chat_args(42, dump_log),
+            baseline.myelin_chat_args(42, dump_log),
             strings(&[
                 "--process",
                 "--cached-model",
                 "--run-id",
                 "42",
-                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+                "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
 
-        let gpu = MvpChatCheckInvocation::parse_args(strings(&["--gpu"])).expect("gpu parses");
-        assert_eq!(gpu.scenario(), MvpChatCheckScenario::Gpu);
+        let gpu = MyelinChatCheckInvocation::parse_args(strings(&["--gpu"])).expect("gpu parses");
+        assert_eq!(gpu.scenario(), MyelinChatCheckScenario::Gpu);
         assert!(gpu.env_overrides().is_empty());
         assert_eq!(
-            gpu.mvp_chat_args(42, dump_log),
+            gpu.myelin_chat_args(42, dump_log),
             strings(&[
                 "--process",
                 "--gpu",
                 "--run-id",
                 "42",
-                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+                "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
 
-        let multinode = MvpChatCheckInvocation::parse_args(strings(&["--multinode"]))
+        let multinode = MyelinChatCheckInvocation::parse_args(strings(&["--multinode"]))
             .expect("multinode parses");
-        assert_eq!(multinode.scenario(), MvpChatCheckScenario::Multinode);
+        assert_eq!(multinode.scenario(), MyelinChatCheckScenario::Multinode);
         assert_eq!(
-            multinode.mvp_chat_args(42, dump_log),
+            multinode.myelin_chat_args(42, dump_log),
             strings(&[
                 "--process",
                 "--pipeline-stages",
@@ -4895,18 +4895,18 @@ mod tests {
                 "--cached-model",
                 "--run-id",
                 "42",
-                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+                "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
 
-        let multinode_docker = MvpChatCheckInvocation::parse_args(strings(&["--multinode-docker"]))
+        let multinode_docker = MyelinChatCheckInvocation::parse_args(strings(&["--multinode-docker"]))
             .expect("multinode docker parses");
         assert_eq!(
             multinode_docker.scenario(),
-            MvpChatCheckScenario::MultinodeDocker
+            MyelinChatCheckScenario::MultinodeDocker
         );
         assert_eq!(
-            multinode_docker.mvp_chat_args(42, dump_log),
+            multinode_docker.myelin_chat_args(42, dump_log),
             strings(&[
                 "--docker",
                 "--pipeline-stages",
@@ -4914,15 +4914,15 @@ mod tests {
                 "--cached-model",
                 "--run-id",
                 "42",
-                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+                "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
 
         let vastai =
-            MvpChatCheckInvocation::parse_args(strings(&["--vastai"])).expect("vastai parses");
-        assert_eq!(vastai.scenario(), MvpChatCheckScenario::VastAi);
+            MyelinChatCheckInvocation::parse_args(strings(&["--vastai"])).expect("vastai parses");
+        assert_eq!(vastai.scenario(), MyelinChatCheckScenario::VastAi);
         assert_eq!(
-            vastai.mvp_chat_args(42, dump_log),
+            vastai.myelin_chat_args(42, dump_log),
             strings(&[
                 "--vastai",
                 "--cached-model",
@@ -4931,16 +4931,16 @@ mod tests {
                 "relay-only",
                 "--run-id",
                 "42",
-                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+                "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
 
         let vastai_sweep =
-            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages", "8"]))
+            MyelinChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages", "8"]))
                 .expect("vastai sweep parses");
-        assert_eq!(vastai_sweep.scenario(), MvpChatCheckScenario::VastAi);
+        assert_eq!(vastai_sweep.scenario(), MyelinChatCheckScenario::VastAi);
         assert_eq!(
-            vastai_sweep.mvp_chat_args(42, dump_log),
+            vastai_sweep.myelin_chat_args(42, dump_log),
             strings(&[
                 "--vastai",
                 "--pipeline-stages",
@@ -4951,14 +4951,14 @@ mod tests {
                 "relay-only",
                 "--run-id",
                 "42",
-                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+                "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
         let vastai_parallel =
-            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-parallel", "4"]))
+            MyelinChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-parallel", "4"]))
                 .expect("vastai pipeline-parallel parses");
         assert_eq!(
-            vastai_parallel.mvp_chat_args(42, dump_log),
+            vastai_parallel.myelin_chat_args(42, dump_log),
             strings(&[
                 "--vastai",
                 "--pipeline-stages",
@@ -4969,7 +4969,7 @@ mod tests {
                 "relay-only",
                 "--run-id",
                 "42",
-                "--dump-logs=/tmp/mvp-chat-check.ndjson",
+                "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
     }
@@ -4977,27 +4977,27 @@ mod tests {
     #[test]
     fn scenario_flags_reject_unknown_or_ambiguous_invocations() {
         assert!(
-            MvpChatCheckInvocation::parse_args(strings(&["--docker"]))
+            MyelinChatCheckInvocation::parse_args(strings(&["--docker"]))
                 .expect_err("unknown flag fails")
-                .contains("unsupported mvp-chat-check argument")
+                .contains("unsupported myelin-chat-check argument")
         );
         assert!(
-            MvpChatCheckInvocation::parse_args(strings(&["--gpu", "--multinode"]))
+            MyelinChatCheckInvocation::parse_args(strings(&["--gpu", "--multinode"]))
                 .expect_err("multiple scenarios fail")
                 .contains("at most one scenario flag")
         );
         assert!(
-            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages", "0"]))
+            MyelinChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages", "0"]))
                 .expect_err("zero pipeline stages fail")
                 .contains("--pipeline-stages must be greater than 0")
         );
         assert!(
-            MvpChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages"]))
+            MyelinChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-stages"]))
                 .expect_err("missing pipeline stages fail")
                 .contains("--pipeline-stages requires a value")
         );
         assert!(
-            MvpChatCheckInvocation::parse_args(strings(&[
+            MyelinChatCheckInvocation::parse_args(strings(&[
                 "--vastai",
                 "--pipeline-stages",
                 "4",
@@ -5019,15 +5019,15 @@ mod tests {
 
     #[test]
     fn failure_artifacts_include_gap_report_and_evidence_manifest() {
-        let root = unique_temp_dir("mvp-chat-check-failure-artifacts");
-        let paths = write_mvp_chat_check_paths(&root).expect("paths");
+        let root = unique_temp_dir("myelin-chat-check-failure-artifacts");
+        let paths = write_myelin_chat_check_paths(&root).expect("paths");
         fs::write(&paths.dump_log, "synthetic datastream\n").expect("write datastream");
 
         write_failure_artifacts(
             &paths,
             "child exited nonzero",
             "",
-            "mvp-chat: missing required VAST_API_KEY\n",
+            "myelin-chat: missing required VAST_API_KEY\n",
             None,
         )
         .expect("failure artifacts");
@@ -5189,7 +5189,7 @@ mod tests {
                 "run_id": 9,
                 "detail": {},
             }),
-            "mvp-chat",
+            "myelin-chat",
             wall_unix_ms,
             mono_ms,
         )
@@ -5220,7 +5220,7 @@ mod tests {
                     "response_started": true,
                 },
             }),
-            "mvp-chat",
+            "myelin-chat",
             wall_unix_ms,
             mono_ms,
         )
@@ -5283,7 +5283,7 @@ mod tests {
                 "request_id": request_id,
                 "detail": detail,
             }),
-            "mvp-orchestrator",
+            "myelin-orchestrator",
             wall_unix_ms,
             mono_ms,
         )
@@ -5294,15 +5294,15 @@ mod tests {
         for request_id in 1..=2 {
             let base = 1_200 + request_id * 100;
             events.push((
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span("prompt_submitted", "ready", request_id, base, base - 1_000),
             ));
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event("PromptStarted", request_id, base + 5, request_id * 100),
             ));
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event(
                     "PromptEncodeStarted",
                     request_id,
@@ -5311,7 +5311,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event(
                     "PromptEncodeReady",
                     request_id,
@@ -5320,7 +5320,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event(
                     "DecodeStarted",
                     request_id,
@@ -5330,7 +5330,7 @@ mod tests {
             ));
             if include_first_token {
                 events.push((
-                    "mvp.worker.prompt",
+                    "myelin.worker.prompt",
                     worker_prompt_event(
                         "FirstTokenReady",
                         request_id,
@@ -5340,11 +5340,11 @@ mod tests {
                 ));
             }
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event("DecodeReady", request_id, base + 40, request_id * 100 + 40),
             ));
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event(
                     "TextDecodeStarted",
                     request_id,
@@ -5353,7 +5353,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event(
                     "TextDecodeReady",
                     request_id,
@@ -5362,7 +5362,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.worker.prompt",
+                "myelin.worker.prompt",
                 worker_prompt_event(
                     "PromptCompleted",
                     request_id,
@@ -5371,7 +5371,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span(
                     "request_completed",
                     "ready",
@@ -5389,11 +5389,11 @@ mod tests {
         for request_id in 1..=2 {
             let base = 1_200 + request_id * 100;
             events.push((
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span("prompt_submitted", "ready", request_id, base, base - 1_000),
             ));
             events.push((
-                "mvp.orch.prompt",
+                "myelin.orch.prompt",
                 pipeline_prompt_event(
                     "pipeline_tokenizer_encode",
                     "started",
@@ -5404,7 +5404,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.orch.prompt",
+                "myelin.orch.prompt",
                 pipeline_prompt_event(
                     "pipeline_tokenizer_encode",
                     "ready",
@@ -5415,7 +5415,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.orch.prompt",
+                "myelin.orch.prompt",
                 pipeline_prompt_event(
                     "pipeline_token_in",
                     "started",
@@ -5427,7 +5427,7 @@ mod tests {
             ));
             if include_first_token {
                 events.push((
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     pipeline_prompt_event(
                         "pipeline_token_out",
                         "observed",
@@ -5439,7 +5439,7 @@ mod tests {
                 ));
             }
             events.push((
-                "mvp.orch.prompt",
+                "myelin.orch.prompt",
                 pipeline_prompt_event(
                     "pipeline_tokenizer_decode",
                     "started",
@@ -5450,7 +5450,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.orch.prompt",
+                "myelin.orch.prompt",
                 pipeline_prompt_event(
                     "pipeline_tokenizer_decode",
                     "ready",
@@ -5461,7 +5461,7 @@ mod tests {
                 ),
             ));
             events.push((
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span(
                     "request_completed",
                     "ready",
@@ -5477,11 +5477,11 @@ mod tests {
     fn benchmark_report_base_events() -> Vec<(&'static str, Value)> {
         vec![
             (
-                "mvp.xtask.benchmark",
+                "myelin.xtask.benchmark",
                 stamped(
                     json!({
                         "type": "XtaskBenchmark",
-                        "phase": "cargo_run_mvp_chat",
+                        "phase": "cargo_run_myelin_chat",
                         "status": "started",
                         "run_id": 9,
                         "detail": {},
@@ -5492,11 +5492,11 @@ mod tests {
                 ),
             ),
             (
-                "mvp.xtask.benchmark",
+                "myelin.xtask.benchmark",
                 stamped(
                     json!({
                         "type": "XtaskBenchmark",
-                        "phase": "cargo_run_mvp_chat",
+                        "phase": "cargo_run_myelin_chat",
                         "status": "ready",
                         "run_id": 9,
                         "detail": {},
@@ -5507,7 +5507,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.chat.benchmark",
+                "myelin.chat.benchmark",
                 stamped(
                     json!({
                         "type":"BenchmarkRunEnvelope",
@@ -5520,33 +5520,33 @@ mod tests {
                             "model":{"id":"unit-model"},
                         },
                     }),
-                    "mvp-chat",
+                    "myelin-chat",
                     995,
                     0,
                 ),
             ),
             (
-                "mvp.chat.benchmark",
+                "myelin.chat.benchmark",
                 chat_span("endpoint_config_snapshot", "ready", 998, 0),
             ),
             (
-                "mvp.chat.runtime",
+                "myelin.chat.runtime",
                 chat_span("prepare_runtime", "started", 1_030, 30),
             ),
             (
-                "mvp.chat.runtime",
+                "myelin.chat.runtime",
                 chat_span("ensure_orch_binary", "ready", 1_035, 35),
             ),
             (
-                "mvp.chat.runtime",
+                "myelin.chat.runtime",
                 chat_span("ensure_worker_binary", "ready", 1_036, 36),
             ),
             (
-                "mvp.chat.runtime",
+                "myelin.chat.runtime",
                 chat_span("prepare_runtime", "ready", 1_040, 40),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({
                         "type": "OrchBootstrap",
@@ -5557,22 +5557,22 @@ mod tests {
                         "node_id": 1,
                         "detail": {},
                     }),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     1_100,
                     100,
                 ),
             ),
             (
-                "mvp.node.worker",
+                "myelin.node.worker",
                 stamped(
                     json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":3,"stage_index":2,"detail":{"device":"CPU"}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_050,
                     50,
                 ),
             ),
             (
-                "mvp.worker.initialize",
+                "myelin.worker.initialize",
                 stamped(
                     json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":3,"stage_index":2,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
@@ -5581,7 +5581,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.chat.runtime",
+                "myelin.chat.runtime",
                 chat_span("prompt_rpc", "ready", 1_120, 120),
             ),
         ]
@@ -5592,9 +5592,9 @@ mod tests {
         include_cpu_fallback: bool,
     ) -> Vec<(&'static str, Value)> {
         let mut events = vec![
-            ("mvp.chat.lifecycle", chat_span("config", "ready", 1_000, 0)),
+            ("myelin.chat.lifecycle", chat_span("config", "ready", 1_000, 0)),
             (
-                "mvp.chat.benchmark",
+                "myelin.chat.benchmark",
                 stamped(
                     json!({
                         "type":"BenchmarkRunEnvelope",
@@ -5607,52 +5607,52 @@ mod tests {
                             "model":{"id":"unit"},
                         },
                     }),
-                    "mvp-chat",
+                    "myelin-chat",
                     1_001,
                     0,
                 ),
             ),
             (
-                "mvp.chat.benchmark",
+                "myelin.chat.benchmark",
                 chat_span("endpoint_config_snapshot", "ready", 1_002, 2),
             ),
             (
-                "mvp.chat.runtime",
+                "myelin.chat.runtime",
                 chat_span("prepare_runtime", "ready", 1_010, 10),
             ),
             (
-                "mvp.chat.runtime",
+                "myelin.chat.runtime",
                 chat_span("prompt_rpc", "ready", 1_020, 20),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"iroh_driver","status":"ready","run_id":9,"node_id":1,"detail":{}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     1_030,
                     30,
                 ),
             ),
             (
-                "mvp.node.bootstrap",
+                "myelin.node.bootstrap",
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_040,
                     40,
                 ),
             ),
             (
-                "mvp.node.worker",
+                "myelin.node.worker",
                 stamped(
                     json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"device":"CUDA"}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_050,
                     50,
                 ),
             ),
             (
-                "mvp.worker.initialize",
+                "myelin.worker.initialize",
                 stamped(
                     json!({"type":"PythonDatastreamConfigured","phase":"PythonDatastreamConfigured","status":"configured","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
@@ -5661,7 +5661,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.worker.initialize",
+                "myelin.worker.initialize",
                 stamped(
                     json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
@@ -5670,36 +5670,36 @@ mod tests {
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"weights_loaded","status":"ready","run_id":9,"node_id":1,"detail":{}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     1_060,
                     60,
                 ),
             ),
             (
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span("response_text", "observed", 1, 1_200, 200),
             ),
             (
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span("request_completed", "ready", 1, 1_210, 210),
             ),
             (
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span("response_text", "observed", 2, 1_300, 300),
             ),
             (
-                "mvp.chat.prompt",
+                "myelin.chat.prompt",
                 prompt_chat_span("request_completed", "ready", 2, 1_310, 310),
             ),
             (
-                "mvp.chat.lifecycle",
+                "myelin.chat.lifecycle",
                 chat_span("shutdown", "requested", 1_400, 400),
             ),
             (
-                "mvp.chat.component",
+                "myelin.chat.component",
                 chat_span("orchestrator_process", "stopped", 1_410, 410),
             ),
         ];
@@ -5707,7 +5707,7 @@ mod tests {
         if include_gpu {
             events.extend([
                 (
-                    "mvp.worker.initialize",
+                    "myelin.worker.initialize",
                     stamped(
                         json!({"type":"TinygradImportStarted","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","env_DEV":"CUDA"}),
                         "tinygrad-worker",
@@ -5716,7 +5716,7 @@ mod tests {
                     ),
                 ),
                 (
-                    "mvp.worker.initialize",
+                    "myelin.worker.initialize",
                     stamped(
                         json!({"type":"TinygradImportReady","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","env_DEV":"CUDA"}),
                         "tinygrad-worker",
@@ -5725,7 +5725,7 @@ mod tests {
                     ),
                 ),
                 (
-                    "mvp.worker.initialize",
+                    "myelin.worker.initialize",
                     stamped(
                         json!({"type":"TinygradDeviceProbeReady","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","probe_result":[1]}),
                         "tinygrad-worker",
@@ -5734,7 +5734,7 @@ mod tests {
                     ),
                 ),
                 (
-                    "mvp.worker.initialize",
+                    "myelin.worker.initialize",
                     stamped(
                         json!({"type":"WorkerReady","run_id":9,"node_id":3,"stage_index":1,"backend":{"requested_device":"CUDA","env_DEV":"CUDA","tinygrad_device":"CUDA"},"cuda_probe":[1]}),
                         "tinygrad-worker",
@@ -5745,7 +5745,7 @@ mod tests {
             ]);
             if include_cpu_fallback {
                 events.push((
-                    "mvp.worker.initialize",
+                    "myelin.worker.initialize",
                     stamped(
                         json!({"type":"TinygradCpuCompilerSelected","run_id":9,"node_id":3,"stage_index":1,"requested_device":"CUDA","selected_device":"CPU:X86"}),
                         "tinygrad-worker",
@@ -5758,19 +5758,19 @@ mod tests {
                 let base = 1_200 + request_id * 100;
                 events.extend([
                     (
-                        "mvp.worker.prompt",
+                        "myelin.worker.prompt",
                         worker_prompt_event("DecodeStarted", request_id, base + 20, base - 980),
                     ),
                     (
-                        "mvp.worker.prompt",
+                        "myelin.worker.prompt",
                         worker_prompt_event("FirstTokenReady", request_id, base + 25, base - 975),
                     ),
                     (
-                        "mvp.worker.prompt",
+                        "myelin.worker.prompt",
                         worker_prompt_event("DecodeReady", request_id, base + 40, base - 960),
                     ),
                     (
-                        "mvp.worker.prompt",
+                        "myelin.worker.prompt",
                         worker_prompt_event("PromptCompleted", request_id, base + 50, base - 950),
                     ),
                 ]);
@@ -5782,11 +5782,11 @@ mod tests {
     #[test]
     fn benchmark_observability_dump_log_path_parser_finds_equals_and_separate_forms() {
         assert_eq!(
-            explicit_dump_log_path_from_mvp_chat_args(&strings(&["--dump-logs=/tmp/a.ndjson"])),
+            explicit_dump_log_path_from_myelin_chat_args(&strings(&["--dump-logs=/tmp/a.ndjson"])),
             Some(PathBuf::from("/tmp/a.ndjson"))
         );
         assert_eq!(
-            explicit_dump_log_path_from_mvp_chat_args(&strings(&[
+            explicit_dump_log_path_from_myelin_chat_args(&strings(&[
                 "--",
                 "--run-id",
                 "7",
@@ -5796,19 +5796,19 @@ mod tests {
             Some(PathBuf::from("-logs.ndjson"))
         );
         assert_eq!(
-            explicit_dump_log_path_from_mvp_chat_args(&strings(&["--dump-logs"])),
+            explicit_dump_log_path_from_myelin_chat_args(&strings(&["--dump-logs"])),
             None
         );
         assert_eq!(
-            explicit_dump_log_path_from_mvp_chat_args(&strings(&["--dump-logs", "--run-id"])),
+            explicit_dump_log_path_from_myelin_chat_args(&strings(&["--dump-logs", "--run-id"])),
             None
         );
         assert_eq!(
-            run_id_from_mvp_chat_args(&strings(&["--", "--run-id", "42"])),
+            run_id_from_myelin_chat_args(&strings(&["--", "--run-id", "42"])),
             Some(42)
         );
         assert_eq!(
-            run_id_from_mvp_chat_args(&strings(&["--run-id", "0"])),
+            run_id_from_myelin_chat_args(&strings(&["--run-id", "0"])),
             None
         );
     }
@@ -5856,12 +5856,12 @@ mod tests {
     fn benchmark_observability_gpu_dump_facts_require_cuda_worker_and_decode_cycles() {
         let path = write_synthetic_event_dump("gpu-dump-facts", dump_log_fact_events(true, false));
 
-        let events = assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu, 9, None)
+        let events = assert_dump_log_facts(&path, MyelinChatCheckScenario::Gpu, 9, None)
             .expect("GPU dump log facts pass");
         let _ = fs::remove_file(path);
 
         assert!(events.iter().any(|event| {
-            event.channel == "mvp.worker.initialize"
+            event.channel == "myelin.worker.initialize"
                 && event.event.get("type").and_then(Value::as_str) == Some("WorkerReady")
         }));
     }
@@ -5913,7 +5913,7 @@ mod tests {
                 request_id,
                 json!({"tokens":4}),
             );
-            record_gpu_dump_log_event("mvp.orch.prompt", &event, &mut facts);
+            record_gpu_dump_log_event("myelin.orch.prompt", &event, &mut facts);
         }
         require_gpu_dump_log_facts(&facts).expect("orchestrator encode evidence passes");
     }
@@ -5923,53 +5923,53 @@ mod tests {
         let mut events = dump_log_fact_events(false, false);
         events.extend([
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"full","provider":"docker","worker_count":2}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     1_071,
                     71,
                 ),
             ),
             (
-                "mvp.node.bootstrap",
+                "myelin.node.bootstrap",
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"full","has_relay":false,"direct_addr_count":3}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_072,
                     72,
                 ),
             ),
             (
-                "mvp.node.bootstrap",
+                "myelin.node.bootstrap",
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"endpoint_addr_mask":"full","has_relay":false,"direct_addr_count":3}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_073,
                     73,
                 ),
             ),
             (
-                "mvp.node.bootstrap",
+                "myelin.node.bootstrap",
                 stamped(
                     json!({"type":"NodeEvent","phase":"coordinator_join","status":"started","run_id":9,"node_id":2,"stage_index":0,"detail":{"has_relay":false,"direct_addr_count":4}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_074,
                     74,
                 ),
             ),
             (
-                "mvp.node.bootstrap",
+                "myelin.node.bootstrap",
                 stamped(
                     json!({"type":"NodeEvent","phase":"coordinator_join","status":"started","run_id":9,"node_id":3,"stage_index":1,"detail":{"has_relay":false,"direct_addr_count":4}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_075,
                     75,
                 ),
             ),
         ]);
         let path = write_synthetic_event_dump("multinode-docker-direct-network", events);
-        assert_dump_log_facts(&path, MvpChatCheckScenario::MultinodeDocker, 9, None)
+        assert_dump_log_facts(&path, MyelinChatCheckScenario::MultinodeDocker, 9, None)
             .expect("direct-network multinode Docker facts pass");
         let _ = fs::remove_file(path);
     }
@@ -5979,47 +5979,47 @@ mod tests {
         let mut events = dump_log_fact_events(true, false);
         events.extend([
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"provider_start","status":"failed","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":3,"stage_index":0,"attempt":1,"error":"transient provider failure"}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     1_072,
                     72,
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"node_spec","status":"ready","run_id":9,"node_id":1,"detail":{"endpoint_addr_mask":"relay-only","provider":"vastai","worker_count":2}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     9_071,
                     9_071,
                 ),
             ),
             (
-                "mvp.provisioning.events",
-                json!({"event":{"run_id":9,"node_id":3,"kind":"ProvisionStart","provider":"vastai","message":"starting vastai image registry.example/mvp-node:latest"}}),
+                "myelin.provisioning.events",
+                json!({"event":{"run_id":9,"node_id":3,"kind":"ProvisionStart","provider":"vastai","message":"starting vastai image registry.example/myelin-node:latest"}}),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":3,"stage_index":0}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     9_073,
                     9_073,
                 ),
             ),
             (
-                "mvp.node.bootstrap",
+                "myelin.node.bootstrap",
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"relay-only","has_relay":true,"direct_addr_count":0}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     9_074,
                     9_074,
                 ),
             ),
             (
-                "mvp.worker.ring",
+                "myelin.worker.ring",
                 stamped(
                     json!({"type":"RingInstalled","run_id":9,"node_id":2,"stage_index":0,"ring_id":1,"direction":"egress","edge_id":77,"kind":"activation","max_extent":4096}),
                     "tinygrad-worker",
@@ -6028,7 +6028,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.worker.ring",
+                "myelin.worker.ring",
                 stamped(
                     json!({"type":"RingInstalled","run_id":9,"node_id":3,"stage_index":1,"ring_id":2,"direction":"ingress","edge_id":77,"kind":"activation","max_extent":4096}),
                     "tinygrad-worker",
@@ -6037,7 +6037,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.worker.step",
+                "myelin.worker.step",
                 stamped(
                     json!({"type":"StepExecuted","run_id":9,"node_id":2,"stage_index":0,"execution_backend":"pipeline_stage","committed_bytes":4096}),
                     "tinygrad-worker",
@@ -6046,7 +6046,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.worker.ingress",
+                "myelin.worker.ingress",
                 stamped(
                     json!({"type":"ObjectLoaded","run_id":9,"node_id":3,"stage_index":1,"edge_id":77,"kind":"activation","extent":4056}),
                     "tinygrad-worker",
@@ -6056,25 +6056,25 @@ mod tests {
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":4,"stage_index":1}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     9_084,
                     9_084,
                 ),
             ),
             (
-                "mvp.node.worker",
+                "myelin.node.worker",
                 stamped(
                     json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"device":"CUDA"}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     9_085,
                     9_085,
                 ),
             ),
             (
-                "mvp.worker.initialize",
+                "myelin.worker.initialize",
                 stamped(
                     json!({"type":"WorkerReady","run_id":9,"node_id":2,"stage_index":0,"backend":{"requested_device":"CUDA","env_DEV":"CUDA","tinygrad_device":"CUDA"},"cuda_probe":[1]}),
                     "tinygrad-worker",
@@ -6122,7 +6122,7 @@ mod tests {
         require_vastai_network_facts(&orch_runtime_only)
             .expect("orchestrator runtime-ready events are valid VastAI worker evidence");
         let path = write_synthetic_event_dump("vastai-remote-provider", events);
-        assert_dump_log_facts(&path, MvpChatCheckScenario::VastAi, 9, Some(2))
+        assert_dump_log_facts(&path, MyelinChatCheckScenario::VastAi, 9, Some(2))
             .expect("VastAI remote provider facts pass");
         let _ = fs::remove_file(path);
     }
@@ -6131,20 +6131,20 @@ mod tests {
     fn benchmark_observability_dump_facts_reject_unexpected_failed_events() {
         let mut events = dump_log_fact_events(false, false);
         events.push((
-            "mvp.chat.runtime",
+            "myelin.chat.runtime",
             chat_span("prepare_node_image", "failed", 1_500, 500),
         ));
         let path = write_synthetic_event_dump("unexpected-failed-event", events);
 
         let error =
-            match assert_dump_log_facts(&path, MvpChatCheckScenario::ProcessBaseline, 9, None) {
+            match assert_dump_log_facts(&path, MyelinChatCheckScenario::ProcessBaseline, 9, None) {
                 Ok(_) => panic!("unexpected failed event should fail the check"),
                 Err(error) => error,
             };
         let _ = fs::remove_file(path);
 
         assert!(
-            error.contains("failed event channel=mvp.chat.runtime"),
+            error.contains("failed event channel=myelin.chat.runtime"),
             "unexpected error: {error}"
         );
     }
@@ -6173,7 +6173,7 @@ mod tests {
     fn validator_rejects_missing_python_datastream_connectivity() {
         let mut events = dump_log_fact_events(false, false);
         events.retain(|(channel, event)| {
-            !(*channel == "mvp.worker.initialize"
+            !(*channel == "myelin.worker.initialize"
                 && event.get("type").and_then(Value::as_str) == Some("PythonDatastreamConnected"))
         });
         let parsed = parse_synthetic_events("missing-python-datastream", events);
@@ -6181,7 +6181,7 @@ mod tests {
         let validation = validate_benchmark_observability(
             &parsed,
             9,
-            MvpChatCheckScenario::ProcessBaseline,
+            MyelinChatCheckScenario::ProcessBaseline,
             None,
         );
 
@@ -6195,7 +6195,7 @@ mod tests {
     fn benchmark_observability_gpu_dump_facts_reject_cpu_fallback() {
         let path = write_synthetic_event_dump("gpu-cpu-fallback", dump_log_fact_events(true, true));
 
-        let error = match assert_dump_log_facts(&path, MvpChatCheckScenario::Gpu, 9, None) {
+        let error = match assert_dump_log_facts(&path, MyelinChatCheckScenario::Gpu, 9, None) {
             Ok(_) => panic!("CPU fallback should fail GPU check"),
             Err(error) => error,
         };
@@ -6212,101 +6212,101 @@ mod tests {
         let mut events = dump_log_fact_events(true, false);
         events.retain(|(channel, event)| {
             event_stage_index(event) != Some(1)
-                || !(channel.starts_with("mvp.worker.") || channel.starts_with("mvp.node."))
+                || !(channel.starts_with("myelin.worker.") || channel.starts_with("myelin.node."))
         });
         events.extend([
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":2,"stage_index":0}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_000,
                     1_000,
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":3,"stage_index":1}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_001,
                     1_001,
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"provider_start","status":"started","run_id":9,"node_id":1,"detail":{"provider":"vastai","node_id":4,"stage_index":2}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_002,
                     1_002,
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"node_runtime_ready","status":"ready","run_id":9,"node_id":1,"detail":{"node_id":2,"stage_index":0,"endpoint":{"addrs":[{"Relay":"https://relay.example"}]}}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_003,
                     1_003,
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"node_runtime_ready","status":"ready","run_id":9,"node_id":1,"detail":{"node_id":3,"stage_index":1,"endpoint":{"addrs":[{"Relay":"https://relay.example"}]}}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_004,
                     1_004,
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"node_runtime_ready","status":"ready","run_id":9,"node_id":1,"detail":{"node_id":4,"stage_index":2,"endpoint":{"addrs":[{"Relay":"https://relay.example"}]}}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_005,
                     1_005,
                 ),
             ),
             (
-                "mvp.orch.stage_route",
+                "myelin.orch.stage_route",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"stage_route_check","status":"observed","run_id":9,"node_id":1,"detail":{"stage_index":1,"stage_node_id":3,"member_state":"Alive","route_matches_ready":true}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_006,
                     1_006,
                 ),
             ),
             (
-                "mvp.orch.stage_route",
+                "myelin.orch.stage_route",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"stage_route_check","status":"observed","run_id":9,"node_id":1,"detail":{"stage_index":2,"stage_node_id":4,"member_state":"Alive","route_matches_ready":true}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     2_007,
                     1_007,
                 ),
             ),
             (
-                "mvp.node.bootstrap",
+                "myelin.node.bootstrap",
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_driver","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"endpoint_addr_mask":"relay-only","has_relay":true,"direct_addr_count":0}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     2_100,
                     1_100,
                 ),
             ),
             (
-                "mvp.node.worker",
+                "myelin.node.worker",
                 stamped(
                     json!({"type":"NodeEvent","phase":"worker_initialize","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"device":"CUDA"}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     2_101,
                     1_101,
                 ),
             ),
             (
-                "mvp.worker.initialize",
+                "myelin.worker.initialize",
                 stamped(
                     json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":2,"stage_index":0,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
@@ -6315,7 +6315,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.worker.initialize",
+                "myelin.worker.initialize",
                 stamped(
                     json!({"type":"WorkerReady","run_id":9,"node_id":2,"stage_index":0,"backend":{"requested_device":"CUDA","env_DEV":"CUDA","tinygrad_device":"CUDA"},"cuda_probe":[1]}),
                     "tinygrad-worker",
@@ -6324,7 +6324,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.worker.ring",
+                "myelin.worker.ring",
                 stamped(
                     json!({"type":"RingInstalled","run_id":9,"node_id":2,"stage_index":0,"ring_id":1,"direction":"egress","edge_id":70,"kind":"activation","max_extent":4096}),
                     "tinygrad-worker",
@@ -6333,7 +6333,7 @@ mod tests {
                 ),
             ),
             (
-                "mvp.worker.ingress",
+                "myelin.worker.ingress",
                 stamped(
                     json!({"type":"ObjectLoaded","run_id":9,"node_id":4,"stage_index":2,"edge_id":3,"kind":"activation","extent":4056}),
                     "tinygrad-worker",
@@ -6345,7 +6345,7 @@ mod tests {
         let parsed = parse_synthetic_events("vastai-orchestrator-runtime-ready", events);
 
         let validation =
-            validate_benchmark_observability(&parsed, 9, MvpChatCheckScenario::VastAi, Some(3));
+            validate_benchmark_observability(&parsed, 9, MyelinChatCheckScenario::VastAi, Some(3));
 
         let invalid = validation
             .invalid_findings()
@@ -6365,10 +6365,10 @@ mod tests {
     fn validator_rejects_wrong_run_id_as_fatal_gap() {
         let mut events = dump_log_fact_events(false, false);
         events.push((
-            "mvp.chat.runtime",
+            "myelin.chat.runtime",
             stamped(
                 json!({"type":"ChatProgress","phase":"prepare_runtime","status":"ready","run_id":99,"detail":{}}),
-                "mvp-chat",
+                "myelin-chat",
                 9_999,
                 999,
             ),
@@ -6378,7 +6378,7 @@ mod tests {
         let validation = validate_benchmark_observability(
             &parsed,
             9,
-            MvpChatCheckScenario::ProcessBaseline,
+            MyelinChatCheckScenario::ProcessBaseline,
             None,
         );
 
@@ -6395,13 +6395,13 @@ mod tests {
             .expect("event object")
             .remove("span_id");
         let mut events = dump_log_fact_events(false, false);
-        events.push(("mvp.chat.runtime", event));
+        events.push(("myelin.chat.runtime", event));
         let parsed = parse_synthetic_events("missing-span-id", events);
 
         let validation = validate_benchmark_observability(
             &parsed,
             9,
-            MvpChatCheckScenario::ProcessBaseline,
+            MyelinChatCheckScenario::ProcessBaseline,
             None,
         );
 
@@ -6416,11 +6416,11 @@ mod tests {
     fn benchmark_observability_report_requires_granular_decode_events() {
         let events = parse_synthetic_events("missing-first-token", benchmark_report_events(false));
 
-        let error = build_benchmark_report(&events, 80, 9, MvpChatCheckScenario::ProcessBaseline)
+        let error = build_benchmark_report(&events, 80, 9, MyelinChatCheckScenario::ProcessBaseline)
             .expect_err("missing first token should fail");
 
         assert!(
-            error.starts_with("mvp-chat-check: missing benchmark event "),
+            error.starts_with("myelin-chat-check: missing benchmark event "),
             "{error}"
         );
         assert!(
@@ -6434,22 +6434,22 @@ mod tests {
         let events =
             parse_synthetic_events("pipeline-report", pipeline_benchmark_report_events(true));
 
-        let report = build_benchmark_report(&events, 80, 9, MvpChatCheckScenario::ProcessBaseline)
+        let report = build_benchmark_report(&events, 80, 9, MyelinChatCheckScenario::ProcessBaseline)
             .expect("pipeline report builds");
 
         assert!(
             report
                 .lines
                 .iter()
-                .any(|line| line == "mvp-chat-check: benchmark: run_id=9")
+                .any(|line| line == "myelin-chat-check: benchmark: run_id=9")
         );
         assert!(report.lines.iter().any(|line| {
-            line.starts_with("mvp-chat-check: benchmark prompt 1 ")
+            line.starts_with("myelin-chat-check: benchmark prompt 1 ")
                 && line.contains("first_token_ms=8")
                 && line.contains("decode_ms=8")
         }));
         assert!(report.lines.iter().any(|line| {
-            line.starts_with("mvp-chat-check: benchmark prompt 2 ")
+            line.starts_with("myelin-chat-check: benchmark prompt 2 ")
                 && line.contains("first_token_ms=8")
                 && line.contains("decode_ms=8")
         }));
@@ -6459,7 +6459,7 @@ mod tests {
     fn benchmark_summary_preserves_workload_artifacts_and_prompt_timings() {
         let mut event_pairs = benchmark_report_events(true);
         event_pairs.push((
-            "mvp.chat.benchmark",
+            "myelin.chat.benchmark",
             stamped(
                 json!({
                     "type": "BenchmarkRunEnvelope",
@@ -6472,14 +6472,14 @@ mod tests {
                         "provider": {"kind": "process", "node_image": "unit-image"},
                     },
                 }),
-                "mvp-chat",
+                "myelin-chat",
                 2_001,
                 1,
             ),
         ));
         let path = write_synthetic_event_dump("summary-contract", event_pairs);
         let events = parse_dump_log_events(&path).expect("parse summary events");
-        let paths = MvpChatCheckPaths {
+        let paths = MyelinChatCheckPaths {
             root: std::env::temp_dir(),
             dump_log: path.clone(),
             stdout: temp_path("summary-stdout"),
@@ -6495,7 +6495,7 @@ mod tests {
             &events,
             80,
             9,
-            MvpChatCheckScenario::ProcessBaseline,
+            MyelinChatCheckScenario::ProcessBaseline,
             &paths,
             None,
             123,
@@ -6567,7 +6567,7 @@ mod tests {
         let mut event_pairs = dump_log_fact_events(true, false);
         event_pairs.extend([
             (
-                "mvp.provisioning.logs.node.2.stderr",
+                "myelin.provisioning.logs.node.2.stderr",
                 json!({
                     "run_id": 9,
                     "node_id": 2,
@@ -6576,7 +6576,7 @@ mod tests {
                 }),
             ),
             (
-                "mvp.provisioning.logs.node.8.stderr",
+                "myelin.provisioning.logs.node.8.stderr",
                 json!({
                     "run_id": 9,
                     "node_id": 8,
@@ -6607,19 +6607,19 @@ mod tests {
                 }),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"stage_provision_send","status":"sent","run_id":9,"node_id":1,"detail":{"attempt":1,"stage_count":8,"stage_index":7,"loaded_stage_count":0,"stage_send_count":1}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     1_500,
                     500,
                 ),
             ),
             (
-                "mvp.orch.bootstrap",
+                "myelin.orch.bootstrap",
                 stamped(
                     json!({"type":"OrchBootstrap","phase":"stage_provision_send","status":"sent","run_id":9,"node_id":1,"detail":{"attempt":2,"stage_count":8,"stage_index":7,"loaded_stage_count":0,"stage_send_count":2}}),
-                    "mvp-orchestrator",
+                    "myelin-orchestrator",
                     1_501,
                     501,
                 ),
@@ -6629,7 +6629,7 @@ mod tests {
             let base = 1_600 + request_id * 100;
             event_pairs.extend([
                 (
-                    "mvp.worker.tokenizer",
+                    "myelin.worker.tokenizer",
                     stamped(
                         json!({"type":"PromptEncoded","run_id":9,"node_id":2,"stage_index":0,"request_id":request_id,"tokens":[1,2,3]}),
                         "tinygrad-worker",
@@ -6638,7 +6638,7 @@ mod tests {
                     ),
                 ),
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     pipeline_prompt_event(
                         "pipeline_token_in",
                         "started",
@@ -6649,7 +6649,7 @@ mod tests {
                     ),
                 ),
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     pipeline_prompt_event(
                         "pipeline_token_in",
                         "ready",
@@ -6660,7 +6660,7 @@ mod tests {
                     ),
                 ),
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     pipeline_prompt_event(
                         "pipeline_token_out",
                         "observed",
@@ -6671,7 +6671,7 @@ mod tests {
                     ),
                 ),
                 (
-                    "mvp.orch.prompt",
+                    "myelin.orch.prompt",
                     pipeline_prompt_event(
                         "pipeline_tokenizer_decode",
                         "ready",
@@ -6684,7 +6684,7 @@ mod tests {
             ]);
         }
         event_pairs.push((
-            "mvp.worker.step",
+            "myelin.worker.step",
             stamped(
                 json!({"type":"StepExecuted","run_id":9,"node_id":2,"stage_index":0,"execution_backend":"pipeline_stage","committed_bytes":4096}),
                 "tinygrad-worker",
@@ -6694,46 +6694,46 @@ mod tests {
         ));
         event_pairs.extend([
             (
-                "mvp.node.stage",
+                "myelin.node.stage",
                 stamped(
                     json!({"type":"NodeEvent","phase":"egress_ring_read","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"edge_id":77,"edge_kind":"Activation","ring_id":11,"step_id":5,"sequence":3,"object_id":44,"record_bytes":4096,"helper_execute_ms":9,"egress_ring_read_ms":2}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_901,
                     901,
                 ),
             ),
             (
-                "mvp.node.stage",
+                "myelin.node.stage",
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_edge_bytes_sent","status":"ready","run_id":9,"node_id":2,"stage_index":0,"detail":{"edge_id":77,"edge_kind":"Activation","step_id":5,"sequence":3,"object_id":44,"record_bytes":4096,"send_ms":1}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_902,
                     902,
                 ),
             ),
             (
-                "mvp.node.stage",
+                "myelin.node.stage",
                 stamped(
                     json!({"type":"NodeEvent","phase":"iroh_edge_bytes_read","status":"observed","run_id":9,"node_id":3,"stage_index":1,"detail":{"edge_id":77,"stream_id":1,"bytes":4096}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_903,
                     903,
                 ),
             ),
             (
-                "mvp.node.stage",
+                "myelin.node.stage",
                 stamped(
                     json!({"type":"NodeEvent","phase":"ingress_ring_write","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"edge_id":77,"edge_kind":"Activation","ring_id":12,"stream_id":1,"object_id":44,"sequence":3,"record_bytes":4096,"ingress_ring_write_ms":3}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_904,
                     904,
                 ),
             ),
             (
-                "mvp.node.stage",
+                "myelin.node.stage",
                 stamped(
                     json!({"type":"NodeEvent","phase":"object_loaded","status":"ready","run_id":9,"node_id":3,"stage_index":1,"detail":{"edge_id":77,"edge_kind":"Activation","ring_id":12,"stream_id":1,"object_id":44,"sequence":3,"handle_id":99,"object_load_ms":4}}),
-                    "mvp-worker-node",
+                    "myelin-worker",
                     1_905,
                     905,
                 ),
@@ -6741,7 +6741,7 @@ mod tests {
         ]);
         let path = write_synthetic_event_dump("vastai-summary-operator", event_pairs);
         let events = parse_dump_log_events(&path).expect("parse summary events");
-        let paths = MvpChatCheckPaths {
+        let paths = MyelinChatCheckPaths {
             root: std::env::temp_dir(),
             dump_log: path.clone(),
             stdout: temp_path("vastai-summary-stdout"),
@@ -6757,7 +6757,7 @@ mod tests {
             &events,
             80,
             9,
-            MvpChatCheckScenario::VastAi,
+            MyelinChatCheckScenario::VastAi,
             &paths,
             Some(1),
             12,
@@ -6855,9 +6855,9 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("test") if args.next().is_none() => run_tests(),
-        Some("mvp-chat-check") => run_mvp_chat_check(args.collect()),
-        Some("mvp-chat-compare") => run_mvp_chat_compare(args.collect()),
-        Some("mvp-chat") => run_mvp_chat(args.collect()),
+        Some("myelin-chat-check") => run_myelin_chat_check(args.collect()),
+        Some("myelin-chat-compare") => run_myelin_chat_compare(args.collect()),
+        Some("myelin-chat") => run_myelin_chat(args.collect()),
         Some("help" | "--help" | "-h") | None => {
             print_usage();
             ExitCode::SUCCESS

@@ -11,11 +11,11 @@ members = [
     "crates/datastream",
     "crates/data-plane",
     "crates/dashboard",
-    "crates/mvp-system",
+    "apps/myelin",
     "xtask",
     "tools/vastai",
 ]
-exclude = ["crates/bindings/wasm-crypto", "examples", "apps"]
+exclude = ["crates/bindings/wasm-crypto", "examples"]
 
 [package]
 name = "swactor"
