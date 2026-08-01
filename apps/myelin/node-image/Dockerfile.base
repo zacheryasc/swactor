@@ -1,0 +1,68 @@
+# Myelin node BASE image — CUDA/Python/tinygrad/sshd/PID-1 foundation.
+# Build from workspace root:
+#   docker build -f apps/myelin/node-image/Dockerfile.base -t myelin-node-base:cuda12.6 .
+
+FROM nvidia/cuda:12.6.3-runtime-ubuntu24.04 AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3 \
+        python3-pip \
+        ca-certificates \
+        cuda-cudart-dev-12-6 && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+        --target=/opt/myelin-pydeps \
+        tinygrad==0.12.0 numpy && \
+    find /opt/myelin-pydeps -depth -type d \
+        \( -name '__pycache__' -o -name 'tests' -o -name 'test' \) \
+        -exec rm -rf {} + && \
+    find /opt/myelin-pydeps -name '*.pyc' -delete && \
+    find /opt/myelin-pydeps -type d -name '*.dist-info' -exec rm -rf {} +
+
+RUN mkdir -p /opt/myelin-nvrtc-include && \
+    cp -rL /usr/local/cuda/include/. /opt/myelin-nvrtc-include/ && \
+    test -f /opt/myelin-nvrtc-include/vector_types.h
+
+FROM nvidia/cuda:12.6.3-base-ubuntu24.04 AS runtime
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        python3 \
+        cuda-cudart-12-6 \
+        cuda-nvrtc-12-6 \
+        ca-certificates \
+        procps \
+        openssh-server && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* \
+           /var/cache/apt/archives/* \
+           /var/cache/apt/*.bin \
+           /var/log/apt/* \
+           /var/log/dpkg.log \
+           /tmp/* \
+           /var/tmp/* \
+           /usr/share/doc/* \
+           /usr/share/man/* \
+           /usr/share/info/* && \
+    find /usr -depth -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true && \
+    find /usr -type f -name '*.pyc' -delete 2>/dev/null || true && \
+    mkdir -p /usr/local/share/myelin /var/cache/myelin-models /var/log
+
+COPY --from=builder /opt/myelin-nvrtc-include/ /usr/local/cuda/include/
+COPY --from=builder /opt/myelin-pydeps /opt/myelin-pydeps
+ENV PYTHONPATH=/opt/myelin-pydeps
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV CUDA=1
+ENV DEV=CUDA
+ENV MYELIN_MODEL_CACHE_DIR=/var/cache/myelin-models
+ENV MYELIN_TINYGRAD_WORKER=/usr/local/share/myelin/tinygrad_worker.py
+
+COPY apps/myelin/node-image/myelin_entrypoint.sh /usr/local/bin/myelin_entrypoint.sh
+RUN chmod +x /usr/local/bin/myelin_entrypoint.sh
+
+ARG DEPLOY_PUBKEY=""
+RUN if [ -n "$DEPLOY_PUBKEY" ]; then printf '%s\n' "$DEPLOY_PUBKEY" > /etc/myelin_deploy_key.pub; fi
+
+ENTRYPOINT ["/usr/local/bin/myelin_entrypoint.sh"]

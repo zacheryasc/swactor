@@ -350,7 +350,7 @@ mod tests {
     fn request(count: u32) -> ProvisionRequest {
         ProvisionRequest {
             count,
-            image: "registry.example/mvp-worker:latest".to_owned(),
+            image: "registry.example/myelin-worker:latest".to_owned(),
             label: Some("lease-test".to_owned()),
             disk_gb: 80,
             env: BTreeMap::new(),
