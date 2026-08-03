@@ -998,10 +998,13 @@ impl ActorPool {
             let mut type_counts: Vec<(&'static str, u64)> =
                 slot.msg_type_counts.iter().map(|(&k, &v)| (k, v)).collect();
             type_counts.sort_by(|a, b| b.1.cmp(&a.1));
+            let metadata = slot.actor.metadata();
             ActorSnapshot {
                 address: addr,
                 mailbox_depth: slot.mailbox.len(),
                 last_msg_type: slot.last_msg_type,
+                actor_type: Some(metadata.actor_type_name),
+                message_type: Some(metadata.message_type_name),
                 messages_processed: slot.messages_processed,
                 poisoned: slot.poisoned,
                 message_type_counts: type_counts,

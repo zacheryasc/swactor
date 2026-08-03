@@ -502,6 +502,7 @@ mod run_fsm {
     //! `specs/BEHAVIOR_GUARANTEES.md`.
 
     use crate::run_fsm as fsm;
+    use crate::tests::harness::OrchestratorHarness;
 
     // A three-stage plan proves multi-stage provisioning and readiness without
     // making tests depend on any placement heuristic. The plan is already valid;
@@ -529,8 +530,8 @@ mod run_fsm {
     // The harness is the black-box public boundary for the run FSM. It accepts
     // observable events and records emitted commands/events; tests never inspect an
     // internal FSM enum or private readiness counter.
-    fn new_run() -> fsm::OrchestratorHarness {
-        fsm::OrchestratorHarness::new(fsm::RunConfig {
+    fn new_run() -> OrchestratorHarness {
+        OrchestratorHarness::new(fsm::RunConfig {
             run_id: fsm::RunId(7),
             max_tokens: 4,
             prompt: vec![101, 102, 103],
@@ -680,7 +681,6 @@ mod run_fsm {
         });
         assert!(invalid.events().iter().any(|event| {
             matches!(event, fsm::LifecycleEvent::RunFaulted { .. })
-                || matches!(event, fsm::LifecycleEvent::RunRejected { .. })
         }));
     }
 

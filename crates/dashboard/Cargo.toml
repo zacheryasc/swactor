@@ -10,5 +10,5 @@ swactor = { path = "../..", features = ["serde"] }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["net", "rt-multi-thread", "sync"] }
+tokio.workspace = true
 tokio-stream = "0.1"

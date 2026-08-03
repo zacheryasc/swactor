@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::run_fsm as fsm;
 use crate::run_plan as plan;
+use crate::tests::harness::OrchestratorHarness;
 use data_plane::edge_actor;
 use myelin::observability::lifecycle as obs;
 use myelin::orchestration::engine_builder as engine;
@@ -34,7 +35,7 @@ pub struct LocalMockCluster {
     engine_events: Vec<engine::EngineEvent>,
     plan: plan::RunPlan,
     nodes: BTreeMap<u32, MockNode>,
-    orchestrator: Option<fsm::OrchestratorHarness>,
+    orchestrator: Option<OrchestratorHarness>,
     orchestrator_command_cursor: usize,
     orchestrator_event_cursor: usize,
     trace: Vec<obs::Event>,
@@ -303,7 +304,7 @@ impl LocalMockCluster {
         self.orchestrator_command_cursor = 0;
         self.orchestrator_event_cursor = 0;
         self.scenario = scenario;
-        self.orchestrator = Some(fsm::OrchestratorHarness::new(fsm::RunConfig {
+        self.orchestrator = Some(OrchestratorHarness::new(fsm::RunConfig {
             run_id: fsm::RunId(self.run_id.0),
             max_tokens: u64::from(self.max_tokens),
             prompt: tokenize(prompt),
@@ -742,7 +743,6 @@ impl LocalMockCluster {
                     self.push_run(obs::EventKind::RunCompleted, obs::Component::Orchestrator);
                 }
                 fsm::LifecycleEvent::RunFaulted { .. }
-                | fsm::LifecycleEvent::RunRejected { .. }
                 | fsm::LifecycleEvent::RunOperatorStopped { .. } => {
                     self.push_run(obs::EventKind::RunFaulted, obs::Component::Orchestrator);
                 }
@@ -852,7 +852,7 @@ impl LocalMockCluster {
             .count()
     }
 
-    fn orchestrator_mut(&mut self) -> &mut fsm::OrchestratorHarness {
+    fn orchestrator_mut(&mut self) -> &mut OrchestratorHarness {
         self.orchestrator
             .as_mut()
             .expect("run_prompt must initialize orchestrator")

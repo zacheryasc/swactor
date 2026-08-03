@@ -22,7 +22,7 @@ swactor-process = { path = "../../crates/process" }
 distribution = { path = "../../crates/distribution" }
 iroh-driver = { path = "../../crates/iroh-driver" }
 iroh = "0.98"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "signal"] }
+tokio.workspace = true
 swactor-vastai = { path = "../../tools/vastai" }
 parking_lot = "0.12"
 blake3 = "1"

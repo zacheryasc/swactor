@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Actor dossier — swactor</title>
+<style>
+:root{
+  --bg:#0f172a; --panel:#1e293b; --panel2:#172033; --border:#334155;
+  --text:#e2e8f0; --muted:#94a3b8; --accent:#60a5fa;
+  --running:#34d399; --poisoned:#f87171;
+  font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+}
+*{box-sizing:border-box}
+body{margin:0;padding:0;background:var(--bg);color:var(--text);}
+.mono,.table,th,td,.value,.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+header.bar{display:flex;align-items:center;gap:16px;padding:14px 20px;border-bottom:1px solid var(--border);background:var(--panel);position:sticky;top:0;z-index:5;}
+header.bar h1{font-size:18px;margin:0;font-weight:600;letter-spacing:.01em;}
+nav.tabs{display:flex;gap:4px;margin-left:auto;}
+nav.tabs a{padding:6px 12px;border-radius:8px;color:var(--muted);text-decoration:none;font-size:13px;border:1px solid transparent;}
+nav.tabs a:hover{color:var(--text);background:var(--panel2);}
+nav.tabs a.cur{color:var(--accent);background:var(--panel2);border-color:var(--border);}
+select{background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:6px 8px;font-size:13px;}
+.wrap{padding:20px;max-width:1100px;margin:0 auto;}
+.picker{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:18px;}
+.picker label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;}
+#pick{min-width:300px;max-width:560px;flex:1;}
+.back-link{font-size:13px;}
+.badge{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:600;}
+.empty{padding:28px;border:1px dashed #475569;border-radius:12px;color:var(--muted);text-align:center;}
+.toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:var(--panel2);border:1px solid var(--border);color:var(--text);padding:10px 16px;border-radius:10px;font-size:13px;max-width:min(90vw,560px);text-align:center;z-index:50;box-shadow:0 8px 24px rgba(0,0,0,.45);}
+.toast.err{border-color:var(--poisoned);color:var(--poisoned);}
+.kvs{display:grid;grid-template-columns:max-content 1fr;gap:6px 14px;}
+.kvs .k{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.05em;}
+.kvs .v{font-size:13px;word-break:break-word;}
+.section{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px 18px;margin-bottom:16px;}
+h2{font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:0 0 12px;}
+.mb-dyn{display:flex;gap:24px;align-items:center;flex-wrap:wrap;}
+.mb-spark{flex:1 1 320px;min-width:0;}
+.mb-spark .spark{display:block;width:100%;height:120px;}
+.mb-vals{display:flex;flex-direction:column;gap:16px;min-width:150px;}
+.mb-val .label{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;}
+.mb-val .value{font-size:28px;margin-top:4px;font-weight:600;line-height:1;}
+.bar-row{display:flex;align-items:center;gap:8px;margin:5px 0;}
+.bar-row .name{width:48%;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.bar-track{flex:1;height:10px;background:var(--panel2);border-radius:99px;overflow:hidden;}
+.bar-fill{height:100%;background:var(--accent);border-radius:99px;}
+.bar-row .num{width:90px;text-align:right;color:var(--muted);}
+.bar-row.last .bar-fill{background:var(--running);}
+.bar-row.last{font-weight:600;}
+a{color:var(--accent);text-decoration:none;}
+.stale{opacity:.55;}
+</style>
+</head>
+<body>
+<header class="bar">
+  <h1>Actor dossier</h1>
+  <select id="runtime"></select>
+  <nav class="tabs">
+    <a href="/view/swactor/actor-overview">Overview</a>
+    <a href="/view/swactor/actor-dossier" class="cur">Dossier</a>
+    <a href="/view/swactor/workers">Workers</a>
+  </nav>
+</header>
+<div class="wrap">
+  <div class="picker">
+    <label for="pick">Actor</label>
+    <select id="pick"></select>
+    <a class="back-link" href="/view/swactor/actor-overview">&larr; back to overview</a>
+  </div>
+  <div id="empty" class="toast" hidden>No runtime actor frames yet.</div>
+  <div id="content"></div>
+</div>
+<script>
+const POLL_MS=750;
+const STATE_COLOR={running:'#34d399',poisoned:'#f87171'};
+const elRuntime=document.getElementById('runtime');
+const elPick=document.getElementById('pick');
+const elEmpty=document.getElementById('empty');
+const elContent=document.getElementById('content');
+let runtimes=[],runtimeKey='',selectedAddr='';
+
+function fmt(n,d=0){if(n==null||n===undefined)return'\u2014';if(typeof n!=='number')return String(n);return n.toLocaleString(undefined,{maximumFractionDigits:d});}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function shortAddr(a){a=String(a||'');return a.length<=12?a:a.slice(0,6)+'\u2026'+a.slice(-4);}
+function urlActor(){try{return new URLSearchParams(location.search).get('actor');}catch(e){return null;}}
+function stateBadge(a){const s=a.poisoned?'poisoned':'running';const c=STATE_COLOR[s];return '<span class="badge" style="color:'+c+';background:'+c+'22">'+s+'</span>';}
+function growthColor(g){if(g>1.5)return '#f87171';if(g>0.3)return '#fbbf24';return '#34d399';}
+function areaChart(data,w,h,color){
+  if(!data||data.length<2)return '<svg class="spark" viewBox="0 0 '+w+' '+h+'" width="100%" height="'+h+'" preserveAspectRatio="none"></svg>';
+  const max=Math.max(1,...data);const n=data.length;
+  let line='',area='0,'+h+' ';
+  for(let i=0;i<n;i++){const x=(i/(n-1)*w).toFixed(1);const y=(h-(data[i]/max)*(h-2)-1).toFixed(1);line+=x+','+y+' ';area+=x+','+y+' ';}
+  area+=' '+w+','+h;
+  return '<svg class="spark" viewBox="0 0 '+w+' '+h+'" width="100%" height="'+h+'" preserveAspectRatio="none">'+
+    '<polygon points="'+area.trim()+'" fill="'+(color||'#60a5fa')+'22"/>'+
+    '<polyline points="'+line.trim()+'" fill="none" stroke="'+(color||'#60a5fa')+'" stroke-width="1.5"/></svg>';
+}
+function kv(k,vhtml){return '<div class="k">'+esc(k)+'</div><div class="v">'+vhtml+'</div>';}
+function typeShort(t){t=String(t||'');const i=t.lastIndexOf('::');return i>=0?t.slice(i+2):t;}
+function pickRuntime(list){
+  if(!runtimeKey||!list.some(r=>r.stream.key===runtimeKey)){
+    const live=list.find(r=>r.live)||list[0];runtimeKey=live?live.stream.key:'';
+  }
+  return list.find(r=>r.stream.key===runtimeKey)||null;
+}
+function currentActors(rt){return rt?(rt.actors||[]):[];}
+function findActor(rt){
+  const actors=currentActors(rt);
+  if(selectedAddr){const hit=actors.find(a=>a.address===selectedAddr);if(hit)return hit;}
+  return actors[0]||null;
+}
+function renderPicker(rt){
+  const actors=currentActors(rt);
+  elPick.innerHTML=actors.map(a=>
+    '<option value="'+esc(a.address)+'">'+esc(shortAddr(a.address))+(a.name?' \u00b7 '+esc(a.name):'')+'</option>'
+  ).join('');
+  const cur=findActor(rt);
+  if(cur){selectedAddr=cur.address;elPick.value=selectedAddr;}
+}
+function renderRuntimeSelector(){
+  elRuntime.innerHTML=runtimes.map(r=>
+    '<option value="'+esc(r.stream.key)+'">'+esc(r.stream.node)+'#'+r.stream.life+(r.live?'':' (stale)')+'</option>'
+  ).join('');
+  if(runtimeKey)elRuntime.value=runtimeKey;
+}
+function render(a,rt){
+  if(!a){elContent.innerHTML='<div class="empty">Select an actor. None are present on the current frame.</div>';return;}
+  const lastType=a.last_msg_type||'\u2014';
+  const diet=(a.message_type_counts||[]).slice();
+  diet.sort((x,y)=>y.count-x.count);
+  const dmax=Math.max(1,...diet.map(d=>d.count));
+  const lastName=a.last_msg_type;
+  const dietHtml=diet.length?diet.map(d=>{
+    const cls=d.message_type===lastName?'bar-row last':'bar-row';
+    return '<div class="'+cls+'"><span class="name">'+esc(d.message_type)+'</span>'+
+      '<div class="bar-track"><div class="bar-fill" style="width:'+(d.count/dmax*100).toFixed(1)+'%"></div></div>'+
+      '<span class="num">'+fmt(d.count)+'</span></div>';
+  }).join(''):'<div class="empty">no message-type counts on frame</div>';
+  const hist=(a.history||[]).map(h=>h.mailbox_depth);
+  const g=a.mailbox_growth||0;
+  elContent.innerHTML=
+    '<div class="section"><h2>Identity &amp; lifecycle</h2><div class="kvs">'+
+      kv('address','<span class="mono">'+esc(a.address)+'</span>')+
+      (a.name?kv('name',esc(a.name)):'')+
+      (a.actor_type?kv('actor type','<span class="mono" title="'+esc(a.actor_type)+'">'+esc(typeShort(a.actor_type))+'</span>'):'')+
+      (a.message_type?kv('message type','<span class="mono" title="'+esc(a.message_type)+'">'+esc(typeShort(a.message_type))+'</span>'):'')+
+      kv('state',stateBadge(a))+
+      kv('worker',a.worker_id==null?'\u2014':esc(a.worker_id))+
+      kv('last message',esc(lastType))+
+      kv('last seen',a.last_seen_ms_ago!=null?(a.last_seen_ms_ago/1000).toFixed(1)+'s ago':'\u2014')+
+    '</div></div>'+
+    '<div class="section"><h2>Mailbox dynamics</h2><div class="mb-dyn">'+
+      '<div class="mb-spark">'+areaChart(hist,720,120,growthColor(g))+'</div>'+
+      '<div class="mb-vals">'+
+        '<div class="mb-val"><div class="label">depth</div><div class="value" style="color:'+growthColor(g)+'">'+fmt(a.mailbox_depth)+'</div></div>'+
+        '<div class="mb-val"><div class="label">growth</div><div class="value">'+fmt(g,1)+'/s</div></div>'+
+        '<div class="mb-val"><div class="label">msg/s</div><div class="value">'+fmt(a.msg_per_sec,1)+'</div></div>'+
+      '</div>'+
+    '</div></div>'+
+    '<div class="section"><h2>Message diet</h2>'+dietHtml+'</div>';
+}
+async function refresh(){
+  try{
+    const res=await fetch('/api/view/swactor/actor-dossier',{cache:'no-store'});
+    if(!res.ok)throw new Error('HTTP '+res.status);
+    const data=await res.json();
+    runtimes=data.runtimes||[];
+    renderRuntimeSelector();
+    const rt=pickRuntime(runtimes);
+    if(rt&&currentActors(rt).length>0){elEmpty.hidden=true;}else{elEmpty.className='toast';elEmpty.textContent='No runtime actor frames yet.';elEmpty.hidden=false;}
+    renderPicker(rt);
+    render(findActor(rt),rt);
+  }catch(e){
+    elEmpty.className='toast err';elEmpty.hidden=false;elEmpty.textContent='Failed to load actor frames: '+e.message;elContent.innerHTML='';
+  }
+}
+elRuntime.addEventListener('change',e=>{runtimeKey=e.target.value;const rt=pickRuntime(runtimes);renderPicker(rt);render(findActor(rt),rt);});
+elPick.addEventListener('change',e=>{selectedAddr=e.target.value;const rt=pickRuntime(runtimes);render(findActor(rt),rt);});
+const q=urlActor();if(q)selectedAddr=q;
+refresh();
+setInterval(refresh,POLL_MS);
+</script>
+</body>
+</html>

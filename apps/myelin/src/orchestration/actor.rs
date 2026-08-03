@@ -68,6 +68,13 @@ pub(crate) enum OrchestratorMsg {
         stage_index: u32,
     },
     ObserveTokenEndpointsStopped,
+    ObserveOperatorStop {
+        run_id: u64,
+    },
+    ObserveMembershipLost {
+        run_id: u64,
+        node_id: u64,
+    },
     AdvanceTimeMs(u64),
     Snapshot {
         reply_to: ActorAddress,
@@ -131,7 +138,6 @@ pub(crate) enum RunCommandWire {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum LifecycleEventWire {
-    RunRejected { run_id: u64 },
     RunFaulted { run_id: u64 },
     RunCompleted { run_id: u64 },
     RunOperatorStopped { run_id: u64 },
@@ -271,6 +277,17 @@ impl OrchestratorActor {
             }),
             OrchestratorMsg::ObserveTokenEndpointsStopped => {
                 self.core.observe(core::RunEvent::TokenEndpointsStopped)
+            }
+            OrchestratorMsg::ObserveOperatorStop { run_id } => {
+                self.core.observe(core::RunEvent::OperatorStop {
+                    run_id: core::RunId(run_id),
+                });
+            }
+            OrchestratorMsg::ObserveMembershipLost { run_id, node_id } => {
+                self.core.observe(core::RunEvent::MembershipLost {
+                    run_id: core::RunId(run_id),
+                    node_id: core::NodeId(node_id),
+                });
             }
             OrchestratorMsg::AdvanceTimeMs(delta) => self.core.advance_time_ms(delta),
         }
@@ -449,9 +466,6 @@ impl From<&core::RunCommand> for RunCommandWire {
 impl From<&core::LifecycleEvent> for LifecycleEventWire {
     fn from(event: &core::LifecycleEvent) -> Self {
         match event {
-            core::LifecycleEvent::RunRejected { run_id, .. } => {
-                Self::RunRejected { run_id: run_id.0 }
-            }
             core::LifecycleEvent::RunFaulted { run_id, .. } => {
                 Self::RunFaulted { run_id: run_id.0 }
             }

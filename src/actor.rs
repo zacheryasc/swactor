@@ -162,6 +162,18 @@ impl ActorAddress {
         crate::get_random(&mut bytes);
         Self(bytes)
     }
+
+    /// Full 64-character hex encoding of all 32 bytes, for displays that need
+    /// the untruncated address (dashboards). [`Display`](std::fmt::Display)
+    /// stays short for logs.
+    pub fn to_full_hex(&self) -> String {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(64);
+        for b in &self.0 {
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
+    }
 }
 
 // ─── Environment ─────────────────────────────────────────────────────────────

@@ -97,6 +97,8 @@ impl DashboardHandle {
         views.register(Arc::new(live_explorer::LiveDatastreamExplorer::default()));
         views.register(Arc::new(hardware_view::HardwareDashboardView::default()));
         views.register(swactor::worker_view());
+        views.register(swactor::actor_overview_view());
+        views.register(swactor::actor_dossier_view());
         let store = Arc::new(DashboardStore::new(
             config.raw_frame_history,
             Arc::clone(&views),

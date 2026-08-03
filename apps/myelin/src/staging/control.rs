@@ -19,12 +19,6 @@ pub(crate) struct DeviceHandle {
     pub id: u64,
 }
 
-impl DeviceHandle {
-    pub(crate) fn new_current(id: u64) -> Self {
-        Self { generation: 1, id }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LayerRange {
     pub start: u32,
@@ -49,14 +43,6 @@ impl WeightSource {
             gguf_source,
             tokenizer,
         }
-    }
-
-    pub(crate) fn embedded_gguf(model_id: impl Into<String>, path: impl Into<String>) -> Self {
-        Self::new(
-            model_id,
-            GgufSource::LocalPath(path.into()),
-            TokenizerSource::EmbeddedGguf,
-        )
     }
 }
 
@@ -228,9 +214,6 @@ pub(crate) enum StageCommand {
         range: LayerRange,
         shard_plan: Option<StageShardPlan>,
     },
-    RewireEdge {
-        edge_id: EdgeId,
-    },
     ExecuteStep(ExecuteStep),
     ReleaseInputHandle {
         object_id: ObjectId,
@@ -243,8 +226,6 @@ pub(crate) enum StageCommand {
         run_id: RunId,
     },
 }
-
-pub type StageControllerHarness = StageController;
 
 pub(crate) struct StageController {
     local_node_id: NodeId,

@@ -16,16 +16,6 @@ pub(crate) struct RunPlan {
     pub stages: Vec<StageRef>,
 }
 
-impl RunPlan {
-    pub(crate) fn test_linear(run_id: RunId, stages: Vec<StageRef>) -> Self {
-        Self { run_id, stages }
-    }
-
-    pub(crate) fn stage_nodes(&self) -> Vec<NodeId> {
-        self.stages.iter().map(|stage| stage.node_id).collect()
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunConfig {
     pub run_id: RunId,
@@ -125,10 +115,6 @@ pub(crate) enum RunFaultReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum LifecycleEvent {
-    RunRejected {
-        run_id: RunId,
-        reason: RunFaultReason,
-    },
     RunFaulted {
         run_id: RunId,
         reason: RunFaultReason,
@@ -174,8 +160,6 @@ pub(crate) enum RunCommand {
         run_id: RunId,
     },
 }
-
-pub type OrchestratorHarness = OrchestratorRun;
 
 pub(crate) struct OrchestratorRun {
     config: RunConfig,

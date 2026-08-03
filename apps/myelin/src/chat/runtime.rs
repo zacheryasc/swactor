@@ -56,7 +56,7 @@ OPTIONS:
   --relay-mode <mode>           Relay mode: default or disabled
   --relay-url <url>             Custom relay URL passed to myelin-orchestrator
   --endpoint-addr-mask <mask>   Endpoint address mask: full or relay-only
-  --cached-model[=<path>]       Use discovered or explicit cached GGUF model
+  --cached-model[=<path>]       Use discovered or explicit cached GGUF model (default for --process)
   --dump-logs[=<path>]          Write datastream frame log
   --run-id <id>                 Override run id
   --skip-rebuild                Reuse existing Cargo artifacts
@@ -793,9 +793,15 @@ impl Config {
         let gpu_run = args.gpu || env_flag(MYELIN_CHAT_GPU_RUN_ENV, false);
         let endpoint_addr_mask = Self::endpoint_addr_mask(&args, &toml)?;
         let (relay_mode, relay_url) = Self::relay_settings(&args, &toml, endpoint_addr_mask)?;
-        let cached_model = Self::cached_model_source(&args, gpu_run, &provider)
-            .map(CachedModelConfig::from_source)
-            .transpose()?;
+        let cached_model = match Self::cached_model_source(&args, &provider) {
+            None => None,
+            Some(CachedModelSource::Path(path)) => Some(CachedModelConfig::from_path(path)?),
+            Some(CachedModelSource::Discover) => match CachedModelConfig::discover() {
+                Ok(config) => Some(config),
+                Err(error) if args.cached_model.is_some() => return Err(error),
+                Err(_) => None,
+            },
+        };
         let model = Self::model_config(&provider, &toml, cached_model.as_ref())?;
         let datastream_frame_log = Self::datastream_frame_log(&args, &toml);
         let vastai = if provider == provider_kind::vastai() {
@@ -876,16 +882,15 @@ impl Config {
         Ok((relay_mode, relay_url))
     }
 
-    fn cached_model_source(
-        args: &ParsedArgs,
-        gpu_run: bool,
-        provider: &ProviderKind,
-    ) -> Option<CachedModelSource> {
+    /// Resolve the cached-model source. The process provider defaults to
+    /// best-effort discovery of `.model-cache/` so `cargo myelin-chat` runs a
+    /// cached GGUF model without explicit flags. Explicit `--cached-model` is
+    /// always honored (and stays strict); the default degrades gracefully to
+    /// the normal download path when no cached model is present.
+    fn cached_model_source(args: &ParsedArgs, provider: &ProviderKind) -> Option<CachedModelSource> {
         match &args.cached_model {
             Some(source) => Some(source.clone()),
-            None if gpu_run && provider == &provider_kind::process() => {
-                Some(CachedModelSource::Discover)
-            }
+            None if provider == &provider_kind::process() => Some(CachedModelSource::Discover),
             None => None,
         }
     }
@@ -2122,13 +2127,6 @@ struct CachedModelConfig {
 }
 
 impl CachedModelConfig {
-    fn from_source(source: CachedModelSource) -> Result<Self, String> {
-        match source {
-            CachedModelSource::Discover => Self::discover(),
-            CachedModelSource::Path(path) => Self::from_path(path),
-        }
-    }
-
     fn from_path(path: PathBuf) -> Result<Self, String> {
         let metadata = fs::metadata(&path)
             .map_err(|e| format!("stat cached model {}: {e}", path.display()))?;
@@ -2515,6 +2513,34 @@ tag = " alias "
                 assert_eq!(config.image_tag, Some("alias".to_owned()));
             },
         );
+    }
+
+    #[test]
+    fn config_defaults_use_cached_model_for_process_when_present() {
+        let temp = TempDir::new("cached-model-default");
+
+        with_process_state(&[], Some(temp.path()), || {
+            let cache_dir = temp.path().join(REPO_MODEL_CACHE_DIR);
+            fs::create_dir_all(&cache_dir).expect("create model cache dir");
+            fs::write(
+                cache_dir.join(DEFAULT_PIPELINE_CACHED_MODEL_FILE),
+                Vec::<u8>::new(),
+            )
+            .expect("seed cached model file");
+
+            let defaults = Config::from_args(Vec::<String>::new()).expect("defaults resolve");
+
+            assert_eq!(defaults.provider, provider_kind::process());
+            let cached_model = defaults
+                .cached_model
+                .expect("process provider discovers a cached model by default");
+            assert!(
+                cached_model
+                    .host_path
+                    .ends_with(DEFAULT_PIPELINE_CACHED_MODEL_FILE),
+                "discovered the seeded cached model"
+            );
+        });
     }
 
     #[test]

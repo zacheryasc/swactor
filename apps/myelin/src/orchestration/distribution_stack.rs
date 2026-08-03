@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Ctx, Runtime};
+use swactor::stats::StatsHook;
 use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, CodecRemoteSink, NetworkMessage, TransportRouter};
 
@@ -44,7 +45,6 @@ pub(crate) struct DistributionActorAddrs {
 }
 
 pub(crate) struct DistributionRuntimeStack {
-    pub node_id: NodeId,
     pub runtime: Arc<Runtime>,
     pub codec: Arc<CodecRegistry>,
     pub outbox: Outbox,
@@ -61,6 +61,7 @@ impl DistributionRuntimeStack {
         node_id: NodeId,
         config: DistributedNodeConfig,
         extend_codecs: impl FnOnce(&mut CodecRegistry),
+        stats_hook: Option<Arc<dyn StatsHook>>,
     ) -> Self {
         let mut runtime =
             Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
@@ -72,6 +73,9 @@ impl DistributionRuntimeStack {
             Arc::clone(&codec),
             Arc::clone(&transport_router),
         )));
+        if let Some(hook) = stats_hook {
+            runtime.set_stats_hook(hook);
+        }
         let runtime = Arc::new(runtime);
 
         let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
@@ -146,7 +150,6 @@ impl DistributionRuntimeStack {
             .expect("subscribe MembershipFanout");
 
         Self {
-            node_id,
             runtime,
             codec,
             outbox,
