@@ -300,6 +300,8 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
         address: actor,
         mailbox_depth: 3,
         last_msg_type: Some("Ping"),
+        actor_type: Some("TestActor"),
+        message_type: Some("Ping"),
         messages_processed: 5,
         poisoned: false,
         message_type_counts: vec![("Ping", 5)],
@@ -313,11 +315,13 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
     assert_eq!(delivery.channel.channel, runtime);
     let json: Value = serde_json::from_slice(&delivery.payload).unwrap();
     assert_eq!(json["worker_id"], 2);
-    assert_eq!(json["actors"][0]["address"], actor.to_string());
+    assert_eq!(json["actors"][0]["address"], actor.to_full_hex());
     assert_eq!(json["actors"][0]["mailbox_depth"], 3);
     assert_eq!(json["actors"][0]["last_msg_type"], "Ping");
     assert_eq!(json["actors"][0]["messages_processed"], 5);
     assert_eq!(json["actors"][0]["message_type_counts"][0]["ty"], "Ping");
+    assert_eq!(json["actors"][0]["actor_type"], "TestActor");
+    assert_eq!(json["actors"][0]["message_type"], "Ping");
 }
 
 fn positions(events: &[DatastreamEvent]) -> Vec<u64> {

@@ -165,7 +165,6 @@ pub(crate) enum EdgeKind {
 pub(crate) enum ObjectKind {
     Token,
     Activation,
-    Weight,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

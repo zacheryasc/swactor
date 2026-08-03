@@ -12,6 +12,7 @@ mod stage_controller {
     //! `specs/BEHAVIOR_GUARANTEES.md`.
 
     use myelin::staging as stage;
+    use crate::tests::harness::StageControllerHarness;
 
     // This provision fixture represents a single middle stage. It has one inbound
     // and one outbound edge so tests can prove the controller uses assigned edges
@@ -37,8 +38,8 @@ mod stage_controller {
     // The harness exposes only public messages. Tests intentionally do not inspect
     // private controller states such as "Preparing" or "Executing"; they infer
     // controller behavior from emitted commands and lifecycle events.
-    fn new_controller() -> stage::StageControllerHarness {
-        stage::StageControllerHarness::new(stage::NodeId(11))
+    fn new_controller() -> StageControllerHarness {
+        StageControllerHarness::new(stage::NodeId(11))
     }
 
     // Preparation readiness has four independent prerequisites. Listing them as
@@ -60,7 +61,7 @@ mod stage_controller {
     // This helper provisions and readies a stage through public events. Tests that
     // focus on execution use it to avoid duplicating setup while still going through
     // the same observable path as production.
-    fn ready_stage() -> stage::StageControllerHarness {
+    fn ready_stage() -> StageControllerHarness {
         let mut harness = new_controller();
         harness.observe(stage::StageEvent::ProvisionStage {
             from: stage::NodeId(99),
@@ -102,15 +103,6 @@ mod stage_controller {
                 }
             )
         }));
-
-        // The controller must not emit any command that replaces the provisioned
-        // edge ids with a locally chosen edge.
-        assert!(
-            !harness
-                .commands()
-                .iter()
-                .any(|command| { matches!(command, stage::StageCommand::RewireEdge { .. }) })
-        );
 
         // An unauthorized provision attempt must fault before setup can begin.
         let mut unauthorized = new_controller();

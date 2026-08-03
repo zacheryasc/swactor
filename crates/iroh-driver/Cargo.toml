@@ -19,9 +19,8 @@ iroh = "0.98"
 # `test-utils` exposes `CaRootsConfig::insecure_skip_verify()` so clients can
 # trust operator-controlled custom relays with self-signed QAD certs.
 iroh-relay = { version = "0.98", features = ["test-utils"] }
-tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+tokio.workspace = true
 parking_lot = "0.12"
 
 [dev-dependencies]
 iroh-relay = { version = "0.98", features = ["server", "test-utils"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }

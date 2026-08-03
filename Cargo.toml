@@ -15,7 +15,27 @@ members = [
     "xtask",
     "tools/vastai",
 ]
+default-members = [
+    ".",
+    "crates/process",
+    "crates/provisioning",
+    "crates/transport",
+    "crates/distribution",
+    "crates/iroh-driver",
+    "crates/datastream",
+    "crates/data-plane",
+    "crates/dashboard",
+    "apps/myelin",
+    "tools/vastai",
+]
+# The language bindings (python, wasm) and xtask are built on demand
+# (-p / --workspace / cargo-xtask), not during normal native iteration.
 exclude = ["crates/bindings/wasm-crypto", "examples"]
+[workspace.dependencies]
+# Centralized so every member resolves tokio with the SAME feature set.
+# Without this, members declared tokio with different features, so building
+# one member vs another (or `run` vs `test`) recompiled tokio each time.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net", "signal"] }
 
 [package]
 name = "swactor"

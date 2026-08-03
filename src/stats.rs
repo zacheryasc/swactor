@@ -124,6 +124,8 @@ pub struct ActorSnapshot {
     pub address: ActorAddress,
     pub mailbox_depth: usize,
     pub last_msg_type: Option<&'static str>,
+    pub actor_type: Option<&'static str>,
+    pub message_type: Option<&'static str>,
     pub messages_processed: u64,
     pub poisoned: bool,
     /// Per-message-type counts, sorted descending by count.

@@ -170,6 +170,19 @@ pub(crate) enum NodeAgentMsg {
     WorkerCrashed {
         reason: Option<String>,
     },
+    StepFailed {
+        step_id: u64,
+    },
+    ObjectFailed {
+        edge_id: u64,
+        object_id: Option<u64>,
+    },
+    OutputFault {
+        edge_id: u64,
+    },
+    EdgeFault {
+        edge_id: u64,
+    },
     StopRun {
         run_id: u64,
     },
@@ -235,9 +248,6 @@ pub(crate) enum StageCommandWire {
         layer_start: u32,
         layer_end_exclusive: u32,
         stage_shard_plan: Option<StageShardPlan>,
-    },
-    RewireEdge {
-        edge_id: u64,
     },
     ExecuteStep {
         step_id: u64,
@@ -531,6 +541,27 @@ impl NodeAgentActor {
                 self.last_worker_crash = reason;
                 self.core.observe(stage::StageEvent::WorkerCrashed)
             }
+            NodeAgentMsg::StepFailed { step_id } => {
+                self.core.observe(stage::StageEvent::StepFailed {
+                    step_id: stage::StepId(step_id),
+                })
+            }
+            NodeAgentMsg::ObjectFailed { edge_id, object_id } => {
+                self.core.observe(stage::StageEvent::ObjectFailed {
+                    edge_id: stage::EdgeId(edge_id),
+                    object_id: object_id.map(stage::ObjectId),
+                })
+            }
+            NodeAgentMsg::OutputFault { edge_id } => {
+                self.core.observe(stage::StageEvent::OutputFault {
+                    edge_id: stage::EdgeId(edge_id),
+                })
+            }
+            NodeAgentMsg::EdgeFault { edge_id } => {
+                self.core.observe(stage::StageEvent::EdgeFault {
+                    edge_id: stage::EdgeId(edge_id),
+                })
+            }
             NodeAgentMsg::StopRun { run_id } => self.core.observe(stage::StageEvent::StopRun {
                 run_id: stage::RunId(run_id),
             }),
@@ -692,7 +723,6 @@ impl From<&stage::StageCommand> for StageCommandWire {
                 layer_end_exclusive: range.end_exclusive,
                 stage_shard_plan: shard_plan.clone(),
             },
-            stage::StageCommand::RewireEdge { edge_id } => Self::RewireEdge { edge_id: edge_id.0 },
             stage::StageCommand::ExecuteStep(step) => Self::ExecuteStep {
                 step_id: step.step_id.0,
                 input_edge_id: step.input.edge_id.0,

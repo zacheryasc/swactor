@@ -1,6 +1,7 @@
 use crate::run_plan as plan;
 use data_plane::edge_actor;
 use myelin::staging as stage;
+use crate::tests::harness::StageControllerHarness;
 
 use super::mock_transport::MockObject;
 use super::mock_worker::MockWorker;
@@ -16,7 +17,7 @@ pub struct MockNode {
     inbound_edge: Option<plan::EdgeId>,
     outbound_edge: Option<plan::EdgeId>,
     outbound_object_allocator: Option<edge_actor::ObjectIdAllocator>,
-    controller: stage::StageControllerHarness,
+    controller: StageControllerHarness,
     worker: MockWorker,
     event_cursor: usize,
 }
@@ -34,7 +35,7 @@ impl MockNode {
             inbound_edge: None,
             outbound_edge: None,
             outbound_object_allocator: None,
-            controller: stage::StageControllerHarness::new(stage::NodeId(node_id.0)),
+            controller: StageControllerHarness::new(stage::NodeId(node_id.0)),
             worker: MockWorker::new(stage_index, eos_after_sequence),
             event_cursor: 0,
         }

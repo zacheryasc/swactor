@@ -758,9 +758,11 @@ impl<'a> RuntimeActorStatsRecord<'a> {
             actors: snapshots
                 .iter()
                 .map(|snapshot| RuntimeActorSnapshotRecord {
-                    address: snapshot.address.to_string(),
+                    address: snapshot.address.to_full_hex(),
                     mailbox_depth: snapshot.mailbox_depth,
                     last_msg_type: snapshot.last_msg_type,
+                    actor_type: snapshot.actor_type,
+                    message_type: snapshot.message_type,
                     messages_processed: snapshot.messages_processed,
                     poisoned: snapshot.poisoned,
                     message_type_counts: snapshot
@@ -779,6 +781,8 @@ struct RuntimeActorSnapshotRecord<'a> {
     address: String,
     mailbox_depth: usize,
     last_msg_type: Option<&'static str>,
+    actor_type: Option<&'static str>,
+    message_type: Option<&'static str>,
     messages_processed: u64,
     poisoned: bool,
     message_type_counts: Vec<RuntimeMessageTypeCount<'a>>,

@@ -19,7 +19,7 @@ use crate::node_actor::{
 #[cfg(feature = "dashboard")]
 use crate::observability::dashboard_view::MyelinClusterDashboardView;
 use crate::observability::{benchmark, frame_archive::FrameArchive};
-use crate::orchestration::actor::{OrchestratorActor, OrchestratorReport};
+use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
@@ -56,6 +56,7 @@ use datastream::{
 };
 use distribution::node::DistributedNodeConfig;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
+use distribution::swim::telemetry::ObservedTransition;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
@@ -283,6 +284,8 @@ where
             "connectivity_preflight":"ready",
         }),
     );
+    let actors_channel = orch_datastream.channel_by_name("runtime.actors");
+    let orch_stats_hook = orch_datastream.producer.stats_hook_on(actors_channel);
     let stack = DistributionRuntimeStack::new_with_codecs(
         driver.node_id(),
         DistributedNodeConfig::default(),
@@ -290,6 +293,7 @@ where
             register_myelin_actor_codecs(registry);
             datastream::wire::register_datastream_codec(registry);
         },
+        Some(orch_stats_hook),
     );
     bootstrap(
         &mut orch_datastream,
@@ -455,7 +459,7 @@ where
         tx: Mutex::new(obs_tx),
     }));
     let pipeline_coordinator_endpoint = coordinator_endpoint.clone();
-    let (mut provisioned_nodes, ready) = start_and_provision_workers(
+    let (mut provisioned_nodes, ready, swim_to_node) = start_and_provision_workers(
         provisioner,
         &config,
         pipeline_plan.as_ref(),
@@ -473,6 +477,7 @@ where
             run_id: config.run_id,
             orchestrator_node_id: config.node_id,
             provider: &config.provider,
+            orchestrator_actor,
         },
         sink,
         coordinator_endpoint,
@@ -547,6 +552,7 @@ where
             run_id: config.run_id,
             orchestrator_node_id: config.node_id,
             provider: &config.provider,
+            orchestrator_actor,
         },
         &work_rx,
         &prompt_events,
@@ -558,6 +564,7 @@ where
         tokenizer_reply_actor,
         pipeline_plan.as_ref(),
         ready.first_stage.endpoint.clone(),
+        &swim_to_node,
     );
     if let Err(error) = &result {
         bootstrap(
@@ -2024,6 +2031,7 @@ struct RuntimeReadyAckLoop<'a> {
     run_id: u64,
     orchestrator_node_id: u64,
     provider: &'a ProviderKind,
+    orchestrator_actor: ActorAddress,
 }
 
 fn wait_for_runtime_ready_acks(
@@ -2045,6 +2053,7 @@ fn wait_for_runtime_ready_acks(
         run_id,
         orchestrator_node_id,
         provider,
+        ..
     } = ctx;
     let bootstrap = |ds: &mut OrchDatastream, phase: &str, status: &str, detail: Value| {
         ds.emit_bootstrap(
@@ -2232,7 +2241,7 @@ fn start_and_provision_workers(
     coordinator: EndpointAddr,
     pipeline_coordinator: EndpointAddr,
     orchestrator_actor: ActorAddress,
-) -> Result<(ProvisionedClusterGuard, PromptRuntimeReady), String> {
+) -> Result<(ProvisionedClusterGuard, PromptRuntimeReady, BTreeMap<DistNodeId, u64>), String> {
     let RuntimeReadyAckLoop {
         driver,
         stack,
@@ -2439,6 +2448,7 @@ fn start_and_provision_workers(
                 run_id: config.run_id,
                 orchestrator_node_id: config.node_id,
                 provider: &config.provider,
+                orchestrator_actor,
             },
             &expected_node_ids,
         ) {
@@ -2468,6 +2478,7 @@ fn start_and_provision_workers(
             run_id: config.run_id,
             orchestrator_node_id: config.node_id,
             provider: &config.provider,
+            orchestrator_actor,
         }) {
             Ok(ready) => ready,
             Err(error) => {
@@ -2512,6 +2523,7 @@ fn start_and_provision_workers(
             run_id: config.run_id,
             orchestrator_node_id: config.node_id,
             provider: &config.provider,
+            orchestrator_actor,
         },
         &ack_targets,
         &pipeline_coordinator,
@@ -2555,6 +2567,7 @@ fn start_and_provision_workers(
                 run_id: config.run_id,
                 orchestrator_node_id: config.node_id,
                 provider: &config.provider,
+                orchestrator_actor,
             },
             expected_node_ids.len(),
             pipeline_plan.expect("pipeline mode requires plan"),
@@ -2578,6 +2591,7 @@ fn start_and_provision_workers(
                 run_id: config.run_id,
                 orchestrator_node_id: config.node_id,
                 provider: &config.provider,
+                orchestrator_actor,
             },
             config.stage_index,
         )
@@ -2640,7 +2654,11 @@ fn start_and_provision_workers(
             final_stage: ready,
         }
     };
-    Ok((provisioned_nodes, prompt_ready))
+    let swim_to_node = readies
+        .iter()
+        .map(|(node_id, ready)| (ready.swim_node_id, *node_id))
+        .collect::<BTreeMap<DistNodeId, u64>>();
+    Ok((provisioned_nodes, prompt_ready, swim_to_node))
 }
 
 fn stage_node_specs(
@@ -2999,6 +3017,7 @@ fn wait_for_weights_loaded_count(
         run_id,
         orchestrator_node_id: node_id,
         provider,
+        ..
     } = ctx;
     let expected_stages = pipeline_plan
         .stages
@@ -4126,6 +4145,7 @@ fn wait_for_runtime_ready(ctx: RuntimeReadyAckLoop<'_>) -> Result<RuntimeReady, 
         run_id,
         orchestrator_node_id: node_id,
         provider,
+        ..
     } = ctx;
     let mut pending_ready: Option<RuntimeReady> = None;
     let mut node_swim_started = false;
@@ -4271,6 +4291,7 @@ fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Re
         run_id,
         orchestrator_node_id: node_id,
         provider,
+        ..
     } = ctx;
     loop {
         pump(driver, stack, frame_tx);
@@ -4913,6 +4934,7 @@ fn serve_prompts(
     tokenizer_reply_to: ActorAddress,
     pipeline_plan: Option<&run_plan::RunPlan>,
     prompt_endpoint: EndpointAddr,
+    swim_to_node: &BTreeMap<DistNodeId, u64>,
 ) -> Result<(), String> {
     let RuntimeReadyAckLoop {
         driver,
@@ -4927,6 +4949,7 @@ fn serve_prompts(
         run_id,
         orchestrator_node_id: node_id,
         provider,
+        orchestrator_actor,
         ..
     } = ctx;
     let emit_prompt_evt =
@@ -4949,6 +4972,7 @@ fn serve_prompts(
     let mut active: Option<ActivePrompt> = None;
     loop {
         pump(driver, stack, frame_tx);
+        orch_datastream.flush(dashboard, "orchestrator");
         if let Some(pipeline) = pipeline_runtime.as_mut() {
             pipeline.poll_driver(driver);
             pipeline.drain_tokenizer_events(
@@ -4971,6 +4995,21 @@ fn serve_prompts(
         )?;
         drain_frames(frame_rx, dashboard, orch_datastream);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
+        let swim_transitions =
+            emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
+        for transition in &swim_transitions {
+            if transition.to == MemberState::Dead
+                && let Some(&lost_node_id) = swim_to_node.get(&transition.peer)
+            {
+                let _ = stack.runtime.send_to(
+                    orchestrator_actor,
+                    OrchestratorMsg::ObserveMembershipLost {
+                        run_id,
+                        node_id: lost_node_id,
+                    },
+                );
+            }
+        }
         if stop_rx.try_recv().is_ok() {
             orch_datastream.emit_bootstrap(
                 dashboard,
@@ -4980,6 +5019,10 @@ fn serve_prompts(
                 "started",
                 json!({"source":"stdin"}),
             );
+            let _ = stack
+                .runtime
+                .send_to(orchestrator_actor, OrchestratorMsg::ObserveOperatorStop { run_id });
+            pump(driver, stack, frame_tx);
             return Ok(());
         }
 
@@ -5337,8 +5380,9 @@ fn emit_swim_transitions(
     run_id: u64,
     node_id: u64,
     stack: &DistributionRuntimeStack,
-) {
-    for transition in stack.drain_swim_transitions() {
+) -> Vec<ObservedTransition> {
+    let transitions = stack.drain_swim_transitions();
+    for transition in &transitions {
         let peer = format!("{:?}", transition.peer);
         let from = transition.from.map(|state| format!("{:?}", state));
         let to = format!("{:?}", transition.to);
@@ -5366,8 +5410,9 @@ fn emit_swim_transitions(
                 "member_state":member_state.clone(),
             }),
         );
-        orch_datastream.emit_record(dashboard, &stack.membership_transition(&transition));
+        orch_datastream.emit_record(dashboard, &stack.membership_transition(transition));
     }
+    transitions
 }
 
 fn emit_swim_probe_events(
@@ -5418,18 +5463,24 @@ fn local_tinygrad_worker_env(provider: &str) -> Option<(String, String)> {
 }
 
 fn default_local_tinygrad_worker_path() -> Option<PathBuf> {
-    let cwd_candidate = std::env::current_dir()
-        .ok()
-        .map(|cwd| cwd.join("apps").join("myelin-node").join("tinygrad_worker.py"));
+    // The tinygrad worker script ships in the node-image build context at
+    // `apps/myelin/node-image/tinygrad_worker.py` (see `chat/node_image.rs` and
+    // the node-image Dockerfile). The process provider runs it directly via
+    // `python3`, so resolve that path from the workspace cwd or this crate's
+    // manifest dir. (Previously looked in `apps/myelin-node/`, a path left stale
+    // by the `mvp-system` -> `myelin` app refactor and never present on disk.)
+    let cwd_candidate = std::env::current_dir().ok().map(|cwd| {
+        cwd.join("apps")
+            .join("myelin")
+            .join("node-image")
+            .join("tinygrad_worker.py")
+    });
     if let Some(candidate) = cwd_candidate.filter(|path| path.is_file()) {
         return Some(candidate.canonicalize().unwrap_or(candidate));
     }
 
     let manifest_candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("apps")
-        .join("myelin-node")
+        .join("node-image")
         .join("tinygrad_worker.py");
     manifest_candidate.is_file().then(|| {
         manifest_candidate

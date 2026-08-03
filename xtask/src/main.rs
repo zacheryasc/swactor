@@ -280,7 +280,7 @@ OPTIONS:
                                 Select the runtime provider
   --config <path>               Load config overlay
   --pipeline-stages <count>     Number of pipeline stages
-  --cached-model[=<path>]       Use discovered or explicit cached GGUF model
+  --cached-model[=<path>]       Use discovered or explicit cached GGUF model (default for --process)
   --dump-logs[=<path>]          Write datastream frame log
   --run-id <id>                 Override run id
   --skip-rebuild                Reuse existing Cargo artifacts

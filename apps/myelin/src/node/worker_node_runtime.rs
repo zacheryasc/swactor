@@ -1013,7 +1013,7 @@ impl WorkerEdgeRuntime {
         );
         let step_started = Instant::now();
         let mut pump = || pump_network(driver, stack);
-        let committed_bytes = worker.execute_step(
+        let committed_bytes = match worker.execute_step(
             u64::from(config.stage_index) + 1,
             step_id,
             object_id,
@@ -1027,7 +1027,15 @@ impl WorkerEdgeRuntime {
             config,
             datastream,
             &mut pump,
-        )?;
+        ) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                let _ = stack
+                    .runtime
+                    .send_to(node_actor, NodeAgentMsg::StepFailed { step_id });
+                return Err(e);
+            }
+        };
         let helper_execute_ms = duration_ms_u64(step_started.elapsed());
         let egress_read_started = Instant::now();
         let record = {
@@ -1035,9 +1043,16 @@ impl WorkerEdgeRuntime {
             let lease = arena
                 .lookup_lease(arena::RingId(output_ring_id))
                 .ok_or_else(|| format!("outbound ring {output_ring_id} lease missing"))?;
-            arena
-                .read_arena(lease.layout.data_offset, committed_bytes)
-                .map_err(|e| format!("read egress ring: {e}"))?
+            arena.read_arena(lease.layout.data_offset, committed_bytes)
+        };
+        let record = match record {
+            Ok(record) => record,
+            Err(e) => {
+                let _ = stack
+                    .runtime
+                    .send_to(node_actor, NodeAgentMsg::OutputFault { edge_id: outbound.edge_id });
+                return Err(format!("read egress ring: {e}"));
+            }
         };
         let egress_read_ms = duration_ms_u64(egress_read_started.elapsed());
         let record_bytes = record.len();
@@ -1067,7 +1082,12 @@ impl WorkerEdgeRuntime {
             .as_ref()
             .ok_or_else(|| "outbound edge sender missing".to_owned())?;
         let edge_send_started = Instant::now();
-        sender.send(record)?;
+        if let Err(e) = sender.send(record) {
+            let _ = stack
+                .runtime
+                .send_to(node_actor, NodeAgentMsg::OutputFault { edge_id: outbound.edge_id });
+            return Err(e);
+        }
         let edge_send_ms = duration_ms_u64(edge_send_started.elapsed());
         node_stage(
             datastream,
@@ -1131,8 +1151,17 @@ impl WorkerEdgeRuntime {
             buffer.extend_from_slice(&bytes);
             let buffered_bytes = buffer.len();
             let mut records = Vec::new();
-            while let Some(record) = take_complete_ingress_record(buffer, inbound.object_spec)? {
-                records.push(record);
+            loop {
+                match take_complete_ingress_record(buffer, inbound.object_spec) {
+                    Ok(Some(record)) => records.push(record),
+                    Ok(None) => break,
+                    Err(e) => {
+                        let _ = stack
+                            .runtime
+                            .send_to(node_actor, NodeAgentMsg::ObjectFailed { edge_id, object_id: None });
+                        return Err(e);
+                    }
+                }
             }
             (records, buffered_bytes)
         };
@@ -1171,14 +1200,22 @@ impl WorkerEdgeRuntime {
                 }),
             );
             let object_load_started = Instant::now();
-            let loaded = worker.ring_readable(
+            let loaded = match worker.ring_readable(
                 ring_id,
                 edge_id,
                 inbound.object_spec,
                 config,
                 datastream,
                 &mut || {},
-            )?;
+            ) {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    let _ = stack
+                        .runtime
+                        .send_to(node_actor, NodeAgentMsg::ObjectFailed { edge_id, object_id: Some(record.object_id) });
+                    return Err(e);
+                }
+            };
             let object_load_ms = duration_ms_u64(object_load_started.elapsed());
             let key = ObjectKey {
                 edge_id,
@@ -1510,11 +1547,9 @@ impl WorkerEdgeRuntime {
                         .runtime
                         .send_to(
                             node_actor,
-                            NodeAgentMsg::WorkerCrashed {
-                                reason: Some(format!("edge {} faulted: {reason:?}", edge_id.0)),
-                            },
+                            NodeAgentMsg::EdgeFault { edge_id: edge_id.0 },
                         )
-                        .map_err(|e| format!("mark worker crashed after edge fault: {e}"))?;
+                        .map_err(|e| format!("report edge fault: {e}"))?;
                     return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
                 }
                 edge::EdgeLifecycleEvent::EdgeStopped { .. } => {}
@@ -1691,6 +1726,8 @@ fn run() -> Result<(), String> {
         )?;
     }
 
+    let mut datastream = NodeDatastream::new(&config);
+    let worker_stats_hook = datastream.producer.stats_hook();
     let stack = DistributionRuntimeStack::new_with_codecs(
         driver.node_id(),
         DistributedNodeConfig::default(),
@@ -1698,6 +1735,7 @@ fn run() -> Result<(), String> {
             register_myelin_actor_codecs(registry);
             datastream::wire::register_datastream_codec(registry);
         },
+        Some(worker_stats_hook),
     );
     boot(
         "distribution_stack",
@@ -1750,7 +1788,6 @@ fn run() -> Result<(), String> {
     };
     let arena_fd = arena_manager.lock().arena_fd();
 
-    let mut datastream = NodeDatastream::new(&config);
     let node_boot = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, &config, NODE_BOOTSTRAP_CHANNEL, phase, status, detail)
     };
@@ -3557,15 +3594,6 @@ fn handle_stage_command(
                 "outbound_edge",
                 "ready",
                 json!({"edge_id":edge_id}),
-            );
-            Ok(())
-        }
-        StageCommandWire::RewireEdge { .. } => {
-            node_stage(
-                datastream,
-                "rewire_edge",
-                "skipped",
-                json!({"reason":"not implemented in myelin-worker image path"}),
             );
             Ok(())
         }

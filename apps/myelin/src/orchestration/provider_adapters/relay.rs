@@ -72,12 +72,6 @@ impl StaticRelayProvider {
         parse_relay_url(raw).map(Self::new)
     }
 
-    pub(crate) fn from_env() -> Result<Option<Self>, String> {
-        selected_relay_url_from_env()
-            .map(|url| Self::from_url_str(&url).map(Some))
-            .unwrap_or(Ok(None))
-    }
-
     pub(crate) fn url(&self) -> String {
         self.url.to_string()
     }
