@@ -1,23 +1,392 @@
 # swactor
 
-Minimal actor runtime for Rust. One trait, one message type.
-Single-threaded (`tick()`) or multi-threaded (`run()`).
+A small, WASM-first actor runtime for Rust: one trait, location-transparent
+addresses, and a built-in cluster. Actors are ordinary structs; a message is
+any `Clone + Send + Sync` type; an address works the same whether the actor
+lives in this process, on a peer, or behind NAT on another node.
 
-## Description
+## What it is
 
-Core runtime is `src/`. Actors implement `ActorInterface` (in `actor.rs`),
-interact through `Ctx` (in `runtime.rs`), and run on worker threads (`worker.rs`).
+Every actor is one trait. There is no separate message trait to implement —
+anything `Clone + Send + Sync` is a message by blanket impl:
 
-`crates/` builds upward: `std` adds OTP patterns (supervision, monitoring, groups),
-`distribution` adds clustering, everything else composes from there.
+```rust
+// src/actor.rs
+pub trait Message: 'static + Sized + Clone + Send + Sync {}
+impl<T: 'static + Sized + Clone + Send + Sync> Message for T {}
 
-## Dev commands
-
-`cargo xtask --help` for the basic test command.
-
-## Testing
-
+pub trait ActorInterface: 'static + Send {
+    type Incoming: Message;
+    type Response: Message;
+    fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming);
+    // ...on_start, on_stop, handle_down (death monitoring) as needed
+}
 ```
+
+You drive the runtime single-threaded with `tick()` (this is what compiles to
+WASM) or multi-threaded with `run()`:
+
+```rust
+use swactor::actor::{ActorInterface, Ctx};
+use swactor::runtime::{Runtime, RuntimeConfig};
+
+struct Counter { count: u64 }
+
+impl ActorInterface for Counter {
+    type Incoming = ();            // `()` is Clone + Send + Sync, so it's a message
+    type Response = ();
+    fn handle(&mut self, _ctx: &Ctx, _: Self::Incoming) {
+        self.count += 1;
+        println!("hit #{self.count}");
+    }
+}
+
+fn main() -> Result<(), swactor::Error> {
+    let rt = Runtime::new(RuntimeConfig::default()); // 1 worker → drive with tick()
+    let addr = rt.spawn(Counter { count: 0 })?;
+    rt.send_to(addr, ())?;
+    for _ in 0..3 { rt.tick(); }                      // spawn → handle → done
+    Ok(())
+}
+```
+
+`RuntimeConfig` is four knobs — `max_actors`, `channel_buffer_size`,
+`num_threads`, and a per-tick `actor_message_budget` (inspired by BEAM's
+reduction count, so one chatty mailbox can't starve the rest).
+
+## Features
+
+Each feature is shown in the code that implements it.
+
+### Route messages by actor_id across cluster boundaries
+
+An actor's identity is a 32-byte address, not a pointer:
+
+```rust
+// src/actor.rs
+pub struct ActorAddress(pub [u8; 32]);
+```
+
+You send to it the same way whether it lives in this process, on a peer across
+the room, or behind NAT on another continent — one call, `ctx.send(addr, msg)`.
+The locality decision is exactly one address-map lookup; a miss hands the
+message to the cluster transport instead of a local worker:
+
+```rust
+// src/delivery.rs — the cluster boundary
+fn route_nonlocal(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
+    #[cfg(feature = "transport")]
+    {
+        if self.inbox_registry.contains(&addr) {        // a pending reply inbox
+            return self.inbox_registry.try_deliver(addr, msg);
+        }
+        if let Some(sink) = self.remote_sink {          // ← off this node
+            return sink.send(addr, msg);
+        }
+    }
+    self.inbox_registry.try_deliver(addr, msg)
+}
+```
+
+The transport seam is a single trait — any cluster driver satisfies it:
+
+```rust
+// src/runtime.rs
+pub trait RemoteSink: Send + Sync {
+    fn send(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
+}
+```
+
+Where `addr` lives is resolved from a signed, gossiped directory: a host-signed
+`DirectoryEntry` binds `actor_addr → node_id`, backed by an LRU `LocationCache`.
+The node's own mailbox (`node_id → ActorAddress`) is rebound on restart without
+changing identity, which is why `NodeId` and `ActorAddress` are deliberately
+distinct types.
+
+### WASM by default
+
+The same runtime that runs on a thread pool also compiles to `wasm32` and steps
+one tick at a time from a host (browser, Node, an embedding app). Randomness,
+timers, and the address map all have a no-op/wasm path behind the `wasm`
+feature. The [ping-pong demo](examples/ping-pong) is one runtime compiled to a
+`.wasm` cdylib and driven by Node:
+
+```sh
+cd examples/ping-pong && ./run.sh
+```
+
+### Built-in engine and driver, tasks included
+
+A node ships batteries-included: the actor engine (worker threads), a network
+driver, and the pump/fanout tasks that wire them — you don't assemble the glue.
+The driver tracks its own established send/recv pumps per QUIC stream and emits
+lifecycle events (edge ready, stream fault, pump stopped):
+
+```rust
+// crates/iroh-driver/src/driver_pumps.rs
+pub enum DriverEventOut {
+    DriverEdgeReady { edge_id: EdgeId },
+    StreamFault { edge_id: EdgeId },
+    PumpStopped { edge_id: EdgeId, ring_id: RingId },
+}
+```
+
+### `iroh` integration — QUIC, TLS, and NAT traversal
+
+The bundled driver is [iroh](https://iroh.computer): QUIC-based peer transport
+with built-in TLS, NAT hole-punching, and relay-server fallback. You hand it a
+Tokio engine and it runs accepts, dials, stream I/O, retries, and shutdown on
+it; peers are admitted through an optional allow-list:
+
+```rust
+// crates/iroh-driver/src/iroh_driver.rs
+pub struct IrohDriverConfig {
+    pub secret_key: Option<SecretKey>,   // None → fresh random identity
+    pub relay_mode: RelayMode,           // default: n0 production relays
+    pub node: DistributedNodeConfig,
+    pub peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
+    pub additional_alpns: Vec<Vec<u8>>,  // opaque to the driver
+}
+```
+
+### Built-in SWIM cluster
+
+Membership is a real SWIM implementation — direct + indirect (relay) probes,
+suspicion timers, and Lifeguard local-health scaling — not heartbeats. The probe
+state machine emits typed actions; the host adapter turns them into sends:
+
+```rust
+// crates/distribution/src/swim/probe.rs
+pub enum SwimAction {
+    SendPing { to: NodeId, sequence: u64 },
+    SendPingReq { relay: NodeId, target: NodeId, sequence: u64 }, // indirect probe
+    Suspect(NodeId),
+    DeclareDead(NodeId),
+    Diag(SwimDiagEvent), // RTT samples — observation only, no protocol effect
+}
+```
+
+Name bindings, node metadata (relay URL, human name), and the actor→host
+directory each run as independent gossip actors, so the cluster goes quiet once
+it converges.
+
+### OTP-style standard library
+
+Behind the `std` feature, one extension adds the patterns you reach for:
+symbolic naming, death monitoring (watching), and process groups. Install it on
+the runtime and actors get `CtxWatching` / `CtxNaming`:
+
+```rust
+// src/std/extension.rs
+pub struct StdExtension {
+    name_registry: NameRegistry,    // logical names → addresses
+    watch_registry: WatchRegistry,  // exit notifications
+    group_registry: GroupRegistry,  // named groups / pub-sub
+}
+// runtime.with_extension(Arc::new(StdExtension::new()));
+```
+
+### Process manager for external processes
+
+Treat an OS process like an actor. Describe it, spawn it onto the runtime, and
+send it commands; its lifecycle (started / exited / signaled) arrives as
+messages:
+
+```rust
+// crates/process/src/types.rs
+pub struct ProcessSpec {
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: HashMap<String, String>,
+    pub working_dir: Option<std::path::PathBuf>,
+    pub label: Option<String>,
+}
+```
+
+There's a YAML-driven pipeline layer on top (`crates/process/src/pipeline.rs`)
+for multi-step jobs with progress and failure reporting.
+
+### Zero-copy movement of large byte objects
+
+The data-plane ships large, *typed* byte objects between actors — and across
+nodes — without copying. The motivating workload is sharded inference: one GPU's
+output activation is the next GPU's input, so it rides a bounded ring leased from
+a shared arena. A ring is either local (IPC between two actors on one node) or
+the two ends of a QUIC edge:
+
+```text
+producer → egress ring ──QUIC──▶ ingress ring → consumer
+           (arena lease; zero-copy at both ends)
+```
+
+What travels on a wire edge is typed, so the receiver knows what arrived:
+
+```rust
+// crates/data-plane/src/actor.rs
+pub enum EdgeKind {
+    TokenIn,
+    Activation,   // a hidden-state tensor forwarded to the next shard
+    TokenOut,
+}
+
+// crates/data-plane/src/edge_lifecycle.rs
+pub struct ObjectSpec {
+    pub kind: ObjectKind,        // Activation
+    pub dtype: DType,            // F16
+    pub max_extent_bytes: u64,
+}
+```
+
+The edge actor owns the lifecycle: lease a byte range, install an ingress or
+egress ring, and release it only with a `QuiescenceProof`, so a range is never
+recycled under a live reader. The worker consumes whole objects off its ingress
+ring as plain bytes:
+
+```rust
+// apps/myelin/src/node/worker_node_runtime.rs
+match ingress::read_object_record(buffer, object_spec, false)? {
+    ingress::ObjectRecordRead::Incomplete => Ok(None),      // wait for more bytes
+    ingress::ObjectRecordRead::Complete(record) => {        // a full activation arrived
+        let bytes: Vec<u8> = buffer.drain(..record.total_len).collect();
+        Ok(Some(IngressRecordBytes { bytes, object_id: record.object_id.0, .. }))
+    }
+}
+```
+
+### Custom metrics through the datastream
+
+Telemetry is a deliberately dumb pipe: producers tag bytes with a channel id,
+nothing in the middle interprets the payload, and views are read-time
+projections. To add a metric stream, define a type and implement one constant —
+no schema registry to negotiate with:
+
+```rust
+// crates/datastream/src/record.rs
+pub trait Record {
+    const CHANNEL: &'static str;
+}
+
+// crates/data-plane/src/arena.rs — the arena publishes its own health this way
+impl Record for ArenaSample {
+    const CHANNEL: &'static str = ARENA_SAMPLE_CHANNEL; // "mvp.arena"
+}
+```
+
+### Built-in dashboard
+
+A read-only HTML/SSE dashboard renders the frames the datastream already
+carries — workers, the actor roster, per-actor dossiers, fleet hardware. It sends
+no control signals back, so the whole thing is one Axum router:
+
+```rust
+// crates/dashboard/src/server.rs
+fn router(state: AppState) -> Router {
+    Router::new()
+        .route("/", get(root_page))
+        .route("/events", get(frame_stream))                 // live frames over SSE
+        .route("/api/frames", get(recent_frames))
+        .route("/api/views", get(views_json))
+        .route("/api/view/{*path}", get(view_snapshot))
+        .route("/view/{*path}", get(view_page))
+        .with_state(state)
+}
+```
+
+## Architecture
+
+The workspace builds upward from a tiny core. Each crate is one responsibility:
+
+```mermaid
+flowchart TD
+    app["myelin<br/>node · orchestrator"]
+    driver["iroh-driver<br/>QUIC network driver"]
+    dist["distribution<br/>SWIM · registry · directory"]
+    dash["dashboard<br/>read-only view over datastream"]
+    proc["process<br/>managed external processes"]
+    dp["data-plane<br/>zero-copy byte movement · IPC · links"]
+    ds["datastream<br/>metrics / telemetry pipe"]
+    trans["transport<br/>codec · identity · crypto"]
+    core["swactor<br/>core runtime + std (OTP)<br/>ActorInterface · Ctx"]
+
+    app --> driver
+    app --> dist
+    app --> dp
+    app --> dash
+    app --> proc
+    driver --> dist
+    driver --> ds
+    dist --> trans
+    dist --> ds
+    dash --> ds
+    proc --> ds
+    ds --> trans
+    trans --> core
+    dp --> core
+    ds --> core
+    proc --> core
+```
+
+| Crate | Role |
+| --- | --- |
+| `swactor` (`src/`) | Core runtime: the actor trait, `Ctx`, scheduler, address map, channels |
+| `crates/transport` | Codec registry, node identity, message signing — transport-agnostic |
+| `crates/distribution` | Clustering: SWIM membership, naming, metadata + actor directory gossip |
+| `crates/iroh-driver` | iroh/QUIC network driver with its pump/fanout tasks |
+| `crates/datastream` | Metrics / telemetry pipe — nothing in the middle interprets payloads |
+| `crates/data-plane` | Zero-copy movement of large typed byte objects over IPC or a network link |
+| `crates/process` | Managed external processes and YAML pipelines |
+| `crates/dashboard` | Read-only HTML/SSE dashboard over datastream frames |
+| `crates/provisioning` | Cloud node provisioning |
+| `crates/bindings/{python,wasm-runtime,wasm-crypto}` | Language / target bindings |
+| `apps/myelin` | The node binary that wires the above into a runnable cluster node |
+| `tools/vastai` | Vast.ai GPU-marketplace tooling |
+
+## Used for
+
+- **A drop-in replacement for GPU jobs on cloud infrastructure.** `apps/myelin`
+  ships an orchestrator plus a containerized worker node
+  (`apps/myelin/node-image`) that provisions, stages models, and runs them.
+- **Orchestration for sharded inference.** The node image includes a
+  [tinygrad](https://github.com/tinygrad/tinygrad) worker
+  (`apps/myelin/node-image/tinygrad_worker.py`); a vLLM backend is planned.
+
+## Examples
+
+**Working:** [`examples/ping-pong`](examples/ping-pong) — two actors volley on a
+single-threaded runtime compiled to WebAssembly, driven tick-by-tick from Node.
+Shows spawning, message passing, and death monitoring in one file.
+
+**Planned** (tracked in `.deployment-notes/ROADMAP.md`):
+
+- Two actors talking in-process, over IPC, and across a WAN — in Rust, Python,
+  and WASM — from the same code.
+- Typed chunk streaming across IPC or WAN.
+- A non-trivially sharded training job (not easily expressed in Ray).
+- A full pipeline-parallel example of a model sharded across N ≥ 3 cheap GPUs.
+
+## Developing
+
+Requires the pinned nightly toolchain (`rust-toolchain.toml`):
+
+```sh
 cargo check --workspace
-cargo xtask test
+cargo xtask test          # see `cargo xtask --help`
 ```
+
+The language bindings (`crates/bindings/*`) build on demand with `-p` /
+`--workspace`, not during normal native iteration.
+
+## Status
+
+swactor is early and under active development. The runtime, clustering, and the
+`myelin` node are exercised by the workspace test suite, but APIs are still
+moving.
+
+## License
+
+Licensed under the [GNU Affero General Public License v3.0 only]
+(./LICENSE) (`AGPL-3.0-only`). The AGPL's network clause (§13) requires anyone
+who runs a modified swactor as a network service to offer its source to users.
+The copyright holder is not bound by their own license and may relicense future
+releases freely; external contributors should expect a CLA requirement before
+changes are merged.
