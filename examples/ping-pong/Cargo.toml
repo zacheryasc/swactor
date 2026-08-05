@@ -1,0 +1,18 @@
+[package]
+name = "pingpong"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+description = "swactor ping-pong: a minimal WebAssembly actor demo"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Declares this example as its own workspace root so it builds standalone
+# (with `./run.sh`) without joining the root workspace.
+[workspace]
+
+[dependencies]
+swactor = { path = "../..", default-features = false, features = ["wasm", "std"] }
+wasm-bindgen = "0.2"
