@@ -1,9 +1,8 @@
 # The Datastream — Specification
 
-> **Status.** Current-state specification for the `datastream` crate. This keeps
-> the original outline, but updates the model to the implementation that now
-> exists: stream-local numeric channel ids, a channel catalog, broadcast endpoint
-> subscriptions, and catalog-aware transport events.
+Id: 7
+Last modified:
+Last reviewed:
 
 ---
 

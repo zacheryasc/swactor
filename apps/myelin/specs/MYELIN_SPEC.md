@@ -1,7 +1,9 @@
 # Myelin System Specification
  ***STALE! FOR HISTORICAL REFERENCE ONLY*** 
 
-**Status:** draft consolidated system specification.
+Id: 9
+Last modified:
+Last reviewed:
 
 This document is the single Myelin reference for the swactor GGUF pipeline system.
 It folds the system behavior previously split across the orchestration,
