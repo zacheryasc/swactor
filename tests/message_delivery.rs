@@ -111,7 +111,6 @@ fn message_routing_at_scale() {
     let rt = std_runtime(RuntimeConfig {
         max_actors: 300,
         channel_buffer_size: 1024,
-        num_threads: 1,
         ..Default::default()
     });
     let inbox = rt.new_inbox::<NumberedReply>().unwrap();
@@ -148,7 +147,6 @@ fn message_routing_at_scale() {
     let rt = std_runtime(RuntimeConfig {
         max_actors: 200,
         channel_buffer_size: 1024,
-        num_threads: 1,
         ..Default::default()
     });
     let inbox = rt.new_inbox::<RingDone>().unwrap();

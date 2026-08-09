@@ -50,8 +50,8 @@ fn main() -> Result<(), swactor::Error> {
 }
 ```
 
-`RuntimeConfig` is four knobs — `max_actors`, `channel_buffer_size`,
-`num_threads`, and a per-tick `actor_message_budget` (inspired by BEAM's
+`RuntimeConfig` is three knobs — `max_actors`, `channel_buffer_size`,
+and a per-tick `actor_message_budget` (inspired by BEAM's
 reduction count, so one chatty mailbox can't starve the rest).
 
 ## Features

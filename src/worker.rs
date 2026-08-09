@@ -3,8 +3,7 @@ use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::atomic::Ordering;
 
 use crate::Error;
 use crate::actor::{
@@ -16,7 +15,7 @@ use crate::admin::{
     ListActorsResponse, OperationResult,
 };
 use crate::channel::Receiver;
-use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
+use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext};
 use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
 
 use crate::extension::WorkerExtension;
@@ -42,7 +41,7 @@ pub(crate) fn determine_stop_reason(poisoned: bool, has_exit_value: bool) -> Sto
     }
 }
 
-/// Route a message: try local pool first, then address_map for cross-worker,
+/// Route a message: try local pool first, then deposit for pending-spawn actors,
 /// then inbox_registry for external receivers.
 fn route_to_pool_or_remote(
     pool: &mut ActorPool,
@@ -52,24 +51,18 @@ fn route_to_pool_or_remote(
 ) {
     if pool.contains(&dest) {
         pool.deliver(&dest, msg);
+    } else if tc.address_map.contains(&dest) {
+        // Actor exists but not yet in pool (pending spawn) — deposit for next tick
+        tc.transfer_tx.send(Envelope::new(dest, msg));
     } else {
-        match tc.address_map.lookup(&dest) {
-            Some(wid) => {
-                tc.transfer_txs[wid.as_usize()].send(Envelope::new(dest, msg));
-                crate::runtime::notify_worker(tc.worker_threads, wid.as_usize());
-            }
-            None => {
-                let _ = tc.inbox_registry.try_deliver(dest, msg);
-            }
-        }
+        let _ = tc.route_nonlocal(dest, msg);
     }
 }
 
 // ─── Worker ─────────────────────────────────────────────────────────────────
 
-/// A worker owns a set of actors and runs them in a loop.
+/// A worker owns a set of actors and processes them via tick_once.
 pub(crate) struct Worker {
-    pub(crate) id: WorkerId,
     pub(crate) pool: ActorPool,
     transfer_rx: Receiver<Envelope>,
     spawn_rx: Receiver<SpawnRequest>,
@@ -86,14 +79,12 @@ pub(crate) struct Worker {
 
 impl Worker {
     pub(crate) fn new(
-        id: WorkerId,
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<SpawnRequest>,
         admin_rx: Receiver<AdminCommand>,
         stats: Arc<WorkerStats>,
     ) -> Self {
         Self {
-            id,
             pool: ActorPool::new(),
             transfer_rx,
             spawn_rx,
@@ -142,7 +133,7 @@ impl Worker {
         #[cfg(feature = "tracing")]
         if spawn_count > 0 {
             tracing::debug!(
-                worker_id = self.id.0,
+                worker_id = 0,
                 count = spawn_count,
                 "worker.spawns_drained"
             );
@@ -171,7 +162,7 @@ impl Worker {
         match cmd {
             AdminCommand::ListActors { acc } => {
                 let mut local = Vec::new();
-                self.pool.actor_summaries_into(self.id, &mut local);
+                self.pool.actor_summaries_into(&mut local);
                 {
                     let mut summaries = acc.summaries.lock();
                     summaries.extend(local);
@@ -187,7 +178,7 @@ impl Worker {
             AdminCommand::InspectActor { actor, reply_to } => {
                 let result = self
                     .pool
-                    .actor_summary(self.id, actor)
+                    .actor_summary(actor)
                     .map(|summary| InspectActorResponse { summary });
                 Self::send_admin_reply(tc, reply_to, result);
             }
@@ -242,7 +233,6 @@ impl Worker {
         let cleanup_requests: RefCell<Vec<Box<dyn Any + Send>>> = RefCell::new(Vec::new());
         let dead = {
             let cleanup_ctx = WorkerContext {
-                worker_id: self.id,
                 tc,
                 pending_local: &cleanup_pending,
                 stop_requests: &cleanup_stops,
@@ -290,7 +280,7 @@ impl Worker {
 
     pub(crate) fn tick_once(&mut self, tc: &TickContext) -> bool {
         #[cfg(feature = "tracing")]
-        let _span = tracing::trace_span!("worker.tick", worker_id = self.id.0).entered();
+        let _span = tracing::trace_span!("worker.tick", worker_id = 0).entered();
 
         // Fast idle path: skip the entire tick when nothing could have changed.
         // Cost: ~3 atomic loads, zero syscalls, zero actor iteration.
@@ -339,7 +329,6 @@ impl Worker {
         let processed;
         {
             let worker_ctx = WorkerContext {
-                worker_id: self.id,
                 tc,
                 pending_local: &pending_local,
                 stop_requests: &stop_requests,
@@ -352,9 +341,6 @@ impl Worker {
                 &worker_ctx,
                 &self.stats,
                 tc.config.actor_message_budget,
-                &stop_requests,
-                &stop_with_values,
-                &suspend_requests,
             );
             if processed > 0 {
                 did_work = true;
@@ -365,7 +351,7 @@ impl Worker {
         #[cfg(feature = "tracing")]
         if processed > 0 {
             tracing::debug!(
-                worker_id = self.id.0,
+                worker_id = 0,
                 messages_processed = processed,
                 "worker.tick_all"
             );
@@ -408,7 +394,7 @@ impl Worker {
 
             if let Some(hook) = tc.stats_hook {
                 self.pool.mailbox_depths_into(&mut self.snapshot_buf);
-                hook.on_tick(self.id.0, &self.snapshot_buf);
+                hook.on_tick(0, &self.snapshot_buf);
             }
         }
 
@@ -432,7 +418,7 @@ impl Worker {
         #[cfg(feature = "tracing")]
         if did_work {
             tracing::debug!(
-                worker_id = self.id.0,
+                worker_id = 0,
                 num_actors = self.pool.len(),
                 mailbox_depth = self.pool.total_mailbox_depth(),
                 messages_processed = processed,
@@ -447,26 +433,13 @@ impl Worker {
         did_work
     }
 
-    pub(crate) fn run(&mut self, tc: &TickContext, is_running: &AtomicBool) {
-        #[cfg(feature = "tracing")]
-        let _span = tracing::info_span!("worker.run", worker_id = self.id.0).entered();
-
-        while is_running.load(Ordering::Acquire) {
-            if !self.tick_once(tc) {
-                // Park indefinitely — woken by unpark() from send_to/spawn/stop/shutdown.
-                // Spurious wakes hit the fast idle path (~3 atomic loads) and park again.
-                thread::park();
-            }
-        }
-    }
 }
 
-/// The `ContextInner` impl for worker threads.
+/// The `ContextInner` impl for in-worker sends.
 ///
-/// Same-worker sends are buffered in `pending_local` (delivered after current tick round).
-/// Cross-worker sends go through the transfer queue.
+/// All sends to local actors are buffered in `pending_local` (delivered after
+/// the current tick round). Non-local addresses route to inbox_registry or remote.
 struct WorkerContext<'a> {
-    worker_id: WorkerId,
     tc: &'a TickContext<'a>,
     pending_local: &'a RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>>,
     stop_requests: &'a RefCell<Vec<ActorAddress>>,
@@ -478,30 +451,19 @@ struct WorkerContext<'a> {
 
 impl ContextInner for WorkerContext<'_> {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
-        match self.tc.address_map.lookup(&addr) {
-            Some(wid) if wid == self.worker_id => {
-                self.stats.local_sends.fetch_add(1, Ordering::Relaxed);
-                self.pending_local.borrow_mut().push((addr, msg));
-                Ok(())
-            }
-            Some(wid) => {
-                self.stats.cross_sends.fetch_add(1, Ordering::Relaxed);
-                self.tc.transfer_txs[wid.as_usize()].send(Envelope::new(addr, msg));
-                crate::runtime::notify_worker(self.tc.worker_threads, wid.as_usize());
-                Ok(())
-            }
-            None => {
-                self.stats.inbox_sends.fetch_add(1, Ordering::Relaxed);
-                self.tc.route_nonlocal(addr, msg)
-            }
+        if self.tc.address_map.contains(&addr) {
+            self.stats.local_sends.fetch_add(1, Ordering::Relaxed);
+            self.pending_local.borrow_mut().push((addr, msg));
+            Ok(())
+        } else {
+            self.stats.inbox_sends.fetch_add(1, Ordering::Relaxed);
+            self.tc.route_nonlocal(addr, msg)
         }
     }
 
     fn spawn_any(&self, request: SpawnRequest) {
-        let worker_id = self.tc.placement.next_worker();
-        self.tc.address_map.insert(request.addr, worker_id);
-        self.tc.spawn_txs[worker_id.as_usize()].send(request);
-        crate::runtime::notify_worker(self.tc.worker_threads, worker_id.as_usize());
+        self.tc.address_map.insert(request.addr);
+        self.tc.spawn_tx.send(request);
     }
 
     fn request_stop(&self, addr: ActorAddress) {
@@ -517,8 +479,6 @@ impl ContextInner for WorkerContext<'_> {
     }
 
     fn request_resume(&self, addr: ActorAddress) {
-        // Same-worker: buffer as pending_local ResumeSignal
-        // Cross-worker: would go through transfer queue (handled by Runtime impl)
         self.pending_local
             .borrow_mut()
             .push((addr, Box::new(ResumeSignal)));
@@ -539,17 +499,10 @@ impl ContextInner for WorkerContext<'_> {
     }
 
     fn system_info(&self) -> SystemInfo {
-        let num_workers = self.tc.config.num_threads.max(1);
-        let total_actors: usize = self
-            .tc
-            .worker_stats
-            .iter()
-            .map(|ws| ws.num_actors.load(Ordering::Relaxed))
-            .sum();
         SystemInfo {
-            worker_id: self.worker_id.0,
-            num_workers,
-            total_actors,
+            worker_id: 0,
+            num_workers: 1,
+            total_actors: self.tc.worker_stats.num_actors.load(Ordering::Relaxed),
             uptime_ms: self.tc.created_at.elapsed().as_millis() as u64,
         }
     }
@@ -652,17 +605,13 @@ impl ActorPool {
         self.actors.get_mut(&addr).map(|slot| slot.actor.as_mut())
     }
 
-    fn actor_summary_from_slot(
-        worker_id: WorkerId,
-        address: ActorAddress,
-        slot: &ActorSlot,
-    ) -> ActorSummary {
+    fn actor_summary_from_slot(address: ActorAddress, slot: &ActorSlot) -> ActorSummary {
         let metadata = slot.actor.metadata();
         ActorSummary {
             address,
             actor_type: metadata.actor_type_name,
             message_type: metadata.message_type_name,
-            worker_id: worker_id.as_usize(),
+            worker_id: 0,
             parent: slot.parent_addr,
             mailbox_depth: slot.mailbox.len(),
             status: ActorStatus {
@@ -676,19 +625,19 @@ impl ActorPool {
         }
     }
 
-    fn actor_summary(&self, worker_id: WorkerId, addr: ActorAddress) -> AdminResult<ActorSummary> {
+    fn actor_summary(&self, addr: ActorAddress) -> AdminResult<ActorSummary> {
         self.actors
             .get(&addr)
-            .map(|slot| Self::actor_summary_from_slot(worker_id, addr, slot))
+            .map(|slot| Self::actor_summary_from_slot(addr, slot))
             .ok_or(AdminError::ActorNotFound { actor: addr })
     }
 
-    fn actor_summaries_into(&self, worker_id: WorkerId, out: &mut Vec<ActorSummary>) {
+    fn actor_summaries_into(&self, out: &mut Vec<ActorSummary>) {
         out.clear();
         out.extend(
             self.actors
                 .iter()
-                .map(|(&addr, slot)| Self::actor_summary_from_slot(worker_id, addr, slot)),
+                .map(|(&addr, slot)| Self::actor_summary_from_slot(addr, slot)),
         );
     }
 
@@ -734,14 +683,11 @@ impl ActorPool {
     ///
     /// Each actor processes up to `budget` messages per tick (0 = unlimited).
     /// This prevents a single hot actor from starving others on the same worker.
-    pub fn tick_all(
+    fn tick_all(
         &mut self,
-        inner: &dyn ContextInner,
+        wctx: &WorkerContext<'_>,
         stats: &WorkerStats,
         budget: usize,
-        stop_requests: &RefCell<Vec<ActorAddress>>,
-        stop_with_values: &RefCell<Vec<(ActorAddress, ExitValue)>>,
-        suspend_requests: &RefCell<Vec<ActorAddress>>,
     ) -> usize {
         let mut count = 0;
         for (&addr, slot) in self.actors.iter_mut() {
@@ -769,7 +715,7 @@ impl ActorPool {
             snap_type_counts.sort_by(|a, b| b.1.cmp(&a.1));
 
             let ctx = Ctx::new(
-                inner,
+                wctx,
                 addr,
                 slot.parent_addr,
                 slot.env.clone(),
@@ -795,14 +741,14 @@ impl ActorPool {
                 }
                 // Check if on_start requested stop or stop_with
                 {
-                    let stops = stop_requests.borrow();
+                    let stops = wctx.stop_requests.borrow();
                     if !stops.is_empty() && stops.contains(&addr) {
                         drop(stops);
                         slot.stopping = true;
                         stats.stops.fetch_add(1, Ordering::Relaxed);
                         slot.mailbox.clear();
                         // Check for stop_with value
-                        let mut sws = stop_with_values.borrow_mut();
+                        let mut sws = wctx.stop_with_values.borrow_mut();
                         if let Some(pos) = sws.iter().position(|(a, _)| *a == addr) {
                             let (_, val) = sws.swap_remove(pos);
                             slot.exit_value = Some(val);
@@ -812,7 +758,7 @@ impl ActorPool {
                 }
                 // Check if on_start requested stop_with (without plain stop)
                 {
-                    let mut sws = stop_with_values.borrow_mut();
+                    let mut sws = wctx.stop_with_values.borrow_mut();
                     if let Some(pos) = sws.iter().position(|(a, _)| *a == addr) {
                         let (_, val) = sws.swap_remove(pos);
                         slot.exit_value = Some(val);
@@ -824,7 +770,7 @@ impl ActorPool {
                 }
                 // Check if on_start requested suspend
                 {
-                    let suspends = suspend_requests.borrow();
+                    let suspends = wctx.suspend_requests.borrow();
                     if !suspends.is_empty() && suspends.contains(&addr) {
                         drop(suspends);
                         slot.suspended = true;
@@ -891,11 +837,11 @@ impl ActorPool {
 
                 // Check if handler requested self-stop or stop_with
                 {
-                    let stops = stop_requests.borrow();
+                    let stops = wctx.stop_requests.borrow();
                     let has_stop = !stops.is_empty() && stops.contains(&addr);
                     drop(stops);
 
-                    let mut sws = stop_with_values.borrow_mut();
+                    let mut sws = wctx.stop_with_values.borrow_mut();
                     let sw_pos = sws.iter().position(|(a, _)| *a == addr);
 
                     if has_stop || sw_pos.is_some() {
@@ -914,7 +860,7 @@ impl ActorPool {
 
                 // Check if handler requested suspend
                 {
-                    let suspends = suspend_requests.borrow();
+                    let suspends = wctx.suspend_requests.borrow();
                     if !suspends.is_empty() && suspends.contains(&addr) {
                         drop(suspends);
                         slot.suspended = true;

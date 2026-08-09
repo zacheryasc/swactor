@@ -4,12 +4,13 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, mpsc};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use datastream::DatastreamProducer;
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeHandle};
+use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeConfig};
 use swactor_vastai::{
     CreateInstanceRequest, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedInstance,
     SelectionPolicy, classify_vastai_error, create_instance,
@@ -55,27 +56,46 @@ pub(crate) struct VastAiSshEndpoint {
 }
 
 pub(crate) struct VastAiProviderMonitor {
-    runtime: Option<RuntimeHandle>,
+    runtime: Arc<Runtime>,
     actor: ActorAddress,
+    tick_thread: Option<JoinHandle<()>>,
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl VastAiProviderMonitor {
-    fn new(runtime: RuntimeHandle, actor: ActorAddress) -> Self {
+    fn new(runtime: Runtime, actor: ActorAddress) -> Self {
+        let runtime = Arc::new(runtime);
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let rt = Arc::clone(&runtime);
+        let flag = Arc::clone(&stop_flag);
+        let tick_thread = thread::spawn(move || {
+            while !flag.load(Ordering::Relaxed) || rt.has_work() {
+                if rt.has_work() {
+                    rt.tick();
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+
         Self {
-            runtime: Some(runtime),
+            runtime,
             actor,
+            tick_thread: Some(tick_thread),
+            stop_flag,
         }
     }
 
     fn stop(&mut self) {
-        let Some(runtime) = self.runtime.take() else {
+        let Some(tick_thread) = self.tick_thread.take() else {
             return;
         };
-        let _ = runtime
+        let _ = self
             .runtime
             .send_to(self.actor, VastAiProviderMonitorMsg::Stop);
-        runtime.shutdown();
-        runtime.join();
+        self.stop_flag.store(true, Ordering::Relaxed);
+        let _ = tick_thread.join();
     }
 }
 
@@ -552,7 +572,6 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
                 sender,
             ))
             .ok()?;
-        let runtime = runtime.run().ok()?;
         Some(VastAiProviderMonitor::new(runtime, actor))
     }
 

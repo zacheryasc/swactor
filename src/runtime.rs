@@ -1,11 +1,8 @@
 use crate::Instant;
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread::Thread;
-#[cfg(not(target_arch = "wasm32"))]
-use std::thread::{self, JoinHandle};
 
 use crate::actor::{
     Actor, ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Environment, ExitValue,
@@ -18,7 +15,7 @@ use crate::admin::{
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::RuntimeConfig;
-use crate::delivery::{AddressMap, Envelope, InboxRegistry, Placement, TickContext, WorkerId};
+use crate::delivery::{AddressMap, Envelope, InboxRegistry, TickContext};
 use crate::extension::RuntimeExtension;
 use crate::stats::{StatsHook, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
@@ -40,6 +37,16 @@ impl<M: Message> Inbox<M> {
     pub fn try_recv(&self) -> Option<M> {
         self.inner.try_recv()
     }
+
+    pub fn recv_ticking(&self, rt: &Runtime, max_ticks: usize) -> Option<M> {
+        for _ in 0..max_ticks {
+            rt.tick();
+            if let Some(msg) = self.inner.try_recv() {
+                return Some(msg);
+            }
+        }
+        None
+    }
 }
 
 /// Pending ask response — wraps an inbox with convenience recv methods.
@@ -51,48 +58,12 @@ pub struct Ask<R: Message> {
 }
 
 impl<R: Message> Ask<R> {
-    /// Try to receive the response without ticking.
     pub fn try_recv(&self) -> Option<R> {
         self.inbox.try_recv()
     }
 
-    /// Tick the runtime until a response arrives or `max_ticks` is exhausted.
-    ///
-    /// Only valid for single-threaded runtimes (panics if `num_threads >= 2`).
-    pub fn recv_ticking(&self, rt: &Runtime, max_ticks: usize) -> Result<R, Error> {
-        for _ in 0..max_ticks {
-            rt.tick();
-            if let Some(resp) = self.inbox.try_recv() {
-                return Ok(resp);
-            }
-        }
-        Err(Error::from("ask timeout: no response within max_ticks"))
-    }
-
-    /// Get the reply address (for manual message construction).
-    pub fn reply_addr(&self) -> &ActorAddress {
-        self.inbox.addr()
-    }
-}
-
-/// Handle for dealing with a runtime that has started via the `Runtime::run()` method.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct RuntimeHandle {
-    pub runtime: Arc<Runtime>,
-    threads: Vec<JoinHandle<()>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl RuntimeHandle {
-    pub fn join(self) {
-        for handle in self.threads {
-            let _ = handle.join();
-        }
-    }
-
-    /// Simple helper, calls the inner `Runtime::shutdown()` method
-    pub fn shutdown(&self) {
-        self.runtime.shutdown();
+    pub fn recv_ticking(&self, rt: &Runtime, max_ticks: usize) -> Option<R> {
+        self.inbox.recv_ticking(rt, max_ticks)
     }
 }
 
@@ -103,38 +74,43 @@ pub use crate::actor::Ctx;
 // ─── Runtime ─────────────────────────────────────────────────────────────────
 
 /// The `Runtime` struct is the primary gateway for interacting with the framework.
+///
+/// Owns a single `Worker` advanced by the caller via `tick()` / `try_tick()`.
+///
+/// Core is a transition-only state machine. Each call mutates state and
+/// returns immediately, holding no control flow between calls. When to take
+/// the next step is the engine's decision, not core's. Any driver that can
+/// call `tick` (tokio, std-thread, a test stepper) can host it.
 pub struct Runtime {
     config: RuntimeConfig,
     address_map: Arc<AddressMap>,
     inbox_registry: Arc<InboxRegistry>,
     extension: Option<Arc<dyn RuntimeExtension>>,
-    transfer_txs: Vec<Sender<Envelope>>,
-    spawn_txs: Vec<Sender<SpawnRequest>>,
-    admin_txs: Vec<Sender<AdminCommand>>,
-    placement: Placement,
-    is_running: AtomicBool,
-    worker_stats: Vec<Arc<WorkerStats>>,
+    transfer_tx: Sender<Envelope>,
+    spawn_tx: Sender<SpawnRequest>,
+    admin_tx: Sender<AdminCommand>,
+    worker_stats: Arc<WorkerStats>,
     stats_hook: Option<Arc<dyn StatsHook>>,
     process_output_observer: OnceLock<Arc<dyn crate::process_observer::ProcessOutputObserver>>,
-    /// Workers available for tick(). run() drains this and moves workers to threads.
-    tick_workers: RefCell<Vec<Worker>>,
-    /// Thread handles for waking parked workers. Set by workers on startup via OnceLock.
-    worker_threads: Arc<Vec<OnceLock<Thread>>>,
+    worker: RefCell<Worker>,
     created_at: Instant,
     #[cfg(feature = "transport")]
     remote_sink: Option<Arc<dyn RemoteSink>>,
 }
 
-// Safety: RefCell<Vec<Worker>> is only accessed from the owning thread via tick().
-// After run() the RefCell is empty and not accessed by worker threads.
+// Safety: `RefCell<Worker>` is only borrowed from the owning thread in
+// `tick()` / `try_tick()` / `has_work()` / `with_extension()`. All `&self`
+// methods callable through `Arc<Runtime>` from other threads (`send_to`,
+// `spawn`, `deliver_raw`, `stats`, `create_sender`) access only `Sync` fields
+// (Arcs, atomics, channels) — never the `RefCell`. No worker threads exist.
 unsafe impl Sync for Runtime {}
 
 /// Core's only hook for delivering a message to a **non-local** address.
 ///
-/// Implemented outside core (e.g. `swactor-transport`'s `CodecRemoteSink`),
+/// Implemented outside core (e.g., `swactor-transport`'s `CodecRemoteSink`),
 /// which owns all codec/transport concerns. Core stays codec-free: it hands the
 /// sink a type-erased message and an address, and nothing more. `Send + Sync`
-/// because the sink is stored in an `Arc` and shared across worker threads.
+/// because the sink is stored in an `Arc` and shared across threads.
 #[cfg(feature = "transport")]
 pub trait RemoteSink: Send + Sync {
     fn send(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error>;
@@ -172,27 +148,20 @@ impl RuntimeAddress {
 /// actor system.
 pub struct ExternalSender {
     address_map: Arc<AddressMap>,
-    transfer_txs: Vec<Sender<Envelope>>,
-    worker_threads: Arc<Vec<OnceLock<Thread>>>,
+    transfer_tx: Sender<Envelope>,
 }
 
 impl Clone for ExternalSender {
     fn clone(&self) -> Self {
         Self {
             address_map: self.address_map.clone(),
-            transfer_txs: self.transfer_txs.clone(),
-            worker_threads: self.worker_threads.clone(),
+            transfer_tx: self.transfer_tx.clone(),
         }
     }
 }
 
-// Safety: All fields are Send+Sync (Arc<AddressMap> uses RwLock,
-// Sender<Envelope> wraps Arc<HybridChannel>, Thread is Send+Sync).
-unsafe impl Send for ExternalSender {}
-unsafe impl Sync for ExternalSender {}
-
 impl ExternalSender {
-    /// Send a typed message to an actor address, waking the owning worker thread.
+    /// Send a typed message to an actor address.
     ///
     /// Returns `Ok(())` if the message was accepted for routing. This does **not**
     /// guarantee delivery — the recipient may stop before processing it. If
@@ -200,80 +169,47 @@ impl ExternalSender {
     ///
     /// Returns `Err` if the address is not found in the runtime's address map.
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
-        match self.address_map.lookup(&addr) {
-            Some(wid) => {
-                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(msg)));
-                notify_worker(&self.worker_threads, wid.as_usize());
-                Ok(())
-            }
-            None => Err(Error::from("Address not found")),
+        if self.address_map.contains(&addr) {
+            self.transfer_tx.send(Envelope::new(addr, Box::new(msg)));
+            Ok(())
+        } else {
+            Err(Error::from("Address not found"))
         }
     }
 }
 
 impl Runtime {
-    /// Builds a new `Runtime` struct, but does not yet run anything. If multithreaded, call
-    /// `run()`, if single threaded, needs to be driven by calls to the `tick()` method.
+    /// Builds a new `Runtime` struct, but does not yet run anything.
+    /// Drive via `tick()` / `try_tick()`.
     pub fn new(config: RuntimeConfig) -> Self {
-        let num_workers = if config.num_threads < 2 {
-            1
-        } else {
-            config.num_threads
-        };
-
         let address_map = Arc::new(AddressMap::with_capacity(config.max_actors));
         let inbox_registry = Arc::new(InboxRegistry::new());
 
-        let mut transfer_txs = Vec::with_capacity(num_workers);
-        let mut spawn_txs = Vec::with_capacity(num_workers);
-        let mut admin_txs = Vec::with_capacity(num_workers);
-        let mut worker_stats = Vec::with_capacity(num_workers);
-        let mut workers = Vec::with_capacity(num_workers);
+        let transfer_rx = Receiver::<Envelope>::new(config.channel_buffer_size);
+        let transfer_tx = transfer_rx.new_sender();
 
-        for i in 0..num_workers {
-            let transfer_rx = Receiver::<Envelope>::new(config.channel_buffer_size);
-            let transfer_tx = transfer_rx.new_sender();
-            transfer_txs.push(transfer_tx);
+        let spawn_rx = Receiver::<SpawnRequest>::new(config.max_actors);
+        let spawn_tx = spawn_rx.new_sender();
 
-            let spawn_rx = Receiver::<SpawnRequest>::new(config.max_actors);
-            let spawn_tx = spawn_rx.new_sender();
-            spawn_txs.push(spawn_tx);
+        let admin_rx = Receiver::<AdminCommand>::new(config.channel_buffer_size);
+        let admin_tx = admin_rx.new_sender();
 
-            let admin_rx = Receiver::<AdminCommand>::new(config.channel_buffer_size);
-            let admin_tx = admin_rx.new_sender();
-            admin_txs.push(admin_tx);
+        let worker_stats = Arc::new(WorkerStats::new());
 
-            let stats = Arc::new(WorkerStats::new());
-            worker_stats.push(stats.clone());
-            workers.push(Worker::new(
-                WorkerId(i),
-                transfer_rx,
-                spawn_rx,
-                admin_rx,
-                stats,
-            ));
-        }
-
-        let placement = Placement::new(num_workers, worker_stats.clone());
-
-        let worker_threads: Arc<Vec<OnceLock<Thread>>> =
-            Arc::new((0..num_workers).map(|_| OnceLock::new()).collect());
+        let worker = Worker::new(transfer_rx, spawn_rx, admin_rx, worker_stats.clone());
 
         let rt = Self {
             config,
             address_map,
             inbox_registry,
             extension: None,
-            transfer_txs,
-            spawn_txs,
-            admin_txs,
-            placement,
-            is_running: AtomicBool::new(false),
+            transfer_tx,
+            spawn_tx,
+            admin_tx,
             worker_stats,
             stats_hook: None,
             process_output_observer: OnceLock::new(),
-            tick_workers: RefCell::new(workers),
-            worker_threads,
+            worker: RefCell::new(worker),
             created_at: Instant::now(),
             #[cfg(feature = "transport")]
             remote_sink: None,
@@ -281,7 +217,6 @@ impl Runtime {
 
         #[cfg(feature = "tracing")]
         tracing::info!(
-            num_workers,
             max_actors = rt.config.max_actors,
             "runtime.created"
         );
@@ -292,10 +227,9 @@ impl Runtime {
     /// Spawn an actor, returns its address
     pub fn spawn<A: ActorInterface>(&self, actor: A) -> Result<ActorAddress, Error> {
         let addr = ActorAddress::new_random();
-        let worker_id = self.placement.next_worker();
-        self.address_map.insert(addr, worker_id);
+        self.address_map.insert(addr);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.spawn_txs[worker_id.as_usize()].send(SpawnRequest {
+        self.spawn_tx.send(SpawnRequest {
             addr,
             actor: boxed,
             parent: None,
@@ -305,7 +239,6 @@ impl Runtime {
         #[cfg(feature = "tracing")]
         tracing::info!(
             actor_addr = %addr,
-            worker_id = worker_id.as_usize(),
             "actor.spawned"
         );
 
@@ -319,10 +252,9 @@ impl Runtime {
         env: Environment,
     ) -> Result<ActorAddress, Error> {
         let addr = ActorAddress::new_random();
-        let worker_id = self.placement.next_worker();
-        self.address_map.insert(addr, worker_id);
+        self.address_map.insert(addr);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.spawn_txs[worker_id.as_usize()].send(SpawnRequest {
+        self.spawn_tx.send(SpawnRequest {
             addr,
             actor: boxed,
             parent: None,
@@ -332,7 +264,6 @@ impl Runtime {
         #[cfg(feature = "tracing")]
         tracing::info!(
             actor_addr = %addr,
-            worker_id = worker_id.as_usize(),
             "actor.spawned"
         );
 
@@ -342,13 +273,10 @@ impl Runtime {
     /// Install a runtime extension. Extensions provide higher-level features
     /// (naming, monitoring, groups) via lifecycle hooks.
     ///
-    /// Must be called before `run()` or `tick()`.
+    /// Must be called before `tick()`.
     pub fn with_extension(mut self, ext: Arc<dyn RuntimeExtension>) -> Self {
-        // Create per-worker extensions (e.g., timer wheels)
-        for worker in self.tick_workers.get_mut().iter_mut() {
-            if let Some(wext) = ext.create_worker_extension() {
-                worker.worker_ext = Some(wext);
-            }
+        if let Some(wext) = ext.create_worker_extension() {
+            self.worker.get_mut().worker_ext = Some(wext);
         }
         self.extension = Some(ext);
         self
@@ -414,23 +342,20 @@ impl Runtime {
     pub fn create_sender(&self) -> ExternalSender {
         ExternalSender {
             address_map: self.address_map.clone(),
-            transfer_txs: self.transfer_txs.iter().cloned().collect(),
-            worker_threads: self.worker_threads.clone(),
+            transfer_tx: self.transfer_tx.clone(),
         }
     }
 
     fn make_tick_context(&self) -> TickContext<'_> {
         TickContext {
             address_map: &self.address_map,
-            transfer_txs: &self.transfer_txs,
-            spawn_txs: &self.spawn_txs,
-            placement: &self.placement,
+            spawn_tx: &self.spawn_tx,
+            transfer_tx: &self.transfer_tx,
             inbox_registry: &self.inbox_registry,
             config: &self.config,
             extension: self.extension.as_deref(),
             process_output_observer: self.process_output_observer.get(),
             stats_hook: self.stats_hook.as_deref(),
-            worker_threads: &self.worker_threads,
             worker_stats: &self.worker_stats,
             created_at: self.created_at,
             #[cfg(feature = "transport")]
@@ -438,120 +363,42 @@ impl Runtime {
         }
     }
 
-    /// Return whether the single-threaded runtime currently has schedulable work.
-    ///
-    /// Panics if called on a multi-threaded runtime — use `run()` instead.
+    /// Return whether the runtime currently has schedulable work.
     pub fn has_work(&self) -> bool {
-        assert!(
-            self.config.num_threads < 2,
-            "has_work() is only valid for single-threaded runtimes; use run() for multi-threaded"
-        );
-
-        self.tick_workers.borrow().iter().any(Worker::has_work)
+        self.worker.borrow().has_work()
     }
 
-    /// Try to drive one tick of the single-threaded runtime.
+    /// Try to drive one tick of the runtime.
     ///
-    /// Returns `false` if no worker performed work.
-    /// Returns `true` if at least one worker performed work.
-    ///
-    /// Panics if called on a multi-threaded runtime — use `run()` instead.
+    /// Returns `false` if no work was performed.
+    /// Returns `true` if at least one actor was processed.
     pub fn try_tick(&self) -> bool {
-        assert!(
-            self.config.num_threads < 2,
-            "try_tick() is only valid for single-threaded runtimes; use run() for multi-threaded"
-        );
-
         let tc = self.make_tick_context();
-        self.tick_workers
-            .borrow_mut()
-            .iter_mut()
-            .fold(false, |did_work, worker| worker.tick_once(&tc) || did_work)
+        self.worker.borrow_mut().tick_once(&tc)
     }
 
-    /// Drive one tick of the single-threaded worker.
-    ///
-    /// Panics if called on a multi-threaded runtime — use `run()` instead.
+    /// Drive one tick of the runtime.
     pub fn tick(&self) {
         let _ = self.try_tick();
     }
 
-    /// Spawn worker threads and start processing, returning a handle
-    /// to interact with the runtime and join the threads later.
-    ///
-    /// Works in both single-threaded and multi-threaded configurations.
-    /// In single-threaded mode, one background thread is spawned.
-    ///
-    /// Not available on wasm32 — use the browser crate's Web Worker-based run instead.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn run(self) -> Result<RuntimeHandle, Error> {
-        self.is_running.store(true, Ordering::Release);
-
-        #[cfg(feature = "tracing")]
-        tracing::info!(
-            num_workers = self.config.num_threads.max(1),
-            "runtime.started"
-        );
-
-        let workers: Vec<Worker> = self.tick_workers.replace(Vec::new());
-
-        let rt = Arc::new(self);
-        let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(workers.len());
-
-        for mut worker in workers {
-            let rt_clone = rt.clone();
-            let worker_id = worker.id.0;
-            let name = format!("swactor-worker-{}", worker_id);
-            let handle = thread::Builder::new()
-                .name(name)
-                .spawn(move || {
-                    // Register this thread so send_to/spawn can unpark us
-                    let _ = rt_clone.worker_threads[worker_id].set(thread::current());
-                    let tc = rt_clone.make_tick_context();
-                    worker.run(&tc, &rt_clone.is_running);
-                })
-                .expect("failed to spawn worker thread");
-            handles.push(handle);
-        }
-
-        Ok(RuntimeHandle {
-            runtime: rt,
-            threads: handles,
-        })
-    }
-
     /// Returns a snapshot of runtime stats: actor placements and per-worker info.
     pub fn stats(&self) -> RuntimeStats {
-        let num_workers = if self.config.num_threads < 2 {
-            1
-        } else {
-            self.config.num_threads
-        };
-
-        let workers = self
-            .worker_stats
-            .iter()
-            .enumerate()
-            .map(|(i, ws)| ws.snapshot(i))
-            .collect();
+        let workers = vec![self.worker_stats.snapshot(0)];
 
         let actors = self
             .address_map
-            .snapshot()
+            .addresses()
             .into_iter()
-            .map(|(addr, wid)| (addr, wid.as_usize()))
+            .map(|addr| (addr, 0))
             .collect();
 
-        let tick_timings = self
-            .worker_stats
-            .iter()
-            .map(|ws| ws.drain_tick_timings())
-            .collect();
+        let tick_timings = vec![self.worker_stats.drain_tick_timings()];
 
         let uptime_ms = self.created_at.elapsed().as_millis() as u64;
 
         RuntimeStats {
-            num_workers,
+            num_workers: 1,
             uptime_ms,
             actors,
             workers,
@@ -567,33 +414,18 @@ impl Runtime {
     ///
     /// Returns `Err` if the actor address is not found in the runtime.
     pub fn stop_actor(&self, addr: ActorAddress) -> Result<(), Error> {
-        match self.address_map.lookup(&addr) {
-            Some(wid) => {
-                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(StopSignal)));
-                notify_worker(&self.worker_threads, wid.as_usize());
-                Ok(())
-            }
-            None => Err(Error::from("Actor not found")),
-        }
-    }
-
-    /// Signal all workers to stop and wake any that are parked.
-    pub fn shutdown(&self) {
-        #[cfg(feature = "tracing")]
-        tracing::info!("runtime.shutdown");
-
-        self.is_running.store(false, Ordering::Release);
-        // Wake all parked workers so they see the shutdown flag immediately
-        for thread in self.worker_threads.iter() {
-            if let Some(t) = thread.get() {
-                t.unpark();
-            }
+        if self.address_map.contains(&addr) {
+            self.transfer_tx
+                .send(Envelope::new(addr, Box::new(StopSignal)));
+            Ok(())
+        } else {
+            Err(Error::from("Actor not found"))
         }
     }
 
     /// Set a stats hook to receive per-actor snapshots from workers.
     ///
-    /// Must be called before [`run()`](Self::run) or [`tick()`](Self::tick).
+    /// Must be called before [`tick()`](Self::tick).
     pub fn set_stats_hook(&mut self, hook: Arc<dyn StatsHook>) {
         self.stats_hook = Some(hook);
     }
@@ -613,12 +445,11 @@ impl Runtime {
     /// this to inject the resulting message for a local actor or inbox.
     #[cfg(feature = "transport")]
     pub fn deliver_raw(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
-        match self.address_map.lookup(&addr) {
-            Some(wid) => {
-                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, msg));
-                Ok(())
-            }
-            None => self.inbox_registry.try_deliver(addr, msg),
+        if self.address_map.contains(&addr) {
+            self.transfer_tx.send(Envelope::new(addr, msg));
+            Ok(())
+        } else {
+            self.inbox_registry.try_deliver(addr, msg)
         }
     }
 }
@@ -642,27 +473,26 @@ impl RuntimeAdmin<'_> {
     pub fn list_actors(&self) -> Result<Admin<ListActorsResponse>, Error> {
         let (admin, reply_to) = self.new_admin::<ListActorsResponse>()?;
         let acc = Arc::new(ListActorsAccumulator {
-            remaining: AtomicUsize::new(self.runtime.admin_txs.len()),
+            remaining: AtomicUsize::new(1),
             summaries: parking_lot::Mutex::new(Vec::new()),
             reply_to,
         });
 
-        for (idx, tx) in self.runtime.admin_txs.iter().enumerate() {
-            tx.send(AdminCommand::ListActors { acc: acc.clone() });
-            notify_worker(&self.runtime.worker_threads, idx);
-        }
+        self.runtime
+            .admin_tx
+            .send(AdminCommand::ListActors { acc: acc.clone() });
 
         Ok(admin)
     }
 
     pub fn inspect_actor(&self, actor: ActorAddress) -> Result<Admin<InspectActorResponse>, Error> {
-        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+        if !self.runtime.address_map.contains(&actor) {
             return self.ready::<InspectActorResponse>(Err(AdminError::ActorNotFound { actor }));
-        };
+        }
         let (admin, reply_to) = self.new_admin::<InspectActorResponse>()?;
-        let worker_idx = wid.as_usize();
-        self.runtime.admin_txs[worker_idx].send(AdminCommand::InspectActor { actor, reply_to });
-        notify_worker(&self.runtime.worker_threads, worker_idx);
+        self.runtime
+            .admin_tx
+            .send(AdminCommand::InspectActor { actor, reply_to });
         Ok(admin)
     }
 
@@ -673,10 +503,10 @@ impl RuntimeAdmin<'_> {
     where
         A: ActorInterface + Clone + Sync,
     {
-        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+        if !self.runtime.address_map.contains(&actor) {
             return self
                 .ready::<GetActorStateResponse<A>>(Err(AdminError::ActorNotFound { actor }));
-        };
+        }
         let (admin, reply_to) = self.new_admin::<GetActorStateResponse<A>>()?;
 
         let get = Box::new(
@@ -728,14 +558,12 @@ impl RuntimeAdmin<'_> {
             )) as Box<dyn Any + Send>
         });
 
-        let worker_idx = wid.as_usize();
-        self.runtime.admin_txs[worker_idx].send(AdminCommand::GetActorState {
+        self.runtime.admin_tx.send(AdminCommand::GetActorState {
             actor,
             reply_to,
             get,
             not_found,
         });
-        notify_worker(&self.runtime.worker_threads, worker_idx);
         Ok(admin)
     }
 
@@ -754,9 +582,9 @@ impl RuntimeAdmin<'_> {
             }));
         }
 
-        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+        if !self.runtime.address_map.contains(&actor) {
             return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        };
+        }
         let (admin, reply_to) = self.new_admin::<OperationResult>()?;
 
         let actor_instance = state.actor_instance;
@@ -791,104 +619,89 @@ impl RuntimeAdmin<'_> {
             },
         );
 
-        let worker_idx = wid.as_usize();
-        self.runtime.admin_txs[worker_idx].send(AdminCommand::ReplaceActorState {
-            actor,
-            reply_to,
-            replace,
-        });
-        notify_worker(&self.runtime.worker_threads, worker_idx);
+        self.runtime
+            .admin_tx
+            .send(AdminCommand::ReplaceActorState {
+                actor,
+                reply_to,
+                replace,
+            });
         Ok(admin)
     }
 
     pub fn stop_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
-        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+        if !self.runtime.address_map.contains(&actor) {
             return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        };
+        }
         let (admin, reply_to) = self.new_admin::<OperationResult>()?;
-        let worker_idx = wid.as_usize();
-        self.runtime.admin_txs[worker_idx].send(AdminCommand::StopActor { actor, reply_to });
-        notify_worker(&self.runtime.worker_threads, worker_idx);
+        self.runtime
+            .admin_tx
+            .send(AdminCommand::StopActor { actor, reply_to });
         Ok(admin)
     }
 
     pub fn suspend_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
-        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+        if !self.runtime.address_map.contains(&actor) {
             return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        };
+        }
         let (admin, reply_to) = self.new_admin::<OperationResult>()?;
-        let worker_idx = wid.as_usize();
-        self.runtime.admin_txs[worker_idx].send(AdminCommand::SuspendActor { actor, reply_to });
-        notify_worker(&self.runtime.worker_threads, worker_idx);
+        self.runtime
+            .admin_tx
+            .send(AdminCommand::SuspendActor { actor, reply_to });
         Ok(admin)
     }
 
     pub fn resume_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
-        let Some(wid) = self.runtime.address_map.lookup(&actor) else {
+        if !self.runtime.address_map.contains(&actor) {
             return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        };
+        }
         let (admin, reply_to) = self.new_admin::<OperationResult>()?;
-        let worker_idx = wid.as_usize();
-        self.runtime.admin_txs[worker_idx].send(AdminCommand::ResumeActor { actor, reply_to });
-        notify_worker(&self.runtime.worker_threads, worker_idx);
+        self.runtime
+            .admin_tx
+            .send(AdminCommand::ResumeActor { actor, reply_to });
         Ok(admin)
-    }
-}
-
-/// Wake a parked worker thread so it can process new work.
-/// No-op if the thread handle hasn't been registered yet (single-threaded tick mode).
-#[inline]
-pub(crate) fn notify_worker(threads: &[OnceLock<Thread>], wid: usize) {
-    if let Some(t) = threads.get(wid).and_then(|o| o.get()) {
-        t.unpark();
     }
 }
 
 #[allow(private_interfaces)]
 impl ContextInner for Runtime {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
-        match self.address_map.lookup(&addr) {
-            Some(wid) => {
-                self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, msg));
-                notify_worker(&self.worker_threads, wid.as_usize());
-                Ok(())
-            }
-            None => self.make_tick_context().route_nonlocal(addr, msg),
+        if self.address_map.contains(&addr) {
+            self.transfer_tx.send(Envelope::new(addr, msg));
+            Ok(())
+        } else {
+            self.make_tick_context().route_nonlocal(addr, msg)
         }
     }
 
     fn spawn_any(&self, request: SpawnRequest) {
-        let worker_id = self.placement.next_worker();
-        self.address_map.insert(request.addr, worker_id);
-        self.spawn_txs[worker_id.as_usize()].send(request);
-        notify_worker(&self.worker_threads, worker_id.as_usize());
+        self.address_map.insert(request.addr);
+        self.spawn_tx.send(request);
     }
 
     fn request_stop(&self, addr: ActorAddress) {
-        // From spawn context (outside worker), send StopSignal through transfer queue
-        if let Some(wid) = self.address_map.lookup(&addr) {
-            self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(StopSignal)));
-            notify_worker(&self.worker_threads, wid.as_usize());
+        if self.address_map.contains(&addr) {
+            self.transfer_tx
+                .send(Envelope::new(addr, Box::new(StopSignal)));
         }
     }
 
     fn request_stop_with(&self, addr: ActorAddress, value: ExitValue) {
-        if let Some(wid) = self.address_map.lookup(&addr) {
-            self.transfer_txs[wid.as_usize()]
+        if self.address_map.contains(&addr) {
+            self.transfer_tx
                 .send(Envelope::new(addr, Box::new(StopWithSignal(value))));
-            notify_worker(&self.worker_threads, wid.as_usize());
         }
     }
 
     fn request_suspend(&self, addr: ActorAddress) {
-        // Outside worker context — not supported (suspend is per-actor, from handler)
+        // From spawn context (outside worker), not supported (suspend is per-actor, from handler)
         eprintln!("swactor: request_suspend called outside worker context for {addr} — ignored");
     }
 
     fn request_resume(&self, addr: ActorAddress) {
-        if let Some(wid) = self.address_map.lookup(&addr) {
-            self.transfer_txs[wid.as_usize()].send(Envelope::new(addr, Box::new(ResumeSignal)));
-            notify_worker(&self.worker_threads, wid.as_usize());
+        if self.address_map.contains(&addr) {
+            self.transfer_tx
+                .send(Envelope::new(addr, Box::new(ResumeSignal)));
         }
     }
 
@@ -909,16 +722,10 @@ impl ContextInner for Runtime {
     }
 
     fn system_info(&self) -> SystemInfo {
-        let num_workers = self.config.num_threads.max(1);
-        let total_actors: usize = self
-            .worker_stats
-            .iter()
-            .map(|ws| ws.num_actors.load(Ordering::Relaxed))
-            .sum();
         SystemInfo {
             worker_id: 0,
-            num_workers,
-            total_actors,
+            num_workers: 1,
+            total_actors: self.worker_stats.num_actors.load(Ordering::Relaxed),
             uptime_ms: self.created_at.elapsed().as_millis() as u64,
         }
     }
