@@ -8,7 +8,7 @@ use ::swactor::actor::{
     Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest,
 };
 use ::swactor::config::RuntimeConfig;
-use ::swactor::runtime::{Inbox, Runtime, RuntimeHandle};
+use ::swactor::runtime::{Inbox, Runtime};
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
 
@@ -221,8 +221,6 @@ impl PyInbox {
 #[derive(Clone)]
 pub struct PyRuntimeConfig {
     #[pyo3(get, set)]
-    num_threads: usize,
-    #[pyo3(get, set)]
     max_actors: usize,
     #[pyo3(get, set)]
     channel_buffer_size: usize,
@@ -233,13 +231,11 @@ impl PyRuntimeConfig {
     #[new]
     #[pyo3(signature = (
         *,
-        num_threads = 1,
         max_actors = 1_000,
         channel_buffer_size = 1_000,
     ))]
-    fn new(num_threads: usize, max_actors: usize, channel_buffer_size: usize) -> Self {
+    fn new(max_actors: usize, channel_buffer_size: usize) -> Self {
         Self {
-            num_threads,
             max_actors,
             channel_buffer_size,
         }
@@ -249,7 +245,6 @@ impl PyRuntimeConfig {
 impl From<PyRuntimeConfig> for RuntimeConfig {
     fn from(py: PyRuntimeConfig) -> Self {
         RuntimeConfig {
-            num_threads: py.num_threads,
             max_actors: py.max_actors,
             channel_buffer_size: py.channel_buffer_size,
             ..Default::default()
@@ -280,7 +275,7 @@ impl PyRuntime {
 
     fn spawn(&self, handler: PyObject) -> PyResult<PyActorAddress> {
         let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
         })?;
         let actor = PyActor::new(handler);
         let addr = rt.spawn(actor).map_err(to_py_err)?;
@@ -289,14 +284,14 @@ impl PyRuntime {
 
     fn send(&self, addr: &PyActorAddress, msg: PyObject) -> PyResult<()> {
         let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
         })?;
         rt.send_to(addr.inner, PyMsg(msg)).map_err(to_py_err)
     }
 
     fn inbox(&self) -> PyResult<PyInbox> {
         let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
         })?;
         let inbox: Inbox<PyMsg> = rt.new_inbox().map_err(to_py_err)?;
         Ok(PyInbox { inner: inbox })
@@ -304,97 +299,20 @@ impl PyRuntime {
 
     fn tick(&self) -> PyResult<()> {
         let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
         })?;
         rt.tick();
         Ok(())
     }
 
-    fn run(&mut self, py: Python<'_>) -> PyResult<PyRuntimeHandle> {
-        let rt = self.inner.take().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
-        })?;
-        let handle = py.allow_threads(|| rt.run().map_err(to_py_err))?;
-        Ok(PyRuntimeHandle {
-            inner: Some(handle),
-        })
-    }
-
     fn stats(&self) -> PyResult<PyRuntimeStats> {
         let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
+            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
         })?;
         Ok(build_stats(rt))
     }
-
-    fn shutdown(&self) -> PyResult<()> {
-        let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime consumed by run()")
-        })?;
-        rt.shutdown();
-        Ok(())
-    }
 }
 
-// ─── PyRuntimeHandle ─────────────────────────────────────────────────────────
-
-#[pyclass(name = "RuntimeHandle")]
-pub struct PyRuntimeHandle {
-    inner: Option<RuntimeHandle>,
-}
-
-#[pymethods]
-impl PyRuntimeHandle {
-    fn spawn(&self, handler: PyObject) -> PyResult<PyActorAddress> {
-        let handle = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-        })?;
-        let actor = PyActor::new(handler);
-        let addr = handle.runtime.spawn(actor).map_err(to_py_err)?;
-        Ok(PyActorAddress::from(addr))
-    }
-
-    fn send(&self, addr: &PyActorAddress, msg: PyObject) -> PyResult<()> {
-        let handle = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-        })?;
-        handle
-            .runtime
-            .send_to(addr.inner, PyMsg(msg))
-            .map_err(to_py_err)
-    }
-
-    fn inbox(&self) -> PyResult<PyInbox> {
-        let handle = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-        })?;
-        let inbox: Inbox<PyMsg> = handle.runtime.new_inbox().map_err(to_py_err)?;
-        Ok(PyInbox { inner: inbox })
-    }
-
-    fn stats(&self) -> PyResult<PyRuntimeStats> {
-        let handle = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-        })?;
-        Ok(build_stats(&handle.runtime))
-    }
-
-    fn shutdown(&self) -> PyResult<()> {
-        let handle = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-        })?;
-        handle.shutdown();
-        Ok(())
-    }
-
-    fn join(&mut self, py: Python<'_>) -> PyResult<()> {
-        let handle = self.inner.take().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("RuntimeHandle consumed by join()")
-        })?;
-        py.allow_threads(|| handle.join());
-        Ok(())
-    }
-}
 
 // ─── ActorInfo / RuntimeStats ────────────────────────────────────────────────
 
@@ -518,7 +436,6 @@ fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyInbox>()?;
     m.add_class::<PyRuntimeConfig>()?;
     m.add_class::<PyRuntime>()?;
-    m.add_class::<PyRuntimeHandle>()?;
     m.add_class::<PyActorInfo>()?;
     m.add_class::<PyWorkerInfo>()?;
     m.add_class::<PyRuntimeStats>()?;

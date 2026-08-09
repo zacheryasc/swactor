@@ -2,7 +2,6 @@
 pub struct RuntimeConfig {
     pub max_actors: usize,
     pub channel_buffer_size: usize,
-    pub num_threads: usize,
     /// Maximum messages processed per actor per tick.
     /// Prevents a single actor with a large mailbox from starving others.
     /// `0` means unlimited (drain entire mailbox).
@@ -26,7 +25,6 @@ impl Default for RuntimeConfig {
         Self {
             max_actors: DEFAULT_MAX_ACTORS,
             channel_buffer_size: DEFAULT_CHANNEL_BUFFER_SIZE,
-            num_threads: 1,
             actor_message_budget: DEFAULT_ACTOR_MESSAGE_BUDGET,
         }
     }

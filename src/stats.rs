@@ -25,15 +25,10 @@ pub struct WorkerStats {
     pub messages_processed: AtomicU64,
     // Message routing counters
     pub local_sends: AtomicU64,
-    pub cross_sends: AtomicU64,
     pub inbox_sends: AtomicU64,
     // Error counters
     pub type_mismatches: AtomicU64,
     pub panics: AtomicU64,
-    /// Messages dropped due to mailbox overflow (bounded mailbox policy).
-    pub messages_dropped: AtomicU64,
-    /// Number of actor restarts after panic (restartable actors only).
-    pub restarts: AtomicU64,
     /// Number of actors gracefully stopped via `ctx.stop_self()` or `Runtime::stop_actor()`.
     pub stops: AtomicU64,
     // Tick timing ring buffer (last N ticks, lock-free)
@@ -53,12 +48,9 @@ impl WorkerStats {
             total_mailbox_depth: AtomicUsize::new(0),
             messages_processed: AtomicU64::new(0),
             local_sends: AtomicU64::new(0),
-            cross_sends: AtomicU64::new(0),
             inbox_sends: AtomicU64::new(0),
             type_mismatches: AtomicU64::new(0),
             panics: AtomicU64::new(0),
-            messages_dropped: AtomicU64::new(0),
-            restarts: AtomicU64::new(0),
             stops: AtomicU64::new(0),
             tick_timings: ArrayQueue::new(TICK_BUFFER_CAP),
         }
@@ -90,12 +82,9 @@ impl WorkerStats {
             mailbox_depth: self.total_mailbox_depth.load(Relaxed),
             messages_processed: self.messages_processed.load(Relaxed),
             local_sends: self.local_sends.load(Relaxed),
-            cross_sends: self.cross_sends.load(Relaxed),
             inbox_sends: self.inbox_sends.load(Relaxed),
             type_mismatches: self.type_mismatches.load(Relaxed),
             panics: self.panics.load(Relaxed),
-            messages_dropped: self.messages_dropped.load(Relaxed),
-            restarts: self.restarts.load(Relaxed),
             stops: self.stops.load(Relaxed),
         }
     }
@@ -110,12 +99,9 @@ pub struct WorkerInfo {
     pub mailbox_depth: usize,
     pub messages_processed: u64,
     pub local_sends: u64,
-    pub cross_sends: u64,
     pub inbox_sends: u64,
     pub type_mismatches: u64,
     pub panics: u64,
-    pub messages_dropped: u64,
-    pub restarts: u64,
     pub stops: u64,
 }
 

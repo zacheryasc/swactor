@@ -6,7 +6,6 @@ use common::*;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 
 use swactor::admin::{ActorStateSnapshot, AdminError, OperationResult};
 use swactor::config::RuntimeConfig;
@@ -75,30 +74,6 @@ impl ActorInterface for StopProbe {
     }
 }
 
-fn poll_admin<T: swactor::actor::Message>(
-    admin: &swactor::admin::Admin<T>,
-    timeout: Duration,
-) -> Option<swactor::admin::AdminResult<T>> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Some(value) = admin.try_recv() {
-            return Some(value);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    None
-}
-
-fn poll_inbox<M: swactor::actor::Message>(inbox: &Inbox<M>, timeout: Duration) -> Option<M> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Some(value) = inbox.try_recv() {
-            return Some(value);
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    None
-}
 
 fn operation_applied() -> OperationResult {
     OperationResult { applied: true }
@@ -500,11 +475,8 @@ fn admin_stop_clears_pending_mailbox_without_calling_handle() {
 }
 
 #[test]
-fn threaded_admin_suspend_resume_wakes_parked_worker() {
-    let rt = std_runtime(RuntimeConfig {
-        num_threads: 2,
-        ..Default::default()
-    });
+fn admin_suspend_resume() {
+    let rt = std_runtime(RuntimeConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let addr = rt
         .spawn(CountingPingActor {
@@ -512,45 +484,46 @@ fn threaded_admin_suspend_resume_wakes_parked_worker() {
         })
         .unwrap();
     let pong_inbox = rt.new_inbox::<Pong>().unwrap();
+    rt.tick(); // process on_start
 
-    let handle = rt.run().unwrap();
-    std::thread::sleep(Duration::from_millis(50));
+    // Suspend
+    let suspended = rt.admin().suspend_actor(addr).unwrap();
+    let suspended = suspended.recv_ticking(&rt, 5);
+    assert_eq!(suspended, Ok(operation_applied()));
 
-    let suspended = handle.runtime.admin().suspend_actor(addr).unwrap();
-    let suspended = poll_admin(&suspended, Duration::from_secs(1));
+    // Send while suspended — should not process
+    rt.send_to(
+        addr,
+        Ping {
+            reply_to: *pong_inbox.addr(),
+        },
+    )
+    .unwrap();
+    tick_n(&rt, 3);
+    assert!(
+        pong_inbox.try_recv().is_none(),
+        "no pong while suspended"
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
 
-    handle
-        .runtime
-        .send_to(
-            addr,
-            Ping {
-                reply_to: *pong_inbox.addr(),
-            },
-        )
-        .unwrap();
-    let pong_while_suspended = poll_inbox(&pong_inbox, Duration::from_millis(100));
-    let count_while_suspended = counter.load(Ordering::SeqCst);
+    // Resume
+    let resumed = rt.admin().resume_actor(addr).unwrap();
+    let resumed = resumed.recv_ticking(&rt, 5);
+    assert_eq!(resumed, Ok(operation_applied()));
 
-    let resumed = handle.runtime.admin().resume_actor(addr).unwrap();
-    let resumed = poll_admin(&resumed, Duration::from_secs(1));
-    let pong_after_resume = poll_inbox(&pong_inbox, Duration::from_secs(1));
-    let final_count = counter.load(Ordering::SeqCst);
-
-    handle.shutdown();
-    handle.join();
-
-    assert_eq!(suspended, Some(Ok(operation_applied())));
-    assert_eq!(pong_while_suspended, None);
-    assert_eq!(count_while_suspended, 0);
-    assert_eq!(resumed, Some(Ok(operation_applied())));
-    assert_eq!(pong_after_resume, Some(Pong));
-    assert_eq!(final_count, 1);
+    // Tick — message should now be processed
+    tick_n(&rt, 3);
+    assert_eq!(
+        pong_inbox.try_recv(),
+        Some(Pong),
+        "pong delivered after resume"
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
 }
 
 #[test]
-fn admin_list_actors_aggregates_all_workers() {
+fn admin_list_actors() {
     let rt = std_runtime(RuntimeConfig {
-        num_threads: 4,
         max_actors: 100,
         ..Default::default()
     });
@@ -558,51 +531,25 @@ fn admin_list_actors_aggregates_all_workers() {
     for _ in 0..16 {
         addrs.push(rt.spawn(CounterActor { count: 0 }).unwrap());
     }
+    rt.tick(); // process spawns
 
-    let handle = rt.run().unwrap();
-    let start = Instant::now();
-    let mut response = None;
-    while start.elapsed() < Duration::from_secs(1) {
-        let admin = handle.runtime.admin().list_actors().unwrap();
-        if let Some(Ok(list)) = poll_admin(&admin, Duration::from_millis(100)) {
-            if list.actors.len() == addrs.len() {
-                response = Some(list);
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    let admin = rt.admin().list_actors().unwrap();
+    let list = admin
+        .recv_ticking(&rt, 5)
+        .expect("list_actors timed out");
 
-    handle.shutdown();
-    handle.join();
-
-    let response = response.expect("admin list did not observe all spawned actors within timeout");
     let expected: HashSet<_> = addrs.iter().copied().collect();
-    let actual: HashSet<_> = response
-        .actors
-        .iter()
-        .map(|summary| summary.address)
-        .collect();
+    let actual: HashSet<_> = list.actors.iter().map(|s| s.address).collect();
     assert_eq!(actual, expected);
+
     for addr in &addrs {
         assert_eq!(
-            response
-                .actors
+            list.actors
                 .iter()
                 .filter(|summary| summary.address == *addr)
                 .count(),
             1,
-            "actor {addr} appears exactly once in aggregated list"
+            "actor {addr} appears exactly once"
         );
     }
-
-    let worker_ids: HashSet<_> = response
-        .actors
-        .iter()
-        .map(|summary| summary.worker_id)
-        .collect();
-    assert!(
-        worker_ids.len() >= 2,
-        "aggregation should include actors from at least two workers, got {worker_ids:?}"
-    );
 }

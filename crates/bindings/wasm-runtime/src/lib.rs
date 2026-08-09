@@ -103,10 +103,7 @@ pub struct WasmRuntime {
 impl WasmRuntime {
     #[wasm_bindgen(constructor)]
     pub fn new() -> Self {
-        let rt = Runtime::new(RuntimeConfig {
-            num_threads: 1,
-            ..RuntimeConfig::default()
-        })
+        let rt = Runtime::new(RuntimeConfig::default())
         .with_extension(Arc::new(StdExtension::new()));
         Self { rt }
     }

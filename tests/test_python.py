@@ -35,13 +35,11 @@ class TestActorAddress(unittest.TestCase):
 class TestRuntimeConfig(unittest.TestCase):
     def test_defaults(self):
         cfg = RuntimeConfig()
-        self.assertEqual(cfg.num_threads, 1)
         self.assertEqual(cfg.max_actors, 1000)
         self.assertEqual(cfg.channel_buffer_size, 1000)
 
     def test_custom(self):
-        cfg = RuntimeConfig(num_threads=4, max_actors=500)
-        self.assertEqual(cfg.num_threads, 4)
+        cfg = RuntimeConfig(max_actors=500)
         self.assertEqual(cfg.max_actors, 500)
 
 
@@ -105,43 +103,6 @@ class TestSingleThreaded(unittest.TestCase):
         rt = Runtime()
         inbox = rt.inbox()
         self.assertIsNone(inbox.try_recv())
-
-
-class TestMultiThreaded(unittest.TestCase):
-    def test_run_shutdown_join(self):
-        """Multi-threaded runtime can spawn, send, and receive."""
-        import time
-
-        rt = Runtime(RuntimeConfig(num_threads=2))
-
-        def echo(ctx, msg):
-            ctx.send(msg["reply_to"], msg["payload"])
-
-        addr = rt.spawn(echo)
-        inbox = rt.inbox()
-        handle = rt.run()
-        handle.send(addr, {"payload": "mt_hello", "reply_to": inbox.addr})
-
-        # Poll for result
-        result = None
-        for _ in range(100):
-            result = inbox.try_recv()
-            if result is not None:
-                break
-            time.sleep(0.01)
-        self.assertEqual(result, "mt_hello")
-
-        handle.shutdown()
-        handle.join()
-
-    def test_run_consumes_runtime(self):
-        """After run(), tick() should raise."""
-        rt = Runtime(RuntimeConfig(num_threads=2))
-        handle = rt.run()
-        with self.assertRaises(RuntimeError):
-            rt.tick()
-        handle.shutdown()
-        handle.join()
 
 
 if __name__ == "__main__":
