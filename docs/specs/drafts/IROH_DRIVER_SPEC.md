@@ -1,6 +1,8 @@
 # Iroh Driver Fixed Specification
 
-**Status:** draft current-state specification for `iroh-driver`.
+Id: 5
+Last modified:
+Last reviewed:
 
 > Review checkpoint: reviewed through Section 3.2; resume with Section 3.3 Accepted Connection Output.
 
