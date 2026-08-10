@@ -90,8 +90,8 @@ pub struct DashboardHandle {
 impl DashboardHandle {
     /// Create the datastream dashboard state.
     ///
-    /// The HTTP server is not started until `spawn_http` or
-    /// `start_http_standalone` is called.
+    /// The HTTP server future is obtained from [`DashboardHandle::http_server`]
+    /// and scheduled by the owning swactor engine.
     pub fn new(config: DashboardConfig) -> Self {
         let views = Arc::new(ViewRegistry::new());
         views.register(Arc::new(live_explorer::LiveDatastreamExplorer::default()));
@@ -150,28 +150,12 @@ impl DashboardHandle {
         }
     }
 
-    /// Spawn the HTTP server on an existing Tokio runtime and return its task handle.
-    pub fn spawn_http(&self, handle: &tokio::runtime::Handle) -> tokio::task::JoinHandle<()> {
-        handle.spawn(self.http_server())
-    }
-
-    /// Spawn the HTTP server on a dedicated Tokio runtime in a background thread.
-    pub fn start_http_standalone(&self) {
-        let server = self.http_server();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_io()
-                .build()
-                .expect("dashboard standalone HTTP runtime");
-            runtime.block_on(server);
-        });
-    }
 }
 
 /// Create the datastream dashboard state.
 ///
-/// The HTTP server is not started until `DashboardHandle::start_http_standalone`
-/// or `DashboardHandle::spawn_http` is called.
+/// The HTTP server future is obtained from [`DashboardHandle::http_server`] and
+/// scheduled by the owning swactor engine.
 pub fn start_dashboard(config: DashboardConfig) -> DashboardHandle {
     DashboardHandle::new(config)
 }

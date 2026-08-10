@@ -2149,6 +2149,7 @@ dependencies = [
  "serde",
  "serde_json",
  "swactor",
+ "swactor-engine",
  "swactor-transport",
  "tokio",
 ]
@@ -2534,6 +2535,7 @@ dependencies = [
  "serde_json",
  "signal-hook",
  "swactor",
+ "swactor-engine",
  "swactor-process",
  "swactor-transport",
  "swactor-vastai",
@@ -4399,6 +4401,15 @@ dependencies = [
  "serde",
  "tracing",
  "web-time 0.2.4",
+]
+
+[[package]]
+name = "swactor-engine"
+version = "0.1.0"
+dependencies = [
+ "parking_lot",
+ "swactor",
+ "tokio",
 ]
 
 [[package]]

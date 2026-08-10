@@ -235,6 +235,8 @@ fn lock_process_child(
 }
 
 impl ProvisionPlugin for LocalProcessPlugin {
+    // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     fn start_node(
         &mut self,
         spec: NodeProvisionSpec,
@@ -341,6 +343,8 @@ impl ProvisionPlugin for LocalProcessPlugin {
         Ok(())
     }
 
+    // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
@@ -434,6 +438,8 @@ impl Drop for LocalProcessPlugin {
 }
 
 impl ProvisionPlugin for LocalDockerPlugin {
+    // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     fn start_node(
         &mut self,
         spec: NodeProvisionSpec,

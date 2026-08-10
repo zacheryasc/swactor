@@ -1,4 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 use datastream::{
     ChannelContent, DatastreamEndpoint, DatastreamEvent, Lifetime, NodeId, Position, StreamId,
@@ -8,80 +9,109 @@ use iroh_driver::{
     DATASTREAM_ALPN, DatastreamQuicHeader, read_next_uni_from_connection,
     write_available_subscription,
 };
+use swactor::config::RuntimeConfig;
+use swactor::runtime::Runtime;
+use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
-    let source = test_endpoint().await;
-    let collector = test_endpoint().await;
-    let collector_addr = endpoint_addr(&collector);
-    let collector_accept = {
-        let collector = collector.clone();
-        tokio::spawn(async move {
-            collector
-                .accept()
-                .await
-                .expect("incoming connection")
-                .await
-                .expect("accepted connection")
-        })
-    };
+/// Datastream transport test scheduled through `EngineHandle`, not an ambient
+/// `#[tokio::test]` runtime (ENGINE_SPEC.md).
+#[test]
+fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
+    let runtime = Runtime::new(RuntimeConfig::default());
+    let engine = Engine::new(
+        Arc::new(runtime),
+        TokioBackend::new(TokioConfig::default()).expect("test backend"),
+    )
+    .expect("test engine");
+    let handle = engine.handle();
 
-    let stream = StreamId::new(NodeId::new("source-node"), Lifetime(1));
-    let endpoint = DatastreamEndpoint::with_capacity(stream.clone(), 8, 8);
-    let producer = endpoint.producer();
-    let runtime_log = producer.register_channel("runtime.log", ChannelContent::TextStream);
-    let subscription = endpoint.subscribe_all("iroh");
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let h = handle.clone();
+    handle.spawn(async move {
+        let source = test_endpoint().await;
+        let collector = test_endpoint().await;
+        let collector_addr = endpoint_addr(&collector);
 
-    producer.submit_text(runtime_log, "alpha");
-    producer.submit_text(runtime_log, "beta");
-    endpoint.tick();
-
-    let conn = source
-        .connect(collector_addr, DATASTREAM_ALPN)
-        .await
-        .expect("connect datastream ALPN");
-    let send = conn.open_uni().await.expect("open uni stream");
-    let header =
-        DatastreamQuicHeader::from_snapshot([7; 16], b"token".to_vec(), subscription.snapshot())
-            .expect("header from subscription snapshot");
-    let wrote = write_available_subscription(send, &header, &subscription)
-        .await
-        .expect("write subscription");
-    assert_eq!(wrote.events, 2);
-
-    let accepted = collector_accept.await.expect("collector accept task");
-    let read = read_next_uni_from_connection(&accepted)
-        .await
-        .expect("read datastream uni stream");
-
-    assert_eq!(read.header, header);
-    assert_eq!(read.header.stream.stream, stream);
-    assert!(
-        read.header
-            .channels
-            .iter()
-            .any(|descriptor| descriptor.id == runtime_log && descriptor.name == "runtime.log")
-    );
-    assert_eq!(read.events.len(), 2);
-    match &read.events[0] {
-        DatastreamEvent::Frame(frame) => {
-            assert_eq!(frame.channel.stream, stream);
-            assert_eq!(frame.channel.channel, runtime_log);
-            assert_eq!(frame.position, Position(0));
-            assert_eq!(frame.payload, b"alpha");
+        // Accept the incoming connection through an engine-hosted task + oneshot,
+        // since EngineHandle::spawn is fire-and-forget (no JoinHandle).
+        let (accept_tx, accept_rx) = tokio::sync::oneshot::channel();
+        {
+            let collector = collector.clone();
+            h.spawn(async move {
+                let conn = collector
+                    .accept()
+                    .await
+                    .expect("incoming connection")
+                    .await
+                    .expect("accepted connection");
+                let _ = accept_tx.send(conn);
+            });
         }
-        other => panic!("expected frame event, got {other:?}"),
-    }
-    match &read.events[1] {
-        DatastreamEvent::Frame(frame) => {
-            assert_eq!(frame.position, Position(1));
-            assert_eq!(frame.payload, b"beta");
-        }
-        other => panic!("expected frame event, got {other:?}"),
-    }
 
-    source.close().await;
-    collector.close().await;
+        let stream = StreamId::new(NodeId::new("source-node"), Lifetime(1));
+        let endpoint = DatastreamEndpoint::with_capacity(stream.clone(), 8, 8);
+        let producer = endpoint.producer();
+        let runtime_log = producer.register_channel("runtime.log", ChannelContent::TextStream);
+        let subscription = endpoint.subscribe_all("iroh");
+
+        producer.submit_text(runtime_log, "alpha");
+        producer.submit_text(runtime_log, "beta");
+        endpoint.tick();
+
+        let conn = source
+            .connect(collector_addr, DATASTREAM_ALPN)
+            .await
+            .expect("connect datastream ALPN");
+        let send = conn.open_uni().await.expect("open uni stream");
+        let header =
+            DatastreamQuicHeader::from_snapshot([7; 16], b"token".to_vec(), subscription.snapshot())
+                .expect("header from subscription snapshot");
+        let wrote = write_available_subscription(&h, send, &header, &subscription)
+            .await
+            .expect("write subscription");
+        assert_eq!(wrote.events, 2);
+
+        let accepted = accept_rx.await.expect("collector accept task");
+        let read = read_next_uni_from_connection(&accepted)
+            .await
+            .expect("read datastream uni stream");
+
+        assert_eq!(read.header, header);
+        assert_eq!(read.header.stream.stream, stream);
+        assert!(
+            read.header
+                .channels
+                .iter()
+                .any(|descriptor| descriptor.id == runtime_log && descriptor.name == "runtime.log")
+        );
+        assert_eq!(read.events.len(), 2);
+        match &read.events[0] {
+            DatastreamEvent::Frame(frame) => {
+                assert_eq!(frame.channel.stream, stream);
+                assert_eq!(frame.channel.channel, runtime_log);
+                assert_eq!(frame.position, Position(0));
+                assert_eq!(frame.payload, b"alpha");
+            }
+            other => panic!("expected frame event, got {other:?}"),
+        }
+        match &read.events[1] {
+            DatastreamEvent::Frame(frame) => {
+                assert_eq!(frame.position, Position(1));
+                assert_eq!(frame.payload, b"beta");
+            }
+            other => panic!("expected frame event, got {other:?}"),
+        }
+
+        source.close().await;
+        collector.close().await;
+        let _ = done_tx.send(Ok(()));
+    });
+
+    match done_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => panic!("test failed: {e}"),
+        Err(_) => panic!("test task dropped"),
+    }
 }
 
 async fn test_endpoint() -> Endpoint {

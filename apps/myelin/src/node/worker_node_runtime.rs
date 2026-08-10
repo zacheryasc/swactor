@@ -50,6 +50,7 @@ use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface};
+use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor::runtime::{Ctx, ExternalSender};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -306,7 +307,7 @@ fn debug_join_request_line(endpoint: EndpointAddr) -> Result<String, String> {
 }
 
 fn spawn_debug_join_listener(
-    handle: tokio::runtime::Handle,
+    engine: EngineHandle,
     path: PathBuf,
 ) -> Result<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>, String> {
     use std::os::unix::fs::PermissionsExt;
@@ -321,20 +322,29 @@ fn spawn_debug_join_listener(
             ));
         }
     }
-    let listener = {
-        let _guard = handle.enter();
-        tokio::net::UnixListener::bind(&path)
-            .map_err(|e| format!("bind debug join socket {}: {e}", path.display()))?
-    };
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod debug join socket {}: {e}", path.display()))?;
     let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel::<DebugJoinCommand>();
-    handle.spawn(async move {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let engine_inner = engine.clone();
+    engine.spawn(async move {
+        let listener = match tokio::net::UnixListener::bind(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                let _ = ready_tx
+                    .send(Err(format!("bind debug join socket {}: {e}", path.display())));
+                return;
+            }
+        };
+        if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
+            let _ = ready_tx
+                .send(Err(format!("chmod debug join socket {}: {e}", path.display())));
+            return;
+        }
+        let _ = ready_tx.send(Ok(()));
         loop {
             match listener.accept().await {
                 Ok((stream, _addr)) => {
                     let command_tx = command_tx.clone();
-                    tokio::spawn(async move {
+                    engine_inner.spawn(async move {
                         handle_debug_join_stream(stream, command_tx).await;
                     });
                 }
@@ -345,6 +355,11 @@ fn spawn_debug_join_listener(
             }
         }
     });
+    match ready_rx.recv() {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err("debug join listener task dropped".to_owned()),
+    }
     Ok(command_rx)
 }
 
@@ -579,7 +594,7 @@ fn submit_sampler_sample_health(
 }
 
 fn spawn_blocking_sampler<S: Record + Send + 'static>(
-    handle: tokio::runtime::Handle,
+    engine: EngineHandle,
     producer: DatastreamProducer,
     channel: ChannelId,
     health_channel: ChannelId,
@@ -592,7 +607,8 @@ fn spawn_blocking_sampler<S: Record + Send + 'static>(
     error_fn: fn(u64, String) -> S,
     error_of: fn(&S) -> Option<&str>,
 ) {
-    handle.spawn(async move {
+    let engine_inner = engine.clone();
+    engine.spawn(async move {
         submit_sampler_started(
             &producer,
             health_channel,
@@ -602,15 +618,20 @@ fn spawn_blocking_sampler<S: Record + Send + 'static>(
             interval,
         );
         let mut seq = 0_u64;
-        let mut interval = tokio::time::interval(interval);
+        let mut interval = engine_inner.interval(interval);
 
         loop {
-            interval.tick().await;
+            (&mut interval).await;
 
             let sample_seq = seq;
-            let sample = match tokio::task::spawn_blocking(move || sample_fn(sample_seq)).await {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            engine_inner.spawn_blocking(move || {
+                let result = sample_fn(sample_seq);
+                let _ = tx.send(result);
+            });
+            let sample = match rx.await {
                 Ok(sample) => sample,
-                Err(error) => error_fn(sample_seq, format!("{error_label}: {error}")),
+                Err(_) => error_fn(sample_seq, format!("{error_label}: dropped")),
             };
 
             submit_sampler_sample_health(
@@ -629,14 +650,14 @@ fn spawn_blocking_sampler<S: Record + Send + 'static>(
 }
 
 fn spawn_host_gpu_sampler(
-    handle: tokio::runtime::Handle,
+    engine: EngineHandle,
     producer: DatastreamProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
 ) {
     spawn_blocking_sampler(
-        handle,
+        engine,
         producer,
         channel,
         health_channel,
@@ -652,37 +673,62 @@ fn spawn_host_gpu_sampler(
 }
 
 fn spawn_host_cpu_sampler(
-    handle: tokio::runtime::Handle,
+    engine: EngineHandle,
     producer: DatastreamProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
     watched_pids: Vec<u32>,
 ) {
-    handle.spawn(async move {
-        let sample_channel = datastream::hardware::cpu::HOST_CPU_CHANNEL;
+    let engine_inner = engine.clone();
+    engine.spawn(async move {
+        use datastream::hardware::cpu::{
+            CpuSampler, CPU_SAMPLE_INTERVAL, HOST_CPU_CHANNEL, HostCpuSample,
+        };
         submit_sampler_started(
             &producer,
             health_channel,
             health_context,
             "cpu",
-            sample_channel,
-            datastream::hardware::cpu::CPU_SAMPLE_INTERVAL,
+            HOST_CPU_CHANNEL,
+            CPU_SAMPLE_INTERVAL,
         );
         let mut seq = 0_u64;
-        let mut sampler = datastream::hardware::cpu::CpuSampler::new(watched_pids);
-        let mut interval = tokio::time::interval(datastream::hardware::cpu::CPU_SAMPLE_INTERVAL);
+        let recovery_pids = watched_pids.clone();
+        let mut sampler = CpuSampler::new(watched_pids);
+        let mut interval = engine_inner.interval(CPU_SAMPLE_INTERVAL);
 
         loop {
-            interval.tick().await;
+            (&mut interval).await;
 
-            let sample = sampler.sample(seq);
+            // CPU sampling reads `/proc` and performs blocking filesystem
+            // queries, so each query runs on the engine's blocking pool rather
+            // than the async core-driving worker. The stateful sampler is
+            // carried into and back out of each blocking call so its
+            // previous-sample deltas persist across samples
+            // (ENGINE_SPEC.md).
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            engine_inner.spawn_blocking(move || {
+                let sample = sampler.sample(seq);
+                let _ = tx.send((sampler, sample));
+            });
+            let sample = match rx.await {
+                Ok((returned, sample)) => {
+                    sampler = returned;
+                    sample
+                }
+                Err(_) => {
+                    sampler = CpuSampler::new(recovery_pids.clone());
+                    HostCpuSample::error(seq, "cpu sampler blocking task dropped".to_string())
+                }
+            };
+
             submit_sampler_sample_health(
                 &producer,
                 health_channel,
                 health_context,
                 "cpu",
-                sample_channel,
+                HOST_CPU_CHANNEL,
                 seq,
                 sample.error.as_deref(),
             );
@@ -692,14 +738,14 @@ fn spawn_host_cpu_sampler(
     });
 }
 fn spawn_host_net_sampler(
-    handle: tokio::runtime::Handle,
+    engine: EngineHandle,
     producer: DatastreamProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
 ) {
     spawn_blocking_sampler(
-        handle,
+        engine,
         producer,
         channel,
         health_channel,
@@ -715,17 +761,18 @@ fn spawn_host_net_sampler(
 }
 
 fn spawn_arena_sampler(
-    handle: tokio::runtime::Handle,
+    engine: EngineHandle,
     producer: DatastreamProducer,
     channel: ChannelId,
     arena_manager: Arc<Mutex<arena::ArenaManager>>,
 ) {
-    handle.spawn(async move {
+    let engine_inner = engine.clone();
+    engine.spawn(async move {
         let mut seq = 0_u64;
-        let mut interval = tokio::time::interval(arena::ARENA_SAMPLE_INTERVAL);
+        let mut interval = engine_inner.interval(arena::ARENA_SAMPLE_INTERVAL);
 
         loop {
-            interval.tick().await;
+            (&mut interval).await;
 
             let sample: arena::ArenaSample = arena_manager.lock().sample(seq).into();
             seq = seq.saturating_add(1);
@@ -797,7 +844,6 @@ impl WorkerEdgeRuntime {
         let node_stage = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
         };
-        driver.pump_edge_ingress();
         for event in driver.drain_edge_events() {
             match event {
                 EdgeTransportEvent::StreamArrived {
@@ -978,7 +1024,7 @@ impl WorkerEdgeRuntime {
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        driver: &mut IrohDriver,
+        _driver: &mut IrohDriver,
     ) -> Result<(), String> {
         let node_stage = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
@@ -1012,7 +1058,6 @@ impl WorkerEdgeRuntime {
             crate::node_actor::StageEdgeKindWire::TokenOut
         );
         let step_started = Instant::now();
-        let mut pump = || pump_network(driver, stack);
         let committed_bytes = match worker.execute_step(
             u64::from(config.stage_index) + 1,
             step_id,
@@ -1026,7 +1071,6 @@ impl WorkerEdgeRuntime {
             outbound.object_spec,
             config,
             datastream,
-            &mut pump,
         ) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1116,11 +1160,10 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        driver: &mut IrohDriver,
-        stack: &DistributionRuntimeStack,
+        _driver: &mut IrohDriver,
+        _stack: &DistributionRuntimeStack,
     ) -> Result<(), String> {
-        let mut pump = || pump_network(driver, stack);
-        worker.release_device_object(handle_id, config, datastream, &mut pump)
+        worker.release_device_object(handle_id, config, datastream)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1206,7 +1249,6 @@ impl WorkerEdgeRuntime {
                 inbound.object_spec,
                 config,
                 datastream,
-                &mut || {},
             ) {
                 Ok(loaded) => loaded,
                 Err(e) => {
@@ -1400,7 +1442,6 @@ impl WorkerEdgeRuntime {
                         wire_spec,
                         config,
                         datastream,
-                        &mut || {},
                     )?;
                     self.establisher
                         .observe(edge::EdgeEvent::RingInstalled { edge_id, ring_id });
@@ -1451,8 +1492,7 @@ impl WorkerEdgeRuntime {
                     self.driver_model.stop_edge(driver_model::EdgeId(edge_id.0));
                 }
                 edge::EdgeCommand::UninstallWorkerRing { ring_id, .. } => {
-                    let mut pump = || {};
-                    worker.uninstall_ring(ring_id.0, config, datastream, &mut pump)?;
+                    worker.uninstall_ring(ring_id.0, config, datastream)?;
                     self.establisher
                         .observe(edge::EdgeEvent::RingQuiesced { ring_id });
                 }
@@ -1645,6 +1685,8 @@ fn run_stage_shard_fetcher() -> Result<(), String> {
     })
 }
 
+// synchronous process-control sequencing: polls helper-process liveness and shutdown; the engine drives all background actor/transport/sampling work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn run() -> Result<(), String> {
     let config = DeploymentConfig::from_env()?;
     let boot = |phase: &str, status: &str, detail: Value| {
@@ -1674,22 +1716,37 @@ fn run() -> Result<(), String> {
         json!({"binary":"myelin-worker","pid":std::process::id()}),
     )?;
 
-    let tokio = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => {
-            boot("tokio_runtime", "ready", json!({"runtime":"tokio"}))?;
-            runtime
+    // Datastream must exist before the runtime: its stats hook is wired in
+    // during runtime construction.
+    let mut datastream = NodeDatastream::new(&config);
+
+    // Build the core swactor runtime, then hand it to the engine. The engine
+    // owns both the runtime (it drives actor progression) and the Tokio
+    // substrate (it schedules all background work). After this point the engine
+    // is the sole owner of Tokio and core progression — no raw handles are
+    // passed to components (ENGINE_SPEC.md).
+    let worker_stats_hook = datastream.producer.stats_hook();
+    let (runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
+        |registry| {
+            register_myelin_actor_codecs(registry);
+            datastream::wire::register_datastream_codec(registry);
+        },
+        Some(worker_stats_hook),
+    );
+    let engine = match TokioBackend::new(TokioConfig::default())
+        .and_then(|backend| Engine::new(runtime.clone(), backend))
+    {
+        Ok(engine) => {
+            boot("engine", "ready", json!({"backend":"tokio","owns":"core+substrate"}))?;
+            engine
         }
         Err(error) => {
-            boot(
-                "tokio_runtime",
-                "failed",
-                json!({"error":error.to_string()}),
-            )?;
-            return Err(format!("tokio runtime: {error}"));
+            boot("engine", "failed", json!({"error":error.to_string()}))?;
+            return Err(format!("create engine: {error}"));
         }
     };
-    let mut driver = match IrohDriver::with_handle(
-        tokio.handle().clone(),
+    let mut driver = match IrohDriver::with_engine(
+        engine.handle(),
         IrohDriverConfig {
             secret_key: None,
             relay_mode: config.relay_mode.clone(),
@@ -1726,16 +1783,13 @@ fn run() -> Result<(), String> {
         )?;
     }
 
-    let mut datastream = NodeDatastream::new(&config);
-    let worker_stats_hook = datastream.producer.stats_hook();
-    let stack = DistributionRuntimeStack::new_with_codecs(
+    let stack = DistributionRuntimeStack::new_from_runtime(
+        runtime,
+        codec,
+        transport_router,
         driver.node_id(),
         DistributedNodeConfig::default(),
-        |registry| {
-            register_myelin_actor_codecs(registry);
-            datastream::wire::register_datastream_codec(registry);
-        },
-        Some(worker_stats_hook),
+        engine.handle(),
     );
     boot(
         "distribution_stack",
@@ -1754,11 +1808,16 @@ fn run() -> Result<(), String> {
         stack.actors.swim,
         stack.relay_mirror.clone(),
         stack.route_view.clone(),
+        stack.outbox.clone(),
     );
+    // Engine owns protocol tick injection and core progression; the application
+    // loop only drains integration-owned queues (ENGINE_SPEC.md).
+    stack.spawn_protocol_ticker(PUMP_INTERVAL);
+    driver.install_actor_bridge_pump(PUMP_INTERVAL);
     boot(
         "actor_bridge",
         "ready",
-        json!({"transport":"iroh","routes":"attached"}),
+        json!({"transport":"iroh","routes":"attached","protocol_ticker":"engine-hosted"}),
     )?;
 
     let arena_manager = match arena::ArenaManager::boot(arena::ArenaConfig {
@@ -1817,21 +1876,21 @@ fn run() -> Result<(), String> {
     let sampler_health_channel = datastream.channel_by_name(NODE_SAMPLER_CHANNEL);
     let sampler_health_context = SamplerHealthContext::from_config(&config);
     spawn_host_gpu_sampler(
-        tokio.handle().clone(),
+        engine.handle(),
         datastream.producer.clone(),
         datastream.channels.host_gpu,
         sampler_health_channel,
         sampler_health_context,
     );
     spawn_host_net_sampler(
-        tokio.handle().clone(),
+        engine.handle(),
         datastream.producer.clone(),
         datastream.channels.host_net,
         sampler_health_channel,
         sampler_health_context,
     );
     spawn_arena_sampler(
-        tokio.handle().clone(),
+        engine.handle(),
         datastream.producer.clone(),
         datastream.channels.arena,
         Arc::clone(&arena_manager),
@@ -1871,7 +1930,7 @@ fn run() -> Result<(), String> {
     }
     let mut debug_join_rx = match &config.debug_join_socket {
         Some(path) => {
-            match spawn_debug_join_listener(tokio.handle().clone(), PathBuf::from(path)) {
+            match spawn_debug_join_listener(engine.handle(), PathBuf::from(path)) {
                 Ok(rx) => {
                     node_runtime(
                         &mut datastream,
@@ -1968,7 +2027,7 @@ fn run() -> Result<(), String> {
             "stderr":"piped",
         }),
     )?;
-    let mut worker = match TinygradWorker::spawn(&config, arena_fd) {
+    let mut worker = match TinygradWorker::spawn(&config, arena_fd, engine.handle()) {
         Ok(worker) => worker,
         Err(error) => {
             worker_evt("worker_process", "failed", json!({"error":error}))?;
@@ -1976,7 +2035,7 @@ fn run() -> Result<(), String> {
         }
     };
     spawn_host_cpu_sampler(
-        tokio.handle().clone(),
+        engine.handle(),
         datastream.producer.clone(),
         datastream.channels.host_cpu,
         sampler_health_channel,
@@ -1988,8 +2047,7 @@ fn run() -> Result<(), String> {
         "started",
         json!({"command":"InitializeWorker","helper_abi_version":1,"device":&config.device}),
     )?;
-    let mut initial_pump = || {};
-    match worker.initialize(&config.device, &config, &mut datastream, &mut initial_pump) {
+    match worker.initialize(&config.device, &config, &mut datastream) {
         Ok(()) => worker_evt(
             "worker_initialize",
             "ready",
@@ -2057,7 +2115,6 @@ fn run() -> Result<(), String> {
         }),
     );
     loop {
-        pump_network(&mut driver, &stack);
         emit_swim_telemetry(&mut datastream, &stack, "main_loop");
         drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut datastream);
         datastream.tick();
@@ -2148,8 +2205,7 @@ fn run() -> Result<(), String> {
                 "started",
                 json!({"source":"stdin","command":"shutdown"}),
             );
-            let mut pump = || pump_network(&mut driver, &stack);
-            match worker.shutdown(&config, &mut datastream, &mut pump) {
+            match worker.shutdown(&config, &mut datastream) {
                 Ok(()) => {
                     node_shutdown(
                         &mut datastream,
@@ -2186,18 +2242,10 @@ fn run() -> Result<(), String> {
                     reason: Some(format!("tinygrad helper exited with {status}")),
                 },
             );
-            pump_network(&mut driver, &stack);
             return Err(format!("tinygrad helper exited with {status}"));
         }
         thread::sleep(PUMP_INTERVAL);
     }
-}
-
-fn pump_network(driver: &mut IrohDriver, stack: &DistributionRuntimeStack) {
-    stack.tick_protocol_actors(Instant::now());
-    driver.pump_inbound_to_actors();
-    stack.pump_runtime_once();
-    driver.drain_outbox(&stack.outbox);
 }
 
 fn emit_swim_telemetry(
@@ -2681,7 +2729,7 @@ fn handle_prompt_request(
     reply_to: ActorAddress,
     config: &DeploymentConfig,
     stack: &DistributionRuntimeStack,
-    driver: &mut IrohDriver,
+    _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
     datastream: &mut NodeDatastream,
 ) -> Result<(), String> {
@@ -2701,9 +2749,8 @@ fn handle_prompt_request(
         "started",
         json!({"request_id":request_id,"command":"InferPrompt","max_tokens":max_tokens}),
     );
-    let mut pump = || pump_network(driver, stack);
     match worker.infer_prompt(
-        request_id, &prompt, max_tokens, config, datastream, &mut pump,
+        request_id, &prompt, max_tokens, config, datastream,
     ) {
         Ok(result) => {
             let text = result
@@ -2828,7 +2875,7 @@ fn handle_encode_prompt_request(
     reply_to: ActorAddress,
     config: &DeploymentConfig,
     stack: &DistributionRuntimeStack,
-    driver: &mut IrohDriver,
+    _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
     datastream: &mut NodeDatastream,
 ) -> Result<(), String> {
@@ -2841,8 +2888,7 @@ fn handle_encode_prompt_request(
         "started",
         json!({"request_id":request_id,"prompt_bytes":prompt.len(),"reply_to":reply_to}),
     );
-    let mut pump = || pump_network(driver, stack);
-    let event = match worker.encode_prompt(request_id, &prompt, config, datastream, &mut pump) {
+    let event = match worker.encode_prompt(request_id, &prompt, config, datastream) {
         Ok(tokens) => {
             node_prompt(
                 datastream,
@@ -2874,7 +2920,7 @@ fn handle_decode_tokens_request(
     reply_to: ActorAddress,
     config: &DeploymentConfig,
     stack: &DistributionRuntimeStack,
-    driver: &mut IrohDriver,
+    _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
     datastream: &mut NodeDatastream,
 ) -> Result<(), String> {
@@ -2887,8 +2933,7 @@ fn handle_decode_tokens_request(
         "started",
         json!({"request_id":request_id,"tokens":tokens.len(),"reply_to":reply_to}),
     );
-    let mut pump = || pump_network(driver, stack);
-    let event = match worker.decode_tokens(request_id, &tokens, config, datastream, &mut pump) {
+    let event = match worker.decode_tokens(request_id, &tokens, config, datastream) {
         Ok(text) => {
             node_prompt(
                 datastream,
@@ -2949,9 +2994,11 @@ struct StageShardFetchActor {
     output_path: PathBuf,
     report_to: ActorAddress,
     sender: ExternalSender,
+    /// The node's engine. Reader tasks and delayed messages schedule on this
+    /// stored handle; the actor never creates another engine
+    /// (ENGINE_SPEC.md).
+    engine: EngineHandle,
     child: Option<Child>,
-    stdout_reader: Option<thread::JoinHandle<()>>,
-    stderr_reader: Option<thread::JoinHandle<()>>,
     stdout_closed: bool,
     stderr_closed: bool,
     ready_path: Option<PathBuf>,
@@ -2965,15 +3012,15 @@ impl StageShardFetchActor {
         output_path: PathBuf,
         report_to: ActorAddress,
         sender: ExternalSender,
+        engine: EngineHandle,
     ) -> Self {
         Self {
             request_json,
             output_path,
             report_to,
             sender,
+            engine,
             child: None,
-            stdout_reader: None,
-            stderr_reader: None,
             stdout_closed: true,
             stderr_closed: true,
             ready_path: None,
@@ -3028,27 +3075,30 @@ impl StageShardFetchActor {
         self.ready_path = None;
         self.exit_status = None;
         if let Some(stdout) = child.stdout.take() {
-            self.stdout_reader = Some(spawn_stage_shard_reader(
+            spawn_stage_shard_reader(
                 StageShardProcessStream::Stdout,
                 stdout,
                 self.sender.clone(),
                 ctx.self_addr(),
-            ));
+                &self.engine,
+            );
         } else {
             self.stdout_closed = true;
         }
         if let Some(stderr) = child.stderr.take() {
-            self.stderr_reader = Some(spawn_stage_shard_reader(
+            spawn_stage_shard_reader(
                 StageShardProcessStream::Stderr,
                 stderr,
                 self.sender.clone(),
                 ctx.self_addr(),
-            ));
+                &self.engine,
+            );
         } else {
             self.stderr_closed = true;
         }
         self.child = Some(child);
         schedule_stage_shard_message(
+            &self.engine,
             self.sender.clone(),
             ctx.self_addr(),
             StageShardFetchMsg::PollChild,
@@ -3070,6 +3120,7 @@ impl StageShardFetchActor {
                 self.maybe_finish(ctx);
             }
             Ok(None) => schedule_stage_shard_message(
+                &self.engine,
                 self.sender.clone(),
                 ctx.self_addr(),
                 StageShardFetchMsg::PollChild,
@@ -3159,12 +3210,10 @@ impl StageShardFetchActor {
     }
 
     fn join_readers(&mut self) {
-        if let Some(reader) = self.stdout_reader.take() {
-            let _ = reader.join();
-        }
-        if let Some(reader) = self.stderr_reader.take() {
-            let _ = reader.join();
-        }
+        // Reader tasks are engine-hosted (spawn_blocking) and signal completion
+        // through `ReaderClosed` messages tracked by the `*_closed` flags;
+        // there are no thread handles to join. Killing the child closes its
+        // pipes, so outstanding readers hit EOF and exit on their own.
         self.stdout_closed = true;
         self.stderr_closed = true;
     }
@@ -3205,8 +3254,12 @@ fn spawn_stage_shard_reader<R: Read + Send + 'static>(
     reader: R,
     sender: ExternalSender,
     actor: ActorAddress,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
+    engine: &EngineHandle,
+) {
+    // Blocking stdout/stderr reads run on the engine's blocking pool so they
+    // never occupy an async core-driving worker. Each decoded line is delivered
+    // to the actor through the existing external sender (ENGINE_SPEC.md).
+    engine.spawn_blocking(move || {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         loop {
@@ -3235,17 +3288,22 @@ fn spawn_stage_shard_reader<R: Read + Send + 'static>(
             }
         }
         let _ = sender.send_to(actor, StageShardFetchMsg::ReaderClosed { stream });
-    })
+    });
 }
 
 fn schedule_stage_shard_message(
+    engine: &EngineHandle,
     sender: ExternalSender,
     actor: ActorAddress,
     msg: StageShardFetchMsg,
     delay: Duration,
 ) {
-    thread::spawn(move || {
-        thread::sleep(delay);
+    // Delayed actor messages use an engine task plus an engine timer, measured
+    // in engine time, rather than a std thread plus sleep
+    // (ENGINE_SPEC.md).
+    let timer_engine = engine.clone();
+    engine.clone().spawn(async move {
+        timer_engine.timer(delay).await;
         let _ = sender.send_to(actor, msg);
     });
 }
@@ -3264,11 +3322,13 @@ fn publish_stage_shard_fetch_event(
     Ok(())
 }
 
+// synchronous process-control sequencing: waits for an engine-driven actor; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn materialize_stage_shard_with_process(
     plan: &StageShardPlan,
     config: &DeploymentConfig,
     datastream: &mut NodeDatastream,
-    driver: &mut IrohDriver,
+    _driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
 ) -> Result<PathBuf, String> {
     let output_path = std::env::var("MYELIN_MODEL_CACHE_DIR")
@@ -3325,6 +3385,7 @@ fn materialize_stage_shard_with_process(
             output_path,
             *reports.addr(),
             stack.runtime.create_sender(),
+            stack.engine.clone(),
         ))
         .map_err(|e| format!("spawn stage shard fetch actor: {e}"))?;
     stack
@@ -3333,7 +3394,6 @@ fn materialize_stage_shard_with_process(
         .map_err(|e| format!("start stage shard fetch actor: {e}"))?;
 
     loop {
-        pump_network(driver, stack);
         while let Some(report) = reports.try_recv() {
             match report {
                 StageShardFetchReport::Progress(event) => {
@@ -3379,7 +3439,6 @@ fn handle_stage_command(
                 "started",
                 json!({"run_id":run_id,"stage_index":stage_index,"layer_range":{"start":layer_start,"end_exclusive":layer_end_exclusive}}),
             );
-            let mut pump = || pump_network(driver, stack);
             match worker.configure_role(
                 run_id,
                 stage_index,
@@ -3387,7 +3446,6 @@ fn handle_stage_command(
                 layer_end_exclusive,
                 config,
                 datastream,
-                &mut pump,
             ) {
                 Ok(()) => node_stage(
                     datastream,
@@ -3408,7 +3466,6 @@ fn handle_stage_command(
                             reason: Some(error.clone()),
                         },
                     );
-                    pump();
                     return Err(error);
                 }
             }
@@ -3459,7 +3516,6 @@ fn handle_stage_command(
                                     reason: Some(error.clone()),
                                 },
                             );
-                            pump_network(driver, stack);
                             return Err(error);
                         }
                     }
@@ -3472,7 +3528,6 @@ fn handle_stage_command(
                 "started",
                 json!({"model_id":&model_id,"gguf_source":gguf_source_kind,"tokenizer":tokenizer_kind,"stage_shard":using_stage_shard,"layer_range":{"start":layer_start,"end_exclusive":layer_end_exclusive}}),
             );
-            let mut pump = || pump_network(driver, stack);
             match worker.load_weights(
                 model_id.clone(),
                 resolved_gguf_source,
@@ -3481,7 +3536,6 @@ fn handle_stage_command(
                 layer_end_exclusive,
                 config,
                 datastream,
-                &mut pump,
             ) {
                 Ok(()) => node_stage(
                     datastream,
@@ -3497,7 +3551,6 @@ fn handle_stage_command(
                             reason: Some(error.clone()),
                         },
                     );
-                    pump();
                     return Err(error);
                 }
             }
@@ -3642,8 +3695,8 @@ fn run_self_test(
     config: &DeploymentConfig,
     prompt: &str,
     datastream: &mut NodeDatastream,
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
+    _driver: &mut IrohDriver,
+    _stack: &DistributionRuntimeStack,
 ) -> Result<(), String> {
     emit_node_event(
         datastream,
@@ -3653,7 +3706,6 @@ fn run_self_test(
         "started",
         json!({"prompt_bytes":prompt.len()}),
     );
-    let mut pump = || pump_network(driver, stack);
     worker.configure_role(
         config.run_id,
         config.stage_index,
@@ -3661,7 +3713,6 @@ fn run_self_test(
         config.self_test_layer_end,
         config,
         datastream,
-        &mut pump,
     )?;
     worker.load_weights(
         config.model_id.clone(),
@@ -3671,7 +3722,6 @@ fn run_self_test(
         config.self_test_layer_end,
         config,
         datastream,
-        &mut pump,
     )?;
     let result = worker.infer_prompt(
         0,
@@ -3679,7 +3729,6 @@ fn run_self_test(
         config.self_test_max_tokens,
         config,
         datastream,
-        &mut pump,
     )?;
     let record = json!({"type":"self_test_completed","prompt_bytes":prompt.len(),"result":result});
     datastream.submit_text(datastream.channels.node_self_test, record.to_string());
@@ -3830,8 +3879,15 @@ impl HelperCommandWaitConfig {
     }
 }
 
-fn spawn_helper_stdout_reader<R: Read + Send + 'static>(reader: R, tx: Sender<HelperStdoutEvent>) {
-    thread::spawn(move || {
+fn spawn_helper_stdout_reader<R: Read + Send + 'static>(
+    reader: R,
+    tx: Sender<HelperStdoutEvent>,
+    engine: &EngineHandle,
+) {
+    // Blocking helper stdout reads run on the engine's blocking pool, never on
+    // an async core-driving worker. The channel, parsing, and
+    // actor/application-facing behavior are unchanged (ENGINE_SPEC.md).
+    engine.spawn_blocking(move || {
         let mut reader = BufReader::new(reader);
         loop {
             let mut line = String::new();
@@ -3849,6 +3905,20 @@ fn spawn_helper_stdout_reader<R: Read + Send + 'static>(reader: R, tx: Sender<He
                     let _ = tx.send(HelperStdoutEvent::ReadError(error.to_string()));
                     break;
                 }
+            }
+        }
+    });
+}
+
+fn spawn_helper_stderr_reader<R: Read + Send + 'static>(
+    reader: R,
+    tx: Sender<String>,
+    engine: &EngineHandle,
+) {
+    engine.spawn_blocking(move || {
+        for line in BufReader::new(reader).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
             }
         }
     });
@@ -3881,7 +3951,6 @@ fn wait_for_helper_event(
     channel: ChannelId,
     channel_name: &str,
     wait_config: HelperCommandWaitConfig,
-    pump: &mut dyn FnMut(),
 ) -> Result<Value, String> {
     let node_worker = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_WORKER_CHANNEL, phase, status, detail)
@@ -3940,7 +4009,6 @@ fn wait_for_helper_event(
                 emit_stdio_datastream_frame(channel_name, &value)
                     .map_err(|e| format!("emit worker stdio datastream frame: {e}"))?;
                 datastream.tick();
-                pump();
                 if worker_event_type == "WorkerFatal" {
                     return Err(format!("worker fatal: {value}"));
                 }
@@ -3982,7 +4050,6 @@ fn wait_for_helper_event(
             }
             Err(RecvTimeoutError::Timeout) => {
                 wait_cycles = wait_cycles.saturating_add(1);
-                pump();
                 if let Some(stderr_rx) = stderr_rx {
                     drain_worker_stderr(stderr_rx, config, datastream);
                 }
@@ -4031,7 +4098,7 @@ struct TinygradWorker {
 }
 
 impl TinygradWorker {
-    fn spawn(config: &DeploymentConfig, arena_fd: std::os::fd::RawFd) -> Result<Self, String> {
+    fn spawn(config: &DeploymentConfig, arena_fd: std::os::fd::RawFd, engine: EngineHandle) -> Result<Self, String> {
         let mut child = Command::new("python3")
             .arg(&config.worker_script)
             .env("DEV", &config.device)
@@ -4077,15 +4144,9 @@ impl TinygradWorker {
             .take()
             .ok_or_else(|| "tinygrad helper stderr missing".to_owned())?;
         let (stdout_tx, stdout_rx) = mpsc::channel();
-        spawn_helper_stdout_reader(stdout, stdout_tx);
+        spawn_helper_stdout_reader(stdout, stdout_tx, &engine);
         let (stderr_tx, stderr_rx) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                if stderr_tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
+        spawn_helper_stderr_reader(stderr, stderr_tx, &engine);
         Ok(Self {
             child,
             stdin,
@@ -4099,7 +4160,6 @@ impl TinygradWorker {
         device: &str,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
             json!({"type":"InitializeWorker","helper_abi_version":1,"backend":{"device":device}}),
@@ -4107,7 +4167,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.initialize",
-            pump,
         )
         .map(|_| ())
     }
@@ -4120,7 +4179,6 @@ impl TinygradWorker {
         layer_end_exclusive: u32,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
             json!({
@@ -4137,7 +4195,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.role",
-            pump,
         )
         .map(|_| ())
     }
@@ -4151,7 +4208,6 @@ impl TinygradWorker {
         layer_end_exclusive: u32,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
             json!({
@@ -4166,7 +4222,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.weights",
-            pump,
         )
         .map(|_| ())
     }
@@ -4178,7 +4233,6 @@ impl TinygradWorker {
         max_tokens: u32,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<Value, String> {
         self.command(
             json!({"type":"InferPrompt","request_id":request_id,"prompt":prompt,"max_tokens":max_tokens}),
@@ -4186,7 +4240,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.prompt",
-            pump,
         )
     }
 
@@ -4196,7 +4249,6 @@ impl TinygradWorker {
         prompt: &str,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<Vec<u32>, String> {
         let result = self.command(
             json!({"type":"EncodePrompt","request_id":request_id,"prompt":prompt}),
@@ -4204,7 +4256,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.tokenizer",
-            pump,
         )?;
         result
             .get("tokens")
@@ -4227,7 +4278,6 @@ impl TinygradWorker {
         tokens: &[u32],
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<String, String> {
         let result = self.command(
             json!({"type":"DecodeTokens","request_id":request_id,"tokens":tokens}),
@@ -4235,7 +4285,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.tokenizer",
-            pump,
         )?;
         result
             .get("text")
@@ -4254,7 +4303,6 @@ impl TinygradWorker {
         object_spec: StageObjectSpecWire,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
             json!({
@@ -4280,7 +4328,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.ring",
-            pump,
         )
         .map(|_| ())
     }
@@ -4290,7 +4337,6 @@ impl TinygradWorker {
         ring_id: u64,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
             json!({"type":"UninstallRing","ring_id":ring_id}),
@@ -4298,7 +4344,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.ring",
-            pump,
         )
         .map(|_| ())
     }
@@ -4310,7 +4355,6 @@ impl TinygradWorker {
         object_spec: StageObjectSpecWire,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<LoadedObject, String> {
         let event = self.command(
             json!({
@@ -4326,7 +4370,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.ingress",
-            pump,
         )?;
         Ok(LoadedObject {
             object_id: value_u64(&event, "object_id")?,
@@ -4351,7 +4394,6 @@ impl TinygradWorker {
         output_spec: StageObjectSpecWire,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<usize, String> {
         let event = self.command(
             json!({
@@ -4374,7 +4416,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.step",
-            pump,
         )?;
         usize::try_from(value_u64(&event, "committed_bytes")?)
             .map_err(|_| "StepExecuted committed_bytes does not fit usize".to_owned())
@@ -4385,7 +4426,6 @@ impl TinygradWorker {
         handle_id: u64,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
             json!({"type":"ReleaseDeviceObject","handle_id":handle_id}),
@@ -4393,7 +4433,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.device_object",
-            pump,
         )
         .map(|_| ())
     }
@@ -4402,7 +4441,6 @@ impl TinygradWorker {
         &mut self,
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
-        pump: &mut dyn FnMut(),
     ) -> Result<(), String> {
         self.command(
             json!({"type":"ShutdownWorker"}),
@@ -4410,7 +4448,6 @@ impl TinygradWorker {
             config,
             datastream,
             "myelin.worker.shutdown",
-            pump,
         )
         .map(|_| ())
     }
@@ -4428,7 +4465,6 @@ impl TinygradWorker {
         config: &DeploymentConfig,
         datastream: &mut NodeDatastream,
         channel_name: &str,
-        pump: &mut dyn FnMut(),
     ) -> Result<Value, String> {
         let node_worker = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_WORKER_CHANNEL, phase, status, detail)
@@ -4478,7 +4514,6 @@ impl TinygradWorker {
             datastream,
             channel,
             channel_name,
-            pump,
         )
     }
 
@@ -4490,7 +4525,6 @@ impl TinygradWorker {
         datastream: &mut NodeDatastream,
         channel: ChannelId,
         channel_name: &str,
-        pump: &mut dyn FnMut(),
     ) -> Result<Value, String> {
         wait_for_helper_event(
             &self.stdout_rx,
@@ -4502,7 +4536,6 @@ impl TinygradWorker {
             channel,
             channel_name,
             HelperCommandWaitConfig::production(),
-            pump,
         )
     }
 }
@@ -4514,6 +4547,8 @@ impl Drop for TinygradWorker {
     }
 }
 
+// blocking user-stdin thread is process control, out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn spawn_stdin_shutdown_listener() -> Receiver<()> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {

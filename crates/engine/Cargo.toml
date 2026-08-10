@@ -1,0 +1,14 @@
+[package]
+name = "swactor-engine"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+
+[dependencies]
+swactor = { path = "../.." }
+parking_lot = "0.12"
+tokio = { workspace = true, optional = true }

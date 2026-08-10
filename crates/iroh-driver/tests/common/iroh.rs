@@ -3,15 +3,16 @@
 //! Each node is an [`IrohNode`]: a real iroh [`IrohDriver`] (endpoint with
 //! `RelayMode::Disabled`) bridged to a per-node swactor [`Runtime`] hosting the
 //! four protocol actors — `SwimActor`, `RegistryActor`, `MetadataActor`,
-//! `DirectoryActor`. The driver decodes inbound frames into actor mailboxes,
-//! the actors enqueue outbound frames on a shared [`Outbox`], and the driver
-//! writes them to iroh.
+//! `DirectoryActor`. Each node owns a swactor [`Engine`] that drives actor
+//! progression and injects protocol ticks; iroh adapter progression is
+//! engine-hosted. The driver decodes inbound frames into actor mailboxes, the
+//! actors enqueue outbound frames on a shared [`Outbox`], and engine-hosted
+//! writers send them to iroh.
 //!
-//! The synchronous `#[test]`s drive the stack by *pumping*: each iteration
-//! injects the four `Tick`s, then `pump_inbound_to_actors()` / `rt.tick()` /
-//! `drain_outbox()`. SWIM is wall-clock driven, so the `pump_until*` helpers
-//! sleep ~10ms between iterations to let real time elapse.
-//!
+//! The synchronous `#[test]`s observe the stack through converge-or-timeout
+//! polls: the `pump_until*` helpers sleep ~10ms between checks and re-read the
+//! membership mirror. The engine drives core progression, protocol ticks, and
+//! all iroh work in the background; the tests no longer pump any queue.
 //! Membership is observed through the harness `membership_mirror` (a
 //! `MemberList` filled by the [`MembershipFanout`] from SWIM's
 //! `MembershipChanged` stream). The driver snapshot no longer carries members.
@@ -19,12 +20,12 @@
 
 use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
 
 use iroh::{EndpointAddr, PublicKey, RelayMode};
 use parking_lot::Mutex;
-use tokio::runtime::{Handle, Runtime as TokioRuntime};
+use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
@@ -48,19 +49,6 @@ use distribution::types::{MemberState, NodeId};
 
 use super::test_config;
 
-/// Process-wide multi-threaded tokio runtime backing the test drivers.
-///
-/// Production runs every driver on one ambient tokio runtime (the node owns a
-/// single `#[tokio::main]` runtime). The drivers no longer own a runtime, so the
-/// sync `#[test]`s supply one here and construct via [`IrohDriver::with_handle`].
-/// The runtime is kept alive for the whole test process via `OnceLock`; the
-/// `pump_*` helpers run the actor stack from the test's own (non-async) thread.
-fn test_tokio_handle() -> Handle {
-    static RT: OnceLock<TokioRuntime> = OnceLock::new();
-    RT.get_or_init(|| TokioRuntime::new().expect("build test tokio runtime"))
-        .handle()
-        .clone()
-}
 
 // ── Membership fanout (copied verbatim from main.rs) ────────────────────────
 // Adapts the SwimActor's `MembershipChanged` stream (its sole observable) into
@@ -102,6 +90,9 @@ pub struct IrohNode {
     membership_mirror: Arc<Mutex<MemberList>>,
     relay_mirror: RelayMirror,
     route_view: RouteView,
+    /// The engine that owns this node's Tokio substrate and drives the core
+    /// runtime. Declared last so it drops after the driver on teardown.
+    _engine: Engine,
 }
 
 impl IrohNode {
@@ -110,17 +101,9 @@ impl IrohNode {
     /// `RouteViewTransport` + `OutboxRouteBinder`; `MembershipFanout` + `Subscribe`;
     /// the `routes` tag table; `enable_actor_bridge`).
     fn from_config(config: IrohDriverConfig) -> Self {
-        let mut driver = IrohDriver::with_handle(test_tokio_handle(), config)
-            .expect("failed to create iroh driver");
-        let node_id = driver.node_id();
-
-        // The node's distribution config (SWIM/registry/metadata params).
-        let node_config = test_config();
-        let swim_config = node_config.swim.clone();
-        let registry_config = node_config.registry.clone();
-        let metadata_lambda = node_config.metadata_lambda;
-
-        // Per-node swactor runtime + codec + transport router.
+        // Per-node swactor runtime + codec + transport router. The runtime is
+        // created before the driver so the engine can own it; the driver needs
+        // the engine handle, and actors need the driver's node_id.
         let mut swactor_rt =
             Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
         let actor_codec = Arc::new(actor_codec_registry());
@@ -130,6 +113,24 @@ impl IrohNode {
             Arc::clone(&transport_router),
         )));
         let rt: Arc<Runtime> = Arc::new(swactor_rt);
+
+        // The engine owns the runtime (drives actor progression) and the Tokio
+        // substrate (schedules all iroh background work).
+        let engine = Engine::new(
+            Arc::clone(&rt),
+            TokioBackend::new(TokioConfig::default()).expect("build test tokio backend"),
+        )
+        .expect("build test engine");
+
+        let mut driver = IrohDriver::with_engine(engine.handle(), config)
+            .expect("failed to create iroh driver");
+        let node_id = driver.node_id();
+
+        // The node's distribution config (SWIM/registry/metadata params).
+        let node_config = test_config();
+        let swim_config = node_config.swim.clone();
+        let registry_config = node_config.registry.clone();
+        let metadata_lambda = node_config.metadata_lambda;
 
         // Shared egress state.
         let outbox: Outbox = Arc::new(StdMutex::new(Vec::new()));
@@ -221,7 +222,29 @@ impl IrohNode {
             swim_addr,
             Arc::clone(&relay_mirror),
             Arc::clone(&route_view),
+            Arc::clone(&outbox),
         );
+        // Engine-hosted adapter pump: drains ingress/egress/datastream/edge on
+        // a timer so the synchronous test loop no longer pumps these by hand.
+        driver.install_actor_bridge_pump(Duration::from_millis(10));
+
+        // Engine-hosted protocol tick injection + core progression. The pump
+        // helpers only drain iroh queues; the engine drives actor ticks and
+        // protocol injection (ENGINE_SPEC.md).
+        let ticker_handle = engine.handle();
+        let ticker_inner = ticker_handle.clone();
+        let ticker_rt = Arc::clone(&rt);
+        ticker_handle.spawn(async move {
+            let mut interval = ticker_inner.interval(Duration::from_millis(10));
+            loop {
+                (&mut interval).await;
+                let now = Instant::now();
+                let _ = ticker_rt.send_to(swim_addr, SwimIn::Tick { now });
+                let _ = ticker_rt.send_to(registry_addr, RegistryIn::Tick);
+                let _ = ticker_rt.send_to(metadata_addr, MetadataIn::Tick);
+                let _ = ticker_rt.send_to(directory_addr, DirectoryIn::Tick);
+            }
+        });
 
         Self {
             driver,
@@ -234,22 +257,10 @@ impl IrohNode {
             membership_mirror,
             relay_mirror,
             route_view,
+            _engine: engine,
         }
     }
 
-    /// One pump iteration for this node: inject the four `Tick`s, decode inbound
-    /// frames into mailboxes, advance the actors, then write outbound frames to
-    /// iroh. The production driver loop, condensed to one step.
-    fn pump(&mut self) {
-        let now = Instant::now();
-        let _ = self.rt.send_to(self.swim_addr, SwimIn::Tick { now });
-        let _ = self.rt.send_to(self.registry_addr, RegistryIn::Tick);
-        let _ = self.rt.send_to(self.metadata_addr, MetadataIn::Tick);
-        let _ = self.rt.send_to(self.directory_addr, DirectoryIn::Tick);
-        self.driver.pump_inbound_to_actors();
-        self.rt.tick();
-        self.driver.drain_outbox(&self.outbox);
-    }
 
     // ── Passthroughs to the driver (keep consumer churn small) ──────────────
 
@@ -326,19 +337,10 @@ pub fn make_driver_with_relay(relay_url: iroh::RelayUrl) -> IrohNode {
     })
 }
 
-/// Pump one node (one full actor-stack step).
-pub fn pump_one(node: &mut IrohNode) {
-    node.pump();
-}
 
-/// Pump a slice of nodes.
-pub fn pump_all(nodes: &mut [IrohNode]) {
-    for n in nodes.iter_mut() {
-        n.pump();
-    }
-}
-
-/// Pump two nodes until a condition is met or timeout expires.
+/// Poll until `check_fn` holds over `a` and `b` or `timeout` elapses, sleeping
+/// ~10ms between checks. Progression is engine-hosted; this only waits for
+/// wall-clock SWIM convergence.
 pub fn pump_until_pair(
     a: &mut IrohNode,
     b: &mut IrohNode,
@@ -347,8 +349,6 @@ pub fn pump_until_pair(
 ) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        a.pump();
-        b.pump();
         if check_fn(a, b) {
             return true;
         }
@@ -357,14 +357,15 @@ pub fn pump_until_pair(
     false
 }
 
-/// Pump N nodes until a condition is met or timeout expires.
+/// Poll until `check_fn` holds over `nodes` or `timeout` elapses, sleeping
+/// ~10ms between checks. Progression is engine-hosted; this only waits for
+/// wall-clock SWIM convergence.
 pub fn pump_until<F>(nodes: &mut [IrohNode], timeout: Duration, check_fn: F) -> bool
 where
     F: Fn(&[IrohNode]) -> bool,
 {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        pump_all(nodes);
         if check_fn(nodes) {
             return true;
         }
@@ -483,34 +484,16 @@ impl IrohTestCluster {
         self.nodes[idx].key()
     }
 
-    /// Pump all nodes until a condition is met or timeout expires.
+    /// Poll until `check_fn` holds over the full node slice or `timeout`
+    /// elapses, sleeping ~10ms between checks. Actor progression and iroh
+    /// adapter work are engine-hosted, so this loop only waits for wall-clock
+    /// SWIM convergence — it no longer drives nodes.
     pub fn pump_until<F>(&mut self, timeout: Duration, check_fn: F) -> bool
-    where
-        F: Fn(&[IrohNode]) -> bool,
-    {
-        self.pump_until_excluding(&[], timeout, check_fn)
-    }
-
-    /// Pump every node EXCEPT those whose index is in `excluded` (a killed node
-    /// must not be driven), until `check_fn` holds over the full node slice or
-    /// `timeout` elapses. This is the converge-or-timeout poll for real death.
-    pub fn pump_until_excluding<F>(
-        &mut self,
-        excluded: &[usize],
-        timeout: Duration,
-        check_fn: F,
-    ) -> bool
     where
         F: Fn(&[IrohNode]) -> bool,
     {
         let start = Instant::now();
         while start.elapsed() < timeout {
-            for (i, n) in self.nodes.iter_mut().enumerate() {
-                if excluded.contains(&i) {
-                    continue;
-                }
-                n.pump();
-            }
             if check_fn(&self.nodes) {
                 return true;
             }

@@ -1,3 +1,9 @@
+// Engine boundary enforcement: disallowed scheduling/time/core-driving methods
+// are hard errors in this crate (ENGINE_SPEC.md §2). The VastAI
+// provider adapter carries a module-level `#![allow]` pending its separate
+// redesign; unit tests that drive a raw Runtime in isolation are exempted
+// locally.
+#![deny(clippy::disallowed_methods)]
 #![recursion_limit = "256"]
 
 #[cfg(test)]

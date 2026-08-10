@@ -621,6 +621,8 @@ enum CommandOutputLine {
     Stderr(String),
 }
 
+// container image build is provisioning infrastructure, out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn spawn_line_reader<R>(
     reader: R,
     to_line: fn(String) -> CommandOutputLine,
@@ -660,6 +662,8 @@ fn drain_command_lines(
     }
 }
 
+// container image build is provisioning infrastructure, out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn run_status_command(
     root: &Path,
     program: &str,

@@ -66,7 +66,7 @@ use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::ActorAddress;
-
+use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
 const DEFAULT_IMAGE: &str = "myelin-node:latest";
 const MYELIN_RUNTIME_CONFIG_ENV: &str = "MYELIN_RUNTIME_CONFIG";
 const CACHED_MODEL_HOST_ENV: &str = "MYELIN_CACHED_MODEL_HOST_PATH";
@@ -216,30 +216,47 @@ where
         None
     };
 
-    let tokio = match tokio::runtime::Runtime::new() {
-        Ok(runtime) => {
+    let actors_channel = orch_datastream.channel_by_name("runtime.actors");
+    let orch_stats_hook = orch_datastream.producer.stats_hook_on(actors_channel);
+
+    // Build the core swactor runtime, then hand it to the engine. The engine
+    // owns both the runtime (it drives actor progression) and the Tokio
+    // substrate (it schedules all background work). After this point the engine
+    // is the sole owner of Tokio and core progression — no raw handles are
+    // passed to components (ENGINE_SPEC.md).
+    let (runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
+        |registry| {
+            register_myelin_actor_codecs(registry);
+            datastream::wire::register_datastream_codec(registry);
+        },
+        Some(orch_stats_hook),
+    );
+    let engine = match TokioBackend::new(TokioConfig::default())
+        .and_then(|backend| Engine::new(runtime.clone(), backend))
+    {
+        Ok(engine) => {
             bootstrap(
                 &mut orch_datastream,
                 None,
-                "tokio_runtime",
+                "engine",
                 "ready",
-                json!({"runtime":"tokio"}),
+                json!({"backend":"tokio","owns":"core+substrate"}),
             );
-            runtime
+            engine
         }
         Err(error) => {
             bootstrap(
                 &mut orch_datastream,
                 None,
-                "tokio_runtime",
+                "engine",
                 "failed",
                 json!({"error":error.to_string()}),
             );
-            return Err(format!("tokio runtime: {error}"));
+            return Err(format!("create engine: {error}"));
         }
     };
-    let mut driver = match IrohDriver::with_handle(
-        tokio.handle().clone(),
+    let mut driver = match IrohDriver::with_engine(
+        engine.handle(),
         IrohDriverConfig {
             secret_key: None,
             relay_mode: config.relay.mode.clone(),
@@ -284,16 +301,13 @@ where
             "connectivity_preflight":"ready",
         }),
     );
-    let actors_channel = orch_datastream.channel_by_name("runtime.actors");
-    let orch_stats_hook = orch_datastream.producer.stats_hook_on(actors_channel);
-    let stack = DistributionRuntimeStack::new_with_codecs(
+    let stack = DistributionRuntimeStack::new_from_runtime(
+        runtime,
+        codec,
+        transport_router,
         driver.node_id(),
         DistributedNodeConfig::default(),
-        |registry| {
-            register_myelin_actor_codecs(registry);
-            datastream::wire::register_datastream_codec(registry);
-        },
-        Some(orch_stats_hook),
+        engine.handle(),
     );
     bootstrap(
         &mut orch_datastream,
@@ -316,13 +330,18 @@ where
         stack.actors.swim,
         stack.relay_mirror.clone(),
         stack.route_view.clone(),
+        stack.outbox.clone(),
     );
+    // Engine owns protocol tick injection and core progression; the application
+    // loop only drains integration-owned queues (ENGINE_SPEC.md).
+    stack.spawn_protocol_ticker(PUMP_INTERVAL);
+    driver.install_actor_bridge_pump(PUMP_INTERVAL);
     bootstrap(
         &mut orch_datastream,
         None,
         "actor_bridge",
         "ready",
-        json!({"transport":"iroh","routes":"attached"}),
+        json!({"transport":"iroh","routes":"attached","protocol_ticker":"engine-hosted"}),
     );
 
     let (frame_tx, frame_rx) = mpsc::channel::<CollectedDatastreamFrame>();
@@ -333,7 +352,7 @@ where
         "ready",
         json!({"alpn":String::from_utf8_lossy(DATASTREAM_ALPN)}),
     );
-    let dashboard = DashboardSupport::start(config.dashboard)?;
+    let dashboard = DashboardSupport::start(config.dashboard, &engine.handle())?;
     bootstrap(
         &mut orch_datastream,
         dashboard.as_ref(),
@@ -496,7 +515,7 @@ where
         }),
     );
 
-    let rpc_addr = match spawn_prompt_rpc(config.rpc_bind, work_tx, config.default_max_tokens) {
+    let rpc_addr = match spawn_prompt_rpc(&engine.handle(), config.rpc_bind, work_tx, config.default_max_tokens) {
         Ok(addr) => {
             bootstrap(
                 &mut orch_datastream,
@@ -2034,6 +2053,8 @@ struct RuntimeReadyAckLoop<'a> {
     orchestrator_actor: ActorAddress,
 }
 
+// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn wait_for_runtime_ready_acks(
     ctx: RuntimeReadyAckLoop<'_>,
     targets: &[RuntimeReadyAckTarget],
@@ -2083,7 +2104,7 @@ fn wait_for_runtime_ready_acks(
     let mut last_send = None::<Instant>;
 
     while !pending.is_empty() {
-        pump(driver, stack, frame_tx);
+        pump(driver, frame_tx);
         drain_orch_stdio_capture(
             orch_stdio_rx,
             orch_datastream,
@@ -2171,7 +2192,6 @@ fn wait_for_runtime_ready_acks(
                     }),
                 );
             }
-            driver.drain_outbox(&stack.outbox);
             last_send = Some(Instant::now());
         }
         thread::sleep(PUMP_INTERVAL);
@@ -2232,6 +2252,8 @@ impl Drop for ProvisionedClusterGuard {
     }
 }
 
+// provider lifecycle/provisioning is out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn start_and_provision_workers(
     mut provisioner: Box<dyn ProvisionPlugin>,
     config: &Config,
@@ -2901,6 +2923,8 @@ fn stage_ring_spec_wire(spec: run_plan::RingSpec) -> StageRingSpecWire {
     }
 }
 
+// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn wait_for_runtime_readies(
     ctx: RuntimeReadyAckLoop<'_>,
     expected_node_ids: &[u64],
@@ -2923,7 +2947,7 @@ fn wait_for_runtime_readies(
     let expected = expected_node_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut pending = BTreeMap::<u64, RuntimeReady>::new();
     loop {
-        pump(driver, stack, frame_tx);
+        pump(driver, frame_tx);
         emit_swim_transitions(
             orch_datastream,
             dashboard,
@@ -2995,6 +3019,8 @@ fn wait_for_runtime_readies(
     }
 }
 
+// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn wait_for_weights_loaded_count(
     ctx: RuntimeReadyAckLoop<'_>,
     expected_count: usize,
@@ -3031,7 +3057,7 @@ fn wait_for_weights_loaded_count(
     let mut stage_last_sends = BTreeMap::<u32, Instant>::new();
     let mut load_progress = BTreeMap::<u64, StageLoadProgress>::new();
     loop {
-        pump(driver, stack, frame_tx);
+        pump(driver, frame_tx);
         emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
         emit_swim_probe_events(orch_datastream, dashboard, stack, "weights_loaded_wait");
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
@@ -3363,7 +3389,7 @@ fn send_pipeline_stage_provision(
         ctx.pipeline_coordinator,
         ctx.stage_shard_plans,
     )?;
-    pump(ctx.driver, ctx.stack, ctx.frame_tx);
+    pump(ctx.driver, ctx.frame_tx);
     Ok(())
 }
 
@@ -3630,10 +3656,9 @@ fn load_phase_for_worker_event(event_type: &str) -> Option<&'static str> {
 }
 
 fn drain_datastream_connections(
-    driver: &mut IrohDriver,
+    driver: &IrohDriver,
     frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
 ) {
-    driver.pump_datastream_ingress();
     for read in driver.drain_datastream_reads() {
         let mut channels = read
             .header
@@ -3953,6 +3978,8 @@ impl OrchStdioCapture {
         Ok(unsafe { File::from_raw_fd(pipe_fds[0]) })
     }
 
+    // provider log capture is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     fn spawn_reader(file: File, stream: ProvisionLogStream, tx: mpsc::Sender<OrchStdioLine>) {
         thread::spawn(move || {
             let reader = BufReader::new(file);
@@ -4001,12 +4028,11 @@ fn drain_orch_stdio_capture(
 #[cfg(feature = "dashboard")]
 struct DashboardSupport {
     handle: dashboard::DashboardHandle,
-    _runtime: tokio::runtime::Runtime,
 }
 
 #[cfg(feature = "dashboard")]
 impl DashboardSupport {
-    fn start(enabled: bool) -> Result<Option<Self>, String> {
+    fn start(enabled: bool, engine: &EngineHandle) -> Result<Option<Self>, String> {
         if !enabled {
             return Ok(None);
         }
@@ -4016,17 +4042,10 @@ impl DashboardSupport {
                 .parse::<u16>()
                 .map_err(|e| format!("invalid MYELIN_DASHBOARD_PORT={port:?}: {e}"))?;
         }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| format!("dashboard runtime: {e}"))?;
         let handle = dashboard::DashboardHandle::new(config);
         handle.register_view(Arc::new(MyelinClusterDashboardView::new()));
-        handle.spawn_http(runtime.handle());
-        Ok(Some(Self {
-            handle,
-            _runtime: runtime,
-        }))
+        engine.spawn(handle.http_server());
+        Ok(Some(Self { handle }))
     }
 
     fn publish_frame(&self, stream: &StreamId, channel: &str, frame: &Frame) {
@@ -4047,7 +4066,7 @@ struct DashboardSupport;
 
 #[cfg(not(feature = "dashboard"))]
 impl DashboardSupport {
-    fn start(enabled: bool) -> Result<Option<Self>, String> {
+    fn start(enabled: bool, _engine: &EngineHandle) -> Result<Option<Self>, String> {
         if enabled {
             return Err(
                 "MYELIN_DASHBOARD requires building myelin-system with feature dashboard".to_owned(),
@@ -4058,6 +4077,7 @@ impl DashboardSupport {
 
     fn publish_frame(&self, _stream: &StreamId, _channel: &str, _frame: &Frame) {}
 }
+
 
 struct ChannelObservationSink {
     tx: Mutex<mpsc::Sender<PluginObservation>>,
@@ -4070,21 +4090,43 @@ impl PluginObservationSink for ChannelObservationSink {
 }
 
 fn spawn_prompt_rpc(
+    engine: &EngineHandle,
     bind: SocketAddr,
     work_tx: mpsc::Sender<PromptWork>,
     default_max_tokens: u32,
 ) -> Result<SocketAddr, String> {
-    let listener = TcpListener::bind(bind).map_err(|e| format!("bind prompt RPC {bind}: {e}"))?;
-    let addr = listener
+    // Bind synchronously (there is no ambient runtime at orchestrator startup)
+    // and report the bound address, then drive accept on the orchestrator
+    // engine. Each accepted connection runs on the engine's blocking pool,
+    // reusing the synchronous request/response parser unchanged. There is no
+    // listener thread and no per-connection std thread (ENGINE_SPEC.md);
+    // no raw Tokio handle or second runtime is introduced.
+    let std_listener = TcpListener::bind(bind)
+        .map_err(|e| format!("bind prompt RPC {bind}: {e}"))?;
+    let addr = std_listener
         .local_addr()
         .map_err(|e| format!("read prompt RPC addr: {e}"))?;
-    thread::spawn(move || {
-        for accepted in listener.incoming() {
-            match accepted {
-                Ok(stream) => {
+    std_listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set prompt RPC nonblocking: {e}"))?;
+    let engine = engine.clone();
+    engine.clone().spawn(async move {
+        let listener = match tokio::net::TcpListener::from_std(std_listener) {
+            Ok(listener) => listener,
+            Err(_) => return,
+        };
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
                     let tx = work_tx.clone();
-                    thread::spawn(move || {
-                        let _ = handle_prompt_connection(stream, tx, default_max_tokens);
+                    let engine = engine.clone();
+                    engine.spawn_blocking(move || {
+                        if let Ok(std_stream) = stream.into_std() {
+                            // The synchronous parser uses blocking I/O.
+                            let _ = std_stream.set_nonblocking(false);
+                            let _ =
+                                handle_prompt_connection(std_stream, tx, default_max_tokens);
+                        }
                     });
                 }
                 Err(_) => break,
@@ -4130,6 +4172,8 @@ fn handle_prompt_connection(
     Ok(())
 }
 
+// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn wait_for_runtime_ready(ctx: RuntimeReadyAckLoop<'_>) -> Result<RuntimeReady, String> {
     let RuntimeReadyAckLoop {
         driver,
@@ -4152,7 +4196,7 @@ fn wait_for_runtime_ready(ctx: RuntimeReadyAckLoop<'_>) -> Result<RuntimeReady, 
     let mut node_swim_ready = false;
     let mut node_route_started = false;
     loop {
-        pump(driver, stack, frame_tx);
+        pump(driver, frame_tx);
         drain_frames(frame_rx, dashboard, orch_datastream);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
@@ -4276,10 +4320,12 @@ fn provision_stage(
         .map_err(|e| format!("send stage provision: {e}"))
 }
 
+// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Result<(), String> {
     let RuntimeReadyAckLoop {
         driver,
-        stack,
+        stack: _,
         obs_rx,
         frame_rx,
         frame_tx,
@@ -4294,7 +4340,7 @@ fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Re
         ..
     } = ctx;
     loop {
-        pump(driver, stack, frame_tx);
+        pump(driver, frame_tx);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for weights loaded".to_owned());
@@ -4788,7 +4834,6 @@ impl PipelinePromptRuntime {
     }
 
     fn poll_driver(&mut self, driver: &mut IrohDriver) {
-        driver.pump_edge_ingress();
         for event in driver.drain_edge_events() {
             match event {
                 EdgeTransportEvent::BytesRead { edge_id, bytes, .. }
@@ -4922,6 +4967,8 @@ fn take_pipeline_token_record(
     Ok(Some(out))
 }
 
+// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn serve_prompts(
     ctx: RuntimeReadyAckLoop<'_>,
     work_rx: &mpsc::Receiver<PromptWork>,
@@ -4971,7 +5018,7 @@ fn serve_prompts(
     };
     let mut active: Option<ActivePrompt> = None;
     loop {
-        pump(driver, stack, frame_tx);
+        pump(driver, frame_tx);
         orch_datastream.flush(dashboard, "orchestrator");
         if let Some(pipeline) = pipeline_runtime.as_mut() {
             pipeline.poll_driver(driver);
@@ -5022,7 +5069,7 @@ fn serve_prompts(
             let _ = stack
                 .runtime
                 .send_to(orchestrator_actor, OrchestratorMsg::ObserveOperatorStop { run_id });
-            pump(driver, stack, frame_tx);
+            pump(driver, frame_tx);
             return Ok(());
         }
 
@@ -5191,6 +5238,8 @@ fn stop_requested(stop_rx: &mpsc::Receiver<()>) -> bool {
     stop_rx.try_recv().is_ok()
 }
 
+// top-level OS signal handling is process control, out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn spawn_stop_listener() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel();
     #[cfg(target_os = "linux")]
@@ -5427,15 +5476,14 @@ fn emit_swim_probe_events(
     }
 }
 
+/// Drain iroh ingress/egress queues and datastream connections. Core
+/// progression and protocol tick injection are owned by the engine (see
+/// `spawn_protocol_ticker`); this only drains integration-owned queues
+/// (ENGINE_SPEC.md).
 fn pump(
-    driver: &mut IrohDriver,
-    stack: &DistributionRuntimeStack,
+    driver: &IrohDriver,
     frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
 ) {
-    stack.tick_protocol_actors(Instant::now());
-    driver.pump_inbound_to_actors();
-    stack.pump_runtime_once();
-    driver.drain_outbox(&stack.outbox);
     drain_datastream_connections(driver, frame_tx);
 }
 

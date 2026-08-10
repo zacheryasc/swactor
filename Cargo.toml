@@ -1,6 +1,7 @@
 [workspace]
 members = [
     ".",
+    "crates/engine",
     "crates/bindings/python",
     "crates/bindings/wasm-runtime",
     "crates/process",
@@ -17,6 +18,7 @@ members = [
 ]
 default-members = [
     ".",
+    "crates/engine",
     "crates/process",
     "crates/provisioning",
     "crates/transport",

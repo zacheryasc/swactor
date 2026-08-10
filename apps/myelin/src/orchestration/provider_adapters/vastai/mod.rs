@@ -1,3 +1,9 @@
+// VastAI provider adapter: temporarily exempt from the engine disallowed-methods
+// policy. This module owns private Tokio runtimes, blocking facades, and a
+// polling thread because it predates the engine and is explicitly OUT of engine
+// scope (ENGINE_SPEC.md §2). It will be redesigned independently; until then it
+// carries this narrow allowance rather than being migrated piecemeal.
+#![allow(clippy::disallowed_methods)]
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, Read};

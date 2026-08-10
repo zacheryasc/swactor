@@ -2,25 +2,30 @@
 
 `iroh-driver` is the iroh-backed transport bridge for the actorized distribution stack. It owns the concrete iroh endpoint, QUIC connections, relay configuration, peer authorization, and frame shuttling between iroh and swactor actor mailboxes.
 
-## Tokio runtime ownership
+## Engine ownership
 
-The driver needs Tokio because iroh's endpoint, accepts, dials, stream reads/writes, retry timers, and shutdown APIs are async. New call sites should make that engine explicit by constructing the driver with:
+The driver runs on a caller-supplied swactor [`EngineHandle`](swactor_engine) — the
+single engine that owns the node's Tokio substrate.  All accepts, reads, dials,
+writes, retries, and teardown are scheduled through that handle; the driver
+stores no raw Tokio handle and performs no ambient-runtime detection
+(ENGINE_SPEC.md §7).
 
 ```rust
-let driver = IrohDriver::with_handle(tokio_handle, config)?;
+let driver = IrohDriver::with_engine(engine.handle(), config)?;
 ```
 
-`with_handle` does not own the Tokio runtime. The caller must keep the runtime alive for as long as the driver exists.
+The driver validates that the engine provides the `tasks`, `timers`, and `io`
+capabilities before binding the endpoint or starting any background work
+(ENGINE_SPEC.md).  Endpoint construction runs as an engine-hosted
+task; `with_engine` blocks on a synchronous channel until the endpoint is bound
+(or fails), so callers need not enter or possess the raw substrate runtime.
 
-## Legacy implicit constructor
+## Engine-hosted progression
 
-`IrohDriver::new(config)` is still present as a compatibility convenience, but it hides runtime ownership:
-
-- If called inside an existing Tokio runtime, it uses `Handle::try_current()` and shares that ambient engine.
-- If called outside Tokio, it silently builds and owns a multi-threaded Tokio runtime with `enable_all()`.
-
-Avoid `IrohDriver::new` in new production code. Use `with_handle` or an explicit engine wrapper at the application boundary so every Tokio engine in the process is visible in construction code.
-
-## Sync facade caveat
-
-The synchronous facade methods that bridge to async with `block_on` must run from a non-async thread. Do not call those methods from inside tasks running on the same Tokio runtime; Tokio will panic on nested `block_on`.
+All adapter progression — actor-bridge ingress/egress, datastream ingress, and
+edge ingress — is driven by an engine-hosted interval pump installed via
+`install_actor_bridge_pump`. Applications do not (and cannot) manually pump
+these adapters; the single engine owns progression for the node's lifetime
+(ENGINE_SPEC.md). `snapshot` is a pure-synchronous read of driver
+state, callable from any thread. The `shutdown` method closes the endpoint via
+an engine-hosted task, blocking on a synchronous channel until completion.

@@ -1,0 +1,52 @@
+# Clippy enforcement policy for the swactor engine boundary
+# (ENGINE_SPEC.md §2 / §3.1).
+#
+# These direct runtime / scheduling / time / core-driving operations are
+# disallowed outside the engine's own substrate implementation. Integrations
+# (iroh-driver, myelin, ...) must go through `EngineHandle`. The
+# `swactor-engine` Tokio backend and the core driver carry narrow
+# `#[allow(clippy::disallowed_methods)]` exemptions because they ARE the
+# substrate implementor; the VastAI provider module carries a temporary
+# module-level exemption pending its separate redesign (out of scope per §2).
+#
+# In-scope work that backs actors, transport, RPC, sampling, or node/orchestrator
+# progression must schedule through `EngineHandle`. The only retained direct
+# uses are narrow exclusions (§2): provider adapters/lifecycle (VastAI),
+# provider-specific process supervision and log capture, and top-level OS-signal
+# / blocking user-stdin / synchronous process-control sequencing. Each retained
+# use carries a local `#[allow]` with its exclusion reason.
+#
+# Workspace-wide enforcement: `swactor-engine`, `iroh-driver`, and in-scope
+# `myelin` carry `#![deny(clippy::disallowed_methods)]` and pass clean.
+
+disallowed-methods = [
+    { path = "tokio::runtime::Runtime::new", reason = "runtime ownership belongs to the engine; construct an engine-owned substrate instead" },
+    { path = "tokio::runtime::Builder::new_current_thread", reason = "runtime ownership belongs to the engine; use EngineHandle" },
+    { path = "tokio::runtime::Builder::new_multi_thread", reason = "runtime ownership belongs to the engine; use EngineHandle" },
+    { path = "tokio::runtime::Handle::current", reason = "ambient runtime detection is forbidden; construct an engine-owned substrate instead" },
+    { path = "tokio::runtime::Handle::try_current", reason = "ambient runtime detection is forbidden; construct an engine-owned substrate instead" },
+    { path = "tokio::runtime::Runtime::block_on", reason = "blocking on a runtime is forbidden; schedule through EngineHandle" },
+    { path = "tokio::runtime::Handle::block_on", reason = "blocking on a runtime is forbidden; schedule through EngineHandle" },
+
+    { path = "tokio::spawn", reason = "direct scheduling is forbidden; use EngineHandle::spawn" },
+    { path = "tokio::task::spawn", reason = "direct scheduling is forbidden; use EngineHandle::spawn" },
+    { path = "tokio::task::spawn_blocking", reason = "use EngineHandle::spawn_blocking" },
+    { path = "tokio::runtime::Runtime::spawn", reason = "direct scheduling is forbidden; use EngineHandle::spawn" },
+    { path = "tokio::runtime::Handle::spawn", reason = "direct scheduling is forbidden; use EngineHandle::spawn" },
+    { path = "tokio::runtime::Runtime::spawn_blocking", reason = "use EngineHandle::spawn_blocking" },
+    { path = "tokio::runtime::Handle::spawn_blocking", reason = "use EngineHandle::spawn_blocking" },
+
+    { path = "tokio::time::sleep", reason = "use EngineHandle::timer" },
+    { path = "tokio::time::sleep_until", reason = "use EngineHandle::timer" },
+    { path = "tokio::time::interval", reason = "use EngineHandle::interval" },
+    { path = "tokio::time::interval_at", reason = "use EngineHandle::interval" },
+    { path = "tokio::time::timeout", reason = "use an engine-derived timeout" },
+    { path = "tokio::time::timeout_at", reason = "use an engine-derived timeout" },
+
+    { path = "std::thread::spawn", reason = "direct thread scheduling is forbidden; schedule through EngineHandle" },
+    { path = "std::thread::sleep", reason = "use EngineHandle::timer; retained only for narrow process-control exclusions (ENGINE_SPEC.md §2)" },
+
+    { path = "swactor::runtime::Runtime::tick", reason = "manual core driving is forbidden; the engine owns core progression" },
+    { path = "swactor::runtime::Runtime::try_tick", reason = "manual core driving is forbidden; the engine owns core progression" },
+    { path = "swactor::runtime::Runtime::has_work", reason = "manual core driving is forbidden; the engine owns core progression" },
+]

@@ -4,22 +4,23 @@
 //! Uses iroh's QUIC-based peer-to-peer transport with built-in TLS, NAT
 //! hole-punching, and relay server fallback.
 //!
-//! Runtime ownership is intentionally explicit in new call sites: prefer
-//! [`IrohDriver::with_handle`] so the caller supplies the Tokio engine used for
-//! iroh accepts, dials, stream I/O, retries, and shutdown. The legacy
-//! [`IrohDriver::new`] convenience still performs ambient-runtime detection and
-//! silently builds an owned multi-threaded Tokio runtime when no ambient handle
-//! exists; see the crate README before using it.
+//! The driver runs on a caller-supplied swactor [`EngineHandle`] — the single
+//! engine that owns the node's Tokio substrate. All accepts, reads, dials,
+//! writes, retries, and teardown are scheduled through that handle; the driver
+//! stores no raw Tokio handle and performs no ambient-runtime detection
+//! (ENGINE_SPEC.md §7). Construct with
+//! [`IrohDriver::with_engine`].
 
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, PublicKey, RelayMode, SecretKey};
-use tokio::runtime::Handle;
+use swactor_engine::{Capabilities, EngineHandle};
 
 use distribution::crypto::{Keypair, KeypairExt};
 use distribution::messages::*;
@@ -219,7 +220,7 @@ pub struct JoinStatus {
 /// subscription/catalog semantics in the datastream crate.
 #[derive(Clone)]
 pub struct DatastreamPublishHandle {
-    rt: Handle,
+    engine: EngineHandle,
     endpoint: Endpoint,
 }
 
@@ -231,8 +232,8 @@ impl DatastreamPublishHandle {
         subscription: datastream::DatastreamSubscription,
         idle_sleep: Duration,
     ) {
-        let _ = spawn_subscription_writer(
-            &self.rt,
+        spawn_subscription_writer(
+            &self.engine,
             self.endpoint.clone(),
             peer,
             header,
@@ -242,25 +243,39 @@ impl DatastreamPublishHandle {
     }
 }
 
+/// Mutable connection state consolidated under a single lock: the cached
+/// connections, the generation counter for generation-aware eviction, and
+/// the per-peer relay URLs learned from join seeds. Held inside an
+/// `Arc<Mutex<ConnCache>>` shared between the driver and the engine-hosted
+/// adapter pump so both can progress connections without `&mut self`.
+struct ConnCache {
+    connections: HashMap<NodeId, CachedConnection>,
+    next_generation: u64,
+    peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
+}
+
 /// iroh P2P network transport bridge.
 ///
 /// Bridges the actorized distribution protocol (running on a swactor runtime)
-/// to iroh's async QUIC transport. Runs on a caller-supplied Tokio [`Handle`]
-/// in explicit call sites. [`Self::pump_inbound_to_actors`] and
-/// [`Self::drain_outbox`] are pure-synchronous (they drain in-memory queues
-/// filled by background accept/dial/reader/send tasks), so the node's async
-/// driver loop can call them on a tokio worker. The constructor and the
-/// synchronous [`Self::shutdown`] still `block_on` and must run on a non-async
-/// thread; the async loop uses [`Self::close`] for teardown.
+/// to iroh's async QUIC transport. Runs on a caller-supplied swactor
+/// [`EngineHandle`] — the single engine that owns the node's Tokio substrate.
+/// All accepts, reads, dials, writes, retries, and adapter progression
+/// (actor-bridge, datastream, edge) are scheduled through that handle as
+/// engine-hosted work via [`Self::install_actor_bridge_pump`]; the driver stores
+/// no raw Tokio handle. Endpoint construction and [`Self::shutdown`] are hosted
+/// as engine tasks, never requiring the caller to enter or possess the raw
+/// substrate runtime; the async loop uses [`Self::close`] for teardown.
 pub struct IrohDriver {
     /// This node's signing identity (reconstructed from the iroh endpoint
     /// secret). Signs `DirectoryEntry` claims for locally-spawned actors
     /// ([`Self::register_actor`]) and is the source of [`Self::node_id`].
     keypair: Keypair,
     endpoint: Endpoint,
-    rt: Handle,
-    connections: HashMap<NodeId, CachedConnection>,
-    next_connection_generation: u64,
+    /// The swactor engine that owns the node's Tokio substrate. All background
+    /// iroh work is scheduled through this handle; it never exposes the raw
+    /// Tokio runtime (ENGINE_SPEC.md §7).
+    engine: EngineHandle,
+    conns: Arc<Mutex<ConnCache>>,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
     /// Collects connections from background join tasks.
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
@@ -277,35 +292,26 @@ pub struct IrohDriver {
     datastream_reads: Arc<Mutex<Vec<DatastreamQuicRead>>>,
     /// Logical edge events emitted by driver-owned EDGE_ALPN byte pumps.
     edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
-    next_edge_stream_group: u64,
-    /// Frames read by per-connection reader tasks, drained synchronously by
-    /// `recv()` / `pump_inbound_to_actors()`. This decouples network reads from the
-    /// state machine so `recv()`/`tick()` are pure-sync (no `block_on`) and can run
-    /// inside the unified async driver loop on a tokio worker. Each entry is
-    /// `(dest, type_tag, payload, from)` — `dest` is the destination actor address
-    /// carried on the wire (`DIRECTORY.md` §5); the legacy `recv` path ignores it.
+    next_edge_stream_group: Arc<AtomicU64>,
+    /// Frames read by per-connection reader tasks, drained by the engine-hosted
+    /// adapter pump ([`Self::install_actor_bridge_pump`]). This decouples network
+    /// reads from the state machine. Each entry is `(dest, type_tag, payload,
+    /// from)` — `dest` is the destination actor address carried on the wire
+    /// (`DIRECTORY.md` §5).
     incoming: Arc<Mutex<Vec<(ActorAddress, String, Vec<u8>, NodeId)>>>,
     /// Connections whose fire-and-forget send failed; evicted (and re-dialed)
     /// on the next `recv()`. Populated by the spawned send tasks.
     evict: Arc<Mutex<Vec<FailedConnection>>>,
-    /// Relay URLs learned from join seeds, used for reconnection.
-    peer_relay_urls: HashMap<NodeId, iroh::RelayUrl>,
     /// Real-time join status for each peer being joined.
     join_statuses: Arc<Mutex<HashMap<NodeId, JoinStatus>>>,
     /// Relay URL configured or exposed by the bound endpoint, if any.
     relay_url: Option<iroh::RelayUrl>,
     /// Actor-bridge wiring, installed via [`Self::enable_actor_bridge`]. When
-    /// present, the driver decodes inbound frames into actor messages
-    /// ([`Self::pump_inbound_to_actors`]) and writes actor-produced outbound
-    /// frames drained from the shared outbox ([`Self::drain_outbox`]). Installed
-    /// in production; `None` only in harnesses that route frames by hand.
-    actor_bridge: Option<ActorBridge>,
-    /// A tokio runtime owned by this driver, present only when the legacy
-    /// [`Self::new`] convenience was called outside any tokio context and
-    /// silently created one. Explicit construction via [`Self::with_handle`]
-    /// always leaves this `None`.
-    /// Declared last so it is dropped after the endpoint/connections on teardown.
-    _owned_rt: Option<tokio::runtime::Runtime>,
+    /// present, the engine-hosted adapter pump decodes inbound frames into actor
+    /// messages and writes actor-produced outbound frames drained from the shared
+    /// outbox. Installed in production; `None` only in harnesses that route
+    /// frames by hand.
+    actor_bridge: Option<Arc<ActorBridge>>,
 }
 
 /// State the driver needs to shuttle frames between iroh and the swactor runtime
@@ -329,61 +335,50 @@ struct ActorBridge {
     /// The directory's converged actor→host view, published by the `DirectoryActor`.
     /// Read for the `directory_route_count` snapshot field (observability only).
     route_view: RouteView,
+    /// The actors' shared outbound queue; drained by the engine-hosted pump.
+    outbox: Outbox,
 }
 
 impl IrohDriver {
-    /// Legacy convenience constructor that adapts to the caller's tokio context.
+    /// Create a new iroh driver running on a caller-supplied swactor engine.
     ///
-    /// - **Inside a tokio runtime**: shares that ambient runtime.
-    /// - **Outside any tokio runtime**: silently creates and owns a multi-threaded
-    ///   runtime.
+    /// The driver schedules all background work — accept loop, reads, dials,
+    /// writes, retries — through `engine` and validates that it provides the
+    /// task and native I/O capabilities before any endpoint or background work
+    /// created (ENGINE_SPEC.md).
     ///
-    /// Prefer [`Self::with_handle`] in new code so Tokio engine ownership is
-    /// explicit. Either way the synchronous facade (`recv`/`tick`/`snapshot`/
-    /// `shutdown`) must be driven from a non-async thread; methods that
-    /// `block_on` will panic if called from inside the runtime they use.
-    pub fn new(config: IrohDriverConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        match Handle::try_current() {
-            Ok(handle) => Self::build(handle, None, config),
-            Err(_) => {
-                let owned = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                let handle = owned.handle().clone();
-                Self::build(handle, Some(owned), config)
-            }
-        }
-    }
-
-    /// Create a new iroh driver bound to an explicit tokio runtime handle.
-    ///
-    /// The driver runs entirely on `rt` (a runtime it does **not** own — the
-    /// caller keeps it alive): the background accept loop and dials are
-    /// `rt.spawn`ed, and the synchronous facade (`recv`/`tick`/`snapshot`/
-    /// `shutdown`) bridges to async via `rt.block_on`. **Those methods must
-    /// therefore be driven from a non-async thread** (a dedicated pump thread),
-    /// never from inside an async task running on `rt`, or `block_on` will panic.
-    pub fn with_handle(
-        rt: Handle,
+    /// Endpoint construction runs as an engine-hosted task; this constructor
+    /// blocks on a synchronous channel until the endpoint is bound (or fails),
+    /// so callers need not enter or possess the raw substrate runtime
+    /// (ENGINE_SPEC.md).
+    pub fn with_engine(
+        engine: EngineHandle,
         config: IrohDriverConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        Self::build(rt, None, config)
+        Self::build(engine, config)
     }
 
     /// Shared constructor body.
-    ///
-    /// `owned` carries a runtime the driver must keep alive (when [`Self::new`]
-    /// created one because there was no ambient runtime), or `None` when running
-    /// on a shared handle.
     ///
     /// `relay_mode` is passed directly to the endpoint. Custom relays remain
     /// supported as endpoint configuration; this driver no longer starts relay
     /// servers itself.
     fn build(
-        rt: Handle,
-        owned: Option<tokio::runtime::Runtime>,
+        engine: EngineHandle,
         config: IrohDriverConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Validate engine capabilities before allocating any resources. The
+        // driver needs task scheduling (spawn), the native I/O reactor (QUIC),
+        // and timers (retry/backoff/timeout inside engine-hosted work). An
+        // engine that cannot provide these is rejected before the endpoint
+        // binds or background work starts (ENGINE_SPEC.md).
+        engine.require(Capabilities {
+            tasks: true,
+            timers: true,
+            io: true,
+            ..Capabilities::TASKS_ONLY
+        })?;
+
         let effective_relay_mode = config.relay_mode;
         let configured_relay_url = match &effective_relay_mode {
             RelayMode::Custom(relay_map) => relay_map.urls::<Vec<_>>().into_iter().next(),
@@ -391,18 +386,19 @@ impl IrohDriver {
         };
         let custom_relay = matches!(&effective_relay_mode, RelayMode::Custom(_));
 
-        // A custom relay is operator-controlled (typically `iroh-driver-relay`
-        // on a VPS, serving QUIC Address Discovery with a self-signed cert).
-        // We trust its cert below so QAD's TLS handshake succeeds — without
-        // that, address discovery fails and every connection stays
-        // `conn_type=Relay`, which defeats hole-punching and makes a NAT'd peer
-        // (e.g. a locally-run orchestrator) reachable only over the relay.
-        let endpoint = rt.block_on(async {
-            let mut alpns = vec![ALPN.to_vec()];
-            alpns.extend(config.additional_alpns.iter().cloned());
+        // Bind the endpoint inside an engine-hosted task. The result is
+        // delivered through a synchronous channel so this constructor blocks
+        // only on a std recv — never on a tokio block_on and never requiring
+        // the caller to enter the raw substrate runtime.
+        let additional_alpns = config.additional_alpns;
+        let secret_key = config.secret_key;
+        let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel::<Result<Endpoint, String>>();
+        engine.spawn(async move {
+            let mut all_alpns = vec![ALPN.to_vec()];
+            all_alpns.extend(additional_alpns);
             let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
                 .relay_mode(effective_relay_mode)
-                .alpns(alpns);
+                .alpns(all_alpns);
 
             // Only relax relay-cert verification for a custom relay; Default /
             // Staging relays keep full WebPKI verification.
@@ -410,12 +406,19 @@ impl IrohDriver {
                 builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
             }
 
-            if let Some(key) = config.secret_key {
+            if let Some(key) = secret_key {
                 builder = builder.secret_key(key);
             }
 
-            builder.bind().await
-        })?;
+            let result = builder.bind().await;
+            let _ = endpoint_tx.send(result.map_err(|e| e.to_string()));
+        });
+        let endpoint = endpoint_rx
+            .recv()
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                format!("engine endpoint-bind task dropped: {e}").into()
+            })?
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         let relay_url = endpoint
             .addr()
             .relay_urls()
@@ -443,7 +446,7 @@ impl IrohDriver {
             let peer_auth = config.peer_auth.clone();
             let swim_buf = Arc::clone(&accepted_conns);
             let other_buf = Arc::clone(&other_accepted_conns);
-            rt.spawn(async move {
+            engine.spawn(async move {
                 loop {
                     match ep.accept().await {
                         Some(incoming) => match incoming.await {
@@ -478,9 +481,12 @@ impl IrohDriver {
         Ok(Self {
             keypair,
             endpoint,
-            rt,
-            connections: HashMap::new(),
-            next_connection_generation: 1,
+            engine,
+            conns: Arc::new(Mutex::new(ConnCache {
+                connections: HashMap::new(),
+                next_generation: 1,
+                peer_relay_urls: HashMap::new(),
+            })),
             peer_auth: config.peer_auth,
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             dialing: Arc::new(Mutex::new(HashSet::new())),
@@ -488,27 +494,15 @@ impl IrohDriver {
             other_accepted_conns,
             datastream_reads,
             edge_events,
-            next_edge_stream_group: 1,
+            next_edge_stream_group: Arc::new(AtomicU64::new(1)),
             incoming: Arc::new(Mutex::new(Vec::new())),
             evict: Arc::new(Mutex::new(Vec::new())),
-            peer_relay_urls: HashMap::new(),
             join_statuses: Arc::new(Mutex::new(HashMap::new())),
             relay_url,
             actor_bridge: None,
-            _owned_rt: owned,
         })
     }
 
-    /// Get a handle to the tokio runtime this driver runs on (the outer,
-    /// ambient runtime — the driver does not own it).
-    pub fn runtime_handle(&self) -> tokio::runtime::Handle {
-        self.rt.clone()
-    }
-
-    /// Backward-compatible alias for [`Self::runtime_handle`].
-    pub fn tokio_handle(&self) -> tokio::runtime::Handle {
-        self.runtime_handle()
-    }
 
     /// Clone the iroh endpoint for creating outbound connections.
     pub fn endpoint(&self) -> Endpoint {
@@ -547,21 +541,6 @@ impl IrohDriver {
         drained
     }
 
-    /// Claim accepted datastream connections and read them inside driver-owned tasks.
-    pub fn pump_datastream_ingress(&mut self) {
-        for (_node, conn) in self.drain_accepted_for_alpn(DATASTREAM_ALPN) {
-            let reads = Arc::clone(&self.datastream_reads);
-            self.rt.spawn(async move {
-                while let Ok(recv) = conn.accept_uni().await {
-                    match read_events_from_stream(recv).await {
-                        Ok(read) => reads.lock().push(read),
-                        Err(_) => break,
-                    }
-                }
-            });
-        }
-    }
-
     /// Drain decoded datastream QUIC reads emitted by driver-owned adapter tasks.
     pub fn drain_datastream_reads(&self) -> Vec<DatastreamQuicRead> {
         self.datastream_reads.lock().drain(..).collect()
@@ -575,8 +554,8 @@ impl IrohDriver {
         subscription: datastream::DatastreamSubscription,
         idle_sleep: Duration,
     ) {
-        let _ = spawn_subscription_writer(
-            &self.rt,
+        spawn_subscription_writer(
+            &self.engine,
             self.endpoint.clone(),
             peer,
             header,
@@ -588,23 +567,8 @@ impl IrohDriver {
     /// Return a cloneable logical datastream transport handle for publisher actors.
     pub fn datastream_publish_handle(&self) -> DatastreamPublishHandle {
         DatastreamPublishHandle {
-            rt: self.rt.clone(),
+            engine: self.engine.clone(),
             endpoint: self.endpoint.clone(),
-        }
-    }
-
-    /// Claim accepted MVP edge connections and read opaque edge bytes inside the driver.
-    pub fn pump_edge_ingress(&mut self) {
-        for (node, conn) in self.drain_accepted_for_alpn(EDGE_ALPN) {
-            let stream_group = self.next_edge_stream_group;
-            self.next_edge_stream_group = self.next_edge_stream_group.saturating_add(1).max(1);
-            spawn_edge_recv_pump(
-                self.rt.clone(),
-                conn,
-                node,
-                Arc::clone(&self.edge_events),
-                stream_group,
-            );
         }
     }
 
@@ -619,7 +583,7 @@ impl IrohDriver {
         peer: EndpointAddr,
         edge_id: u64,
     ) -> Result<EdgeSendHandle, String> {
-        spawn_edge_sender_task(self.rt.clone(), self.endpoint.clone(), peer, edge_id)
+        spawn_edge_sender_task(self.engine.clone(), self.endpoint.clone(), peer, edge_id)
     }
 
     /// The node's identity.
@@ -774,35 +738,38 @@ impl IrohDriver {
     /// direct addresses). Connect+send is spawned as a background task so
     /// that the peer can accept the connection during its `recv()` cycle.
     /// Results are collected in the next `recv()` call.
-    pub fn join(&mut self, seeds: &[EndpointAddr]) {
+    pub fn join(&self, seeds: &[EndpointAddr]) {
         for seed_addr in seeds {
-            // Store relay URL for future reconnection
+            // Store relay URL for future reconnection, and discard any cached
+            // control connection iroh already reports closed before re-issuing
+            // the semantic join request.
             let seed_node_id = NodeId(*seed_addr.id.as_bytes());
-            if let Some(relay) = seed_addr.relay_urls().next() {
-                self.peer_relay_urls.insert(seed_node_id, relay.clone());
-            }
-            // Preserve a proven live control connection. Only discard a cached
-            // entry that iroh already reports closed before issuing the semantic
-            // join request.
-            if self
-                .connections
-                .get(&seed_node_id)
-                .is_some_and(|cached| cached.conn.close_reason().is_some())
             {
-                self.connections.remove(&seed_node_id);
+                let mut cache = self.conns.lock();
+                if let Some(relay) = seed_addr.relay_urls().next() {
+                    cache.peer_relay_urls.insert(seed_node_id, relay.clone());
+                }
+                if cache
+                    .connections
+                    .get(&seed_node_id)
+                    .is_some_and(|cached| cached.conn.close_reason().is_some())
+                {
+                    cache.connections.remove(&seed_node_id);
+                }
             }
-            // Enrich the seed addr with a cached relay URL if it doesn't
-            // have one. The re-peer flow sends only a bare public key
-            // because metadata (including relay URL) is stripped when a
-            // node is declared dead. Without a relay URL iroh cannot
-            // reach the peer through NAT.
+            // Enrich the seed addr with a cached relay URL if it doesn't have
+            // one. The re-peer flow sends only a bare public key because
+            // metadata (including relay URL) is stripped when a node is
+            // declared dead. Without a relay URL iroh cannot reach the peer
+            // through NAT.
             let enriched = if seed_addr.relay_urls().next().is_none() {
-                if let Some(relay) = self
+                let cached_relay = self
+                    .conns
+                    .lock()
                     .peer_relay_urls
                     .get(&seed_node_id)
-                    .cloned()
-                    .or_else(|| self.home_relay_url())
-                {
+                    .cloned();
+                if let Some(relay) = cached_relay.or_else(|| self.home_relay_url()) {
                     seed_addr.clone().with_relay_url(relay)
                 } else {
                     seed_addr.clone()
@@ -829,7 +796,8 @@ impl IrohDriver {
         let direct_addr_count = seed_addr.ip_addrs().count();
         let has_direct = direct_addr_count > 0;
 
-        self.rt.spawn(async move {
+        let engine = self.engine.clone();
+        self.engine.spawn(async move {
             let mut delay = Duration::from_secs(2);
             let max_delay = Duration::from_secs(30);
             let max_attempts: u32 = 5;
@@ -837,7 +805,7 @@ impl IrohDriver {
 
             for attempt in 1..=max_attempts {
                 if attempt > 1 {
-                    tokio::time::sleep(delay).await;
+                    engine.timer(delay).await;
                     delay = (delay * 2).min(max_delay);
                 }
 
@@ -854,12 +822,12 @@ impl IrohDriver {
                             has_relay,
                             has_direct,
                             direct_addr_count,
-                            updated_at: Instant::now(),
+                            updated_at: engine.now().to_instant(),
                         },
                     );
                 }
 
-                let connect_result = tokio::time::timeout(
+                let connect_result = engine.timeout(
                     per_attempt_timeout,
                     endpoint.connect(seed_addr.clone(), ALPN),
                 )
@@ -880,7 +848,7 @@ impl IrohDriver {
                                     has_relay,
                                     has_direct,
                                     direct_addr_count,
-                                    updated_at: Instant::now(),
+                                    updated_at: engine.now().to_instant(),
                                 },
                             );
                         }
@@ -916,7 +884,7 @@ impl IrohDriver {
                                             has_relay,
                                             has_direct,
                                             direct_addr_count,
-                                            updated_at: Instant::now(),
+                                            updated_at: engine.now().to_instant(),
                                         },
                                     );
                                 }
@@ -951,56 +919,148 @@ impl IrohDriver {
                         has_relay,
                         has_direct,
                         direct_addr_count,
-                        updated_at: Instant::now(),
+                        updated_at: engine.now().to_instant(),
                     },
                 );
             }
         });
     }
 
-    /// Spawn a persistent reader task for `conn` that pushes each valid framed
-    /// message into the shared `incoming` queue. A malformed or truncated
-    /// unidirectional stream is dropped without destroying the connection; an
-    /// accept failure queues generation-aware eviction for the closed connection.
-    /// Reads run on the tokio pool; `recv()` only drains the queue.
-    fn spawn_reader(&self, node_id: NodeId, generation: u64, conn: Connection) {
-        let incoming = Arc::clone(&self.incoming);
-        let evict = Arc::clone(&self.evict);
-        self.rt.spawn(async move {
+    // ─── Actor bridge: iroh ⇄ swactor runtime ─────────────────────────
+
+    /// Install the actor-bridge wiring so the driver shuttles frames between iroh
+    /// and the swactor runtime — the seam by which the protocol actors send and
+    /// receive over iroh. Frame progression is driven by the engine-hosted
+    /// adapter pump ([`Self::install_actor_bridge_pump`]).
+    pub fn enable_actor_bridge(
+        &mut self,
+        rt: Arc<Runtime>,
+        codec: Arc<CodecRegistry>,
+        routes: HashMap<String, ActorAddress>,
+        swim_addr: ActorAddress,
+        relay_mirror: RelayMirror,
+        route_view: RouteView,
+        outbox: Outbox,
+    ) {
+        let self_peer_addr = peer_addr(self.node_id());
+        self.actor_bridge = Some(Arc::new(ActorBridge {
+            rt,
+            codec,
+            routes,
+            swim_addr,
+            self_peer_addr,
+            relay_mirror,
+            route_view,
+            outbox,
+        }));
+    }
+
+    /// Relay URL configured or exposed by the bound endpoint, if any.
+    pub fn relay_url(&self) -> Option<&str> {
+        self.relay_url.as_ref().map(|url| url.as_str())
+    }
+
+    /// The endpoint's live or configured home relay URL, if any.
+    pub fn home_relay_url(&self) -> Option<iroh::RelayUrl> {
+        self.endpoint
+            .addr()
+            .relay_urls()
+            .next()
+            .cloned()
+            .or_else(|| self.relay_url.clone())
+    }
+
+    /// Async teardown for the unified driver loop, which runs on a tokio worker
+    /// where `block_on` would panic. Mirrors [`Self::shutdown`] without blocking.
+    pub async fn close(&self) {
+        self.endpoint.close().await;
+    }
+
+    /// Shut down the driver by closing the iroh endpoint.
+    ///
+    /// The close runs as an engine-hosted task; this method blocks on a
+    /// synchronous channel until it completes, so it can be called from any
+    /// non-async thread without entering or possessing the raw substrate
+    /// runtime. The node's driver loop uses [`Self::close`] instead.
+    pub fn shutdown(&self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let endpoint = self.endpoint.clone();
+        self.engine.spawn(async move {
+            endpoint.close().await;
+            let _ = tx.send(());
+        });
+        let _ = rx.recv();
+    }
+
+    /// Install engine-hosted interval tasks that drive adapter progression
+    /// (actor-bridge ingress/egress, datastream ingress, edge ingress). After
+    /// this call, the application must not manually pump these adapters
+    /// (ENGINE_SPEC.md). Progression is scheduled on the engine the
+    /// driver already stores; a bound driver does not accept an unrelated
+    /// execution engine (ENGINE_SPEC.md).
+    pub fn install_actor_bridge_pump(&self, period: Duration) {
+        let pump = AdapterPump {
+            engine: self.engine.clone(),
+            endpoint: self.endpoint.clone(),
+            conns: Arc::clone(&self.conns),
+            incoming: Arc::clone(&self.incoming),
+            evict: Arc::clone(&self.evict),
+            pending_joins: Arc::clone(&self.pending_joins),
+            accepted_conns: Arc::clone(&self.accepted_conns),
+            other_accepted_conns: Arc::clone(&self.other_accepted_conns),
+            datastream_reads: Arc::clone(&self.datastream_reads),
+            edge_events: Arc::clone(&self.edge_events),
+            next_edge_stream_group: Arc::clone(&self.next_edge_stream_group),
+            dialing: Arc::clone(&self.dialing),
+            peer_auth: self.peer_auth.clone(),
+            relay_url: self.relay_url.clone(),
+            bridge: Arc::clone(self.actor_bridge.as_ref().expect("bridge installed")),
+        };
+        let engine = self.engine.clone();
+        engine.clone().spawn(async move {
+            let mut interval = engine.interval(period);
             loop {
-                match conn.accept_uni().await {
-                    Ok(mut recv) => match read_message(&mut recv).await {
-                        Ok((dest, tag, payload)) => {
-                            incoming.lock().push((dest, tag, payload, node_id));
-                        }
-                        Err(_) => continue,
-                    },
-                    Err(_) => {
-                        evict.lock().push(FailedConnection {
-                            node_id,
-                            generation,
-                        });
-                        break;
-                    }
-                }
+                (&mut interval).await;
+                pump.run_pump_cycle();
             }
         });
     }
+}
 
-    /// Cache a connection and start reading from it.
-    fn cache_connection(&mut self, node_id: NodeId, conn: Connection) {
-        let generation = self.next_connection_generation;
-        self.next_connection_generation = self.next_connection_generation.wrapping_add(1).max(1);
-        self.spawn_reader(node_id, generation, conn.clone());
-        self.connections
-            .insert(node_id, CachedConnection { generation, conn });
-    }
+// ─── Engine-hosted adapter pump ─────────────────────────────────────────────
 
+/// Cloneable handles for the engine-hosted adapter pump task.
+///
+/// Held inside the spawned engine task installed by
+/// [`IrohDriver::install_actor_bridge_pump`]; each pump cycle folds completed
+/// joins/accepts into the connection cache, decodes inbound frames into actor
+/// messages, drains the actors' outbound queue onto the wire, and drives the
+/// driver-owned datastream/edge ingress adapters. All shared state is behind
+/// `Arc<Mutex<…>>` / `Arc<AtomicU64>`, so the pump needs only `&self`.
+#[derive(Clone)]
+struct AdapterPump {
+    engine: EngineHandle,
+    endpoint: Endpoint,
+    conns: Arc<Mutex<ConnCache>>,
+    incoming: Arc<Mutex<Vec<(ActorAddress, String, Vec<u8>, NodeId)>>>,
+    evict: Arc<Mutex<Vec<FailedConnection>>>,
+    pending_joins: Arc<Mutex<Vec<JoinResult>>>,
+    accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
+    other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
+    datastream_reads: Arc<Mutex<Vec<DatastreamQuicRead>>>,
+    edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
+    next_edge_stream_group: Arc<AtomicU64>,
+    dialing: Arc<Mutex<HashSet<NodeId>>>,
+    peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
+    relay_url: Option<iroh::RelayUrl>,
+    bridge: Arc<ActorBridge>,
+}
+
+impl AdapterPump {
     /// Fold completed background dials/joins and accepted connections into the
     /// connection cache (spawning readers), then evict + re-dial connections
-    /// whose fire-and-forget send failed. Shared by the legacy `recv` and the
-    /// actor ingress pump ([`Self::pump_inbound_to_actors`]).
-    fn fold_connections(&mut self) {
+    /// whose fire-and-forget send failed.
+    fn fold_connections(&self) {
         // Fold completed background join connections into the cache (+ read).
         let joins: Vec<JoinResult> = self.pending_joins.lock().drain(..).collect();
         for result in joins {
@@ -1018,56 +1078,39 @@ impl IrohDriver {
         // replacement. Kick a fresh dial for the current failed generation.
         let evicted: Vec<FailedConnection> = self.evict.lock().drain(..).collect();
         for failed in evicted {
-            let still_current = self
+            let should_redial = {
+                let mut cache = self.conns.lock();
+                let still_current = cache
+                    .connections
+                    .get(&failed.node_id)
+                    .is_some_and(|cached| cached.generation == failed.generation);
+                if still_current {
+                    cache.connections.remove(&failed.node_id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_redial {
+                if let Ok(key) = PublicKey::from_bytes(&failed.node_id.0) {
+                    let _ = self.get_or_connect(failed.node_id, key);
+                }
+            }
+        }
+    }
+
+    /// Cache a connection and start reading from it.
+    fn cache_connection(&self, node_id: NodeId, conn: Connection) {
+        let generation = {
+            let mut cache = self.conns.lock();
+            let generation = cache.next_generation;
+            cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
+            cache
                 .connections
-                .get(&failed.node_id)
-                .is_some_and(|cached| cached.generation == failed.generation);
-            if !still_current {
-                continue;
-            }
-            self.connections.remove(&failed.node_id);
-            if let Ok(key) = PublicKey::from_bytes(&failed.node_id.0) {
-                let _ = self.get_or_connect(failed.node_id, key);
-            }
-        }
-    }
-
-    // ─── Actor bridge: iroh ⇄ swactor runtime ─────────────────────────
-
-    /// Install the actor-bridge wiring so the driver shuttles frames between iroh
-    /// and the swactor runtime ([`Self::pump_inbound_to_actors`] /
-    /// [`Self::drain_outbox`]) — the seam by which the protocol actors send and
-    /// receive over iroh.
-    pub fn enable_actor_bridge(
-        &mut self,
-        rt: Arc<Runtime>,
-        codec: Arc<CodecRegistry>,
-        routes: HashMap<String, ActorAddress>,
-        swim_addr: ActorAddress,
-        relay_mirror: RelayMirror,
-        route_view: RouteView,
-    ) {
-        let self_peer_addr = peer_addr(self.node_id());
-        self.actor_bridge = Some(ActorBridge {
-            rt,
-            codec,
-            routes,
-            swim_addr,
-            self_peer_addr,
-            relay_mirror,
-            route_view,
-        });
-    }
-
-    /// Drain the actors' outbound queue and submit each current frame to iroh
-    /// exactly once. A connection cache miss starts or continues a background
-    /// dial and drops that frame best-effort; stream writes remain fire-and-forget
-    /// on the tokio pool, so this never blocks.
-    pub fn drain_outbox(&mut self, outbox: &Outbox) {
-        let frames: Vec<OutFrame> = outbox.lock().unwrap().drain(..).collect();
-        for frame in frames {
-            self.send_wire(frame);
-        }
+                .insert(node_id, CachedConnection { generation, conn: conn.clone() });
+            generation
+        };
+        self.spawn_reader(node_id, generation, conn);
     }
 
     /// Ingress: fold new connections, then decode each received frame and
@@ -1081,26 +1124,34 @@ impl IrohDriver {
     ///  - **An application message** routed by the directory carries the target
     ///    actor's own address as `dest`; it is delivered straight into that actor's
     ///    mailbox. A `dest` for an actor that isn't local here drops best-effort.
-    pub fn pump_inbound_to_actors(&mut self) {
+    fn pump_inbound(&self) {
         self.fold_connections();
         let messages: Vec<(ActorAddress, String, Vec<u8>, NodeId)> =
             self.incoming.lock().drain(..).collect();
-        let Some(bridge) = self.actor_bridge.as_ref() else {
-            return;
-        };
         for (dest, tag, payload, _from) in messages {
-            let Ok(boxed) = bridge.codec.decode(&tag, &payload) else {
+            let Ok(boxed) = self.bridge.codec.decode(&tag, &payload) else {
                 continue;
             };
-            if dest == bridge.self_peer_addr {
+            if dest == self.bridge.self_peer_addr {
                 // Gossip: route by tag to the protocol actor that owns it.
-                if let Some(&addr) = bridge.routes.get(&tag) {
-                    let _ = bridge.rt.deliver_raw(addr, boxed);
+                if let Some(&addr) = self.bridge.routes.get(&tag) {
+                    let _ = self.bridge.rt.deliver_raw(addr, boxed);
                 }
             } else {
                 // Application message: deliver straight to the addressed actor.
-                let _ = bridge.rt.deliver_raw(dest, boxed);
+                let _ = self.bridge.rt.deliver_raw(dest, boxed);
             }
+        }
+    }
+
+    /// Drain the actors' outbound queue and submit each current frame to iroh
+    /// exactly once. A connection cache miss starts or continues a background
+    /// dial and drops that frame best-effort; stream writes remain
+    /// fire-and-forget on the tokio pool, so this never blocks.
+    fn drain_outbox(&self) {
+        let frames: Vec<OutFrame> = self.bridge.outbox.lock().unwrap().drain(..).collect();
+        for frame in frames {
+            self.send_wire(frame);
         }
     }
 
@@ -1109,7 +1160,7 @@ impl IrohDriver {
     /// frame best-effort. A stream-write failure evicts the failed connection,
     /// drops the current frame, and, for SWIM frames only, delivers
     /// `SendFailed { to }` to the SwimActor (§4.3).
-    fn send_wire(&mut self, frame: OutFrame) {
+    fn send_wire(&self, frame: OutFrame) {
         let target_key = match PublicKey::from_bytes(&frame.to.0) {
             Ok(k) => k,
             Err(_) => return,
@@ -1130,13 +1181,11 @@ impl IrohDriver {
         // Only SWIM frames feed failure detection via SendFailed; gossip is
         // best-effort and just drops.
         let send_failed = if is_swim_tag(&type_tag) {
-            self.actor_bridge
-                .as_ref()
-                .map(|b| (b.rt.clone(), b.swim_addr))
+            Some((self.bridge.rt.clone(), self.bridge.swim_addr))
         } else {
             None
         };
-        self.rt.spawn(async move {
+        self.engine.spawn(async move {
             let result: Result<(), Box<dyn std::error::Error>> = async {
                 let mut send = conn.open_uni().await?;
                 write_message(&mut send, dest, type_tag.as_bytes(), &payload).await?;
@@ -1160,7 +1209,7 @@ impl IrohDriver {
     /// or continue a background dial and report that the current frame must be
     /// dropped best-effort rather than retained by the driver.
     fn get_or_connect(
-        &mut self,
+        &self,
         node_id: NodeId,
         key: PublicKey,
     ) -> Result<CachedConnection, Box<dyn std::error::Error>> {
@@ -1174,40 +1223,43 @@ impl IrohDriver {
         }
 
         // Check for cached connection that's still open
-        if let Some(cached) = self.connections.get(&node_id) {
-            if cached.conn.close_reason().is_none() {
-                return Ok(cached.clone());
+        {
+            let mut cache = self.conns.lock();
+            if let Some(cached) = cache.connections.get(&node_id) {
+                if cached.conn.close_reason().is_none() {
+                    return Ok(cached.clone());
+                }
+                // Connection closed, remove it
+                cache.connections.remove(&node_id);
             }
-            // Connection closed, remove it
-            self.connections.remove(&node_id);
         }
 
-        // Resolve relay URL: explicit cache → MetadataActor mirror → legacy SWIM
-        // metadata (retained node) → own home relay.
-        let relay = if let Some(r) = self.peer_relay_urls.get(&node_id).cloned() {
-            Some(r)
-        } else if let Some(r) = self
-            .actor_bridge
-            .as_ref()
-            .and_then(|b| b.relay_mirror.read().ok()?.get(&node_id).cloned())
-            .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
-        {
-            Some(r)
-        } else if let Some(r) = self.home_relay_url() {
-            Some(r)
-        } else {
-            None
+        // Resolve relay URL: explicit cache → MetadataActor mirror → own home
+        // relay.
+        let relay = {
+            let cached_relay = self.conns.lock().peer_relay_urls.get(&node_id).cloned();
+            if let Some(r) = cached_relay {
+                Some(r)
+            } else if let Some(r) = self
+                .bridge
+                .relay_mirror
+                .read()
+                .ok()
+                .and_then(|view| view.get(&node_id).cloned())
+                .and_then(|s| s.parse::<iroh::RelayUrl>().ok())
+            {
+                Some(r)
+            } else if let Some(r) = self.home_relay_url() {
+                Some(r)
+            } else {
+                None
+            }
         };
 
         // Hand the dial to a background task instead of blocking the SWIM
-        // pump. A synchronous dial of up to ATTEMPTS × per-attempt-timeout
-        // (tens of seconds) to an unreachable peer would freeze the whole node
-        // — catastrophic for failure detection, which is exactly when peers go
-        // unreachable. The connection lands in `pending_joins` and is folded
-        // into the cache by the next `recv()`; this send is dropped
-        // best-effort and SWIM re-sends over the cached connection on a later
-        // tick (a genuinely dead peer is still detected via its probe/Ack
-        // timeout, no longer masked by a 30s blocking dial).
+        // pump. The connection lands in `pending_joins` and is folded into the
+        // cache by the next pump cycle; this send is dropped best-effort and
+        // SWIM re-sends over the cached connection on a later tick.
         let dial_addr = match &relay {
             Some(r) => EndpointAddr::new(key).with_relay_url(r.clone()),
             None => EndpointAddr::new(key),
@@ -1217,12 +1269,11 @@ impl IrohDriver {
     }
 
     /// Dial `node_id` in the background (never blocks the SWIM pump),
-    /// mirroring `spawn_join_request`'s retry/backoff but
-    /// without sending a join payload. At most one dial runs per peer at a
-    /// time (`dialing` guards re-entry); on success the connection is queued in
-    /// `pending_joins` for `recv()` to cache, and the in-flight flag is always
-    /// cleared when the task ends. The WAN-tuned 3 × 10s budget is preserved —
-    /// it just no longer stalls the caller.
+    /// mirroring `spawn_join_request`'s retry/backoff but without sending a
+    /// join payload. At most one dial runs per peer at a time (`dialing`
+    /// guards re-entry); on success the connection is queued in
+    /// `pending_joins` for the next pump cycle to cache, and the in-flight
+    /// flag is always cleared when the task ends.
     fn spawn_connect(&self, node_id: NodeId, dial_addr: EndpointAddr) {
         if !self.dialing.lock().insert(node_id) {
             return; // a dial is already in flight for this peer
@@ -1230,11 +1281,12 @@ impl IrohDriver {
         let endpoint = self.endpoint.clone();
         let pending = Arc::clone(&self.pending_joins);
         let dialing = Arc::clone(&self.dialing);
-        self.rt.spawn(async move {
+        let engine = self.engine.clone();
+        self.engine.spawn(async move {
             const ATTEMPTS: u32 = 3;
             let per_attempt_timeout = Duration::from_secs(10);
             for attempt in 1..=ATTEMPTS {
-                let result = tokio::time::timeout(
+                let result = engine.timeout(
                     per_attempt_timeout,
                     endpoint.connect(dial_addr.clone(), ALPN),
                 )
@@ -1245,14 +1297,103 @@ impl IrohDriver {
                 }
                 if attempt < ATTEMPTS {
                     let backoff = if attempt == 1 { 200 } else { 600 };
-                    tokio::time::sleep(Duration::from_millis(backoff)).await;
+                    engine.timer(Duration::from_millis(backoff)).await;
                 }
             }
             dialing.lock().remove(&node_id);
         });
     }
 
-    // ─── Incoming: iroh → handler ────────────────────────────────────
+    /// Spawn a persistent reader task for `conn` that pushes each valid framed
+    /// message into the shared `incoming` queue. A malformed or truncated
+    /// unidirectional stream is dropped without destroying the connection; an
+    /// accept failure queues generation-aware eviction for the closed
+    /// connection.
+    fn spawn_reader(&self, node_id: NodeId, generation: u64, conn: Connection) {
+        let incoming = Arc::clone(&self.incoming);
+        let evict = Arc::clone(&self.evict);
+        self.engine.spawn(async move {
+            loop {
+                match conn.accept_uni().await {
+                    Ok(mut recv) => match read_message(&mut recv).await {
+                        Ok((dest, tag, payload)) => {
+                            incoming.lock().push((dest, tag, payload, node_id));
+                        }
+                        Err(_) => continue,
+                    },
+                    Err(_) => {
+                        evict.lock().push(FailedConnection {
+                            node_id,
+                            generation,
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Claim accepted datastream connections and read them inside driver-owned
+    /// tasks.
+    fn pump_datastream_ingress(&self) {
+        let drained = {
+            let mut pending = self.other_accepted_conns.lock();
+            let mut keep = Vec::new();
+            let mut drained = Vec::new();
+            for (node, negotiated, conn) in pending.drain(..) {
+                if negotiated == DATASTREAM_ALPN {
+                    drained.push((node, conn));
+                } else {
+                    keep.push((node, negotiated, conn));
+                }
+            }
+            *pending = keep;
+            drained
+        };
+        for (_node, conn) in drained {
+            let reads = Arc::clone(&self.datastream_reads);
+            self.engine.spawn(async move {
+                while let Ok(recv) = conn.accept_uni().await {
+                    match read_events_from_stream(recv).await {
+                        Ok(read) => reads.lock().push(read),
+                        Err(_) => break,
+                    }
+                }
+            });
+        }
+    }
+
+    /// Claim accepted MVP edge connections and read opaque edge bytes inside
+    /// the driver.
+    fn pump_edge_ingress(&self) {
+        let drained = {
+            let mut pending = self.other_accepted_conns.lock();
+            let mut keep = Vec::new();
+            let mut drained = Vec::new();
+            for (node, negotiated, conn) in pending.drain(..) {
+                if negotiated == EDGE_ALPN {
+                    drained.push((node, conn));
+                } else {
+                    keep.push((node, negotiated, conn));
+                }
+            }
+            *pending = keep;
+            drained
+        };
+        for (node, conn) in drained {
+            let stream_group = self
+                .next_edge_stream_group
+                .fetch_add(1, Ordering::Relaxed)
+                .max(1);
+            spawn_edge_recv_pump(
+                self.engine.clone(),
+                conn,
+                node,
+                Arc::clone(&self.edge_events),
+                stream_group,
+            );
+        }
+    }
 
     fn is_peer_allowed(&self, node_id: &NodeId) -> bool {
         match &self.peer_auth {
@@ -1261,13 +1402,8 @@ impl IrohDriver {
         }
     }
 
-    /// Relay URL configured or exposed by the bound endpoint, if any.
-    pub fn relay_url(&self) -> Option<&str> {
-        self.relay_url.as_ref().map(|url| url.as_str())
-    }
-
     /// The endpoint's live or configured home relay URL, if any.
-    pub fn home_relay_url(&self) -> Option<iroh::RelayUrl> {
+    fn home_relay_url(&self) -> Option<iroh::RelayUrl> {
         self.endpoint
             .addr()
             .relay_urls()
@@ -1276,19 +1412,14 @@ impl IrohDriver {
             .or_else(|| self.relay_url.clone())
     }
 
-    /// Async teardown for the unified driver loop, which runs on a tokio worker
-    /// where `block_on` would panic. Mirrors [`Self::shutdown`] without blocking.
-    pub async fn close(&mut self) {
-        self.endpoint.close().await;
-    }
-
-    /// Shut down the driver by closing the iroh endpoint.
-    /// (the test harness / standalone binaries). The node's async driver loop
-    /// uses [`Self::close`] instead.
-    pub fn shutdown(&mut self) {
-        self.rt.block_on(async {
-            self.endpoint.close().await;
-        });
+    /// One full pump cycle: fold connections, drain inbound/outbound, drive
+    /// the datastream and edge ingress adapters.
+    fn run_pump_cycle(&self) {
+        self.fold_connections();
+        self.pump_inbound();
+        self.drain_outbox();
+        self.pump_datastream_ingress();
+        self.pump_edge_ingress();
     }
 }
 

@@ -1,4 +1,9 @@
 //! Behavior guarantees for the `node` module.
+//!
+//! These unit tests drive a raw `Runtime` in isolation to verify actor message
+//! routing — they are not engine integration tests and are exempt from the
+//! disallowed-methods policy (ENGINE_SPEC.md §2).
+#![allow(clippy::disallowed_methods)]
 
 use crate::node_actor::{NodeAgentActor, NodeAgentMsg, NodeAgentReport};
 use crate::orchestration::actor::OrchestratorMsg;

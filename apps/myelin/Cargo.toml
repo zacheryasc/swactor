@@ -18,6 +18,7 @@ dashboard = { path = "../../crates/dashboard" }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 swactor = { path = "../..", features = ["serde", "transport"] }
+swactor-engine = { path = "../../crates/engine" }
 swactor-transport = { path = "../../crates/transport" }
 swactor-process = { path = "../../crates/process" }
 distribution = { path = "../../crates/distribution" }

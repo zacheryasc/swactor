@@ -11,8 +11,8 @@ use distribution::types::NodeId;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr};
 use parking_lot::Mutex;
+use swactor_engine::EngineHandle;
 use tokio::io::AsyncWriteExt;
-use tokio::runtime::Handle;
 use tokio::sync::mpsc as tokio_mpsc;
 
 pub const EDGE_ALPN: &[u8] = b"mvp/pipeline-edge/0";
@@ -64,14 +64,15 @@ impl EdgeSendHandle {
 }
 
 pub(crate) fn spawn_edge_send_pump(
-    handle: Handle,
+    engine: EngineHandle,
     endpoint: Endpoint,
     peer: EndpointAddr,
     edge_id: u64,
 ) -> Result<EdgeSendHandle, String> {
     let (tx, mut rx) = tokio_mpsc::unbounded_channel::<Vec<u8>>();
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    handle.spawn(async move {
+    let engine_handle = engine.clone();
+    engine.spawn(async move {
         let result: Result<(), String> = async {
             macro_rules! open_edge_stream {
                 () => {{
@@ -99,7 +100,7 @@ pub(crate) fn spawn_edge_send_pump(
                 let mut attempts = 0_u8;
                 loop {
                     attempts = attempts.saturating_add(1);
-                    let write_result = tokio::time::timeout(Duration::from_secs(30), async {
+                    let write_result = engine_handle.timeout(Duration::from_secs(30), async {
                         send.write_all(&record)
                             .await
                             .map_err(|e| format!("write edge record {edge_id}: {e}"))?;
@@ -112,27 +113,9 @@ pub(crate) fn spawn_edge_send_pump(
 
                     match write_result {
                         Ok(()) => break,
-                        Err(error) if attempts < 3 => {
+                        Err(_error) if attempts < 3 => {
                             send = open_edge_stream!();
-                            let retry_result =
-                                tokio::time::timeout(Duration::from_secs(30), async {
-                                    send.write_all(&record).await.map_err(|e| {
-                                        format!("write edge record {edge_id} after reconnect: {e}")
-                                    })?;
-                                    send.flush().await.map_err(|e| {
-                                        format!("flush edge record {edge_id} after reconnect: {e}")
-                                    })
-                                })
-                                .await
-                                .map_err(|_| {
-                                    format!(
-                                        "write edge record {edge_id} after reconnect: timed out"
-                                    )
-                                })?;
-                            retry_result.map_err(|retry_error| {
-                                format!("{error}; reconnect write failed: {retry_error}")
-                            })?;
-                            break;
+                            continue;
                         }
                         Err(error) => return Err(error),
                     }
@@ -154,13 +137,13 @@ pub(crate) fn spawn_edge_send_pump(
 }
 
 pub(crate) fn spawn_edge_recv_pump(
-    handle: Handle,
+    engine: EngineHandle,
     conn: Connection,
     peer: NodeId,
     events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
     stream_group: u64,
 ) {
-    handle.spawn(async move {
+    engine.spawn(async move {
         let mut next_uni_stream_id = stream_group << 32;
         while let Ok(mut recv) = conn.accept_uni().await {
             next_uni_stream_id = next_uni_stream_id.saturating_add(1);

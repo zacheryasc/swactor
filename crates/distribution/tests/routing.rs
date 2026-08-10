@@ -760,9 +760,9 @@ mod directory_route_path {
             c
         }
 
-        /// Move every queued frame to its destination, mirroring the live driver:
-        /// `drain_outbox` (sender side) then `pump_inbound_to_actors` (receiver side,
-        /// dest-first). A frame addressed to a node's peer-mailbox is gossip and is
+        /// Move every queued frame to its destination, mirroring the
+        /// engine-hosted adapter pump (sender-side outbox drain, then dest-first
+        /// delivery). A frame addressed to a node's peer-mailbox is gossip and is
         /// routed by tag; anything else is an app message delivered to its `dest`.
         fn deliver_wire(&self) {
             let mut frames: Vec<OutFrame> = Vec::new();

@@ -4,6 +4,11 @@
 //! distribution crate owns cluster dynamics, protocol actors, routing claims, and
 //! wire message definitions.
 
+// Engine boundary enforcement: disallowed scheduling/time/core-driving methods
+// are hard errors in this crate (ENGINE_SPEC.md §2). All engine-hosted
+// work goes through `EngineHandle`.
+#![deny(clippy::disallowed_methods)]
+
 pub mod datastream_transport;
 pub mod driver_pumps;
 pub mod edge_transport;

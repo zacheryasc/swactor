@@ -1,7 +1,7 @@
 # Iroh Driver Fixed Specification
 
 Id: 5
-Last modified:
+Last modified: f8fc594b95871813a890b5d60f60dee505ef93bc
 Last reviewed:
 
 > Review checkpoint: reviewed through Section 3.2; resume with Section 3.3 Accepted Connection Output.
@@ -47,7 +47,7 @@ The driver accepts input through construction configuration, explicit method cal
 
 ### 2.1 Construction and Configuration Inputs
 
-Construction input is `IrohDriverConfig` plus a Tokio runtime handle.
+Construction input is `IrohDriverConfig` plus a swactor engine handle (see §2.1).
 
 `IrohDriverConfig` contains:
 
@@ -71,13 +71,15 @@ IrohDriverConfig {
 
 `additional_alpns` registers internal wire ALPNs on the iroh endpoint. Non-actor connections negotiated on those wire protocols are handled by registered protocol adapters rather than returned directly to callers.
 
-The target driver is constructed inside the process's single Tokio runtime:
+The target driver is constructed with a swactor engine handle — the single
+engine that owns the process's Tokio substrate:
 
 ```text
-IrohDriver::with_handle(tokio_handle, config)
+IrohDriver::with_engine(engine_handle, config)
 ```
 
-The target driver must not create or own a second Tokio runtime. Any legacy constructor that creates or discovers a runtime is outside this target contract.
+The driver validates engine capabilities (tasks, timers, io) before binding the
+endpoint. It must not create, discover, or store a raw Tokio runtime handle.
 
 ### 2.2 Actor Egress Channel Input
 
@@ -154,7 +156,7 @@ Each seed carries the peer public key and may carry direct socket addresses and 
 
 A join request is sent as a framed actor message over the actor ALPN. The request is addressed to the seed node's peer mailbox and uses the `JoinRequest` network message type tag.
 
-Join attempts run in background Tokio tasks. The `join` call does not synchronously wait for connection establishment or membership convergence.
+Join attempts run as engine-hosted tasks. The `join` call does not synchronously wait for connection establishment or membership convergence.
 
 ### 2.4 Incoming Iroh Connection Input
 
@@ -285,7 +287,7 @@ Shutdown input is async and runtime-owned:
 IrohDriver::close().await
 ```
 
-`close` is the target teardown path. It closes the iroh endpoint from inside the same Tokio runtime that owns the driver tasks.
+`close` is the target teardown path. It closes the iroh endpoint from inside the engine substrate that owns the driver tasks.
 
 ---
 
@@ -662,35 +664,26 @@ updates join status during attempts
 queues a successful connection for later cache folding
 ```
 
-Membership convergence is not completed by `join` alone. SWIM and the distribution actors must be pumped after a connection exists.
+Membership convergence is not completed by `join` alone. SWIM and the distribution actors must progress after a connection exists.
 
-### 6.4 Running Pump Cycle
+### 6.4 Engine-Hosted Progression
 
-A production runtime loop must pump both the distribution actors and the driver.
+Actor progression, protocol ticks, and all driver adapter work — inbound actor frames, actor egress, protocol adapter ingress/status, and ring-backed protocol pumps — are owned by a single swactor engine. The application installs the engine-hosted adapter pump via `IrohDriver::install_actor_bridge_pump` and does not pump any queue itself.
 
-The expected pump shape is:
+The engine-hosted pump cycle advances the following per interval:
 
 ```text
 send protocol actor ticks
-pump inbound iroh actor frames into Swactor
+drain inbound iroh actor frames into Swactor
 run Swactor runtime work
 drain actor egress channel to iroh
 drain protocol adapter ingress/status queues
 wake or drain ring-backed protocol pumps as needed
 ```
 
-The driver provides only its side of this loop:
-
-```text
-pump_inbound_to_actors
-drain_actor_egress
-drain_protocol_ingress
-drain_protocol_status
-```
-
 Protocol adapter drains carry messages, logical stream status, readiness, and faults. Payload bytes for ring-backed protocols move through rings and ring wakeups, not through actor-drained byte messages.
 
-The caller owns the loop, timing, shutdown select, and protocol actor tick injection.
+The engine owns the loop, timing, and protocol actor tick injection; the application only configures components, consumes reports, and owns domain queues (ENGINE_SPEC.md §5).
 
 ### 6.5 Datastream Connection Handling
 

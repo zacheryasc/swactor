@@ -54,7 +54,6 @@ fn endpoint_addr_includes_home_relay() {
         if start.elapsed() >= Duration::from_secs(5) {
             break (false, current_relay_url);
         }
-        pump_one(&mut node);
         std::thread::sleep(Duration::from_millis(10));
     };
 
@@ -208,9 +207,9 @@ fn goal2_shutdown_node_is_detected_dead_by_survivors() {
     let dead_key = cluster.key(dead);
     cluster.shutdown_one(dead);
 
-    // The survivors' probes to the dead node now truly fail; drive them until
-    // both converge on it being Dead.
-    let detected = cluster.pump_until_excluding(&[dead], Duration::from_secs(30), |drivers| {
+    // The survivors' probes to the dead node now truly fail; poll until both
+    // converge on it being Dead.
+    let detected = cluster.pump_until(Duration::from_secs(30), |drivers| {
         drivers
             .iter()
             .enumerate()
@@ -221,4 +220,36 @@ fn goal2_shutdown_node_is_detected_dead_by_survivors() {
     // Tear down the two survivors (the third is already shut down).
     cluster[0].shutdown();
     cluster[1].shutdown();
+}
+
+// ─── Capability binding (ENGINE_SPEC.md) ──────────────────────
+
+#[test]
+fn driver_rejects_engine_without_io() {
+    // The SteppingBackend advertises tasks + timers + blocking but NOT io.
+    // The driver requires tasks + timers + io, so construction must fail
+    // before any endpoint is bound or background work starts.
+    use distribution::node::DistributedNodeConfig;
+    use iroh::RelayMode;
+    use iroh_driver::{IrohDriver, IrohDriverConfig};
+    use swactor::config::RuntimeConfig;
+    use swactor::runtime::Runtime;
+    use swactor_engine::{Engine, SteppingBackend};
+
+    let rt = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let engine = Engine::new(rt, SteppingBackend::default()).expect("stepping engine");
+    let result = IrohDriver::with_engine(
+        engine.handle(),
+        IrohDriverConfig {
+            secret_key: None,
+            relay_mode: RelayMode::Disabled,
+            node: DistributedNodeConfig::default(),
+            peer_auth: None,
+            additional_alpns: vec![],
+        },
+    );
+    assert!(
+        result.is_err(),
+        "driver must reject an engine that lacks the io capability"
+    );
 }

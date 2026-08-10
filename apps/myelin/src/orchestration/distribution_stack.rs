@@ -3,8 +3,10 @@
 //!
 //! This is the production version of the actor-stack setup that integration
 //! tests used to copy by hand: a swactor runtime, the four distribution protocol
-//! actors, codec/transport routing, the actor-directory mirrors, and one pumpable
-//! tick seam for concrete network drivers such as `iroh-driver`.
+//! actors, codec/transport routing, and the actor-directory mirrors. Protocol
+//! tick injection is owned by the swactor engine (see
+//! [`DistributionRuntimeStack::spawn_protocol_ticker`]); the application loop
+//! no longer manually ticks core.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant};
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Ctx, Runtime};
+use swactor_engine::EngineHandle;
 use swactor::stats::StatsHook;
 use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, CodecRemoteSink, NetworkMessage, TransportRouter};
@@ -46,6 +49,10 @@ pub(crate) struct DistributionActorAddrs {
 
 pub(crate) struct DistributionRuntimeStack {
     pub runtime: Arc<Runtime>,
+    /// The node engine this stack is bound to. Protocol ticking and all
+    /// supporting work schedule on this stored handle; the stack does not
+    /// accept an unrelated engine at each call (ENGINE_SPEC.md).
+    pub engine: EngineHandle,
     pub codec: Arc<CodecRegistry>,
     pub outbox: Outbox,
     pub relay_mirror: RelayMirror,
@@ -57,12 +64,19 @@ pub(crate) struct DistributionRuntimeStack {
 }
 
 impl DistributionRuntimeStack {
-    pub(crate) fn new_with_codecs(
-        node_id: NodeId,
-        config: DistributedNodeConfig,
+    /// Build and configure the core swactor runtime + codec, returning the
+    /// shared transport router needed by [`new_from_runtime`]. The runtime is
+    /// fully configured — extension, remote sink, statistics hook — but no
+    /// actors are spawned yet.
+    ///
+    /// This split lets the engine own the runtime before the driver exists:
+    /// construct the runtime, hand it to [`Engine::new`](swactor_engine::Engine),
+    /// create the driver (which needs the engine handle), then spawn actors via
+    /// [`new_from_runtime`] using `driver.node_id()`.
+    pub(crate) fn build_runtime(
         extend_codecs: impl FnOnce(&mut CodecRegistry),
         stats_hook: Option<Arc<dyn StatsHook>>,
-    ) -> Self {
+    ) -> (Arc<Runtime>, Arc<CodecRegistry>, Arc<TransportRouter>) {
         let mut runtime =
             Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
         let mut codec = actor_codec_registry();
@@ -76,8 +90,19 @@ impl DistributionRuntimeStack {
         if let Some(hook) = stats_hook {
             runtime.set_stats_hook(hook);
         }
-        let runtime = Arc::new(runtime);
+        (Arc::new(runtime), codec, transport_router)
+    }
 
+    /// Spawn the four distribution protocol actors on a pre-built runtime.
+    /// Used after [`build_runtime`] when the engine already owns the runtime.
+    pub(crate) fn new_from_runtime(
+        runtime: Arc<Runtime>,
+        codec: Arc<CodecRegistry>,
+        transport_router: Arc<TransportRouter>,
+        node_id: NodeId,
+        config: DistributedNodeConfig,
+        engine: EngineHandle,
+    ) -> Self {
         let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
         let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
         let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
@@ -151,6 +176,7 @@ impl DistributionRuntimeStack {
 
         Self {
             runtime,
+            engine,
             codec,
             outbox,
             relay_mirror,
@@ -166,6 +192,20 @@ impl DistributionRuntimeStack {
                 membership_fanout: fanout_addr,
             },
         }
+    }
+
+    /// Convenience: build the runtime and spawn actors in one step. Use
+    /// [`build_runtime`] + [`new_from_runtime`] when the engine must own the
+    /// runtime before the driver is constructed.
+    pub(crate) fn new_with_codecs(
+        node_id: NodeId,
+        config: DistributedNodeConfig,
+        extend_codecs: impl FnOnce(&mut CodecRegistry),
+        stats_hook: Option<Arc<dyn StatsHook>>,
+        engine: EngineHandle,
+    ) -> Self {
+        let (runtime, codec, transport_router) = Self::build_runtime(extend_codecs, stats_hook);
+        Self::new_from_runtime(runtime, codec, transport_router, node_id, config, engine)
     }
 
     pub(crate) fn actor_bridge_routes(&self) -> HashMap<String, ActorAddress> {
@@ -189,17 +229,29 @@ impl DistributionRuntimeStack {
         routes
     }
 
-    pub(crate) fn tick_protocol_actors(&self, now: Instant) {
-        let _ = self.runtime.send_to(self.actors.swim, SwimIn::Tick { now });
-        let _ = self.runtime.send_to(self.actors.registry, RegistryIn::Tick);
-        let _ = self.runtime.send_to(self.actors.metadata, MetadataIn::Tick);
-        let _ = self
-            .runtime
-            .send_to(self.actors.directory, DirectoryIn::Tick);
-    }
-
-    pub(crate) fn pump_runtime_once(&self) {
-        self.runtime.tick();
+    /// Spawn an engine-hosted interval task that injects protocol Tick messages
+    /// (SWIM, registry, metadata, directory), replacing the manual tick
+    /// injection previously done by the application pump loop
+    /// (ENGINE_SPEC.md). The engine owns protocol progression; the
+    /// application loop no longer calls tick or core-driving methods.
+    pub(crate) fn spawn_protocol_ticker(&self, period: Duration) {
+        let runtime = self.runtime.clone();
+        let swim = self.actors.swim;
+        let registry = self.actors.registry;
+        let metadata = self.actors.metadata;
+        let directory = self.actors.directory;
+        let engine = self.engine.clone();
+        engine.clone().spawn(async move {
+            let mut interval = engine.interval(period);
+            loop {
+                (&mut interval).await;
+                let now = engine.now().to_instant();
+                let _ = runtime.send_to(swim, SwimIn::Tick { now });
+                let _ = runtime.send_to(registry, RegistryIn::Tick);
+                let _ = runtime.send_to(metadata, MetadataIn::Tick);
+                let _ = runtime.send_to(directory, DirectoryIn::Tick);
+            }
+        });
     }
 
     pub(crate) fn register_local_actor(&self, entry: DirectoryEntry) {

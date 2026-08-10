@@ -11,7 +11,7 @@ use datastream::{
 };
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
-use tokio::runtime::Handle;
+use swactor_engine::EngineHandle;
 
 pub const DATASTREAM_ALPN: &[u8] = b"swactor/datastream/0";
 
@@ -73,34 +73,36 @@ pub struct DatastreamQuicRead {
 }
 
 pub fn spawn_subscription_writer(
-    handle: &Handle,
+    engine: &EngineHandle,
     endpoint: Endpoint,
     peer: EndpointAddr,
     header: DatastreamQuicHeader,
     subscription: DatastreamSubscription,
     idle_sleep: Duration,
-) -> tokio::task::JoinHandle<Result<DatastreamQuicWriteStats, String>> {
-    handle.spawn(async move {
-        let conn = endpoint
-            .connect(peer, DATASTREAM_ALPN)
-            .await
-            .map_err(|error| error.to_string())?;
-        let send = conn.open_uni().await.map_err(|error| error.to_string())?;
-        write_subscription_until_closed(send, header, subscription, idle_sleep)
-            .await
-            .map_err(|error| error.to_string())
-    })
+) {
+    let engine_handle = engine.clone();
+    engine.spawn(async move {
+        let Ok(conn) = endpoint.connect(peer, DATASTREAM_ALPN).await else {
+            return;
+        };
+        let Ok(send) = conn.open_uni().await else {
+            return;
+        };
+        let _ = write_subscription_until_closed(&engine_handle, send, header, subscription, idle_sleep).await;
+    });
 }
 
 pub async fn write_available_subscription(
+    engine: &EngineHandle,
     send: SendStream,
     header: &DatastreamQuicHeader,
     subscription: &DatastreamSubscription,
 ) -> Result<DatastreamQuicWriteStats, BoxError> {
-    write_subscription_inner(send, header, subscription, None).await
+    write_subscription_inner(engine, send, header, subscription, None).await
 }
 
 pub async fn write_subscription_until_closed(
+    engine: &EngineHandle,
     mut send: SendStream,
     header: DatastreamQuicHeader,
     subscription: DatastreamSubscription,
@@ -118,7 +120,7 @@ pub async fn write_subscription_until_closed(
                 }
             }
             Err(TryRecvError::Empty) => {
-                tokio::time::sleep(idle_sleep).await;
+                engine.timer(idle_sleep).await;
             }
             Err(TryRecvError::Disconnected) => break,
         }
@@ -128,6 +130,7 @@ pub async fn write_subscription_until_closed(
 }
 
 async fn write_subscription_inner(
+    engine: &EngineHandle,
     mut send: SendStream,
     header: &DatastreamQuicHeader,
     subscription: &DatastreamSubscription,
@@ -145,7 +148,7 @@ async fn write_subscription_inner(
                 }
             }
             Err(TryRecvError::Empty) => match idle_sleep {
-                Some(delay) => tokio::time::sleep(delay).await,
+                Some(delay) => engine.timer(delay).await,
                 None => break,
             },
             Err(TryRecvError::Disconnected) => break,
@@ -208,26 +211,26 @@ pub async fn read_next_uni_from_connection(
 }
 
 pub fn spawn_connection_reader(
-    handle: &Handle,
+    engine: &EngineHandle,
     conn: Connection,
     sink: std::sync::mpsc::Sender<DatastreamEvent>,
-) -> tokio::task::JoinHandle<Result<(), String>> {
-    handle.spawn(async move {
+) {
+    engine.spawn(async move {
         loop {
             let recv = match conn.accept_uni().await {
                 Ok(recv) => recv,
-                Err(error) => return Err(error.to_string()),
+                Err(_) => return,
             };
-            let read = read_events_from_stream(recv)
-                .await
-                .map_err(|error| error.to_string())?;
+            let Ok(read) = read_events_from_stream(recv).await else {
+                continue;
+            };
             for event in read.events {
                 if sink.send(event).is_err() {
-                    return Ok(());
+                    return;
                 }
             }
         }
-    })
+    });
 }
 
 async fn write_header(

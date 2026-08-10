@@ -75,6 +75,8 @@ impl BootstrapDatastreamBridge {
         });
     }
 
+    // provider log capture is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn spawn_stdout_reader<R>(&self, stdout: R) -> JoinHandle<()>
     where
         R: Read + Send + 'static,
@@ -83,6 +85,8 @@ impl BootstrapDatastreamBridge {
         thread::spawn(move || bridge.read_stdout(stdout))
     }
 
+    // provider log capture is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn spawn_stderr_reader<R>(&self, stderr: R) -> JoinHandle<()>
     where
         R: Read + Send + 'static,

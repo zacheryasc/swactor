@@ -120,6 +120,8 @@ impl Drop for RuntimeEnvGuard {
     }
 }
 
+// blocking user-stdin thread is process control, out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn run<I>(args: I) -> Result<(), String>
 where
     I: IntoIterator<Item = String>,
@@ -1356,6 +1358,8 @@ struct InProcessOrch {
     cleaned: bool,
 }
 
+// synchronous process-control readiness sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn wait_for_rpc_ready(
     rpc_addr: &str,
     mut check_dead: impl FnMut() -> Result<(), String>,
@@ -1384,6 +1388,8 @@ fn wait_for_rpc_ready(
 }
 
 impl InProcessOrch {
+// spawns the orchestrator process; process control, out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
     fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
         let args = config.orchestrator_cli_args(image_ref);
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -1412,6 +1418,8 @@ impl InProcessOrch {
         })
     }
 
+// synchronous process-control readiness sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
     fn shutdown(&mut self) {
         if self.cleaned {
             return;
@@ -1509,6 +1517,8 @@ impl OrchChild {
 
     // The orchestrator shutdown spec is still pending. Replace this with the approved
     // shutdown contract when it is finalized; do not add private stdin commands here.
+// synchronous process-control readiness sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
     fn shutdown(&mut self) {
         if self.cleaned {
             return;
@@ -2102,6 +2112,8 @@ fn ensure_runtime_binary(
     }
 }
 
+// top-level OS signal handling is process control, out of scope (ENGINE_SPEC.md §2)
+#[allow(clippy::disallowed_methods)]
 fn install_signal_handlers() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {

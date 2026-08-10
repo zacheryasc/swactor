@@ -1,3 +1,4 @@
+mod engine_composition;
 mod harness;
 mod local_e2e_guarantees;
 mod local_mock;
