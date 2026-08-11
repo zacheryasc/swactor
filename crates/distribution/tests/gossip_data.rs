@@ -228,12 +228,13 @@ mod standalone_gossip_transport {
     //! Actorized registry/metadata/directory gossip over one codec and transport, proving
     //! standalone frames converge without piggybacking on SWIM.
 
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
 
     use swactor::Error;
     use swactor::actor::ActorAddress;
-    use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
+    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
     use swactor::std::StdExtension;
     use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
 
@@ -251,7 +252,7 @@ mod standalone_gossip_transport {
     /// production ingress — decode, then `deliver_raw` to the local actor that owns
     /// the frame's `type_tag` (the tag→actor routing the real driver does).
     struct Link {
-        dst_rt: Arc<Runtime>,
+        dst_rt: Runtime,
         routes: HashMap<String, ActorAddress>,
         codec: Arc<CodecRegistry>,
     }
@@ -270,7 +271,8 @@ mod standalone_gossip_transport {
     /// One node: a runtime hosting a RegistryActor + MetadataActor + DirectoryActor,
     /// plus the shared state needed to wire it into a mesh.
     struct Node {
-        rt: Arc<Runtime>,
+        rt: Runtime,
+        host: RefCell<SingleThreadRuntime>,
         registry: ActorAddress,
         metadata: ActorAddress,
         directory: ActorAddress,
@@ -295,14 +297,15 @@ mod standalone_gossip_transport {
             // Phase 1: per-node runtime + actors.
             let mut nodes = Vec::new();
             for &nid in &ids {
-                let mut rt = Runtime::new(RuntimeConfig::default())
+                let parts = RuntimeParts::new(RuntimeConfig::default())
                     .with_extension(Arc::new(StdExtension::new()));
+                let rt = parts.runtime().clone();
                 let router = Arc::new(TransportRouter::new());
                 rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
                     codec.clone(),
                     router.clone(),
                 )));
-                let rt = Arc::new(rt);
+                let host = RefCell::new(SingleThreadRuntime::new(parts));
 
                 let dir = SharedPeerDirectory::new();
                 let relay_mirror: RelayMirror = Arc::new(RwLock::new(HashMap::new()));
@@ -333,6 +336,7 @@ mod standalone_gossip_transport {
 
                 nodes.push(Node {
                     rt,
+                    host,
                     registry,
                     metadata,
                     directory,
@@ -403,7 +407,7 @@ mod standalone_gossip_transport {
         fn pump(&self, k: usize) {
             for _ in 0..k {
                 for node in &self.nodes {
-                    node.rt.tick();
+                    node.host.borrow_mut().tick();
                 }
             }
         }
@@ -444,7 +448,7 @@ mod standalone_gossip_transport {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].rt.tick();
+            self.nodes[observer].host.borrow_mut().tick();
             inbox.try_recv().and_then(|r| r.binding)
         }
 
@@ -461,7 +465,7 @@ mod standalone_gossip_transport {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].rt.tick();
+            self.nodes[observer].host.borrow_mut().tick();
             inbox.try_recv().and_then(|r| r.relay_url)
         }
 
@@ -478,7 +482,7 @@ mod standalone_gossip_transport {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].rt.tick();
+            self.nodes[observer].host.borrow_mut().tick();
             inbox.try_recv().and_then(|located| located.host)
         }
     }

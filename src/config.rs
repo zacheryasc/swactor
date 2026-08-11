@@ -6,6 +6,18 @@ pub struct RuntimeConfig {
     /// Prevents a single actor with a large mailbox from starving others.
     /// `0` means unlimited (drain entire mailbox).
     pub actor_message_budget: usize,
+    /// Number of logical workers created with the runtime.
+    ///
+    /// Actors are pinned to one logical worker at spawn and never moved.
+    /// Defaults to `1` to preserve single-worker behavior unless a caller opts
+    /// into more workers. `0` is rejected during runtime construction.
+    pub worker_count: usize,
+    /// Maximum number of items consumed by one ingress drain (transfer, spawn,
+    /// admin) per worker pass. `0` means unlimited.
+    ///
+    /// Each drain operation is bounded independently, so a backlog in one queue
+    /// cannot permanently block another. Defaults to `1024`.
+    pub worker_ingress_budget: usize,
 }
 
 /// 8kB for the `Box<..>` before counting the rest of the memory
@@ -20,12 +32,22 @@ const DEFAULT_CHANNEL_BUFFER_SIZE: usize = 1_000;
 /// 64 is a good default: high enough for throughput, low enough for fairness.
 const DEFAULT_ACTOR_MESSAGE_BUDGET: usize = 64;
 
+/// Default logical worker count. Preserves the historic single-worker runtime
+/// unless a caller explicitly opts into more workers.
+const DEFAULT_WORKER_COUNT: usize = 1;
+
+/// Default per-drain ingress budget. `0` would mean unlimited, so the default
+/// is a finite, generous cap that keeps every worker pass bounded.
+const DEFAULT_WORKER_INGRESS_BUDGET: usize = 1_024;
+
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             max_actors: DEFAULT_MAX_ACTORS,
             channel_buffer_size: DEFAULT_CHANNEL_BUFFER_SIZE,
             actor_message_budget: DEFAULT_ACTOR_MESSAGE_BUDGET,
+            worker_count: DEFAULT_WORKER_COUNT,
+            worker_ingress_budget: DEFAULT_WORKER_INGRESS_BUDGET,
         }
     }
 }

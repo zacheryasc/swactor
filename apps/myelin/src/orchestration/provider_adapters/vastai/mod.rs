@@ -1,8 +1,7 @@
-// VastAI provider adapter: temporarily exempt from the engine disallowed-methods
-// policy. This module owns private Tokio runtimes, blocking facades, and a
-// polling thread because it predates the engine and is explicitly OUT of engine
-// scope (ENGINE_SPEC.md §2). It will be redesigned independently; until then it
-// carries this narrow allowance rather than being migrated piecemeal.
+// VastAI provider adapter: owns private blocking facades and a legacy provider
+// monitor thread outside the orchestration engine. The monitor's swactor core
+// is driven by an explicit SingleThreadRuntime owned by that thread; the main
+// orchestration engine owns all bootstrap actors spawned on its runtime handle.
 #![allow(clippy::disallowed_methods)]
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -16,7 +15,9 @@ use std::time::{Duration, Instant};
 
 use datastream::DatastreamProducer;
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor::runtime::{Ctx, ExternalSender, Runtime, RuntimeConfig};
+use swactor::runtime::{
+    Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
+};
 use swactor_vastai::{
     CreateInstanceRequest, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedInstance,
     SelectionPolicy, classify_vastai_error, create_instance,
@@ -62,23 +63,21 @@ pub(crate) struct VastAiSshEndpoint {
 }
 
 pub(crate) struct VastAiProviderMonitor {
-    runtime: Arc<Runtime>,
+    runtime: Runtime,
     actor: ActorAddress,
     tick_thread: Option<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
 }
 
 impl VastAiProviderMonitor {
-    fn new(runtime: Runtime, actor: ActorAddress) -> Self {
-        let runtime = Arc::new(runtime);
+    fn new(runtime: Runtime, mut host: SingleThreadRuntime, actor: ActorAddress) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
 
-        let rt = Arc::clone(&runtime);
         let flag = Arc::clone(&stop_flag);
         let tick_thread = thread::spawn(move || {
-            while !flag.load(Ordering::Relaxed) || rt.has_work() {
-                if rt.has_work() {
-                    rt.tick();
+            while !flag.load(Ordering::Relaxed) || host.has_work() {
+                if host.has_work() {
+                    host.tick();
                 } else {
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -565,7 +564,8 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Option<VastAiProviderMonitor> {
-        let runtime = Runtime::new(RuntimeConfig::default());
+        let parts = RuntimeParts::new(RuntimeConfig::default());
+        let runtime = parts.runtime().clone();
         let sender = runtime.create_sender();
         let actor = runtime
             .spawn(VastAiProviderMonitorActor::new(
@@ -578,7 +578,11 @@ impl VastAiLeaseClient for ToolsVastAiLeaseClient {
                 sender,
             ))
             .ok()?;
-        Some(VastAiProviderMonitor::new(runtime, actor))
+        Some(VastAiProviderMonitor::new(
+            runtime,
+            SingleThreadRuntime::new(parts),
+            actor,
+        ))
     }
 
     fn destroy_contract(&mut self, contract_id: u64) -> Result<(), String> {
@@ -951,15 +955,15 @@ fn stop_ssh_child(child: &mut Option<Child>) {
 #[derive(Clone)]
 pub(crate) struct SshCommandBootstrapLauncher {
     ssh_identity: Option<PathBuf>,
-    runtime: Arc<Runtime>,
+    runtime: Runtime,
 }
 pub(crate) struct SshCommandBootstrapHandle {
     actor: ActorAddress,
-    runtime: Arc<Runtime>,
+    runtime: Runtime,
 }
 
 impl SshCommandBootstrapLauncher {
-    pub(crate) fn new(ssh_identity: Option<PathBuf>, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(ssh_identity: Option<PathBuf>, runtime: Runtime) -> Self {
         Self {
             ssh_identity,
             runtime,
@@ -999,13 +1003,12 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
 
         Ok(SshCommandBootstrapHandle {
             actor,
-            runtime: Arc::clone(&self.runtime),
+            runtime: self.runtime.clone(),
         })
     }
 
     fn stop_bootstrap(&mut self, handle: &mut Self::Handle) {
         let _ = handle.runtime.send_to(handle.actor, SshBootstrapMsg::Stop);
-        handle.runtime.tick();
     }
 }
 

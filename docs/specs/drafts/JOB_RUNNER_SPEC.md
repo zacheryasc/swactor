@@ -1,8 +1,9 @@
 # Synaptic Job Runner Specification
 
 Id: 4
-Last modified:
+Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
 Last reviewed:
+> Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
 ---
 

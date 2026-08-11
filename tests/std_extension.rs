@@ -46,7 +46,7 @@ impl ActorInterface for JoinOnStart {
 
 #[test]
 fn std_extension_installs() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let actor = rt.spawn(PingPongActor).unwrap();
 
@@ -57,14 +57,14 @@ fn std_extension_installs() {
         },
     )
     .unwrap();
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
 
     assert_eq!(inbox.try_recv(), Some(Pong));
 }
 
 #[test]
 fn runtime_naming_lifecycle() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let actor = rt.spawn(PingPongActor).unwrap();
 
@@ -79,7 +79,7 @@ fn runtime_naming_lifecycle() {
         },
     )
     .unwrap();
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
     assert_eq!(inbox.try_recv(), Some(Pong));
 
     assert!(
@@ -96,13 +96,13 @@ fn runtime_naming_lifecycle() {
 
     rt.register_name("worker", actor).unwrap();
     rt.stop_actor(actor).unwrap();
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
     assert_eq!(rt.where_is("worker"), None, "dead actors are unregistered");
 }
 
 #[test]
 fn runtime_groups_lifecycle() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let a = rt.spawn(PingPongActor).unwrap();
     let b = rt.spawn(PingPongActor).unwrap();
@@ -126,21 +126,21 @@ fn runtime_groups_lifecycle() {
         ),
         2
     );
-    tick_n(&rt, 2);
-    assert_eq!(tick_and_drain(&rt, &inbox, 0), vec![Pong, Pong]);
+    tick_n(&mut host, 2);
+    assert_eq!(tick_and_drain(&mut host, &inbox, 0), vec![Pong, Pong]);
 
     rt.leave_group(a, "workers");
     assert_eq!(rt.group_members("workers"), vec![b]);
 
     rt.stop_actor(b).unwrap();
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
     assert!(rt.group_members("workers").is_empty());
     assert!(rt.groups().is_empty());
 }
 
 #[test]
 fn ctx_watch_delivers_actor_exited() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<ActorExited>().unwrap();
     let target = rt.spawn(PanicActor).unwrap();
     rt.spawn(ReportExitTo {
@@ -148,10 +148,10 @@ fn ctx_watch_delivers_actor_exited() {
         report_to: *inbox.addr(),
     })
     .unwrap();
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
 
     rt.send_to(target, PanicMsg).unwrap();
-    tick_n(&rt, 4);
+    tick_n(&mut host, 4);
 
     let exited = inbox.try_recv().expect("watch notification");
     assert_eq!(exited.addr, target);
@@ -160,10 +160,10 @@ fn ctx_watch_delivers_actor_exited() {
 
 #[test]
 fn ctx_join_group_receives_runtime_publish() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     rt.spawn(JoinOnStart { group: "joined" }).unwrap();
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
 
     assert_eq!(rt.group_members("joined").len(), 1);
     assert_eq!(
@@ -175,7 +175,7 @@ fn ctx_join_group_receives_runtime_publish() {
         ),
         1
     );
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
 
     assert_eq!(inbox.try_recv(), Some(Pong));
 }

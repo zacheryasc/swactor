@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
-use swactor::runtime::{Ctx, Runtime};
-use swactor_engine::EngineHandle;
+use swactor::runtime::{Ctx, Runtime, RuntimeParts};
 use swactor::stats::StatsHook;
+use swactor_engine::EngineHandle;
 use swactor::std::StdExtension;
 use swactor_transport::{CodecRegistry, CodecRemoteSink, NetworkMessage, TransportRouter};
 
@@ -48,7 +48,7 @@ pub(crate) struct DistributionActorAddrs {
 }
 
 pub(crate) struct DistributionRuntimeStack {
-    pub runtime: Arc<Runtime>,
+    pub runtime: Runtime,
     /// The node engine this stack is bound to. Protocol ticking and all
     /// supporting work schedule on this stored handle; the stack does not
     /// accept an unrelated engine at each call (ENGINE_SPEC.md).
@@ -64,39 +64,41 @@ pub(crate) struct DistributionRuntimeStack {
 }
 
 impl DistributionRuntimeStack {
-    /// Build and configure the core swactor runtime + codec, returning the
-    /// shared transport router needed by [`new_from_runtime`]. The runtime is
-    /// fully configured — extension, remote sink, statistics hook — but no
-    /// actors are spawned yet.
+    /// Build and configure the core swactor runtime parts + codec, returning the
+    /// cloned runtime handle and shared transport router needed by
+    /// [`new_from_runtime`]. The parts are fully configured — extension, remote
+    /// sink, statistics hook — but no actors are spawned yet.
     ///
-    /// This split lets the engine own the runtime before the driver exists:
-    /// construct the runtime, hand it to [`Engine::new`](swactor_engine::Engine),
-    /// create the driver (which needs the engine handle), then spawn actors via
-    /// [`new_from_runtime`] using `driver.node_id()`.
+    /// This split lets the engine own the runtime workers before the driver
+    /// exists: construct the parts, clone the runtime handle, hand the parts to
+    /// [`Engine::new`](swactor_engine::Engine), create the driver (which needs
+    /// the engine handle), then spawn actors via [`new_from_runtime`] using
+    /// `driver.node_id()`.
     pub(crate) fn build_runtime(
         extend_codecs: impl FnOnce(&mut CodecRegistry),
         stats_hook: Option<Arc<dyn StatsHook>>,
-    ) -> (Arc<Runtime>, Arc<CodecRegistry>, Arc<TransportRouter>) {
-        let mut runtime =
-            Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
+    ) -> (RuntimeParts, Runtime, Arc<CodecRegistry>, Arc<TransportRouter>) {
+        let mut parts = RuntimeParts::new(RuntimeConfig::default())
+            .with_extension(Arc::new(StdExtension::new()));
         let mut codec = actor_codec_registry();
         extend_codecs(&mut codec);
         let codec = Arc::new(codec);
         let transport_router = Arc::new(TransportRouter::new());
+        let runtime = parts.runtime().clone();
         runtime.set_remote_sink(Arc::new(CodecRemoteSink::new(
             Arc::clone(&codec),
             Arc::clone(&transport_router),
         )));
         if let Some(hook) = stats_hook {
-            runtime.set_stats_hook(hook);
+            parts = parts.with_stats_hook(hook);
         }
-        (Arc::new(runtime), codec, transport_router)
+        (parts, runtime, codec, transport_router)
     }
 
     /// Spawn the four distribution protocol actors on a pre-built runtime.
-    /// Used after [`build_runtime`] when the engine already owns the runtime.
+    /// Used after [`build_runtime`] when the engine already owns the workers.
     pub(crate) fn new_from_runtime(
-        runtime: Arc<Runtime>,
+        runtime: Runtime,
         codec: Arc<CodecRegistry>,
         transport_router: Arc<TransportRouter>,
         node_id: NodeId,
@@ -192,20 +194,6 @@ impl DistributionRuntimeStack {
                 membership_fanout: fanout_addr,
             },
         }
-    }
-
-    /// Convenience: build the runtime and spawn actors in one step. Use
-    /// [`build_runtime`] + [`new_from_runtime`] when the engine must own the
-    /// runtime before the driver is constructed.
-    pub(crate) fn new_with_codecs(
-        node_id: NodeId,
-        config: DistributedNodeConfig,
-        extend_codecs: impl FnOnce(&mut CodecRegistry),
-        stats_hook: Option<Arc<dyn StatsHook>>,
-        engine: EngineHandle,
-    ) -> Self {
-        let (runtime, codec, transport_router) = Self::build_runtime(extend_codecs, stats_hook);
-        Self::new_from_runtime(runtime, codec, transport_router, node_id, config, engine)
     }
 
     pub(crate) fn actor_bridge_routes(&self) -> HashMap<String, ActorAddress> {

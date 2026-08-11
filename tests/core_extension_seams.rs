@@ -8,7 +8,7 @@ use swactor::actor::{
 };
 use swactor::config::RuntimeConfig;
 use swactor::extension::{RuntimeExtension, WorkerExtension};
-use swactor::runtime::Runtime;
+use swactor::runtime::{RuntimeParts, SingleThreadRuntime};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SpawnMarker(&'static str);
@@ -143,9 +143,9 @@ impl WorkerExtension for SeamWorkerExtension {
     }
 }
 
-fn tick_n(rt: &Runtime, n: usize) {
+fn tick_n(host: &mut SingleThreadRuntime, n: usize) {
     for _ in 0..n {
-        rt.tick();
+        host.try_tick();
     }
 }
 
@@ -168,16 +168,19 @@ impl ActorInterface for MarkerReporter {
 #[test]
 fn on_spawn_environment_mutation_is_visible_to_actor() {
     let state = Arc::new(SeamState::default());
-    let rt = Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(
-        SeamExtension::new(Arc::clone(&state)).with_spawn_marker(),
-    ));
+    let parts = RuntimeParts::new(RuntimeConfig::default())
+        .with_extension(Arc::new(
+            SeamExtension::new(Arc::clone(&state)).with_spawn_marker(),
+        ));
+    let rt = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let inbox = rt.new_inbox::<SpawnMarkerSeen>().unwrap();
 
     rt.spawn(MarkerReporter {
         report_to: *inbox.addr(),
     })
     .unwrap();
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
 
     assert_eq!(
         inbox.try_recv(),
@@ -199,14 +202,16 @@ impl ActorInterface for PanicOnPing {
 #[test]
 fn on_actor_death_messages_are_routed() {
     let state = Arc::new(SeamState::default());
-    let rt = Runtime::new(RuntimeConfig::default())
+    let parts = RuntimeParts::new(RuntimeConfig::default())
         .with_extension(Arc::new(SeamExtension::new(Arc::clone(&state))));
+    let rt = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let inbox = rt.new_inbox::<DeathSeen>().unwrap();
     *state.death_report_to.lock() = Some(*inbox.addr());
 
     let target = rt.spawn(PanicOnPing).unwrap();
     rt.send_to(target, ()).unwrap();
-    tick_n(&rt, 4);
+    tick_n(&mut host, 4);
 
     assert_eq!(inbox.try_recv(), Some(DeathSeen(target)));
 }
@@ -214,12 +219,14 @@ fn on_actor_death_messages_are_routed() {
 #[test]
 fn cleanup_dead_receives_dead_actor_batch() {
     let state = Arc::new(SeamState::default());
-    let rt = Runtime::new(RuntimeConfig::default())
+    let parts = RuntimeParts::new(RuntimeConfig::default())
         .with_extension(Arc::new(SeamExtension::new(Arc::clone(&state))));
+    let rt = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
 
     let target = rt.spawn(PanicOnPing).unwrap();
     rt.send_to(target, ()).unwrap();
-    tick_n(&rt, 4);
+    tick_n(&mut host, 4);
 
     assert!(state.cleaned.lock().contains(&target));
 }
@@ -242,9 +249,11 @@ impl ActorInterface for WorkerRequestActor {
 #[test]
 fn worker_extension_request_is_handled_and_emits_message() {
     let state = Arc::new(SeamState::default());
-    let rt = Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(
+    let parts = RuntimeParts::new(RuntimeConfig::default()).with_extension(Arc::new(
         SeamExtension::new(Arc::clone(&state)).with_worker_extension(),
     ));
+    let rt = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let inbox = rt.new_inbox::<WorkerExtFired>().unwrap();
     let actor = rt
         .spawn(WorkerRequestActor {
@@ -253,7 +262,7 @@ fn worker_extension_request_is_handled_and_emits_message() {
         .unwrap();
 
     rt.send_to(actor, ()).unwrap();
-    tick_n(&rt, 4);
+    tick_n(&mut host, 4);
 
     assert_eq!(inbox.try_recv(), Some(WorkerExtFired));
 }
@@ -261,13 +270,15 @@ fn worker_extension_request_is_handled_and_emits_message() {
 #[test]
 fn worker_extension_pending_work_keeps_runtime_progressing() {
     let state = Arc::new(SeamState::default());
-    let rt = Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(
+    let parts = RuntimeParts::new(RuntimeConfig::default()).with_extension(Arc::new(
         SeamExtension::new(Arc::clone(&state)).with_worker_extension(),
     ));
+    let rt = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let inbox = rt.new_inbox::<WorkerExtFired>().unwrap();
     state.worker_pending.lock().push(*inbox.addr());
 
-    rt.tick();
+    host.try_tick();
 
     assert_eq!(inbox.try_recv(), Some(WorkerExtFired));
 }

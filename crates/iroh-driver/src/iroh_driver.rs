@@ -317,8 +317,8 @@ pub struct IrohDriver {
 /// State the driver needs to shuttle frames between iroh and the swactor runtime
 /// once the protocol runs as actors (see [`IrohDriver::enable_actor_bridge`]).
 struct ActorBridge {
-    /// The swactor runtime, for `deliver_raw` of decoded inbound + `SendFailed`.
-    rt: Arc<Runtime>,
+    /// The swactor runtime handle, for `deliver_raw` of decoded inbound + `SendFailed`.
+    rt: Runtime,
     /// Actor codec: wire `type_tag` → the actor `Incoming` variant and back.
     codec: Arc<CodecRegistry>,
     /// `type_tag` → the local actor mailbox that owns it (ingress routing table).
@@ -934,7 +934,7 @@ impl IrohDriver {
     /// adapter pump ([`Self::install_actor_bridge_pump`]).
     pub fn enable_actor_bridge(
         &mut self,
-        rt: Arc<Runtime>,
+        rt: Runtime,
         codec: Arc<CodecRegistry>,
         routes: HashMap<String, ActorAddress>,
         swim_addr: ActorAddress,

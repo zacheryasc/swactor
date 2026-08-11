@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use swactor::{
     actor::{ActorAddress, ActorInterface},
-    runtime::{Ctx, Runtime, RuntimeConfig},
+    runtime::{Ctx, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime},
     Error,
 };
 use swactor_transport::{
@@ -111,9 +111,16 @@ fn build_codec_registry() -> CodecRegistry {
     cr
 }
 
-fn tick_n(rt: &Runtime, n: usize) {
+fn runtime_host() -> (Runtime, SingleThreadRuntime) {
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let host = SingleThreadRuntime::new(parts);
+    (runtime, host)
+}
+
+fn tick_n(host: &mut SingleThreadRuntime, n: usize) {
     for _ in 0..n {
-        rt.tick();
+        host.tick();
     }
 }
 
@@ -141,18 +148,17 @@ fn two_runtimes_communicate_via_in_memory_transport() {
     let codecs = Arc::new(build_codec_registry());
 
     // Runtime A — the sender
-    let mut rt_a = Runtime::new(RuntimeConfig::default());
+    let (rt_a, _host_a) = runtime_host();
     let (transport_a_to_b, rx_b) = InMemoryTransport::pair();
     let router_a = TransportRouter::new();
 
     // Runtime B — has the PongActor
-    let mut rt_b = Runtime::new(RuntimeConfig::default());
+    let (rt_b, mut host_b) = runtime_host();
     let (transport_b_to_a, rx_a) = InMemoryTransport::pair();
     let router_b = TransportRouter::new();
 
-    // Spawn PongActor on B, drain spawn queue
+    // Spawn PongActor on B; drain spawn queue after remote sinks are installed.
     let pong_addr = rt_b.spawn(PongActor).unwrap();
-    tick_n(&rt_b, 1);
 
     // Create inbox on A to receive the reply
     let inbox_a = rt_a.new_inbox::<Pong>().unwrap();
@@ -171,6 +177,7 @@ fn two_runtimes_communicate_via_in_memory_transport() {
         codecs.clone(),
         Arc::new(router_b),
     )));
+    tick_n(&mut host_b, 1);
 
     // A sends Ping to pong_addr — this goes via transport
     rt_a.send_to(
@@ -184,7 +191,7 @@ fn two_runtimes_communicate_via_in_memory_transport() {
 
     // Deliver from A→B transport, tick B to process
     drain_transport(&rx_b, &codecs, &rt_b);
-    tick_n(&rt_b, 1);
+    tick_n(&mut host_b, 1);
 
     // Deliver reply from B→A transport
     drain_transport(&rx_a, &codecs, &rt_a);
@@ -207,7 +214,7 @@ fn unregistered_type_produces_clear_error() {
     let fake_addr = ActorAddress::new_random();
     router.add_route(fake_addr, transport);
 
-    let mut rt = Runtime::new(RuntimeConfig::default());
+    let (rt, _host) = runtime_host();
     rt.set_remote_sink(Arc::new(CodecRemoteSink::new(codecs, Arc::new(router))));
 
     let result = rt.send_to(
@@ -258,7 +265,7 @@ fn local_send_still_bypasses_transport() {
     let remote_addr = ActorAddress::new_random();
     router.add_route(remote_addr, transport);
 
-    let mut rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     rt.set_remote_sink(Arc::new(CodecRemoteSink::new(codecs, Arc::new(router))));
 
     // Spawn a local PongActor + inbox
@@ -275,7 +282,7 @@ fn local_send_still_bypasses_transport() {
     )
     .unwrap();
 
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
 
     // Verify local delivery worked
     let pong = inbox.try_recv().expect("should receive Pong locally");
@@ -295,8 +302,8 @@ fn round_trip_across_two_runtimes() {
     let codecs = Arc::new(build_codec_registry());
 
     // Set up two runtimes with bidirectional transports
-    let mut rt_a = Runtime::new(RuntimeConfig::default());
-    let mut rt_b = Runtime::new(RuntimeConfig::default());
+    let (rt_a, _host_a) = runtime_host();
+    let (rt_b, mut host_b) = runtime_host();
 
     let (transport_a2b, rx_b) = InMemoryTransport::pair();
     let (transport_b2a, rx_a) = InMemoryTransport::pair();
@@ -304,9 +311,8 @@ fn round_trip_across_two_runtimes() {
     let router_a = TransportRouter::new();
     let router_b = TransportRouter::new();
 
-    // Spawn actors
+    // Spawn actors; drain spawn queue after remote sinks are installed.
     let pong_addr = rt_b.spawn(PongActor).unwrap();
-    tick_n(&rt_b, 1);
 
     let inbox_a = rt_a.new_inbox::<Pong>().unwrap();
     let inbox_addr = *inbox_a.addr();
@@ -323,6 +329,7 @@ fn round_trip_across_two_runtimes() {
         codecs.clone(),
         Arc::new(router_b),
     )));
+    tick_n(&mut host_b, 1);
 
     // Send 3 pings and verify 3 pongs come back
     for i in 0..3u32 {
@@ -338,7 +345,7 @@ fn round_trip_across_two_runtimes() {
 
     // Flush A→B
     drain_transport(&rx_b, &codecs, &rt_b);
-    tick_n(&rt_b, 1);
+    tick_n(&mut host_b, 1);
 
     // Flush B→A
     drain_transport(&rx_a, &codecs, &rt_a);

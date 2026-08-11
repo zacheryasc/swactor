@@ -3,6 +3,9 @@
 //! Uses proptest for randomized testing and proptest-state-machine for
 //! stateful property testing with automatic shrinking of failing sequences.
 
+mod common;
+use common::plain_host;
+
 use std::collections::HashMap;
 
 use proptest::prelude::*;
@@ -10,7 +13,7 @@ use proptest_state_machine::{ReferenceStateMachine, StateMachineTest, prop_state
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
-use swactor::runtime::{Ctx, Inbox, Runtime};
+use swactor::runtime::{Ctx, Inbox, Runtime, SingleThreadRuntime};
 
 // ─── Shared Actor Types ────────────────────────────────────────────────────
 
@@ -76,7 +79,7 @@ proptest! {
             actor_message_budget: budget,
             ..Default::default()
         };
-        let rt = Runtime::new(config);
+        let (rt, mut host) = plain_host(config);
         let inbox = rt.new_inbox::<Ping>().unwrap();
 
         let mut addrs = Vec::new();
@@ -84,7 +87,7 @@ proptest! {
             addrs.push(rt.spawn(CounterActor { count: 0, reply_to: *inbox.addr() }).unwrap());
         }
 
-        rt.tick(); // on_start
+        host.try_tick(); // on_start
 
         // Send msgs_per messages to each actor
         for addr in &addrs {
@@ -94,7 +97,7 @@ proptest! {
         }
 
         // Single tick — each actor should process at most `budget` messages
-        rt.tick();
+        host.try_tick();
 
         // Drain inbox to count replies per actor
         // CounterActor replies with incrementing count, so max reply value = messages processed
@@ -114,12 +117,12 @@ proptest! {
     /// Spawn N actors and verify all get unique addresses and appear in stats.
     #[test]
     fn spawn_n_actors_all_tracked(n in 1usize..50) {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, mut host) = plain_host(RuntimeConfig::default());
         let mut addrs = Vec::new();
         for _ in 0..n {
             addrs.push(rt.spawn(NoopActor).unwrap());
         }
-        rt.tick(); // process spawns
+        host.try_tick(); // process spawns
 
         let stats = rt.stats();
         prop_assert_eq!(stats.actors.len(), n, "Expected {} actors in stats", n);
@@ -286,6 +289,8 @@ impl ReferenceStateMachine for SwactorModel {
 
 struct SutState {
     runtime: Runtime,
+    /// Single-thread host that owns the workers; ticking lives here.
+    host: SingleThreadRuntime,
     inbox: Inbox<Ping>,
     /// Maps reference actor_id to actual ActorAddress
     actor_map: HashMap<usize, ActorAddress>,
@@ -304,10 +309,11 @@ impl StateMachineTest for SwactorTest {
     type Reference = SwactorModel;
 
     fn init_test(_ref_state: &RefState) -> Self::SystemUnderTest {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, host) = plain_host(RuntimeConfig::default());
         let inbox = rt.new_inbox::<Ping>().unwrap();
         SutState {
             runtime: rt,
+            host,
             inbox,
             actor_map: HashMap::new(),
             panic_ids: Vec::new(),
@@ -357,11 +363,11 @@ impl StateMachineTest for SwactorTest {
                 }
             }
             Transition::Tick => {
-                sut.runtime.tick();
+                sut.host.try_tick();
             }
             Transition::TickN(n) => {
                 for _ in 0..n {
-                    sut.runtime.tick();
+                    sut.host.try_tick();
                 }
             }
             Transition::StopActor(idx) => {

@@ -10,6 +10,28 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use swactor::actor::{ActorInterface, Ctx};
+use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts};
+
+pub fn runtime_parts(config: RuntimeConfig) -> (RuntimeParts, Runtime) {
+    let parts = RuntimeParts::new(config);
+    let runtime = parts.runtime().clone();
+    (parts, runtime)
+}
+
+pub fn default_runtime_parts() -> (RuntimeParts, Runtime) {
+    runtime_parts(RuntimeConfig::default())
+}
+pub fn runtime_parts_with_workers(worker_count: usize) -> (RuntimeParts, Runtime) {
+    let mut config = RuntimeConfig::default();
+    config.worker_count = worker_count;
+    runtime_parts(config)
+}
+
+
+pub fn default_parts() -> RuntimeParts {
+    RuntimeParts::new(RuntimeConfig::default())
+}
+
 
 // ── Probe message ───────────────────────────────────────────────────────────
 

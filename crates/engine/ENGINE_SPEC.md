@@ -1,8 +1,9 @@
 # swactor engine — specification
 
 Id: 1
-Last modified: f8fc594b95871813a890b5d60f60dee505ef93bc
+Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
 Last reviewed: f8fc594b95871813a890b5d60f60dee505ef93bc
+> Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
 **Scope:** the execution substrate that drives swactor workers and hosts its async side-work, defined as an interface implemented per environment.
 
@@ -46,9 +47,9 @@ This spec defines the **engine**: a swactor-owned composite that retains a selec
 
 ## 3. Model
 
-- The **core runtime** owns its actor-workers, pools, mailboxes, and routing. Actor execution remains synchronous and single-writer; core exposes tick semantics that advance those state machines and return immediately.
-- The **engine** is a swactor-owned composite. It retains the selected execution substrate and the core runtime, and it does exactly two things:
-  1. **Drives actor execution** — schedules core ticks without application involvement.
+- The **core runtime** is constructed as `RuntimeParts`: a cloneable runtime handle plus a fixed set of owned workers. The handle owns shared routing, inboxes, and producer queues; each worker owns its actor pool and mailbox drains. Actor execution remains synchronous and single-writer; each worker exposes a synchronous transition that advances its state machine and returns immediately.
+- The **engine** is a swactor-owned composite. It retains the selected execution substrate, retains the core runtime handle, moves every worker into a core driver, and does exactly two things:
+  1. **Drives actor execution** — schedules worker transitions without application involvement.
   2. **Runs supporting work** — schedules the I/O, blocking calls, retries, and other long-lived flows that back actors.
 - **The engine owns all progression.** Actor handlers never `.await`. Every handler is a synchronous transition that returns control immediately; the engine carries control flow across time.
 - Actor execution and supporting work are not independently driven systems. They share one engine, one execution policy, and one lifecycle. An engine may use multiple internal pools, threads, scheduler domains, or substrate-native facilities to meet its progression and performance requirements.
@@ -58,7 +59,7 @@ This spec defines the **engine**: a swactor-owned composite that retains a selec
 
 The interface is authored from swactor's needs. It is a **contract** — operations plus their semantics and invariants. A Rust trait is its canonical Rust binding; Go, JS, and other hosts implement the same contract natively. This spec defines the contract, not the Rust signature.
 
-Constructing a swactor engine consumes or retains the selected execution substrate and establishes core driving for the engine's lifetime. Worker installation is internal engine behavior: applications and integrations do not register workers or receive core routing handles.
+Constructing a swactor engine consumes configured `RuntimeParts` and the selected execution substrate, then establishes core driving for the engine's lifetime. Worker installation is internal engine behavior: applications and integrations do not register workers or receive core routing handles.
 
 **The engine handle provides:**
 
@@ -71,13 +72,13 @@ Constructing a swactor engine consumes or retains the selected execution substra
 
 Time belongs to the engine rather than actor core. Engine-hosted work needs delays, intervals, retry deadlines, and timeouts; leaving those operations outside the contract would keep integrations such as Iroh and Myelin coupled to `tokio::time` or `std::thread::sleep`. An engine-owned monotonic clock also gives all hosted work one time source and allows a deterministic engine to substitute virtual time without changing integration code.
 
-**Existing core integration.** The engine wraps and drives core without redefining it. Actor progression uses the existing `Runtime::tick()` / `Runtime::try_tick()` surface, and message delivery continues through existing runtime and sender APIs. Core implements no engine trait, exposes no worker callback, and receives no engine-specific routing handle. Core owns actor logic, routing, inboxes, and delivery; the engine owns when core transitions run and schedules all supporting work on the same substrate. **Core only transitions. The engine drives.**
+**Existing core integration.** The engine wraps and drives core without redefining it. Actor progression uses one core driver per worker; each driver calls that worker's synchronous transition and never touches any other worker. Message delivery continues through existing runtime and sender APIs. Core implements no engine trait, exposes no worker callback, and receives no engine-specific routing handle. Core owns actor logic, routing, inboxes, and delivery; the engine owns when core transitions run and schedules all supporting work on the same substrate. **Core only transitions. The engine drives.**
 
 ## 5. Driving workers
 
 - Driving core is intrinsic to the engine and is established during engine construction. Application code and integrations never register or manually drive workers.
-- The engine advances core through its existing synchronous tick semantics. Each tick runs to completion and returns control to the engine scheduler.
-- **Non-reentrancy.** The engine must never invoke the same worker concurrently. Actor state is live only for the duration of a synchronous tick.
+- The engine advances core through one long-lived driver task per worker. Each poll runs one worker transition to completion and returns control to the engine scheduler.
+- **Non-reentrancy.** The engine must never invoke the same worker concurrently. Moving each worker into exactly one driver is the native Rust implementation's non-reentrancy proof.
 - **Scheduling strategy is the engine's choice.** Tick cadence, batching, thread placement, and cooperative scheduling are implementation decisions, subject to the progress guarantees in §8.
 
 ## 6. Capability surface

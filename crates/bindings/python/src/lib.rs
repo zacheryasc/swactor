@@ -8,7 +8,9 @@ use ::swactor::actor::{
     Actor, ActorAddress, ActorInterface, AnyActor, Ctx, Environment, SpawnRequest,
 };
 use ::swactor::config::RuntimeConfig;
-use ::swactor::runtime::{Inbox, Runtime};
+use ::swactor::runtime::{
+    Inbox, Runtime, RuntimeParts, SingleThreadRuntime as SingleThreadRuntimeHost,
+};
 
 // ─── PyMsg newtype ───────────────────────────────────────────────────────────
 
@@ -224,6 +226,12 @@ pub struct PyRuntimeConfig {
     max_actors: usize,
     #[pyo3(get, set)]
     channel_buffer_size: usize,
+    #[pyo3(get, set)]
+    actor_message_budget: usize,
+    #[pyo3(get, set)]
+    worker_count: usize,
+    #[pyo3(get, set)]
+    worker_ingress_budget: usize,
 }
 
 #[pymethods]
@@ -233,11 +241,23 @@ impl PyRuntimeConfig {
         *,
         max_actors = 1_000,
         channel_buffer_size = 1_000,
+        actor_message_budget = 64,
+        worker_count = 1,
+        worker_ingress_budget = 1_024,
     ))]
-    fn new(max_actors: usize, channel_buffer_size: usize) -> Self {
+    fn new(
+        max_actors: usize,
+        channel_buffer_size: usize,
+        actor_message_budget: usize,
+        worker_count: usize,
+        worker_ingress_budget: usize,
+    ) -> Self {
         Self {
             max_actors,
             channel_buffer_size,
+            actor_message_budget,
+            worker_count,
+            worker_ingress_budget,
         }
     }
 }
@@ -247,16 +267,19 @@ impl From<PyRuntimeConfig> for RuntimeConfig {
         RuntimeConfig {
             max_actors: py.max_actors,
             channel_buffer_size: py.channel_buffer_size,
-            ..Default::default()
+            actor_message_budget: py.actor_message_budget,
+            worker_count: py.worker_count,
+            worker_ingress_budget: py.worker_ingress_budget,
         }
     }
 }
 
 // ─── PyRuntime ───────────────────────────────────────────────────────────────
 
-#[pyclass(name = "Runtime")]
+#[pyclass(name = "Runtime", unsendable)]
 pub struct PyRuntime {
-    inner: Option<Runtime>,
+    runtime: Runtime,
+    host: SingleThreadRuntimeHost,
 }
 
 #[pymethods]
@@ -268,47 +291,37 @@ impl PyRuntime {
             Some(c) => c.into(),
             None => RuntimeConfig::default(),
         };
-        Self {
-            inner: Some(Runtime::new(config)),
-        }
+        let parts = RuntimeParts::new(config);
+        let runtime = parts.runtime().clone();
+        let host = SingleThreadRuntimeHost::new(parts);
+        Self { runtime, host }
     }
 
     fn spawn(&self, handler: PyObject) -> PyResult<PyActorAddress> {
-        let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
-        })?;
+        let rt = &self.runtime;
         let actor = PyActor::new(handler);
         let addr = rt.spawn(actor).map_err(to_py_err)?;
         Ok(PyActorAddress::from(addr))
     }
 
     fn send(&self, addr: &PyActorAddress, msg: PyObject) -> PyResult<()> {
-        let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
-        })?;
+        let rt = &self.runtime;
         rt.send_to(addr.inner, PyMsg(msg)).map_err(to_py_err)
     }
 
     fn inbox(&self) -> PyResult<PyInbox> {
-        let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
-        })?;
+        let rt = &self.runtime;
         let inbox: Inbox<PyMsg> = rt.new_inbox().map_err(to_py_err)?;
         Ok(PyInbox { inner: inbox })
     }
 
-    fn tick(&self) -> PyResult<()> {
-        let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
-        })?;
-        rt.tick();
+    fn tick(&mut self) -> PyResult<()> {
+        self.host.tick();
         Ok(())
     }
 
     fn stats(&self) -> PyResult<PyRuntimeStats> {
-        let rt = self.inner.as_ref().ok_or_else(|| {
-            pyo3::exceptions::PyRuntimeError::new_err("Runtime not available")
-        })?;
+        let rt = &self.runtime;
         Ok(build_stats(rt))
     }
 }

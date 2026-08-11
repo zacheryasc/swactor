@@ -219,12 +219,11 @@ where
     let actors_channel = orch_datastream.channel_by_name("runtime.actors");
     let orch_stats_hook = orch_datastream.producer.stats_hook_on(actors_channel);
 
-    // Build the core swactor runtime, then hand it to the engine. The engine
-    // owns both the runtime (it drives actor progression) and the Tokio
-    // substrate (it schedules all background work). After this point the engine
-    // is the sole owner of Tokio and core progression — no raw handles are
-    // passed to components (ENGINE_SPEC.md).
-    let (runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
+    // Build the core swactor runtime parts, clone the routing handle needed by
+    // integrations, then hand the workers to the engine. The engine owns both
+    // core progression and the Tokio substrate (it schedules all background
+    // work); components retain only cheap Runtime handles (ENGINE_SPEC.md).
+    let (parts, runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
         |registry| {
             register_myelin_actor_codecs(registry);
             datastream::wire::register_datastream_codec(registry);
@@ -232,7 +231,7 @@ where
         Some(orch_stats_hook),
     );
     let engine = match TokioBackend::new(TokioConfig::default())
-        .and_then(|backend| Engine::new(runtime.clone(), backend))
+        .and_then(|backend| Engine::new(parts, backend))
     {
         Ok(engine) => {
             bootstrap(
@@ -461,7 +460,7 @@ where
     let (work_tx, work_rx) = mpsc::channel::<PromptWork>();
     let stop_rx = stop_rx.unwrap_or_else(spawn_stop_listener);
 
-    let provisioner = config.build_provisioner(Arc::clone(&stack.runtime))?;
+    let provisioner = config.build_provisioner(stack.runtime.clone())?;
     bootstrap(
         &mut orch_datastream,
         dashboard.as_ref(),
@@ -1765,7 +1764,7 @@ impl Config {
 
     fn build_provisioner(
         &self,
-        bootstrap_runtime: Arc<swactor::runtime::Runtime>,
+        bootstrap_runtime: swactor::runtime::Runtime,
     ) -> Result<Box<dyn ProvisionPlugin>, String> {
         match self.provider.as_str() {
             "process" => {
@@ -4476,7 +4475,7 @@ impl PipelinePromptRuntime {
         &mut self,
         request: SubmitPrompt,
         events: mpsc::Sender<PromptEvent>,
-        runtime: &Arc<swactor::runtime::Runtime>,
+        runtime: &swactor::runtime::Runtime,
         dashboard: Option<&DashboardSupport>,
         orch_datastream: &mut OrchDatastream,
         run_id: u64,
@@ -4583,7 +4582,7 @@ impl PipelinePromptRuntime {
 
     fn drain_tokenizer_events(
         &mut self,
-        runtime: &Arc<swactor::runtime::Runtime>,
+        runtime: &swactor::runtime::Runtime,
         tokenizer_events: &swactor::runtime::Inbox<TokenizerEvent>,
         dashboard: Option<&DashboardSupport>,
         orch_datastream: &mut OrchDatastream,
@@ -4676,7 +4675,7 @@ impl PipelinePromptRuntime {
     #[allow(clippy::too_many_arguments)]
     fn handle_decoded_tokens(
         &mut self,
-        _runtime: &Arc<swactor::runtime::Runtime>,
+        _runtime: &swactor::runtime::Runtime,
         request_id: u64,
         text: String,
         dashboard: Option<&DashboardSupport>,
@@ -4791,7 +4790,7 @@ impl PipelinePromptRuntime {
 
     fn request_decode(
         &mut self,
-        runtime: &Arc<swactor::runtime::Runtime>,
+        runtime: &swactor::runtime::Runtime,
         request_id: u64,
         token_id: u32,
         eos: bool,
@@ -4863,7 +4862,7 @@ impl PipelinePromptRuntime {
 
     fn drain_tokens(
         &mut self,
-        runtime: &Arc<swactor::runtime::Runtime>,
+        runtime: &swactor::runtime::Runtime,
         dashboard: Option<&DashboardSupport>,
         orch_datastream: &mut OrchDatastream,
         run_id: u64,

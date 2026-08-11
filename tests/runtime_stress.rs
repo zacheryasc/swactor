@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// then processes messages correctly.
 #[test]
 fn runtime_basics() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let addr = rt.spawn(PingPongActor).unwrap();
     let inbox = rt.new_inbox::<Pong>().unwrap();
     rt.send_to(
@@ -29,7 +29,7 @@ fn runtime_basics() {
     .unwrap();
 
     assert!(inbox.try_recv().is_none(), "no processing before tick");
-    tick_n(&rt, 2);
+    tick_n(&mut host, 2);
     assert!(
         inbox.try_recv().is_some(),
         "tick() drives processing"
@@ -47,7 +47,7 @@ fn runtime_basics() {
     )
     .unwrap();
 
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
     assert_eq!(
         done_inbox.try_recv(),
         Some(Done(6)),
@@ -70,7 +70,7 @@ fn high_volume_delivery() {
 
     // ── Part A: 50 senders × 100 messages → one receiver ──
     {
-        let rt = std_runtime(cfg());
+        let (rt, mut host) = std_host(cfg());
         let counter = Arc::new(AtomicUsize::new(0));
         let dummy = rt.new_inbox::<Pong>().unwrap();
         let receiver = rt
@@ -92,7 +92,7 @@ fn high_volume_delivery() {
             }
         }
 
-        tick_n(&rt, 200);
+        tick_n(&mut host, 200);
         let processed = counter.load(Ordering::SeqCst);
         assert_eq!(
             processed, total_expected,
@@ -102,7 +102,7 @@ fn high_volume_delivery() {
 
     // ── Part B: 200 concurrent spawn+send pairs ──
     {
-        let rt = std_runtime(cfg());
+        let (rt, mut host) = std_host(cfg());
         let counter = Arc::new(AtomicUsize::new(0));
         let dummy = rt.new_inbox::<Pong>().unwrap();
         for _ in 0..200 {
@@ -120,14 +120,14 @@ fn high_volume_delivery() {
             .unwrap();
         }
 
-        tick_n(&rt, 50);
+        tick_n(&mut host, 50);
         let received = counter.load(Ordering::SeqCst);
         assert_eq!(received, 200, "all 200 spawn+send pairs complete");
     }
 
     // ── Part C: 50-level chain ──
     {
-        let rt = std_runtime(cfg());
+        let (rt, mut host) = std_host(cfg());
         let addr = rt.spawn(ChainActor).unwrap();
         let inbox = rt.new_inbox::<Done>().unwrap();
         rt.send_to(
@@ -140,7 +140,7 @@ fn high_volume_delivery() {
         )
         .unwrap();
 
-        tick_n(&rt, 100);
+        tick_n(&mut host, 100);
         assert_eq!(
             inbox.try_recv(),
             Some(Done(50)),
@@ -155,7 +155,7 @@ fn high_volume_delivery() {
 /// and all 1000 healthy messages are still processed.
 #[test]
 fn panic_isolation_under_load() {
-    let rt = std_runtime(RuntimeConfig {
+    let (rt, mut host) = std_host(RuntimeConfig {
         max_actors: 5_000,
         channel_buffer_size: 10_000,
         ..Default::default()
@@ -192,7 +192,7 @@ fn panic_isolation_under_load() {
         }
     }
 
-    tick_n(&rt, 200);
+    tick_n(&mut host, 200);
     let expected = 10 * 100;
     let processed = counter.load(Ordering::SeqCst);
 
@@ -209,7 +209,7 @@ fn panic_isolation_under_load() {
 /// messages are accounted for.
 #[test]
 fn sustained_throughput_no_message_loss() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let dummy = rt.new_inbox::<Pong>().unwrap();
     let addr = rt
@@ -228,7 +228,7 @@ fn sustained_throughput_no_message_loss() {
             )
             .unwrap();
         }
-        tick_n(&rt, 5);
+        tick_n(&mut host, 5);
         let processed = counter.load(Ordering::SeqCst);
         assert!(
             processed > batch * 50,
@@ -237,7 +237,7 @@ fn sustained_throughput_no_message_loss() {
     }
 
     // Drain remaining.
-    tick_n(&rt, 100);
+    tick_n(&mut host, 100);
     let total = counter.load(Ordering::SeqCst);
     assert_eq!(total, 1000, "sustained load should not drop any messages");
 }

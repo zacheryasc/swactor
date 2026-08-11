@@ -18,8 +18,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
-use swactor::config::RuntimeConfig;
-use swactor::runtime::Runtime;
 
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
@@ -32,9 +30,9 @@ const DEADLINE: Duration = Duration::from_secs(5);
 #[test]
 fn engine_runs_without_an_ambient_tokio_runtime() {
     // No outer Tokio runtime, no `#[tokio::test]`. The engine owns its runtime.
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let engine = Engine::new(runtime, backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -50,7 +48,7 @@ fn engine_runs_without_an_ambient_tokio_runtime() {
 
 #[test]
 fn engine_drives_core_without_application_ticks() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let (parts, runtime) = default_runtime_parts();
     let received = Arc::new(AtomicUsize::new(0));
     let addr = runtime
         .spawn(RecordingProbe {
@@ -59,7 +57,7 @@ fn engine_drives_core_without_application_ticks() {
         .expect("spawn probe actor");
 
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let _engine = Engine::new(runtime.clone(), backend).expect("construct engine");
+    let _engine = Engine::new(parts, backend).expect("construct engine");
 
     // Deliver AFTER engine construction: a later tick must observe it.
     runtime
@@ -76,9 +74,9 @@ fn engine_drives_core_without_application_ticks() {
 
 #[test]
 fn spawned_supporting_work_runs() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let engine = Engine::new(runtime, backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -94,7 +92,7 @@ fn spawned_supporting_work_runs() {
 
 #[test]
 fn actor_ticks_and_supporting_work_both_progress() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let (parts, runtime) = default_runtime_parts();
     let received = Arc::new(AtomicUsize::new(0));
     let addr = runtime
         .spawn(RecordingProbe {
@@ -103,7 +101,7 @@ fn actor_ticks_and_supporting_work_both_progress() {
         .expect("spawn probe actor");
 
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let engine = Engine::new(runtime.clone(), backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     // Long-lived cooperative supporting work that yields between steps so it
@@ -135,7 +133,7 @@ fn actor_ticks_and_supporting_work_both_progress() {
 
 #[test]
 fn runtime_ticks_are_never_concurrent() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let (parts, runtime) = default_runtime_parts();
     let entered = Arc::new(AtomicBool::new(false));
     let violations = Arc::new(AtomicUsize::new(0));
     let handled = Arc::new(AtomicUsize::new(0));
@@ -148,7 +146,7 @@ fn runtime_ticks_are_never_concurrent() {
         .expect("spawn reentrancy probe");
 
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let _engine = Engine::new(runtime.clone(), backend).expect("construct engine");
+    let _engine = Engine::new(parts, backend).expect("construct engine");
 
     let sender = runtime.create_sender();
     const SENDERS: usize = 4;
@@ -198,7 +196,7 @@ fn blocking_work_does_not_stop_actor_ticks() {
     // A blocking-capability test, not part of the baseline tasks-plus-time
     // contract. Configure a small async worker pool so passing cannot be an
     // accident of excessive worker count.
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let (parts, runtime) = default_runtime_parts();
     let received = Arc::new(AtomicUsize::new(0));
     let addr = runtime
         .spawn(RecordingProbe {
@@ -208,7 +206,7 @@ fn blocking_work_does_not_stop_actor_ticks() {
 
     let backend = TokioBackend::new(TokioConfig { worker_threads: 1 })
         .expect("build tokio backend");
-    let engine = Engine::new(runtime.clone(), backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     // Blocking work that waits on a barrier; it stays stuck for the whole test
@@ -238,9 +236,9 @@ fn blocking_work_does_not_stop_actor_ticks() {
 
 #[test]
 fn engine_clock_is_monotonic() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let engine = Engine::new(runtime, backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     let mut prev = handle.now();
@@ -255,9 +253,9 @@ fn engine_clock_is_monotonic() {
 
 #[test]
 fn engine_timer_fires() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let engine = Engine::new(runtime, backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -275,9 +273,9 @@ fn engine_timer_fires() {
 
 #[test]
 fn engine_interval_recurs() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let engine = Engine::new(runtime, backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
@@ -305,9 +303,9 @@ fn engine_timer_can_be_created_off_runtime() {
     // Construct the timer directly in the test body — no spawned task, no ambient
     // runtime — then await it on an engine task. If the tokio backend's timer
     // needed runtime context at construction, this would panic.
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = TokioBackend::new(TokioConfig::default()).expect("build tokio backend");
-    let engine = Engine::new(runtime, backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
     // Constructed off-runtime: must not panic.
@@ -342,7 +340,7 @@ fn engine_adopts_caller_tuned_tokio_runtime() {
         .expect("build tuned tokio runtime");
     let backend = TokioBackend::from_runtime(tuned);
 
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let (parts, runtime) = default_runtime_parts();
     let received = Arc::new(AtomicUsize::new(0));
     let addr = runtime
         .spawn(RecordingProbe {
@@ -350,7 +348,7 @@ fn engine_adopts_caller_tuned_tokio_runtime() {
         })
         .expect("spawn probe actor");
 
-    let engine = Engine::new(runtime.clone(), backend).expect("construct engine");
+    let engine = Engine::new(parts, backend).expect("construct engine");
     // The adopted substrate still exposes every native capability (§9).
     assert_eq!(
         engine.handle().capabilities(),

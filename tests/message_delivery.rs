@@ -108,7 +108,7 @@ impl ActorInterface for RingNode {
 #[test]
 fn message_routing_at_scale() {
     // 200-actor numbered routing
-    let rt = std_runtime(RuntimeConfig {
+    let (rt, mut host) = std_host(RuntimeConfig {
         max_actors: 300,
         channel_buffer_size: 1024,
         ..Default::default()
@@ -119,7 +119,7 @@ fn message_routing_at_scale() {
     for _ in 0..200 {
         addrs.push(rt.spawn(NumberedActor).unwrap());
     }
-    rt.tick();
+    host.try_tick();
     for (i, addr) in addrs.iter().enumerate() {
         rt.send_to(
             *addr,
@@ -130,7 +130,7 @@ fn message_routing_at_scale() {
         )
         .unwrap();
     }
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
     let replies: Vec<NumberedReply> = std::iter::from_fn(|| inbox.try_recv()).collect();
     assert_eq!(replies.len(), 200, "all 200 actors replied");
     for (i, addr) in addrs.iter().enumerate() {
@@ -144,7 +144,7 @@ fn message_routing_at_scale() {
     }
 
     // 100-hop ring
-    let rt = std_runtime(RuntimeConfig {
+    let (rt, mut host) = std_host(RuntimeConfig {
         max_actors: 200,
         channel_buffer_size: 1024,
         ..Default::default()
@@ -159,7 +159,7 @@ fn message_routing_at_scale() {
         next = addr;
     }
     ring_addrs.reverse();
-    rt.tick();
+    host.try_tick();
     rt.send_to(
         ring_addrs[0],
         RingHop {
@@ -168,7 +168,7 @@ fn message_routing_at_scale() {
         },
     )
     .unwrap();
-    let result = tick_until_recv(&rt, &inbox, 110);
+    let result = tick_until_recv(&mut host, &inbox, 110);
     assert_eq!(
         result,
         Some(RingDone(100)),
@@ -180,7 +180,7 @@ fn message_routing_at_scale() {
 /// rapid spawn+immediate-send, multiple inbox types coexist.
 #[test]
 fn delivery_from_within_handlers() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
 
     // Delegation: spawn+send in handler
     let delegator = rt.spawn(DelegatorActor).unwrap();
@@ -193,7 +193,7 @@ fn delivery_from_within_handlers() {
         },
     )
     .unwrap();
-    let reply = tick_until_recv(&rt, &inbox, 20);
+    let reply = tick_until_recv(&mut host, &inbox, 20);
     assert_eq!(
         reply,
         Some(Done(10)),
@@ -210,7 +210,7 @@ fn delivery_from_within_handlers() {
         },
     )
     .unwrap();
-    let reply = tick_until_recv(&rt, &inbox, 50);
+    let reply = tick_until_recv(&mut host, &inbox, 50);
     assert_eq!(reply, Some(Done(0)), "self-send chain completes");
 
     // Multiple senders reach same actor
@@ -231,7 +231,7 @@ fn delivery_from_within_handlers() {
         },
     )
     .unwrap();
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
     assert!(inbox_a.try_recv().is_some());
     assert_eq!(
         inbox_b.try_recv(),
@@ -240,7 +240,7 @@ fn delivery_from_within_handlers() {
     );
 
     // 50 rapid spawn+immediate-send pairs
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let pong_inbox = rt.new_inbox::<Pong>().unwrap();
     for _ in 0..50 {
         let addr = rt.spawn(PingPongActor).unwrap();
@@ -252,11 +252,11 @@ fn delivery_from_within_handlers() {
         )
         .unwrap();
     }
-    let replies = tick_and_drain(&rt, &pong_inbox, 50);
+    let replies = tick_and_drain(&mut host, &pong_inbox, 50);
     assert_eq!(replies.len(), 50, "all spawn+send pairs complete");
 
     // Multiple inbox types coexist
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let counter_addr = rt.spawn(CounterActor { count: 0 }).unwrap();
     let pinger_addr = rt.spawn(PingPongActor).unwrap();
     let count_inbox = rt.new_inbox::<Count>().unwrap();
@@ -275,7 +275,7 @@ fn delivery_from_within_handlers() {
         },
     )
     .unwrap();
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
     assert_eq!(count_inbox.try_recv(), Some(Count(1)));
     assert_eq!(pong_inbox.try_recv(), Some(Pong));
 }
@@ -284,7 +284,7 @@ fn delivery_from_within_handlers() {
 /// type_mismatch counter.
 #[test]
 fn address_error_handling() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
 
     // Nonexistent address
     let bogus = ActorAddress::new_random();
@@ -298,7 +298,7 @@ fn address_error_handling() {
     rt.send_to(addr, Count(42)).unwrap(); // Count instead of Ping
     rt.send_to(addr, Count(0)).unwrap();
     rt.send_to(addr, Count(0)).unwrap();
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
     let stats = rt.stats();
     let mismatches: u64 = stats.workers.iter().map(|w| w.type_mismatches).sum();
     assert_eq!(mismatches, 3, "3 wrong-type messages counted as mismatches");
@@ -309,7 +309,7 @@ fn address_error_handling() {
 #[test]
 fn fairness_budget_prevents_starvation() {
     // Hot (1000 msgs) vs cold (1 msg), budget=64
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let hot_counter = Arc::new(AtomicUsize::new(0));
     let cold_inbox = rt.new_inbox::<Pong>().unwrap();
     let hot = rt
@@ -335,7 +335,7 @@ fn fairness_budget_prevents_starvation() {
         },
     )
     .unwrap();
-    rt.tick();
+    host.try_tick();
     assert!(
         cold_inbox.try_recv().is_some(),
         "cold actor not starved by hot actor"
@@ -346,7 +346,7 @@ fn fairness_budget_prevents_starvation() {
     );
 
     // Budget=4 with self-send chain of 20 → completes across multiple ticks
-    let rt = std_runtime(RuntimeConfig {
+    let (rt, mut host) = std_host(RuntimeConfig {
         actor_message_budget: 4,
         ..Default::default()
     });
@@ -360,7 +360,7 @@ fn fairness_budget_prevents_starvation() {
         },
     )
     .unwrap();
-    tick_n(&rt, 30);
+    tick_n(&mut host, 30);
     assert_eq!(
         inbox.try_recv(),
         Some(Done(0)),
@@ -368,7 +368,7 @@ fn fairness_budget_prevents_starvation() {
     );
 
     // Unlimited budget (0) drains all
-    let rt = std_runtime(RuntimeConfig {
+    let (rt, mut host) = std_host(RuntimeConfig {
         actor_message_budget: 0,
         ..Default::default()
     });
@@ -388,8 +388,8 @@ fn fairness_budget_prevents_starvation() {
         )
         .unwrap();
     }
-    rt.tick();
-    rt.tick();
+    host.try_tick();
+    host.try_tick();
     assert_eq!(
         counter.load(Ordering::SeqCst),
         500,

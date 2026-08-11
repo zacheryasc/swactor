@@ -345,7 +345,7 @@ fn actor_from_birth_to_first_message() {
     let stopped = Arc::new(AtomicUsize::new(0));
     let handled = Arc::new(AtomicUsize::new(0));
 
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
 
     // Spawn one tracked actor + 4 more sharing the same counters
@@ -366,7 +366,7 @@ fn actor_from_birth_to_first_message() {
     }
 
     // First tick: all 5 on_start fire, no messages processed yet
-    rt.tick();
+    host.try_tick();
     assert_eq!(started.load(Ordering::Relaxed), 5, "on_start per instance");
     assert_eq!(
         handled.load(Ordering::Relaxed),
@@ -386,7 +386,7 @@ fn actor_from_birth_to_first_message() {
         )
         .unwrap();
     }
-    let replies = tick_and_drain(&rt, &count_inbox, 10);
+    let replies = tick_and_drain(&mut host, &count_inbox, 10);
     assert_eq!(
         replies,
         vec![Count(1), Count(2), Count(3)],
@@ -394,8 +394,8 @@ fn actor_from_birth_to_first_message() {
     );
 
     // on_start must not fire again on subsequent ticks
-    rt.tick();
-    rt.tick();
+    host.try_tick();
+    host.try_tick();
     assert_eq!(started.load(Ordering::Relaxed), 5, "on_start not repeated");
 
     // Verify the first actor still responds normally
@@ -406,7 +406,7 @@ fn actor_from_birth_to_first_message() {
         },
     )
     .unwrap();
-    let reply = tick_until_recv(&rt, &inbox, 10);
+    let reply = tick_until_recv(&mut host, &inbox, 10);
     assert!(reply.is_some(), "actor handles messages after on_start");
 }
 
@@ -414,7 +414,7 @@ fn actor_from_birth_to_first_message() {
 /// distributes work. Spawn+send interleaving in a single handler works.
 #[test]
 fn parent_child_delegation_and_spawn_chains() {
-    let rt = std_runtime(RuntimeConfig {
+    let (rt, mut host) = std_host(RuntimeConfig {
         max_actors: 2000,
         ..Default::default()
     });
@@ -430,7 +430,7 @@ fn parent_child_delegation_and_spawn_chains() {
         },
     )
     .unwrap();
-    let reply = tick_until_recv(&rt, &inbox, 20);
+    let reply = tick_until_recv(&mut host, &inbox, 20);
     assert_eq!(reply, Some(Done(14)), "delegator child doubles value");
 
     // Act 2: Chain of depth 20
@@ -444,7 +444,7 @@ fn parent_child_delegation_and_spawn_chains() {
         },
     )
     .unwrap();
-    let reply = tick_until_recv(&rt, &inbox, 200);
+    let reply = tick_until_recv(&mut host, &inbox, 200);
     assert_eq!(reply, Some(Done(20)), "chain reaches depth 20");
 
     // Act 3: Fan-out to 20 children
@@ -457,7 +457,7 @@ fn parent_child_delegation_and_spawn_chains() {
         },
     )
     .unwrap();
-    let replies = tick_and_drain(&rt, &inbox, 50);
+    let replies = tick_and_drain(&mut host, &inbox, 50);
     assert_eq!(replies.len(), 20, "all 20 fan-out children reply");
 }
 
@@ -467,7 +467,7 @@ fn parent_child_delegation_and_spawn_chains() {
 fn graceful_stop_lifecycle() {
     // --- Part A: SelfStopActor ---
     let stopped = Arc::new(AtomicUsize::new(0));
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Done>().unwrap();
 
     let addr = rt
@@ -487,7 +487,7 @@ fn graceful_stop_lifecycle() {
             },
         );
     }
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
 
     let mut replies = Vec::new();
     while let Some(Done(v)) = inbox.try_recv() {
@@ -512,16 +512,16 @@ fn graceful_stop_lifecycle() {
     );
 
     // --- Part B: FarewellActor sends farewell in on_stop ---
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let addr = rt
         .spawn(FarewellActor {
             farewell_to: *inbox.addr(),
         })
         .unwrap();
-    rt.tick();
+    host.try_tick();
     rt.stop_actor(addr).unwrap();
-    tick_n(&rt, 5);
+    tick_n(&mut host, 5);
     assert_eq!(
         inbox.try_recv(),
         Some(Pong),
@@ -531,7 +531,7 @@ fn graceful_stop_lifecycle() {
     // --- Part C: External stop after pending messages ---
     let stopped = Arc::new(AtomicUsize::new(0));
     let handled = Arc::new(AtomicUsize::new(0));
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let addr = rt
         .spawn(LifecycleActor {
@@ -549,7 +549,7 @@ fn graceful_stop_lifecycle() {
         );
     }
     rt.stop_actor(addr).unwrap();
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
     assert_eq!(
         handled.load(Ordering::Relaxed),
         10,
@@ -563,7 +563,7 @@ fn graceful_stop_lifecycle() {
 
     // --- Part D: External stop before messages → 0 processed ---
     let handled = Arc::new(AtomicUsize::new(0));
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let addr = rt
         .spawn(LifecycleActor {
@@ -572,7 +572,7 @@ fn graceful_stop_lifecycle() {
             handled: handled.clone(),
         })
         .unwrap();
-    rt.tick(); // on_start
+    host.try_tick(); // on_start
     rt.stop_actor(addr).unwrap();
     for _ in 0..5 {
         let _ = rt.send_to(
@@ -582,7 +582,7 @@ fn graceful_stop_lifecycle() {
             },
         );
     }
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
     assert_eq!(
         handled.load(Ordering::Relaxed),
         0,
@@ -591,15 +591,15 @@ fn graceful_stop_lifecycle() {
 
     // --- Part E: Mid-mailbox stop trigger ---
     let processed = Arc::new(AtomicUsize::new(0));
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let addr = rt.spawn(StopOnTrigger(processed.clone())).unwrap();
-    rt.tick();
+    host.try_tick();
     rt.send_to(addr, Trigger(false)).unwrap();
     rt.send_to(addr, Trigger(false)).unwrap();
     rt.send_to(addr, Trigger(true)).unwrap(); // stop trigger
     rt.send_to(addr, Trigger(false)).unwrap();
     rt.send_to(addr, Trigger(false)).unwrap();
-    tick_n(&rt, 5);
+    tick_n(&mut host, 5);
     assert_eq!(
         processed.load(Ordering::Relaxed),
         3,
@@ -614,7 +614,7 @@ fn graceful_stop_lifecycle() {
 /// delivered, bulk cleanup, on_start panic also poisons.
 #[test]
 fn panic_isolation_and_cleanup() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let count_inbox = rt.new_inbox::<Count>().unwrap();
 
@@ -636,7 +636,7 @@ fn panic_isolation_and_cleanup() {
             reply_to: *inbox.addr(),
         },
     );
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
 
     // Healthy actor still works
     rt.send_to(
@@ -653,7 +653,7 @@ fn panic_isolation_and_cleanup() {
         },
     )
     .unwrap();
-    let replies = tick_and_drain(&rt, &count_inbox, 10);
+    let replies = tick_and_drain(&mut host, &count_inbox, 10);
     assert_eq!(
         replies,
         vec![Count(1), Count(2)],
@@ -681,7 +681,7 @@ fn panic_isolation_and_cleanup() {
 
     // --- Mid-batch panic discards remaining ---
     let counter = Arc::new(AtomicUsize::new(0));
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let dummy = rt.new_inbox::<Pong>().unwrap();
     let addr = rt
         .spawn(PanicAfterNActor {
@@ -698,7 +698,7 @@ fn panic_isolation_and_cleanup() {
         )
         .unwrap();
     }
-    tick_n(&rt, 20);
+    tick_n(&mut host, 20);
     assert_eq!(
         counter.load(Ordering::SeqCst),
         2,
@@ -706,7 +706,7 @@ fn panic_isolation_and_cleanup() {
     );
 
     // --- Child spawned before parent panic survives ---
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Done>().unwrap();
     let parent = rt.spawn(SpawnThenPanicActor).unwrap();
     rt.send_to(
@@ -717,11 +717,11 @@ fn panic_isolation_and_cleanup() {
         },
     )
     .unwrap();
-    let reply = tick_until_recv(&rt, &inbox, 30);
+    let reply = tick_until_recv(&mut host, &inbox, 30);
     assert_eq!(reply, Some(Done(10)), "child survives parent panic");
 
     // --- Message sent before panic is delivered ---
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Pong>().unwrap();
     let addr = rt.spawn(SendThenPanicActor).unwrap();
     rt.send_to(
@@ -731,11 +731,11 @@ fn panic_isolation_and_cleanup() {
         },
     )
     .unwrap();
-    let reply = tick_until_recv(&rt, &inbox, 20);
+    let reply = tick_until_recv(&mut host, &inbox, 20);
     assert!(reply.is_some(), "message sent before panic still delivered");
 
     // --- Bulk cleanup: 20 panicking actors all cleaned ---
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let mut addrs = Vec::new();
     for _ in 0..20 {
         addrs.push(rt.spawn(PanicActor).unwrap());
@@ -743,7 +743,7 @@ fn panic_isolation_and_cleanup() {
     for &addr in &addrs {
         let _ = rt.send_to(addr, PanicMsg);
     }
-    tick_n(&rt, 10);
+    tick_n(&mut host, 10);
     let stats = rt.stats();
     assert_eq!(
         stats.workers[0].num_actors, 0,
@@ -756,7 +756,7 @@ fn panic_isolation_and_cleanup() {
 /// runtime-level watch works.
 #[test]
 fn watch_notification_contract() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
 
     let target = rt.spawn(PanicActor).unwrap();
     let (w1, s1) = new_exit_watcher();
@@ -770,14 +770,14 @@ fn watch_notification_contract() {
     rt.send_to(w1_addr, WatcherCmd::WatchThis(target)).unwrap();
     rt.send_to(w2_addr, WatcherCmd::WatchThis(target)).unwrap();
     rt.send_to(w3_addr, WatcherCmd::WatchThis(target)).unwrap();
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
 
     // w2 double-watches: registration is idempotent.
     rt.send_to(w2_addr, WatcherCmd::WatchThis(target)).unwrap();
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
 
     rt.send_to(target, PanicMsg).unwrap();
-    tick_n(&rt, 5);
+    tick_n(&mut host, 5);
 
     assert_eq!(s1.count(), 1, "watcher 1 notified");
     assert_eq!(s2.count(), 1, "double-watch still only one notification");
@@ -790,14 +790,14 @@ fn watch_notification_contract() {
 #[test]
 fn watch_edge_cases() {
     // Self-watch — no crash
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let (w, _s) = new_exit_watcher();
     let addr = rt.spawn(w).unwrap();
     rt.send_to(addr, WatcherCmd::WatchThis(addr)).unwrap();
-    tick_n(&rt, 5);
+    tick_n(&mut host, 5);
 
     // Watcher reacts to death by spawning replacement
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let spawned = Arc::new(AtomicUsize::new(0));
 
     struct SupervisorWatcher {
@@ -830,9 +830,9 @@ fn watch_edge_cases() {
         })
         .unwrap();
     rt.send_to(sup, SupCmd::WatchThis(target)).unwrap();
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
     rt.send_to(target, PanicMsg).unwrap();
-    tick_n(&rt, 5);
+    tick_n(&mut host, 5);
     assert_eq!(
         spawned.load(Ordering::SeqCst),
         1,
@@ -846,7 +846,7 @@ fn watch_edge_cases() {
 #[test]
 fn lifecycle_decision_paths_match_runtime_behavior() {
     for msg_count in 1..=5 {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, mut host) = plain_host(RuntimeConfig::default());
         let started = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicUsize::new(0));
         let handled = Arc::new(AtomicUsize::new(0));
@@ -858,22 +858,22 @@ fn lifecycle_decision_paths_match_runtime_behavior() {
                 handled: handled.clone(),
             })
             .unwrap();
-        rt.tick();
+        host.try_tick();
 
         for _ in 0..msg_count {
             rt.send_to(addr, Work).unwrap();
         }
-        tick_n(&rt, msg_count + 3);
+        tick_n(&mut host, msg_count + 3);
         assert_eq!(started.load(Ordering::SeqCst), 1);
         assert_eq!(handled.load(Ordering::SeqCst), msg_count);
 
         rt.stop_actor(addr).unwrap();
-        tick_n(&rt, 3);
+        tick_n(&mut host, 3);
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
     }
 
     for msg_count in 1..=5 {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, mut host) = plain_host(RuntimeConfig::default());
         let started = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicUsize::new(0));
         let handled = Arc::new(AtomicUsize::new(0));
@@ -885,19 +885,19 @@ fn lifecycle_decision_paths_match_runtime_behavior() {
                 handled: handled.clone(),
             })
             .unwrap();
-        rt.tick();
+        host.try_tick();
 
         rt.stop_actor(addr).unwrap();
         for _ in 0..msg_count {
             let _ = rt.send_to(addr, Work);
         }
-        tick_n(&rt, 5);
+        tick_n(&mut host, 5);
         assert_eq!(handled.load(Ordering::SeqCst), 0);
         assert_eq!(stopped.load(Ordering::SeqCst), 1);
     }
 
     for msg_count in 1..=5 {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, mut host) = plain_host(RuntimeConfig::default());
         let handled = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicUsize::new(0));
 
@@ -907,27 +907,27 @@ fn lifecycle_decision_paths_match_runtime_behavior() {
                 stopped: stopped.clone(),
             })
             .unwrap();
-        rt.tick();
+        host.try_tick();
 
         for _ in 0..msg_count {
             let _ = rt.send_to(addr, Work);
         }
-        tick_n(&rt, msg_count + 3);
+        tick_n(&mut host, msg_count + 3);
         assert_eq!(handled.load(Ordering::SeqCst), 0);
         assert_eq!(stopped.load(Ordering::SeqCst), 0);
     }
 
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = plain_host(RuntimeConfig::default());
     let stopped = Arc::new(AtomicUsize::new(0));
     let addr = rt
         .spawn(PanicOnHandleWithStopReport {
             stopped: stopped.clone(),
         })
         .unwrap();
-    rt.tick();
+    host.try_tick();
 
     rt.send_to(addr, Work).unwrap();
-    tick_n(&rt, 5);
+    tick_n(&mut host, 5);
     assert_eq!(stopped.load(Ordering::SeqCst), 0);
 }
 
@@ -936,7 +936,7 @@ fn lifecycle_decision_paths_match_runtime_behavior() {
 #[test]
 fn panicking_actors_do_not_affect_sibling_progress() {
     for (healthy_count, msg_count, panic_at) in [(2, 1, 1), (4, 65, 17), (8, 130, 1)] {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, mut host) = plain_host(RuntimeConfig::default());
         let report_inbox = rt.new_inbox::<WorkCount>().unwrap();
         let report_to = *report_inbox.addr();
 
@@ -956,7 +956,7 @@ fn panicking_actors_do_not_affect_sibling_progress() {
                 panic_at,
             })
             .unwrap();
-        rt.tick();
+        host.try_tick();
 
         for _ in 0..msg_count {
             for &addr in &healthy {
@@ -964,12 +964,12 @@ fn panicking_actors_do_not_affect_sibling_progress() {
             }
             rt.send_to(panicker, Work).unwrap();
         }
-        tick_n(&rt, (msg_count / 64) + 10);
+        tick_n(&mut host, (msg_count / 64) + 10);
 
         for &addr in &healthy {
             rt.stop_actor(addr).unwrap();
         }
-        tick_n(&rt, 3);
+        tick_n(&mut host, 3);
 
         let reports = drain_work_counts(&report_inbox);
         assert_eq!(reports.len(), healthy_count);
@@ -983,7 +983,7 @@ fn panicking_actors_do_not_affect_sibling_progress() {
 #[test]
 fn on_start_panic_does_not_block_siblings() {
     for (before_count, after_count, msgs_each) in [(1, 1, 1), (4, 4, 25), (8, 3, 70)] {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, mut host) = plain_host(RuntimeConfig::default());
         let started = Arc::new(AtomicUsize::new(0));
         let stopped = Arc::new(AtomicUsize::new(0));
         let handled = Arc::new(AtomicUsize::new(0));
@@ -1019,7 +1019,7 @@ fn on_start_panic_does_not_block_siblings() {
                 .unwrap(),
             );
         }
-        tick_n(&rt, 3);
+        tick_n(&mut host, 3);
 
         assert_eq!(started.load(Ordering::SeqCst), siblings.len());
         assert_eq!(panic_handled.load(Ordering::SeqCst), 0);
@@ -1030,13 +1030,13 @@ fn on_start_panic_does_not_block_siblings() {
                 rt.send_to(addr, Work).unwrap();
             }
         }
-        tick_n(&rt, (msgs_each / 64) + 5);
+        tick_n(&mut host, (msgs_each / 64) + 5);
         assert_eq!(handled.load(Ordering::SeqCst), siblings.len() * msgs_each);
 
         for &addr in &siblings {
             rt.stop_actor(addr).unwrap();
         }
-        tick_n(&rt, 3);
+        tick_n(&mut host, 3);
         assert_eq!(stopped.load(Ordering::SeqCst), siblings.len());
     }
 }
@@ -1044,7 +1044,7 @@ fn on_start_panic_does_not_block_siblings() {
 #[test]
 fn multiple_panics_in_same_tick_preserve_healthy_actors() {
     for (healthy_count, panic_count, msgs_each) in [(2, 2, 1), (6, 4, 70)] {
-        let rt = Runtime::new(RuntimeConfig::default());
+        let (rt, mut host) = plain_host(RuntimeConfig::default());
         let report_inbox = rt.new_inbox::<WorkCount>().unwrap();
         let report_to = *report_inbox.addr();
 
@@ -1069,7 +1069,7 @@ fn multiple_panics_in_same_tick_preserve_healthy_actors() {
                 .unwrap(),
             );
         }
-        rt.tick();
+        host.try_tick();
 
         for _ in 0..msgs_each {
             for &addr in &healthy {
@@ -1079,12 +1079,12 @@ fn multiple_panics_in_same_tick_preserve_healthy_actors() {
                 rt.send_to(addr, Work).unwrap();
             }
         }
-        tick_n(&rt, (msgs_each / 64) + 10);
+        tick_n(&mut host, (msgs_each / 64) + 10);
 
         for &addr in &healthy {
             rt.stop_actor(addr).unwrap();
         }
-        tick_n(&rt, 3);
+        tick_n(&mut host, 3);
 
         let reports = drain_work_counts(&report_inbox);
         assert_eq!(reports.len(), healthy_count);

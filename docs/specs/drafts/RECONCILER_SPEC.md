@@ -1,8 +1,9 @@
 # cluster reconciler — specification
 
 Id: 3
-Last modified:
+Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
 Last reviewed:
+> Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
 **Scope:** a level-triggered reconciler that drives a declared cluster shape toward
 convergence over the existing node lifecycle, living in `crates/provisioning`

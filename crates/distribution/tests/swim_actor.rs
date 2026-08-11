@@ -16,11 +16,12 @@ mod single_runtime_actor {
     //! SwimActor behavior in one runtime: subscription stream convergence and genuine unreachable-
     //! peer death detection.
 
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use swactor::runtime::{Runtime, RuntimeConfig};
+    use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
     use swactor::std::StdExtension;
 
     use distribution::swim::actor::{
@@ -54,6 +55,7 @@ mod single_runtime_actor {
     /// `MembershipChanged` subscriber inbox, and a shared Binding.
     struct ActorCluster {
         rt: Runtime,
+        host: RefCell<SingleThreadRuntime>,
         ids: Vec<NodeId>,
         addrs: Vec<swactor::actor::ActorAddress>,
         inboxes: Vec<swactor::runtime::Inbox<MembershipChanged>>,
@@ -67,8 +69,10 @@ mod single_runtime_actor {
         /// Spawn `n` actors. Nodes `1..n` join via node 0 (the seed). Returns once
         /// the join requests have been issued (not yet converged).
         fn new(n: usize) -> Self {
-            let rt = Runtime::new(RuntimeConfig::default())
+            let parts = RuntimeParts::new(RuntimeConfig::default())
                 .with_extension(Arc::new(StdExtension::new()));
+            let rt = parts.runtime().clone();
+            let host = RefCell::new(SingleThreadRuntime::new(parts));
             let dir = SharedPeerDirectory::new();
             let now = Instant::now();
             let ids: Vec<NodeId> = (0..n).map(|i| id(i as u8)).collect();
@@ -99,6 +103,7 @@ mod single_runtime_actor {
             }
             let mut c = ActorCluster {
                 rt,
+                host,
                 ids,
                 addrs,
                 inboxes,
@@ -123,7 +128,7 @@ mod single_runtime_actor {
 
         fn pump(&self, n: usize) {
             for _ in 0..n {
-                self.rt.tick();
+                self.host.borrow_mut().tick();
             }
         }
 
@@ -237,13 +242,14 @@ mod transport_runtime_actor {
     //! SwimActor behavior across separate runtimes through codec, TransportRouter, deliver_raw, and
     //! transport send failure.
 
+    use std::cell::RefCell;
     use std::collections::{BTreeMap, HashSet};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use swactor::Error;
     use swactor::actor::ActorAddress;
-    use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
+    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
     use swactor::std::StdExtension;
     use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
 
@@ -289,7 +295,7 @@ mod transport_runtime_actor {
     struct Link {
         src: usize,
         dst: usize,
-        dst_rt: Arc<Runtime>,
+        dst_rt: Runtime,
         dst_swim: ActorAddress,
         codec: Arc<CodecRegistry>,
         partition: Arc<Mutex<HashSet<usize>>>,
@@ -314,7 +320,8 @@ mod transport_runtime_actor {
     /// A cluster of `n` `SwimActor`s, each on its **own** runtime, meshed through
     /// `Link` transports — the multi-runtime analog of `swim_actor.rs::ActorCluster`.
     struct TransportCluster {
-        rts: Vec<Arc<Runtime>>,
+        rts: Vec<Runtime>,
+        hosts: Vec<RefCell<SingleThreadRuntime>>,
         swims: Vec<ActorAddress>,
         inboxes: Vec<Inbox<MembershipChanged>>,
         streams: Vec<Vec<MembershipChanged>>,
@@ -331,6 +338,7 @@ mod transport_runtime_actor {
             let partition = Arc::new(Mutex::new(HashSet::new()));
 
             let mut rts = Vec::new();
+            let mut hosts = Vec::new();
             let mut swims = Vec::new();
             let mut dirs = Vec::new();
             let mut routers = Vec::new();
@@ -339,14 +347,15 @@ mod transport_runtime_actor {
             // Phase 1: one runtime per node, each with the actor codec registry + an
             // (initially empty) transport router. Spawn the SwimActor and subscribe.
             for &nid in &ids {
-                let mut rt = Runtime::new(RuntimeConfig::default())
+                let parts = RuntimeParts::new(RuntimeConfig::default())
                     .with_extension(Arc::new(StdExtension::new()));
+                let rt = parts.runtime().clone();
                 let router = Arc::new(TransportRouter::new());
                 rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
                     codec.clone(),
                     router.clone(),
                 )));
-                let rt = Arc::new(rt);
+                let host = RefCell::new(SingleThreadRuntime::new(parts));
 
                 let dir = SharedPeerDirectory::new();
                 let swim = rt
@@ -369,6 +378,7 @@ mod transport_runtime_actor {
                 .unwrap();
 
                 rts.push(rt);
+                hosts.push(host);
                 swims.push(swim);
                 dirs.push(dir);
                 routers.push(router);
@@ -377,7 +387,8 @@ mod transport_runtime_actor {
 
             // Phase 2: mesh. Each node resolves every peer's NodeId to its synthetic
             // peer address and routes that address through a Link into the peer's
-            // runtime. Now both Arcs exist, so the mutual references close cleanly.
+            // runtime handle. Now every cloned handle exists, so the mutual references
+            // close cleanly.
             for i in 0..n {
                 for j in 0..n {
                     if i == j {
@@ -401,6 +412,7 @@ mod transport_runtime_actor {
 
             let mut c = TransportCluster {
                 rts,
+                hosts,
                 swims,
                 inboxes,
                 streams: vec![Vec::new(); n],
@@ -431,8 +443,8 @@ mod transport_runtime_actor {
         /// iterations; `k` is sized so a probe + its notification settle per round.
         fn pump(&self, k: usize) {
             for _ in 0..k {
-                for rt in &self.rts {
-                    rt.tick();
+                for host in &self.hosts {
+                    host.borrow_mut().tick();
                 }
             }
         }
@@ -535,11 +547,12 @@ mod actor_membership_safety_edges {
     //! Actor-observable safety edges: resurrection after silence, multi-hop death dissemination,
     //! and bounded stale-refute behavior.
 
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    use swactor::runtime::{Runtime, RuntimeConfig};
+    use swactor::runtime::{Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
     use swactor::std::StdExtension;
 
     use distribution::swim::actor::{
@@ -576,6 +589,7 @@ mod actor_membership_safety_edges {
     /// but lets the test choose the config and rebind a dropped node.
     struct Cluster {
         rt: Runtime,
+        host: RefCell<SingleThreadRuntime>,
         ids: Vec<NodeId>,
         addrs: Vec<swactor::actor::ActorAddress>,
         inboxes: Vec<swactor::runtime::Inbox<MembershipChanged>>,
@@ -586,8 +600,10 @@ mod actor_membership_safety_edges {
 
     impl Cluster {
         fn new(n: usize, config: SwimConfig) -> Self {
-            let rt = Runtime::new(RuntimeConfig::default())
+            let parts = RuntimeParts::new(RuntimeConfig::default())
                 .with_extension(Arc::new(StdExtension::new()));
+            let rt = parts.runtime().clone();
+            let host = RefCell::new(SingleThreadRuntime::new(parts));
             let dir = SharedPeerDirectory::new();
             let now = Instant::now();
             let ids: Vec<NodeId> = (0..n).map(|i| id(i as u8)).collect();
@@ -617,6 +633,7 @@ mod actor_membership_safety_edges {
             }
             let mut c = Cluster {
                 rt,
+                host,
                 ids,
                 addrs,
                 inboxes,
@@ -638,7 +655,7 @@ mod actor_membership_safety_edges {
 
         fn pump(&self, n: usize) {
             for _ in 0..n {
-                self.rt.tick();
+                self.host.borrow_mut().tick();
             }
         }
 

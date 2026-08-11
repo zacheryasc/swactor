@@ -2,8 +2,9 @@
  ***STALE! FOR HISTORICAL REFERENCE ONLY*** 
 
 Id: 9
-Last modified:
+Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
 Last reviewed:
+> Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
 This document is the single Myelin reference for the swactor GGUF pipeline system.
 It folds the system behavior previously split across the orchestration,

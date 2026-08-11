@@ -1,12 +1,11 @@
 use crate::Instant;
 use std::any::{Any, TypeId};
-use std::cell::RefCell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::actor::{
-    Actor, ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Environment, ExitValue,
-    Message, ResumeSignal, SpawnRequest, StopSignal, StopWithSignal, SystemInfo,
+    Actor, ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Environment,
+    Message, SpawnRequest, StopSignal,
 };
 use crate::admin::{
     ActorStateSnapshot, Admin, AdminCommand, AdminError, AdminResult, GetActorStateResponse,
@@ -15,12 +14,11 @@ use crate::admin::{
 use crate::channel::{Receiver, Sender};
 // Re-export config types so existing code using `runtime::RuntimeConfig` still works
 pub use crate::config::RuntimeConfig;
-use crate::delivery::{AddressMap, Envelope, InboxRegistry, TickContext};
+use crate::delivery::{AddressMap, Envelope, InboxRegistry, WorkerId};
 use crate::extension::RuntimeExtension;
-use crate::stats::{StatsHook, WorkerStats};
+use crate::stats::{RuntimeStats, StatsHook, WorkerInfo, WorkerStats};
 // Re-export stats types so existing code using `runtime::*` still works
 use crate::Error;
-pub use crate::stats::{RuntimeStats, WorkerInfo};
 use crate::worker::Worker;
 
 /// Generic message inbox for receiving messages outside of the runtime.
@@ -38,9 +36,11 @@ impl<M: Message> Inbox<M> {
         self.inner.try_recv()
     }
 
-    pub fn recv_ticking(&self, rt: &Runtime, max_ticks: usize) -> Option<M> {
+    /// Poll up to `max_ticks` times, driving `host` once per attempt, returning
+    /// the first received message or `None` on timeout.
+    pub fn recv_ticking(&self, host: &mut SingleThreadRuntime, max_ticks: usize) -> Option<M> {
         for _ in 0..max_ticks {
-            rt.tick();
+            host.try_tick();
             if let Some(msg) = self.inner.try_recv() {
                 return Some(msg);
             }
@@ -62,48 +62,90 @@ impl<R: Message> Ask<R> {
         self.inbox.try_recv()
     }
 
-    pub fn recv_ticking(&self, rt: &Runtime, max_ticks: usize) -> Option<R> {
-        self.inbox.recv_ticking(rt, max_ticks)
+    pub fn recv_ticking(&self, host: &mut SingleThreadRuntime, max_ticks: usize) -> Option<R> {
+        self.inbox.recv_ticking(host, max_ticks)
     }
 }
 
 // Re-export Ctx for backwards compatibility
-use crate::actor::ContextInner;
 pub use crate::actor::Ctx;
+
+// ─── RuntimeShared ──────────────────────────────────────────────────────────
+
+/// Runtime-wide shared state, owned via `Arc` by the [`Runtime`] handle and
+/// every [`Worker`]. Contains only `Sync` data: routing tables, per-worker
+/// producer handles, atomics, and the shared extension/observer hooks.
+///
+/// `Runtime` holds no worker state and needs no `unsafe Sync` justification.
+pub(crate) struct RuntimeShared {
+    pub(crate) config: RuntimeConfig,
+    pub(crate) address_map: AddressMap,
+    pub(crate) inbox_registry: InboxRegistry,
+    pub(crate) extension: OnceLock<Arc<dyn RuntimeExtension>>,
+    /// Per-worker transfer/spawn/admin producers, indexed by `WorkerId`.
+    pub(crate) transfer_txs: Vec<Sender<Envelope>>,
+    pub(crate) spawn_txs: Vec<Sender<SpawnRequest>>,
+    pub(crate) admin_txs: Vec<Sender<AdminCommand>>,
+    pub(crate) worker_stats: Vec<Arc<WorkerStats>>,
+    /// Round-robin cursor for runtime-handle spawns.
+    pub(crate) rr_worker: AtomicUsize,
+    pub(crate) stats_hook: OnceLock<Arc<dyn StatsHook>>,
+    pub(crate) process_output_observer: OnceLock<Arc<dyn crate::process_observer::ProcessOutputObserver>>,
+    pub(crate) created_at: Instant,
+    #[cfg(feature = "transport")]
+    pub(crate) remote_sink: OnceLock<Arc<dyn RemoteSink>>,
+}
+
+impl RuntimeShared {
+    /// Number of logical workers in this runtime.
+    pub(crate) fn worker_count(&self) -> usize {
+        self.worker_stats.len()
+    }
+
+    /// Pick the next worker for a runtime-handle spawn (round-robin).
+    pub(crate) fn next_worker(&self) -> WorkerId {
+        let n = self.worker_count();
+        // fetch_add grows monotonically; wrap with modular arithmetic. `n >= 1`
+        // is guaranteed at construction, so this never divides by zero.
+        let idx = self.rr_worker.fetch_add(1, Ordering::Relaxed);
+        WorkerId(idx % n)
+    }
+
+    /// Route a message whose destination is not a local actor address:
+    /// process-local inbox registry first, then the remote transport seam.
+    pub(crate) fn route_nonlocal(
+        &self,
+        addr: ActorAddress,
+        msg: Box<dyn Any + Send>,
+    ) -> Result<(), Error> {
+        #[cfg(feature = "transport")]
+        {
+            if self.inbox_registry.contains(&addr) {
+                return self.inbox_registry.try_deliver(addr, msg);
+            }
+            if let Some(sink) = self.remote_sink.get() {
+                return sink.send(addr, msg);
+            }
+        }
+        self.inbox_registry.try_deliver(addr, msg)
+    }
+}
 
 // ─── Runtime ─────────────────────────────────────────────────────────────────
 
-/// The `Runtime` struct is the primary gateway for interacting with the framework.
+/// The cloneable shared handle for a swactor runtime.
 ///
-/// Owns a single `Worker` advanced by the caller via `tick()` / `try_tick()`.
+/// `Runtime` routes and spawns; it owns no executable worker state and has no
+/// `tick()` / `try_tick()`. Worker progression is owned by exactly one
+/// execution host ([`SingleThreadRuntime`] or an engine that consumes
+/// [`RuntimeParts`]).
 ///
-/// Core is a transition-only state machine. Each call mutates state and
-/// returns immediately, holding no control flow between calls. When to take
-/// the next step is the engine's decision, not core's. Any driver that can
-/// call `tick` (tokio, std-thread, a test stepper) can host it.
+/// Core is a transition-only state machine. Each call mutates shared routing
+/// state and returns immediately, holding no control flow between calls.
+#[derive(Clone)]
 pub struct Runtime {
-    config: RuntimeConfig,
-    address_map: Arc<AddressMap>,
-    inbox_registry: Arc<InboxRegistry>,
-    extension: Option<Arc<dyn RuntimeExtension>>,
-    transfer_tx: Sender<Envelope>,
-    spawn_tx: Sender<SpawnRequest>,
-    admin_tx: Sender<AdminCommand>,
-    worker_stats: Arc<WorkerStats>,
-    stats_hook: Option<Arc<dyn StatsHook>>,
-    process_output_observer: OnceLock<Arc<dyn crate::process_observer::ProcessOutputObserver>>,
-    worker: RefCell<Worker>,
-    created_at: Instant,
-    #[cfg(feature = "transport")]
-    remote_sink: Option<Arc<dyn RemoteSink>>,
+    pub(crate) shared: Arc<RuntimeShared>,
 }
-
-// Safety: `RefCell<Worker>` is only borrowed from the owning thread in
-// `tick()` / `try_tick()` / `has_work()` / `with_extension()`. All `&self`
-// methods callable through `Arc<Runtime>` from other threads (`send_to`,
-// `spawn`, `deliver_raw`, `stats`, `create_sender`) access only `Sync` fields
-// (Arcs, atomics, channels) — never the `RefCell`. No worker threads exist.
-unsafe impl Sync for Runtime {}
 
 /// Core's only hook for delivering a message to a **non-local** address.
 ///
@@ -144,18 +186,15 @@ impl RuntimeAddress {
 /// from any thread — including non-actor I/O threads.
 ///
 /// Created via [`Runtime::create_sender`]. The primary use case is bridging
-/// background I/O (e.g., pipe readers, network listeners) with the tick-based
-/// actor system.
+/// background I/O (e.g., pipe readers, network listeners) with the actor system.
 pub struct ExternalSender {
-    address_map: Arc<AddressMap>,
-    transfer_tx: Sender<Envelope>,
+    shared: Arc<RuntimeShared>,
 }
 
 impl Clone for ExternalSender {
     fn clone(&self) -> Self {
         Self {
-            address_map: self.address_map.clone(),
-            transfer_tx: self.transfer_tx.clone(),
+            shared: self.shared.clone(),
         }
     }
 }
@@ -169,8 +208,8 @@ impl ExternalSender {
     ///
     /// Returns `Err` if the address is not found in the runtime's address map.
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
-        if self.address_map.contains(&addr) {
-            self.transfer_tx.send(Envelope::new(addr, Box::new(msg)));
+        if let Some(w) = self.shared.address_map.worker_of(&addr) {
+            self.shared.transfer_txs[w.index()].send(Envelope::new(addr, Box::new(msg)));
             Ok(())
         } else {
             Err(Error::from("Address not found"))
@@ -178,58 +217,142 @@ impl ExternalSender {
     }
 }
 
-impl Runtime {
-    /// Builds a new `Runtime` struct, but does not yet run anything.
-    /// Drive via `tick()` / `try_tick()`.
+// ─── RuntimeParts ────────────────────────────────────────────────────────────
+
+/// The linear construction bundle: one [`Runtime`] handle and the [`Worker`]
+/// values it routes to. Consumed by exactly one execution host.
+///
+/// Configuration that creates per-worker state — especially
+/// [`RuntimeExtension::create_worker_extension`] — must be installed (via
+/// [`RuntimeParts::with_extension`]) before the parts are consumed by a host.
+pub struct RuntimeParts {
+    runtime: Runtime,
+    workers: Vec<Worker>,
+}
+
+impl RuntimeParts {
+    /// Build a runtime with `config.worker_count` logical workers, each with its
+    /// own transfer/spawn/admin queues and `WorkerStats`.
+    ///
+    /// Panics if `config.worker_count == 0`.
     pub fn new(config: RuntimeConfig) -> Self {
-        let address_map = Arc::new(AddressMap::with_capacity(config.max_actors));
-        let inbox_registry = Arc::new(InboxRegistry::new());
+        assert!(
+            config.worker_count >= 1,
+            "swactor: RuntimeConfig.worker_count must be >= 1"
+        );
+        let n = config.worker_count;
+        let max_actors = config.max_actors;
+        let channel_buffer_size = config.channel_buffer_size;
 
-        let transfer_rx = Receiver::<Envelope>::new(config.channel_buffer_size);
-        let transfer_tx = transfer_rx.new_sender();
+        let mut transfer_rxs = Vec::with_capacity(n);
+        let mut transfer_txs = Vec::with_capacity(n);
+        let mut spawn_rxs = Vec::with_capacity(n);
+        let mut spawn_txs = Vec::with_capacity(n);
+        let mut admin_rxs = Vec::with_capacity(n);
+        let mut admin_txs = Vec::with_capacity(n);
+        let mut worker_stats = Vec::with_capacity(n);
+        for _ in 0..n {
+            let transfer_rx = Receiver::<Envelope>::new(channel_buffer_size);
+            transfer_txs.push(transfer_rx.new_sender());
+            transfer_rxs.push(transfer_rx);
 
-        let spawn_rx = Receiver::<SpawnRequest>::new(config.max_actors);
-        let spawn_tx = spawn_rx.new_sender();
+            let spawn_rx = Receiver::<SpawnRequest>::new(max_actors);
+            spawn_txs.push(spawn_rx.new_sender());
+            spawn_rxs.push(spawn_rx);
 
-        let admin_rx = Receiver::<AdminCommand>::new(config.channel_buffer_size);
-        let admin_tx = admin_rx.new_sender();
+            let admin_rx = Receiver::<AdminCommand>::new(channel_buffer_size);
+            admin_txs.push(admin_rx.new_sender());
+            admin_rxs.push(admin_rx);
 
-        let worker_stats = Arc::new(WorkerStats::new());
+            worker_stats.push(Arc::new(WorkerStats::new()));
+        }
 
-        let worker = Worker::new(transfer_rx, spawn_rx, admin_rx, worker_stats.clone());
-
-        let rt = Self {
+        let shared = Arc::new(RuntimeShared {
             config,
-            address_map,
-            inbox_registry,
-            extension: None,
-            transfer_tx,
-            spawn_tx,
-            admin_tx,
+            address_map: AddressMap::with_capacity(max_actors),
+            inbox_registry: InboxRegistry::new(),
+            extension: OnceLock::new(),
+            transfer_txs,
+            spawn_txs,
+            admin_txs,
             worker_stats,
-            stats_hook: None,
+            rr_worker: AtomicUsize::new(0),
+            stats_hook: OnceLock::new(),
             process_output_observer: OnceLock::new(),
-            worker: RefCell::new(worker),
             created_at: Instant::now(),
             #[cfg(feature = "transport")]
-            remote_sink: None,
-        };
+            remote_sink: OnceLock::new(),
+        });
 
         #[cfg(feature = "tracing")]
-        tracing::info!(
-            max_actors = rt.config.max_actors,
-            "runtime.created"
-        );
+        tracing::info!(max_actors, worker_count = n, "runtime.created");
 
-        rt
+        let workers: Vec<Worker> = transfer_rxs
+            .into_iter()
+            .zip(spawn_rxs)
+            .zip(admin_rxs)
+            .enumerate()
+            .map(|(i, ((trx, srx), arx))| {
+                Worker::new(
+                    WorkerId(i),
+                    shared.clone(),
+                    trx,
+                    srx,
+                    arx,
+                    shared.worker_stats[i].clone(),
+                )
+            })
+            .collect();
+
+        Self {
+            runtime: Runtime { shared },
+            workers,
+        }
     }
 
-    /// Spawn an actor, returns its address
+    /// Borrow the cloneable runtime handle.
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    /// Install a runtime extension and create one `WorkerExtension` per worker.
+    ///
+    /// Must be called before the parts are consumed by a host.
+    pub fn with_extension(mut self, ext: Arc<dyn RuntimeExtension>) -> Self {
+        for w in &mut self.workers {
+            if let Some(wext) = ext.create_worker_extension() {
+                w.worker_ext = Some(wext);
+            }
+        }
+        let _ = self.runtime.shared.extension.set(ext);
+        self
+    }
+
+    /// Install a stats hook across all workers. Must be called before the parts
+    /// are consumed by a host.
+    pub fn with_stats_hook(self, hook: Arc<dyn StatsHook>) -> Self {
+        let _ = self.runtime.shared.stats_hook.set(hook);
+        self
+    }
+
+    /// Consume the parts, returning the workers for an execution host to own.
+    ///
+    /// The runtime handle must be cloned beforehand via [`runtime`](Self::runtime).
+    pub fn into_workers(self) -> Vec<Worker> {
+        self.workers
+    }
+}
+
+impl Runtime {
+    /// Spawn an actor, returns its address.
+    ///
+    /// Runtime-handle spawns are assigned round-robin across workers.
     pub fn spawn<A: ActorInterface>(&self, actor: A) -> Result<ActorAddress, Error> {
         let addr = ActorAddress::new_random();
-        self.address_map.insert(addr);
+        let worker = self.shared.next_worker();
+        self.shared.address_map.insert(addr, worker);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.spawn_tx.send(SpawnRequest {
+        self.shared.spawn_txs[worker.index()].send(SpawnRequest {
             addr,
             actor: boxed,
             parent: None,
@@ -237,10 +360,7 @@ impl Runtime {
         });
 
         #[cfg(feature = "tracing")]
-        tracing::info!(
-            actor_addr = %addr,
-            "actor.spawned"
-        );
+        tracing::info!(actor_addr = %addr, "actor.spawned");
 
         Ok(addr)
     }
@@ -252,9 +372,10 @@ impl Runtime {
         env: Environment,
     ) -> Result<ActorAddress, Error> {
         let addr = ActorAddress::new_random();
-        self.address_map.insert(addr);
+        let worker = self.shared.next_worker();
+        self.shared.address_map.insert(addr, worker);
         let boxed: Box<dyn AnyActor> = Box::new(Actor::new(actor));
-        self.spawn_tx.send(SpawnRequest {
+        self.shared.spawn_txs[worker.index()].send(SpawnRequest {
             addr,
             actor: boxed,
             parent: None,
@@ -262,29 +383,14 @@ impl Runtime {
         });
 
         #[cfg(feature = "tracing")]
-        tracing::info!(
-            actor_addr = %addr,
-            "actor.spawned"
-        );
+        tracing::info!(actor_addr = %addr, "actor.spawned");
 
         Ok(addr)
     }
 
-    /// Install a runtime extension. Extensions provide higher-level features
-    /// (naming, monitoring, groups) via lifecycle hooks.
-    ///
-    /// Must be called before `tick()`.
-    pub fn with_extension(mut self, ext: Arc<dyn RuntimeExtension>) -> Self {
-        if let Some(wext) = ext.create_worker_extension() {
-            self.worker.get_mut().worker_ext = Some(wext);
-        }
-        self.extension = Some(ext);
-        self
-    }
-
     /// Access the installed runtime extension (if any).
     pub fn extension(&self) -> Option<&dyn RuntimeExtension> {
-        self.extension.as_deref()
+        self.shared.extension.get().map(|a| a.as_ref())
     }
 
     pub fn admin(&self) -> RuntimeAdmin<'_> {
@@ -315,7 +421,14 @@ impl Runtime {
     ///
     /// Returns `Err` if the address is unknown to the runtime.
     pub fn send_to<M: Message>(&self, addr: ActorAddress, msg: M) -> Result<(), Error> {
-        let result = self.send_any(addr, Box::new(msg));
+        let boxed: Box<dyn Any + Send> = Box::new(msg);
+        let result = match self.shared.address_map.worker_of(&addr) {
+            Some(w) => {
+                self.shared.transfer_txs[w.index()].send(Envelope::new(addr, boxed));
+                Ok(())
+            }
+            None => self.shared.route_nonlocal(addr, boxed),
+        };
 
         #[cfg(feature = "tracing")]
         tracing::trace!(dest = %addr, "message.sent");
@@ -326,9 +439,9 @@ impl Runtime {
     /// Create an external inbox for receiving messages in the outer process containing the runtime
     pub fn new_inbox<M: Message>(&self) -> Result<Inbox<M>, Error> {
         let addr = ActorAddress::new_random();
-        let receiver = Receiver::<M>::new(self.config.channel_buffer_size);
+        let receiver = Receiver::<M>::new(self.shared.config.channel_buffer_size);
         let sender = receiver.new_sender();
-        self.inbox_registry.register(addr, Arc::new(sender));
+        self.shared.inbox_registry.register(addr, Arc::new(sender));
         Ok(Inbox {
             addr,
             inner: receiver,
@@ -341,64 +454,35 @@ impl Runtime {
     /// background I/O threads to bridge external events into the actor system.
     pub fn create_sender(&self) -> ExternalSender {
         ExternalSender {
-            address_map: self.address_map.clone(),
-            transfer_tx: self.transfer_tx.clone(),
+            shared: self.shared.clone(),
         }
-    }
-
-    fn make_tick_context(&self) -> TickContext<'_> {
-        TickContext {
-            address_map: &self.address_map,
-            spawn_tx: &self.spawn_tx,
-            transfer_tx: &self.transfer_tx,
-            inbox_registry: &self.inbox_registry,
-            config: &self.config,
-            extension: self.extension.as_deref(),
-            process_output_observer: self.process_output_observer.get(),
-            stats_hook: self.stats_hook.as_deref(),
-            worker_stats: &self.worker_stats,
-            created_at: self.created_at,
-            #[cfg(feature = "transport")]
-            remote_sink: self.remote_sink.as_deref(),
-        }
-    }
-
-    /// Return whether the runtime currently has schedulable work.
-    pub fn has_work(&self) -> bool {
-        self.worker.borrow().has_work()
-    }
-
-    /// Try to drive one tick of the runtime.
-    ///
-    /// Returns `false` if no work was performed.
-    /// Returns `true` if at least one actor was processed.
-    pub fn try_tick(&self) -> bool {
-        let tc = self.make_tick_context();
-        self.worker.borrow_mut().tick_once(&tc)
-    }
-
-    /// Drive one tick of the runtime.
-    pub fn tick(&self) {
-        let _ = self.try_tick();
     }
 
     /// Returns a snapshot of runtime stats: actor placements and per-worker info.
     pub fn stats(&self) -> RuntimeStats {
-        let workers = vec![self.worker_stats.snapshot(0)];
-
-        let actors = self
-            .address_map
-            .addresses()
-            .into_iter()
-            .map(|addr| (addr, 0))
+        let s = &self.shared;
+        let num_workers = s.worker_count();
+        let workers: Vec<WorkerInfo> = s
+            .worker_stats
+            .iter()
+            .enumerate()
+            .map(|(i, ws)| ws.snapshot(i))
             .collect();
-
-        let tick_timings = vec![self.worker_stats.drain_tick_timings()];
-
-        let uptime_ms = self.created_at.elapsed().as_millis() as u64;
+        let actors = s
+            .address_map
+            .placements()
+            .into_iter()
+            .map(|(a, w)| (a, w.index()))
+            .collect();
+        let tick_timings: Vec<_> = s
+            .worker_stats
+            .iter()
+            .map(|ws| ws.drain_tick_timings())
+            .collect();
+        let uptime_ms = s.created_at.elapsed().as_millis() as u64;
 
         RuntimeStats {
-            num_workers: 1,
+            num_workers,
             uptime_ms,
             actors,
             workers,
@@ -410,13 +494,13 @@ impl Runtime {
     /// Request an actor to stop gracefully.
     ///
     /// The actor's `on_stop()` hook is called before removal. Pending messages
-    /// in the mailbox are discarded. The stop takes effect on the next tick.
+    /// in the mailbox are discarded. The stop takes effect on the owning
+    /// worker's next pass.
     ///
     /// Returns `Err` if the actor address is not found in the runtime.
     pub fn stop_actor(&self, addr: ActorAddress) -> Result<(), Error> {
-        if self.address_map.contains(&addr) {
-            self.transfer_tx
-                .send(Envelope::new(addr, Box::new(StopSignal)));
+        if let Some(w) = self.shared.address_map.worker_of(&addr) {
+            self.shared.transfer_txs[w.index()].send(Envelope::new(addr, Box::new(StopSignal)));
             Ok(())
         } else {
             Err(Error::from("Actor not found"))
@@ -425,9 +509,9 @@ impl Runtime {
 
     /// Set a stats hook to receive per-actor snapshots from workers.
     ///
-    /// Must be called before [`tick()`](Self::tick).
-    pub fn set_stats_hook(&mut self, hook: Arc<dyn StatsHook>) {
-        self.stats_hook = Some(hook);
+    /// Must be called before the runtime is driven.
+    pub fn set_stats_hook(&self, hook: Arc<dyn StatsHook>) {
+        let _ = self.shared.stats_hook.set(hook);
     }
 
     /// Set the sink for non-local (remote) message delivery.
@@ -435,8 +519,8 @@ impl Runtime {
     /// The sink owns all codec/transport concerns; core only knows how to hand
     /// it a type-erased message destined for a non-local address.
     #[cfg(feature = "transport")]
-    pub fn set_remote_sink(&mut self, sink: Arc<dyn RemoteSink>) {
-        self.remote_sink = Some(sink);
+    pub fn set_remote_sink(&self, sink: Arc<dyn RemoteSink>) {
+        let _ = self.shared.remote_sink.set(sink);
     }
 
     /// Deliver a raw deserialized message into the runtime.
@@ -445,11 +529,11 @@ impl Runtime {
     /// this to inject the resulting message for a local actor or inbox.
     #[cfg(feature = "transport")]
     pub fn deliver_raw(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
-        if self.address_map.contains(&addr) {
-            self.transfer_tx.send(Envelope::new(addr, msg));
+        if let Some(w) = self.shared.address_map.worker_of(&addr) {
+            self.shared.transfer_txs[w.index()].send(Envelope::new(addr, msg));
             Ok(())
         } else {
-            self.inbox_registry.try_deliver(addr, msg)
+            self.shared.inbox_registry.try_deliver(addr, msg)
         }
     }
 }
@@ -465,34 +549,44 @@ impl RuntimeAdmin<'_> {
         let (admin, reply_to) = self.new_admin::<T>()?;
         let _ = self
             .runtime
+            .shared
             .inbox_registry
             .try_deliver(reply_to, Box::new(result));
         Ok(admin)
     }
 
+    /// Borrow the producer that owns `actor`'s worker, or `None` if unknown.
+    fn admin_tx_for(&self, actor: ActorAddress) -> Option<&Sender<AdminCommand>> {
+        self.runtime
+            .shared
+            .address_map
+            .worker_of(&actor)
+            .map(|w| &self.runtime.shared.admin_txs[w.index()])
+    }
+
     pub fn list_actors(&self) -> Result<Admin<ListActorsResponse>, Error> {
         let (admin, reply_to) = self.new_admin::<ListActorsResponse>()?;
+        let n = self.runtime.shared.worker_count();
         let acc = Arc::new(ListActorsAccumulator {
-            remaining: AtomicUsize::new(1),
+            remaining: AtomicUsize::new(n),
             summaries: parking_lot::Mutex::new(Vec::new()),
             reply_to,
         });
 
-        self.runtime
-            .admin_tx
-            .send(AdminCommand::ListActors { acc: acc.clone() });
+        // Broadcast to every worker; the last to finish aggregates and replies.
+        for tx in &self.runtime.shared.admin_txs {
+            tx.send(AdminCommand::ListActors { acc: acc.clone() });
+        }
 
         Ok(admin)
     }
 
     pub fn inspect_actor(&self, actor: ActorAddress) -> Result<Admin<InspectActorResponse>, Error> {
-        if !self.runtime.address_map.contains(&actor) {
+        let Some(tx) = self.admin_tx_for(actor) else {
             return self.ready::<InspectActorResponse>(Err(AdminError::ActorNotFound { actor }));
-        }
+        };
         let (admin, reply_to) = self.new_admin::<InspectActorResponse>()?;
-        self.runtime
-            .admin_tx
-            .send(AdminCommand::InspectActor { actor, reply_to });
+        tx.send(AdminCommand::InspectActor { actor, reply_to });
         Ok(admin)
     }
 
@@ -503,10 +597,10 @@ impl RuntimeAdmin<'_> {
     where
         A: ActorInterface + Clone + Sync,
     {
-        if !self.runtime.address_map.contains(&actor) {
+        let Some(tx) = self.admin_tx_for(actor) else {
             return self
                 .ready::<GetActorStateResponse<A>>(Err(AdminError::ActorNotFound { actor }));
-        }
+        };
         let (admin, reply_to) = self.new_admin::<GetActorStateResponse<A>>()?;
 
         let get = Box::new(
@@ -558,7 +652,7 @@ impl RuntimeAdmin<'_> {
             )) as Box<dyn Any + Send>
         });
 
-        self.runtime.admin_tx.send(AdminCommand::GetActorState {
+        tx.send(AdminCommand::GetActorState {
             actor,
             reply_to,
             get,
@@ -582,9 +676,9 @@ impl RuntimeAdmin<'_> {
             }));
         }
 
-        if !self.runtime.address_map.contains(&actor) {
+        let Some(tx) = self.admin_tx_for(actor) else {
             return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        }
+        };
         let (admin, reply_to) = self.new_admin::<OperationResult>()?;
 
         let actor_instance = state.actor_instance;
@@ -619,114 +713,88 @@ impl RuntimeAdmin<'_> {
             },
         );
 
-        self.runtime
-            .admin_tx
-            .send(AdminCommand::ReplaceActorState {
-                actor,
-                reply_to,
-                replace,
-            });
+        tx.send(AdminCommand::ReplaceActorState {
+            actor,
+            reply_to,
+            replace,
+        });
         Ok(admin)
     }
 
     pub fn stop_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
-        if !self.runtime.address_map.contains(&actor) {
+        let Some(tx) = self.admin_tx_for(actor) else {
             return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        }
+        };
         let (admin, reply_to) = self.new_admin::<OperationResult>()?;
-        self.runtime
-            .admin_tx
-            .send(AdminCommand::StopActor { actor, reply_to });
+        tx.send(AdminCommand::StopActor { actor, reply_to });
         Ok(admin)
     }
 
     pub fn suspend_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
-        if !self.runtime.address_map.contains(&actor) {
+        let Some(tx) = self.admin_tx_for(actor) else {
             return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        }
+        };
         let (admin, reply_to) = self.new_admin::<OperationResult>()?;
-        self.runtime
-            .admin_tx
-            .send(AdminCommand::SuspendActor { actor, reply_to });
+        tx.send(AdminCommand::SuspendActor { actor, reply_to });
         Ok(admin)
     }
 
     pub fn resume_actor(&self, actor: ActorAddress) -> Result<Admin<OperationResult>, Error> {
-        if !self.runtime.address_map.contains(&actor) {
-            return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
-        }
-        let (admin, reply_to) = self.new_admin::<OperationResult>()?;
-        self.runtime
-            .admin_tx
-            .send(AdminCommand::ResumeActor { actor, reply_to });
-        Ok(admin)
-    }
+    let Some(tx) = self.admin_tx_for(actor) else {
+        return self.ready::<OperationResult>(Err(AdminError::ActorNotFound { actor }));
+    };
+    let (admin, reply_to) = self.new_admin::<OperationResult>()?;
+    tx.send(AdminCommand::ResumeActor { actor, reply_to });
+    Ok(admin)
+}
 }
 
-#[allow(private_interfaces)]
-impl ContextInner for Runtime {
-    fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
-        if self.address_map.contains(&addr) {
-            self.transfer_tx.send(Envelope::new(addr, msg));
-            Ok(())
-        } else {
-            self.make_tick_context().route_nonlocal(addr, msg)
+// ─── SingleThreadRuntime ────────────────────────────────────────────────────
+
+/// The explicit manual host: consumes [`RuntimeParts`] and sequentially advances
+/// every worker once per [`try_tick`](Self::try_tick), without locks.
+///
+/// External handles retain only a cloned [`Runtime`]; the host owns the workers.
+pub struct SingleThreadRuntime {
+    runtime: Runtime,
+    workers: Vec<Worker>,
+}
+
+impl SingleThreadRuntime {
+    /// Consume `parts` and own its workers for manual progression.
+    pub fn new(parts: RuntimeParts) -> Self {
+        Self {
+            runtime: parts.runtime,
+            workers: parts.workers,
         }
     }
 
-    fn spawn_any(&self, request: SpawnRequest) {
-        self.address_map.insert(request.addr);
-        self.spawn_tx.send(request);
+    /// Borrow the cloneable runtime handle.
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
     }
 
-    fn request_stop(&self, addr: ActorAddress) {
-        if self.address_map.contains(&addr) {
-            self.transfer_tx
-                .send(Envelope::new(addr, Box::new(StopSignal)));
+    /// Return whether any owned worker currently has schedulable work.
+    pub fn has_work(&self) -> bool {
+        self.workers.iter().any(|w| w.has_work())
+    }
+
+    /// Advance every owned worker exactly once, combining their results.
+    ///
+    /// Does not short-circuit: later workers are still ticked after an earlier
+    /// productive one, so cross-worker backlogs drain on the same call.
+    pub fn try_tick(&mut self) -> bool {
+        let mut did_work = false;
+        for w in &mut self.workers {
+            if w.try_tick() {
+                did_work = true;
+            }
         }
+        did_work
     }
 
-    fn request_stop_with(&self, addr: ActorAddress, value: ExitValue) {
-        if self.address_map.contains(&addr) {
-            self.transfer_tx
-                .send(Envelope::new(addr, Box::new(StopWithSignal(value))));
-        }
-    }
-
-    fn request_suspend(&self, addr: ActorAddress) {
-        // From spawn context (outside worker), not supported (suspend is per-actor, from handler)
-        eprintln!("swactor: request_suspend called outside worker context for {addr} — ignored");
-    }
-
-    fn request_resume(&self, addr: ActorAddress) {
-        if self.address_map.contains(&addr) {
-            self.transfer_tx
-                .send(Envelope::new(addr, Box::new(ResumeSignal)));
-        }
-    }
-
-    fn post_worker_request(&self, _request: Box<dyn Any + Send>) {
-        // Worker requests (e.g., timers) are per-worker; posting from outside
-        // a worker context (e.g., rt.spawn() callback) is not supported.
-        eprintln!("swactor: post_worker_request called outside worker context — ignored");
-    }
-
-    fn extension(&self) -> Option<&dyn RuntimeExtension> {
-        self.extension.as_deref()
-    }
-
-    fn process_output_observer(
-        &self,
-    ) -> Option<Arc<dyn crate::process_observer::ProcessOutputObserver>> {
-        self.process_output_observer.get().cloned()
-    }
-
-    fn system_info(&self) -> SystemInfo {
-        SystemInfo {
-            worker_id: 0,
-            num_workers: 1,
-            total_actors: self.worker_stats.num_actors.load(Ordering::Relaxed),
-            uptime_ms: self.created_at.elapsed().as_millis() as u64,
-        }
+    /// Drive one pass of every worker (ignoring whether work was done).
+    pub fn tick(&mut self) {
+        let _ = self.try_tick();
     }
 }

@@ -81,7 +81,7 @@ fn operation_applied() -> OperationResult {
 
 #[test]
 fn ask_recv_ticking_delivers_reply_through_runtime_inbox() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let actor = rt.spawn(SelfAddrActor).unwrap();
 
     let ask = rt
@@ -94,7 +94,7 @@ fn ask_recv_ticking_delivers_reply_through_runtime_inbox() {
         "ask reply is not available before ticking"
     );
     assert_eq!(
-        ask.recv_ticking(&rt, 5).unwrap(),
+        ask.recv_ticking(&mut host, 5).unwrap(),
         MyAddr(actor),
         "recv_ticking drives the runtime inbox reply path"
     );
@@ -102,10 +102,10 @@ fn ask_recv_ticking_delivers_reply_through_runtime_inbox() {
 
 #[test]
 fn admin_list_and_inspect_report_actor_slot_metadata() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let ping_pong = rt.spawn(PingPongActor).unwrap();
     let counter = rt.spawn(CounterActor { count: 0 }).unwrap();
-    rt.tick();
+    host.try_tick();
 
     let count_inbox = rt.new_inbox::<Count>().unwrap();
     rt.send_to(
@@ -123,14 +123,13 @@ fn admin_list_and_inspect_report_actor_slot_metadata() {
     )
     .unwrap();
 
-    assert_eq!(tick_until_recv(&rt, &count_inbox, 5), Some(Count(1)));
-    assert_eq!(tick_until_recv(&rt, &count_inbox, 5), Some(Count(2)));
+    assert_eq!(tick_until_recv(&mut host, &count_inbox, 5), Some(Count(1)));
+    assert_eq!(tick_until_recv(&mut host, &count_inbox, 5), Some(Count(2)));
 
     let response = rt
         .admin()
         .list_actors()
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap();
 
     assert_eq!(
@@ -172,8 +171,7 @@ fn admin_list_and_inspect_report_actor_slot_metadata() {
     let inspect = rt
         .admin()
         .inspect_actor(counter)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(inspect.summary, *counter_summary);
 
@@ -181,8 +179,7 @@ fn admin_list_and_inspect_report_actor_slot_metadata() {
     let missing_result = rt
         .admin()
         .inspect_actor(missing)
-        .unwrap()
-        .recv_ticking(&rt, 5);
+        .unwrap().recv_ticking(&mut host, 5);
     assert!(
         matches!(missing_result, Err(AdminError::ActorNotFound { actor }) if actor == missing),
         "missing actor is reported through AdminResult"
@@ -191,7 +188,7 @@ fn admin_list_and_inspect_report_actor_slot_metadata() {
 
 #[test]
 fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let started = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
     let addr = rt
@@ -201,7 +198,7 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
             stopped: stopped.clone(),
         })
         .unwrap();
-    rt.tick();
+    host.try_tick();
 
     assert_eq!(started.load(Ordering::SeqCst), 1);
     assert_eq!(stopped.load(Ordering::SeqCst), 0);
@@ -215,13 +212,12 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
         },
     )
     .unwrap();
-    assert_eq!(tick_until_recv(&rt, &count_inbox, 5), Some(Count(2)));
+    assert_eq!(tick_until_recv(&mut host, &count_inbox, 5), Some(Count(2)));
 
     let state = rt
         .admin()
         .get_actor_state::<ReplaceProbe>(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap()
         .state;
     assert_eq!(state.actor, addr);
@@ -240,8 +236,7 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
     let replace_result = rt
         .admin()
         .replace_actor_state::<ReplaceProbe>(addr, replacement)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(replace_result, operation_applied());
     assert_eq!(
@@ -263,13 +258,12 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
         },
     )
     .unwrap();
-    assert_eq!(tick_until_recv(&rt, &count_inbox, 5), Some(Count(101)));
+    assert_eq!(tick_until_recv(&mut host, &count_inbox, 5), Some(Count(101)));
 
     let summary = rt
         .admin()
         .inspect_actor(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap()
         .summary;
     assert_eq!(summary.address, addr);
@@ -282,17 +276,16 @@ fn admin_get_and_replace_actor_state_preserves_slot_metadata() {
     let stop_result = rt
         .admin()
         .stop_actor(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(stop_result, operation_applied());
-    rt.tick();
+    host.try_tick();
     assert_eq!(stopped.load(Ordering::SeqCst), 1);
 }
 
 #[test]
 fn admin_replace_rejects_wrong_actor_type_and_wrong_snapshot_address() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let started = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
     let addr = rt
@@ -302,14 +295,13 @@ fn admin_replace_rejects_wrong_actor_type_and_wrong_snapshot_address() {
             stopped: stopped.clone(),
         })
         .unwrap();
-    rt.tick();
+    host.try_tick();
 
     let wrong_type_snapshot = ActorStateSnapshot::new(addr, WrongProbe);
     let wrong_type = rt
         .admin()
         .replace_actor_state::<WrongProbe>(addr, wrong_type_snapshot)
-        .unwrap()
-        .recv_ticking(&rt, 5);
+        .unwrap().recv_ticking(&mut host, 5);
     assert!(
         matches!(wrong_type, Err(AdminError::TypeMismatch { .. })),
         "wrong concrete actor type is rejected"
@@ -327,8 +319,7 @@ fn admin_replace_rejects_wrong_actor_type_and_wrong_snapshot_address() {
     let wrong_address = rt
         .admin()
         .replace_actor_state::<ReplaceProbe>(addr, wrong_addr_snapshot)
-        .unwrap()
-        .recv_ticking(&rt, 5);
+        .unwrap().recv_ticking(&mut host, 5);
     assert!(
         matches!(wrong_address, Err(AdminError::AddressMismatch { requested, snapshot }) if requested == addr && snapshot == wrong_addr),
         "snapshot address must match the target address"
@@ -344,7 +335,7 @@ fn admin_replace_rejects_wrong_actor_type_and_wrong_snapshot_address() {
     )
     .unwrap();
     assert_eq!(
-        tick_until_recv(&rt, &count_inbox, 5),
+        tick_until_recv(&mut host, &count_inbox, 5),
         Some(Count(11)),
         "failed replacements do not mutate the original actor state"
     );
@@ -352,20 +343,19 @@ fn admin_replace_rejects_wrong_actor_type_and_wrong_snapshot_address() {
 
 #[test]
 fn admin_suspend_queues_messages_until_resume() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let addr = rt
         .spawn(CountingPingActor {
             counter: counter.clone(),
         })
         .unwrap();
-    rt.tick();
+    host.try_tick();
 
     let suspend_result = rt
         .admin()
         .suspend_actor(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(suspend_result, operation_applied());
 
@@ -379,15 +369,14 @@ fn admin_suspend_queues_messages_until_resume() {
         )
         .unwrap();
     }
-    tick_n(&rt, 5);
+    tick_n(&mut host, 5);
     assert_eq!(counter.load(Ordering::SeqCst), 0);
     assert_eq!(pong_inbox.try_recv(), None);
 
     let suspended = rt
         .admin()
         .inspect_actor(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap()
         .summary;
     assert!(suspended.status.suspended);
@@ -396,20 +385,18 @@ fn admin_suspend_queues_messages_until_resume() {
     let resume_result = rt
         .admin()
         .resume_actor(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(resume_result, operation_applied());
     for _ in 0..3 {
-        assert_eq!(tick_until_recv(&rt, &pong_inbox, 5), Some(Pong));
+        assert_eq!(tick_until_recv(&mut host, &pong_inbox, 5), Some(Pong));
     }
     assert_eq!(counter.load(Ordering::SeqCst), 3);
 
     let resumed = rt
         .admin()
         .inspect_actor(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap()
         .summary;
     assert!(!resumed.status.suspended);
@@ -419,7 +406,7 @@ fn admin_suspend_queues_messages_until_resume() {
 
 #[test]
 fn admin_stop_clears_pending_mailbox_without_calling_handle() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let started = Arc::new(AtomicUsize::new(0));
     let handled = Arc::new(AtomicUsize::new(0));
     let stopped = Arc::new(AtomicUsize::new(0));
@@ -430,7 +417,7 @@ fn admin_stop_clears_pending_mailbox_without_calling_handle() {
             stopped: stopped.clone(),
         })
         .unwrap();
-    rt.tick();
+    host.try_tick();
     assert_eq!(started.load(Ordering::SeqCst), 1);
 
     let pong_inbox = rt.new_inbox::<Pong>().unwrap();
@@ -447,11 +434,10 @@ fn admin_stop_clears_pending_mailbox_without_calling_handle() {
     let stop_result = rt
         .admin()
         .stop_actor(addr)
-        .unwrap()
-        .recv_ticking(&rt, 5)
+        .unwrap().recv_ticking(&mut host, 5)
         .unwrap();
     assert_eq!(stop_result, operation_applied());
-    rt.tick();
+    host.try_tick();
 
     assert_eq!(handled.load(Ordering::SeqCst), 0);
     assert_eq!(stopped.load(Ordering::SeqCst), 1);
@@ -467,7 +453,7 @@ fn admin_stop_clears_pending_mailbox_without_calling_handle() {
         "admin-stopped actor is removed from normal send routing"
     );
 
-    let inspect = rt.admin().inspect_actor(addr).unwrap().recv_ticking(&rt, 5);
+    let inspect = rt.admin().inspect_actor(addr).unwrap().recv_ticking(&mut host, 5);
     assert!(
         matches!(inspect, Err(AdminError::ActorNotFound { actor }) if actor == addr),
         "admin-stopped actor is no longer inspectable"
@@ -476,7 +462,7 @@ fn admin_stop_clears_pending_mailbox_without_calling_handle() {
 
 #[test]
 fn admin_suspend_resume() {
-    let rt = std_runtime(RuntimeConfig::default());
+    let (rt, mut host) = std_host(RuntimeConfig::default());
     let counter = Arc::new(AtomicUsize::new(0));
     let addr = rt
         .spawn(CountingPingActor {
@@ -484,11 +470,11 @@ fn admin_suspend_resume() {
         })
         .unwrap();
     let pong_inbox = rt.new_inbox::<Pong>().unwrap();
-    rt.tick(); // process on_start
+    host.try_tick(); // process on_start
 
     // Suspend
     let suspended = rt.admin().suspend_actor(addr).unwrap();
-    let suspended = suspended.recv_ticking(&rt, 5);
+    let suspended = suspended.recv_ticking(&mut host, 5);
     assert_eq!(suspended, Ok(operation_applied()));
 
     // Send while suspended — should not process
@@ -499,7 +485,7 @@ fn admin_suspend_resume() {
         },
     )
     .unwrap();
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
     assert!(
         pong_inbox.try_recv().is_none(),
         "no pong while suspended"
@@ -508,11 +494,11 @@ fn admin_suspend_resume() {
 
     // Resume
     let resumed = rt.admin().resume_actor(addr).unwrap();
-    let resumed = resumed.recv_ticking(&rt, 5);
+    let resumed = resumed.recv_ticking(&mut host, 5);
     assert_eq!(resumed, Ok(operation_applied()));
 
     // Tick — message should now be processed
-    tick_n(&rt, 3);
+    tick_n(&mut host, 3);
     assert_eq!(
         pong_inbox.try_recv(),
         Some(Pong),
@@ -523,7 +509,7 @@ fn admin_suspend_resume() {
 
 #[test]
 fn admin_list_actors() {
-    let rt = std_runtime(RuntimeConfig {
+    let (rt, mut host) = std_host(RuntimeConfig {
         max_actors: 100,
         ..Default::default()
     });
@@ -531,11 +517,10 @@ fn admin_list_actors() {
     for _ in 0..16 {
         addrs.push(rt.spawn(CounterActor { count: 0 }).unwrap());
     }
-    rt.tick(); // process spawns
+    host.try_tick(); // process spawns
 
     let admin = rt.admin().list_actors().unwrap();
-    let list = admin
-        .recv_ticking(&rt, 5)
+    let list = admin.recv_ticking(&mut host, 5)
         .expect("list_actors timed out");
 
     let expected: HashSet<_> = addrs.iter().copied().collect();

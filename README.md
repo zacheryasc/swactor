@@ -23,12 +23,12 @@ pub trait ActorInterface: 'static + Send {
 }
 ```
 
-You drive the runtime single-threaded with `tick()` (this is what compiles to
-WASM) or multi-threaded with `run()`:
+You can drive core explicitly with `SingleThreadRuntime` (the WASM-friendly
+host) or hand `RuntimeParts` to an engine substrate:
 
 ```rust
 use swactor::actor::{ActorInterface, Ctx};
-use swactor::runtime::{Runtime, RuntimeConfig};
+use swactor::runtime::{RuntimeConfig, RuntimeParts, SingleThreadRuntime};
 
 struct Counter { count: u64 }
 
@@ -42,17 +42,19 @@ impl ActorInterface for Counter {
 }
 
 fn main() -> Result<(), swactor::Error> {
-    let rt = Runtime::new(RuntimeConfig::default()); // 1 worker → drive with tick()
+    let parts = RuntimeParts::new(RuntimeConfig::default()); // 1 worker by default
+    let rt = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let addr = rt.spawn(Counter { count: 0 })?;
     rt.send_to(addr, ())?;
-    for _ in 0..3 { rt.tick(); }                      // spawn → handle → done
+    for _ in 0..3 { host.tick(); }                         // spawn → handle → done
     Ok(())
 }
 ```
 
-`RuntimeConfig` is three knobs — `max_actors`, `channel_buffer_size`,
-and a per-tick `actor_message_budget` (inspired by BEAM's
-reduction count, so one chatty mailbox can't starve the rest).
+`RuntimeConfig` exposes worker count, actor/worker ingress budgets, actor
+capacity, and channel buffer sizing. The per-tick actor budget is inspired by
+BEAM's reduction count, so one chatty mailbox can't starve the rest.
 
 ## Features
 

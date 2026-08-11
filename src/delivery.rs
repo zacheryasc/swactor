@@ -7,7 +7,7 @@ use crate::Error;
 use crate::actor::{ActorAddress, Message, SpawnRequest};
 use crate::channel::Sender;
 use crate::config::RuntimeConfig;
-use crate::stats::WorkerStats;
+use crate::stats::{StatsHook, WorkerStats};
 
 // ─── Identity Hasher for ActorAddress ───────────────────────────────────────
 
@@ -54,45 +54,69 @@ pub type AddrMap<V> = HashMap<ActorAddress, V, AddrBuildHasher>;
 /// HashSet optimized for ActorAddress keys.
 pub type AddrSet = HashSet<ActorAddress, AddrBuildHasher>;
 
+// ─── Worker identity ────────────────────────────────────────────────────────
+
+/// Opaque internal identity of a logical worker within one runtime.
+///
+/// Created during runtime construction and used only to index the arrays
+/// (transfer/spawn/admin producers and per-worker stats) that belong to that
+/// same runtime. It is intentionally `pub(crate)`: no code outside core
+/// constructs or compares `WorkerId` values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct WorkerId(pub(crate) usize);
+
+impl WorkerId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 // ─── Address Registry ───────────────────────────────────────────────────────
 
-/// Tracks which actor addresses belong to this runtime.
+/// Routes actor addresses to their owning logical worker.
 ///
-/// `RwLock<AddrSet>` — zero contention for parallel reads, write-rare (only on spawn).
+/// `RwLock<AddrMap<WorkerId>>` — zero contention for parallel reads; writes
+/// happen only at spawn (insert) and cleanup (remove).
 pub(crate) struct AddressMap {
-    inner: RwLock<AddrSet>,
+    inner: RwLock<AddrMap<WorkerId>>,
 }
 
 impl AddressMap {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            inner: RwLock::new(HashSet::with_capacity_and_hasher(
-                capacity,
-                AddrBuildHasher,
-            )),
+            inner: RwLock::new(HashMap::with_capacity_and_hasher(capacity, AddrBuildHasher)),
         }
     }
 
-    pub fn insert(&self, addr: ActorAddress) {
-        self.inner.write().insert(addr);
+
+    /// Number of routed actor addresses (runtime-wide actor count).
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+    /// Record that `addr` lives on `worker`.
+    pub fn insert(&self, addr: ActorAddress, worker: WorkerId) {
+        self.inner.write().insert(addr, worker);
     }
 
-    pub fn contains(&self, addr: &ActorAddress) -> bool {
-        self.inner.read().contains(addr)
+    /// Resolve the owning worker for `addr`, if it is a local actor.
+    pub fn worker_of(&self, addr: &ActorAddress) -> Option<WorkerId> {
+        self.inner.read().get(addr).copied()
     }
 
+    /// Remove the routing entry for `addr` (called when the actor terminates).
     pub fn remove(&self, addr: &ActorAddress) {
         self.inner.write().remove(addr);
     }
 
-    pub fn addresses(&self) -> Vec<ActorAddress> {
-        self.inner.read().iter().copied().collect()
+    /// Iterate `(address, worker)` pairs for stats reporting.
+    pub fn placements(&self) -> Vec<(ActorAddress, WorkerId)> {
+        self.inner.read().iter().map(|(&a, &w)| (a, w)).collect()
     }
 }
 
 // ─── Delivery Types ──────────────────────────────────────────────────────────
 
-/// A type-erased message envelope for depositing into the worker's inbox.
+/// A type-erased message envelope for depositing into a worker's transfer queue.
 ///
 /// Uses `Box` (no atomic refcount) and move semantics (no clone).
 pub(crate) struct Envelope {
@@ -142,7 +166,6 @@ impl InboxRegistry {
     pub fn register(&self, addr: ActorAddress, sender: Arc<dyn SenderT>) {
         self.senders.write().insert(addr, sender);
     }
-
     /// Check if an address is registered without consuming a message.
     #[cfg(feature = "transport")]
     pub fn contains(&self, addr: &ActorAddress) -> bool {
@@ -160,26 +183,53 @@ impl InboxRegistry {
     }
 }
 
-/// Shared state passed to tick_once — single thin pointer avoids register spill.
+/// Shared routing context passed into a worker pass.
+///
+/// Borrows the runtime-wide shared state plus the per-worker slices needed to
+/// route messages. The current worker's identity (`worker_id`) selects its own
+/// producer handles; cross-worker sends index `transfer_txs` by the target's
+/// `WorkerId`.
 pub(crate) struct TickContext<'a> {
     pub(crate) address_map: &'a AddressMap,
-    pub(crate) spawn_tx: &'a Sender<SpawnRequest>,
-    pub(crate) transfer_tx: &'a Sender<Envelope>,
+    pub(crate) spawn_txs: &'a [Sender<SpawnRequest>],
+    pub(crate) transfer_txs: &'a [Sender<Envelope>],
     pub(crate) inbox_registry: &'a InboxRegistry,
     pub(crate) config: &'a RuntimeConfig,
     pub(crate) extension: Option<&'a dyn crate::extension::RuntimeExtension>,
     pub(crate) process_output_observer:
         Option<&'a Arc<dyn crate::process_observer::ProcessOutputObserver>>,
-    pub(crate) stats_hook: Option<&'a dyn crate::stats::StatsHook>,
+    pub(crate) stats_hook: Option<&'a dyn StatsHook>,
     pub(crate) worker_stats: &'a WorkerStats,
+    pub(crate) num_workers: usize,
+    pub(crate) worker_id: WorkerId,
     pub(crate) created_at: crate::Instant,
     #[cfg(feature = "transport")]
     pub(crate) remote_sink: Option<&'a dyn crate::runtime::RemoteSink>,
 }
 
 impl<'a> TickContext<'a> {
-    /// Route a message whose destination is not in the local address map.
-    /// Tries inbox registry, then remote transport, then falls back to inbox error.
+    pub(crate) fn worker_id(&self) -> WorkerId {
+        self.worker_id
+    }
+
+    /// Resolve the owning worker for `addr`, if it is a local actor.
+    pub(crate) fn worker_of(&self, addr: &ActorAddress) -> Option<WorkerId> {
+        self.address_map.worker_of(addr)
+    }
+
+    /// Borrow the transfer producer for `worker`.
+    pub(crate) fn transfer_tx(&self, worker: WorkerId) -> &'a Sender<Envelope> {
+        &self.transfer_txs[worker.index()]
+    }
+
+    /// Borrow the spawn producer for `worker`.
+    pub(crate) fn spawn_tx(&self, worker: WorkerId) -> &'a Sender<SpawnRequest> {
+        &self.spawn_txs[worker.index()]
+    }
+
+    /// Route a message whose destination is not a local actor address.
+    /// Tries the process-local inbox registry, then remote transport, then
+    /// falls back to an inbox error.
     pub(crate) fn route_nonlocal(
         &self,
         addr: ActorAddress,

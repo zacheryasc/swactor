@@ -16,13 +16,14 @@ mod directory_actor {
     //! DirectoryActor convergence and safety: signed claims, supersede, deterministic conflict
     //! resolution, dead-host hiding, catch-up, quieting, and retained recovery claims.
 
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, RwLock};
 
     use swactor::Error;
     use swactor::actor::ActorAddress;
-    use swactor::runtime::{Inbox, Runtime, RuntimeConfig};
+    use swactor::runtime::{Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
     use swactor::std::StdExtension;
     use swactor_transport::{CodecRegistry, Transport, TransportRouter, WireEnvelope};
 
@@ -40,7 +41,7 @@ mod directory_actor {
     /// frame's `type_tag`. Counts every frame it carries, so a test can prove a
     /// settled cluster has gone quiet.
     struct Link {
-        dst_rt: Arc<Runtime>,
+        dst_rt: Runtime,
         routes: HashMap<String, ActorAddress>,
         codec: Arc<CodecRegistry>,
         frames: Arc<AtomicUsize>,
@@ -61,7 +62,8 @@ mod directory_actor {
     /// One node: a runtime hosting a `DirectoryActor`, plus the shared state needed to
     /// wire it into a mesh and observe it.
     struct Node {
-        rt: Arc<Runtime>,
+        rt: Runtime,
+        host: RefCell<SingleThreadRuntime>,
         directory: ActorAddress,
         dir: SharedPeerDirectory,
         router: Arc<TransportRouter>,
@@ -84,14 +86,15 @@ mod directory_actor {
 
             let mut nodes = Vec::new();
             for &nid in &ids {
-                let mut rt = Runtime::new(RuntimeConfig::default())
+                let parts = RuntimeParts::new(RuntimeConfig::default())
                     .with_extension(Arc::new(StdExtension::new()));
+                let rt = parts.runtime().clone();
                 let router = Arc::new(TransportRouter::new());
                 rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
                     codec.clone(),
                     router.clone(),
                 )));
-                let rt = Arc::new(rt);
+                let host = RefCell::new(SingleThreadRuntime::new(parts));
 
                 let dir = SharedPeerDirectory::new();
                 let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
@@ -106,6 +109,7 @@ mod directory_actor {
 
                 nodes.push(Node {
                     rt,
+                    host,
                     directory,
                     dir,
                     router,
@@ -177,7 +181,7 @@ mod directory_actor {
         fn pump(&self, k: usize) {
             for _ in 0..k {
                 for node in &self.nodes {
-                    node.rt.tick();
+                    node.host.borrow_mut().tick();
                 }
             }
         }
@@ -242,7 +246,7 @@ mod directory_actor {
                     },
                 )
                 .unwrap();
-            self.nodes[observer].rt.tick();
+            self.nodes[observer].host.borrow_mut().tick();
             inbox.try_recv().and_then(|located| located.host)
         }
 
@@ -581,13 +585,14 @@ mod directory_route_path {
     //! Application delivery through the directory route view: address-only sends, supersede, and
     //! best-effort drops.
 
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex, RwLock};
 
     use serde::{Deserialize, Serialize};
     use swactor::Error;
     use swactor::actor::{ActorAddress, ActorInterface};
-    use swactor::runtime::{Ctx, Runtime, RuntimeConfig};
+    use swactor::runtime::{Ctx, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
     use swactor::std::StdExtension;
     use swactor_transport::{CodecRegistry, NetworkMessage, TransportRouter};
 
@@ -653,7 +658,8 @@ mod directory_route_path {
     // ── The harness ─────────────────────────────────────────────────────────────
 
     struct RouteNode {
-        rt: Arc<Runtime>,
+        rt: Runtime,
+        host: RefCell<SingleThreadRuntime>,
         outbox: Outbox,
         route_view: RouteView,
         directory: ActorAddress,
@@ -688,14 +694,15 @@ mod directory_route_path {
 
             let mut nodes = Vec::new();
             for &nid in &ids {
-                let mut rt = Runtime::new(RuntimeConfig::default())
+                let parts = RuntimeParts::new(RuntimeConfig::default())
                     .with_extension(Arc::new(StdExtension::new()));
+                let rt = parts.runtime().clone();
                 let router = Arc::new(TransportRouter::new());
                 rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
                     codec.clone(),
                     router.clone(),
                 )));
-                let rt = Arc::new(rt);
+                let host = RefCell::new(SingleThreadRuntime::new(parts));
 
                 let outbox: Outbox = Arc::new(Mutex::new(Vec::new()));
                 let route_view: RouteView = Arc::new(RwLock::new(HashMap::new()));
@@ -724,6 +731,7 @@ mod directory_route_path {
 
                 nodes.push(RouteNode {
                     rt,
+                    host,
                     outbox,
                     route_view,
                     directory,
@@ -793,7 +801,7 @@ mod directory_route_path {
         fn settle(&self, k: usize) {
             for _ in 0..k {
                 for node in &self.nodes {
-                    node.rt.tick();
+                    node.host.borrow_mut().tick();
                 }
                 self.deliver_wire();
             }

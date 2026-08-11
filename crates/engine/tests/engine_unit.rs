@@ -13,8 +13,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering::SeqCst;
 use std::time::Duration;
 
-use swactor::config::RuntimeConfig;
-use swactor::runtime::Runtime;
 
 use swactor_engine::{
     Capabilities, Engine, EngineError, ExecutionBackend, SteppingBackend,
@@ -133,8 +131,8 @@ impl swactor_engine::ExecutionBackend for NoCapBackend {
 
 #[test]
 fn engine_new_rejects_backend_without_tasks() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
-    let result = Engine::new(runtime, NoCapBackend);
+    let parts = default_parts();
+    let result = Engine::new(parts, NoCapBackend);
     assert!(
         matches!(result, Err(EngineError::MissingRequiredCapability)),
         "Engine::new must reject a backend that cannot schedule tasks"
@@ -143,9 +141,9 @@ fn engine_new_rejects_backend_without_tasks() {
 
 #[test]
 fn engine_new_accepts_stepping_backend() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend).expect("stepping backend has tasks");
+    let engine = Engine::new(parts, backend).expect("stepping backend has tasks");
     drop(engine);
 }
 
@@ -155,9 +153,9 @@ fn engine_new_accepts_stepping_backend() {
 
 #[test]
 fn require_accepts_when_all_capabilities_present() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend).unwrap();
+    let engine = Engine::new(parts, backend).unwrap();
     let handle = engine.handle();
 
     // Stepping provides tasks + timers + blocking.
@@ -172,9 +170,9 @@ fn require_accepts_when_all_capabilities_present() {
 
 #[test]
 fn require_rejects_when_io_missing() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend).unwrap();
+    let engine = Engine::new(parts, backend).unwrap();
     let handle = engine.handle();
 
     // Stepping does NOT provide io.
@@ -198,8 +196,8 @@ fn require_rejects_when_timers_missing() {
         }
     }
 
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
-    let engine = Engine::new(runtime, TaskOnlyBackend).unwrap();
+    let parts = default_parts();
+    let engine = Engine::new(parts, TaskOnlyBackend).unwrap();
     let handle = engine.handle();
 
     assert!(
@@ -218,9 +216,9 @@ fn require_rejects_when_timers_missing() {
 
 #[test]
 fn require_can_be_called_multiple_times() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend).unwrap();
+    let engine = Engine::new(parts, backend).unwrap();
     let handle = engine.handle();
 
     assert!(handle.require(Capabilities::TASKS_ONLY).is_ok());
@@ -266,7 +264,7 @@ const STEPS: usize = 30;
 
 #[test]
 fn stepping_core_progresses_without_tokio() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let (parts, runtime) = default_runtime_parts();
     let received = Arc::new(AtomicUsize::new(0));
     let addr = runtime
         .spawn(RecordingProbe {
@@ -275,7 +273,7 @@ fn stepping_core_progresses_without_tokio() {
         .expect("spawn probe");
 
     let backend = SteppingBackend::new();
-    let _engine = Engine::new(runtime.clone(), backend.clone()).expect("construct engine");
+    let _engine = Engine::new(parts, backend.clone()).expect("construct engine");
 
     // Deliver AFTER engine construction — a later tick must observe it.
     runtime.send_to(addr, Probe).expect("deliver probe");
@@ -291,10 +289,60 @@ fn stepping_core_progresses_without_tokio() {
 }
 
 #[test]
-fn stepping_supporting_work_progresses() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+fn stepping_engine_installs_one_driver_per_worker() {
+    let (parts, _runtime) = runtime_parts_with_workers(3);
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend.clone()).expect("construct engine");
+
+    let _engine = Engine::new(parts, backend.clone()).expect("construct engine");
+
+    assert_eq!(
+        backend.pending_task_count(),
+        3,
+        "one core-driving task is installed per worker"
+    );
+}
+
+#[test]
+fn stepping_engine_drives_every_worker() {
+    let (parts, runtime) = runtime_parts_with_workers(3);
+    let counters: Vec<_> = (0..3)
+        .map(|_| Arc::new(AtomicUsize::new(0)))
+        .collect();
+    let addrs: Vec<_> = counters
+        .iter()
+        .map(|received| {
+            runtime
+                .spawn(RecordingProbe {
+                    received: received.clone(),
+                })
+                .expect("spawn probe")
+        })
+        .collect();
+
+    let backend = SteppingBackend::new();
+    let _engine = Engine::new(parts, backend.clone()).expect("construct engine");
+
+    for addr in addrs {
+        runtime.send_to(addr, Probe).expect("deliver probe");
+    }
+    for _ in 0..STEPS {
+        backend.step();
+    }
+
+    for (worker, received) in counters.iter().enumerate() {
+        assert_eq!(
+            received.load(SeqCst),
+            1,
+            "worker {worker} must be driven by its own core driver"
+        );
+    }
+}
+
+#[test]
+fn stepping_supporting_work_progresses() {
+    let parts = default_parts();
+    let backend = SteppingBackend::new();
+    let engine = Engine::new(parts, backend.clone()).expect("construct engine");
     let handle = engine.handle();
 
     let done = Arc::new(AtomicBool::new(false));
@@ -315,7 +363,7 @@ fn stepping_supporting_work_progresses() {
 
 #[test]
 fn stepping_core_and_supporting_work_both_progress() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let (parts, runtime) = default_runtime_parts();
     let received = Arc::new(AtomicUsize::new(0));
     let addr = runtime
         .spawn(RecordingProbe {
@@ -324,7 +372,7 @@ fn stepping_core_and_supporting_work_both_progress() {
         .expect("spawn probe");
 
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime.clone(), backend.clone()).expect("construct engine");
+    let engine = Engine::new(parts, backend.clone()).expect("construct engine");
     let handle = engine.handle();
 
     // Long-lived cooperative supporting work that yields between steps.
@@ -367,9 +415,9 @@ fn stepping_virtual_time_is_monotonic() {
 
 #[test]
 fn stepping_virtual_now_matches_engine_now() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend.clone()).unwrap();
+    let engine = Engine::new(parts, backend.clone()).unwrap();
     let handle = engine.handle();
 
     assert_eq!(handle.now(), backend.virtual_now());
@@ -380,9 +428,9 @@ fn stepping_virtual_now_matches_engine_now() {
 
 #[test]
 fn stepping_timer_does_not_fire_before_advance() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend.clone()).expect("construct engine");
+    let engine = Engine::new(parts, backend.clone()).expect("construct engine");
     let handle = engine.handle();
 
     let fired = Arc::new(AtomicBool::new(false));
@@ -404,9 +452,9 @@ fn stepping_timer_does_not_fire_before_advance() {
 
 #[test]
 fn stepping_timer_fires_after_virtual_time_advance() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend.clone()).expect("construct engine");
+    let engine = Engine::new(parts, backend.clone()).expect("construct engine");
     let handle = engine.handle();
 
     let fired = Arc::new(AtomicBool::new(false));
@@ -435,9 +483,9 @@ fn stepping_timer_fires_after_virtual_time_advance() {
 
 #[test]
 fn stepping_blocking_work_runs_isolated() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend.clone()).expect("construct engine");
+    let engine = Engine::new(parts, backend.clone()).expect("construct engine");
     let handle = engine.handle();
 
     let done = Arc::new(AtomicBool::new(false));
@@ -461,9 +509,9 @@ fn stepping_blocking_work_runs_isolated() {
 
 #[test]
 fn stepping_spawned_task_completing_is_removed_from_queue() {
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let backend = SteppingBackend::new();
-    let engine = Engine::new(runtime, backend.clone()).expect("construct engine");
+    let engine = Engine::new(parts, backend.clone()).expect("construct engine");
     let handle = engine.handle();
 
     handle.spawn(async {});
@@ -529,9 +577,9 @@ fn dropping_engine_releases_backend_even_with_live_handles() {
     // core-driver task it owns) is released once the engine drops — even while
     // handles remain alive (ENGINE_SPEC.md).
     let sentinel = Arc::new(());
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
+    let parts = default_parts();
     let engine = Engine::new(
-        runtime,
+        parts,
         SentinelBackend { sentinel: sentinel.clone() },
     )
     .expect("tasks capability present");
@@ -562,8 +610,8 @@ fn handle_used_after_engine_drop_degrades_gracefully() {
     // Behavior beyond the engine's lifetime is out of spec, but a handle must
     // not retain the backend and should degrade through the smallest practical
     // API rather than panic (ENGINE_SPEC.md).
-    let runtime = Arc::new(Runtime::new(RuntimeConfig::default()));
-    let engine = Engine::new(runtime, SteppingBackend::default()).unwrap();
+    let parts = default_parts();
+    let engine = Engine::new(parts, SteppingBackend::default()).unwrap();
     let handle = engine.handle();
     // Live handle reports the stepping backend's capabilities.
     assert!(handle.capabilities().tasks);

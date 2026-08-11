@@ -1,8 +1,9 @@
 # Iroh Driver Fixed Specification
 
 Id: 5
-Last modified: f8fc594b95871813a890b5d60f60dee505ef93bc
+Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
 Last reviewed:
+> Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
 > Review checkpoint: reviewed through Section 3.2; resume with Section 3.3 Accepted Connection Output.
 
@@ -537,7 +538,7 @@ datastream_transport
 ```text
 keypair
 endpoint
-Tokio handle
+engine handle
 connection cache
 pending joins
 accepted actor connections
@@ -548,10 +549,9 @@ eviction queue
 peer relay cache
 join status map
 actor bridge
-optional owned Tokio runtime for legacy construction
 ```
 
-The driver core is intentionally pumpable. Network I/O runs in background Tokio tasks. Pump methods drain in-memory queues and do not perform long blocking network operations.
+The driver core is intentionally pumpable. Network I/O runs in engine-hosted tasks. Pump methods drain in-memory queues and do not perform long blocking network operations.
 
 ### 5.2 Actor Bridge
 
@@ -632,7 +632,7 @@ Boot begins when a caller constructs the driver.
 Construction:
 
 ```text
-resolve Tokio handle
+resolve swactor engine handle and required capabilities
 build iroh endpoint with actor ALPN and additional protocol wire ALPNs
 apply relay mode
 apply secret key when configured
@@ -675,7 +675,7 @@ The engine-hosted pump cycle advances the following per interval:
 ```text
 send protocol actor ticks
 drain inbound iroh actor frames into Swactor
-run Swactor runtime work
+actor work progresses through the engine-owned worker drivers
 drain actor egress channel to iroh
 drain protocol adapter ingress/status queues
 wake or drain ring-backed protocol pumps as needed
@@ -847,7 +847,7 @@ shutdown check:
     close stops endpoint accept, protocol runners, and pump work without caller-held task handles
 ```
 
-Legacy APIs that expose endpoint clones, Tokio handles, raw accepted connections, raw streams, or transport task handles are compatibility surfaces only. They are not part of the target behavioral contract.
+Legacy APIs that expose endpoint clones, raw accepted connections, raw streams, or transport task handles are compatibility surfaces only. They are not part of the target behavioral contract.
 
 ---
 
@@ -855,9 +855,9 @@ Legacy APIs that expose endpoint clones, Tokio handles, raw accepted connections
 
 The driver is only one part of a running distributed actor node. Several components must be established around it.
 
-### 8.1 Tokio Runtime
+### 8.1 Engine Substrate
 
-The driver requires a Tokio runtime for:
+The driver requires a swactor engine handle with task, timer, and I/O capability for:
 
 - endpoint bind;
 - endpoint accept;
@@ -867,9 +867,9 @@ The driver requires a Tokio runtime for:
 - retry timers;
 - async close.
 
-New production code must pass this runtime explicitly with `with_handle`.
+Production code passes this substrate explicitly with `with_engine`.
 
-The driver must not create or own another Tokio runtime. The caller keeps the single process runtime alive for at least as long as the driver is alive.
+The driver must not create, discover, or store a raw Tokio runtime. The caller keeps the owning swactor engine alive for at least as long as the driver is alive.
 
 ### 8.2 Iroh Endpoint
 
@@ -881,13 +881,13 @@ The endpoint must register the actor ALPN and every internal wire ALPN required 
 
 ### 8.3 Swactor Runtime
 
-The Swactor runtime owns local actor mailboxes and actor execution.
+The Swactor runtime handle owns local actor mailboxes and actor delivery APIs.
 
-The driver needs an `Arc<Runtime>` only after the actor bridge is installed.
+The driver stores a cloned `Runtime` handle only after the actor bridge is installed.
 
 The driver delivers decoded inbound actor messages into this runtime with `deliver_raw`.
 
-The Swactor runtime still must be ticked by the caller. The driver does not schedule actors by itself.
+Actor execution is driven by the swactor engine that consumed `RuntimeParts`; the driver does not tick actors itself.
 
 ### 8.4 Distribution Actors
 
@@ -902,7 +902,7 @@ DirectoryActor
 
 The driver transports their messages but does not implement their state machines.
 
-The caller must create these actors, route their message type tags, inject protocol ticks, and subscribe/fan out membership changes as required by the distribution stack.
+The caller must create these actors, route their message type tags, install the engine-hosted protocol tick pump, and subscribe/fan out membership changes as required by the distribution stack.
 
 ### 8.5 Codec Registry, Transport Router, and Actor Egress Channel
 
@@ -942,7 +942,7 @@ Driver errors are localized to the operation that observes them. Higher-level li
 
 Construction can fail while building or binding the iroh endpoint.
 
-Construction errors return from `with_handle`.
+Construction errors return from `with_engine`.
 
 No runtime pump contract exists for a driver that failed construction.
 

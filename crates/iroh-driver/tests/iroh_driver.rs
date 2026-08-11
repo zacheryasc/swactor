@@ -233,11 +233,11 @@ fn driver_rejects_engine_without_io() {
     use iroh::RelayMode;
     use iroh_driver::{IrohDriver, IrohDriverConfig};
     use swactor::config::RuntimeConfig;
-    use swactor::runtime::Runtime;
+    use swactor::runtime::RuntimeParts;
     use swactor_engine::{Engine, SteppingBackend};
 
-    let rt = Arc::new(Runtime::new(RuntimeConfig::default()));
-    let engine = Engine::new(rt, SteppingBackend::default()).expect("stepping engine");
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let engine = Engine::new(parts, SteppingBackend::default()).expect("stepping engine");
     let result = IrohDriver::with_engine(
         engine.handle(),
         IrohDriverConfig {

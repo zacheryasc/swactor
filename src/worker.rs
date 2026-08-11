@@ -15,10 +15,11 @@ use crate::admin::{
     ListActorsResponse, OperationResult,
 };
 use crate::channel::Receiver;
-use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext};
+use crate::delivery::{AddrBuildHasher, AddrMap, Envelope, TickContext, WorkerId};
 use crate::stats::{ActorSnapshot, TickTiming, WorkerStats};
 
 use crate::extension::WorkerExtension;
+use crate::runtime::RuntimeShared;
 
 /// Whether an actor should be skipped during `tick_all`.
 pub(crate) fn should_skip_actor(poisoned: bool, stopping: bool, suspended: bool) -> bool {
@@ -41,9 +42,10 @@ pub(crate) fn determine_stop_reason(poisoned: bool, has_exit_value: bool) -> Sto
     }
 }
 
-/// Route a message: try local pool first, then deposit for pending-spawn actors,
-/// then inbox_registry for external receivers.
-fn route_to_pool_or_remote(
+/// Route a runtime-injected message (extension output, death notification) to
+/// its destination: same-worker pool first, then the owning worker's transfer
+/// queue, then the non-local (inbox/transport) seam.
+fn route_runtime_message(
     pool: &mut ActorPool,
     tc: &TickContext,
     dest: ActorAddress,
@@ -51,23 +53,28 @@ fn route_to_pool_or_remote(
 ) {
     if pool.contains(&dest) {
         pool.deliver(&dest, msg);
-    } else if tc.address_map.contains(&dest) {
-        // Actor exists but not yet in pool (pending spawn) — deposit for next tick
-        tc.transfer_tx.send(Envelope::new(dest, msg));
     } else {
-        let _ = tc.route_nonlocal(dest, msg);
+        match tc.worker_of(&dest) {
+            Some(w) => tc.transfer_tx(w).send(Envelope::new(dest, msg)),
+            None => {
+                let _ = tc.route_nonlocal(dest, msg);
+            }
+        }
     }
 }
 
-// ─── Worker ─────────────────────────────────────────────────────────────────
-
-/// A worker owns a set of actors and processes them via tick_once.
-pub(crate) struct Worker {
+/// A worker owns a disjoint set of actors and processes them via [`Worker::try_tick`].
+///
+/// Each worker is owned by exactly one execution host (a [`SingleThreadRuntime`]
+/// or an engine driver) and requires only `Send`, not `Sync`.
+pub struct Worker {
+    pub(crate) id: WorkerId,
+    pub(crate) shared: Arc<RuntimeShared>,
     pub(crate) pool: ActorPool,
     transfer_rx: Receiver<Envelope>,
     spawn_rx: Receiver<SpawnRequest>,
     admin_rx: Receiver<AdminCommand>,
-    stats: Arc<WorkerStats>,
+    pub(crate) stats: Arc<WorkerStats>,
     /// Reusable scratch buffer for building per-actor snapshots.
     snapshot_buf: Vec<ActorSnapshot>,
     /// Per-worker extension (e.g., timer wheel). Created by RuntimeExtension factory.
@@ -75,16 +82,25 @@ pub(crate) struct Worker {
     /// True if the previous tick did work — ensures one full tick follows a productive
     /// tick so pending_local messages delivered to mailboxes get drained.
     has_backlog: bool,
+    /// Transfers whose address is mapped to this worker but whose spawn request
+    /// has not reached the pool yet.
+    deferred_transfers: VecDeque<Envelope>,
+    /// Targeted admin commands waiting for their mapped spawn to be installed.
+    deferred_admin: VecDeque<AdminCommand>,
 }
 
 impl Worker {
     pub(crate) fn new(
+        id: WorkerId,
+        shared: Arc<RuntimeShared>,
         transfer_rx: Receiver<Envelope>,
         spawn_rx: Receiver<SpawnRequest>,
         admin_rx: Receiver<AdminCommand>,
         stats: Arc<WorkerStats>,
     ) -> Self {
         Self {
+            id,
+            shared,
             pool: ActorPool::new(),
             transfer_rx,
             spawn_rx,
@@ -93,6 +109,8 @@ impl Worker {
             snapshot_buf: Vec::new(),
             worker_ext: None,
             has_backlog: false,
+            deferred_transfers: VecDeque::new(),
+            deferred_admin: VecDeque::new(),
         }
     }
 
@@ -100,187 +118,21 @@ impl Worker {
         self.has_backlog
             || !self.spawn_rx.is_empty()
             || !self.transfer_rx.is_empty()
+            || !self.deferred_transfers.is_empty()
             || !self.admin_rx.is_empty()
+            || !self.deferred_admin.is_empty()
             || self
                 .worker_ext
                 .as_ref()
                 .map_or(false, |e| e.has_pending_work())
     }
 
-    /// Run one iteration of the worker loop. Returns `true` if any work was done.
-    /// Drain the spawn queue, inserting new actors into the pool.
-    /// Used in phases 1 and 4 of tick_once.
-    fn drain_spawns(&mut self, tc: &TickContext) -> bool {
-        let mut did_work = false;
-        #[cfg(feature = "tracing")]
-        let mut spawn_count: usize = 0;
-        while let Some(mut req) = self.spawn_rx.try_recv() {
-            if let Some(ext) = tc.extension {
-                req.env = ext.on_spawn(
-                    req.addr,
-                    req.parent,
-                    req.env,
-                    tc.created_at.elapsed().as_millis() as u64,
-                );
-            }
-            self.pool.insert(req);
-            #[cfg(feature = "tracing")]
-            {
-                spawn_count += 1;
-            }
-            did_work = true;
-        }
-        #[cfg(feature = "tracing")]
-        if spawn_count > 0 {
-            tracing::debug!(
-                worker_id = 0,
-                count = spawn_count,
-                "worker.spawns_drained"
-            );
-        }
-        did_work
-    }
-
-    fn drain_admin(&mut self, tc: &TickContext) -> bool {
-        let mut did_work = false;
-        while let Some(cmd) = self.admin_rx.try_recv() {
-            did_work = true;
-            self.apply_admin_command(tc, cmd);
-        }
-        did_work
-    }
-
-    fn send_admin_reply<T: crate::actor::Message>(
-        tc: &TickContext,
-        reply_to: ActorAddress,
-        result: AdminResult<T>,
-    ) {
-        let _ = tc.inbox_registry.try_deliver(reply_to, Box::new(result));
-    }
-
-    fn apply_admin_command(&mut self, tc: &TickContext, cmd: AdminCommand) {
-        match cmd {
-            AdminCommand::ListActors { acc } => {
-                let mut local = Vec::new();
-                self.pool.actor_summaries_into(&mut local);
-                {
-                    let mut summaries = acc.summaries.lock();
-                    summaries.extend(local);
-                }
-                if acc.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    let actors = {
-                        let mut summaries = acc.summaries.lock();
-                        std::mem::take(&mut *summaries)
-                    };
-                    Self::send_admin_reply(tc, acc.reply_to, Ok(ListActorsResponse { actors }));
-                }
-            }
-            AdminCommand::InspectActor { actor, reply_to } => {
-                let result = self
-                    .pool
-                    .actor_summary(actor)
-                    .map(|summary| InspectActorResponse { summary });
-                Self::send_admin_reply(tc, reply_to, result);
-            }
-            AdminCommand::GetActorState {
-                actor,
-                reply_to,
-                get,
-                not_found,
-            } => {
-                let boxed = match self.pool.get_actor_erased(actor) {
-                    Some(erased) => get(actor, erased, erased.metadata()),
-                    None => not_found(actor),
-                };
-                let _ = tc.inbox_registry.try_deliver(reply_to, boxed);
-            }
-            AdminCommand::ReplaceActorState {
-                actor,
-                reply_to,
-                replace,
-            } => {
-                let result = match self.pool.get_actor_erased_mut(actor) {
-                    Some(erased) => {
-                        let metadata = erased.metadata();
-                        replace(erased, metadata)
-                    }
-                    None => Err(AdminError::ActorNotFound { actor }),
-                };
-                Self::send_admin_reply(tc, reply_to, result);
-            }
-            AdminCommand::StopActor { actor, reply_to } => {
-                let result = self.pool.stop_actor_admin(actor, &self.stats);
-                Self::send_admin_reply(tc, reply_to, result);
-            }
-            AdminCommand::SuspendActor { actor, reply_to } => {
-                let result = self.pool.suspend_actor_admin(actor);
-                Self::send_admin_reply(tc, reply_to, result);
-            }
-            AdminCommand::ResumeActor { actor, reply_to } => {
-                let result = self.pool.resume_actor_admin(actor);
-                Self::send_admin_reply(tc, reply_to, result);
-            }
-        }
-    }
-
-    /// Phase 7: clean up dead actors, deliver death notifications, GC extension state.
-    fn cleanup_dead_actors(&mut self, tc: &TickContext) -> bool {
-        let cleanup_pending: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
-            RefCell::new(Vec::new());
-        let cleanup_stops: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
-        let cleanup_stop_withs: RefCell<Vec<(ActorAddress, ExitValue)>> = RefCell::new(Vec::new());
-        let cleanup_suspends: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
-        let cleanup_requests: RefCell<Vec<Box<dyn Any + Send>>> = RefCell::new(Vec::new());
-        let dead = {
-            let cleanup_ctx = WorkerContext {
-                tc,
-                pending_local: &cleanup_pending,
-                stop_requests: &cleanup_stops,
-                stop_with_values: &cleanup_stop_withs,
-                suspend_requests: &cleanup_suspends,
-                worker_requests: &cleanup_requests,
-                stats: &self.stats,
-            };
-            self.pool.cleanup_dead(&cleanup_ctx)
-        };
-
-        let had_dead = !dead.is_empty();
-        if had_dead {
-            for (addr, _, _) in &dead {
-                tc.address_map.remove(addr);
-            }
-
-            if let Some(ext) = tc.extension {
-                let notifications = ext.on_actor_death(&dead);
-                let dead_addrs: Vec<_> = dead.iter().map(|(a, _, _)| *a).collect();
-                ext.cleanup_dead(&dead_addrs);
-                for (dest, msg) in notifications {
-                    route_to_pool_or_remote(&mut self.pool, tc, dest, msg);
-                }
-            }
-
-            self.stats
-                .num_actors
-                .store(self.pool.len(), Ordering::Relaxed);
-        }
-
-        // Deliver any messages sent during on_stop callbacks
-        for (addr, msg) in cleanup_pending.into_inner() {
-            self.pool.deliver(&addr, msg);
-        }
-
-        // GC per-worker extension state for dead actors
-        if let Some(ext) = &mut self.worker_ext {
-            let dead_addrs: Vec<ActorAddress> = dead.iter().map(|(a, _, _)| *a).collect();
-            ext.gc_dead(&dead_addrs);
-        }
-
-        had_dead
-    }
-
-    pub(crate) fn tick_once(&mut self, tc: &TickContext) -> bool {
-        #[cfg(feature = "tracing")]
-        let _span = tracing::trace_span!("worker.tick", worker_id = 0).entered();
+    /// Run one synchronous worker pass. Returns `true` if any work was done.
+    ///
+    /// This is the only core worker transition. The owning host calls it; the
+    /// worker never drives itself.
+    pub fn try_tick(&mut self) -> bool {
+        let wid = self.id;
 
         // Fast idle path: skip the entire tick when nothing could have changed.
         // Cost: ~3 atomic loads, zero syscalls, zero actor iteration.
@@ -288,24 +140,60 @@ impl Worker {
             return false;
         }
 
+        // Build the routing context from disjoint fields so the mutable
+        // per-pass state (pool, queues, extension) can still be borrowed below.
+        let shared = &self.shared;
+        let tc = TickContext {
+            address_map: &shared.address_map,
+            spawn_txs: &shared.spawn_txs,
+            transfer_txs: &shared.transfer_txs,
+            inbox_registry: &shared.inbox_registry,
+            config: &shared.config,
+            extension: shared.extension.get().map(|a| a.as_ref()),
+            process_output_observer: shared.process_output_observer.get(),
+            stats_hook: shared.stats_hook.get().map(|a| a.as_ref()),
+            worker_stats: &self.stats,
+            num_workers: shared.worker_stats.len(),
+            worker_id: wid,
+            created_at: shared.created_at,
+            #[cfg(feature = "transport")]
+            remote_sink: shared.remote_sink.get().map(|a| a.as_ref()),
+        };
+
+        #[cfg(feature = "tracing")]
+        let _span = tracing::trace_span!("worker.tick", worker_id = wid.index()).entered();
+
         let mut did_work = false;
         let t0 = Instant::now();
 
         // 1. Drain spawn queue → add actors to pool
-        did_work |= self.drain_spawns(tc);
+        did_work |= Self::drain_spawns(
+            &mut self.pool,
+            &self.spawn_rx,
+            &tc,
+            tc.config.worker_ingress_budget,
+        );
         let t1 = Instant::now();
 
-        // 2. Drain transfer queue → deliver envelopes to actors
-        while let Some(envelope) = self.transfer_rx.try_recv() {
-            let dest = envelope.dest();
-            let payload = envelope.into_payload();
-            self.pool.deliver(&dest, payload);
-            did_work = true;
-        }
+        // 2. Drain retained transfers first, then the transfer queue → deliver
+        // envelopes to actors or retain them until their mapped spawn installs.
+        did_work |= Self::drain_transfers(
+            &mut self.pool,
+            &self.transfer_rx,
+            &mut self.deferred_transfers,
+            &tc,
+            tc.config.worker_ingress_budget,
+        );
         let t2 = Instant::now();
 
         // 3. Drain admin queue → inspect or mutate worker-owned slots before handlers
-        did_work |= self.drain_admin(tc);
+        did_work |= Self::drain_admin(
+            &mut self.pool,
+            &self.admin_rx,
+            &mut self.deferred_admin,
+            &tc,
+            tc.config.worker_ingress_budget,
+        );
 
         // 4. Fire per-worker extension (e.g., timers) → deliver before tick_all
         let ext_msgs: Vec<_> = self
@@ -314,7 +202,7 @@ impl Worker {
             .map(|ext| ext.on_tick())
             .unwrap_or_default();
         for (dest, msg) in ext_msgs {
-            route_to_pool_or_remote(&mut self.pool, tc, dest, msg);
+            route_runtime_message(&mut self.pool, &tc, dest, msg);
             did_work = true;
         }
 
@@ -329,7 +217,7 @@ impl Worker {
         let processed;
         {
             let worker_ctx = WorkerContext {
-                tc,
+                tc: &tc,
                 pending_local: &pending_local,
                 stop_requests: &stop_requests,
                 stop_with_values: &stop_with_values,
@@ -337,11 +225,9 @@ impl Worker {
                 worker_requests: &worker_requests,
                 stats: &self.stats,
             };
-            processed = self.pool.tick_all(
-                &worker_ctx,
-                &self.stats,
-                tc.config.actor_message_budget,
-            );
+            processed = self
+                .pool
+                .tick_all(&worker_ctx, &self.stats, tc.config.actor_message_budget);
             if processed > 0 {
                 did_work = true;
             }
@@ -351,7 +237,7 @@ impl Worker {
         #[cfg(feature = "tracing")]
         if processed > 0 {
             tracing::debug!(
-                worker_id = 0,
+                worker_id = wid.index(),
                 messages_processed = processed,
                 "worker.tick_all"
             );
@@ -359,7 +245,12 @@ impl Worker {
 
         // 6. Drain spawn queue again — actors spawned during step 5
         //    must be in the pool before pending_local delivery.
-        did_work |= self.drain_spawns(tc);
+        did_work |= Self::drain_spawns(
+            &mut self.pool,
+            &self.spawn_rx,
+            &tc,
+            tc.config.worker_ingress_budget,
+        );
         let t4 = Instant::now();
 
         // 7. Drain pending_local buffer → deliver to local actors
@@ -368,7 +259,12 @@ impl Worker {
             did_work = true;
         }
         for (addr, msg) in pending {
-            self.pool.deliver(&addr, msg);
+            Self::deliver_or_defer_transfer(
+                &mut self.pool,
+                &tc,
+                &mut self.deferred_transfers,
+                Envelope::new(addr, msg),
+            );
         }
 
         // 7.5. Process worker extension requests from handlers (e.g., timer scheduling)
@@ -394,7 +290,7 @@ impl Worker {
 
             if let Some(hook) = tc.stats_hook {
                 self.pool.mailbox_depths_into(&mut self.snapshot_buf);
-                hook.on_tick(0, &self.snapshot_buf);
+                hook.on_tick(wid.index(), &self.snapshot_buf);
             }
         }
 
@@ -418,7 +314,7 @@ impl Worker {
         #[cfg(feature = "tracing")]
         if did_work {
             tracing::debug!(
-                worker_id = 0,
+                worker_id = wid.index(),
                 num_actors = self.pool.len(),
                 mailbox_depth = self.pool.total_mailbox_depth(),
                 messages_processed = processed,
@@ -427,18 +323,318 @@ impl Worker {
         }
 
         // 9. Clean up poisoned and stopping actors
-        did_work |= self.cleanup_dead_actors(tc);
+        did_work |= Self::cleanup_dead_actors(
+            &mut self.pool,
+            &mut self.worker_ext,
+            &mut self.deferred_transfers,
+            &tc,
+        );
 
         self.has_backlog = did_work;
         did_work
     }
 
+    fn drain_spawns(
+        pool: &mut ActorPool,
+        spawn_rx: &Receiver<SpawnRequest>,
+        tc: &TickContext,
+        budget: usize,
+    ) -> bool {
+        let mut did_work = false;
+        let mut count = 0usize;
+        #[cfg(feature = "tracing")]
+        let mut spawn_count: usize = 0;
+        while let Some(mut req) = spawn_rx.try_recv() {
+            if let Some(ext) = tc.extension {
+                req.env = ext.on_spawn(
+                    req.addr,
+                    req.parent,
+                    req.env,
+                    tc.created_at.elapsed().as_millis() as u64,
+                );
+            }
+            pool.insert(req);
+            #[cfg(feature = "tracing")]
+            {
+                spawn_count += 1;
+            }
+            did_work = true;
+            count += 1;
+            if budget != 0 && count >= budget {
+                break;
+            }
+        }
+        #[cfg(feature = "tracing")]
+        if spawn_count > 0 {
+            tracing::debug!(
+                worker_id = tc.worker_id().index(),
+                count = spawn_count,
+                "worker.spawns_drained"
+            );
+        }
+        did_work
+    }
+
+    fn deliver_or_defer_transfer(
+        pool: &mut ActorPool,
+        tc: &TickContext,
+        deferred: &mut VecDeque<Envelope>,
+        envelope: Envelope,
+    ) -> bool {
+        let dest = envelope.dest();
+        if pool.contains(&dest) {
+            pool.deliver(&dest, envelope.into_payload());
+            true
+        } else if tc.worker_of(&dest) == Some(tc.worker_id()) {
+            deferred.push_back(envelope);
+            false
+        } else {
+            true
+        }
+    }
+
+    fn drain_transfers(
+        pool: &mut ActorPool,
+        transfer_rx: &Receiver<Envelope>,
+        deferred: &mut VecDeque<Envelope>,
+        tc: &TickContext,
+        budget: usize,
+    ) -> bool {
+        let mut did_work = false;
+        let mut count = 0usize;
+
+        while budget == 0 || count < budget {
+            let Some(envelope) = deferred.pop_front() else {
+                break;
+            };
+            if Self::deliver_or_defer_transfer(pool, tc, deferred, envelope) {
+                did_work = true;
+            }
+            count += 1;
+        }
+
+        while budget == 0 || count < budget {
+            let Some(envelope) = transfer_rx.try_recv() else {
+                break;
+            };
+            did_work = true;
+            Self::deliver_or_defer_transfer(pool, tc, deferred, envelope);
+            count += 1;
+        }
+
+        did_work
+    }
+
+    fn admin_target(cmd: &AdminCommand) -> Option<ActorAddress> {
+        match cmd {
+            AdminCommand::ListActors { .. } => None,
+            AdminCommand::InspectActor { actor, .. }
+            | AdminCommand::GetActorState { actor, .. }
+            | AdminCommand::ReplaceActorState { actor, .. }
+            | AdminCommand::StopActor { actor, .. }
+            | AdminCommand::SuspendActor { actor, .. }
+            | AdminCommand::ResumeActor { actor, .. } => Some(*actor),
+        }
+    }
+
+    fn should_defer_admin_command(
+        pool: &ActorPool,
+        tc: &TickContext,
+        cmd: &AdminCommand,
+    ) -> bool {
+        Self::admin_target(cmd).is_some_and(|actor| {
+            !pool.contains(&actor) && tc.worker_of(&actor) == Some(tc.worker_id())
+        })
+    }
+
+    fn apply_or_defer_admin_command(
+        pool: &mut ActorPool,
+        tc: &TickContext,
+        deferred: &mut VecDeque<AdminCommand>,
+        cmd: AdminCommand,
+    ) -> bool {
+        if Self::should_defer_admin_command(pool, tc, &cmd) {
+            deferred.push_back(cmd);
+            false
+        } else {
+            Self::apply_admin_command(pool, tc, cmd);
+            true
+        }
+    }
+
+    fn drain_admin(
+        pool: &mut ActorPool,
+        admin_rx: &Receiver<AdminCommand>,
+        deferred: &mut VecDeque<AdminCommand>,
+        tc: &TickContext,
+        budget: usize,
+    ) -> bool {
+        let mut did_work = false;
+        let mut count = 0usize;
+
+        while budget == 0 || count < budget {
+            let Some(cmd) = deferred.pop_front() else {
+                break;
+            };
+            if Self::apply_or_defer_admin_command(pool, tc, deferred, cmd) {
+                did_work = true;
+            }
+            count += 1;
+        }
+
+        while budget == 0 || count < budget {
+            let Some(cmd) = admin_rx.try_recv() else {
+                break;
+            };
+            did_work = true;
+            Self::apply_or_defer_admin_command(pool, tc, deferred, cmd);
+            count += 1;
+        }
+
+        did_work
+    }
+
+    fn send_admin_reply<T: crate::actor::Message>(
+        tc: &TickContext,
+        reply_to: ActorAddress,
+        result: AdminResult<T>,
+    ) {
+        let _ = tc.inbox_registry.try_deliver(reply_to, Box::new(result));
+    }
+
+    fn apply_admin_command(pool: &mut ActorPool, tc: &TickContext, cmd: AdminCommand) {
+        match cmd {
+            AdminCommand::ListActors { acc } => {
+                let mut local = Vec::new();
+                pool.actor_summaries_into(&mut local, tc.worker_id);
+                {
+                    let mut summaries = acc.summaries.lock();
+                    summaries.extend(local);
+                }
+                if acc.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    let actors = {
+                        let mut summaries = acc.summaries.lock();
+                        std::mem::take(&mut *summaries)
+                    };
+                    Self::send_admin_reply(tc, acc.reply_to, Ok(ListActorsResponse { actors }));
+                }
+            }
+            AdminCommand::InspectActor { actor, reply_to } => {
+                let result = pool
+                    .actor_summary(actor, tc.worker_id)
+                    .map(|summary| InspectActorResponse { summary });
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::GetActorState {
+                actor,
+                reply_to,
+                get,
+                not_found,
+            } => {
+                let boxed = match pool.get_actor_erased(actor) {
+                    Some(erased) => get(actor, erased, erased.metadata()),
+                    None => not_found(actor),
+                };
+                let _ = tc.inbox_registry.try_deliver(reply_to, boxed);
+            }
+            AdminCommand::ReplaceActorState {
+                actor,
+                reply_to,
+                replace,
+            } => {
+                let result = match pool.get_actor_erased_mut(actor) {
+                    Some(erased) => {
+                        let metadata = erased.metadata();
+                        replace(erased, metadata)
+                    }
+                    None => Err(AdminError::ActorNotFound { actor }),
+                };
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::StopActor { actor, reply_to } => {
+                let result = pool.stop_actor_admin(actor, tc.worker_stats);
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::SuspendActor { actor, reply_to } => {
+                let result = pool.suspend_actor_admin(actor);
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+            AdminCommand::ResumeActor { actor, reply_to } => {
+                let result = pool.resume_actor_admin(actor);
+                Self::send_admin_reply(tc, reply_to, result);
+            }
+        }
+    }
+
+    /// Phase 9: clean up dead actors, deliver death notifications, GC extension state.
+    fn cleanup_dead_actors(
+        pool: &mut ActorPool,
+        worker_ext: &mut Option<Box<dyn WorkerExtension>>,
+        deferred_transfers: &mut VecDeque<Envelope>,
+        tc: &TickContext,
+    ) -> bool {
+        let cleanup_pending: RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>> =
+            RefCell::new(Vec::new());
+        let cleanup_stops: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
+        let cleanup_stop_withs: RefCell<Vec<(ActorAddress, ExitValue)>> = RefCell::new(Vec::new());
+        let cleanup_suspends: RefCell<Vec<ActorAddress>> = RefCell::new(Vec::new());
+        let cleanup_requests: RefCell<Vec<Box<dyn Any + Send>>> = RefCell::new(Vec::new());
+        let dead = {
+            let cleanup_ctx = WorkerContext {
+                tc,
+                pending_local: &cleanup_pending,
+                stop_requests: &cleanup_stops,
+                stop_with_values: &cleanup_stop_withs,
+                suspend_requests: &cleanup_suspends,
+                worker_requests: &cleanup_requests,
+                stats: tc.worker_stats,
+            };
+            pool.cleanup_dead(&cleanup_ctx)
+        };
+
+        let had_dead = !dead.is_empty();
+        if had_dead {
+            for (addr, _, _) in &dead {
+                tc.address_map.remove(addr);
+            }
+
+            if let Some(ext) = tc.extension {
+                let notifications = ext.on_actor_death(&dead);
+                let dead_addrs: Vec<_> = dead.iter().map(|(a, _, _)| *a).collect();
+                ext.cleanup_dead(&dead_addrs);
+                for (dest, msg) in notifications {
+                    route_runtime_message(pool, tc, dest, msg);
+                }
+            }
+
+            tc.worker_stats.num_actors.store(pool.len(), Ordering::Relaxed);
+        }
+
+        // Deliver any messages sent during on_stop callbacks.
+        for (addr, msg) in cleanup_pending.into_inner() {
+            Self::deliver_or_defer_transfer(
+                pool,
+                tc,
+                deferred_transfers,
+                Envelope::new(addr, msg),
+            );
+        }
+
+        // GC per-worker extension state for dead actors
+        if let Some(ext) = worker_ext {
+            let dead_addrs: Vec<ActorAddress> = dead.iter().map(|(a, _, _)| *a).collect();
+            ext.gc_dead(&dead_addrs);
+        }
+
+        had_dead
+    }
 }
 
 /// The `ContextInner` impl for in-worker sends.
 ///
-/// All sends to local actors are buffered in `pending_local` (delivered after
-/// the current tick round). Non-local addresses route to inbox_registry or remote.
+/// Same-worker sends are staged in `pending_local` (eligible next pass).
+/// Cross-worker sends move an `Envelope` into the target worker's transfer
+/// queue. Non-actor addresses route to the inbox registry / transport seam.
 struct WorkerContext<'a> {
     tc: &'a TickContext<'a>,
     pending_local: &'a RefCell<Vec<(ActorAddress, Box<dyn Any + Send>)>>,
@@ -451,19 +647,29 @@ struct WorkerContext<'a> {
 
 impl ContextInner for WorkerContext<'_> {
     fn send_any(&self, addr: ActorAddress, msg: Box<dyn Any + Send>) -> Result<(), Error> {
-        if self.tc.address_map.contains(&addr) {
-            self.stats.local_sends.fetch_add(1, Ordering::Relaxed);
-            self.pending_local.borrow_mut().push((addr, msg));
-            Ok(())
-        } else {
-            self.stats.inbox_sends.fetch_add(1, Ordering::Relaxed);
-            self.tc.route_nonlocal(addr, msg)
+        match self.tc.worker_of(&addr) {
+            Some(w) if w == self.tc.worker_id() => {
+                self.stats.local_sends.fetch_add(1, Ordering::Relaxed);
+                self.pending_local.borrow_mut().push((addr, msg));
+                Ok(())
+            }
+            Some(w) => {
+                // Cross-worker: move the payload through shared memory.
+                self.stats.local_sends.fetch_add(1, Ordering::Relaxed);
+                self.tc.transfer_tx(w).send(Envelope::new(addr, msg));
+                Ok(())
+            }
+            None => {
+                self.stats.inbox_sends.fetch_add(1, Ordering::Relaxed);
+                self.tc.route_nonlocal(addr, msg)
+            }
         }
     }
 
     fn spawn_any(&self, request: SpawnRequest) {
-        self.tc.address_map.insert(request.addr);
-        self.tc.spawn_tx.send(request);
+        // ctx.spawn pins the child to the current worker.
+        self.tc.address_map.insert(request.addr, self.tc.worker_id());
+        self.tc.spawn_tx(self.tc.worker_id()).send(request);
     }
 
     fn request_stop(&self, addr: ActorAddress) {
@@ -500,9 +706,9 @@ impl ContextInner for WorkerContext<'_> {
 
     fn system_info(&self) -> SystemInfo {
         SystemInfo {
-            worker_id: 0,
-            num_workers: 1,
-            total_actors: self.tc.worker_stats.num_actors.load(Ordering::Relaxed),
+            worker_id: self.tc.worker_id().index(),
+            num_workers: self.tc.num_workers,
+            total_actors: self.tc.address_map.len(),
             uptime_ms: self.tc.created_at.elapsed().as_millis() as u64,
         }
     }
@@ -605,13 +811,13 @@ impl ActorPool {
         self.actors.get_mut(&addr).map(|slot| slot.actor.as_mut())
     }
 
-    fn actor_summary_from_slot(address: ActorAddress, slot: &ActorSlot) -> ActorSummary {
+    fn actor_summary_from_slot(address: ActorAddress, slot: &ActorSlot, worker: WorkerId) -> ActorSummary {
         let metadata = slot.actor.metadata();
         ActorSummary {
             address,
             actor_type: metadata.actor_type_name,
             message_type: metadata.message_type_name,
-            worker_id: 0,
+            worker_id: worker.index(),
             parent: slot.parent_addr,
             mailbox_depth: slot.mailbox.len(),
             status: ActorStatus {
@@ -625,19 +831,19 @@ impl ActorPool {
         }
     }
 
-    fn actor_summary(&self, addr: ActorAddress) -> AdminResult<ActorSummary> {
+    fn actor_summary(&self, addr: ActorAddress, worker: WorkerId) -> AdminResult<ActorSummary> {
         self.actors
             .get(&addr)
-            .map(|slot| Self::actor_summary_from_slot(addr, slot))
+            .map(|slot| Self::actor_summary_from_slot(addr, slot, worker))
             .ok_or(AdminError::ActorNotFound { actor: addr })
     }
 
-    fn actor_summaries_into(&self, out: &mut Vec<ActorSummary>) {
+    fn actor_summaries_into(&self, out: &mut Vec<ActorSummary>, worker: WorkerId) {
         out.clear();
         out.extend(
             self.actors
                 .iter()
-                .map(|(&addr, slot)| Self::actor_summary_from_slot(addr, slot)),
+                .map(|(&addr, slot)| Self::actor_summary_from_slot(addr, slot, worker)),
         );
     }
 

@@ -1,7 +1,7 @@
 use data_plane::actor as dp;
 use data_plane::object_record;
 use swactor::config::RuntimeConfig;
-use swactor::runtime::Runtime;
+use swactor::runtime::{RuntimeParts, SingleThreadRuntime};
 
 fn object_spec() -> dp::ObjectSpec {
     dp::ObjectSpec {
@@ -60,7 +60,9 @@ fn inbound_endpoint() -> dp::WireEdgeEndpoint {
 
 #[test]
 fn inbound_wire_edge_establishes_through_arena_worker_transport_then_reports_ready() {
-    let runtime = Runtime::new(RuntimeConfig::default());
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let arena = runtime
         .new_inbox::<dp::DataPlaneArenaMsg>()
         .expect("arena inbox");
@@ -96,7 +98,7 @@ fn inbound_wire_edge_establishes_through_arena_worker_transport_then_reports_rea
             dp::DataPlaneNodeMsg::ProvisionWireEdgeEndpoint(inbound_endpoint()),
         )
         .expect("provision inbound");
-    runtime.tick();
+    host.tick();
 
     assert_eq!(
         arena.try_recv(),
@@ -118,7 +120,7 @@ fn inbound_wire_edge_establishes_through_arena_worker_transport_then_reports_rea
             }),
         )
         .expect("ring leased");
-    runtime.tick();
+    host.tick();
 
     assert_eq!(
         worker.try_recv(),
@@ -142,7 +144,7 @@ fn inbound_wire_edge_establishes_through_arena_worker_transport_then_reports_rea
             }),
         )
         .expect("worker installed");
-    runtime.tick();
+    host.tick();
 
     assert_eq!(
         transport.try_recv(),
@@ -161,7 +163,7 @@ fn inbound_wire_edge_establishes_through_arena_worker_transport_then_reports_rea
             }),
         )
         .expect("transport ready");
-    runtime.tick();
+    host.tick();
 
     assert_eq!(
         reports.try_recv(),
@@ -173,7 +175,9 @@ fn inbound_wire_edge_establishes_through_arena_worker_transport_then_reports_rea
 
 #[test]
 fn object_loaded_observation_is_reported_as_coarse_data_plane_outcome() {
-    let runtime = Runtime::new(RuntimeConfig::default());
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let arena = runtime
         .new_inbox::<dp::DataPlaneArenaMsg>()
         .expect("arena inbox");
@@ -216,7 +220,7 @@ fn object_loaded_observation_is_reported_as_coarse_data_plane_outcome() {
             }),
         )
         .expect("object loaded");
-    runtime.tick();
+    host.tick();
 
     assert_eq!(
         reports.try_recv(),

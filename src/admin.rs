@@ -1,5 +1,5 @@
 use crate::actor::{ActorAddress, ActorInterface, ActorTypeMetadata, AnyActor, Message};
-use crate::runtime::{Inbox, Runtime};
+use crate::runtime::{Inbox, Runtime, SingleThreadRuntime};
 use parking_lot::Mutex;
 use std::any::Any;
 use std::sync::Arc;
@@ -102,9 +102,9 @@ impl<T: Message> Admin<T> {
         self.inbox.try_recv()
     }
 
-    pub fn recv_ticking(&self, rt: &Runtime, max_ticks: usize) -> AdminResult<T> {
+    pub fn recv_ticking(&self, host: &mut SingleThreadRuntime, max_ticks: usize) -> AdminResult<T> {
         for _ in 0..max_ticks {
-            rt.tick();
+            host.try_tick();
             if let Some(resp) = self.inbox.try_recv() {
                 return resp;
             }

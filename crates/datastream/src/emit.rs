@@ -146,12 +146,12 @@ impl FrameSink for NoopSink {
 
 /// Legacy swactor frame sink retained until MVP runtime cutover removes it.
 pub struct ClusterFrameSink {
-    rt: Arc<Runtime>,
+    rt: Runtime,
     sink: Arc<OnceLock<ActorAddress>>,
 }
 
 impl ClusterFrameSink {
-    pub fn new(rt: Arc<Runtime>, sink: Arc<OnceLock<ActorAddress>>) -> Self {
+    pub fn new(rt: Runtime, sink: Arc<OnceLock<ActorAddress>>) -> Self {
         Self { rt, sink }
     }
 }

@@ -29,7 +29,7 @@ use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
-use swactor::runtime::{Ctx, Runtime};
+use swactor::runtime::{Ctx, Runtime, RuntimeParts};
 use swactor::std::StdExtension;
 use swactor_transport::TransportRouter;
 
@@ -81,7 +81,7 @@ impl ActorInterface for MembershipFanout {
 /// the four protocol actors. Owns everything that must stay alive and be pumped.
 pub struct IrohNode {
     pub driver: IrohDriver,
-    rt: Arc<Runtime>,
+    rt: Runtime,
     outbox: Outbox,
     swim_addr: ActorAddress,
     registry_addr: ActorAddress,
@@ -104,20 +104,21 @@ impl IrohNode {
         // Per-node swactor runtime + codec + transport router. The runtime is
         // created before the driver so the engine can own it; the driver needs
         // the engine handle, and actors need the driver's node_id.
-        let mut swactor_rt =
-            Runtime::new(RuntimeConfig::default()).with_extension(Arc::new(StdExtension::new()));
+        let parts = RuntimeParts::new(RuntimeConfig::default())
+            .with_extension(Arc::new(StdExtension::new()));
+        let rt = parts.runtime().clone();
         let actor_codec = Arc::new(actor_codec_registry());
         let transport_router = Arc::new(TransportRouter::new());
-        swactor_rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
+        rt.set_remote_sink(Arc::new(swactor_transport::CodecRemoteSink::new(
             Arc::clone(&actor_codec),
             Arc::clone(&transport_router),
         )));
-        let rt: Arc<Runtime> = Arc::new(swactor_rt);
 
-        // The engine owns the runtime (drives actor progression) and the Tokio
-        // substrate (schedules all iroh background work).
+        // The engine owns the runtime workers (drives actor progression) and the
+        // Tokio substrate (schedules all iroh background work). The cloned
+        // `Runtime` handle remains available for actor spawning and sends.
         let engine = Engine::new(
-            Arc::clone(&rt),
+            parts,
             TokioBackend::new(TokioConfig::default()).expect("build test tokio backend"),
         )
         .expect("build test engine");
@@ -216,7 +217,7 @@ impl IrohNode {
         routes.insert("swactor_dist::MetadataGossip".to_string(), metadata_addr);
         routes.insert("swactor_dist::DirectoryGossip".to_string(), directory_addr);
         driver.enable_actor_bridge(
-            Arc::clone(&rt),
+            rt.clone(),
             Arc::clone(&actor_codec),
             routes,
             swim_addr,
@@ -233,7 +234,7 @@ impl IrohNode {
         // protocol injection (ENGINE_SPEC.md).
         let ticker_handle = engine.handle();
         let ticker_inner = ticker_handle.clone();
-        let ticker_rt = Arc::clone(&rt);
+        let ticker_rt = rt.clone();
         ticker_handle.spawn(async move {
             let mut interval = ticker_inner.interval(Duration::from_millis(10));
             loop {

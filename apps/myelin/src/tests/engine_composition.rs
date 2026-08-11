@@ -55,10 +55,10 @@ impl ActorInterface for EchoProbe {
 /// on the same runtime → actor bridge, protocol ticker, and adapter pump are
 /// installed on that one engine.
 fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
-    let (runtime, codec, transport_router) =
+    let (parts, runtime, codec, transport_router) =
         DistributionRuntimeStack::build_runtime(|_| {}, None);
     let engine = Engine::new(
-        runtime.clone(),
+        parts,
         TokioBackend::new(TokioConfig::default()).expect("build tokio backend"),
     )
     .expect("build engine");
@@ -76,7 +76,7 @@ fn build_composition() -> (Engine, IrohDriver, DistributionRuntimeStack) {
     .expect("build iroh driver with engine handle");
 
     let stack = DistributionRuntimeStack::new_from_runtime(
-        runtime,
+        runtime.clone(),
         codec,
         transport_router,
         driver.node_id(),

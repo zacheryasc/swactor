@@ -1720,13 +1720,12 @@ fn run() -> Result<(), String> {
     // during runtime construction.
     let mut datastream = NodeDatastream::new(&config);
 
-    // Build the core swactor runtime, then hand it to the engine. The engine
-    // owns both the runtime (it drives actor progression) and the Tokio
-    // substrate (it schedules all background work). After this point the engine
-    // is the sole owner of Tokio and core progression — no raw handles are
-    // passed to components (ENGINE_SPEC.md).
+    // Build the core swactor runtime parts, clone the routing handle needed by
+    // integrations, then hand the workers to the engine. The engine owns both
+    // core progression and the Tokio substrate (it schedules all background
+    // work); components retain only cheap Runtime handles (ENGINE_SPEC.md).
     let worker_stats_hook = datastream.producer.stats_hook();
-    let (runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
+    let (parts, runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
         |registry| {
             register_myelin_actor_codecs(registry);
             datastream::wire::register_datastream_codec(registry);
@@ -1734,7 +1733,7 @@ fn run() -> Result<(), String> {
         Some(worker_stats_hook),
     );
     let engine = match TokioBackend::new(TokioConfig::default())
-        .and_then(|backend| Engine::new(runtime.clone(), backend))
+        .and_then(|backend| Engine::new(parts, backend))
     {
         Ok(engine) => {
             boot("engine", "ready", json!({"backend":"tokio","owns":"core+substrate"}))?;

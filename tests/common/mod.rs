@@ -10,7 +10,7 @@ pub use swactor::actor::{
     EnvironmentBuilder, ExitReason, ExitValue, LogicalName, MonitorRef, ServiceBinding,
     SpawnBuilder, SpawnTimestamp, StopReason,
 };
-pub use swactor::runtime::{Ctx, Inbox, Runtime, RuntimeConfig};
+pub use swactor::runtime::{Ctx, Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime};
 pub use swactor::std::{CtxGroups, CtxWatching, RuntimeGroups, RuntimeNaming, StdExtension};
 
 // ── Messages ────────────────────────────────────────────────────────────────
@@ -225,19 +225,31 @@ impl ActorInterface for InboxReplyActor {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Helper: construct a Runtime with StdExtension installed.
-pub fn std_runtime(config: RuntimeConfig) -> Runtime {
-    Runtime::new(config).with_extension(Arc::new(StdExtension::new()))
+/// Helper: build a Runtime handle + single-thread host with StdExtension installed.
+/// Returns `(rt, host)`: use `rt` for spawn/send/inbox and `host` for ticking.
+pub fn std_host(config: RuntimeConfig) -> (Runtime, SingleThreadRuntime) {
+    let parts = RuntimeParts::new(config).with_extension(Arc::new(StdExtension::new()));
+    let rt = parts.runtime().clone();
+    let host = SingleThreadRuntime::new(parts);
+    (rt, host)
+}
+
+/// Helper: build a Runtime handle + single-thread host with no extension.
+pub fn plain_host(config: RuntimeConfig) -> (Runtime, SingleThreadRuntime) {
+    let parts = RuntimeParts::new(config);
+    let rt = parts.runtime().clone();
+    let host = SingleThreadRuntime::new(parts);
+    (rt, host)
 }
 
 /// Tick up to `max` times, returning as soon as `inbox` has a message.
 pub fn tick_until_recv<M: swactor::actor::Message>(
-    rt: &Runtime,
+    host: &mut SingleThreadRuntime,
     inbox: &Inbox<M>,
     max: usize,
 ) -> Option<M> {
     for _ in 0..max {
-        rt.tick();
+        host.try_tick();
         if let Some(msg) = inbox.try_recv() {
             return Some(msg);
         }
@@ -246,20 +258,20 @@ pub fn tick_until_recv<M: swactor::actor::Message>(
 }
 
 /// Tick exactly `n` times (no inbox polling).
-pub fn tick_n(rt: &Runtime, n: usize) {
+pub fn tick_n(host: &mut SingleThreadRuntime, n: usize) {
     for _ in 0..n {
-        rt.tick();
+        host.try_tick();
     }
 }
 
 /// Tick `n` times, then drain all messages from the inbox.
 pub fn tick_and_drain<M: swactor::actor::Message>(
-    rt: &Runtime,
+    host: &mut SingleThreadRuntime,
     inbox: &Inbox<M>,
     ticks: usize,
 ) -> Vec<M> {
     for _ in 0..ticks {
-        rt.tick();
+        host.try_tick();
     }
     std::iter::from_fn(|| inbox.try_recv()).collect()
 }

@@ -1,9 +1,7 @@
 //! Behavior guarantees for the `node` module.
 //!
-//! These unit tests drive a raw `Runtime` in isolation to verify actor message
-//! routing — they are not engine integration tests and are exempt from the
-//! disallowed-methods policy (ENGINE_SPEC.md §2).
-#![allow(clippy::disallowed_methods)]
+//! These unit tests drive a manual `SingleThreadRuntime` host in isolation to verify actor
+//! message routing — they are not engine integration tests.
 
 use crate::node_actor::{NodeAgentActor, NodeAgentMsg, NodeAgentReport};
 use crate::orchestration::actor::OrchestratorMsg;
@@ -11,11 +9,13 @@ use iroh::{EndpointAddr, SecretKey};
 use myelin::staging as stage;
 use swactor::actor::ActorAddress;
 use swactor::config::RuntimeConfig;
-use swactor::runtime::Runtime;
+use swactor::runtime::{RuntimeParts, SingleThreadRuntime};
 
 #[test]
 fn node_agent_runtime_loaded_reports_orchestrator() {
-    let runtime = Runtime::new(RuntimeConfig::default());
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let orchestrator_inbox = runtime
         .new_inbox::<OrchestratorMsg>()
         .expect("orchestrator inbox");
@@ -41,7 +41,7 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
             },
         )
         .expect("send runtime loaded");
-    runtime.tick();
+    host.tick();
 
     assert_eq!(
         orchestrator_inbox.try_recv(),
@@ -59,7 +59,9 @@ fn node_agent_runtime_loaded_reports_orchestrator() {
 
 #[test]
 fn node_agent_runtime_ready_ack_reports_worker_loop() {
-    let runtime = Runtime::new(RuntimeConfig::default());
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let mut host = SingleThreadRuntime::new(parts);
     let orchestrator_inbox = runtime
         .new_inbox::<OrchestratorMsg>()
         .expect("orchestrator inbox");
@@ -85,7 +87,7 @@ fn node_agent_runtime_ready_ack_reports_worker_loop() {
             },
         )
         .expect("send runtime ready ack");
-    runtime.tick();
+    host.tick();
 
     assert_eq!(
         reports.try_recv(),

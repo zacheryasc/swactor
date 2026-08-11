@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use datastream::{DatastreamEndpoint, DatastreamEvent, Lifetime, NodeId, StreamId};
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
-use swactor::runtime::{ExternalSender, Inbox, Runtime, RuntimeConfig};
+use swactor::runtime::{
+    ExternalSender, Inbox, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
+};
 use swactor_process::{
     ExitStatus, ProcessCommand, ProcessOutput, ProcessOutputConfig, ProcessSpec,
     send_process_command, spawn_local_process,
@@ -63,13 +65,20 @@ fn drain_outputs(inbox: &Inbox<ProcessOutput>, outputs: &mut Vec<ProcessOutput>)
     }
 }
 
+fn runtime_host() -> (Runtime, SingleThreadRuntime) {
+    let parts = RuntimeParts::new(RuntimeConfig::default());
+    let runtime = parts.runtime().clone();
+    let host = SingleThreadRuntime::new(parts);
+    (runtime, host)
+}
+
 fn drive_once(
-    rt: &Runtime,
+    host: &mut SingleThreadRuntime,
     endpoint: Option<&DatastreamEndpoint>,
     upstream: &Inbox<ProcessOutput>,
     outputs: &mut Vec<ProcessOutput>,
 ) {
-    rt.tick();
+    host.tick();
     std::thread::sleep(Duration::from_millis(5));
     if let Some(endpoint) = endpoint {
         endpoint.tick();
@@ -98,14 +107,14 @@ fn send_spawn(
 }
 
 fn drive_until_spawn_reply(
-    rt: &Runtime,
+    host: &mut SingleThreadRuntime,
     endpoint: Option<&DatastreamEndpoint>,
     upstream: &Inbox<ProcessOutput>,
     outputs: &mut Vec<ProcessOutput>,
     reply: &Inbox<SpawnReply>,
 ) -> SpawnReply {
     for _ in 0..400 {
-        drive_once(rt, endpoint, upstream, outputs);
+        drive_once(host, endpoint, upstream, outputs);
         if let Some(reply) = reply.try_recv() {
             return reply;
         }
@@ -114,14 +123,14 @@ fn drive_until_spawn_reply(
 }
 
 fn drive_until(
-    rt: &Runtime,
+    host: &mut SingleThreadRuntime,
     endpoint: Option<&DatastreamEndpoint>,
     upstream: &Inbox<ProcessOutput>,
     outputs: &mut Vec<ProcessOutput>,
     mut done: impl FnMut(&[ProcessOutput]) -> bool,
 ) {
     for _ in 0..800 {
-        drive_once(rt, endpoint, upstream, outputs);
+        drive_once(host, endpoint, upstream, outputs);
         if done(outputs) {
             return;
         }
@@ -221,7 +230,7 @@ fn channel_names(endpoint: &DatastreamEndpoint) -> Vec<String> {
 
 #[test]
 fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -244,7 +253,7 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         Some(&endpoint),
         &upstream,
         &mut outputs,
@@ -253,11 +262,11 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
     assert_ne!(process_addr, ActorAddress::default());
 
     let mut datastream_events = subscription.drain_available();
-    drive_until(&rt, Some(&endpoint), &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, Some(&endpoint), &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
     for _ in 0..5 {
-        drive_once(&rt, Some(&endpoint), &upstream, &mut outputs);
+        drive_once(&mut host, Some(&endpoint), &upstream, &mut outputs);
         datastream_events.extend(subscription.drain_available());
     }
 
@@ -319,7 +328,7 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
 
 #[test]
 fn spawn_failure_maps_to_public_spawn_failed_output() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -340,13 +349,13 @@ fn spawn_failure_maps_to_public_spawn_failed_output() {
 
     let mut outputs = Vec::new();
     let _process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, has_spawn_failed);
+    drive_until(&mut host, None, &upstream, &mut outputs, has_spawn_failed);
 
     let spawn_failures: Vec<&String> = outputs
         .iter()
@@ -381,7 +390,7 @@ fn spawn_failure_maps_to_public_spawn_failed_output() {
 
 #[test]
 fn command_basename_is_default_lifecycle_label_source() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -399,13 +408,13 @@ fn command_basename_is_default_lifecycle_label_source() {
 
     let mut outputs = Vec::new();
     let _process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         Some(&endpoint),
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, Some(&endpoint), &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, Some(&endpoint), &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
 
@@ -421,7 +430,7 @@ fn command_basename_is_default_lifecycle_label_source() {
 
 #[test]
 fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -439,7 +448,7 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
 
     let mut outputs = Vec::new();
     let first_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         Some(&endpoint),
         &upstream,
         &mut outputs,
@@ -455,7 +464,7 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
         &reply,
     );
     let error = expect_failed(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         Some(&endpoint),
         &upstream,
         &mut outputs,
@@ -476,7 +485,7 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
         },
     )
     .unwrap();
-    drive_until(&rt, Some(&endpoint), &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, Some(&endpoint), &upstream, &mut outputs, |outputs| {
         outputs
             .iter()
             .any(|output| matches!(output, ProcessOutput::Exited { .. }))
@@ -486,7 +495,7 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
 
 #[test]
 fn stop_before_spawn_success_reports_started_then_exited() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -503,7 +512,7 @@ fn stop_before_spawn_success_reports_started_then_exited() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
@@ -517,7 +526,7 @@ fn stop_before_spawn_success_reports_started_then_exited() {
         },
     )
     .unwrap();
-    drive_until(&rt, None, &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
         outputs
             .iter()
             .any(|output| matches!(output, ProcessOutput::Exited { .. }))
@@ -543,7 +552,7 @@ fn stop_before_spawn_success_reports_started_then_exited() {
 
 #[test]
 fn stop_before_spawn_failure_reports_only_spawn_failed() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -564,7 +573,7 @@ fn stop_before_spawn_failure_reports_only_spawn_failed() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
@@ -578,7 +587,7 @@ fn stop_before_spawn_failure_reports_only_spawn_failed() {
         },
     )
     .unwrap();
-    drive_until(&rt, None, &upstream, &mut outputs, has_spawn_failed);
+    drive_until(&mut host, None, &upstream, &mut outputs, has_spawn_failed);
 
     assert_eq!(
         terminal_count(&outputs),
@@ -600,7 +609,7 @@ fn stop_before_spawn_failure_reports_only_spawn_failed() {
 
 #[test]
 fn stop_running_with_kill_after_escalates_to_kill() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -621,13 +630,13 @@ fn stop_running_with_kill_after_escalates_to_kill() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, has_started);
+    drive_until(&mut host, None, &upstream, &mut outputs, has_started);
     send_process_command(
         &sender,
         process_addr,
@@ -636,7 +645,7 @@ fn stop_running_with_kill_after_escalates_to_kill() {
         },
     )
     .unwrap();
-    drive_until(&rt, None, &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Signal(9))
     });
 
@@ -649,7 +658,7 @@ fn stop_running_with_kill_after_escalates_to_kill() {
 
 #[test]
 fn stop_running_without_kill_after_terminates_without_kill_escalation() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -670,20 +679,20 @@ fn stop_running_without_kill_after_terminates_without_kill_escalation() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, has_started);
+    drive_until(&mut host, None, &upstream, &mut outputs, has_started);
     send_process_command(
         &sender,
         process_addr,
         ProcessCommand::Stop { kill_after: None },
     )
     .unwrap();
-    drive_until(&rt, None, &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
 
@@ -700,7 +709,7 @@ fn stop_running_without_kill_after_terminates_without_kill_escalation() {
 
 #[test]
 fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -721,13 +730,13 @@ fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, has_started);
+    drive_until(&mut host, None, &upstream, &mut outputs, has_started);
     send_process_command(
         &sender,
         process_addr,
@@ -736,11 +745,11 @@ fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
         },
     )
     .unwrap();
-    drive_until(&rt, None, &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
     for _ in 0..5 {
-        drive_once(&rt, None, &upstream, &mut outputs);
+        drive_once(&mut host, None, &upstream, &mut outputs);
     }
 
     assert!(
@@ -756,7 +765,7 @@ fn child_exit_before_kill_deadline_suppresses_kill_escalation() {
 
 #[test]
 fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -777,13 +786,13 @@ fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, has_started);
+    drive_until(&mut host, None, &upstream, &mut outputs, has_started);
 
     let first_stop = Instant::now();
     send_process_command(
@@ -804,7 +813,7 @@ fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
     .unwrap();
 
     while first_stop.elapsed() < Duration::from_secs(2) {
-        drive_once(&rt, None, &upstream, &mut outputs);
+        drive_once(&mut host, None, &upstream, &mut outputs);
         if has_exited(&outputs, ExitStatus::Signal(9)) {
             break;
         }
@@ -829,7 +838,7 @@ fn duplicate_stop_while_stopping_is_noop_and_keeps_original_deadline() {
 
 #[test]
 fn stop_after_terminal_output_emits_no_additional_output() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -846,13 +855,13 @@ fn stop_after_terminal_output_emits_no_additional_output() {
 
     let mut outputs = Vec::new();
     let process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
     let output_len = outputs.len();
@@ -865,7 +874,7 @@ fn stop_after_terminal_output_emits_no_additional_output() {
         },
     );
     for _ in 0..10 {
-        drive_once(&rt, None, &upstream, &mut outputs);
+        drive_once(&mut host, None, &upstream, &mut outputs);
     }
 
     assert_eq!(
@@ -878,7 +887,7 @@ fn stop_after_terminal_output_emits_no_additional_output() {
 
 #[test]
 fn lifecycle_mirror_submit_failure_does_not_suppress_upstream_or_emit_error() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -896,13 +905,13 @@ fn lifecycle_mirror_submit_failure_does_not_suppress_upstream_or_emit_error() {
 
     let mut outputs = Vec::new();
     let _process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
     let dropped = endpoint.mux().dropped();
@@ -925,7 +934,7 @@ fn lifecycle_mirror_submit_failure_does_not_suppress_upstream_or_emit_error() {
 
 #[test]
 fn stdout_and_stderr_writes_do_not_affect_lifecycle() {
-    let rt = Runtime::new(RuntimeConfig::default());
+    let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
@@ -949,13 +958,13 @@ fn stdout_and_stderr_writes_do_not_affect_lifecycle() {
 
     let mut outputs = Vec::new();
     let _process_addr = expect_spawned(drive_until_spawn_reply(
-        &rt,
+        &mut host,
         None,
         &upstream,
         &mut outputs,
         &reply,
     ));
-    drive_until(&rt, None, &upstream, &mut outputs, |outputs| {
+    drive_until(&mut host, None, &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
 

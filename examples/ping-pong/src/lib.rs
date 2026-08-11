@@ -17,7 +17,9 @@ use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
 use swactor::actor::{ActorAddress, ActorExited, ActorInterface};
-use swactor::runtime::{Ctx, Inbox, Runtime as SwactorRuntime, RuntimeConfig};
+use swactor::runtime::{
+    Ctx, Inbox, Runtime as SwactorRuntime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
+};
 use swactor::std::{CtxWatching, StdExtension};
 
 // ─── Host-facing bindings ───────────────────────────────────────────────────
@@ -51,23 +53,26 @@ impl LogInbox {
 #[wasm_bindgen]
 pub struct App {
     rt: SwactorRuntime,
+    host: SingleThreadRuntime,
 }
 
 #[wasm_bindgen]
 impl App {
     #[wasm_bindgen(constructor)]
     pub fn new() -> App {
-        let rt = SwactorRuntime::new(RuntimeConfig {
-            num_threads: 1,
+        let parts = RuntimeParts::new(RuntimeConfig {
+            worker_count: 1,
             ..RuntimeConfig::default()
         })
         .with_extension(Arc::new(StdExtension::new()));
-        App { rt }
+        let rt = parts.runtime().clone();
+        let host = SingleThreadRuntime::new(parts);
+        App { rt, host }
     }
 
     /// Advance the runtime one tick.
-    pub fn tick(&self) {
-        self.rt.tick();
+    pub fn tick(&mut self) {
+        self.host.tick();
     }
 
     /// Actors currently alive.

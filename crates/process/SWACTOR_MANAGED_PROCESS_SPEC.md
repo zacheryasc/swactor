@@ -1,8 +1,9 @@
 # Swactor Managed Process Specification
 
 Id: 8
-Last modified:
+Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
 Last reviewed:
+> Any edit to this spec must update `Last modified` above to the current `git HEAD` commit.
 
 `swactor-process` provides a Swactor actor interface for launching, supervising,
 stopping, and observing one operating-system child process per process actor.

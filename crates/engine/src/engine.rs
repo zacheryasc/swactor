@@ -5,40 +5,43 @@ use std::time::Duration;
 
 use crate::backend::{Capabilities, EngineError, ExecutionBackend};
 use crate::time::{EngineInstant, Interval, Timer, Timeout};
+use swactor::runtime::{Runtime, RuntimeParts};
 
-/// The composite engine: retains a configured core runtime and its execution
-/// backend, and owns the sole core-driving loop for that runtime.
+
+/// The composite engine: retains a configured core runtime handle and its
+/// execution backend, and owns one core-driving loop per worker.
 ///
 /// Construct with [`Engine::new`]; obtain a scheduler handle with
 /// [`Engine::handle`].
 pub struct Engine {
-    /// Retained so the engine owns the runtime it drives for its full lifetime.
-    /// The core driver holds its own clone; this field anchors ownership (and
-    /// future admin/shutdown surfaces) even though it is not read directly.
+    /// Retained so the engine owns the runtime handle it drives for its full
+    /// lifetime. Core workers are moved into substrate tasks at construction.
     #[allow(dead_code)]
-    runtime: Arc<swactor::runtime::Runtime>,
+    runtime: Runtime,
     backend: Arc<dyn ExecutionBackend>,
 }
 
 impl Engine {
-    /// Construct an engine over `runtime` driven by `backend`.
+    /// Construct an engine over `parts` driven by `backend`.
     ///
-    /// The runtime must be fully configured beforehand; after construction the
-    /// engine is its sole driver. Construction fails if `backend` does not
-    /// advertise a capability the engine requires (at minimum, `tasks`).
+    /// The runtime parts must be fully configured beforehand; after construction
+    /// the engine owns every worker and is their sole driver. Construction fails
+    /// if `backend` does not advertise a capability the engine requires (at
+    /// minimum, `tasks`).
     pub fn new(
-        runtime: Arc<swactor::runtime::Runtime>,
+        parts: RuntimeParts,
         backend: impl ExecutionBackend,
     ) -> Result<Self, EngineError> {
         let backend: Arc<dyn ExecutionBackend> = Arc::new(backend);
         if !backend.capabilities().tasks {
             return Err(EngineError::MissingRequiredCapability);
         }
-        // Install exactly one core-driving loop; the engine is now the sole
-        // driver of `runtime`. This is substrate-neutral — no Tokio feature
-        // gate — so core progression does not silently disappear when an
-        // alternate backend is used (ENGINE_SPEC.md).
-        crate::core_driver::install(runtime.clone(), &backend);
+        let runtime = parts.runtime().clone();
+        let workers = parts.into_workers();
+        // Install one core-driving loop per worker. This is substrate-neutral —
+        // no Tokio feature gate — so core progression does not silently
+        // disappear when an alternate backend is used (ENGINE_SPEC.md).
+        crate::core_driver::install(workers, &backend);
         Ok(Engine { runtime, backend })
     }
 

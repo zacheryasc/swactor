@@ -1,5 +1,4 @@
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 
 use datastream::{
     ChannelContent, DatastreamEndpoint, DatastreamEvent, Lifetime, NodeId, Position, StreamId,
@@ -10,16 +9,16 @@ use iroh_driver::{
     write_available_subscription,
 };
 use swactor::config::RuntimeConfig;
-use swactor::runtime::Runtime;
+use swactor::runtime::RuntimeParts;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
 /// Datastream transport test scheduled through `EngineHandle`, not an ambient
 /// `#[tokio::test]` runtime (ENGINE_SPEC.md).
 #[test]
 fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
-    let runtime = Runtime::new(RuntimeConfig::default());
+    let parts = RuntimeParts::new(RuntimeConfig::default());
     let engine = Engine::new(
-        Arc::new(runtime),
+        parts,
         TokioBackend::new(TokioConfig::default()).expect("test backend"),
     )
     .expect("test engine");
