@@ -50,8 +50,8 @@ use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface};
-use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
 use swactor::runtime::{Ctx, ExternalSender};
+use swactor_engine::{Engine, EngineHandle, TokioBackend, TokioConfig};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 const DEFAULT_WORKER_SCRIPT: &str = "/usr/local/share/myelin/tinygrad_worker.py";
@@ -329,14 +329,18 @@ fn spawn_debug_join_listener(
         let listener = match tokio::net::UnixListener::bind(&path) {
             Ok(l) => l,
             Err(e) => {
-                let _ = ready_tx
-                    .send(Err(format!("bind debug join socket {}: {e}", path.display())));
+                let _ = ready_tx.send(Err(format!(
+                    "bind debug join socket {}: {e}",
+                    path.display()
+                )));
                 return;
             }
         };
         if let Err(e) = fs::set_permissions(&path, fs::Permissions::from_mode(0o600)) {
-            let _ = ready_tx
-                .send(Err(format!("chmod debug join socket {}: {e}", path.display())));
+            let _ = ready_tx.send(Err(format!(
+                "chmod debug join socket {}: {e}",
+                path.display()
+            )));
             return;
         }
         let _ = ready_tx.send(Ok(()));
@@ -577,10 +581,7 @@ fn submit_sampler_sample_health(
             "failed",
             json!({"state":"error","sample_seq":seq,"error":error}),
         ),
-        None => (
-            "ready",
-            json!({"state":"sample_observed","sample_seq":seq}),
-        ),
+        None => ("ready", json!({"state":"sample_observed","sample_seq":seq})),
     };
     submit_sampler_health(
         producer,
@@ -683,7 +684,7 @@ fn spawn_host_cpu_sampler(
     let engine_inner = engine.clone();
     engine.spawn(async move {
         use datastream::hardware::cpu::{
-            CpuSampler, CPU_SAMPLE_INTERVAL, HOST_CPU_CHANNEL, HostCpuSample,
+            CPU_SAMPLE_INTERVAL, CpuSampler, HOST_CPU_CHANNEL, HostCpuSample,
         };
         submit_sampler_started(
             &producer,
@@ -1092,9 +1093,12 @@ impl WorkerEdgeRuntime {
         let record = match record {
             Ok(record) => record,
             Err(e) => {
-                let _ = stack
-                    .runtime
-                    .send_to(node_actor, NodeAgentMsg::OutputFault { edge_id: outbound.edge_id });
+                let _ = stack.runtime.send_to(
+                    node_actor,
+                    NodeAgentMsg::OutputFault {
+                        edge_id: outbound.edge_id,
+                    },
+                );
                 return Err(format!("read egress ring: {e}"));
             }
         };
@@ -1127,9 +1131,12 @@ impl WorkerEdgeRuntime {
             .ok_or_else(|| "outbound edge sender missing".to_owned())?;
         let edge_send_started = Instant::now();
         if let Err(e) = sender.send(record) {
-            let _ = stack
-                .runtime
-                .send_to(node_actor, NodeAgentMsg::OutputFault { edge_id: outbound.edge_id });
+            let _ = stack.runtime.send_to(
+                node_actor,
+                NodeAgentMsg::OutputFault {
+                    edge_id: outbound.edge_id,
+                },
+            );
             return Err(e);
         }
         let edge_send_ms = duration_ms_u64(edge_send_started.elapsed());
@@ -1199,9 +1206,13 @@ impl WorkerEdgeRuntime {
                     Ok(Some(record)) => records.push(record),
                     Ok(None) => break,
                     Err(e) => {
-                        let _ = stack
-                            .runtime
-                            .send_to(node_actor, NodeAgentMsg::ObjectFailed { edge_id, object_id: None });
+                        let _ = stack.runtime.send_to(
+                            node_actor,
+                            NodeAgentMsg::ObjectFailed {
+                                edge_id,
+                                object_id: None,
+                            },
+                        );
                         return Err(e);
                     }
                 }
@@ -1252,9 +1263,13 @@ impl WorkerEdgeRuntime {
             ) {
                 Ok(loaded) => loaded,
                 Err(e) => {
-                    let _ = stack
-                        .runtime
-                        .send_to(node_actor, NodeAgentMsg::ObjectFailed { edge_id, object_id: Some(record.object_id) });
+                    let _ = stack.runtime.send_to(
+                        node_actor,
+                        NodeAgentMsg::ObjectFailed {
+                            edge_id,
+                            object_id: Some(record.object_id),
+                        },
+                    );
                     return Err(e);
                 }
             };
@@ -1585,10 +1600,7 @@ impl WorkerEdgeRuntime {
                 edge::EdgeLifecycleEvent::EdgeFaulted { edge_id, reason } => {
                     stack
                         .runtime
-                        .send_to(
-                            node_actor,
-                            NodeAgentMsg::EdgeFault { edge_id: edge_id.0 },
-                        )
+                        .send_to(node_actor, NodeAgentMsg::EdgeFault { edge_id: edge_id.0 })
                         .map_err(|e| format!("report edge fault: {e}"))?;
                     return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
                 }
@@ -1736,7 +1748,11 @@ fn run() -> Result<(), String> {
         .and_then(|backend| Engine::new(parts, backend))
     {
         Ok(engine) => {
-            boot("engine", "ready", json!({"backend":"tokio","owns":"core+substrate"}))?;
+            boot(
+                "engine",
+                "ready",
+                json!({"backend":"tokio","owns":"core+substrate"}),
+            )?;
             engine
         }
         Err(error) => {
@@ -1928,28 +1944,26 @@ fn run() -> Result<(), String> {
         );
     }
     let mut debug_join_rx = match &config.debug_join_socket {
-        Some(path) => {
-            match spawn_debug_join_listener(engine.handle(), PathBuf::from(path)) {
-                Ok(rx) => {
-                    node_runtime(
-                        &mut datastream,
-                        "debug_join_socket",
-                        "ready",
-                        json!({"socket":path}),
-                    );
-                    Some(rx)
-                }
-                Err(error) => {
-                    node_runtime(
-                        &mut datastream,
-                        "debug_join_socket",
-                        "failed",
-                        json!({"socket":path,"error":error}),
-                    );
-                    return Err(format!("bind debug join socket {}: {error}", path));
-                }
+        Some(path) => match spawn_debug_join_listener(engine.handle(), PathBuf::from(path)) {
+            Ok(rx) => {
+                node_runtime(
+                    &mut datastream,
+                    "debug_join_socket",
+                    "ready",
+                    json!({"socket":path}),
+                );
+                Some(rx)
             }
-        }
+            Err(error) => {
+                node_runtime(
+                    &mut datastream,
+                    "debug_join_socket",
+                    "failed",
+                    json!({"socket":path,"error":error}),
+                );
+                return Err(format!("bind debug join socket {}: {error}", path));
+            }
+        },
         None => {
             node_runtime(
                 &mut datastream,
@@ -2547,7 +2561,7 @@ impl PendingRuntimeReady {
                 .coordinator_endpoint
                 .as_ref()
                 .map(|endpoint| DistNodeId(*endpoint.id.as_bytes())),
-            readiness_id: 1,
+            readiness_id: config.attempt_id,
             attempts: 0,
             next_attempt_at: Instant::now(),
             backoff: RUNTIME_READY_RETRY_INITIAL,
@@ -2748,9 +2762,7 @@ fn handle_prompt_request(
         "started",
         json!({"request_id":request_id,"command":"InferPrompt","max_tokens":max_tokens}),
     );
-    match worker.infer_prompt(
-        request_id, &prompt, max_tokens, config, datastream,
-    ) {
+    match worker.infer_prompt(request_id, &prompt, max_tokens, config, datastream) {
         Ok(result) => {
             let text = result
                 .get("text")
@@ -3722,13 +3734,7 @@ fn run_self_test(
         config,
         datastream,
     )?;
-    let result = worker.infer_prompt(
-        0,
-        prompt,
-        config.self_test_max_tokens,
-        config,
-        datastream,
-    )?;
+    let result = worker.infer_prompt(0, prompt, config.self_test_max_tokens, config, datastream)?;
     let record = json!({"type":"self_test_completed","prompt_bytes":prompt.len(),"result":result});
     datastream.submit_text(datastream.channels.node_self_test, record.to_string());
     emit_node_event(
@@ -3753,6 +3759,7 @@ fn env_optional(name: &str) -> Option<String> {
 struct DeploymentConfig {
     run_id: u64,
     logical_node_id: u64,
+    attempt_id: u64,
     stage_index: u32,
     coordinator_endpoint: Option<EndpointAddr>,
     orchestrator_actor: Option<ActorAddress>,
@@ -3786,6 +3793,7 @@ impl DeploymentConfig {
         }
         let run_id = env_parse!("MYELIN_RUN_ID", 1)?;
         let logical_node_id = env_parse!("MYELIN_LOGICAL_NODE_ID", 1)?;
+        let attempt_id = env_parse!("MYELIN_NODE_ATTEMPT_ID", 1)?;
         let relay = relay_runtime_config_from_env(run_id)?;
         let debug_join_socket = match env_optional("MYELIN_DEBUG_JOIN_SOCKET").as_deref() {
             Some("disabled") => None,
@@ -3808,6 +3816,7 @@ impl DeploymentConfig {
         Ok(Self {
             run_id,
             logical_node_id,
+            attempt_id,
             stage_index: env_parse!("MYELIN_STAGE_INDEX", 0)?,
             coordinator_endpoint: env_optional("MYELIN_COORDINATOR_ENDPOINT")
                 .map(|value| {
@@ -3832,7 +3841,8 @@ impl DeploymentConfig {
             worker_script: env_optional("MYELIN_TINYGRAD_WORKER")
                 .unwrap_or_else(|| DEFAULT_WORKER_SCRIPT.to_owned()),
             device: env_optional("DEV").unwrap_or_else(|| default_device.to_owned()),
-            model_id: env_optional("MYELIN_MODEL_ID").unwrap_or_else(|| DEFAULT_MODEL_ID.to_owned()),
+            model_id: env_optional("MYELIN_MODEL_ID")
+                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_owned()),
             gguf_source: if let Some(path) = env_optional("MYELIN_GGUF_LOCAL_PATH") {
                 GgufSource::LocalPath(path)
             } else {
@@ -4097,7 +4107,11 @@ struct TinygradWorker {
 }
 
 impl TinygradWorker {
-    fn spawn(config: &DeploymentConfig, arena_fd: std::os::fd::RawFd, engine: EngineHandle) -> Result<Self, String> {
+    fn spawn(
+        config: &DeploymentConfig,
+        arena_fd: std::os::fd::RawFd,
+        engine: EngineHandle,
+    ) -> Result<Self, String> {
         let mut child = Command::new("python3")
             .arg(&config.worker_script)
             .env("DEV", &config.device)

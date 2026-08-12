@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
 use crate::codecs::register_myelin_actor_codecs;
@@ -21,7 +21,6 @@ use crate::observability::dashboard_view::MyelinClusterDashboardView;
 use crate::observability::{benchmark, frame_archive::FrameArchive};
 use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
-const PROVIDER_START_MAX_ATTEMPTS: usize = 4;
 
 use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
 use crate::node_provisioning::{ProviderKind, provider_kind};
@@ -29,10 +28,11 @@ use crate::observability::telemetry::{
     MYELIN_PROVISIONING_EVENTS, MyelinProvisionEventRecord, MyelinProvisionLogRecord,
     myelin_provision_log_channel,
 };
+use crate::orchestration::cluster_reconciler::{ProvisionedClusterGuard, ReconcilerNodeBinding};
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
 use crate::orchestration::provider_adapters::relay::{
-    MYELIN_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV, relay_mode_env_value,
-    relay_runtime_config_from_settings,
+    MYELIN_IROH_RELAY_URL_ENV, RelayRuntimeConfig, SWACTOR_IROH_RELAY_URL_ENV,
+    relay_mode_env_value, relay_runtime_config_from_settings,
 };
 use crate::orchestration::provider_adapters::vastai::{
     SshCommandBootstrapLauncher, ToolsVastAiLeaseClient, VastAiProvisioningConfig,
@@ -48,6 +48,11 @@ use crate::provisioning::{
 };
 use crate::run_fsm::{RunConfig, RunId};
 use crate::run_plan::{self, GgufSource, TokenizerSource};
+use ::provisioning::{
+    BootSpec, ClusterShape, DesiredNodeShape, LogicalNodeId as ReconcilerLogicalNodeId,
+    NodeGroupId, ProviderKind as ReconcilerProviderKind, RetryPolicy, RoleId,
+    RunId as ClusterRunId, RunNodeGroupSpec, SwactorId, SwarmJoinTemplate,
+};
 use data_plane::object_record as ingress;
 use datastream::{
     ChannelContent, ChannelId, ChannelRef, DatastreamEndpoint, DatastreamEvent, DatastreamProducer,
@@ -55,8 +60,8 @@ use datastream::{
     StreamId, StreamOrigin, SubscriptionRequest,
 };
 use distribution::node::DistributedNodeConfig;
-use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::swim::telemetry::ObservedTransition;
+use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
@@ -514,7 +519,12 @@ where
         }),
     );
 
-    let rpc_addr = match spawn_prompt_rpc(&engine.handle(), config.rpc_bind, work_tx, config.default_max_tokens) {
+    let rpc_addr = match spawn_prompt_rpc(
+        &engine.handle(),
+        config.rpc_bind,
+        work_tx,
+        config.default_max_tokens,
+    ) {
         Ok(addr) => {
             bootstrap(
                 &mut orch_datastream,
@@ -1135,7 +1145,9 @@ impl ConfigBuilder {
             self.config_profile = RuntimeConfigProfile::parse(&profile)?;
         });
         env_parse!("MYELIN_RUN_ID", |run_id| { self.run_id = run_id });
-        env_parse!("MYELIN_LOGICAL_NODE_ID", |node_id| { self.node_id = node_id });
+        env_parse!("MYELIN_LOGICAL_NODE_ID", |node_id| {
+            self.node_id = node_id
+        });
         env_parse!("MYELIN_STAGE_INDEX", |stage_index| {
             self.stage_index = stage_index
         });
@@ -1821,6 +1833,7 @@ impl Config {
         let mut keys: Vec<String> = vec![
             "MYELIN_RUN_ID",
             "MYELIN_LOGICAL_NODE_ID",
+            "MYELIN_NODE_ATTEMPT_ID",
             "MYELIN_NODE_PROVIDER",
             "MYELIN_STAGE_INDEX",
             "MYELIN_COORDINATOR_ENDPOINT",
@@ -1956,6 +1969,7 @@ impl Config {
         Ok(NodeProvisionSpec {
             run_id: self.run_id,
             node_id: logical_node_id,
+            attempt_id: 0,
             stage_index: Some(stage_index),
             image: self.image.clone(),
             env,
@@ -2058,7 +2072,8 @@ fn wait_for_runtime_ready_acks(
     ctx: RuntimeReadyAckLoop<'_>,
     targets: &[RuntimeReadyAckTarget],
     collector_endpoint: &EndpointAddr,
-) -> Result<(), String> {
+    cluster: &mut ProvisionedClusterGuard,
+) -> Result<bool, String> {
     let RuntimeReadyAckLoop {
         driver,
         stack,
@@ -2103,6 +2118,15 @@ fn wait_for_runtime_ready_acks(
     let mut last_send = None::<Instant>;
 
     while !pending.is_empty() {
+        cluster
+            .poll(SystemTime::now())
+            .map_err(|error| format!("cluster reconcile while awaiting ready ack: {error}"))?;
+        if targets.iter().any(|target| {
+            cluster.current_attempt(target.node_id)
+                != Some(::provisioning::NodeAttemptId(target.ready.readiness_id))
+        }) {
+            return Ok(false);
+        }
         pump(driver, frame_tx);
         drain_orch_stdio_capture(
             orch_stdio_rx,
@@ -2116,13 +2140,9 @@ fn wait_for_runtime_ready_acks(
                 "shutdown requested while waiting for runtime-ready acknowledgements".to_owned(),
             );
         }
-        drain_observations_with_exit(
-            obs_rx,
-            dashboard,
-            orch_datastream,
-            provider,
-            |node_id, status| format!("node {node_id} exited before ready: {status:?}"),
-        )?;
+        while let Ok(observation) = obs_rx.try_recv() {
+            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+        }
         drain_frames(frame_rx, dashboard, orch_datastream);
         while let Some(report) = orchestrator_reports.try_recv() {
             let OrchestratorReport::NodeRuntimeReadyAck {
@@ -2154,7 +2174,7 @@ fn wait_for_runtime_ready_acks(
             );
         }
         if pending.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         if last_send.is_none_or(|sent_at| sent_at.elapsed() >= RUNTIME_READY_ACK_RETRY_INTERVAL) {
             for (key, target) in &pending {
@@ -2195,66 +2215,112 @@ fn wait_for_runtime_ready_acks(
         }
         thread::sleep(PUMP_INTERVAL);
     }
-    Ok(())
+    Ok(true)
 }
 
-struct ProvisionedClusterGuard {
+fn reconciler_group(config: &Config, spec: &NodeProvisionSpec) -> RunNodeGroupSpec {
+    let group_id = NodeGroupId(format!("node-{}", spec.node_id));
+    let ssh_user = config
+        .vastai
+        .as_ref()
+        .map(|vastai| vastai.provisioning.ssh_user.clone())
+        .unwrap_or_else(|| "root".to_owned());
+    let disk_gb = config
+        .vastai
+        .as_ref()
+        .map(|vastai| vastai.provisioning.disk_gb)
+        .unwrap_or_default();
+    let orchestrator = spec
+        .env
+        .iter()
+        .find(|(name, _)| name == "MYELIN_ORCHESTRATOR_ACTOR")
+        .map(|(_, value)| value.clone())
+        .unwrap_or_default();
+    RunNodeGroupSpec {
+        run_id: ClusterRunId(config.run_id),
+        group_id,
+        role: RoleId(format!(
+            "stage-{}",
+            spec.stage_index.unwrap_or(config.stage_index)
+        )),
+        count: 1,
+        provider: ReconcilerProviderKind::new(config.provider.as_str()),
+        shape: DesiredNodeShape {
+            image: spec.image.clone(),
+            disk_gb,
+            gpu_name: None,
+            min_gpu_ram_mb: None,
+            min_down_mbps: None,
+            min_up_mbps: None,
+            min_reliability: None,
+            require_verified: false,
+            provider_labels: BTreeMap::from([(
+                "myelin.provider_config".to_owned(),
+                config.provider_datastream_detail().to_string(),
+            )]),
+        },
+        boot: BootSpec {
+            ssh_user,
+            verify_commands: Vec::new(),
+            start_swactor_command: spec.args.join(" "),
+            stdout_sources: Vec::new(),
+            stderr_sources: Vec::new(),
+            env: spec.env.clone(),
+            args: spec.args.clone(),
+            mounts: spec.mounts.clone(),
+        },
+        swarm_join: SwarmJoinTemplate {
+            orch_swactor_addr: orchestrator,
+            join_token_ref: "myelin-runtime-ready".to_owned(),
+        },
+    }
+}
+
+fn build_reconciled_cluster(
     provisioner: Box<dyn ProvisionPlugin>,
-    handles: Vec<crate::provisioning::PluginNodeHandle>,
+    config: &Config,
+    stage_specs: &[NodeProvisionSpec],
+    runtime: swactor::runtime::Runtime,
+    engine: EngineHandle,
+    sink: PluginSink,
+) -> Result<ProvisionedClusterGuard, String> {
+    let groups = stage_specs
+        .iter()
+        .map(|spec| reconciler_group(config, spec))
+        .collect::<Vec<_>>();
+    let desired = ClusterShape {
+        run_id: ClusterRunId(config.run_id),
+        generation: 1,
+        groups,
+    };
+    let expanded = desired.expand().map_err(|error| error.to_string())?;
+    let mut first = Some(provisioner);
+    let mut bindings = Vec::with_capacity(stage_specs.len());
+    for spec in stage_specs {
+        let logical_node_id = ReconcilerLogicalNodeId(format!("node-{}-0", spec.node_id));
+        if !expanded.contains_key(&logical_node_id) {
+            return Err(format!(
+                "reconciler shape did not expand node {}",
+                logical_node_id.0
+            ));
+        }
+        let plugin = match first.take() {
+            Some(plugin) => plugin,
+            None => config.build_provisioner(runtime.clone())?,
+        };
+        bindings.push(ReconcilerNodeBinding {
+            logical_node_id,
+            provision: spec.clone(),
+            plugin,
+        });
+    }
+    ProvisionedClusterGuard::new(desired, bindings, RetryPolicy::default(), engine, sink)
 }
 
-impl ProvisionedClusterGuard {
-    fn new(
-        provisioner: Box<dyn ProvisionPlugin>,
-        handles: Vec<crate::provisioning::PluginNodeHandle>,
-    ) -> Self {
-        Self {
-            provisioner,
-            handles,
-        }
-    }
-
-    fn stop(&mut self) -> Result<(), String> {
-        let mut first_error = None;
-        while let Some(handle) = self.handles.pop() {
-            if let Err(error) = self.provisioner.stop_node(&handle)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-
-    fn complete_bootstrap(&mut self) -> Result<(), String> {
-        let mut first_error = None;
-        for handle in &self.handles {
-            if let Err(error) = self.provisioner.complete_bootstrap(handle)
-                && first_error.is_none()
-            {
-                first_error = Some(error);
-            }
-        }
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
-    }
-}
-
-impl Drop for ProvisionedClusterGuard {
-    fn drop(&mut self) {
-        let _ = self.stop();
-    }
-}
-
-// provider lifecycle/provisioning is out of scope (ENGINE_SPEC.md §2)
+// Synchronous orchestration sequencing; provider work and timers are engine-hosted.
 #[allow(clippy::disallowed_methods)]
 fn start_and_provision_workers(
-    mut provisioner: Box<dyn ProvisionPlugin>,
+    provisioner: Box<dyn ProvisionPlugin>,
     config: &Config,
     pipeline_plan: Option<&run_plan::RunPlan>,
     ctx: RuntimeReadyAckLoop<'_>,
@@ -2262,7 +2328,14 @@ fn start_and_provision_workers(
     coordinator: EndpointAddr,
     pipeline_coordinator: EndpointAddr,
     orchestrator_actor: ActorAddress,
-) -> Result<(ProvisionedClusterGuard, PromptRuntimeReady, BTreeMap<DistNodeId, u64>), String> {
+) -> Result<
+    (
+        ProvisionedClusterGuard,
+        PromptRuntimeReady,
+        BTreeMap<DistNodeId, u64>,
+    ),
+    String,
+> {
     let RuntimeReadyAckLoop {
         driver,
         stack,
@@ -2321,124 +2394,79 @@ fn start_and_provision_workers(
     } else {
         BTreeMap::new()
     };
-    let mut handles = Vec::with_capacity(stage_specs.len());
-    let mut pending_specs = stage_specs;
-    for attempt in 1..=PROVIDER_START_MAX_ATTEMPTS {
-        for node_spec in &pending_specs {
-            orch_datastream.emit_event(
-                dashboard,
-                ProvisionEvent {
-                    run_id: config.run_id,
-                    node_id: node_spec.node_id,
-                    kind: ProvisionEventKind::ProvisionStart,
-                    provider: Some(config.provider.as_str().to_owned()),
-                    message: Some(format!(
-                        "starting {} image {}",
-                        config.provider.as_str(),
-                        config.image
-                    )),
-                },
-            );
-            bootstrap(
-                orch_datastream,
-                "provider_start",
-                "started",
-                json!({
-                    "provider":config.provider.as_str(),
-                    "image":&config.image,
-                    "node_id":node_spec.node_id,
-                    "stage_index":node_spec.stage_index,
-                    "attempt":attempt,
-                }),
-            );
-        }
-        let (tx, rx) = mpsc::channel();
-        thread::spawn({
-            let sink = sink.clone();
-            move || {
-                let mut provisioner = provisioner;
-                let results = provisioner.start_nodes(pending_specs, sink);
-                let _ = tx.send((provisioner, results));
-            }
-        });
-        let start_results = loop {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok((returned_provisioner, start_results)) => {
-                    provisioner = returned_provisioner;
-                    break start_results;
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    drain_orch_stdio_capture(
-                        orch_stdio_rx,
-                        orch_datastream,
-                        dashboard,
-                        config.run_id,
-                        config.node_id,
-                    );
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("provider start worker disconnected".to_owned());
-                }
-            }
-        };
-        let mut failed_specs = Vec::new();
-        let mut first_error = None;
-        for (node_spec, handle_result) in start_results {
-            match handle_result {
-                Ok(handle) => {
-                    bootstrap(
-                        orch_datastream,
-                        "provider_start",
-                        "ready",
-                        json!({
-                            "provider":config.provider.as_str(),
-                            "node_id":node_spec.node_id,
-                            "stage_index":node_spec.stage_index,
-                            "attempt":attempt,
-                        }),
-                    );
-                    handles.push(handle);
-                }
-                Err(error) => {
-                    bootstrap(
-                        orch_datastream,
-                        "provider_start",
-                        "failed",
-                        json!({
-                            "provider":config.provider.as_str(),
-                            "node_id":node_spec.node_id,
-                            "stage_index":node_spec.stage_index,
-                            "attempt":attempt,
-                            "error":error,
-                        }),
-                    );
-                    failed_specs.push(node_spec);
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
-            }
-        }
-        if first_error.is_none() {
+    for node_spec in &stage_specs {
+        orch_datastream.emit_event(
+            dashboard,
+            ProvisionEvent {
+                run_id: config.run_id,
+                node_id: node_spec.node_id,
+                kind: ProvisionEventKind::ProvisionStart,
+                provider: Some(config.provider.as_str().to_owned()),
+                message: Some(format!(
+                    "reconciling {} image {}",
+                    config.provider.as_str(),
+                    config.image
+                )),
+            },
+        );
+        bootstrap(
+            orch_datastream,
+            "provider_start",
+            "started",
+            json!({
+                "provider":config.provider.as_str(),
+                "image":&config.image,
+                "node_id":node_spec.node_id,
+                "stage_index":node_spec.stage_index,
+                "generation":1,
+            }),
+        );
+    }
+    let mut provisioned_nodes = build_reconciled_cluster(
+        provisioner,
+        config,
+        &stage_specs,
+        stack.runtime.clone(),
+        stack.engine.clone(),
+        sink,
+    )?;
+    loop {
+        provisioned_nodes
+            .poll(SystemTime::now())
+            .map_err(|error| format!("cluster reconcile: {error}"))?;
+        if provisioned_nodes.awaiting_runtime() || provisioned_nodes.is_converged() {
             break;
         }
-        if attempt == PROVIDER_START_MAX_ATTEMPTS {
-            let error = first_error.expect("checked provider-start failure");
-            while let Some(handle) = handles.pop() {
-                let _ = provisioner.stop_node(&handle);
-            }
-            drain_orch_stdio_capture(
-                orch_stdio_rx,
-                orch_datastream,
-                dashboard,
-                config.run_id,
-                config.node_id,
-            );
-            return Err(error);
+        pump(driver, frame_tx);
+        drain_frames(frame_rx, dashboard, orch_datastream);
+        drain_orch_stdio_capture(
+            orch_stdio_rx,
+            orch_datastream,
+            dashboard,
+            config.run_id,
+            config.node_id,
+        );
+        while let Ok(observation) = obs_rx.try_recv() {
+            emit_plugin_observation(orch_datastream, dashboard, &config.provider, &observation);
         }
-        pending_specs = failed_specs;
+        if stop_requested(stop_rx) {
+            return Err("shutdown requested while reconciling worker nodes".to_owned());
+        }
+        thread::sleep(PUMP_INTERVAL);
     }
-    let mut provisioned_nodes = ProvisionedClusterGuard::new(provisioner, handles);
+    for node_spec in &stage_specs {
+        bootstrap(
+            orch_datastream,
+            "provider_start",
+            "ready",
+            json!({
+                "provider":config.provider.as_str(),
+                "node_id":node_spec.node_id,
+                "stage_index":node_spec.stage_index,
+                "attempt":provisioned_nodes.current_attempt(node_spec.node_id).map(|attempt| attempt.0),
+            }),
+        );
+    }
     drain_orch_stdio_capture(
         orch_stdio_rx,
         orch_datastream,
@@ -2453,8 +2481,8 @@ fn start_and_provision_workers(
         "started",
         json!({"worker_count":expected_node_ids.len(),"node_ids":expected_node_ids}),
     );
-    let readies = if pipeline_plan.is_some() {
-        match wait_for_runtime_readies(
+    let readies = loop {
+        let readies = match wait_for_runtime_readies(
             RuntimeReadyAckLoop {
                 driver,
                 stack,
@@ -2472,6 +2500,7 @@ fn start_and_provision_workers(
                 orchestrator_actor,
             },
             &expected_node_ids,
+            &mut provisioned_nodes,
         ) {
             Ok(readies) => readies,
             Err(error) => {
@@ -2483,75 +2512,80 @@ fn start_and_provision_workers(
                 );
                 return Err(error);
             }
-        }
-    } else {
-        let ready = match wait_for_runtime_ready(RuntimeReadyAckLoop {
-            driver,
-            stack,
-            obs_rx,
-            frame_rx,
-            frame_tx,
-            orchestrator_reports,
-            stop_rx,
-            dashboard,
-            orch_datastream,
-            orch_stdio_rx,
-            run_id: config.run_id,
-            orchestrator_node_id: config.node_id,
-            provider: &config.provider,
-            orchestrator_actor,
-        }) {
-            Ok(ready) => ready,
-            Err(error) => {
-                bootstrap(
-                    orch_datastream,
-                    "node_runtime_ready",
-                    "failed",
-                    json!({"error":error}),
-                );
-                return Err(error);
-            }
         };
-        BTreeMap::from([(config.node_id, ready)])
-    };
-    for (node_id, ready) in &readies {
+        for (node_id, ready) in &readies {
+            bootstrap(
+                orch_datastream,
+                "node_runtime_ready",
+                "ready",
+                json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"node_id":node_id,"stage_index":ready.stage_index,"attempt":ready.readiness_id}),
+            );
+        }
+        let ack_targets = readies
+            .iter()
+            .map(|(node_id, ready)| RuntimeReadyAckTarget {
+                node_id: *node_id,
+                ready: ready.clone(),
+            })
+            .collect::<Vec<_>>();
+        if wait_for_runtime_ready_acks(
+            RuntimeReadyAckLoop {
+                driver,
+                stack,
+                obs_rx,
+                frame_rx,
+                frame_tx,
+                orchestrator_reports,
+                stop_rx,
+                dashboard,
+                orch_datastream,
+                orch_stdio_rx,
+                run_id: config.run_id,
+                orchestrator_node_id: config.node_id,
+                provider: &config.provider,
+                orchestrator_actor,
+            },
+            &ack_targets,
+            &pipeline_coordinator,
+            &mut provisioned_nodes,
+        )? {
+            break readies;
+        }
         bootstrap(
             orch_datastream,
             "node_runtime_ready",
-            "ready",
-            json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"node_id":node_id,"stage_index":ready.stage_index}),
+            "retry",
+            json!({"reason":"node attempt changed before ready acknowledgement"}),
         );
+    };
+    for (node_id, ready) in &readies {
+        let attempt = ::provisioning::NodeAttemptId(ready.readiness_id);
+        if !provisioned_nodes.observe_runtime_ready(
+            *node_id,
+            attempt,
+            SwactorId(format!("{:?}", ready.node_actor)),
+            SystemTime::now(),
+        ) {
+            return Err(format!(
+                "stale runtime-ready observation for node {node_id} attempt {}",
+                attempt.0
+            ));
+        }
     }
-    let ack_targets = readies
-        .iter()
-        .map(|(node_id, ready)| RuntimeReadyAckTarget {
-            node_id: *node_id,
-            ready: ready.clone(),
-        })
-        .collect::<Vec<_>>();
-    wait_for_runtime_ready_acks(
-        RuntimeReadyAckLoop {
-            driver,
-            stack,
-            obs_rx,
-            frame_rx,
-            frame_tx,
-            orchestrator_reports,
-            stop_rx,
-            dashboard,
-            orch_datastream,
-            orch_stdio_rx,
-            run_id: config.run_id,
-            orchestrator_node_id: config.node_id,
-            provider: &config.provider,
-            orchestrator_actor,
-        },
-        &ack_targets,
-        &pipeline_coordinator,
-    )?;
-    provisioned_nodes
-        .complete_bootstrap()
-        .map_err(|e| format!("complete provider bootstrap after runtime-ready: {e}"))?;
+    while !provisioned_nodes.is_converged() {
+        provisioned_nodes
+            .poll(SystemTime::now())
+            .map_err(|error| format!("cluster convergence: {error}"))?;
+        pump(driver, frame_tx);
+        drain_frames(frame_rx, dashboard, orch_datastream);
+        while let Ok(observation) = obs_rx.try_recv() {
+            emit_plugin_observation(orch_datastream, dashboard, &config.provider, &observation);
+        }
+        if stop_requested(stop_rx) {
+            return Err("shutdown requested while converging worker nodes".to_owned());
+        }
+        thread::sleep(PUMP_INTERVAL);
+    }
 
     bootstrap(
         orch_datastream,
@@ -2927,6 +2961,7 @@ fn stage_ring_spec_wire(spec: run_plan::RingSpec) -> StageRingSpecWire {
 fn wait_for_runtime_readies(
     ctx: RuntimeReadyAckLoop<'_>,
     expected_node_ids: &[u64],
+    cluster: &mut ProvisionedClusterGuard,
 ) -> Result<BTreeMap<u64, RuntimeReady>, String> {
     let RuntimeReadyAckLoop {
         driver,
@@ -2946,6 +2981,13 @@ fn wait_for_runtime_readies(
     let expected = expected_node_ids.iter().copied().collect::<BTreeSet<_>>();
     let mut pending = BTreeMap::<u64, RuntimeReady>::new();
     loop {
+        cluster
+            .poll(SystemTime::now())
+            .map_err(|error| format!("cluster reconcile while awaiting runtime: {error}"))?;
+        pending.retain(|node_id, ready| {
+            cluster.current_attempt(*node_id)
+                == Some(::provisioning::NodeAttemptId(ready.readiness_id))
+        });
         pump(driver, frame_tx);
         emit_swim_transitions(
             orch_datastream,
@@ -2972,13 +3014,9 @@ fn wait_for_runtime_readies(
                 PluginObservation::DatastreamFrame { .. }
                 | PluginObservation::ProviderLine { .. }
                 | PluginObservation::StdoutLine { .. }
-                | PluginObservation::StderrLine { .. } => {}
-                PluginObservation::Failed { reason, .. } => return Err(reason),
-                PluginObservation::Exited {
-                    status, node_id, ..
-                } => {
-                    return Err(format!("node {node_id} exited before ready: {status:?}"));
-                }
+                | PluginObservation::StderrLine { .. }
+                | PluginObservation::Failed { .. }
+                | PluginObservation::Exited { .. } => {}
             }
         }
         while let Some(report) = orchestrator_reports.try_recv() {
@@ -2993,6 +3031,8 @@ fn wait_for_runtime_readies(
             } = report
                 && report_run_id == run_id
                 && expected.contains(&node_id)
+                && cluster.current_attempt(node_id)
+                    == Some(::provisioning::NodeAttemptId(readiness_id))
             {
                 pending.insert(
                     node_id,
@@ -3739,7 +3779,9 @@ impl OrchDatastream {
             producer,
             channels: BTreeMap::new(),
             channel_names: BTreeMap::new(),
-            archive: frame_log.map(|p| FrameArchive::open_with_label(p, "datastream frame log")).transpose()?
+            archive: frame_log
+                .map(|p| FrameArchive::open_with_label(p, "datastream frame log"))
+                .transpose()?,
         };
         for name in [
             MYELIN_PROVISIONING_EVENTS,
@@ -3788,8 +3830,8 @@ impl OrchDatastream {
 
     fn emit_log(&mut self, dashboard: Option<&DashboardSupport>, line: ProvisionLogLine) {
         let channel = myelin_provision_log_channel(line.node_id, line.stream);
-        let payload =
-            serde_json::to_vec(&MyelinProvisionLogRecord::new(line)).expect("serialize provision log");
+        let payload = serde_json::to_vec(&MyelinProvisionLogRecord::new(line))
+            .expect("serialize provision log");
         self.emit_bytes(dashboard, &channel, payload);
     }
 
@@ -4068,7 +4110,8 @@ impl DashboardSupport {
     fn start(enabled: bool, _engine: &EngineHandle) -> Result<Option<Self>, String> {
         if enabled {
             return Err(
-                "MYELIN_DASHBOARD requires building myelin-system with feature dashboard".to_owned(),
+                "MYELIN_DASHBOARD requires building myelin-system with feature dashboard"
+                    .to_owned(),
             );
         }
         Ok(None)
@@ -4076,7 +4119,6 @@ impl DashboardSupport {
 
     fn publish_frame(&self, _stream: &StreamId, _channel: &str, _frame: &Frame) {}
 }
-
 
 struct ChannelObservationSink {
     tx: Mutex<mpsc::Sender<PluginObservation>>,
@@ -4100,8 +4142,8 @@ fn spawn_prompt_rpc(
     // reusing the synchronous request/response parser unchanged. There is no
     // listener thread and no per-connection std thread (ENGINE_SPEC.md);
     // no raw Tokio handle or second runtime is introduced.
-    let std_listener = TcpListener::bind(bind)
-        .map_err(|e| format!("bind prompt RPC {bind}: {e}"))?;
+    let std_listener =
+        TcpListener::bind(bind).map_err(|e| format!("bind prompt RPC {bind}: {e}"))?;
     let addr = std_listener
         .local_addr()
         .map_err(|e| format!("read prompt RPC addr: {e}"))?;
@@ -4123,8 +4165,7 @@ fn spawn_prompt_rpc(
                         if let Ok(std_stream) = stream.into_std() {
                             // The synchronous parser uses blocking I/O.
                             let _ = std_stream.set_nonblocking(false);
-                            let _ =
-                                handle_prompt_connection(std_stream, tx, default_max_tokens);
+                            let _ = handle_prompt_connection(std_stream, tx, default_max_tokens);
                         }
                     });
                 }
@@ -4169,119 +4210,6 @@ fn handle_prompt_connection(
         }
     }
     Ok(())
-}
-
-// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
-fn wait_for_runtime_ready(ctx: RuntimeReadyAckLoop<'_>) -> Result<RuntimeReady, String> {
-    let RuntimeReadyAckLoop {
-        driver,
-        stack,
-        obs_rx,
-        frame_rx,
-        frame_tx,
-        orchestrator_reports,
-        stop_rx,
-        dashboard,
-        orch_datastream,
-        orch_stdio_rx,
-        run_id,
-        orchestrator_node_id: node_id,
-        provider,
-        ..
-    } = ctx;
-    let mut pending_ready: Option<RuntimeReady> = None;
-    let mut node_swim_started = false;
-    let mut node_swim_ready = false;
-    let mut node_route_started = false;
-    loop {
-        pump(driver, frame_tx);
-        drain_frames(frame_rx, dashboard, orch_datastream);
-        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
-        if stop_requested(stop_rx) {
-            return Err("shutdown requested while waiting for node ready".to_owned());
-        }
-        drain_observations_with_exit(obs_rx, dashboard, orch_datastream, provider, |_, status| {
-            format!("node exited before ready: {status:?}")
-        })?;
-        while let Some(report) = orchestrator_reports.try_recv() {
-            if let OrchestratorReport::NodeRuntimeReady {
-                run_id: report_run_id,
-                node_id: report_node_id,
-                stage_index,
-                endpoint,
-                node_actor,
-                datastream_publisher,
-                readiness_id,
-            } = report
-            {
-                if report_run_id == run_id && report_node_id == node_id {
-                    let reset_progress = pending_ready
-                        .as_ref()
-                        .map(|ready| ready.readiness_id != readiness_id)
-                        .unwrap_or(true);
-                    if reset_progress {
-                        node_swim_started = false;
-                        node_swim_ready = false;
-                        node_route_started = false;
-                    }
-                    let swim_node_id = DistNodeId(*endpoint.id.as_bytes());
-                    pending_ready = Some(RuntimeReady {
-                        endpoint,
-                        node_actor,
-                        datastream_publisher,
-                        stage_index,
-                        readiness_id,
-                        swim_node_id,
-                    });
-                }
-            }
-        }
-        if let Some(ready) = pending_ready.as_ref() {
-            if runtime_ready_barrier_met(stack, ready) {
-                return Ok(ready.clone());
-            }
-            let swim_ready = stack.member_state(ready.swim_node_id) == Some(MemberState::Alive);
-            let route_ready = stack.route_owner(ready.node_actor) == Some(ready.swim_node_id);
-            if !swim_ready {
-                if !node_swim_started {
-                    orch_datastream.emit_bootstrap(
-                        dashboard,
-                        run_id,
-                        node_id,
-                        "node_swim",
-                        "started",
-                        json!({"node":format!("{:?}", ready.swim_node_id),"readiness_id":ready.readiness_id}),
-                    );
-                    node_swim_started = true;
-                }
-            } else if !route_ready {
-                if !node_swim_ready {
-                    orch_datastream.emit_bootstrap(
-                        dashboard,
-                        run_id,
-                        node_id,
-                        "node_swim",
-                        "ready",
-                        json!({"node":format!("{:?}", ready.swim_node_id),"readiness_id":ready.readiness_id}),
-                    );
-                    node_swim_ready = true;
-                }
-                if !node_route_started {
-                    orch_datastream.emit_bootstrap(
-                        dashboard,
-                        run_id,
-                        node_id,
-                        "node_route",
-                        "started",
-                        json!({"node_actor":ready.node_actor,"node":format!("{:?}", ready.swim_node_id),"readiness_id":ready.readiness_id}),
-                    );
-                    node_route_started = true;
-                }
-            }
-        }
-        thread::sleep(PUMP_INTERVAL);
-    }
 }
 
 fn provision_stage(
@@ -5065,9 +4993,10 @@ fn serve_prompts(
                 "started",
                 json!({"source":"stdin"}),
             );
-            let _ = stack
-                .runtime
-                .send_to(orchestrator_actor, OrchestratorMsg::ObserveOperatorStop { run_id });
+            let _ = stack.runtime.send_to(
+                orchestrator_actor,
+                OrchestratorMsg::ObserveOperatorStop { run_id },
+            );
             pump(driver, frame_tx);
             return Ok(());
         }
@@ -5479,10 +5408,7 @@ fn emit_swim_probe_events(
 /// progression and protocol tick injection are owned by the engine (see
 /// `spawn_protocol_ticker`); this only drains integration-owned queues
 /// (ENGINE_SPEC.md).
-fn pump(
-    driver: &IrohDriver,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-) {
+fn pump(driver: &IrohDriver, frame_tx: &mpsc::Sender<CollectedDatastreamFrame>) {
     drain_datastream_connections(driver, frame_tx);
 }
 
@@ -5589,7 +5515,8 @@ fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
 fn ssh_public_key_fingerprint(public_key: &str) -> String {
     const UNAVAILABLE: &str = "unavailable";
 
-    let path = std::env::temp_dir().join(format!("myelin-vastai-ssh-key-{}.pub", std::process::id()));
+    let path =
+        std::env::temp_dir().join(format!("myelin-vastai-ssh-key-{}.pub", std::process::id()));
     if std::fs::write(&path, format!("{public_key}\n")).is_err() {
         return UNAVAILABLE.to_owned();
     }

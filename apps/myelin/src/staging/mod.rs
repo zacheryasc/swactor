@@ -1,4 +1,3 @@
-
 //! Myelin stage control, shard planning, and weight lifecycle public surface.
 
 pub(crate) mod control;

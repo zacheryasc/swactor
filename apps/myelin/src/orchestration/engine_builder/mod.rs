@@ -1,4 +1,3 @@
-
 //! Pool-based engine/node builder primitives.
 //!
 //! This module owns topology construction: acquire a role-neutral node pool,

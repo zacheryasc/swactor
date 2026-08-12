@@ -1,4 +1,3 @@
-
 //! Relay provisioning shims for Myelin runtimes.
 //!
 //! The current implementations are deliberately small: local tests get the same
@@ -56,7 +55,6 @@ pub(crate) trait RelayProvider: Send {
 
     fn relay_mode(&self, lease: &RelayLease) -> Result<RelayMode, String>;
 }
-
 
 #[derive(Clone, Debug)]
 pub(crate) struct StaticRelayProvider {

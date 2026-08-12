@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::types::{
-    LabeledInstance, LifecyclePolicy, Offer, ProviderInstanceStatus, ProvisionRequest,
-    ProvisionedFleet, RunningInstance,
+    CreateInstanceRequest, InstanceInfo, LabeledInstance, LifecyclePolicy, Offer,
+    ProviderInstanceStatus, ProvisionRequest, ProvisionedFleet, RunningInstance,
 };
 
 /// Small convenience wrapper around a reqwest client + vast.ai endpoint.
@@ -30,16 +30,26 @@ impl VastClient {
         }
     }
 
-    pub fn http(&self) -> &reqwest::Client {
-        &self.http
+    pub async fn create_instance(
+        &self,
+        req: &CreateInstanceRequest,
+    ) -> Result<InstanceInfo, String> {
+        crate::provision::create_instance(&self.http, &self.base_url, &self.api_key, req).await
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    pub async fn destroy_instance(&self, contract_id: u64) -> Result<(), String> {
+        crate::teardown::destroy_instance(&self.http, &self.base_url, &self.api_key, contract_id)
+            .await
     }
 
-    pub fn api_key(&self) -> &str {
-        &self.api_key
+    pub async fn destroy_instance_with_retry(&self, contract_id: u64) -> Result<(), String> {
+        crate::teardown::destroy_instance_with_retry(
+            &self.http,
+            &self.base_url,
+            &self.api_key,
+            contract_id,
+        )
+        .await
     }
 
     pub async fn search_offers(

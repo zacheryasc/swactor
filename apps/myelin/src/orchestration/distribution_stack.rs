@@ -1,4 +1,3 @@
-
 //! Myelin-system swactor distribution runtime wiring.
 //!
 //! This is the production version of the actor-stack setup that integration
@@ -16,8 +15,8 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::config::RuntimeConfig;
 use swactor::runtime::{Ctx, Runtime, RuntimeParts};
 use swactor::stats::StatsHook;
-use swactor_engine::EngineHandle;
 use swactor::std::StdExtension;
+use swactor_engine::EngineHandle;
 use swactor_transport::{CodecRegistry, CodecRemoteSink, NetworkMessage, TransportRouter};
 
 use distribution::directory_actor::{DirectoryActor, DirectoryIn};
@@ -77,7 +76,12 @@ impl DistributionRuntimeStack {
     pub(crate) fn build_runtime(
         extend_codecs: impl FnOnce(&mut CodecRegistry),
         stats_hook: Option<Arc<dyn StatsHook>>,
-    ) -> (RuntimeParts, Runtime, Arc<CodecRegistry>, Arc<TransportRouter>) {
+    ) -> (
+        RuntimeParts,
+        Runtime,
+        Arc<CodecRegistry>,
+        Arc<TransportRouter>,
+    ) {
         let mut parts = RuntimeParts::new(RuntimeConfig::default())
             .with_extension(Arc::new(StdExtension::new()));
         let mut codec = actor_codec_registry();

@@ -1,4 +1,3 @@
-
 //! Myelin-system-owned datastream channel records.
 
 use datastream::Record;
@@ -64,4 +63,3 @@ pub(crate) fn myelin_provision_log_channel(node_id: u64, stream: ProvisionLogStr
 impl Record for MyelinProvisionLogRecord {
     const CHANNEL: &'static str = MYELIN_PROVISIONING_LOGS;
 }
-

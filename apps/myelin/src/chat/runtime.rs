@@ -889,7 +889,10 @@ impl Config {
     /// cached GGUF model without explicit flags. Explicit `--cached-model` is
     /// always honored (and stays strict); the default degrades gracefully to
     /// the normal download path when no cached model is present.
-    fn cached_model_source(args: &ParsedArgs, provider: &ProviderKind) -> Option<CachedModelSource> {
+    fn cached_model_source(
+        args: &ParsedArgs,
+        provider: &ProviderKind,
+    ) -> Option<CachedModelSource> {
         match &args.cached_model {
             Some(source) => Some(source.clone()),
             None if provider == &provider_kind::process() => Some(CachedModelSource::Discover),
@@ -1388,8 +1391,8 @@ fn wait_for_rpc_ready(
 }
 
 impl InProcessOrch {
-// spawns the orchestrator process; process control, out of scope (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
+    // spawns the orchestrator process; process control, out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     fn spawn(config: &Config, image_ref: &str) -> Result<Self, String> {
         let args = config.orchestrator_cli_args(image_ref);
         let (stop_tx, stop_rx) = mpsc::channel();
@@ -1418,8 +1421,8 @@ impl InProcessOrch {
         })
     }
 
-// synchronous process-control readiness sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
+    // synchronous process-control readiness sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     fn shutdown(&mut self) {
         if self.cleaned {
             return;
@@ -1517,8 +1520,8 @@ impl OrchChild {
 
     // The orchestrator shutdown spec is still pending. Replace this with the approved
     // shutdown contract when it is finalized; do not add private stdin commands here.
-// synchronous process-control readiness sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
+    // synchronous process-control readiness sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
     fn shutdown(&mut self) {
         if self.cleaned {
             return;
@@ -1688,14 +1691,7 @@ where
             config.skip_rebuild,
             &config.worker_bin,
             "myelin-worker",
-            &[
-                "build",
-                "--quiet",
-                "-p",
-                "myelin",
-                "--bin",
-                "myelin-worker",
-            ],
+            &["build", "--quiet", "-p", "myelin", "--bin", "myelin-worker"],
         )?;
         emit_chat_progress(
             &mut progress,
@@ -1733,14 +1729,7 @@ where
             config.skip_rebuild,
             &config.worker_bin,
             "myelin-worker",
-            &[
-                "build",
-                "--quiet",
-                "-p",
-                "myelin",
-                "--bin",
-                "myelin-worker",
-            ],
+            &["build", "--quiet", "-p", "myelin", "--bin", "myelin-worker"],
         )?;
         emit_chat_progress(
             &mut progress,
@@ -1895,7 +1884,15 @@ fn run_chat_session_with_output_and_progress(
     let mut progress = progress;
     let mut next_request_id = 1_u64;
     let mut next_prompt_index = 1_u64;
-    let prompt_exited = |progress: &mut Option<&mut ChatDatastream>, reason: &str| emit_chat_progress(progress, CHAT_PROMPT_CHANNEL, "prompt_loop", "exited", json!({"reason": reason}));
+    let prompt_exited = |progress: &mut Option<&mut ChatDatastream>, reason: &str| {
+        emit_chat_progress(
+            progress,
+            CHAT_PROMPT_CHANNEL,
+            "prompt_loop",
+            "exited",
+            json!({"reason": reason}),
+        )
+    };
 
     loop {
         if STOP_REQUESTED.load(Ordering::SeqCst) {

@@ -6,7 +6,9 @@ use crate::gguf_common::{GgufValueType, read_integer_value, read_u32, read_u64};
 use serde::{Deserialize, Serialize};
 
 use crate::run_plan::GgufSource;
-use crate::staging::gguf_metadata::{skip_scalar as skip_value, read_gguf_string, GGUF_MAGIC, SUPPORTED_GGUF_VERSION};
+use crate::staging::gguf_metadata::{
+    GGUF_MAGIC, SUPPORTED_GGUF_VERSION, read_gguf_string, skip_scalar as skip_value,
+};
 
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_STRING_BYTES: u64 = 64 * 1024 * 1024;
@@ -204,7 +206,10 @@ pub(crate) fn source_url(source: &GgufSource) -> Result<String, String> {
         } => Ok(format!(
             "https://huggingface.co/{repo}/resolve/{}/{}",
             revision.as_deref().unwrap_or("main"),
-            file.split('/').map(percent_encode_path_segment).collect::<Vec<_>>().join("/")
+            file.split('/')
+                .map(percent_encode_path_segment)
+                .collect::<Vec<_>>()
+                .join("/")
         )),
         GgufSource::LocalPath(path) => Err(format!(
             "stage shard range fetching requires a remote Hugging Face source; got local path {path:?}"

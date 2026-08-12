@@ -679,9 +679,12 @@ mod run_fsm {
             run_id: fsm::RunId(7),
             stage_index: 99,
         });
-        assert!(invalid.events().iter().any(|event| {
-            matches!(event, fsm::LifecycleEvent::RunFaulted { .. })
-        }));
+        assert!(
+            invalid
+                .events()
+                .iter()
+                .any(|event| { matches!(event, fsm::LifecycleEvent::RunFaulted { .. }) })
+        );
     }
 
     // This proves execution has one start signal and advances by the token feedback

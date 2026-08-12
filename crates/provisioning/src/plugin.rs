@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 pub struct NodeProvisionSpec {
     pub run_id: u64,
     pub node_id: u64,
+    /// Concrete attempt identity. Zero is reserved for an unbound template.
+    #[serde(default)]
+    pub attempt_id: u64,
     pub stage_index: Option<u32>,
     pub image: String,
     pub env: Vec<(String, String)>,
@@ -115,24 +118,18 @@ impl PluginSink {
 }
 
 pub trait ProvisionPlugin: Send {
-    fn start_node(
+    /// Acquires or adopts the provider resource for one concrete node attempt.
+    fn create_node(
         &mut self,
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Result<PluginNodeHandle, String>;
 
-    fn start_nodes(
-        &mut self,
-        specs: Vec<NodeProvisionSpec>,
-        sink: PluginSink,
-    ) -> Vec<(NodeProvisionSpec, Result<PluginNodeHandle, String>)> {
-        specs
-            .into_iter()
-            .map(|spec| {
-                let result = self.start_node(spec.clone(), sink.clone());
-                (spec, result)
-            })
-            .collect()
+    /// Starts or adopts bootstrap work on an already-created provider resource.
+    fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
+
+    fn cancel_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
+        Ok(())
     }
 
     fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
@@ -161,6 +158,7 @@ mod tests {
         let spec = NodeProvisionSpec {
             run_id: 17,
             node_id: 23,
+            attempt_id: 7,
             stage_index: Some(2),
             image: "runtime:latest".to_owned(),
             env: vec![("A".to_owned(), "B".to_owned())],
@@ -191,6 +189,7 @@ mod tests {
         .expect("legacy spec decodes");
 
         assert!(decoded.mounts.is_empty());
+        assert_eq!(decoded.attempt_id, 0);
     }
 
     #[test]

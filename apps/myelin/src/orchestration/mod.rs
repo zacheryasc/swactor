@@ -7,6 +7,7 @@
 
 pub(crate) mod actor;
 pub(crate) mod app;
+pub(crate) mod cluster_reconciler;
 pub(crate) mod config;
 pub(crate) mod distribution_stack;
 #[cfg(test)]

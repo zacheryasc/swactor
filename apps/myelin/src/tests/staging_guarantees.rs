@@ -11,8 +11,8 @@ mod stage_controller {
     //! They assert the guarantees in
     //! `specs/BEHAVIOR_GUARANTEES.md`.
 
-    use myelin::staging as stage;
     use crate::tests::harness::StageControllerHarness;
+    use myelin::staging as stage;
 
     // This provision fixture represents a single middle stage. It has one inbound
     // and one outbound edge so tests can prove the controller uses assigned edges

@@ -161,7 +161,10 @@ fn required_u32(map: &BTreeMap<String, u64>, key: &str, label: &str) -> Result<u
     u32::try_from(value).map_err(|_| format!("GGUF metadata {label} key {key} exceeds u32"))
 }
 
-pub(crate) fn skip_scalar<R: Read + Seek>(reader: &mut R, value_type: GgufValueType) -> Result<(), String> {
+pub(crate) fn skip_scalar<R: Read + Seek>(
+    reader: &mut R,
+    value_type: GgufValueType,
+) -> Result<(), String> {
     match value_type {
         GgufValueType::String => skip_gguf_string(reader),
         GgufValueType::Array => skip_array(reader),
@@ -195,7 +198,10 @@ pub(crate) fn skip_array<R: Read + Seek>(reader: &mut R) -> Result<(), String> {
     }
 }
 
-pub(crate) fn read_gguf_string<R: Read + Seek>(reader: &mut R, max_len: u64) -> Result<String, String> {
+pub(crate) fn read_gguf_string<R: Read + Seek>(
+    reader: &mut R,
+    max_len: u64,
+) -> Result<String, String> {
     let len = read_u64(reader)?;
     if len > max_len {
         return Err(format!(

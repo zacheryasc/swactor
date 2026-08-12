@@ -1,4 +1,3 @@
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct RunId(pub(crate) u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -288,7 +287,9 @@ impl OrchestratorRun {
                 sequence: sequence + 1,
                 payload: TokenObjectPayload::Decode {
                     token_id,
-                    sampling: SamplingData { source_sequence: sequence },
+                    sampling: SamplingData {
+                        source_sequence: sequence,
+                    },
                 },
             });
         } else {

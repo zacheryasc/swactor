@@ -106,14 +106,7 @@ fn prepare_node_image_inner(
     run_status_command(
         &root,
         "cargo",
-        &[
-            "build",
-            "--quiet",
-            "-p",
-            "myelin",
-            "--bin",
-            "myelin-worker",
-        ],
+        &["build", "--quiet", "-p", "myelin", "--bin", "myelin-worker"],
         "build myelin-worker",
         None,
         progress,
@@ -365,7 +358,12 @@ fn collect_hash_inputs(root: &Path, path: &Path, out: &mut Vec<PathBuf>) -> Resu
         }
         return Ok(());
     }
-    if !metadata.is_dir() || matches!(path.file_name().and_then(|name| name.to_str()), Some(".git" | "target" | "__pycache__")) {
+    if !metadata.is_dir()
+        || matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(".git" | "target" | "__pycache__")
+        )
+    {
         return Ok(());
     }
     let entries = fs::read_dir(path).map_err(|e| format!("read dir {display}: {e}"))?;
@@ -703,7 +701,7 @@ fn run_status_command(
     );
     let mut child = match Command::new(program)
         .current_dir(root)
-            .args(&args)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

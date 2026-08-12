@@ -1,4 +1,3 @@
-
 use std::io::{BufRead, BufReader, Read};
 use std::thread::{self, JoinHandle};
 
@@ -179,4 +178,3 @@ pub(crate) fn parse_stdio_datastream_frame(
         payload: frame.payload.to_string(),
     })
 }
-

@@ -1,7 +1,7 @@
 use crate::run_plan as plan;
+use crate::tests::harness::StageControllerHarness;
 use data_plane::edge_actor;
 use myelin::staging as stage;
-use crate::tests::harness::StageControllerHarness;
 
 use super::mock_transport::MockObject;
 use super::mock_worker::MockWorker;

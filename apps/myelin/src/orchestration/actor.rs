@@ -234,7 +234,10 @@ impl OrchestratorActor {
                 run_id: core::RunId(run_id),
                 stage_index,
             }),
-            OrchestratorMsg::ObserveNodeRuntimeReady { .. } | OrchestratorMsg::ObserveNodeRuntimeReadyAck { .. } | OrchestratorMsg::ObserveWeightsReady { .. } | OrchestratorMsg::Snapshot { .. } => {}
+            OrchestratorMsg::ObserveNodeRuntimeReady { .. }
+            | OrchestratorMsg::ObserveNodeRuntimeReadyAck { .. }
+            | OrchestratorMsg::ObserveWeightsReady { .. }
+            | OrchestratorMsg::Snapshot { .. } => {}
             OrchestratorMsg::ObserveTokenInEndpointReady => {
                 self.core.observe(core::RunEvent::TokenInEndpointReady)
             }

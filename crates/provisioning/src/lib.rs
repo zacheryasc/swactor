@@ -1,11 +1,15 @@
 //! Reusable provider-neutral provisioning contracts.
 //!
-//! This crate owns lease, boot, destroy, bootstrap-session, and provider plugin
-//! state machines that do not depend on GGUF, prompts, stage execution, Docker,
-//! VastAI, or MVP runtime policy. Concrete provider adapters live in application
-//! crates and implement these contracts.
+//! This crate owns provider-neutral lifecycle facts and commands together with
+//! the level-triggered reconciler and identity-aware executor contracts. Concrete
+//! provider adapters live in application crates and implement the executor
+//! backend contract.
 
+pub mod executor;
 pub mod node;
 pub mod plugin;
+pub mod reconciler;
 
+pub use executor::*;
 pub use node::*;
+pub use reconciler::*;

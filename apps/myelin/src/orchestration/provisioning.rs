@@ -31,8 +31,10 @@ pub(crate) struct LocalDockerPlugin {
 }
 
 struct LocalDockerNode {
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
     container_name: String,
-    stdin: ChildStdin,
+    stdin: Option<ChildStdin>,
 }
 
 pub(crate) struct LocalProcessPlugin {
@@ -42,10 +44,14 @@ pub(crate) struct LocalProcessPlugin {
 }
 
 struct LocalProcessNode {
-    stdin: ChildStdin,
-    child: Arc<Mutex<Option<Child>>>,
     spec: NodeProvisionSpec,
     sink: PluginSink,
+    runtime: Option<LocalProcessRuntime>,
+}
+
+struct LocalProcessRuntime {
+    stdin: ChildStdin,
+    child: Arc<Mutex<Option<Child>>>,
 }
 
 impl LocalProcessPlugin {
@@ -65,6 +71,35 @@ impl LocalDockerPlugin {
             next_handle_id: 1,
             nodes: BTreeMap::new(),
         }
+    }
+}
+
+fn docker_container_name(prefix: &str, spec: &NodeProvisionSpec) -> String {
+    format!(
+        "{prefix}-{}-{}-attempt-{}",
+        spec.run_id, spec.node_id, spec.attempt_id
+    )
+}
+
+#[allow(clippy::disallowed_methods)]
+fn docker_container_is_absent(name: &str) -> Result<bool, String> {
+    let output = Command::new("docker")
+        .arg("inspect")
+        .arg(name)
+        .output()
+        .map_err(|error| format!("inspect Docker container {name}: {error}"))?;
+    if output.status.success() {
+        return Ok(false);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No such object") || stderr.contains("No such container") {
+        Ok(true)
+    } else {
+        Err(format!(
+            "inspect Docker container {name} exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ))
     }
 }
 
@@ -235,13 +270,39 @@ fn lock_process_child(
 }
 
 impl ProvisionPlugin for LocalProcessPlugin {
-    // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
-    #[allow(clippy::disallowed_methods)]
-    fn start_node(
+    fn create_node(
         &mut self,
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Result<PluginNodeHandle, String> {
+        let handle = PluginNodeHandle {
+            id: self.next_handle_id,
+            provider_process_id: None,
+        };
+        self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
+        self.nodes.insert(
+            handle.id,
+            LocalProcessNode {
+                spec,
+                sink,
+                runtime: None,
+            },
+        );
+        Ok(handle)
+    }
+
+    // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
+    fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        let node = self
+            .nodes
+            .get_mut(&handle.id)
+            .ok_or_else(|| format!("local process node handle {} is absent", handle.id))?;
+        if node.runtime.is_some() {
+            return Ok(());
+        }
+        let spec = node.spec.clone();
+        let sink = node.sink.clone();
         let mut command = Command::new(&self.program);
         for (key, value) in &spec.env {
             command.env(key, value);
@@ -269,36 +330,22 @@ impl ProvisionPlugin for LocalProcessPlugin {
                 self.program.display()
             )
         })?;
-        let provider_process_id = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("local process node {} stdin missing", spec.node_id))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("local process node {} stdout missing", spec.node_id))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| format!("local process node {} stderr missing", spec.node_id))?;
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "local process node {} did not expose piped stdio",
+                spec.node_id
+            ));
+        };
 
         let child = Arc::new(Mutex::new(Some(child)));
-        let handle = PluginNodeHandle {
-            id: self.next_handle_id,
-            provider_process_id: Some(provider_process_id),
-        };
-        self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
-        self.nodes.insert(
-            handle.id,
-            LocalProcessNode {
-                stdin,
-                child: Arc::clone(&child),
-                spec: spec.clone(),
-                sink: sink.clone(),
-            },
-        );
-
+        node.runtime = Some(LocalProcessRuntime {
+            stdin,
+            child: Arc::clone(&child),
+        });
         spawn_stdout_reader(spec.clone(), sink.clone(), stdout);
         spawn_stderr_reader(spec.clone(), sink.clone(), stderr);
         thread::spawn(move || {
@@ -318,14 +365,11 @@ impl ProvisionPlugin for LocalProcessPlugin {
                             })
                         }
                         Ok(None) => None,
-                        Err(error) => {
-                            *slot = None;
-                            Some(PluginObservation::Failed {
-                                run_id: spec.run_id,
-                                node_id: spec.node_id,
-                                reason: format!("wait local process node: {error}"),
-                            })
-                        }
+                        Err(error) => Some(PluginObservation::Failed {
+                            run_id: spec.run_id,
+                            node_id: spec.node_id,
+                            reason: format!("wait local process node: {error}"),
+                        }),
                     }
                 };
                 if let Some(observation) = observation {
@@ -335,8 +379,7 @@ impl ProvisionPlugin for LocalProcessPlugin {
                 thread::sleep(Duration::from_millis(100));
             }
         });
-
-        Ok(handle)
+        Ok(())
     }
 
     fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
@@ -349,45 +392,53 @@ impl ProvisionPlugin for LocalProcessPlugin {
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
-        let _ = node.stdin.write_all(b"shutdown\n");
-        let _ = node.stdin.flush();
+        let Some(mut runtime) = node.runtime.take() else {
+            return Ok(());
+        };
+        let _ = runtime.stdin.write_all(b"shutdown\n");
+        let _ = runtime.stdin.flush();
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while Instant::now() < deadline {
-            let observation = {
-                let mut slot = lock_process_child(&node.child);
+            let status = {
+                let mut slot = lock_process_child(&runtime.child);
                 let Some(child) = slot.as_mut() else {
                     return Ok(());
                 };
                 match child.try_wait() {
                     Ok(Some(status)) => {
                         *slot = None;
-                        Some(PluginObservation::Exited {
-                            run_id: node.spec.run_id,
-                            node_id: node.spec.node_id,
-                            status: status.code(),
-                        })
+                        Ok(Some(status.code()))
                     }
-                    Ok(None) => None,
-                    Err(error) => {
-                        *slot = None;
-                        Some(PluginObservation::Failed {
-                            run_id: node.spec.run_id,
-                            node_id: node.spec.node_id,
-                            reason: format!("wait local process node: {error}"),
-                        })
-                    }
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(format!("wait local process node: {error}")),
                 }
             };
-            if let Some(observation) = observation {
-                node.sink.observe(observation);
-                return Ok(());
+            match status {
+                Ok(Some(status)) => {
+                    node.sink.observe(PluginObservation::Exited {
+                        run_id: node.spec.run_id,
+                        node_id: node.spec.node_id,
+                        status,
+                    });
+                    return Ok(());
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(50)),
+                Err(reason) => {
+                    node.sink.observe(PluginObservation::Failed {
+                        run_id: node.spec.run_id,
+                        node_id: node.spec.node_id,
+                        reason: reason.clone(),
+                    });
+                    node.runtime = Some(runtime);
+                    self.nodes.insert(handle.id, node);
+                    return Err(reason);
+                }
             }
-            thread::sleep(Duration::from_millis(50));
         }
 
-        let observation = {
-            let mut slot = lock_process_child(&node.child);
+        let status = {
+            let mut slot = lock_process_child(&runtime.child);
             let Some(child) = slot.as_mut() else {
                 return Ok(());
             };
@@ -395,28 +446,40 @@ impl ProvisionPlugin for LocalProcessPlugin {
             unsafe {
                 let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
             }
-            let _ = child.kill();
+            let kill_error = child.kill().err();
             match child.wait() {
                 Ok(status) => {
                     *slot = None;
-                    PluginObservation::Exited {
-                        run_id: node.spec.run_id,
-                        node_id: node.spec.node_id,
-                        status: status.code(),
-                    }
+                    Ok(status.code())
                 }
-                Err(error) => {
-                    *slot = None;
-                    PluginObservation::Failed {
-                        run_id: node.spec.run_id,
-                        node_id: node.spec.node_id,
-                        reason: format!("kill local process node: {error}"),
+                Err(error) => Err(match kill_error {
+                    Some(kill_error) => {
+                        format!("kill local process node: {kill_error}; wait failed: {error}")
                     }
-                }
+                    None => format!("wait for killed local process node: {error}"),
+                }),
             }
         };
-        node.sink.observe(observation);
-        Ok(())
+        match status {
+            Ok(status) => {
+                node.sink.observe(PluginObservation::Exited {
+                    run_id: node.spec.run_id,
+                    node_id: node.spec.node_id,
+                    status,
+                });
+                Ok(())
+            }
+            Err(reason) => {
+                node.sink.observe(PluginObservation::Failed {
+                    run_id: node.spec.run_id,
+                    node_id: node.spec.node_id,
+                    reason: reason.clone(),
+                });
+                node.runtime = Some(runtime);
+                self.nodes.insert(handle.id, node);
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -438,17 +501,41 @@ impl Drop for LocalProcessPlugin {
 }
 
 impl ProvisionPlugin for LocalDockerPlugin {
-    // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
-    #[allow(clippy::disallowed_methods)]
-    fn start_node(
+    fn create_node(
         &mut self,
         spec: NodeProvisionSpec,
         sink: PluginSink,
     ) -> Result<PluginNodeHandle, String> {
-        let container_name = format!(
-            "{}-{}-{}",
-            self.container_name_prefix, spec.run_id, spec.node_id
+        let handle = PluginNodeHandle {
+            id: self.next_handle_id,
+            provider_process_id: None,
+        };
+        self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
+        self.nodes.insert(
+            handle.id,
+            LocalDockerNode {
+                container_name: docker_container_name(&self.container_name_prefix, &spec),
+                spec,
+                sink,
+                stdin: None,
+            },
         );
+        Ok(handle)
+    }
+
+    // provider process supervision/lifecycle is out of scope (ENGINE_SPEC.md §2)
+    #[allow(clippy::disallowed_methods)]
+    fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
+        let node = self
+            .nodes
+            .get_mut(&handle.id)
+            .ok_or_else(|| format!("Docker node handle {} is absent", handle.id))?;
+        if node.stdin.is_some() {
+            return Ok(());
+        }
+        let spec = node.spec.clone();
+        let sink = node.sink.clone();
+        let container_name = node.container_name.clone();
         let mut command = Command::new("docker");
         command
             .arg("run")
@@ -499,33 +586,24 @@ impl ProvisionPlugin for LocalDockerPlugin {
             .spawn()
             .map_err(|e| format!("spawn Docker node {}: {e}", spec.node_id))?;
 
-        let provider_process_id = child.id();
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("Docker node {} stdin missing", spec.node_id))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("Docker node {} stdout missing", spec.node_id))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| format!("Docker node {} stderr missing", spec.node_id))?;
-
-        let handle = PluginNodeHandle {
-            id: self.next_handle_id,
-            provider_process_id: Some(provider_process_id),
+        let (Some(stdin), Some(stdout), Some(stderr)) =
+            (child.stdin.take(), child.stdout.take(), child.stderr.take())
+        else {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = Command::new("docker")
+                .arg("rm")
+                .arg("-f")
+                .arg(&container_name)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            return Err(format!(
+                "Docker node {} did not expose piped stdio",
+                spec.node_id
+            ));
         };
-        self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
-        self.nodes.insert(
-            handle.id,
-            LocalDockerNode {
-                container_name: container_name.clone(),
-                stdin,
-            },
-        );
-
+        node.stdin = Some(stdin);
         spawn_stdout_reader(spec.clone(), sink.clone(), stdout);
         spawn_stderr_reader(spec.clone(), sink.clone(), stderr);
         thread::spawn(move || match child.wait() {
@@ -540,8 +618,7 @@ impl ProvisionPlugin for LocalDockerPlugin {
                 reason: format!("wait Docker node: {error}"),
             }),
         });
-
-        Ok(handle)
+        Ok(())
     }
 
     fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
@@ -552,9 +629,12 @@ impl ProvisionPlugin for LocalDockerPlugin {
         let Some(mut node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
-        let _ = writeln!(node.stdin, "shutdown");
-        let _ = node.stdin.flush();
-        let status = Command::new("docker")
+        let Some(stdin) = node.stdin.as_mut() else {
+            return Ok(());
+        };
+        let _ = writeln!(stdin, "shutdown");
+        let _ = stdin.flush();
+        let result = match Command::new("docker")
             .arg("stop")
             .arg("-t")
             .arg("2")
@@ -562,15 +642,32 @@ impl ProvisionPlugin for LocalDockerPlugin {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .map_err(|e| format!("docker stop {}: {e}", node.container_name))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "docker stop {} exited with {status}",
-                node.container_name
-            ))
+        {
+            Ok(status) if status.success() => Ok(()),
+            Ok(status) => match docker_container_is_absent(&node.container_name) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(format!(
+                    "docker stop {} exited with {status}",
+                    node.container_name
+                )),
+                Err(inspect_error) => Err(format!(
+                    "docker stop {} exited with {status}; {inspect_error}",
+                    node.container_name
+                )),
+            },
+            Err(error) => match docker_container_is_absent(&node.container_name) {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(format!("docker stop {}: {error}", node.container_name)),
+                Err(inspect_error) => Err(format!(
+                    "docker stop {}: {error}; {inspect_error}",
+                    node.container_name
+                )),
+            },
+        };
+        if result.is_err() {
+            self.nodes.insert(handle.id, node);
         }
+        result
     }
 }
 
@@ -588,4 +685,74 @@ fn spawn_stderr_reader(
     stderr: impl std::io::Read + Send + 'static,
 ) {
     BootstrapDatastreamBridge::new(spec, sink, None).spawn_stderr_reader(stderr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    struct ChannelSink(mpsc::Sender<PluginObservation>);
+
+    impl PluginObservationSink for ChannelSink {
+        fn observe(&self, observation: PluginObservation) {
+            let _ = self.0.send(observation);
+        }
+    }
+
+    fn test_spec() -> NodeProvisionSpec {
+        NodeProvisionSpec {
+            run_id: 5,
+            node_id: 7,
+            attempt_id: 11,
+            stage_index: Some(0),
+            image: "node:v1".to_owned(),
+            env: Vec::new(),
+            args: Vec::new(),
+            mounts: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_process_creation_does_not_start_bootstrap() {
+        let (tx, rx) = mpsc::channel();
+        let sink = PluginSink::new(Arc::new(ChannelSink(tx)));
+        let mut spec = test_spec();
+        spec.args = vec![
+            "-c".to_owned(),
+            "printf 'started\\n'; IFS= read -r line".to_owned(),
+        ];
+        let mut plugin = LocalProcessPlugin::new("/bin/sh");
+
+        let handle = plugin.create_node(spec, sink).unwrap();
+        assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        plugin.start_bootstrap(&handle).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let line = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let observation = rx.recv_timeout(remaining).unwrap();
+            if let PluginObservation::StdoutLine { line, .. } = observation {
+                break line;
+            }
+        };
+        assert_eq!(line, "started");
+        plugin.stop_node(&handle).unwrap();
+    }
+
+    #[test]
+    fn docker_container_identity_distinguishes_node_attempts() {
+        let mut spec = test_spec();
+
+        assert_eq!(
+            docker_container_name("myelin", &spec),
+            "myelin-5-7-attempt-11"
+        );
+        spec.attempt_id = 12;
+        assert_eq!(
+            docker_container_name("myelin", &spec),
+            "myelin-5-7-attempt-12"
+        );
+    }
 }
