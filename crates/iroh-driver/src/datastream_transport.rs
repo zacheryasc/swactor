@@ -5,10 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::TryRecvError;
-use datastream::{
-    ChannelDescriptor, ChannelId, ChannelRef, DatastreamEvent, DatastreamSnapshot,
-    DatastreamSubscription, FrameDelivery, Position, StreamDescriptor,
-};
+use datastream::{DatastreamSnapshot, DatastreamSubscription};
+use datastream::frame::{ChannelDescriptor, ChannelId, ChannelRef, DatastreamEvent, FrameDelivery, Position,
+StreamDescriptor,};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use swactor_engine::EngineHandle;

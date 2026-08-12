@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use datastream::{
     ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, DatastreamEndpoint,
-    DatastreamEvent, FrameDelivery, Lifetime, NodeId, Position, Record, SourceFilter, StreamId,
-    SubscriptionRequest,
+    Lifetime, NodeId, Position, Record, SourceFilter, StreamId, SubscriptionRequest,
 };
+use datastream::frame::{DatastreamEvent, FrameDelivery};
 use serde_json::Value;
 use swactor::actor::ActorAddress;
 use swactor::stats::ActorSnapshot;

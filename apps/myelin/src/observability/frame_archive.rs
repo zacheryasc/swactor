@@ -2,7 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use datastream::{Frame, StreamId};
+use datastream::frame::{Frame, StreamId};
 use serde_json::json;
 
 use crate::observability::benchmark;

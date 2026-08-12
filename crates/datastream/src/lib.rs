@@ -1,11 +1,28 @@
 //! The per-node telemetry **datastream** (see `DATASTREAM_SPEC.md`).
 //!
-//! A deliberately dumb pipe: producers dump bytes tagged by stream-local
+//! A deliberately dumb pipe: producers dump bytes tagged with a stream-local
 //! channel id, a single per-node mux accepts those bytes and assigns canonical
 //! positions during drain, the endpoint broadcasts catalog-aware events to
 //! subscribers, ingest reconstructs streams by position, and views are
 //! read-time projections over stored frames. Nothing between a producer and a
 //! view interprets the payload.
+//!
+//! ## Producer vs observer surface
+//!
+//! This crate has two surfaces:
+//!
+//! - **Producer** — re-exported at the crate root ([`DatastreamEndpoint`],
+//!   [`DatastreamProducer`], [`Record`], [`ChannelId`], [`StreamId`], …).
+//!   Everything control-plane and actor code needs to *emit* telemetry.
+//!
+//! - **Observer** — in submodules ([`frame::Frame`], [`frame::DatastreamEvent`],
+//!   [`store::Store`], [`views`], [`ingest::Consumer`]).  Everything a sink
+//!   (dashboard, archive, transport) needs to *read* telemetry.
+//!
+//! The crate root deliberately does **not** re-export [`frame::Frame`] or
+//! [`frame::DatastreamEvent`].  `use datastream::Frame` is a compile error; the
+//! full path `datastream::frame::Frame` compiles but is banned in control-plane
+//! modules by `cargo xtask check-telemetry-isolation`.
 //!
 //! ```text
 //!    producers (caller-owned records + text)
@@ -46,17 +63,18 @@ pub mod transport;
 pub mod views;
 pub mod wire;
 
+// ── Producer surface (re-exported at root; safe for control-plane code) ──
+
 pub use endpoint::{
     CatalogSnapshot, ChannelRegistrationError, DatastreamEndpoint, DatastreamProducer,
     DatastreamSnapshot, DatastreamSubscription, DeliveryFanout, EndpointTick, SubscriberSnapshot,
-    SubscriptionId, frame_event_to_delivery,
+    SubscriptionId,
 };
 pub use frame::{
     ChannelContent, ChannelContentKind, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef,
-    DatastreamEvent, Frame, FrameDelivery, Lifetime, NodeId, Position, SourceFilter,
-    StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest,
+    Lifetime, NodeId, Position, SourceFilter, StreamDescriptor, StreamId, StreamOrigin,
+    SubscriptionRequest,
 };
-pub use ingest::Consumer;
 pub use mux::Mux;
 pub use publisher_actor::{
     DATASTREAM_PUBLISHER_NAME, DatastreamPublisherActor, DatastreamPublisherMsg,
@@ -64,6 +82,11 @@ pub use publisher_actor::{
 };
 pub use record::{ChannelKind, ChannelRegistry, Record};
 pub use sink_actor::{DATASTREAM_SINK_NAME, DatastreamSink};
-pub use store::{GapSpan, Store, StoredStream};
-pub use transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
-pub use views::{Body, LogEntry, MergedFrame};
+
+// ── Observer surface (in submodules; NOT re-exported at root) ──
+//
+// frame::Frame, frame::DatastreamEvent, frame::FrameDelivery,
+// store::Store, ingest::Consumer, views::*, transport::Delivery
+//
+// Access these via their module paths (e.g. `datastream::frame::Frame`).
+// Control-plane modules must not import them — enforced by CI.

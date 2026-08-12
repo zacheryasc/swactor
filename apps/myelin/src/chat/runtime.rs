@@ -12,9 +12,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use datastream::{
-    ChannelContent, ChannelId, DatastreamEndpoint, DatastreamProducer, Frame, Lifetime, NodeId,
+    ChannelContent, ChannelId, DatastreamEndpoint, DatastreamProducer, Lifetime, NodeId,
     StreamDescriptor, StreamId, StreamOrigin,
 };
+use datastream::frame::Frame;
 use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(target_os = "linux")]

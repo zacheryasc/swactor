@@ -7,9 +7,9 @@ use swactor::actor::ActorAddress;
 use swactor::process_observer::ProcessOutputObserver;
 use swactor::runtime::Runtime;
 
-use super::frame::{ChannelId, Frame, Lifetime, NodeId, StreamId};
+use crate::frame::{ChannelId, Frame, Lifetime, NodeId, StreamId};
+use crate::record::Record;
 use super::mux::Mux;
-use super::record::Record;
 use super::wire::{DatastreamFrame, encode_delivery};
 
 /// Legacy sink for frames after mux drain has assigned positions.

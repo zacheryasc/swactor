@@ -7,7 +7,7 @@
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::frame::{ChannelId, Frame, Position, StreamId};
+use crate::frame::{ChannelId, Frame, Position, StreamId};
 
 struct PendingFrame {
     channel: ChannelId,

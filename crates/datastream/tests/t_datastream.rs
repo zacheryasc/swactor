@@ -1,14 +1,13 @@
 use std::sync::Arc;
 use std::thread;
 
+use datastream::frame::Frame;
 use datastream::ingest::Consumer;
 use datastream::mux::Mux;
 use datastream::transport::{Delivery, Reorder, ScriptedTransport, StreamScript};
 use datastream::views::{self, Body, LogEntry};
 use datastream::wire::{decode_delivery, encode_delivery};
-use datastream::{
-    ChannelId, ChannelKind, ChannelRegistry, Frame, Lifetime, NodeId, Position, Record, StreamId,
-};
+use datastream::{ChannelId, ChannelKind, ChannelRegistry, Lifetime, NodeId, Position, Record, StreamId};
 use serde::{Deserialize, Serialize};
 
 const RESOURCE_CHANNEL: ChannelId = ChannelId(1);

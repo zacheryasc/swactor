@@ -14,7 +14,7 @@
 use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;
 
-use super::frame::{Frame, StreamId};
+use crate::frame::{Frame, StreamId};
 use super::wire::{DatastreamFrame, decode_delivery};
 
 /// Receives legacy [`DatastreamFrame`] cluster messages and folds each decoded

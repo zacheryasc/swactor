@@ -4,11 +4,12 @@ use std::collections::{HashMap, HashSet};
 use std::net::UdpSocket;
 use std::time::Duration;
 
+use datastream::frame::Frame;
 use datastream::ingest::Consumer;
 use datastream::mux::Mux;
 use datastream::transport::Delivery;
 use datastream::wire::{decode_delivery, encode_delivery};
-use datastream::{ChannelId, Frame, Lifetime, NodeId, Position, Record, StreamId};
+use datastream::{ChannelId, Lifetime, NodeId, Position, Record, StreamId};
 use serde::{Deserialize, Serialize};
 
 const RESOURCE_CHANNEL: ChannelId = ChannelId(1);

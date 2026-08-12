@@ -16,18 +16,15 @@ use crate::node_actor::{
     NodeAgentMsg, StageEdgeKindWire, StageInboundEdgeWire, StageObjectSpecWire,
     StageOutboundEdgeWire, StageProvisionWire, StageRingSpecWire,
 };
-#[cfg(feature = "dashboard")]
-use crate::observability::dashboard_view::MyelinClusterDashboardView;
-use crate::observability::{benchmark, frame_archive::FrameArchive};
+use crate::observability::frame_collector::{FrameCollector, StageLoadProgress};
+use crate::observability::orch_datastream::{
+    DashboardSupport, OrchDatastream, MYELIN_STAGE_ROUTE, MYELIN_SWIM_MEMBERSHIP,
+};
 use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
 
 use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
 use crate::node_provisioning::{ProviderKind, provider_kind};
-use crate::observability::telemetry::{
-    MYELIN_PROVISIONING_EVENTS, MyelinProvisionEventRecord, MyelinProvisionLogRecord,
-    myelin_provision_log_channel,
-};
 use crate::orchestration::cluster_reconciler::{ProvisionedClusterGuard, ReconcilerNodeBinding};
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
 use crate::orchestration::provider_adapters::relay::{
@@ -54,14 +51,9 @@ use ::provisioning::{
     RunId as ClusterRunId, RunNodeGroupSpec, SwactorId, SwarmJoinTemplate,
 };
 use data_plane::object_record as ingress;
-use datastream::{
-    ChannelContent, ChannelId, ChannelRef, DatastreamEndpoint, DatastreamEvent, DatastreamProducer,
-    DatastreamPublisherMsg, DatastreamSubscribe, Frame, Lifetime, NodeId, Record, StreamDescriptor,
-    StreamId, StreamOrigin, SubscriptionRequest,
-};
+use datastream::{DatastreamPublisherMsg, DatastreamSubscribe, SubscriptionRequest};
 use distribution::node::DistributedNodeConfig;
 use distribution::swim::telemetry::ObservedTransition;
-use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
@@ -87,10 +79,6 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STAGE_PROVISION_ACTIVE_RESEND_AFTER: Duration = Duration::from_secs(60);
 const PIPELINE_PROMPT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
-const MYELIN_ORCH_BOOTSTRAP: &str = "myelin.orch.bootstrap";
-const MYELIN_ORCH_PROMPT: &str = "myelin.orch.prompt";
-const MYELIN_SWIM_MEMBERSHIP: &str = "myelin.swim.membership";
-const MYELIN_STAGE_ROUTE: &str = "myelin.orch.stage_route";
 const DATASTREAM_FRAME_LOG_ENV: &str = "MYELIN_DATASTREAM_FRAME_LOG";
 
 pub(crate) fn run_with_options<I>(
@@ -222,7 +210,7 @@ where
     };
 
     let actors_channel = orch_datastream.channel_by_name("runtime.actors");
-    let orch_stats_hook = orch_datastream.producer.stats_hook_on(actors_channel);
+    let orch_stats_hook = orch_datastream.stats_hook_on(actors_channel);
 
     // Build the core swactor runtime parts, clone the routing handle needed by
     // integrations, then hand the workers to the engine. The engine owns both
@@ -348,7 +336,7 @@ where
         json!({"transport":"iroh","routes":"attached","protocol_ticker":"engine-hosted"}),
     );
 
-    let (frame_tx, frame_rx) = mpsc::channel::<CollectedDatastreamFrame>();
+    let collector = FrameCollector::new();
     bootstrap(
         &mut orch_datastream,
         None,
@@ -490,8 +478,7 @@ where
             driver: &mut driver,
             stack: &stack,
             obs_rx: &obs_rx,
-            frame_rx: &frame_rx,
-            frame_tx: &frame_tx,
+            collector: &collector,
             orchestrator_reports: &orchestrator_reports,
             stop_rx: &stop_rx,
             dashboard: dashboard.as_ref(),
@@ -570,8 +557,7 @@ where
             driver: &mut driver,
             stack: &stack,
             obs_rx: &obs_rx,
-            frame_rx: &frame_rx,
-            frame_tx: &frame_tx,
+            collector: &collector,
             orchestrator_reports: &orchestrator_reports,
             stop_rx: &stop_rx,
             dashboard: dashboard.as_ref(),
@@ -2053,8 +2039,7 @@ struct RuntimeReadyAckLoop<'a> {
     driver: &'a mut IrohDriver,
     stack: &'a DistributionRuntimeStack,
     obs_rx: &'a mpsc::Receiver<PluginObservation>,
-    frame_rx: &'a mpsc::Receiver<CollectedDatastreamFrame>,
-    frame_tx: &'a mpsc::Sender<CollectedDatastreamFrame>,
+    collector: &'a FrameCollector,
     orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
     stop_rx: &'a mpsc::Receiver<()>,
     dashboard: Option<&'a DashboardSupport>,
@@ -2078,8 +2063,7 @@ fn wait_for_runtime_ready_acks(
         driver,
         stack,
         obs_rx,
-        frame_rx,
-        frame_tx,
+        collector,
         orchestrator_reports,
         stop_rx,
         dashboard,
@@ -2127,7 +2111,7 @@ fn wait_for_runtime_ready_acks(
         }) {
             return Ok(false);
         }
-        pump(driver, frame_tx);
+        collector.pump(driver);
         drain_orch_stdio_capture(
             orch_stdio_rx,
             orch_datastream,
@@ -2143,7 +2127,12 @@ fn wait_for_runtime_ready_acks(
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
         }
-        drain_frames(frame_rx, dashboard, orch_datastream);
+        collector.drain(|stream, channel, frame| {
+            if let Some(d) = dashboard {
+                d.publish_frame(stream, channel, frame);
+            }
+            orch_datastream.archive_frame("node", stream, channel, frame);
+        });
         while let Some(report) = orchestrator_reports.try_recv() {
             let OrchestratorReport::NodeRuntimeReadyAck {
                 run_id: ack_run_id,
@@ -2340,8 +2329,7 @@ fn start_and_provision_workers(
         driver,
         stack,
         obs_rx,
-        frame_rx,
-        frame_tx,
+        collector,
         orchestrator_reports,
         stop_rx,
         dashboard,
@@ -2437,8 +2425,13 @@ fn start_and_provision_workers(
         if provisioned_nodes.awaiting_runtime() || provisioned_nodes.is_converged() {
             break;
         }
-        pump(driver, frame_tx);
-        drain_frames(frame_rx, dashboard, orch_datastream);
+        collector.pump(driver);
+        collector.drain(|stream, channel, frame| {
+            if let Some(d) = dashboard {
+                d.publish_frame(stream, channel, frame);
+            }
+            orch_datastream.archive_frame("node", stream, channel, frame);
+        });
         drain_orch_stdio_capture(
             orch_stdio_rx,
             orch_datastream,
@@ -2487,8 +2480,7 @@ fn start_and_provision_workers(
                 driver,
                 stack,
                 obs_rx,
-                frame_rx,
-                frame_tx,
+                collector,
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
@@ -2533,8 +2525,7 @@ fn start_and_provision_workers(
                 driver,
                 stack,
                 obs_rx,
-                frame_rx,
-                frame_tx,
+                collector,
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
@@ -2576,8 +2567,13 @@ fn start_and_provision_workers(
         provisioned_nodes
             .poll(SystemTime::now())
             .map_err(|error| format!("cluster convergence: {error}"))?;
-        pump(driver, frame_tx);
-        drain_frames(frame_rx, dashboard, orch_datastream);
+        collector.pump(driver);
+        collector.drain(|stream, channel, frame| {
+            if let Some(d) = dashboard {
+                d.publish_frame(stream, channel, frame);
+            }
+            orch_datastream.archive_frame("node", stream, channel, frame);
+        });
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_datastream, dashboard, &config.provider, &observation);
         }
@@ -2612,8 +2608,7 @@ fn start_and_provision_workers(
                 driver,
                 stack,
                 obs_rx,
-                frame_rx,
-                frame_tx,
+                collector,
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
@@ -2636,8 +2631,7 @@ fn start_and_provision_workers(
                 driver,
                 stack,
                 obs_rx,
-                frame_rx,
-                frame_tx,
+                collector,
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
@@ -2967,8 +2961,7 @@ fn wait_for_runtime_readies(
         driver,
         stack,
         obs_rx,
-        frame_rx,
-        frame_tx,
+        collector,
         orchestrator_reports,
         stop_rx,
         dashboard,
@@ -2988,7 +2981,7 @@ fn wait_for_runtime_readies(
             cluster.current_attempt(*node_id)
                 == Some(::provisioning::NodeAttemptId(ready.readiness_id))
         });
-        pump(driver, frame_tx);
+        collector.pump(driver);
         emit_swim_transitions(
             orch_datastream,
             dashboard,
@@ -2997,7 +2990,12 @@ fn wait_for_runtime_readies(
             stack,
         );
         emit_swim_probe_events(orch_datastream, dashboard, stack, "runtime_ready_wait");
-        drain_frames(frame_rx, dashboard, orch_datastream);
+        collector.drain(|stream, channel, frame| {
+            if let Some(d) = dashboard {
+                d.publish_frame(stream, channel, frame);
+            }
+            orch_datastream.archive_frame("node", stream, channel, frame);
+        });
         drain_orch_stdio_capture(
             orch_stdio_rx,
             orch_datastream,
@@ -3072,8 +3070,7 @@ fn wait_for_weights_loaded_count(
         driver,
         stack,
         obs_rx,
-        frame_rx,
-        frame_tx,
+        collector,
         orchestrator_reports,
         stop_rx,
         dashboard,
@@ -3096,7 +3093,7 @@ fn wait_for_weights_loaded_count(
     let mut stage_last_sends = BTreeMap::<u32, Instant>::new();
     let mut load_progress = BTreeMap::<u64, StageLoadProgress>::new();
     loop {
-        pump(driver, frame_tx);
+        collector.pump(driver);
         emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
         emit_swim_probe_events(orch_datastream, dashboard, stack, "weights_loaded_wait");
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
@@ -3124,7 +3121,7 @@ fn wait_for_weights_loaded_count(
                 let mut provision = PipelineStageProvision {
                     driver: &mut *driver,
                     stack,
-                    frame_tx,
+                    collector,
                     dashboard,
                     orch_datastream: &mut *orch_datastream,
                     run_id,
@@ -3194,7 +3191,12 @@ fn wait_for_weights_loaded_count(
                 | PluginObservation::StderrLine { .. } => {}
             }
         }
-        drain_frames_with_load_progress(frame_rx, dashboard, orch_datastream, &mut load_progress);
+        collector.drain_with_progress(&mut load_progress, |stream, channel, frame| {
+            if let Some(d) = dashboard {
+                d.publish_frame(stream, channel, frame);
+            }
+            orch_datastream.archive_frame("node", stream, channel, frame);
+        });
         while let Some(report) = orchestrator_reports.try_recv() {
             match report {
                 OrchestratorReport::WeightsReady {
@@ -3230,7 +3232,7 @@ fn wait_for_weights_loaded_count(
 struct PipelineStageProvision<'a> {
     driver: &'a mut IrohDriver,
     stack: &'a DistributionRuntimeStack,
-    frame_tx: &'a mpsc::Sender<CollectedDatastreamFrame>,
+    collector: &'a FrameCollector,
     dashboard: Option<&'a DashboardSupport>,
     orch_datastream: &'a mut OrchDatastream,
     run_id: u64,
@@ -3428,7 +3430,7 @@ fn send_pipeline_stage_provision(
         ctx.pipeline_coordinator,
         ctx.stage_shard_plans,
     )?;
-    pump(ctx.driver, ctx.frame_tx);
+    ctx.collector.pump(ctx.driver);
     Ok(())
 }
 
@@ -3440,43 +3442,6 @@ struct PromptWork {
 struct ActivePrompt {
     request: SubmitPrompt,
     events: mpsc::Sender<PromptEvent>,
-}
-
-#[derive(Clone, Debug)]
-struct CollectedDatastreamFrame {
-    stream: StreamId,
-    channel_name: String,
-    frame: Frame,
-}
-
-#[derive(Clone, Debug, Default)]
-struct StageLoadProgress {
-    node_id: u64,
-    stage_index: Option<u32>,
-    phase: Option<String>,
-    bytes_done: Option<u64>,
-    bytes_total: Option<u64>,
-    last_progress: Option<Instant>,
-    last_worker_event: Option<String>,
-    failure_reason: Option<String>,
-    host_gpu_samples: u64,
-}
-
-impl StageLoadProgress {
-    fn to_json(&self) -> Value {
-        json!({
-            "node_id": self.node_id,
-            "stage_index": self.stage_index,
-            "phase": self.phase.as_deref().unwrap_or("unknown"),
-            "bytes_done": self.bytes_done,
-            "bytes_total": self.bytes_total,
-            "last_progress_age_ms": self.last_progress.map(|at| at.elapsed().as_millis()),
-            "last_worker_event": self.last_worker_event,
-            "failure_reason": self.failure_reason,
-            "host_gpu_samples": self.host_gpu_samples,
-            "host_gpu_missing": self.host_gpu_samples == 0,
-        })
-    }
 }
 
 fn stage_load_phase_is_active(phase: Option<&str>) -> bool {
@@ -3554,425 +3519,6 @@ fn stage_load_liveness_detail(
         "load_progress": progress.map(StageLoadProgress::to_json),
         "host_gpu_missing": progress.is_none_or(|progress| progress.host_gpu_samples == 0),
     })
-}
-
-fn update_load_progress_from_frame(
-    progress: &mut BTreeMap<u64, StageLoadProgress>,
-    collected: &CollectedDatastreamFrame,
-    now: Instant,
-) {
-    let stream_node_id = collected.stream.node.as_str().parse::<u64>().ok();
-    if collected.channel_name == "host.gpu" {
-        if let Some(node_id) = stream_node_id {
-            let entry = progress
-                .entry(node_id)
-                .or_insert_with(|| StageLoadProgress {
-                    node_id,
-                    ..StageLoadProgress::default()
-                });
-            entry.host_gpu_samples = entry.host_gpu_samples.saturating_add(1);
-        }
-        return;
-    }
-
-    let Ok(value) = serde_json::from_slice::<Value>(&collected.frame.payload) else {
-        return;
-    };
-    if value.get("type").and_then(Value::as_str) == Some("NodeEvent") {
-        update_load_progress_from_node_event(progress, &value, now);
-        return;
-    }
-    if collected.channel_name == "myelin.worker.weights" {
-        let Some(node_id) = stream_node_id else {
-            return;
-        };
-        update_load_progress_from_worker_event(progress, node_id, None, &value, now);
-    }
-}
-
-fn update_load_progress_from_node_event(
-    progress: &mut BTreeMap<u64, StageLoadProgress>,
-    value: &Value,
-    now: Instant,
-) {
-    let Some(node_id) = numeric_json_field(value, "node_id") else {
-        return;
-    };
-    let stage_index =
-        numeric_json_field(value, "stage_index").and_then(|stage| u32::try_from(stage).ok());
-    let phase = value.get("phase").and_then(Value::as_str);
-    let status = value.get("status").and_then(Value::as_str);
-    let detail = value.get("detail").unwrap_or(&Value::Null);
-    if phase == Some("load_weights") {
-        let load_phase = match status {
-            Some("started") => Some("loading_weights"),
-            Some("ready") => Some("weights_loaded"),
-            Some("failed") => Some("failed"),
-            _ => None,
-        };
-        if let Some(load_phase) = load_phase {
-            let entry = progress
-                .entry(node_id)
-                .or_insert_with(|| StageLoadProgress {
-                    node_id,
-                    ..StageLoadProgress::default()
-                });
-            entry.stage_index = stage_index.or(entry.stage_index);
-            entry.phase = Some(load_phase.to_owned());
-            entry.last_progress = Some(now);
-            if status == Some("failed") {
-                entry.failure_reason = detail
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-            }
-        }
-    }
-    if let Some(worker_event) = detail.get("event") {
-        update_load_progress_from_worker_event(progress, node_id, stage_index, worker_event, now);
-    }
-}
-
-fn update_load_progress_from_worker_event(
-    progress: &mut BTreeMap<u64, StageLoadProgress>,
-    node_id: u64,
-    stage_index: Option<u32>,
-    event: &Value,
-    now: Instant,
-) {
-    let Some(event_type) = event.get("type").and_then(Value::as_str) else {
-        return;
-    };
-    let Some(phase) = load_phase_for_worker_event(event_type) else {
-        return;
-    };
-    let entry = progress
-        .entry(node_id)
-        .or_insert_with(|| StageLoadProgress {
-            node_id,
-            ..StageLoadProgress::default()
-        });
-    entry.stage_index = stage_index.or(entry.stage_index);
-    entry.phase = Some(phase.to_owned());
-    entry.last_worker_event = Some(event_type.to_owned());
-    entry.last_progress = Some(now);
-    if let Some(bytes_done) =
-        numeric_json_field(event, "bytes_done").or_else(|| numeric_json_field(event, "bytes"))
-    {
-        entry.bytes_done = Some(bytes_done);
-    }
-    if let Some(bytes_total) = numeric_json_field(event, "bytes_total") {
-        entry.bytes_total = Some(bytes_total);
-    }
-}
-
-fn numeric_json_field(value: &Value, field: &str) -> Option<u64> {
-    value
-        .get(field)
-        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
-}
-
-fn load_phase_for_worker_event(event_type: &str) -> Option<&'static str> {
-    match event_type {
-        "GgufDownloadStarted" | "GgufDownloadProgress" => Some("prefetching_model"),
-        "GgufCacheReady" => Some("cache_ready"),
-        "StageShardFetchStarted"
-        | "StageShardRangeFetchStarted"
-        | "StageShardRangeFetchReady"
-        | "StageShardTensorFetchStarted"
-        | "StageShardTensorFetchReady" => Some("fetching_stage_shard"),
-        "StageShardCacheReady" => Some("stage_shard_cache_ready"),
-        "StageShardReady" => Some("stage_shard_ready"),
-        "StageShardFetchFailed" => Some("failed"),
-        "PipelineStageFromGgufStarted" => Some("constructing_stage"),
-        "PipelineStageFromGgufReady" => Some("stage_constructed"),
-        "TokenizerBuildStarted" => Some("building_tokenizer"),
-        "TokenizerBuildReady" => Some("tokenizer_ready"),
-        "WeightsLoaded" => Some("weights_loaded"),
-        "WorkerFatal" => Some("failed"),
-        _ => None,
-    }
-}
-
-fn drain_datastream_connections(
-    driver: &IrohDriver,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
-) {
-    for read in driver.drain_datastream_reads() {
-        let mut channels = read
-            .header
-            .channels
-            .iter()
-            .map(|descriptor| {
-                (
-                    ChannelRef {
-                        stream: descriptor.stream.clone(),
-                        channel: descriptor.id,
-                    },
-                    descriptor.name.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for event in read.events {
-            match event {
-                DatastreamEvent::ChannelDeclared(descriptor) => {
-                    channels.insert(
-                        ChannelRef {
-                            stream: descriptor.stream.clone(),
-                            channel: descriptor.id,
-                        },
-                        descriptor.name,
-                    );
-                }
-                DatastreamEvent::Frame(delivery) => {
-                    let channel_name = channels
-                        .get(&delivery.channel)
-                        .cloned()
-                        .unwrap_or_else(|| format!("channel#{}", delivery.channel.channel.0));
-                    let frame = Frame::new(
-                        delivery.channel.channel,
-                        delivery.position,
-                        delivery.payload,
-                    );
-                    if frame_tx
-                        .send(CollectedDatastreamFrame {
-                            stream: delivery.channel.stream,
-                            channel_name,
-                            frame,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                DatastreamEvent::StreamDeclared(_) | DatastreamEvent::StreamEnded(_) => {}
-            }
-        }
-    }
-}
-
-struct OrchDatastream {
-    stream: StreamId,
-    endpoint: DatastreamEndpoint,
-    producer: DatastreamProducer,
-    channels: BTreeMap<String, ChannelId>,
-    channel_names: BTreeMap<ChannelId, String>,
-    archive: Option<FrameArchive>,
-}
-
-impl OrchDatastream {
-    fn new(run_id: u64, frame_log: Option<&Path>) -> Result<Self, String> {
-        let stream = StreamId::new(NodeId::new("myelin-orchestrator"), Lifetime(run_id));
-        let endpoint = DatastreamEndpoint::with_descriptor(
-            StreamDescriptor {
-                stream: stream.clone(),
-                label: Some("myelin orchestrator".to_owned()),
-                origin: StreamOrigin::Orchestrator,
-            },
-            4096,
-            1024,
-        );
-        let producer = endpoint.producer();
-        let mut out = Self {
-            stream,
-            endpoint,
-            producer,
-            channels: BTreeMap::new(),
-            channel_names: BTreeMap::new(),
-            archive: frame_log
-                .map(|p| FrameArchive::open_with_label(p, "datastream frame log"))
-                .transpose()?,
-        };
-        for name in [
-            MYELIN_PROVISIONING_EVENTS,
-            MYELIN_ORCH_BOOTSTRAP,
-            MYELIN_ORCH_PROMPT,
-            MYELIN_SWIM_MEMBERSHIP,
-            MYELIN_STAGE_ROUTE,
-        ] {
-            out.channel_by_name(name);
-        }
-        out.record_channel::<MembershipTransition>();
-        out.record_channel::<SwimProbeEvent>();
-        Ok(out)
-    }
-
-    fn channel_by_name(&mut self, name: &str) -> ChannelId {
-        if let Some(id) = self.channels.get(name).copied() {
-            return id;
-        }
-        let id = self.producer.register_channel(
-            name,
-            ChannelContent::JsonRecord {
-                schema: Some(name.to_owned()),
-            },
-        );
-        self.channels.insert(name.to_owned(), id);
-        self.channel_names.insert(id, name.to_owned());
-        id
-    }
-
-    fn record_channel<R: Record>(&mut self) -> ChannelId {
-        if let Some(id) = self.channels.get(R::CHANNEL).copied() {
-            return id;
-        }
-        let id = self.producer.register_record::<R>();
-        self.channels.insert(R::CHANNEL.to_owned(), id);
-        self.channel_names.insert(id, R::CHANNEL.to_owned());
-        id
-    }
-
-    fn emit_event(&mut self, dashboard: Option<&DashboardSupport>, event: ProvisionEvent) {
-        let payload = serde_json::to_vec(&MyelinProvisionEventRecord::new(event))
-            .expect("serialize provisioning event");
-        self.emit_bytes(dashboard, MYELIN_PROVISIONING_EVENTS, payload);
-    }
-
-    fn emit_log(&mut self, dashboard: Option<&DashboardSupport>, line: ProvisionLogLine) {
-        let channel = myelin_provision_log_channel(line.node_id, line.stream);
-        let payload = serde_json::to_vec(&MyelinProvisionLogRecord::new(line))
-            .expect("serialize provision log");
-        self.emit_bytes(dashboard, &channel, payload);
-    }
-
-    fn emit_bootstrap(
-        &mut self,
-        dashboard: Option<&DashboardSupport>,
-        run_id: u64,
-        node_id: u64,
-        phase: &str,
-        status: &str,
-        detail: Value,
-    ) {
-        self.emit_bootstrap_to_channel(
-            dashboard,
-            MYELIN_ORCH_BOOTSTRAP,
-            run_id,
-            node_id,
-            phase,
-            status,
-            detail,
-        );
-    }
-
-    fn emit_bootstrap_to_channel(
-        &mut self,
-        dashboard: Option<&DashboardSupport>,
-        channel: &str,
-        run_id: u64,
-        node_id: u64,
-        phase: &str,
-        status: &str,
-        detail: Value,
-    ) {
-        let benchmark = benchmark::stamp("myelin-orchestrator");
-        let payload = serde_json::to_vec(&json!({
-            "schema_version": benchmark["schema_version"].clone(),
-            "type":"OrchBootstrap",
-            "event_type":"OrchBootstrap",
-            "event_name":phase,
-            "phase":phase,
-            "status":status,
-            "run_id":run_id,
-            "node_id":node_id,
-            "producer_component":benchmark["producer_component"].clone(),
-            "producer_instance_id":benchmark["producer_instance_id"].clone(),
-            "producer_process_id":benchmark["producer_process_id"].clone(),
-            "producer_sequence":benchmark["producer_sequence"].clone(),
-            "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
-            "monotonic_ms":benchmark["monotonic_ms"].clone(),
-            "clock_source":benchmark["clock_source"].clone(),
-            "span_id":format!("myelin-orchestrator:{run_id}:{}:{phase}", benchmark["producer_sequence"]),
-            "parent_span_id":Value::Null,
-            "benchmark":benchmark,
-            "detail":detail,
-        }))
-        .expect("serialize orch bootstrap event");
-        self.emit_bytes(dashboard, channel, payload);
-    }
-
-    fn emit_prompt(
-        &mut self,
-        dashboard: Option<&DashboardSupport>,
-        run_id: u64,
-        node_id: u64,
-        request_id: u64,
-        phase: &str,
-        status: &str,
-        detail: Value,
-    ) {
-        let benchmark = benchmark::stamp("myelin-orchestrator");
-        let payload = serde_json::to_vec(&json!({
-            "schema_version": benchmark["schema_version"].clone(),
-            "type":"OrchPromptEvent",
-            "event_type":"OrchPromptEvent",
-            "event_name":phase,
-            "phase":phase,
-            "status":status,
-            "run_id":run_id,
-            "node_id":node_id,
-            "request_id":request_id,
-            "producer_component":benchmark["producer_component"].clone(),
-            "producer_instance_id":benchmark["producer_instance_id"].clone(),
-            "producer_process_id":benchmark["producer_process_id"].clone(),
-            "producer_sequence":benchmark["producer_sequence"].clone(),
-            "wall_clock_unix_ms":benchmark["wall_clock_unix_ms"].clone(),
-            "monotonic_ms":benchmark["monotonic_ms"].clone(),
-            "clock_source":benchmark["clock_source"].clone(),
-            "span_id":format!("myelin-orchestrator:{run_id}:{request_id}:{}:{phase}", benchmark["producer_sequence"]),
-            "parent_span_id":format!("request:{request_id}"),
-            "benchmark":benchmark,
-            "detail":detail,
-        }))
-        .expect("serialize orch prompt event");
-        self.emit_bytes(dashboard, MYELIN_ORCH_PROMPT, payload);
-    }
-
-    fn emit_record<R: Record>(&mut self, dashboard: Option<&DashboardSupport>, record: &R) {
-        let id = self.record_channel::<R>();
-        self.producer.submit_record(id, record);
-        self.flush(dashboard, "orchestrator");
-    }
-
-    fn emit_bytes(
-        &mut self,
-        dashboard: Option<&DashboardSupport>,
-        channel: &str,
-        payload: Vec<u8>,
-    ) {
-        self.emit_bytes_from(dashboard, channel, payload, "orchestrator");
-    }
-
-    fn emit_bytes_from(
-        &mut self,
-        dashboard: Option<&DashboardSupport>,
-        channel: &str,
-        payload: Vec<u8>,
-        source: &str,
-    ) {
-        let id = self.channel_by_name(channel);
-        self.producer.submit_bytes(id, payload);
-        self.flush(dashboard, source);
-    }
-
-    fn flush(&mut self, dashboard: Option<&DashboardSupport>, source: &str) {
-        let stream = self.stream.clone();
-        for frame in self.endpoint.mux().drain() {
-            let channel = self
-                .channel_names
-                .get(&frame.channel)
-                .cloned()
-                .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
-            ingest_dashboard_frame(dashboard, &stream, &channel, &frame);
-            self.archive_frame(source, &stream, &channel, &frame);
-        }
-    }
-
-    fn archive_frame(&mut self, source: &str, stream: &StreamId, channel: &str, frame: &Frame) {
-        if let Some(archive) = &mut self.archive {
-            let _ = archive.record(source, stream, channel, frame);
-        }
-    }
 }
 
 struct OrchStdioCapture;
@@ -4064,60 +3610,6 @@ fn drain_orch_stdio_capture(
             },
         );
     }
-}
-
-#[cfg(feature = "dashboard")]
-struct DashboardSupport {
-    handle: dashboard::DashboardHandle,
-}
-
-#[cfg(feature = "dashboard")]
-impl DashboardSupport {
-    fn start(enabled: bool, engine: &EngineHandle) -> Result<Option<Self>, String> {
-        if !enabled {
-            return Ok(None);
-        }
-        let mut config = dashboard::DashboardConfig::default();
-        if let Some(port) = env_optional("MYELIN_DASHBOARD_PORT") {
-            config.port = port
-                .parse::<u16>()
-                .map_err(|e| format!("invalid MYELIN_DASHBOARD_PORT={port:?}: {e}"))?;
-        }
-        let handle = dashboard::DashboardHandle::new(config);
-        handle.register_view(Arc::new(MyelinClusterDashboardView::new()));
-        engine.spawn(handle.http_server());
-        Ok(Some(Self { handle }))
-    }
-
-    fn publish_frame(&self, stream: &StreamId, channel: &str, frame: &Frame) {
-        self.handle.publish(dashboard::FrameEvent {
-            stream: dashboard::StreamEvent {
-                node: stream.node.as_str().to_string(),
-                life: stream.life.0,
-            },
-            channel: channel.to_owned(),
-            position: frame.position.0,
-            payload: frame.payload.clone(),
-        });
-    }
-}
-
-#[cfg(not(feature = "dashboard"))]
-struct DashboardSupport;
-
-#[cfg(not(feature = "dashboard"))]
-impl DashboardSupport {
-    fn start(enabled: bool, _engine: &EngineHandle) -> Result<Option<Self>, String> {
-        if enabled {
-            return Err(
-                "MYELIN_DASHBOARD requires building myelin-system with feature dashboard"
-                    .to_owned(),
-            );
-        }
-        Ok(None)
-    }
-
-    fn publish_frame(&self, _stream: &StreamId, _channel: &str, _frame: &Frame) {}
 }
 
 struct ChannelObservationSink {
@@ -4254,8 +3746,7 @@ fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Re
         driver,
         stack: _,
         obs_rx,
-        frame_rx,
-        frame_tx,
+        collector,
         orchestrator_reports,
         stop_rx,
         dashboard,
@@ -4267,7 +3758,7 @@ fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Re
         ..
     } = ctx;
     loop {
-        pump(driver, frame_tx);
+        collector.pump(driver);
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for weights loaded".to_owned());
@@ -4275,7 +3766,12 @@ fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Re
         drain_observations_with_exit(obs_rx, dashboard, orch_datastream, provider, |_, status| {
             format!("node exited while loading weights: {status:?}")
         })?;
-        drain_frames(frame_rx, dashboard, orch_datastream);
+        collector.drain(|stream, channel, frame| {
+            if let Some(d) = dashboard {
+                d.publish_frame(stream, channel, frame);
+            }
+            orch_datastream.archive_frame("node", stream, channel, frame);
+        });
         while let Some(report) = orchestrator_reports.try_recv() {
             match report {
                 OrchestratorReport::WeightsReady {
@@ -4914,8 +4410,7 @@ fn serve_prompts(
         driver,
         stack,
         obs_rx,
-        frame_rx,
-        frame_tx,
+        collector,
         stop_rx,
         dashboard,
         orch_datastream,
@@ -4945,7 +4440,7 @@ fn serve_prompts(
     };
     let mut active: Option<ActivePrompt> = None;
     loop {
-        pump(driver, frame_tx);
+        collector.pump(driver);
         orch_datastream.flush(dashboard, "orchestrator");
         if let Some(pipeline) = pipeline_runtime.as_mut() {
             pipeline.poll_driver(driver);
@@ -4967,7 +4462,12 @@ fn serve_prompts(
             &provider,
             |_, status| format!("node exited: {status:?}"),
         )?;
-        drain_frames(frame_rx, dashboard, orch_datastream);
+        collector.drain(|stream, channel, frame| {
+            if let Some(d) = dashboard {
+                d.publish_frame(stream, channel, frame);
+            }
+            orch_datastream.archive_frame("node", stream, channel, frame);
+        });
         drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
         let swim_transitions =
             emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
@@ -4997,7 +4497,7 @@ fn serve_prompts(
                 orchestrator_actor,
                 OrchestratorMsg::ObserveOperatorStop { run_id },
             );
-            pump(driver, frame_tx);
+            collector.pump(driver);
             return Ok(());
         }
 
@@ -5299,58 +4799,6 @@ fn emit_plugin_observation(
     }
 }
 
-fn drain_frames(
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-) {
-    while let Ok(collected) = frame_rx.try_recv() {
-        archive_collected_frame(collected, dashboard, orch_datastream);
-    }
-}
-
-fn drain_frames_with_load_progress(
-    frame_rx: &mpsc::Receiver<CollectedDatastreamFrame>,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-    progress: &mut BTreeMap<u64, StageLoadProgress>,
-) {
-    while let Ok(collected) = frame_rx.try_recv() {
-        update_load_progress_from_frame(progress, &collected, Instant::now());
-        archive_collected_frame(collected, dashboard, orch_datastream);
-    }
-}
-
-fn archive_collected_frame(
-    collected: CollectedDatastreamFrame,
-    dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
-) {
-    ingest_dashboard_frame(
-        dashboard,
-        &collected.stream,
-        &collected.channel_name,
-        &collected.frame,
-    );
-    orch_datastream.archive_frame(
-        "node",
-        &collected.stream,
-        &collected.channel_name,
-        &collected.frame,
-    );
-}
-
-fn ingest_dashboard_frame(
-    dashboard: Option<&DashboardSupport>,
-    stream: &StreamId,
-    channel: &str,
-    frame: &Frame,
-) {
-    if let Some(dashboard) = dashboard {
-        dashboard.publish_frame(stream, channel, frame);
-    }
-}
-
 fn emit_swim_transitions(
     orch_datastream: &mut OrchDatastream,
     dashboard: Option<&DashboardSupport>,
@@ -5404,15 +4852,7 @@ fn emit_swim_probe_events(
     }
 }
 
-/// Drain iroh ingress/egress queues and datastream connections. Core
-/// progression and protocol tick injection are owned by the engine (see
-/// `spawn_protocol_ticker`); this only drains integration-owned queues
-/// (ENGINE_SPEC.md).
-fn pump(driver: &IrohDriver, frame_tx: &mpsc::Sender<CollectedDatastreamFrame>) {
-    drain_datastream_connections(driver, frame_tx);
-}
-
-fn env_optional(name: &str) -> Option<String> {
+pub(crate) fn env_optional(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
         .map(|value| value.trim().to_owned())

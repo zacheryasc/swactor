@@ -9,7 +9,7 @@ use datastream::hardware::gpu::{
     GpuDeviceSample, GpuProcessSample, HOST_GPU_CHANNEL, HostGpuSample,
 };
 use datastream::hardware::net::{HOST_NET_CHANNEL, HostNetSample, NetInterfaceSample};
-use datastream::record::Record;
+use datastream::Record;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};

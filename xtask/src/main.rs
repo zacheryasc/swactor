@@ -266,6 +266,7 @@ COMMANDS:
                      Run real cargo myelin-chat acceptance check and write benchmark artifacts.
   myelin-chat-compare <baseline-summary.json> <candidate-summary.json>
                      Compare two benchmark summaries and report comparable deltas.
+  check-telemetry-isolation  Verify no frame types appear in control-plane modules.
   test                Run the basic non-binding test barrier: root crate plus each
                       non-binding repository package with `cargo test -p`."
     );
@@ -6851,9 +6852,91 @@ mod tests {
     }
 }
 
+/// Scan control-plane source files for forbidden telemetry frame type references.
+/// The datastream is metrics/logging only; control decisions must never branch
+/// on a frame. Frame types live in `datastream::frame::*` (not re-exported at
+/// root) and must not appear in orchestration or other control modules.
+fn check_telemetry_isolation() -> ExitCode {
+    /// Directories whose .rs files are control-plane: they must not touch
+    /// frame types or read-side modules.
+    const CONTROL_DIRS: &[&str] = &[
+        "apps/myelin/src/orchestration",
+        "crates/distribution/src",
+        "crates/data-plane/src",
+        "crates/provisioning/src",
+    ];
+
+    /// Substrings that indicate a telemetry frame type or read-side module
+    /// has leaked into control code.  `datastream::frame::` covers Frame,
+    /// DatastreamEvent, FrameDelivery, and every other frame-module type.
+    const FORBIDDEN: &[&str] = &[
+        "datastream::frame::",
+        "datastream::store::",
+        "datastream::ingest::",
+        "datastream::views::",
+        "datastream::transport::",
+        "CollectedDatastreamFrame",
+    ];
+    let mut violations = Vec::new();
+    for dir in CONTROL_DIRS {
+        collect_rs_files(dir, &mut violations);
+    }
+
+    let mut found = false;
+    for file in &violations {
+        let Ok(src) = std::fs::read_to_string(file) else {
+            continue;
+        };
+        for (lineno, line) in src.lines().enumerate() {
+            for pat in FORBIDDEN {
+                if line.contains(pat) {
+                    eprintln!(
+                        "telemetry-isolation violation: {file}:{}: {}",
+                        lineno + 1,
+                        line.trim()
+                    );
+                    found = true;
+                }
+            }
+        }
+    }
+
+    if found {
+        eprintln!(
+            "\ntelemetry-isolation: control-plane code must not import frame types \
+             or read-side modules. Use the datastream producer API (root re-exports) \
+             for emitting telemetry, never `datastream::frame::*` for reading it."
+        );
+        ExitCode::from(1)
+    } else {
+        println!("telemetry-isolation: OK — no frame types in control-plane modules.");
+        ExitCode::SUCCESS
+    }
+}
+
+/// Recursively collect .rs file paths under `dir` into `out`.
+fn collect_rs_files(dir: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(s) = path.to_str() {
+                collect_rs_files(s, out);
+            }
+        } else if path.extension().is_some_and(|ext| ext == "rs") {
+            if let Some(s) = path.to_str() {
+                out.push(s.to_owned());
+            }
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("check-telemetry-isolation") => check_telemetry_isolation(),
         Some("test") if args.next().is_none() => run_tests(),
         Some("myelin-chat-check") => run_myelin_chat_check(args.collect()),
         Some("myelin-chat-compare") => run_myelin_chat_compare(args.collect()),

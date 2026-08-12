@@ -17,10 +17,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use datastream::{
-    ChannelContent, ChannelId, DATASTREAM_PUBLISHER_NAME, DatastreamEndpoint, DatastreamEvent,
+    ChannelContent, ChannelId, DATASTREAM_PUBLISHER_NAME, DatastreamEndpoint,
     DatastreamProducer, DatastreamPublisherActor, DatastreamSubscribe, DatastreamSubscription,
     Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
 };
+use datastream::frame::DatastreamEvent;
 
 use crate::codecs::register_myelin_actor_codecs;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
