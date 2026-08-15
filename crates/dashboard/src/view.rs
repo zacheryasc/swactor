@@ -20,6 +20,18 @@ pub trait DashboardView: Send + Sync {
     fn channels(&self) -> &'static [&'static str];
     fn ingest(&self, stream: &StreamId, frame: &Frame, event: &FrameEvent);
     fn snapshot_json(&self) -> Value;
+    /// Bounded per-entity detail lookup for focused UI panes. `query` is the
+    /// raw URL query string (e.g. `stream=...&actor=...`). Views that offer
+    /// no detail endpoint leave this default.
+    fn detail_json(&self, query: &str) -> Option<Value> {
+        let _ = query;
+        None
+    }
+    /// Whether this view appears in the unified top navbar. Registration
+    /// order controls link order.
+    fn show_in_nav(&self) -> bool {
+        true
+    }
     fn html(&self) -> Option<&'static str> {
         None
     }
@@ -33,6 +45,7 @@ pub struct ViewDescriptor {
     pub page: String,
     pub api: String,
     pub channels: &'static [&'static str],
+    pub show_in_nav: bool,
 }
 
 #[derive(Default)]
@@ -72,8 +85,18 @@ impl ViewRegistry {
                 page: format!("/view/{}", view.path()),
                 api: format!("/api/view/{}", view.path()),
                 channels: view.channels(),
+                show_in_nav: view.show_in_nav(),
             })
             .collect()
+    }
+
+    /// Per-entity detail lookup: `/api/view/<path>/detail?<query>`.
+    pub fn detail(&self, path: &str, query: &str) -> Option<Value> {
+        self.views
+            .read()
+            .iter()
+            .find(|view| view.path() == path || view.id() == path)
+            .and_then(|view| view.detail_json(query))
     }
 
     pub fn snapshot(&self, path: &str) -> Option<Value> {

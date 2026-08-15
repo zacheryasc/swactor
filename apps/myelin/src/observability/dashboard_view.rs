@@ -211,6 +211,7 @@ const MYELIN_CLUSTER_HTML: &str = r#"<!doctype html>
   </style>
 </head>
 <body>
+<!--swactor:nav-->
   <h1>Myelin cluster</h1>
   <p id="status" class="muted">loading…</p>
   <h2>Provisioned nodes</h2>

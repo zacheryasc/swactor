@@ -8,4 +8,4 @@ Keep this crate read-only with respect to observed programs.
 - It must not send control signals to observed runtimes.
 - It must not require changes outside `crates/dashboard` for dashboard-only work.
 
-Main built-in views: `/view/swactor/workers` (worker-centric) and `/view/swactor/actor-overview` + `/view/swactor/actor-dossier` (actor-centric), all backed by `runtime.stats`, `runtime.workers`, and `runtime.actors` frames when present. Actor views are pure frame consumers and tolerant of publisher shape.
+Main built-in view: the fused control plane at `/` and `/view/fleet` (node cards with machine + actor rollup, per-node roster, per-actor dossier via `/api/view/fleet/detail`), backed by `host.*`, `proc.<label>.lifecycle`, `runtime.stats`, and `runtime.actors` frames when present. It is a pure frame consumer, tolerant of publisher shape. Message history is folded view-side from `messages_processed` deltas — no producer changes. The unified navbar is injected server-side from the view registry; pages opt in with a `<!--swactor:nav-->` placeholder.

@@ -1,10 +1,10 @@
 use std::convert::Infallible;
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use tokio::sync::{broadcast, mpsc};
@@ -98,53 +98,60 @@ async fn control_remove(
     }
 }
 
-async fn root_page(State(state): State<AppState>) -> Html<String> {
-    let mut views = state.views.descriptors();
-    views.sort_by(|left, right| left.title.cmp(right.title));
-    let links = views
-        .iter()
-        .map(|view| {
-            format!(
-                "<li><a href=\"{}\">{}</a> <code>{}</code></li>",
-                escape_html(&view.page),
-                escape_html(view.title),
-                escape_html(view.id)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("");
-    Html(format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>swactor dashboard</title>
-  <style>
-    :root {{ color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #111827; color: #e5e7eb; }}
-    body {{ margin: 0; padding: 32px; }}
-    a {{ color: #93c5fd; }}
-    code {{ color: #fbbf24; }}
-    .card {{ max-width: 760px; background: #1f2937; border: 1px solid #374151; border-radius: 16px; padding: 24px; }}
-    li {{ margin: 10px 0; }}
-  </style>
-</head>
-<body>
-  <main class="card">
-    <h1>swactor dashboard</h1>
-    <p>Read-only views over live telemetry frames.</p>
-    <h2>Views</h2>
-    <ul>{links}</ul>
-    <h2>Raw APIs</h2>
-    <ul>
-      <li><a href="/api/views">Registered views JSON</a></li>
-      <li><code>/events</code> streams raw incoming frames as SSE.</li>
-      <li><code>/api/frames</code> returns the bounded recent raw frame window.</li>
-    </ul>
-  </main>
-</body>
-</html>"#
-    ))
+async fn root_page(State(state): State<AppState>) -> Response {
+    // Home is the fleet control-plane view.
+    match state.views.html("fleet") {
+        Some(html) => Html(inject_nav(html, "fleet", &state)).into_response(),
+        None => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "fleet control-plane view missing",
+        )
+            .into_response(),
+    }
+}
+
+/// Placeholder marker pages include to receive the shared navbar.
+const NAV_PLACEHOLDER: &str = "<!--swactor:nav-->";
+
+/// Build the unified top navbar from the view registry (registration order,
+/// active by served path). Fleet links to `/` — it is the home page.
+fn inject_nav(html: &str, active_path: &str, state: &AppState) -> String {
+    if !html.contains(NAV_PLACEHOLDER) {
+        return html.to_owned();
+    }
+    let mut links = Vec::new();
+    for view in state.views.descriptors() {
+        if !view.show_in_nav {
+            continue;
+        }
+        let href = if view.path == "fleet" {
+            "/".to_owned()
+        } else {
+            view.page.clone()
+        };
+        let active = view.path == active_path;
+        links.push(format!(
+            r#"<a href="{}"{}>{}</a>"#,
+            escape_html(&href),
+            if active { r#" aria-current="page" data-active="true""# } else { "" },
+            escape_html(view.title),
+        ));
+    }
+    let nav = format!(
+        concat!(
+            r#"<style>"#,
+            r#".sw-nav{{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px;padding:8px;"#,
+            r#"background:#111827;border:1px solid #334155;border-radius:12px;}}"#,
+            r#".sw-nav a{{padding:7px 10px;color:#cbd5e1;border:1px solid transparent;"#,
+            r#"border-radius:8px;text-decoration:none;font-size:14px;}}"#,
+            r#".sw-nav a:hover{{color:#f8fafc;background:#1e293b;}}"#,
+            r#".sw-nav a[data-active="true"]{{color:#eff6ff;background:#172554;border-color:#60a5fa;}}"#,
+            r#"</style>"#,
+            r#"<nav class="sw-nav" aria-label="Dashboard views">{}</nav>"#,
+        ),
+        links.join("")
+    );
+    html.replace(NAV_PLACEHOLDER, &nav)
 }
 
 fn escape_html(value: &str) -> String {
@@ -165,17 +172,26 @@ async fn views_json(State(state): State<AppState>) -> Json<serde_json::Value> {
 
 async fn view_snapshot(
     Path(path): Path<String>,
+    RawQuery(query): RawQuery,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> Response {
+    // `/api/view/<path>/detail?<query>` serves bounded per-entity detail.
+    if let Some(base) = path.strip_suffix("/detail") {
+        let query = query.unwrap_or_default();
+        return match state.views.detail(base, &query) {
+            Some(snapshot) => Json(snapshot).into_response(),
+            None => (StatusCode::NOT_FOUND, "unknown dashboard detail").into_response(),
+        };
+    }
     match state.views.snapshot(&path) {
         Some(snapshot) => Json(snapshot).into_response(),
         None => (StatusCode::NOT_FOUND, "unknown dashboard view").into_response(),
     }
 }
 
-async fn view_page(Path(path): Path<String>, State(state): State<AppState>) -> impl IntoResponse {
+async fn view_page(Path(path): Path<String>, State(state): State<AppState>) -> Response {
     match state.views.html(&path) {
-        Some(html) => Html(html).into_response(),
+        Some(html) => Html(inject_nav(html, &path, &state)).into_response(),
         None => (StatusCode::NOT_FOUND, "unknown dashboard view").into_response(),
     }
 }

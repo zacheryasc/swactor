@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>swactor fleet</title>
+  <style>
+    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 18px; }
+    header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+    h1 { margin: 0; font-size: 24px; }
+    h2 { margin: 22px 0 10px; font-size: 17px; }
+    .muted { color: #94a3b8; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+    .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
+    .totals .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 10px 12px; }
+    .totals .label { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+    .totals .value { font-size: 20px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
+    .node-card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 14px; cursor: pointer; transition: border-color .12s; }
+    .node-card:hover { border-color: #60a5fa; }
+    .node-card[data-live="false"] { opacity: .55; }
+    .node-card h3 { margin: 0 0 2px; font-size: 15px; word-break: break-all; }
+    .node-card .meta { color: #94a3b8; font-size: 12px; margin-bottom: 8px; }
+    .bars { display: grid; gap: 5px; }
+    .bar-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+    .bar-row .name { width: 92px; color: #94a3b8; }
+    .bar-track { flex: 1; height: 8px; background: #111827; border-radius: 99px; overflow: hidden; }
+    .bar-fill { height: 100%; border-radius: 99px; }
+    .bar-fill.ok { background: #34d399; } .bar-fill.warn { background: #fbbf24; } .bar-fill.bad { background: #f87171; }
+    .bar-row .num { width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
+    .pill { display: inline-flex; padding: 2px 8px; border-radius: 999px; border: 1px solid #334155; font-size: 11px; }
+    .pill.live { color: #34d399; border-color: #065f46; }
+    .pill.stale { color: #f87171; border-color: #7f1d1d; }
+    .pill.poisoned { color: #f87171; border-weight: 600; }
+    details.stale { margin-top: 18px; }
+    details.stale summary { cursor: pointer; color: #94a3b8; padding: 8px 0; }
+    .focus-back { display: inline-block; margin-bottom: 12px; color: #93c5fd; text-decoration: none; }
+    .node-view { display: grid; gap: 14px; }
+    .panel { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 14px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #1f2937; font-variant-numeric: tabular-nums; }
+    th { color: #93c5fd; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    tbody tr[data-addr] { cursor: pointer; }
+    tbody tr[data-addr]:hover { background: #17255466; }
+    tbody tr[data-selected="true"] { background: #17255488; }
+    input[type=search] { background: #111827; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px; padding: 7px 10px; width: 240px; max-width: 100%; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+    @media (min-width: 1100px) { .layout.with-dossier { grid-template-columns: minmax(0, 1fr) 420px; } }
+    .dossier { position: sticky; top: 12px; align-self: start; max-height: calc(100vh - 24px); overflow: auto; }
+    .kv { display: grid; grid-template-columns: 120px 1fr; gap: 4px 10px; font-size: 13px; }
+    .kv .k { color: #94a3b8; }
+    .diet .bar-row .name { width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .receipts td { font-size: 12px; }
+    .empty { padding: 24px; border: 1px dashed #475569; border-radius: 12px; color: #94a3b8; }
+    .notice { font-size: 12px; color: #94a3b8; margin: 6px 0; }
+    canvas { width: 100%; height: 64px; background: #111827; border: 1px solid #334155; border-radius: 10px; }
+    .err { color: #f87171; }
+  </style>
+</head>
+<body>
+<!--swactor:nav-->
+<header>
+  <h1>Fleet</h1>
+  <span class="muted" id="status">loading…</span>
+</header>
+
+<div id="page">
+  <div class="empty">Waiting for telemetry frames…</div>
+</div>
+
+<script>
+'use strict';
+const POLL_MS = 1000;
+const ROSTER_RENDER_CAP = 200;
+
+const params = new URLSearchParams(window.location.search);
+let selectedStream = params.get('stream') || null;
+let selectedActor = params.get('actor') || null;
+let rosterFilter = '';
+let lastSnapshot = null;
+let detailTimer = null;
+
+function esc(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
+}
+function fmt(value, digits = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  return n.toLocaleString(undefined, { maximumFractionDigits: digits });
+}
+function fmtRate(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '—';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + ' G';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + ' M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + ' k';
+  return n.toFixed(n < 10 ? 1 : 0);
+}
+function typeShort(name) {
+  if (!name) return '—';
+  const parts = String(name).split('::');
+  return esc(parts[parts.length - 1] || name);
+}
+function ago(ms) {
+  if (ms == null) return '—';
+  if (ms < 1000) return ms + 'ms';
+  if (ms < 60000) return Math.round(ms / 1000) + 's';
+  if (ms < 3600000) return Math.round(ms / 60000) + 'm';
+  return Math.round(ms / 3600000) + 'h';
+}
+function bar(percent, max = 100) {
+  if (percent == null) return '<div class="bar-track"></div>';
+  const clamped = Math.max(0, Math.min(100, percent / max * 100));
+  const cls = clamped >= 90 ? 'bad' : clamped >= 70 ? 'warn' : 'ok';
+  return `<div class="bar-track"><div class="bar-fill ${cls}" style="width:${clamped}%"></div></div>`;
+}
+
+function pushUrl() {
+  const next = new URL(window.location);
+  if (selectedStream) next.searchParams.set('stream', selectedStream); else next.searchParams.delete('stream');
+  if (selectedActor) next.searchParams.set('actor', selectedActor); else next.searchParams.delete('actor');
+  window.history.replaceState(null, '', next);
+}
+
+async function refresh() {
+  let data;
+  try {
+    const response = await fetch('/api/view/fleet');
+    data = await response.json();
+  } catch { return; }
+  lastSnapshot = data;
+  render();
+}
+
+function render() {
+  const page = document.getElementById('page');
+  const status = document.getElementById('status');
+  const data = lastSnapshot;
+  const live = data.live || [];
+  const stale = data.stale || [];
+  const totals = data.totals || {};
+  status.textContent = `${fmt(totals.live_nodes)} live · ${fmt(totals.stale_nodes)} stale · ${fmt(totals.actors)} actors`;
+
+  const node = live.concat(stale).find(n => n.stream.key === selectedStream)
+    || live.find(n => n.stream.key === selectedStream);
+  if (node) {
+    renderNode(page, node, live, stale);
+  } else {
+    renderFleet(page, live, stale, totals);
+  }
+}
+
+function renderFleet(page, live, stale, totals) {
+  stopDetailPolling();
+  const parts = [];
+  parts.push(`<div class="totals">
+    ${totalCard('Live nodes', fmt(totals.live_nodes))}
+    ${totalCard('Actors', fmt(totals.actors))}
+    ${totalCard('Msg/s', fmtRate(totals.msg_per_sec))}
+    ${totalCard('Mailbox', fmt(totals.mailbox_depth))}
+    ${totalCard('Poisoned', fmt(totals.poisoned), totals.poisoned > 0 ? 'err' : '')}
+    ${totalCard('CPU avg', totals.cpu_avg_percent == null ? '—' : fmt(totals.cpu_avg_percent, 1) + '%')}
+    ${totalCard('GPU max', totals.gpu_max_percent == null ? '—' : fmt(totals.gpu_max_percent) + '%')}
+    ${totalCard('GPU mem', totals.gpu_memory_total_mib ? fmt(totals.gpu_memory_used_mib) + '/' + fmt(totals.gpu_memory_total_mib) + ' MiB' : '—')}
+    ${totalCard('Net', fmtRate(totals.net_rx_bps) + '↓ ' + fmtRate(totals.net_tx_bps) + '↑')}
+  </div>`);
+
+  if (!live.length && !stale.length) {
+    parts.push('<div class="empty">No telemetry streams yet. A live swactor runtime or host publisher will populate this page.</div>');
+  } else {
+    parts.push('<div class="grid">' + live.map(nodeCard).join('') + '</div>');
+    if (stale.length) {
+      parts.push(`<details class="stale">
+        <summary>Stale nodes (${stale.length}) — silent beyond the liveness window</summary>
+        <div class="grid">${stale.map(nodeCard).join('')}</div>
+      </details>`);
+    }
+  }
+  page.innerHTML = parts.join('');
+  bindCards();
+}
+
+function totalCard(label, value, cls = '') {
+  return `<div class="card"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(value)}</div></div>`;
+}
+
+function nodeCard(node) {
+  const summary = node.actor_summary || {};
+  const cpu = node.cpu && node.cpu.host ? node.cpu.host.total_percent : null;
+  const gpu = node.gpu && node.gpu.gpus && node.gpu.gpus.length
+    ? node.gpu.gpus.reduce((max, d) => Math.max(max, d.utilization_gpu_percent || 0), 0)
+    : null;
+  const gpuMem = node.gpu && node.gpu.gpus && node.gpu.gpus.length
+    ? node.gpu.gpus.reduce((acc, d) => ({
+        used: acc.used + (d.memory_used_mib || 0),
+        total: acc.total + (d.memory_total_mib || 0) }), { used: 0, total: 0 })
+    : null;
+  const proc = node.process ? `<span class="pill">${esc(node.process.state)}</span> ` : '';
+  return `<article class="node-card" data-stream="${esc(node.stream.key)}" data-live="${node.live ? 'true' : 'false'}">
+    <h3>${esc(node.stream.node)} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
+    <div class="meta">${proc}seen ${ago(node.last_seen_ms_ago)} ago · ${fmt(summary.actors)} actors · ${fmtRate(summary.msg_per_sec)} msg/s${summary.num_workers != null ? ' · ' + fmt(summary.num_workers) + ' workers' : ''}${summary.uptime_ms != null ? ' · up ' + ago(summary.uptime_ms) : ''}</div>
+    <div class="bars">
+      <div class="bar-row"><span class="name">CPU</span>${bar(cpu)}<span class="num">${cpu == null ? '—' : fmt(cpu, 0) + '%'}</span></div>
+      <div class="bar-row"><span class="name">GPU</span>${bar(gpu)}<span class="num">${gpu == null ? '—' : fmt(gpu) + '%'}</span></div>
+      ${gpuMem && gpuMem.total ? `<div class="bar-row"><span class="name">GPU mem</span>${bar(gpuMem.used, gpuMem.total)}<span class="num">${fmt(gpuMem.used)}/${fmt(gpuMem.total)}</span></div>` : ''}
+      <div class="bar-row"><span class="name">Mailbox</span>${bar(summary.mailbox_depth, Math.max(64, summary.mailbox_depth))}<span class="num">${fmt(summary.mailbox_depth)}</span></div>
+    </div>
+    ${summary.poisoned ? `<div class="notice err">${fmt(summary.poisoned)} poisoned actor(s)</div>` : ''}
+  </article>`;
+}
+
+function renderNode(page, node, live, stale) {
+  const summary = node.actor_summary || {};
+  const machine = machineDetail(node);
+  page.innerHTML = `
+    <a class="focus-back" href="/">← Fleet (${fmt(live.length)} live, ${fmt(stale.length)} stale)</a>
+    <div class="layout ${selectedActor ? 'with-dossier' : ''}">
+      <div class="node-view">
+        <section class="panel">
+          <h2 style="margin:0 0 8px">${esc(node.stream.node)} <span class="muted" style="font-size:13px">life ${fmt(node.stream.life)} · ${node.live ? 'live' : 'stale ' + ago(node.last_seen_ms_ago) + ' ago'}</span></h2>
+          ${machine}
+        </section>
+        <section class="panel">
+          <h2 style="margin:0 0 8px">Actors (${fmt(summary.actors)})</h2>
+          <input type="search" id="roster-filter" placeholder="filter by type, address, worker…" value="${esc(rosterFilter)}">
+          <div id="roster-wrap" style="margin-top:10px"></div>
+        </section>
+      </div>
+      <div id="dossier-slot"></div>
+    </div>`;
+  renderRoster(node);
+  const filter = document.getElementById('roster-filter');
+  filter.addEventListener('input', e => { rosterFilter = e.target.value; renderRoster(node); });
+  if (selectedActor) startDetailPolling();
+}
+
+function machineDetail(node) {
+  const cpu = node.cpu, gpu = node.gpu, net = node.net;
+  const rows = [];
+  const cpuTotal = cpu && cpu.host ? cpu.host.total_percent : null;
+  rows.push(`<div class="bar-row"><span class="name">CPU</span>${bar(cpuTotal)}<span class="num">${cpuTotal == null ? '—' : fmt(cpuTotal, 1) + '%'}</span></div>`);
+  if (gpu && gpu.gpus) {
+    gpu.gpus.forEach((device, index) => {
+      const util = device.utilization_gpu_percent;
+      const used = device.memory_used_mib || 0, total = device.memory_total_mib || 0;
+      rows.push(`<div class="bar-row"><span class="name">GPU ${fmt(index)}</span>${bar(util)}<span class="num">${util == null ? '—' : fmt(util) + '%'}</span></div>`);
+      if (total) rows.push(`<div class="bar-row"><span class="name">&nbsp;</span>${bar(used, total)}<span class="num">${fmt(used)}/${fmt(total)} MiB</span></div>`);
+    });
+  }
+  if (net && net.interfaces) {
+    net.interfaces.slice(0, 4).forEach(nic => {
+      rows.push(`<div class="bar-row"><span class="name" title="${esc(nic.name)}">${esc(nic.name.slice(0, 12))}</span><span class="num" style="width:auto;flex:1">${fmtRate(nic.rx_bps)}↓ ${fmtRate(nic.tx_bps)}↑</span></div>`);
+    });
+  }
+  if (node.history && node.history.length) drawMachineHistory(node.history);
+  const errors = (node.errors || []).map(e => `<div class="notice err">${esc(e)}</div>`).join('');
+  return `<div class="bars">${rows.join('')}</div><canvas id="machine-spark" width="600" height="64"></canvas>${errors}`;
+}
+
+function drawMachineHistory(history) {
+  requestAnimationFrame(() => {
+    const canvas = document.getElementById('machine-spark');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const points = history.map(h => ({ cpu: h.cpu_total_percent, gpu: h.gpu_max_percent }));
+    drawLine(ctx, points.map(p => p.gpu), '#fbbf24');
+    drawLine(ctx, points.map(p => p.cpu), '#34d399');
+  });
+}
+
+function drawLine(ctx, values, color) {
+  const valid = values.filter(v => v != null);
+  if (valid.length < 2) return;
+  const max = Math.max(100, ...valid);
+  const step = ctx.canvas.width / (values.length - 1 || 1);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  let started = false;
+  values.forEach((value, index) => {
+    if (value == null) return;
+    const x = index * step;
+    const y = ctx.canvas.height - (value / max) * (ctx.canvas.height - 6) - 3;
+    if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+function renderRoster(node) {
+  const wrap = document.getElementById('roster-wrap');
+  if (!wrap) return;
+  let rows = node.roster || [];
+  if (rosterFilter) {
+    const q = rosterFilter.toLowerCase();
+    rows = rows.filter(a => `${a.name || ''} ${a.actor_type || ''} ${a.address} ${a.worker_id ?? ''}`.toLowerCase().includes(q));
+  }
+  const capped = rows.slice(0, ROSTER_RENDER_CAP);
+  const notice = rows.length > capped.length
+    ? `<div class="notice">showing ${fmt(capped.length)} of ${fmt(rows.length)} — refine the filter to see more</div>`
+    : '';
+  if (!rows.length) {
+    wrap.innerHTML = '<div class="empty">No actors on this stream (or none match the filter).</div>';
+    return;
+  }
+  wrap.innerHTML = notice + `<table>
+    <thead><tr><th>Actor</th><th>Type</th><th>State</th><th>Mailbox</th><th>Msg/s</th><th>Processed</th><th>Worker</th><th>Last message</th></tr></thead>
+    <tbody>${capped.map(a => `<tr data-addr="${esc(a.address)}" ${a.address === selectedActor ? 'data-selected="true"' : ''}>
+      <td class="mono">${esc(shortAddr(a.address))}${a.name ? `<br><span class="muted">${esc(a.name)}</span>` : ''}</td>
+      <td><span class="muted" title="${esc(a.actor_type || '')}">${typeShort(a.actor_type)}</span></td>
+      <td>${a.poisoned ? '<span class="pill poisoned">poisoned</span>' : '<span class="muted">running</span>'}</td>
+      <td>${fmt(a.mailbox_depth)}</td>
+      <td>${fmtRate(a.msg_per_sec)}</td>
+      <td>${fmt(a.messages_processed)}</td>
+      <td>${a.worker_id == null ? '—' : fmt(a.worker_id)}</td>
+      <td><span class="muted" title="${esc(a.last_msg_type || '')}">${typeShort(a.last_msg_type)}</span></td>
+    </tr>`).join('')}</tbody>
+  </table>`;
+  wrap.querySelectorAll('tr[data-addr]').forEach(tr => {
+    tr.addEventListener('click', () => {
+      selectedActor = tr.getAttribute('data-addr');
+      pushUrl();
+      render();
+    });
+  });
+}
+
+function shortAddr(address) {
+  const s = String(address || '');
+  return s.length > 14 ? s.slice(0, 8) + '…' + s.slice(-4) : s;
+}
+
+function stopDetailPolling() {
+  if (detailTimer) { clearInterval(detailTimer); detailTimer = null; }
+}
+
+function startDetailPolling() {
+  stopDetailPolling();
+  const poll = async () => {
+    if (!selectedStream || !selectedActor) return;
+    let detail;
+    try {
+      const response = await fetch(`/api/view/fleet/detail?stream=${encodeURIComponent(selectedStream)}&actor=${encodeURIComponent(selectedActor)}`);
+      if (!response.ok) { stopDetailPolling(); return; }
+      detail = await response.json();
+    } catch { return; }
+    renderDossier(detail);
+  };
+  poll();
+  detailTimer = setInterval(poll, POLL_MS);
+}
+
+function renderDossier(d) {
+  const slot = document.getElementById('dossier-slot');
+  if (!slot) return;
+  const diet = (d.message_type_counts || []).slice().sort((a, b) => b.count - a.count);
+  const dietMax = Math.max(1, ...diet.map(x => x.count));
+  const lastName = d.last_msg_type;
+  const dietHtml = diet.length ? diet.map(x => `
+    <div class="bar-row"><span class="name" title="${esc(x.message_type)}">${esc(x.message_type)}</span>
+    <div class="bar-track"><div class="bar-fill" style="width:${(x.count / dietMax * 100).toFixed(1)}%"></div></div>
+    <span class="num">${fmt(x.count)}</span></div>`).join('')
+    : '<div class="empty">no message-type counts on frame</div>';
+  const receipts = (d.receipts || []).slice().reverse();
+  const receiptsHtml = receipts.length ? `<table class="receipts">
+      <thead><tr><th>When</th><th>Message type</th><th>Folded</th></tr></thead>
+      <tbody>${receipts.map(r => `<tr>
+        <td class="muted">${ago(r.ms_ago)} ago</td>
+        <td><span class="mono" title="${esc(r.ty)}">${typeShort(r.ty)}</span></td>
+        <td class="muted">${r.folded ? '+' + fmt(r.folded) + ' sampled' : '—'}</td>
+      </tr>`).join('')}</tbody>
+    </table>
+    <div class="notice">showing last ${fmt(receipts.length)} receipts · ${fmt(d.sampled_out)} messages sampled out · ${fmt(d.messages_processed)} processed total</div>`
+    : '<div class="empty">no message receipts folded yet</div>';
+  slot.innerHTML = `<section class="panel dossier">
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
+      <h2 style="margin:0">${typeShort(d.actor_type)} <span class="muted mono" style="font-size:12px">${esc(shortAddr(d.address))}</span></h2>
+      <button id="dossier-close" style="background:none;border:none;color:#94a3b8;cursor:pointer;font-size:16px">×</button>
+    </div>
+    <div class="kv" style="margin-top:10px">
+      <span class="k">node</span><span>${esc(d.stream.node)}</span>
+      <span class="k">address</span><span class="mono">${esc(d.address)}</span>
+      ${d.name ? `<span class="k">name</span><span>${esc(d.name)}</span>` : ''}
+      <span class="k">actor type</span><span class="mono" title="${esc(d.actor_type || '')}">${esc(d.actor_type || '—')}</span>
+      <span class="k">message type</span><span class="mono" title="${esc(d.message_type || '')}">${esc(d.message_type || '—')}</span>
+      <span class="k">state</span><span>${d.poisoned ? '<span class="pill poisoned">poisoned</span>' : 'running'}</span>
+      <span class="k">worker</span><span>${d.worker_id == null ? '—' : fmt(d.worker_id)}</span>
+      <span class="k">mailbox</span><span>${fmt(d.mailbox_depth)} (${d.mailbox_growth >= 0 ? '+' : ''}${fmtRate(d.mailbox_growth)}/s)</span>
+      <span class="k">throughput</span><span>${fmtRate(d.msg_per_sec)} msg/s</span>
+      <span class="k">processed</span><span>${fmt(d.messages_processed)}</span>
+      <span class="k">last message</span><span class="mono" title="${esc(d.last_msg_type || '')}">${esc(d.last_msg_type || '—')}</span>
+    </div>
+    <h2>Throughput</h2>
+    <canvas id="dossier-spark" width="380" height="64"></canvas>
+    <h2>Message diet</h2>
+    <div class="diet">${dietHtml}</div>
+    <h2>Message history</h2>
+    ${receiptsHtml}
+  </section>`;
+  document.getElementById('dossier-close').addEventListener('click', () => {
+    selectedActor = null;
+    pushUrl();
+    render();
+  });
+  const history = d.history || [];
+  const canvas = document.getElementById('dossier-spark');
+  if (canvas && history.length > 1) {
+    const ctx = canvas.getContext('2d');
+    drawLine(ctx, history.map(h => h.msg_per_sec), '#60a5fa');
+  }
+}
+
+function bindCards() {
+  document.querySelectorAll('.node-card').forEach(card => {
+    card.addEventListener('click', () => {
+      selectedStream = card.getAttribute('data-stream');
+      selectedActor = null;
+      pushUrl();
+      render();
+    });
+  });
+}
+
+refresh();
+setInterval(refresh, POLL_MS);
+</script>
+</body>
+</html>

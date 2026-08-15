@@ -2,12 +2,15 @@
 pub mod control;
 #[cfg(feature = "demo-control")]
 mod demo_control;
+mod control_plane;
 mod hardware_view;
 mod live_explorer;
 mod server;
 mod store;
 pub mod swactor;
 pub mod view;
+
+pub use control_plane::ControlPlaneView;
 
 use std::sync::Arc;
 
@@ -100,12 +103,9 @@ impl DashboardHandle {
     pub fn new(config: DashboardConfig) -> Self {
         let views = Arc::new(ViewRegistry::new());
         views.register(Arc::new(live_explorer::LiveTelemetryExplorer::default()));
-        views.register(Arc::new(hardware_view::HardwareDashboardView::default()));
+        views.register(Arc::new(ControlPlaneView::default()));
         #[cfg(feature = "demo-control")]
         views.register(Arc::new(demo_control::DemoControlView::default()));
-        views.register(swactor::worker_view());
-        views.register(swactor::actor_overview_view());
-        views.register(swactor::actor_dossier_view());
         let store = Arc::new(DashboardStore::new(
             config.raw_frame_history,
             Arc::clone(&views),

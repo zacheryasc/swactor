@@ -1,105 +1,64 @@
-//! Actor-centric read-only view over `runtime.actors` / `runtime.stats` frames.
+//! Actor-side folding for the fused control-plane view.
 //!
-//! Pure frame consumer: it folds incoming per-actor snapshots into local state
-//! and exposes JSON + HTML. It sends nothing back to observed runtimes. Parsing
-//! is intentionally tolerant of publisher shape — a frame is a flat record that
-//! may come from the per-worker `TelemetryStatsHook` envelope
-//! (`{worker_id, actors:[...]}`) or from a process that publishes a merged
-//! `{actors:[...]}` payload (the dashboard dummy node, app runtimes). Fields the
-//! publisher includes (name, worker_id, lifecycle flags) are displayed; ones it
-//! omits are left blank rather than fabricated.
+//! Pure frame consumer: folds per-actor snapshots from `runtime.actors` /
+//! `runtime.stats` frames into [`RuntimeState`] / [`ActorState`]. It sends
+//! nothing back to observed runtimes. Parsing is intentionally tolerant of
+//! publisher shape — a frame is a flat record that may come from the per-worker
+//! `TelemetryStatsHook` envelope (`{worker_id, actors:[...]}`) or from a
+//! process that publishes a merged `{actors:[...]}` payload. Fields the
+//! publisher includes are displayed; omitted ones stay blank rather than
+//! fabricated.
 //!
-//! Reliably on the frame today: address, mailbox depth, throughput, last
-//! message, poisoned flag, and the message-type diet. `worker_id` and `name`
-//! appear when the publisher sends them. Finer lifecycle granularity
-//! (new/suspended/stopping), actor Rust type, and spawn age are not on the
-//! current frame and are therefore not shown — enriching the feed is a separate
-//! core concern, not a dashboard one.
+//! Reliably on the frame: address, mailbox depth, throughput, last message,
+//! poisoned flag, the message-type diet, and the actor/message Rust type names
+//! (`std::any::type_name` strings published by the stats hook). The Rust type
+//! is the actor's display name; the address is the unique key.
 //!
-//! Two pages share one data model: the fused overview+roster
-//! (`/view/swactor/actor-overview`) and the per-actor dossier
-//! (`/view/swactor/actor-dossier`). Each is a self-contained `DashboardView`
-//! instance ingesting the same channels.
+//! Message *history* is folded here from consecutive frames: a jump in
+//! `messages_processed` between frames yields one receipt carrying
+//! `last_msg_type`; the messages hidden inside the jump are counted as sampled
+//! out. Receipts are bounded and interval-spaced so noisy actors cannot flood
+//! the page.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use telemetry::frame::{Frame, StreamId};
-use parking_lot::RwLock;
-use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::swactor::{RUNTIME_ACTORS, RUNTIME_STATS};
-use crate::view::DashboardView;
-use crate::{FrameEvent, StreamEvent};
 
-const CHANNELS: &[&str] = &[RUNTIME_ACTORS, RUNTIME_STATS];
 const HISTORY_CAP: usize = 512;
 const HISTORY_MIN_INTERVAL: Duration = Duration::from_millis(250);
 const PER_ACTOR_HISTORY_CAP: usize = 120;
 const GROWTH_WINDOW: usize = 12;
-const LIVE_TTL: Duration = Duration::from_secs(8);
+/// Sampled message-receipt ring bound (view side).
+pub(crate) const RECEIPT_CAP: usize = 16;
+/// Minimum spacing between receipts; bounds ring churn for noisy actors.
+pub(crate) const RECEIPT_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Read-only actor panel. One instance per served page so each page owns its
-/// state independently; both ingest the same frames.
-pub struct ActorPanelView {
-    id: &'static str,
-    title: &'static str,
-    path: &'static str,
-    html: &'static str,
-    state: RwLock<PanelState>,
+/// One sampled message receipt folded from a `messages_processed` jump.
+#[derive(Clone)]
+pub(crate) struct ActorReceipt {
+    pub(crate) at: Instant,
+    /// Rust type name of the last message handled in the jump.
+    pub(crate) ty: String,
+    /// Messages folded into this receipt whose types were not visible.
+    pub(crate) folded: u64,
 }
 
-impl ActorPanelView {
-    /// Fused overview + roster at `/view/swactor/actor-overview`.
-    pub fn overview() -> Self {
-        Self::new(
-            "swactor-actor-overview",
-            "Actor overview",
-            "swactor/actor-overview",
-            include_str!("actor_overview.html"),
-        )
-    }
-
-    /// Per-actor dossier at `/view/swactor/actor-dossier`.
-    pub fn dossier() -> Self {
-        Self::new(
-            "swactor-actor-dossier",
-            "Actor dossier",
-            "swactor/actor-dossier",
-            include_str!("actor_dossier.html"),
-        )
-    }
-
-    fn new(id: &'static str, title: &'static str, path: &'static str, html: &'static str) -> Self {
-        Self {
-            id,
-            title,
-            path,
-            html,
-            state: RwLock::new(PanelState::default()),
-        }
-    }
+pub(crate) struct RuntimeState {
+    pub(crate) last_seen: Instant,
+    pub(crate) num_workers: Option<u32>,
+    pub(crate) uptime_ms: Option<u64>,
+    pub(crate) actors: BTreeMap<String, ActorState>,
+    pub(crate) history: VecDeque<HistorySample>,
 }
 
-#[derive(Default)]
-struct PanelState {
-    runtimes: BTreeMap<String, RuntimeState>,
-}
 
-struct RuntimeState {
-    stream: StreamEvent,
-    last_seen: Instant,
-    num_workers: Option<u32>,
-    uptime_ms: Option<u64>,
-    actors: BTreeMap<String, ActorState>,
-    history: VecDeque<HistorySample>,
-}
 
 impl RuntimeState {
-    fn new(stream: StreamEvent, now: Instant) -> Self {
+    pub(crate) fn new(now: Instant) -> Self {
         Self {
-            stream,
             last_seen: now,
             num_workers: None,
             uptime_ms: None,
@@ -108,7 +67,7 @@ impl RuntimeState {
         }
     }
 
-    fn update(&mut self, channel: &str, payload: &[u8], now: Instant) {
+    pub(crate) fn update(&mut self, channel: &str, payload: &[u8], now: Instant) {
         self.last_seen = now;
         let Ok(value) = serde_json::from_slice::<Value>(payload) else {
             return;
@@ -195,7 +154,7 @@ impl RuntimeState {
         });
     }
 
-    fn totals(&self) -> Totals {
+    pub(crate) fn totals(&self) -> Totals {
         let mut totals = Totals::default();
         totals.actors = self.actors.len().min(u32::MAX as usize) as u32;
         for actor in self.actors.values() {
@@ -210,21 +169,24 @@ impl RuntimeState {
 }
 
 #[derive(Clone)]
-struct ActorState {
-    address: String,
-    name: Option<String>,
-    actor_type: Option<String>,
-    message_type: Option<String>,
-    worker_id: Option<u32>,
-    mailbox_depth: u32,
-    mailbox_growth: f64,
-    messages_processed: u64,
-    msg_per_sec: f64,
-    last_msg_type: Option<String>,
-    poisoned: bool,
-    message_type_counts: Vec<(String, u64)>,
-    history: VecDeque<ActorHistorySample>,
-    last_update: Option<Instant>,
+pub(crate) struct ActorState {
+    pub(crate) address: String,
+    pub(crate) name: Option<String>,
+    pub(crate) actor_type: Option<String>,
+    pub(crate) message_type: Option<String>,
+    pub(crate) worker_id: Option<u32>,
+    pub(crate) mailbox_depth: u32,
+    pub(crate) mailbox_growth: f64,
+    pub(crate) messages_processed: u64,
+    pub(crate) msg_per_sec: f64,
+    pub(crate) last_msg_type: Option<String>,
+    pub(crate) poisoned: bool,
+    pub(crate) message_type_counts: Vec<(String, u64)>,
+    pub(crate) history: VecDeque<ActorHistorySample>,
+    pub(crate) receipts: VecDeque<ActorReceipt>,
+    /// Messages folded away by the receipt sampling interval.
+    pub(crate) sampled_out: u64,
+    pub(crate) last_update: Option<Instant>,
 }
 
 impl ActorState {
@@ -243,6 +205,8 @@ impl ActorState {
             poisoned: false,
             message_type_counts: Vec::new(),
             history: VecDeque::new(),
+            receipts: VecDeque::with_capacity(RECEIPT_CAP),
+            sampled_out: 0,
             last_update: None,
         }
     }
@@ -266,6 +230,7 @@ impl ActorState {
         } else if self.worker_id.is_none() {
             self.worker_id = default_worker;
         }
+        let processed_before = self.messages_processed;
         assign_u32(&mut self.mailbox_depth, value, &["mailbox_depth", "queued"]);
         assign_u64_rate(
             &mut self.messages_processed,
@@ -289,8 +254,37 @@ impl ActorState {
             self.message_type_counts = counts;
         }
         self.last_update = Some(now);
+        self.fold_receipt(now, self.messages_processed.saturating_sub(processed_before));
         self.push_history(now);
         self.recompute_growth();
+    }
+
+    /// Fold a `messages_processed` jump into the sampled receipt ring. The
+    /// receipt carries the last message type visible on the frame; messages
+    /// hidden inside the jump (or skipped by the interval) are counted, not
+    /// logged, so noisy actors cannot flood the page.
+    fn fold_receipt(&mut self, now: Instant, delta: u64) {
+        if delta == 0 {
+            return;
+        }
+        if let Some(last) = self.receipts.back_mut()
+            && now.duration_since(last.at) < RECEIPT_MIN_INTERVAL
+        {
+            self.sampled_out += delta;
+            return;
+        }
+        if self.receipts.len() == RECEIPT_CAP {
+            self.receipts.pop_front();
+        }
+        let ty = self
+            .last_msg_type
+            .clone()
+            .unwrap_or_else(|| "?".to_owned());
+        self.receipts.push_back(ActorReceipt {
+            at: now,
+            ty,
+            folded: delta.saturating_sub(1),
+        });
     }
 
     fn push_history(&mut self, now: Instant) {
@@ -331,215 +325,28 @@ impl ActorState {
 }
 
 #[derive(Clone, Copy)]
-struct HistorySample {
-    at: Instant,
-    mailbox_depth: u32,
-    msg_per_sec: f64,
+pub(crate) struct HistorySample {
+    pub(crate) at: Instant,
+    pub(crate) mailbox_depth: u32,
+    pub(crate) msg_per_sec: f64,
 }
 
 #[derive(Clone, Copy)]
-struct ActorHistorySample {
-    at: Instant,
-    mailbox_depth: u32,
-    msg_per_sec: f64,
+pub(crate) struct ActorHistorySample {
+    pub(crate) at: Instant,
+    pub(crate) mailbox_depth: u32,
+    pub(crate) msg_per_sec: f64,
 }
 
 #[derive(Default)]
-struct Totals {
-    actors: u32,
-    mailbox_depth: u32,
-    msg_per_sec: f64,
-    poisoned: u32,
+pub(crate) struct Totals {
+    pub(crate) actors: u32,
+    pub(crate) mailbox_depth: u32,
+    pub(crate) msg_per_sec: f64,
+    pub(crate) poisoned: u32,
 }
 
-#[derive(Serialize)]
-struct PanelSnapshot {
-    runtimes: Vec<RuntimeSnapshot>,
-}
 
-#[derive(Serialize)]
-struct RuntimeSnapshot {
-    stream: StreamSnapshot,
-    live: bool,
-    last_seen_ms_ago: u64,
-    summary: SummarySnapshot,
-    actors: Vec<ActorSnapshot>,
-    history: Vec<HistorySnapshot>,
-}
-
-#[derive(Serialize)]
-struct StreamSnapshot {
-    key: String,
-    node: String,
-    life: u64,
-}
-
-#[derive(Serialize)]
-struct SummarySnapshot {
-    actors: u32,
-    msg_per_sec: f64,
-    mailbox_depth: u32,
-    poisoned: u32,
-    uptime_ms: Option<u64>,
-    num_workers: Option<u32>,
-}
-
-#[derive(Serialize)]
-struct ActorSnapshot {
-    address: String,
-    name: Option<String>,
-    actor_type: Option<String>,
-    message_type: Option<String>,
-    worker_id: Option<u32>,
-    /// Single derived display state. The frame carries only `poisoned`, so the
-    /// granularity is poisoned | running until the feed is enriched.
-    state: &'static str,
-    mailbox_depth: u32,
-    mailbox_growth: f64,
-    messages_processed: u64,
-    msg_per_sec: f64,
-    last_msg_type: Option<String>,
-    poisoned: bool,
-    message_type_counts: Vec<MessageTypeCountSnapshot>,
-    history: Vec<ActorHistorySnapshot>,
-    last_seen_ms_ago: u64,
-}
-
-#[derive(Serialize)]
-struct MessageTypeCountSnapshot {
-    message_type: String,
-    count: u64,
-}
-
-#[derive(Serialize)]
-struct HistorySnapshot {
-    ms_ago: u64,
-    msg_per_sec: f64,
-    mailbox_depth: u32,
-}
-
-#[derive(Serialize)]
-struct ActorHistorySnapshot {
-    ms_ago: u64,
-    mailbox_depth: u32,
-    msg_per_sec: f64,
-}
-
-impl DashboardView for ActorPanelView {
-    fn id(&self) -> &'static str {
-        self.id
-    }
-
-    fn title(&self) -> &'static str {
-        self.title
-    }
-
-    fn path(&self) -> &'static str {
-        self.path
-    }
-
-    fn channels(&self) -> &'static [&'static str] {
-        CHANNELS
-    }
-
-    fn ingest(&self, _stream: &StreamId, _frame: &Frame, event: &FrameEvent) {
-        let now = Instant::now();
-        let mut state = self.state.write();
-        let key = stream_key(&event.stream);
-        state
-            .runtimes
-            .entry(key)
-            .or_insert_with(|| RuntimeState::new(event.stream.clone(), now))
-            .update(&event.channel, &event.payload, now);
-    }
-
-    fn snapshot_json(&self) -> Value {
-        let now = Instant::now();
-        let snapshot = PanelSnapshot {
-            runtimes: self
-                .state
-                .read()
-                .runtimes
-                .values()
-                .map(|runtime| runtime_snapshot(runtime, now))
-                .collect(),
-        };
-        serde_json::to_value(snapshot).unwrap_or_else(|_| json!({ "runtimes": [] }))
-    }
-
-    fn html(&self) -> Option<&'static str> {
-        Some(self.html)
-    }
-}
-
-fn runtime_snapshot(runtime: &RuntimeState, now: Instant) -> RuntimeSnapshot {
-    let totals = runtime.totals();
-    RuntimeSnapshot {
-        stream: StreamSnapshot {
-            key: stream_key(&runtime.stream),
-            node: runtime.stream.node.clone(),
-            life: runtime.stream.life,
-        },
-        live: now.duration_since(runtime.last_seen) <= LIVE_TTL,
-        last_seen_ms_ago: now.duration_since(runtime.last_seen).as_millis() as u64,
-        summary: SummarySnapshot {
-            actors: totals.actors,
-            msg_per_sec: totals.msg_per_sec,
-            mailbox_depth: totals.mailbox_depth,
-            poisoned: totals.poisoned,
-            uptime_ms: runtime.uptime_ms,
-            num_workers: runtime.num_workers,
-        },
-        actors: runtime
-            .actors
-            .values()
-            .map(|actor| ActorSnapshot {
-                address: actor.address.clone(),
-                name: actor.name.clone(),
-                actor_type: actor.actor_type.clone(),
-                message_type: actor.message_type.clone(),
-                worker_id: actor.worker_id,
-                state: if actor.poisoned { "poisoned" } else { "running" },
-                mailbox_depth: actor.mailbox_depth,
-                mailbox_growth: actor.mailbox_growth,
-                messages_processed: actor.messages_processed,
-                msg_per_sec: actor.msg_per_sec,
-                last_msg_type: actor.last_msg_type.clone(),
-                poisoned: actor.poisoned,
-                message_type_counts: actor
-                    .message_type_counts
-                    .iter()
-                    .map(|(message_type, count)| MessageTypeCountSnapshot {
-                        message_type: message_type.clone(),
-                        count: *count,
-                    })
-                    .collect(),
-                history: actor
-                    .history
-                    .iter()
-                    .map(|sample| ActorHistorySnapshot {
-                        ms_ago: now.duration_since(sample.at).as_millis() as u64,
-                        mailbox_depth: sample.mailbox_depth,
-                        msg_per_sec: sample.msg_per_sec,
-                    })
-                    .collect(),
-                last_seen_ms_ago: actor
-                    .last_update
-                    .map(|then| now.duration_since(then).as_millis() as u64)
-                    .unwrap_or(0),
-            })
-            .collect(),
-        history: runtime
-            .history
-            .iter()
-            .map(|sample| HistorySnapshot {
-                ms_ago: now.duration_since(sample.at).as_millis() as u64,
-                msg_per_sec: sample.msg_per_sec,
-                mailbox_depth: sample.mailbox_depth,
-            })
-            .collect(),
-    }
-}
 
 // --- tolerant JSON helpers (publisher-shape-agnostic readers) ---------------
 
@@ -630,6 +437,3 @@ fn parse_message_type_counts(value: Option<&Value>) -> Option<Vec<(String, u64)>
     None
 }
 
-fn stream_key(stream: &StreamEvent) -> String {
-    format!("{}#{}", stream.node, stream.life)
-}
