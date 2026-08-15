@@ -137,7 +137,7 @@ pub(crate) enum NodeAgentMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
-        datastream_publisher: ActorAddress,
+        telemetry_publisher: ActorAddress,
         readiness_id: u64,
     },
     RuntimeReadyAck {
@@ -450,7 +450,7 @@ impl NodeAgentActor {
                 stage_index,
                 endpoint,
                 node_actor,
-                datastream_publisher,
+                telemetry_publisher,
                 readiness_id,
             } => {
                 self.core.observe(stage::StageEvent::WorkerReady);
@@ -462,7 +462,7 @@ impl NodeAgentActor {
                         stage_index,
                         endpoint,
                         node_actor,
-                        datastream_publisher,
+                        telemetry_publisher,
                         readiness_id,
                     },
                 );

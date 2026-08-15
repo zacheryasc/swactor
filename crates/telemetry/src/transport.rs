@@ -1,6 +1,6 @@
 //! Legacy transport/test seam for carrying positioned frames into ingest.
 //!
-//! The live endpoint path now fans out catalog-aware [`DatastreamEvent`] values;
+//! The live endpoint path now fans out catalog-aware [`TelemetryEvent`] values;
 //! this module keeps the older [`Delivery`] shape used by ingest, storage tests,
 //! and scripted conformance checks.
 //!

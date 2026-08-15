@@ -7,7 +7,7 @@ CONTAINER=${CONTAINER:-myelin-node-e2e-$$}
 GPUS=${MYELIN_CUDA_GPUS:-all}
 PROMPT=${MYELIN_NODE_SELF_TEST_PROMPT:-ping}
 TIMEOUT_SECS=${MYELIN_NODE_E2E_TIMEOUT_SECS:-1800}
-FRAME_LOG=${MYELIN_DATASTREAM_FRAME_LOG:-/var/log/myelin-datastream.ndjson}
+FRAME_LOG=${MYELIN_TELEMETRY_FRAME_LOG:-/var/log/myelin-telemetry.ndjson}
 
 cleanup() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -25,7 +25,7 @@ docker run -d \
     -e MYELIN_NODE_MAX_RUNTIME_SECS=1 \
     -e MYELIN_SELF_TEST_MAX_TOKENS="${MYELIN_SELF_TEST_MAX_TOKENS:-1}" \
     -e MYELIN_MODEL_CACHE_DIR=/var/cache/myelin-models \
-    -e MYELIN_DATASTREAM_FRAME_LOG="$FRAME_LOG" \
+    -e MYELIN_TELEMETRY_FRAME_LOG="$FRAME_LOG" \
     ${HF_TOKEN:+-e HF_TOKEN="$HF_TOKEN"} \
     "$IMAGE" >/dev/null
 

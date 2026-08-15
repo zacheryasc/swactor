@@ -1,21 +1,22 @@
 use std::net::{IpAddr, SocketAddr};
 
-use datastream::{
-    ChannelContent, DatastreamEndpoint, DatastreamEvent, Lifetime, NodeId, Position, StreamId,
+use telemetry::frame::TelemetryEvent;
+use telemetry::{
+    ChannelContent, TelemetryEndpoint, Lifetime, NodeId, Position, StreamId,
 };
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh_driver::{
-    DATASTREAM_ALPN, DatastreamQuicHeader, read_next_uni_from_connection,
+    TELEMETRY_ALPN, TelemetryQuicHeader, read_next_uni_from_connection,
     write_available_subscription,
 };
 use swactor::config::RuntimeConfig;
 use swactor::runtime::RuntimeParts;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
-/// Datastream transport test scheduled through `EngineHandle`, not an ambient
+/// Telemetry transport test scheduled through `EngineHandle`, not an ambient
 /// `#[tokio::test]` runtime (ENGINE_SPEC.md).
 #[test]
-fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
+fn iroh_telemetry_alpn_carries_catalog_and_numeric_frames() {
     let parts = RuntimeParts::new(RuntimeConfig::default());
     let engine = Engine::new(
         parts,
@@ -48,7 +49,7 @@ fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
         }
 
         let stream = StreamId::new(NodeId::new("source-node"), Lifetime(1));
-        let endpoint = DatastreamEndpoint::with_capacity(stream.clone(), 8, 8);
+        let endpoint = TelemetryEndpoint::with_capacity(stream.clone(), 8, 8);
         let producer = endpoint.producer();
         let runtime_log = producer.register_channel("runtime.log", ChannelContent::TextStream);
         let subscription = endpoint.subscribe_all("iroh");
@@ -58,12 +59,12 @@ fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
         endpoint.tick();
 
         let conn = source
-            .connect(collector_addr, DATASTREAM_ALPN)
+            .connect(collector_addr, TELEMETRY_ALPN)
             .await
-            .expect("connect datastream ALPN");
+            .expect("connect telemetry ALPN");
         let send = conn.open_uni().await.expect("open uni stream");
         let header =
-            DatastreamQuicHeader::from_snapshot([7; 16], b"token".to_vec(), subscription.snapshot())
+            TelemetryQuicHeader::from_snapshot([7; 16], b"token".to_vec(), subscription.snapshot())
                 .expect("header from subscription snapshot");
         let wrote = write_available_subscription(&h, send, &header, &subscription)
             .await
@@ -73,7 +74,7 @@ fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
         let accepted = accept_rx.await.expect("collector accept task");
         let read = read_next_uni_from_connection(&accepted)
             .await
-            .expect("read datastream uni stream");
+            .expect("read telemetry uni stream");
 
         assert_eq!(read.header, header);
         assert_eq!(read.header.stream.stream, stream);
@@ -85,7 +86,7 @@ fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
         );
         assert_eq!(read.events.len(), 2);
         match &read.events[0] {
-            DatastreamEvent::Frame(frame) => {
+            TelemetryEvent::Frame(frame) => {
                 assert_eq!(frame.channel.stream, stream);
                 assert_eq!(frame.channel.channel, runtime_log);
                 assert_eq!(frame.position, Position(0));
@@ -94,7 +95,7 @@ fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
             other => panic!("expected frame event, got {other:?}"),
         }
         match &read.events[1] {
-            DatastreamEvent::Frame(frame) => {
+            TelemetryEvent::Frame(frame) => {
                 assert_eq!(frame.position, Position(1));
                 assert_eq!(frame.payload, b"beta");
             }
@@ -116,7 +117,7 @@ fn iroh_datastream_alpn_carries_catalog_and_numeric_frames() {
 async fn test_endpoint() -> Endpoint {
     Endpoint::builder(iroh::endpoint::presets::Minimal)
         .relay_mode(RelayMode::Disabled)
-        .alpns(vec![DATASTREAM_ALPN.to_vec()])
+        .alpns(vec![TELEMETRY_ALPN.to_vec()])
         .bind()
         .await
         .expect("bind test endpoint")

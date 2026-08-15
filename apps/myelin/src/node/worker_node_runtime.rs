@@ -1,7 +1,7 @@
 //! Worker-node runtime behavior behind the `myelin::node` boundary.
 //!
 //! The `myelin-worker` binary remains a thin entrypoint wrapper; this module
-//! owns the reusable node-local runtime, helper-command, datastream archive,
+//! owns the reusable node-local runtime, helper-command, telemetry archive,
 //! debug-join, staging, transport, and worker coordination behavior.
 
 use std::collections::BTreeMap;
@@ -16,12 +16,12 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use datastream::{
-    ChannelContent, ChannelId, DATASTREAM_PUBLISHER_NAME, DatastreamEndpoint,
-    DatastreamProducer, DatastreamPublisherActor, DatastreamSubscribe, DatastreamSubscription,
-    Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
+use telemetry::frame::TelemetryEvent;
+use telemetry::{
+    ChannelContent, ChannelId, TELEMETRY_PUBLISHER_NAME, TelemetryEndpoint, TelemetryProducer,
+    TelemetryPublisherActor, TelemetrySubscribe, TelemetrySubscription, Lifetime, NodeId,
+    Record, StreamDescriptor, StreamId, StreamOrigin,
 };
-use datastream::frame::DatastreamEvent;
 
 use crate::codecs::register_myelin_actor_codecs;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
@@ -44,7 +44,7 @@ use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::driver_pumps as driver_model;
 use iroh_driver::{
-    DATASTREAM_ALPN, DatastreamPublishHandle, DatastreamQuicHeader, EDGE_ALPN, EdgeSendHandle,
+    TELEMETRY_ALPN, TelemetryPublishHandle, TelemetryQuicHeader, EDGE_ALPN, EdgeSendHandle,
     EdgeTransportEvent, IrohDriver, IrohDriverConfig,
 };
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
@@ -121,19 +121,19 @@ fn node_event_payload(
     })
 }
 
-fn emit_stdio_datastream_frame(channel: &str, payload: &Value) -> Result<(), String> {
+fn emit_stdio_telemetry_frame(channel: &str, payload: &Value) -> Result<(), String> {
     println!(
         "{}",
         json!({
             "myelin_stdio_event":1,
-            "kind":"datastream_frame",
+            "kind":"telemetry_frame",
             "channel":channel,
             "payload":payload,
         })
     );
     std::io::stdout()
         .flush()
-        .map_err(|e| format!("flush stdio datastream frame: {e}"))
+        .map_err(|e| format!("flush stdio telemetry frame: {e}"))
 }
 
 fn emit_stdio_node_event(
@@ -144,23 +144,23 @@ fn emit_stdio_node_event(
     detail: Value,
 ) -> Result<(), String> {
     let payload = node_event_payload(config, phase, status, detail);
-    emit_stdio_datastream_frame(channel, &payload)
+    emit_stdio_telemetry_frame(channel, &payload)
 }
 
 fn emit_node_event(
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
     config: &DeploymentConfig,
     channel: &str,
     phase: &str,
     status: &str,
     detail: Value,
 ) {
-    let channel = datastream.channel_by_name(channel);
-    datastream.submit_text(
+    let channel = telemetry.channel_by_name(channel);
+    telemetry.submit_text(
         channel,
         node_event_payload(config, phase, status, detail).to_string(),
     );
-    datastream.tick();
+    telemetry.tick();
 }
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -439,7 +439,7 @@ fn drain_debug_join_commands(
     debug_join_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<DebugJoinCommand>>,
     driver: &mut IrohDriver,
     config: &DeploymentConfig,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
 ) {
     let Some(rx) = debug_join_rx else {
         return;
@@ -452,7 +452,7 @@ fn drain_debug_join_commands(
                 let direct_addr_count = endpoint.ip_addrs().count();
                 driver.join(std::slice::from_ref(&endpoint));
                 emit_node_event(
-                    datastream,
+                    telemetry,
                     config,
                     NODE_RUNTIME_CHANNEL,
                     "debug_join",
@@ -526,7 +526,7 @@ fn sampler_health_payload(
 }
 
 fn submit_sampler_health(
-    producer: &DatastreamProducer,
+    producer: &TelemetryProducer,
     channel: ChannelId,
     context: SamplerHealthContext,
     sampler: &str,
@@ -541,7 +541,7 @@ fn submit_sampler_health(
 }
 
 fn submit_sampler_started(
-    producer: &DatastreamProducer,
+    producer: &TelemetryProducer,
     health_channel: ChannelId,
     context: SamplerHealthContext,
     sampler: &str,
@@ -569,7 +569,7 @@ fn submit_sampler_started(
 }
 
 fn submit_sampler_sample_health(
-    producer: &DatastreamProducer,
+    producer: &TelemetryProducer,
     health_channel: ChannelId,
     context: SamplerHealthContext,
     sampler: &str,
@@ -597,7 +597,7 @@ fn submit_sampler_sample_health(
 
 fn spawn_blocking_sampler<S: Record + Send + 'static>(
     engine: EngineHandle,
-    producer: DatastreamProducer,
+    producer: TelemetryProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
@@ -653,7 +653,7 @@ fn spawn_blocking_sampler<S: Record + Send + 'static>(
 
 fn spawn_host_gpu_sampler(
     engine: EngineHandle,
-    producer: DatastreamProducer,
+    producer: TelemetryProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
@@ -665,18 +665,18 @@ fn spawn_host_gpu_sampler(
         health_channel,
         health_context,
         "gpu",
-        datastream::hardware::gpu::HOST_GPU_CHANNEL,
-        datastream::hardware::gpu::GPU_SAMPLE_INTERVAL,
+        telemetry::hardware::gpu::HOST_GPU_CHANNEL,
+        telemetry::hardware::gpu::GPU_SAMPLE_INTERVAL,
         "gpu sampler task failed",
-        datastream::hardware::gpu::sample,
-        datastream::hardware::gpu::HostGpuSample::error,
+        telemetry::hardware::gpu::sample,
+        telemetry::hardware::gpu::HostGpuSample::error,
         |s| s.error.as_deref(),
     );
 }
 
 fn spawn_host_cpu_sampler(
     engine: EngineHandle,
-    producer: DatastreamProducer,
+    producer: TelemetryProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
@@ -684,7 +684,7 @@ fn spawn_host_cpu_sampler(
 ) {
     let engine_inner = engine.clone();
     engine.spawn(async move {
-        use datastream::hardware::cpu::{
+        use telemetry::hardware::cpu::{
             CPU_SAMPLE_INTERVAL, CpuSampler, HOST_CPU_CHANNEL, HostCpuSample,
         };
         submit_sampler_started(
@@ -741,7 +741,7 @@ fn spawn_host_cpu_sampler(
 }
 fn spawn_host_net_sampler(
     engine: EngineHandle,
-    producer: DatastreamProducer,
+    producer: TelemetryProducer,
     channel: ChannelId,
     health_channel: ChannelId,
     health_context: SamplerHealthContext,
@@ -753,18 +753,18 @@ fn spawn_host_net_sampler(
         health_channel,
         health_context,
         "net",
-        datastream::hardware::net::HOST_NET_CHANNEL,
-        datastream::hardware::net::HOST_NET_SAMPLE_INTERVAL,
+        telemetry::hardware::net::HOST_NET_CHANNEL,
+        telemetry::hardware::net::HOST_NET_SAMPLE_INTERVAL,
         "network sampler task failed",
-        datastream::hardware::net::sample,
-        datastream::hardware::net::HostNetSample::error,
+        telemetry::hardware::net::sample,
+        telemetry::hardware::net::HostNetSample::error,
         |s| s.error.as_deref(),
     );
 }
 
 fn spawn_arena_sampler(
     engine: EngineHandle,
-    producer: DatastreamProducer,
+    producer: TelemetryProducer,
     channel: ChannelId,
     arena_manager: Arc<Mutex<arena::ArenaManager>>,
 ) {
@@ -841,9 +841,9 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
-        let node_stage = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+        let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
         };
         for event in driver.drain_edge_events() {
@@ -856,7 +856,7 @@ impl WorkerEdgeRuntime {
                         driver_model::StreamId(stream_id),
                     );
                     node_stage(
-                        datastream,
+                        telemetry,
                         "iroh_edge_stream_arrived",
                         "observed",
                         json!({"edge_id":edge_id,"stream_id":stream_id}),
@@ -867,7 +867,7 @@ impl WorkerEdgeRuntime {
                         worker,
                         arena_manager,
                         config,
-                        datastream,
+                        telemetry,
                         driver,
                     )?;
                 }
@@ -879,7 +879,7 @@ impl WorkerEdgeRuntime {
                 } => {
                     let byte_count = bytes.len();
                     node_stage(
-                        datastream,
+                        telemetry,
                         "iroh_edge_bytes_read",
                         "observed",
                         json!({"edge_id":edge_id,"stream_id":stream_id,"bytes":byte_count}),
@@ -893,7 +893,7 @@ impl WorkerEdgeRuntime {
                         worker,
                         arena_manager,
                         config,
-                        datastream,
+                        telemetry,
                         driver,
                     )?;
                 }
@@ -908,7 +908,7 @@ impl WorkerEdgeRuntime {
                         worker,
                         arena_manager,
                         config,
-                        datastream,
+                        telemetry,
                         driver,
                     )?;
                 }
@@ -928,7 +928,7 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         driver: &mut IrohDriver,
     ) -> Result<(), String> {
         self.inbound_edge = Some(edge.clone());
@@ -954,7 +954,7 @@ impl WorkerEdgeRuntime {
             worker,
             arena_manager,
             config,
-            datastream,
+            telemetry,
             driver,
         )
     }
@@ -968,7 +968,7 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         driver: &mut IrohDriver,
     ) -> Result<(), String> {
         if edge.consumer_endpoint.is_none() {
@@ -1008,7 +1008,7 @@ impl WorkerEdgeRuntime {
             worker,
             arena_manager,
             config,
-            datastream,
+            telemetry,
             driver,
         )
     }
@@ -1025,10 +1025,10 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         _driver: &mut IrohDriver,
     ) -> Result<(), String> {
-        let node_stage = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+        let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
         };
         let input_key = ObjectKey {
@@ -1072,7 +1072,7 @@ impl WorkerEdgeRuntime {
             final_stage,
             outbound.object_spec,
             config,
-            datastream,
+            telemetry,
         ) {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -1106,7 +1106,7 @@ impl WorkerEdgeRuntime {
         let egress_read_ms = duration_ms_u64(egress_read_started.elapsed());
         let record_bytes = record.len();
         node_stage(
-            datastream,
+            telemetry,
             "egress_ring_read",
             "ready",
             json!({
@@ -1142,7 +1142,7 @@ impl WorkerEdgeRuntime {
         }
         let edge_send_ms = duration_ms_u64(edge_send_started.elapsed());
         node_stage(
-            datastream,
+            telemetry,
             "iroh_edge_bytes_sent",
             "ready",
             json!({
@@ -1167,11 +1167,11 @@ impl WorkerEdgeRuntime {
         handle_id: u64,
         worker: &mut TinygradWorker,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         _driver: &mut IrohDriver,
         _stack: &DistributionRuntimeStack,
     ) -> Result<(), String> {
-        worker.release_device_object(handle_id, config, datastream)
+        worker.release_device_object(handle_id, config, telemetry)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1185,10 +1185,10 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         driver: &mut IrohDriver,
     ) -> Result<(), String> {
-        let node_stage = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+        let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
         };
         let Some(inbound) = self.inbound_edge.clone() else {
@@ -1236,7 +1236,7 @@ impl WorkerEdgeRuntime {
             }
             let ingress_ring_write_ms = duration_ms_u64(ring_write_started.elapsed());
             node_stage(
-                datastream,
+                telemetry,
                 "ingress_ring_write",
                 "ready",
                 json!({
@@ -1260,7 +1260,7 @@ impl WorkerEdgeRuntime {
                 edge_id,
                 inbound.object_spec,
                 config,
-                datastream,
+                telemetry,
             ) {
                 Ok(loaded) => loaded,
                 Err(e) => {
@@ -1281,7 +1281,7 @@ impl WorkerEdgeRuntime {
             };
             self.object_handles.insert(key, loaded.clone());
             node_stage(
-                datastream,
+                telemetry,
                 "object_loaded",
                 "ready",
                 json!({
@@ -1316,7 +1316,7 @@ impl WorkerEdgeRuntime {
             worker,
             arena_manager,
             config,
-            datastream,
+            telemetry,
             driver,
         )
     }
@@ -1329,12 +1329,12 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         driver: &mut IrohDriver,
     ) -> Result<(), String> {
         loop {
             let progressed =
-                self.drain_edge_commands(worker, arena_manager, config, datastream, driver)?
+                self.drain_edge_commands(worker, arena_manager, config, telemetry, driver)?
                     || self.drain_driver_events()
                     || self.drain_edge_events(stack, node_actor)?;
             if !progressed {
@@ -1349,7 +1349,7 @@ impl WorkerEdgeRuntime {
         worker: &mut TinygradWorker,
         arena_manager: &Arc<Mutex<arena::ArenaManager>>,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         driver: &mut IrohDriver,
     ) -> Result<bool, String> {
         let mut progressed = false;
@@ -1457,7 +1457,7 @@ impl WorkerEdgeRuntime {
                         lease.layout,
                         wire_spec,
                         config,
-                        datastream,
+                        telemetry,
                     )?;
                     self.establisher
                         .observe(edge::EdgeEvent::RingInstalled { edge_id, ring_id });
@@ -1508,7 +1508,7 @@ impl WorkerEdgeRuntime {
                     self.driver_model.stop_edge(driver_model::EdgeId(edge_id.0));
                 }
                 edge::EdgeCommand::UninstallWorkerRing { ring_id, .. } => {
-                    worker.uninstall_ring(ring_id.0, config, datastream)?;
+                    worker.uninstall_ring(ring_id.0, config, telemetry)?;
                     self.establisher
                         .observe(edge::EdgeEvent::RingQuiesced { ring_id });
                 }
@@ -1729,19 +1729,19 @@ fn run() -> Result<(), String> {
         json!({"binary":"myelin-worker","pid":std::process::id()}),
     )?;
 
-    // Datastream must exist before the runtime: its stats hook is wired in
+    // Telemetry must exist before the runtime: its stats hook is wired in
     // during runtime construction.
-    let mut datastream = NodeDatastream::new(&config);
+    let mut telemetry = NodeTelemetry::new(&config);
 
     // Build the core swactor runtime parts, clone the routing handle needed by
     // integrations, then hand the workers to the engine. The engine owns both
     // core progression and the Tokio substrate (it schedules all background
     // work); components retain only cheap Runtime handles (ENGINE_SPEC.md).
-    let worker_stats_hook = datastream.producer.stats_hook();
+    let worker_stats_hook = telemetry.producer.stats_hook();
     let (parts, runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
         |registry| {
             register_myelin_actor_codecs(registry);
-            datastream::wire::register_datastream_codec(registry);
+            telemetry::wire::register_telemetry_codec(registry);
         },
         Some(worker_stats_hook),
     );
@@ -1768,7 +1768,7 @@ fn run() -> Result<(), String> {
             relay_mode: config.relay_mode.clone(),
             node: DistributedNodeConfig::default(),
             peer_auth: None,
-            additional_alpns: vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()],
+            additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
         },
     ) {
         Ok(driver) => driver,
@@ -1815,7 +1815,7 @@ fn run() -> Result<(), String> {
     boot(
         "codecs",
         "ready",
-        json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","datastream"]}),
+        json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
     )?;
     driver.enable_actor_bridge(
         stack.runtime.clone(),
@@ -1863,81 +1863,81 @@ fn run() -> Result<(), String> {
     };
     let arena_fd = arena_manager.lock().arena_fd();
 
-    let node_boot = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_boot = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, &config, NODE_BOOTSTRAP_CHANNEL, phase, status, detail)
     };
-    let node_runtime = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_runtime = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, &config, NODE_RUNTIME_CHANNEL, phase, status, detail)
     };
-    let node_shutdown = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_shutdown = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, &config, NODE_SHUTDOWN_CHANNEL, phase, status, detail)
     };
-    let datastream_transport = driver.datastream_publish_handle();
-    let datastream_publisher = match stack
+    let telemetry_transport = driver.telemetry_publish_handle();
+    let telemetry_publisher = match stack
         .runtime
-        .spawn(datastream.publisher_actor(datastream_transport))
+        .spawn(telemetry.publisher_actor(telemetry_transport))
     {
         Ok(actor) => actor,
         Err(error) => {
             node_boot(
-                &mut datastream,
-                "datastream_publisher",
+                &mut telemetry,
+                "telemetry_publisher",
                 "failed",
                 json!({"error":error.to_string()}),
             );
-            return Err(format!("spawn datastream publisher: {error}"));
+            return Err(format!("spawn telemetry publisher: {error}"));
         }
     };
-    stack.register_local_actor(driver.register_actor(datastream_publisher, 1));
-    let sampler_health_channel = datastream.channel_by_name(NODE_SAMPLER_CHANNEL);
+    stack.register_local_actor(driver.register_actor(telemetry_publisher, 1));
+    let sampler_health_channel = telemetry.channel_by_name(NODE_SAMPLER_CHANNEL);
     let sampler_health_context = SamplerHealthContext::from_config(&config);
     spawn_host_gpu_sampler(
         engine.handle(),
-        datastream.producer.clone(),
-        datastream.channels.host_gpu,
+        telemetry.producer.clone(),
+        telemetry.channels.host_gpu,
         sampler_health_channel,
         sampler_health_context,
     );
     spawn_host_net_sampler(
         engine.handle(),
-        datastream.producer.clone(),
-        datastream.channels.host_net,
+        telemetry.producer.clone(),
+        telemetry.channels.host_net,
         sampler_health_channel,
         sampler_health_context,
     );
     spawn_arena_sampler(
         engine.handle(),
-        datastream.producer.clone(),
-        datastream.channels.arena,
+        telemetry.producer.clone(),
+        telemetry.channels.arena,
         Arc::clone(&arena_manager),
     );
     node_boot(
-        &mut datastream,
-        "datastream_publisher",
+        &mut telemetry,
+        "telemetry_publisher",
         "ready",
-        json!({"actor":datastream_publisher,"name":DATASTREAM_PUBLISHER_NAME,"subscription_transport":"iroh"}),
+        json!({"actor":telemetry_publisher,"name":TELEMETRY_PUBLISHER_NAME,"subscription_transport":"iroh"}),
     );
     let worker_synthetic_id = format!(
-        "myelin-worker-{}-{}-datastream-preflight",
+        "myelin-worker-{}-{}-telemetry-preflight",
         config.logical_node_id, config.stage_index
     );
     for (phase, status) in [
-        ("DatastreamProducerConfigured", "configured"),
-        ("DatastreamProducerConnected", "ready"),
-        ("DatastreamSyntheticEventSent", "sent"),
-        ("DatastreamSyntheticEventObserved", "observed"),
+        ("TelemetryProducerConfigured", "configured"),
+        ("TelemetryProducerConnected", "ready"),
+        ("TelemetrySyntheticEventSent", "sent"),
+        ("TelemetrySyntheticEventObserved", "observed"),
     ] {
         node_boot(
-            &mut datastream,
+            &mut telemetry,
             phase,
             status,
             json!({
                 "producer":"myelin-worker",
                 "producer_class":"rust-worker-node",
                 "synthetic_id":worker_synthetic_id,
-                "datastream_endpoint":{
+                "telemetry_endpoint":{
                     "role":"worker-node-iroh-publisher",
-                    "transport":"iroh-datastream",
+                    "transport":"iroh-telemetry",
                     "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
                     "relay_mode":format!("{:?}", config.relay_mode),
                 },
@@ -1948,7 +1948,7 @@ fn run() -> Result<(), String> {
         Some(path) => match spawn_debug_join_listener(engine.handle(), PathBuf::from(path)) {
             Ok(rx) => {
                 node_runtime(
-                    &mut datastream,
+                    &mut telemetry,
                     "debug_join_socket",
                     "ready",
                     json!({"socket":path}),
@@ -1957,7 +1957,7 @@ fn run() -> Result<(), String> {
             }
             Err(error) => {
                 node_runtime(
-                    &mut datastream,
+                    &mut telemetry,
                     "debug_join_socket",
                     "failed",
                     json!({"socket":path,"error":error}),
@@ -1967,7 +1967,7 @@ fn run() -> Result<(), String> {
         },
         None => {
             node_runtime(
-                &mut datastream,
+                &mut telemetry,
                 "debug_join_socket",
                 "skipped",
                 json!({"reason":"MYELIN_DEBUG_JOIN_SOCKET=disabled"}),
@@ -2050,8 +2050,8 @@ fn run() -> Result<(), String> {
     };
     spawn_host_cpu_sampler(
         engine.handle(),
-        datastream.producer.clone(),
-        datastream.channels.host_cpu,
+        telemetry.producer.clone(),
+        telemetry.channels.host_cpu,
         sampler_health_channel,
         sampler_health_context,
         vec![std::process::id(), worker.child.id()],
@@ -2061,7 +2061,7 @@ fn run() -> Result<(), String> {
         "started",
         json!({"command":"InitializeWorker","helper_abi_version":1,"device":&config.device}),
     )?;
-    match worker.initialize(&config.device, &config, &mut datastream) {
+    match worker.initialize(&config.device, &config, &mut telemetry) {
         Ok(()) => worker_evt(
             "worker_initialize",
             "ready",
@@ -2077,7 +2077,7 @@ fn run() -> Result<(), String> {
         &config,
         advertised_self_endpoint.clone(),
         node_actor,
-        datastream_publisher,
+        telemetry_publisher,
     );
 
     let ready = json!({
@@ -2085,7 +2085,7 @@ fn run() -> Result<(), String> {
         "role":"node",
         "endpoint": advertised_self_endpoint.clone(),
         "node_actor": node_actor,
-        "datastream_publisher": datastream_publisher,
+        "telemetry_publisher": telemetry_publisher,
         "logical_node_id": config.logical_node_id,
         "stage_index": config.stage_index,
     });
@@ -2106,7 +2106,7 @@ fn run() -> Result<(), String> {
             &mut worker,
             &config,
             prompt,
-            &mut datastream,
+            &mut telemetry,
             &mut driver,
             &stack,
         )?;
@@ -2114,25 +2114,25 @@ fn run() -> Result<(), String> {
 
     let shutdown_rx = spawn_stdin_shutdown_listener();
     node_runtime(
-        &mut datastream,
+        &mut telemetry,
         "stdin_shutdown_listener",
         "ready",
         json!({"command":"shutdown"}),
     );
     node_runtime(
-        &mut datastream,
+        &mut telemetry,
         "main_loop",
         "started",
         json!({
             "poll_interval_ms":PUMP_INTERVAL.as_millis(),
-            "checks":["network","edge_streams","datastream","node_reports","stdin_shutdown","worker_health"],
+            "checks":["network","edge_streams","telemetry","node_reports","stdin_shutdown","worker_health"],
         }),
     );
     loop {
-        emit_swim_telemetry(&mut datastream, &stack, "main_loop");
-        drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut datastream);
-        datastream.tick();
-        drain_worker_stderr(&worker.stderr_rx, &config, &mut datastream);
+        emit_swim_telemetry(&mut telemetry, &stack, "main_loop");
+        drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut telemetry);
+        telemetry.tick();
+        drain_worker_stderr(&worker.stderr_rx, &config, &mut telemetry);
         edge_runtime.poll_iroh(
             &mut driver,
             &stack,
@@ -2140,7 +2140,7 @@ fn run() -> Result<(), String> {
             &mut worker,
             &arena_manager,
             &config,
-            &mut datastream,
+            &mut telemetry,
         )?;
         while let Some(report) = reports.try_recv() {
             match handle_node_report(
@@ -2152,7 +2152,7 @@ fn run() -> Result<(), String> {
                 &mut worker,
                 &mut edge_runtime,
                 &arena_manager,
-                &mut datastream,
+                &mut telemetry,
             )? {
                 NodeReportOutcome::None => {}
                 NodeReportOutcome::RuntimeReadyAck {
@@ -2164,7 +2164,7 @@ fn run() -> Result<(), String> {
                     if pending_runtime_ready.observe_ack(run_id, node_id, stage_index, readiness_id)
                     {
                         node_boot(
-                            &mut datastream,
+                            &mut telemetry,
                             "runtime_ready_ack",
                             "ready",
                             json!({
@@ -2174,12 +2174,12 @@ fn run() -> Result<(), String> {
                                 "node_actor":pending_runtime_ready.node_actor,
                             }),
                         );
-                        datastream.submit_text(datastream.channels.node_ready, ready.to_string());
+                        telemetry.submit_text(telemetry.channels.node_ready, ready.to_string());
                         node_boot(
-                            &mut datastream,
-                            "datastream_handoff",
+                            &mut telemetry,
+                            "telemetry_handoff",
                             "ready",
-                            json!({"from":"runtime_ready_ack","to":"cluster_datastream","channel":"myelin.node.ready"}),
+                            json!({"from":"runtime_ready_ack","to":"cluster_telemetry","channel":"myelin.node.ready"}),
                         );
                     }
                 }
@@ -2187,7 +2187,7 @@ fn run() -> Result<(), String> {
         }
         if !pending_runtime_ready.swim_logged && pending_runtime_ready.swim_ready(&stack) {
             node_runtime(
-                &mut datastream,
+                &mut telemetry,
                 "coordinator_swim",
                 "ready",
                 json!({
@@ -2202,7 +2202,7 @@ fn run() -> Result<(), String> {
         }
         if !pending_runtime_ready.acked && pending_runtime_ready.maybe_send(&stack, node_actor)? {
             node_runtime(
-                &mut datastream,
+                &mut telemetry,
                 "runtime_ready_signal",
                 "sent",
                 json!({
@@ -2214,28 +2214,28 @@ fn run() -> Result<(), String> {
         }
         if shutdown_rx.try_recv().is_ok() {
             node_shutdown(
-                &mut datastream,
+                &mut telemetry,
                 "shutdown",
                 "started",
                 json!({"source":"stdin","command":"shutdown"}),
             );
-            match worker.shutdown(&config, &mut datastream) {
+            match worker.shutdown(&config, &mut telemetry) {
                 Ok(()) => {
                     node_shutdown(
-                        &mut datastream,
+                        &mut telemetry,
                         "worker_shutdown",
                         "ready",
                         json!({"worker_event_type":"WorkerStopped"}),
                     );
                     node_shutdown(
-                        &mut datastream,
+                        &mut telemetry,
                         "node_exit",
                         "ready",
                         json!({"result":"ok"}),
                     );
                 }
                 Err(error) => node_shutdown(
-                    &mut datastream,
+                    &mut telemetry,
                     "worker_shutdown",
                     "failed",
                     json!({"error":error}),
@@ -2245,7 +2245,7 @@ fn run() -> Result<(), String> {
         }
         if let Some(status) = worker.try_wait()? {
             node_shutdown(
-                &mut datastream,
+                &mut telemetry,
                 "worker_process",
                 "failed",
                 json!({"exit_status":status.to_string()}),
@@ -2263,26 +2263,26 @@ fn run() -> Result<(), String> {
 }
 
 fn emit_swim_telemetry(
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
     stack: &DistributionRuntimeStack,
     local_phase: &str,
 ) {
     for transition in stack.drain_swim_transitions() {
         let record = stack.membership_transition(&transition);
-        datastream
+        telemetry
             .producer
-            .submit_record(datastream.channels.membership, &record);
+            .submit_record(telemetry.channels.membership, &record);
     }
     for event in stack.drain_swim_probe_events() {
         let record = stack.swim_probe_event_record(event, local_phase);
-        datastream
+        telemetry
             .producer
-            .submit_record(datastream.channels.swim_probes, &record);
+            .submit_record(telemetry.channels.swim_probes, &record);
     }
 }
 
 #[derive(Clone, Copy)]
-struct DatastreamChannelSet {
+struct TelemetryChannelSet {
     node_ready: ChannelId,
     node_lifecycle: ChannelId,
     node_self_test: ChannelId,
@@ -2295,22 +2295,22 @@ struct DatastreamChannelSet {
     arena: ChannelId,
 }
 
-struct NodeDatastream {
-    endpoint: Arc<DatastreamEndpoint>,
-    producer: DatastreamProducer,
-    channels: DatastreamChannelSet,
+struct NodeTelemetry {
+    endpoint: Arc<TelemetryEndpoint>,
+    producer: TelemetryProducer,
+    channels: TelemetryChannelSet,
     by_name: BTreeMap<String, ChannelId>,
     by_id: BTreeMap<ChannelId, String>,
-    archive: Option<DatastreamArchive>,
+    archive: Option<TelemetryArchive>,
 }
 
-impl NodeDatastream {
+impl NodeTelemetry {
     fn new(config: &DeploymentConfig) -> Self {
         let stream = StreamId::new(
             NodeId::new(config.logical_node_id.to_string()),
             Lifetime(config.run_id),
         );
-        let endpoint = Arc::new(DatastreamEndpoint::with_descriptor(
+        let endpoint = Arc::new(TelemetryEndpoint::with_descriptor(
             StreamDescriptor {
                 stream: stream.clone(),
                 label: Some("myelin worker node".to_owned()),
@@ -2345,7 +2345,7 @@ impl NodeDatastream {
             register_json_channel(&producer, &mut by_name, &mut by_id, name);
         }
 
-        let channels = DatastreamChannelSet {
+        let channels = TelemetryChannelSet {
             node_ready: register_json_channel(
                 &producer,
                 &mut by_name,
@@ -2370,17 +2370,17 @@ impl NodeDatastream {
                 &mut by_id,
                 "myelin.worker.stderr",
             ),
-            host_cpu: register_record_channel::<datastream::hardware::cpu::HostCpuSample>(
+            host_cpu: register_record_channel::<telemetry::hardware::cpu::HostCpuSample>(
                 &producer,
                 &mut by_name,
                 &mut by_id,
             ),
-            host_gpu: register_record_channel::<datastream::hardware::gpu::HostGpuSample>(
+            host_gpu: register_record_channel::<telemetry::hardware::gpu::HostGpuSample>(
                 &producer,
                 &mut by_name,
                 &mut by_id,
             ),
-            host_net: register_record_channel::<datastream::hardware::net::HostNetSample>(
+            host_net: register_record_channel::<telemetry::hardware::net::HostNetSample>(
                 &producer,
                 &mut by_name,
                 &mut by_id,
@@ -2401,8 +2401,8 @@ impl NodeDatastream {
                 &mut by_id,
             ),
         };
-        let archive = config.datastream_frame_log.as_deref().and_then(|path| {
-            DatastreamArchive::open(path, endpoint.subscribe_all("frame-log")).ok()
+        let archive = config.telemetry_frame_log.as_deref().and_then(|path| {
+            TelemetryArchive::open(path, endpoint.subscribe_all("frame-log")).ok()
         });
 
         Self {
@@ -2433,11 +2433,11 @@ impl NodeDatastream {
         }
     }
 
-    fn publisher_actor(&self, transport: DatastreamPublishHandle) -> DatastreamPublisherActor {
-        DatastreamPublisherActor::new(
+    fn publisher_actor(&self, transport: TelemetryPublishHandle) -> TelemetryPublisherActor {
+        TelemetryPublisherActor::new(
             Arc::clone(&self.endpoint),
-            move |subscribe: DatastreamSubscribe, subscription: DatastreamSubscription| {
-                let Ok(header) = DatastreamQuicHeader::from_snapshot(
+            move |subscribe: TelemetrySubscribe, subscription: TelemetrySubscription| {
+                let Ok(header) = TelemetryQuicHeader::from_snapshot(
                     subscribe.flow_id,
                     subscribe.token,
                     subscription.snapshot(),
@@ -2456,7 +2456,7 @@ impl NodeDatastream {
 }
 
 fn register_json_channel(
-    producer: &DatastreamProducer,
+    producer: &TelemetryProducer,
     by_name: &mut BTreeMap<String, ChannelId>,
     by_id: &mut BTreeMap<ChannelId, String>,
     name: &str,
@@ -2473,7 +2473,7 @@ fn register_json_channel(
 }
 
 fn register_record_channel<R: Record>(
-    producer: &DatastreamProducer,
+    producer: &TelemetryProducer,
     by_name: &mut BTreeMap<String, ChannelId>,
     by_id: &mut BTreeMap<ChannelId, String>,
 ) -> ChannelId {
@@ -2483,13 +2483,13 @@ fn register_record_channel<R: Record>(
     id
 }
 
-struct DatastreamArchive {
+struct TelemetryArchive {
     file: File,
-    subscription: DatastreamSubscription,
+    subscription: TelemetrySubscription,
 }
 
-impl DatastreamArchive {
-    fn open(path: &str, subscription: DatastreamSubscription) -> std::io::Result<Self> {
+impl TelemetryArchive {
+    fn open(path: &str, subscription: TelemetrySubscription) -> std::io::Result<Self> {
         Ok(Self {
             file: OpenOptions::new().create(true).append(true).open(path)?,
             subscription,
@@ -2498,7 +2498,7 @@ impl DatastreamArchive {
 
     fn drain(&mut self, channel_names: &BTreeMap<ChannelId, String>) {
         for event in self.subscription.drain_available() {
-            if let DatastreamEvent::Frame(frame) = event {
+            if let TelemetryEvent::Frame(frame) = event {
                 let channel = channel_names
                     .get(&frame.channel.channel)
                     .cloned()
@@ -2534,7 +2534,7 @@ struct PendingRuntimeReady {
     stage_index: u32,
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
-    datastream_publisher: ActorAddress,
+    telemetry_publisher: ActorAddress,
     coordinator: Option<DistNodeId>,
     readiness_id: u64,
     attempts: u32,
@@ -2549,7 +2549,7 @@ impl PendingRuntimeReady {
         config: &DeploymentConfig,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
-        datastream_publisher: ActorAddress,
+        telemetry_publisher: ActorAddress,
     ) -> Self {
         Self {
             run_id: config.run_id,
@@ -2557,7 +2557,7 @@ impl PendingRuntimeReady {
             stage_index: config.stage_index,
             endpoint,
             node_actor,
-            datastream_publisher,
+            telemetry_publisher,
             coordinator: config
                 .coordinator_endpoint
                 .as_ref()
@@ -2619,7 +2619,7 @@ impl PendingRuntimeReady {
                     stage_index: self.stage_index,
                     endpoint: self.endpoint.clone(),
                     node_actor: self.node_actor,
-                    datastream_publisher: self.datastream_publisher,
+                    telemetry_publisher: self.telemetry_publisher,
                     readiness_id: self.readiness_id,
                 },
             )
@@ -2644,9 +2644,9 @@ fn handle_node_report(
     worker: &mut TinygradWorker,
     edge_runtime: &mut WorkerEdgeRuntime,
     arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
 ) -> Result<NodeReportOutcome, String> {
-    let node_stage = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
     };
     let kind = match &report {
@@ -2659,7 +2659,7 @@ fn handle_node_report(
         NodeAgentReport::Snapshot { .. } => "Snapshot",
     };
     emit_node_event(
-        datastream,
+        telemetry,
         config,
         NODE_RUNTIME_CHANNEL,
         "node_report",
@@ -2677,17 +2677,17 @@ fn handle_node_report(
                 worker,
                 edge_runtime,
                 arena_manager,
-                datastream,
+                telemetry,
             )?;
             Ok(NodeReportOutcome::None)
         }
         NodeAgentReport::Lifecycle(event) => {
             let event = format!("{event:?}");
-            datastream.submit_text(
-                datastream.channels.node_lifecycle,
+            telemetry.submit_text(
+                telemetry.channels.node_lifecycle,
                 json!({"type":"node_lifecycle","event":event}).to_string(),
             );
-            node_stage(datastream, "lifecycle", "observed", json!({"event":event}));
+            node_stage(telemetry, "lifecycle", "observed", json!({"event":event}));
             Ok(NodeReportOutcome::None)
         }
         NodeAgentReport::PromptRequested {
@@ -2697,7 +2697,7 @@ fn handle_node_report(
             reply_to,
         } => {
             handle_prompt_request(
-                request_id, prompt, max_tokens, reply_to, config, stack, driver, worker, datastream,
+                request_id, prompt, max_tokens, reply_to, config, stack, driver, worker, telemetry,
             )?;
             Ok(NodeReportOutcome::None)
         }
@@ -2707,7 +2707,7 @@ fn handle_node_report(
             reply_to,
         } => {
             handle_encode_prompt_request(
-                request_id, prompt, reply_to, config, stack, driver, worker, datastream,
+                request_id, prompt, reply_to, config, stack, driver, worker, telemetry,
             )?;
             Ok(NodeReportOutcome::None)
         }
@@ -2717,7 +2717,7 @@ fn handle_node_report(
             reply_to,
         } => {
             handle_decode_tokens_request(
-                request_id, tokens, reply_to, config, stack, driver, worker, datastream,
+                request_id, tokens, reply_to, config, stack, driver, worker, telemetry,
             )?;
             Ok(NodeReportOutcome::None)
         }
@@ -2745,25 +2745,25 @@ fn handle_prompt_request(
     stack: &DistributionRuntimeStack,
     _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
-    let node_prompt = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_prompt = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_PROMPT_CHANNEL, phase, status, detail)
     };
     let started = Instant::now();
     node_prompt(
-        datastream,
+        telemetry,
         "prompt_requested",
         "started",
         json!({"request_id":request_id,"max_tokens":max_tokens,"reply_to":reply_to,"prompt_bytes":prompt.len()}),
     );
     node_prompt(
-        datastream,
+        telemetry,
         "infer_prompt",
         "started",
         json!({"request_id":request_id,"command":"InferPrompt","max_tokens":max_tokens}),
     );
-    match worker.infer_prompt(request_id, &prompt, max_tokens, config, datastream) {
+    match worker.infer_prompt(request_id, &prompt, max_tokens, config, telemetry) {
         Ok(result) => {
             let text = result
                 .get("text")
@@ -2785,7 +2785,7 @@ fn handle_prompt_request(
                 .and_then(Value::as_u64)
                 .unwrap_or_else(|| started.elapsed().as_millis() as u64);
             node_prompt(
-                datastream,
+                telemetry,
                 "infer_prompt",
                 "ready",
                 json!({"request_id":request_id,"worker_event_type":"PromptCompleted","prompt_tokens":prompt_tokens,"tokens_generated":tokens_generated,"elapsed_ms":elapsed_ms,"text_bytes":text_bytes,"worker_result_payload_bytes":worker_result_payload_bytes}),
@@ -2799,14 +2799,14 @@ fn handle_prompt_request(
                     },
                 ) {
                     Ok(()) => node_prompt(
-                        datastream,
+                        telemetry,
                         "prompt_response",
                         "ready",
                         json!({"request_id":request_id,"event":"TextDelta","bytes":text_bytes,"reply_to":reply_to}),
                     ),
                     Err(error) => {
                         node_prompt(
-                            datastream,
+                            telemetry,
                             "prompt_response",
                             "failed",
                             json!({"request_id":request_id,"event":"TextDelta","error":error.to_string()}),
@@ -2826,7 +2826,7 @@ fn handle_prompt_request(
             ) {
                 Ok(()) => {
                     node_prompt(
-                        datastream,
+                        telemetry,
                         "prompt_response",
                         "ready",
                         json!({"request_id":request_id,"event":"Done","tokens_generated":tokens_generated,"elapsed_ms":elapsed_ms,"final_text_bytes":text_bytes,"reply_to":reply_to}),
@@ -2835,7 +2835,7 @@ fn handle_prompt_request(
                 }
                 Err(error) => {
                     node_prompt(
-                        datastream,
+                        telemetry,
                         "prompt_response",
                         "failed",
                         json!({"request_id":request_id,"event":"Done","error":error.to_string()}),
@@ -2846,7 +2846,7 @@ fn handle_prompt_request(
         }
         Err(error) => {
             node_prompt(
-                datastream,
+                telemetry,
                 "infer_prompt",
                 "failed",
                 json!({"request_id":request_id,"error":error}),
@@ -2860,7 +2860,7 @@ fn handle_prompt_request(
             ) {
                 Ok(()) => {
                     node_prompt(
-                        datastream,
+                        telemetry,
                         "prompt_response",
                         "ready",
                         json!({"request_id":request_id,"event":"Fault","reply_to":reply_to}),
@@ -2869,7 +2869,7 @@ fn handle_prompt_request(
                 }
                 Err(send_error) => {
                     node_prompt(
-                        datastream,
+                        telemetry,
                         "prompt_response",
                         "failed",
                         json!({"request_id":request_id,"event":"Fault","error":send_error.to_string()}),
@@ -2889,21 +2889,21 @@ fn handle_encode_prompt_request(
     stack: &DistributionRuntimeStack,
     _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
-    let node_prompt = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_prompt = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_PROMPT_CHANNEL, phase, status, detail)
     };
     node_prompt(
-        datastream,
+        telemetry,
         "encode_prompt",
         "started",
         json!({"request_id":request_id,"prompt_bytes":prompt.len(),"reply_to":reply_to}),
     );
-    let event = match worker.encode_prompt(request_id, &prompt, config, datastream) {
+    let event = match worker.encode_prompt(request_id, &prompt, config, telemetry) {
         Ok(tokens) => {
             node_prompt(
-                datastream,
+                telemetry,
                 "encode_prompt",
                 "ready",
                 json!({"request_id":request_id,"tokens":tokens.len(),"reply_to":reply_to}),
@@ -2912,7 +2912,7 @@ fn handle_encode_prompt_request(
         }
         Err(error) => {
             node_prompt(
-                datastream,
+                telemetry,
                 "encode_prompt",
                 "failed",
                 json!({"request_id":request_id,"error":error,"reply_to":reply_to}),
@@ -2934,21 +2934,21 @@ fn handle_decode_tokens_request(
     stack: &DistributionRuntimeStack,
     _driver: &mut IrohDriver,
     worker: &mut TinygradWorker,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
-    let node_prompt = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_prompt = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_PROMPT_CHANNEL, phase, status, detail)
     };
     node_prompt(
-        datastream,
+        telemetry,
         "decode_tokens",
         "started",
         json!({"request_id":request_id,"tokens":tokens.len(),"reply_to":reply_to}),
     );
-    let event = match worker.decode_tokens(request_id, &tokens, config, datastream) {
+    let event = match worker.decode_tokens(request_id, &tokens, config, telemetry) {
         Ok(text) => {
             node_prompt(
-                datastream,
+                telemetry,
                 "decode_tokens",
                 "ready",
                 json!({"request_id":request_id,"tokens":tokens.len(),"text_bytes":text.len(),"reply_to":reply_to}),
@@ -2957,7 +2957,7 @@ fn handle_decode_tokens_request(
         }
         Err(error) => {
             node_prompt(
-                datastream,
+                telemetry,
                 "decode_tokens",
                 "failed",
                 json!({"request_id":request_id,"error":error,"reply_to":reply_to}),
@@ -3321,16 +3321,16 @@ fn schedule_stage_shard_message(
 }
 
 fn publish_stage_shard_fetch_event(
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
     config: &DeploymentConfig,
     event: &Value,
 ) -> Result<(), String> {
-    let channel = datastream.channel_by_name("myelin.worker.weights");
+    let channel = telemetry.channel_by_name("myelin.worker.weights");
     let payload = node_event_payload(config, "stage_shard_fetch", "event", event.clone());
-    datastream.submit_text(channel, payload.to_string());
-    emit_stdio_datastream_frame("myelin.worker.weights", &payload)
-        .map_err(|e| format!("emit stage shard fetch datastream frame: {e}"))?;
-    datastream.tick();
+    telemetry.submit_text(channel, payload.to_string());
+    emit_stdio_telemetry_frame("myelin.worker.weights", &payload)
+        .map_err(|e| format!("emit stage shard fetch telemetry frame: {e}"))?;
+    telemetry.tick();
     Ok(())
 }
 
@@ -3339,7 +3339,7 @@ fn publish_stage_shard_fetch_event(
 fn materialize_stage_shard_with_process(
     plan: &StageShardPlan,
     config: &DeploymentConfig,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
     _driver: &mut IrohDriver,
     stack: &DistributionRuntimeStack,
 ) -> Result<PathBuf, String> {
@@ -3358,7 +3358,7 @@ fn materialize_stage_shard_with_process(
                     "path":output_path,
                     "cache_hit":true,
                 });
-                publish_stage_shard_fetch_event(datastream, config, &event)?;
+                publish_stage_shard_fetch_event(telemetry, config, &event)?;
                 return Ok(output_path);
             }
             Err(error) => {
@@ -3369,7 +3369,7 @@ fn materialize_stage_shard_with_process(
                     "cache_hit":false,
                     "error":error,
                 });
-                publish_stage_shard_fetch_event(datastream, config, &event)?;
+                publish_stage_shard_fetch_event(telemetry, config, &event)?;
                 std::fs::remove_file(&output_path).map_err(|remove_error| {
                     format!(
                         "remove invalid stage shard cache {}: {remove_error}",
@@ -3409,7 +3409,7 @@ fn materialize_stage_shard_with_process(
         while let Some(report) = reports.try_recv() {
             match report {
                 StageShardFetchReport::Progress(event) => {
-                    if let Err(error) = publish_stage_shard_fetch_event(datastream, config, &event)
+                    if let Err(error) = publish_stage_shard_fetch_event(telemetry, config, &event)
                     {
                         let _ = stack.runtime.stop_actor(actor);
                         return Err(error);
@@ -3419,7 +3419,7 @@ fn materialize_stage_shard_with_process(
                 StageShardFetchReport::Failed(error) => return Err(error),
             }
         }
-        datastream.tick();
+        telemetry.tick();
         thread::sleep(PUMP_INTERVAL);
     }
 }
@@ -3433,9 +3433,9 @@ fn handle_stage_command(
     worker: &mut TinygradWorker,
     edge_runtime: &mut WorkerEdgeRuntime,
     arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
 ) -> Result<(), String> {
-    let node_stage = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
     };
     match command {
@@ -3446,7 +3446,7 @@ fn handle_stage_command(
             layer_end_exclusive,
         } => {
             node_stage(
-                datastream,
+                telemetry,
                 "configure_worker_role",
                 "started",
                 json!({"run_id":run_id,"stage_index":stage_index,"layer_range":{"start":layer_start,"end_exclusive":layer_end_exclusive}}),
@@ -3457,17 +3457,17 @@ fn handle_stage_command(
                 layer_start,
                 layer_end_exclusive,
                 config,
-                datastream,
+                telemetry,
             ) {
                 Ok(()) => node_stage(
-                    datastream,
+                    telemetry,
                     "configure_worker_role",
                     "ready",
                     json!({"worker_event_type":"RoleConfigured"}),
                 ),
                 Err(error) => {
                     node_stage(
-                        datastream,
+                        telemetry,
                         "configure_worker_role",
                         "failed",
                         json!({"error":error}),
@@ -3507,7 +3507,7 @@ fn handle_stage_command(
                     match materialize_stage_shard_with_process(
                         &stage_plan,
                         config,
-                        datastream,
+                        telemetry,
                         driver,
                         stack,
                     ) {
@@ -3517,7 +3517,7 @@ fn handle_stage_command(
                         ),
                         Err(error) => {
                             node_stage(
-                                datastream,
+                                telemetry,
                                 "load_weights",
                                 "failed",
                                 json!({"error":error,"stage_shard":true}),
@@ -3535,7 +3535,7 @@ fn handle_stage_command(
                     (gguf_source, false)
                 };
             node_stage(
-                datastream,
+                telemetry,
                 "load_weights",
                 "started",
                 json!({"model_id":&model_id,"gguf_source":gguf_source_kind,"tokenizer":tokenizer_kind,"stage_shard":using_stage_shard,"layer_range":{"start":layer_start,"end_exclusive":layer_end_exclusive}}),
@@ -3547,16 +3547,16 @@ fn handle_stage_command(
                 layer_start,
                 layer_end_exclusive,
                 config,
-                datastream,
+                telemetry,
             ) {
                 Ok(()) => node_stage(
-                    datastream,
+                    telemetry,
                     "load_weights",
                     "ready",
                     json!({"worker_event_type":"WeightsLoaded","model_id":model_id}),
                 ),
                 Err(error) => {
-                    node_stage(datastream, "load_weights", "failed", json!({"error":error}));
+                    node_stage(telemetry, "load_weights", "failed", json!({"error":error}));
                     let _ = stack.runtime.send_to(
                         node_actor,
                         NodeAgentMsg::WorkerCrashed {
@@ -3588,7 +3588,7 @@ fn handle_stage_command(
                 .send_to(node_actor, NodeAgentMsg::WorkerRingsQuiesced { run_id })
                 .map_err(|e| format!("mark worker rings quiesced: {e}"))?;
             node_stage(
-                datastream,
+                telemetry,
                 "local_edges",
                 "ready",
                 json!({"run_id":run_id,"sent":["LocalEdgesStopped","WorkerRingsQuiesced"]}),
@@ -3605,7 +3605,7 @@ fn handle_stage_command(
                 .send_to(node_actor, NodeAgentMsg::WorkerRoleReset { run_id })
                 .map_err(|e| format!("mark worker role reset: {e}"))?;
             node_stage(
-                datastream,
+                telemetry,
                 "device_objects",
                 "ready",
                 json!({"run_id":run_id,"sent":["DeviceObjectsReleased","WorkerRoleReset"]}),
@@ -3614,7 +3614,7 @@ fn handle_stage_command(
         }
         StageCommandWire::EstablishInboundEdge { edge_id, edge } => {
             node_stage(
-                datastream,
+                telemetry,
                 "inbound_edge",
                 "started",
                 json!({"edge_id":edge_id,"kind":format!("{:?}", edge.kind),"ring_data_capacity":edge.ring_spec.data_capacity}),
@@ -3626,11 +3626,11 @@ fn handle_stage_command(
                 worker,
                 arena_manager,
                 config,
-                datastream,
+                telemetry,
                 driver,
             )?;
             node_stage(
-                datastream,
+                telemetry,
                 "inbound_edge",
                 "ready",
                 json!({"edge_id":edge_id}),
@@ -3639,7 +3639,7 @@ fn handle_stage_command(
         }
         StageCommandWire::EstablishOutboundEdge { edge_id, edge } => {
             node_stage(
-                datastream,
+                telemetry,
                 "outbound_edge",
                 "started",
                 json!({"edge_id":edge_id,"kind":format!("{:?}", edge.kind),"consumer_node_id":edge.consumer_node_id,"has_consumer_endpoint":edge.consumer_endpoint.is_some()}),
@@ -3651,11 +3651,11 @@ fn handle_stage_command(
                 worker,
                 arena_manager,
                 config,
-                datastream,
+                telemetry,
                 driver,
             )?;
             node_stage(
-                datastream,
+                telemetry,
                 "outbound_edge",
                 "ready",
                 json!({"edge_id":edge_id}),
@@ -3663,7 +3663,7 @@ fn handle_stage_command(
             Ok(())
         }
         StageCommandWire::ReleaseInputHandle { handle_id, .. } => {
-            edge_runtime.release_input_handle(handle_id, worker, config, datastream, driver, stack)
+            edge_runtime.release_input_handle(handle_id, worker, config, telemetry, driver, stack)
         }
         StageCommandWire::ExecuteStep {
             step_id,
@@ -3673,7 +3673,7 @@ fn handle_stage_command(
             ..
         } => {
             node_stage(
-                datastream,
+                telemetry,
                 "execute_step",
                 "started",
                 json!({"step_id":step_id,"input_edge_id":input_edge_id,"object_id":object_id,"sequence":sequence}),
@@ -3688,11 +3688,11 @@ fn handle_stage_command(
                 worker,
                 arena_manager,
                 config,
-                datastream,
+                telemetry,
                 driver,
             )?;
             node_stage(
-                datastream,
+                telemetry,
                 "execute_step",
                 "ready",
                 json!({"step_id":step_id}),
@@ -3706,12 +3706,12 @@ fn run_self_test(
     worker: &mut TinygradWorker,
     config: &DeploymentConfig,
     prompt: &str,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
     _driver: &mut IrohDriver,
     _stack: &DistributionRuntimeStack,
 ) -> Result<(), String> {
     emit_node_event(
-        datastream,
+        telemetry,
         config,
         NODE_RUNTIME_CHANNEL,
         "self_test",
@@ -3724,7 +3724,7 @@ fn run_self_test(
         0,
         config.self_test_layer_end,
         config,
-        datastream,
+        telemetry,
     )?;
     worker.load_weights(
         config.model_id.clone(),
@@ -3733,13 +3733,13 @@ fn run_self_test(
         0,
         config.self_test_layer_end,
         config,
-        datastream,
+        telemetry,
     )?;
-    let result = worker.infer_prompt(0, prompt, config.self_test_max_tokens, config, datastream)?;
+    let result = worker.infer_prompt(0, prompt, config.self_test_max_tokens, config, telemetry)?;
     let record = json!({"type":"self_test_completed","prompt_bytes":prompt.len(),"result":result});
-    datastream.submit_text(datastream.channels.node_self_test, record.to_string());
+    telemetry.submit_text(telemetry.channels.node_self_test, record.to_string());
     emit_node_event(
-        datastream,
+        telemetry,
         config,
         NODE_RUNTIME_CHANNEL,
         "self_test",
@@ -3764,7 +3764,7 @@ struct DeploymentConfig {
     stage_index: u32,
     coordinator_endpoint: Option<EndpointAddr>,
     orchestrator_actor: Option<ActorAddress>,
-    datastream_frame_log: Option<String>,
+    telemetry_frame_log: Option<String>,
     debug_join_socket: Option<String>,
     relay_mode: iroh::RelayMode,
     endpoint_addr_mask: EndpointAddrMask,
@@ -3831,7 +3831,7 @@ impl DeploymentConfig {
                         .map_err(|e| format!("invalid MYELIN_ORCHESTRATOR_ACTOR JSON: {e}"))
                 })
                 .transpose()?,
-            datastream_frame_log: env_optional("MYELIN_DATASTREAM_FRAME_LOG"),
+            telemetry_frame_log: env_optional("MYELIN_TELEMETRY_FRAME_LOG"),
             debug_join_socket,
             relay_mode: relay.mode,
             endpoint_addr_mask: env_optional(MVP_IROH_ENDPOINT_ADDR_MASK_ENV)
@@ -3937,16 +3937,16 @@ fn spawn_helper_stderr_reader<R: Read + Send + 'static>(
 fn drain_worker_stderr(
     stderr_rx: &Receiver<String>,
     config: &DeploymentConfig,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
 ) {
     let mut emitted = false;
     while let Ok(line) = stderr_rx.try_recv() {
         let payload = node_event_payload(config, "worker_stderr", "observed", json!({"line":line}));
-        datastream.submit_text(datastream.channels.worker_stderr, payload.to_string());
+        telemetry.submit_text(telemetry.channels.worker_stderr, payload.to_string());
         emitted = true;
     }
     if emitted {
-        datastream.tick();
+        telemetry.tick();
     }
 }
 
@@ -3957,16 +3957,16 @@ fn wait_for_helper_event(
     expected: &str,
     command_type: &str,
     config: &DeploymentConfig,
-    datastream: &mut NodeDatastream,
+    telemetry: &mut NodeTelemetry,
     channel: ChannelId,
     channel_name: &str,
     wait_config: HelperCommandWaitConfig,
 ) -> Result<Value, String> {
-    let node_worker = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+    let node_worker = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, config, NODE_WORKER_CHANNEL, phase, status, detail)
     };
     node_worker(
-        datastream,
+        telemetry,
         "worker_stdout_read",
         "started",
         json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name}),
@@ -3978,17 +3978,17 @@ fn wait_for_helper_event(
         match stdout_rx.recv_timeout(wait_config.poll_interval) {
             Ok(HelperStdoutEvent::Line(line)) => {
                 if let Some(stderr_rx) = stderr_rx {
-                    drain_worker_stderr(stderr_rx, config, datastream);
+                    drain_worker_stderr(stderr_rx, config, telemetry);
                 }
                 let line_bytes = line.len();
                 node_worker(
-                    datastream,
+                    telemetry,
                     "worker_stdout_read",
                     "ready",
                     json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes}),
                 );
                 node_worker(
-                    datastream,
+                    telemetry,
                     "worker_stdout_parse",
                     "started",
                     json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes}),
@@ -3997,7 +3997,7 @@ fn wait_for_helper_event(
                     Ok(value) => value,
                     Err(error) => {
                         node_worker(
-                            datastream,
+                            telemetry,
                             "worker_stdout_parse",
                             "failed",
                             json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes,"error":error.to_string()}),
@@ -4010,15 +4010,15 @@ fn wait_for_helper_event(
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
                 node_worker(
-                    datastream,
+                    telemetry,
                     "worker_stdout_parse",
                     "ready",
                     json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":line_bytes,"worker_event_type":worker_event_type}),
                 );
-                datastream.submit_text(channel, value.to_string());
-                emit_stdio_datastream_frame(channel_name, &value)
-                    .map_err(|e| format!("emit worker stdio datastream frame: {e}"))?;
-                datastream.tick();
+                telemetry.submit_text(channel, value.to_string());
+                emit_stdio_telemetry_frame(channel_name, &value)
+                    .map_err(|e| format!("emit worker stdio telemetry frame: {e}"))?;
+                telemetry.tick();
                 if worker_event_type == "WorkerFatal" {
                     return Err(format!("worker fatal: {value}"));
                 }
@@ -4026,7 +4026,7 @@ fn wait_for_helper_event(
                     return Ok(value);
                 }
                 node_worker(
-                    datastream,
+                    telemetry,
                     "worker_event",
                     "observed",
                     json!({"command_type":command_type,"command_waiting_for":expected,"worker_event_type":worker_event_type,"event":value}),
@@ -4034,10 +4034,10 @@ fn wait_for_helper_event(
             }
             Ok(HelperStdoutEvent::Closed) => {
                 if let Some(stderr_rx) = stderr_rx {
-                    drain_worker_stderr(stderr_rx, config, datastream);
+                    drain_worker_stderr(stderr_rx, config, telemetry);
                 }
                 node_worker(
-                    datastream,
+                    telemetry,
                     "worker_stdout_read",
                     "failed",
                     json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":0,"error":"stdout closed"}),
@@ -4048,10 +4048,10 @@ fn wait_for_helper_event(
             }
             Ok(HelperStdoutEvent::ReadError(error)) => {
                 if let Some(stderr_rx) = stderr_rx {
-                    drain_worker_stderr(stderr_rx, config, datastream);
+                    drain_worker_stderr(stderr_rx, config, telemetry);
                 }
                 node_worker(
-                    datastream,
+                    telemetry,
                     "worker_stdout_read",
                     "failed",
                     json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"error":error}),
@@ -4061,12 +4061,12 @@ fn wait_for_helper_event(
             Err(RecvTimeoutError::Timeout) => {
                 wait_cycles = wait_cycles.saturating_add(1);
                 if let Some(stderr_rx) = stderr_rx {
-                    drain_worker_stderr(stderr_rx, config, datastream);
+                    drain_worker_stderr(stderr_rx, config, telemetry);
                 }
                 let now = Instant::now();
                 if now >= next_telemetry_at {
                     node_worker(
-                        datastream,
+                        telemetry,
                         "worker_command_wait",
                         "waiting",
                         json!({
@@ -4083,11 +4083,11 @@ fn wait_for_helper_event(
                         .checked_add(wait_config.telemetry_interval)
                         .unwrap_or(now);
                 }
-                datastream.tick();
+                telemetry.tick();
             }
             Err(RecvTimeoutError::Disconnected) => {
                 node_worker(
-                    datastream,
+                    telemetry,
                     "worker_stdout_read",
                     "failed",
                     json!({"command_type":command_type,"expected_event_type":expected,"channel":channel_name,"line_bytes":0,"error":"stdout reader disconnected"}),
@@ -4122,7 +4122,7 @@ impl TinygradWorker {
             .env("MYELIN_ARENA_FD", arena_fd.to_string())
             .env("MYELIN_ARENA_BYTES", config.arena_bytes.to_string())
             .env(
-                "MYELIN_DATASTREAM_ENDPOINT_ID",
+                "MYELIN_TELEMETRY_ENDPOINT_ID",
                 format!(
                     "worker-node-{}-stage-{}-stdio-bridge",
                     config.logical_node_id, config.stage_index
@@ -4173,13 +4173,13 @@ impl TinygradWorker {
         &mut self,
         device: &str,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
         self.command(
             json!({"type":"InitializeWorker","helper_abi_version":1,"backend":{"device":device}}),
             "WorkerReady",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.initialize",
         )
         .map(|_| ())
@@ -4192,7 +4192,7 @@ impl TinygradWorker {
         layer_start: u32,
         layer_end_exclusive: u32,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
         self.command(
             json!({
@@ -4207,7 +4207,7 @@ impl TinygradWorker {
             }),
             "RoleConfigured",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.role",
         )
         .map(|_| ())
@@ -4221,7 +4221,7 @@ impl TinygradWorker {
         layer_start: u32,
         layer_end_exclusive: u32,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
         self.command(
             json!({
@@ -4234,7 +4234,7 @@ impl TinygradWorker {
             }),
             "WeightsLoaded",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.weights",
         )
         .map(|_| ())
@@ -4246,13 +4246,13 @@ impl TinygradWorker {
         prompt: &str,
         max_tokens: u32,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<Value, String> {
         self.command(
             json!({"type":"InferPrompt","request_id":request_id,"prompt":prompt,"max_tokens":max_tokens}),
             "PromptCompleted",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.prompt",
         )
     }
@@ -4262,13 +4262,13 @@ impl TinygradWorker {
         request_id: u64,
         prompt: &str,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<Vec<u32>, String> {
         let result = self.command(
             json!({"type":"EncodePrompt","request_id":request_id,"prompt":prompt}),
             "PromptEncoded",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.tokenizer",
         )?;
         result
@@ -4291,13 +4291,13 @@ impl TinygradWorker {
         request_id: u64,
         tokens: &[u32],
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<String, String> {
         let result = self.command(
             json!({"type":"DecodeTokens","request_id":request_id,"tokens":tokens}),
             "TokensDecoded",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.tokenizer",
         )?;
         result
@@ -4316,7 +4316,7 @@ impl TinygradWorker {
         layout: arena::RingLayout,
         object_spec: StageObjectSpecWire,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
         self.command(
             json!({
@@ -4340,7 +4340,7 @@ impl TinygradWorker {
             }),
             "RingInstalled",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.ring",
         )
         .map(|_| ())
@@ -4350,13 +4350,13 @@ impl TinygradWorker {
         &mut self,
         ring_id: u64,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
         self.command(
             json!({"type":"UninstallRing","ring_id":ring_id}),
             "RingUninstalled",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.ring",
         )
         .map(|_| ())
@@ -4368,7 +4368,7 @@ impl TinygradWorker {
         edge_id: u64,
         object_spec: StageObjectSpecWire,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<LoadedObject, String> {
         let event = self.command(
             json!({
@@ -4382,7 +4382,7 @@ impl TinygradWorker {
             }),
             "ObjectLoaded",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.ingress",
         )?;
         Ok(LoadedObject {
@@ -4407,7 +4407,7 @@ impl TinygradWorker {
         final_stage: bool,
         output_spec: StageObjectSpecWire,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<usize, String> {
         let event = self.command(
             json!({
@@ -4428,7 +4428,7 @@ impl TinygradWorker {
             }),
             "StepExecuted",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.step",
         )?;
         usize::try_from(value_u64(&event, "committed_bytes")?)
@@ -4439,13 +4439,13 @@ impl TinygradWorker {
         &mut self,
         handle_id: u64,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
         self.command(
             json!({"type":"ReleaseDeviceObject","handle_id":handle_id}),
             "DeviceObjectReleased",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.device_object",
         )
         .map(|_| ())
@@ -4454,13 +4454,13 @@ impl TinygradWorker {
     fn shutdown(
         &mut self,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
         self.command(
             json!({"type":"ShutdownWorker"}),
             "WorkerStopped",
             config,
-            datastream,
+            telemetry,
             "myelin.worker.shutdown",
         )
         .map(|_| ())
@@ -4477,13 +4477,13 @@ impl TinygradWorker {
         command: Value,
         expected: &str,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         channel_name: &str,
     ) -> Result<Value, String> {
-        let node_worker = |ds: &mut NodeDatastream, phase: &str, status: &str, detail: Value| {
+        let node_worker = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_WORKER_CHANNEL, phase, status, detail)
         };
-        let channel = datastream.channel_by_name(channel_name);
+        let channel = telemetry.channel_by_name(channel_name);
         let command_type = command
             .get("type")
             .and_then(Value::as_str)
@@ -4492,14 +4492,14 @@ impl TinygradWorker {
         let command_text = command.to_string();
         let command_bytes = command_text.len() + 1;
         node_worker(
-            datastream,
+            telemetry,
             "worker_command_write",
             "started",
             json!({"command_type":command_type.as_str(),"expected_event_type":expected,"command_bytes":command_bytes}),
         );
         if let Err(error) = writeln!(self.stdin, "{command_text}") {
             node_worker(
-                datastream,
+                telemetry,
                 "worker_command_write",
                 "failed",
                 json!({"command_type":command_type.as_str(),"expected_event_type":expected,"command_bytes":command_bytes,"error":error.to_string()}),
@@ -4508,7 +4508,7 @@ impl TinygradWorker {
         }
         if let Err(error) = self.stdin.flush() {
             node_worker(
-                datastream,
+                telemetry,
                 "worker_command_write",
                 "failed",
                 json!({"command_type":command_type.as_str(),"expected_event_type":expected,"command_bytes":command_bytes,"error":error.to_string()}),
@@ -4516,7 +4516,7 @@ impl TinygradWorker {
             return Err(format!("flush helper command: {error}"));
         }
         node_worker(
-            datastream,
+            telemetry,
             "worker_command_write",
             "ready",
             json!({"command_type":command_type.as_str(),"expected_event_type":expected,"command_bytes":command_bytes}),
@@ -4525,7 +4525,7 @@ impl TinygradWorker {
             expected,
             command_type.as_str(),
             config,
-            datastream,
+            telemetry,
             channel,
             channel_name,
         )
@@ -4536,7 +4536,7 @@ impl TinygradWorker {
         expected: &str,
         command_type: &str,
         config: &DeploymentConfig,
-        datastream: &mut NodeDatastream,
+        telemetry: &mut NodeTelemetry,
         channel: ChannelId,
         channel_name: &str,
     ) -> Result<Value, String> {
@@ -4546,7 +4546,7 @@ impl TinygradWorker {
             expected,
             command_type,
             config,
-            datastream,
+            telemetry,
             channel,
             channel_name,
             HelperCommandWaitConfig::production(),

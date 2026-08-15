@@ -52,16 +52,16 @@ unquote, expand, or shell-parse argument strings.
 
 `working_dir`, when present, is passed as the child current working directory.
 
-`label`, when present, is the lifecycle datastream label source. When `label` is
+`label`, when present, is the lifecycle telemetry label source. When `label` is
 absent, the label source is the basename of `command`.
 
 ### 1.2 ProcessOutputConfig
 
 ```text
 ProcessOutputConfig::disabled(upstream: ActorAddress) -> ProcessOutputConfig
-ProcessOutputConfig::datastream_mirror(
+ProcessOutputConfig::telemetry_mirror(
     upstream: ActorAddress,
-    producer: DatastreamProducer,
+    producer: TelemetryProducer,
 ) -> ProcessOutputConfig
 ProcessOutputConfig::upstream(&self) -> ActorAddress
 ProcessOutputConfig::observability(&self) -> ProcessLifecycleObservability
@@ -71,14 +71,14 @@ ProcessOutputConfig::observability(&self) -> ProcessLifecycleObservability
 
 `disabled` sends only upstream `ProcessOutput`.
 
-`datastream_mirror` sends upstream `ProcessOutput` and also mirrors each
-lifecycle/control output to one datastream channel.
+`telemetry_mirror` sends upstream `ProcessOutput` and also mirrors each
+lifecycle/control output to one telemetry channel.
 
 ### 1.3 ProcessLifecycleObservability
 
 ```text
 ProcessLifecycleObservability::Disabled
-ProcessLifecycleObservability::DatastreamMirror
+ProcessLifecycleObservability::TelemetryMirror
 ```
 
 This setting controls lifecycle/control mirroring only. It does not enable child
@@ -161,7 +161,7 @@ The actor owns:
 
 - lifecycle state;
 - the configured upstream output address;
-- optional lifecycle datastream mirror state;
+- optional lifecycle telemetry mirror state;
 - a private supervisor thread handle.
 
 The private supervisor thread owns:
@@ -209,8 +209,8 @@ If `cmd.spawn()` fails, the actor emits exactly one terminal
 
 The actor sends each public `ProcessOutput` to the configured upstream actor.
 
-When `ProcessOutputConfig::datastream_mirror` is used, the actor also mirrors
-each output to the configured datastream producer. Datastream submit failure is
+When `ProcessOutputConfig::telemetry_mirror` is used, the actor also mirrors
+each output to the configured telemetry producer. Telemetry submit failure is
 ignored and does not suppress upstream output or emit `ProcessOutput::Error`.
 
 Public lifecycle/control output order follows observed lifecycle:
@@ -223,7 +223,7 @@ Public lifecycle/control output order follows observed lifecycle:
 
 ---
 
-## 5. Lifecycle datastream labels and records
+## 5. Lifecycle telemetry labels and records
 
 The label source is:
 
@@ -259,11 +259,11 @@ ChannelContent::JsonRecord {
 }
 ```
 
-Duplicate lifecycle labels on the same datastream stream are rejected before the
+Duplicate lifecycle labels on the same telemetry stream are rejected before the
 process actor is spawned with an error containing:
 
 ```text
-duplicate process lifecycle datastream channel: proc.<label>.lifecycle on stream <stream>
+duplicate process lifecycle telemetry channel: proc.<label>.lifecycle on stream <stream>
 ```
 
 Lifecycle JSON records are:

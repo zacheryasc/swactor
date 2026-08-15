@@ -17,8 +17,8 @@ use crate::node_actor::{
     StageOutboundEdgeWire, StageProvisionWire, StageRingSpecWire,
 };
 use crate::observability::frame_collector::{FrameCollector, StageLoadProgress};
-use crate::observability::orch_datastream::{
-    DashboardSupport, OrchDatastream, MYELIN_STAGE_ROUTE, MYELIN_SWIM_MEMBERSHIP,
+use crate::observability::orch_telemetry::{
+    DashboardSupport, MYELIN_STAGE_ROUTE, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
 };
 use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
@@ -51,13 +51,13 @@ use ::provisioning::{
     RunId as ClusterRunId, RunNodeGroupSpec, SwactorId, SwarmJoinTemplate,
 };
 use data_plane::object_record as ingress;
-use datastream::{DatastreamPublisherMsg, DatastreamSubscribe, SubscriptionRequest};
+use telemetry::{TelemetryPublisherMsg, TelemetrySubscribe, SubscriptionRequest};
 use distribution::node::DistributedNodeConfig;
 use distribution::swim::telemetry::ObservedTransition;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
 use iroh_driver::{
-    DATASTREAM_ALPN, EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, IrohDriver, IrohDriverConfig,
+    TELEMETRY_ALPN, EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, IrohDriver, IrohDriverConfig,
 };
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
@@ -79,7 +79,7 @@ const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const STAGE_PROVISION_ACTIVE_RESEND_AFTER: Duration = Duration::from_secs(60);
 const PIPELINE_PROMPT_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(15);
-const DATASTREAM_FRAME_LOG_ENV: &str = "MYELIN_DATASTREAM_FRAME_LOG";
+const TELEMETRY_FRAME_LOG_ENV: &str = "MYELIN_TELEMETRY_FRAME_LOG";
 
 pub(crate) fn run_with_options<I>(
     args: I,
@@ -103,11 +103,11 @@ where
     } else {
         None
     };
-    let mut orch_datastream =
-        OrchDatastream::new(config.run_id, config.datastream_frame_log.as_deref())?;
+    let mut orch_telemetry =
+        OrchTelemetry::new(config.run_id, config.telemetry_frame_log.as_deref())?;
     let run_id = config.run_id;
     let node_id = config.node_id;
-    let bootstrap = |ds: &mut OrchDatastream,
+    let bootstrap = |ds: &mut OrchTelemetry,
                      dash: Option<&DashboardSupport>,
                      phase: &str,
                      status: &str,
@@ -115,7 +115,7 @@ where
         ds.emit_bootstrap(dash, run_id, node_id, phase, status, detail);
     };
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
         "config",
         "ready",
@@ -133,38 +133,38 @@ where
             "relay_mode":format!("{:?}", config.relay.mode),
             "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
             "pipeline_stages":config.pipeline_stages,
-            "provider_config":config.provider_datastream_detail(),
+            "provider_config":config.provider_telemetry_detail(),
         }),
     );
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
-        "datastream_preflight",
+        "telemetry_preflight",
         "configured",
         json!({
             "producer":"myelin-orchestrator",
-            "datastream_endpoint":{
+            "telemetry_endpoint":{
                 "role":"orchestrator-frame-archive",
-                "transport":"datastream-frame-log",
-                "configured":config.datastream_frame_log.is_some(),
-                "archive_path":config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+                "transport":"telemetry-frame-log",
+                "configured":config.telemetry_frame_log.is_some(),
+                "archive_path":config.telemetry_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
             },
             "expected_worker_producers":["myelin-worker","tinygrad-worker"],
             "provider":config.provider.as_str(),
             "pipeline_stages":config.pipeline_stages,
             "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
-            "provider_config":config.provider_datastream_detail(),
+            "provider_config":config.provider_telemetry_detail(),
         }),
     );
-    let orch_synthetic_id = format!("myelin-orchestrator-{}-datastream-preflight", config.run_id);
+    let orch_synthetic_id = format!("myelin-orchestrator-{}-telemetry-preflight", config.run_id);
     for (phase, status) in [
-        ("DatastreamProducerConfigured", "configured"),
-        ("DatastreamProducerConnected", "ready"),
-        ("DatastreamSyntheticEventSent", "sent"),
-        ("DatastreamSyntheticEventObserved", "observed"),
+        ("TelemetryProducerConfigured", "configured"),
+        ("TelemetryProducerConnected", "ready"),
+        ("TelemetrySyntheticEventSent", "sent"),
+        ("TelemetrySyntheticEventObserved", "observed"),
     ] {
         bootstrap(
-            &mut orch_datastream,
+            &mut orch_telemetry,
             None,
             phase,
             status,
@@ -172,18 +172,18 @@ where
                 "producer":"myelin-orchestrator",
                 "producer_class":"rust-orchestrator",
                 "synthetic_id":orch_synthetic_id,
-                "datastream_endpoint":{
+                "telemetry_endpoint":{
                     "role":"orchestrator-frame-archive",
-                    "transport":"datastream-frame-log",
-                    "configured":config.datastream_frame_log.is_some(),
-                    "archive_path":config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+                    "transport":"telemetry-frame-log",
+                    "configured":config.telemetry_frame_log.is_some(),
+                    "archive_path":config.telemetry_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
                 },
             }),
         );
     }
     drain_orch_stdio_capture(
         orch_stdio_rx.as_ref(),
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
         config.run_id,
         config.node_id,
@@ -191,7 +191,7 @@ where
     let pipeline_plan = if config.uses_planned_execution() {
         let plan = config.build_run_plan()?;
         bootstrap(
-            &mut orch_datastream,
+            &mut orch_telemetry,
             None,
             "run_plan",
             "ready",
@@ -209,8 +209,8 @@ where
         None
     };
 
-    let actors_channel = orch_datastream.channel_by_name("runtime.actors");
-    let orch_stats_hook = orch_datastream.stats_hook_on(actors_channel);
+    let actors_channel = orch_telemetry.channel_by_name("runtime.actors");
+    let orch_stats_hook = orch_telemetry.stats_hook_on(actors_channel);
 
     // Build the core swactor runtime parts, clone the routing handle needed by
     // integrations, then hand the workers to the engine. The engine owns both
@@ -219,7 +219,7 @@ where
     let (parts, runtime, codec, transport_router) = DistributionRuntimeStack::build_runtime(
         |registry| {
             register_myelin_actor_codecs(registry);
-            datastream::wire::register_datastream_codec(registry);
+            telemetry::wire::register_telemetry_codec(registry);
         },
         Some(orch_stats_hook),
     );
@@ -228,7 +228,7 @@ where
     {
         Ok(engine) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 None,
                 "engine",
                 "ready",
@@ -238,7 +238,7 @@ where
         }
         Err(error) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 None,
                 "engine",
                 "failed",
@@ -254,13 +254,13 @@ where
             relay_mode: config.relay.mode.clone(),
             node: DistributedNodeConfig::default(),
             peer_auth: None,
-            additional_alpns: vec![EDGE_ALPN.to_vec(), DATASTREAM_ALPN.to_vec()],
+            additional_alpns: vec![EDGE_ALPN.to_vec(), TELEMETRY_ALPN.to_vec()],
         },
     ) {
         Ok(driver) => driver,
         Err(error) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 None,
                 "iroh_driver",
                 "failed",
@@ -272,14 +272,14 @@ where
     let coordinator_endpoint =
         advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
         "iroh_driver",
         "ready",
         json!({"endpoint":coordinator_endpoint.clone(),"has_relay":coordinator_endpoint.relay_urls().next().is_some(),"direct_addr_count":coordinator_endpoint.ip_addrs().count(),"relay_mode":format!("{:?}", config.relay.mode),"endpoint_addr_mask":config.endpoint_addr_mask.as_str()}),
     );
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
         "endpoint_config_snapshot",
         "ready",
@@ -302,18 +302,18 @@ where
         engine.handle(),
     );
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
         "distribution_stack",
         "ready",
         json!({"actors":"initialized","route_view":"initialized","swim":"initialized"}),
     );
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
         "codecs",
         "ready",
-        json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","datastream"]}),
+        json!({"registered":["node_agent","orchestrator","provisioner","prompt_rpc","telemetry"]}),
     );
     driver.enable_actor_bridge(
         stack.runtime.clone(),
@@ -329,7 +329,7 @@ where
     stack.spawn_protocol_ticker(PUMP_INTERVAL);
     driver.install_actor_bridge_pump(PUMP_INTERVAL);
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
         "actor_bridge",
         "ready",
@@ -338,15 +338,15 @@ where
 
     let collector = FrameCollector::new();
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         None,
-        "datastream_collector",
+        "telemetry_collector",
         "ready",
-        json!({"alpn":String::from_utf8_lossy(DATASTREAM_ALPN)}),
+        json!({"alpn":String::from_utf8_lossy(TELEMETRY_ALPN)}),
     );
     let dashboard = DashboardSupport::start(config.dashboard, &engine.handle())?;
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "dashboard",
         "ready",
@@ -357,7 +357,7 @@ where
         Ok(inbox) => inbox,
         Err(error) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 dashboard.as_ref(),
                 "orchestrator_report_actor",
                 "failed",
@@ -369,7 +369,7 @@ where
     let orchestrator_report_actor = *orchestrator_reports.addr();
     stack.register_local_actor(driver.register_actor(orchestrator_report_actor, 1));
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "orchestrator_report_actor",
         "ready",
@@ -386,7 +386,7 @@ where
         Ok(actor) => actor,
         Err(error) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 dashboard.as_ref(),
                 "orchestrator_actor",
                 "failed",
@@ -397,7 +397,7 @@ where
     };
     stack.register_local_actor(driver.register_actor(orchestrator_actor, 1));
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "orchestrator_actor",
         "ready",
@@ -408,7 +408,7 @@ where
         Ok(inbox) => inbox,
         Err(error) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 dashboard.as_ref(),
                 "prompt_reply_actor",
                 "failed",
@@ -420,7 +420,7 @@ where
     let prompt_reply_actor = *prompt_events.addr();
     stack.register_local_actor(driver.register_actor(prompt_reply_actor, 1));
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "prompt_reply_actor",
         "ready",
@@ -431,7 +431,7 @@ where
         Ok(inbox) => inbox,
         Err(error) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 dashboard.as_ref(),
                 "tokenizer_reply_actor",
                 "failed",
@@ -443,7 +443,7 @@ where
     let tokenizer_reply_actor = *tokenizer_events.addr();
     stack.register_local_actor(driver.register_actor(tokenizer_reply_actor, 1));
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "tokenizer_reply_actor",
         "ready",
@@ -455,14 +455,14 @@ where
 
     let provisioner = config.build_provisioner(stack.runtime.clone())?;
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "node_provisioner",
         "ready",
         json!({
             "provider":config.provider.as_str(),
             "owner":"myelin-orchestrator",
-            "config":config.provider_datastream_detail(),
+            "config":config.provider_telemetry_detail(),
         }),
     );
     let (obs_tx, obs_rx) = mpsc::channel::<PluginObservation>();
@@ -482,7 +482,7 @@ where
             orchestrator_reports: &orchestrator_reports,
             stop_rx: &stop_rx,
             dashboard: dashboard.as_ref(),
-            orch_datastream: &mut orch_datastream,
+            orch_telemetry: &mut orch_telemetry,
             orch_stdio_rx: orch_stdio_rx.as_ref(),
             run_id: config.run_id,
             orchestrator_node_id: config.node_id,
@@ -496,7 +496,7 @@ where
     )?;
 
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "prompt_rpc",
         "started",
@@ -514,7 +514,7 @@ where
     ) {
         Ok(addr) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 dashboard.as_ref(),
                 "prompt_rpc",
                 "ready",
@@ -527,7 +527,7 @@ where
         }
         Err(error) => {
             bootstrap(
-                &mut orch_datastream,
+                &mut orch_telemetry,
                 dashboard.as_ref(),
                 "prompt_rpc",
                 "failed",
@@ -538,7 +538,7 @@ where
     };
 
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "prompt_loop",
         "ready",
@@ -546,7 +546,7 @@ where
     );
 
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "serve_prompts",
         "started",
@@ -561,7 +561,7 @@ where
             orchestrator_reports: &orchestrator_reports,
             stop_rx: &stop_rx,
             dashboard: dashboard.as_ref(),
-            orch_datastream: &mut orch_datastream,
+            orch_telemetry: &mut orch_telemetry,
             orch_stdio_rx: orch_stdio_rx.as_ref(),
             run_id: config.run_id,
             orchestrator_node_id: config.node_id,
@@ -582,7 +582,7 @@ where
     );
     if let Err(error) = &result {
         bootstrap(
-            &mut orch_datastream,
+            &mut orch_telemetry,
             dashboard.as_ref(),
             "serve_prompts",
             "failed",
@@ -590,7 +590,7 @@ where
         );
     }
     bootstrap(
-        &mut orch_datastream,
+        &mut orch_telemetry,
         dashboard.as_ref(),
         "provider_stop",
         "started",
@@ -599,14 +599,14 @@ where
     let stop_result = provisioned_nodes.stop();
     match &stop_result {
         Ok(()) => bootstrap(
-            &mut orch_datastream,
+            &mut orch_telemetry,
             dashboard.as_ref(),
             "provider_stop",
             "ready",
             json!({"provider":config.provider.as_str(),"node_id":config.node_id}),
         ),
         Err(error) => bootstrap(
-            &mut orch_datastream,
+            &mut orch_telemetry,
             dashboard.as_ref(),
             "provider_stop",
             "failed",
@@ -615,7 +615,7 @@ where
     }
     if result.is_ok() && stop_result.is_ok() {
         bootstrap(
-            &mut orch_datastream,
+            &mut orch_telemetry,
             dashboard.as_ref(),
             "orch_exit",
             "ready",
@@ -741,7 +741,7 @@ impl VastAiRuntimeConfig {
         })
     }
 
-    fn datastream_detail(&self) -> Value {
+    fn telemetry_detail(&self) -> Value {
         json!({
             "disk_gb": self.provisioning.disk_gb,
             "ssh_user": &self.provisioning.ssh_user,
@@ -825,7 +825,7 @@ impl CachedModelConfig {
         })
     }
 
-    fn datastream_detail(&self) -> Value {
+    fn telemetry_detail(&self) -> Value {
         json!({
             "host_path_present": true,
             "file": self.host_path.file_name().and_then(|name| name.to_str()),
@@ -870,7 +870,7 @@ struct Config {
     endpoint_addr_mask: EndpointAddrMask,
     vastai: Option<VastAiRuntimeConfig>,
     cached_model: Option<CachedModelConfig>,
-    datastream_frame_log: Option<PathBuf>,
+    telemetry_frame_log: Option<PathBuf>,
     worker_bin: Option<PathBuf>,
 }
 
@@ -924,7 +924,7 @@ struct ConfigBuilder {
     vastai_blacklist_hosts: Vec<u64>,
     vastai_poll_interval_secs_raw: Option<String>,
     cached_model_host_path: Option<PathBuf>,
-    datastream_frame_log: Option<PathBuf>,
+    telemetry_frame_log: Option<PathBuf>,
     worker_bin: Option<PathBuf>,
 }
 
@@ -983,7 +983,7 @@ impl ConfigBuilder {
             vastai_blacklist_hosts: Vec::new(),
             vastai_poll_interval_secs_raw: None,
             cached_model_host_path: None,
-            datastream_frame_log: None,
+            telemetry_frame_log: None,
             worker_bin: None,
         }
     }
@@ -1050,8 +1050,8 @@ impl ConfigBuilder {
         apply!(overlay.docker.cached_model_host_path, |path| {
             self.cached_model_host_path = Some(PathBuf::from(path))
         });
-        apply!(overlay.observability.datastream_frame_log, |path| {
-            self.datastream_frame_log = Some(PathBuf::from(path))
+        apply!(overlay.observability.telemetry_frame_log, |path| {
+            self.telemetry_frame_log = Some(PathBuf::from(path))
         });
         apply!(overlay.vastai.image, |image| {
             self.toml_vastai_image = Some(image)
@@ -1170,8 +1170,8 @@ impl ConfigBuilder {
         env_apply!("MYELIN_DASHBOARD", |dashboard| {
             self.dashboard = Self::parse_bool("MYELIN_DASHBOARD", &dashboard)?;
         });
-        env_apply!(DATASTREAM_FRAME_LOG_ENV, |path| {
-            self.datastream_frame_log = Some(PathBuf::from(path))
+        env_apply!(TELEMETRY_FRAME_LOG_ENV, |path| {
+            self.telemetry_frame_log = Some(PathBuf::from(path))
         });
         env_apply!("MYELIN_MODEL_ID", |model_id| { self.model_id = model_id });
         env_apply!("MYELIN_GGUF_LOCAL_PATH", |path| {
@@ -1299,10 +1299,10 @@ impl ConfigBuilder {
                 "--max-tokens" => self.default_max_tokens = parse_next(&mut args, "--max-tokens")?,
                 "--dashboard" => self.dashboard = true,
                 "--no-dashboard" => self.dashboard = false,
-                "--datastream-frame-log" => {
-                    self.datastream_frame_log = Some(PathBuf::from(next_arg(
+                "--telemetry-frame-log" => {
+                    self.telemetry_frame_log = Some(PathBuf::from(next_arg(
                         &mut args,
-                        "--datastream-frame-log",
+                        "--telemetry-frame-log",
                     )?));
                 }
                 "--model-id" => self.model_id = next_arg(&mut args, "--model-id")?,
@@ -1506,7 +1506,7 @@ impl ConfigBuilder {
             vastai,
             cached_model,
             worker_bin: self.worker_bin,
-            datastream_frame_log: self.datastream_frame_log,
+            telemetry_frame_log: self.telemetry_frame_log,
         })
     }
 
@@ -1578,20 +1578,20 @@ impl Config {
         self.cached_model.is_some() || self.pipeline_stages > 1
     }
 
-    fn provider_datastream_detail(&self) -> Value {
+    fn provider_telemetry_detail(&self) -> Value {
         match self.provider.as_str() {
             "process" => json!({
                 "worker_bin": self.worker_bin.as_ref().map(|path| path.to_string_lossy().to_string()),
-                "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
+                "cached_model": self.cached_model.as_ref().map(CachedModelConfig::telemetry_detail),
             }),
             "docker" => json!({
                 "docker_gpus": &self.docker_gpus,
-                "cached_model": self.cached_model.as_ref().map(CachedModelConfig::datastream_detail),
+                "cached_model": self.cached_model.as_ref().map(CachedModelConfig::telemetry_detail),
             }),
             "vastai" => self
                 .vastai
                 .as_ref()
-                .map_or_else(|| json!({}), VastAiRuntimeConfig::datastream_detail),
+                .map_or_else(|| json!({}), VastAiRuntimeConfig::telemetry_detail),
             _ => json!({}),
         }
     }
@@ -1969,7 +1969,7 @@ impl Config {
 struct RuntimeReady {
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
-    datastream_publisher: ActorAddress,
+    telemetry_publisher: ActorAddress,
     stage_index: u32,
     readiness_id: u64,
     swim_node_id: DistNodeId,
@@ -2011,7 +2011,7 @@ fn enqueue_runtime_ready_ack(
         .map_err(|e| format!("send runtime ready ack: {e}"))
 }
 
-fn enqueue_datastream_subscribe(
+fn enqueue_telemetry_subscribe(
     stack: &DistributionRuntimeStack,
     ready: &RuntimeReady,
     collector: &EndpointAddr,
@@ -2024,15 +2024,15 @@ fn enqueue_datastream_subscribe(
     stack
         .runtime
         .send_to(
-            ready.datastream_publisher,
-            DatastreamPublisherMsg::Subscribe(DatastreamSubscribe {
+            ready.telemetry_publisher,
+            TelemetryPublisherMsg::Subscribe(TelemetrySubscribe {
                 collector: collector.clone(),
                 request: SubscriptionRequest::all(),
                 flow_id,
                 token: Vec::new(),
             }),
         )
-        .map_err(|e| format!("send datastream subscribe: {e}"))
+        .map_err(|e| format!("send telemetry subscribe: {e}"))
 }
 
 struct RuntimeReadyAckLoop<'a> {
@@ -2043,7 +2043,7 @@ struct RuntimeReadyAckLoop<'a> {
     orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
     stop_rx: &'a mpsc::Receiver<()>,
     dashboard: Option<&'a DashboardSupport>,
-    orch_datastream: &'a mut OrchDatastream,
+    orch_telemetry: &'a mut OrchTelemetry,
     orch_stdio_rx: Option<&'a mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     orchestrator_node_id: u64,
@@ -2067,14 +2067,14 @@ fn wait_for_runtime_ready_acks(
         orchestrator_reports,
         stop_rx,
         dashboard,
-        orch_datastream,
+        orch_telemetry,
         orch_stdio_rx,
         run_id,
         orchestrator_node_id,
         provider,
         ..
     } = ctx;
-    let bootstrap = |ds: &mut OrchDatastream, phase: &str, status: &str, detail: Value| {
+    let bootstrap = |ds: &mut OrchTelemetry, phase: &str, status: &str, detail: Value| {
         ds.emit_bootstrap(
             dashboard,
             run_id,
@@ -2114,7 +2114,7 @@ fn wait_for_runtime_ready_acks(
         collector.pump(driver);
         drain_orch_stdio_capture(
             orch_stdio_rx,
-            orch_datastream,
+            orch_telemetry,
             dashboard,
             run_id,
             orchestrator_node_id,
@@ -2125,13 +2125,13 @@ fn wait_for_runtime_ready_acks(
             );
         }
         while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+            emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
         }
         collector.drain(|stream, channel, frame| {
             if let Some(d) = dashboard {
                 d.publish_frame(stream, channel, frame);
             }
-            orch_datastream.archive_frame("node", stream, channel, frame);
+            orch_telemetry.archive_frame("node", stream, channel, frame);
         });
         while let Some(report) = orchestrator_reports.try_recv() {
             let OrchestratorReport::NodeRuntimeReadyAck {
@@ -2151,7 +2151,7 @@ fn wait_for_runtime_ready_acks(
                 continue;
             };
             bootstrap(
-                orch_datastream,
+                orch_telemetry,
                 "runtime_ready_ack",
                 "ready",
                 json!({
@@ -2167,9 +2167,9 @@ fn wait_for_runtime_ready_acks(
         }
         if last_send.is_none_or(|sent_at| sent_at.elapsed() >= RUNTIME_READY_ACK_RETRY_INTERVAL) {
             for (key, target) in &pending {
-                if stack.route_owner(target.ready.datastream_publisher)
+                if stack.route_owner(target.ready.telemetry_publisher)
                     == Some(target.ready.swim_node_id)
-                    && let Err(error) = enqueue_datastream_subscribe(
+                    && let Err(error) = enqueue_telemetry_subscribe(
                         stack,
                         &target.ready,
                         collector_endpoint,
@@ -2178,8 +2178,8 @@ fn wait_for_runtime_ready_acks(
                     )
                 {
                     bootstrap(
-                        orch_datastream,
-                        "datastream_subscribe",
+                        orch_telemetry,
+                        "telemetry_subscribe",
                         "failed",
                         json!({"node_id":target.node_id,"error":error}),
                     );
@@ -2189,7 +2189,7 @@ fn wait_for_runtime_ready_acks(
                 *attempt += 1;
                 let attempt = *attempt;
                 bootstrap(
-                    orch_datastream,
+                    orch_telemetry,
                     "runtime_ready_ack",
                     "sent",
                     json!({
@@ -2245,7 +2245,7 @@ fn reconciler_group(config: &Config, spec: &NodeProvisionSpec) -> RunNodeGroupSp
             require_verified: false,
             provider_labels: BTreeMap::from([(
                 "myelin.provider_config".to_owned(),
-                config.provider_datastream_detail().to_string(),
+                config.provider_telemetry_detail().to_string(),
             )]),
         },
         boot: BootSpec {
@@ -2333,13 +2333,13 @@ fn start_and_provision_workers(
         orchestrator_reports,
         stop_rx,
         dashboard,
-        orch_datastream,
+        orch_telemetry,
         orch_stdio_rx,
         ..
     } = ctx;
     let run_id = config.run_id;
     let node_id = config.node_id;
-    let bootstrap = |ds: &mut OrchDatastream, phase: &str, status: &str, detail: Value| {
+    let bootstrap = |ds: &mut OrchTelemetry, phase: &str, status: &str, detail: Value| {
         ds.emit_bootstrap(dashboard, run_id, node_id, phase, status, detail);
     };
     let stage_specs = stage_node_specs(
@@ -2353,7 +2353,7 @@ fn start_and_provision_workers(
         .map(|spec| spec.node_id)
         .collect::<Vec<_>>();
     bootstrap(
-        orch_datastream,
+        orch_telemetry,
         "node_spec",
         "ready",
         json!({
@@ -2362,7 +2362,7 @@ fn start_and_provision_workers(
             "relay_mode":relay_mode_env_value(&config.relay.mode),
             "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
             "docker_gpus":if config.provider.as_str() == "docker" { Some(config.docker_gpus.as_str()) } else { None },
-            "provider_config":config.provider_datastream_detail(),
+            "provider_config":config.provider_telemetry_detail(),
             "env_keys":config.node_spec_env_keys(),
             "worker_count":stage_specs.len(),
             "worker_node_ids":expected_node_ids,
@@ -2373,7 +2373,7 @@ fn start_and_provision_workers(
         let plans = pipeline_stage_shard_plans(config, plan)?;
         emit_stage_shard_plan_summaries(
             dashboard,
-            orch_datastream,
+            orch_telemetry,
             config.run_id,
             config.node_id,
             &plans,
@@ -2383,7 +2383,7 @@ fn start_and_provision_workers(
         BTreeMap::new()
     };
     for node_spec in &stage_specs {
-        orch_datastream.emit_event(
+        orch_telemetry.emit_event(
             dashboard,
             ProvisionEvent {
                 run_id: config.run_id,
@@ -2398,7 +2398,7 @@ fn start_and_provision_workers(
             },
         );
         bootstrap(
-            orch_datastream,
+            orch_telemetry,
             "provider_start",
             "started",
             json!({
@@ -2430,17 +2430,17 @@ fn start_and_provision_workers(
             if let Some(d) = dashboard {
                 d.publish_frame(stream, channel, frame);
             }
-            orch_datastream.archive_frame("node", stream, channel, frame);
+            orch_telemetry.archive_frame("node", stream, channel, frame);
         });
         drain_orch_stdio_capture(
             orch_stdio_rx,
-            orch_datastream,
+            orch_telemetry,
             dashboard,
             config.run_id,
             config.node_id,
         );
         while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, &config.provider, &observation);
+            emit_plugin_observation(orch_telemetry, dashboard, &config.provider, &observation);
         }
         if stop_requested(stop_rx) {
             return Err("shutdown requested while reconciling worker nodes".to_owned());
@@ -2449,7 +2449,7 @@ fn start_and_provision_workers(
     }
     for node_spec in &stage_specs {
         bootstrap(
-            orch_datastream,
+            orch_telemetry,
             "provider_start",
             "ready",
             json!({
@@ -2462,14 +2462,14 @@ fn start_and_provision_workers(
     }
     drain_orch_stdio_capture(
         orch_stdio_rx,
-        orch_datastream,
+        orch_telemetry,
         dashboard,
         config.run_id,
         config.node_id,
     );
 
     bootstrap(
-        orch_datastream,
+        orch_telemetry,
         "node_runtime_ready",
         "started",
         json!({"worker_count":expected_node_ids.len(),"node_ids":expected_node_ids}),
@@ -2484,7 +2484,7 @@ fn start_and_provision_workers(
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
-                orch_datastream,
+                orch_telemetry,
                 orch_stdio_rx,
                 run_id: config.run_id,
                 orchestrator_node_id: config.node_id,
@@ -2497,7 +2497,7 @@ fn start_and_provision_workers(
             Ok(readies) => readies,
             Err(error) => {
                 bootstrap(
-                    orch_datastream,
+                    orch_telemetry,
                     "node_runtime_ready",
                     "failed",
                     json!({"error":error}),
@@ -2507,7 +2507,7 @@ fn start_and_provision_workers(
         };
         for (node_id, ready) in &readies {
             bootstrap(
-                orch_datastream,
+                orch_telemetry,
                 "node_runtime_ready",
                 "ready",
                 json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"node_id":node_id,"stage_index":ready.stage_index,"attempt":ready.readiness_id}),
@@ -2529,7 +2529,7 @@ fn start_and_provision_workers(
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
-                orch_datastream,
+                orch_telemetry,
                 orch_stdio_rx,
                 run_id: config.run_id,
                 orchestrator_node_id: config.node_id,
@@ -2543,7 +2543,7 @@ fn start_and_provision_workers(
             break readies;
         }
         bootstrap(
-            orch_datastream,
+            orch_telemetry,
             "node_runtime_ready",
             "retry",
             json!({"reason":"node attempt changed before ready acknowledgement"}),
@@ -2572,10 +2572,10 @@ fn start_and_provision_workers(
             if let Some(d) = dashboard {
                 d.publish_frame(stream, channel, frame);
             }
-            orch_datastream.archive_frame("node", stream, channel, frame);
+            orch_telemetry.archive_frame("node", stream, channel, frame);
         });
         while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, &config.provider, &observation);
+            emit_plugin_observation(orch_telemetry, dashboard, &config.provider, &observation);
         }
         if stop_requested(stop_rx) {
             return Err("shutdown requested while converging worker nodes".to_owned());
@@ -2584,7 +2584,7 @@ fn start_and_provision_workers(
     }
 
     bootstrap(
-        orch_datastream,
+        orch_telemetry,
         "stage_provision",
         "started",
         stage_provision_detail(config, pipeline_plan),
@@ -2597,7 +2597,7 @@ fn start_and_provision_workers(
     }
 
     bootstrap(
-        orch_datastream,
+        orch_telemetry,
         "weights_loaded",
         "started",
         json!({"model_id":&config.model_id,"expected":expected_node_ids.len()}),
@@ -2612,7 +2612,7 @@ fn start_and_provision_workers(
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
-                orch_datastream,
+                orch_telemetry,
                 orch_stdio_rx,
                 run_id: config.run_id,
                 orchestrator_node_id: config.node_id,
@@ -2635,7 +2635,7 @@ fn start_and_provision_workers(
                 orchestrator_reports,
                 stop_rx,
                 dashboard,
-                orch_datastream,
+                orch_telemetry,
                 orch_stdio_rx,
                 run_id: config.run_id,
                 orchestrator_node_id: config.node_id,
@@ -2647,21 +2647,21 @@ fn start_and_provision_workers(
     };
     match weights_result {
         Ok(()) => bootstrap(
-            orch_datastream,
+            orch_telemetry,
             "weights_loaded",
             "ready",
             json!({"source":"actor_stage_ready","model_id":&config.model_id,"expected":expected_node_ids.len()}),
         ),
         Err(error) => {
             bootstrap(
-                orch_datastream,
+                orch_telemetry,
                 "weights_loaded",
                 "failed",
                 json!({"error":error}),
             );
             drain_orch_stdio_capture(
                 orch_stdio_rx,
-                orch_datastream,
+                orch_telemetry,
                 dashboard,
                 config.run_id,
                 config.node_id,
@@ -2883,13 +2883,13 @@ fn stage_shard_plan_summary_detail(plan: &StageShardPlan) -> Value {
 
 fn emit_stage_shard_plan_summaries(
     dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
+    orch_telemetry: &mut OrchTelemetry,
     run_id: u64,
     node_id: u64,
     stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
 ) {
     for plan in stage_shard_plans.values() {
-        orch_datastream.emit_bootstrap(
+        orch_telemetry.emit_bootstrap(
             dashboard,
             run_id,
             node_id,
@@ -2965,7 +2965,7 @@ fn wait_for_runtime_readies(
         orchestrator_reports,
         stop_rx,
         dashboard,
-        orch_datastream,
+        orch_telemetry,
         orch_stdio_rx,
         run_id,
         provider,
@@ -2983,22 +2983,22 @@ fn wait_for_runtime_readies(
         });
         collector.pump(driver);
         emit_swim_transitions(
-            orch_datastream,
+            orch_telemetry,
             dashboard,
             run_id,
             expected_node_ids.first().copied().unwrap_or(0),
             stack,
         );
-        emit_swim_probe_events(orch_datastream, dashboard, stack, "runtime_ready_wait");
+        emit_swim_probe_events(orch_telemetry, dashboard, stack, "runtime_ready_wait");
         collector.drain(|stream, channel, frame| {
             if let Some(d) = dashboard {
                 d.publish_frame(stream, channel, frame);
             }
-            orch_datastream.archive_frame("node", stream, channel, frame);
+            orch_telemetry.archive_frame("node", stream, channel, frame);
         });
         drain_orch_stdio_capture(
             orch_stdio_rx,
-            orch_datastream,
+            orch_telemetry,
             dashboard,
             run_id,
             expected_node_ids.first().copied().unwrap_or(0),
@@ -3007,9 +3007,9 @@ fn wait_for_runtime_readies(
             return Err("shutdown requested while waiting for pipeline nodes ready".to_owned());
         }
         while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+            emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
             match observation {
-                PluginObservation::DatastreamFrame { .. }
+                PluginObservation::TelemetryFrame { .. }
                 | PluginObservation::ProviderLine { .. }
                 | PluginObservation::StdoutLine { .. }
                 | PluginObservation::StderrLine { .. }
@@ -3024,7 +3024,7 @@ fn wait_for_runtime_readies(
                 stage_index,
                 endpoint,
                 node_actor,
-                datastream_publisher,
+                telemetry_publisher,
                 readiness_id,
             } = report
                 && report_run_id == run_id
@@ -3037,7 +3037,7 @@ fn wait_for_runtime_readies(
                     RuntimeReady {
                         endpoint: endpoint.clone(),
                         node_actor,
-                        datastream_publisher,
+                        telemetry_publisher,
                         stage_index,
                         readiness_id,
                         swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
@@ -3074,7 +3074,7 @@ fn wait_for_weights_loaded_count(
         orchestrator_reports,
         stop_rx,
         dashboard,
-        orch_datastream,
+        orch_telemetry,
         orch_stdio_rx,
         run_id,
         orchestrator_node_id: node_id,
@@ -3094,9 +3094,9 @@ fn wait_for_weights_loaded_count(
     let mut load_progress = BTreeMap::<u64, StageLoadProgress>::new();
     loop {
         collector.pump(driver);
-        emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
-        emit_swim_probe_events(orch_datastream, dashboard, stack, "weights_loaded_wait");
-        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
+        emit_swim_transitions(orch_telemetry, dashboard, run_id, node_id, stack);
+        emit_swim_probe_events(orch_telemetry, dashboard, stack, "weights_loaded_wait");
+        drain_orch_stdio_capture(orch_stdio_rx, orch_telemetry, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for pipeline weights loaded".to_owned());
         }
@@ -3123,7 +3123,7 @@ fn wait_for_weights_loaded_count(
                     stack,
                     collector,
                     dashboard,
-                    orch_datastream: &mut *orch_datastream,
+                    orch_telemetry: &mut *orch_telemetry,
                     run_id,
                     node_id,
                     pipeline_plan,
@@ -3140,14 +3140,14 @@ fn wait_for_weights_loaded_count(
             last_resend = Instant::now();
         }
         while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+            emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
             match observation {
                 PluginObservation::Failed {
                     reason,
                     node_id: failed_node_id,
                     ..
                 } => {
-                    orch_datastream.emit_bootstrap(
+                    orch_telemetry.emit_bootstrap(
                         dashboard,
                         run_id,
                         node_id,
@@ -3169,7 +3169,7 @@ fn wait_for_weights_loaded_count(
                 } => {
                     let reason =
                         format!("node {exited_node_id} exited while loading weights: {status:?}");
-                    orch_datastream.emit_bootstrap(
+                    orch_telemetry.emit_bootstrap(
                         dashboard,
                         run_id,
                         node_id,
@@ -3185,7 +3185,7 @@ fn wait_for_weights_loaded_count(
                     );
                     return Err(reason);
                 }
-                PluginObservation::DatastreamFrame { .. }
+                PluginObservation::TelemetryFrame { .. }
                 | PluginObservation::ProviderLine { .. }
                 | PluginObservation::StdoutLine { .. }
                 | PluginObservation::StderrLine { .. } => {}
@@ -3195,7 +3195,7 @@ fn wait_for_weights_loaded_count(
             if let Some(d) = dashboard {
                 d.publish_frame(stream, channel, frame);
             }
-            orch_datastream.archive_frame("node", stream, channel, frame);
+            orch_telemetry.archive_frame("node", stream, channel, frame);
         });
         while let Some(report) = orchestrator_reports.try_recv() {
             match report {
@@ -3234,7 +3234,7 @@ struct PipelineStageProvision<'a> {
     stack: &'a DistributionRuntimeStack,
     collector: &'a FrameCollector,
     dashboard: Option<&'a DashboardSupport>,
-    orch_datastream: &'a mut OrchDatastream,
+    orch_telemetry: &'a mut OrchTelemetry,
     run_id: u64,
     node_id: u64,
     pipeline_plan: &'a run_plan::RunPlan,
@@ -3264,14 +3264,14 @@ fn send_pipeline_stage_provision(
         .get(&stage_node_id)
         .ok_or_else(|| format!("missing runtime-ready node for stage {}", stage.stage_index))?;
     let route_owner = ctx.stack.route_owner(ready.node_actor);
-    let datastream_route_owner = ctx.stack.route_owner(ready.datastream_publisher);
+    let telemetry_route_owner = ctx.stack.route_owner(ready.telemetry_publisher);
     let member_state = ctx.stack.member_state(ready.swim_node_id);
     let route_matches_ready = route_owner == Some(ready.swim_node_id);
     let (dashboard, run_id, node_id) = (ctx.dashboard, ctx.run_id, ctx.node_id);
-    let bootstrap = |ds: &mut OrchDatastream, phase: &str, status: &str, detail: Value| {
+    let bootstrap = |ds: &mut OrchTelemetry, phase: &str, status: &str, detail: Value| {
         ds.emit_bootstrap(dashboard, run_id, node_id, phase, status, detail);
     };
-    ctx.orch_datastream.emit_bootstrap_to_channel(
+    ctx.orch_telemetry.emit_bootstrap_to_channel(
         ctx.dashboard,
         MYELIN_STAGE_ROUTE,
         ctx.run_id,
@@ -3283,11 +3283,11 @@ fn send_pipeline_stage_provision(
             "stage_index":stage.stage_index,
             "stage_node_id":stage_node_id,
             "node_actor":ready.node_actor,
-            "datastream_publisher":ready.datastream_publisher,
+            "telemetry_publisher":ready.telemetry_publisher,
             "swim_node_id":format!("{:?}", ready.swim_node_id),
             "member_state":member_state.map(|state| format!("{:?}", state)),
             "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
-            "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
+            "telemetry_route_owner":telemetry_route_owner.map(|owner| format!("{:?}", owner)),
             "route_matches_ready":route_matches_ready,
         }),
     );
@@ -3302,12 +3302,12 @@ fn send_pipeline_stage_provision(
             stage_node_id,
             member_state,
             route_owner,
-            datastream_route_owner,
+            telemetry_route_owner,
             route_matches_ready,
             "heartbeat_missed",
         );
         bootstrap(
-            ctx.orch_datastream,
+            ctx.orch_telemetry,
             "stage_provision_wait",
             "failed",
             json!({
@@ -3319,7 +3319,7 @@ fn send_pipeline_stage_provision(
                 "loaded_stage_count":ctx.loaded_stages.len(),
                 "member_state":"Dead",
                 "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
-                "datastream_route_owner":datastream_route_owner.map(|owner| format!("{:?}", owner)),
+                "telemetry_route_owner":telemetry_route_owner.map(|owner| format!("{:?}", owner)),
                 "classification":"heartbeat_missed",
                 "liveness":liveness,
                 "reason":reason,
@@ -3335,7 +3335,7 @@ fn send_pipeline_stage_provision(
     );
     if !should_send {
         bootstrap(
-            ctx.orch_datastream,
+            ctx.orch_telemetry,
             "stage_provision_wait",
             "observed",
             json!({
@@ -3353,7 +3353,7 @@ fn send_pipeline_stage_provision(
                     stage_node_id,
                     member_state,
                     route_owner,
-                    datastream_route_owner,
+                    telemetry_route_owner,
                     route_matches_ready,
                     "waiting",
                 ),
@@ -3377,7 +3377,7 @@ fn send_pipeline_stage_provision(
     };
     ctx.stage_last_sends.insert(stage.stage_index, now);
     bootstrap(
-        ctx.orch_datastream,
+        ctx.orch_telemetry,
         "stage_provision_send",
         "sent",
         json!({
@@ -3392,7 +3392,7 @@ fn send_pipeline_stage_provision(
     );
     if stage_send_count == 1 || stage_send_count % 15 == 0 {
         bootstrap(
-            ctx.orch_datastream,
+            ctx.orch_telemetry,
             "stage_provision_wait",
             "observed",
             json!({
@@ -3408,7 +3408,7 @@ fn send_pipeline_stage_provision(
                     stage_node_id,
                     member_state,
                     route_owner,
-                    datastream_route_owner,
+                    telemetry_route_owner,
                     route_matches_ready,
                     "waiting",
                 ),
@@ -3504,7 +3504,7 @@ fn stage_load_liveness_detail(
     stage_node_id: u64,
     member_state: Option<MemberState>,
     route_owner: Option<DistNodeId>,
-    datastream_route_owner: Option<DistNodeId>,
+    telemetry_route_owner: Option<DistNodeId>,
     route_matches_ready: bool,
     classification: &str,
 ) -> Value {
@@ -3514,7 +3514,7 @@ fn stage_load_liveness_detail(
         "stage_node_id": stage_node_id,
         "member_state": member_state.map(|state| format!("{:?}", state)),
         "route_owner": route_owner.map(|owner| format!("{:?}", owner)),
-        "datastream_route_owner": datastream_route_owner.map(|owner| format!("{:?}", owner)),
+        "telemetry_route_owner": telemetry_route_owner.map(|owner| format!("{:?}", owner)),
         "route_matches_ready": route_matches_ready,
         "load_progress": progress.map(StageLoadProgress::to_json),
         "host_gpu_missing": progress.is_none_or(|progress| progress.host_gpu_samples == 0),
@@ -3591,7 +3591,7 @@ impl OrchStdioCapture {
 
 fn drain_orch_stdio_capture(
     rx: Option<&mpsc::Receiver<OrchStdioLine>>,
-    datastream: &mut OrchDatastream,
+    telemetry: &mut OrchTelemetry,
     dashboard: Option<&DashboardSupport>,
     run_id: u64,
     node_id: u64,
@@ -3600,7 +3600,7 @@ fn drain_orch_stdio_capture(
         return;
     };
     while let Ok(line) = rx.try_recv() {
-        datastream.emit_log(
+        telemetry.emit_log(
             dashboard,
             ProvisionLogLine {
                 run_id,
@@ -3750,7 +3750,7 @@ fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Re
         orchestrator_reports,
         stop_rx,
         dashboard,
-        orch_datastream,
+        orch_telemetry,
         orch_stdio_rx,
         run_id,
         orchestrator_node_id: node_id,
@@ -3759,18 +3759,18 @@ fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Re
     } = ctx;
     loop {
         collector.pump(driver);
-        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
+        drain_orch_stdio_capture(orch_stdio_rx, orch_telemetry, dashboard, run_id, node_id);
         if stop_requested(stop_rx) {
             return Err("shutdown requested while waiting for weights loaded".to_owned());
         }
-        drain_observations_with_exit(obs_rx, dashboard, orch_datastream, provider, |_, status| {
+        drain_observations_with_exit(obs_rx, dashboard, orch_telemetry, provider, |_, status| {
             format!("node exited while loading weights: {status:?}")
         })?;
         collector.drain(|stream, channel, frame| {
             if let Some(d) = dashboard {
                 d.publish_frame(stream, channel, frame);
             }
-            orch_datastream.archive_frame("node", stream, channel, frame);
+            orch_telemetry.archive_frame("node", stream, channel, frame);
         });
         while let Some(report) = orchestrator_reports.try_recv() {
             match report {
@@ -3901,12 +3901,12 @@ impl PipelinePromptRuntime {
         events: mpsc::Sender<PromptEvent>,
         runtime: &swactor::runtime::Runtime,
         dashboard: Option<&DashboardSupport>,
-        orch_datastream: &mut OrchDatastream,
+        orch_telemetry: &mut OrchTelemetry,
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
         let emit_prompt_evt =
-            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
                 ds.emit_prompt(
                     dashboard, run_id, node_id, request_id, phase, status, detail,
                 )
@@ -3915,7 +3915,7 @@ impl PipelinePromptRuntime {
         if self.active.is_some() || self.pending_encode.is_some() || self.pending_decode.is_some() {
             let active_request_id = self.active.as_ref().map(|active| active.request.request_id);
             emit_prompt_evt(
-                orch_datastream,
+                orch_telemetry,
                 request_id,
                 "pipeline_prompt_busy",
                 "failed",
@@ -3939,7 +3939,7 @@ impl PipelinePromptRuntime {
         self.started_at = Some(Instant::now());
         self.note_progress();
         emit_prompt_evt(
-            orch_datastream,
+            orch_telemetry,
             request_id,
             "pipeline_tokenizer_encode",
             "started",
@@ -3962,12 +3962,12 @@ impl PipelinePromptRuntime {
     fn emit_wait_progress(
         &mut self,
         dashboard: Option<&DashboardSupport>,
-        orch_datastream: &mut OrchDatastream,
+        orch_telemetry: &mut OrchTelemetry,
         run_id: u64,
         node_id: u64,
     ) {
         let emit_prompt_evt =
-            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
                 ds.emit_prompt(
                     dashboard, run_id, node_id, request_id, phase, status, detail,
                 )
@@ -3987,7 +3987,7 @@ impl PipelinePromptRuntime {
             .unwrap_or(elapsed_ms);
         if self.next_wait_log_at.is_some_and(|next| now >= next) {
             emit_prompt_evt(
-                orch_datastream,
+                orch_telemetry,
                 request_id,
                 "pipeline_prompt_wait",
                 "waiting",
@@ -4009,7 +4009,7 @@ impl PipelinePromptRuntime {
         runtime: &swactor::runtime::Runtime,
         tokenizer_events: &swactor::runtime::Inbox<TokenizerEvent>,
         dashboard: Option<&DashboardSupport>,
-        orch_datastream: &mut OrchDatastream,
+        orch_telemetry: &mut OrchTelemetry,
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
@@ -4020,7 +4020,7 @@ impl PipelinePromptRuntime {
                         request_id,
                         tokens,
                         dashboard,
-                        orch_datastream,
+                        orch_telemetry,
                         run_id,
                         node_id,
                     )?,
@@ -4029,7 +4029,7 @@ impl PipelinePromptRuntime {
                     request_id,
                     text,
                     dashboard,
-                    orch_datastream,
+                    orch_telemetry,
                     run_id,
                     node_id,
                 )?,
@@ -4046,12 +4046,12 @@ impl PipelinePromptRuntime {
         request_id: u64,
         tokens: Vec<u32>,
         dashboard: Option<&DashboardSupport>,
-        orch_datastream: &mut OrchDatastream,
+        orch_telemetry: &mut OrchTelemetry,
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
         let emit_prompt_evt =
-            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
                 ds.emit_prompt(
                     dashboard, run_id, node_id, request_id, phase, status, detail,
                 )
@@ -4070,7 +4070,7 @@ impl PipelinePromptRuntime {
             return Ok(());
         }
         emit_prompt_evt(
-            orch_datastream,
+            orch_telemetry,
             request_id,
             "pipeline_tokenizer_encode",
             "ready",
@@ -4078,7 +4078,7 @@ impl PipelinePromptRuntime {
         );
         let sequence = self.next_sequence;
         emit_prompt_evt(
-            orch_datastream,
+            orch_telemetry,
             request_id,
             "pipeline_token_in",
             "started",
@@ -4087,7 +4087,7 @@ impl PipelinePromptRuntime {
         self.send_token_in(sequence, &tokens, true)?;
         self.note_progress();
         emit_prompt_evt(
-            orch_datastream,
+            orch_telemetry,
             request_id,
             "pipeline_token_in",
             "ready",
@@ -4103,12 +4103,12 @@ impl PipelinePromptRuntime {
         request_id: u64,
         text: String,
         dashboard: Option<&DashboardSupport>,
-        orch_datastream: &mut OrchDatastream,
+        orch_telemetry: &mut OrchTelemetry,
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
         let emit_prompt_evt =
-            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
                 ds.emit_prompt(
                     dashboard, run_id, node_id, request_id, phase, status, detail,
                 )
@@ -4128,7 +4128,7 @@ impl PipelinePromptRuntime {
         }
         let events = active.events.clone();
         emit_prompt_evt(
-            orch_datastream,
+            orch_telemetry,
             request_id,
             "pipeline_tokenizer_decode",
             "ready",
@@ -4147,7 +4147,7 @@ impl PipelinePromptRuntime {
             let final_text = self.final_text.clone();
             let tokens_generated = self.generated_tokens.len() as u32;
             emit_prompt_evt(
-                orch_datastream,
+                orch_telemetry,
                 request_id,
                 "prompt_complete",
                 "ready",
@@ -4173,7 +4173,7 @@ impl PipelinePromptRuntime {
         }
         let sequence = self.next_sequence;
         emit_prompt_evt(
-            orch_datastream,
+            orch_telemetry,
             request_id,
             "pipeline_token_in",
             "started",
@@ -4182,7 +4182,7 @@ impl PipelinePromptRuntime {
         self.send_token_in(sequence, &[pending.token_id], false)?;
         self.note_progress();
         emit_prompt_evt(
-            orch_datastream,
+            orch_telemetry,
             request_id,
             "pipeline_token_in",
             "ready",
@@ -4288,12 +4288,12 @@ impl PipelinePromptRuntime {
         &mut self,
         runtime: &swactor::runtime::Runtime,
         dashboard: Option<&DashboardSupport>,
-        orch_datastream: &mut OrchDatastream,
+        orch_telemetry: &mut OrchTelemetry,
         run_id: u64,
         node_id: u64,
     ) -> Result<(), String> {
         let emit_prompt_evt =
-            |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
                 ds.emit_prompt(
                     dashboard, run_id, node_id, request_id, phase, status, detail,
                 )
@@ -4319,7 +4319,7 @@ impl PipelinePromptRuntime {
                 };
                 let request_id = active.request.request_id;
                 emit_prompt_evt(
-                    orch_datastream,
+                    orch_telemetry,
                     request_id,
                     "pipeline_token_out",
                     "observed",
@@ -4328,7 +4328,7 @@ impl PipelinePromptRuntime {
                 self.generated_tokens.push(record.token_id);
                 let reached_limit = self.generated_tokens.len() as u32 >= active.request.max_tokens;
                 emit_prompt_evt(
-                    orch_datastream,
+                    orch_telemetry,
                     request_id,
                     "pipeline_tokenizer_decode",
                     "started",
@@ -4413,7 +4413,7 @@ fn serve_prompts(
         collector,
         stop_rx,
         dashboard,
-        orch_datastream,
+        orch_telemetry,
         orch_stdio_rx,
         run_id,
         orchestrator_node_id: node_id,
@@ -4422,7 +4422,7 @@ fn serve_prompts(
         ..
     } = ctx;
     let emit_prompt_evt =
-        |ds: &mut OrchDatastream, request_id: u64, phase: &str, status: &str, detail: Value| {
+        |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
             ds.emit_prompt(
                 dashboard, run_id, node_id, request_id, phase, status, detail,
             )
@@ -4441,24 +4441,24 @@ fn serve_prompts(
     let mut active: Option<ActivePrompt> = None;
     loop {
         collector.pump(driver);
-        orch_datastream.flush(dashboard, "orchestrator");
+        orch_telemetry.flush(dashboard, "orchestrator");
         if let Some(pipeline) = pipeline_runtime.as_mut() {
             pipeline.poll_driver(driver);
             pipeline.drain_tokenizer_events(
                 &stack.runtime,
                 tokenizer_events,
                 dashboard,
-                orch_datastream,
+                orch_telemetry,
                 run_id,
                 node_id,
             )?;
-            pipeline.drain_tokens(&stack.runtime, dashboard, orch_datastream, run_id, node_id)?;
-            pipeline.emit_wait_progress(dashboard, orch_datastream, run_id, node_id);
+            pipeline.drain_tokens(&stack.runtime, dashboard, orch_telemetry, run_id, node_id)?;
+            pipeline.emit_wait_progress(dashboard, orch_telemetry, run_id, node_id);
         }
         drain_observations_with_exit(
             obs_rx,
             dashboard,
-            orch_datastream,
+            orch_telemetry,
             &provider,
             |_, status| format!("node exited: {status:?}"),
         )?;
@@ -4466,11 +4466,11 @@ fn serve_prompts(
             if let Some(d) = dashboard {
                 d.publish_frame(stream, channel, frame);
             }
-            orch_datastream.archive_frame("node", stream, channel, frame);
+            orch_telemetry.archive_frame("node", stream, channel, frame);
         });
-        drain_orch_stdio_capture(orch_stdio_rx, orch_datastream, dashboard, run_id, node_id);
+        drain_orch_stdio_capture(orch_stdio_rx, orch_telemetry, dashboard, run_id, node_id);
         let swim_transitions =
-            emit_swim_transitions(orch_datastream, dashboard, run_id, node_id, stack);
+            emit_swim_transitions(orch_telemetry, dashboard, run_id, node_id, stack);
         for transition in &swim_transitions {
             if transition.to == MemberState::Dead
                 && let Some(&lost_node_id) = swim_to_node.get(&transition.peer)
@@ -4485,7 +4485,7 @@ fn serve_prompts(
             }
         }
         if stop_rx.try_recv().is_ok() {
-            orch_datastream.emit_bootstrap(
+            orch_telemetry.emit_bootstrap(
                 dashboard,
                 run_id,
                 node_id,
@@ -4510,7 +4510,7 @@ fn serve_prompts(
             let request = work.request;
             let request_id = request.request_id;
             emit_prompt_evt(
-                orch_datastream,
+                orch_telemetry,
                 request_id,
                 "prompt_work",
                 "observed",
@@ -4525,14 +4525,14 @@ fn serve_prompts(
                     work.events,
                     &stack.runtime,
                     dashboard,
-                    orch_datastream,
+                    orch_telemetry,
                     run_id,
                     node_id,
                 )?;
                 continue;
             }
             emit_prompt_evt(
-                orch_datastream,
+                orch_telemetry,
                 request_id,
                 "node_prompt_send",
                 "started",
@@ -4549,7 +4549,7 @@ fn serve_prompts(
             ) {
                 Ok(()) => {
                     emit_prompt_evt(
-                        orch_datastream,
+                        orch_telemetry,
                         request_id,
                         "node_prompt_send",
                         "ready",
@@ -4562,7 +4562,7 @@ fn serve_prompts(
                 }
                 Err(error) => {
                     emit_prompt_evt(
-                        orch_datastream,
+                        orch_telemetry,
                         request_id,
                         "node_prompt_send",
                         "failed",
@@ -4577,7 +4577,7 @@ fn serve_prompts(
             let request_id = event.request_id();
             let Some(current) = active.as_ref() else {
                 emit_prompt_evt(
-                    orch_datastream,
+                    orch_telemetry,
                     request_id,
                     "node_prompt_event",
                     "dropped",
@@ -4587,7 +4587,7 @@ fn serve_prompts(
             };
             if request_id != current.request.request_id {
                 emit_prompt_evt(
-                    orch_datastream,
+                    orch_telemetry,
                     request_id,
                     "node_prompt_event",
                     "dropped",
@@ -4608,7 +4608,7 @@ fn serve_prompts(
                 PromptEvent::TextDelta { .. } => None,
             };
             emit_prompt_evt(
-                orch_datastream,
+                orch_telemetry,
                 request_id,
                 "node_prompt_event",
                 "observed",
@@ -4617,7 +4617,7 @@ fn serve_prompts(
             let _ = current.events.send(event);
             if let Some((status, detail)) = completion {
                 emit_prompt_evt(
-                    orch_datastream,
+                    orch_telemetry,
                     request_id,
                     "prompt_complete",
                     status,
@@ -4694,18 +4694,18 @@ fn spawn_stop_listener() -> mpsc::Receiver<()> {
 fn drain_observations_with_exit(
     obs_rx: &mpsc::Receiver<PluginObservation>,
     dashboard: Option<&DashboardSupport>,
-    orch_datastream: &mut OrchDatastream,
+    orch_telemetry: &mut OrchTelemetry,
     provider: &ProviderKind,
     exit_message: impl Fn(u64, Option<i32>) -> String,
 ) -> Result<(), String> {
     while let Ok(observation) = obs_rx.try_recv() {
-        emit_plugin_observation(orch_datastream, dashboard, provider, &observation);
+        emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
         match observation {
             PluginObservation::Failed { reason, .. } => return Err(reason),
             PluginObservation::Exited {
                 node_id, status, ..
             } => return Err(exit_message(node_id, status)),
-            PluginObservation::DatastreamFrame { .. }
+            PluginObservation::TelemetryFrame { .. }
             | PluginObservation::ProviderLine { .. }
             | PluginObservation::StdoutLine { .. }
             | PluginObservation::StderrLine { .. } => {}
@@ -4715,7 +4715,7 @@ fn drain_observations_with_exit(
 }
 
 fn emit_plugin_observation(
-    orch_datastream: &mut OrchDatastream,
+    orch_telemetry: &mut OrchTelemetry,
     dashboard: Option<&DashboardSupport>,
     provider: &ProviderKind,
     observation: &PluginObservation,
@@ -4725,7 +4725,7 @@ fn emit_plugin_observation(
             run_id,
             node_id,
             line,
-        } => orch_datastream.emit_log(
+        } => orch_telemetry.emit_log(
             dashboard,
             ProvisionLogLine {
                 run_id: *run_id,
@@ -4738,7 +4738,7 @@ fn emit_plugin_observation(
             run_id,
             node_id,
             line,
-        } => orch_datastream.emit_log(
+        } => orch_telemetry.emit_log(
             dashboard,
             ProvisionLogLine {
                 run_id: *run_id,
@@ -4751,7 +4751,7 @@ fn emit_plugin_observation(
             run_id,
             node_id,
             line,
-        } => orch_datastream.emit_log(
+        } => orch_telemetry.emit_log(
             dashboard,
             ProvisionLogLine {
                 run_id: *run_id,
@@ -4760,9 +4760,9 @@ fn emit_plugin_observation(
                 line: line.clone(),
             },
         ),
-        PluginObservation::DatastreamFrame {
+        PluginObservation::TelemetryFrame {
             channel, payload, ..
-        } => orch_datastream.emit_bytes_from(
+        } => orch_telemetry.emit_bytes_from(
             dashboard,
             channel,
             payload.as_bytes().to_vec(),
@@ -4772,7 +4772,7 @@ fn emit_plugin_observation(
             run_id,
             node_id,
             status,
-        } => orch_datastream.emit_event(
+        } => orch_telemetry.emit_event(
             dashboard,
             ProvisionEvent {
                 run_id: *run_id,
@@ -4786,7 +4786,7 @@ fn emit_plugin_observation(
             run_id,
             node_id,
             reason,
-        } => orch_datastream.emit_event(
+        } => orch_telemetry.emit_event(
             dashboard,
             ProvisionEvent {
                 run_id: *run_id,
@@ -4800,7 +4800,7 @@ fn emit_plugin_observation(
 }
 
 fn emit_swim_transitions(
-    orch_datastream: &mut OrchDatastream,
+    orch_telemetry: &mut OrchTelemetry,
     dashboard: Option<&DashboardSupport>,
     run_id: u64,
     node_id: u64,
@@ -4817,7 +4817,7 @@ fn emit_swim_transitions(
         let last_ack_age_ms = transition.last_ack_age.map(duration_ms_u64);
         let consecutive_timeouts = transition.consecutive_timeouts;
         let recent_probe_targets = stack.swim_recent_probe_targets();
-        orch_datastream.emit_bootstrap_to_channel(
+        orch_telemetry.emit_bootstrap_to_channel(
             dashboard,
             MYELIN_SWIM_MEMBERSHIP,
             run_id,
@@ -4835,20 +4835,20 @@ fn emit_swim_transitions(
                 "member_state":member_state.clone(),
             }),
         );
-        orch_datastream.emit_record(dashboard, &stack.membership_transition(transition));
+        orch_telemetry.emit_record(dashboard, &stack.membership_transition(transition));
     }
     transitions
 }
 
 fn emit_swim_probe_events(
-    orch_datastream: &mut OrchDatastream,
+    orch_telemetry: &mut OrchTelemetry,
     dashboard: Option<&DashboardSupport>,
     stack: &DistributionRuntimeStack,
     local_phase: &str,
 ) {
     for event in stack.drain_swim_probe_events() {
         let record = stack.swim_probe_event_record(event, local_phase);
-        orch_datastream.emit_record(dashboard, &record);
+        orch_telemetry.emit_record(dashboard, &record);
     }
 }
 
@@ -4902,7 +4902,7 @@ fn default_local_tinygrad_worker_path() -> Option<PathBuf> {
     })
 }
 
-fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
+pub(crate) fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, String> {
     match explicit {
         Some(path) => Ok(path),
         None => {
@@ -4916,7 +4916,7 @@ fn resolve_vastai_ssh_identity(explicit: Option<PathBuf>) -> Result<PathBuf, Str
     }
 }
 
-fn expand_home_path(value: &str) -> Result<PathBuf, String> {
+pub(crate) fn expand_home_path(value: &str) -> Result<PathBuf, String> {
     let trimmed = value.trim();
     if let Some(rest) = trimmed.strip_prefix("~/") {
         let home = std::env::var_os("HOME")
@@ -4927,7 +4927,7 @@ fn expand_home_path(value: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(trimmed))
 }
 
-fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
+pub(crate) fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
     let output = Command::new("ssh-keygen")
         .arg("-y")
         .arg("-f")
@@ -4952,7 +4952,7 @@ fn derive_ssh_public_key(identity: &Path) -> Result<String, String> {
     Ok(public_key)
 }
 
-fn ssh_public_key_fingerprint(public_key: &str) -> String {
+pub(crate) fn ssh_public_key_fingerprint(public_key: &str) -> String {
     const UNAVAILABLE: &str = "unavailable";
 
     let path =
@@ -4997,7 +4997,7 @@ fn vastai_account_has_ssh_key(api_key: &str, public_key: &str) -> Result<bool, S
     ))
 }
 
-fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), String> {
+pub(crate) fn ensure_vastai_account_ssh_key(api_key: &str, public_key: &str) -> Result<(), String> {
     if vastai_account_has_ssh_key(api_key, public_key)? {
         return Ok(());
     }

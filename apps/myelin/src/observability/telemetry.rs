@@ -1,6 +1,6 @@
-//! Myelin-system-owned datastream channel records.
+//! Myelin-system-owned telemetry channel records.
 
-use datastream::Record;
+use telemetry::Record;
 use serde::{Deserialize, Serialize};
 
 use crate::observability::lifecycle as obs;
@@ -14,7 +14,7 @@ pub(crate) const MYELIN_PROVISIONING_EVENTS: &str = "myelin.provisioning.events"
 /// Raw provider/process stream lines captured during provisioning.
 pub(crate) const MYELIN_PROVISIONING_LOGS: &str = "myelin.provisioning.logs";
 
-/// Datastream payload for the Myelin lifecycle channel.
+/// Telemetry payload for the Myelin lifecycle channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MyelinLifecycleRecord {
     pub event: obs::Event,
@@ -23,7 +23,7 @@ pub(crate) struct MyelinLifecycleRecord {
 impl Record for MyelinLifecycleRecord {
     const CHANNEL: &'static str = MYELIN_LIFECYCLE;
 }
-/// Datastream payload for provisioning lifecycle events.
+/// Telemetry payload for provisioning lifecycle events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MyelinProvisionEventRecord {
     pub event: provisioning::ProvisionEvent,
@@ -39,7 +39,7 @@ impl Record for MyelinProvisionEventRecord {
     const CHANNEL: &'static str = MYELIN_PROVISIONING_EVENTS;
 }
 
-/// Datastream payload for provisioning stdout/stderr/provider lines.
+/// Telemetry payload for provisioning stdout/stderr/provider lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct MyelinProvisionLogRecord {
     pub line: provisioning::ProvisionLogLine,

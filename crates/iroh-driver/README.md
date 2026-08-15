@@ -22,7 +22,7 @@ task; `with_engine` blocks on a synchronous channel until the endpoint is bound
 
 ## Engine-hosted progression
 
-All adapter progression — actor-bridge ingress/egress, datastream ingress, and
+All adapter progression — actor-bridge ingress/egress, telemetry ingress, and
 edge ingress — is driven by an engine-hosted interval pump installed via
 `install_actor_bridge_pump`. Applications do not (and cannot) manually pump
 these adapters; the single engine owns progression for the node's lifetime

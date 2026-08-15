@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use datastream::{DatastreamEndpoint, DatastreamEvent, Lifetime, NodeId, StreamId};
+use telemetry::frame::TelemetryEvent;
+use telemetry::{TelemetryEndpoint, Lifetime, NodeId, StreamId};
 use serde_json::{Value, json};
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
 use swactor::runtime::{
@@ -74,7 +75,7 @@ fn runtime_host() -> (Runtime, SingleThreadRuntime) {
 
 fn drive_once(
     host: &mut SingleThreadRuntime,
-    endpoint: Option<&DatastreamEndpoint>,
+    endpoint: Option<&TelemetryEndpoint>,
     upstream: &Inbox<ProcessOutput>,
     outputs: &mut Vec<ProcessOutput>,
 ) {
@@ -108,7 +109,7 @@ fn send_spawn(
 
 fn drive_until_spawn_reply(
     host: &mut SingleThreadRuntime,
-    endpoint: Option<&DatastreamEndpoint>,
+    endpoint: Option<&TelemetryEndpoint>,
     upstream: &Inbox<ProcessOutput>,
     outputs: &mut Vec<ProcessOutput>,
     reply: &Inbox<SpawnReply>,
@@ -124,7 +125,7 @@ fn drive_until_spawn_reply(
 
 fn drive_until(
     host: &mut SingleThreadRuntime,
-    endpoint: Option<&DatastreamEndpoint>,
+    endpoint: Option<&TelemetryEndpoint>,
     upstream: &Inbox<ProcessOutput>,
     outputs: &mut Vec<ProcessOutput>,
     mut done: impl FnMut(&[ProcessOutput]) -> bool,
@@ -219,7 +220,7 @@ fn exited_index(outputs: &[ProcessOutput]) -> usize {
         .unwrap_or_else(|| panic!("missing Exited output: {outputs:?}"))
 }
 
-fn channel_names(endpoint: &DatastreamEndpoint) -> Vec<String> {
+fn channel_names(endpoint: &TelemetryEndpoint) -> Vec<String> {
     endpoint
         .catalog_snapshot()
         .channels
@@ -229,13 +230,13 @@ fn channel_names(endpoint: &DatastreamEndpoint) -> Vec<String> {
 }
 
 #[test]
-fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
+fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_telemetry() {
     let (rt, mut host) = runtime_host();
     let sender = rt.create_sender();
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
     let spawner = rt.spawn(SpawnerActor).unwrap();
-    let endpoint = DatastreamEndpoint::new(stage2_stream());
+    let endpoint = TelemetryEndpoint::new(stage2_stream());
     let subscription = endpoint.subscribe_all("process-stage2-lifecycle");
 
     send_spawn(
@@ -247,7 +248,7 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
             vec!["-c", "echo stdout; echo stderr >&2; exit 0"],
             Some("trainer.0/foo"),
         ),
-        ProcessOutputConfig::datastream_mirror(*upstream.addr(), endpoint.producer()),
+        ProcessOutputConfig::telemetry_mirror(*upstream.addr(), endpoint.producer()),
         &reply,
     );
 
@@ -261,13 +262,13 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
     ));
     assert_ne!(process_addr, ActorAddress::default());
 
-    let mut datastream_events = subscription.drain_available();
+    let mut telemetry_events = subscription.drain_available();
     drive_until(&mut host, Some(&endpoint), &upstream, &mut outputs, |outputs| {
         has_exited(outputs, ExitStatus::Code(0))
     });
     for _ in 0..5 {
         drive_once(&mut host, Some(&endpoint), &upstream, &mut outputs);
-        datastream_events.extend(subscription.drain_available());
+        telemetry_events.extend(subscription.drain_available());
     }
 
     let started = started_index(&outputs);
@@ -293,10 +294,10 @@ fn lifecycle_outputs_are_sent_upstream_and_mirrored_to_datastream() {
         "process core should not register stdout/stderr channels: {names:?}"
     );
 
-    let payloads: Vec<Value> = datastream_events
+    let payloads: Vec<Value> = telemetry_events
         .iter()
         .filter_map(|event| match event {
-            DatastreamEvent::Frame(delivery) => serde_json::from_slice(&delivery.payload).ok(),
+            TelemetryEvent::Frame(delivery) => serde_json::from_slice(&delivery.payload).ok(),
             _ => None,
         })
         .collect();
@@ -395,14 +396,14 @@ fn command_basename_is_default_lifecycle_label_source() {
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
     let spawner = rt.spawn(SpawnerActor).unwrap();
-    let endpoint = DatastreamEndpoint::new(stage2_stream());
+    let endpoint = TelemetryEndpoint::new(stage2_stream());
 
     send_spawn(
         &rt,
         spawner,
         &sender,
         shell_spec("/bin/sh", vec!["-c", "exit 0"], None),
-        ProcessOutputConfig::datastream_mirror(*upstream.addr(), endpoint.producer()),
+        ProcessOutputConfig::telemetry_mirror(*upstream.addr(), endpoint.producer()),
         &reply,
     );
 
@@ -435,14 +436,14 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
     let spawner = rt.spawn(SpawnerActor).unwrap();
-    let endpoint = DatastreamEndpoint::new(stage2_stream());
+    let endpoint = TelemetryEndpoint::new(stage2_stream());
 
     send_spawn(
         &rt,
         spawner,
         &sender,
         shell_spec("/bin/sh", vec!["-c", "sleep 2"], Some("trainer.0/foo")),
-        ProcessOutputConfig::datastream_mirror(*upstream.addr(), endpoint.producer()),
+        ProcessOutputConfig::telemetry_mirror(*upstream.addr(), endpoint.producer()),
         &reply,
     );
 
@@ -460,7 +461,7 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
         spawner,
         &sender,
         shell_spec("/bin/echo", vec!["unused"], Some("trainer.0/foo")),
-        ProcessOutputConfig::datastream_mirror(*upstream.addr(), endpoint.producer()),
+        ProcessOutputConfig::telemetry_mirror(*upstream.addr(), endpoint.producer()),
         &reply,
     );
     let error = expect_failed(drive_until_spawn_reply(
@@ -472,7 +473,7 @@ fn explicit_label_overrides_basename_and_duplicate_labels_are_rejected() {
     ));
     assert!(
         error.contains(
-            "duplicate process lifecycle datastream channel: proc.trainer_0_foo.lifecycle"
+            "duplicate process lifecycle telemetry channel: proc.trainer_0_foo.lifecycle"
         ),
         "duplicate label error should name lifecycle channel, got {error}"
     );
@@ -892,14 +893,14 @@ fn lifecycle_mirror_submit_failure_does_not_suppress_upstream_or_emit_error() {
     let upstream = rt.new_inbox::<ProcessOutput>().unwrap();
     let reply = rt.new_inbox::<SpawnReply>().unwrap();
     let spawner = rt.spawn(SpawnerActor).unwrap();
-    let endpoint = DatastreamEndpoint::with_capacity(stage2_stream(), 1, 16);
+    let endpoint = TelemetryEndpoint::with_capacity(stage2_stream(), 1, 16);
 
     send_spawn(
         &rt,
         spawner,
         &sender,
         shell_spec("sh", vec!["-c", "exit 0"], Some("mirror-drop")),
-        ProcessOutputConfig::datastream_mirror(*upstream.addr(), endpoint.producer()),
+        ProcessOutputConfig::telemetry_mirror(*upstream.addr(), endpoint.producer()),
         &reply,
     );
 

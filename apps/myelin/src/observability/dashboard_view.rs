@@ -1,11 +1,11 @@
-//! Dashboard view over Myelin cluster provisioning and lifecycle datastream records.
+//! Dashboard view over Myelin cluster provisioning and lifecycle telemetry records.
 
 use std::collections::{BTreeMap, VecDeque};
 
 use dashboard::FrameEvent;
 use dashboard::view::DashboardView;
-use datastream::Record;
-use datastream::frame::{Frame, StreamId};
+use telemetry::Record;
+use telemetry::frame::{Frame, StreamId};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::RwLock;

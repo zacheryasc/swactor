@@ -1,7 +1,7 @@
 //! Production SWIM telemetry — the observer the live node installs.
 //!
 //! Without a production observer, SWIM ran with `observer = None`, so three live
-//! signals never reached the datastream: per-probe round-trip time, the recent
+//! signals never reached the telemetry: per-probe round-trip time, the recent
 //! probe targets, and the *cause* of each membership transition (the M4
 //! state-diff can see *that* a peer changed but not *why*). This installs a real
 //! [`SwimObserver`] that reconstructs all three from the observation stream, and

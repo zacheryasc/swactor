@@ -899,7 +899,7 @@ name = "dashboard"
 version = "0.1.0"
 dependencies = [
  "axum",
- "datastream",
+ "telemetry",
  "parking_lot",
  "serde",
  "serde_json",
@@ -952,14 +952,14 @@ dependencies = [
 name = "data-plane"
 version = "0.1.0"
 dependencies = [
- "datastream",
+ "telemetry",
  "libc",
  "serde",
  "swactor",
 ]
 
 [[package]]
-name = "datastream"
+name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
@@ -1138,7 +1138,7 @@ dependencies = [
 name = "distribution"
 version = "0.1.0"
 dependencies = [
- "datastream",
+ "telemetry",
  "libc",
  "proptest",
  "serde",
@@ -2141,7 +2141,7 @@ name = "iroh-driver"
 version = "0.1.0"
 dependencies = [
  "crossbeam-channel",
- "datastream",
+ "telemetry",
  "distribution",
  "iroh",
  "iroh-relay",
@@ -2524,7 +2524,7 @@ dependencies = [
  "blake3",
  "dashboard",
  "data-plane",
- "datastream",
+ "telemetry",
  "distribution",
  "iroh",
  "iroh-driver",
@@ -4418,7 +4418,7 @@ name = "swactor-process"
 version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
- "datastream",
+ "telemetry",
  "libc",
  "serde",
  "serde_json",

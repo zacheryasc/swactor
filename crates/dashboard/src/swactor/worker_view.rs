@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use datastream::frame::{Frame, StreamId};
+use telemetry::frame::{Frame, StreamId};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};

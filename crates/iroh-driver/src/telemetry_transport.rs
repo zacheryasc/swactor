@@ -1,18 +1,18 @@
-//! Iroh/QUIC transport adapter for datastream subscriptions.
+//! Iroh/QUIC transport adapter for telemetry subscriptions.
 
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::TryRecvError;
-use datastream::{DatastreamSnapshot, DatastreamSubscription};
-use datastream::frame::{ChannelDescriptor, ChannelId, ChannelRef, DatastreamEvent, FrameDelivery, Position,
+use telemetry::{TelemetrySnapshot, TelemetrySubscription};
+use telemetry::frame::{ChannelDescriptor, ChannelId, ChannelRef, TelemetryEvent, FrameDelivery, Position,
 StreamDescriptor,};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use swactor_engine::EngineHandle;
 
-pub const DATASTREAM_ALPN: &[u8] = b"swactor/datastream/0";
+pub const TELEMETRY_ALPN: &[u8] = b"swactor/telemetry/0";
 
 const MAGIC: &[u8; 4] = b"DSQ1";
 const TAG_CHANNEL_DECLARED: u8 = 0x01;
@@ -23,14 +23,14 @@ const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatastreamQuicHeader {
+pub struct TelemetryQuicHeader {
     pub flow_id: [u8; 16],
     pub token: Vec<u8>,
     pub stream: StreamDescriptor,
     pub channels: Vec<ChannelDescriptor>,
 }
 
-impl DatastreamQuicHeader {
+impl TelemetryQuicHeader {
     pub fn new(
         flow_id: [u8; 16],
         token: impl Into<Vec<u8>>,
@@ -48,40 +48,40 @@ impl DatastreamQuicHeader {
     pub fn from_snapshot(
         flow_id: [u8; 16],
         token: impl Into<Vec<u8>>,
-        snapshot: &DatastreamSnapshot,
+        snapshot: &TelemetrySnapshot,
     ) -> Result<Self, BoxError> {
         let stream = snapshot
             .streams
             .first()
             .cloned()
-            .ok_or("datastream subscription snapshot has no stream")?;
+            .ok_or("telemetry subscription snapshot has no stream")?;
         Ok(Self::new(flow_id, token, stream, snapshot.channels.clone()))
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DatastreamQuicWriteStats {
+pub struct TelemetryQuicWriteStats {
     pub events: usize,
     pub bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DatastreamQuicRead {
-    pub header: DatastreamQuicHeader,
-    pub events: Vec<DatastreamEvent>,
+pub struct TelemetryQuicRead {
+    pub header: TelemetryQuicHeader,
+    pub events: Vec<TelemetryEvent>,
 }
 
 pub fn spawn_subscription_writer(
     engine: &EngineHandle,
     endpoint: Endpoint,
     peer: EndpointAddr,
-    header: DatastreamQuicHeader,
-    subscription: DatastreamSubscription,
+    header: TelemetryQuicHeader,
+    subscription: TelemetrySubscription,
     idle_sleep: Duration,
 ) {
     let engine_handle = engine.clone();
     engine.spawn(async move {
-        let Ok(conn) = endpoint.connect(peer, DATASTREAM_ALPN).await else {
+        let Ok(conn) = endpoint.connect(peer, TELEMETRY_ALPN).await else {
             return;
         };
         let Ok(send) = conn.open_uni().await else {
@@ -94,21 +94,21 @@ pub fn spawn_subscription_writer(
 pub async fn write_available_subscription(
     engine: &EngineHandle,
     send: SendStream,
-    header: &DatastreamQuicHeader,
-    subscription: &DatastreamSubscription,
-) -> Result<DatastreamQuicWriteStats, BoxError> {
+    header: &TelemetryQuicHeader,
+    subscription: &TelemetrySubscription,
+) -> Result<TelemetryQuicWriteStats, BoxError> {
     write_subscription_inner(engine, send, header, subscription, None).await
 }
 
 pub async fn write_subscription_until_closed(
     engine: &EngineHandle,
     mut send: SendStream,
-    header: DatastreamQuicHeader,
-    subscription: DatastreamSubscription,
+    header: TelemetryQuicHeader,
+    subscription: TelemetrySubscription,
     idle_sleep: Duration,
-) -> Result<DatastreamQuicWriteStats, BoxError> {
+) -> Result<TelemetryQuicWriteStats, BoxError> {
     write_header(&mut send, &header).await?;
-    let mut stats = DatastreamQuicWriteStats::default();
+    let mut stats = TelemetryQuicWriteStats::default();
     loop {
         match subscription.try_recv() {
             Ok(event) => {
@@ -131,12 +131,12 @@ pub async fn write_subscription_until_closed(
 async fn write_subscription_inner(
     engine: &EngineHandle,
     mut send: SendStream,
-    header: &DatastreamQuicHeader,
-    subscription: &DatastreamSubscription,
+    header: &TelemetryQuicHeader,
+    subscription: &TelemetrySubscription,
     idle_sleep: Option<Duration>,
-) -> Result<DatastreamQuicWriteStats, BoxError> {
+) -> Result<TelemetryQuicWriteStats, BoxError> {
     write_header(&mut send, header).await?;
-    let mut stats = DatastreamQuicWriteStats::default();
+    let mut stats = TelemetryQuicWriteStats::default();
     loop {
         match subscription.try_recv() {
             Ok(event) => {
@@ -159,38 +159,38 @@ async fn write_subscription_inner(
 
 pub async fn write_event(
     send: &mut SendStream,
-    event: &DatastreamEvent,
+    event: &TelemetryEvent,
 ) -> Result<usize, BoxError> {
     let mut bytes = Vec::new();
     match event {
-        DatastreamEvent::StreamDeclared(_) => return Ok(0),
-        DatastreamEvent::ChannelDeclared(descriptor) => {
+        TelemetryEvent::StreamDeclared(_) => return Ok(0),
+        TelemetryEvent::ChannelDeclared(descriptor) => {
             bytes.push(TAG_CHANNEL_DECLARED);
             put_json(&mut bytes, descriptor)?;
         }
-        DatastreamEvent::Frame(delivery) => {
+        TelemetryEvent::Frame(delivery) => {
             bytes.push(TAG_FRAME);
             bytes.extend_from_slice(&delivery.channel.channel.0.to_le_bytes());
             bytes.extend_from_slice(&delivery.position.0.to_le_bytes());
             put_bytes(&mut bytes, &delivery.payload)?;
         }
-        DatastreamEvent::StreamEnded(_) => {
+        TelemetryEvent::StreamEnded(_) => {
             bytes.push(TAG_STREAM_ENDED);
         }
     }
     if bytes.len() > MAX_RECORD_BYTES {
-        return Err("datastream QUIC record exceeds max size".into());
+        return Err("telemetry QUIC record exceeds max size".into());
     }
     send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
     send.write_all(&bytes).await?;
     Ok(4 + bytes.len())
 }
 
-pub async fn read_stream_header(recv: &mut RecvStream) -> Result<DatastreamQuicHeader, BoxError> {
+pub async fn read_stream_header(recv: &mut RecvStream) -> Result<TelemetryQuicHeader, BoxError> {
     read_header(recv).await
 }
 
-pub async fn read_events_from_stream(mut recv: RecvStream) -> Result<DatastreamQuicRead, BoxError> {
+pub async fn read_events_from_stream(mut recv: RecvStream) -> Result<TelemetryQuicRead, BoxError> {
     let header = read_header(&mut recv).await?;
     let mut events = Vec::new();
     loop {
@@ -199,12 +199,12 @@ pub async fn read_events_from_stream(mut recv: RecvStream) -> Result<DatastreamQ
             None => break,
         }
     }
-    Ok(DatastreamQuicRead { header, events })
+    Ok(TelemetryQuicRead { header, events })
 }
 
 pub async fn read_next_uni_from_connection(
     conn: &Connection,
-) -> Result<DatastreamQuicRead, BoxError> {
+) -> Result<TelemetryQuicRead, BoxError> {
     let recv = conn.accept_uni().await?;
     read_events_from_stream(recv).await
 }
@@ -212,7 +212,7 @@ pub async fn read_next_uni_from_connection(
 pub fn spawn_connection_reader(
     engine: &EngineHandle,
     conn: Connection,
-    sink: std::sync::mpsc::Sender<DatastreamEvent>,
+    sink: std::sync::mpsc::Sender<TelemetryEvent>,
 ) {
     engine.spawn(async move {
         loop {
@@ -234,10 +234,10 @@ pub fn spawn_connection_reader(
 
 async fn write_header(
     send: &mut SendStream,
-    header: &DatastreamQuicHeader,
+    header: &TelemetryQuicHeader,
 ) -> Result<(), BoxError> {
     if header.token.len() > u16::MAX as usize {
-        return Err("datastream token exceeds u16 length prefix".into());
+        return Err("telemetry token exceeds u16 length prefix".into());
     }
     send.write_all(MAGIC).await?;
     send.write_all(&header.flow_id).await?;
@@ -249,11 +249,11 @@ async fn write_header(
     Ok(())
 }
 
-async fn read_header(recv: &mut RecvStream) -> Result<DatastreamQuicHeader, BoxError> {
+async fn read_header(recv: &mut RecvStream) -> Result<TelemetryQuicHeader, BoxError> {
     let mut magic = [0u8; 4];
     recv.read_exact(&mut magic).await?;
     if &magic != MAGIC {
-        return Err("invalid datastream QUIC magic".into());
+        return Err("invalid telemetry QUIC magic".into());
     }
     let mut flow_id = [0u8; 16];
     recv.read_exact(&mut flow_id).await?;
@@ -264,7 +264,7 @@ async fn read_header(recv: &mut RecvStream) -> Result<DatastreamQuicHeader, BoxE
     recv.read_exact(&mut token).await?;
     let stream = read_json(recv).await?;
     let channels = read_json(recv).await?;
-    Ok(DatastreamQuicHeader {
+    Ok(TelemetryQuicHeader {
         flow_id,
         token,
         stream,
@@ -275,32 +275,32 @@ async fn read_header(recv: &mut RecvStream) -> Result<DatastreamQuicHeader, BoxE
 pub async fn read_next_event(
     recv: &mut RecvStream,
     stream: &StreamDescriptor,
-) -> Result<Option<DatastreamEvent>, BoxError> {
+) -> Result<Option<TelemetryEvent>, BoxError> {
     let mut len = [0u8; 4];
     if recv.read_exact(&mut len).await.is_err() {
         return Ok(None);
     }
     let len = u32::from_le_bytes(len) as usize;
     if len > MAX_RECORD_BYTES {
-        return Err("datastream QUIC record exceeds max size".into());
+        return Err("telemetry QUIC record exceeds max size".into());
     }
     let mut buf = vec![0u8; len];
     recv.read_exact(&mut buf).await?;
     decode_record(&buf, stream).map(Some)
 }
 
-fn decode_record(buf: &[u8], stream: &StreamDescriptor) -> Result<DatastreamEvent, BoxError> {
+fn decode_record(buf: &[u8], stream: &StreamDescriptor) -> Result<TelemetryEvent, BoxError> {
     if buf.is_empty() {
-        return Err("empty datastream QUIC record".into());
+        return Err("empty telemetry QUIC record".into());
     }
     match buf[0] {
         TAG_CHANNEL_DECLARED => {
             let descriptor: ChannelDescriptor = serde_json::from_slice(&buf[1..])?;
-            Ok(DatastreamEvent::ChannelDeclared(descriptor))
+            Ok(TelemetryEvent::ChannelDeclared(descriptor))
         }
         TAG_FRAME => {
             if buf.len() < 1 + 4 + 8 + 4 {
-                return Err("datastream QUIC frame record truncated".into());
+                return Err("telemetry QUIC frame record truncated".into());
             }
             let channel = ChannelId(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]));
             let position = Position(u64::from_le_bytes([
@@ -311,11 +311,11 @@ fn decode_record(buf: &[u8], stream: &StreamDescriptor) -> Result<DatastreamEven
             let payload_len = u32::from_le_bytes(len) as usize;
             let payload = buf
                 .get(17..17 + payload_len)
-                .ok_or("datastream QUIC frame payload truncated")?;
+                .ok_or("telemetry QUIC frame payload truncated")?;
             if 17 + payload_len != buf.len() {
-                return Err("bytes remain after datastream QUIC frame record".into());
+                return Err("bytes remain after telemetry QUIC frame record".into());
             }
-            Ok(DatastreamEvent::Frame(FrameDelivery {
+            Ok(TelemetryEvent::Frame(FrameDelivery {
                 channel: ChannelRef {
                     stream: stream.stream.clone(),
                     channel,
@@ -324,15 +324,15 @@ fn decode_record(buf: &[u8], stream: &StreamDescriptor) -> Result<DatastreamEven
                 payload: payload.to_vec(),
             }))
         }
-        TAG_STREAM_ENDED => Ok(DatastreamEvent::StreamEnded(stream.stream.clone())),
-        _ => Err("unknown datastream QUIC record tag".into()),
+        TAG_STREAM_ENDED => Ok(TelemetryEvent::StreamEnded(stream.stream.clone())),
+        _ => Err("unknown telemetry QUIC record tag".into()),
     }
 }
 
 pub async fn read_stream_into_fanout(
     recv: RecvStream,
-    fanout: Arc<datastream::DeliveryFanout>,
-) -> Result<DatastreamQuicHeader, BoxError> {
+    fanout: Arc<telemetry::DeliveryFanout>,
+) -> Result<TelemetryQuicHeader, BoxError> {
     let read = read_events_from_stream(recv).await?;
     fanout.publish_batch(read.events);
     Ok(read.header)
@@ -345,7 +345,7 @@ fn put_json<T: serde::Serialize>(out: &mut Vec<u8>, value: &T) -> Result<(), Box
 
 fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), BoxError> {
     if bytes.len() > u32::MAX as usize {
-        return Err("datastream delivery exceeds u32 length prefix".into());
+        return Err("telemetry delivery exceeds u32 length prefix".into());
     }
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
     out.extend_from_slice(bytes);
@@ -355,7 +355,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), BoxError> {
 async fn write_json<T: serde::Serialize>(send: &mut SendStream, value: &T) -> Result<(), BoxError> {
     let bytes = serde_json::to_vec(value)?;
     if bytes.len() > u32::MAX as usize {
-        return Err("datastream header JSON exceeds u32 length prefix".into());
+        return Err("telemetry header JSON exceeds u32 length prefix".into());
     }
     send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
     send.write_all(&bytes).await?;
@@ -367,7 +367,7 @@ async fn read_json<T: serde::de::DeserializeOwned>(recv: &mut RecvStream) -> Res
     recv.read_exact(&mut len).await?;
     let len = u32::from_le_bytes(len) as usize;
     if len > MAX_RECORD_BYTES {
-        return Err("datastream QUIC record exceeds max size".into());
+        return Err("telemetry QUIC record exceeds max size".into());
     }
     let mut bytes = vec![0u8; len];
     recv.read_exact(&mut bytes).await?;

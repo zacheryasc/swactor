@@ -16,7 +16,7 @@ pub const ROOT_HTML: &str = r#"<!doctype html>
 <body>
   <main class="card">
     <h1>swactor dashboard</h1>
-    <p>Read-only views over live datastream frames.</p>
+    <p>Read-only views over live telemetry frames.</p>
     <ul>
       <li><a href="/view/swactor/workers">Swactor workers</a></li>
       <li><a href="/api/views">Registered views JSON</a></li>

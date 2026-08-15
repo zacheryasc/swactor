@@ -1,10 +1,10 @@
-//! Wire helpers for datastream actor messages and compact event records.
+//! Wire helpers for telemetry actor messages and compact event records.
 
 use serde::{Deserialize, Serialize};
 use swactor::Error;
 use swactor_transport::{Codec, CodecRegistry, NetworkMessage};
 
-use crate::frame::{ChannelId, DatastreamEvent, Frame, Lifetime, NodeId, Position, StreamId};
+use crate::frame::{ChannelId, TelemetryEvent, Frame, Lifetime, NodeId, Position, StreamId};
 
 /// Why a buffer could not be decoded as an envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,7 +23,7 @@ impl std::fmt::Display for WireError {
             WireError::BadLength => f.write_str("envelope length prefix exceeds buffer"),
             WireError::NotUtf8 => f.write_str("envelope string field is not valid UTF-8"),
             WireError::TrailingBytes => f.write_str("bytes remain after a complete envelope"),
-            WireError::UnknownTag => f.write_str("unknown datastream event record tag"),
+            WireError::UnknownTag => f.write_str("unknown telemetry event record tag"),
         }
     }
 }
@@ -59,43 +59,43 @@ pub fn decode_delivery(buf: &[u8]) -> Result<(StreamId, Frame), WireError> {
     Ok((stream, frame))
 }
 
-/// Legacy actor-message payload wrapper for datastream bytes.
+/// Legacy actor-message payload wrapper for telemetry bytes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DatastreamFrame {
+pub struct TelemetryFrame {
     pub payload: Vec<u8>,
 }
 
-impl NetworkMessage for DatastreamFrame {
+impl NetworkMessage for TelemetryFrame {
     fn type_tag() -> &'static str {
-        "swactor::DatastreamFrame"
+        "swactor::TelemetryFrame"
     }
 }
 
-/// Identity codec for [`DatastreamFrame`].
-pub struct DatastreamFrameCodec;
+/// Identity codec for [`TelemetryFrame`].
+pub struct TelemetryFrameCodec;
 
-impl Codec<DatastreamFrame> for DatastreamFrameCodec {
-    fn encode(&self, msg: &DatastreamFrame) -> Result<Vec<u8>, Error> {
+impl Codec<TelemetryFrame> for TelemetryFrameCodec {
+    fn encode(&self, msg: &TelemetryFrame) -> Result<Vec<u8>, Error> {
         Ok(msg.payload.clone())
     }
-    fn decode(&self, bytes: &[u8]) -> Result<DatastreamFrame, Error> {
-        Ok(DatastreamFrame {
+    fn decode(&self, bytes: &[u8]) -> Result<TelemetryFrame, Error> {
+        Ok(TelemetryFrame {
             payload: bytes.to_vec(),
         })
     }
 }
 
-/// Register the [`DatastreamFrame`] codec.
-pub fn register_datastream_codec(cr: &mut CodecRegistry) {
-    cr.register::<DatastreamFrame, _>(DatastreamFrameCodec);
+/// Register the [`TelemetryFrame`] codec.
+pub fn register_telemetry_codec(cr: &mut CodecRegistry) {
+    cr.register::<TelemetryFrame, _>(TelemetryFrameCodec);
 }
 
 /// JSON event envelope for actor/control paths that can tolerate metadata size.
-pub fn encode_datastream_event(event: &DatastreamEvent) -> Vec<u8> {
-    serde_json::to_vec(event).expect("datastream event serializes")
+pub fn encode_telemetry_event(event: &TelemetryEvent) -> Vec<u8> {
+    serde_json::to_vec(event).expect("telemetry event serializes")
 }
 
-pub fn decode_datastream_event(bytes: &[u8]) -> Result<DatastreamEvent, serde_json::Error> {
+pub fn decode_telemetry_event(bytes: &[u8]) -> Result<TelemetryEvent, serde_json::Error> {
     serde_json::from_slice(bytes)
 }
 

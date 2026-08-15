@@ -79,7 +79,7 @@ async fn root_page(State(state): State<AppState>) -> Html<String> {
 <body>
   <main class="card">
     <h1>swactor dashboard</h1>
-    <p>Read-only views over live datastream frames.</p>
+    <p>Read-only views over live telemetry frames.</p>
     <h2>Views</h2>
     <ul>{links}</ul>
     <h2>Raw APIs</h2>

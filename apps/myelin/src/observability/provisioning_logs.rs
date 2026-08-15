@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::thread::{self, JoinHandle};
 
-use datastream::{ChannelContent, DatastreamProducer, Lifetime, NodeId, StreamId};
+use telemetry::{ChannelContent, TelemetryProducer, Lifetime, NodeId, StreamId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -17,17 +17,17 @@ pub(crate) fn node_stream_id(run_id: u64, node_id: u64) -> StreamId {
 }
 
 #[derive(Clone)]
-pub(crate) struct BootstrapDatastreamBridge {
+pub(crate) struct BootstrapTelemetryBridge {
     spec: NodeProvisionSpec,
     sink: PluginSink,
-    producer: Option<DatastreamProducer>,
+    producer: Option<TelemetryProducer>,
 }
 
-impl BootstrapDatastreamBridge {
+impl BootstrapTelemetryBridge {
     pub(crate) fn new(
         spec: NodeProvisionSpec,
         sink: PluginSink,
-        producer: Option<DatastreamProducer>,
+        producer: Option<TelemetryProducer>,
     ) -> Self {
         Self {
             spec,
@@ -42,7 +42,7 @@ impl BootstrapDatastreamBridge {
 
     pub(crate) fn observe_stdout_line(&self, line: impl Into<String>) {
         let line = line.into();
-        if let Some(frame) = parse_stdio_datastream_frame(&self.spec, &line) {
+        if let Some(frame) = parse_stdio_telemetry_frame(&self.spec, &line) {
             self.sink.observe(frame);
             return;
         }
@@ -156,22 +156,22 @@ impl BootstrapDatastreamBridge {
 }
 
 #[derive(Deserialize, Serialize)]
-struct StdioDatastreamFrame {
+struct StdioTelemetryFrame {
     myelin_stdio_event: u32,
     kind: String,
     channel: String,
     payload: Value,
 }
 
-pub(crate) fn parse_stdio_datastream_frame(
+pub(crate) fn parse_stdio_telemetry_frame(
     spec: &NodeProvisionSpec,
     line: &str,
 ) -> Option<PluginObservation> {
-    let frame = serde_json::from_str::<StdioDatastreamFrame>(line).ok()?;
-    if frame.myelin_stdio_event != 1 || frame.kind != "datastream_frame" {
+    let frame = serde_json::from_str::<StdioTelemetryFrame>(line).ok()?;
+    if frame.myelin_stdio_event != 1 || frame.kind != "telemetry_frame" {
         return None;
     }
-    Some(PluginObservation::DatastreamFrame {
+    Some(PluginObservation::TelemetryFrame {
         run_id: spec.run_id,
         node_id: spec.node_id,
         channel: frame.channel,

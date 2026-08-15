@@ -1,6 +1,6 @@
-//! Distribution-owned datastream records.
+//! Distribution-owned telemetry records.
 
-use datastream::Record;
+use telemetry::Record;
 use serde::{Deserialize, Serialize};
 
 /// Transport internals — connectivity to peers and relay.

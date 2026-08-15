@@ -2,14 +2,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use datastream::frame::{Frame, StreamId};
+use telemetry::frame::{Frame, StreamId};
 use serde_json::json;
 
 use crate::observability::benchmark;
 
-/// JSONL archive for Myelin-owned datastream frames.
+/// JSONL archive for Myelin-owned telemetry frames.
 ///
-/// The datastream crate owns frame transport; this helper owns the Myelin archive
+/// The telemetry crate owns frame transport; this helper owns the Myelin archive
 /// record shape used as benchmark and contract evidence.
 pub(crate) struct FrameArchive {
     file: File,

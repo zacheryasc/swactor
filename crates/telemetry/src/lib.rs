@@ -1,4 +1,4 @@
-//! The per-node telemetry **datastream** (see `DATASTREAM_SPEC.md`).
+//! The per-node telemetry **telemetry** (see `TELEMETRY_SPEC.md`).
 //!
 //! A deliberately dumb pipe: producers dump bytes tagged with a stream-local
 //! channel id, a single per-node mux accepts those bytes and assigns canonical
@@ -11,17 +11,17 @@
 //!
 //! This crate has two surfaces:
 //!
-//! - **Producer** — re-exported at the crate root ([`DatastreamEndpoint`],
-//!   [`DatastreamProducer`], [`Record`], [`ChannelId`], [`StreamId`], …).
+//! - **Producer** — re-exported at the crate root ([`TelemetryEndpoint`],
+//!   [`TelemetryProducer`], [`Record`], [`ChannelId`], [`StreamId`], …).
 //!   Everything control-plane and actor code needs to *emit* telemetry.
 //!
-//! - **Observer** — in submodules ([`frame::Frame`], [`frame::DatastreamEvent`],
+//! - **Observer** — in submodules ([`frame::Frame`], [`frame::TelemetryEvent`],
 //!   [`store::Store`], [`views`], [`ingest::Consumer`]).  Everything a sink
 //!   (dashboard, archive, transport) needs to *read* telemetry.
 //!
 //! The crate root deliberately does **not** re-export [`frame::Frame`] or
-//! [`frame::DatastreamEvent`].  `use datastream::Frame` is a compile error; the
-//! full path `datastream::frame::Frame` compiles but is banned in control-plane
+//! [`frame::TelemetryEvent`].  `use telemetry::Frame` is a compile error; the
+//! full path `telemetry::frame::Frame` compiles but is banned in control-plane
 //! modules by `cargo xtask check-telemetry-isolation`.
 //!
 //! ```text
@@ -46,7 +46,7 @@
 //! The data model ([`frame`]), extension contract ([`record`]), endpoint/fanout
 //! seam ([`endpoint`]), and compatibility wire helpers ([`wire`]) are the seams
 //! tests observe. Channel meanings live in producer/consumer crates, not in a
-//! datastream-wide global registry.
+//! telemetry-wide global registry.
 
 pub mod emit;
 pub mod endpoint;
@@ -66,8 +66,8 @@ pub mod wire;
 // ── Producer surface (re-exported at root; safe for control-plane code) ──
 
 pub use endpoint::{
-    CatalogSnapshot, ChannelRegistrationError, DatastreamEndpoint, DatastreamProducer,
-    DatastreamSnapshot, DatastreamSubscription, DeliveryFanout, EndpointTick, SubscriberSnapshot,
+    CatalogSnapshot, ChannelRegistrationError, TelemetryEndpoint, TelemetryProducer,
+    TelemetrySnapshot, TelemetrySubscription, DeliveryFanout, EndpointTick, SubscriberSnapshot,
     SubscriptionId,
 };
 pub use frame::{
@@ -77,16 +77,16 @@ pub use frame::{
 };
 pub use mux::Mux;
 pub use publisher_actor::{
-    DATASTREAM_PUBLISHER_NAME, DatastreamPublisherActor, DatastreamPublisherMsg,
-    DatastreamSubscribe, register_datastream_publisher_codec,
+    TELEMETRY_PUBLISHER_NAME, TelemetryPublisherActor, TelemetryPublisherMsg,
+    TelemetrySubscribe, register_telemetry_publisher_codec,
 };
 pub use record::{ChannelKind, ChannelRegistry, Record};
-pub use sink_actor::{DATASTREAM_SINK_NAME, DatastreamSink};
+pub use sink_actor::{TELEMETRY_SINK_NAME, TelemetrySink};
 
 // ── Observer surface (in submodules; NOT re-exported at root) ──
 //
-// frame::Frame, frame::DatastreamEvent, frame::FrameDelivery,
+// frame::Frame, frame::TelemetryEvent, frame::FrameDelivery,
 // store::Store, ingest::Consumer, views::*, transport::Delivery
 //
-// Access these via their module paths (e.g. `datastream::frame::Frame`).
+// Access these via their module paths (e.g. `telemetry::frame::Frame`).
 // Control-plane modules must not import them — enforced by CI.

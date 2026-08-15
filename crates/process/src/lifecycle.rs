@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use datastream::{ChannelContent, DatastreamProducer, StreamId};
+use telemetry::{ChannelContent, TelemetryProducer, StreamId};
 use serde_json::json;
 use swactor::actor::ActorAddress;
 
@@ -11,14 +11,14 @@ use crate::types::{ExitStatus, ProcessSpec};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessLifecycleObservability {
     Disabled,
-    DatastreamMirror,
+    TelemetryMirror,
 }
 
 #[derive(Clone)]
 pub struct ProcessOutputConfig {
     upstream: ActorAddress,
     observability: ProcessLifecycleObservability,
-    datastream: Option<DatastreamProducer>,
+    telemetry: Option<TelemetryProducer>,
 }
 
 impl ProcessOutputConfig {
@@ -26,15 +26,15 @@ impl ProcessOutputConfig {
         Self {
             upstream,
             observability: ProcessLifecycleObservability::Disabled,
-            datastream: None,
+            telemetry: None,
         }
     }
 
-    pub fn datastream_mirror(upstream: ActorAddress, producer: DatastreamProducer) -> Self {
+    pub fn telemetry_mirror(upstream: ActorAddress, producer: TelemetryProducer) -> Self {
         Self {
             upstream,
-            observability: ProcessLifecycleObservability::DatastreamMirror,
-            datastream: Some(producer),
+            observability: ProcessLifecycleObservability::TelemetryMirror,
+            telemetry: Some(producer),
         }
     }
 
@@ -49,16 +49,16 @@ impl ProcessOutputConfig {
 
 pub(crate) struct PreparedProcessOutput {
     pub(crate) upstream: ActorAddress,
-    pub(crate) mirror: Option<LifecycleDatastreamMirror>,
+    pub(crate) mirror: Option<LifecycleTelemetryMirror>,
     pub(crate) _label_reservation: Option<LifecycleLabelReservation>,
 }
 
-pub(crate) struct LifecycleDatastreamMirror {
-    channel: datastream::ChannelId,
-    producer: DatastreamProducer,
+pub(crate) struct LifecycleTelemetryMirror {
+    channel: telemetry::ChannelId,
+    producer: TelemetryProducer,
 }
 
-impl LifecycleDatastreamMirror {
+impl LifecycleTelemetryMirror {
     pub(crate) fn submit(&self, output: &ProcessOutput) {
         let payload = match output {
             ProcessOutput::Started { pid } => json!({"event": "started", "pid": pid}),
@@ -92,10 +92,10 @@ pub(crate) fn prepare_process_output(
             mirror: None,
             _label_reservation: None,
         }),
-        ProcessLifecycleObservability::DatastreamMirror => {
+        ProcessLifecycleObservability::TelemetryMirror => {
             let producer = config
-                .datastream
-                .expect("datastream mirror config stores producer");
+                .telemetry
+                .expect("telemetry mirror config stores producer");
             let reservation =
                 LifecycleLabelReservation::reserve(producer.stream_id().clone(), &label)?;
             let channel_name = label.channel_name();
@@ -107,16 +107,16 @@ pub(crate) fn prepare_process_output(
                     },
                 )
                 .map_err(|err| match err {
-                    datastream::ChannelRegistrationError::ConflictingName { name } => {
+                    telemetry::ChannelRegistrationError::ConflictingName { name } => {
                         swactor::Error::from(format!(
-                            "conflicting datastream channel registration for {name}"
+                            "conflicting telemetry channel registration for {name}"
                         ))
                     }
                 })?;
 
             Ok(PreparedProcessOutput {
                 upstream: config.upstream,
-                mirror: Some(LifecycleDatastreamMirror { channel, producer }),
+                mirror: Some(LifecycleTelemetryMirror { channel, producer }),
                 _label_reservation: Some(reservation),
             })
         }
@@ -197,7 +197,7 @@ impl LifecycleLabelReservation {
             .expect("process lifecycle label registry poisoned");
         if !labels.insert(key.clone()) {
             return Err(swactor::Error::from(format!(
-                "duplicate process lifecycle datastream channel: {} on stream {}",
+                "duplicate process lifecycle telemetry channel: {} on stream {}",
                 label.channel_name(),
                 key.0
             )));
@@ -222,7 +222,7 @@ impl Drop for LifecycleLabelReservation {
 mod tests {
     use std::collections::HashMap;
 
-    use datastream::{DatastreamEndpoint, Lifetime, NodeId, StreamId};
+    use telemetry::{TelemetryEndpoint, Lifetime, NodeId, StreamId};
     use swactor::actor::ActorAddress;
 
     use super::*;
@@ -286,34 +286,34 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_datastream_label_reservations_are_released_on_drop() {
-        let endpoint = DatastreamEndpoint::new(StreamId::new(NodeId::new("stage2"), Lifetime(1)));
+    fn duplicate_telemetry_label_reservations_are_released_on_drop() {
+        let endpoint = TelemetryEndpoint::new(StreamId::new(NodeId::new("stage2"), Lifetime(1)));
         let upstream = ActorAddress::new_random();
         let spec = spec("sh", Some("trainer.0/foo"));
 
         let first = prepare_process_output(
             &spec,
-            ProcessOutputConfig::datastream_mirror(upstream, endpoint.producer()),
+            ProcessOutputConfig::telemetry_mirror(upstream, endpoint.producer()),
         )
         .unwrap();
 
         let err = match prepare_process_output(
             &spec,
-            ProcessOutputConfig::datastream_mirror(upstream, endpoint.producer()),
+            ProcessOutputConfig::telemetry_mirror(upstream, endpoint.producer()),
         ) {
             Ok(_) => panic!("duplicate lifecycle label should be rejected"),
             Err(err) => err,
         };
         assert_eq!(
             err.to_string(),
-            "duplicate process lifecycle datastream channel: proc.trainer_0_foo.lifecycle on stream stage2#1"
+            "duplicate process lifecycle telemetry channel: proc.trainer_0_foo.lifecycle on stream stage2#1"
         );
 
         drop(first);
 
         let second = prepare_process_output(
             &spec,
-            ProcessOutputConfig::datastream_mirror(upstream, endpoint.producer()),
+            ProcessOutputConfig::telemetry_mirror(upstream, endpoint.producer()),
         )
         .unwrap();
         drop(second);

@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use datastream::DatastreamProducer;
+use telemetry::TelemetryProducer;
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{
     Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
@@ -22,7 +22,7 @@ use swactor_vastai::{
     SelectionPolicy, classify_vastai_error,
 };
 
-use crate::observability::provisioning_logs::{BootstrapDatastreamBridge, node_stream_id};
+use crate::observability::provisioning_logs::{BootstrapTelemetryBridge, node_stream_id};
 use crate::provisioning::{
     NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionPlugin,
 };
@@ -609,7 +609,7 @@ pub(crate) trait VastAiBootstrapLauncher: Send {
         spec: NodeProvisionSpec,
         endpoint: VastAiSshEndpoint,
         sink: PluginSink,
-        producer: Option<DatastreamProducer>,
+        producer: Option<TelemetryProducer>,
         lifecycle: LifecyclePolicy,
     ) -> Result<Self::Handle, String>;
 
@@ -641,7 +641,7 @@ enum SshBootstrapMsg {
 }
 
 struct SshBootstrapActor {
-    bridge: BootstrapDatastreamBridge,
+    bridge: BootstrapTelemetryBridge,
     endpoint: VastAiSshEndpoint,
     ssh_identity: Option<PathBuf>,
     sender: ExternalSender,
@@ -660,7 +660,7 @@ struct SshBootstrapActor {
 
 impl SshBootstrapActor {
     fn new(
-        bridge: BootstrapDatastreamBridge,
+        bridge: BootstrapTelemetryBridge,
         endpoint: VastAiSshEndpoint,
         ssh_identity: Option<PathBuf>,
         sender: ExternalSender,
@@ -948,7 +948,7 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
         spec: NodeProvisionSpec,
         endpoint: VastAiSshEndpoint,
         sink: PluginSink,
-        producer: Option<DatastreamProducer>,
+        producer: Option<TelemetryProducer>,
         _lifecycle: LifecyclePolicy,
     ) -> Result<Self::Handle, String> {
         if spec.args.is_empty() {
@@ -959,7 +959,7 @@ impl VastAiBootstrapLauncher for SshCommandBootstrapLauncher {
         }
 
         let sender = self.runtime.create_sender();
-        let bridge = BootstrapDatastreamBridge::new(spec, sink, producer);
+        let bridge = BootstrapTelemetryBridge::new(spec, sink, producer);
         let actor = self
             .runtime
             .spawn(SshBootstrapActor::new(
@@ -1118,7 +1118,7 @@ where
     client: C,
     bootstrap: B,
     config: VastAiProvisioningConfig,
-    bootstrap_producer: Option<DatastreamProducer>,
+    bootstrap_producer: Option<TelemetryProducer>,
     leased_host_ids: BTreeSet<u64>,
     failed_host_ids: BTreeSet<u64>,
     next_handle_id: u64,
@@ -1598,7 +1598,7 @@ mod tests {
             _spec: NodeProvisionSpec,
             _endpoint: VastAiSshEndpoint,
             _sink: PluginSink,
-            _producer: Option<DatastreamProducer>,
+            _producer: Option<TelemetryProducer>,
             _lifecycle: LifecyclePolicy,
         ) -> Result<Self::Handle, String> {
             self.starts.fetch_add(1, Ordering::SeqCst);

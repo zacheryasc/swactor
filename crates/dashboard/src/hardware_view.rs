@@ -1,15 +1,15 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use datastream::frame::{Frame, StreamId};
-use datastream::hardware::cpu::{
+use telemetry::frame::{Frame, StreamId};
+use telemetry::hardware::cpu::{
     CpuCoreSample, CpuHostSample, CpuProcessSample, HOST_CPU_CHANNEL, HostCpuSample,
 };
-use datastream::hardware::gpu::{
+use telemetry::hardware::gpu::{
     GpuDeviceSample, GpuProcessSample, HOST_GPU_CHANNEL, HostGpuSample,
 };
-use datastream::hardware::net::{HOST_NET_CHANNEL, HostNetSample, NetInterfaceSample};
-use datastream::Record;
+use telemetry::hardware::net::{HOST_NET_CHANNEL, HostNetSample, NetInterfaceSample};
+use telemetry::Record;
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -581,8 +581,8 @@ fn saturating_u32(value: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datastream::frame::{ChannelId, Lifetime, NodeId, Position};
-    use datastream::hardware::gpu::GpuDeviceSample;
+    use telemetry::frame::{ChannelId, Lifetime, NodeId, Position};
+    use telemetry::hardware::gpu::GpuDeviceSample;
 
     #[test]
     fn hardware_view_groups_samples_by_node_and_derives_network_rates() {

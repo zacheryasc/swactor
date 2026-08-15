@@ -1,4 +1,4 @@
-//! Extension contract for typed datastream payloads.
+//! Extension contract for typed telemetry payloads.
 //!
 //! The pipe owns frames, ordering, transport, ingest, and storage. It does not
 //! own the universe of channel meanings. Producers and consumers define records
@@ -57,7 +57,7 @@ pub trait Record: Serialize + for<'de> Deserialize<'de> + Sized {
 }
 
 /// Small composable classifier for consumers that want registry-style decoding
-/// without putting a global catalog inside `datastream`.
+/// without putting a global catalog inside `telemetry`.
 #[derive(Debug, Clone, Default)]
 pub struct ChannelRegistry {
     typed: BTreeSet<String>,

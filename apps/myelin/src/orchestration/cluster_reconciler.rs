@@ -124,7 +124,7 @@ impl PluginObservationSink for AttemptObservationSink {
             )),
             PluginObservation::StdoutLine { .. }
             | PluginObservation::StderrLine { .. }
-            | PluginObservation::DatastreamFrame { .. }
+            | PluginObservation::TelemetryFrame { .. }
             | PluginObservation::ProviderLine { .. } => None,
         };
         self.downstream.observe(observation);
@@ -859,7 +859,7 @@ mod tests {
 
     use crate::provisioning::ProviderMount;
     use ::provisioning::{
-        BootSpec, BootstrapSessionSpec, ClusterShape, CreateLeaseRequest, DatastreamStreamId,
+        BootSpec, BootstrapSessionSpec, ClusterShape, CreateLeaseRequest, TelemetryStreamId,
         DesiredNodeShape, LogicalNodeSpec, NodeGroupId, OperationId, ProviderKind, RetryPolicy,
         RoleId, RunId, RunNodeGroupSpec, SwarmJoinSpec, SwarmJoinTemplate,
     };
@@ -1125,7 +1125,7 @@ mod tests {
                 },
                 boot: desired.boot.clone(),
                 swarm_join: desired.swarm_join.clone(),
-                datastream: DatastreamStreamId("bootstrap".to_owned()),
+                telemetry: TelemetryStreamId("bootstrap".to_owned()),
             }),
         );
         assert!(matches!(
@@ -1231,7 +1231,7 @@ mod tests {
                 },
                 boot: desired.boot,
                 swarm_join: desired.swarm_join,
-                datastream: DatastreamStreamId("bootstrap".to_owned()),
+                telemetry: TelemetryStreamId("bootstrap".to_owned()),
             }),
         );
 

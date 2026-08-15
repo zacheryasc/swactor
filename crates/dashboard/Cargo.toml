@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 axum = "0.8"
-datastream = { path = "../datastream" }
+telemetry = { path = "../telemetry" }
 swactor = { path = "../..", features = ["serde"] }
 parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }

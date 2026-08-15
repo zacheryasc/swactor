@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use datastream::frame::{Frame, StreamId};
+use telemetry::frame::{Frame, StreamId};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::Value;
 
 use crate::FrameEvent;
 
-/// Read-only interpretation of one or more datastream channels.
+/// Read-only interpretation of one or more telemetry channels.
 ///
 /// Views are observation-only: they fold incoming frames into local state and
 /// expose JSON/HTML. They do not send control messages back to the runtime.

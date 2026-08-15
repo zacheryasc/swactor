@@ -170,7 +170,7 @@ pub(crate) struct DockerConfigOverlay {
 pub(crate) struct ObservabilityConfigOverlay {
     pub dump_logs: Option<bool>,
     pub dump_log_path: Option<String>,
-    pub datastream_frame_log: Option<String>,
+    pub telemetry_frame_log: Option<String>,
 }
 
 impl TomlConfigOverlay {

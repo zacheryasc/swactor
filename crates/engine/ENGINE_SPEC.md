@@ -42,7 +42,7 @@ This spec defines the **engine**: a swactor-owned composite that retains a selec
 - Cancellation and shutdown lifecycle (deferred; nice-to-have).
 - Failure / observability propagation from engine-hosted work.
 - Cross-process / cross-isolation delivery and serialization.
-- Specific protocols and codecs (iroh/QUIC, datastream framing). Those are crate logic built *on* the engine.
+- Specific protocols and codecs (iroh/QUIC, telemetry framing). Those are crate logic built *on* the engine.
 - Provider adapters, including the VastAI provider adapter. Their private runtimes, manually driven swactor runtimes, blocking facades, polling threads, and provider lifecycle are crate-level concerns built *beside* the engine, not on it; they require their own redesign rather than incremental engine migration.
 
 ## 3. Model

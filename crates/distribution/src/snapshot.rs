@@ -1,7 +1,7 @@
 //! Serializable shape of a node's observable distribution state.
 //!
 //! This is the JSON contract distribution observers render. The node no longer
-//! *collects* it by polling — per-node telemetry now flows over the datastream.
+//! *collects* it by polling — per-node telemetry now flows over the telemetry.
 //! The type is retained as the shared wire shape so external consumers (the
 //! example clusters, the docker integration tests) can deserialize a node's
 //! `/api/distribution` response, and so producers that build the shape directly

@@ -372,7 +372,7 @@ fn successful_outcomes_track_one_live_lease_and_bootstrap_per_attempt() {
         ssh: lease_result(attempt).endpoint.unwrap(),
         boot: logical_spec("worker-0").boot,
         swarm_join: logical_spec("worker-0").swarm_join,
-        datastream: DatastreamStreamId("bootstrap".to_owned()),
+        telemetry: TelemetryStreamId("bootstrap".to_owned()),
     });
     executor.submit(&start).unwrap();
     executor.drain_results();

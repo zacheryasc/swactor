@@ -1,9 +1,9 @@
-//! Legacy `DatastreamSink` for [`DatastreamFrame`] actor messages.
+//! Legacy `TelemetrySink` for [`TelemetryFrame`] actor messages.
 //!
-//! New live transports should prefer catalog-aware [`crate::DatastreamEvent`]
+//! New live transports should prefer catalog-aware [`crate::TelemetryEvent`]
 //! streams. This actor remains as the counterpart to
 //! [`ClusterFrameSink`](super::emit::ClusterFrameSink): a node ships positioned
-//! telemetry as legacy `DatastreamFrame` actor messages over regular Swactor
+//! telemetry as legacy `TelemetryFrame` actor messages over regular Swactor
 //! transport, and this actor receives them, decodes each back into a
 //! `(StreamId, Frame)` delivery, and hands it to a caller-supplied fold.
 //!
@@ -15,20 +15,20 @@ use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;
 
 use crate::frame::{Frame, StreamId};
-use super::wire::{DatastreamFrame, decode_delivery};
+use super::wire::{TelemetryFrame, decode_delivery};
 
-/// Receives legacy [`DatastreamFrame`] cluster messages and folds each decoded
+/// Receives legacy [`TelemetryFrame`] cluster messages and folds each decoded
 /// delivery through `on_frame`. Spawn it, then publish its address under
-/// [`DATASTREAM_SINK_NAME`] so legacy emitters can resolve and ship to it.
-pub struct DatastreamSink {
+/// [`TELEMETRY_SINK_NAME`] so legacy emitters can resolve and ship to it.
+pub struct TelemetrySink {
     on_frame: Box<dyn FnMut(StreamId, Frame) + Send>,
 }
 
-/// The cluster name a [`DatastreamSink`] is published under. Emitters resolve
+/// The cluster name a [`TelemetrySink`] is published under. Emitters resolve
 /// this to fill their `ClusterFrameSink` destination.
-pub const DATASTREAM_SINK_NAME: &str = "datastream-sink";
+pub const TELEMETRY_SINK_NAME: &str = "telemetry-sink";
 
-impl DatastreamSink {
+impl TelemetrySink {
     /// Build a sink that folds every decoded delivery through `on_frame`.
     pub fn new(on_frame: impl FnMut(StreamId, Frame) + Send + 'static) -> Self {
         Self {
@@ -37,11 +37,11 @@ impl DatastreamSink {
     }
 }
 
-impl ActorInterface for DatastreamSink {
-    type Incoming = DatastreamFrame;
+impl ActorInterface for TelemetrySink {
+    type Incoming = TelemetryFrame;
     type Response = ();
 
-    fn handle(&mut self, _ctx: &Ctx, msg: DatastreamFrame) {
+    fn handle(&mut self, _ctx: &Ctx, msg: TelemetryFrame) {
         // Best-effort: a malformed datagram is dropped, never panics the sink.
         if let Ok((stream, frame)) = decode_delivery(&msg.payload) {
             (self.on_frame)(stream, frame);

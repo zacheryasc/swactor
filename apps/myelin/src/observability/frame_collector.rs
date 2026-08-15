@@ -1,25 +1,25 @@
 //! Frame collection and load-progress extraction for the control loop.
 //!
-//! [`FrameCollector`] wraps the mpsc channel that buffers datastream frames
+//! [`FrameCollector`] wraps the mpsc channel that buffers telemetry frames
 //! drained from the iroh driver. It exposes two drain methods that forward
 //! queued frames to sinks (dashboard/archive) via closures; the control loop
-//! never names [`Frame`] or [`DatastreamEvent`] directly — frames reach sinks
+//! never names [`Frame`] or [`TelemetryEvent`] directly — frames reach sinks
 //! only through these closures. Load-progress extraction
 //! ([`StageLoadProgress`]) is co-located here because it is the one legitimate
 //! read of telemetry content for control decisions (weight-load liveness).
 
-use datastream::frame::{ChannelRef, DatastreamEvent, Frame, StreamId};
+use telemetry::frame::{ChannelRef, TelemetryEvent, Frame, StreamId};
 use iroh_driver::IrohDriver;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::mpsc;
 use std::time::Instant;
 
-use crate::observability::orch_datastream::DashboardSupport;
+use crate::observability::orch_telemetry::DashboardSupport;
 
-/// A datastream frame queued from a remote node, with its resolved channel name.
+/// A telemetry frame queued from a remote node, with its resolved channel name.
 #[derive(Clone, Debug)]
-struct CollectedDatastreamFrame {
+struct CollectedTelemetryFrame {
     stream: StreamId,
     channel_name: String,
     frame: Frame,
@@ -56,10 +56,10 @@ impl StageLoadProgress {
     }
 }
 
-/// Buffers datastream frames drained from the driver and forwards them to sinks.
+/// Buffers telemetry frames drained from the driver and forwards them to sinks.
 pub(crate) struct FrameCollector {
-    tx: mpsc::Sender<CollectedDatastreamFrame>,
-    rx: mpsc::Receiver<CollectedDatastreamFrame>,
+    tx: mpsc::Sender<CollectedTelemetryFrame>,
+    rx: mpsc::Receiver<CollectedTelemetryFrame>,
 }
 
 impl FrameCollector {
@@ -68,9 +68,9 @@ impl FrameCollector {
         Self { tx, rx }
     }
 
-    /// Drain iroh datastream connections into the internal queue.
+    /// Drain iroh telemetry connections into the internal queue.
     pub(crate) fn pump(&self, driver: &IrohDriver) {
-        drain_datastream_connections(driver, &self.tx);
+        drain_telemetry_connections(driver, &self.tx);
     }
 
     /// Drain queued frames, forwarding each via the closure. No progress extraction.
@@ -103,7 +103,7 @@ impl FrameCollector {
 
 fn update_load_progress_from_frame(
     progress: &mut BTreeMap<u64, StageLoadProgress>,
-    collected: &CollectedDatastreamFrame,
+    collected: &CollectedTelemetryFrame,
     now: Instant,
 ) {
     let stream_node_id = collected.stream.node.as_str().parse::<u64>().ok();
@@ -239,11 +239,11 @@ fn load_phase_for_worker_event(event_type: &str) -> Option<&'static str> {
     }
 }
 
-fn drain_datastream_connections(
+fn drain_telemetry_connections(
     driver: &IrohDriver,
-    frame_tx: &mpsc::Sender<CollectedDatastreamFrame>,
+    frame_tx: &mpsc::Sender<CollectedTelemetryFrame>,
 ) {
-    for read in driver.drain_datastream_reads() {
+    for read in driver.drain_telemetry_reads() {
         let mut channels = read
             .header
             .channels
@@ -260,7 +260,7 @@ fn drain_datastream_connections(
             .collect::<BTreeMap<_, _>>();
         for event in read.events {
             match event {
-                DatastreamEvent::ChannelDeclared(descriptor) => {
+                TelemetryEvent::ChannelDeclared(descriptor) => {
                     channels.insert(
                         ChannelRef {
                             stream: descriptor.stream.clone(),
@@ -269,7 +269,7 @@ fn drain_datastream_connections(
                         descriptor.name,
                     );
                 }
-                DatastreamEvent::Frame(delivery) => {
+                TelemetryEvent::Frame(delivery) => {
                     let channel_name = channels
                         .get(&delivery.channel)
                         .cloned()
@@ -280,7 +280,7 @@ fn drain_datastream_connections(
                         delivery.payload,
                     );
                     if frame_tx
-                        .send(CollectedDatastreamFrame {
+                        .send(CollectedTelemetryFrame {
                             stream: delivery.channel.stream,
                             channel_name,
                             frame,
@@ -290,7 +290,7 @@ fn drain_datastream_connections(
                         return;
                     }
                 }
-                DatastreamEvent::StreamDeclared(_) | DatastreamEvent::StreamEnded(_) => {}
+                TelemetryEvent::StreamDeclared(_) | TelemetryEvent::StreamEnded(_) => {}
             }
         }
     }

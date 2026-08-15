@@ -9,12 +9,12 @@
 //!   into behavior.
 //! - Transition causes and recent probe targets are externally visible when promised.
 
-mod datastream_records {
-    //! Distribution-owned datastream records keep their channels and JSON payloads stable through
+mod telemetry_records {
+    //! Distribution-owned telemetry records keep their channels and JSON payloads stable through
     //! the mux.
 
-    use datastream::frame::{Lifetime, NodeId, StreamId};
-    use datastream::{ChannelId, Mux, Position, Record};
+    use telemetry::frame::{Lifetime, NodeId, StreamId};
+    use telemetry::{ChannelId, Mux, Position, Record};
     use distribution::telemetry::{
         CacheEntryRec, DIST_STATE, DistributionState, MEMBERSHIP, MembershipTransition,
         RegistryEntryRec, SWIM_PROBES, SwimProbeEvent, TRANSPORT_INTERNALS, TransportInternals,
@@ -47,7 +47,7 @@ mod datastream_records {
     }
 
     #[test]
-    fn distribution_emits_owned_channel_through_datastream_mux() {
+    fn distribution_emits_owned_channel_through_telemetry_mux() {
         let stream = StreamId::new(NodeId::new("dist-node"), Lifetime(1));
         let mux = Mux::unbounded(stream);
         let state = DistributionState {

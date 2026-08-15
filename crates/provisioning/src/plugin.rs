@@ -69,7 +69,7 @@ pub enum PluginObservation {
         node_id: u64,
         line: String,
     },
-    DatastreamFrame {
+    TelemetryFrame {
         run_id: u64,
         node_id: u64,
         channel: String,

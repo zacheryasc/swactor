@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use datastream::frame::{Frame, StreamId};
+use telemetry::frame::{Frame, StreamId};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
 
@@ -12,17 +12,17 @@ const LIVE_EXPLORER_HTML: &str = include_str!("live_explorer_page.html");
 const FRAME_HISTORY_CAP: usize = 500;
 
 #[derive(Default)]
-pub struct LiveDatastreamExplorer {
+pub struct LiveTelemetryExplorer {
     state: RwLock<BTreeMap<(String, u64, String), VecDeque<FrameEvent>>>,
 }
 
-impl DashboardView for LiveDatastreamExplorer {
+impl DashboardView for LiveTelemetryExplorer {
     fn id(&self) -> &'static str {
-        "datastream/live"
+        "telemetry/live"
     }
 
     fn title(&self) -> &'static str {
-        "Datastream live explorer"
+        "Telemetry live explorer"
     }
 
     fn channels(&self) -> &'static [&'static str] {
@@ -68,11 +68,11 @@ impl DashboardView for LiveDatastreamExplorer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datastream::frame::{ChannelId, Lifetime, NodeId, Position};
+    use telemetry::frame::{ChannelId, Lifetime, NodeId, Position};
 
     #[test]
     fn retains_quiet_channels_and_bounds_each_channel_independently() {
-        let view = LiveDatastreamExplorer::default();
+        let view = LiveTelemetryExplorer::default();
         let stream = StreamId::new(NodeId::new("node-a"), Lifetime(1));
         ingest(&view, &stream, "quiet", 0);
 
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn retains_same_channel_separately_across_stream_lifetimes() {
-        let view = LiveDatastreamExplorer::default();
+        let view = LiveTelemetryExplorer::default();
         let first = StreamId::new(NodeId::new("node-a"), Lifetime(1));
         let second = StreamId::new(NodeId::new("node-a"), Lifetime(2));
         ingest(&view, &first, "host.cpu", 7);
@@ -120,7 +120,7 @@ mod tests {
         assert_eq!(frames[1]["position"].as_u64(), Some(0));
     }
 
-    fn ingest(view: &LiveDatastreamExplorer, stream: &StreamId, channel: &str, position: u64) {
+    fn ingest(view: &LiveTelemetryExplorer, stream: &StreamId, channel: &str, position: u64) {
         let frame = Frame::new(
             ChannelId(position as u32 + 1),
             Position(position),

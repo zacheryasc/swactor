@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 publish = false
 
 [dependencies]
-datastream = { path = "../datastream" }
+telemetry = { path = "../telemetry" }
 serde = { version = "1", features = ["derive"] }
 swactor = { path = "../.." }
 

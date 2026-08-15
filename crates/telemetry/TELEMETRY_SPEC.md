@@ -1,4 +1,4 @@
-# The Datastream — Specification
+# The Telemetry — Specification
 
 Id: 7
 Last modified: b887e941cbe6f1e209339abd0375507aca9bfe52
@@ -7,9 +7,9 @@ Last reviewed:
 
 ---
 
-## 1. What the datastream is
+## 1. What the telemetry is
 
-The datastream is a **per-node, append-only telemetry pipe**. Every stream is
+The telemetry is a **per-node, append-only telemetry pipe**. Every stream is
 produced by one node incarnation, identified by `(node, life)`. A node can feed
 zero, one, or many local/remote consumers: the mux is drained once, then the
 endpoint fans out the resulting events to subscribers.
@@ -94,7 +94,7 @@ stream-local channel id at a stream-local position. `payload` is opaque to the
 mux, transport, ingest, and store.
 
 There is still **no timestamp field on `Frame`**. Time, wall-clock correlation,
-latency, or tracing data is producer payload, not a datastream-owned sidecar or
+latency, or tracing data is producer payload, not a telemetry-owned sidecar or
 property on the frame envelope.
 
 ### 2.2 Stream identity — incarnations never merge
@@ -188,7 +188,7 @@ The globally resolved raw channel identity is `ChannelRef`, not a bare
 `ChannelId`. A view usually needs the `ChannelDescriptor` for that `ChannelRef`
 to recover the channel name and choose a decode/display path.
 
-### 2.5 Datastream events
+### 2.5 Telemetry events
 
 The live endpoint/subscription path carries catalog-aware events:
 
@@ -199,7 +199,7 @@ pub struct FrameDelivery {
     pub payload: Vec<u8>,
 }
 
-pub enum DatastreamEvent {
+pub enum TelemetryEvent {
     StreamDeclared(StreamDescriptor),
     ChannelDeclared(ChannelDescriptor),
     Frame(FrameDelivery),
@@ -215,7 +215,7 @@ legacy adapters (§6.1, §7.1).
 `StreamDeclared` is part of the event vocabulary, but current QUIC transport
 puts the stream descriptor in the stream header and does not emit a separate
 `StreamDeclared` event. `StreamEnded` is also part of the event vocabulary, but
-current `DatastreamEndpoint` exposes no public `end_stream` method; terminal
+current `TelemetryEndpoint` exposes no public `end_stream` method; terminal
 source records remain a producer convention until a stream-ending API is added
 (§5.7).
 
@@ -261,7 +261,7 @@ A channel name is a dotted sequence of segments:
 
 ```text
 channel := namespace ( "." qualifier )*
-namespace := owning subsystem          e.g. datastream, host, runtime, proc,
+namespace := owning subsystem          e.g. telemetry, host, runtime, proc,
                                             mvp, transport, dist, identity
 qualifier := instance-key | leaf       instance-key identifies a dynamic source;
                                             leaf names the signal
@@ -271,7 +271,7 @@ Current names and families seen in code include:
 
 | Path or family                                      | Owner / meaning |
 |-----------------------------------------------------|-----------------|
-| `datastream.health`                                 | datastream self-health record |
+| `telemetry.health`                                 | telemetry self-health record |
 | `host.cpu`, `host.gpu`, `host.net`                  | host hardware samples |
 | `runtime.actors`                                    | swactor runtime actor stats |
 | `proc.<label>.stdout`, `proc.<label>.stderr`        | managed process output streams |
@@ -343,10 +343,10 @@ Examples:
 
 ### 4.1 The endpoint owns stream-local allocation and fanout
 
-The current public owner of a stream is `DatastreamEndpoint`:
+The current public owner of a stream is `TelemetryEndpoint`:
 
 ```rust
-pub struct DatastreamEndpoint { /* stream, mux, catalog, fanout, counters */ }
+pub struct TelemetryEndpoint { /* stream, mux, catalog, fanout, counters */ }
 ```
 
 An endpoint owns:
@@ -358,15 +358,15 @@ An endpoint owns:
 - counters for assigned, drained, mux-dropped, and bitbucketed frames.
 
 Code that emits telemetry normally asks the endpoint for a cloneable
-`DatastreamProducer`:
+`TelemetryProducer`:
 
 ```rust
 let producer = endpoint.producer();
 ```
 
-Legacy `DatastreamEmitter` / `DatastreamEventSink` APIs still exist for old
-call sites. New code should register channels on `DatastreamEndpoint` or
-`DatastreamProducer` and submit through `DatastreamProducer`.
+Legacy `TelemetryEmitter` / `TelemetryEventSink` APIs still exist for old
+call sites. New code should register channels on `TelemetryEndpoint` or
+`TelemetryProducer` and submit through `TelemetryProducer`.
 
 ### 4.2 Register or reuse a channel, then submit bytes
 
@@ -461,9 +461,9 @@ receiver-disconnect before they enter the queue. Once a frame has been drained
 and assigned a position, later transport or store loss can still surface as an
 interior gap if bracketing positions arrive.
 
-> **Decision of record — lossy, not blocking.** A datastream is allowed to lose
+> **Decision of record — lossy, not blocking.** A telemetry is allowed to lose
 > frames; it is not allowed to stall a producer or silently renumber around a
-> loss. Anything that cannot tolerate loss does not belong on the datastream as
+> loss. Anything that cannot tolerate loss does not belong on the telemetry as
 > its sole source of truth.
 
 ---
@@ -522,7 +522,7 @@ registry.
 ### 5.3 Static channels and dynamic families
 
 - **Static channel** — a fully literal path known at compile time, such as
-  `host.cpu`, `host.net`, `datastream.health`, or `runtime.actors`.
+  `host.cpu`, `host.net`, `telemetry.health`, or `runtime.actors`.
 - **Dynamic family** — a path template with domain-owned parameter segments,
   such as `proc.<label>.stdout` or
   `mvp.provisioning.logs.node.<id>.<stream>`.
@@ -601,8 +601,8 @@ channel teardown or channel garbage collection.
 
 A producer may emit a terminal **data record** if the domain has something to
 say, such as a process exit record. Separately, the event vocabulary includes
-`DatastreamEvent::StreamEnded(StreamId)` for stream-level control, and QUIC can
-encode it. Current `DatastreamEndpoint` does not expose a public method to emit
+`TelemetryEvent::StreamEnded(StreamId)` for stream-level control, and QUIC can
+encode it. Current `TelemetryEndpoint` does not expose a public method to emit
 `StreamEnded`, so it is a defined control event whose emission policy is not yet
 wired through the endpoint API.
 
@@ -619,7 +619,7 @@ Discovery has moved from store-only scanning to catalog metadata:
 - The **store** answers which numeric frames were delivered and stored.
 - A **view** joins the two when it wants named projections.
 
-A live subscriber receives an initial `DatastreamSnapshot { streams, channels }`
+A live subscriber receives an initial `TelemetrySnapshot { streams, channels }`
 and future `ChannelDeclared` events. A durable store that must render names
 after restart must persist or reconstruct catalog descriptors alongside frames;
 frames alone contain only numeric channel ids.
@@ -631,7 +631,7 @@ not be contradicted:
 
 | Namespace/path | Current meaning |
 |----------------|-----------------|
-| `datastream.health` | datastream self-health counters |
+| `telemetry.health` | telemetry self-health counters |
 | `host.cpu`, `host.gpu`, `host.net` | host hardware samples |
 | `runtime.actors` | runtime actor stats hook output |
 | `proc.<label>.stdout`, `proc.<label>.stderr` | managed process output |
@@ -659,9 +659,9 @@ pub struct Delivery {
 `Consumer::accept` ingests `Delivery`. Scripted transport and the legacy actor
 wire envelope still use this shape.
 
-The live endpoint/subscription seam is `DatastreamEvent` (§2.5). It carries
+The live endpoint/subscription seam is `TelemetryEvent` (§2.5). It carries
 catalog declarations and `FrameDelivery` events. A transitional helper converts
-`DatastreamEvent::Frame` back to `Delivery` when a stored-stream test or adapter
+`TelemetryEvent::Frame` back to `Delivery` when a stored-stream test or adapter
 needs the old shape.
 
 ### 6.2 Local fanout: drain once, publish to subscribers
@@ -677,8 +677,8 @@ pub struct EndpointTick {
 }
 ```
 
-`DatastreamEndpoint::tick` drains queued mux frames, converts them to
-`DatastreamEvent::Frame`, and publishes the batch to `DeliveryFanout`
+`TelemetryEndpoint::tick` drains queued mux frames, converts them to
+`TelemetryEvent::Frame`, and publishes the batch to `DeliveryFanout`
 subscribers. Future-event fanout is broadcast-only: every current subscriber is
 offered every future event, regardless of its `SubscriptionRequest`. A slow
 subscriber drops only its own copies; other subscribers can still receive the
@@ -748,7 +748,7 @@ impl Consumer { fn accept(&mut self, d: Delivery) -> bool; }
 Ingest routes each `Delivery` to its `StreamId` and records the frame at its
 position. It does not decode, thin, aggregate, or inspect payload bytes.
 
-Live `DatastreamEvent::Frame` values can be converted to `Delivery` when feeding
+Live `TelemetryEvent::Frame` values can be converted to `Delivery` when feeding
 the store. Catalog events are not stored by `Store`; callers that need durable
 name resolution must persist catalog metadata elsewhere or extend storage.
 
@@ -889,7 +889,7 @@ without reaching into private internals.
 
 ### 9.2 Compatibility notes
 
-The old `DatastreamEmitter`, `DatastreamEventSink`, legacy actor envelope, and
+The old `TelemetryEmitter`, `TelemetryEventSink`, legacy actor envelope, and
 `Delivery` test seam are compatibility surfaces. New producer code should prefer
-`DatastreamEndpoint` and `DatastreamProducer`; new live transports should prefer
-catalog-aware `DatastreamEvent` streams.
+`TelemetryEndpoint` and `TelemetryProducer`; new live transports should prefer
+catalog-aware `TelemetryEvent` streams.

@@ -2,7 +2,7 @@
 
 Keep this crate read-only with respect to observed programs.
 
-- It may ingest datastream frames.
+- It may ingest telemetry frames.
 - It may retain bounded raw-frame and view state for HTML/API rendering.
 - It may host universal swactor runtime views.
 - It must not send control signals to observed runtimes.

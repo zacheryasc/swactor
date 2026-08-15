@@ -165,7 +165,7 @@ name = "dashboard"
 version = "0.1.0"
 dependencies = [
  "axum",
- "datastream",
+ "telemetry",
  "parking_lot",
  "serde",
  "serde_json",
@@ -175,7 +175,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "datastream"
+name = "telemetry"
 version = "0.1.0"
 dependencies = [
  "libc",

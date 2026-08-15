@@ -1,4 +1,4 @@
-//! Generic datastream emission helpers.
+//! Generic telemetry emission helpers.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -10,7 +10,7 @@ use swactor::runtime::Runtime;
 use crate::frame::{ChannelId, Frame, Lifetime, NodeId, StreamId};
 use crate::record::Record;
 use super::mux::Mux;
-use super::wire::{DatastreamFrame, encode_delivery};
+use super::wire::{TelemetryFrame, encode_delivery};
 
 /// Legacy sink for frames after mux drain has assigned positions.
 pub trait FrameSink: Send {
@@ -38,15 +38,15 @@ impl ProcessOutputObserver for MuxProcObserver {
 }
 
 /// Legacy per-node emitter retained while runtime callsites move to
-/// [`crate::DatastreamEndpoint`]. New code should register channels on the
-/// endpoint and submit through [`crate::DatastreamProducer`].
-pub struct DatastreamEmitter {
+/// [`crate::TelemetryEndpoint`]. New code should register channels on the
+/// endpoint and submit through [`crate::TelemetryProducer`].
+pub struct TelemetryEmitter {
     stream_id: StreamId,
     mux: Arc<Mux>,
     sink: Box<dyn FrameSink>,
 }
 
-impl DatastreamEmitter {
+impl TelemetryEmitter {
     pub fn new(cfg: EmitterConfig, sink: Box<dyn FrameSink>) -> Self {
         let stream_id = StreamId::new(NodeId::new(&cfg.node_hex), Lifetime(cfg.life));
         let mux = Arc::new(Mux::new(stream_id.clone(), cfg.mux_capacity));
@@ -106,20 +106,20 @@ impl DatastreamEmitter {
         }
     }
 
-    pub fn event_sink(&self) -> DatastreamEventSink {
-        DatastreamEventSink {
+    pub fn event_sink(&self) -> TelemetryEventSink {
+        TelemetryEventSink {
             mux: self.mux.clone(),
         }
     }
 }
 
-/// A thread-safe submit handle. Legacy; prefer [`crate::DatastreamProducer`].
+/// A thread-safe submit handle. Legacy; prefer [`crate::TelemetryProducer`].
 #[derive(Clone)]
-pub struct DatastreamEventSink {
+pub struct TelemetryEventSink {
     mux: Arc<Mux>,
 }
 
-impl DatastreamEventSink {
+impl TelemetryEventSink {
     pub fn submit_record<R: Record>(&self, channel: ChannelId, record: &R) -> bool {
         self.mux.submit(channel, record.encode())
     }
@@ -161,7 +161,7 @@ impl FrameSink for ClusterFrameSink {
         if let Some(addr) = self.sink.get() {
             let _ = self.rt.send_to(
                 *addr,
-                DatastreamFrame {
+                TelemetryFrame {
                     payload: encode_delivery(stream, frame),
                 },
             );

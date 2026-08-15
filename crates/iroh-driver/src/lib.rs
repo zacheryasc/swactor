@@ -9,7 +9,7 @@
 // work goes through `EngineHandle`.
 #![deny(clippy::disallowed_methods)]
 
-pub mod datastream_transport;
+pub mod telemetry_transport;
 pub mod driver_pumps;
 pub mod edge_transport;
 pub mod endpoint_advertisement;
@@ -19,14 +19,14 @@ pub use endpoint_advertisement::{
     EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint,
 };
 pub use iroh_driver::{
-    ConnType, DatastreamPublishHandle, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus,
+    ConnType, TelemetryPublishHandle, IrohDriver, IrohDriverConfig, JoinPhase, JoinStatus,
     conn_type_of, discover_lan_ips,
 };
 
 pub use edge_transport::{EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, EdgeTransportFault};
 
-pub use datastream_transport::{
-    DATASTREAM_ALPN, DatastreamQuicHeader, DatastreamQuicRead, DatastreamQuicWriteStats,
+pub use telemetry_transport::{
+    TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, TelemetryQuicWriteStats,
     read_events_from_stream, read_next_event, read_next_uni_from_connection, read_stream_header,
     read_stream_into_fanout, spawn_connection_reader, spawn_subscription_writer,
     write_available_subscription, write_event, write_subscription_until_closed,

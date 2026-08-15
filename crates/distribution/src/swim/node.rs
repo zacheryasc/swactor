@@ -7,7 +7,7 @@
 //! Membership and probe lifecycle surface through an optional
 //! [`SwimObserver`] (diagnostics-free): production installs none and pays
 //! nothing, while the simulator records [`SwimObservation`]s for scenario
-//! evaluation. Node-level telemetry is captured separately by the datastream
+//! evaluation. Node-level telemetry is captured separately by the telemetry
 //! membership channel, which diffs the member view each tick.
 
 use std::time::Instant;

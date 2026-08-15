@@ -225,7 +225,7 @@ impl IrohNode {
             Arc::clone(&route_view),
             Arc::clone(&outbox),
         );
-        // Engine-hosted adapter pump: drains ingress/egress/datastream/edge on
+        // Engine-hosted adapter pump: drains ingress/egress/telemetry/edge on
         // a timer so the synchronous test loop no longer pumps these by hand.
         driver.install_actor_bridge_pump(Duration::from_millis(10));
 

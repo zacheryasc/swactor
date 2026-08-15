@@ -3,7 +3,7 @@
 //! Pure frame consumer: it folds incoming per-actor snapshots into local state
 //! and exposes JSON + HTML. It sends nothing back to observed runtimes. Parsing
 //! is intentionally tolerant of publisher shape — a frame is a flat record that
-//! may come from the per-worker `DatastreamStatsHook` envelope
+//! may come from the per-worker `TelemetryStatsHook` envelope
 //! (`{worker_id, actors:[...]}`) or from a process that publishes a merged
 //! `{actors:[...]}` payload (the dashboard dummy node, app runtimes). Fields the
 //! publisher includes (name, worker_id, lifecycle flags) are displayed; ones it
@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use datastream::frame::{Frame, StreamId};
+use telemetry::frame::{Frame, StreamId};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -122,7 +122,7 @@ impl RuntimeState {
     }
 
     fn apply_actors(&mut self, value: &Value, now: Instant) {
-        // Per-worker `worker_id` wrapper (DatastreamStatsHook shape) is the
+        // Per-worker `worker_id` wrapper (TelemetryStatsHook shape) is the
         // default placement for actors that do not carry one inline.
         let wrapper_worker = u32_field(value, &["worker_id", "worker"]);
         if let Some(actors) = value.get("actors").and_then(Value::as_array) {

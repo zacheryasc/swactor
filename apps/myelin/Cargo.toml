@@ -11,7 +11,7 @@ default = []
 dashboard = []
 
 [dependencies]
-datastream = { path = "../../crates/datastream" }
+telemetry = { path = "../../crates/telemetry" }
 data-plane = { path = "../../crates/data-plane" }
 provisioning = { path = "../../crates/provisioning" }
 dashboard = { path = "../../crates/dashboard" }

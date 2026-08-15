@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use datastream::Record;
+use telemetry::Record;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

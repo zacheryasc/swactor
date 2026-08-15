@@ -31,8 +31,8 @@ use distribution::swim::actor::SwimIn;
 use distribution::transport_bridge::{OutFrame, Outbox, RelayMirror, RouteView, peer_addr};
 use distribution::types::NodeId;
 
-use crate::datastream_transport::{
-    DATASTREAM_ALPN, DatastreamQuicHeader, DatastreamQuicRead, read_events_from_stream,
+use crate::telemetry_transport::{
+    TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, read_events_from_stream,
     spawn_subscription_writer,
 };
 use crate::edge_transport::{
@@ -215,21 +215,21 @@ pub struct JoinStatus {
 
 // ─── Driver ─────────────────────────────────────────────────────────────────
 
-/// Cloneable logical datastream publisher transport. It hides the raw iroh
-/// endpoint and Tokio task handle from callers while leaving datastream
-/// subscription/catalog semantics in the datastream crate.
+/// Cloneable logical telemetry publisher transport. It hides the raw iroh
+/// endpoint and Tokio task handle from callers while leaving telemetry
+/// subscription/catalog semantics in the telemetry crate.
 #[derive(Clone)]
-pub struct DatastreamPublishHandle {
+pub struct TelemetryPublishHandle {
     engine: EngineHandle,
     endpoint: Endpoint,
 }
 
-impl DatastreamPublishHandle {
+impl TelemetryPublishHandle {
     pub fn publish_subscription(
         &self,
         peer: EndpointAddr,
-        header: DatastreamQuicHeader,
-        subscription: datastream::DatastreamSubscription,
+        header: TelemetryQuicHeader,
+        subscription: telemetry::TelemetrySubscription,
         idle_sleep: Duration,
     ) {
         spawn_subscription_writer(
@@ -260,7 +260,7 @@ struct ConnCache {
 /// to iroh's async QUIC transport. Runs on a caller-supplied swactor
 /// [`EngineHandle`] — the single engine that owns the node's Tokio substrate.
 /// All accepts, reads, dials, writes, retries, and adapter progression
-/// (actor-bridge, datastream, edge) are scheduled through that handle as
+/// (actor-bridge, telemetry, edge) are scheduled through that handle as
 /// engine-hosted work via [`Self::install_actor_bridge_pump`]; the driver stores
 /// no raw Tokio handle. Endpoint construction and [`Self::shutdown`] are hosted
 /// as engine tasks, never requiring the caller to enter or possess the raw
@@ -288,8 +288,8 @@ pub struct IrohDriver {
     accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
     /// Connections accepted on non-SWIM ALPNs before driver-owned adapters claim them.
     other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
-    /// Completed datastream QUIC reads from driver-owned DATASTREAM_ALPN adapters.
-    datastream_reads: Arc<Mutex<Vec<DatastreamQuicRead>>>,
+    /// Completed telemetry QUIC reads from driver-owned TELEMETRY_ALPN adapters.
+    telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
     /// Logical edge events emitted by driver-owned EDGE_ALPN byte pumps.
     edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
     next_edge_stream_group: Arc<AtomicU64>,
@@ -402,9 +402,15 @@ impl IrohDriver {
 
             // Only relax relay-cert verification for a custom relay; Default /
             // Staging relays keep full WebPKI verification.
-            if custom_relay {
-                builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
-            }
+        if custom_relay {
+            builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
+            // Relay-only: drop direct IP transports so the endpoint neither
+            // advertises nor chases direct addresses. Without this, iroh learns
+            // a peer's NAT-obscured/container-local direct addr via discovery
+            // and prefers it over the relay, black-holing all data. Applied to
+            // every endpoint so neither side has a direct addr to publish.
+            builder = builder.clear_ip_transports();
+        }
 
             if let Some(key) = secret_key {
                 builder = builder.secret_key(key);
@@ -438,7 +444,7 @@ impl IrohDriver {
             Arc::new(Mutex::new(Vec::new()));
         let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let datastream_reads: Arc<Mutex<Vec<DatastreamQuicRead>>> =
+        let telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>> =
             Arc::new(Mutex::new(Vec::new()));
         let edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>> = Arc::new(Mutex::new(Vec::new()));
         {
@@ -492,7 +498,7 @@ impl IrohDriver {
             dialing: Arc::new(Mutex::new(HashSet::new())),
             accepted_conns,
             other_accepted_conns,
-            datastream_reads,
+            telemetry_reads,
             edge_events,
             next_edge_stream_group: Arc::new(AtomicU64::new(1)),
             incoming: Arc::new(Mutex::new(Vec::new())),
@@ -525,13 +531,13 @@ impl IrohDriver {
         drained
     }
 
-    /// Drain non-SWIM, non-datastream connections kept for legacy stream users.
+    /// Drain non-SWIM, non-telemetry connections kept for legacy stream users.
     pub fn drain_other_connections(&self) -> Vec<(NodeId, Connection)> {
         let mut pending = self.other_accepted_conns.lock();
         let mut keep = Vec::new();
         let mut drained = Vec::new();
         for (node, negotiated, conn) in pending.drain(..) {
-            if negotiated == DATASTREAM_ALPN {
+            if negotiated == TELEMETRY_ALPN {
                 keep.push((node, negotiated, conn));
             } else {
                 drained.push((node, conn));
@@ -541,17 +547,17 @@ impl IrohDriver {
         drained
     }
 
-    /// Drain decoded datastream QUIC reads emitted by driver-owned adapter tasks.
-    pub fn drain_datastream_reads(&self) -> Vec<DatastreamQuicRead> {
-        self.datastream_reads.lock().drain(..).collect()
+    /// Drain decoded telemetry QUIC reads emitted by driver-owned adapter tasks.
+    pub fn drain_telemetry_reads(&self) -> Vec<TelemetryQuicRead> {
+        self.telemetry_reads.lock().drain(..).collect()
     }
 
-    /// Start a driver-owned datastream subscription writer task.
-    pub fn publish_datastream_subscription(
+    /// Start a driver-owned telemetry subscription writer task.
+    pub fn publish_telemetry_subscription(
         &self,
         peer: EndpointAddr,
-        header: DatastreamQuicHeader,
-        subscription: datastream::DatastreamSubscription,
+        header: TelemetryQuicHeader,
+        subscription: telemetry::TelemetrySubscription,
         idle_sleep: Duration,
     ) {
         spawn_subscription_writer(
@@ -564,9 +570,9 @@ impl IrohDriver {
         );
     }
 
-    /// Return a cloneable logical datastream transport handle for publisher actors.
-    pub fn datastream_publish_handle(&self) -> DatastreamPublishHandle {
-        DatastreamPublishHandle {
+    /// Return a cloneable logical telemetry transport handle for publisher actors.
+    pub fn telemetry_publish_handle(&self) -> TelemetryPublishHandle {
+        TelemetryPublishHandle {
             engine: self.engine.clone(),
             endpoint: self.endpoint.clone(),
         }
@@ -575,6 +581,13 @@ impl IrohDriver {
     /// Drain logical edge transport events emitted by driver-owned byte pumps.
     pub fn drain_edge_events(&self) -> Vec<EdgeTransportEvent> {
         self.edge_events.lock().drain(..).collect()
+    }
+
+    /// Clone of the shared edge-event queue, so callers outside the driver
+    /// (e.g. a job worker) can drain `EDGE_ALPN` byte events from their own
+    /// thread/task without going through `&self`.
+    pub fn edge_events_handle(&self) -> Arc<Mutex<Vec<EdgeTransportEvent>>> {
+        Arc::clone(&self.edge_events)
     }
 
     /// Start a driver-owned EDGE_ALPN send pump and return its logical byte input handle.
@@ -662,7 +675,7 @@ impl IrohDriver {
 
     /// Capture the driver-owned slice of the node's observable state: identity,
     /// listen address, and the directory route-view extent. The core node no
-    /// longer polls this (its telemetry flows over the datastream), so this is
+    /// longer polls this (its telemetry flows over the telemetry), so this is
     /// kept as a convenience over [`listen_addr`](Self::listen_addr) and
     /// [`directory_route_count`](Self::directory_route_count).
     pub fn snapshot(&self) -> DistributionNodeSnapshot {
@@ -717,6 +730,17 @@ impl IrohDriver {
     /// Get a snapshot of all join statuses.
     pub fn join_statuses(&self) -> HashMap<NodeId, JoinStatus> {
         self.join_statuses.lock().clone()
+    }
+    /// Whether an open iroh connection to `node_id` is currently cached. A
+    /// connection lands here from either an outbound join/dial or an inbound
+    /// connection accepted from the peer, so this is true once the actor-plane
+    /// data path is ready in either direction.
+    pub fn has_active_connection(&self, node_id: &NodeId) -> bool {
+        self.conns
+            .lock()
+            .connections
+            .get(node_id)
+            .is_some_and(|cached| cached.conn.close_reason().is_none())
     }
 
     /// Clear join statuses for the given node IDs (e.g. peers that are now alive).
@@ -993,7 +1017,7 @@ impl IrohDriver {
     }
 
     /// Install engine-hosted interval tasks that drive adapter progression
-    /// (actor-bridge ingress/egress, datastream ingress, edge ingress). After
+    /// (actor-bridge ingress/egress, telemetry ingress, edge ingress). After
     /// this call, the application must not manually pump these adapters
     /// (ENGINE_SPEC.md). Progression is scheduled on the engine the
     /// driver already stores; a bound driver does not accept an unrelated
@@ -1008,7 +1032,7 @@ impl IrohDriver {
             pending_joins: Arc::clone(&self.pending_joins),
             accepted_conns: Arc::clone(&self.accepted_conns),
             other_accepted_conns: Arc::clone(&self.other_accepted_conns),
-            datastream_reads: Arc::clone(&self.datastream_reads),
+            telemetry_reads: Arc::clone(&self.telemetry_reads),
             edge_events: Arc::clone(&self.edge_events),
             next_edge_stream_group: Arc::clone(&self.next_edge_stream_group),
             dialing: Arc::clone(&self.dialing),
@@ -1035,7 +1059,7 @@ impl IrohDriver {
 /// [`IrohDriver::install_actor_bridge_pump`]; each pump cycle folds completed
 /// joins/accepts into the connection cache, decodes inbound frames into actor
 /// messages, drains the actors' outbound queue onto the wire, and drives the
-/// driver-owned datastream/edge ingress adapters. All shared state is behind
+/// driver-owned telemetry/edge ingress adapters. All shared state is behind
 /// `Arc<Mutex<…>>` / `Arc<AtomicU64>`, so the pump needs only `&self`.
 #[derive(Clone)]
 struct AdapterPump {
@@ -1047,7 +1071,7 @@ struct AdapterPump {
     pending_joins: Arc<Mutex<Vec<JoinResult>>>,
     accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
     other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
-    datastream_reads: Arc<Mutex<Vec<DatastreamQuicRead>>>,
+    telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
     edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
     next_edge_stream_group: Arc<AtomicU64>,
     dialing: Arc<Mutex<HashSet<NodeId>>>,
@@ -1333,15 +1357,15 @@ impl AdapterPump {
         });
     }
 
-    /// Claim accepted datastream connections and read them inside driver-owned
+    /// Claim accepted telemetry connections and read them inside driver-owned
     /// tasks.
-    fn pump_datastream_ingress(&self) {
+    fn pump_telemetry_ingress(&self) {
         let drained = {
             let mut pending = self.other_accepted_conns.lock();
             let mut keep = Vec::new();
             let mut drained = Vec::new();
             for (node, negotiated, conn) in pending.drain(..) {
-                if negotiated == DATASTREAM_ALPN {
+                if negotiated == TELEMETRY_ALPN {
                     drained.push((node, conn));
                 } else {
                     keep.push((node, negotiated, conn));
@@ -1351,7 +1375,7 @@ impl AdapterPump {
             drained
         };
         for (_node, conn) in drained {
-            let reads = Arc::clone(&self.datastream_reads);
+            let reads = Arc::clone(&self.telemetry_reads);
             self.engine.spawn(async move {
                 while let Ok(recv) = conn.accept_uni().await {
                     match read_events_from_stream(recv).await {
@@ -1413,12 +1437,12 @@ impl AdapterPump {
     }
 
     /// One full pump cycle: fold connections, drain inbound/outbound, drive
-    /// the datastream and edge ingress adapters.
+    /// the telemetry and edge ingress adapters.
     fn run_pump_cycle(&self) {
         self.fold_connections();
         self.pump_inbound();
         self.drain_outbox();
-        self.pump_datastream_ingress();
+        self.pump_telemetry_ingress();
         self.pump_edge_ingress();
     }
 }

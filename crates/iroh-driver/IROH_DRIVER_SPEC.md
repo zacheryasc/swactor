@@ -24,7 +24,7 @@ The driver is responsible for:
 - caching live peer connections;
 - shuttling framed actor messages between iroh QUIC streams and Swactor actor mailboxes;
 - running driver-owned adapters for accepted non-actor protocols and emitting protocol-level ingress/status;
-- providing the datastream QUIC adapter used by datastream subscribers and collectors;
+- providing the telemetry QUIC adapter used by telemetry subscribers and collectors;
 - reporting local endpoint identity, endpoint address, join status, and route-view extent.
 
 The driver is not responsible for:
@@ -34,17 +34,17 @@ The driver is not responsible for:
 - actor scheduling;
 - application actor behavior;
 - model/runtime orchestration;
-- datastream record meaning;
+- telemetry record meaning;
 - relay-server operation;
 - durable logging or telemetry storage.
 
-Those behaviors belong to the `distribution`, `swactor`, `datastream`, and application crates. The driver supplies transport and pump seams that those systems use.
+Those behaviors belong to the `distribution`, `swactor`, `telemetry`, and application crates. The driver supplies transport and pump seams that those systems use.
 
 ---
 
 ## 2. Input Channels
 
-The driver accepts input through construction configuration, explicit method calls, an actor egress MPSC channel, inbound iroh connections, datastream subscriptions, and shutdown requests.
+The driver accepts input through construction configuration, explicit method calls, an actor egress MPSC channel, inbound iroh connections, telemetry subscriptions, and shutdown requests.
 
 ### 2.1 Construction and Configuration Inputs
 
@@ -179,7 +179,7 @@ Connections negotiated on the actor ALPN enter the actor connection cache path. 
 
 `additional_alpns` are internal wire selectors registered on the same iroh endpoint in addition to the actor ALPN.
 
-They exist so one node identity and one iroh endpoint can carry non-actor protocols such as datastream transport or edge byte transport without routing those bytes through Swactor actor mailboxes.
+They exist so one node identity and one iroh endpoint can carry non-actor protocols such as telemetry transport or edge byte transport without routing those bytes through Swactor actor mailboxes.
 
 The target caller-facing input is a logical protocol binding, not an accepted iroh connection:
 
@@ -210,22 +210,22 @@ driver construction registers additional wire ALPN bytes
 
 The target driver does not expose raw accepted connections for additional protocols. Any legacy drain method that returns an iroh connection is a compatibility surface, not the target orchestration contract.
 
-### 2.6 Datastream Subscription Input
+### 2.6 Telemetry Subscription Input
 
-Datastream uses the actor plane for subscription control and the datastream ALPN for frame transport.
+Telemetry uses the actor plane for subscription control and the telemetry ALPN for frame transport.
 
 Subscription control flow:
 
 ```text
 collector/orchestrator
--> DatastreamPublisherMsg::Subscribe(DatastreamSubscribe)
--> source node's DatastreamPublisherActor
--> source DatastreamEndpoint::subscribe(request)
--> DatastreamSubscription
--> datastream QUIC writer
+-> TelemetryPublisherMsg::Subscribe(TelemetrySubscribe)
+-> source node's TelemetryPublisherActor
+-> source TelemetryEndpoint::subscribe(request)
+-> TelemetrySubscription
+-> telemetry QUIC writer
 ```
 
-`DatastreamSubscribe` carries:
+`TelemetrySubscribe` carries:
 
 ```text
 collector EndpointAddr
@@ -234,15 +234,15 @@ flow_id
 token
 ```
 
-The source node's publisher actor owns the local subscription step. Its transport callback starts the iroh writer for the returned `DatastreamSubscription`.
+The source node's publisher actor owns the local subscription step. Its transport callback starts the iroh writer for the returned `TelemetrySubscription`.
 
-Outbound datastream frame flow:
+Outbound telemetry frame flow:
 
 ```text
-local producers submit frames to DatastreamEndpoint
--> DatastreamEndpoint::tick drains the local mux
--> DeliveryFanout publishes future DatastreamEvent values to subscribers
--> datastream QUIC writer dials collector over DATASTREAM_ALPN
+local producers submit frames to TelemetryEndpoint
+-> TelemetryEndpoint::tick drains the local mux
+-> DeliveryFanout publishes future TelemetryEvent values to subscribers
+-> telemetry QUIC writer dials collector over TELEMETRY_ALPN
 -> writer opens a unidirectional stream
 -> writer sends header snapshot
 -> writer sends future subscription events until the subscription closes
@@ -250,14 +250,14 @@ local producers submit frames to DatastreamEndpoint
 
 The header snapshot contains stream identity and channel catalog state visible at subscription time. It is not a replay of prior frames.
 
-Inbound datastream frame flow:
+Inbound telemetry frame flow:
 
 ```text
-collector driver accepts DATASTREAM_ALPN internally
--> datastream adapter owns the connection reader task
--> adapter accepts datastream unidirectional streams
+collector driver accepts TELEMETRY_ALPN internally
+-> telemetry adapter owns the connection reader task
+-> adapter accepts telemetry unidirectional streams
 -> adapter decodes header and event records
--> adapter forwards DatastreamEvent values to the collector fanout or sink
+-> adapter forwards TelemetryEvent values to the collector fanout or sink
 ```
 
 Reader helpers:
@@ -278,7 +278,7 @@ write_subscription_until_closed
 write_event
 ```
 
-Datastream broadcasts are local fanout broadcasts inside `DatastreamEndpoint`. Over iroh, each remote collector subscription is a separate writer/connection flow. The driver crate transports datastream events; it does not define the semantic meaning of datastream channel payloads.
+Telemetry broadcasts are local fanout broadcasts inside `TelemetryEndpoint`. Over iroh, each remote collector subscription is a separate writer/connection flow. The driver crate transports telemetry events; it does not define the semantic meaning of telemetry channel payloads.
 
 ### 2.7 Shutdown Input
 
@@ -294,7 +294,7 @@ IrohDriver::close().await
 
 ## 3. Output Channels
 
-The driver emits output through Swactor actor delivery, iroh QUIC streams, protocol adapter ingress/status queues, datastream events, and observable driver state.
+The driver emits output through Swactor actor delivery, iroh QUIC streams, protocol adapter ingress/status queues, telemetry events, and observable driver state.
 
 ### 3.1 Swactor Actor Delivery Output
 
@@ -349,20 +349,20 @@ For ring-backed protocols, payload bytes are not copied through actor messages. 
 
 Actors observe lifecycle, readiness, wake, and fault messages. They do not receive iroh connections, negotiated ALPNs, QUIC streams, or Tokio task handles.
 
-### 3.4 Datastream QUIC Output
+### 3.4 Telemetry QUIC Output
 
-Datastream writer functions emit datastream headers and datastream event records over iroh unidirectional QUIC streams.
+Telemetry writer functions emit telemetry headers and telemetry event records over iroh unidirectional QUIC streams.
 
-Datastream reader functions emit:
+Telemetry reader functions emit:
 
 ```text
-DatastreamQuicRead {
+TelemetryQuicRead {
     header,
     events,
 }
 ```
 
-or forward decoded `DatastreamEvent` values to a `DeliveryFanout` or `mpsc::Sender`.
+or forward decoded `TelemetryEvent` values to a `DeliveryFanout` or `mpsc::Sender`.
 
 ### 3.5 Driver State and Join Status Output
 
@@ -387,7 +387,7 @@ These outputs are diagnostic and coordination aids. They do not by themselves ma
 
 ## 4. Wire and Address Model
 
-The driver defines ALPN selection, the concrete iroh wire format for actor messages, and the datastream adapter's concrete iroh wire format for datastream records.
+The driver defines ALPN selection, the concrete iroh wire format for actor messages, and the telemetry adapter's concrete iroh wire format for telemetry records.
 
 ### 4.1 ALPN Negotiation Model
 
@@ -395,7 +395,7 @@ ALPN means Application-Layer Protocol Negotiation.
 
 In this driver, an ALPN is a byte-string protocol name attached to an iroh/QUIC connection attempt. The connecting peer asks for one protocol name, the accepting endpoint must have registered that protocol name, and the established connection records the negotiated protocol.
 
-ALPN is connection-level protocol selection. It is not peer authorization, actor routing, datastream channel selection, subscription selection, or payload decoding.
+ALPN is connection-level protocol selection. It is not peer authorization, actor routing, telemetry channel selection, subscription selection, or payload decoding.
 
 During driver construction, the endpoint is bound with:
 
@@ -414,7 +414,7 @@ else:
     hand connection to the registered protocol adapter for that wire protocol
 ```
 
-Actor-message connections may carry one or more actor-message streams. Each actor-message stream may carry one or more length-delimited actor records. Additional protocol connections may carry adapter-owned transport streams such as datastream streams or edge byte streams. The bytes inside those streams are interpreted only by the selected adapter after the connection has been classified by ALPN.
+Actor-message connections may carry one or more actor-message streams. Each actor-message stream may carry one or more length-delimited actor records. Additional protocol connections may carry adapter-owned transport streams such as telemetry streams or edge byte streams. The bytes inside those streams are interpreted only by the selected adapter after the connection has been classified by ALPN.
 
 ### 4.2 Actor Message ALPN
 
@@ -446,19 +446,19 @@ Target wire record:
 
 `payload` is the already-encoded actor message payload.
 
-### 4.4 Datastream ALPN
+### 4.4 Telemetry ALPN
 
-Datastream records use:
+Telemetry records use:
 
 ```text
-swactor/datastream/0
+swactor/telemetry/0
 ```
 
-The datastream transport opens unidirectional streams over a connection negotiated with this ALPN.
+The telemetry transport opens unidirectional streams over a connection negotiated with this ALPN.
 
-### 4.5 Datastream Frame
+### 4.5 Telemetry Frame
 
-A datastream unidirectional stream begins with a header:
+A telemetry unidirectional stream begins with a header:
 
 ```text
 magic = "DSQ1"
@@ -494,7 +494,7 @@ payload_len: u32 LE
 payload bytes
 ```
 
-Each datastream record is bounded by `16 * 1024 * 1024` bytes.
+Each telemetry record is bounded by `16 * 1024 * 1024` bytes.
 
 `StreamDeclared` events are represented in the stream header and are not emitted as individual records by the current writer.
 
@@ -528,7 +528,7 @@ The crate has two public modules:
 
 ```text
 iroh_driver
-datastream_transport
+telemetry_transport
 ```
 
 ### 5.1 Driver Core
@@ -601,23 +601,23 @@ Send failures queue generation-scoped eviction records. A delayed failure from a
 
 After evicting a current failed connection, the driver starts a background redial when it can reconstruct the peer public key.
 
-### 5.5 Datastream Transport Adapter
+### 5.5 Telemetry Transport Adapter
 
-`datastream_transport` is a QUIC adapter for `datastream` subscriptions.
+`telemetry_transport` is a QUIC adapter for `telemetry` subscriptions.
 
 It owns:
 
 ```text
-DATASTREAM_ALPN
-DatastreamQuicHeader
-DatastreamQuicWriteStats
-DatastreamQuicRead
+TELEMETRY_ALPN
+TelemetryQuicHeader
+TelemetryQuicWriteStats
+TelemetryQuicRead
 writer helpers
 reader helpers
 fanout helper
 ```
 
-It is transport code only. Channel naming, record schemas, catalog semantics, and storage belong to the `datastream` crate and callers.
+It is transport code only. Channel naming, record schemas, catalog semantics, and storage belong to the `telemetry` crate and callers.
 
 ---
 
@@ -685,13 +685,13 @@ Protocol adapter drains carry messages, logical stream status, readiness, and fa
 
 The engine owns the loop, timing, and protocol actor tick injection; the application only configures components, consumes reports, and owns domain queues (ENGINE_SPEC.md §5).
 
-### 6.5 Datastream Connection Handling
+### 6.5 Telemetry Connection Handling
 
-Datastream handling is established by registering `DATASTREAM_ALPN` as an internal wire protocol for the datastream adapter.
+Telemetry handling is established by registering `TELEMETRY_ALPN` as an internal wire protocol for the telemetry adapter.
 
-A collector installs a datastream ingress sink or fanout. The driver-owned datastream adapter consumes accepted datastream connections internally, accepts unidirectional streams, decodes headers and events, and forwards `DatastreamEvent` values to that sink.
+A collector installs a telemetry ingress sink or fanout. The driver-owned telemetry adapter consumes accepted telemetry connections internally, accepts unidirectional streams, decodes headers and events, and forwards `TelemetryEvent` values to that sink.
 
-A publisher uses the datastream transport writer adapter to connect to a collector endpoint address, open a datastream stream, write the header snapshot, and stream subscription events until the subscription closes.
+A publisher uses the telemetry transport writer adapter to connect to a collector endpoint address, open a telemetry stream, write the header snapshot, and stream subscription events until the subscription closes.
 
 ### 6.6 Shutdown and Close
 
@@ -785,23 +785,23 @@ Send failures enqueue generation-specific eviction. Only the current matching ge
 
 After current-generation eviction, the driver attempts background redial when the peer public key is available.
 
-### 7.7 Datastream Ordering and Limits
+### 7.7 Telemetry Ordering and Limits
 
-Datastream ordering is stream-local and follows the order in which events are read from one datastream unidirectional stream.
+Telemetry ordering is stream-local and follows the order in which events are read from one telemetry unidirectional stream.
 
-The datastream transport preserves each event's channel id, position, and payload bytes.
+The telemetry transport preserves each event's channel id, position, and payload bytes.
 
-A datastream record larger than `16 * 1024 * 1024` bytes is rejected.
+A telemetry record larger than `16 * 1024 * 1024` bytes is rejected.
 
-A datastream header token larger than `u16::MAX` bytes is rejected.
+A telemetry header token larger than `u16::MAX` bytes is rejected.
 
-Datastream channel semantics remain outside the iroh driver.
+Telemetry channel semantics remain outside the iroh driver.
 
 ### 7.8 Transport Boundary Conformance
 
 The driver boundary is a capability boundary. Raw Tokio and iroh transport capabilities are confined to `iroh-driver`.
 
-Callers outside the driver must not depend on accepted iroh connections, QUIC stream handles, Tokio task handles, or caller-side ALPN dispatch for production transport behavior. They observe actor delivery, typed datastream ingress/status, logical protocol status and faults, ring wakeups, and ring byte movement.
+Callers outside the driver must not depend on accepted iroh connections, QUIC stream handles, Tokio task handles, or caller-side ALPN dispatch for production transport behavior. They observe actor delivery, typed telemetry ingress/status, logical protocol status and faults, ring wakeups, and ring byte movement.
 
 Conforming implementations satisfy four boundary rules:
 
@@ -811,7 +811,7 @@ transport capability boundary:
     callers do not accept connections, open streams, or manage transport task handles
 
 protocol surface boundary:
-    datastream exposes decoded datastream ingress/status/faults
+    telemetry exposes decoded telemetry ingress/status/faults
     ring-backed protocols expose readiness, wakeups, closure, and faults
     no protocol surface exposes iroh connection or stream objects
 
@@ -831,11 +831,11 @@ boundary check:
     production code outside iroh-driver cannot use raw iroh/Tokio transport capabilities except through explicitly marked compatibility surfaces
 
 ALPN dispatch check:
-    actor, datastream, and ring-backed connections are accepted and dispatched inside the driver
+    actor, telemetry, and ring-backed connections are accepted and dispatched inside the driver
     callers do not drain accepted iroh connections
 
-datastream check:
-    datastream QUIC traffic becomes typed datastream ingress/status/fault output
+telemetry check:
+    telemetry QUIC traffic becomes typed telemetry ingress/status/fault output
     callers do not observe iroh connections, streams, ALPNs, or task handles
 
 ring-backed protocol check:
@@ -926,11 +926,11 @@ Receiver<OutFrame>
 
 The driver owns the `Receiver<OutFrame>` for each peer. Transport routes and actor worker threads hold cloned `Sender<OutFrame>` handles. The queue implementation is the core hybrid channel: array-backed hot path with linked spillover, not a mutex-protected vector.
 
-### 8.6 Datastream Endpoint and Fanout
+### 8.6 Telemetry Endpoint and Fanout
 
-Datastream producers, endpoints, subscriptions, and fanout are owned by the `datastream` crate and application code.
+Telemetry producers, endpoints, subscriptions, and fanout are owned by the `telemetry` crate and application code.
 
-The driver crate supplies the QUIC transport adapter. A collector provides a fanout or ingress sink for decoded events. A publisher provides subscriptions for outbound publishing. The driver-owned adapter handles accepted datastream connections and stream reader/writer tasks internally.
+The driver crate supplies the QUIC transport adapter. A collector provides a fanout or ingress sink for decoded events. A publisher provides subscriptions for outbound publishing. The driver-owned adapter handles accepted telemetry connections and stream reader/writer tasks internally.
 
 ---
 
@@ -970,13 +970,13 @@ If the frame was a SWIM frame and the actor bridge is installed, the driver repo
 
 The failed frame is not retried by the driver.
 
-### 9.5 Datastream Failures
+### 9.5 Telemetry Failures
 
-Datastream writer and reader adapters report invalid headers, invalid record tags, oversized records, truncated frames, stream read/write failures, and JSON decode failures as datastream status or fault results.
+Telemetry writer and reader adapters report invalid headers, invalid record tags, oversized records, truncated frames, stream read/write failures, and JSON decode failures as telemetry status or fault results.
 
-Datastream helper internals may use Tokio tasks, but callers observe protocol status through driver/datastream outputs rather than managing task handles.
+Telemetry helper internals may use Tokio tasks, but callers observe protocol status through driver/telemetry outputs rather than managing task handles.
 
-Datastream failures are transport failures. Whether they are fatal to a runtime is decided by the caller.
+Telemetry failures are transport failures. Whether they are fatal to a runtime is decided by the caller.
 
 ### 9.6 Additional Protocol Adapter Failures
 
@@ -1005,7 +1005,7 @@ This specification does not define:
 - registry, metadata, or directory data models;
 - application actor message schemas;
 - model-runtime or orchestrator lifecycle semantics;
-- datastream channel schemas or dashboard rendering;
+- telemetry channel schemas or dashboard rendering;
 - relay server deployment;
 - encryption beyond iroh's transport security;
 - multi-endpoint ownership inside one driver;

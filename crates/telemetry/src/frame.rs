@@ -195,7 +195,7 @@ pub struct FrameDelivery {
 
 /// Catalog and frame events delivered to subscribers.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum DatastreamEvent {
+pub enum TelemetryEvent {
     StreamDeclared(StreamDescriptor),
     ChannelDeclared(ChannelDescriptor),
     Frame(FrameDelivery),

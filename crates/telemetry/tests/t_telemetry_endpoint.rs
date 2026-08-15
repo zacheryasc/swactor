@@ -1,10 +1,10 @@
 use std::time::Duration;
 
-use datastream::{
-    ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, DatastreamEndpoint,
+use telemetry::{
+    ChannelContent, ChannelContentKind, ChannelFilter, ChannelId, TelemetryEndpoint,
     Lifetime, NodeId, Position, Record, SourceFilter, StreamId, SubscriptionRequest,
 };
-use datastream::frame::{DatastreamEvent, FrameDelivery};
+use telemetry::frame::{TelemetryEvent, FrameDelivery};
 use serde_json::Value;
 use swactor::actor::ActorAddress;
 use swactor::stats::ActorSnapshot;
@@ -22,13 +22,13 @@ fn stream() -> StreamId {
     StreamId::new(NodeId::new("node-endpoint"), Lifetime(7))
 }
 
-fn endpoint() -> DatastreamEndpoint {
-    DatastreamEndpoint::with_capacity(stream(), 64, 8)
+fn endpoint() -> TelemetryEndpoint {
+    TelemetryEndpoint::with_capacity(stream(), 64, 8)
 }
 
-fn frame_event(event: &DatastreamEvent) -> &FrameDelivery {
+fn frame_event(event: &TelemetryEvent) -> &FrameDelivery {
     match event {
-        DatastreamEvent::Frame(delivery) => delivery,
+        TelemetryEvent::Frame(delivery) => delivery,
         other => panic!("expected frame event, got {other:?}"),
     }
 }
@@ -62,7 +62,7 @@ fn channel_registration_allocates_numeric_ids() {
     assert_eq!(stderr, ChannelId(2));
     assert_eq!(runtime, ChannelId(3));
     let catalog = endpoint.catalog_snapshot();
-    let removed_timing_name = ["datastream", "frame_time"].join(".");
+    let removed_timing_name = ["telemetry", "frame_time"].join(".");
     assert!(
         !catalog
             .channels
@@ -232,7 +232,7 @@ fn channel_declared_is_broadcast_to_filtered_subscribers() {
     let events = subscription.drain_available();
     assert_eq!(events.len(), 1);
     match &events[0] {
-        DatastreamEvent::ChannelDeclared(descriptor) => {
+        TelemetryEvent::ChannelDeclared(descriptor) => {
             assert_eq!(descriptor.id, channel);
             assert_eq!(descriptor.name, "runtime.json");
         }
@@ -324,7 +324,7 @@ fn stats_hook_adapter_submits_worker_snapshot_json() {
     assert_eq!(json["actors"][0]["message_type"], "Ping");
 }
 
-fn positions(events: &[DatastreamEvent]) -> Vec<u64> {
+fn positions(events: &[TelemetryEvent]) -> Vec<u64> {
     let mut positions: Vec<u64> = events
         .iter()
         .map(|event| frame_event(event).position.0)

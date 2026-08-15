@@ -1,4 +1,4 @@
-//! Process-local datastream endpoint.
+//! Process-local telemetry endpoint.
 //!
 //! The endpoint is the stream owner: it allocates numeric channel ids, stores
 //! stream/channel metadata, orders producer frames through the mux, and fans
@@ -17,7 +17,7 @@ use swactor::process_observer::ProcessOutputObserver;
 use swactor::stats::{ActorSnapshot, StatsHook};
 
 use crate::frame::{
-    ChannelContent, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef, DatastreamEvent,
+    ChannelContent, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef, TelemetryEvent,
     FrameDelivery, SourceFilter, StreamDescriptor, StreamId, StreamOrigin, SubscriptionRequest,
 };
 use crate::mux::Mux;
@@ -28,7 +28,7 @@ const DEFAULT_MUX_CAPACITY: usize = 4096;
 const DEFAULT_SUBSCRIBER_CAPACITY: usize = 1024;
 const DEFAULT_STATS_CHANNEL: &str = "runtime.actors";
 
-/// Stable handle identifying a local datastream subscription.
+/// Stable handle identifying a local telemetry subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubscriptionId(pub u64);
 
@@ -55,7 +55,7 @@ pub struct SubscriberSnapshot {
 
 /// Current catalog snapshot delivered at subscription time, filtered by request.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DatastreamSnapshot {
+pub struct TelemetrySnapshot {
     pub streams: Vec<StreamDescriptor>,
     pub channels: Vec<ChannelDescriptor>,
 }
@@ -67,15 +67,15 @@ pub enum ChannelRegistrationError {
 }
 
 /// Bounded future-event subscription.
-pub struct DatastreamSubscription {
+pub struct TelemetrySubscription {
     id: SubscriptionId,
     name: String,
     request: SubscriptionRequest,
-    snapshot: DatastreamSnapshot,
-    rx: Receiver<DatastreamEvent>,
+    snapshot: TelemetrySnapshot,
+    rx: Receiver<TelemetryEvent>,
 }
 
-impl DatastreamSubscription {
+impl TelemetrySubscription {
     pub fn id(&self) -> SubscriptionId {
         self.id
     }
@@ -88,26 +88,26 @@ impl DatastreamSubscription {
         &self.request
     }
 
-    pub fn snapshot(&self) -> &DatastreamSnapshot {
+    pub fn snapshot(&self) -> &TelemetrySnapshot {
         &self.snapshot
     }
 
-    pub fn try_recv(&self) -> Result<DatastreamEvent, TryRecvError> {
+    pub fn try_recv(&self) -> Result<TelemetryEvent, TryRecvError> {
         self.rx.try_recv()
     }
 
-    pub fn recv(&self) -> Result<DatastreamEvent, RecvError> {
+    pub fn recv(&self) -> Result<TelemetryEvent, RecvError> {
         self.rx.recv()
     }
 
     pub fn recv_timeout(
         &self,
         timeout: std::time::Duration,
-    ) -> Result<DatastreamEvent, RecvTimeoutError> {
+    ) -> Result<TelemetryEvent, RecvTimeoutError> {
         self.rx.recv_timeout(timeout)
     }
 
-    pub fn drain_available(&self) -> Vec<DatastreamEvent> {
+    pub fn drain_available(&self) -> Vec<TelemetryEvent> {
         let mut out = Vec::new();
         while let Ok(event) = self.rx.try_recv() {
             out.push(event);
@@ -118,13 +118,13 @@ impl DatastreamSubscription {
 
 struct SubscriberSlot {
     name: String,
-    tx: Sender<DatastreamEvent>,
+    tx: Sender<TelemetryEvent>,
     dropped: u64,
 }
 
 struct FanoutTarget {
     id: SubscriptionId,
-    tx: Sender<DatastreamEvent>,
+    tx: Sender<TelemetryEvent>,
 }
 
 struct FanoutReport {
@@ -158,8 +158,8 @@ impl DeliveryFanout {
     pub fn subscribe_all(
         &self,
         name: impl Into<String>,
-        snapshot: DatastreamSnapshot,
-    ) -> DatastreamSubscription {
+        snapshot: TelemetrySnapshot,
+    ) -> TelemetrySubscription {
         self.subscribe(name, SubscriptionRequest::all(), snapshot)
     }
 
@@ -167,8 +167,8 @@ impl DeliveryFanout {
         &self,
         name: impl Into<String>,
         request: SubscriptionRequest,
-        snapshot: DatastreamSnapshot,
-    ) -> DatastreamSubscription {
+        snapshot: TelemetrySnapshot,
+    ) -> TelemetrySubscription {
         self.subscribe_with_capacity(name, request, snapshot, self.default_capacity)
     }
 
@@ -176,12 +176,12 @@ impl DeliveryFanout {
         &self,
         name: impl Into<String>,
         request: SubscriptionRequest,
-        snapshot: DatastreamSnapshot,
+        snapshot: TelemetrySnapshot,
         capacity: usize,
-    ) -> DatastreamSubscription {
+    ) -> TelemetrySubscription {
         let name = name.into();
         let (tx, rx) = bounded(capacity.max(1));
-        let mut state = self.state.lock().expect("datastream fanout poisoned");
+        let mut state = self.state.lock().expect("telemetry fanout poisoned");
         let id = SubscriptionId(state.next_id);
         state.next_id = state.next_id.wrapping_add(1).max(1);
         state.subscribers.insert(
@@ -192,7 +192,7 @@ impl DeliveryFanout {
                 dropped: 0,
             },
         );
-        DatastreamSubscription {
+        TelemetrySubscription {
             id,
             name,
             request,
@@ -204,7 +204,7 @@ impl DeliveryFanout {
     pub fn subscriber_count(&self) -> usize {
         self.state
             .lock()
-            .expect("datastream fanout poisoned")
+            .expect("telemetry fanout poisoned")
             .subscribers
             .len()
     }
@@ -212,7 +212,7 @@ impl DeliveryFanout {
     pub fn subscriber_snapshots(&self) -> Vec<SubscriberSnapshot> {
         self.state
             .lock()
-            .expect("datastream fanout poisoned")
+            .expect("telemetry fanout poisoned")
             .subscribers
             .iter()
             .map(|(id, slot)| SubscriberSnapshot {
@@ -223,12 +223,12 @@ impl DeliveryFanout {
             .collect()
     }
 
-    pub fn publish(&self, event: DatastreamEvent) -> EndpointTick {
+    pub fn publish(&self, event: TelemetryEvent) -> EndpointTick {
         self.publish_batch(std::iter::once(event))
     }
 
-    pub fn publish_batch(&self, events: impl IntoIterator<Item = DatastreamEvent>) -> EndpointTick {
-        let events: Vec<DatastreamEvent> = events.into_iter().collect();
+    pub fn publish_batch(&self, events: impl IntoIterator<Item = TelemetryEvent>) -> EndpointTick {
+        let events: Vec<TelemetryEvent> = events.into_iter().collect();
         if events.is_empty() {
             return EndpointTick::default();
         }
@@ -237,7 +237,7 @@ impl DeliveryFanout {
         // deliver outside the lock so large batches or slow subscribers do not
         // block subscribe/snapshot control-plane operations.
         let (targets, subscribers) = {
-            let state = self.state.lock().expect("datastream fanout poisoned");
+            let state = self.state.lock().expect("telemetry fanout poisoned");
             let subscribers = state.subscribers.len();
             let targets = state
                 .subscribers
@@ -284,7 +284,7 @@ impl DeliveryFanout {
 
         let dropped_for_subscribers = reports.iter().map(|report| report.dropped).sum::<u64>();
         if !reports.is_empty() {
-            let mut state = self.state.lock().expect("datastream fanout poisoned");
+            let mut state = self.state.lock().expect("telemetry fanout poisoned");
             for report in &reports {
                 if let Some(slot) = state.subscribers.get_mut(&report.id) {
                     slot.dropped = slot.dropped.saturating_add(report.dropped);
@@ -314,7 +314,7 @@ pub struct CatalogSnapshot {
 
 impl CatalogSnapshot {
     /// Apply a subscription request to the initial metadata snapshot only.
-    pub fn datastream_snapshot(&self, request: &SubscriptionRequest) -> DatastreamSnapshot {
+    pub fn telemetry_snapshot(&self, request: &SubscriptionRequest) -> TelemetrySnapshot {
         let channels: Vec<ChannelDescriptor> = self
             .channels
             .values()
@@ -334,7 +334,7 @@ impl CatalogSnapshot {
                 streams.push(descriptor.clone());
             }
         }
-        DatastreamSnapshot { streams, channels }
+        TelemetrySnapshot { streams, channels }
     }
 
     pub fn descriptor_for(&self, channel: &ChannelRef) -> Option<&ChannelDescriptor> {
@@ -416,8 +416,8 @@ impl ChannelCatalogState {
     }
 }
 
-/// Process-local datastream endpoint.
-pub struct DatastreamEndpoint {
+/// Process-local telemetry endpoint.
+pub struct TelemetryEndpoint {
     stream: StreamId,
     mux: Arc<Mux>,
     catalog: Arc<Mutex<ChannelCatalogState>>,
@@ -426,7 +426,7 @@ pub struct DatastreamEndpoint {
     bitbucketed: AtomicU64,
 }
 
-impl DatastreamEndpoint {
+impl TelemetryEndpoint {
     pub fn new(stream: StreamId) -> Self {
         Self::with_capacity(stream, DEFAULT_MUX_CAPACITY, DEFAULT_SUBSCRIBER_CAPACITY)
     }
@@ -475,12 +475,12 @@ impl DatastreamEndpoint {
     pub fn catalog_snapshot(&self) -> CatalogSnapshot {
         self.catalog
             .lock()
-            .expect("datastream catalog poisoned")
+            .expect("telemetry catalog poisoned")
             .snapshot()
     }
 
-    pub fn producer(&self) -> DatastreamProducer {
-        DatastreamProducer {
+    pub fn producer(&self) -> TelemetryProducer {
+        TelemetryProducer {
             mux: Arc::clone(&self.mux),
             catalog: Arc::clone(&self.catalog),
             fanout: Arc::clone(&self.fanout),
@@ -499,7 +499,7 @@ impl DatastreamEndpoint {
         self.try_register_channel(name, content.clone())
             .unwrap_or_else(|err| match err {
                 ChannelRegistrationError::ConflictingName { name } => {
-                    panic!("conflicting datastream channel registration for {name}")
+                    panic!("conflicting telemetry channel registration for {name}")
                 }
             })
     }
@@ -517,12 +517,12 @@ impl DatastreamEndpoint {
         &self,
         name: impl Into<String>,
         request: SubscriptionRequest,
-    ) -> DatastreamSubscription {
-        let snapshot = self.catalog_snapshot().datastream_snapshot(&request);
+    ) -> TelemetrySubscription {
+        let snapshot = self.catalog_snapshot().telemetry_snapshot(&request);
         self.fanout.subscribe(name, request, snapshot)
     }
 
-    pub fn subscribe_all(&self, name: impl Into<String>) -> DatastreamSubscription {
+    pub fn subscribe_all(&self, name: impl Into<String>) -> TelemetrySubscription {
         self.subscribe(name, SubscriptionRequest::all())
     }
 
@@ -530,9 +530,9 @@ impl DatastreamEndpoint {
         &self,
         name: impl Into<String>,
         capacity: usize,
-    ) -> DatastreamSubscription {
+    ) -> TelemetrySubscription {
         let request = SubscriptionRequest::all();
-        let snapshot = self.catalog_snapshot().datastream_snapshot(&request);
+        let snapshot = self.catalog_snapshot().telemetry_snapshot(&request);
         self.fanout
             .subscribe_with_capacity(name, request, snapshot, capacity)
     }
@@ -554,12 +554,12 @@ impl DatastreamEndpoint {
         self.publish_events(events)
     }
 
-    fn drain_events(&self) -> Vec<DatastreamEvent> {
+    fn drain_events(&self) -> Vec<TelemetryEvent> {
         self.mux
             .drain()
             .into_iter()
             .map(|frame| {
-                DatastreamEvent::Frame(FrameDelivery {
+                TelemetryEvent::Frame(FrameDelivery {
                     channel: ChannelRef {
                         stream: self.stream.clone(),
                         channel: frame.channel,
@@ -571,7 +571,7 @@ impl DatastreamEndpoint {
             .collect()
     }
 
-    fn publish_events(&self, events: Vec<DatastreamEvent>) -> EndpointTick {
+    fn publish_events(&self, events: Vec<TelemetryEvent>) -> EndpointTick {
         let drained = events.len();
         self.drained.fetch_add(drained as u64, Ordering::Relaxed);
         let tick = self.fanout.publish_batch(events);
@@ -601,13 +601,13 @@ impl DatastreamEndpoint {
 
 /// Cloneable producer handle for code that emits telemetry.
 #[derive(Clone)]
-pub struct DatastreamProducer {
+pub struct TelemetryProducer {
     mux: Arc<Mux>,
     catalog: Arc<Mutex<ChannelCatalogState>>,
     fanout: Arc<DeliveryFanout>,
 }
 
-impl DatastreamProducer {
+impl TelemetryProducer {
     pub fn stream_id(&self) -> &StreamId {
         self.mux.stream_id()
     }
@@ -624,7 +624,7 @@ impl DatastreamProducer {
         self.try_register_channel(name, content.clone())
             .unwrap_or_else(|err| match err {
                 ChannelRegistrationError::ConflictingName { name } => {
-                    panic!("conflicting datastream channel registration for {name}")
+                    panic!("conflicting telemetry channel registration for {name}")
                 }
             })
     }
@@ -641,7 +641,7 @@ impl DatastreamProducer {
     pub fn channel_id_for_name(&self, name: &str) -> Option<ChannelId> {
         self.catalog
             .lock()
-            .expect("datastream catalog poisoned")
+            .expect("telemetry catalog poisoned")
             .id_for_name(name)
     }
 
@@ -665,7 +665,7 @@ impl DatastreamProducer {
     where
         F: Fn(&str, bool) -> ChannelId + Send + Sync + 'static,
     {
-        Arc::new(DatastreamProcessObserver {
+        Arc::new(TelemetryProcessObserver {
             producer: self.clone(),
             channel_for: Arc::new(channel_for),
         })
@@ -682,7 +682,7 @@ impl DatastreamProducer {
     }
 
     pub fn stats_hook_on(&self, channel: ChannelId) -> Arc<dyn StatsHook> {
-        Arc::new(DatastreamStatsHook {
+        Arc::new(TelemetryStatsHook {
             producer: self.clone(),
             channel,
         })
@@ -698,11 +698,11 @@ fn register_channel(
     // New channel declarations publish a future event immediately; existing-name
     // reuse only returns the prior id.
     let (id, event) = {
-        let mut catalog = catalog.lock().expect("datastream catalog poisoned");
+        let mut catalog = catalog.lock().expect("telemetry catalog poisoned");
         match catalog.try_register_channel(name.clone(), content)? {
             Some(descriptor) => (
                 descriptor.id,
-                Some(DatastreamEvent::ChannelDeclared(descriptor)),
+                Some(TelemetryEvent::ChannelDeclared(descriptor)),
             ),
             None => {
                 let id = catalog
@@ -719,12 +719,12 @@ fn register_channel(
 }
 
 /// Legacy/custom process-output observer adapter that submits stdout/stderr chunks as frames.
-pub struct DatastreamProcessObserver {
-    producer: DatastreamProducer,
+pub struct TelemetryProcessObserver {
+    producer: TelemetryProducer,
     channel_for: Arc<dyn Fn(&str, bool) -> ChannelId + Send + Sync>,
 }
 
-impl ProcessOutputObserver for DatastreamProcessObserver {
+impl ProcessOutputObserver for TelemetryProcessObserver {
     fn on_output(&self, label: &str, is_stderr: bool, data: &[u8]) {
         self.producer
             .submit_bytes((self.channel_for)(label, is_stderr), data.to_vec());
@@ -732,12 +732,12 @@ impl ProcessOutputObserver for DatastreamProcessObserver {
 }
 
 /// Runtime stats hook that submits one JSON record per productive worker tick.
-pub struct DatastreamStatsHook {
-    producer: DatastreamProducer,
+pub struct TelemetryStatsHook {
+    producer: TelemetryProducer,
     channel: ChannelId,
 }
 
-impl StatsHook for DatastreamStatsHook {
+impl StatsHook for TelemetryStatsHook {
     fn on_tick(&self, worker_id: usize, snapshots: &[ActorSnapshot]) {
         let payload = RuntimeActorStatsRecord::from_snapshots(worker_id, snapshots);
         let bytes = serde_json::to_vec(&payload).expect("runtime stats record serializes");
@@ -830,9 +830,9 @@ fn channel_matches(descriptor: &ChannelDescriptor, filter: &ChannelFilter) -> bo
 
 /// Convert a live event back to the legacy transport delivery shape when a
 /// stored-stream test or transitional adapter needs it.
-pub fn frame_event_to_delivery(event: DatastreamEvent) -> Option<Delivery> {
+pub fn frame_event_to_delivery(event: TelemetryEvent) -> Option<Delivery> {
     match event {
-        DatastreamEvent::Frame(delivery) => Some(Delivery::new(
+        TelemetryEvent::Frame(delivery) => Some(Delivery::new(
             delivery.channel.stream,
             crate::frame::Frame::new(
                 delivery.channel.channel,

@@ -13,7 +13,7 @@ swactor = { path = "../..", features = ["serde", "transport"] }
 swactor-engine = { path = "../engine" }
 swactor-transport = { path = "../transport" }
 distribution = { path = "../distribution" }
-datastream = { path = "../datastream" }
+telemetry = { path = "../telemetry" }
 crossbeam-channel = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

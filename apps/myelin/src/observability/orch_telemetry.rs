@@ -1,13 +1,13 @@
-//! Orchestrator-owned datastream producer plus dashboard sink support.
+//! Orchestrator-owned telemetry producer plus dashboard sink support.
 //!
-//! [`OrchDatastream`] owns the producer-side endpoint that emits bootstrap,
+//! [`OrchTelemetry`] owns the producer-side endpoint that emits bootstrap,
 //! prompt, provisioning, and SWIM telemetry. [`DashboardSupport`] adapts the
 //! optional live dashboard. Both are consumed by the control loop in
 //! `orchestration::app`; frame-bearing read paths live in `frame_collector`.
 
-use datastream::frame::{Frame, StreamId};
-use datastream::{
-    ChannelContent, ChannelId, DatastreamEndpoint, DatastreamProducer, Lifetime, NodeId, Record,
+use telemetry::frame::{Frame, StreamId};
+use telemetry::{
+    ChannelContent, ChannelId, TelemetryEndpoint, TelemetryProducer, Lifetime, NodeId, Record,
     StreamDescriptor, StreamOrigin,
 };
 use serde_json::{Value, json};
@@ -16,10 +16,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::observability::benchmark;
-use crate::observability::frame_archive::FrameArchive;
-use crate::observability::frame_collector::ingest_dashboard_frame;
 #[cfg(feature = "dashboard")]
 use crate::observability::dashboard_view::MyelinClusterDashboardView;
+use crate::observability::frame_archive::FrameArchive;
+use crate::observability::frame_collector::ingest_dashboard_frame;
 use crate::observability::telemetry::{
     MYELIN_PROVISIONING_EVENTS, MyelinProvisionEventRecord, MyelinProvisionLogRecord,
     myelin_provision_log_channel,
@@ -28,27 +28,27 @@ use crate::observability::telemetry::{
 use crate::orchestration::app::env_optional;
 use crate::provisioning::{ProvisionEvent, ProvisionLogLine};
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
-use swactor_engine::EngineHandle;
 use swactor::stats::StatsHook;
+use swactor_engine::EngineHandle;
 
 pub(crate) const MYELIN_ORCH_BOOTSTRAP: &str = "myelin.orch.bootstrap";
 pub(crate) const MYELIN_ORCH_PROMPT: &str = "myelin.orch.prompt";
 pub(crate) const MYELIN_SWIM_MEMBERSHIP: &str = "myelin.swim.membership";
 pub(crate) const MYELIN_STAGE_ROUTE: &str = "myelin.orch.stage_route";
 
-pub(crate) struct OrchDatastream {
+pub(crate) struct OrchTelemetry {
     stream: StreamId,
-    endpoint: DatastreamEndpoint,
-    producer: DatastreamProducer,
+    endpoint: TelemetryEndpoint,
+    producer: TelemetryProducer,
     channels: BTreeMap<String, ChannelId>,
     channel_names: BTreeMap<ChannelId, String>,
     archive: Option<FrameArchive>,
 }
 
-impl OrchDatastream {
+impl OrchTelemetry {
     pub(crate) fn new(run_id: u64, frame_log: Option<&Path>) -> Result<Self, String> {
         let stream = StreamId::new(NodeId::new("myelin-orchestrator"), Lifetime(run_id));
-        let endpoint = DatastreamEndpoint::with_descriptor(
+        let endpoint = TelemetryEndpoint::with_descriptor(
             StreamDescriptor {
                 stream: stream.clone(),
                 label: Some("myelin orchestrator".to_owned()),
@@ -65,7 +65,7 @@ impl OrchDatastream {
             channels: BTreeMap::new(),
             channel_names: BTreeMap::new(),
             archive: frame_log
-                .map(|p| FrameArchive::open_with_label(p, "datastream frame log"))
+                .map(|p| FrameArchive::open_with_label(p, "telemetry frame log"))
                 .transpose()?,
         };
         for name in [
@@ -277,7 +277,7 @@ impl OrchDatastream {
         }
     }
 
-    /// Attach the datastream stats hook on `channel` so actor snapshots flow to it.
+    /// Attach the telemetry stats hook on `channel` so actor snapshots flow to it.
     pub(crate) fn stats_hook_on(&self, channel: ChannelId) -> Arc<dyn StatsHook> {
         self.producer.stats_hook_on(channel)
     }

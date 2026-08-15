@@ -212,8 +212,8 @@ const BASIC_TESTS: &[TestStep] = &[
         args: &["test"],
     },
     TestStep {
-        label: "datastream",
-        args: &["test", "-p", "datastream"],
+        label: "telemetry",
+        args: &["test", "-p", "telemetry"],
     },
     TestStep {
         label: "distribution",
@@ -282,7 +282,7 @@ OPTIONS:
   --config <path>               Load config overlay
   --pipeline-stages <count>     Number of pipeline stages
   --cached-model[=<path>]       Use discovered or explicit cached GGUF model (default for --process)
-  --dump-logs[=<path>]          Write datastream frame log
+  --dump-logs[=<path>]          Write telemetry frame log
   --run-id <id>                 Override run id
   --skip-rebuild                Reuse existing Cargo artifacts
   --yes, -y                     Approve Vast.ai lease prompts
@@ -762,7 +762,7 @@ fn write_myelin_chat_check_paths(root: &Path) -> Result<MyelinChatCheckPaths, St
             root.display()
         ));
     }
-    let dump_log = root.join("datastream.ndjson");
+    let dump_log = root.join("telemetry.ndjson");
     if dump_log.exists() {
         return Err(format!(
             "myelin-chat-check: dump log path already exists: {}",
@@ -808,7 +808,7 @@ fn run_myelin_chat_check(args: Vec<String>) -> ExitCode {
     let run_id = myelin_chat_check_run_id();
     println!("myelin-chat-check: scenario {}", invocation.name());
     println!("myelin-chat-check: artifacts {}", paths.root.display());
-    println!("myelin-chat-check: datastream {}", paths.dump_log.display());
+    println!("myelin-chat-check: telemetry {}", paths.dump_log.display());
 
     let output = match run_myelin_chat_check_process(&workspace, &paths, run_id, &invocation) {
         Ok(output) => output,
@@ -1203,7 +1203,7 @@ fn write_failure_artifacts(
         "status": "failed",
         "reason": reason,
         "child_status": status.map(|status| status.to_string()),
-        "datastream": {
+        "telemetry": {
             "path": paths.dump_log.display().to_string(),
             "exists": paths.dump_log.is_file(),
             "bytes": file_len(&paths.dump_log),
@@ -1218,15 +1218,15 @@ fn write_failure_artifacts(
         },
         "side_channel_audit": {
             "status": "captured_not_authoritative",
-            "stdout_datastream_substitute": false,
-            "stderr_datastream_substitute": false,
+            "stdout_telemetry_substitute": false,
+            "stderr_telemetry_substitute": false,
         },
     });
     write_json_file(&paths.benchmark_evidence, &evidence)?;
     fs::write(
         &paths.benchmark_gaps,
         format!(
-            "# Benchmark observability gaps\n\n- status: failed\n- reason: {reason}\n- datastream: {} (exists: {}, bytes: {})\n- stdout: {} bytes; side-channel only, not benchmark evidence\n- stderr: {} bytes; side-channel only, not benchmark evidence\n- remediation: fix the failed child run, then rerun so benchmark summary generation can validate canonical datastream evidence.\n",
+            "# Benchmark observability gaps\n\n- status: failed\n- reason: {reason}\n- telemetry: {} (exists: {}, bytes: {})\n- stdout: {} bytes; side-channel only, not benchmark evidence\n- stderr: {} bytes; side-channel only, not benchmark evidence\n- remediation: fix the failed child run, then rerun so benchmark summary generation can validate canonical telemetry evidence.\n",
             paths.dump_log.display(),
             paths.dump_log.is_file(),
             file_len(&paths.dump_log).unwrap_or(0),
@@ -1248,7 +1248,7 @@ fn write_failure_artifacts(
         "created_unix_ms": unix_ms_now(),
         "artifacts": {
             "root": paths.root.display().to_string(),
-            "datastream": {
+            "telemetry": {
                 "path": paths.dump_log.display().to_string(),
                 "exists": paths.dump_log.is_file(),
                 "bytes": file_len(&paths.dump_log),
@@ -1471,7 +1471,7 @@ impl ValidatorFinding {
                 "stage_index": self.stage_index,
             },
             "source_event_ids": [],
-            "remediation_hint": format!("emit or repair datastream evidence for {}", self.code),
+            "remediation_hint": format!("emit or repair telemetry evidence for {}", self.code),
         })
     }
 }
@@ -1494,7 +1494,7 @@ struct BenchmarkValidation {
     requests_completed: BTreeSet<u64>,
     run_envelope_present: bool,
     endpoint_snapshot_present: bool,
-    python_datastream_connected: bool,
+    python_telemetry_connected: bool,
 }
 
 impl BenchmarkValidation {
@@ -1543,7 +1543,7 @@ impl BenchmarkValidation {
             "error_count": self.error_count(),
             "warning_count": self.warning_count(),
             "producer_classes": self.producers.iter().cloned().collect::<Vec<_>>(),
-            "python_datastream_connected": self.python_datastream_connected,
+            "python_telemetry_connected": self.python_telemetry_connected,
             "expected_pipeline_stages": self.expected_pipeline_stages,
             "severity_policy": ["fatal", "benchmark_failure", "observability_gap", "profiling_gap", "warning"],
             "findings": self.findings_json(),
@@ -2023,7 +2023,7 @@ fn validate_benchmark_observability(
             validation.push(
                 ValidatorFinding::warning(
                     "canonical.benchmark_stamp.not_required",
-                    "typed myelin datastream event was not part of the strict benchmark validator set",
+                    "typed myelin telemetry event was not part of the strict benchmark validator set",
                 )
                 .at_event(record),
             );
@@ -2084,16 +2084,16 @@ fn validate_benchmark_observability(
                     .and_then(Value::as_str)
                     .map(str::to_owned);
             }
-            (_, _, Some("endpoint_config_snapshot" | "datastream_preflight"), _) => {
+            (_, _, Some("endpoint_config_snapshot" | "telemetry_preflight"), _) => {
                 validation.endpoint_snapshot_present = true;
             }
             (
                 "myelin.worker.initialize",
-                Some("PythonDatastreamConnected"),
-                Some("PythonDatastreamConnected"),
+                Some("PythonTelemetryConnected"),
+                Some("PythonTelemetryConnected"),
                 Some("ready"),
             ) => {
-                validation.python_datastream_connected = true;
+                validation.python_telemetry_connected = true;
             }
             (_, Some("OrchBootstrap"), Some("provider_start"), Some("started")) => {
                 if detail_str(&record.event, "provider") == Some("vastai")
@@ -2215,7 +2215,7 @@ fn validate_benchmark_observability(
     if !validation.endpoint_snapshot_present {
         validation.push(ValidatorFinding::error(
             "endpoint_config_snapshot.missing",
-            "endpoint/datastream configuration snapshot is required for benchmark attribution",
+            "endpoint/telemetry configuration snapshot is required for benchmark attribution",
         ));
     }
     for required in [
@@ -2227,14 +2227,14 @@ fn validate_benchmark_observability(
         if !validation.producers.contains(required) {
             validation.push(ValidatorFinding::fatal(
                 "producer.connectivity.missing",
-                format!("required producer {required} did not emit canonical datastream evidence"),
+                format!("required producer {required} did not emit canonical telemetry evidence"),
             ));
         }
     }
-    if !validation.python_datastream_connected {
+    if !validation.python_telemetry_connected {
         validation.push(ValidatorFinding::error(
-            "python.datastream.connected.missing",
-            "Python worker did not emit PythonDatastreamConnected through the canonical datastream",
+            "python.telemetry.connected.missing",
+            "Python worker did not emit PythonTelemetryConnected through the canonical telemetry",
         ));
     }
     for request_id in [1_u64, 2] {
@@ -2457,7 +2457,7 @@ fn build_benchmark_evidence_json(
 ) -> Value {
     json!({
         "schema": "swactor.myelin_chat.benchmark_evidence.v1",
-        "source": "canonical_datastream",
+        "source": "canonical_telemetry",
         "run_id": run_id,
         "scenario": scenario.name(),
         "created_unix_ms": unix_ms_now(),
@@ -2480,7 +2480,7 @@ fn build_benchmark_evidence_json(
             "endpoint_snapshot_present": validation.endpoint_snapshot_present,
         },
         "artifacts": {
-            "datastream": paths.dump_log.display().to_string(),
+            "telemetry": paths.dump_log.display().to_string(),
             "summary": paths.summary.display().to_string(),
             "gaps": paths.benchmark_gaps.display().to_string(),
         },
@@ -2927,9 +2927,9 @@ fn build_benchmark_summary(
     for record in events {
         record_dump_log_event(scenario, &record.channel, &record.event, &mut dump_facts)?;
     }
-    let datastream_bytes = file_size(&paths.dump_log)?;
+    let telemetry_bytes = file_size(&paths.dump_log)?;
     let prompt_bytes = u64::try_from(MYELIN_CHAT_CHECK_PROMPTS.len()).unwrap_or(u64::MAX);
-    let known_artifact_bytes = datastream_bytes
+    let known_artifact_bytes = telemetry_bytes
         .saturating_add(stdout_bytes)
         .saturating_add(stderr_bytes)
         .saturating_add(prompt_bytes);
@@ -2945,7 +2945,7 @@ fn build_benchmark_summary(
         validate_benchmark_observability(events, run_id, scenario, expected_pipeline_stages);
     let summary = json!({
         "schema": "swactor.myelin_chat.benchmark_summary.v1",
-        "source": "datastream",
+        "source": "telemetry",
         "run_id": run_id,
         "scenario": scenario.name(),
         "created_unix_ms": unix_ms_now(),
@@ -2960,9 +2960,9 @@ fn build_benchmark_summary(
         "artifacts": {
             "root": paths.root.display().to_string(),
             "known_total_bytes": known_artifact_bytes,
-            "datastream": {
+            "telemetry": {
                 "path": paths.dump_log.display().to_string(),
-                "bytes": datastream_bytes,
+                "bytes": telemetry_bytes,
                 "blake3": file_blake3_hex(&paths.dump_log)?,
             },
             "stdout": {
@@ -3022,14 +3022,14 @@ fn build_benchmark_summary(
                 {
                     "name": "stdout",
                     "role": "functional smoke transcript",
-                    "datastream_substitute": false,
+                    "telemetry_substitute": false,
                     "used_for_benchmark_metrics": false,
                     "artifact": paths.stdout.display().to_string(),
                 },
                 {
                     "name": "stderr",
                     "role": "debug transcript",
-                    "datastream_substitute": false,
+                    "telemetry_substitute": false,
                     "used_for_benchmark_metrics": false,
                     "artifact": paths.stderr.display().to_string(),
                 }
@@ -3155,7 +3155,7 @@ fn benchmark_run_envelope(events: &[DumpLogEvent], run_id: u64) -> Value {
                 "type": "BenchmarkRunEnvelope",
                 "status": "unavailable",
                 "detail": {
-                    "reason": "event not present in datastream",
+                    "reason": "event not present in telemetry",
                 },
             })
         })
@@ -5022,7 +5022,7 @@ mod tests {
     fn failure_artifacts_include_gap_report_and_evidence_manifest() {
         let root = unique_temp_dir("myelin-chat-check-failure-artifacts");
         let paths = write_myelin_chat_check_paths(&root).expect("paths");
-        fs::write(&paths.dump_log, "synthetic datastream\n").expect("write datastream");
+        fs::write(&paths.dump_log, "synthetic telemetry\n").expect("write telemetry");
 
         write_failure_artifacts(
             &paths,
@@ -5575,7 +5575,7 @@ mod tests {
             (
                 "myelin.worker.initialize",
                 stamped(
-                    json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":3,"stage_index":2,"endpoint":{"transport":"stdout-json-lines"}}),
+                    json!({"type":"PythonTelemetryConnected","phase":"PythonTelemetryConnected","status":"ready","run_id":9,"node_id":3,"stage_index":2,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
                     1_060,
                     60,
@@ -5655,7 +5655,7 @@ mod tests {
             (
                 "myelin.worker.initialize",
                 stamped(
-                    json!({"type":"PythonDatastreamConfigured","phase":"PythonDatastreamConfigured","status":"configured","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
+                    json!({"type":"PythonTelemetryConfigured","phase":"PythonTelemetryConfigured","status":"configured","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
                     1_055,
                     55,
@@ -5664,7 +5664,7 @@ mod tests {
             (
                 "myelin.worker.initialize",
                 stamped(
-                    json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
+                    json!({"type":"PythonTelemetryConnected","phase":"PythonTelemetryConnected","status":"ready","run_id":9,"node_id":3,"stage_index":1,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
                     1_056,
                     56,
@@ -6171,13 +6171,13 @@ mod tests {
     }
 
     #[test]
-    fn validator_rejects_missing_python_datastream_connectivity() {
+    fn validator_rejects_missing_python_telemetry_connectivity() {
         let mut events = dump_log_fact_events(false, false);
         events.retain(|(channel, event)| {
             !(*channel == "myelin.worker.initialize"
-                && event.get("type").and_then(Value::as_str) == Some("PythonDatastreamConnected"))
+                && event.get("type").and_then(Value::as_str) == Some("PythonTelemetryConnected"))
         });
-        let parsed = parse_synthetic_events("missing-python-datastream", events);
+        let parsed = parse_synthetic_events("missing-python-telemetry", events);
 
         let validation = validate_benchmark_observability(
             &parsed,
@@ -6188,7 +6188,7 @@ mod tests {
 
         assert!(validation.findings.iter().any(|finding| {
             finding.severity == "observability_gap"
-                && finding.code == "python.datastream.connected.missing"
+                && finding.code == "python.telemetry.connected.missing"
         }));
     }
 
@@ -6309,7 +6309,7 @@ mod tests {
             (
                 "myelin.worker.initialize",
                 stamped(
-                    json!({"type":"PythonDatastreamConnected","phase":"PythonDatastreamConnected","status":"ready","run_id":9,"node_id":2,"stage_index":0,"endpoint":{"transport":"stdout-json-lines"}}),
+                    json!({"type":"PythonTelemetryConnected","phase":"PythonTelemetryConnected","status":"ready","run_id":9,"node_id":2,"stage_index":0,"endpoint":{"transport":"stdout-json-lines"}}),
                     "tinygrad-worker",
                     2_200,
                     1_200,
@@ -6507,7 +6507,7 @@ mod tests {
 
         assert_eq!(
             summary.get("source").and_then(Value::as_str),
-            Some("datastream")
+            Some("telemetry")
         );
         assert_eq!(
             summary
@@ -6529,7 +6529,7 @@ mod tests {
         );
         assert!(
             summary
-                .pointer("/artifacts/datastream/blake3")
+                .pointer("/artifacts/telemetry/blake3")
                 .and_then(Value::as_str)
                 .is_some()
         );
@@ -6853,8 +6853,8 @@ mod tests {
 }
 
 /// Scan control-plane source files for forbidden telemetry frame type references.
-/// The datastream is metrics/logging only; control decisions must never branch
-/// on a frame. Frame types live in `datastream::frame::*` (not re-exported at
+/// The telemetry is metrics/logging only; control decisions must never branch
+/// on a frame. Frame types live in `telemetry::frame::*` (not re-exported at
 /// root) and must not appear in orchestration or other control modules.
 fn check_telemetry_isolation() -> ExitCode {
     /// Directories whose .rs files are control-plane: they must not touch
@@ -6867,15 +6867,15 @@ fn check_telemetry_isolation() -> ExitCode {
     ];
 
     /// Substrings that indicate a telemetry frame type or read-side module
-    /// has leaked into control code.  `datastream::frame::` covers Frame,
-    /// DatastreamEvent, FrameDelivery, and every other frame-module type.
+    /// has leaked into control code.  `telemetry::frame::` covers Frame,
+    /// TelemetryEvent, FrameDelivery, and every other frame-module type.
     const FORBIDDEN: &[&str] = &[
-        "datastream::frame::",
-        "datastream::store::",
-        "datastream::ingest::",
-        "datastream::views::",
-        "datastream::transport::",
-        "CollectedDatastreamFrame",
+        "telemetry::frame::",
+        "telemetry::store::",
+        "telemetry::ingest::",
+        "telemetry::views::",
+        "telemetry::transport::",
+        "CollectedTelemetryFrame",
     ];
     let mut violations = Vec::new();
     for dir in CONTROL_DIRS {
@@ -6904,8 +6904,8 @@ fn check_telemetry_isolation() -> ExitCode {
     if found {
         eprintln!(
             "\ntelemetry-isolation: control-plane code must not import frame types \
-             or read-side modules. Use the datastream producer API (root re-exports) \
-             for emitting telemetry, never `datastream::frame::*` for reading it."
+             or read-side modules. Use the telemetry producer API (root re-exports) \
+             for emitting telemetry, never `telemetry::frame::*` for reading it."
         );
         ExitCode::from(1)
     } else {

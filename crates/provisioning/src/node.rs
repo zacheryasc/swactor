@@ -31,7 +31,7 @@ pub struct SwactorId(pub String);
 pub struct BootstrapSessionId(pub u64);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct DatastreamStreamId(pub String);
+pub struct TelemetryStreamId(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ProviderKind(pub String);
@@ -299,7 +299,7 @@ pub struct BootstrapSessionSpec {
     pub ssh: SshEndpoint,
     pub boot: BootSpec,
     pub swarm_join: SwarmJoinSpec,
-    pub datastream: DatastreamStreamId,
+    pub telemetry: TelemetryStreamId,
 }
 
 #[cfg(test)]

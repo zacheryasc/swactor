@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use datastream::frame::{Frame, StreamId};
+use telemetry::frame::{Frame, StreamId};
 use parking_lot::Mutex;
 
 use crate::FrameEvent;
@@ -30,7 +30,7 @@ impl DashboardStore {
     }
 
     pub fn publish(&self, event: FrameEvent) {
-        if let Some((stream, frame)) = event.to_datastream_parts() {
+        if let Some((stream, frame)) = event.to_telemetry_parts() {
             self.views.dispatch(&stream, &frame, &event);
         }
         self.record(event);

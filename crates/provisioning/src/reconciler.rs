@@ -484,7 +484,7 @@ fn start_bootstrap_command(record: &NodeRecord) -> Option<NodeManagerCommand> {
     let ssh = record.connection.clone()?;
     Some(NodeManagerCommand::StartBootstrap(
         crate::node::BootstrapSessionSpec {
-            datastream: crate::node::DatastreamStreamId(format!(
+            telemetry: crate::node::TelemetryStreamId(format!(
                 "run/{}/node/{}/bootstrap",
                 record.run_id.0, record.logical_node_id.0
             )),

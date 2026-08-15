@@ -255,7 +255,7 @@ match ingress::read_object_record(buffer, object_spec, false)? {
 }
 ```
 
-### Custom metrics through the datastream
+### Custom metrics through the telemetry
 
 Telemetry is a deliberately dumb pipe: producers tag bytes with a channel id,
 nothing in the middle interprets the payload, and views are read-time
@@ -263,7 +263,7 @@ projections. To add a metric stream, define a type and implement one constant �
 no schema registry to negotiate with:
 
 ```rust
-// crates/datastream/src/record.rs
+// crates/telemetry/src/record.rs
 pub trait Record {
     const CHANNEL: &'static str;
 }
@@ -276,7 +276,7 @@ impl Record for ArenaSample {
 
 ### Built-in dashboard
 
-A read-only HTML/SSE dashboard renders the frames the datastream already
+A read-only HTML/SSE dashboard renders the frames the telemetry already
 carries — workers, the actor roster, per-actor dossiers, fleet hardware. It sends
 no control signals back, so the whole thing is one Axum router:
 
@@ -303,10 +303,10 @@ flowchart TD
     app["myelin<br/>node · orchestrator"]
     driver["iroh-driver<br/>QUIC network driver"]
     dist["distribution<br/>SWIM · registry · directory"]
-    dash["dashboard<br/>read-only view over datastream"]
+    dash["dashboard<br/>read-only view over telemetry"]
     proc["process<br/>managed external processes"]
     dp["data-plane<br/>zero-copy byte movement · IPC · links"]
-    ds["datastream<br/>metrics / telemetry pipe"]
+    ds["telemetry<br/>metrics / telemetry pipe"]
     trans["transport<br/>codec · identity · crypto"]
     core["swactor<br/>core runtime + std (OTP)<br/>ActorInterface · Ctx"]
 
@@ -334,10 +334,10 @@ flowchart TD
 | `crates/transport` | Codec registry, node identity, message signing — transport-agnostic |
 | `crates/distribution` | Clustering: SWIM membership, naming, metadata + actor directory gossip |
 | `crates/iroh-driver` | iroh/QUIC network driver with its pump/fanout tasks |
-| `crates/datastream` | Metrics / telemetry pipe — nothing in the middle interprets payloads |
+| `crates/telemetry` | Metrics / telemetry pipe — nothing in the middle interprets payloads |
 | `crates/data-plane` | Zero-copy movement of large typed byte objects over IPC or a network link |
 | `crates/process` | Managed external processes and YAML pipelines |
-| `crates/dashboard` | Read-only HTML/SSE dashboard over datastream frames |
+| `crates/dashboard` | Read-only HTML/SSE dashboard over telemetry frames |
 | `crates/provisioning` | Cloud node provisioning |
 | `crates/bindings/{python,wasm-runtime,wasm-crypto}` | Language / target bindings |
 | `apps/myelin` | The node binary that wires the above into a runnable cluster node |

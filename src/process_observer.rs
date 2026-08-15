@@ -2,8 +2,8 @@
 //!
 //! Current `swactor-process` managed-process core does not call this hook.
 //! Managed-process lifecycle/control output is delivered as `ProcessOutput` to
-//! the configured upstream owner and may be mirrored to datastream through
-//! `ProcessOutputConfig::datastream_mirror`.
+//! the configured upstream owner and may be mirrored to telemetry through
+//! `ProcessOutputConfig::telemetry_mirror`.
 //!
 //! The runtime is only the storage location for callers that still wire this
 //! hook themselves; it does not interpret the bytes.

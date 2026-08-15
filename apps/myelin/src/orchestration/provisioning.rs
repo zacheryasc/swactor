@@ -2,7 +2,7 @@
 //!
 //! Provider-neutral lifecycle contracts live in the reusable `provisioning`
 //! crate. This module keeps Myelin-local process/Docker plugin implementations
-//! that know about bootstrap datastream plumbing and local runtime execution.
+//! that know about bootstrap telemetry plumbing and local runtime execution.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,7 +22,7 @@ pub use ::provisioning::plugin::{
     ProvisionPlugin,
 };
 
-use crate::observability::provisioning_logs::BootstrapDatastreamBridge;
+use crate::observability::provisioning_logs::BootstrapTelemetryBridge;
 
 pub(crate) struct LocalDockerPlugin {
     container_name_prefix: String,
@@ -552,7 +552,7 @@ impl ProvisionPlugin for LocalDockerPlugin {
             .map(|(_, value)| value.clone())
             .or_else(|| std::env::var("MYELIN_DOCKER_GPUS").ok())
             .filter(|value| !value.trim().is_empty());
-        sink.observe(PluginObservation::DatastreamFrame {
+        sink.observe(PluginObservation::TelemetryFrame {
             run_id: spec.run_id,
             node_id: spec.node_id,
             channel: "myelin.provisioning.events".to_owned(),
@@ -676,7 +676,7 @@ fn spawn_stdout_reader(
     sink: PluginSink,
     stdout: impl std::io::Read + Send + 'static,
 ) {
-    BootstrapDatastreamBridge::new(spec, sink, None).spawn_stdout_reader(stdout);
+    BootstrapTelemetryBridge::new(spec, sink, None).spawn_stdout_reader(stdout);
 }
 
 fn spawn_stderr_reader(
@@ -684,7 +684,7 @@ fn spawn_stderr_reader(
     sink: PluginSink,
     stderr: impl std::io::Read + Send + 'static,
 ) {
-    BootstrapDatastreamBridge::new(spec, sink, None).spawn_stderr_reader(stderr);
+    BootstrapTelemetryBridge::new(spec, sink, None).spawn_stderr_reader(stderr);
 }
 
 #[cfg(test)]

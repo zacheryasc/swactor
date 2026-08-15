@@ -6,7 +6,7 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 swactor = { path = "../..", default-features = false, features = ["no_random"] }
-datastream = { path = "../datastream" }
+telemetry = { path = "../telemetry" }
 crossbeam-queue = "0.3.12"
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }

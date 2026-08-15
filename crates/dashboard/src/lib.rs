@@ -7,14 +7,14 @@ pub mod view;
 
 use std::sync::Arc;
 
-use datastream::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
+use telemetry::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use serde::Serialize;
 use tokio::sync::broadcast;
 
 use crate::store::DashboardStore;
 use crate::view::{DashboardView, ViewRegistry};
 
-/// Configuration for the datastream dashboard server.
+/// Configuration for the telemetry dashboard server.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
     pub port: u16,
@@ -34,7 +34,7 @@ impl Default for DashboardConfig {
     }
 }
 
-/// JSON shape emitted for each incoming datastream frame.
+/// JSON shape emitted for each incoming telemetry frame.
 #[derive(Debug, Clone, Serialize)]
 pub struct FrameEvent {
     pub stream: StreamEvent,
@@ -62,7 +62,7 @@ impl FrameEvent {
         }
     }
 
-    pub(crate) fn to_datastream_parts(&self) -> Option<(StreamId, Frame)> {
+    pub(crate) fn to_telemetry_parts(&self) -> Option<(StreamId, Frame)> {
         let stream = StreamId::new(NodeId::new(&self.stream.node), Lifetime(self.stream.life));
         let channel = self
             .channel
@@ -76,7 +76,7 @@ impl FrameEvent {
 
 /// Handle to the read-only dashboard server.
 ///
-/// The handle's data path publishes observed datastream frames to HTTP clients
+/// The handle's data path publishes observed telemetry frames to HTTP clients
 /// and registered views. It does not send signals back to producers or mutate
 /// runtime state.
 pub struct DashboardHandle {
@@ -88,13 +88,13 @@ pub struct DashboardHandle {
 }
 
 impl DashboardHandle {
-    /// Create the datastream dashboard state.
+    /// Create the telemetry dashboard state.
     ///
     /// The HTTP server future is obtained from [`DashboardHandle::http_server`]
     /// and scheduled by the owning swactor engine.
     pub fn new(config: DashboardConfig) -> Self {
         let views = Arc::new(ViewRegistry::new());
-        views.register(Arc::new(live_explorer::LiveDatastreamExplorer::default()));
+        views.register(Arc::new(live_explorer::LiveTelemetryExplorer::default()));
         views.register(Arc::new(hardware_view::HardwareDashboardView::default()));
         views.register(swactor::worker_view());
         views.register(swactor::actor_overview_view());
@@ -119,7 +119,7 @@ impl DashboardHandle {
         self.views.register(view);
     }
 
-    /// Publish one incoming datastream frame to raw clients and all matching views.
+    /// Publish one incoming telemetry frame to raw clients and all matching views.
     pub fn ingest(&self, stream: &StreamId, frame: &Frame) {
         let event = self.store.ingest(stream, frame);
         let _ = self.frames.send(event);
@@ -152,7 +152,7 @@ impl DashboardHandle {
 
 }
 
-/// Create the datastream dashboard state.
+/// Create the telemetry dashboard state.
 ///
 /// The HTTP server future is obtained from [`DashboardHandle::http_server`] and
 /// scheduled by the owning swactor engine.

@@ -186,11 +186,11 @@ def env_int(name: str) -> int | None:
         return None
 
 
-def datastream_endpoint_snapshot() -> dict[str, Any]:
+def telemetry_endpoint_snapshot() -> dict[str, Any]:
     return {
         "role": "python-worker-stdio-json-bridge",
         "transport": "stdout-json-lines",
-        "endpoint_identity": os.environ.get("MYELIN_DATASTREAM_ENDPOINT_ID", "worker-stdio-bridge"),
+        "endpoint_identity": os.environ.get("MYELIN_TELEMETRY_ENDPOINT_ID", "worker-stdio-bridge"),
         "configured_source": "worker-node-env",
         "resolved_source": "TinygradWorker::spawn environment",
         "authentication_present": False,
@@ -213,7 +213,7 @@ def apply_canonical_envelope(event: dict[str, Any]) -> None:
     event.setdefault("wall_clock_unix_ms", benchmark.get("wall_clock_unix_ms", benchmark.get("wall_unix_ms")))
     event.setdefault("monotonic_ms", benchmark.get("monotonic_ms", benchmark.get("mono_ms")))
     event.setdefault("clock_source", benchmark.get("clock_source"))
-    event.setdefault("datastream_endpoint", datastream_endpoint_snapshot())
+    event.setdefault("telemetry_endpoint", telemetry_endpoint_snapshot())
     event.setdefault(
         "span_id",
         f"{event.get('producer_instance_id')}:{event.get('producer_sequence')}:{event.get('event_name')}",
@@ -1327,31 +1327,31 @@ def shutdown_worker(_: dict[str, Any]) -> None:
     raise SystemExit(0)
 
 
-def emit_python_datastream_preflight() -> None:
-    endpoint = datastream_endpoint_snapshot()
+def emit_python_telemetry_preflight() -> None:
+    endpoint = telemetry_endpoint_snapshot()
     control(
-        type="PythonDatastreamConfigured",
-        phase="PythonDatastreamConfigured",
+        type="PythonTelemetryConfigured",
+        phase="PythonTelemetryConfigured",
         status="configured",
         endpoint=endpoint,
     )
     control(
-        type="PythonDatastreamConnected",
-        phase="PythonDatastreamConnected",
+        type="PythonTelemetryConnected",
+        phase="PythonTelemetryConnected",
         status="ready",
         endpoint=endpoint,
     )
     synthetic_id = f"python-{os.getpid()}-{_benchmark_seq + 1}"
     control(
-        type="PythonDatastreamSyntheticEventSent",
-        phase="PythonDatastreamSyntheticEventSent",
+        type="PythonTelemetrySyntheticEventSent",
+        phase="PythonTelemetrySyntheticEventSent",
         status="sent",
         endpoint=endpoint,
         synthetic_id=synthetic_id,
     )
     control(
-        type="PythonDatastreamSyntheticEventObserved",
-        phase="PythonDatastreamSyntheticEventObserved",
+        type="PythonTelemetrySyntheticEventObserved",
+        phase="PythonTelemetrySyntheticEventObserved",
         status="observed",
         endpoint=endpoint,
         synthetic_id=synthetic_id,
@@ -1373,7 +1373,7 @@ HANDLERS = {
     "ShutdownWorker": shutdown_worker,
 }
 
-emit_python_datastream_preflight()
+emit_python_telemetry_preflight()
 
 for raw in sys.stdin:
     if not raw.strip():

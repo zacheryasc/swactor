@@ -11,11 +11,11 @@ use std::sync::{Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use datastream::{
-    ChannelContent, ChannelId, DatastreamEndpoint, DatastreamProducer, Lifetime, NodeId,
+use telemetry::frame::Frame;
+use telemetry::{
+    ChannelContent, ChannelId, TelemetryEndpoint, TelemetryProducer, Lifetime, NodeId,
     StreamDescriptor, StreamId, StreamOrigin,
 };
-use datastream::frame::Frame;
 use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(target_os = "linux")]
@@ -58,7 +58,7 @@ OPTIONS:
   --relay-url <url>             Custom relay URL passed to myelin-orchestrator
   --endpoint-addr-mask <mask>   Endpoint address mask: full or relay-only
   --cached-model[=<path>]       Use discovered or explicit cached GGUF model (default for --process)
-  --dump-logs[=<path>]          Write datastream frame log
+  --dump-logs[=<path>]          Write telemetry frame log
   --run-id <id>                 Override run id
   --skip-rebuild                Reuse existing Cargo artifacts
   --yes, -y                     Approve Vast.ai lease prompts
@@ -137,7 +137,7 @@ where
     }
     let config = Config::from_args(provided_args)?;
     let _gpu_env = RuntimeEnvGuard::apply_gpu_defaults(config.gpu_run);
-    let mut progress = ChatDatastream::new(config.run_id, config.datastream_frame_log.clone())?;
+    let mut progress = ChatTelemetry::new(config.run_id, config.telemetry_frame_log.clone())?;
     progress.emit(
         CHAT_LIFECYCLE_CHANNEL,
         "config",
@@ -147,7 +147,7 @@ where
             "pipeline_stages": config.pipeline_stages,
             "max_tokens": config.max_tokens,
             "cached_model": config.cached_model.as_ref().map(|model| model.host_path.to_string_lossy().to_string()),
-            "dump_logs": config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "dump_logs": config.telemetry_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
             "gpu_run": config.gpu_run,
         }),
     );
@@ -362,7 +362,7 @@ struct Config {
     provider: ProviderKind,
     image_tag: Option<String>,
     cached_model: Option<CachedModelConfig>,
-    datastream_frame_log: Option<PathBuf>,
+    telemetry_frame_log: Option<PathBuf>,
     run_id: u64,
     vastai_yes: bool,
     vastai: Option<ResolvedVastAiConfig>,
@@ -376,21 +376,21 @@ struct Config {
     endpoint_addr_mask: EndpointAddrMask,
 }
 
-struct ChatDatastream {
+struct ChatTelemetry {
     stream: StreamId,
     run_id: u64,
-    endpoint: DatastreamEndpoint,
-    producer: DatastreamProducer,
+    endpoint: TelemetryEndpoint,
+    producer: TelemetryProducer,
     channels: BTreeMap<String, ChannelId>,
     channel_names: BTreeMap<ChannelId, String>,
     archive_path: Option<PathBuf>,
     pending: Vec<(String, StreamId, String, Frame)>,
 }
 
-impl ChatDatastream {
+impl ChatTelemetry {
     fn new(run_id: u64, archive_path: Option<PathBuf>) -> Result<Self, String> {
         let stream = StreamId::new(NodeId::new("myelin-chat"), Lifetime(run_id));
-        let endpoint = DatastreamEndpoint::with_descriptor(
+        let endpoint = TelemetryEndpoint::with_descriptor(
             StreamDescriptor {
                 stream: stream.clone(),
                 label: Some("myelin chat".to_owned()),
@@ -544,9 +544,9 @@ impl ChatDatastream {
     fn emit_endpoint_config_snapshot(&mut self, config: &Config) {
         let endpoint = json!({
             "role": "chat-frame-archive",
-            "transport": "datastream-frame-log",
-            "configured": config.datastream_frame_log.is_some(),
-            "archive_path": config.datastream_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "transport": "telemetry-frame-log",
+            "configured": config.telemetry_frame_log.is_some(),
+            "archive_path": config.telemetry_frame_log.as_ref().map(|path| path.to_string_lossy().to_string()),
         });
         let runtime_endpoint = json!({
             "provider": config.provider.as_str(),
@@ -554,12 +554,12 @@ impl ChatDatastream {
             "relay_configured": config.relay_url.is_some(),
             "endpoint_addr_mask": config.endpoint_addr_mask.as_str(),
         });
-        let synthetic_id = format!("myelin-chat-{}-datastream-preflight", self.run_id);
+        let synthetic_id = format!("myelin-chat-{}-telemetry-preflight", self.run_id);
         for (phase, status) in [
-            ("DatastreamProducerConfigured", "configured"),
-            ("DatastreamProducerConnected", "ready"),
-            ("DatastreamSyntheticEventSent", "sent"),
-            ("DatastreamSyntheticEventObserved", "observed"),
+            ("TelemetryProducerConfigured", "configured"),
+            ("TelemetryProducerConnected", "ready"),
+            ("TelemetrySyntheticEventSent", "sent"),
+            ("TelemetrySyntheticEventObserved", "observed"),
         ] {
             self.emit(
                 CHAT_BENCHMARK_CHANNEL,
@@ -569,7 +569,7 @@ impl ChatDatastream {
                     "producer": "myelin-chat",
                     "producer_class": "rust-chat",
                     "synthetic_id": synthetic_id,
-                    "datastream_endpoint": endpoint,
+                    "telemetry_endpoint": endpoint,
                     "runtime_endpoint": runtime_endpoint,
                 }),
             );
@@ -581,11 +581,11 @@ impl ChatDatastream {
             json!({
                 "producer": "myelin-chat",
                 "expected_producers": ["myelin-chat", "myelin-orchestrator", "myelin-worker", "tinygrad-worker"],
-                "datastream_endpoint": endpoint,
+                "telemetry_endpoint": endpoint,
                 "runtime_endpoint": runtime_endpoint,
                 "connectivity_preflight": {
                     "status": "configured",
-                    "canonical_datastream_required": true,
+                    "canonical_telemetry_required": true,
                 },
             }),
         );
@@ -612,7 +612,7 @@ impl ChatDatastream {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let mut archive = FrameArchive::open_with_label(path, "myelin-chat datastream frame log")?;
+        let mut archive = FrameArchive::open_with_label(path, "myelin-chat telemetry frame log")?;
         for (source, stream, channel, frame) in self.pending.drain(..) {
             archive.record(&source, &stream, &channel, &frame)?;
         }
@@ -620,7 +620,7 @@ impl ChatDatastream {
     }
 }
 
-impl NodeImageProgressSink for ChatDatastream {
+impl NodeImageProgressSink for ChatTelemetry {
     fn emit(&mut self, event: NodeImageProgressEvent) {
         let mut detail = serde_json::Map::new();
         if let Some(command_label) = event.command_label {
@@ -806,7 +806,7 @@ impl Config {
             },
         };
         let model = Self::model_config(&provider, &toml, cached_model.as_ref())?;
-        let datastream_frame_log = Self::datastream_frame_log(&args, &toml);
+        let telemetry_frame_log = Self::telemetry_frame_log(&args, &toml);
         let vastai = if provider == provider_kind::vastai() {
             Some(resolve_vastai_config(&toml.vastai, &node_image)?)
         } else {
@@ -821,7 +821,7 @@ impl Config {
             provider,
             image_tag: first_non_empty([toml.image.tag.clone()]),
             cached_model,
-            datastream_frame_log,
+            telemetry_frame_log,
             run_id: args.run_id.unwrap_or(1),
             vastai_yes: args.vastai_yes,
             pipeline_stages,
@@ -917,7 +917,7 @@ impl Config {
         }
     }
 
-    fn datastream_frame_log(args: &ParsedArgs, toml: &ChatTomlConfig) -> Option<PathBuf> {
+    fn telemetry_frame_log(args: &ParsedArgs, toml: &ChatTomlConfig) -> Option<PathBuf> {
         if args.dump_logs {
             return Some(
                 args.dump_log_path
@@ -1005,8 +1005,8 @@ impl Config {
         }
         push_opt!(
             args,
-            &self.datastream_frame_log,
-            "--datastream-frame-log",
+            &self.telemetry_frame_log,
+            "--telemetry-frame-log",
             |path| { path.to_string_lossy().to_string() }
         );
         push_opt!(args, &self.relay_mode, "--relay-mode", |mode| mode.clone());
@@ -1579,7 +1579,7 @@ fn signal_orch_process_group(child: &Child, signal: libc::c_int) -> io::Result<(
 }
 
 fn ensure_binary_with_progress(
-    progress: &mut Option<&mut ChatDatastream>,
+    progress: &mut Option<&mut ChatTelemetry>,
     phase: &str,
     mode: &str,
     verbose: bool,
@@ -1635,7 +1635,7 @@ fn ensure_binary_with_progress(
 fn prepare_runtime_with_progress<F>(
     config: &Config,
     mut prepare_node_image_fn: F,
-    progress: Option<&mut ChatDatastream>,
+    progress: Option<&mut ChatTelemetry>,
 ) -> Result<String, String>
 where
     F: FnMut(NodeImageRequest, Option<&mut dyn NodeImageProgressSink>) -> Result<String, String>,
@@ -1795,7 +1795,7 @@ fn run_chat_loop_with_input_and_progress(
     addr: &str,
     max_tokens: u32,
     input_rx: mpsc::Receiver<PromptInput>,
-    progress: Option<&mut ChatDatastream>,
+    progress: Option<&mut ChatTelemetry>,
 ) -> Result<(), String> {
     let mut progress = progress;
     emit_chat_progress(
@@ -1863,7 +1863,7 @@ fn run_chat_session_with_output(
 }
 
 fn emit_chat_progress(
-    progress: &mut Option<&mut ChatDatastream>,
+    progress: &mut Option<&mut ChatTelemetry>,
     channel: &str,
     phase: &str,
     status: &str,
@@ -1880,12 +1880,12 @@ fn run_chat_session_with_output_and_progress(
     input_rx: mpsc::Receiver<PromptInput>,
     max_tokens: u32,
     output: &mut impl Write,
-    progress: Option<&mut ChatDatastream>,
+    progress: Option<&mut ChatTelemetry>,
 ) -> Result<(), String> {
     let mut progress = progress;
     let mut next_request_id = 1_u64;
     let mut next_prompt_index = 1_u64;
-    let prompt_exited = |progress: &mut Option<&mut ChatDatastream>, reason: &str| {
+    let prompt_exited = |progress: &mut Option<&mut ChatTelemetry>, reason: &str| {
         emit_chat_progress(
             progress,
             CHAT_PROMPT_CHANNEL,
@@ -2481,7 +2481,7 @@ mod tests {
                 assert_eq!(defaults.provider, provider_kind::process());
                 assert_eq!(defaults.pipeline_stages, 1);
                 assert_eq!(defaults.run_id, 1);
-                assert!(defaults.datastream_frame_log.is_none());
+                assert!(defaults.telemetry_frame_log.is_none());
                 assert!(defaults.cached_model.is_none());
                 assert!(defaults.vastai.is_none());
                 assert!(!defaults.skip_rebuild);
@@ -2518,7 +2518,7 @@ tag = " alias "
 
                 assert_eq!(config.provider, provider_kind::process());
                 assert_eq!(config.pipeline_stages, 4);
-                assert_eq!(config.datastream_frame_log, Some(PathBuf::from("cli.log")));
+                assert_eq!(config.telemetry_frame_log, Some(PathBuf::from("cli.log")));
                 assert_eq!(config.node_image, "docker.io/acme/node:toml");
                 assert_eq!(config.image_tag, Some("alias".to_owned()));
             },
