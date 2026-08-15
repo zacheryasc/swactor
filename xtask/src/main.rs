@@ -266,6 +266,10 @@ COMMANDS:
                      Run real cargo myelin-chat acceptance check and write benchmark artifacts.
   myelin-chat-compare <baseline-summary.json> <candidate-summary.json>
                      Compare two benchmark summaries and report comparable deltas.
+  provisioning-reconciler-demo [--port n] [--nodes n]
+                      Run the visual E2E provisioning reconciler sanity demo
+                      (supervisor + dashboard on localhost, node children
+                      join over iroh). Ctrl-C tears down.
   check-telemetry-isolation  Verify no frame types appear in control-plane modules.
   test                Run the basic non-binding test barrier: root crate plus each
                       non-binding repository package with `cargo test -p`."
@@ -6933,6 +6937,8 @@ fn collect_rs_files(dir: &str, out: &mut Vec<String>) {
     }
 }
 
+mod provisioning_demo;
+
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
@@ -6941,6 +6947,9 @@ fn main() -> ExitCode {
         Some("myelin-chat-check") => run_myelin_chat_check(args.collect()),
         Some("myelin-chat-compare") => run_myelin_chat_compare(args.collect()),
         Some("myelin-chat") => run_myelin_chat(args.collect()),
+        Some("provisioning-reconciler-demo") => {
+            provisioning_demo::run(&args.collect::<Vec<String>>())
+        }
         Some("help" | "--help" | "-h") | None => {
             print_usage();
             ExitCode::SUCCESS

@@ -35,14 +35,67 @@ pub(crate) async fn run_server(state: AppState, port: u16) {
 }
 
 fn router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/", get(root_page))
         .route("/events", get(frame_stream))
         .route("/api/frames", get(recent_frames))
         .route("/api/views", get(views_json))
         .route("/api/view/{*path}", get(view_snapshot))
-        .route("/view/{*path}", get(view_page))
-        .with_state(state)
+        .route("/view/{*path}", get(view_page));
+    #[cfg(feature = "demo-control")]
+    let router = router
+        .route("/control/kill", axum::routing::post(control_kill))
+        .route("/control/provision", axum::routing::post(control_provision))
+        .route("/control/remove", axum::routing::post(control_remove));
+    router.with_state(state)
+}
+
+#[cfg(feature = "demo-control")]
+async fn control_kill(
+    Json(command): Json<crate::control::ControlCommand>,
+) -> impl IntoResponse {
+    match command {
+        crate::control::ControlCommand::Kill { .. } => {
+            if crate::control::dispatch(command) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    }
+}
+
+#[cfg(feature = "demo-control")]
+async fn control_provision(
+    Json(command): Json<crate::control::ControlCommand>,
+) -> impl IntoResponse {
+    match command {
+        crate::control::ControlCommand::Provision { .. } => {
+            if crate::control::dispatch(command) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    }
+}
+
+#[cfg(feature = "demo-control")]
+async fn control_remove(
+    Json(command): Json<crate::control::ControlCommand>,
+) -> impl IntoResponse {
+    match command {
+        crate::control::ControlCommand::Remove { .. } => {
+            if crate::control::dispatch(command) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    }
 }
 
 async fn root_page(State(state): State<AppState>) -> Html<String> {

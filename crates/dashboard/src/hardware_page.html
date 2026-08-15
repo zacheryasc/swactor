@@ -664,6 +664,7 @@
         </div>
         <div class="fleet-card-meta">
           <span class="muted">Seen ${escapeHtml(fmtDuration(node.last_seen_ms_ago))} ago</span>
+          ${node.process ? `<span class="pill ${node.process.state === 'running' ? 'ok' : 'warn'}">pid ${escapeHtml(node.process.pid ?? '—')} · ${escapeHtml(node.process.state)}</span>` : ''}
           <span class="${errors.length ? 'bad' : 'ok'}">${escapeHtml(fmtNumber(errors.length))} error${errors.length === 1 ? '' : 's'}</span>
         </div>
         <div class="fleet-activity">

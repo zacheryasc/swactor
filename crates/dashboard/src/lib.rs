@@ -1,3 +1,7 @@
+#[cfg(feature = "demo-control")]
+pub mod control;
+#[cfg(feature = "demo-control")]
+mod demo_control;
 mod hardware_view;
 mod live_explorer;
 mod server;
@@ -7,8 +11,8 @@ pub mod view;
 
 use std::sync::Arc;
 
-use telemetry::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use serde::Serialize;
+use telemetry::frame::{ChannelId, Frame, Lifetime, NodeId, Position, StreamId};
 use tokio::sync::broadcast;
 
 use crate::store::DashboardStore;
@@ -79,6 +83,7 @@ impl FrameEvent {
 /// The handle's data path publishes observed telemetry frames to HTTP clients
 /// and registered views. It does not send signals back to producers or mutate
 /// runtime state.
+#[derive(Clone)]
 pub struct DashboardHandle {
     port: u16,
     frames: broadcast::Sender<FrameEvent>,
@@ -96,6 +101,8 @@ impl DashboardHandle {
         let views = Arc::new(ViewRegistry::new());
         views.register(Arc::new(live_explorer::LiveTelemetryExplorer::default()));
         views.register(Arc::new(hardware_view::HardwareDashboardView::default()));
+        #[cfg(feature = "demo-control")]
+        views.register(Arc::new(demo_control::DemoControlView::default()));
         views.register(swactor::worker_view());
         views.register(swactor::actor_overview_view());
         views.register(swactor::actor_dossier_view());

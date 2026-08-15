@@ -40,7 +40,15 @@ struct NodeHardwareState {
     cpu: Option<HostCpuSample>,
     gpu: Option<HostGpuSample>,
     net: Option<NetSnapshot>,
+    process: Option<ProcessSnapshot>,
     history: VecDeque<HardwareHistoryState>,
+}
+
+/// Managed-process state folded from `proc.<label>.lifecycle` frames.
+#[derive(Clone, Serialize)]
+struct ProcessSnapshot {
+    pid: Option<u32>,
+    state: String,
 }
 
 impl NodeHardwareState {
@@ -52,6 +60,7 @@ impl NodeHardwareState {
             cpu: None,
             gpu: None,
             net: None,
+            process: None,
             history: VecDeque::with_capacity(HISTORY_CAP),
         }
     }
@@ -83,7 +92,19 @@ impl NodeHardwareState {
                 }
                 Err(error) => self.store_decode_error(HOST_NET_CHANNEL, error),
             },
-            _ => {}
+            _ => {
+                if channel.starts_with("proc.") && channel.ends_with(".lifecycle") {
+                    self.process = decode_process_snapshot(payload);
+                    // Lifecycle frames also prove liveness.
+                    self.last_seen = now;
+                } else if channel == "node.status" {
+                    // Liveness heartbeat from the supervisor.
+                    self.last_seen = now;
+                    if let Some(status) = decode_process_snapshot(payload) {
+                        self.process.get_or_insert(status);
+                    }
+                }
+            }
         }
     }
 
@@ -108,13 +129,12 @@ impl NodeHardwareState {
                     gpu_max_percent =
                         Some(gpu_max_percent.map_or(percent, |current: u64| current.max(percent)));
                 }
-                gpu_memory_used_mib =
-                    gpu_memory_used_mib.saturating_add(device.memory_used_mib.unwrap_or_default());
+                gpu_memory_used_mib = gpu_memory_used_mib
+                    .saturating_add(device.memory_used_mib.unwrap_or_default());
                 gpu_memory_total_mib = gpu_memory_total_mib
                     .saturating_add(device.memory_total_mib.unwrap_or_default());
             }
         }
-
         let (net_rx_bps, net_tx_bps) = self.net.as_ref().map_or((0.0, 0.0), |net| {
             net.interfaces.iter().fold((0.0, 0.0), |totals, interface| {
                 (
@@ -185,6 +205,28 @@ impl NodeHardwareState {
         }
         errors
     }
+}
+
+/// Decode a `swactor_process.lifecycle.v1` payload into fleet-card state.
+fn decode_process_snapshot(payload: &[u8]) -> Option<ProcessSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let pid = value
+        .get("pid")
+        .and_then(serde_json::Value::as_u64)
+        .map(|pid| pid as u32);
+    let state = match value.get("event").and_then(serde_json::Value::as_str) {
+        Some("started") => "running",
+        Some("exited") => "exited",
+        Some("spawn_failed") | Some("error") => "failed",
+        Some(other) => other,
+        None => match value.get("alive").and_then(serde_json::Value::as_bool) {
+            Some(true) => "running",
+            Some(false) => "exited",
+            None => return None,
+        },
+    }
+    .to_owned();
+    Some(ProcessSnapshot { pid, state })
 }
 
 #[derive(Clone, Serialize)]
@@ -340,6 +382,7 @@ struct NodeHardwareSnapshot {
     cpu: Option<CpuSnapshot>,
     gpu: Option<GpuSnapshot>,
     net: Option<NetSnapshot>,
+    process: Option<ProcessSnapshot>,
     history: Vec<HardwareHistorySnapshot>,
 }
 
@@ -486,6 +529,7 @@ fn node_snapshot(node: &NodeHardwareState, now: Instant) -> NodeHardwareSnapshot
         cpu: node.cpu.as_ref().map(CpuSnapshot::from),
         gpu: node.gpu.as_ref().map(GpuSnapshot::from),
         net: node.net.clone(),
+        process: node.process.clone(),
         history: node
             .history
             .iter()

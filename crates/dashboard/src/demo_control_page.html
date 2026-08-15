@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Fleet Control</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 20px; }
+    .nav { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; padding: 8px; background: #111827; border: 1px solid #334155; border-radius: 12px; }
+    .nav a { padding: 7px 10px; color: #cbd5e1; border: 1px solid transparent; border-radius: 8px; text-decoration: none; }
+    .nav a:hover { color: #f8fafc; background: #1e293b; }
+    header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; margin-bottom: 18px; }
+    h1 { font-size: 24px; margin: 0; }
+    .muted { color: #94a3b8; }
+    .panel { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 16px; margin-bottom: 18px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #334155; }
+    th { color: #94a3b8; font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+    .pill { display: inline-flex; padding: 3px 8px; border-radius: 999px; border: 1px solid #334155; font-size: 12px; }
+    .running { color: #34d399; }
+    .exited, .failed { color: #f87171; }
+    button { font: inherit; border-radius: 8px; border: 1px solid #475569; background: #334155; color: #e2e8f0; padding: 6px 12px; cursor: pointer; }
+    button.danger { background: #7f1d1d; border-color: #b91c1c; color: #fee2e2; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #status { margin-left: 12px; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <nav class="nav">
+    <a href="/">dashboard</a>
+    <a href="/view/fleet">fleet</a>
+    <a href="/view/demo-control" data-active="true">fleet control</a>
+  </nav>
+  <header>
+    <h1>Fleet Control</h1>
+    <div>
+      <label class="muted" for="provision-count">nodes</label>
+      <input id="provision-count" type="number" min="1" max="8" value="1" style="width: 3.5em; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:6px; padding:5px 8px;">
+      <button id="provision">+ provision</button>
+      <button id="remove">− remove</button>
+      <span id="status" class="muted"></span>
+    </div>
+  </header>
+  <section class="panel">
+    <table>
+      <thead>
+        <tr><th>node</th><th>pid</th><th>state</th><th>seen</th><th></th></tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p class="muted" id="empty" hidden>No provisioned processes observed yet.</p>
+  </section>
+  <script>
+    'use strict';
+    const API_URL = '/api/view/demo-control';
+    const rows = document.getElementById('rows');
+    const empty = document.getElementById('empty');
+    const status = document.getElementById('status');
+
+    function setStatus(text, isError) {
+      status.textContent = text;
+      status.className = isError ? 'failed' : 'muted';
+      if (text) setTimeout(() => { if (status.textContent === text) status.textContent = ''; }, 4000);
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+      }[ch]));
+    }
+
+    function fmtSeen(msAgo) {
+      if (msAgo < 1000) return 'just now';
+      if (msAgo < 60_000) return Math.round(msAgo / 1000) + 's ago';
+      return Math.round(msAgo / 60_000) + 'm ago';
+    }
+
+    function render(snapshot) {
+      const nodes = (snapshot && snapshot.nodes) || [];
+      empty.hidden = nodes.length > 0;
+      rows.innerHTML = nodes.map((entry) => {
+        const stateClass = entry.state === 'running' ? 'running' : entry.state;
+        return `<tr>
+          <td>${escapeHtml(entry.node)}</td>
+          <td>${entry.pid == null ? '—' : escapeHtml(entry.pid)}</td>
+          <td><span class="pill ${stateClass}">${escapeHtml(entry.state)}</span></td>
+          <td class="muted">${escapeHtml(fmtSeen(entry.seen_ms_ago))}</td>
+          <td><button class="danger" data-node="${escapeHtml(entry.node)}" ${entry.state !== 'running' ? 'disabled' : ''}>kill</button></td>
+        </tr>`;
+      }).join('');
+      for (const button of rows.querySelectorAll('button[data-node]')) {
+        button.addEventListener('click', () => {
+          button.disabled = true;
+          fetch('/control/kill', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ Kill: { node: button.dataset.node } })
+          }).then((response) => {
+            setStatus(response.ok ? 'kill issued' : 'kill failed: HTTP ' + response.status, !response.ok);
+          }).catch((error) => setStatus('kill failed: ' + error, true));
+        });
+      }
+    }
+
+    function nodeCount() {
+      return Math.max(1, Math.min(8, Number(document.getElementById('provision-count').value) || 1));
+    }
+
+    document.getElementById('provision').addEventListener('click', () => {
+      const count = nodeCount();
+      fetch('/control/provision', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ Provision: { count } })
+      }).then((response) => {
+        setStatus(response.ok ? 'provision issued' : 'provision failed: HTTP ' + response.status, !response.ok);
+      }).catch((error) => setStatus('provision failed: ' + error, true));
+    });
+
+    document.getElementById('remove').addEventListener('click', () => {
+      const count = nodeCount();
+      fetch('/control/remove', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ Remove: { count } })
+      }).then((response) => {
+        setStatus(response.ok ? 'remove issued' : 'remove failed: HTTP ' + response.status, !response.ok);
+      }).catch((error) => setStatus('remove failed: ' + error, true));
+    });
+
+    async function poll() {
+      try {
+        const response = await fetch(API_URL);
+        if (response.ok) render(await response.json());
+      } catch { /* transient */ }
+    }
+    poll();
+    setInterval(poll, 1000);
+  </script>
+</body>
+</html>
