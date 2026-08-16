@@ -1,22 +1,6 @@
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RunId(pub u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct NodeId(pub u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EdgeId(pub u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct LeaseRequestId(pub u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RingId(pub u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ActorAddress(pub u64);
+pub use crate::ids::{ActorAddress, EdgeId, LeaseRequestId, NodeId, RingId, RunId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RingDirection {

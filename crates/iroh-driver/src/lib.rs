@@ -9,7 +9,6 @@
 // work goes through `EngineHandle`.
 #![deny(clippy::disallowed_methods)]
 
-pub mod driver_pumps;
 pub mod edge_transport;
 pub mod endpoint_advertisement;
 pub mod iroh_driver;
@@ -23,7 +22,7 @@ pub use iroh_driver::{
     conn_type_of, discover_lan_ips,
 };
 
-pub use edge_transport::{EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, EdgeTransportFault};
+pub use edge_transport::{EDGE_ALPN, EdgeSendHandle};
 
 pub use telemetry_transport::{
     TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, TelemetryQuicWriteStats,

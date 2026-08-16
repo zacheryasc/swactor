@@ -56,8 +56,9 @@ use distribution::node::DistributedNodeConfig;
 use distribution::swim::telemetry::ObservedTransition;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
+use data_plane::edge_wire::WireEvent;
 use iroh_driver::{
-    TELEMETRY_ALPN, EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, IrohDriver, IrohDriverConfig,
+    TELEMETRY_ALPN, EDGE_ALPN, EdgeSendHandle, IrohDriver, IrohDriverConfig,
 };
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
@@ -4259,17 +4260,17 @@ impl PipelinePromptRuntime {
     fn poll_driver(&mut self, driver: &mut IrohDriver) {
         for event in driver.drain_edge_events() {
             match event {
-                EdgeTransportEvent::BytesRead { edge_id, bytes, .. }
-                    if edge_id == self.token_out_edge_id =>
+                WireEvent::BytesRead { edge_id, bytes, .. }
+                    if edge_id.0 == self.token_out_edge_id =>
                 {
                     self.note_progress();
                     let _ = self.recv_tx.send(bytes);
                 }
-                EdgeTransportEvent::StreamFault {
+                WireEvent::StreamFault {
                     edge_id: Some(edge_id),
                     reason,
                     ..
-                } if edge_id == self.token_out_edge_id => {
+                } if edge_id.0 == self.token_out_edge_id => {
                     if let Some(request_id) =
                         self.active.as_ref().map(|active| active.request.request_id)
                     {

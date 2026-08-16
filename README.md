@@ -121,17 +121,19 @@ cd examples/ping-pong && ./run.sh
 
 A node ships batteries-included: the actor engine (worker threads), a network
 driver, and the pump/fanout tasks that wire them — you don't assemble the glue.
-The driver tracks its own established send/recv pumps per QUIC stream and emits
-lifecycle events (edge ready, stream fault, pump stopped):
+The driver's edge surface is a deliberately tiny reader/writer port; all edge
+logic — lifecycle, ring bookkeeping, ingress parsing — lives in the data-plane:
 
 ```rust
-// crates/iroh-driver/src/driver_pumps.rs
-pub enum DriverEventOut {
-    DriverEdgeReady { edge_id: EdgeId },
-    StreamFault { edge_id: EdgeId },
-    PumpStopped { edge_id: EdgeId, ring_id: RingId },
+// crates/data-plane/src/edge_wire.rs — the whole transport contract
+pub trait EdgeTransport {
+    type Writer: EdgeWriter;
+    type PeerAddr: Clone;
+    fn open_writer(&mut self, edge_id: EdgeId, peer: &Self::PeerAddr)
+        -> Result<Self::Writer, String>;
+    fn drain_events(&mut self) -> Vec<WireEvent>;
 }
-```
+// crates/iroh-driver: `impl EdgeTransport for IrohDriver`
 
 ### `iroh` integration — QUIC, TLS, and NAT traversal
 
@@ -224,13 +226,6 @@ producer → egress ring ──QUIC──▶ ingress ring → consumer
 What travels on a wire edge is typed, so the receiver knows what arrived:
 
 ```rust
-// crates/data-plane/src/actor.rs
-pub enum EdgeKind {
-    TokenIn,
-    Activation,   // a hidden-state tensor forwarded to the next shard
-    TokenOut,
-}
-
 // crates/data-plane/src/edge_lifecycle.rs
 pub struct ObjectSpec {
     pub kind: ObjectKind,        // Activation
@@ -239,18 +234,18 @@ pub struct ObjectSpec {
 }
 ```
 
-The edge actor owns the lifecycle: lease a byte range, install an ingress or
+The edge runtime owns the lifecycle: lease a byte range, install an ingress or
 egress ring, and release it only with a `QuiescenceProof`, so a range is never
 recycled under a live reader. The worker consumes whole objects off its ingress
 ring as plain bytes:
 
 ```rust
-// apps/myelin/src/node/worker_node_runtime.rs
-match ingress::read_object_record(buffer, object_spec, false)? {
-    ingress::ObjectRecordRead::Incomplete => Ok(None),      // wait for more bytes
-    ingress::ObjectRecordRead::Complete(record) => {        // a full activation arrived
+// crates/data-plane/src/edge_runtime.rs
+match read_object_record(buffer, object_spec, false)? {
+    ObjectRecordRead::Incomplete => Ok(None),      // wait for more bytes
+    ObjectRecordRead::Complete(record) => {        // a full activation arrived
         let bytes: Vec<u8> = buffer.drain(..record.total_len).collect();
-        Ok(Some(IngressRecordBytes { bytes, object_id: record.object_id.0, .. }))
+        // ... written into the edge's arena ring, then loaded on the worker
     }
 }
 ```

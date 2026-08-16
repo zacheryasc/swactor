@@ -31,10 +31,9 @@ use distribution::swim::actor::SwimIn;
 use distribution::transport_bridge::{OutFrame, Outbox, RelayMirror, RouteView, peer_addr};
 use distribution::types::NodeId;
 
-use crate::edge_transport::{
-    EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, spawn_edge_recv_pump,
-    spawn_edge_send_pump as spawn_edge_sender_task,
-};
+use crate::edge_transport::{EDGE_ALPN, EdgeSendHandle, spawn_edge_recv_pump};
+use crate::edge_transport::spawn_edge_send_pump as spawn_edge_sender_task;
+use data_plane::edge_wire::WireEvent;
 use crate::telemetry_transport::{
     TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, read_events_from_stream,
     spawn_subscription_writer,
@@ -291,7 +290,7 @@ pub struct IrohDriver {
     /// Completed telemetry QUIC reads from driver-owned TELEMETRY_ALPN adapters.
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
     /// Logical edge events emitted by driver-owned EDGE_ALPN byte pumps.
-    edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
+    edge_events: Arc<Mutex<Vec<WireEvent>>>,
     next_edge_stream_group: Arc<AtomicU64>,
     /// Frames read by per-connection reader tasks, drained by the engine-hosted
     /// adapter pump ([`Self::install_actor_bridge_pump`]). This decouples network
@@ -445,7 +444,7 @@ impl IrohDriver {
         let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>> = Arc::new(Mutex::new(Vec::new()));
-        let edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let edge_events: Arc<Mutex<Vec<WireEvent>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let ep = endpoint.clone();
             let peer_auth = config.peer_auth.clone();
@@ -577,14 +576,14 @@ impl IrohDriver {
     }
 
     /// Drain logical edge transport events emitted by driver-owned byte pumps.
-    pub fn drain_edge_events(&self) -> Vec<EdgeTransportEvent> {
+    pub fn drain_edge_events(&self) -> Vec<WireEvent> {
         self.edge_events.lock().drain(..).collect()
     }
 
     /// Clone of the shared edge-event queue, so callers outside the driver
     /// (e.g. a job worker) can drain `EDGE_ALPN` byte events from their own
     /// thread/task without going through `&self`.
-    pub fn edge_events_handle(&self) -> Arc<Mutex<Vec<EdgeTransportEvent>>> {
+    pub fn edge_events_handle(&self) -> Arc<Mutex<Vec<WireEvent>>> {
         Arc::clone(&self.edge_events)
     }
 
@@ -1181,7 +1180,7 @@ struct AdapterPump {
     accepted_conns: Arc<Mutex<Vec<(NodeId, Connection)>>>,
     other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
-    edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>>,
+    edge_events: Arc<Mutex<Vec<WireEvent>>>,
     next_edge_stream_group: Arc<AtomicU64>,
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
@@ -1518,7 +1517,7 @@ impl AdapterPump {
             *pending = keep;
             drained
         };
-        for (node, conn) in drained {
+        for (_node, conn) in drained {
             let stream_group = self
                 .next_edge_stream_group
                 .fetch_add(1, Ordering::Relaxed)
@@ -1526,7 +1525,6 @@ impl AdapterPump {
             spawn_edge_recv_pump(
                 self.engine.clone(),
                 conn,
-                node,
                 Arc::clone(&self.edge_events),
                 stream_group,
             );
@@ -1623,4 +1621,26 @@ async fn read_message(
     let payload = recv.read_to_end(64 * 1024).await?;
 
     Ok((dest, tag, payload))
+}
+
+// ─── Data-plane edge transport port ────────────────────────────────────────
+
+/// The driver as a data-plane byte transport: open one writer per outbound
+/// edge and expose inbound edge-stream events. All edge semantics live in
+/// the data-plane crate's edge runtime; this impl is deliberately thin.
+impl data_plane::edge_wire::EdgeTransport for IrohDriver {
+    type Writer = EdgeSendHandle;
+    type PeerAddr = EndpointAddr;
+
+    fn open_writer(
+        &mut self,
+        edge_id: data_plane::ids::EdgeId,
+        peer: &EndpointAddr,
+    ) -> Result<Self::Writer, String> {
+        self.spawn_edge_send_pump(peer.clone(), edge_id.0)
+    }
+
+    fn drain_events(&mut self) -> Vec<data_plane::edge_wire::WireEvent> {
+        self.drain_edge_events()
+    }
 }

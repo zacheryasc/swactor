@@ -12,6 +12,7 @@ path = "src/lib.rs"
 swactor = { path = "../..", features = ["serde", "transport"] }
 swactor-engine = { path = "../engine" }
 swactor-transport = { path = "../transport" }
+data-plane = { path = "../data-plane" }
 distribution = { path = "../distribution" }
 telemetry = { path = "../telemetry" }
 crossbeam-channel = "0.5"

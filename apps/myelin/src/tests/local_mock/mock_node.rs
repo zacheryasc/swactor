@@ -1,6 +1,6 @@
 use crate::run_plan as plan;
 use crate::tests::harness::StageControllerHarness;
-use data_plane::edge_actor;
+use data_plane::object_record::ObjectIdAllocator;
 use myelin::staging as stage;
 
 use super::mock_transport::MockObject;
@@ -16,7 +16,7 @@ pub struct MockNode {
     stage_count: u32,
     inbound_edge: Option<plan::EdgeId>,
     outbound_edge: Option<plan::EdgeId>,
-    outbound_object_allocator: Option<edge_actor::ObjectIdAllocator>,
+    outbound_object_allocator: Option<ObjectIdAllocator>,
     controller: StageControllerHarness,
     worker: MockWorker,
     event_cursor: usize,
@@ -44,9 +44,7 @@ impl MockNode {
     pub fn provision(&mut self, from: stage::NodeId, provision: stage::ProvisionStage) {
         self.inbound_edge = Some(plan::EdgeId(provision.inbound.edge_id.0));
         self.outbound_edge = Some(plan::EdgeId(provision.outbound.edge_id.0));
-        self.outbound_object_allocator = Some(edge_actor::ObjectIdAllocator::new(
-            edge_actor::EdgeId(provision.outbound.edge_id.0),
-        ));
+        self.outbound_object_allocator = Some(ObjectIdAllocator::new());
         self.controller
             .observe(stage::StageEvent::ProvisionStage { from, provision });
     }
@@ -54,9 +52,7 @@ impl MockNode {
     pub fn provision_from_wrong_orchestrator(&mut self, provision: stage::ProvisionStage) {
         self.inbound_edge = Some(plan::EdgeId(provision.inbound.edge_id.0));
         self.outbound_edge = Some(plan::EdgeId(provision.outbound.edge_id.0));
-        self.outbound_object_allocator = Some(edge_actor::ObjectIdAllocator::new(
-            edge_actor::EdgeId(provision.outbound.edge_id.0),
-        ));
+        self.outbound_object_allocator = Some(ObjectIdAllocator::new());
         self.controller.observe(stage::StageEvent::ProvisionStage {
             from: stage::NodeId(provision.authorized_orchestrator.0 + 1),
             provision,
@@ -97,7 +93,7 @@ impl MockNode {
                 stage::StageCommand::ExecuteStep(step) => Some(step.clone()),
                 _ => None,
             })?;
-        let output_object_id = self.outbound_object_allocator.as_mut()?.alloc().object_id.0;
+        let output_object_id = self.outbound_object_allocator.as_mut()?.alloc().0;
         let produced = self.worker.execute(
             &step,
             outbound_edge,

@@ -268,3 +268,28 @@ pub fn read_object_record(
         total_len,
     }))
 }
+
+/// Monotonic per-producer source of object ids for one edge's outbound
+/// objects. Ids start at 1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObjectIdAllocator {
+    next: u64,
+}
+
+impl ObjectIdAllocator {
+    pub fn new() -> Self {
+        Self { next: 1 }
+    }
+
+    pub fn alloc(&mut self) -> ObjectId {
+        let object_id = ObjectId(self.next);
+        self.next = self.next.saturating_add(1);
+        object_id
+    }
+}
+
+impl Default for ObjectIdAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}

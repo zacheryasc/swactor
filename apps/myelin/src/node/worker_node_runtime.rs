@@ -37,15 +37,15 @@ use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::control as stage;
 use data_plane::arena;
 use data_plane::edge_lifecycle as edge;
-use data_plane::ingress;
+use data_plane::object_record as ingress;
 use distribution::node::DistributedNodeConfig;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
-use iroh_driver::driver_pumps as driver_model;
+use data_plane::edge_runtime;
 use iroh_driver::{
-    TELEMETRY_ALPN, TelemetryPublishHandle, TelemetryQuicHeader, EDGE_ALPN, EdgeSendHandle,
-    EdgeTransportEvent, IrohDriver, IrohDriverConfig,
+    EDGE_ALPN, TELEMETRY_ALPN, TelemetryPublishHandle, TelemetryQuicHeader, IrohDriver,
+    IrohDriverConfig,
 };
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
@@ -783,13 +783,6 @@ fn spawn_arena_sampler(
     });
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct ObjectKey {
-    edge_id: u64,
-    object_id: u64,
-}
-
-#[derive(Clone, Debug)]
 struct LoadedObject {
     object_id: u64,
     sequence: u64,
@@ -797,42 +790,293 @@ struct LoadedObject {
     handle_id: u64,
 }
 
+/// All edge logic — lifecycle, wire bookkeeping, ingress parsing, arena and
+/// worker orchestration — lives in the data-plane edge runtime. This wrapper
+/// only supplies myelin effects (tinygrad worker port, telemetry, node-agent
+/// reporting) around it.
 struct WorkerEdgeRuntime {
-    establisher: edge::EdgeEstablisher,
-    driver_model: driver_model::Driver,
-    edge_command_cursor: usize,
-    edge_event_cursor: usize,
-    driver_event_cursor: usize,
+    runtime: edge_runtime::EdgeRuntime<IrohDriver>,
     inbound_edge: Option<StageInboundEdgeWire>,
     outbound_edge: Option<StageOutboundEdgeWire>,
-    inbound_ring_id: Option<u64>,
-    outbound_ring_id: Option<u64>,
-    outbound_sender: Option<EdgeSendHandle>,
-    next_output_object_id: u64,
-    object_handles: BTreeMap<ObjectKey, LoadedObject>,
-    ingress_streams: BTreeMap<u64, Vec<u8>>,
+}
+
+/// Worker-ring effects the data-plane edge runtime drives over the tinygrad
+/// worker.
+struct TinygradRingPort<'a> {
+    worker: &'a mut TinygradWorker,
+    config: &'a DeploymentConfig,
+    telemetry: &'a mut NodeTelemetry,
+    inbound: Option<StageInboundEdgeWire>,
+    outbound: Option<StageOutboundEdgeWire>,
+}
+
+impl edge_runtime::WorkerPort for TinygradRingPort<'_> {
+    fn install_ring(
+        &mut self,
+        edge_id: edge::EdgeId,
+        ring_id: edge::RingId,
+        direction: edge::RingDirection,
+        layout: &arena::RingLayout,
+        object_spec: &edge::ObjectSpec,
+    ) -> Result<(), String> {
+        let (port, direction_name, wire_spec) = match direction {
+            edge::RingDirection::Ingress => (
+                "input",
+                "ingress",
+                self.inbound.as_ref().map(|edge| edge.object_spec),
+            ),
+            edge::RingDirection::Egress => (
+                "output",
+                "egress",
+                self.outbound.as_ref().map(|edge| edge.object_spec),
+            ),
+        };
+        let wire_spec = wire_spec.unwrap_or(StageObjectSpecWire {
+            max_extent: object_spec.max_extent_bytes,
+            alignment: 4,
+        });
+        self.worker.install_ring(
+            ring_id.0,
+            edge_id.0,
+            port,
+            direction_name,
+            layout.clone(),
+            wire_spec,
+            self.config,
+            self.telemetry,
+        )
+    }
+
+    fn uninstall_ring(&mut self, ring_id: edge::RingId) -> Result<(), String> {
+        self.worker
+            .uninstall_ring(ring_id.0, self.config, self.telemetry)
+    }
+
+    fn load_object(
+        &mut self,
+        edge_id: edge::EdgeId,
+        ring_id: edge::RingId,
+        _record: &ingress::ObjectRecord,
+        spec: &ingress::ObjectSpec,
+    ) -> Result<edge_runtime::LoadedObject, String> {
+        let wire_spec = StageObjectSpecWire {
+            max_extent: spec.max_extent,
+            alignment: spec.alignment.min(u64::from(u32::MAX)) as u32,
+        };
+        let loaded = self
+            .worker
+            .ring_readable(ring_id.0, edge_id.0, wire_spec, self.config, self.telemetry)?;
+        Ok(edge_runtime::LoadedObject {
+            object_id: loaded.object_id,
+            sequence: loaded.sequence,
+            handle_generation: loaded.handle_generation,
+            handle_id: loaded.handle_id,
+        })
+    }
 }
 
 impl WorkerEdgeRuntime {
     fn new(local_node_id: u64) -> Self {
         Self {
-            establisher: edge::EdgeEstablisher::new(edge::NodeId(local_node_id)),
-            driver_model: driver_model::Driver::new(),
-            edge_command_cursor: 0,
-            edge_event_cursor: 0,
-            driver_event_cursor: 0,
+            runtime: edge_runtime::EdgeRuntime::new(edge::NodeId(local_node_id)),
             inbound_edge: None,
             outbound_edge: None,
-            inbound_ring_id: None,
-            outbound_ring_id: None,
-            outbound_sender: None,
-            next_output_object_id: 1,
-            object_handles: BTreeMap::new(),
-            ingress_streams: BTreeMap::new(),
         }
     }
 
+    /// Run one data-plane edge-runtime tick, then map its observations to
+    /// telemetry and node-agent messages. The poll error (if any) propagates
+    /// after the observations are reported, mirroring the previous
+    /// composition's report-then-halt behavior.
     #[allow(clippy::too_many_arguments)]
+    fn poll_and_report(
+        &mut self,
+        driver: &mut IrohDriver,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        worker: &mut TinygradWorker,
+        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
+        config: &DeploymentConfig,
+        telemetry: &mut NodeTelemetry,
+    ) -> Result<(), String> {
+        let result = {
+            let mut arena = arena_manager.lock();
+            let mut port = TinygradRingPort {
+                worker,
+                config,
+                telemetry,
+                inbound: self.inbound_edge.clone(),
+                outbound: self.outbound_edge.clone(),
+            };
+            self.runtime.poll(driver, &mut arena, &mut port)
+        };
+        self.report(stack, node_actor, config, telemetry)?;
+        result
+    }
+
+    /// Map drained runtime observations to telemetry events and node-agent
+    /// messages.
+    fn report(
+        &mut self,
+        stack: &DistributionRuntimeStack,
+        node_actor: ActorAddress,
+        config: &DeploymentConfig,
+        telemetry: &mut NodeTelemetry,
+    ) -> Result<(), String> {
+        let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
+            emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
+        };
+        for observation in self.runtime.take_observations() {
+            match observation {
+                edge_runtime::Observation::StreamArrived { edge_id, stream_id } => {
+                    node_stage(
+                        telemetry,
+                        "iroh_edge_stream_arrived",
+                        "observed",
+                        json!({"edge_id":edge_id.0,"stream_id":stream_id.0}),
+                    );
+                }
+                edge_runtime::Observation::BytesRead {
+                    edge_id,
+                    stream_id,
+                    byte_count,
+                } => {
+                    node_stage(
+                        telemetry,
+                        "iroh_edge_bytes_read",
+                        "observed",
+                        json!({"edge_id":edge_id.0,"stream_id":stream_id.0,"bytes":byte_count}),
+                    );
+                }
+                edge_runtime::Observation::IngressRingWrite {
+                    edge_id,
+                    ring_id,
+                    stream_id,
+                    object_id,
+                    sequence,
+                    extent,
+                    begin_sequence,
+                    end_of_sequence,
+                    record_bytes,
+                    buffered_bytes,
+                    write_ms,
+                } => {
+                    let edge_kind = self
+                        .inbound_edge
+                        .as_ref()
+                        .map(|edge| format!("{:?}", edge.kind))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    node_stage(
+                        telemetry,
+                        "ingress_ring_write",
+                        "ready",
+                        json!({
+                            "edge_id":edge_id.0,
+                            "edge_kind":edge_kind,
+                            "ring_id":ring_id.0,
+                            "stream_id":stream_id.0,
+                            "object_id":object_id,
+                            "sequence":sequence,
+                            "extent":extent,
+                            "begin_sequence":begin_sequence,
+                            "end_of_sequence":end_of_sequence,
+                            "record_bytes":record_bytes,
+                            "ingress_buffer_bytes":buffered_bytes,
+                            "ingress_ring_write_ms":write_ms,
+                        }),
+                    );
+                }
+                edge_runtime::Observation::ObjectLoaded {
+                    edge_id,
+                    ring_id,
+                    stream_id,
+                    object,
+                    load_ms,
+                } => {
+                    let edge_kind = self
+                        .inbound_edge
+                        .as_ref()
+                        .map(|edge| format!("{:?}", edge.kind))
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    node_stage(
+                        telemetry,
+                        "object_loaded",
+                        "ready",
+                        json!({
+                            "edge_id":edge_id.0,
+                            "edge_kind":edge_kind,
+                            "ring_id":ring_id.0,
+                            "stream_id":stream_id.0,
+                            "object_id":object.object_id,
+                            "sequence":object.sequence,
+                            "handle_generation":object.handle_generation,
+                            "handle_id":object.handle_id,
+                            "object_load_ms":load_ms,
+                        }),
+                    );
+                    stack
+                        .runtime
+                        .send_to(
+                            node_actor,
+                            NodeAgentMsg::ObjectLoaded {
+                                edge_id: edge_id.0,
+                                object_id: object.object_id,
+                                sequence: object.sequence,
+                                handle_generation: object.handle_generation,
+                                handle_id: object.handle_id,
+                            },
+                        )
+                        .map_err(|e| format!("report object loaded: {e}"))?;
+                }
+                edge_runtime::Observation::ObjectFailed { edge_id, object_id } => {
+                    let _ = stack.runtime.send_to(
+                        node_actor,
+                        NodeAgentMsg::ObjectFailed {
+                            edge_id: edge_id.0,
+                            object_id,
+                        },
+                    );
+                }
+                edge_runtime::Observation::EdgeReady { edge_id, .. } => {
+                    if self
+                        .inbound_edge
+                        .as_ref()
+                        .is_some_and(|edge| edge.edge_id == edge_id.0)
+                    {
+                        stack
+                            .runtime
+                            .send_to(
+                                node_actor,
+                                NodeAgentMsg::MarkInboundEdgeReady { edge_id: edge_id.0 },
+                            )
+                            .map_err(|e| format!("mark inbound ready: {e}"))?;
+                    }
+                    if self
+                        .outbound_edge
+                        .as_ref()
+                        .is_some_and(|edge| edge.edge_id == edge_id.0)
+                    {
+                        stack
+                            .runtime
+                            .send_to(
+                                node_actor,
+                                NodeAgentMsg::MarkOutboundEdgeReady { edge_id: edge_id.0 },
+                            )
+                            .map_err(|e| format!("mark outbound ready: {e}"))?;
+                    }
+                }
+                edge_runtime::Observation::EdgeFaulted { edge_id, .. } => {
+                    stack
+                        .runtime
+                        .send_to(node_actor, NodeAgentMsg::EdgeFault { edge_id: edge_id.0 })
+                        .map_err(|e| format!("report edge fault: {e}"))?;
+                }
+                edge_runtime::Observation::EdgeStopped { .. } => {}
+            }
+        }
+        Ok(())
+    }
+
     fn poll_iroh(
         &mut self,
         driver: &mut IrohDriver,
@@ -843,86 +1087,12 @@ impl WorkerEdgeRuntime {
         config: &DeploymentConfig,
         telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
-        let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
-            emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
-        };
-        for event in driver.drain_edge_events() {
-            match event {
-                EdgeTransportEvent::StreamArrived {
-                    edge_id, stream_id, ..
-                } => {
-                    self.driver_model.incoming_uni_stream(
-                        driver_model::EdgeId(edge_id),
-                        driver_model::StreamId(stream_id),
-                    );
-                    node_stage(
-                        telemetry,
-                        "iroh_edge_stream_arrived",
-                        "observed",
-                        json!({"edge_id":edge_id,"stream_id":stream_id}),
-                    );
-                    self.drive_edge_workflow(
-                        stack,
-                        node_actor,
-                        worker,
-                        arena_manager,
-                        config,
-                        telemetry,
-                        driver,
-                    )?;
-                }
-                EdgeTransportEvent::BytesRead {
-                    edge_id,
-                    stream_id,
-                    bytes,
-                    ..
-                } => {
-                    let byte_count = bytes.len();
-                    node_stage(
-                        telemetry,
-                        "iroh_edge_bytes_read",
-                        "observed",
-                        json!({"edge_id":edge_id,"stream_id":stream_id,"bytes":byte_count}),
-                    );
-                    self.ingest_stream_bytes(
-                        edge_id,
-                        stream_id,
-                        bytes,
-                        stack,
-                        node_actor,
-                        worker,
-                        arena_manager,
-                        config,
-                        telemetry,
-                        driver,
-                    )?;
-                }
-                EdgeTransportEvent::StreamFault {
-                    edge_id: Some(edge_id),
-                    ..
-                } => {
-                    self.driver_model.read_error(driver_model::EdgeId(edge_id));
-                    self.drive_edge_workflow(
-                        stack,
-                        node_actor,
-                        worker,
-                        arena_manager,
-                        config,
-                        telemetry,
-                        driver,
-                    )?;
-                }
-                EdgeTransportEvent::StreamEnded { .. }
-                | EdgeTransportEvent::StreamFault { edge_id: None, .. } => {}
-            }
-        }
-        Ok(())
+        self.poll_and_report(driver, stack, node_actor, worker, arena_manager, config, telemetry)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn establish_inbound(
         &mut self,
-        edge: StageInboundEdgeWire,
+        edge_wire: StageInboundEdgeWire,
         stack: &DistributionRuntimeStack,
         node_actor: ActorAddress,
         worker: &mut TinygradWorker,
@@ -931,38 +1101,36 @@ impl WorkerEdgeRuntime {
         telemetry: &mut NodeTelemetry,
         driver: &mut IrohDriver,
     ) -> Result<(), String> {
-        self.inbound_edge = Some(edge.clone());
-        self.establisher
-            .observe(edge::EdgeEvent::ProvisionRx(edge::ProvisionRx {
+        let parse_spec = ingress::ObjectSpec {
+            max_extent: edge_wire.object_spec.max_extent,
+            alignment: u64::from(edge_wire.object_spec.alignment),
+            layout: ingress::ObjectLayout::Token,
+        };
+        self.runtime.establish_inbound(
+            edge::ProvisionRx {
                 run_id: edge::RunId(config.run_id),
-                edge_id: edge::EdgeId(edge.edge_id),
+                edge_id: edge::EdgeId(edge_wire.edge_id),
                 local_node_id: edge::NodeId(config.logical_node_id),
                 object_spec: edge::ObjectSpec {
                     kind: edge::ObjectKind::Activation,
                     dtype: edge::DType::F16,
-                    max_extent_bytes: edge.object_spec.max_extent,
+                    max_extent_bytes: edge_wire.object_spec.max_extent,
                 },
                 ring_spec: edge::RingSpec {
                     header_bytes: 0,
-                    data_bytes: edge.ring_spec.data_capacity,
-                    alignment: u64::from(edge.ring_spec.alignment),
+                    data_bytes: edge_wire.ring_spec.data_capacity,
+                    alignment: u64::from(edge_wire.ring_spec.alignment),
                 },
-            }));
-        self.drive_edge_workflow(
-            stack,
-            node_actor,
-            worker,
-            arena_manager,
-            config,
-            telemetry,
-            driver,
-        )
+            },
+            parse_spec,
+        );
+        self.inbound_edge = Some(edge_wire);
+        self.poll_and_report(driver, stack, node_actor, worker, arena_manager, config, telemetry)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn establish_outbound(
         &mut self,
-        edge: StageOutboundEdgeWire,
+        edge_wire: StageOutboundEdgeWire,
         stack: &DistributionRuntimeStack,
         node_actor: ActorAddress,
         worker: &mut TinygradWorker,
@@ -971,49 +1139,46 @@ impl WorkerEdgeRuntime {
         telemetry: &mut NodeTelemetry,
         driver: &mut IrohDriver,
     ) -> Result<(), String> {
-        if edge.consumer_endpoint.is_none() {
+        if edge_wire.consumer_endpoint.is_none() {
             stack
                 .runtime
                 .send_to(
                     node_actor,
                     NodeAgentMsg::MarkOutboundEdgeReady {
-                        edge_id: edge.edge_id,
+                        edge_id: edge_wire.edge_id,
                     },
                 )
                 .map_err(|e| format!("mark outbound edge ready: {e}"))?;
-            self.outbound_edge = Some(edge);
+            self.outbound_edge = Some(edge_wire);
             return Ok(());
         }
-        self.outbound_edge = Some(edge.clone());
-        self.establisher
-            .observe(edge::EdgeEvent::ProvisionTx(edge::ProvisionTx {
+        let peer = edge_wire
+            .consumer_endpoint
+            .clone()
+            .expect("consumer endpoint presence checked above");
+        self.runtime.establish_outbound(
+            edge::ProvisionTx {
                 run_id: edge::RunId(config.run_id),
-                edge_id: edge::EdgeId(edge.edge_id),
+                edge_id: edge::EdgeId(edge_wire.edge_id),
                 local_node_id: edge::NodeId(config.logical_node_id),
-                consumer_node_id: edge::NodeId(edge.consumer_node_id),
+                consumer_node_id: edge::NodeId(edge_wire.consumer_node_id),
                 object_spec: edge::ObjectSpec {
                     kind: edge::ObjectKind::Activation,
                     dtype: edge::DType::F16,
-                    max_extent_bytes: edge.object_spec.max_extent,
+                    max_extent_bytes: edge_wire.object_spec.max_extent,
                 },
                 ring_spec: edge::RingSpec {
                     header_bytes: 0,
-                    data_bytes: edge.ring_spec.data_capacity,
-                    alignment: u64::from(edge.ring_spec.alignment),
+                    data_bytes: edge_wire.ring_spec.data_capacity,
+                    alignment: u64::from(edge_wire.ring_spec.alignment),
                 },
-            }));
-        self.drive_edge_workflow(
-            stack,
-            node_actor,
-            worker,
-            arena_manager,
-            config,
-            telemetry,
-            driver,
-        )
+            },
+            peer,
+        );
+        self.outbound_edge = Some(edge_wire);
+        self.poll_and_report(driver, stack, node_actor, worker, arena_manager, config, telemetry)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn execute_step(
         &mut self,
         step_id: u64,
@@ -1031,18 +1196,16 @@ impl WorkerEdgeRuntime {
         let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
             emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
         };
-        let input_key = ObjectKey {
-            edge_id: input_edge_id,
-            object_id,
-        };
         let loaded = self
-            .object_handles
-            .get(&input_key)
+            .runtime
+            .loaded_object(edge::EdgeId(input_edge_id), object_id)
             .cloned()
-            .ok_or_else(|| format!("object {input_key:?} has no loaded device handle"))?;
+            .ok_or_else(|| {
+                format!("object (edge {input_edge_id}, id {object_id}) has no loaded device handle")
+            })?;
         if loaded.sequence != sequence {
             return Err(format!(
-                "object {input_key:?} sequence {} does not match command sequence {sequence}",
+                "object (edge {input_edge_id}, id {object_id}) sequence {} does not match command sequence {sequence}",
                 loaded.sequence
             ));
         }
@@ -1051,10 +1214,11 @@ impl WorkerEdgeRuntime {
             .clone()
             .ok_or_else(|| "outbound edge missing".to_owned())?;
         let output_ring_id = self
-            .outbound_ring_id
-            .ok_or_else(|| "outbound ring missing".to_owned())?;
-        let output_object_id = self.next_output_object_id;
-        self.next_output_object_id = self.next_output_object_id.saturating_add(1);
+            .runtime
+            .outbound_ring_id()
+            .ok_or_else(|| "outbound ring missing".to_owned())?
+            .0;
+        let output_object_id = self.runtime.alloc_output_object_id()?;
         let final_stage = matches!(
             outbound.kind,
             crate::node_actor::StageEdgeKindWire::TokenOut
@@ -1126,11 +1290,11 @@ impl WorkerEdgeRuntime {
                 "egress_ring_read_ms":egress_read_ms,
             }),
         );
-        let sender = self
-            .outbound_sender
-            .as_ref()
-            .ok_or_else(|| "outbound edge sender missing".to_owned())?;
         let edge_send_started = Instant::now();
+        let sender = self
+            .runtime
+            .outbound_writer()
+            .ok_or_else(|| "outbound edge sender missing".to_owned())?;
         if let Err(e) = sender.send(record) {
             let _ = stack.runtime.send_to(
                 node_actor,
@@ -1173,481 +1337,6 @@ impl WorkerEdgeRuntime {
     ) -> Result<(), String> {
         worker.release_device_object(handle_id, config, telemetry)
     }
-
-    #[allow(clippy::too_many_arguments)]
-    fn ingest_stream_bytes(
-        &mut self,
-        edge_id: u64,
-        stream_id: u64,
-        bytes: Vec<u8>,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-        driver: &mut IrohDriver,
-    ) -> Result<(), String> {
-        let node_stage = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
-            emit_node_event(ds, config, NODE_STAGE_CHANNEL, phase, status, detail)
-        };
-        let Some(inbound) = self.inbound_edge.clone() else {
-            return Ok(());
-        };
-        if inbound.edge_id != edge_id {
-            return Ok(());
-        }
-        let (records, buffered_bytes) = {
-            let buffer = self.ingress_streams.entry(stream_id).or_default();
-            buffer.extend_from_slice(&bytes);
-            let buffered_bytes = buffer.len();
-            let mut records = Vec::new();
-            loop {
-                match take_complete_ingress_record(buffer, inbound.object_spec) {
-                    Ok(Some(record)) => records.push(record),
-                    Ok(None) => break,
-                    Err(e) => {
-                        let _ = stack.runtime.send_to(
-                            node_actor,
-                            NodeAgentMsg::ObjectFailed {
-                                edge_id,
-                                object_id: None,
-                            },
-                        );
-                        return Err(e);
-                    }
-                }
-            }
-            (records, buffered_bytes)
-        };
-        for record in records {
-            let ring_id = self
-                .inbound_ring_id
-                .ok_or_else(|| "inbound ring missing".to_owned())?;
-            let ring_write_started = Instant::now();
-            {
-                let arena = arena_manager.lock();
-                let lease = arena
-                    .lookup_lease(arena::RingId(ring_id))
-                    .ok_or_else(|| format!("inbound ring {ring_id} lease missing"))?;
-                arena
-                    .write_arena(lease.layout.data_offset, &record.bytes)
-                    .map_err(|e| format!("write ingress ring: {e}"))?;
-            }
-            let ingress_ring_write_ms = duration_ms_u64(ring_write_started.elapsed());
-            node_stage(
-                telemetry,
-                "ingress_ring_write",
-                "ready",
-                json!({
-                    "edge_id":edge_id,
-                    "edge_kind":format!("{:?}", inbound.kind),
-                    "ring_id":ring_id,
-                    "stream_id":stream_id,
-                    "object_id":record.object_id,
-                    "sequence":record.sequence,
-                    "extent":record.extent,
-                    "begin_sequence":record.begin_sequence,
-                    "end_of_sequence":record.end_of_sequence,
-                    "record_bytes":record.bytes.len(),
-                    "ingress_buffer_bytes":buffered_bytes,
-                    "ingress_ring_write_ms":ingress_ring_write_ms,
-                }),
-            );
-            let object_load_started = Instant::now();
-            let loaded = match worker.ring_readable(
-                ring_id,
-                edge_id,
-                inbound.object_spec,
-                config,
-                telemetry,
-            ) {
-                Ok(loaded) => loaded,
-                Err(e) => {
-                    let _ = stack.runtime.send_to(
-                        node_actor,
-                        NodeAgentMsg::ObjectFailed {
-                            edge_id,
-                            object_id: Some(record.object_id),
-                        },
-                    );
-                    return Err(e);
-                }
-            };
-            let object_load_ms = duration_ms_u64(object_load_started.elapsed());
-            let key = ObjectKey {
-                edge_id,
-                object_id: loaded.object_id,
-            };
-            self.object_handles.insert(key, loaded.clone());
-            node_stage(
-                telemetry,
-                "object_loaded",
-                "ready",
-                json!({
-                    "edge_id":edge_id,
-                    "edge_kind":format!("{:?}", inbound.kind),
-                    "ring_id":ring_id,
-                    "stream_id":stream_id,
-                    "object_id":loaded.object_id,
-                    "sequence":loaded.sequence,
-                    "handle_generation":loaded.handle_generation,
-                    "handle_id":loaded.handle_id,
-                    "object_load_ms":object_load_ms,
-                }),
-            );
-            stack
-                .runtime
-                .send_to(
-                    node_actor,
-                    NodeAgentMsg::ObjectLoaded {
-                        edge_id,
-                        object_id: loaded.object_id,
-                        sequence: loaded.sequence,
-                        handle_generation: loaded.handle_generation,
-                        handle_id: loaded.handle_id,
-                    },
-                )
-                .map_err(|e| format!("report object loaded: {e}"))?;
-        }
-        self.drive_edge_workflow(
-            stack,
-            node_actor,
-            worker,
-            arena_manager,
-            config,
-            telemetry,
-            driver,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn drive_edge_workflow(
-        &mut self,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-        driver: &mut IrohDriver,
-    ) -> Result<(), String> {
-        loop {
-            let progressed =
-                self.drain_edge_commands(worker, arena_manager, config, telemetry, driver)?
-                    || self.drain_driver_events()
-                    || self.drain_edge_events(stack, node_actor)?;
-            if !progressed {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn drain_edge_commands(
-        &mut self,
-        worker: &mut TinygradWorker,
-        arena_manager: &Arc<Mutex<arena::ArenaManager>>,
-        config: &DeploymentConfig,
-        telemetry: &mut NodeTelemetry,
-        driver: &mut IrohDriver,
-    ) -> Result<bool, String> {
-        let mut progressed = false;
-        while self.edge_command_cursor < self.establisher.commands().len() {
-            let command = self.establisher.commands()[self.edge_command_cursor].clone();
-            self.edge_command_cursor += 1;
-            progressed = true;
-            match command {
-                edge::EdgeCommand::LeaseRing {
-                    request_id,
-                    ring_spec,
-                    ..
-                } => {
-                    let events = arena_manager.lock().request(arena::ArenaRequest::LeaseRing(
-                        arena::LeaseRing {
-                            request_id: arena::LeaseRequestId(request_id.0),
-                            ring_spec: arena::RingSpec {
-                                header_bytes: ring_spec.header_bytes,
-                                data_bytes: ring_spec.data_bytes,
-                                alignment: ring_spec.alignment,
-                            },
-                        },
-                    ));
-                    for event in events {
-                        match event {
-                            arena::ArenaEvent::RingLeased { lease } => {
-                                self.establisher.observe(edge::EdgeEvent::RingLeased {
-                                    request_id: edge::LeaseRequestId(lease.request_id.0),
-                                    ring_id: edge::RingId(lease.ring_id.0),
-                                    layout: edge::RingLayout {
-                                        start_offset: lease.layout.start_offset,
-                                        header_offset: lease.layout.header_offset,
-                                        data_offset: lease.layout.data_offset,
-                                        end_offset: lease.layout.end_offset,
-                                        data_bytes: lease.layout.data_bytes,
-                                        alignment: lease.layout.alignment,
-                                    },
-                                });
-                            }
-                            arena::ArenaEvent::RingLeaseRejected { request_id, reason } => {
-                                let reason = match reason {
-                                    arena::RingLeaseRejection::CannotFitWithinCeiling => {
-                                        edge::RingLeaseRejection::CannotFit
-                                    }
-                                    arena::RingLeaseRejection::ArenaShuttingDown => {
-                                        edge::RingLeaseRejection::ArenaShuttingDown
-                                    }
-                                };
-                                self.establisher
-                                    .observe(edge::EdgeEvent::RingLeaseRejected {
-                                        request_id: edge::LeaseRequestId(request_id.0),
-                                        reason,
-                                    });
-                            }
-                            arena::ArenaEvent::RingLeaseQueued { .. }
-                            | arena::ArenaEvent::RingReleased { .. }
-                            | arena::ArenaEvent::RingReleaseRejected { .. }
-                            | arena::ArenaEvent::CancelledFreshLeaseReleased { .. } => {}
-                        }
-                    }
-                }
-                edge::EdgeCommand::InstallWorkerRing {
-                    edge_id,
-                    ring_id,
-                    direction,
-                    object_spec,
-                    ..
-                } => {
-                    let lease = arena_manager
-                        .lock()
-                        .lookup_lease(arena::RingId(ring_id.0))
-                        .ok_or_else(|| format!("ring {} lease missing", ring_id.0))?
-                        .clone();
-                    let (port, direction_name, wire_spec) = match direction {
-                        edge::RingDirection::Ingress => {
-                            self.inbound_ring_id = Some(ring_id.0);
-                            let spec = self
-                                .inbound_edge
-                                .as_ref()
-                                .map(|edge| edge.object_spec)
-                                .unwrap_or(StageObjectSpecWire {
-                                    max_extent: object_spec.max_extent_bytes,
-                                    alignment: 4,
-                                });
-                            ("input", "ingress", spec)
-                        }
-                        edge::RingDirection::Egress => {
-                            self.outbound_ring_id = Some(ring_id.0);
-                            let spec = self
-                                .outbound_edge
-                                .as_ref()
-                                .map(|edge| edge.object_spec)
-                                .unwrap_or(StageObjectSpecWire {
-                                    max_extent: object_spec.max_extent_bytes,
-                                    alignment: 4,
-                                });
-                            ("output", "egress", spec)
-                        }
-                    };
-                    worker.install_ring(
-                        ring_id.0,
-                        edge_id.0,
-                        port,
-                        direction_name,
-                        lease.layout,
-                        wire_spec,
-                        config,
-                        telemetry,
-                    )?;
-                    self.establisher
-                        .observe(edge::EdgeEvent::RingInstalled { edge_id, ring_id });
-                }
-                edge::EdgeCommand::EstablishSend { edge_id, .. } => {
-                    let outbound = self
-                        .outbound_edge
-                        .as_ref()
-                        .ok_or_else(|| "outbound edge missing".to_owned())?;
-                    let peer = outbound
-                        .consumer_endpoint
-                        .clone()
-                        .ok_or_else(|| "outbound consumer endpoint missing".to_owned())?;
-                    let record = self
-                        .establisher
-                        .local_record(edge_id)
-                        .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
-                    let ring_id = record
-                        .ring_id
-                        .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
-                    self.driver_model.establish_send(
-                        driver_model::EdgeId(edge_id.0),
-                        driver_model::RingId(ring_id.0),
-                    );
-                    self.outbound_sender = Some(driver.spawn_edge_send_pump(peer, edge_id.0)?);
-                }
-                edge::EdgeCommand::EstablishRecv { edge_id, .. } => {
-                    let record = self
-                        .establisher
-                        .local_record(edge_id)
-                        .ok_or_else(|| format!("edge {} record missing", edge_id.0))?;
-                    let ring_id = record
-                        .ring_id
-                        .ok_or_else(|| format!("edge {} ring missing", edge_id.0))?;
-                    self.driver_model.establish_recv(
-                        driver_model::EdgeId(edge_id.0),
-                        driver_model::RingId(ring_id.0),
-                    );
-                }
-                edge::EdgeCommand::CancelQueuedLease { request_id, .. } => {
-                    let _ = arena_manager
-                        .lock()
-                        .request(arena::ArenaRequest::CancelLease {
-                            request_id: arena::LeaseRequestId(request_id.0),
-                        });
-                }
-                edge::EdgeCommand::StopPump { edge_id, .. } => {
-                    self.driver_model.stop_edge(driver_model::EdgeId(edge_id.0));
-                }
-                edge::EdgeCommand::UninstallWorkerRing { ring_id, .. } => {
-                    worker.uninstall_ring(ring_id.0, config, telemetry)?;
-                    self.establisher
-                        .observe(edge::EdgeEvent::RingQuiesced { ring_id });
-                }
-                edge::EdgeCommand::ReleaseArenaLease { ring_id, proof } => {
-                    let proof = if proof == edge::QuiescenceProof::verified() {
-                        arena::QuiescenceProof::verified()
-                    } else {
-                        arena::QuiescenceProof::missing()
-                    };
-                    let _ = arena_manager
-                        .lock()
-                        .request(arena::ArenaRequest::ReleaseRing {
-                            ring_id: arena::RingId(ring_id.0),
-                            proof,
-                        });
-                }
-            }
-        }
-        Ok(progressed)
-    }
-
-    fn drain_driver_events(&mut self) -> bool {
-        let mut progressed = false;
-        while self.driver_event_cursor < self.driver_model.events().len() {
-            let event = self.driver_model.events()[self.driver_event_cursor].clone();
-            self.driver_event_cursor += 1;
-            progressed = true;
-            match event {
-                driver_model::DriverEventOut::DriverEdgeReady { edge_id } => {
-                    self.establisher.observe(edge::EdgeEvent::DriverEdgeReady {
-                        edge_id: edge::EdgeId(edge_id.0),
-                    });
-                }
-                driver_model::DriverEventOut::StreamFault { edge_id } => {
-                    self.establisher.observe(edge::EdgeEvent::StreamFault {
-                        edge_id: edge::EdgeId(edge_id.0),
-                        reason: edge::StreamFaultReason::ReadError,
-                    });
-                }
-                driver_model::DriverEventOut::PumpStopped { edge_id, ring_id } => {
-                    self.establisher.observe(edge::EdgeEvent::PumpStopped {
-                        edge_id: edge::EdgeId(edge_id.0),
-                        ring_id: edge::RingId(ring_id.0),
-                    });
-                }
-            }
-        }
-        progressed
-    }
-
-    fn drain_edge_events(
-        &mut self,
-        stack: &DistributionRuntimeStack,
-        node_actor: ActorAddress,
-    ) -> Result<bool, String> {
-        let mut progressed = false;
-        while self.edge_event_cursor < self.establisher.events().len() {
-            let event = self.establisher.events()[self.edge_event_cursor].clone();
-            self.edge_event_cursor += 1;
-            progressed = true;
-            match event {
-                edge::EdgeLifecycleEvent::EdgeReady { edge_id, .. } => {
-                    if self
-                        .inbound_edge
-                        .as_ref()
-                        .is_some_and(|edge| edge.edge_id == edge_id.0)
-                    {
-                        stack
-                            .runtime
-                            .send_to(
-                                node_actor,
-                                NodeAgentMsg::MarkInboundEdgeReady { edge_id: edge_id.0 },
-                            )
-                            .map_err(|e| format!("mark inbound ready: {e}"))?;
-                    }
-                    if self
-                        .outbound_edge
-                        .as_ref()
-                        .is_some_and(|edge| edge.edge_id == edge_id.0)
-                    {
-                        stack
-                            .runtime
-                            .send_to(
-                                node_actor,
-                                NodeAgentMsg::MarkOutboundEdgeReady { edge_id: edge_id.0 },
-                            )
-                            .map_err(|e| format!("mark outbound ready: {e}"))?;
-                    }
-                }
-                edge::EdgeLifecycleEvent::EdgeFaulted { edge_id, reason } => {
-                    stack
-                        .runtime
-                        .send_to(node_actor, NodeAgentMsg::EdgeFault { edge_id: edge_id.0 })
-                        .map_err(|e| format!("report edge fault: {e}"))?;
-                    return Err(format!("edge {} faulted: {reason:?}", edge_id.0));
-                }
-                edge::EdgeLifecycleEvent::EdgeStopped { .. } => {}
-            }
-        }
-        Ok(progressed)
-    }
-}
-
-struct IngressRecordBytes {
-    bytes: Vec<u8>,
-    object_id: u64,
-    sequence: u64,
-    extent: u64,
-    begin_sequence: bool,
-    end_of_sequence: bool,
-}
-
-fn take_complete_ingress_record(
-    buffer: &mut Vec<u8>,
-    spec: StageObjectSpecWire,
-) -> Result<Option<IngressRecordBytes>, String> {
-    let record = match ingress::read_object_record(
-        buffer,
-        ingress::ObjectSpec {
-            max_extent: spec.max_extent,
-            alignment: u64::from(spec.alignment),
-            layout: ingress::ObjectLayout::Token,
-        },
-        false,
-    )
-    .map_err(|reason| format!("invalid object record: {reason:?}"))?
-    {
-        ingress::ObjectRecordRead::Incomplete => return Ok(None),
-        ingress::ObjectRecordRead::Complete(record) => record,
-    };
-    let bytes = buffer.drain(..record.total_len).collect();
-    Ok(Some(IngressRecordBytes {
-        bytes,
-        object_id: record.object_id.0,
-        sequence: record.sequence,
-        extent: record.extent,
-        begin_sequence: record.flags.begin_sequence,
-        end_of_sequence: record.flags.end_of_sequence,
-    }))
 }
 
 fn value_u64(value: &Value, field: &str) -> Result<u64, String> {

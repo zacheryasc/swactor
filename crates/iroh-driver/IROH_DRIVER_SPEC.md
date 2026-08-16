@@ -524,12 +524,20 @@ relay URLs
 
 ## 5. Code Architecture
 
-The crate has two public modules:
+The crate has four public modules:
 
 ```text
 iroh_driver
 telemetry_transport
+edge_transport
+endpoint_advertisement
 ```
+
+Edge semantics (lifecycle, ring bookkeeping, object-record parsing) live in
+the `data-plane` crate's edge runtime. This crate's edge surface is the thin
+`data_plane::edge_wire::EdgeTransport` port implementation in
+`edge_transport`: open one writer per outbound edge, and surface inbound
+edge-stream events. `IrohDriver` implements the port directly.
 
 ### 5.1 Driver Core
 

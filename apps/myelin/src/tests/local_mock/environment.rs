@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::run_fsm as fsm;
 use crate::run_plan as plan;
 use crate::tests::harness::OrchestratorHarness;
-use data_plane::edge_actor;
+use data_plane::object_record::ObjectIdAllocator;
 use myelin::observability::lifecycle as obs;
 use myelin::orchestration::engine_builder as engine;
 use myelin::staging as stage;
@@ -42,7 +42,7 @@ pub struct LocalMockCluster {
     transport: MockTransport,
     resources: ResourceTracker,
     observed_edges: BTreeSet<plan::EdgeId>,
-    object_allocators: BTreeMap<plan::EdgeId, edge_actor::ObjectIdAllocator>,
+    object_allocators: BTreeMap<plan::EdgeId, ObjectIdAllocator>,
     scenario: LocalMockScenario,
 }
 
@@ -811,9 +811,8 @@ impl LocalMockCluster {
     fn allocate_object_id(&mut self, edge_id: plan::EdgeId) -> u64 {
         self.object_allocators
             .entry(edge_id)
-            .or_insert_with(|| edge_actor::ObjectIdAllocator::new(edge_actor::EdgeId(edge_id.0)))
+            .or_insert_with(ObjectIdAllocator::new)
             .alloc()
-            .object_id
             .0
     }
 
