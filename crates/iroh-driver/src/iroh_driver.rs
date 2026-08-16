@@ -31,13 +31,13 @@ use distribution::swim::actor::SwimIn;
 use distribution::transport_bridge::{OutFrame, Outbox, RelayMirror, RouteView, peer_addr};
 use distribution::types::NodeId;
 
-use crate::telemetry_transport::{
-    TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, read_events_from_stream,
-    spawn_subscription_writer,
-};
 use crate::edge_transport::{
     EDGE_ALPN, EdgeSendHandle, EdgeTransportEvent, spawn_edge_recv_pump,
     spawn_edge_send_pump as spawn_edge_sender_task,
+};
+use crate::telemetry_transport::{
+    TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, read_events_from_stream,
+    spawn_subscription_writer,
 };
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
@@ -402,15 +402,15 @@ impl IrohDriver {
 
             // Only relax relay-cert verification for a custom relay; Default /
             // Staging relays keep full WebPKI verification.
-        if custom_relay {
-            builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
-            // Relay-only: drop direct IP transports so the endpoint neither
-            // advertises nor chases direct addresses. Without this, iroh learns
-            // a peer's NAT-obscured/container-local direct addr via discovery
-            // and prefers it over the relay, black-holing all data. Applied to
-            // every endpoint so neither side has a direct addr to publish.
-            builder = builder.clear_ip_transports();
-        }
+            if custom_relay {
+                builder = builder.ca_roots_config(iroh::tls::CaRootsConfig::insecure_skip_verify());
+                // Relay-only: drop direct IP transports so the endpoint neither
+                // advertises nor chases direct addresses. Without this, iroh learns
+                // a peer's NAT-obscured/container-local direct addr via discovery
+                // and prefers it over the relay, black-holing all data. Applied to
+                // every endpoint so neither side has a direct addr to publish.
+                builder = builder.clear_ip_transports();
+            }
 
             if let Some(key) = secret_key {
                 builder = builder.secret_key(key);
@@ -444,8 +444,7 @@ impl IrohDriver {
             Arc::new(Mutex::new(Vec::new()));
         let other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>> =
             Arc::new(Mutex::new(Vec::new()));
-        let telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>> = Arc::new(Mutex::new(Vec::new()));
         let edge_events: Arc<Mutex<Vec<EdgeTransportEvent>>> = Arc::new(Mutex::new(Vec::new()));
         {
             let ep = endpoint.clone();
@@ -508,7 +507,6 @@ impl IrohDriver {
             actor_bridge: None,
         })
     }
-
 
     /// Clone the iroh endpoint for creating outbound connections.
     pub fn endpoint(&self) -> Endpoint {
@@ -851,11 +849,12 @@ impl IrohDriver {
                     );
                 }
 
-                let connect_result = engine.timeout(
-                    per_attempt_timeout,
-                    endpoint.connect(seed_addr.clone(), ALPN),
-                )
-                .await;
+                let connect_result = engine
+                    .timeout(
+                        per_attempt_timeout,
+                        endpoint.connect(seed_addr.clone(), ALPN),
+                    )
+                    .await;
 
                 match connect_result {
                     Ok(Ok(conn)) => {
@@ -949,7 +948,117 @@ impl IrohDriver {
             }
         });
     }
-
+    /// Fire-and-forget a single tagged gossip frame to the peer behind
+    /// `addr`.
+    ///
+    /// The frame format matches the actor-bridge ingress (`write_message`)
+    /// with the destination set to the peer's peer-mailbox, so a receiving
+    /// bridge routes it by `type_tag` through its `routes` table. This is
+    /// lightweight egress for clients that never install the actor bridge —
+    /// e.g. a bootstrap node announcing its identity to a supervisor. The
+    /// send reuses an open cached connection (folding completed
+    /// [`Self::join`] dials first), connects fresh otherwise, and retries
+    /// with backoff; callers that need delivery guarantees re-send at their
+    /// own cadence.
+    pub fn send_tagged_gossip(&self, addr: EndpointAddr, tag: &[u8], payload: Vec<u8>) {
+        let tag = tag.to_vec();
+        let peer = NodeId(*addr.id.as_bytes());
+        let endpoint = self.endpoint.clone();
+        let engine = self.engine.clone();
+        let conns = Arc::clone(&self.conns);
+        let pending_joins = Arc::clone(&self.pending_joins);
+        self.engine.spawn(async move {
+            let dest = peer_addr(peer);
+            let tag_len = (tag.len() as u32).to_be_bytes();
+            let mut delay = Duration::from_millis(250);
+            let max_delay = Duration::from_secs(2);
+            for _ in 0..4 {
+                // Reuse an open cached connection, or fold a completed (but
+                // uncached) join dial into the cache and take it. Sync-only,
+                // so no guard crosses an await.
+                let reused = {
+                    let mut cache = conns.lock();
+                    if let Some(cached) = cache.connections.get(&peer) {
+                        if cached.conn.close_reason().is_none() {
+                            Some(cached.conn.clone())
+                        } else {
+                            cache.connections.remove(&peer);
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                .or_else(|| {
+                    let mut pending = pending_joins.lock();
+                    let index = pending.iter().position(|result| result.node_id == peer)?;
+                    let result = pending.remove(index);
+                    let mut cache = conns.lock();
+                    let generation = cache.next_generation;
+                    cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
+                    cache.connections.insert(
+                        peer,
+                        CachedConnection {
+                            generation,
+                            conn: result.conn.clone(),
+                        },
+                    );
+                    Some(result.conn)
+                });
+                let conn = match reused {
+                    Some(conn) => conn,
+                    None => {
+                        // No connection yet: dial one (no locks held). The
+                        // fresh connection is cached so later sends reuse it.
+                        let connect = engine
+                            .timeout(
+                                Duration::from_secs(10),
+                                endpoint.connect(addr.clone(), ALPN),
+                            )
+                            .await;
+                        match connect {
+                            Ok(Ok(conn)) => {
+                                let mut cache = conns.lock();
+                                let generation = cache.next_generation;
+                                cache.next_generation =
+                                    cache.next_generation.wrapping_add(1).max(1);
+                                cache.connections.insert(
+                                    peer,
+                                    CachedConnection {
+                                        generation,
+                                        conn: conn.clone(),
+                                    },
+                                );
+                                conn
+                            }
+                            _ => {
+                                engine.timer(delay).await;
+                                delay = (delay * 2).min(max_delay);
+                                continue;
+                            }
+                        }
+                    }
+                };
+                let result: Result<(), Box<dyn std::error::Error + Send + Sync>> = async {
+                    let mut send = conn.open_uni().await?;
+                    send.write_all(&dest.0).await?;
+                    send.write_all(&tag_len).await?;
+                    send.write_all(&tag).await?;
+                    send.write_all(&payload).await?;
+                    send.finish()?;
+                    Ok(())
+                }
+                .await;
+                if result.is_ok() {
+                    return;
+                }
+                // Write failed: evict so the next attempt re-dials.
+                conns.lock().connections.remove(&peer);
+                engine.timer(delay).await;
+                delay = (delay * 2).min(max_delay);
+            }
+        });
+    }
     // ─── Actor bridge: iroh ⇄ swactor runtime ─────────────────────────
 
     /// Install the actor-bridge wiring so the driver shuttles frames between iroh
@@ -1129,9 +1238,13 @@ impl AdapterPump {
             let mut cache = self.conns.lock();
             let generation = cache.next_generation;
             cache.next_generation = cache.next_generation.wrapping_add(1).max(1);
-            cache
-                .connections
-                .insert(node_id, CachedConnection { generation, conn: conn.clone() });
+            cache.connections.insert(
+                node_id,
+                CachedConnection {
+                    generation,
+                    conn: conn.clone(),
+                },
+            );
             generation
         };
         self.spawn_reader(node_id, generation, conn);
@@ -1310,11 +1423,12 @@ impl AdapterPump {
             const ATTEMPTS: u32 = 3;
             let per_attempt_timeout = Duration::from_secs(10);
             for attempt in 1..=ATTEMPTS {
-                let result = engine.timeout(
-                    per_attempt_timeout,
-                    endpoint.connect(dial_addr.clone(), ALPN),
-                )
-                .await;
+                let result = engine
+                    .timeout(
+                        per_attempt_timeout,
+                        endpoint.connect(dial_addr.clone(), ALPN),
+                    )
+                    .await;
                 if let Ok(Ok(conn)) = result {
                     pending.lock().push(JoinResult { node_id, conn });
                     break;

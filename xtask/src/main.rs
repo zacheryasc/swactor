@@ -266,10 +266,12 @@ COMMANDS:
                      Run real cargo myelin-chat acceptance check and write benchmark artifacts.
   myelin-chat-compare <baseline-summary.json> <candidate-summary.json>
                      Compare two benchmark summaries and report comparable deltas.
-  provisioning-reconciler-demo [--port n] [--nodes n]
+  provisioning-reconciler-demo [--port n] [--nodes n] [--docker]
                       Run the visual E2E provisioning reconciler sanity demo
                       (supervisor + dashboard on localhost, node children
-                      join over iroh). Ctrl-C tears down.
+                      join over iroh; --docker launches nodes as scratch
+                      containers on a per-run bridge network). Ctrl-C tears
+                      down and sweeps.
   check-telemetry-isolation  Verify no frame types appear in control-plane modules.
   test                Run the basic non-binding test barrier: root crate plus each
                       non-binding repository package with `cargo test -p`."
@@ -364,9 +366,12 @@ fn run_myelin_chat(args: Vec<String>) -> ExitCode {
                 "args": MYELIN_CHAT_CARGO_RUN_ARGS,
             }),
         );
-        if let Err(error) =
-            append_synthetic_benchmark_frame(path, "xtask-myelin-chat", "myelin.xtask.benchmark", event)
-        {
+        if let Err(error) = append_synthetic_benchmark_frame(
+            path,
+            "xtask-myelin-chat",
+            "myelin.xtask.benchmark",
+            event,
+        ) {
             eprintln!("Failed to write myelin-chat benchmark frame: {error}");
             return ExitCode::from(1);
         }
@@ -381,9 +386,12 @@ fn run_myelin_chat(args: Vec<String>) -> ExitCode {
             Err(error) => ("failed", json!({"error": error.to_string()})),
         };
         let event = xtask_myelin_chat_benchmark_event(run_id, status, detail);
-        if let Err(error) =
-            append_synthetic_benchmark_frame(path, "xtask-myelin-chat", "myelin.xtask.benchmark", event)
-        {
+        if let Err(error) = append_synthetic_benchmark_frame(
+            path,
+            "xtask-myelin-chat",
+            "myelin.xtask.benchmark",
+            event,
+        ) {
             eprintln!("Failed to write myelin-chat benchmark frame: {error}");
             return ExitCode::from(1);
         }
@@ -1098,7 +1106,9 @@ fn terminate_myelin_chat_child(child: &mut Child) -> Result<ExitStatus, String> 
                 Ok(Some(status)) => return Ok(status),
                 Ok(None) => thread::sleep(Duration::from_millis(MYELIN_CHAT_CHECK_POLL_MS)),
                 Err(error) => {
-                    return Err(format!("myelin-chat-check: poll child after SIGTERM: {error}"));
+                    return Err(format!(
+                        "myelin-chat-check: poll child after SIGTERM: {error}"
+                    ));
                 }
             }
         }
@@ -1347,7 +1357,9 @@ fn find_stdout_marker(
     stdout[start..]
         .find(marker)
         .map(|offset| start + offset)
-        .ok_or_else(|| format!("myelin-chat-check: missing {label} marker for prompt cycle {cycle}"))
+        .ok_or_else(|| {
+            format!("myelin-chat-check: missing {label} marker for prompt cycle {cycle}")
+        })
 }
 
 #[derive(Clone)]
@@ -2196,12 +2208,22 @@ fn validate_benchmark_observability(
                     validation.edges_with_consumer.insert(edge_id);
                 }
             }
-            ("myelin.chat.prompt", Some("ChatProgress"), Some("prompt_submitted"), Some("ready")) => {
+            (
+                "myelin.chat.prompt",
+                Some("ChatProgress"),
+                Some("prompt_submitted"),
+                Some("ready"),
+            ) => {
                 if let Some(request_id) = benchmark_request_id(&record.event) {
                     validation.requests_started.insert(request_id);
                 }
             }
-            ("myelin.chat.prompt", Some("ChatProgress"), Some("request_completed"), Some("ready")) => {
+            (
+                "myelin.chat.prompt",
+                Some("ChatProgress"),
+                Some("request_completed"),
+                Some("ready"),
+            ) => {
                 if let Some(request_id) = benchmark_request_id(&record.event) {
                     validation.requests_completed.insert(request_id);
                 }
@@ -3945,7 +3967,10 @@ fn pipeline_stage_index(event: &Value) -> Option<u64> {
         .or_else(|| event_u64(event, "role_id").and_then(|role| role.checked_sub(1)))
 }
 
-fn benchmark_invariants_json(facts: &DumpLogFacts, scenario: MyelinChatCheckScenario) -> Vec<Value> {
+fn benchmark_invariants_json(
+    facts: &DumpLogFacts,
+    scenario: MyelinChatCheckScenario,
+) -> Vec<Value> {
     let mut invariants = vec![
         invariant_json("chat_config_ready", facts.chat_config_ready),
         invariant_json("prepare_runtime_ready", facts.prepare_runtime_ready),
@@ -4494,7 +4519,9 @@ fn record_gpu_dump_log_event(channel: &str, event: &Value, facts: &mut DumpLogFa
         {
             facts.gpu_probe_ready = true;
         }
-        ("myelin.worker.initialize", Some("WorkerReady")) if worker_ready_backend_is_cuda(event) => {
+        ("myelin.worker.initialize", Some("WorkerReady"))
+            if worker_ready_backend_is_cuda(event) =>
+        {
             facts.gpu_worker_ready = true;
         }
         ("myelin.worker.prompt", Some("DecodeStarted"))
@@ -4862,7 +4889,10 @@ mod tests {
 
         let baseline =
             MyelinChatCheckInvocation::parse_args(Vec::new()).expect("default scenario parses");
-        assert_eq!(baseline.scenario(), MyelinChatCheckScenario::ProcessBaseline);
+        assert_eq!(
+            baseline.scenario(),
+            MyelinChatCheckScenario::ProcessBaseline
+        );
         assert_eq!(
             baseline.myelin_chat_args(42, dump_log),
             strings(&[
@@ -4904,8 +4934,9 @@ mod tests {
             ])
         );
 
-        let multinode_docker = MyelinChatCheckInvocation::parse_args(strings(&["--multinode-docker"]))
-            .expect("multinode docker parses");
+        let multinode_docker =
+            MyelinChatCheckInvocation::parse_args(strings(&["--multinode-docker"]))
+                .expect("multinode docker parses");
         assert_eq!(
             multinode_docker.scenario(),
             MyelinChatCheckScenario::MultinodeDocker
@@ -4959,9 +4990,12 @@ mod tests {
                 "--dump-logs=/tmp/myelin-chat-check.ndjson",
             ])
         );
-        let vastai_parallel =
-            MyelinChatCheckInvocation::parse_args(strings(&["--vastai", "--pipeline-parallel", "4"]))
-                .expect("vastai pipeline-parallel parses");
+        let vastai_parallel = MyelinChatCheckInvocation::parse_args(strings(&[
+            "--vastai",
+            "--pipeline-parallel",
+            "4",
+        ]))
+        .expect("vastai pipeline-parallel parses");
         assert_eq!(
             vastai_parallel.myelin_chat_args(42, dump_log),
             strings(&[
@@ -5597,7 +5631,10 @@ mod tests {
         include_cpu_fallback: bool,
     ) -> Vec<(&'static str, Value)> {
         let mut events = vec![
-            ("myelin.chat.lifecycle", chat_span("config", "ready", 1_000, 0)),
+            (
+                "myelin.chat.lifecycle",
+                chat_span("config", "ready", 1_000, 0),
+            ),
             (
                 "myelin.chat.benchmark",
                 stamped(
@@ -6421,8 +6458,9 @@ mod tests {
     fn benchmark_observability_report_requires_granular_decode_events() {
         let events = parse_synthetic_events("missing-first-token", benchmark_report_events(false));
 
-        let error = build_benchmark_report(&events, 80, 9, MyelinChatCheckScenario::ProcessBaseline)
-            .expect_err("missing first token should fail");
+        let error =
+            build_benchmark_report(&events, 80, 9, MyelinChatCheckScenario::ProcessBaseline)
+                .expect_err("missing first token should fail");
 
         assert!(
             error.starts_with("myelin-chat-check: missing benchmark event "),
@@ -6439,8 +6477,9 @@ mod tests {
         let events =
             parse_synthetic_events("pipeline-report", pipeline_benchmark_report_events(true));
 
-        let report = build_benchmark_report(&events, 80, 9, MyelinChatCheckScenario::ProcessBaseline)
-            .expect("pipeline report builds");
+        let report =
+            build_benchmark_report(&events, 80, 9, MyelinChatCheckScenario::ProcessBaseline)
+                .expect("pipeline report builds");
 
         assert!(
             report

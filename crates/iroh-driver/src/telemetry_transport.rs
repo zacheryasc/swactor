@@ -5,12 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::TryRecvError;
-use telemetry::{TelemetrySnapshot, TelemetrySubscription};
-use telemetry::frame::{ChannelDescriptor, ChannelId, ChannelRef, TelemetryEvent, FrameDelivery, Position,
-StreamDescriptor,};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use iroh::{Endpoint, EndpointAddr};
 use swactor_engine::EngineHandle;
+use telemetry::frame::{
+    ChannelDescriptor, ChannelId, ChannelRef, FrameDelivery, Position, StreamDescriptor,
+    TelemetryEvent,
+};
+use telemetry::{TelemetrySnapshot, TelemetrySubscription};
 
 pub const TELEMETRY_ALPN: &[u8] = b"swactor/telemetry/0";
 
@@ -18,6 +20,134 @@ const MAGIC: &[u8; 4] = b"DSQ1";
 const TAG_CHANNEL_DECLARED: u8 = 0x01;
 const TAG_FRAME: u8 = 0x02;
 const TAG_STREAM_ENDED: u8 = 0x03;
+
+// ─── Pull model: collector-initiated subscriptions ───────────────────────────
+//
+// A supervising node dials a freshly-bootstrapped node on `TELEMETRY_ALPN`,
+// sends one subscription request on the first uni stream, and the node answers
+// by writing the existing header+events stream shape on a uni stream of the
+// same connection. Subscription lifetime = connection lifetime.
+
+/// Write a pull request (magic + flow id + token + `SubscriptionRequest`) and
+/// finish the stream so the serving side's read completes.
+const REQUEST_MAGIC: &[u8; 4] = b"DSQR";
+pub async fn write_pull_request(
+    send: &mut SendStream,
+    flow_id: [u8; 16],
+    token: &[u8],
+    request: &telemetry::SubscriptionRequest,
+) -> Result<(), BoxError> {
+    if token.len() > u16::MAX as usize {
+        return Err("telemetry pull token exceeds u16 length prefix".into());
+    }
+    send.write_all(REQUEST_MAGIC).await?;
+    send.write_all(&flow_id).await?;
+    send.write_all(&(token.len() as u16).to_le_bytes()).await?;
+    send.write_all(token).await?;
+    write_json(send, request).await?;
+    send.finish()?;
+    Ok(())
+}
+
+/// Read a pull request written by [`write_pull_request`].
+pub async fn read_pull_request(
+    recv: &mut RecvStream,
+) -> Result<([u8; 16], Vec<u8>, telemetry::SubscriptionRequest), BoxError> {
+    let mut magic = [0u8; 4];
+    recv.read_exact(&mut magic).await?;
+    if &magic != REQUEST_MAGIC {
+        return Err("invalid telemetry pull request magic".into());
+    }
+    let mut flow_id = [0u8; 16];
+    recv.read_exact(&mut flow_id).await?;
+    let mut token_len = [0u8; 2];
+    recv.read_exact(&mut token_len).await?;
+    let token_len = u16::from_le_bytes(token_len) as usize;
+    let mut token = vec![0u8; token_len];
+    recv.read_exact(&mut token).await?;
+    let request = read_json(recv).await?;
+    Ok((flow_id, token, request))
+}
+
+/// Node side: serve one accepted `TELEMETRY_ALPN` connection. Reads the pull
+/// request from the first uni stream, subscribes the local endpoint, and
+/// writes the answering subscription stream (header + events, until the
+/// subscription ends or the connection drops) on a uni stream of the same
+/// connection. One request per connection; the task exits when the writer
+/// ends or the connection fails.
+pub fn spawn_pull_server(
+    engine: &EngineHandle,
+    conn: Connection,
+    endpoint: std::sync::Arc<telemetry::TelemetryEndpoint>,
+    idle_sleep: Duration,
+) {
+    let engine_handle = engine.clone();
+    engine.spawn(async move {
+        let Ok(mut recv) = conn.accept_uni().await else {
+            return;
+        };
+        let Ok((_flow_id, token, request)) = read_pull_request(&mut recv).await else {
+            return;
+        };
+        let subscription = endpoint.subscribe("supervisor-pull", request);
+        let header =
+            match TelemetryQuicHeader::from_snapshot(_flow_id, token, subscription.snapshot()) {
+                Ok(header) => header,
+                Err(_) => return,
+            };
+        let Ok(send) = conn.open_uni().await else {
+            return;
+        };
+        let _ =
+            write_subscription_until_closed(&engine_handle, send, header, subscription, idle_sleep)
+                .await;
+    });
+}
+
+/// Supervisor side: dial a node on `TELEMETRY_ALPN`, send the pull request,
+/// and stream answering events into `fanout` as they arrive (incrementally,
+/// not buffered until stream end). The header is reported through
+/// `on_header` first so the caller can register stream/channel metadata
+/// before any frame lands.
+pub fn spawn_pull_collector(
+    engine: &EngineHandle,
+    endpoint: Endpoint,
+    peer: EndpointAddr,
+    flow_id: [u8; 16],
+    token: Vec<u8>,
+    request: telemetry::SubscriptionRequest,
+    fanout: std::sync::Arc<telemetry::DeliveryFanout>,
+    on_header: std::sync::mpsc::Sender<TelemetryQuicHeader>,
+) {
+    engine.spawn(async move {
+        let peer_id = peer.id.to_string();
+        let Ok(conn) = endpoint.connect(peer, TELEMETRY_ALPN).await else {
+            eprintln!("telemetry-pull: connect to {peer_id} failed");
+            return;
+        };
+        let Ok(mut req) = conn.open_uni().await else {
+            eprintln!("telemetry-pull: open request stream to {peer_id} failed");
+            return;
+        };
+        if let Err(error) = write_pull_request(&mut req, flow_id, &token, &request).await {
+            eprintln!("telemetry-pull: write request to {peer_id} failed: {error}");
+            return;
+        }
+        let Ok(mut recv) = conn.accept_uni().await else {
+            eprintln!("telemetry-pull: no answer stream from {peer_id}");
+            return;
+        };
+        let Ok(header) = read_header(&mut recv).await else {
+            eprintln!("telemetry-pull: answer header from {peer_id} unreadable");
+            return;
+        };
+        let _ = on_header.send(header.clone());
+        let stream = header.stream.clone();
+        while let Ok(Some(event)) = read_next_event(&mut recv, &stream).await {
+            fanout.publish(event);
+        }
+    });
+}
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 
 type BoxError = Box<dyn Error + Send + Sync + 'static>;
@@ -87,7 +217,9 @@ pub fn spawn_subscription_writer(
         let Ok(send) = conn.open_uni().await else {
             return;
         };
-        let _ = write_subscription_until_closed(&engine_handle, send, header, subscription, idle_sleep).await;
+        let _ =
+            write_subscription_until_closed(&engine_handle, send, header, subscription, idle_sleep)
+                .await;
     });
 }
 
@@ -157,10 +289,7 @@ async fn write_subscription_inner(
     Ok(stats)
 }
 
-pub async fn write_event(
-    send: &mut SendStream,
-    event: &TelemetryEvent,
-) -> Result<usize, BoxError> {
+pub async fn write_event(send: &mut SendStream, event: &TelemetryEvent) -> Result<usize, BoxError> {
     let mut bytes = Vec::new();
     match event {
         TelemetryEvent::StreamDeclared(_) => return Ok(0),
@@ -232,10 +361,7 @@ pub fn spawn_connection_reader(
     });
 }
 
-async fn write_header(
-    send: &mut SendStream,
-    header: &TelemetryQuicHeader,
-) -> Result<(), BoxError> {
+async fn write_header(send: &mut SendStream, header: &TelemetryQuicHeader) -> Result<(), BoxError> {
     if header.token.len() > u16::MAX as usize {
         return Err("telemetry token exceeds u16 length prefix".into());
     }

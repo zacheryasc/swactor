@@ -4,36 +4,30 @@
 //! Each tick mirrors the production `ClusterReconciler` poll semantics:
 //! drain executor results (closing bootstrap sessions after convergence),
 //! classify due operations, requeue, drive until blocked — then feeds the
-//! real world back in (key-file observations, iroh join checks, child exits),
-//! emits `prov.reconciler.*` telemetry, and drains every telemetry endpoint
-//! into the dashboard.
+//! real world back in (wire announces, child exits), emits
+//! `prov.reconciler.*` telemetry, and drains every telemetry endpoint into
+//! the dashboard.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+use provisioning::executor::{
+    BlockingEffectSpawner, BlockingEffectWork, ExecutorOperationStatus, IdempotentEffectExecutor,
+};
+use provisioning::node::{
+    BootstrapObservation, BootstrapStage, NodeGroupId, NodeStage, RoleId, RunId, SwactorId,
+};
+use provisioning::reconciler::{ClusterDriver, EffectExecutor};
+use provisioning::reconciler::{
+    ClusterShape, NodeObservation, OperationOutcome, PlannedEffect, RetryPolicy,
+};
 use serde_json::json;
 use swactor::actor::{ActorInterface, Ctx};
 use swactor_engine::EngineHandle;
-use swactor_process::{spawn_local_process, ProcessOutputConfig, ProcessSpec};
-
-use provisioning::executor::{
-    BlockingEffectSpawner, BlockingEffectWork, ExecutorOperationStatus,
-    IdempotentEffectExecutor,
-};
-use provisioning::node::{
-    BootstrapObservation, BootstrapStage, NodeGroupId,
-    NodeStage, RoleId, RunId, SwactorId,
-};
-use provisioning::reconciler::{
-    ClusterShape, NodeObservation, RetryPolicy, PlannedEffect, OperationOutcome,
-};
-use provisioning::reconciler::{ClusterDriver, EffectExecutor};
 use telemetry::{ChannelContent, StreamDescriptor, TelemetryEndpoint, TelemetryProducer};
 
-use crate::provisioning_demo::node::read_key_report;
 use crate::provisioning_demo::provider::{
-    register_node_channels, unix_ms, DemoBackend, NodeManager, NodeRelayActor,
-    NodeTelemetry,
+    DemoBackend, NodeManager, NodeTelemetry, register_node_channels, unix_ms,
 };
 
 /// Supervisor telemetry: channels + name resolution for the dashboard path.
@@ -136,10 +130,30 @@ pub enum SupervisorMsg {
     Tick,
     Control(dashboard::control::ControlCommand),
     Spawn(crate::provisioning_demo::provider::SpawnNodeRequest),
+    /// Event from a per-node bootstrap actor.
+    Bootstrap(provisioning::BootstrapEvent),
+    /// A remote node's telemetry pull stream registered its header (stream
+    /// descriptor + channel catalog), associated with its logical node and
+    /// provision attempt. Frames are fused onto the logical node's stream.
+    NodeStream {
+        header: iroh_driver::TelemetryQuicHeader,
+        logical_node: String,
+        attempt: u64,
+    },
     /// Drain the cluster: desired → empty, stop every child, flag when done.
     Shutdown {
         drained: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
+}
+
+/// Metadata for one remote node telemetry pull, keyed by the node's hex
+/// transport key: channel catalog + which logical node stream its frames
+/// are fused onto.
+#[derive(Clone, Default)]
+struct RemoteStreamMeta {
+    logical_node: String,
+    attempt: u64,
+    channels: BTreeMap<telemetry::ChannelId, String>,
 }
 
 /// Per-node telemetry handle kept while the attempt is live.
@@ -158,6 +172,18 @@ pub struct SupervisorActor {
     pub events_channel: telemetry::ChannelId,
     pub snapshot_channel: telemetry::ChannelId,
     pub sender: swactor::runtime::ExternalSender,
+    /// Bootstrap kind registry (spec.kind → logic).
+    registry: provisioning::BootstrapRegistry,
+    /// Pull collector fired by bootstrap actors on Bootstrapped.
+    collector: std::sync::Arc<dyn provisioning::NodeTelemetryCollector>,
+    /// Engine handle for bootstrap actor probe intervals.
+    engine: EngineHandle,
+    /// Subscription draining the remote-stream fanout into the dashboard.
+    remote_sub: telemetry::TelemetrySubscription,
+    remote_streams: BTreeMap<String, RemoteStreamMeta>,
+    /// Bootstrap reports parked until the reconciler opens the attempt's
+    /// bootstrap session (early joins / failures).
+    pending_reports: BTreeMap<u64, provisioning::BootstrapEvent>,
     /// Desired shape slots: singleton groups, one per logical node.
     slots: Vec<String>,
     slot_seq: u64,
@@ -167,7 +193,7 @@ pub struct SupervisorActor {
     last_stages: BTreeMap<String, (NodeStage, Option<BootstrapStage>)>,
     pub dashboard: dashboard::DashboardHandle,
     status_tick: u64,
-    exe: std::path::PathBuf,
+    launch: crate::provisioning_demo::LaunchStyle,
 }
 
 impl SupervisorActor {
@@ -180,9 +206,13 @@ impl SupervisorActor {
         mut telemetry: SupervisorTelemetry,
         dashboard: dashboard::DashboardHandle,
         sender: swactor::runtime::ExternalSender,
+        registry: provisioning::BootstrapRegistry,
+        collector: std::sync::Arc<dyn provisioning::NodeTelemetryCollector>,
+        engine: EngineHandle,
+        remote_sub: telemetry::TelemetrySubscription,
         initial_slots: Vec<String>,
         run_id: RunId,
-        exe: std::path::PathBuf,
+        launch: crate::provisioning_demo::LaunchStyle,
     ) -> Self {
         let events_channel = telemetry.register("prov.reconciler.events");
         let snapshot_channel = telemetry.register("prov.reconciler.snapshot");
@@ -195,6 +225,12 @@ impl SupervisorActor {
             events_channel,
             snapshot_channel,
             sender,
+            registry,
+            collector,
+            engine,
+            remote_sub,
+            remote_streams: BTreeMap::new(),
+            pending_reports: BTreeMap::new(),
             nodes: BTreeMap::new(),
             run_id,
             slot_seq: initial_slots.len() as u64,
@@ -203,7 +239,7 @@ impl SupervisorActor {
             last_stages: BTreeMap::new(),
             dashboard,
             status_tick: 0,
-            exe,
+            launch,
         }
     }
 
@@ -223,49 +259,103 @@ impl SupervisorActor {
             "detail": detail,
         });
         let bytes = serde_json::to_vec(&payload).expect("event serializes");
-        self.telemetry.producer.submit_bytes(self.events_channel, bytes);
+        self.telemetry
+            .producer
+            .submit_bytes(self.events_channel, bytes);
     }
 
-    /// Handle a spawn request from the provider (runs in actor context).
-    fn spawn_node(&mut self, ctx: &Ctx, request: crate::provisioning_demo::provider::SpawnNodeRequest) {
+    /// Handle a spawn request from the provider (runs in actor context):
+    /// spawn the per-attempt bootstrap actor through the registry — the
+    /// supervision never launches nodes directly.
+    fn spawn_node(
+        &mut self,
+        ctx: &Ctx,
+        request: crate::provisioning_demo::provider::SpawnNodeRequest,
+    ) {
         let attempt = request.attempt;
-        let relay = match ctx.spawn(NodeRelayActor::new(self.manager.clone(), attempt)) {
-            Ok(addr) => addr,
-            Err(error) => {
-                let _ = request.reply.send(Err(format!("spawn relay actor: {error}")));
-                return;
-            }
-        };
 
-        let spec = ProcessSpec {
-            command: self.exe.to_string_lossy().to_string(),
-            args: vec![
-                "provisioning-reconciler-demo".to_owned(),
-                "--demo-node".to_owned(),
-                self.driver_handle.supervisor_addr_json.clone(),
-            ],
-            env: [
-                (
-                    "DEMO_NODE_KEY_FILE".to_owned(),
-                    request.key_file.to_string_lossy().to_string(),
-                ),
-                ("DEMO_NODE_ID".to_owned(), request.logical_node.clone()),
-            ]
-            .into_iter()
-            .collect(),
-            working_dir: None,
-            label: Some(request.logical_node.clone()),
-        };
-
+        // Supervisor-authored lifecycle stream (kept alive independent of
+        // the node: it reports death even when the node cannot).
         self.node_life += 1;
         let telemetry = NodeTelemetry::new(&request.logical_node, self.node_life);
         let status_channel = register_node_channels(&telemetry.producer);
-        // The lifecycle channel is registered by the process crate with the
-        // sanitized label; mirror it for name resolution during drain.
-        let output =
-            ProcessOutputConfig::telemetry_mirror(relay, telemetry.producer.clone());
-        match spawn_local_process(ctx, &self.sender, spec, output) {
-            Ok(process_actor) => {
+
+        let (kind, argv, mut env) = match &self.launch {
+            crate::provisioning_demo::LaunchStyle::Process { exe } => (
+                "process",
+                vec![
+                    exe.to_string_lossy().to_string(),
+                    "provisioning-reconciler-demo".to_owned(),
+                    "--demo-node".to_owned(),
+                    self.driver_handle.supervisor_addr_json.clone(),
+                    "--demo-attempt".to_owned(),
+                    attempt.to_string(),
+                ],
+                Vec::new(),
+            ),
+            crate::provisioning_demo::LaunchStyle::Docker(docker) => (
+                "docker",
+                vec![
+                    "docker".to_owned(),
+                    "run".to_owned(),
+                    "--rm".to_owned(),
+                    "--name".to_owned(),
+                    crate::provisioning_demo::docker::container_name(attempt),
+                    "--label".to_owned(),
+                    format!("{}=1", crate::provisioning_demo::docker::SWEEP_LABEL),
+                    "--label".to_owned(),
+                    format!(
+                        "{}={}",
+                        crate::provisioning_demo::docker::RUN_LABEL,
+                        docker.run_token
+                    ),
+                    "--network".to_owned(),
+                    docker.network.clone(),
+                    docker.image.clone(),
+                    "provisioning-reconciler-demo".to_owned(),
+                    "--demo-node".to_owned(),
+                    docker.supervisor_addr_json.clone(),
+                    "--demo-attempt".to_owned(),
+                    attempt.to_string(),
+                ],
+                Vec::new(),
+            ),
+        };
+        env.push(("DEMO_NODE_ID".to_owned(), request.logical_node.clone()));
+
+        let spec = provisioning::NodeLaunchSpec {
+            kind: kind.to_owned(),
+            attempt,
+            logical_node: request.logical_node.clone(),
+            argv,
+            env,
+            workdir: None,
+            label: Some(request.logical_node.clone()),
+        };
+
+        let reporter: provisioning::BootstrapReporter = {
+            let sender = self.sender.clone();
+            let supervisor = ctx.self_addr();
+            std::sync::Arc::new(move |event| {
+                let _ = sender.send_to(supervisor, SupervisorMsg::Bootstrap(event));
+            })
+        };
+        let config = provisioning::BootstrapConfig {
+            reporter,
+            sender: self.sender.clone(),
+            collector: Some(std::sync::Arc::clone(&self.collector)),
+            probe_period: provisioning::DEFAULT_PROBE_PERIOD,
+            spec: spec.clone(),
+        };
+        let logic = match self.registry.create(&spec) {
+            Ok(logic) => logic,
+            Err(error) => {
+                let _ = request.reply.send(Err(format!("bootstrap logic: {error}")));
+                return;
+            }
+        };
+        match provisioning::spawn_bootstrap_actor(ctx, &self.engine, logic, config) {
+            Ok(bootstrap) => {
                 self.nodes.insert(
                     attempt,
                     NodeStreams {
@@ -273,36 +363,27 @@ impl SupervisorActor {
                         status_channel,
                     },
                 );
-                self.manager.register(
-                    crate::provisioning_demo::provider::NodeRuntime {
-                        attempt,
-                        logical_node: request.logical_node.clone(),
-                        process_actor,
-                        key_file: request.key_file.clone(),
-                        pid: None,
-                        exited: None,
-                        spawn_failed: None,
-                    },
-                );
-                let _ = request.reply.send(Ok(
-                    crate::provisioning_demo::provider::NodeRuntime {
-                        attempt,
-                        logical_node: request.logical_node,
-                        process_actor,
-                        key_file: request.key_file,
-                        pid: None,
-                        exited: None,
-                        spawn_failed: None,
-                    },
-                ));
+                let runtime = crate::provisioning_demo::provider::NodeRuntime {
+                    attempt,
+                    logical_node: request.logical_node.clone(),
+                    bootstrap,
+                    pid: None,
+                    exited: None,
+                    spawn_failed: None,
+                    last_announce_ms: None,
+                };
+                let _ = request.reply.send(Ok(runtime));
             }
             Err(error) => {
-                let _ = request.reply.send(Err(format!("spawn process actor: {error}")));
+                let _ = request
+                    .reply
+                    .send(Err(format!("spawn bootstrap actor: {error}")));
             }
         }
     }
 
-    /// Feed real-world observations into the driver.
+    /// Feed bootstrap-progress observations into the driver. Join detection
+    /// and exit classification moved into the per-node bootstrap actors
     fn observe_world(&mut self, now: SystemTime) {
         let node_ids: Vec<String> = self
             .driver
@@ -312,87 +393,246 @@ impl SupervisorActor {
             .map(|id| id.0.clone())
             .collect();
         for node_id in node_ids {
-            let Some(managed) = self.driver.state().nodes.get(&provisioning::node::LogicalNodeId(node_id.clone())) else {
+            let Some(managed) = self
+                .driver
+                .state()
+                .nodes
+                .get(&provisioning::node::LogicalNodeId(node_id.clone()))
+            else {
                 continue;
             };
             let attempt = managed.attempt;
-            let stage = managed.record.stage;
-            let active_bootstrap = managed.active_bootstrap;
-            let runtime = match self.manager.get(attempt.0) {
-                Some(runtime) => runtime,
-                None => continue,
+            let Some(session_id) = managed.active_bootstrap else {
+                continue;
             };
+            let Some(runtime) = self.manager.get(attempt.0) else {
+                continue;
+            };
+            // Stage evidence: the supervised child started (process pid /
+            // docker CLI pid observed) means the node runtime is coming up
+            // and we are waiting for its control-plane announce; before
+            // that the lease exists but the foreign process is not up yet.
+            let stage_seen = if runtime.pid.is_some() {
+                BootstrapStage::WaitingForSwactorJoin
+            } else {
+                BootstrapStage::SshReady
+            };
+            self.driver.apply_observation(
+                &provisioning::node::LogicalNodeId(node_id.clone()),
+                attempt,
+                NodeObservation::BootstrapObserved {
+                    session_id,
+                    observation: BootstrapObservation::stage(stage_seen),
+                },
+                now,
+            );
+        }
+    }
 
-            // Child exit or spawn failure: fail the attempt while it is
-            // still bootstrapping so the reconciler retries with a fresh
-            // lease instead of wedging at SshReady forever.
-            if runtime.exited.is_some() || runtime.spawn_failed.is_some() {
-                if stage != NodeStage::Failed && active_bootstrap.is_some() {
-                    let reason = if let Some(status) = &runtime.exited {
-                        format!("node process exited: {status:?}")
-                    } else {
-                        format!(
-                            "node process failed to spawn: {}",
-                            runtime.spawn_failed.as_deref().unwrap_or("unknown")
-                        )
-                    };
-                    self.emit_event("observation", &node_id, reason.clone());
+    /// Fold bootstrap-actor events into the reconciler. A report that
+    /// arrives before the reconciler has an active bootstrap session for
+    /// the attempt (the actor starts at spawn, `StartBootstrap` comes
+    /// later) is parked and re-delivered on the next tick — the join signal
+    /// is exactly-once, so dropping an early one wedges the session.
+    fn handle_bootstrap_event(&mut self, now: SystemTime, event: provisioning::BootstrapEvent) {
+        let attempt = match &event {
+            provisioning::BootstrapEvent::Bootstrapped(identity) => identity.attempt,
+            provisioning::BootstrapEvent::Failed { attempt, .. }
+            | provisioning::BootstrapEvent::Exited { attempt, .. } => *attempt,
+        };
+        if !self.deliver_bootstrap_report(now, event.clone()) {
+            self.pending_reports.insert(attempt, event);
+        }
+    }
+
+    /// Deliver one bootstrap report to the reconciler driver. Returns false
+    /// when the attempt has no active bootstrap session yet.
+    fn deliver_bootstrap_report(
+        &mut self,
+        now: SystemTime,
+        event: provisioning::BootstrapEvent,
+    ) -> bool {
+        match event {
+            provisioning::BootstrapEvent::Bootstrapped(identity) => {
+                let Some((node_id, session_id)) = self.node_for_attempt(identity.attempt) else {
+                    return false;
+                };
+                let key_prefix = &identity.key_hex[..8.min(identity.key_hex.len())];
+                self.emit_event(
+                    "observation",
+                    &node_id,
+                    format!("swactor join confirmed (key {key_prefix}…)"),
+                );
+                self.driver.apply_observation(
+                    &provisioning::node::LogicalNodeId(node_id),
+                    provisioning::NodeAttemptId(identity.attempt),
+                    NodeObservation::SwactorJoined {
+                        session_id,
+                        swactor_id: SwactorId(identity.key_hex),
+                    },
+                    now,
+                );
+            }
+            provisioning::BootstrapEvent::Failed { attempt, reason } => {
+                let Some((node_id, session_id)) = self.node_for_attempt(attempt) else {
+                    return false;
+                };
+                self.emit_event("observation", &node_id, reason.clone());
+                self.driver.apply_observation(
+                    &provisioning::node::LogicalNodeId(node_id),
+                    provisioning::NodeAttemptId(attempt),
+                    NodeObservation::BootstrapFailed { session_id, reason },
+                    now,
+                );
+            }
+            provisioning::BootstrapEvent::Exited { attempt, reason } => {
+                // An exit while a session is still open is a bootstrap
+                // failure (death before join); otherwise it is a plain
+                // death observation.
+                if let Some((node_id, session_id)) = self.node_for_attempt(attempt) {
+                    self.emit_event("observation", &node_id, format!("node runtime: {reason}"));
                     self.driver.apply_observation(
-                        &provisioning::node::LogicalNodeId(node_id.clone()),
-                        attempt,
+                        &provisioning::node::LogicalNodeId(node_id),
+                        provisioning::NodeAttemptId(attempt),
                         NodeObservation::BootstrapFailed {
-                            session_id: active_bootstrap.expect("checked above"),
-                            reason,
+                            session_id,
+                            reason: format!("node process exited: {reason}"),
                         },
                         now,
                     );
                 }
-                continue;
-            }
-
-            // Bootstrap progression from the key file and iroh join state.
-            if let Some(session_id) = active_bootstrap {
-                let report = read_key_report(&runtime.key_file);
-                let mut stage_seen = BootstrapStage::SshReady;
-                if let Some(report) = &report {
-                    let connected = report
-                        .node_hex
-                        .parse_key()
-                        .is_some_and(|key| self.driver_handle.has_active_connection(key));
-                    if connected {
-                        let heartbeat_age = unix_ms(now).saturating_sub(report.last_seen_ms);
-                        self.emit_event(
-                            "observation",
-                            &node_id,
-                            format!(
-                                "swactor join confirmed (key {}…, heartbeat {}ms old)",
-                                &report.node_hex[..8.min(report.node_hex.len())],
-                                heartbeat_age
-                            ),
-                        );
-                        let swactor_id = SwactorId(report.node_hex.clone());
-                        self.driver.apply_observation(
-                            &provisioning::node::LogicalNodeId(node_id.clone()),
-                            attempt,
-                            NodeObservation::SwactorJoined {
-                                session_id,
-                                swactor_id,
-                            },
-                            now,
-                        );
-                        continue;
+                // Publish the terminal status now: once the reconciler
+                // destroys the lease the runtime is deregistered, and the
+                // Fleet Control table would otherwise keep its last
+                // "running" state forever. Derive the logical name from the
+                // lifecycle stream itself — the registry entry can already
+                // be gone (lease destroy races the bootstrap probe).
+                if let Some(streams) = self.nodes.get(&attempt) {
+                    let logical = streams
+                        .telemetry
+                        .endpoint
+                        .stream_id()
+                        .node
+                        .as_str()
+                        .to_owned();
+                    let pid = self.manager.get(attempt).and_then(|r| r.pid);
+                    let payload = json!({
+                        "at_ms": unix_ms(now),
+                        "node": logical,
+                        "alive": false,
+                        "pid": pid,
+                        "event": "exited",
+                    });
+                    if let Ok(bytes) = serde_json::to_vec(&payload) {
+                        streams
+                            .telemetry
+                            .producer
+                            .submit_bytes(streams.status_channel, bytes);
                     }
-                    stage_seen = BootstrapStage::WaitingForSwactorJoin;
                 }
-                self.driver.apply_observation(
-                    &provisioning::node::LogicalNodeId(node_id.clone()),
-                    attempt,
-                    NodeObservation::BootstrapObserved {
-                        session_id,
-                        observation: BootstrapObservation::stage(stage_seen),
-                    },
-                    now,
-                );
+                // Death-replacement is shape logic: `replace_dead_ready_nodes`
+                // reads the exit from the shared registry.
+            }
+        }
+        true
+    }
+
+    /// Re-deliver parked bootstrap reports whose session has appeared.
+    fn deliver_pending_reports(&mut self, now: SystemTime) {
+        let attempts: Vec<u64> = self.pending_reports.keys().copied().collect();
+        for attempt in attempts {
+            let Some(event) = self.pending_reports.get(&attempt).cloned() else {
+                continue;
+            };
+            if self.deliver_bootstrap_report(now, event) {
+                self.pending_reports.remove(&attempt);
+            }
+        }
+    }
+
+    /// Resolve a driver node (id + active bootstrap session) by attempt.
+    fn node_for_attempt(
+        &self,
+        attempt: u64,
+    ) -> Option<(String, provisioning::node::BootstrapSessionId)> {
+        self.driver
+            .state()
+            .nodes
+            .iter()
+            .find(|(_, managed)| managed.attempt.0 == attempt)
+            .and_then(|(id, managed)| {
+                managed
+                    .active_bootstrap
+                    .map(|session| (id.0.clone(), session))
+            })
+    }
+
+    /// Register a remote node telemetry stream header (pull side).
+    fn register_remote_stream(
+        &mut self,
+        header: iroh_driver::TelemetryQuicHeader,
+        logical_node: String,
+        attempt: u64,
+    ) {
+        let key = header.stream.stream.node.as_str().to_string();
+        let meta = self.remote_streams.entry(key.clone()).or_default();
+        meta.logical_node = logical_node.clone();
+        meta.attempt = attempt;
+        for channel in &header.channels {
+            meta.channels.insert(channel.id, channel.name.clone());
+        }
+        println!(
+            "demo: fusing telemetry of node {logical_node} (stream {key}, {} channels)",
+            meta.channels.len()
+        );
+    }
+    /// Drain remote-node telemetry frames into the dashboard, fusing them
+    /// onto the logical node's stream: one card per node, carrying both the
+    /// supervisor-authored lifecycle channels and the node's real runtime
+    /// channels (runtime.actors, node.beat, node.status).
+    fn flush_remote_streams(&mut self) {
+        for event in self.remote_sub.drain_available() {
+            match event {
+                telemetry::frame::TelemetryEvent::Frame(delivery) => {
+                    let key = delivery.channel.stream.node.as_str().to_string();
+                    let Some(meta) = self.remote_streams.get(&key).cloned() else {
+                        continue;
+                    };
+                    let Some(node_stream) = self.nodes.get(&meta.attempt) else {
+                        continue;
+                    };
+                    // Fuse: republish on the logical node's stream.
+                    let target_stream = node_stream.telemetry.endpoint.stream_id().clone();
+                    let origin = node_stream.telemetry.origin;
+                    let label = node_stream.telemetry.label.clone();
+                    let channel_name = meta
+                        .channels
+                        .get(&delivery.channel.channel)
+                        .cloned()
+                        .unwrap_or_else(|| format!("channel#{}", delivery.channel.channel.0));
+                    let frame = telemetry::frame::Frame {
+                        channel: delivery.channel.channel,
+                        position: delivery.position,
+                        payload: delivery.payload,
+                    };
+                    publish_frame(
+                        &self.dashboard,
+                        &target_stream,
+                        &channel_name,
+                        &frame,
+                        origin,
+                        &label,
+                    );
+                }
+                telemetry::frame::TelemetryEvent::ChannelDeclared(descriptor) => {
+                    let key = descriptor.stream.node.as_str().to_string();
+                    self.remote_streams
+                        .entry(key)
+                        .or_default()
+                        .channels
+                        .insert(descriptor.id, descriptor.name);
+                }
+                _ => {}
             }
         }
     }
@@ -403,7 +643,8 @@ impl SupervisorActor {
         let state = self.driver.state().clone();
         let mut replacements: Vec<(String, String)> = Vec::new();
         for (id, managed) in &state.nodes {
-            if managed.record.ready && managed.intent == provisioning::reconciler::NodeIntent::Active
+            if managed.record.ready
+                && managed.intent == provisioning::reconciler::NodeIntent::Active
             {
                 let Some(runtime) = self.manager.get(managed.attempt.0) else {
                     continue;
@@ -419,7 +660,11 @@ impl SupervisorActor {
             return;
         }
         for (dead, fresh) in &replacements {
-            self.emit_event("control", dead, format!("runtime death; replacing as {fresh}"));
+            self.emit_event(
+                "control",
+                dead,
+                format!("runtime death; replacing as {fresh}"),
+            );
             self.slots.retain(|slot| slot_group_id(slot) != *dead);
             self.slots.push(fresh.clone());
         }
@@ -514,16 +759,20 @@ impl SupervisorActor {
             let Some(runtime) = self.manager.get(attempt) else {
                 continue;
             };
-            let report = read_key_report(&runtime.key_file);
-            let heartbeat_ms_ago = report
-                .as_ref()
-                .map(|r| unix_ms(now).saturating_sub(r.last_seen_ms))
-                .unwrap_or(u64::MAX);
+            // Wire liveness: the node re-announces every heartbeat period,
+            // so the age of the last announce is the control-plane
+            // heartbeat. `null` until the first announce.
+            let heartbeat_ms_ago = runtime
+                .last_announce_ms
+                .map(|ms| unix_ms(now).saturating_sub(ms));
             let payload = json!({
                 "at_ms": unix_ms(now),
                 "node": runtime.logical_node,
                 "alive": runtime.exited.is_none(),
                 "pid": runtime.pid,
+                // Process state for the Fleet Control table (same shape the
+                // process lifecycle mirror used to publish).
+                "event": if runtime.exited.is_some() { "exited" } else { "started" },
                 "heartbeat_ms_ago": heartbeat_ms_ago,
             });
             let bytes = serde_json::to_vec(&payload).expect("status serializes");
@@ -681,6 +930,7 @@ impl ActorInterface for SupervisorActor {
         match msg {
             SupervisorMsg::Tick => {
                 let now = SystemTime::now();
+                self.deliver_pending_reports(now);
                 self.poll(now);
                 self.observe_world(now);
                 self.replace_dead_ready_nodes(now);
@@ -688,9 +938,20 @@ impl ActorInterface for SupervisorActor {
                 self.emit_node_status(now);
                 self.emit_feed(now);
                 self.flush_telemetry();
+                self.flush_remote_streams();
             }
             SupervisorMsg::Control(command) => self.handle_control(command),
             SupervisorMsg::Spawn(request) => self.spawn_node(ctx, request),
+            SupervisorMsg::Bootstrap(event) => {
+                let now = SystemTime::now();
+                self.handle_bootstrap_event(now, event);
+                self.poll(now);
+            }
+            SupervisorMsg::NodeStream {
+                header,
+                logical_node,
+                attempt,
+            } => self.register_remote_stream(header, logical_node, attempt),
             SupervisorMsg::Shutdown { drained } => {
                 self.slots.clear();
                 let generation = self.driver.desired().generation.saturating_add(1);
@@ -715,10 +976,9 @@ impl SupervisorActor {
                             &node,
                             format!("kill requested (pid {:?})", runtime.pid),
                         );
-                        let _ = swactor_process::send_process_command(
-                            &self.sender,
-                            runtime.process_actor,
-                            swactor_process::ProcessCommand::Stop {
+                        let _ = self.sender.send_to(
+                            runtime.bootstrap,
+                            provisioning::BootstrapMsg::Stop {
                                 kill_after: Some(Duration::ZERO),
                             },
                         );
@@ -757,19 +1017,6 @@ impl SupervisorActor {
                 }
             }
         }
-    }
-}
-
-/// Parse a hex node key into a transport NodeId.
-trait ParseKey {
-    fn parse_key(&self) -> Option<swactor_transport::NodeId>;
-}
-
-impl ParseKey for String {
-    fn parse_key(&self) -> Option<swactor_transport::NodeId> {
-        let bytes = swactor_transport::hex_decode(self)?;
-        let array: [u8; 32] = bytes.try_into().ok()?;
-        Some(swactor_transport::NodeId(array))
     }
 }
 
@@ -832,4 +1079,3 @@ pub fn demo_retry_policy() -> RetryPolicy {
         endpoint_probe_interval: Duration::from_secs(1),
     }
 }
-

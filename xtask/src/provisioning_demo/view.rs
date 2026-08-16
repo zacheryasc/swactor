@@ -13,8 +13,8 @@ use serde::Serialize;
 use serde_json::Value;
 use telemetry::frame::{Frame, StreamId};
 
-use dashboard::view::DashboardView;
 use dashboard::FrameEvent;
+use dashboard::view::DashboardView;
 
 const EVENTS_CHANNEL: &str = "prov.reconciler.events";
 const SNAPSHOT_CHANNEL: &str = "prov.reconciler.snapshot";
@@ -171,4 +171,3 @@ impl DashboardView for ReconcilerDashboardView {
         None
     }
 }
-

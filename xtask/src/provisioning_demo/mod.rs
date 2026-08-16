@@ -12,11 +12,25 @@
 //! (per-node PID/state), kill nodes from Fleet Control or a shell, and watch
 //! the reconciler replace them for real.
 
+pub mod bootstrap;
 pub mod control;
+pub mod docker;
 pub mod feed;
 pub mod node;
 pub mod provider;
 pub mod view;
+
+/// How the supervisor launches node-role children (bootstrap kind + launch
+/// facts). Selected by `--docker`; default is local processes.
+#[derive(Clone)]
+pub enum LaunchStyle {
+    /// Re-exec this binary as a local child process (`kind: "process"`).
+    Process { exe: std::path::PathBuf },
+    /// Run the demo docker image per node on the per-run bridge network
+    /// (`kind: "docker"`) — nodes are foreign: own IPs, gateway-dialed
+    /// supervisor, no shared filesystem.
+    Docker(docker::DockerLaunch),
+}
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -30,12 +44,12 @@ use swactor_engine::{Engine, TokioBackend, TokioConfig};
 use distribution::node::DistributedNodeConfig;
 use iroh_driver::{IrohDriver, IrohDriverConfig};
 use provisioning::executor::IdempotentEffectExecutor;
-use provisioning::{ClusterShape, RunId};
 use provisioning::reconciler::ClusterDriver;
+use provisioning::{ClusterShape, RunId};
 
 use feed::{
-    demo_retry_policy, initial_slots, EngineSpawner, SupervisorActor, SupervisorMsg,
-    SupervisorTelemetry,
+    EngineSpawner, SupervisorActor, SupervisorMsg, SupervisorTelemetry, demo_retry_policy,
+    initial_slots,
 };
 use provider::{DemoBackend, DemoProvider, NodeManager};
 
@@ -81,27 +95,92 @@ fn resolve_exe() -> std::path::PathBuf {
     std::path::PathBuf::from("xtask")
 }
 
-/// Shared handle the supervisor actor uses to check iroh connections.
+/// Shared iroh driver handle: the supervisor's endpoint address (handed to
+/// node roles) and the endpoint for outbound telemetry pulls.
 pub struct DemoDriverHandle {
     pub supervisor_addr_json: String,
-    driver: IrohDriver,
+    pub(crate) driver: IrohDriver,
 }
 
 impl DemoDriverHandle {
-    pub fn has_active_connection(&self, node: swactor_transport::NodeId) -> bool {
-        self.driver.has_active_connection(&node)
+    /// Clone the iroh endpoint for outbound telemetry pulls.
+    pub fn endpoint(&self) -> iroh::Endpoint {
+        self.driver.endpoint()
     }
 }
 
-/// Entry point: `provisioning-reconciler-demo [--port N] [--nodes N]` for the
-/// supervisor, or `--demo-node <supervisor-addr-json>` for node children.
+/// Pull collector fired by bootstrap actors: dials the freshly-bootstrapped
+/// node on `TELEMETRY_ALPN`, sends the subscription request, and streams its
+/// telemetry into the supervisor's remote-stream fanout. The header lands in
+/// the supervisor actor so frames can be classified before publishing.
+struct DemoTelemetryCollector {
+    engine: swactor_engine::EngineHandle,
+    endpoint: iroh::Endpoint,
+    fanout: Arc<telemetry::DeliveryFanout>,
+    sender: swactor::runtime::ExternalSender,
+    supervisor_slot: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>>,
+}
+
+impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
+    fn collect(&self, identity: &provisioning::NodeIdentity) {
+        let Ok(addr) = serde_json::from_str::<iroh::EndpointAddr>(&identity.transport_addr) else {
+            eprintln!(
+                "demo: node {} advertised unparsable endpoint address",
+                identity.logical_node
+            );
+            return;
+        };
+        println!(
+            "demo: pulling telemetry from node {} (key {}…)",
+            identity.logical_node,
+            &identity.key_hex[..8.min(identity.key_hex.len())]
+        );
+        let mut flow_id = [0u8; 16];
+        flow_id[..8].copy_from_slice(&identity.attempt.to_le_bytes());
+        let (header_tx, header_rx) = std::sync::mpsc::channel();
+        iroh_driver::spawn_pull_collector(
+            &self.engine,
+            self.endpoint.clone(),
+            addr,
+            flow_id,
+            Vec::new(),
+            telemetry::SubscriptionRequest::all(),
+            Arc::clone(&self.fanout),
+            header_tx,
+        );
+        let sender = self.sender.clone();
+        if let Some(supervisor) = self.supervisor_slot.get() {
+            let supervisor = supervisor.clone();
+            let logical_node = identity.logical_node.clone();
+            let attempt = identity.attempt;
+            std::thread::spawn(move || {
+                if let Ok(header) = header_rx.recv() {
+                    let _ = sender.send_to(
+                        supervisor,
+                        feed::SupervisorMsg::NodeStream {
+                            header,
+                            logical_node,
+                            attempt,
+                        },
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Entry point: `provisioning-reconciler-demo [--port N] [--nodes N]
+/// [--docker]` for the supervisor, or `--demo-node <supervisor-addr-json>
+/// --demo-attempt <n>` for node children.
 pub fn run(args: &[String]) -> ExitCode {
     if let Some(index) = args.iter().position(|arg| arg == "--demo-node") {
-        let addr = args
-            .get(index + 1)
-            .map(String::as_str)
-            .unwrap_or_default();
-        return match node::run_node_role(addr) {
+        let addr = args.get(index + 1).map(String::as_str).unwrap_or_default();
+        let attempt = arg_value(args, "--demo-attempt").and_then(|value| value.parse::<u64>().ok());
+        let Some(attempt) = attempt else {
+            eprintln!("demo node: --demo-attempt <n> is required");
+            return ExitCode::FAILURE;
+        };
+        return match node::run_node_role(addr, attempt) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("demo node: {error}");
@@ -130,6 +209,13 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     let nodes: u64 = arg_value(args, "--nodes")
         .and_then(|value| value.parse().ok())
         .unwrap_or(DEFAULT_NODES);
+    let docker_mode = args.iter().any(|arg| arg == "--docker");
+
+    // Node registry + spawn channel: needed before the actor bridge so the
+    // announce relay can route wire announces into bootstrap actors.
+    let manager = NodeManager::new();
+    let (spawn_tx, spawn_rx) = std::sync::mpsc::channel::<provider::SpawnNodeRequest>();
+    manager.set_spawn_channel(spawn_tx);
 
     // Telemetry endpoint with the runtime stats hook attached before the
     // engine takes the parts.
@@ -168,29 +254,42 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         use distribution::transport_bridge::{Outbox, RelayMirror, RouteView};
         use swactor_transport::CodecRegistry;
 
-        struct NoopActor;
-        impl swactor::actor::ActorInterface for NoopActor {
-            type Incoming = ();
-            type Response = ();
-            fn handle(&mut self, _ctx: &swactor::actor::Ctx, _msg: ()) {}
-        }
-        let noop = runtime
-            .spawn(NoopActor)
-            .map_err(|e| format!("spawn noop actor: {e}"))?;
-        let relay_mirror: RelayMirror = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
-        let route_view: RouteView = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        // The announce relay is the bridge's only decoded ingress: node
+        // roles announce over the control plane (tag-routed gossip), and
+        // the relay correlates by attempt → bootstrap actor. The
+        // `swim_addr` argument only names a SendFailed target, which never
+        // fires for inbound frames; the relay doubles for it. Undecodable
+        // frames (e.g. the driver's own JoinRequest) still drop harmlessly.
+        let announce = runtime
+            .spawn(provider::AnnounceActor::new(
+                manager.clone(),
+                sender.clone(),
+            ))
+            .map_err(|e| format!("spawn announce actor: {e}"))?;
+        let mut codec = CodecRegistry::new();
+        codec.register_decoder::<node::NodeAnnounce>(node::ANNOUNCE_TAG, |bytes| {
+            serde_json::from_slice(bytes)
+                .map_err(|e| swactor::Error::from(format!("announce decode: {e}")))
+        });
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(node::ANNOUNCE_TAG.to_owned(), announce);
+        let relay_mirror: RelayMirror =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let route_view: RouteView =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let outbox: Outbox = Arc::new(std::sync::Mutex::new(Vec::new()));
         driver.enable_actor_bridge(
             runtime.clone(),
-            Arc::new(CodecRegistry::new()),
-            std::collections::HashMap::new(),
-            noop,
+            Arc::new(codec),
+            routes,
+            announce,
             relay_mirror,
             route_view,
             outbox,
         );
         driver.install_actor_bridge_pump(Duration::from_millis(250));
     }
+
     let driver_handle = Arc::new(DemoDriverHandle {
         supervisor_addr_json: supervisor_addr_json.clone(),
         driver,
@@ -205,15 +304,23 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     engine.handle().spawn(dashboard.http_server());
 
     // Provisioning: driver + plugin + executor.
-    let keys_dir = std::env::temp_dir().join(format!(
-        "provisioning-demo-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&keys_dir).map_err(|e| format!("keys dir: {e}"))?;
-
-    let manager = NodeManager::new();
-    let (spawn_tx, spawn_rx) = std::sync::mpsc::channel::<provider::SpawnNodeRequest>();
-    manager.set_spawn_channel(spawn_tx);
+    let launch = if docker_mode {
+        let addrs = driver_handle.driver.direct_addresses();
+        let port = addrs
+            .iter()
+            .find(|addr| addr.is_ipv4())
+            .or_else(|| addrs.first())
+            .map(|addr| addr.port())
+            .ok_or_else(|| "supervisor has no bound direct address".to_owned())?;
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask manifest dir has a parent")
+            .to_path_buf();
+        let launch = docker::preflight(&root, driver_handle.driver.endpoint().id(), port)?;
+        LaunchStyle::Docker(launch)
+    } else {
+        LaunchStyle::Process { exe: resolve_exe() }
+    };
 
     let slots = initial_slots(nodes);
     let shape = ClusterShape {
@@ -224,7 +331,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     let cluster_driver =
         ClusterDriver::new(shape, demo_retry_policy()).map_err(|e| format!("driver: {e}"))?;
 
-    let plugin = DemoProvider::new(manager.clone(), keys_dir.clone());
+    let plugin = DemoProvider::new(manager.clone());
     let spawner = EngineSpawner::new(engine.handle());
     let executor = IdempotentEffectExecutor::new(
         DemoBackend {
@@ -235,6 +342,50 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         spawner,
     );
 
+    // The supervisor's address travels through a shared slot; long-lived
+    // engine tasks installed below wait for it lazily. (Spawning engine
+    // tasks after the actor spawn proved flaky at startup.)
+    let supervisor_slot: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>> =
+        Arc::new(std::sync::OnceLock::new());
+
+    // Bootstrap machinery: kind registry with the process logic, the
+    // remote-stream fanout, and the pull collector.
+    let fanout = Arc::new(telemetry::DeliveryFanout::new(1024));
+    let remote_sub = fanout.subscribe_all(
+        "dashboard",
+        telemetry::TelemetrySnapshot {
+            streams: Vec::new(),
+            channels: Vec::new(),
+        },
+    );
+    let mut bootstrap_registry = provisioning::BootstrapRegistry::new();
+    bootstrap_registry.register("process", {
+        let manager = manager.clone();
+        Arc::new(move |spec| {
+            Ok(Box::new(bootstrap::LocalProcessLogic::new(
+                spec.clone(),
+                manager.clone(),
+            )) as Box<dyn provisioning::BootstrapLogic>)
+        })
+    });
+    bootstrap_registry.register("docker", {
+        let manager = manager.clone();
+        Arc::new(move |spec| {
+            Ok(Box::new(docker::DockerProcessLogic::new(
+                spec.clone(),
+                manager.clone(),
+            )) as Box<dyn provisioning::BootstrapLogic>)
+        })
+    });
+    let collector: Arc<dyn provisioning::NodeTelemetryCollector> =
+        Arc::new(DemoTelemetryCollector {
+            engine: engine.handle(),
+            endpoint: driver_handle.endpoint(),
+            fanout: Arc::clone(&fanout),
+            sender: sender.clone(),
+            supervisor_slot: supervisor_slot.clone(),
+        });
+
     let supervisor = SupervisorActor::new(
         cluster_driver,
         executor,
@@ -243,16 +394,14 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         telemetry,
         dashboard.clone(),
         sender.clone(),
+        bootstrap_registry,
+        collector,
+        engine.handle(),
+        remote_sub,
         slots,
         RunId(1),
-        resolve_exe(),
+        launch.clone(),
     );
-    // Long-lived engine tasks are installed BEFORE the actor spawn: the
-    // supervisor's address travels through a shared slot, and the tasks wait
-    // for it lazily. (Spawning engine tasks after the actor spawn proved
-    // flaky at startup.)
-    let supervisor_slot: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>> =
-        Arc::new(std::sync::OnceLock::new());
 
     // Control plane: dashboard → supervisor.
     control::install(&engine.handle(), sender.clone(), supervisor_slot.clone());
@@ -260,14 +409,16 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     // Spawn-request pump: provider blocking threads → supervisor actor.
     let pump_sender = sender.clone();
     let pump_slot = supervisor_slot.clone();
-    engine.handle().spawn_blocking(move || loop {
-        match spawn_rx.recv() {
-            Ok(request) => {
-                if let Some(addr) = pump_slot.get() {
-                    let _ = pump_sender.send_to(addr.clone(), SupervisorMsg::Spawn(request));
+    engine.handle().spawn_blocking(move || {
+        loop {
+            match spawn_rx.recv() {
+                Ok(request) => {
+                    if let Some(addr) = pump_slot.get() {
+                        let _ = pump_sender.send_to(addr.clone(), SupervisorMsg::Spawn(request));
+                    }
                 }
+                Err(_) => return,
             }
-            Err(_) => return,
         }
     });
 
@@ -328,8 +479,11 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         std::thread::sleep(TICK);
     }
     // Best-effort drain window closed: children still alive (if any) are
-    // killed by the kernel parent-death signal armed in the node role.
-    let _ = std::fs::remove_dir_all(&keys_dir);
+    // killed by the kernel parent-death signal armed in the node role
+    // (process kind) or swept by label below (docker kind).
+    if let LaunchStyle::Docker(docker) = &launch {
+        docker::sweep_run(docker);
+    }
     std::process::exit(0);
 }
 
@@ -344,6 +498,10 @@ fn install_sigint_flag() {
     unsafe {
         let handler: extern "C" fn(libc::c_int) = sigint_handler;
         libc::signal(libc::SIGINT, handler as usize);
+        // Supervisors under process managers (systemd, container runtimes,
+        // harnesses) stop children with SIGTERM; treat it exactly like
+        // Ctrl-C so the drain + sweep path runs instead of a default kill.
+        libc::signal(libc::SIGTERM, handler as usize);
     }
 }
 

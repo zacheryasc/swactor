@@ -5,10 +5,12 @@
 //! provider adapters live in application crates and implement the executor
 //! backend contract.
 
+pub mod bootstrap;
 pub mod executor;
 pub mod node;
 pub mod plugin;
 pub mod reconciler;
+pub use bootstrap::*;
 
 pub use executor::*;
 pub use node::*;

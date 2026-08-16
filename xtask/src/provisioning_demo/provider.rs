@@ -12,13 +12,12 @@
 //! channel to the supervisor actor; the plugin call blocks for the reply on
 //! an executor blocking thread.
 //!
-//! Because the process actor supervises children with stdio null, each child
-//! publishes its swactor node key and heartbeats to a per-attempt key file
-//! (`DEMO_NODE_KEY_FILE`); the supervisor reads it to learn the child's iroh
-//! identity and liveness.
+//! Children run with stdio null, so the supervisor learns a node's iroh
+//! identity and liveness from the wire announce (see `node.rs`): the
+//! [`AnnounceActor`] routes it to the owning bootstrap actor and records
+//! `last_announce_ms` in the [`NodeManager`] registry.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -31,8 +30,8 @@ use provisioning::node::{
     BootstrapSessionId, CreateLeaseResult, DestroyHandle, LeaseFacts, NodeManagerCommand,
     ProviderKind, ProviderLeaseId, SshEndpoint,
 };
-use provisioning::reconciler::{OperationId, OperationOutcome, PlannedEffect};
 use provisioning::plugin::{NodeProvisionSpec, PluginNodeHandle, PluginSink, ProvisionPlugin};
+use provisioning::reconciler::{OperationId, OperationOutcome, PlannedEffect};
 use telemetry::{ChannelContent, StreamDescriptor, TelemetryEndpoint, TelemetryProducer};
 
 /// How long a blocking plugin call waits for the supervisor actor.
@@ -43,11 +42,15 @@ pub const BACKEND_WAIT: Duration = Duration::from_secs(20);
 pub struct NodeRuntime {
     pub attempt: u64,
     pub logical_node: String,
-    pub process_actor: ActorAddress,
-    pub key_file: PathBuf,
+    /// The bootstrap actor that owns this attempt's lifecycle.
+    pub bootstrap: ActorAddress,
     pub pid: Option<u32>,
     pub exited: Option<ExitStatus>,
     pub spawn_failed: Option<String>,
+    /// Wall-clock ms of the last wire announce from the node (None until
+    /// the first announce). The node re-announces every heartbeat period,
+    /// so staleness here means the control-plane path is dead.
+    pub last_announce_ms: Option<u64>,
 }
 
 /// Spawn request from the plugin (blocking thread) to the supervisor actor.
@@ -55,7 +58,6 @@ pub struct NodeRuntime {
 pub struct SpawnNodeRequest {
     pub attempt: u64,
     pub logical_node: String,
-    pub key_file: PathBuf,
     pub reply: std::sync::mpsc::Sender<Result<NodeRuntime, String>>,
 }
 
@@ -81,17 +83,11 @@ impl NodeManager {
         self.inner.lock().expect("node manager").spawn_tx = Some(sender);
     }
 
-    pub fn request_spawn(
-        &self,
-        attempt: u64,
-        logical_node: String,
-        key_file: PathBuf,
-    ) -> Result<NodeRuntime, String> {
+    pub fn request_spawn(&self, attempt: u64, logical_node: String) -> Result<NodeRuntime, String> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let request = SpawnNodeRequest {
             attempt,
             logical_node,
-            key_file,
             reply: reply_tx,
         };
         {
@@ -160,23 +156,27 @@ impl NodeManager {
         self.update(attempt, |runtime| runtime.spawn_failed = Some(reason));
     }
 
-    pub fn remove(&self, attempt: u64) {
-        self.inner.lock().expect("node manager").nodes.remove(&attempt);
+    pub fn set_announce(&self, attempt: u64, at_ms: u64) {
+        self.update(attempt, |runtime| runtime.last_announce_ms = Some(at_ms));
     }
-
+    pub fn remove(&self, attempt: u64) {
+        self.inner
+            .lock()
+            .expect("node manager")
+            .nodes
+            .remove(&attempt);
+    }
 }
 
 /// The demo `ProvisionPlugin`: resources are node-role child processes.
 pub struct DemoProvider {
     manager: NodeManager,
-    keys_dir: PathBuf,
 }
 
 impl DemoProvider {
-    pub fn new(manager: NodeManager, keys_dir: PathBuf) -> Self {
-        Self { manager, keys_dir }
+    pub fn new(manager: NodeManager) -> Self {
+        Self { manager }
     }
-
 }
 
 impl ProvisionPlugin for DemoProvider {
@@ -199,10 +199,7 @@ impl ProvisionPlugin for DemoProvider {
             .find(|(key, _)| key == "DEMO_LOGICAL_NODE")
             .map(|(_, value)| value.clone())
             .ok_or_else(|| "spec missing DEMO_LOGICAL_NODE".to_owned())?;
-        let key_file = self.keys_dir.join(format!("node-{attempt}.key"));
-        let runtime = self
-            .manager
-            .request_spawn(attempt, logical_node, key_file)?;
+        let runtime = self.manager.request_spawn(attempt, logical_node)?;
         Ok(PluginNodeHandle {
             id: attempt,
             provider_process_id: runtime.pid,
@@ -297,6 +294,51 @@ impl ActorInterface for NodeRelayActor {
     }
 }
 
+/// Supervisor-side announce relay. The iroh actor bridge decodes inbound
+/// [`NodeAnnounce`] gossip frames and routes them here by wire tag; this
+/// actor correlates by attempt token and forwards to the owning bootstrap
+/// actor ([`provisioning::BootstrapMsg::Announce`]) — the handoff from
+/// bootstrap to control plane. Announces for unknown attempts (deregistered
+/// lease, stale container from a dead attempt) are dropped with a log line.
+pub struct AnnounceActor {
+    manager: NodeManager,
+    sender: ExternalSender,
+}
+
+impl AnnounceActor {
+    pub fn new(manager: NodeManager, sender: ExternalSender) -> Self {
+        Self { manager, sender }
+    }
+}
+
+impl ActorInterface for AnnounceActor {
+    type Incoming = crate::provisioning_demo::node::NodeAnnounce;
+    type Response = ();
+
+    fn handle(&mut self, _ctx: &Ctx, announce: crate::provisioning_demo::node::NodeAnnounce) {
+        self.manager.set_announce(announce.attempt, announce.at_ms);
+        let Some(runtime) = self.manager.get(announce.attempt) else {
+            let key = &announce.key_hex;
+            eprintln!(
+                "demo: announce for unknown attempt {} (key {}…) dropped",
+                announce.attempt,
+                &key[..8.min(key.len())]
+            );
+            return;
+        };
+        let identity = provisioning::NodeIdentity {
+            attempt: announce.attempt,
+            logical_node: announce.logical_node,
+            key_hex: announce.key_hex,
+            transport_addr: announce.endpoint_addr_json,
+        };
+        let _ = self.sender.send_to(
+            runtime.bootstrap,
+            provisioning::BootstrapMsg::Announce(identity),
+        );
+    }
+}
+
 /// Demo lease/session identity (attempt-encoded, kit conventions).
 pub fn demo_lease(attempt: u64) -> LeaseFacts {
     let provider = ProviderKind::new("demo");
@@ -331,7 +373,9 @@ pub fn session_id_for(operation: OperationId) -> BootstrapSessionId {
 }
 
 fn runtime_exited(manager: &NodeManager, attempt: u64) -> bool {
-    manager.get(attempt).is_some_and(|runtime| runtime.exited.is_some())
+    manager
+        .get(attempt)
+        .is_some_and(|runtime| runtime.exited.is_some())
 }
 
 /// The demo `EffectBackend`: routes effects through the plugin.
@@ -352,7 +396,6 @@ impl DemoBackend {
         }
     }
 }
-
 
 impl EffectBackend for DemoBackend {
     fn execute(&self, effect: &PlannedEffect) -> Result<OperationOutcome, EffectError> {
@@ -433,10 +476,9 @@ fn stop_node_with_sender(
 ) -> Result<(), String> {
     if let Some(runtime) = manager.get(handle.id) {
         if runtime.pid.is_some() && runtime.exited.is_none() {
-            let _ = swactor_process::send_process_command(
-                sender,
-                runtime.process_actor,
-                swactor_process::ProcessCommand::Stop {
+            let _ = sender.send_to(
+                runtime.bootstrap,
+                provisioning::BootstrapMsg::Stop {
                     kill_after: Some(Duration::from_secs(1)),
                 },
             );
