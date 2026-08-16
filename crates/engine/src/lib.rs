@@ -14,9 +14,7 @@ mod time;
 #[cfg(feature = "tokio")]
 mod tokio;
 
-pub use backend::{
-    BoxTask, BoxTimer, BoxWork, Capabilities, EngineError, ExecutionBackend,
-};
+pub use backend::{BoxTask, BoxTimer, BoxWork, Capabilities, EngineError, ExecutionBackend};
 pub use engine::{Engine, EngineHandle};
 pub use stepping::SteppingBackend;
 pub use time::{Elapsed, EngineInstant, Interval, Timeout, Timer};

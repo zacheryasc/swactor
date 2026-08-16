@@ -4,9 +4,8 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::backend::{Capabilities, EngineError, ExecutionBackend};
-use crate::time::{EngineInstant, Interval, Timer, Timeout};
+use crate::time::{EngineInstant, Interval, Timeout, Timer};
 use swactor::runtime::{Runtime, RuntimeParts};
-
 
 /// The composite engine: retains a configured core runtime handle and its
 /// execution backend, and owns one core-driving loop per worker.
@@ -28,10 +27,7 @@ impl Engine {
     /// the engine owns every worker and is their sole driver. Construction fails
     /// if `backend` does not advertise a capability the engine requires (at
     /// minimum, `tasks`).
-    pub fn new(
-        parts: RuntimeParts,
-        backend: impl ExecutionBackend,
-    ) -> Result<Self, EngineError> {
+    pub fn new(parts: RuntimeParts, backend: impl ExecutionBackend) -> Result<Self, EngineError> {
         let backend: Arc<dyn ExecutionBackend> = Arc::new(backend);
         if !backend.capabilities().tasks {
             return Err(EngineError::MissingRequiredCapability);
@@ -109,7 +105,9 @@ impl EngineHandle {
     /// fires.
     pub fn timer(&self, delay: Duration) -> Timer {
         match self.backend() {
-            Some(backend) => Timer { inner: backend.timer(delay) },
+            Some(backend) => Timer {
+                inner: backend.timer(delay),
+            },
             None => Timer::closed(),
         }
     }

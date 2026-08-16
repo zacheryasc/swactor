@@ -18,11 +18,20 @@ use crate::time::EngineInstant;
 pub struct TokioConfig {
     /// Number of async worker threads backing the runtime.
     pub worker_threads: usize,
+    /// How long a core driver parks between ticks while its worker is idle.
+    ///
+    /// Bounds the wakeup latency for work delivered to an idle worker
+    /// (an external send, transport delivery, process output). Busy workers
+    /// never park. `Duration::ZERO` restores the always-immediate re-arm.
+    pub core_idle_poll: Duration,
 }
 
 impl Default for TokioConfig {
     fn default() -> Self {
-        Self { worker_threads: 2 }
+        Self {
+            worker_threads: 2,
+            core_idle_poll: Duration::from_micros(500),
+        }
     }
 }
 
@@ -33,6 +42,7 @@ impl Default for TokioConfig {
 /// [`EngineHandle`](crate::EngineHandle).
 pub struct TokioBackend {
     pub(crate) runtime: tokio::runtime::Runtime,
+    core_idle_poll: Duration,
 }
 
 impl TokioBackend {
@@ -52,12 +62,19 @@ impl TokioBackend {
             .enable_all()
             .build()
             .map_err(|e| EngineError::BackendSetup(e.to_string()))?;
-        Ok(Self { runtime })
+        Ok(Self {
+            runtime,
+            core_idle_poll: config.core_idle_poll,
+        })
     }
 
     /// Adopt a caller-tuned Tokio runtime, moving it into engine ownership.
+    /// Core drivers park for the default idle interval.
     pub fn from_runtime(runtime: tokio::runtime::Runtime) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            core_idle_poll: TokioConfig::default().core_idle_poll,
+        }
     }
 }
 
@@ -87,7 +104,9 @@ impl ExecutionBackend for TokioBackend {
     }
 
     fn now(&self) -> EngineInstant {
-        EngineInstant { instant: Instant::now() }
+        EngineInstant {
+            instant: Instant::now(),
+        }
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -101,6 +120,10 @@ impl ExecutionBackend for TokioBackend {
             blocking: true,
             io: true,
         }
+    }
+
+    fn core_idle_poll(&self) -> Duration {
+        self.core_idle_poll
     }
 }
 
@@ -120,7 +143,10 @@ struct LazySleep {
 
 impl LazySleep {
     fn new(delay: Duration) -> Self {
-        Self { delay: Some(delay), inner: None }
+        Self {
+            delay: Some(delay),
+            inner: None,
+        }
     }
 }
 

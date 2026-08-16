@@ -14,10 +14,9 @@ mod common;
 use common::*;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
-
 
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 
@@ -60,9 +59,7 @@ fn engine_drives_core_without_application_ticks() {
     let _engine = Engine::new(parts, backend).expect("construct engine");
 
     // Deliver AFTER engine construction: a later tick must observe it.
-    runtime
-        .send_to(addr, Probe)
-        .expect("deliver probe message");
+    runtime.send_to(addr, Probe).expect("deliver probe message");
 
     assert!(
         wait_for(|| received.load(SeqCst) >= 1, DEADLINE),
@@ -116,9 +113,7 @@ fn actor_ticks_and_supporting_work_both_progress() {
     });
 
     // Deliver an actor message while the supporting work is still active.
-    runtime
-        .send_to(addr, Probe)
-        .expect("deliver probe message");
+    runtime.send_to(addr, Probe).expect("deliver probe message");
 
     assert!(
         wait_for(
@@ -204,8 +199,11 @@ fn blocking_work_does_not_stop_actor_ticks() {
         })
         .expect("spawn probe actor");
 
-    let backend = TokioBackend::new(TokioConfig { worker_threads: 1 })
-        .expect("build tokio backend");
+    let backend = TokioBackend::new(TokioConfig {
+        worker_threads: 1,
+        ..Default::default()
+    })
+    .expect("build tokio backend");
     let engine = Engine::new(parts, backend).expect("construct engine");
     let handle = engine.handle();
 
@@ -222,9 +220,7 @@ fn blocking_work_does_not_stop_actor_ticks() {
     });
 
     // Deliver an actor message while the blocking work remains blocked.
-    runtime
-        .send_to(addr, Probe)
-        .expect("deliver probe message");
+    runtime.send_to(addr, Probe).expect("deliver probe message");
 
     assert!(
         wait_for(|| received.load(SeqCst) >= 1, DEADLINE),
@@ -265,8 +261,7 @@ fn engine_timer_fires() {
         let _ = tx.send(());
     });
 
-    rx.recv_timeout(DEADLINE)
-        .expect("engine timer must fire");
+    rx.recv_timeout(DEADLINE).expect("engine timer must fire");
 }
 
 // ── 7.9 ──────────────────────────────────────────────────────────────────────
@@ -360,5 +355,75 @@ fn engine_adopts_caller_tuned_tokio_runtime() {
     assert!(
         wait_for(|| received.load(SeqCst) >= 1, DEADLINE),
         "engine must drive core through an adopted runtime"
+    );
+}
+
+// ── 7.12 ──────────────────────────────────────────────────────────────────────
+
+#[test]
+fn idle_core_observes_late_external_work_within_idle_interval() {
+    // A core driver parks on a timer once its worker goes idle. Work can then
+    // arrive through paths the engine cannot see (an external send from this
+    // thread). The parked driver must wake within its idle interval and tick.
+    // A driver that parks and never re-arms would hang this test.
+    let (parts, runtime) = default_runtime_parts();
+    let received = Arc::new(AtomicUsize::new(0));
+    let addr = runtime
+        .spawn(RecordingProbe {
+            received: received.clone(),
+        })
+        .expect("spawn probe actor");
+
+    let idle_poll = Duration::from_millis(50);
+    let backend = TokioBackend::new(TokioConfig {
+        core_idle_poll: idle_poll,
+        ..Default::default()
+    })
+    .expect("build tokio backend");
+    let _engine = Engine::new(parts, backend).expect("construct engine");
+
+    // First message proves the driver ran before parking.
+    runtime.send_to(addr, Probe).expect("deliver first probe");
+    assert!(
+        wait_for(|| received.load(SeqCst) >= 1, DEADLINE),
+        "driver must process work before going idle"
+    );
+    // Long enough for every worker driver to observe no work and park.
+    std::thread::sleep(Duration::from_millis(300));
+
+    // External send from outside the engine: invisible to any engine-side
+    // wake path, observed only by the parked driver's timer.
+    runtime.send_to(addr, Probe).expect("deliver late probe");
+
+    let start = std::time::Instant::now();
+    assert!(
+        wait_for(|| received.load(SeqCst) >= 2, DEADLINE),
+        "a parked core driver must still observe external work"
+    );
+    // The idle timer is free-running (armed once per idle transition, re-armed
+    // on each firing), so the send lands at a random phase within one
+    // interval: observed latency is uniform in [0, idle_poll). Bound it
+    // generously to absorb scheduler jitter without asserting the phase.
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < idle_poll * 10,
+        "late work observed in {elapsed:?}, far beyond the idle interval"
+    );
+}
+
+#[test]
+fn tokio_backend_reports_configured_core_idle_poll() {
+    use swactor_engine::ExecutionBackend;
+
+    let configured = Duration::from_millis(5);
+    let backend = TokioBackend::new(TokioConfig {
+        core_idle_poll: configured,
+        ..Default::default()
+    })
+    .expect("build tokio backend");
+    assert_eq!(
+        backend.core_idle_poll(),
+        configured,
+        "backend must report its configured idle interval"
     );
 }

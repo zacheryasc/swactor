@@ -33,6 +33,16 @@ pub trait ExecutionBackend: Send + Sync + 'static {
     fn now(&self) -> EngineInstant;
     /// Report the substrate's advertised capabilities.
     fn capabilities(&self) -> Capabilities;
+    /// How long the core driver parks between ticks when its worker is idle.
+    ///
+    /// `Duration::ZERO` (the default) re-arms the driver immediately after
+    /// every tick — a poll loop at scheduler speed. Backends with real timers
+    /// return a small interval so an idle core parks instead of spinning;
+    /// newly delivered work is observed within one interval. Every poll still
+    /// runs one tick, so this only bounds idle wakeup latency.
+    fn core_idle_poll(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// Capabilities an execution backend advertises.
@@ -51,14 +61,29 @@ pub struct Capabilities {
 
 impl Capabilities {
     /// Convenience: only baseline task execution.
-    pub const TASKS_ONLY: Self = Self { tasks: true, timers: false, blocking: false, io: false };
+    pub const TASKS_ONLY: Self = Self {
+        tasks: true,
+        timers: false,
+        blocking: false,
+        io: false,
+    };
 
     /// Convenience: every capability.
-    pub const ALL: Self = Self { tasks: true, timers: true, blocking: true, io: true };
+    pub const ALL: Self = Self {
+        tasks: true,
+        timers: true,
+        blocking: true,
+        io: true,
+    };
 
     /// Convenience: no capabilities. Reported by an [`EngineHandle`](crate::EngineHandle)
     /// whose owning engine has been dropped (ENGINE_SPEC.md).
-    pub const NONE: Self = Self { tasks: false, timers: false, blocking: false, io: false };
+    pub const NONE: Self = Self {
+        tasks: false,
+        timers: false,
+        blocking: false,
+        io: false,
+    };
 
     /// Whether `self` satisfies every capability marked `true` in `required`.
     ///

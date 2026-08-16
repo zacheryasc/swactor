@@ -9,14 +9,11 @@ mod common;
 use common::*;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::atomic::Ordering::SeqCst;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::Duration;
 
-
-use swactor_engine::{
-    Capabilities, Engine, EngineError, ExecutionBackend, SteppingBackend,
-};
+use swactor_engine::{Capabilities, Engine, EngineError, ExecutionBackend, SteppingBackend};
 
 #[cfg(feature = "tokio")]
 use swactor_engine::{TokioBackend, TokioConfig};
@@ -305,9 +302,7 @@ fn stepping_engine_installs_one_driver_per_worker() {
 #[test]
 fn stepping_engine_drives_every_worker() {
     let (parts, runtime) = runtime_parts_with_workers(3);
-    let counters: Vec<_> = (0..3)
-        .map(|_| Arc::new(AtomicUsize::new(0)))
-        .collect();
+    let counters: Vec<_> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
     let addrs: Vec<_> = counters
         .iter()
         .map(|received| {
@@ -391,10 +386,7 @@ fn stepping_core_and_supporting_work_both_progress() {
         backend.step();
     }
 
-    assert!(
-        steps.load(SeqCst) >= 10,
-        "supporting work must finish"
-    );
+    assert!(steps.load(SeqCst) >= 10, "supporting work must finish");
     assert!(
         received.load(SeqCst) >= 1,
         "actor message must be processed"
@@ -580,7 +572,9 @@ fn dropping_engine_releases_backend_even_with_live_handles() {
     let parts = default_parts();
     let engine = Engine::new(
         parts,
-        SentinelBackend { sentinel: sentinel.clone() },
+        SentinelBackend {
+            sentinel: sentinel.clone(),
+        },
     )
     .expect("tasks capability present");
     let handle = engine.handle();

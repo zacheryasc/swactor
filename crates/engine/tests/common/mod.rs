@@ -27,11 +27,9 @@ pub fn runtime_parts_with_workers(worker_count: usize) -> (RuntimeParts, Runtime
     runtime_parts(config)
 }
 
-
 pub fn default_parts() -> RuntimeParts {
     RuntimeParts::new(RuntimeConfig::default())
 }
-
 
 // ── Probe message ───────────────────────────────────────────────────────────
 

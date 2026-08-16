@@ -59,7 +59,9 @@ impl Timer {
     /// dropped, so a handle can still produce a [`Timer`] without keeping the
     /// backend alive (ENGINE_SPEC.md).
     pub(crate) fn closed() -> Self {
-        Timer { inner: Box::pin(std::future::pending()) }
+        Timer {
+            inner: Box::pin(std::future::pending()),
+        }
     }
 }
 
