@@ -146,7 +146,7 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
   <section class="panel">
     <table>
       <thead>
-        <tr><th>node</th><th>stage</th><th>state</th><th>pid</th><th>seen</th><th></th></tr>
+        <tr><th>node</th><th>stage</th><th>state</th><th>pid</th><th>seen</th><th>edge</th><th></th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -176,11 +176,20 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
       Failed: 'b-failed', Destroyed: 'b-destroyed'
     };
     const INTENT_DELETING = new Set(['Deleting']);
-
-    const rows = document.getElementById('rows');
+    const EDGE_CLASS = {
+      provisioning: 'b-progress',
+      ready: 'b-ready',
+      faulted: 'b-failed'
+    };
     const empty = document.getElementById('empty');
     const status = document.getElementById('status');
     const counter = document.getElementById('counter');
+    // A1: last-rendered HTML per region — a poll that produces identical
+    // markup must not swap innerHTML (that destroyed hover/selection and any
+    // button press straddling the rebuild).
+    let lastRowsHtml = null;
+    let lastCommandsHtml = null;
+    let lastEventsHtml = null;
 
     function setStatus(text, isError) {
       status.textContent = text;
@@ -230,27 +239,40 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
         ? `<span class="pill ${escapeHtml(process.state)}">${escapeHtml(process.state)}</span>`
         : '<span class="muted">—</span>';
       const pid = process && process.pid != null ? process.pid : (reconciler && reconciler.pid != null ? reconciler.pid : null);
-      const seen = process ? fmtSeen(process.seen_ms_ago) : '—';
       const attempt = reconciler ? `<div class="node-sub">attempt ${escapeHtml(reconciler.attempt)}${reconciler.ready ? ' · ready' : ''}</div>` : '';
       const failure = reconciler && reconciler.failure
         ? `<div class="row-error">${escapeHtml(reconciler.failure)}</div>`
         : '';
       const killable = process && process.state === 'running';
-      return `<tr>
+      const edge = entry.edge
+        ? `<span class="badge ${EDGE_CLASS[entry.edge.state] || 'b-progress'}">e${escapeHtml(entry.edge.edge)} ${escapeHtml(entry.edge.state)}</span>`
+        : '<span class="muted">—</span>';
+      // "seen" is deliberately absent from this HTML: it is written per-poll
+      // as textContent by updateSeen() so a ticking relative age never
+      // invalidates the cached row markup.
+      return `<tr data-node="${escapeHtml(node)}">
         <td><span class="node-name">${escapeHtml(node)}</span>${attempt}</td>
         <td>${stage}</td>
         <td>${state}</td>
         <td>${pid == null ? '—' : escapeHtml(pid)}</td>
-        <td class="muted">${escapeHtml(seen)}</td>
-        <td><button class="danger" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>kill</button></td>
-      </tr>${failure ? `<tr><td colspan="6" style="padding-top:0">${failure}</td></tr>` : ''}`;
+        <td class="muted" data-seen>—</td>
+        <td>${edge}</td>
+        <td>
+          <button class="edge" data-action="edge" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>edge</button>
+          <button class="danger" data-action="kill" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>kill</button>
+        </td>
+      </tr>${failure ? `<tr><td colspan="7" style="padding-top:0">${failure}</td></tr>` : ''}`;
     }
 
-    function fuse(processes, reconcilerNodes) {
+    function fuse(processes, reconcilerNodes, edges) {
       const byNode = new Map();
       const order = [];
+      const edgeByNode = new Map();
+      for (const edge of edges || []) {
+        if (edge && edge.node != null) edgeByNode.set(edge.node, edge);
+      }
       for (const node of reconcilerNodes || []) {
-        byNode.set(node.id, { reconciler: node, process: null });
+        byNode.set(node.id, { reconciler: node, process: null, edge: edgeByNode.get(node.id) || null });
         order.push(node.id);
       }
       for (const process of processes || []) {
@@ -258,7 +280,7 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
         if (entry) {
           entry.process = process;
         } else {
-          byNode.set(process.node, { reconciler: null, process });
+          byNode.set(process.node, { reconciler: null, process, edge: edgeByNode.get(process.node) || null });
           order.push(process.node);
         }
       }
@@ -268,21 +290,15 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     function render(processSnapshot, reconcilerSnapshot) {
       const processes = (processSnapshot && processSnapshot.nodes) || [];
       const reconcilerNodes = (reconcilerSnapshot && reconcilerSnapshot.nodes) || [];
-      const fused = fuse(processes, reconcilerNodes);
+      const edges = (reconcilerSnapshot && reconcilerSnapshot.edges) || [];
+      const fused = fuse(processes, reconcilerNodes, edges);
       empty.hidden = fused.length > 0;
-      rows.innerHTML = fused.map(renderRow).join('');
-      for (const button of rows.querySelectorAll('button[data-node]')) {
-        button.addEventListener('click', () => {
-          button.disabled = true;
-          fetch('/control/kill', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ Kill: { node: button.dataset.node } })
-          }).then((response) => {
-            setStatus(response.ok ? 'kill issued' : 'kill failed: HTTP ' + response.status, !response.ok);
-          }).catch((error) => setStatus('kill failed: ' + error, true));
-        });
+      const rowsHtml = fused.map(renderRow).join('');
+      if (rowsHtml !== lastRowsHtml) {
+        rows.innerHTML = rowsHtml;
+        lastRowsHtml = rowsHtml;
       }
+      updateSeen(fused);
       if (reconcilerSnapshot) {
         counter.hidden = false;
         setSeg('ready-seg', reconcilerSnapshot.ready);
@@ -292,6 +308,17 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
         converged.className = reconcilerSnapshot.converged ? 'ok' : 'warn blink';
         setSeg('gen-seg', reconcilerSnapshot.generation);
         renderFeeds(reconcilerSnapshot.feed || []);
+      }
+    }
+
+    // Relative "seen" ages tick every poll but must not churn row markup:
+    // write them as textContent against the row keyed by data-node.
+    function updateSeen(fused) {
+      const byNode = new Map(fused.map((entry) => [entry.reconciler ? entry.reconciler.id : entry.process.node, entry]));
+      for (const row of rows.querySelectorAll('tr[data-node]')) {
+        const entry = byNode.get(row.dataset.node);
+        const cell = row.querySelector('td[data-seen]');
+        if (cell) cell.textContent = entry && entry.process ? fmtSeen(entry.process.seen_ms_ago) : '—';
       }
     }
 
@@ -311,12 +338,18 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
 
     function renderFeeds(feed) {
       const recent = feed.slice().reverse();
-      document.getElementById('commands').innerHTML =
-        recent.map((line) => feedLine(line, 'command')).join('') || '<li class="muted" >none</li>';
+      const commandsHtml = recent.map((line) => feedLine(line, 'command')).join('') || '<li class="muted" >none</li>';
       const eventKinds = new Set(['command']);
-      document.getElementById('events').innerHTML =
-        recent.filter((line) => !eventKinds.has(line.kind)).map((line) => feedLine(line)).join('')
+      const eventsHtml = recent.filter((line) => !eventKinds.has(line.kind)).map((line) => feedLine(line)).join('')
         || '<li >none</li>';
+      if (commandsHtml !== lastCommandsHtml) {
+        document.getElementById('commands').innerHTML = commandsHtml;
+        lastCommandsHtml = commandsHtml;
+      }
+      if (eventsHtml !== lastEventsHtml) {
+        document.getElementById('events').innerHTML = eventsHtml;
+        lastEventsHtml = eventsHtml;
+      }
     }
 
     function nodeCount() {
@@ -339,6 +372,32 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
 
     document.getElementById('remove').addEventListener('click', () => {
       post('/control/remove', { Remove: { count: nodeCount() } }, 'remove');
+    });
+
+    // A2: one delegated listener on the persistent tbody. Per-render binding
+    // dropped any press that straddled a row rebuild; delegation survives them.
+    rows.addEventListener('click', (event) => {
+      const button = event.target.closest('button[data-node]');
+      if (!button || !rows.contains(button)) return;
+      const action = button.dataset.action || 'kill';
+      const route = action === 'edge' ? '/control/edge' : '/control/kill';
+      const body = action === 'edge'
+        ? { EstablishEdge: { node: button.dataset.node } }
+        : { Kill: { node: button.dataset.node } };
+      const label = action === 'edge' ? 'edge' : 'kill';
+      if (action === 'edge') button.disabled = false; // edges can be re-issued
+      else button.disabled = true;
+      fetch(route, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body)
+      }).then((response) => {
+        if (!response.ok && action !== 'edge') button.disabled = false;
+        setStatus(response.ok ? label + ' issued' : label + ' failed: HTTP ' + response.status, !response.ok);
+      }).catch((error) => {
+        if (action !== 'edge') button.disabled = false;
+        setStatus(label + ' failed: ' + error, true);
+      });
     });
 
     async function poll() {

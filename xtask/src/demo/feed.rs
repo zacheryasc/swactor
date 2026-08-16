@@ -26,7 +26,9 @@ use swactor::actor::{ActorInterface, Ctx};
 use swactor_engine::EngineHandle;
 use telemetry::{ChannelContent, StreamDescriptor, TelemetryEndpoint, TelemetryProducer};
 
-use crate::provisioning_demo::provider::{
+use crate::demo::edge;
+use crate::demo::edge::{EdgeAck, EdgePumpCmd, EdgeSession};
+use crate::demo::provider::{
     DemoBackend, NodeManager, NodeTelemetry, register_node_channels, unix_ms,
 };
 
@@ -129,7 +131,7 @@ impl EffectExecutor for FeedExecutor<'_> {
 pub enum SupervisorMsg {
     Tick,
     Control(dashboard::control::ControlCommand),
-    Spawn(crate::provisioning_demo::provider::SpawnNodeRequest),
+    Spawn(crate::demo::provider::SpawnNodeRequest),
     /// Event from a per-node bootstrap actor.
     Bootstrap(provisioning::BootstrapEvent),
     /// A remote node's telemetry pull stream registered its header (stream
@@ -140,7 +142,10 @@ pub enum SupervisorMsg {
         logical_node: String,
         attempt: u64,
     },
-    /// Drain the cluster: desired → empty, stop every child, flag when done.
+    /// Control-plane ack from a node's edge agent (edge provisioning).
+    EdgeAck(EdgeAck),
+    /// State + feed update from the edge pump thread (sole session owner).
+    EdgeUpdate(crate::demo::edge::EdgePumpUpdate),
     Shutdown {
         drained: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
@@ -167,7 +172,7 @@ pub struct SupervisorActor {
     pub driver: ClusterDriver,
     pub executor: IdempotentEffectExecutor<DemoBackend, EngineSpawner>,
     pub manager: NodeManager,
-    pub driver_handle: std::sync::Arc<crate::provisioning_demo::DemoDriverHandle>,
+    pub driver_handle: std::sync::Arc<crate::demo::DemoDriverHandle>,
     pub telemetry: SupervisorTelemetry,
     pub events_channel: telemetry::ChannelId,
     pub snapshot_channel: telemetry::ChannelId,
@@ -193,7 +198,12 @@ pub struct SupervisorActor {
     last_stages: BTreeMap<String, (NodeStage, Option<BootstrapStage>)>,
     pub dashboard: dashboard::DashboardHandle,
     status_tick: u64,
-    launch: crate::provisioning_demo::LaunchStyle,
+    launch: crate::demo::LaunchStyle,
+    /// Command channel into the edge pump thread (sole session owner).
+    edge_cmd: std::sync::mpsc::Sender<EdgePumpCmd>,
+    /// Last reported edge-state mirror from the pump (snapshot data).
+    edge_states: Vec<serde_json::Value>,
+    next_edge_id: u64,
 }
 
 impl SupervisorActor {
@@ -202,7 +212,7 @@ impl SupervisorActor {
         driver: ClusterDriver,
         executor: IdempotentEffectExecutor<DemoBackend, EngineSpawner>,
         manager: NodeManager,
-        driver_handle: std::sync::Arc<crate::provisioning_demo::DemoDriverHandle>,
+        driver_handle: std::sync::Arc<crate::demo::DemoDriverHandle>,
         mut telemetry: SupervisorTelemetry,
         dashboard: dashboard::DashboardHandle,
         sender: swactor::runtime::ExternalSender,
@@ -212,7 +222,8 @@ impl SupervisorActor {
         remote_sub: telemetry::TelemetrySubscription,
         initial_slots: Vec<String>,
         run_id: RunId,
-        launch: crate::provisioning_demo::LaunchStyle,
+        launch: crate::demo::LaunchStyle,
+        edge_cmd: std::sync::mpsc::Sender<EdgePumpCmd>,
     ) -> Self {
         let events_channel = telemetry.register("prov.reconciler.events");
         let snapshot_channel = telemetry.register("prov.reconciler.snapshot");
@@ -240,6 +251,9 @@ impl SupervisorActor {
             dashboard,
             status_tick: 0,
             launch,
+            edge_cmd,
+            edge_states: Vec::new(),
+            next_edge_id: 0,
         }
     }
 
@@ -270,7 +284,7 @@ impl SupervisorActor {
     fn spawn_node(
         &mut self,
         ctx: &Ctx,
-        request: crate::provisioning_demo::provider::SpawnNodeRequest,
+        request: crate::demo::provider::SpawnNodeRequest,
     ) {
         let attempt = request.attempt;
 
@@ -281,11 +295,11 @@ impl SupervisorActor {
         let status_channel = register_node_channels(&telemetry.producer);
 
         let (kind, argv, mut env) = match &self.launch {
-            crate::provisioning_demo::LaunchStyle::Process { exe } => (
+            crate::demo::LaunchStyle::Process { exe } => (
                 "process",
                 vec![
                     exe.to_string_lossy().to_string(),
-                    "provisioning-reconciler-demo".to_owned(),
+                    "demo".to_owned(),
                     "--demo-node".to_owned(),
                     self.driver_handle.supervisor_addr_json.clone(),
                     "--demo-attempt".to_owned(),
@@ -293,26 +307,26 @@ impl SupervisorActor {
                 ],
                 Vec::new(),
             ),
-            crate::provisioning_demo::LaunchStyle::Docker(docker) => (
+            crate::demo::LaunchStyle::Docker(docker) => (
                 "docker",
                 vec![
                     "docker".to_owned(),
                     "run".to_owned(),
                     "--rm".to_owned(),
                     "--name".to_owned(),
-                    crate::provisioning_demo::docker::container_name(attempt),
+                    crate::demo::docker::container_name(attempt),
                     "--label".to_owned(),
-                    format!("{}=1", crate::provisioning_demo::docker::SWEEP_LABEL),
+                    format!("{}=1", crate::demo::docker::SWEEP_LABEL),
                     "--label".to_owned(),
                     format!(
                         "{}={}",
-                        crate::provisioning_demo::docker::RUN_LABEL,
+                        crate::demo::docker::RUN_LABEL,
                         docker.run_token
                     ),
                     "--network".to_owned(),
                     docker.network.clone(),
                     docker.image.clone(),
-                    "provisioning-reconciler-demo".to_owned(),
+                    "demo".to_owned(),
                     "--demo-node".to_owned(),
                     docker.supervisor_addr_json.clone(),
                     "--demo-attempt".to_owned(),
@@ -363,7 +377,7 @@ impl SupervisorActor {
                         status_channel,
                     },
                 );
-                let runtime = crate::provisioning_demo::provider::NodeRuntime {
+                let runtime = crate::demo::provider::NodeRuntime {
                     attempt,
                     logical_node: request.logical_node.clone(),
                     bootstrap,
@@ -371,6 +385,7 @@ impl SupervisorActor {
                     exited: None,
                     spawn_failed: None,
                     last_announce_ms: None,
+                    endpoint_addr: None,
                 };
                 let _ = request.reply.send(Ok(runtime));
             }
@@ -488,7 +503,8 @@ impl SupervisorActor {
             provisioning::BootstrapEvent::Exited { attempt, reason } => {
                 // An exit while a session is still open is a bootstrap
                 // failure (death before join); otherwise it is a plain
-                // death observation.
+                // death observation. Either way its edges are dead: the
+                // node process is gone.
                 if let Some((node_id, session_id)) = self.node_for_attempt(attempt) {
                     self.emit_event("observation", &node_id, format!("node runtime: {reason}"));
                     self.driver.apply_observation(
@@ -837,6 +853,7 @@ impl SupervisorActor {
                 "failure": managed.record.failed_reason,
             }));
         }
+        let edges_json = self.edge_states.clone();
 
         let snapshot = json!({
             "at_ms": unix_ms(now),
@@ -845,6 +862,7 @@ impl SupervisorActor {
             "generation": self.driver.desired().generation,
             "converged": self.driver.is_converged(),
             "nodes": nodes_json,
+            "edges": edges_json,
         });
         let bytes = serde_json::to_vec(&snapshot).expect("snapshot serializes");
         self.telemetry
@@ -935,6 +953,7 @@ impl ActorInterface for SupervisorActor {
                 self.observe_world(now);
                 self.replace_dead_ready_nodes(now);
                 self.poll(now);
+                self.sweep_dead_edges();
                 self.emit_node_status(now);
                 self.emit_feed(now);
                 self.flush_telemetry();
@@ -952,12 +971,22 @@ impl ActorInterface for SupervisorActor {
                 logical_node,
                 attempt,
             } => self.register_remote_stream(header, logical_node, attempt),
+            SupervisorMsg::EdgeAck(ack) => {
+                let _ = self.edge_cmd.send(EdgePumpCmd::Ack(ack));
+            }
+            SupervisorMsg::EdgeUpdate(update) => {
+                self.edge_states = update.states;
+                for (node, detail) in update.feed {
+                    self.emit_event("edge", &node, detail);
+                }
+            }
             SupervisorMsg::Shutdown { drained } => {
                 self.slots.clear();
                 let generation = self.driver.desired().generation.saturating_add(1);
                 if let Err(error) = self.driver.update_desired(self.desired_shape(generation)) {
                     eprintln!("demo: shutdown update_desired failed: {error}");
                 }
+                let _ = self.edge_cmd.send(EdgePumpCmd::DropAll);
                 self.emit_event("control", "", "shutdown: desired → empty".to_owned());
                 drained.store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1016,7 +1045,102 @@ impl SupervisorActor {
                     eprintln!("demo: provision update_desired failed: {error}");
                 }
             }
+            dashboard::control::ControlCommand::EstablishEdge { node } => {
+                self.establish_edge(&node);
+            }
         }
+    }
+
+    // ─── Data-plane edges ──────────────────────────────────────────────────
+
+    /// Establish (or replace) the supervisor→node edge from the dashboard.
+    /// Only control-plane facts gate this: the node must be registered,
+    /// alive, and have a fresh announce (endpoint addr + liveness).
+    fn establish_edge(&mut self, node: &str) {
+        let Some(runtime) = self.manager.find_by_stream_node(node) else {
+            self.emit_event("edge", node, "edge: unknown node".to_owned());
+            return;
+        };
+        if runtime.exited.is_some() {
+            self.emit_event("edge", node, "edge: node not running".to_owned());
+            return;
+        }
+        let Some(addr_json) = runtime.endpoint_addr.clone() else {
+            self.emit_event(
+                "edge",
+                node,
+                "edge: node endpoint unknown (no announce yet)".to_owned(),
+            );
+            return;
+        };
+        // Announce freshness is control-plane liveness: a stale announce
+        // means the dial would target a dead endpoint.
+        if let Some(last) = runtime.last_announce_ms {
+            let age = unix_ms(SystemTime::now()).saturating_sub(last);
+            if age > (2 * crate::demo::HEARTBEAT_PERIOD).as_millis() as u64 + 2000 {
+                self.emit_event(
+                    "edge",
+                    node,
+                    format!("edge: announce stale ({age}ms); refusing dial",),
+                );
+                return;
+            }
+        }
+        let Ok(peer) = serde_json::from_str::<iroh::EndpointAddr>(&addr_json) else {
+            self.emit_event("edge", node, "edge: node endpoint unparseable".to_owned());
+            return;
+        };
+        // One live session per node: a new edge replaces the old one (the
+        // pump owns the sessions; replacement happens on its thread).
+        self.next_edge_id += 1;
+        let edge_id = data_plane::ids::EdgeId(self.next_edge_id);
+        let session = EdgeSession::new(
+            edge_id,
+            runtime.attempt,
+            node.to_owned(),
+            peer.clone(),
+        );
+        let provision = session.provision();
+        if self
+            .edge_states
+            .iter()
+            .any(|state| state.get("node").and_then(|v| v.as_str()) == Some(node))
+        {
+            self.emit_event("edge", node, "previous edge torn down (replaced)".to_owned());
+        }
+        if self.edge_cmd.send(EdgePumpCmd::Establish(Box::new(session))).is_err() {
+            self.emit_event("edge", node, "edge: pump gone".to_owned());
+            return;
+        }
+        if let Ok(bytes) = serde_json::to_vec(&provision) {
+            self.driver_handle
+                .driver
+                .send_tagged_gossip(peer, edge::EDGE_PROVISION_TAG.as_bytes(), bytes);
+        }
+        self.emit_event(
+            "edge",
+            node,
+            format!(
+                "edge {}: provision sent (outbound provisioning)",
+                edge_id.0
+            ),
+        );
+    }
+
+    /// Tell the pump which node attempts are still live; it tears down
+    /// sessions for anything else (exit observed or registry entry gone).
+    fn sweep_dead_edges(&mut self) {
+        if self.edge_states.is_empty() {
+            return;
+        }
+        let live: Vec<u64> = self
+            .manager
+            .nodes()
+            .into_iter()
+            .filter(|runtime| runtime.exited.is_none())
+            .map(|runtime| runtime.attempt)
+            .collect();
+        let _ = self.edge_cmd.send(EdgePumpCmd::LiveAttempts(live));
     }
 }
 
@@ -1051,7 +1175,7 @@ pub fn demo_group(id: &str, count: u32) -> provisioning::node::RunNodeGroupSpec 
         boot: provisioning::node::BootSpec {
             ssh_user: "demo".to_owned(),
             verify_commands: vec!["true".to_owned()],
-            start_swactor_command: "xtask provisioning-reconciler-demo".to_owned(),
+            start_swactor_command: "xtask demo".to_owned(),
             stdout_sources: Vec::new(),
             stderr_sources: Vec::new(),
             env: Vec::new(),

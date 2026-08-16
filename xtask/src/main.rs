@@ -266,7 +266,7 @@ COMMANDS:
                      Run real cargo myelin-chat acceptance check and write benchmark artifacts.
   myelin-chat-compare <baseline-summary.json> <candidate-summary.json>
                      Compare two benchmark summaries and report comparable deltas.
-  provisioning-reconciler-demo [--port n] [--nodes n] [--docker]
+  demo [--port n] [--nodes n] [--docker]
                       Run the visual E2E provisioning reconciler sanity demo
                       (supervisor + dashboard on localhost, node children
                       join over iroh; --docker launches nodes as scratch
@@ -6976,7 +6976,7 @@ fn collect_rs_files(dir: &str, out: &mut Vec<String>) {
     }
 }
 
-mod provisioning_demo;
+mod demo;
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -6986,8 +6986,8 @@ fn main() -> ExitCode {
         Some("myelin-chat-check") => run_myelin_chat_check(args.collect()),
         Some("myelin-chat-compare") => run_myelin_chat_compare(args.collect()),
         Some("myelin-chat") => run_myelin_chat(args.collect()),
-        Some("provisioning-reconciler-demo") => {
-            provisioning_demo::run(&args.collect::<Vec<String>>())
+        Some("demo") => {
+            demo::run(&args.collect::<Vec<String>>())
         }
         Some("help" | "--help" | "-h") | None => {
             print_usage();

@@ -33,7 +33,8 @@ use distribution::node::DistributedNodeConfig;
 use iroh_driver::{IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, spawn_pull_server};
 use telemetry::{ChannelContent, TelemetryEndpoint, TelemetryProducer};
 
-use crate::provisioning_demo::HEARTBEAT_PERIOD;
+use crate::demo::edge;
+use crate::demo::HEARTBEAT_PERIOD;
 
 /// Wire tag of the announce gossip frame (`CodecRegistry` decode key on the
 /// supervisor side; raw tag bytes on the node side).
@@ -88,20 +89,22 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
 
     // Bind the driver, then keep it alive for the process lifetime: dropping
     // it closes the endpoint. The endpoint must advertise TELEMETRY_ALPN so
-    // the supervisor's pull connection can negotiate it.
-    let driver = Arc::new(
-        IrohDriver::with_engine(
-            engine.handle(),
-            IrohDriverConfig {
-                secret_key: None,
-                relay_mode: RelayMode::Disabled,
-                node: DistributedNodeConfig::default(),
-                peer_auth: None,
-                additional_alpns: vec![TELEMETRY_ALPN.to_vec()],
-            },
-        )
-        .map_err(|error| format!("iroh driver: {error}"))?,
-    );
+    // the supervisor's pull connection can negotiate it, and EDGE_ALPN so
+    // the supervisor's data-plane edges can dial in.
+    let mut driver = IrohDriver::with_engine(
+        engine.handle(),
+        IrohDriverConfig {
+            secret_key: None,
+            relay_mode: RelayMode::Disabled,
+            node: DistributedNodeConfig::default(),
+            peer_auth: None,
+            additional_alpns: vec![
+                TELEMETRY_ALPN.to_vec(),
+                iroh_driver::EDGE_ALPN.to_vec(),
+            ],
+        },
+    )
+    .map_err(|error| format!("iroh driver: {error}"))?;
     let node_hex = swactor_transport::hex_encode(&driver.node_id().0);
 
     // Telemetry endpoint: stream identity is the transport node key, so
@@ -139,6 +142,76 @@ pub fn run_node_role(supervisor_addr_json: &str, attempt: u64) -> Result<(), Str
         },
     );
     runtime.set_stats_hook(producer.stats_hook_on(actors_channel));
+
+    // Data-plane edge agent: owns this node's (single) inbound edge. The
+    // supervisor provisions it over the control plane (tagged gossip
+    // decoded by the actor bridge below); observations are mirrored onto
+    // the `node.edge` telemetry channel (render-only), and readiness
+    // acks travel back as gossip — never through telemetry.
+    let edge_channel = endpoint.register_channel(
+        edge::NODE_EDGE_CHANNEL,
+        ChannelContent::JsonRecord {
+            schema: Some("demo.node.edge.v1".to_owned()),
+        },
+    );
+    let driver_slot: Arc<std::sync::OnceLock<Arc<IrohDriver>>> =
+        Arc::new(std::sync::OnceLock::new());
+    let edge_agent = runtime
+        .spawn(edge::NodeEdgeAgent::new(
+            attempt,
+            logical_node.clone(),
+            supervisor_addr.clone(),
+            driver_slot.clone(),
+            producer.clone(),
+            edge_channel,
+        ))
+        .map_err(|error| format!("spawn edge agent: {error}"))?;
+    {
+        use distribution::transport_bridge::{Outbox, RelayMirror, RouteView};
+        use swactor_transport::CodecRegistry;
+        let mut codec = CodecRegistry::new();
+        codec.register_decoder::<edge::NodeEdgeMsg>(edge::EDGE_PROVISION_TAG, |bytes| {
+            let provision: edge::EdgeProvision = serde_json::from_slice(bytes)
+                .map_err(|e| swactor::Error::from(format!("edge provision decode: {e}")))?;
+            Ok(edge::NodeEdgeMsg::Provision(provision))
+        });
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(edge::EDGE_PROVISION_TAG.to_owned(), edge_agent);
+        let relay_mirror: RelayMirror =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let route_view: RouteView =
+            Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let outbox: Outbox = Arc::new(std::sync::Mutex::new(Vec::new()));
+        driver.enable_actor_bridge(
+            runtime.clone(),
+            Arc::new(codec),
+            routes,
+            edge_agent,
+            relay_mirror,
+            route_view,
+            outbox,
+        );
+        driver.install_actor_bridge_pump(Duration::from_millis(250));
+    }
+    let driver = Arc::new(driver);
+    let _ = driver_slot.set(Arc::clone(&driver));
+    // The node serves telemetry pulls itself (spawn_pull_server): keep
+    // TELEMETRY_ALPN connections out of the driver-owned ingress so the
+    // serve loop below can drain them.
+    driver.retain_telemetry_connections();
+    {
+        // Edge agent tick: poll the edge runtime on the supervisor's
+        // session cadence.
+        let sender = runtime.create_sender();
+        let edge_engine = engine.handle();
+        edge_engine.clone().spawn(async move {
+            let mut interval = edge_engine.interval(Duration::from_millis(250));
+            loop {
+                (&mut interval).await;
+                let _ = sender.send_to(edge_agent, edge::NodeEdgeMsg::Tick);
+            }
+        });
+    }
 
     // Join, then announce identity + advertised address to the supervisor's
     // bootstrap actor over the control plane (readiness + telemetry dial).

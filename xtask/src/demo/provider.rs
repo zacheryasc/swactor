@@ -51,6 +51,9 @@ pub struct NodeRuntime {
     /// the first announce). The node re-announces every heartbeat period,
     /// so staleness here means the control-plane path is dead.
     pub last_announce_ms: Option<u64>,
+    /// Serde-serialized `iroh::EndpointAddr` from the node's announce —
+    /// what the supervisor dials for telemetry pulls and demo edges.
+    pub endpoint_addr: Option<String>,
 }
 
 /// Spawn request from the plugin (blocking thread) to the supervisor actor.
@@ -122,6 +125,17 @@ impl NodeManager {
             .cloned()
     }
 
+    /// All registered runtimes (snapshot for liveness sweeps).
+    pub fn nodes(&self) -> Vec<NodeRuntime> {
+        self.inner
+            .lock()
+            .expect("node manager")
+            .nodes
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub fn find_by_stream_node(&self, node: &str) -> Option<NodeRuntime> {
         self.inner
             .lock()
@@ -158,6 +172,12 @@ impl NodeManager {
 
     pub fn set_announce(&self, attempt: u64, at_ms: u64) {
         self.update(attempt, |runtime| runtime.last_announce_ms = Some(at_ms));
+    }
+
+    pub fn set_endpoint(&self, attempt: u64, endpoint_addr_json: String) {
+        self.update(attempt, |runtime| {
+            runtime.endpoint_addr = Some(endpoint_addr_json)
+        });
     }
     pub fn remove(&self, attempt: u64) {
         self.inner
@@ -312,11 +332,13 @@ impl AnnounceActor {
 }
 
 impl ActorInterface for AnnounceActor {
-    type Incoming = crate::provisioning_demo::node::NodeAnnounce;
+    type Incoming = crate::demo::node::NodeAnnounce;
     type Response = ();
 
-    fn handle(&mut self, _ctx: &Ctx, announce: crate::provisioning_demo::node::NodeAnnounce) {
+    fn handle(&mut self, _ctx: &Ctx, announce: crate::demo::node::NodeAnnounce) {
         self.manager.set_announce(announce.attempt, announce.at_ms);
+        self.manager
+            .set_endpoint(announce.attempt, announce.endpoint_addr_json.clone());
         let Some(runtime) = self.manager.get(announce.attempt) else {
             let key = &announce.key_hex;
             eprintln!(

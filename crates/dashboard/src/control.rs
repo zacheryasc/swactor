@@ -25,6 +25,10 @@ pub enum ControlCommand {
     /// Lower the desired cluster size by `count` nodes (graceful scale
     /// down: teardown through the reconciler, not a kill).
     Remove { count: u32 },
+    /// Establish (or replace) the data-plane edge toward one node. The
+    /// supervisor provisions the node's inbound edge over the control
+    /// plane and dials it over EDGE_ALPN.
+    EstablishEdge { node: String },
 }
 
 static CONTROL_SENDER: OnceLock<Sender<ControlCommand>> = OnceLock::new();

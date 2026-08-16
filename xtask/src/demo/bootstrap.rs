@@ -17,7 +17,7 @@ use swactor_process::{ProcessOutputConfig, ProcessSpec, spawn_local_process};
 
 use provisioning::bootstrap::{BootstrapLogic, LogicProbe, NodeLaunchSpec};
 
-use crate::provisioning_demo::provider::{NodeManager, NodeRelayActor, NodeRuntime};
+use crate::demo::provider::{NodeManager, NodeRelayActor, NodeRuntime};
 
 /// Local-process bootstrap logic. The spawned process actor's lifecycle
 /// reports fold into the shared [`NodeManager`] registry via
@@ -77,6 +77,7 @@ impl BootstrapLogic for LocalProcessLogic {
             exited: None,
             spawn_failed: None,
             last_announce_ms: None,
+            endpoint_addr: None,
         });
         Ok(())
     }

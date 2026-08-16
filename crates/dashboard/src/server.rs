@@ -46,7 +46,8 @@ fn router(state: AppState) -> Router {
     let router = router
         .route("/control/kill", axum::routing::post(control_kill))
         .route("/control/provision", axum::routing::post(control_provision))
-        .route("/control/remove", axum::routing::post(control_remove));
+        .route("/control/remove", axum::routing::post(control_remove))
+        .route("/control/edge", axum::routing::post(control_edge));
     router.with_state(state)
 }
 
@@ -88,6 +89,22 @@ async fn control_remove(
 ) -> impl IntoResponse {
     match command {
         crate::control::ControlCommand::Remove { .. } => {
+            if crate::control::dispatch(command) {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        }
+        _ => StatusCode::UNPROCESSABLE_ENTITY,
+    }
+}
+
+#[cfg(feature = "demo-control")]
+async fn control_edge(
+    Json(command): Json<crate::control::ControlCommand>,
+) -> impl IntoResponse {
+    match command {
+        crate::control::ControlCommand::EstablishEdge { .. } => {
             if crate::control::dispatch(command) {
                 StatusCode::ACCEPTED
             } else {

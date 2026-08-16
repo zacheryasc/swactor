@@ -291,6 +291,10 @@ pub struct IrohDriver {
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
     /// Logical edge events emitted by driver-owned EDGE_ALPN byte pumps.
     edge_events: Arc<Mutex<Vec<WireEvent>>>,
+    /// When set, TELEMETRY_ALPN connections are NOT claimed by the
+    /// driver-owned telemetry ingress; the application drains them via
+    /// [`Self::drain_accepted_for_alpn`] (e.g. to serve pulls itself).
+    retain_telemetry_conns: Arc<std::sync::atomic::AtomicBool>,
     next_edge_stream_group: Arc<AtomicU64>,
     /// Frames read by per-connection reader tasks, drained by the engine-hosted
     /// adapter pump ([`Self::install_actor_bridge_pump`]). This decouples network
@@ -495,9 +499,10 @@ impl IrohDriver {
             pending_joins: Arc::new(Mutex::new(Vec::new())),
             dialing: Arc::new(Mutex::new(HashSet::new())),
             accepted_conns,
+            edge_events,
+            retain_telemetry_conns: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             other_accepted_conns,
             telemetry_reads,
-            edge_events,
             next_edge_stream_group: Arc::new(AtomicU64::new(1)),
             incoming: Arc::new(Mutex::new(Vec::new())),
             evict: Arc::new(Mutex::new(Vec::new())),
@@ -1124,6 +1129,15 @@ impl IrohDriver {
         let _ = rx.recv();
     }
 
+    /// Keep TELEMETRY_ALPN connections unclaimed by the driver-owned
+    /// telemetry ingress, so the application can drain them with
+    /// [`Self::drain_accepted_for_alpn`] and serve pulls itself. Call
+    /// before [`Self::install_actor_bridge_pump`].
+    pub fn retain_telemetry_connections(&self) {
+        self.retain_telemetry_conns
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Install engine-hosted interval tasks that drive adapter progression
     /// (actor-bridge ingress/egress, telemetry ingress, edge ingress). After
     /// this call, the application must not manually pump these adapters
@@ -1142,6 +1156,7 @@ impl IrohDriver {
             other_accepted_conns: Arc::clone(&self.other_accepted_conns),
             telemetry_reads: Arc::clone(&self.telemetry_reads),
             edge_events: Arc::clone(&self.edge_events),
+            retain_telemetry_conns: Arc::clone(&self.retain_telemetry_conns),
             next_edge_stream_group: Arc::clone(&self.next_edge_stream_group),
             dialing: Arc::clone(&self.dialing),
             peer_auth: self.peer_auth.clone(),
@@ -1181,6 +1196,7 @@ struct AdapterPump {
     other_accepted_conns: Arc<Mutex<Vec<(NodeId, Vec<u8>, Connection)>>>,
     telemetry_reads: Arc<Mutex<Vec<TelemetryQuicRead>>>,
     edge_events: Arc<Mutex<Vec<WireEvent>>>,
+    retain_telemetry_conns: Arc<std::sync::atomic::AtomicBool>,
     next_edge_stream_group: Arc<AtomicU64>,
     dialing: Arc<Mutex<HashSet<NodeId>>>,
     peer_auth: Option<Arc<Mutex<PeerAllowList>>>,
@@ -1471,8 +1487,15 @@ impl AdapterPump {
     }
 
     /// Claim accepted telemetry connections and read them inside driver-owned
-    /// tasks.
+    /// tasks. Skipped when the application retained TELEMETRY_ALPN
+    /// connections to serve pulls itself.
     fn pump_telemetry_ingress(&self) {
+        if self
+            .retain_telemetry_conns
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return;
+        }
         let drained = {
             let mut pending = self.other_accepted_conns.lock();
             let mut keep = Vec::new();

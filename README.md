@@ -5,6 +5,30 @@ addresses, and a built-in cluster. Actors are ordinary structs; a message is
 any `Clone + Send + Sync` type; an address works the same whether the actor
 lives in this process, on a peer, or behind NAT on another node.
 
+## See it run
+
+One command boots a supervisor — a real swactor engine with a real `iroh`
+endpoint and the dashboard — plus a fleet of node processes that join it over
+QUIC, then keeps that fleet alive:
+
+```sh
+cargo xtask demo    # --nodes 8 --port 9871 --docker also work
+```
+
+Open the dashboard it prints and watch the system act like one:
+
+- **Fleet Control** (`/view/demo-control`) — the reconciler's
+  current-vs-desired state as counters, each node's stage
+  (`New → LeaseRequested → … → SwactorJoined → HandedOff`), and the
+  command/result feeds. Press **kill** on a node: the reconciler notices the
+  death and provisions a replacement, for real.
+- **Fleet** (`/view/fleet`) — per-node cards with PID and lifecycle; click
+  through to an actor roster and per-actor dossier.
+
+Nodes are ordinary child processes (or, with `--docker`, scratch containers
+on their own bridge network), so `kill -9` from a shell triggers the same
+recovery. Ctrl-C tears everything down.
+
 ## What it is
 
 Every actor is one trait. There is no separate message trait to implement —

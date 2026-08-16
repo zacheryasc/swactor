@@ -27,7 +27,7 @@ use swactor_process::{ProcessOutputConfig, ProcessSpec, spawn_local_process};
 
 use provisioning::bootstrap::{BootstrapLogic, LogicProbe, NodeLaunchSpec};
 
-use crate::provisioning_demo::provider::{NodeManager, NodeRelayActor, NodeRuntime};
+use crate::demo::provider::{NodeManager, NodeRelayActor, NodeRuntime};
 
 /// Generic label present on every demo container/network (sweep key).
 pub const SWEEP_LABEL: &str = "swactor-demo";
@@ -143,6 +143,7 @@ impl BootstrapLogic for DockerProcessLogic {
             exited: None,
             spawn_failed: None,
             last_announce_ms: None,
+            endpoint_addr: None,
         });
         Ok(())
     }
@@ -324,7 +325,7 @@ pub fn sweep_run(launch: &DockerLaunch) {
 /// Build the scratch image: stage the static binary + Dockerfile in a temp
 /// dir (keeps the build context to one file), then `docker build`.
 fn build_image(root: &Path, image: &str) -> Result<(), String> {
-    println!("provisioning-reconciler-demo --docker: building static node binary…");
+    println!("demo --docker: building static node binary…");
     let bin = root
         .join("target")
         .join(IMAGE_TARGET)
@@ -355,7 +356,7 @@ fn build_image(root: &Path, image: &str) -> Result<(), String> {
     })();
     let _ = std::fs::remove_dir_all(&staging);
     result.map(|_| {
-        println!("provisioning-reconciler-demo --docker: image {image} ready");
+        println!("demo --docker: image {image} ready");
     })
 }
 

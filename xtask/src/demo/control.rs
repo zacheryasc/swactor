@@ -1,15 +1,15 @@
 //! Control plumbing: dashboard control commands → supervisor actor.
 //!
 //! The dashboard (under `demo-control`) dispatches into a std mpsc channel;
-//! an engine task forwards each command as a `SupervisorMsg::Control` message
-//! to the supervisor actor.
+//! a blocking-pool task forwards each command as a `SupervisorMsg::Control`
+//! message to the supervisor actor.
 
 use std::sync::mpsc as std_mpsc;
 
 use swactor::runtime::ExternalSender;
 use swactor_engine::EngineHandle;
 
-use crate::provisioning_demo::feed::SupervisorMsg;
+use crate::demo::feed::SupervisorMsg;
 
 /// Wire the dashboard control channel to the supervisor actor.
 pub fn install(
@@ -21,7 +21,10 @@ pub fn install(
     dashboard::control::set_control_sender(control_tx);
 
     let engine = engine.clone();
-    engine.spawn(async move {
+    // A std-mpsc recv blocks its thread, so this forwarder must live on the
+    // engine's blocking pool — as an async task it would park one of the
+    // (two) Tokio workers indefinitely and starve the reconciler ticks.
+    engine.spawn_blocking(move || {
         loop {
             match control_rx.recv() {
                 Ok(command) => {

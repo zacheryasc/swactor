@@ -5,7 +5,7 @@
 //! table. No standalone page: `html()` is `None` and the view stays out of
 //! the navbar while its API remains registered.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
@@ -15,6 +15,8 @@ use telemetry::frame::{Frame, StreamId};
 
 use dashboard::FrameEvent;
 use dashboard::view::DashboardView;
+
+use crate::demo::edge::NODE_EDGE_CHANNEL;
 
 const EVENTS_CHANNEL: &str = "prov.reconciler.events";
 const SNAPSHOT_CHANNEL: &str = "prov.reconciler.snapshot";
@@ -36,12 +38,17 @@ struct ReconcilerSnapshot {
     converged: bool,
     age_ms: u64,
     nodes: Vec<Value>,
+    edges: Vec<Value>,
+    /// Latest node-side edge record per logical node (render-only).
+    node_edges: Vec<Value>,
     feed: Vec<FeedLine>,
 }
 
 struct ViewState {
     header: Option<Value>,
     nodes: Vec<Value>,
+    edges: Vec<Value>,
+    node_edges: BTreeMap<String, Value>,
     feed: VecDeque<FeedLine>,
     snapshot_at_ms: u64,
 }
@@ -65,6 +72,8 @@ impl Default for ReconcilerDashboardView {
             state: Mutex::new(ViewState {
                 header: None,
                 nodes: Vec::new(),
+                edges: Vec::new(),
+                node_edges: BTreeMap::new(),
                 feed: VecDeque::new(),
                 snapshot_at_ms: 0,
             }),
@@ -92,7 +101,7 @@ impl DashboardView for ReconcilerDashboardView {
     }
 
     fn channels(&self) -> &'static [&'static str] {
-        &[EVENTS_CHANNEL, SNAPSHOT_CHANNEL]
+        &[EVENTS_CHANNEL, SNAPSHOT_CHANNEL, NODE_EDGE_CHANNEL]
     }
 
     fn show_in_nav(&self) -> bool {
@@ -111,11 +120,21 @@ impl DashboardView for ReconcilerDashboardView {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
+                state.edges = payload
+                    .get("edges")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 state.snapshot_at_ms = payload
                     .get("at_ms")
                     .and_then(Value::as_u64)
                     .unwrap_or_else(|| unix_ms(SystemTime::now()));
                 state.header = Some(payload);
+            }
+            NODE_EDGE_CHANNEL => {
+                // Render-only: latest node-side edge record per node.
+                let node = event.stream.node.clone();
+                state.node_edges.insert(node, payload);
             }
             EVENTS_CHANNEL => {
                 let line = FeedLine {
@@ -162,6 +181,8 @@ impl DashboardView for ReconcilerDashboardView {
                 .unwrap_or(false),
             age_ms: now.saturating_sub(state.snapshot_at_ms),
             nodes: state.nodes.clone(),
+            edges: state.edges.clone(),
+            node_edges: state.node_edges.values().cloned().collect(),
             feed: state.feed.iter().cloned().collect(),
         })
         .unwrap_or_else(|_| serde_json::json!({}))

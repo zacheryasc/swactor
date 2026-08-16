@@ -1,4 +1,4 @@
-//! `cargo xtask provisioning-reconciler-demo` — a visual, human-checked E2E
+//! `cargo xtask demo` — a visual, human-checked E2E
 //! sanity scenario for the provisioning reconciler.
 //!
 //! Supervisor role (default): a lightweight orchestrator — swactor engine +
@@ -15,6 +15,7 @@
 pub mod bootstrap;
 pub mod control;
 pub mod docker;
+pub mod edge;
 pub mod feed;
 pub mod node;
 pub mod provider;
@@ -99,7 +100,7 @@ fn resolve_exe() -> std::path::PathBuf {
 /// node roles) and the endpoint for outbound telemetry pulls.
 pub struct DemoDriverHandle {
     pub supervisor_addr_json: String,
-    pub(crate) driver: IrohDriver,
+    pub(crate) driver: std::sync::Arc<IrohDriver>,
 }
 
 impl DemoDriverHandle {
@@ -169,7 +170,7 @@ impl provisioning::NodeTelemetryCollector for DemoTelemetryCollector {
     }
 }
 
-/// Entry point: `provisioning-reconciler-demo [--port N] [--nodes N]
+/// Entry point: `demo [--port N] [--nodes N]
 /// [--docker]` for the supervisor, or `--demo-node <supervisor-addr-json>
 /// --demo-attempt <n>` for node children.
 pub fn run(args: &[String]) -> ExitCode {
@@ -191,7 +192,7 @@ pub fn run(args: &[String]) -> ExitCode {
     match run_supervisor(args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("provisioning-reconciler-demo: {error}");
+            eprintln!("demo: {error}");
             ExitCode::FAILURE
         }
     }
@@ -250,6 +251,11 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     .map_err(|e| format!("iroh driver: {e}"))?;
     let supervisor_addr_json =
         serde_json::to_string(&driver.endpoint_addr()).map_err(|e| format!("addr: {e}"))?;
+    // The supervisor's address travels through a shared slot; long-lived
+    // engine tasks installed below wait for it lazily. (Spawning engine
+    // tasks after the actor spawn proved flaky at startup.)
+    let supervisor_slot: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>> =
+        Arc::new(std::sync::OnceLock::new());
     {
         use distribution::transport_bridge::{Outbox, RelayMirror, RouteView};
         use swactor_transport::CodecRegistry;
@@ -266,13 +272,24 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
                 sender.clone(),
             ))
             .map_err(|e| format!("spawn announce actor: {e}"))?;
+        let ack_relay = runtime
+            .spawn(edge::EdgeAckRelay::new(
+                sender.clone(),
+                supervisor_slot.clone(),
+            ))
+            .map_err(|e| format!("spawn edge ack relay: {e}"))?;
         let mut codec = CodecRegistry::new();
         codec.register_decoder::<node::NodeAnnounce>(node::ANNOUNCE_TAG, |bytes| {
             serde_json::from_slice(bytes)
                 .map_err(|e| swactor::Error::from(format!("announce decode: {e}")))
         });
+        codec.register_decoder::<edge::EdgeAck>(edge::EDGE_ACK_TAG, |bytes| {
+            serde_json::from_slice(bytes)
+                .map_err(|e| swactor::Error::from(format!("edge ack decode: {e}")))
+        });
         let mut routes = std::collections::HashMap::new();
         routes.insert(node::ANNOUNCE_TAG.to_owned(), announce);
+        routes.insert(edge::EDGE_ACK_TAG.to_owned(), ack_relay);
         let relay_mirror: RelayMirror =
             Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let route_view: RouteView =
@@ -292,7 +309,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
 
     let driver_handle = Arc::new(DemoDriverHandle {
         supervisor_addr_json: supervisor_addr_json.clone(),
-        driver,
+        driver: Arc::new(driver),
     });
 
     // Dashboard.
@@ -342,11 +359,6 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         spawner,
     );
 
-    // The supervisor's address travels through a shared slot; long-lived
-    // engine tasks installed below wait for it lazily. (Spawning engine
-    // tasks after the actor spawn proved flaky at startup.)
-    let supervisor_slot: Arc<std::sync::OnceLock<swactor::actor::ActorAddress>> =
-        Arc::new(std::sync::OnceLock::new());
 
     // Bootstrap machinery: kind registry with the process logic, the
     // remote-stream fanout, and the pull collector.
@@ -377,6 +389,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
             )) as Box<dyn provisioning::BootstrapLogic>)
         })
     });
+    let edge_driver = std::sync::Arc::clone(&driver_handle.driver);
     let collector: Arc<dyn provisioning::NodeTelemetryCollector> =
         Arc::new(DemoTelemetryCollector {
             engine: engine.handle(),
@@ -386,6 +399,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
             supervisor_slot: supervisor_slot.clone(),
         });
 
+    let (edge_cmd_tx, edge_cmd_rx) = std::sync::mpsc::channel::<edge::EdgePumpCmd>();
     let supervisor = SupervisorActor::new(
         cluster_driver,
         executor,
@@ -401,6 +415,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         slots,
         RunId(1),
         launch.clone(),
+        edge_cmd_tx,
     );
 
     // Control plane: dashboard → supervisor.
@@ -444,9 +459,20 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         .set(supervisor_addr.clone())
         .expect("supervisor address slot set once");
 
-    println!("provisioning-reconciler-demo: dashboard on http://localhost:{port}");
+    // Edge pump on the blocking pool: it solely owns the edge sessions —
+    // edge runtime polls block their thread (connect handshakes), which
+    // must never run on a Tokio worker or hold a lock the actor needs.
+    edge::start_edge_pump(
+        &engine.handle(),
+        edge_driver,
+        edge_cmd_rx,
+        sender.clone(),
+        supervisor_slot.clone(),
+    );
+
+    println!("demo: dashboard on http://localhost:{port}");
     println!("  /view/fleet        — per-node cards (pid, lifecycle)");
-    println!("  /view/demo-control — Fleet Control: stages, feeds, kill / provision");
+    println!("  /view/demo-control — Fleet Control: stages, feeds, kill / provision / edge");
     println!("  Ctrl-C to tear down.");
 
     // Block until Ctrl-C (synchronous signal flag — the wait must not depend
