@@ -130,6 +130,8 @@ mod tests {
             stream: crate::StreamEvent {
                 node: stream.node.as_str().to_string(),
                 life: stream.life.0,
+                origin: None,
+                label: None,
             },
             channel: channel.to_owned(),
             position,

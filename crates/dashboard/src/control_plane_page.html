@@ -5,65 +5,120 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>swactor fleet</title>
   <style>
-    :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f172a; color: #e2e8f0; }
+    :root {
+      color-scheme: dark;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      /* dark: Bloomberg night housing */
+      --bg: #000000; --panel: #001220; --panel-hover: #001c38; --inset: #00060c;
+      --border: #14406a; --divider: #0d2c4a;
+      --text: #ffffff; --muted: #9db2c4;
+      --amber: #ff9900; --ghost: rgba(255, 153, 0, .16);
+      --ok: #00d400; --bad: #ff4141; --cyan: #5cd5ff;
+      --primary-fill: #ff9900; --primary-ink: #000000;
+      --danger-fill: #7a1010; --danger-border: #ff4141; --danger-ink: #ffd7d7;
+      --selected: rgba(255, 153, 0, .10); --selected-edge: #ff9900;
+      --card-hover: #00263f; --row-hover: #002a47;
+      --r: 2px; --t: 120ms;
+      background: var(--bg); color: var(--text);
+    }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      /* light: Atom One Light bench card */
+      --bg: #fafafa; --panel: #ffffff; --panel-hover: #f0f0f0; --inset: #f5f5f5;
+      --border: #dcdcE0; --divider: #eaeaea;
+      --text: #383a42; --muted: #696c77;
+      --amber: #986801; --ghost: rgba(152, 104, 1, .18);
+      --ok: #50a14f; --bad: #e45649; --cyan: #0184bc;
+      --primary-fill: #0184bc; --primary-ink: #ffffff;
+      --danger-fill: #cc3a2f; --danger-border: #cc3a2f; --danger-ink: #ffffff;
+      --selected: rgba(64, 120, 242, .08); --selected-edge: #4078f2;
+      --card-hover: #f0f4fb; --row-hover: #eef1f8;
+    }
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme]) {
+        color-scheme: light;
+        --bg: #fafafa; --panel: #ffffff; --panel-hover: #f0f0f0; --inset: #f5f5f5;
+        --border: #dcdcE0; --divider: #eaeaea;
+        --text: #383a42; --muted: #696c77;
+        --amber: #986801; --ghost: rgba(152, 104, 1, .18);
+        --ok: #50a14f; --bad: #e45649; --cyan: #0184bc;
+        --primary-fill: #0184bc; --primary-ink: #ffffff;
+        --danger-fill: #cc3a2f; --danger-border: #cc3a2f; --danger-ink: #ffffff;
+        --selected: rgba(64, 120, 242, .08); --selected-edge: #4078f2;
+        --card-hover: #f0f4fb; --row-hover: #eef1f8;
+      }
+    }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 18px; }
-    header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
-    h1 { margin: 0; font-size: 24px; }
-    h2 { margin: 22px 0 10px; font-size: 17px; }
-    .muted { color: #94a3b8; }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
-    .totals { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
-    .totals .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 10px 12px; }
-    .totals .label { color: #94a3b8; font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
-    .totals .value { font-size: 20px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    body { margin: 0; padding: 20px; }
+    header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 20px; }
+    h2 { margin: 20px 0 10px; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--amber); }
+    .muted { color: var(--muted); }
+    .mono { font-family: var(--mono); font-size: 12px; }
+    #status { font-family: var(--mono); font-size: 13px; color: var(--amber); }
+    a.node-card { color: inherit; text-decoration: none; display: block; }
+    .node-card.orchestrator { grid-column: 1 / -1; border-color: var(--amber); background: var(--card-hover); }
+    .node-card .role { display: inline-flex; margin-left: 8px; padding: 2px 6px; border: 1px solid var(--amber); border-radius: var(--r); color: var(--amber); font: 600 10px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .07em; vertical-align: 2px; }
+    :is(a, button, input, summary):focus-visible, tr[data-addr]:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
-    .node-card { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 14px; cursor: pointer; transition: border-color .12s; }
-    .node-card:hover { border-color: #60a5fa; }
+    .node-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); padding: 14px; cursor: pointer; transition: border-color var(--t), background var(--t); }
+    .node-card:hover { border-color: var(--amber); background: var(--card-hover); }
     .node-card[data-live="false"] { opacity: .55; }
-    .node-card h3 { margin: 0 0 2px; font-size: 15px; word-break: break-all; }
-    .node-card .meta { color: #94a3b8; font-size: 12px; margin-bottom: 8px; }
+    .node-card h3 { margin: 0 0 2px; font: 700 13px/1.4 var(--mono); word-break: break-all; }
+    .node-card .meta { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
     .bars { display: grid; gap: 5px; }
-    .bar-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-    .bar-row .name { width: 92px; color: #94a3b8; }
-    .bar-track { flex: 1; height: 8px; background: #111827; border-radius: 99px; overflow: hidden; }
-    .bar-fill { height: 100%; border-radius: 99px; }
-    .bar-fill.ok { background: #34d399; } .bar-fill.warn { background: #fbbf24; } .bar-fill.bad { background: #f87171; }
+    .bar-row { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; }
+    .bar-row .name { width: 92px; color: var(--muted); }
+    .bar-track { flex: 1; height: 8px; background: var(--inset); border-radius: var(--r); overflow: hidden; }
+    .bar-fill { height: 100%; }
+    .bar-fill.ok { background: var(--ok); } .bar-fill.warn { background: var(--amber); } .bar-fill.bad { background: var(--bad); }
     .bar-row .num { width: 64px; text-align: right; font-variant-numeric: tabular-nums; }
-    .pill { display: inline-flex; padding: 2px 8px; border-radius: 999px; border: 1px solid #334155; font-size: 11px; }
-    .pill.live { color: #34d399; border-color: #065f46; }
-    .pill.stale { color: #f87171; border-color: #7f1d1d; }
-    .pill.poisoned { color: #f87171; border-weight: 600; }
+    .pill { display: inline-flex; padding: 3px 6px; border: 1px solid var(--muted); border-radius: var(--r); font: 600 10px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--text); }
+    .pill.live { color: var(--ok); border-color: var(--ok); }
+    .pill.stale { color: var(--bad); border-color: var(--bad); }
+    .pill.poisoned { color: var(--bad); border-color: var(--bad); font-weight: 700; }
     details.stale { margin-top: 18px; }
-    details.stale summary { cursor: pointer; color: #94a3b8; padding: 8px 0; }
-    .focus-back { display: inline-block; margin-bottom: 12px; color: #93c5fd; text-decoration: none; }
+    details.stale summary { cursor: pointer; color: var(--muted); padding: 8px 0; font-family: var(--mono); font-size: 12px; }
+    .focus-back { display: inline-block; margin-bottom: 12px; color: var(--cyan); text-decoration: none; font-family: var(--mono); font-size: 12px; }
+    .focus-back:hover { color: var(--amber); }
     .node-view { display: grid; gap: 14px; }
-    .panel { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 14px; }
-    table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #1f2937; font-variant-numeric: tabular-nums; }
-    th { color: #93c5fd; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
-    tbody tr[data-addr] { cursor: pointer; }
-    tbody tr[data-addr]:hover { background: #17255466; }
-    tbody tr[data-selected="true"] { background: #17255488; }
-    input[type=search] { background: #111827; color: #e2e8f0; border: 1px solid #334155; border-radius: 8px; padding: 7px 10px; width: 240px; max-width: 100%; }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); padding: 14px; }
+    table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+    th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--divider); font-variant-numeric: tabular-nums; }
+    th { color: var(--amber); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+    tbody tr[data-addr] { cursor: pointer; transition: background var(--t); }
+    tbody tr[data-addr]:hover { background: var(--row-hover); }
+    tbody tr[data-selected="true"] { background: var(--selected); box-shadow: inset 2px 0 0 var(--selected-edge); }
+    input[type=search] { background: var(--inset); color: var(--text); border: 1px solid var(--border); border-radius: var(--r); padding: 7px 10px; width: 240px; max-width: 100%; font: 12px var(--mono); }
+    input[type=search]:hover { border-color: var(--cyan); }
     .layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
     @media (min-width: 1100px) { .layout.with-dossier { grid-template-columns: minmax(0, 1fr) 420px; } }
     .dossier { position: sticky; top: 12px; align-self: start; max-height: calc(100vh - 24px); overflow: auto; }
     .kv { display: grid; grid-template-columns: 120px 1fr; gap: 4px 10px; font-size: 13px; }
-    .kv .k { color: #94a3b8; }
+    .kv .k { color: var(--muted); font-family: var(--mono); font-size: 12px; }
     .diet .bar-row .name { width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .receipts td { font-size: 12px; }
-    .empty { padding: 24px; border: 1px dashed #475569; border-radius: 12px; color: #94a3b8; }
-    .notice { font-size: 12px; color: #94a3b8; margin: 6px 0; }
-    canvas { width: 100%; height: 64px; background: #111827; border: 1px solid #334155; border-radius: 10px; }
-    .err { color: #f87171; }
+    .receipts td { font-size: 11px; }
+    .empty { padding: 24px; border: 1px dashed var(--border); border-radius: var(--r); color: var(--muted); font-family: var(--mono); font-size: 12px; }
+    .notice { font-size: 12px; color: var(--muted); margin: 6px 0; }
+    canvas { width: 100%; height: 64px; background: var(--inset); border: 1px solid var(--border); border-radius: var(--r); }
+    .err { color: var(--bad); }
+    @media (prefers-reduced-motion: reduce) { * { transition-duration: 0.01ms !important; animation: none !important; } }
   </style>
 </head>
 <body>
+<!--
+swactor dashboard — direction contract (impeccable seed 8b5f2278)
+THESIS: a numeric instrument bank for a live actor fleet; Bloomberg night housing (dark) / Atom One Light bench card (light); absence drawn as designed negative space, never blank.
+OWN-WORLD: black-on-navy or paper-on-white; amber owns the data register, green/red are law, cyan is the only interactive voice; 2px corners, monospace data, machined caps labels, controls that depress.
+FIRST VIEWPORT: the fleet as an instrument rack — orchestrator module pinned with an amber edge, node cards as module slots with state tags.
+SIGNATURE: state as instrument grammar — lit tag for live, struck dim for dead, no skeleton bars for silent channels.
+RISK: terminal cosplay if decoration creeps past data; held by the palette law.
+-->
 <!--swactor:nav-->
 <header>
   <h1>Fleet</h1>
-  <span class="muted" id="status">loading…</span>
+  <span class="muted" id="status" role="status" aria-live="polite">loading…</span>
 </header>
 
 <div id="page">
@@ -141,7 +196,7 @@ function render() {
   const live = data.live || [];
   const stale = data.stale || [];
   const totals = data.totals || {};
-  status.textContent = `${fmt(totals.live_nodes)} live · ${fmt(totals.stale_nodes)} stale · ${fmt(totals.actors)} actors`;
+  status.textContent = `${fmt(totals.live_nodes)} live · ${fmt(totals.stale_nodes)} stale`;
 
   const node = live.concat(stale).find(n => n.stream.key === selectedStream)
     || live.find(n => n.stream.key === selectedStream);
@@ -154,23 +209,13 @@ function render() {
 
 function renderFleet(page, live, stale, totals) {
   stopDetailPolling();
+  const orchestrators = live.filter(n => (n.stream.origin || '') === 'orchestrator');
+  const workers = live.filter(n => (n.stream.origin || '') !== 'orchestrator');
   const parts = [];
-  parts.push(`<div class="totals">
-    ${totalCard('Live nodes', fmt(totals.live_nodes))}
-    ${totalCard('Actors', fmt(totals.actors))}
-    ${totalCard('Msg/s', fmtRate(totals.msg_per_sec))}
-    ${totalCard('Mailbox', fmt(totals.mailbox_depth))}
-    ${totalCard('Poisoned', fmt(totals.poisoned), totals.poisoned > 0 ? 'err' : '')}
-    ${totalCard('CPU avg', totals.cpu_avg_percent == null ? '—' : fmt(totals.cpu_avg_percent, 1) + '%')}
-    ${totalCard('GPU max', totals.gpu_max_percent == null ? '—' : fmt(totals.gpu_max_percent) + '%')}
-    ${totalCard('GPU mem', totals.gpu_memory_total_mib ? fmt(totals.gpu_memory_used_mib) + '/' + fmt(totals.gpu_memory_total_mib) + ' MiB' : '—')}
-    ${totalCard('Net', fmtRate(totals.net_rx_bps) + '↓ ' + fmtRate(totals.net_tx_bps) + '↑')}
-  </div>`);
-
   if (!live.length && !stale.length) {
     parts.push('<div class="empty">No telemetry streams yet. A live swactor runtime or host publisher will populate this page.</div>');
   } else {
-    parts.push('<div class="grid">' + live.map(nodeCard).join('') + '</div>');
+    parts.push('<div class="grid">' + orchestrators.concat(workers).map(nodeCard).join('') + '</div>');
     if (stale.length) {
       parts.push(`<details class="stale">
         <summary>Stale nodes (${stale.length}) — silent beyond the liveness window</summary>
@@ -182,33 +227,24 @@ function renderFleet(page, live, stale, totals) {
   bindCards();
 }
 
-function totalCard(label, value, cls = '') {
-  return `<div class="card"><div class="label">${esc(label)}</div><div class="value ${cls}">${esc(value)}</div></div>`;
-}
-
 function nodeCard(node) {
   const summary = node.actor_summary || {};
-  const cpu = node.cpu && node.cpu.host ? node.cpu.host.total_percent : null;
-  const gpu = node.gpu && node.gpu.gpus && node.gpu.gpus.length
-    ? node.gpu.gpus.reduce((max, d) => Math.max(max, d.utilization_gpu_percent || 0), 0)
-    : null;
-  const gpuMem = node.gpu && node.gpu.gpus && node.gpu.gpus.length
-    ? node.gpu.gpus.reduce((acc, d) => ({
-        used: acc.used + (d.memory_used_mib || 0),
-        total: acc.total + (d.memory_total_mib || 0) }), { used: 0, total: 0 })
-    : null;
   const proc = node.process ? `<span class="pill">${esc(node.process.state)}</span> ` : '';
-  return `<article class="node-card" data-stream="${esc(node.stream.key)}" data-live="${node.live ? 'true' : 'false'}">
-    <h3>${esc(node.stream.node)} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
-    <div class="meta">${proc}seen ${ago(node.last_seen_ms_ago)} ago · ${fmt(summary.actors)} actors · ${fmtRate(summary.msg_per_sec)} msg/s${summary.num_workers != null ? ' · ' + fmt(summary.num_workers) + ' workers' : ''}${summary.uptime_ms != null ? ' · up ' + ago(summary.uptime_ms) : ''}</div>
-    <div class="bars">
-      <div class="bar-row"><span class="name">CPU</span>${bar(cpu)}<span class="num">${cpu == null ? '—' : fmt(cpu, 0) + '%'}</span></div>
-      <div class="bar-row"><span class="name">GPU</span>${bar(gpu)}<span class="num">${gpu == null ? '—' : fmt(gpu) + '%'}</span></div>
-      ${gpuMem && gpuMem.total ? `<div class="bar-row"><span class="name">GPU mem</span>${bar(gpuMem.used, gpuMem.total)}<span class="num">${fmt(gpuMem.used)}/${fmt(gpuMem.total)}</span></div>` : ''}
-      <div class="bar-row"><span class="name">Mailbox</span>${bar(summary.mailbox_depth, Math.max(64, summary.mailbox_depth))}<span class="num">${fmt(summary.mailbox_depth)}</span></div>
-    </div>
+  const origin = node.stream.origin || '';
+  const isOrchestrator = origin === 'orchestrator';
+  const role = isOrchestrator ? '<span class="role">orchestrator</span>' : '';
+  const stats = [
+    summary.actors ? fmt(summary.actors) + ' actors' : null,
+    summary.msg_per_sec ? fmtRate(summary.msg_per_sec) + ' msg/s' : null,
+    summary.num_workers != null ? fmt(summary.num_workers) + ' workers' : null,
+    summary.uptime_ms != null ? 'up ' + ago(summary.uptime_ms) : null,
+  ].filter(Boolean).join(' · ');
+  const label = node.stream.label ? ` · ${esc(node.stream.label)}` : '';
+  return `<a class="node-card${isOrchestrator ? ' orchestrator' : ''}" data-stream="${esc(node.stream.key)}" data-live="${node.live ? 'true' : 'false'}" href="?stream=${encodeURIComponent(node.stream.key)}">
+    <h3>${esc(node.stream.node)}${role} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
+    <div class="meta">${proc}seen ${ago(node.last_seen_ms_ago)} ago · ${stats || 'no runtime stats'}${label}</div>
     ${summary.poisoned ? `<div class="notice err">${fmt(summary.poisoned)} poisoned actor(s)</div>` : ''}
-  </article>`;
+  </a>`;
 }
 
 function renderNode(page, node, live, stale) {
@@ -219,12 +255,12 @@ function renderNode(page, node, live, stale) {
     <div class="layout ${selectedActor ? 'with-dossier' : ''}">
       <div class="node-view">
         <section class="panel">
-          <h2 style="margin:0 0 8px">${esc(node.stream.node)} <span class="muted" style="font-size:13px">life ${fmt(node.stream.life)} · ${node.live ? 'live' : 'stale ' + ago(node.last_seen_ms_ago) + ' ago'}</span></h2>
+          <h2 style="margin:0 0 8px">${esc(node.stream.node)}${node.stream.label ? ` <span class="muted" style="font-size:13px">${esc(node.stream.label)}</span>` : ''} <span class="muted" style="font-size:13px">life ${fmt(node.stream.life)} · ${node.live ? 'live' : 'stale ' + ago(node.last_seen_ms_ago) + ' ago'}</span></h2>
           ${machine}
         </section>
         <section class="panel">
           <h2 style="margin:0 0 8px">Actors (${fmt(summary.actors)})</h2>
-          <input type="search" id="roster-filter" placeholder="filter by type, address, worker…" value="${esc(rosterFilter)}">
+          <input type="search" id="roster-filter" aria-label="Filter actors" placeholder="filter by type, address, worker…" value="${esc(rosterFilter)}">
           <div id="roster-wrap" style="margin-top:10px"></div>
         </section>
       </div>
@@ -307,7 +343,7 @@ function renderRoster(node) {
   }
   wrap.innerHTML = notice + `<table>
     <thead><tr><th>Actor</th><th>Type</th><th>State</th><th>Mailbox</th><th>Msg/s</th><th>Processed</th><th>Worker</th><th>Last message</th></tr></thead>
-    <tbody>${capped.map(a => `<tr data-addr="${esc(a.address)}" ${a.address === selectedActor ? 'data-selected="true"' : ''}>
+    <tbody>${capped.map(a => `<tr data-addr="${esc(a.address)}" tabindex="0" ${a.address === selectedActor ? 'data-selected="true"' : ''}>
       <td class="mono">${esc(shortAddr(a.address))}${a.name ? `<br><span class="muted">${esc(a.name)}</span>` : ''}</td>
       <td><span class="muted" title="${esc(a.actor_type || '')}">${typeShort(a.actor_type)}</span></td>
       <td>${a.poisoned ? '<span class="pill poisoned">poisoned</span>' : '<span class="muted">running</span>'}</td>
@@ -319,11 +355,13 @@ function renderRoster(node) {
     </tr>`).join('')}</tbody>
   </table>`;
   wrap.querySelectorAll('tr[data-addr]').forEach(tr => {
-    tr.addEventListener('click', () => {
+    const select = () => {
       selectedActor = tr.getAttribute('data-addr');
       pushUrl();
       render();
-    });
+    };
+    tr.addEventListener('click', select);
+    tr.addEventListener('keydown', e => { if (e.key === 'Enter') select(); });
   });
 }
 
@@ -377,7 +415,7 @@ function renderDossier(d) {
   slot.innerHTML = `<section class="panel dossier">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
       <h2 style="margin:0">${typeShort(d.actor_type)} <span class="muted mono" style="font-size:12px">${esc(shortAddr(d.address))}</span></h2>
-      <button id="dossier-close" style="background:none;border:none;color:#94a3b8;cursor:pointer;font-size:16px">×</button>
+      <button id="dossier-close" aria-label="Close dossier" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px">×</button>
     </div>
     <div class="kv" style="margin-top:10px">
       <span class="k">node</span><span>${esc(d.stream.node)}</span>
@@ -414,7 +452,8 @@ function renderDossier(d) {
 
 function bindCards() {
   document.querySelectorAll('.node-card').forEach(card => {
-    card.addEventListener('click', () => {
+    card.addEventListener('click', e => {
+      e.preventDefault();
       selectedStream = card.getAttribute('data-stream');
       selectedActor = null;
       pushUrl();

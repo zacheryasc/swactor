@@ -5,10 +5,65 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Telemetry live explorer</title>
 <style>
-:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0f172a;color:#e2e8f0}body{margin:0;padding:18px}header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:14px}h1{margin:0;font-size:26px}.muted{color:#94a3b8}.top{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}.pill,button,input,select{background:#111827;color:#e2e8f0;border:1px solid #334155;border-radius:9px;padding:8px 10px}.pill{background:#1e293b;border-radius:999px;font-size:12px}button{cursor:pointer}button[data-active=true]{outline:2px solid #60a5fa;background:#172554}input{min-width:280px}.metrics{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:10px;margin-bottom:12px}.grid{display:grid;grid-template-columns:1fr 420px;gap:12px}.card{background:#1e293b;border:1px solid #334155;border-radius:14px;padding:14px}.label{font-size:11px;color:#94a3b8;text-transform:uppercase;letter-spacing:.08em}.value{font-size:23px;font-variant-numeric:tabular-nums}.table-wrap{max-height:740px;overflow:auto}table{width:100%;border-collapse:collapse;background:#111827;border:1px solid #334155;border-radius:12px;overflow:hidden}th,td{padding:8px 9px;border-bottom:1px solid #1f2937;text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}th{background:#1e293b;color:#93c5fd;position:sticky;top:0}tbody tr{cursor:pointer}tr[data-active=true]{outline:2px solid #60a5fa;background:#172554}.tag{font-size:12px;border-radius:999px;padding:3px 8px;background:#334155}.json{color:#86efac}.text{color:#fbbf24}.binary{color:#c4b5fd}.ok{color:#34d399}.warn{color:#fbbf24}.bad{color:#f87171}.kv{display:grid;grid-template-columns:115px 1fr;gap:8px;border-bottom:1px solid #334155;padding:7px 0}pre{white-space:pre-wrap;word-break:break-word;background:#020617;border:1px solid #334155;border-radius:12px;padding:12px;max-height:560px;overflow:auto}.empty{border:1px dashed #475569;border-radius:12px;padding:22px;color:#94a3b8}section[hidden]{display:none}@media(max-width:1100px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}input{min-width:0;width:100%}}
-.nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:14px;background:#1e293b;border:1px solid #334155;border-radius:14px;padding:8px}.nav a{color:#e2e8f0;text-decoration:none;border:1px solid transparent;border-radius:9px;padding:7px 10px}.nav a[data-active="true"]{background:#172554;border-color:#60a5fa}
+:root{color-scheme:dark;font-family:ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--bg:#000000;--panel:#001220;--panel-hover:#001c38;--inset:#00060c;--border:#14406a;--divider:#0d2c4a;--text:#ffffff;--muted:#9db2c4;--amber:#ff9900;--ghost:rgba(255,153,0,.16);--ok:#00d400;--bad:#ff4141;--cyan:#5cd5ff;--magenta:#cc78bc;--primary-fill:#ff9900;--primary-ink:#000000;--selected:rgba(255,153,0,.10);--selected-edge:#ff9900;--row-hover:#002a47;--r:2px;--t:120ms;background:var(--bg);color:var(--text)}
+:root[data-theme="light"]{color-scheme:light;--bg:#fafafa;--panel:#ffffff;--panel-hover:#f0f0f0;--inset:#f5f5f5;--border:#dcdcE0;--divider:#eaeaea;--text:#383a42;--muted:#696c77;--amber:#986801;--ghost:rgba(152,104,1,.18);--ok:#50a14f;--bad:#e45649;--cyan:#0184bc;--magenta:#a626a4;--primary-fill:#0184bc;--primary-ink:#ffffff;--selected:rgba(64,120,242,.08);--selected-edge:#4078f2;--row-hover:#eef1f8}
+@media (prefers-color-scheme: light){:root:not([data-theme]){color-scheme:light;--bg:#fafafa;--panel:#ffffff;--panel-hover:#f0f0f0;--inset:#f5f5f5;--border:#dcdcE0;--divider:#eaeaea;--text:#383a42;--muted:#696c77;--amber:#986801;--ghost:rgba(152,104,1,.18);--ok:#50a14f;--bad:#e45649;--cyan:#0184bc;--magenta:#a626a4;--primary-fill:#0184bc;--primary-ink:#ffffff;--selected:rgba(64,120,242,.08);--selected-edge:#4078f2;--row-hover:#eef1f8}}
+*{box-sizing:border-box}
+body{margin:0;padding:20px}
+header{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:16px}
+h1{margin:0;font-size:20px}
+h2{margin:0 0 8px;font-size:16px}
+.muted{color:var(--muted)}
+.top{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:12px}
+button,input,select{font:600 13px var(--mono);color:var(--text);background:var(--inset);border:1px solid var(--border);border-radius:var(--r);padding:6px 10px}
+button{cursor:pointer;transition:background var(--t),border-color var(--t)}
+button:hover{background:var(--panel-hover);border-color:var(--cyan)}
+button:active{transform:translateY(1px)}
+button[aria-pressed="true"]{color:var(--amber);background:var(--selected);border-color:var(--amber)}
+input:hover,select:hover{border-color:var(--cyan)}
+input{min-width:280px;font-weight:400}
+:is(a,button,input,select,summary):focus-visible,tr[data-stream]:focus-visible,tr[data-channel]:focus-visible,tr[data-frame]:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
+.pill{display:inline-flex;padding:3px 8px;background:transparent;border:1px solid var(--muted);border-radius:var(--r);font-size:11px;font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em}
+.pill.ok{color:var(--ok);border-color:var(--ok)}
+.pill.warn{color:var(--amber);border-color:var(--amber)}
+.pill.bad{color:var(--bad);border-color:var(--bad)}
+.metrics{display:grid;grid-template-columns:repeat(5,minmax(110px,1fr));gap:12px;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:1fr 420px;gap:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--r);padding:14px}
+.label{font:600 10px var(--mono);color:var(--amber);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px}
+.seg{position:relative;display:inline-flex;justify-content:flex-end;font:700 20px/1 var(--mono);color:var(--amber);font-variant-numeric:tabular-nums;letter-spacing:.05em}
+.seg::before{content:attr(data-ghost);position:absolute;right:0;top:0;color:var(--ghost)}
+.seg .seg-v{position:relative}
+.value{font:700 20px/1 var(--mono);color:var(--amber);font-variant-numeric:tabular-nums}
+.table-wrap{max-height:740px;overflow:auto}
+table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+th,td{padding:8px 9px;border-bottom:1px solid var(--divider);text-align:left;vertical-align:top;font-variant-numeric:tabular-nums}
+th{background:var(--panel);color:var(--amber);font-weight:600;font-size:10px;text-transform:uppercase;letter-spacing:.08em;position:sticky;top:0}
+tbody tr[data-stream],tbody tr[data-channel],tbody tr[data-frame]{cursor:pointer;transition:background var(--t)}
+tbody tr[data-stream]:hover,tbody tr[data-channel]:hover,tbody tr[data-frame]:hover{background:var(--row-hover)}
+tr[data-active="true"]{background:var(--selected);box-shadow:inset 2px 0 0 var(--selected-edge)}
+.tag{font-size:10px;border-radius:var(--r);padding:3px 6px;border:1px solid var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.tag.json{color:var(--ok);border-color:var(--ok)}
+.tag.text{color:var(--amber);border-color:var(--amber)}
+.tag.binary{color:var(--magenta);border-color:var(--magenta)}
+.json{color:var(--ok)}.text{color:var(--amber)}.binary{color:var(--magenta)}
+.ok{color:var(--ok)}.warn{color:var(--amber)}.bad{color:var(--bad)}
+.kv{display:grid;grid-template-columns:115px 1fr;gap:8px;border-bottom:1px solid var(--divider);padding:7px 0;font-size:12px;font-family:var(--mono)}
+pre{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);background:var(--inset);border:1px solid var(--border);border-radius:var(--r);padding:12px;max-height:560px;overflow:auto;font-size:12px}
+.empty{border:1px dashed var(--border);border-radius:var(--r);padding:22px;color:var(--muted);font-family:var(--mono);font-size:12px}
+section[hidden]{display:none}
+@media(max-width:1100px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}input{min-width:0;width:100%}}
+@media(prefers-reduced-motion:reduce){*{transition-duration:0.01ms!important;animation:none!important}}
 </style>
 </head>
+<!--
+swactor dashboard — direction contract (impeccable seed 8b5f2278)
+THESIS: a numeric instrument bank for a live actor fleet; Bloomberg night housing (dark) / Atom One Light bench card (light); absence drawn as ghost segments, never blank.
+OWN-WORLD: black-on-navy or paper-on-white; amber owns the data register, green/red are law, cyan is the only interactive voice; 2px corners, monospace data, machined caps labels, controls that depress.
+FIRST VIEWPORT: the telemetry bench — ghost-segment counters over the frame table, channel kinds as colored tags, payload inspection in an inset well.
+SIGNATURE: counters tick by instant segment swap; ghost eights hold every unlit place.
+RISK: terminal cosplay if decoration creeps past data; held by the palette law.
+-->
 <body>
 <!--swactor:nav-->
 <header>
@@ -16,15 +71,14 @@
     <h1>Telemetry live explorer</h1>
     <div class="muted">Auto-connected. Retained channel history is restored from /api/view/telemetry/live, then live frames continue from /events.</div>
   </div>
-  <span class="pill warn" id="status">starting</span>
+  <span class="pill warn" id="status" role="status" aria-live="polite">starting</span>
 </header>
-
 <section class="top">
-  <button data-level="streams">Streams</button>
-  <button data-level="channels">Channels</button>
-  <button data-level="frames">Frames</button>
-  <button id="clearScope">all streams</button>
-  <input id="filter" placeholder="filter visible rows" spellcheck="false">
+  <button data-level="streams" aria-pressed="true">Streams</button>
+  <button data-level="channels" aria-pressed="false">Channels</button>
+  <button data-level="frames" aria-pressed="false">Frames</button>
+  <button id="clearScope" aria-label="Reset scope to all streams">all streams</button>
+  <input id="filter" aria-label="Filter visible rows" placeholder="filter visible rows" spellcheck="false">
   <select id="kind"><option value="">all payloads</option><option value="json">json</option><option value="text">text</option><option value="binary">binary</option></select>
   <label class="muted" for="limit">keep/channel</label>
   <select id="limit"><option>100</option><option selected>500</option><option>1000</option><option>2000</option></select>
@@ -32,10 +86,10 @@
 </section>
 
 <section class="metrics">
-  <div class="card"><div class="label">frames</div><div class="value" id="metricFrames">0</div></div>
-  <div class="card"><div class="label">streams</div><div class="value" id="metricStreams">0</div></div>
-  <div class="card"><div class="label">channels</div><div class="value" id="metricChannels">0</div></div>
-  <div class="card"><div class="label">json</div><div class="value" id="metricJson">0</div></div>
+  <div class="card"><div class="label">frames</div><span class="seg" id="metricFramesSeg" data-ghost="8"><span class="seg-v" id="metricFrames">0</span></span></div>
+  <div class="card"><div class="label">streams</div><span class="seg" id="metricStreamsSeg" data-ghost="8"><span class="seg-v" id="metricStreams">0</span></span></div>
+  <div class="card"><div class="label">channels</div><span class="seg" id="metricChannelsSeg" data-ghost="8"><span class="seg-v" id="metricChannels">0</span></span></div>
+  <div class="card"><div class="label">json</div><span class="seg" id="metricJsonSeg" data-ghost="8"><span class="seg-v" id="metricJson">0</span></span></div>
   <div class="card"><div class="label">scope</div><div class="value" id="metricScope">all</div></div>
 </section>
 
@@ -146,6 +200,7 @@
   function createStream(stream) {
     const row = document.createElement('tr');
     row.dataset.stream = stream.key;
+    row.tabIndex = 0;
     row.innerHTML = '<td></td><td></td><td></td>';
     stream.cells = { key: row.children[0], frames: row.children[1], channels: row.children[2] };
     stream.row = row;
@@ -157,6 +212,7 @@
     const row = document.createElement('tr');
     row.dataset.stream = channel.stream;
     row.dataset.channel = channel.channel;
+    row.tabIndex = 0;
     row.innerHTML = '<td></td><td></td><td></td><td></td><td></td><td></td><td></td>';
     channel.cells = { stream: row.children[0], channel: row.children[1], frames: row.children[2], json: row.children[3], text: row.children[4], binary: row.children[5], latest: row.children[6] };
     channel.row = row;
@@ -285,11 +341,20 @@
     const status = state.error ? 'error' : state.connected ? 'live' : 'connecting';
     nodes.status.textContent = status;
     nodes.status.className = `pill ${status === 'live' ? 'ok' : status === 'error' ? 'bad' : 'warn'}`;
-    nodes.metricFrames.textContent = `${state.totalFrames} (${frameLimit()}/channel)`;
-    nodes.metricStreams.textContent = state.streams.size;
-    nodes.metricChannels.textContent = state.channels.size;
-    nodes.metricJson.textContent = state.jsonFrames;
+    setSeg('metricFramesSeg', state.totalFrames);
+    setSeg('metricStreamsSeg', state.streams.size);
+    setSeg('metricChannelsSeg', state.channels.size);
+    setSeg('metricJsonSeg', state.jsonFrames);
     nodes.metricScope.textContent = selectedScopeText();
+  }
+
+  // Segment display: value over ghost eights; every unlit place stays drawn.
+  function setSeg(id, value) {
+    const seg = document.getElementById(id);
+    if (!seg) return;
+    const text = String(value == null ? '—' : value);
+    seg.dataset.ghost = text === '—' ? '—' : '8'.repeat(Math.max(1, text.length));
+    seg.querySelector('.seg-v').textContent = text;
   }
 
   function updateStreamRow(stream) {
@@ -332,6 +397,7 @@
   function createFrameRow(frame) {
     const row = document.createElement('tr');
     row.dataset.frame = frame.id;
+    row.tabIndex = 0;
     row.innerHTML = `<td>${frame.position}</td><td><span class="tag ${frame.kind}">${frame.kind}</span></td><td>${html(frame.preview)}</td><td>${frame.bytes}</td>`;
     row.dataset.active = String(state.selectedFrame === frame.id);
     return row;
@@ -386,7 +452,7 @@
 
   function selectLevel(level) {
     state.level = level;
-    for (const button of document.querySelectorAll('[data-level]')) button.dataset.active = String(button.dataset.level === level);
+    for (const button of document.querySelectorAll('[data-level]')) button.setAttribute('aria-pressed', String(button.dataset.level === level));
     nodes.streamsPanel.hidden = level !== 'streams';
     nodes.channelsPanel.hidden = level !== 'channels';
     nodes.framesPanel.hidden = level !== 'frames';
@@ -533,6 +599,21 @@
   nodes.channelsBody.addEventListener('click', event => {
     const row = event.target.closest('tr[data-channel]');
     if (row) selectChannel(row.dataset.stream, row.dataset.channel);
+  });
+
+  nodes.streamsBody.addEventListener('keydown', event => {
+    const row = event.target.closest('tr[data-stream]');
+    if (row && event.key === 'Enter') selectStream(row.dataset.stream);
+  });
+
+  nodes.channelsBody.addEventListener('keydown', event => {
+    const row = event.target.closest('tr[data-channel]');
+    if (row && event.key === 'Enter') selectChannel(row.dataset.stream, row.dataset.channel);
+  });
+
+  nodes.framesBody.addEventListener('keydown', event => {
+    const row = event.target.closest('tr[data-frame]');
+    if (row && event.key === 'Enter') selectFrame(row.dataset.frame);
   });
 
   nodes.framesBody.addEventListener('click', event => {

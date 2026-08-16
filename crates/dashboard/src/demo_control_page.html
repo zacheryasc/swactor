@@ -8,57 +8,179 @@
     :root {
       color-scheme: dark;
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      background: #0f172a;
-      color: #e2e8f0;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --bg: #000000; --panel: #001220; --panel-hover: #001c38; --inset: #00060c;
+      --border: #14406a; --divider: #0d2c4a;
+      --text: #ffffff; --muted: #9db2c4;
+      --amber: #ff9900; --ghost: rgba(255, 153, 0, .16);
+      --ok: #00d400; --bad: #ff4141; --cyan: #5cd5ff; --magenta: #cc78bc;
+      --primary-fill: #ff9900; --primary-ink: #000000;
+      --danger-fill: #7a1010; --danger-border: #ff4141; --danger-ink: #ffd7d7;
+      --selected: rgba(255, 153, 0, .10); --selected-edge: #ff9900;
+      --card-hover: #00263f; --row-hover: #002a47;
+      --r: 2px; --t: 120ms;
+      background: var(--bg); color: var(--text);
+    }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg: #fafafa; --panel: #ffffff; --panel-hover: #f0f0f0; --inset: #f5f5f5;
+      --border: #dcdcE0; --divider: #eaeaea;
+      --text: #383a42; --muted: #696c77;
+      --amber: #986801; --ghost: rgba(152, 104, 1, .18);
+      --ok: #50a14f; --bad: #e45649; --cyan: #0184bc; --magenta: #a626a4;
+      --primary-fill: #0184bc; --primary-ink: #ffffff;
+      --danger-fill: #cc3a2f; --danger-border: #cc3a2f; --danger-ink: #ffffff;
+      --selected: rgba(64, 120, 242, .08); --selected-edge: #4078f2;
+      --card-hover: #f0f4fb; --row-hover: #eef1f8;
+    }
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme]) {
+        color-scheme: light;
+        --bg: #fafafa; --panel: #ffffff; --panel-hover: #f0f0f0; --inset: #f5f5f5;
+        --border: #dcdcE0; --divider: #eaeaea;
+        --text: #383a42; --muted: #696c77;
+        --amber: #986801; --ghost: rgba(152, 104, 1, .18);
+        --ok: #50a14f; --bad: #e45649; --cyan: #0184bc; --magenta: #a626a4;
+        --primary-fill: #0184bc; --primary-ink: #ffffff;
+        --danger-fill: #cc3a2f; --danger-border: #cc3a2f; --danger-ink: #ffffff;
+        --selected: rgba(64, 120, 242, .08); --selected-edge: #4078f2;
+        --card-hover: #f0f4fb; --row-hover: #eef1f8;
+      }
     }
     * { box-sizing: border-box; }
     body { margin: 0; padding: 20px; }
-    .nav { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; padding: 8px; background: #111827; border: 1px solid #334155; border-radius: 12px; }
-    .nav a { padding: 7px 10px; color: #cbd5e1; border: 1px solid transparent; border-radius: 8px; text-decoration: none; }
-    .nav a:hover { color: #f8fafc; background: #1e293b; }
-    header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; margin-bottom: 18px; }
-    h1 { font-size: 24px; margin: 0; }
-    .muted { color: #94a3b8; }
-    .panel { background: #1e293b; border: 1px solid #334155; border-radius: 14px; padding: 16px; margin-bottom: 18px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #334155; }
-    th { color: #94a3b8; font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
-    .pill { display: inline-flex; padding: 3px 8px; border-radius: 999px; border: 1px solid #334155; font-size: 12px; }
-    .running { color: #34d399; }
-    .exited, .failed { color: #f87171; }
-    button { font: inherit; border-radius: 8px; border: 1px solid #475569; background: #334155; color: #e2e8f0; padding: 6px 12px; cursor: pointer; }
-    button.danger { background: #7f1d1d; border-color: #b91c1c; color: #fee2e2; }
-    button:disabled { opacity: 0.5; cursor: not-allowed; }
-    #status { margin-left: 12px; font-size: 13px; }
+    .muted { color: var(--muted); }
+    header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px 24px; margin-bottom: 16px; }
+    h1 { font-size: 20px; margin: 0; }
+    .counter { font-variant-numeric: tabular-nums; display: flex; align-items: baseline; gap: 6px; }
+    .counter .muted { font-size: 13px; }
+    .counter .meta { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+    .counter #converged.ok { color: var(--ok); }
+    .counter #converged.warn { color: var(--amber); }
+    .seg { position: relative; display: inline-flex; justify-content: flex-end; font: 700 26px/1 var(--mono); color: var(--amber); font-variant-numeric: tabular-nums; letter-spacing: .05em; }
+    .seg::before { content: attr(data-ghost); position: absolute; right: 0; top: 0; color: var(--ghost); }
+    .seg .seg-v { position: relative; }
+    .seg-sm { font-size: 15px; }
+    .blink { animation: seg-blink 1.1s steps(2, start) infinite; }
+    @keyframes seg-blink { to { visibility: hidden; } }
+    .controls { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .controls input {
+      width: 3.5em; background: var(--inset); color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--r); padding: 6px 8px; font: 13px var(--mono);
+    }
+    .controls input:hover { border-color: var(--cyan); }
+    button { font: 600 13px var(--mono); border-radius: var(--r); border: 1px solid var(--border); background: transparent; color: var(--text); padding: 6px 12px; cursor: pointer; transition: background var(--t), border-color var(--t); }
+    button:hover:not(:disabled) { background: var(--panel-hover); border-color: var(--cyan); }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button.primary { background: var(--primary-fill); border-color: var(--primary-fill); color: var(--primary-ink); }
+    button.primary:hover:not(:disabled) { background: var(--primary-fill); border-color: var(--cyan); filter: brightness(1.1); }
+    button.danger { background: var(--danger-fill); border-color: var(--danger-border); color: var(--danger-ink); }
+    button.danger:hover:not(:disabled) { background: var(--danger-fill); border-color: var(--bad); filter: brightness(1.15); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    :is(a, button, input, summary):focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    #status { font-size: 12px; font-family: var(--mono); }
+    #status.failed { color: var(--bad); }
+    .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); padding: 16px; margin-bottom: 16px; overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 620px; font-family: var(--mono); font-size: 12px; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--divider); font-variant-numeric: tabular-nums; }
+    tr:last-child td { border-bottom: none; }
+    th { color: var(--amber); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; }
+    .node-name { font-weight: 700; }
+    .node-sub { font-size: 11px; color: var(--muted); }
+    .pill { display: inline-flex; padding: 3px 6px; border: 1px solid var(--muted); border-radius: var(--r); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--text); }
+    .pill.running { color: var(--ok); border-color: var(--ok); }
+    .pill.exited, .pill.failed { color: var(--bad); border-color: var(--bad); }
+    .badge { display: inline-block; padding: 3px 6px; border-radius: var(--r); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; border: 1px solid; font-family: var(--mono); }
+    .badge .sub { font-weight: 400; text-transform: none; letter-spacing: 0; opacity: 0.85; }
+    .b-ready { color: var(--ok); border-color: var(--ok); }
+    .b-progress { color: var(--cyan); border-color: var(--cyan); }
+    .b-failed { color: var(--bad); border-color: var(--bad); }
+    .b-deleting { color: var(--amber); border-color: var(--amber); }
+    .b-destroyed { color: var(--muted); border-color: var(--muted); }
+    .row-error { color: var(--bad); font-size: 11px; font-family: var(--mono); }
+    details.activity summary { cursor: pointer; color: var(--muted); padding: 6px 0; font-family: var(--mono); font-size: 12px; }
+    details.activity[open] summary { margin-bottom: 10px; color: var(--amber); }
+    .feeds { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .feed { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); padding: 10px 12px; }
+    .feed h2 { margin: 0 0 8px; font-size: 10px; text-transform: uppercase; letter-spacing: .08em; color: var(--amber); }
+    .feed ul { list-style: none; margin: 0; padding: 0; font-family: var(--mono); font-size: 12px; max-height: 360px; overflow-y: auto; }
+    .feed li { padding: 3px 0; border-bottom: 1px solid var(--divider); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .feed li time { color: var(--muted); margin-right: 8px; }
+    .k-command { color: var(--cyan); }
+    .k-result { color: var(--ok); }
+    .k-transition { color: var(--amber); }
+    .k-control { color: var(--magenta); }
+    .k-observation { color: var(--muted); }
+    .k-error { color: var(--bad); font-weight: 700; }
+    @media (prefers-reduced-motion: reduce) { * { transition-duration: 0.01ms !important; animation: none !important; } }
   </style>
 </head>
 <body>
+<!--
+swactor dashboard — direction contract (impeccable seed 8b5f2278)
+THESIS: a numeric instrument bank for a live actor fleet; Bloomberg night housing (dark) / Atom One Light bench card (light); absence drawn as ghost segments, never blank.
+OWN-WORLD: black-on-navy or paper-on-white; amber owns the data register, green/red are law, cyan is the only interactive voice; 2px corners, monospace data, machined caps labels, controls that depress.
+FIRST VIEWPORT: the control bench — ghost-segment ready/desired counter, generation digit, node rows as channel strips with stage tags and kill switches.
+SIGNATURE: counters tick by instant segment swap; converging blinks like an unset clock; ghost eights hold every unlit place.
+RISK: terminal cosplay if decoration creeps past data; held by the palette law.
+-->
   <!--swactor:nav-->
   <header>
-    <h1>Fleet Control</h1>
     <div>
-      <label class="muted" for="provision-count">nodes</label>
-      <input id="provision-count" type="number" min="1" max="8" value="1" style="width: 3.5em; background:#0f172a; color:#e2e8f0; border:1px solid #334155; border-radius:6px; padding:5px 8px;">
-      <button id="provision">+ provision</button>
-      <button id="remove">− remove</button>
-      <span id="status" class="muted"></span>
+      <h1>Fleet Control</h1>
+      <div class="counter" id="counter" hidden>
+        <span class="seg" id="ready-seg" data-ghost="8"><span class="seg-v" id="ready">0</span></span>
+        <span class="meta">/</span>
+        <span class="seg" id="desired-seg" data-ghost="8"><span class="seg-v" id="desired">0</span></span>
+        <span class="muted">ready</span>
+        <span class="meta">· <span id="converged">—</span> · gen <span class="seg seg-sm" id="gen-seg" data-ghost="8"><span class="seg-v" id="gen">0</span></span></span>
+      </div>
     </div>
-  </header>
+    <div class="controls">
+      <label class="muted" for="provision-count">nodes</label>
+      <input id="provision-count" type="number" min="1" max="8" value="1">
+      <button id="provision" class="primary">+ provision</button>
+      <button id="remove">− remove</button>
+      <span id="status" class="muted" role="status" aria-live="polite"></span>
+    </div>
   <section class="panel">
     <table>
       <thead>
-        <tr><th>node</th><th>pid</th><th>state</th><th>seen</th><th></th></tr>
+        <tr><th>node</th><th>stage</th><th>state</th><th>pid</th><th>seen</th><th></th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
-    <p class="muted" id="empty" hidden>No provisioned processes observed yet.</p>
+    <p class="muted" id="empty" hidden>No provisioned nodes observed yet.</p>
   </section>
+  <details class="activity">
+    <summary>Activity — commands out · events in · transitions</summary>
+    <div class="feeds">
+      <div class="feed">
+        <h2>Commands out</h2>
+        <ul id="commands"></ul>
+      </div>
+      <div class="feed">
+        <h2>Events in · transitions · control</h2>
+        <ul id="events"></ul>
+      </div>
+    </div>
+  </details>
   <script>
     'use strict';
-    const API_URL = '/api/view/demo-control';
+    const CONTROL_URL = '/api/view/demo-control';
+    const RECONCILER_URL = '/api/view/reconciler';
+    const STAGE_CLASS = {
+      New: 'b-destroyed', LeaseRequested: 'b-progress', LeaseCreated: 'b-progress',
+      EndpointKnown: 'b-progress', BootstrapRunning: 'b-progress',
+      SwactorJoined: 'b-progress', HandedOff: 'b-ready', Dormant: 'b-ready',
+      Failed: 'b-failed', Destroyed: 'b-destroyed'
+    };
+    const INTENT_DELETING = new Set(['Deleting']);
+
     const rows = document.getElementById('rows');
     const empty = document.getElementById('empty');
     const status = document.getElementById('status');
+    const counter = document.getElementById('counter');
 
     function setStatus(text, isError) {
       status.textContent = text;
@@ -67,30 +189,88 @@
     }
 
     function escapeHtml(value) {
-      return String(value).replace(/[&<>"']/g, (ch) => ({
+      return String(value ?? '').replace(/[&<>"']/g, (ch) => ({
         '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
       }[ch]));
     }
 
     function fmtSeen(msAgo) {
+      if (msAgo == null || msAgo === Number.MAX_SAFE_INTEGER) return '—';
       if (msAgo < 1000) return 'just now';
       if (msAgo < 60_000) return Math.round(msAgo / 1000) + 's ago';
       return Math.round(msAgo / 60_000) + 'm ago';
     }
 
-    function render(snapshot) {
-      const nodes = (snapshot && snapshot.nodes) || [];
-      empty.hidden = nodes.length > 0;
-      rows.innerHTML = nodes.map((entry) => {
-        const stateClass = entry.state === 'running' ? 'running' : entry.state;
-        return `<tr>
-          <td>${escapeHtml(entry.node)}</td>
-          <td>${entry.pid == null ? '—' : escapeHtml(entry.pid)}</td>
-          <td><span class="pill ${stateClass}">${escapeHtml(entry.state)}</span></td>
-          <td class="muted">${escapeHtml(fmtSeen(entry.seen_ms_ago))}</td>
-          <td><button class="danger" data-node="${escapeHtml(entry.node)}" ${entry.state !== 'running' ? 'disabled' : ''}>kill</button></td>
-        </tr>`;
-      }).join('');
+    function fmtTime(ms) {
+      if (!ms) return '--:--:--';
+      const date = new Date(ms);
+      return [date.getHours(), date.getMinutes(), date.getSeconds()]
+        .map((part) => String(part).padStart(2, '0')).join(':');
+    }
+
+    function stageBadge(node) {
+      const stage = node.stage || 'New';
+      const deleting = INTENT_DELETING.has(node.intent);
+      const cls = deleting ? 'b-deleting' : (STAGE_CLASS[stage] || 'b-progress');
+      const sub = node.bootstrap ? `<span class="sub"> · ${escapeHtml(node.bootstrap)}</span>` : '';
+      return `<span class="badge ${cls}">${escapeHtml(stage)}${sub}</span>`;
+    }
+
+    // One row per logical node: reconciler state (stage, attempt, ready) fused
+    // with the observed process (state, pid, seen). Reconciler order leads;
+    // processes the reconciler no longer tracks still render.
+    function renderRow(entry) {
+      const reconciler = entry.reconciler;
+      const process = entry.process;
+      const node = reconciler ? reconciler.id : process.node;
+      const stage = reconciler
+        ? stageBadge(reconciler)
+        : '<span class="muted">—</span>';
+      const state = process
+        ? `<span class="pill ${escapeHtml(process.state)}">${escapeHtml(process.state)}</span>`
+        : '<span class="muted">—</span>';
+      const pid = process && process.pid != null ? process.pid : (reconciler && reconciler.pid != null ? reconciler.pid : null);
+      const seen = process ? fmtSeen(process.seen_ms_ago) : '—';
+      const attempt = reconciler ? `<div class="node-sub">attempt ${escapeHtml(reconciler.attempt)}${reconciler.ready ? ' · ready' : ''}</div>` : '';
+      const failure = reconciler && reconciler.failure
+        ? `<div class="row-error">${escapeHtml(reconciler.failure)}</div>`
+        : '';
+      const killable = process && process.state === 'running';
+      return `<tr>
+        <td><span class="node-name">${escapeHtml(node)}</span>${attempt}</td>
+        <td>${stage}</td>
+        <td>${state}</td>
+        <td>${pid == null ? '—' : escapeHtml(pid)}</td>
+        <td class="muted">${escapeHtml(seen)}</td>
+        <td><button class="danger" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>kill</button></td>
+      </tr>${failure ? `<tr><td colspan="6" style="padding-top:0">${failure}</td></tr>` : ''}`;
+    }
+
+    function fuse(processes, reconcilerNodes) {
+      const byNode = new Map();
+      const order = [];
+      for (const node of reconcilerNodes || []) {
+        byNode.set(node.id, { reconciler: node, process: null });
+        order.push(node.id);
+      }
+      for (const process of processes || []) {
+        const entry = byNode.get(process.node);
+        if (entry) {
+          entry.process = process;
+        } else {
+          byNode.set(process.node, { reconciler: null, process });
+          order.push(process.node);
+        }
+      }
+      return order.map((id) => byNode.get(id));
+    }
+
+    function render(processSnapshot, reconcilerSnapshot) {
+      const processes = (processSnapshot && processSnapshot.nodes) || [];
+      const reconcilerNodes = (reconcilerSnapshot && reconcilerSnapshot.nodes) || [];
+      const fused = fuse(processes, reconcilerNodes);
+      empty.hidden = fused.length > 0;
+      rows.innerHTML = fused.map(renderRow).join('');
       for (const button of rows.querySelectorAll('button[data-node]')) {
         button.addEventListener('click', () => {
           button.disabled = true;
@@ -103,38 +283,73 @@
           }).catch((error) => setStatus('kill failed: ' + error, true));
         });
       }
+      if (reconcilerSnapshot) {
+        counter.hidden = false;
+        setSeg('ready-seg', reconcilerSnapshot.ready);
+        setSeg('desired-seg', reconcilerSnapshot.desired);
+        const converged = document.getElementById('converged');
+        converged.textContent = reconcilerSnapshot.converged ? 'converged' : 'converging…';
+        converged.className = reconcilerSnapshot.converged ? 'ok' : 'warn blink';
+        setSeg('gen-seg', reconcilerSnapshot.generation);
+        renderFeeds(reconcilerSnapshot.feed || []);
+      }
+    }
+
+    // Segment display: value over ghost eights; every unlit place stays drawn.
+    function setSeg(id, value) {
+      const text = String(value == null ? '—' : value);
+      const seg = document.getElementById(id);
+      seg.dataset.ghost = text === '—' ? '—' : '8'.repeat(text.length);
+      seg.querySelector('.seg-v').textContent = text;
+    }
+
+    function feedLine(line, filter) {
+      if (filter && line.kind !== filter) return '';
+      return `<li class="k-${escapeHtml(line.kind)}"><time>${fmtTime(line.at_ms)}</time>` +
+        `${line.node ? '[' + escapeHtml(line.node) + '] ' : ''}${escapeHtml(line.detail)}</li>`;
+    }
+
+    function renderFeeds(feed) {
+      const recent = feed.slice().reverse();
+      document.getElementById('commands').innerHTML =
+        recent.map((line) => feedLine(line, 'command')).join('') || '<li class="muted" >none</li>';
+      const eventKinds = new Set(['command']);
+      document.getElementById('events').innerHTML =
+        recent.filter((line) => !eventKinds.has(line.kind)).map((line) => feedLine(line)).join('')
+        || '<li >none</li>';
     }
 
     function nodeCount() {
       return Math.max(1, Math.min(8, Number(document.getElementById('provision-count').value) || 1));
     }
 
-    document.getElementById('provision').addEventListener('click', () => {
-      const count = nodeCount();
-      fetch('/control/provision', {
+    function post(path, body, action) {
+      fetch(path, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ Provision: { count } })
+        body: JSON.stringify(body)
       }).then((response) => {
-        setStatus(response.ok ? 'provision issued' : 'provision failed: HTTP ' + response.status, !response.ok);
-      }).catch((error) => setStatus('provision failed: ' + error, true));
+        setStatus(response.ok ? action + ' issued' : action + ' failed: HTTP ' + response.status, !response.ok);
+      }).catch((error) => setStatus(action + ' failed: ' + error, true));
+    }
+
+    document.getElementById('provision').addEventListener('click', () => {
+      post('/control/provision', { Provision: { count: nodeCount() } }, 'provision');
     });
 
     document.getElementById('remove').addEventListener('click', () => {
-      const count = nodeCount();
-      fetch('/control/remove', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ Remove: { count } })
-      }).then((response) => {
-        setStatus(response.ok ? 'remove issued' : 'remove failed: HTTP ' + response.status, !response.ok);
-      }).catch((error) => setStatus('remove failed: ' + error, true));
+      post('/control/remove', { Remove: { count: nodeCount() } }, 'remove');
     });
 
     async function poll() {
       try {
-        const response = await fetch(API_URL);
-        if (response.ok) render(await response.json());
+        const [control, reconciler] = await Promise.allSettled([
+          fetch(CONTROL_URL).then((response) => response.ok ? response.json() : null),
+          fetch(RECONCILER_URL).then((response) => response.ok ? response.json() : null)
+        ]);
+        if (control.status === 'fulfilled' && control.value) {
+          render(control.value, reconciler.status === 'fulfilled' ? reconciler.value : null);
+        }
       } catch { /* transient */ }
     }
     poll();

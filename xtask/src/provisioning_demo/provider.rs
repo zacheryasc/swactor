@@ -230,10 +230,14 @@ impl ProvisionPlugin for DemoProvider {
 }
 
 /// Per-node telemetry: one endpoint/producer per provisioned node so each
-/// lands on its own dashboard stream (one fleet card per node).
+/// lands on its own dashboard stream (one fleet card per node). Carries the
+/// stream descriptor's origin/label so the dashboard can classify the stream
+/// (the frame path itself has no catalog).
 pub struct NodeTelemetry {
     pub endpoint: TelemetryEndpoint,
     pub producer: TelemetryProducer,
+    pub origin: &'static str,
+    pub label: String,
 }
 
 impl NodeTelemetry {
@@ -252,7 +256,12 @@ impl NodeTelemetry {
             16,
         );
         let producer = endpoint.producer();
-        Self { endpoint, producer }
+        Self {
+            endpoint,
+            producer,
+            origin: "remote_node",
+            label: format!("demo node {logical_node}"),
+        }
     }
 }
 

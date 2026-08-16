@@ -7,10 +7,10 @@
 //! re-exec of this binary as a real swactor runtime that joins the
 //! supervisor's iroh endpoint.
 //!
-//! Humans watch `/view/reconciler` (k8s-style current-vs-desired, node
-//! stages, command/result feeds) and the fleet cards (per-node PID/state),
-//! kill nodes from the Fleet Control view or a shell, and watch the
-//! reconciler replace them for real.
+//! Humans watch the Fleet Control view (reconciler current-vs-desired, node
+//! stages, command/result feeds, kill/provision controls) and the fleet cards
+//! (per-node PID/state), kill nodes from Fleet Control or a shell, and watch
+//! the reconciler replace them for real.
 
 pub mod control;
 pub mod feed;
@@ -224,7 +224,7 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
     let cluster_driver =
         ClusterDriver::new(shape, demo_retry_policy()).map_err(|e| format!("driver: {e}"))?;
 
-    let plugin = DemoProvider::new(manager.clone(), keys_dir);
+    let plugin = DemoProvider::new(manager.clone(), keys_dir.clone());
     let spawner = EngineSpawner::new(engine.handle());
     let executor = IdempotentEffectExecutor::new(
         DemoBackend {
@@ -294,9 +294,8 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         .expect("supervisor address slot set once");
 
     println!("provisioning-reconciler-demo: dashboard on http://localhost:{port}");
-    println!("  /view/reconciler   — reconciler state machine, current vs desired");
     println!("  /view/fleet        — per-node cards (pid, lifecycle)");
-    println!("  /view/demo-control — kill / provision controls");
+    println!("  /view/demo-control — Fleet Control: stages, feeds, kill / provision");
     println!("  Ctrl-C to tear down.");
 
     // Block until Ctrl-C (synchronous signal flag — the wait must not depend
@@ -329,8 +328,8 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         std::thread::sleep(TICK);
     }
     // Best-effort drain window closed: children still alive (if any) are
-    // killed by the process-tree teardown of the launching console, so exit
-    // deterministically rather than risking a wedged teardown path.
+    // killed by the kernel parent-death signal armed in the node role.
+    let _ = std::fs::remove_dir_all(&keys_dir);
     std::process::exit(0);
 }
 

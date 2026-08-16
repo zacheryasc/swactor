@@ -54,15 +54,29 @@ pub struct FrameEvent {
 pub struct StreamEvent {
     pub node: String,
     pub life: u64,
+    /// Stream-descriptor metadata when the publisher knows it (catalog
+    /// truth). `None` on raw ingest paths that never saw a descriptor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+impl StreamEvent {
+    fn new(stream: &StreamId) -> Self {
+        Self {
+            node: stream.node.as_str().to_string(),
+            life: stream.life.0,
+            origin: None,
+            label: None,
+        }
+    }
 }
 
 impl FrameEvent {
     pub fn new(stream: &StreamId, frame: &Frame) -> Self {
         Self {
-            stream: StreamEvent {
-                node: stream.node.as_str().to_string(),
-                life: stream.life.0,
-            },
+            stream: StreamEvent::new(stream),
             channel: frame.channel.to_string(),
             position: frame.position.0,
             payload: frame.payload.clone(),

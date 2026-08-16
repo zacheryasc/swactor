@@ -1,9 +1,11 @@
-//! Demo-only fleet control view (`demo-control` feature).
+//! Demo-only Fleet Control view (`demo-control` feature).
 //!
-//! A k8s-style control panel beside the fleet view: one row per provisioned
-//! process (streamed on `proc.<node>.lifecycle`), each with a kill action,
-//! plus a provision action that asks the reconciler for more nodes. Inert in
-//! regular builds — this module compiles only under `demo-control`.
+//! The merged control surface: one row per provisioned node fusing the
+//! process table (`proc.<node>.lifecycle`, `node.status`) with the
+//! provisioning reconciler's stage snapshot (fetched client-side from
+//! `/api/view/reconciler` when that view is registered), plus provision and
+//! kill actions. Inert in regular builds — this module compiles only under
+//! `demo-control`.
 
 use std::collections::BTreeMap;
 use std::time::Instant;

@@ -1,9 +1,9 @@
-//! Reconciler dashboard view — k8s workload semantics.
+//! Reconciler dashboard view — API only.
 //!
-//! Header: current-ready vs desired (Deployment-style `2 / 3`).
-//! Node cards: stage badge, bootstrap sub-stage, attempt, PID — pod status.
-//! Feeds: commands out / results + transitions in, `kubectl describe` events
-//! style, one line each with timestamps.
+//! The snapshot/feed JSON at `/api/view/reconciler` feeds the merged Fleet
+//! Control page (`/view/demo-control`), which fuses it with the process
+//! table. No standalone page: `html()` is `None` and the view stays out of
+//! the navbar while its API remains registered.
 
 use std::collections::VecDeque;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -95,6 +95,10 @@ impl DashboardView for ReconcilerDashboardView {
         &[EVENTS_CHANNEL, SNAPSHOT_CHANNEL]
     }
 
+    fn show_in_nav(&self) -> bool {
+        false
+    }
+
     fn ingest(&self, _stream: &StreamId, _frame: &Frame, event: &FrameEvent) {
         let Ok(payload) = serde_json::from_slice::<Value>(&event.payload) else {
             return;
@@ -164,7 +168,7 @@ impl DashboardView for ReconcilerDashboardView {
     }
 
     fn html(&self) -> Option<&'static str> {
-        Some(include_str!("reconciler_page.html"))
+        None
     }
 }
 

@@ -51,6 +51,8 @@ struct FusedNode {
     last_seen: Instant,
     hardware: NodeHardwareState,
     actors: RuntimeState,
+    origin: Option<String>,
+    label: Option<String>,
 }
 
 impl DashboardView for ControlPlaneView {
@@ -81,8 +83,17 @@ impl DashboardView for ControlPlaneView {
             last_seen: now,
             hardware: NodeHardwareState::new(now),
             actors: RuntimeState::new(now),
+            origin: event.stream.origin.clone(),
+            label: event.stream.label.clone(),
         });
         node.last_seen = now;
+        // Later events may carry descriptor metadata the first lacked.
+        if let Some(origin) = &event.stream.origin {
+            node.origin = Some(origin.clone());
+        }
+        if let Some(label) = &event.stream.label {
+            node.label = Some(label.clone());
+        }
         node.hardware.update(&event.channel, &event.payload, now);
         node.actors.update(&event.channel, &event.payload, now);
         prune(&mut state.streams, &event.stream, now);
@@ -110,7 +121,7 @@ impl DashboardView for ControlPlaneView {
         // Stale pool: most recently seen first, bounded by the physical cap.
         stale.sort_by_key(|right| std::cmp::Reverse(right.last_seen_ms_ago));
         stale.truncate(STALE_POOL_CAP);
-        let totals = fused_totals(&live, stale.len());
+        let totals = fused_totals(live.len(), stale.len());
         let snapshot = FusedSnapshot { totals, live, stale };
         serde_json::to_value(snapshot).unwrap_or_else(|_| {
             json!({
@@ -128,7 +139,14 @@ impl DashboardView for ControlPlaneView {
         let state = self.state.read();
         let node = state.streams.get(&stream)?;
         let actor = node.actors.actors.get(&actor_key)?;
-        Some(actor_detail(actor, &node.stream, &stream, now))
+        Some(actor_detail(
+            actor,
+            &node.stream,
+            &stream,
+            now,
+            node.origin.clone(),
+            node.label.clone(),
+        ))
     }
 
     fn html(&self) -> Option<&'static str> {
@@ -174,21 +192,8 @@ struct FusedSnapshot {
 
 #[derive(Default, Serialize)]
 struct FusedTotals {
-    nodes: u32,
     live_nodes: u32,
     stale_nodes: u32,
-    actors: u32,
-    msg_per_sec: f64,
-    mailbox_depth: u32,
-    poisoned: u32,
-    gpu_count: u32,
-    cpu_avg_percent: Option<f64>,
-    gpu_max_percent: Option<u64>,
-    gpu_memory_used_mib: u64,
-    gpu_memory_total_mib: u64,
-    net_rx_bps: f64,
-    net_tx_bps: f64,
-    errors: u32,
 }
 
 #[derive(Serialize)]
@@ -214,6 +219,10 @@ struct StreamKeySnapshot {
     key: String,
     node: String,
     life: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origin: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
 }
 
 #[derive(Default, Serialize)]
@@ -308,6 +317,8 @@ fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
             key: stream_key(&node.stream),
             node: node.stream.node.clone(),
             life: node.stream.life,
+            origin: node.origin.clone(),
+            label: node.label.clone(),
         },
         live: now.duration_since(node.last_seen) <= LIVE_TTL,
         last_seen_ms_ago: duration_ms(now.duration_since(node.last_seen)),
@@ -365,12 +376,16 @@ fn actor_detail(
     stream: &StreamEvent,
     stream_key_value: &str,
     now: Instant,
+    origin: Option<String>,
+    label: Option<String>,
 ) -> Value {
     let detail = ActorDetail {
         stream: StreamKeySnapshot {
             key: stream_key_value.to_owned(),
             node: stream.node.clone(),
             life: stream.life,
+            origin,
+            label,
         },
         address: actor.address.clone(),
         name: actor.name.clone(),
@@ -415,61 +430,11 @@ fn actor_detail(
     serde_json::to_value(detail).unwrap_or_else(|_| json!({}))
 }
 
-fn fused_totals(live: &[NodeCard], stale_len: usize) -> FusedTotals {
-    let mut totals = FusedTotals {
-        nodes: saturating_u32(live.len() + stale_len),
-        live_nodes: saturating_u32(live.len()),
+fn fused_totals(live_len: usize, stale_len: usize) -> FusedTotals {
+    FusedTotals {
+        live_nodes: saturating_u32(live_len),
         stale_nodes: saturating_u32(stale_len),
-        ..FusedTotals::default()
-    };
-    let mut cpu_total = 0.0;
-    let mut cpu_count = 0_u32;
-    for node in live {
-        let summary = &node.actor_summary;
-        totals.actors = totals.actors.saturating_add(summary.actors);
-        totals.msg_per_sec += summary.msg_per_sec;
-        totals.mailbox_depth = totals.mailbox_depth.saturating_add(summary.mailbox_depth);
-        totals.poisoned = totals.poisoned.saturating_add(summary.poisoned);
-        totals.errors = totals.errors.saturating_add(saturating_u32(node.errors.len()));
-
-        if let Some(cpu_percent) = node
-            .cpu
-            .as_ref()
-            .and_then(|cpu| cpu.host.as_ref())
-            .and_then(|host| host.total_percent)
-        {
-            cpu_total += cpu_percent;
-            cpu_count = cpu_count.saturating_add(1);
-        }
-        if let Some(gpu) = &node.gpu {
-            totals.gpu_count = totals.gpu_count.saturating_add(saturating_u32(gpu.gpus.len()));
-            for device in &gpu.gpus {
-                if let Some(percent) = device.utilization_gpu_percent {
-                    totals.gpu_max_percent = Some(
-                        totals
-                            .gpu_max_percent
-                            .map_or(percent, |current| current.max(percent)),
-                    );
-                }
-                totals.gpu_memory_used_mib = totals
-                    .gpu_memory_used_mib
-                    .saturating_add(device.memory_used_mib.unwrap_or_default());
-                totals.gpu_memory_total_mib = totals
-                    .gpu_memory_total_mib
-                    .saturating_add(device.memory_total_mib.unwrap_or_default());
-            }
-        }
-        if let Some(net) = &node.net {
-            for interface in &net.interfaces {
-                totals.net_rx_bps += interface.rx_bps.unwrap_or_default();
-                totals.net_tx_bps += interface.tx_bps.unwrap_or_default();
-            }
-        }
     }
-    if cpu_count > 0 {
-        totals.cpu_avg_percent = Some(cpu_total / f64::from(cpu_count));
-    }
-    totals
 }
 
 /// Minimal `application/x-www-form-urlencoded` reader with percent-decoding
@@ -523,12 +488,38 @@ mod tests {
             stream: crate::StreamEvent {
                 node: stream.node.as_str().to_string(),
                 life: stream.life.0,
+                origin: None,
+                label: None,
             },
             channel: channel.to_string(),
             position,
             payload: frame.payload.clone(),
         };
         view.ingest(stream, &frame, &event);
+    }
+
+    #[test]
+    fn stream_origin_and_label_surface_on_cards() {
+        let view = ControlPlaneView::default();
+        let stream = StreamId::new(NodeId::new("supervisor"), Lifetime(1));
+        let frame = Frame::new(ChannelId(1), Position(0), actors_payload(0, json!([])));
+        let event = FrameEvent {
+            stream: crate::StreamEvent {
+                node: "supervisor".to_owned(),
+                life: 1,
+                origin: Some("orchestrator".to_owned()),
+                label: Some("provisioning supervisor".to_owned()),
+            },
+            channel: "runtime.actors".to_owned(),
+            position: 0,
+            payload: frame.payload.clone(),
+        };
+        view.ingest(&stream, &frame, &event);
+
+        let snapshot = view.snapshot_json();
+        let card = &snapshot["live"][0]["stream"];
+        assert_eq!(card["origin"], json!("orchestrator"));
+        assert_eq!(card["label"], json!("provisioning supervisor"));
     }
 
     fn actors_payload(worker: u32, actors: serde_json::Value) -> Vec<u8> {

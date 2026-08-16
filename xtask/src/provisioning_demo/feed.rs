@@ -40,6 +40,10 @@ use crate::provisioning_demo::provider::{
 pub struct SupervisorTelemetry {
     pub endpoint: TelemetryEndpoint,
     pub producer: TelemetryProducer,
+    /// Descriptor metadata mirrored onto every published frame so the
+    /// dashboard can classify the stream without a catalog.
+    pub origin: &'static str,
+    pub label: &'static str,
     names: BTreeMap<telemetry::ChannelId, String>,
 }
 
@@ -62,10 +66,11 @@ impl SupervisorTelemetry {
         Self {
             endpoint,
             producer,
+            origin: "orchestrator",
+            label: "provisioning supervisor",
             names: BTreeMap::new(),
         }
     }
-
     pub fn register(&mut self, name: &str) -> telemetry::ChannelId {
         let id = self.endpoint.register_channel(
             name,
@@ -608,7 +613,14 @@ impl SupervisorActor {
                 .get(&frame.channel)
                 .cloned()
                 .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
-            publish_frame(&self.dashboard, &supervisor_stream, &channel, &frame);
+            publish_frame(
+                &self.dashboard,
+                &supervisor_stream,
+                &channel,
+                &frame,
+                self.telemetry.origin,
+                self.telemetry.label,
+            );
         }
         let attempts: Vec<u64> = self.nodes.keys().copied().collect();
         for attempt in attempts {
@@ -626,22 +638,34 @@ impl SupervisorActor {
                     })
                     .map(|descriptor| descriptor.name.clone())
                     .unwrap_or_else(|| format!("channel#{}", frame.channel.0));
-                publish_frame(&self.dashboard, &stream, &channel, &frame);
+                publish_frame(
+                    &self.dashboard,
+                    &stream,
+                    &channel,
+                    &frame,
+                    streams.telemetry.origin,
+                    &streams.telemetry.label,
+                );
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_frame(
     dashboard: &dashboard::DashboardHandle,
     stream: &telemetry::frame::StreamId,
     channel: &str,
     frame: &telemetry::frame::Frame,
+    origin: &str,
+    label: &str,
 ) {
     dashboard.publish(dashboard::FrameEvent {
         stream: dashboard::StreamEvent {
             node: stream.node.as_str().to_string(),
             life: stream.life.0,
+            origin: Some(origin.to_owned()),
+            label: Some(label.to_owned()),
         },
         channel: channel.to_owned(),
         position: frame.position.0,
