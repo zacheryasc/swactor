@@ -6,7 +6,6 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 serde_json = "1"
-blake3 = "1"
 swactor = { path = "..", features = ["serde"] }
 swactor-engine = { path = "../crates/engine" }
 swactor-transport = { path = "../crates/transport" }
@@ -18,7 +17,6 @@ data-plane = { path = "../crates/data-plane" }
 iroh-driver = { path = "../crates/iroh-driver" }
 distribution = { path = "../crates/distribution" }
 iroh = "0.98"
-tokio.workspace = true
 serde = { version = "1", features = ["derive"] }
 parking_lot = "0.12"
 

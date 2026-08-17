@@ -997,7 +997,7 @@ impl ActorInterface for SupervisorActor {
 impl SupervisorActor {
     fn handle_control(&mut self, command: dashboard::control::ControlCommand) {
         match command {
-            dashboard::control::ControlCommand::Kill { node } => {
+            dashboard::control::ControlCommand::Kill { node, .. } => {
                 match self.manager.find_by_stream_node(&node) {
                     Some(runtime) => {
                         self.emit_event(
@@ -1015,7 +1015,7 @@ impl SupervisorActor {
                     None => self.emit_event("control", &node, "kill: unknown node".to_owned()),
                 }
             }
-            dashboard::control::ControlCommand::Remove { count } => {
+            dashboard::control::ControlCommand::Remove { count, .. } => {
                 let removed = self.slots.len().min(count as usize);
                 if removed == 0 {
                     self.emit_event("control", "", "remove: nothing to remove".to_owned());
@@ -1030,7 +1030,7 @@ impl SupervisorActor {
                     eprintln!("demo: remove update_desired failed: {error}");
                 }
             }
-            dashboard::control::ControlCommand::Provision { count } => {
+            dashboard::control::ControlCommand::Provision { count, .. } => {
                 if count == 0 {
                     return;
                 }
@@ -1045,7 +1045,7 @@ impl SupervisorActor {
                     eprintln!("demo: provision update_desired failed: {error}");
                 }
             }
-            dashboard::control::ControlCommand::EstablishEdge { node } => {
+            dashboard::control::ControlCommand::EstablishEdge { node, .. } => {
                 self.establish_edge(&node);
             }
         }

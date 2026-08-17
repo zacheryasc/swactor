@@ -4,17 +4,18 @@ version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-only"
 publish = false
+default-run = "myelin-orchestrator"
 autobins = false
 
 [features]
-default = []
+default = ["dashboard"]
 dashboard = []
 
 [dependencies]
 telemetry = { path = "../../crates/telemetry" }
 data-plane = { path = "../../crates/data-plane" }
 provisioning = { path = "../../crates/provisioning" }
-dashboard = { path = "../../crates/dashboard" }
+dashboard = { path = "../../crates/dashboard", features = ["demo-control"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 swactor = { path = "../..", features = ["serde", "transport"] }
@@ -22,6 +23,7 @@ swactor-engine = { path = "../../crates/engine" }
 swactor-transport = { path = "../../crates/transport" }
 swactor-process = { path = "../../crates/process" }
 distribution = { path = "../../crates/distribution" }
+swactor-job-runner = { path = "../../crates/job-runner" }
 iroh-driver = { path = "../../crates/iroh-driver" }
 iroh = "0.98"
 tokio.workspace = true
@@ -32,6 +34,7 @@ toml = "0.8"
 ureq = "2"
 
 [dev-dependencies]
+tempfile = "3"
 wiremock = "0.6"
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -47,6 +50,10 @@ name = "myelin-orchestrator"
 path = "src/bin/orchestrator.rs"
 
 [[bin]]
-name = "myelin-chat"
-path = "src/bin/chat.rs"
+name = "myelin-job-worker"
+path = "src/bin/job_worker.rs"
+
+[[bin]]
+name = "myelin-job"
+path = "src/bin/job.rs"
 

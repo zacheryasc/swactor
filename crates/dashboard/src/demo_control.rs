@@ -65,12 +65,38 @@ impl DashboardView for DemoControlView {
     }
 
     fn ingest(&self, _stream: &StreamId, _frame: &Frame, event: &FrameEvent) {
-        if !is_lifecycle_channel(&event.channel) && event.channel != "node.status" {
-            return;
-        }
         let Ok(payload) = serde_json::from_slice::<Value>(&event.payload) else {
             return;
         };
+        if event.channel == "myelin.provisioning.events" {
+            let provision = payload.get("event").unwrap_or(&payload);
+            let Some(run_id) = provision.get("run_id").and_then(Value::as_u64) else {
+                return;
+            };
+            let Some(node_id) = provision.get("node_id").and_then(Value::as_u64) else {
+                return;
+            };
+            if node_id == 0 {
+                return;
+            }
+            let node = format!("myelin-node-{run_id}-{node_id}");
+            let mut processes = self.processes.lock();
+            let entry = processes.entry(node).or_default();
+            entry.seen = Some(Instant::now());
+            entry.state = match provision.get("kind").and_then(Value::as_str) {
+                Some("ProvisionStart") => "provisioning",
+                Some("NodeLive") => "running",
+                Some("ProvisionFailed") => "failed",
+                Some("NodeStopped") => "exited",
+                Some(other) => other,
+                None => return,
+            }
+            .to_owned();
+            return;
+        }
+        if !is_lifecycle_channel(&event.channel) && event.channel != "node.status" {
+            return;
+        }
         let node = event.stream.node.clone();
         let mut processes = self.processes.lock();
         let entry = processes.entry(node).or_default();

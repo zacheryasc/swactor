@@ -11,13 +11,11 @@ use std::process::{Child, Command};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use provisioning::plugin::{
-    NodeProvisionSpec, PluginNodeHandle, PluginSink, ProvisionPlugin,
-};
+use provisioning::plugin::{NodeProvisionSpec, PluginNodeHandle, PluginSink, ProvisionPlugin};
 
 use common::{
-    assert_plugin_contracts, run_trace_battery, AMBIGUOUS_FAULT_MARKER, Fault, TestablePlugin,
-    PluginBackendAdapter,
+    AMBIGUOUS_FAULT_MARKER, Fault, PluginBackendAdapter, TestablePlugin, assert_plugin_contracts,
+    run_trace_battery,
 };
 
 struct ProcessPluginState {
@@ -164,6 +162,9 @@ fn process_plugin_passes_seam_contracts() {
 
 #[test]
 fn process_plugin_battery_holds_invariants_and_converges() {
-    run_trace_battery(|| PluginBackendAdapter::new(ProcessPlugin::default()), 16, 28);
+    run_trace_battery(
+        || PluginBackendAdapter::new(ProcessPlugin::default()),
+        16,
+        28,
+    );
 }
-

@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Write};
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
@@ -12,18 +11,16 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::DEFAULT_PIPELINE_CACHED_MODEL_FILE;
 use crate::codecs::register_myelin_actor_codecs;
-use crate::node_actor::{
-    NodeAgentMsg, StageEdgeKindWire, StageInboundEdgeWire, StageObjectSpecWire,
-    StageOutboundEdgeWire, StageProvisionWire, StageRingSpecWire,
-};
-use crate::observability::frame_collector::{FrameCollector, StageLoadProgress};
+use crate::node_actor::NodeAgentMsg;
+use crate::observability::frame_collector::FrameCollector;
 use crate::observability::orch_telemetry::{
-    DashboardSupport, MYELIN_STAGE_ROUTE, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
+    DashboardSupport, MYELIN_SWIM_MEMBERSHIP, OrchTelemetry,
 };
-use crate::orchestration::actor::{OrchestratorActor, OrchestratorMsg, OrchestratorReport};
+use crate::orchestration::actor::{OrchestratorActor, OrchestratorReport};
 use crate::orchestration::config::{DEFAULT_CONFIG_PATH, TomlConfigOverlay};
+use crate::orchestration::daemon;
+use dashboard::control::ControlCommand;
 
-use crate::gguf_shard::{StageShardPlan, plan_stage_shard};
 use crate::node_provisioning::{ProviderKind, provider_kind};
 use crate::orchestration::cluster_reconciler::{ProvisionedClusterGuard, ReconcilerNodeBinding};
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
@@ -35,31 +32,23 @@ use crate::orchestration::provider_adapters::vastai::{
     SshCommandBootstrapLauncher, ToolsVastAiLeaseClient, VastAiProvisioningConfig,
     VastAiProvisioningPlugin,
 };
-use crate::prompt::rpc::{
-    PromptEvent, SubmitPrompt, TokenizerEvent, read_submit_prompt, write_json_line,
-};
 use crate::provisioning::{
     LocalDockerPlugin, LocalProcessPlugin, NodeProvisionSpec, PluginObservation,
-    PluginObservationSink, PluginSink, ProviderMount, ProvisionEvent, ProvisionEventKind,
-    ProvisionLogLine, ProvisionLogStream, ProvisionPlugin,
+    PluginObservationSink, PluginSink, ProvisionEvent, ProvisionEventKind, ProvisionLogLine,
+    ProvisionLogStream, ProvisionPlugin,
 };
 use crate::run_fsm::{RunConfig, RunId};
 use crate::run_plan::{self, GgufSource, TokenizerSource};
 use ::provisioning::{
     BootSpec, ClusterShape, DesiredNodeShape, LogicalNodeId as ReconcilerLogicalNodeId,
     NodeGroupId, ProviderKind as ReconcilerProviderKind, RetryPolicy, RoleId,
-    RunId as ClusterRunId, RunNodeGroupSpec, SwactorId, SwarmJoinTemplate,
+    RunId as ClusterRunId, RunNodeGroupSpec, SwarmJoinTemplate,
 };
-use data_plane::object_record as ingress;
-use telemetry::{TelemetryPublisherMsg, TelemetrySubscribe, SubscriptionRequest};
 use distribution::node::DistributedNodeConfig;
 use distribution::swim::telemetry::ObservedTransition;
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
-use data_plane::edge_wire::WireEvent;
-use iroh_driver::{
-    TELEMETRY_ALPN, EDGE_ALPN, EdgeSendHandle, IrohDriver, IrohDriverConfig,
-};
+use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN};
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -71,10 +60,10 @@ const CACHED_MODEL_HOST_ENV: &str = "MYELIN_CACHED_MODEL_HOST_PATH";
 const MYELIN_WORKER_BIN_ENV: &str = "MYELIN_WORKER_BIN";
 const CACHED_MODEL_CONTAINER_DIR: &str = "/models/cached";
 const DEFAULT_PIPELINE_MODEL_CACHE_DIR: &str = ".model-cache";
-const DEFAULT_RPC_BIND: &str = "127.0.0.1:19777";
 const DEFAULT_HF_REPO: &str = "bartowski/Llama-3.2-1B-Instruct-GGUF";
 const DEFAULT_HF_FILE: &str = "Llama-3.2-1B-Instruct-Q4_K_M.gguf";
 const DEFAULT_MODEL_ID: &str = "llama-3.2-1b-instruct-q4";
+const DEFAULT_STATE_DIR: &str = "./.config";
 const DEFAULT_MAX_TOKENS: u32 = 64;
 const PUMP_INTERVAL: Duration = Duration::from_millis(10);
 const RUNTIME_READY_ACK_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -99,6 +88,25 @@ where
         .overlay_cli(args)?
         .finalize()?;
     config.prepare_vastai_ssh_key()?;
+    let state_dir = daemon::StateDir::new(config.state_dir.clone());
+    if config.reset_state {
+        state_dir.reset()?;
+    }
+    let identity = state_dir.load_or_create_identity()?;
+    let mut snapshot = state_dir.load_snapshot()?;
+    if snapshot.run_id == 0 {
+        snapshot = daemon::ClusterSnapshot::fresh(config.run_id, daemon_label(&config));
+    } else if snapshot.run_id != config.run_id {
+        // Node container names and provider labels derive from run_id; the
+        // persisted run owns them so adoption addresses the same resources.
+        config.run_id = snapshot.run_id;
+    }
+    if let Some(url) = DashboardSupport::configured_url(config.dashboard)? {
+        println!("Myelin dashboard: {url}");
+        std::io::stdout()
+            .flush()
+            .map_err(|error| format!("flush dashboard URL to stdout: {error}"))?;
+    }
     let orch_stdio_rx = if capture_stdio {
         OrchStdioCapture::install()?
     } else {
@@ -127,7 +135,6 @@ where
             },
             "image":&config.image,
             "provider":config.provider.as_str(),
-            "rpc_bind":config.rpc_bind.to_string(),
             "model_id":&config.model_id,
             "stage_index":config.stage_index,
             "legacy_layer_end_exclusive":config.layer_end_exclusive,
@@ -189,27 +196,6 @@ where
         config.run_id,
         config.node_id,
     );
-    let pipeline_plan = if config.uses_planned_execution() {
-        let plan = config.build_run_plan()?;
-        bootstrap(
-            &mut orch_telemetry,
-            None,
-            "run_plan",
-            "ready",
-            json!({
-                "stage_count":plan.stages.len(),
-                "edge_count":plan.edges.len(),
-                "model_layers":plan.model.num_layers,
-                "hidden_dim":plan.model.hidden_dim,
-                "max_seq_len":plan.model.max_seq_len,
-                "eos_token_id":plan.model.eos_token_id,
-            }),
-        );
-        Some(plan)
-    } else {
-        None
-    };
-
     let actors_channel = orch_telemetry.channel_by_name("runtime.actors");
     let orch_stats_hook = orch_telemetry.stats_hook_on(actors_channel);
 
@@ -251,7 +237,7 @@ where
     let mut driver = match IrohDriver::with_engine(
         engine.handle(),
         IrohDriverConfig {
-            secret_key: None,
+            secret_key: Some(identity),
             relay_mode: config.relay.mode.clone(),
             node: DistributedNodeConfig::default(),
             peer_auth: None,
@@ -405,53 +391,6 @@ where
         json!({"actor":orchestrator_actor}),
     );
 
-    let prompt_events = match stack.runtime.new_inbox::<PromptEvent>() {
-        Ok(inbox) => inbox,
-        Err(error) => {
-            bootstrap(
-                &mut orch_telemetry,
-                dashboard.as_ref(),
-                "prompt_reply_actor",
-                "failed",
-                json!({"error":error.to_string()}),
-            );
-            return Err(format!("prompt event inbox: {error}"));
-        }
-    };
-    let prompt_reply_actor = *prompt_events.addr();
-    stack.register_local_actor(driver.register_actor(prompt_reply_actor, 1));
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "prompt_reply_actor",
-        "ready",
-        json!({"actor":prompt_reply_actor}),
-    );
-
-    let tokenizer_events = match stack.runtime.new_inbox::<TokenizerEvent>() {
-        Ok(inbox) => inbox,
-        Err(error) => {
-            bootstrap(
-                &mut orch_telemetry,
-                dashboard.as_ref(),
-                "tokenizer_reply_actor",
-                "failed",
-                json!({"error":error.to_string()}),
-            );
-            return Err(format!("tokenizer event inbox: {error}"));
-        }
-    };
-    let tokenizer_reply_actor = *tokenizer_events.addr();
-    stack.register_local_actor(driver.register_actor(tokenizer_reply_actor, 1));
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "tokenizer_reply_actor",
-        "ready",
-        json!({"actor":tokenizer_reply_actor}),
-    );
-
-    let (work_tx, work_rx) = mpsc::channel::<PromptWork>();
     let stop_rx = stop_rx.unwrap_or_else(spawn_stop_listener);
 
     let provisioner = config.build_provisioner(stack.runtime.clone())?;
@@ -470,160 +409,64 @@ where
     let sink = PluginSink::new(Arc::new(ChannelObservationSink {
         tx: Mutex::new(obs_tx),
     }));
-    let pipeline_coordinator_endpoint = coordinator_endpoint.clone();
-    let (mut provisioned_nodes, ready, swim_to_node) = start_and_provision_workers(
-        provisioner,
-        &config,
-        pipeline_plan.as_ref(),
-        RuntimeReadyAckLoop {
-            driver: &mut driver,
-            stack: &stack,
-            obs_rx: &obs_rx,
-            collector: &collector,
-            orchestrator_reports: &orchestrator_reports,
-            stop_rx: &stop_rx,
-            dashboard: dashboard.as_ref(),
-            orch_telemetry: &mut orch_telemetry,
-            orch_stdio_rx: orch_stdio_rx.as_ref(),
-            run_id: config.run_id,
-            orchestrator_node_id: config.node_id,
-            provider: &config.provider,
-            orchestrator_actor,
-        },
-        sink,
-        coordinator_endpoint,
-        pipeline_coordinator_endpoint,
-        orchestrator_actor,
-    )?;
 
+    let (control_tx, control_rx) = mpsc::channel::<ControlCommand>();
+    dashboard::control::set_control_sender(control_tx);
     bootstrap(
         &mut orch_telemetry,
         dashboard.as_ref(),
-        "prompt_rpc",
+        "fleet_control",
         "started",
         json!({
-            "bind":config.rpc_bind.to_string(),
-            "default_max_tokens":config.default_max_tokens,
+            "mode":"manual",
+            "commands":["add","kill","destroy"],
+            "transport":"dashboard",
         }),
     );
 
-    let rpc_addr = match spawn_prompt_rpc(
-        &engine.handle(),
-        config.rpc_bind,
-        work_tx,
-        config.default_max_tokens,
-    ) {
-        Ok(addr) => {
-            bootstrap(
-                &mut orch_telemetry,
-                dashboard.as_ref(),
-                "prompt_rpc",
-                "ready",
-                json!({
-                    "addr":addr.to_string(),
-                    "default_max_tokens":config.default_max_tokens,
-                }),
-            );
-            addr
-        }
-        Err(error) => {
-            bootstrap(
-                &mut orch_telemetry,
-                dashboard.as_ref(),
-                "prompt_rpc",
-                "failed",
-                json!({"error":error}),
-            );
-            return Err(error);
-        }
-    };
-
     bootstrap(
         &mut orch_telemetry,
         dashboard.as_ref(),
-        "prompt_loop",
-        "ready",
-        json!({"addr":rpc_addr.to_string(),"node_actor":ready.first_stage.node_actor}),
-    );
-
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "serve_prompts",
+        "serve_cluster",
         "started",
-        json!({"mode":"single_active_prompt","poll_interval_ms":PUMP_INTERVAL.as_millis()}),
+        json!({"mode":"daemon","poll_interval_ms":PUMP_INTERVAL.as_millis()}),
     );
-    let result = serve_prompts(
-        RuntimeReadyAckLoop {
-            driver: &mut driver,
-            stack: &stack,
-            obs_rx: &obs_rx,
-            collector: &collector,
-            orchestrator_reports: &orchestrator_reports,
-            stop_rx: &stop_rx,
-            dashboard: dashboard.as_ref(),
-            orch_telemetry: &mut orch_telemetry,
-            orch_stdio_rx: orch_stdio_rx.as_ref(),
-            run_id: config.run_id,
-            orchestrator_node_id: config.node_id,
-            provider: &config.provider,
-            orchestrator_actor,
-        },
-        &work_rx,
-        &prompt_events,
-        ready.first_stage.node_actor,
-        prompt_reply_actor,
-        &tokenizer_events,
-        ready.first_stage.node_actor,
-        ready.final_stage.node_actor,
-        tokenizer_reply_actor,
-        pipeline_plan.as_ref(),
-        ready.first_stage.endpoint.clone(),
-        &swim_to_node,
-    );
+    let result = serve_cluster(ServeCluster {
+        driver: &mut driver,
+        stack: &stack,
+        obs_rx: &obs_rx,
+        collector: &collector,
+        orchestrator_reports: &orchestrator_reports,
+        stop_rx: &stop_rx,
+        dashboard: dashboard.as_ref(),
+        orch_telemetry: &mut orch_telemetry,
+        orch_stdio_rx: orch_stdio_rx.as_ref(),
+        run_id: config.run_id,
+        orchestrator_node_id: config.node_id,
+        provider: &config.provider,
+        orchestrator_actor,
+        coordinator_endpoint,
+        engine: engine.handle(),
+        runtime: stack.runtime.clone(),
+        config: config.clone(),
+        provisioner,
+        live_clusters: BTreeMap::new(),
+        sink,
+        state_dir,
+        snapshot,
+        control_rx: &control_rx,
+        destroy_on_exit: config.destroy_on_exit,
+    });
     if let Err(error) = &result {
         bootstrap(
             &mut orch_telemetry,
             dashboard.as_ref(),
-            "serve_prompts",
+            "serve_cluster",
             "failed",
             json!({"error":error}),
         );
     }
-    bootstrap(
-        &mut orch_telemetry,
-        dashboard.as_ref(),
-        "provider_stop",
-        "started",
-        json!({"provider":config.provider.as_str(),"node_id":config.node_id}),
-    );
-    let stop_result = provisioned_nodes.stop();
-    match &stop_result {
-        Ok(()) => bootstrap(
-            &mut orch_telemetry,
-            dashboard.as_ref(),
-            "provider_stop",
-            "ready",
-            json!({"provider":config.provider.as_str(),"node_id":config.node_id}),
-        ),
-        Err(error) => bootstrap(
-            &mut orch_telemetry,
-            dashboard.as_ref(),
-            "provider_stop",
-            "failed",
-            json!({"provider":config.provider.as_str(),"node_id":config.node_id,"error":error}),
-        ),
-    }
-    if result.is_ok() && stop_result.is_ok() {
-        bootstrap(
-            &mut orch_telemetry,
-            dashboard.as_ref(),
-            "orch_exit",
-            "ready",
-            json!({"result":"ok"}),
-        );
-    }
-    result.and(stop_result)
+    result
 }
 
 #[derive(Clone)]
@@ -855,7 +698,6 @@ struct Config {
     image: String,
     docker_gpus: String,
     provider: ProviderKind,
-    rpc_bind: SocketAddr,
     run_id: u64,
     node_id: u64,
     stage_index: u32,
@@ -866,6 +708,9 @@ struct Config {
     tokenizer: TokenizerSource,
     default_max_tokens: u32,
     dashboard: bool,
+    state_dir: PathBuf,
+    destroy_on_exit: bool,
+    reset_state: bool,
     max_context: Option<u32>,
     relay: RelayRuntimeConfig,
     endpoint_addr_mask: EndpointAddrMask,
@@ -883,8 +728,6 @@ struct ConfigBuilder {
     toml_vastai_image: Option<String>,
     image_overridden_after_toml: bool,
     docker_gpus: String,
-    rpc_bind: String,
-    rpc_bind_label: &'static str,
     run_id: u64,
     node_id: u64,
     stage_index: u32,
@@ -895,6 +738,9 @@ struct ConfigBuilder {
     tokenizer: TokenizerSource,
     default_max_tokens: u32,
     dashboard: bool,
+    state_dir: Option<PathBuf>,
+    destroy_on_exit: bool,
+    reset_state: bool,
     max_context: Option<u32>,
     relay_mode: Option<String>,
     relay_url: Option<String>,
@@ -938,8 +784,6 @@ impl ConfigBuilder {
             toml_vastai_image: None,
             image_overridden_after_toml: false,
             docker_gpus: "all".to_owned(),
-            rpc_bind: DEFAULT_RPC_BIND.to_owned(),
-            rpc_bind_label: "MYELIN_PROMPT_RPC_BIND",
             run_id: 1,
             node_id: 1,
             stage_index: 0,
@@ -953,7 +797,10 @@ impl ConfigBuilder {
             },
             tokenizer: TokenizerSource::EmbeddedGguf,
             default_max_tokens: DEFAULT_MAX_TOKENS,
-            dashboard: false,
+            dashboard: true,
+            state_dir: None,
+            destroy_on_exit: false,
+            reset_state: false,
             max_context: None,
             relay_mode: None,
             relay_url: None,
@@ -1018,10 +865,6 @@ impl ConfigBuilder {
         apply!(overlay.image.node, |image| { self.image = image });
         apply!(overlay.relay.mode, |mode| { self.relay_mode = Some(mode) });
         apply!(overlay.relay.url, |url| { self.relay_url = Some(url) });
-        apply!(overlay.prompt.rpc_addr, |rpc_bind| {
-            self.rpc_bind = rpc_bind;
-            self.rpc_bind_label = "[prompt].rpc_addr";
-        });
         apply!(overlay.prompt.max_tokens, |max_tokens| {
             self.default_max_tokens = max_tokens
         });
@@ -1161,16 +1004,19 @@ impl ConfigBuilder {
         env_apply!(MYELIN_WORKER_BIN_ENV, |path| {
             self.worker_bin = Some(PathBuf::from(path))
         });
-        env_apply!("MYELIN_PROMPT_RPC_BIND", |rpc_bind| {
-            self.rpc_bind = rpc_bind;
-            self.rpc_bind_label = "MYELIN_PROMPT_RPC_BIND";
-        });
         env_parse!("MYELIN_PROMPT_MAX_TOKENS", |max_tokens| {
             self.default_max_tokens = max_tokens
         });
         env_apply!("MYELIN_DASHBOARD", |dashboard| {
             self.dashboard = Self::parse_bool("MYELIN_DASHBOARD", &dashboard)?;
         });
+        env_apply!("MYELIN_STATE_DIR", |state_dir| {
+            self.state_dir = Some(PathBuf::from(state_dir))
+        });
+        env_apply!("MYELIN_DESTROY_ON_EXIT", |destroy_on_exit| {
+            self.destroy_on_exit = Self::parse_bool("MYELIN_DESTROY_ON_EXIT", &destroy_on_exit)?;
+        });
+
         env_apply!(TELEMETRY_FRAME_LOG_ENV, |path| {
             self.telemetry_frame_log = Some(PathBuf::from(path))
         });
@@ -1286,10 +1132,6 @@ impl ConfigBuilder {
                     self.image_overridden_after_toml = true;
                 }
                 "--gpus" => self.docker_gpus = next_arg(&mut args, "--gpus")?,
-                "--rpc-bind" => {
-                    self.rpc_bind = next_arg(&mut args, "--rpc-bind")?;
-                    self.rpc_bind_label = "--rpc-bind";
-                }
                 "--run-id" => self.run_id = parse_next(&mut args, "--run-id")?,
                 "--node-id" => self.node_id = parse_next(&mut args, "--node-id")?,
                 "--stage-index" => self.stage_index = parse_next(&mut args, "--stage-index")?,
@@ -1300,11 +1142,14 @@ impl ConfigBuilder {
                 "--max-tokens" => self.default_max_tokens = parse_next(&mut args, "--max-tokens")?,
                 "--dashboard" => self.dashboard = true,
                 "--no-dashboard" => self.dashboard = false,
+                "--state-dir" => {
+                    self.state_dir = Some(PathBuf::from(next_arg(&mut args, "--state-dir")?))
+                }
+                "--destroy-on-exit" => self.destroy_on_exit = true,
+                "--reset-state" => self.reset_state = true,
                 "--telemetry-frame-log" => {
-                    self.telemetry_frame_log = Some(PathBuf::from(next_arg(
-                        &mut args,
-                        "--telemetry-frame-log",
-                    )?));
+                    self.telemetry_frame_log =
+                        Some(PathBuf::from(next_arg(&mut args, "--telemetry-frame-log")?));
                 }
                 "--model-id" => self.model_id = next_arg(&mut args, "--model-id")?,
                 "--gguf-local-path" => {
@@ -1487,10 +1332,6 @@ impl ConfigBuilder {
             image,
             docker_gpus: self.docker_gpus,
             provider,
-            rpc_bind: self
-                .rpc_bind
-                .parse()
-                .map_err(|e| format!("invalid {}: {e}", self.rpc_bind_label))?,
             run_id: self.run_id,
             node_id: self.node_id,
             stage_index: self.stage_index,
@@ -1501,6 +1342,12 @@ impl ConfigBuilder {
             tokenizer: self.tokenizer,
             default_max_tokens: self.default_max_tokens,
             dashboard: self.dashboard,
+            state_dir: self
+                .state_dir
+                .clone()
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_DIR)),
+            destroy_on_exit: self.destroy_on_exit,
+            reset_state: self.reset_state,
             max_context: self.max_context,
             relay,
             endpoint_addr_mask,
@@ -1769,12 +1616,7 @@ impl Config {
             "process" => {
                 let worker_bin = match &self.worker_bin {
                     Some(worker_bin) => worker_bin.clone(),
-                    None => {
-                        let mut path =
-                            std::env::current_exe().map_err(|e| format!("current exe: {e}"))?;
-                        path.set_file_name("myelin-worker");
-                        path
-                    }
+                    None => std::env::current_exe().map_err(|e| format!("current exe: {e}"))?,
                 };
                 if !worker_bin.is_file() {
                     return Err(format!(
@@ -1822,13 +1664,12 @@ impl Config {
             "MYELIN_LOGICAL_NODE_ID",
             "MYELIN_NODE_ATTEMPT_ID",
             "MYELIN_NODE_PROVIDER",
+            "MYELIN_AGENT_ONLY",
             "MYELIN_STAGE_INDEX",
             "MYELIN_COORDINATOR_ENDPOINT",
             "MYELIN_ORCHESTRATOR_ACTOR",
-            "MYELIN_MODEL_ID",
             "MYELIN_IROH_RELAY_MODE",
             MVP_IROH_ENDPOINT_ADDR_MASK_ENV,
-            "MYELIN_PIPELINE_STAGES",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -1837,53 +1678,14 @@ impl Config {
         keys
     }
 
-    /// Conditional worker env pairs shared by `node_spec_env_keys` and `node_spec_for_stage`.
+    /// Provider-specific environment shared by filter and launch paths.
     fn extra_worker_env(&self) -> Vec<(String, String)> {
-        let provider_name = self.provider.as_str();
         let mut env = Vec::new();
         if let Some(url) = &self.relay.url {
             env.push((MYELIN_IROH_RELAY_URL_ENV.to_owned(), url.clone()));
         }
-        if provider_name == "docker" {
+        if self.provider.as_str() == "docker" {
             env.push(("MYELIN_DOCKER_GPUS".to_owned(), self.docker_gpus.clone()));
-        }
-        if let Some(value) = env_optional("DEV") {
-            env.push(("DEV".to_owned(), value));
-        }
-        env.extend(local_tinygrad_worker_env(provider_name));
-        for name in [
-            "MYELIN_CPU_LINE_PROFILE",
-            "MYELIN_CPU_LINE_PROFILE_INTERVAL_MS",
-            "MYELIN_TOKEN_PROGRESS_EVERY",
-            "CUDA_DEVICE_SCHEDULE",
-            "MYELIN_MODEL_CACHE_DIR",
-            "HF_TOKEN",
-        ] {
-            if let Some(value) = env_optional(name) {
-                env.push((name.to_owned(), value));
-            }
-        }
-        match &self.gguf_source {
-            GgufSource::LocalPath(path) => {
-                env.push(("MYELIN_GGUF_LOCAL_PATH".to_owned(), path.clone()))
-            }
-            GgufSource::HuggingFaceGguf {
-                repo,
-                file,
-                revision,
-            } => {
-                env.push(("MYELIN_GGUF_REPO".to_owned(), repo.clone()));
-                env.push(("MYELIN_GGUF_FILE".to_owned(), file.clone()));
-                if let Some(revision) = revision {
-                    env.push(("MYELIN_GGUF_REVISION".to_owned(), revision.clone()));
-                }
-            }
-        }
-        if let TokenizerSource::LocalPath(path) = &self.tokenizer {
-            env.push(("MYELIN_TOKENIZER_LOCAL_PATH".to_owned(), path.clone()));
-        }
-        if let Some(max_context) = self.max_context {
-            env.push(("MYELIN_MAX_CONTEXT".to_owned(), max_context.to_string()));
         }
         env
     }
@@ -1897,16 +1699,13 @@ impl Config {
     ) -> Result<NodeProvisionSpec, String> {
         let provider_name = self.provider.as_str();
         let mut env = vec![
+            ("MYELIN_AGENT_ONLY".to_owned(), "1".to_owned()),
             ("MYELIN_RUN_ID".to_owned(), self.run_id.to_string()),
             (
                 "MYELIN_LOGICAL_NODE_ID".to_owned(),
                 logical_node_id.to_string(),
             ),
             ("MYELIN_STAGE_INDEX".to_owned(), stage_index.to_string()),
-            (
-                "MYELIN_PIPELINE_STAGES".to_owned(),
-                self.pipeline_stages.to_string(),
-            ),
             (
                 MVP_IROH_ENDPOINT_ADDR_MASK_ENV.to_owned(),
                 self.endpoint_addr_mask.as_str().to_owned(),
@@ -1922,7 +1721,6 @@ impl Config {
                 serde_json::to_string(&orchestrator_actor)
                     .map_err(|e| format!("serialize orchestrator actor: {e}"))?,
             ),
-            ("MYELIN_MODEL_ID".to_owned(), self.model_id.clone()),
             (
                 "MYELIN_IROH_RELAY_MODE".to_owned(),
                 relay_mode_env_value(&self.relay.mode).to_owned(),
@@ -1936,22 +1734,11 @@ impl Config {
                 .and_then(|vastai| vastai.bootstrap_command.clone())
                 .into_iter()
                 .collect(),
+            "process" if self.worker_bin.is_none() => {
+                vec![crate::ORCHESTRATOR_WORKER_MODE_ARG.to_owned()]
+            }
             "process" | "docker" => Vec::new(),
             _ => return Err("myelin-orchestrator does not support mock provider".to_owned()),
-        };
-        let mounts = if provider_name == "docker" {
-            self.cached_model
-                .as_ref()
-                .map(|cached_model| {
-                    vec![ProviderMount {
-                        host_path: cached_model.host_path.to_string_lossy().to_string(),
-                        container_path: cached_model.container_path.clone(),
-                        readonly: self.uses_planned_execution(),
-                    }]
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
         };
         Ok(NodeProvisionSpec {
             run_id: self.run_id,
@@ -1961,7 +1748,7 @@ impl Config {
             image: self.image.clone(),
             env,
             args,
-            mounts,
+            mounts: Vec::new(),
         })
     }
 }
@@ -1976,11 +1763,6 @@ struct RuntimeReady {
     swim_node_id: DistNodeId,
 }
 
-#[derive(Clone)]
-struct PromptRuntimeReady {
-    first_stage: RuntimeReady,
-    final_stage: RuntimeReady,
-}
 #[derive(Clone)]
 struct RuntimeReadyAckTarget {
     node_id: u64,
@@ -2012,30 +1794,6 @@ fn enqueue_runtime_ready_ack(
         .map_err(|e| format!("send runtime ready ack: {e}"))
 }
 
-fn enqueue_telemetry_subscribe(
-    stack: &DistributionRuntimeStack,
-    ready: &RuntimeReady,
-    collector: &EndpointAddr,
-    run_id: u64,
-    node_id: u64,
-) -> Result<(), String> {
-    let mut flow_id = [0_u8; 16];
-    flow_id[..8].copy_from_slice(&run_id.to_le_bytes());
-    flow_id[8..].copy_from_slice(&node_id.to_le_bytes());
-    stack
-        .runtime
-        .send_to(
-            ready.telemetry_publisher,
-            TelemetryPublisherMsg::Subscribe(TelemetrySubscribe {
-                collector: collector.clone(),
-                request: SubscriptionRequest::all(),
-                flow_id,
-                token: Vec::new(),
-            }),
-        )
-        .map_err(|e| format!("send telemetry subscribe: {e}"))
-}
-
 struct RuntimeReadyAckLoop<'a> {
     driver: &'a mut IrohDriver,
     stack: &'a DistributionRuntimeStack,
@@ -2057,7 +1815,6 @@ struct RuntimeReadyAckLoop<'a> {
 fn wait_for_runtime_ready_acks(
     ctx: RuntimeReadyAckLoop<'_>,
     targets: &[RuntimeReadyAckTarget],
-    collector_endpoint: &EndpointAddr,
     cluster: &mut ProvisionedClusterGuard,
 ) -> Result<bool, String> {
     let RuntimeReadyAckLoop {
@@ -2128,9 +1885,9 @@ fn wait_for_runtime_ready_acks(
         while let Ok(observation) = obs_rx.try_recv() {
             emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
         }
-        collector.drain(|stream, channel, frame| {
+        collector.drain(|stream, descriptor, channel, frame| {
             if let Some(d) = dashboard {
-                d.publish_frame(stream, channel, frame);
+                d.publish_collected_frame(stream, descriptor, channel, frame);
             }
             orch_telemetry.archive_frame("node", stream, channel, frame);
         });
@@ -2168,23 +1925,6 @@ fn wait_for_runtime_ready_acks(
         }
         if last_send.is_none_or(|sent_at| sent_at.elapsed() >= RUNTIME_READY_ACK_RETRY_INTERVAL) {
             for (key, target) in &pending {
-                if stack.route_owner(target.ready.telemetry_publisher)
-                    == Some(target.ready.swim_node_id)
-                    && let Err(error) = enqueue_telemetry_subscribe(
-                        stack,
-                        &target.ready,
-                        collector_endpoint,
-                        run_id,
-                        target.node_id,
-                    )
-                {
-                    bootstrap(
-                        orch_telemetry,
-                        "telemetry_subscribe",
-                        "failed",
-                        json!({"node_id":target.node_id,"error":error}),
-                    );
-                }
                 enqueue_runtime_ready_ack(stack, &target.ready, run_id, target.node_id)?;
                 let attempt = attempts.entry(*key).or_default();
                 *attempt += 1;
@@ -2307,650 +2047,6 @@ fn build_reconciled_cluster(
     ProvisionedClusterGuard::new(desired, bindings, RetryPolicy::default(), engine, sink)
 }
 
-// Synchronous orchestration sequencing; provider work and timers are engine-hosted.
-#[allow(clippy::disallowed_methods)]
-fn start_and_provision_workers(
-    provisioner: Box<dyn ProvisionPlugin>,
-    config: &Config,
-    pipeline_plan: Option<&run_plan::RunPlan>,
-    ctx: RuntimeReadyAckLoop<'_>,
-    sink: PluginSink,
-    coordinator: EndpointAddr,
-    pipeline_coordinator: EndpointAddr,
-    orchestrator_actor: ActorAddress,
-) -> Result<
-    (
-        ProvisionedClusterGuard,
-        PromptRuntimeReady,
-        BTreeMap<DistNodeId, u64>,
-    ),
-    String,
-> {
-    let RuntimeReadyAckLoop {
-        driver,
-        stack,
-        obs_rx,
-        collector,
-        orchestrator_reports,
-        stop_rx,
-        dashboard,
-        orch_telemetry,
-        orch_stdio_rx,
-        ..
-    } = ctx;
-    let run_id = config.run_id;
-    let node_id = config.node_id;
-    let bootstrap = |ds: &mut OrchTelemetry, phase: &str, status: &str, detail: Value| {
-        ds.emit_bootstrap(dashboard, run_id, node_id, phase, status, detail);
-    };
-    let stage_specs = stage_node_specs(
-        config,
-        pipeline_plan,
-        coordinator.clone(),
-        orchestrator_actor,
-    )?;
-    let expected_node_ids = stage_specs
-        .iter()
-        .map(|spec| spec.node_id)
-        .collect::<Vec<_>>();
-    bootstrap(
-        orch_telemetry,
-        "node_spec",
-        "ready",
-        json!({
-            "provider":config.provider.as_str(),
-            "image":&config.image,
-            "relay_mode":relay_mode_env_value(&config.relay.mode),
-            "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
-            "docker_gpus":if config.provider.as_str() == "docker" { Some(config.docker_gpus.as_str()) } else { None },
-            "provider_config":config.provider_telemetry_detail(),
-            "env_keys":config.node_spec_env_keys(),
-            "worker_count":stage_specs.len(),
-            "worker_node_ids":expected_node_ids,
-        }),
-    );
-
-    let stage_shard_plans = if let Some(plan) = pipeline_plan {
-        let plans = pipeline_stage_shard_plans(config, plan)?;
-        emit_stage_shard_plan_summaries(
-            dashboard,
-            orch_telemetry,
-            config.run_id,
-            config.node_id,
-            &plans,
-        );
-        plans
-    } else {
-        BTreeMap::new()
-    };
-    for node_spec in &stage_specs {
-        orch_telemetry.emit_event(
-            dashboard,
-            ProvisionEvent {
-                run_id: config.run_id,
-                node_id: node_spec.node_id,
-                kind: ProvisionEventKind::ProvisionStart,
-                provider: Some(config.provider.as_str().to_owned()),
-                message: Some(format!(
-                    "reconciling {} image {}",
-                    config.provider.as_str(),
-                    config.image
-                )),
-            },
-        );
-        bootstrap(
-            orch_telemetry,
-            "provider_start",
-            "started",
-            json!({
-                "provider":config.provider.as_str(),
-                "image":&config.image,
-                "node_id":node_spec.node_id,
-                "stage_index":node_spec.stage_index,
-                "generation":1,
-            }),
-        );
-    }
-    let mut provisioned_nodes = build_reconciled_cluster(
-        provisioner,
-        config,
-        &stage_specs,
-        stack.runtime.clone(),
-        stack.engine.clone(),
-        sink,
-    )?;
-    loop {
-        provisioned_nodes
-            .poll(SystemTime::now())
-            .map_err(|error| format!("cluster reconcile: {error}"))?;
-        if provisioned_nodes.awaiting_runtime() || provisioned_nodes.is_converged() {
-            break;
-        }
-        collector.pump(driver);
-        collector.drain(|stream, channel, frame| {
-            if let Some(d) = dashboard {
-                d.publish_frame(stream, channel, frame);
-            }
-            orch_telemetry.archive_frame("node", stream, channel, frame);
-        });
-        drain_orch_stdio_capture(
-            orch_stdio_rx,
-            orch_telemetry,
-            dashboard,
-            config.run_id,
-            config.node_id,
-        );
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_telemetry, dashboard, &config.provider, &observation);
-        }
-        if stop_requested(stop_rx) {
-            return Err("shutdown requested while reconciling worker nodes".to_owned());
-        }
-        thread::sleep(PUMP_INTERVAL);
-    }
-    for node_spec in &stage_specs {
-        bootstrap(
-            orch_telemetry,
-            "provider_start",
-            "ready",
-            json!({
-                "provider":config.provider.as_str(),
-                "node_id":node_spec.node_id,
-                "stage_index":node_spec.stage_index,
-                "attempt":provisioned_nodes.current_attempt(node_spec.node_id).map(|attempt| attempt.0),
-            }),
-        );
-    }
-    drain_orch_stdio_capture(
-        orch_stdio_rx,
-        orch_telemetry,
-        dashboard,
-        config.run_id,
-        config.node_id,
-    );
-
-    bootstrap(
-        orch_telemetry,
-        "node_runtime_ready",
-        "started",
-        json!({"worker_count":expected_node_ids.len(),"node_ids":expected_node_ids}),
-    );
-    let readies = loop {
-        let readies = match wait_for_runtime_readies(
-            RuntimeReadyAckLoop {
-                driver,
-                stack,
-                obs_rx,
-                collector,
-                orchestrator_reports,
-                stop_rx,
-                dashboard,
-                orch_telemetry,
-                orch_stdio_rx,
-                run_id: config.run_id,
-                orchestrator_node_id: config.node_id,
-                provider: &config.provider,
-                orchestrator_actor,
-            },
-            &expected_node_ids,
-            &mut provisioned_nodes,
-        ) {
-            Ok(readies) => readies,
-            Err(error) => {
-                bootstrap(
-                    orch_telemetry,
-                    "node_runtime_ready",
-                    "failed",
-                    json!({"error":error}),
-                );
-                return Err(error);
-            }
-        };
-        for (node_id, ready) in &readies {
-            bootstrap(
-                orch_telemetry,
-                "node_runtime_ready",
-                "ready",
-                json!({"endpoint":&ready.endpoint,"node_actor":ready.node_actor,"node_id":node_id,"stage_index":ready.stage_index,"attempt":ready.readiness_id}),
-            );
-        }
-        let ack_targets = readies
-            .iter()
-            .map(|(node_id, ready)| RuntimeReadyAckTarget {
-                node_id: *node_id,
-                ready: ready.clone(),
-            })
-            .collect::<Vec<_>>();
-        if wait_for_runtime_ready_acks(
-            RuntimeReadyAckLoop {
-                driver,
-                stack,
-                obs_rx,
-                collector,
-                orchestrator_reports,
-                stop_rx,
-                dashboard,
-                orch_telemetry,
-                orch_stdio_rx,
-                run_id: config.run_id,
-                orchestrator_node_id: config.node_id,
-                provider: &config.provider,
-                orchestrator_actor,
-            },
-            &ack_targets,
-            &pipeline_coordinator,
-            &mut provisioned_nodes,
-        )? {
-            break readies;
-        }
-        bootstrap(
-            orch_telemetry,
-            "node_runtime_ready",
-            "retry",
-            json!({"reason":"node attempt changed before ready acknowledgement"}),
-        );
-    };
-    for (node_id, ready) in &readies {
-        let attempt = ::provisioning::NodeAttemptId(ready.readiness_id);
-        if !provisioned_nodes.observe_runtime_ready(
-            *node_id,
-            attempt,
-            SwactorId(format!("{:?}", ready.node_actor)),
-            SystemTime::now(),
-        ) {
-            return Err(format!(
-                "stale runtime-ready observation for node {node_id} attempt {}",
-                attempt.0
-            ));
-        }
-    }
-    while !provisioned_nodes.is_converged() {
-        provisioned_nodes
-            .poll(SystemTime::now())
-            .map_err(|error| format!("cluster convergence: {error}"))?;
-        collector.pump(driver);
-        collector.drain(|stream, channel, frame| {
-            if let Some(d) = dashboard {
-                d.publish_frame(stream, channel, frame);
-            }
-            orch_telemetry.archive_frame("node", stream, channel, frame);
-        });
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_telemetry, dashboard, &config.provider, &observation);
-        }
-        if stop_requested(stop_rx) {
-            return Err("shutdown requested while converging worker nodes".to_owned());
-        }
-        thread::sleep(PUMP_INTERVAL);
-    }
-
-    bootstrap(
-        orch_telemetry,
-        "stage_provision",
-        "started",
-        stage_provision_detail(config, pipeline_plan),
-    );
-    if pipeline_plan.is_none() {
-        let ready = readies
-            .get(&config.node_id)
-            .ok_or_else(|| "missing runtime-ready node for single-stage run".to_owned())?;
-        provision_stage(stack, ready.node_actor, config)?;
-    }
-
-    bootstrap(
-        orch_telemetry,
-        "weights_loaded",
-        "started",
-        json!({"model_id":&config.model_id,"expected":expected_node_ids.len()}),
-    );
-    let weights_result = if pipeline_plan.is_some() {
-        wait_for_weights_loaded_count(
-            RuntimeReadyAckLoop {
-                driver,
-                stack,
-                obs_rx,
-                collector,
-                orchestrator_reports,
-                stop_rx,
-                dashboard,
-                orch_telemetry,
-                orch_stdio_rx,
-                run_id: config.run_id,
-                orchestrator_node_id: config.node_id,
-                provider: &config.provider,
-                orchestrator_actor,
-            },
-            expected_node_ids.len(),
-            pipeline_plan.expect("pipeline mode requires plan"),
-            &readies,
-            &pipeline_coordinator,
-            &stage_shard_plans,
-        )
-    } else {
-        wait_for_weights_loaded(
-            RuntimeReadyAckLoop {
-                driver,
-                stack,
-                obs_rx,
-                collector,
-                orchestrator_reports,
-                stop_rx,
-                dashboard,
-                orch_telemetry,
-                orch_stdio_rx,
-                run_id: config.run_id,
-                orchestrator_node_id: config.node_id,
-                provider: &config.provider,
-                orchestrator_actor,
-            },
-            config.stage_index,
-        )
-    };
-    match weights_result {
-        Ok(()) => bootstrap(
-            orch_telemetry,
-            "weights_loaded",
-            "ready",
-            json!({"source":"actor_stage_ready","model_id":&config.model_id,"expected":expected_node_ids.len()}),
-        ),
-        Err(error) => {
-            bootstrap(
-                orch_telemetry,
-                "weights_loaded",
-                "failed",
-                json!({"error":error}),
-            );
-            drain_orch_stdio_capture(
-                orch_stdio_rx,
-                orch_telemetry,
-                dashboard,
-                config.run_id,
-                config.node_id,
-            );
-            return Err(error);
-        }
-    }
-
-    let prompt_ready = if let Some(plan) = pipeline_plan {
-        let first_node_id = plan
-            .stages
-            .iter()
-            .find(|stage| stage.stage_index == 0)
-            .map(|stage| stage.node_id.0)
-            .ok_or_else(|| "pipeline plan missing stage 0".to_owned())?;
-        let final_node_id = plan
-            .stages
-            .iter()
-            .find(|stage| stage.stage_index + 1 == stage.stage_count)
-            .map(|stage| stage.node_id.0)
-            .ok_or_else(|| "pipeline plan missing final stage".to_owned())?;
-        PromptRuntimeReady {
-            first_stage: readies
-                .get(&first_node_id)
-                .cloned()
-                .ok_or_else(|| "missing stage 0 runtime-ready node".to_owned())?,
-            final_stage: readies
-                .get(&final_node_id)
-                .cloned()
-                .ok_or_else(|| "missing final-stage runtime-ready node".to_owned())?,
-        }
-    } else {
-        let ready = readies
-            .get(&config.node_id)
-            .cloned()
-            .ok_or_else(|| "missing single-stage runtime-ready node".to_owned())?;
-        PromptRuntimeReady {
-            first_stage: ready.clone(),
-            final_stage: ready,
-        }
-    };
-    let swim_to_node = readies
-        .iter()
-        .map(|(node_id, ready)| (ready.swim_node_id, *node_id))
-        .collect::<BTreeMap<DistNodeId, u64>>();
-    Ok((provisioned_nodes, prompt_ready, swim_to_node))
-}
-
-fn stage_node_specs(
-    config: &Config,
-    pipeline_plan: Option<&run_plan::RunPlan>,
-    coordinator: EndpointAddr,
-    orchestrator_actor: ActorAddress,
-) -> Result<Vec<NodeProvisionSpec>, String> {
-    if let Some(plan) = pipeline_plan {
-        let mut stages = plan.stages.clone();
-        stages.sort_by_key(|stage| stage.stage_index);
-        stages
-            .into_iter()
-            .map(|stage| {
-                config.node_spec_for_stage(
-                    coordinator.clone(),
-                    orchestrator_actor,
-                    stage.node_id.0,
-                    stage.stage_index,
-                )
-            })
-            .collect()
-    } else {
-        Ok(vec![config.node_spec_for_stage(
-            coordinator,
-            orchestrator_actor,
-            config.node_id,
-            config.stage_index,
-        )?])
-    }
-}
-
-fn stage_provision_detail(config: &Config, pipeline_plan: Option<&run_plan::RunPlan>) -> Value {
-    if let Some(plan) = pipeline_plan {
-        json!({
-            "run_id":config.run_id,
-            "stage_count":plan.stages.len(),
-            "stages":plan.stages.iter().map(|stage| {
-                json!({
-                    "node_id":stage.node_id.0,
-                    "stage_index":stage.stage_index,
-                    "layer_range":{"start":stage.layer_start,"end_exclusive":stage.layer_end_exclusive},
-                    "inbound_edge_id":stage.inbound_edge.0,
-                    "outbound_edge_id":stage.outbound_edge.0,
-                })
-            }).collect::<Vec<_>>(),
-            "model_id":&config.model_id,
-        })
-    } else {
-        json!({
-            "run_id":config.run_id,
-            "node_id":config.node_id,
-            "stage_index":config.stage_index,
-            "stage_count":1,
-            "layer_range":{"start":0,"end_exclusive":config.layer_end_exclusive},
-            "model_id":&config.model_id,
-        })
-    }
-}
-
-fn stage_provision_wire_from_plan(
-    plan: &run_plan::RunPlan,
-    stage_index: u32,
-    readies: &BTreeMap<u64, RuntimeReady>,
-    coordinator: &EndpointAddr,
-    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
-) -> Result<StageProvisionWire, String> {
-    let provision = run_plan::derive_stage_provision(plan, stage_index)
-        .map_err(|e| format!("derive stage {stage_index} provision: {e:?}"))?;
-    Ok(StageProvisionWire {
-        run_id: provision.run_id.0,
-        authorized_orchestrator: 0,
-        node_id: provision.node_id.0,
-        stage_index: provision.stage_index,
-        stage_count: provision.stage_count,
-        layer_start: provision.layer_start,
-        layer_end_exclusive: provision.layer_end_exclusive,
-        inbound_edge_id: provision.inbound.edge_id.0,
-        outbound_edge_id: provision.outbound.edge_id.0,
-        inbound_edge: Some(StageInboundEdgeWire {
-            edge_id: provision.inbound.edge_id.0,
-            kind: stage_edge_kind_wire(provision.inbound.kind),
-            object_spec: stage_object_spec_wire(provision.inbound.object_spec),
-            ring_spec: stage_ring_spec_wire(provision.inbound.ring_spec),
-        }),
-        outbound_edge: Some(StageOutboundEdgeWire {
-            edge_id: provision.outbound.edge_id.0,
-            kind: stage_edge_kind_wire(provision.outbound.kind),
-            consumer_node_id: provision.outbound.consumer_node_id.0,
-            consumer_endpoint: stage_consumer_endpoint(
-                provision.outbound.consumer_node_id.0,
-                plan,
-                readies,
-                coordinator,
-            )?,
-            object_spec: stage_object_spec_wire(provision.outbound.object_spec),
-            ring_spec: stage_ring_spec_wire(provision.outbound.ring_spec),
-        }),
-        model_id: provision.model.model_id,
-        gguf_source: provision.gguf_source,
-        tokenizer: provision.tokenizer,
-        stage_shard_plan: stage_shard_plans.get(&stage_index).cloned(),
-    })
-}
-
-fn provision_stage_from_plan(
-    stack: &DistributionRuntimeStack,
-    node_actor: ActorAddress,
-    plan: &run_plan::RunPlan,
-    stage_index: u32,
-    readies: &BTreeMap<u64, RuntimeReady>,
-    coordinator: &EndpointAddr,
-    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
-) -> Result<(), String> {
-    let provision =
-        stage_provision_wire_from_plan(plan, stage_index, readies, coordinator, stage_shard_plans)?;
-    stack
-        .runtime
-        .send_to(node_actor, NodeAgentMsg::ProvisionStage(provision))
-        .map_err(|e| format!("send stage {stage_index} provision: {e}"))
-}
-
-fn pipeline_stage_shard_plans(
-    config: &Config,
-    plan: &run_plan::RunPlan,
-) -> Result<BTreeMap<u32, StageShardPlan>, String> {
-    if !matches!(config.gguf_source, GgufSource::HuggingFaceGguf { .. }) {
-        return Ok(BTreeMap::new());
-    }
-    let planning_gguf = config.local_planning_gguf_path()?;
-    let mut out = BTreeMap::new();
-    for stage in &plan.stages {
-        let shard_plan = plan_stage_shard(
-            &planning_gguf,
-            stage.gguf_source.clone(),
-            stage.stage_index,
-            stage.stage_count,
-            stage.layer_start,
-            stage.layer_end_exclusive,
-        )
-        .map_err(|error| {
-            format!(
-                "plan stage {} HF shard ranges from {}: {error}",
-                stage.stage_index,
-                planning_gguf.display()
-            )
-        })?;
-        out.insert(stage.stage_index, shard_plan);
-    }
-    Ok(out)
-}
-
-fn stage_shard_plan_summary_detail(plan: &StageShardPlan) -> Value {
-    let planned_fetch_bytes = plan.planned_fetch_bytes();
-    json!({
-        "stage_index":plan.stage_index,
-        "stage_count":plan.stage_count,
-        "layer_start":plan.layer_start,
-        "layer_end_exclusive":plan.layer_end_exclusive,
-        "planned_fetch_bytes":planned_fetch_bytes,
-        "source_total_bytes":plan.source_total_bytes,
-        "tensor_count":plan.tensors.len(),
-        "range_count":plan.planned_range_count(),
-        "tensor_range_count":plan.merged_tensor_ranges.len(),
-        "metadata_bytes":plan.metadata_end,
-        "planned_fraction":if plan.source_total_bytes == 0 {
-            Value::Null
-        } else {
-            json!(planned_fetch_bytes as f64 / plan.source_total_bytes as f64)
-        },
-    })
-}
-
-fn emit_stage_shard_plan_summaries(
-    dashboard: Option<&DashboardSupport>,
-    orch_telemetry: &mut OrchTelemetry,
-    run_id: u64,
-    node_id: u64,
-    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
-) {
-    for plan in stage_shard_plans.values() {
-        orch_telemetry.emit_bootstrap(
-            dashboard,
-            run_id,
-            node_id,
-            "stage_shard_plan",
-            "ready",
-            stage_shard_plan_summary_detail(plan),
-        );
-    }
-}
-
-fn stage_consumer_endpoint(
-    consumer_node_id: u64,
-    plan: &run_plan::RunPlan,
-    readies: &BTreeMap<u64, RuntimeReady>,
-    coordinator: &EndpointAddr,
-) -> Result<Option<EndpointAddr>, String> {
-    if consumer_node_id
-        == plan.stages.first().map_or(0, |stage| {
-            plan.edges
-                .iter()
-                .find(|edge| edge.kind == run_plan::EdgeKind::TokenIn)
-                .and_then(|edge| match edge.producer {
-                    run_plan::EdgeEndpoint::Orchestrator { node_id } => Some(node_id.0),
-                    run_plan::EdgeEndpoint::Stage { .. } => None,
-                })
-                .unwrap_or(stage.node_id.0)
-        })
-    {
-        return Ok(Some(coordinator.clone()));
-    }
-    readies
-        .get(&consumer_node_id)
-        .map(|ready| Some(ready.endpoint.clone()))
-        .ok_or_else(|| {
-            format!("missing runtime-ready endpoint for consumer node {consumer_node_id}")
-        })
-}
-
-fn stage_edge_kind_wire(kind: run_plan::EdgeKind) -> StageEdgeKindWire {
-    match kind {
-        run_plan::EdgeKind::TokenIn => StageEdgeKindWire::TokenIn,
-        run_plan::EdgeKind::Activation => StageEdgeKindWire::Activation,
-        run_plan::EdgeKind::TokenOut => StageEdgeKindWire::TokenOut,
-    }
-}
-
-fn stage_object_spec_wire(spec: run_plan::ObjectSpec) -> StageObjectSpecWire {
-    StageObjectSpecWire {
-        max_extent: spec.max_extent,
-        alignment: spec.alignment,
-    }
-}
-
-fn stage_ring_spec_wire(spec: run_plan::RingSpec) -> StageRingSpecWire {
-    StageRingSpecWire {
-        data_capacity: spec.data_capacity,
-        alignment: spec.alignment,
-    }
-}
-
 // synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
 #[allow(clippy::disallowed_methods)]
 fn wait_for_runtime_readies(
@@ -2991,9 +2087,9 @@ fn wait_for_runtime_readies(
             stack,
         );
         emit_swim_probe_events(orch_telemetry, dashboard, stack, "runtime_ready_wait");
-        collector.drain(|stream, channel, frame| {
+        collector.drain(|stream, descriptor, channel, frame| {
             if let Some(d) = dashboard {
-                d.publish_frame(stream, channel, frame);
+                d.publish_collected_frame(stream, descriptor, channel, frame);
             }
             orch_telemetry.archive_frame("node", stream, channel, frame);
         });
@@ -3055,471 +2151,6 @@ fn wait_for_runtime_readies(
         }
         thread::sleep(PUMP_INTERVAL);
     }
-}
-
-// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
-fn wait_for_weights_loaded_count(
-    ctx: RuntimeReadyAckLoop<'_>,
-    expected_count: usize,
-    pipeline_plan: &run_plan::RunPlan,
-    readies: &BTreeMap<u64, RuntimeReady>,
-    pipeline_coordinator: &EndpointAddr,
-    stage_shard_plans: &BTreeMap<u32, StageShardPlan>,
-) -> Result<(), String> {
-    let RuntimeReadyAckLoop {
-        driver,
-        stack,
-        obs_rx,
-        collector,
-        orchestrator_reports,
-        stop_rx,
-        dashboard,
-        orch_telemetry,
-        orch_stdio_rx,
-        run_id,
-        orchestrator_node_id: node_id,
-        provider,
-        ..
-    } = ctx;
-    let expected_stages = pipeline_plan
-        .stages
-        .iter()
-        .map(|stage| stage.stage_index)
-        .collect::<BTreeSet<_>>();
-    let mut loaded_stages = BTreeSet::<u32>::new();
-    let mut last_resend = Instant::now() - Duration::from_secs(15);
-    let mut resend_attempt = 0_u64;
-    let mut stage_resend_counts = BTreeMap::<u32, u64>::new();
-    let mut stage_last_sends = BTreeMap::<u32, Instant>::new();
-    let mut load_progress = BTreeMap::<u64, StageLoadProgress>::new();
-    loop {
-        collector.pump(driver);
-        emit_swim_transitions(orch_telemetry, dashboard, run_id, node_id, stack);
-        emit_swim_probe_events(orch_telemetry, dashboard, stack, "weights_loaded_wait");
-        drain_orch_stdio_capture(orch_stdio_rx, orch_telemetry, dashboard, run_id, node_id);
-        if stop_requested(stop_rx) {
-            return Err("shutdown requested while waiting for pipeline weights loaded".to_owned());
-        }
-        if loaded_stages.len() >= expected_count {
-            return Ok(());
-        }
-        if last_resend.elapsed() >= Duration::from_secs(15) {
-            resend_attempt += 1;
-            let mut pending: Vec<&run_plan::StagePlan> = pipeline_plan
-                .stages
-                .iter()
-                .filter(|stage| !loaded_stages.contains(&stage.stage_index))
-                .collect();
-            pending.sort_by_key(|stage| stage.stage_index);
-            if pending.is_empty() {
-                return Err(format!(
-                    "missing unloaded pipeline weight stage; loaded {} of {expected_count}",
-                    loaded_stages.len()
-                ));
-            }
-            for stage in pending {
-                let mut provision = PipelineStageProvision {
-                    driver: &mut *driver,
-                    stack,
-                    collector,
-                    dashboard,
-                    orch_telemetry: &mut *orch_telemetry,
-                    run_id,
-                    node_id,
-                    pipeline_plan,
-                    readies,
-                    pipeline_coordinator,
-                    stage_shard_plans,
-                    loaded_stages: &loaded_stages,
-                    stage_resend_counts: &mut stage_resend_counts,
-                    stage_last_sends: &mut stage_last_sends,
-                    load_progress: &load_progress,
-                };
-                send_pipeline_stage_provision(&mut provision, stage, resend_attempt)?;
-            }
-            last_resend = Instant::now();
-        }
-        while let Ok(observation) = obs_rx.try_recv() {
-            emit_plugin_observation(orch_telemetry, dashboard, provider, &observation);
-            match observation {
-                PluginObservation::Failed {
-                    reason,
-                    node_id: failed_node_id,
-                    ..
-                } => {
-                    orch_telemetry.emit_bootstrap(
-                        dashboard,
-                        run_id,
-                        node_id,
-                        "stage_provision_wait",
-                        "failed",
-                        json!({
-                            "classification":"worker_process_failed",
-                            "stage_node_id":failed_node_id,
-                            "last_load_progress":load_progress.get(&failed_node_id).map(StageLoadProgress::to_json),
-                            "reason":reason,
-                        }),
-                    );
-                    return Err(reason);
-                }
-                PluginObservation::Exited {
-                    node_id: exited_node_id,
-                    status,
-                    ..
-                } => {
-                    let reason =
-                        format!("node {exited_node_id} exited while loading weights: {status:?}");
-                    orch_telemetry.emit_bootstrap(
-                        dashboard,
-                        run_id,
-                        node_id,
-                        "stage_provision_wait",
-                        "failed",
-                        json!({
-                            "classification":"worker_process_exited",
-                            "stage_node_id":exited_node_id,
-                            "last_load_progress":load_progress.get(&exited_node_id).map(StageLoadProgress::to_json),
-                            "status":status,
-                            "reason":reason,
-                        }),
-                    );
-                    return Err(reason);
-                }
-                PluginObservation::TelemetryFrame { .. }
-                | PluginObservation::ProviderLine { .. }
-                | PluginObservation::StdoutLine { .. }
-                | PluginObservation::StderrLine { .. } => {}
-            }
-        }
-        collector.drain_with_progress(&mut load_progress, |stream, channel, frame| {
-            if let Some(d) = dashboard {
-                d.publish_frame(stream, channel, frame);
-            }
-            orch_telemetry.archive_frame("node", stream, channel, frame);
-        });
-        while let Some(report) = orchestrator_reports.try_recv() {
-            match report {
-                OrchestratorReport::WeightsReady {
-                    run_id: report_run_id,
-                    node_id: _,
-                    stage_index,
-                } if report_run_id == run_id && expected_stages.contains(&stage_index) => {
-                    loaded_stages.insert(stage_index);
-                    if loaded_stages.len() >= expected_count {
-                        return Ok(());
-                    }
-                }
-                OrchestratorReport::StageFault {
-                    run_id: report_run_id,
-                    stage_index,
-                    reason,
-                } if report_run_id == run_id && expected_stages.contains(&stage_index) => {
-                    let mut error =
-                        format!("stage {stage_index} faulted while loading pipeline weights");
-                    if let Some(reason) = reason {
-                        error.push_str(": ");
-                        error.push_str(&reason);
-                    }
-                    return Err(error);
-                }
-                _ => {}
-            }
-        }
-        thread::sleep(PUMP_INTERVAL);
-    }
-}
-
-struct PipelineStageProvision<'a> {
-    driver: &'a mut IrohDriver,
-    stack: &'a DistributionRuntimeStack,
-    collector: &'a FrameCollector,
-    dashboard: Option<&'a DashboardSupport>,
-    orch_telemetry: &'a mut OrchTelemetry,
-    run_id: u64,
-    node_id: u64,
-    pipeline_plan: &'a run_plan::RunPlan,
-    readies: &'a BTreeMap<u64, RuntimeReady>,
-    pipeline_coordinator: &'a EndpointAddr,
-    stage_shard_plans: &'a BTreeMap<u32, StageShardPlan>,
-    loaded_stages: &'a BTreeSet<u32>,
-    stage_resend_counts: &'a mut BTreeMap<u32, u64>,
-    stage_last_sends: &'a mut BTreeMap<u32, Instant>,
-    load_progress: &'a BTreeMap<u64, StageLoadProgress>,
-}
-
-fn send_pipeline_stage_provision(
-    ctx: &mut PipelineStageProvision<'_>,
-    stage: &run_plan::StagePlan,
-    attempt: u64,
-) -> Result<(), String> {
-    let stage_node_id = stage.node_id.0;
-    let current_send_count = ctx
-        .stage_resend_counts
-        .get(&stage.stage_index)
-        .copied()
-        .unwrap_or_default();
-    let now = Instant::now();
-    let ready = ctx
-        .readies
-        .get(&stage_node_id)
-        .ok_or_else(|| format!("missing runtime-ready node for stage {}", stage.stage_index))?;
-    let route_owner = ctx.stack.route_owner(ready.node_actor);
-    let telemetry_route_owner = ctx.stack.route_owner(ready.telemetry_publisher);
-    let member_state = ctx.stack.member_state(ready.swim_node_id);
-    let route_matches_ready = route_owner == Some(ready.swim_node_id);
-    let (dashboard, run_id, node_id) = (ctx.dashboard, ctx.run_id, ctx.node_id);
-    let bootstrap = |ds: &mut OrchTelemetry, phase: &str, status: &str, detail: Value| {
-        ds.emit_bootstrap(dashboard, run_id, node_id, phase, status, detail);
-    };
-    ctx.orch_telemetry.emit_bootstrap_to_channel(
-        ctx.dashboard,
-        MYELIN_STAGE_ROUTE,
-        ctx.run_id,
-        ctx.node_id,
-        "stage_route_check",
-        "observed",
-        json!({
-            "attempt":attempt,
-            "stage_index":stage.stage_index,
-            "stage_node_id":stage_node_id,
-            "node_actor":ready.node_actor,
-            "telemetry_publisher":ready.telemetry_publisher,
-            "swim_node_id":format!("{:?}", ready.swim_node_id),
-            "member_state":member_state.map(|state| format!("{:?}", state)),
-            "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
-            "telemetry_route_owner":telemetry_route_owner.map(|owner| format!("{:?}", owner)),
-            "route_matches_ready":route_matches_ready,
-        }),
-    );
-    if member_state == Some(MemberState::Dead) {
-        let reason = format!(
-            "stage {} node {} is dead while loading pipeline weights",
-            stage.stage_index, stage_node_id
-        );
-        let liveness = stage_load_liveness_detail(
-            ctx.load_progress.get(&stage_node_id),
-            stage.stage_index,
-            stage_node_id,
-            member_state,
-            route_owner,
-            telemetry_route_owner,
-            route_matches_ready,
-            "heartbeat_missed",
-        );
-        bootstrap(
-            ctx.orch_telemetry,
-            "stage_provision_wait",
-            "failed",
-            json!({
-                "attempt":attempt,
-                "stage_count":ctx.pipeline_plan.stages.len(),
-                "stage_index":stage.stage_index,
-                "stage_node_id":stage_node_id,
-                "stage_send_count":current_send_count,
-                "loaded_stage_count":ctx.loaded_stages.len(),
-                "member_state":"Dead",
-                "route_owner":route_owner.map(|owner| format!("{:?}", owner)),
-                "telemetry_route_owner":telemetry_route_owner.map(|owner| format!("{:?}", owner)),
-                "classification":"heartbeat_missed",
-                "liveness":liveness,
-                "reason":reason,
-            }),
-        );
-        return Err(reason);
-    }
-    let (should_send, dispatch_reason) = stage_provision_dispatch(
-        ctx.load_progress.get(&stage_node_id),
-        current_send_count,
-        ctx.stage_last_sends.get(&stage.stage_index).copied(),
-        now,
-    );
-    if !should_send {
-        bootstrap(
-            ctx.orch_telemetry,
-            "stage_provision_wait",
-            "observed",
-            json!({
-                "attempt":attempt,
-                "stage_count":ctx.pipeline_plan.stages.len(),
-                "stage_index":stage.stage_index,
-                "stage_node_id":stage_node_id,
-                "stage_send_count":current_send_count,
-                "loaded_stage_count":ctx.loaded_stages.len(),
-                "resend_suppressed":true,
-                "resend_reason":dispatch_reason,
-                "liveness":stage_load_liveness_detail(
-                    ctx.load_progress.get(&stage_node_id),
-                    stage.stage_index,
-                    stage_node_id,
-                    member_state,
-                    route_owner,
-                    telemetry_route_owner,
-                    route_matches_ready,
-                    "waiting",
-                ),
-                "message":format!(
-                    "loaded {} of {}; waiting on stage {}",
-                    ctx.loaded_stages.len(),
-                    ctx.pipeline_plan.stages.len(),
-                    stage.stage_index
-                )
-            }),
-        );
-        return Ok(());
-    }
-    let stage_send_count = {
-        let count = ctx
-            .stage_resend_counts
-            .entry(stage.stage_index)
-            .or_default();
-        *count += 1;
-        *count
-    };
-    ctx.stage_last_sends.insert(stage.stage_index, now);
-    bootstrap(
-        ctx.orch_telemetry,
-        "stage_provision_send",
-        "sent",
-        json!({
-            "attempt":attempt,
-            "stage_count":ctx.pipeline_plan.stages.len(),
-            "stage_index":stage.stage_index,
-            "stage_send_count":stage_send_count,
-            "loaded_stage_count":ctx.loaded_stages.len(),
-            "parallel_weight_acquisition":true,
-            "resend_reason":dispatch_reason,
-        }),
-    );
-    if stage_send_count == 1 || stage_send_count % 15 == 0 {
-        bootstrap(
-            ctx.orch_telemetry,
-            "stage_provision_wait",
-            "observed",
-            json!({
-                "attempt":attempt,
-                "stage_count":ctx.pipeline_plan.stages.len(),
-                "stage_index":stage.stage_index,
-                "stage_node_id":stage_node_id,
-                "stage_send_count":stage_send_count,
-                "loaded_stage_count":ctx.loaded_stages.len(),
-                "liveness":stage_load_liveness_detail(
-                    ctx.load_progress.get(&stage_node_id),
-                    stage.stage_index,
-                    stage_node_id,
-                    member_state,
-                    route_owner,
-                    telemetry_route_owner,
-                    route_matches_ready,
-                    "waiting",
-                ),
-                "message":format!(
-                    "loaded {} of {}; waiting on stage {}",
-                    ctx.loaded_stages.len(),
-                    ctx.pipeline_plan.stages.len(),
-                    stage.stage_index
-                )
-            }),
-        );
-    }
-    provision_stage_from_plan(
-        ctx.stack,
-        ready.node_actor,
-        ctx.pipeline_plan,
-        stage.stage_index,
-        ctx.readies,
-        ctx.pipeline_coordinator,
-        ctx.stage_shard_plans,
-    )?;
-    ctx.collector.pump(ctx.driver);
-    Ok(())
-}
-
-struct PromptWork {
-    request: SubmitPrompt,
-    events: mpsc::Sender<PromptEvent>,
-}
-
-struct ActivePrompt {
-    request: SubmitPrompt,
-    events: mpsc::Sender<PromptEvent>,
-}
-
-fn stage_load_phase_is_active(phase: Option<&str>) -> bool {
-    matches!(
-        phase,
-        Some(
-            "loading_weights"
-                | "prefetching_model"
-                | "prefetching_stage_shard"
-                | "fetching_stage_shard"
-                | "stage_shard_cache_ready"
-                | "stage_shard_ready"
-                | "cache_ready"
-                | "constructing_stage"
-                | "stage_constructed"
-                | "building_tokenizer"
-                | "tokenizer_ready"
-        )
-    )
-}
-
-fn stage_provision_dispatch(
-    progress: Option<&StageLoadProgress>,
-    send_count: u64,
-    last_send: Option<Instant>,
-    now: Instant,
-) -> (bool, &'static str) {
-    if send_count == 0 {
-        return (true, "initial");
-    }
-    let Some(progress) = progress else {
-        return (true, "no_progress_after_send");
-    };
-    if progress.failure_reason.is_some() || progress.phase.as_deref() == Some("failed") {
-        return (false, "worker_load_failed");
-    }
-    if progress.phase.as_deref() == Some("weights_loaded") {
-        return (false, "weights_loaded_report_pending");
-    }
-    if !stage_load_phase_is_active(progress.phase.as_deref()) {
-        return (true, "unknown_or_inactive_progress");
-    }
-    let Some(last_progress) = progress.last_progress else {
-        return (true, "active_phase_without_progress_time");
-    };
-    if now.duration_since(last_progress) < STAGE_PROVISION_ACTIVE_RESEND_AFTER {
-        return (false, "active_progress");
-    }
-    if let Some(last_send) = last_send
-        && now.duration_since(last_send) < STAGE_PROVISION_ACTIVE_RESEND_AFTER
-    {
-        return (false, "recent_stale_progress_resend");
-    }
-    (true, "stale_progress")
-}
-
-fn stage_load_liveness_detail(
-    progress: Option<&StageLoadProgress>,
-    stage_index: u32,
-    stage_node_id: u64,
-    member_state: Option<MemberState>,
-    route_owner: Option<DistNodeId>,
-    telemetry_route_owner: Option<DistNodeId>,
-    route_matches_ready: bool,
-    classification: &str,
-) -> Value {
-    json!({
-        "classification": classification,
-        "stage_index": stage_index,
-        "stage_node_id": stage_node_id,
-        "member_state": member_state.map(|state| format!("{:?}", state)),
-        "route_owner": route_owner.map(|owner| format!("{:?}", owner)),
-        "telemetry_route_owner": telemetry_route_owner.map(|owner| format!("{:?}", owner)),
-        "route_matches_ready": route_matches_ready,
-        "load_progress": progress.map(StageLoadProgress::to_json),
-        "host_gpu_missing": progress.is_none_or(|progress| progress.host_gpu_samples == 0),
-    })
 }
 
 struct OrchStdioCapture;
@@ -3623,1046 +2254,6 @@ impl PluginObservationSink for ChannelObservationSink {
     }
 }
 
-fn spawn_prompt_rpc(
-    engine: &EngineHandle,
-    bind: SocketAddr,
-    work_tx: mpsc::Sender<PromptWork>,
-    default_max_tokens: u32,
-) -> Result<SocketAddr, String> {
-    // Bind synchronously (there is no ambient runtime at orchestrator startup)
-    // and report the bound address, then drive accept on the orchestrator
-    // engine. Each accepted connection runs on the engine's blocking pool,
-    // reusing the synchronous request/response parser unchanged. There is no
-    // listener thread and no per-connection std thread (ENGINE_SPEC.md);
-    // no raw Tokio handle or second runtime is introduced.
-    let std_listener =
-        TcpListener::bind(bind).map_err(|e| format!("bind prompt RPC {bind}: {e}"))?;
-    let addr = std_listener
-        .local_addr()
-        .map_err(|e| format!("read prompt RPC addr: {e}"))?;
-    std_listener
-        .set_nonblocking(true)
-        .map_err(|e| format!("set prompt RPC nonblocking: {e}"))?;
-    let engine = engine.clone();
-    engine.clone().spawn(async move {
-        let listener = match tokio::net::TcpListener::from_std(std_listener) {
-            Ok(listener) => listener,
-            Err(_) => return,
-        };
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let tx = work_tx.clone();
-                    let engine = engine.clone();
-                    engine.spawn_blocking(move || {
-                        if let Ok(std_stream) = stream.into_std() {
-                            // The synchronous parser uses blocking I/O.
-                            let _ = std_stream.set_nonblocking(false);
-                            let _ = handle_prompt_connection(std_stream, tx, default_max_tokens);
-                        }
-                    });
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    Ok(addr)
-}
-fn handle_prompt_connection(
-    stream: TcpStream,
-    work_tx: mpsc::Sender<PromptWork>,
-    default_max_tokens: u32,
-) -> Result<(), String> {
-    let mut reader = BufReader::new(
-        stream
-            .try_clone()
-            .map_err(|e| format!("clone prompt stream: {e}"))?,
-    );
-    let mut writer = stream;
-    loop {
-        let request = match read_submit_prompt(&mut reader) {
-            Ok(Some(request)) => request,
-            Ok(None) => break,
-            Err(error) if error.contains("expected value at line 1 column 1") => break,
-            Err(error) => return Err(error),
-        };
-        let request = request.with_defaults(default_max_tokens);
-        let (event_tx, event_rx) = mpsc::channel();
-        work_tx
-            .send(PromptWork {
-                request,
-                events: event_tx,
-            })
-            .map_err(|_| "prompt loop stopped".to_owned())?;
-        for event in event_rx {
-            let terminal = event.is_terminal();
-            write_json_line(&mut writer, &event)?;
-            if terminal {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn provision_stage(
-    stack: &DistributionRuntimeStack,
-    node_actor: ActorAddress,
-    config: &Config,
-) -> Result<(), String> {
-    stack
-        .runtime
-        .send_to(
-            node_actor,
-            NodeAgentMsg::ProvisionStage({
-                let layer_end_exclusive = config.layer_end_exclusive.ok_or_else(|| {
-                    "unplanned single-stage execution requires --layer-end-exclusive or MYELIN_LAYER_END_EXCLUSIVE; cached-model runs use metadata-derived planning".to_owned()
-                })?;
-                StageProvisionWire {
-                    run_id: config.run_id,
-                    authorized_orchestrator: 0,
-                    node_id: config.node_id,
-                    stage_index: config.stage_index,
-                    stage_count: 1,
-                    layer_start: 0,
-                    layer_end_exclusive,
-                    inbound_edge_id: 1,
-                    outbound_edge_id: 2,
-                    inbound_edge: None,
-                    outbound_edge: None,
-                    model_id: config.model_id.clone(),
-                    gguf_source: config.gguf_source.clone(),
-                    tokenizer: config.tokenizer.clone(),
-                    stage_shard_plan: None,
-                }
-            }),
-        )
-        .map_err(|e| format!("send stage provision: {e}"))
-}
-
-// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
-fn wait_for_weights_loaded(ctx: RuntimeReadyAckLoop<'_>, stage_index: u32) -> Result<(), String> {
-    let RuntimeReadyAckLoop {
-        driver,
-        stack: _,
-        obs_rx,
-        collector,
-        orchestrator_reports,
-        stop_rx,
-        dashboard,
-        orch_telemetry,
-        orch_stdio_rx,
-        run_id,
-        orchestrator_node_id: node_id,
-        provider,
-        ..
-    } = ctx;
-    loop {
-        collector.pump(driver);
-        drain_orch_stdio_capture(orch_stdio_rx, orch_telemetry, dashboard, run_id, node_id);
-        if stop_requested(stop_rx) {
-            return Err("shutdown requested while waiting for weights loaded".to_owned());
-        }
-        drain_observations_with_exit(obs_rx, dashboard, orch_telemetry, provider, |_, status| {
-            format!("node exited while loading weights: {status:?}")
-        })?;
-        collector.drain(|stream, channel, frame| {
-            if let Some(d) = dashboard {
-                d.publish_frame(stream, channel, frame);
-            }
-            orch_telemetry.archive_frame("node", stream, channel, frame);
-        });
-        while let Some(report) = orchestrator_reports.try_recv() {
-            match report {
-                OrchestratorReport::WeightsReady {
-                    run_id: report_run_id,
-                    node_id: _,
-                    stage_index: report_stage_index,
-                } if report_run_id == run_id && report_stage_index == stage_index => {
-                    return Ok(());
-                }
-                OrchestratorReport::StageFault {
-                    run_id: report_run_id,
-                    stage_index: report_stage_index,
-                    reason,
-                } if report_run_id == run_id && report_stage_index == stage_index => {
-                    let mut error =
-                        format!("stage {report_stage_index} faulted while loading weights");
-                    if let Some(reason) = reason {
-                        error.push_str(": ");
-                        error.push_str(&reason);
-                    }
-                    return Err(error);
-                }
-                _ => {}
-            }
-        }
-        thread::sleep(PUMP_INTERVAL);
-    }
-}
-
-#[derive(Debug)]
-struct PipelineTokenRecord {
-    object_id: u64,
-    sequence: u64,
-    token_id: u32,
-    eos: bool,
-}
-
-type PipelineSendHandle = EdgeSendHandle;
-struct PendingEncode {
-    request_id: u64,
-}
-
-struct PendingDecode {
-    request_id: u64,
-    token_id: u32,
-    eos: bool,
-    reached_limit: bool,
-}
-
-struct PipelinePromptRuntime {
-    token_in_edge_id: u64,
-    token_out_edge_id: u64,
-    token_spec: run_plan::ObjectSpec,
-    token_out_spec: run_plan::ObjectSpec,
-    token_in_sender: PipelineSendHandle,
-    recv_rx: mpsc::Receiver<Vec<u8>>,
-    recv_tx: mpsc::Sender<Vec<u8>>,
-    recv_buffer: Vec<u8>,
-    tokenizer_encode_actor: ActorAddress,
-    tokenizer_decode_actor: ActorAddress,
-    tokenizer_reply_to: ActorAddress,
-    pending_encode: Option<PendingEncode>,
-    pending_decode: Option<PendingDecode>,
-    next_sequence: u64,
-    generated_tokens: Vec<u32>,
-    final_text: String,
-    active: Option<ActivePrompt>,
-    started_at: Option<Instant>,
-    last_progress_at: Option<Instant>,
-    next_wait_log_at: Option<Instant>,
-}
-
-impl PipelinePromptRuntime {
-    fn new(
-        driver: &IrohDriver,
-        plan: &run_plan::RunPlan,
-        first_stage_endpoint: EndpointAddr,
-        tokenizer_encode_actor: ActorAddress,
-        tokenizer_decode_actor: ActorAddress,
-        tokenizer_reply_to: ActorAddress,
-    ) -> Result<Self, String> {
-        let token_in_edge = plan
-            .edges
-            .iter()
-            .find(|edge| edge.kind == run_plan::EdgeKind::TokenIn)
-            .ok_or_else(|| "pipeline plan missing token-in edge".to_owned())?;
-        let token_out_edge = plan
-            .edges
-            .iter()
-            .find(|edge| edge.kind == run_plan::EdgeKind::TokenOut)
-            .ok_or_else(|| "pipeline plan missing token-out edge".to_owned())?;
-        let (recv_tx, recv_rx) = mpsc::channel();
-        Ok(Self {
-            token_in_edge_id: token_in_edge.edge_id.0,
-            token_out_edge_id: token_out_edge.edge_id.0,
-            token_spec: token_in_edge.object_spec,
-            token_out_spec: token_out_edge.object_spec,
-            token_in_sender: driver
-                .spawn_edge_send_pump(first_stage_endpoint, token_in_edge.edge_id.0)?,
-            recv_rx,
-            recv_tx,
-            tokenizer_encode_actor,
-            tokenizer_decode_actor,
-            tokenizer_reply_to,
-            pending_encode: None,
-            pending_decode: None,
-            recv_buffer: Vec::new(),
-            next_sequence: 0,
-            generated_tokens: Vec::new(),
-            final_text: String::new(),
-            active: None,
-            started_at: None,
-            last_progress_at: None,
-            next_wait_log_at: None,
-        })
-    }
-
-    fn note_progress(&mut self) {
-        let now = Instant::now();
-        self.last_progress_at = Some(now);
-        self.next_wait_log_at = now.checked_add(PIPELINE_PROMPT_WAIT_LOG_INTERVAL);
-    }
-
-    fn start_prompt(
-        &mut self,
-        request: SubmitPrompt,
-        events: mpsc::Sender<PromptEvent>,
-        runtime: &swactor::runtime::Runtime,
-        dashboard: Option<&DashboardSupport>,
-        orch_telemetry: &mut OrchTelemetry,
-        run_id: u64,
-        node_id: u64,
-    ) -> Result<(), String> {
-        let emit_prompt_evt =
-            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
-                ds.emit_prompt(
-                    dashboard, run_id, node_id, request_id, phase, status, detail,
-                )
-            };
-        let request_id = request.request_id;
-        if self.active.is_some() || self.pending_encode.is_some() || self.pending_decode.is_some() {
-            let active_request_id = self.active.as_ref().map(|active| active.request.request_id);
-            emit_prompt_evt(
-                orch_telemetry,
-                request_id,
-                "pipeline_prompt_busy",
-                "failed",
-                json!({
-                    "active_request_id":active_request_id,
-                    "pending_encode":self.pending_encode.is_some(),
-                    "pending_decode":self.pending_decode.is_some(),
-                }),
-            );
-            let _ = events.send(PromptEvent::Fault {
-                request_id,
-                error: "pipeline prompt runtime is busy".to_owned(),
-            });
-            return Ok(());
-        }
-        self.generated_tokens.clear();
-        self.final_text.clear();
-        self.recv_buffer.clear();
-        self.pending_decode = None;
-        self.pending_encode = Some(PendingEncode { request_id });
-        self.started_at = Some(Instant::now());
-        self.note_progress();
-        emit_prompt_evt(
-            orch_telemetry,
-            request_id,
-            "pipeline_tokenizer_encode",
-            "started",
-            json!({"node_actor":self.tokenizer_encode_actor,"reply_to":self.tokenizer_reply_to,"prompt_bytes":request.prompt_text.len()}),
-        );
-        runtime
-            .send_to(
-                self.tokenizer_encode_actor,
-                NodeAgentMsg::EncodePrompt {
-                    request_id,
-                    prompt: request.prompt_text.clone(),
-                    reply_to: self.tokenizer_reply_to,
-                },
-            )
-            .map_err(|e| format!("send tokenizer encode request: {e}"))?;
-        self.active = Some(ActivePrompt { request, events });
-        Ok(())
-    }
-
-    fn emit_wait_progress(
-        &mut self,
-        dashboard: Option<&DashboardSupport>,
-        orch_telemetry: &mut OrchTelemetry,
-        run_id: u64,
-        node_id: u64,
-    ) {
-        let emit_prompt_evt =
-            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
-                ds.emit_prompt(
-                    dashboard, run_id, node_id, request_id, phase, status, detail,
-                )
-            };
-        let Some(active) = self.active.as_ref() else {
-            return;
-        };
-        let now = Instant::now();
-        let request_id = active.request.request_id;
-        let elapsed_ms = self
-            .started_at
-            .map(|started| duration_ms_u64(now.saturating_duration_since(started)))
-            .unwrap_or(0);
-        let idle_ms = self
-            .last_progress_at
-            .map(|last| duration_ms_u64(now.saturating_duration_since(last)))
-            .unwrap_or(elapsed_ms);
-        if self.next_wait_log_at.is_some_and(|next| now >= next) {
-            emit_prompt_evt(
-                orch_telemetry,
-                request_id,
-                "pipeline_prompt_wait",
-                "waiting",
-                json!({
-                    "elapsed_ms":elapsed_ms,
-                    "idle_ms":idle_ms,
-                    "pending_encode":self.pending_encode.is_some(),
-                    "pending_decode":self.pending_decode.is_some(),
-                    "generated_tokens":self.generated_tokens.len(),
-                    "next_sequence":self.next_sequence,
-                }),
-            );
-            self.next_wait_log_at = now.checked_add(PIPELINE_PROMPT_WAIT_LOG_INTERVAL);
-        }
-    }
-
-    fn drain_tokenizer_events(
-        &mut self,
-        runtime: &swactor::runtime::Runtime,
-        tokenizer_events: &swactor::runtime::Inbox<TokenizerEvent>,
-        dashboard: Option<&DashboardSupport>,
-        orch_telemetry: &mut OrchTelemetry,
-        run_id: u64,
-        node_id: u64,
-    ) -> Result<(), String> {
-        while let Some(event) = tokenizer_events.try_recv() {
-            match event {
-                TokenizerEvent::PromptEncoded { request_id, tokens } => self
-                    .handle_encoded_prompt(
-                        request_id,
-                        tokens,
-                        dashboard,
-                        orch_telemetry,
-                        run_id,
-                        node_id,
-                    )?,
-                TokenizerEvent::TokensDecoded { request_id, text } => self.handle_decoded_tokens(
-                    runtime,
-                    request_id,
-                    text,
-                    dashboard,
-                    orch_telemetry,
-                    run_id,
-                    node_id,
-                )?,
-                TokenizerEvent::Fault { request_id, error } => {
-                    self.fault_active(request_id, format!("tokenizer request failed: {error}"));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_encoded_prompt(
-        &mut self,
-        request_id: u64,
-        tokens: Vec<u32>,
-        dashboard: Option<&DashboardSupport>,
-        orch_telemetry: &mut OrchTelemetry,
-        run_id: u64,
-        node_id: u64,
-    ) -> Result<(), String> {
-        let emit_prompt_evt =
-            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
-                ds.emit_prompt(
-                    dashboard, run_id, node_id, request_id, phase, status, detail,
-                )
-            };
-        let Some(pending) = self.pending_encode.take() else {
-            return Ok(());
-        };
-        if pending.request_id != request_id {
-            self.pending_encode = Some(pending);
-            return Ok(());
-        }
-        let Some(active) = self.active.as_ref() else {
-            return Ok(());
-        };
-        if active.request.request_id != request_id {
-            return Ok(());
-        }
-        emit_prompt_evt(
-            orch_telemetry,
-            request_id,
-            "pipeline_tokenizer_encode",
-            "ready",
-            json!({"node_actor":self.tokenizer_encode_actor,"reply_to":self.tokenizer_reply_to,"tokens":tokens.len()}),
-        );
-        let sequence = self.next_sequence;
-        emit_prompt_evt(
-            orch_telemetry,
-            request_id,
-            "pipeline_token_in",
-            "started",
-            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":tokens.len(),"begin_sequence":true,"token_count":tokens.len(),"token_ids":&tokens}),
-        );
-        self.send_token_in(sequence, &tokens, true)?;
-        self.note_progress();
-        emit_prompt_evt(
-            orch_telemetry,
-            request_id,
-            "pipeline_token_in",
-            "ready",
-            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"begin_sequence":true,"token_count":tokens.len()}),
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn handle_decoded_tokens(
-        &mut self,
-        _runtime: &swactor::runtime::Runtime,
-        request_id: u64,
-        text: String,
-        dashboard: Option<&DashboardSupport>,
-        orch_telemetry: &mut OrchTelemetry,
-        run_id: u64,
-        node_id: u64,
-    ) -> Result<(), String> {
-        let emit_prompt_evt =
-            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
-                ds.emit_prompt(
-                    dashboard, run_id, node_id, request_id, phase, status, detail,
-                )
-            };
-        let Some(pending) = self.pending_decode.take() else {
-            return Ok(());
-        };
-        if pending.request_id != request_id {
-            self.pending_decode = Some(pending);
-            return Ok(());
-        }
-        let Some(active) = self.active.as_ref() else {
-            return Ok(());
-        };
-        if active.request.request_id != request_id {
-            return Ok(());
-        }
-        let events = active.events.clone();
-        emit_prompt_evt(
-            orch_telemetry,
-            request_id,
-            "pipeline_tokenizer_decode",
-            "ready",
-            json!({"node_actor":self.tokenizer_decode_actor,"reply_to":self.tokenizer_reply_to,"text_bytes":text.len()}),
-        );
-        self.note_progress();
-        self.final_text.push_str(&text);
-        if !text.is_empty() {
-            let _ = events.send(PromptEvent::TextDelta { request_id, text });
-        }
-        if pending.eos || pending.reached_limit {
-            let elapsed_ms = self
-                .started_at
-                .map(|started| started.elapsed().as_millis() as u64)
-                .unwrap_or(0);
-            let final_text = self.final_text.clone();
-            let tokens_generated = self.generated_tokens.len() as u32;
-            emit_prompt_evt(
-                orch_telemetry,
-                request_id,
-                "prompt_complete",
-                "ready",
-                json!({
-                    "event":"Done",
-                    "terminal":true,
-                    "tokens_generated":tokens_generated,
-                    "elapsed_ms":elapsed_ms,
-                    "final_text_bytes":final_text.len(),
-                }),
-            );
-            let _ = events.send(PromptEvent::Done {
-                request_id,
-                final_text,
-                tokens_generated,
-                elapsed_ms,
-            });
-            self.last_progress_at = None;
-            self.started_at = None;
-            self.next_wait_log_at = None;
-            self.active = None;
-            return Ok(());
-        }
-        let sequence = self.next_sequence;
-        emit_prompt_evt(
-            orch_telemetry,
-            request_id,
-            "pipeline_token_in",
-            "started",
-            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"tokens":1,"begin_sequence":false,"token_count":1,"token_id":pending.token_id}),
-        );
-        self.send_token_in(sequence, &[pending.token_id], false)?;
-        self.note_progress();
-        emit_prompt_evt(
-            orch_telemetry,
-            request_id,
-            "pipeline_token_in",
-            "ready",
-            json!({"edge_id":self.token_in_edge_id,"sequence":sequence,"begin_sequence":false,"token_count":1,"token_id":pending.token_id}),
-        );
-        Ok(())
-    }
-    fn send_token_in(
-        &self,
-        sequence: u64,
-        tokens: &[u32],
-        begin_sequence: bool,
-    ) -> Result<(), String> {
-        let payload = tokens
-            .iter()
-            .flat_map(|token| token.to_le_bytes())
-            .collect::<Vec<_>>();
-        let mut flags = ingress::ObjectFlags::default();
-        flags.begin_sequence = begin_sequence;
-        self.token_in_sender.send(
-            ingress::ObjectRecordBuilder::new(ingress_object_spec_from_plan(self.token_spec))
-                .object_id(ingress::ObjectId(9000_u64.saturating_add(sequence)))
-                .sequence(sequence)
-                .payload(payload)
-                .flags(flags)
-                .encode(),
-        )
-    }
-
-    fn request_decode(
-        &mut self,
-        runtime: &swactor::runtime::Runtime,
-        request_id: u64,
-        token_id: u32,
-        eos: bool,
-        reached_limit: bool,
-    ) -> Result<(), String> {
-        self.pending_decode = Some(PendingDecode {
-            request_id,
-            token_id,
-            eos,
-            reached_limit,
-        });
-        runtime
-            .send_to(
-                self.tokenizer_decode_actor,
-                NodeAgentMsg::DecodeTokens {
-                    request_id,
-                    tokens: vec![token_id],
-                    reply_to: self.tokenizer_reply_to,
-                },
-            )
-            .map_err(|e| format!("send tokenizer decode request: {e}"))
-    }
-
-    fn fault_active(&mut self, request_id: u64, error: String) {
-        let should_fault = self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.request.request_id == request_id);
-        if !should_fault {
-            return;
-        }
-        if let Some(active) = self.active.take() {
-            let _ = active.events.send(PromptEvent::Fault { request_id, error });
-        }
-        self.pending_encode = None;
-        self.pending_decode = None;
-        self.started_at = None;
-        self.last_progress_at = None;
-        self.next_wait_log_at = None;
-    }
-
-    fn poll_driver(&mut self, driver: &mut IrohDriver) {
-        for event in driver.drain_edge_events() {
-            match event {
-                WireEvent::BytesRead { edge_id, bytes, .. }
-                    if edge_id.0 == self.token_out_edge_id =>
-                {
-                    self.note_progress();
-                    let _ = self.recv_tx.send(bytes);
-                }
-                WireEvent::StreamFault {
-                    edge_id: Some(edge_id),
-                    reason,
-                    ..
-                } if edge_id.0 == self.token_out_edge_id => {
-                    if let Some(request_id) =
-                        self.active.as_ref().map(|active| active.request.request_id)
-                    {
-                        self.fault_active(
-                            request_id,
-                            format!("pipeline token-out stream fault: {reason:?}"),
-                        );
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    fn drain_tokens(
-        &mut self,
-        runtime: &swactor::runtime::Runtime,
-        dashboard: Option<&DashboardSupport>,
-        orch_telemetry: &mut OrchTelemetry,
-        run_id: u64,
-        node_id: u64,
-    ) -> Result<(), String> {
-        let emit_prompt_evt =
-            |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
-                ds.emit_prompt(
-                    dashboard, run_id, node_id, request_id, phase, status, detail,
-                )
-            };
-        if self.pending_decode.is_some() {
-            return Ok(());
-        }
-        while let Ok(bytes) = self.recv_rx.try_recv() {
-            self.recv_buffer.extend_from_slice(&bytes);
-            while self.pending_decode.is_none()
-                && let Some(record) =
-                    take_pipeline_token_record(&mut self.recv_buffer, self.token_out_spec)?
-            {
-                if record.sequence != self.next_sequence {
-                    return Err(format!(
-                        "pipeline token sequence violation: expected {}, got {}",
-                        self.next_sequence, record.sequence
-                    ));
-                }
-                self.next_sequence = self.next_sequence.saturating_add(1);
-                let Some(active) = self.active.as_ref() else {
-                    continue;
-                };
-                let request_id = active.request.request_id;
-                emit_prompt_evt(
-                    orch_telemetry,
-                    request_id,
-                    "pipeline_token_out",
-                    "observed",
-                    json!({"edge_id":self.token_out_edge_id,"object_id":record.object_id,"sequence":record.sequence,"token_id":record.token_id,"eos":record.eos,"generated_index":self.generated_tokens.len() + 1}),
-                );
-                self.generated_tokens.push(record.token_id);
-                let reached_limit = self.generated_tokens.len() as u32 >= active.request.max_tokens;
-                emit_prompt_evt(
-                    orch_telemetry,
-                    request_id,
-                    "pipeline_tokenizer_decode",
-                    "started",
-                    json!({"node_actor":self.tokenizer_decode_actor,"reply_to":self.tokenizer_reply_to,"token_id":record.token_id,"sequence":record.sequence,"generated_index":self.generated_tokens.len()}),
-                );
-                self.request_decode(
-                    runtime,
-                    request_id,
-                    record.token_id,
-                    record.eos,
-                    reached_limit,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn ingress_object_spec_from_plan(spec: run_plan::ObjectSpec) -> ingress::ObjectSpec {
-    let extent_alignment = match spec.kind {
-        run_plan::ObjectKind::Token => u64::from(spec.dtype_width_bytes),
-        _ => u64::from(spec.alignment),
-    };
-    ingress::ObjectSpec {
-        max_extent: spec.max_extent,
-        alignment: extent_alignment,
-        layout: ingress::ObjectLayout::Token,
-    }
-}
-
-fn take_pipeline_token_record(
-    buffer: &mut Vec<u8>,
-    spec: run_plan::ObjectSpec,
-) -> Result<Option<PipelineTokenRecord>, String> {
-    let record =
-        match ingress::read_object_record(buffer, ingress_object_spec_from_plan(spec), false)
-            .map_err(|reason| format!("invalid token-out record: {reason:?}"))?
-        {
-            ingress::ObjectRecordRead::Incomplete => return Ok(None),
-            ingress::ObjectRecordRead::Complete(record) => record,
-        };
-    let payload = record
-        .payload(buffer)
-        .ok_or_else(|| "token-out record payload missing".to_owned())?;
-    if payload.len() != 4 {
-        return Err(format!(
-            "token-out payload must be exactly one u32, got {}",
-            payload.len()
-        ));
-    }
-    let token_id = u32::from_le_bytes(payload.try_into().unwrap());
-    let out = PipelineTokenRecord {
-        object_id: record.object_id.0,
-        sequence: record.sequence,
-        token_id,
-        eos: record.flags.end_of_sequence,
-    };
-    buffer.drain(..record.total_len);
-    Ok(Some(out))
-}
-
-// synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
-#[allow(clippy::disallowed_methods)]
-fn serve_prompts(
-    ctx: RuntimeReadyAckLoop<'_>,
-    work_rx: &mpsc::Receiver<PromptWork>,
-    prompt_events: &swactor::runtime::Inbox<PromptEvent>,
-    node_actor: ActorAddress,
-    reply_to: ActorAddress,
-    tokenizer_events: &swactor::runtime::Inbox<TokenizerEvent>,
-    tokenizer_encode_actor: ActorAddress,
-    tokenizer_decode_actor: ActorAddress,
-    tokenizer_reply_to: ActorAddress,
-    pipeline_plan: Option<&run_plan::RunPlan>,
-    prompt_endpoint: EndpointAddr,
-    swim_to_node: &BTreeMap<DistNodeId, u64>,
-) -> Result<(), String> {
-    let RuntimeReadyAckLoop {
-        driver,
-        stack,
-        obs_rx,
-        collector,
-        stop_rx,
-        dashboard,
-        orch_telemetry,
-        orch_stdio_rx,
-        run_id,
-        orchestrator_node_id: node_id,
-        provider,
-        orchestrator_actor,
-        ..
-    } = ctx;
-    let emit_prompt_evt =
-        |ds: &mut OrchTelemetry, request_id: u64, phase: &str, status: &str, detail: Value| {
-            ds.emit_prompt(
-                dashboard, run_id, node_id, request_id, phase, status, detail,
-            )
-        };
-    let mut pipeline_runtime = match pipeline_plan {
-        Some(plan) => Some(PipelinePromptRuntime::new(
-            driver,
-            plan,
-            prompt_endpoint,
-            tokenizer_encode_actor,
-            tokenizer_decode_actor,
-            tokenizer_reply_to,
-        )?),
-        None => None,
-    };
-    let mut active: Option<ActivePrompt> = None;
-    loop {
-        collector.pump(driver);
-        orch_telemetry.flush(dashboard, "orchestrator");
-        if let Some(pipeline) = pipeline_runtime.as_mut() {
-            pipeline.poll_driver(driver);
-            pipeline.drain_tokenizer_events(
-                &stack.runtime,
-                tokenizer_events,
-                dashboard,
-                orch_telemetry,
-                run_id,
-                node_id,
-            )?;
-            pipeline.drain_tokens(&stack.runtime, dashboard, orch_telemetry, run_id, node_id)?;
-            pipeline.emit_wait_progress(dashboard, orch_telemetry, run_id, node_id);
-        }
-        drain_observations_with_exit(
-            obs_rx,
-            dashboard,
-            orch_telemetry,
-            &provider,
-            |_, status| format!("node exited: {status:?}"),
-        )?;
-        collector.drain(|stream, channel, frame| {
-            if let Some(d) = dashboard {
-                d.publish_frame(stream, channel, frame);
-            }
-            orch_telemetry.archive_frame("node", stream, channel, frame);
-        });
-        drain_orch_stdio_capture(orch_stdio_rx, orch_telemetry, dashboard, run_id, node_id);
-        let swim_transitions =
-            emit_swim_transitions(orch_telemetry, dashboard, run_id, node_id, stack);
-        for transition in &swim_transitions {
-            if transition.to == MemberState::Dead
-                && let Some(&lost_node_id) = swim_to_node.get(&transition.peer)
-            {
-                let _ = stack.runtime.send_to(
-                    orchestrator_actor,
-                    OrchestratorMsg::ObserveMembershipLost {
-                        run_id,
-                        node_id: lost_node_id,
-                    },
-                );
-            }
-        }
-        if stop_rx.try_recv().is_ok() {
-            orch_telemetry.emit_bootstrap(
-                dashboard,
-                run_id,
-                node_id,
-                "shutdown",
-                "started",
-                json!({"source":"stdin"}),
-            );
-            let _ = stack.runtime.send_to(
-                orchestrator_actor,
-                OrchestratorMsg::ObserveOperatorStop { run_id },
-            );
-            collector.pump(driver);
-            return Ok(());
-        }
-
-        if active.is_none()
-            && pipeline_runtime
-                .as_ref()
-                .is_none_or(|pipeline| pipeline.active.is_none())
-            && let Ok(work) = work_rx.try_recv()
-        {
-            let request = work.request;
-            let request_id = request.request_id;
-            emit_prompt_evt(
-                orch_telemetry,
-                request_id,
-                "prompt_work",
-                "observed",
-                json!({
-                    "prompt_bytes":request.prompt_text.len(),
-                    "max_tokens":request.max_tokens,
-                }),
-            );
-            if let Some(pipeline) = pipeline_runtime.as_mut() {
-                pipeline.start_prompt(
-                    request,
-                    work.events,
-                    &stack.runtime,
-                    dashboard,
-                    orch_telemetry,
-                    run_id,
-                    node_id,
-                )?;
-                continue;
-            }
-            emit_prompt_evt(
-                orch_telemetry,
-                request_id,
-                "node_prompt_send",
-                "started",
-                json!({"node_actor":node_actor,"reply_to":reply_to}),
-            );
-            match stack.runtime.send_to(
-                node_actor,
-                NodeAgentMsg::InferPrompt {
-                    request_id,
-                    prompt: request.prompt_text.clone(),
-                    max_tokens: request.max_tokens,
-                    reply_to,
-                },
-            ) {
-                Ok(()) => {
-                    emit_prompt_evt(
-                        orch_telemetry,
-                        request_id,
-                        "node_prompt_send",
-                        "ready",
-                        json!({"node_actor":node_actor,"reply_to":reply_to}),
-                    );
-                    active = Some(ActivePrompt {
-                        request,
-                        events: work.events,
-                    });
-                }
-                Err(error) => {
-                    emit_prompt_evt(
-                        orch_telemetry,
-                        request_id,
-                        "node_prompt_send",
-                        "failed",
-                        json!({"node_actor":node_actor,"reply_to":reply_to,"error":error.to_string()}),
-                    );
-                    return Err(format!("send prompt request: {error}"));
-                }
-            }
-        }
-
-        while let Some(event) = prompt_events.try_recv() {
-            let request_id = event.request_id();
-            let Some(current) = active.as_ref() else {
-                emit_prompt_evt(
-                    orch_telemetry,
-                    request_id,
-                    "node_prompt_event",
-                    "dropped",
-                    json!({"reason":"no_active_prompt","event":prompt_event_name(&event)}),
-                );
-                continue;
-            };
-            if request_id != current.request.request_id {
-                emit_prompt_evt(
-                    orch_telemetry,
-                    request_id,
-                    "node_prompt_event",
-                    "dropped",
-                    json!({
-                        "reason":"request_mismatch",
-                        "event":prompt_event_name(&event),
-                        "active_request_id":current.request.request_id,
-                    }),
-                );
-                continue;
-            }
-
-            let completion = match &event {
-                PromptEvent::Done { .. } => Some(("ready", json!({"event":"Done"}))),
-                PromptEvent::Fault { error, .. } => {
-                    Some(("failed", json!({"event":"Fault","error":error})))
-                }
-                PromptEvent::TextDelta { .. } => None,
-            };
-            emit_prompt_evt(
-                orch_telemetry,
-                request_id,
-                "node_prompt_event",
-                "observed",
-                prompt_event_detail(&event),
-            );
-            let _ = current.events.send(event);
-            if let Some((status, detail)) = completion {
-                emit_prompt_evt(
-                    orch_telemetry,
-                    request_id,
-                    "prompt_complete",
-                    status,
-                    detail,
-                );
-                active = None;
-            }
-        }
-
-        thread::sleep(PUMP_INTERVAL);
-    }
-}
-
-fn prompt_event_name(event: &PromptEvent) -> &'static str {
-    match event {
-        PromptEvent::TextDelta { .. } => "TextDelta",
-        PromptEvent::Done { .. } => "Done",
-        PromptEvent::Fault { .. } => "Fault",
-    }
-}
-
-fn prompt_event_detail(event: &PromptEvent) -> Value {
-    match event {
-        PromptEvent::TextDelta { text, .. } => {
-            json!({"event":"TextDelta","terminal":false,"text_bytes":text.len()})
-        }
-        PromptEvent::Done {
-            final_text,
-            tokens_generated,
-            elapsed_ms,
-            ..
-        } => json!({
-            "event":"Done",
-            "terminal":true,
-            "tokens_generated":tokens_generated,
-            "elapsed_ms":elapsed_ms,
-            "final_text_bytes":final_text.len(),
-        }),
-        PromptEvent::Fault { error, .. } => {
-            json!({"event":"Fault","terminal":true,"error":error})
-        }
-    }
-}
-
 fn stop_requested(stop_rx: &mpsc::Receiver<()>) -> bool {
     stop_rx.try_recv().is_ok()
 }
@@ -4690,6 +2281,530 @@ fn spawn_stop_listener() -> mpsc::Receiver<()> {
         drop(tx);
     }
     rx
+}
+
+struct ServeCluster<'a> {
+    driver: &'a mut IrohDriver,
+    stack: &'a DistributionRuntimeStack,
+    obs_rx: &'a mpsc::Receiver<PluginObservation>,
+    collector: &'a FrameCollector,
+    orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
+    stop_rx: &'a mpsc::Receiver<()>,
+    dashboard: Option<&'a DashboardSupport>,
+    orch_telemetry: &'a mut OrchTelemetry,
+    orch_stdio_rx: Option<&'a mpsc::Receiver<OrchStdioLine>>,
+    run_id: u64,
+    orchestrator_node_id: u64,
+    provider: &'a ProviderKind,
+    orchestrator_actor: ActorAddress,
+    coordinator_endpoint: EndpointAddr,
+    engine: EngineHandle,
+    runtime: swactor::runtime::Runtime,
+    config: Config,
+    provisioner: Box<dyn ProvisionPlugin>,
+    live_clusters: BTreeMap<u64, ProvisionedClusterGuard>,
+    sink: PluginSink,
+    state_dir: daemon::StateDir,
+    snapshot: daemon::ClusterSnapshot,
+    control_rx: &'a mpsc::Receiver<ControlCommand>,
+    destroy_on_exit: bool,
+}
+
+fn daemon_label(config: &Config) -> String {
+    match config.provider.as_str() {
+        "docker" => env_optional("MYELIN_DOCKER_CONTAINER_PREFIX")
+            .unwrap_or_else(|| "myelin-orchestrator".to_owned()),
+        "vastai" => config
+            .vastai
+            .as_ref()
+            .map(|vastai| vastai.provisioning.label_prefix.clone())
+            .unwrap_or_else(|| "myelin".to_owned()),
+        provider => format!("myelin-{provider}"),
+    }
+}
+
+fn parse_control_node_id(value: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .ok()
+        .or_else(|| {
+            value
+                .split(|ch: char| !ch.is_ascii_digit())
+                .filter(|part| !part.is_empty())
+                .next_back()
+                .and_then(|part| part.parse::<u64>().ok())
+        })
+        .ok_or_else(|| format!("control node id {value:?} contains no numeric logical id"))
+}
+
+impl ServeCluster<'_> {
+    fn ack_context(&mut self) -> RuntimeReadyAckLoop<'_> {
+        RuntimeReadyAckLoop {
+            driver: self.driver,
+            stack: self.stack,
+            obs_rx: self.obs_rx,
+            collector: self.collector,
+            orchestrator_reports: self.orchestrator_reports,
+            stop_rx: self.stop_rx,
+            dashboard: self.dashboard,
+            orch_telemetry: self.orch_telemetry,
+            orch_stdio_rx: self.orch_stdio_rx,
+            run_id: self.run_id,
+            orchestrator_node_id: self.orchestrator_node_id,
+            provider: self.provider,
+            orchestrator_actor: self.orchestrator_actor,
+        }
+    }
+
+    fn save_snapshot(&self) -> Result<(), String> {
+        self.state_dir.save_snapshot(&self.snapshot)
+    }
+
+    fn emit_command_event(
+        &mut self,
+        node_id: u64,
+        kind: ProvisionEventKind,
+        message: impl Into<String>,
+    ) {
+        self.orch_telemetry.emit_event(
+            self.dashboard,
+            ProvisionEvent {
+                run_id: self.run_id,
+                node_id,
+                kind,
+                provider: Some(self.provider.as_str().to_owned()),
+                message: Some(message.into()),
+            },
+        );
+    }
+
+    fn adopt_snapshot(&mut self) -> Result<(), String> {
+        let mut accounted = BTreeSet::new();
+        let ids = self
+            .snapshot
+            .nodes
+            .iter()
+            .filter_map(|node| node.spec.as_ref().map(|_| node.logical_node_id))
+            .collect::<Vec<_>>();
+        for node_id in ids {
+            let spec = self
+                .snapshot
+                .node(node_id)
+                .and_then(|node| node.spec.clone())
+                .expect("filtered snapshot node has spec");
+            match self.provisioner.adopt_by_spec(&spec, self.sink.clone()) {
+                Ok(Some(adopted)) => {
+                    accounted.insert(adopted.provider_ref.clone());
+                    if let Some(node) = self.snapshot.node_mut(node_id) {
+                        node.provider_ref = Some(adopted.provider_ref);
+                        node.status = daemon::NodeStatus::Running;
+                        node.last_seen_unix_ms = daemon::unix_ms_now();
+                    }
+                    if let Some(runtime) = self
+                        .snapshot
+                        .node(node_id)
+                        .and_then(|node| node.runtime.as_ref())
+                    {
+                        let endpoint = serde_json::from_str::<EndpointAddr>(&runtime.endpoint)
+                            .map_err(|error| {
+                                format!(
+                                    "snapshot node {node_id} telemetry endpoint is invalid: {error}"
+                                )
+                            })?;
+                        self.collector.subscribe_node(
+                            &self.engine,
+                            self.driver.endpoint(),
+                            endpoint,
+                            self.run_id,
+                            node_id,
+                        );
+                    }
+                    self.emit_command_event(
+                        node_id,
+                        ProvisionEventKind::NodeLive,
+                        "adopted provider resource after daemon restart",
+                    );
+                }
+                Ok(None) => {
+                    if let Some(node) = self.snapshot.node_mut(node_id) {
+                        node.status = daemon::NodeStatus::Dead;
+                    }
+                    self.emit_command_event(
+                        node_id,
+                        ProvisionEventKind::NodeStopped,
+                        "snapshot node is absent from provider",
+                    );
+                }
+                Err(error) => {
+                    if let Some(node) = self.snapshot.node_mut(node_id) {
+                        node.status = daemon::NodeStatus::Dead;
+                    }
+                    self.emit_command_event(
+                        node_id,
+                        ProvisionEventKind::ProvisionFailed,
+                        format!("provider adoption failed: {error}"),
+                    );
+                }
+            }
+        }
+
+        let provider_only = self
+            .provisioner
+            .list_managed_refs()?
+            .into_iter()
+            .filter(|provider_ref| !accounted.contains(provider_ref))
+            .collect::<Vec<_>>();
+        for provider_ref in self.snapshot.sync_orphans(provider_only) {
+            self.emit_command_event(
+                0,
+                ProvisionEventKind::NodeLive,
+                format!("unmanaged provider resource discovered: {provider_ref}"),
+            );
+        }
+        self.save_snapshot()
+    }
+
+    fn add_node(&mut self) -> Result<u64, String> {
+        let logical_node_id = self.snapshot.allocate_node_id();
+        // Persist allocation before any provider side effect so a crash never
+        // reuses the id or ambiguously attributes a lease.
+        self.save_snapshot()?;
+        let spec = self.config.node_spec_for_stage(
+            self.coordinator_endpoint.clone(),
+            self.orchestrator_actor,
+            logical_node_id,
+            0,
+        )?;
+        self.emit_command_event(
+            logical_node_id,
+            ProvisionEventKind::ProvisionStart,
+            "manual add-node command accepted",
+        );
+        let mut cluster = build_reconciled_cluster(
+            self.config.build_provisioner(self.runtime.clone())?,
+            &self.config,
+            std::slice::from_ref(&spec),
+            self.runtime.clone(),
+            self.engine.clone(),
+            self.sink.clone(),
+        )?;
+        let readies =
+            wait_for_runtime_readies(self.ack_context(), &[logical_node_id], &mut cluster)?;
+        let ready = readies
+            .get(&logical_node_id)
+            .cloned()
+            .ok_or_else(|| format!("node {logical_node_id} did not announce runtime ready"))?;
+        self.collector.subscribe_node(
+            &self.engine,
+            self.driver.endpoint(),
+            ready.endpoint.clone(),
+            self.run_id,
+            logical_node_id,
+        );
+        let acknowledged = wait_for_runtime_ready_acks(
+            self.ack_context(),
+            &[RuntimeReadyAckTarget {
+                node_id: logical_node_id,
+                ready: ready.clone(),
+            }],
+            &mut cluster,
+        )?;
+        if !acknowledged {
+            return Err(format!(
+                "node {logical_node_id} changed attempt before runtime-ready acknowledgement"
+            ));
+        }
+        let attempt_id = cluster
+            .current_attempt(logical_node_id)
+            .ok_or_else(|| format!("node {logical_node_id} has no live reconciler attempt"))?
+            .0;
+        let mut persisted_spec = spec;
+        persisted_spec.attempt_id = attempt_id;
+        persisted_spec
+            .env
+            .retain(|(name, _)| name != "MYELIN_NODE_ATTEMPT_ID");
+        persisted_spec
+            .env
+            .push(("MYELIN_NODE_ATTEMPT_ID".to_owned(), attempt_id.to_string()));
+        let provider_ref = self.provisioner.provider_ref_for(&persisted_spec);
+        if self.provider.as_str() == "process" {
+            self.live_clusters.insert(logical_node_id, cluster);
+        } else {
+            cluster.detach();
+        }
+        self.snapshot.upsert_node(daemon::SnapshotNode {
+            logical_node_id,
+            spec: Some(persisted_spec),
+            provider_ref: Some(provider_ref),
+            status: daemon::NodeStatus::Running,
+            runtime: Some(daemon::RuntimeFacts {
+                endpoint: serde_json::to_string(&ready.endpoint)
+                    .map_err(|error| format!("serialize node endpoint: {error}"))?,
+                node_actor: ready.node_actor,
+                telemetry_publisher: ready.telemetry_publisher,
+                swim_node_id: ready.swim_node_id,
+                stage_index: ready.stage_index,
+                readiness_id: ready.readiness_id,
+            }),
+            last_seen_unix_ms: daemon::unix_ms_now(),
+        });
+        self.save_snapshot()?;
+        self.emit_command_event(
+            logical_node_id,
+            ProvisionEventKind::NodeLive,
+            "manual add-node command completed",
+        );
+        Ok(logical_node_id)
+    }
+
+    fn kill_node(&mut self, logical_node_id: u64) -> Result<bool, String> {
+        let Some(node) = self.snapshot.node(logical_node_id) else {
+            return Ok(false);
+        };
+        if node.status == daemon::NodeStatus::Dead {
+            return Ok(true);
+        }
+        let Some(spec) = node.spec.clone() else {
+            return Ok(false);
+        };
+        if let Some(mut cluster) = self.live_clusters.remove(&logical_node_id) {
+            cluster.stop()?;
+        } else {
+            let _ = self.provisioner.stop_by_spec(&spec, self.sink.clone())?;
+        }
+        if let Some(node) = self.snapshot.node_mut(logical_node_id) {
+            node.status = daemon::NodeStatus::Dead;
+            node.last_seen_unix_ms = daemon::unix_ms_now();
+        }
+        self.save_snapshot()?;
+        self.emit_command_event(
+            logical_node_id,
+            ProvisionEventKind::NodeStopped,
+            "manual kill command completed",
+        );
+        Ok(true)
+    }
+
+    fn destroy_node(&mut self, logical_node_id: u64) -> Result<bool, String> {
+        let Some(node) = self.snapshot.node(logical_node_id).cloned() else {
+            return Ok(false);
+        };
+        if let Some(mut cluster) = self.live_clusters.remove(&logical_node_id) {
+            cluster.stop()?;
+        } else if let Some(spec) = node.spec {
+            let _ = self.provisioner.stop_by_spec(&spec, self.sink.clone())?;
+        }
+        self.snapshot.remove_node(logical_node_id);
+        self.save_snapshot()?;
+        self.emit_command_event(
+            logical_node_id,
+            ProvisionEventKind::NodeStopped,
+            "manual destroy command completed",
+        );
+        Ok(true)
+    }
+
+    fn handle_dashboard_command(&mut self, command: ControlCommand) {
+        let command_id = command.command_id().to_owned();
+        match self.snapshot.accept_command(&command_id) {
+            Ok(false) => {
+                self.emit_command_event(
+                    0,
+                    ProvisionEventKind::NodeLive,
+                    format!("duplicate dashboard command ignored: {command_id}"),
+                );
+                return;
+            }
+            Err(error) => {
+                self.emit_command_event(0, ProvisionEventKind::ProvisionFailed, error);
+                return;
+            }
+            Ok(true) => {}
+        }
+        if let Err(error) = self.save_snapshot() {
+            self.emit_command_event(
+                0,
+                ProvisionEventKind::ProvisionFailed,
+                format!("persist dashboard command {command_id}: {error}"),
+            );
+            return;
+        }
+        let result = match command {
+            ControlCommand::Provision { count, .. } => {
+                (0..count).try_for_each(|_| self.add_node().map(|_| ()))
+            }
+            ControlCommand::Kill { node, .. } => {
+                parse_control_node_id(&node).and_then(|node_id| self.kill_node(node_id).map(|_| ()))
+            }
+            ControlCommand::Remove { count, .. } => {
+                let mut ids = self
+                    .snapshot
+                    .nodes
+                    .iter()
+                    .filter(|node| node.spec.is_some())
+                    .map(|node| node.logical_node_id)
+                    .collect::<Vec<_>>();
+                ids.sort_unstable_by(|left, right| right.cmp(left));
+                ids.into_iter()
+                    .take(count as usize)
+                    .try_for_each(|node_id| self.destroy_node(node_id).map(|_| ()))
+            }
+            ControlCommand::EstablishEdge { node, .. } => {
+                Err(format!("edge establishment for node {node} is deferred"))
+            }
+        };
+        if let Err(error) = result {
+            self.emit_command_event(
+                0,
+                ProvisionEventKind::ProvisionFailed,
+                format!("dashboard control {command_id} failed: {error}"),
+            );
+        }
+    }
+
+    fn observe_report(&mut self, report: OrchestratorReport) {
+        if let OrchestratorReport::NodeRuntimeReady {
+            run_id,
+            node_id,
+            stage_index,
+            endpoint,
+            node_actor,
+            telemetry_publisher,
+            readiness_id,
+        } = report
+            && run_id == self.run_id
+        {
+            if let Some(node) = self.snapshot.node_mut(node_id) {
+                node.status = daemon::NodeStatus::Running;
+                node.runtime = Some(daemon::RuntimeFacts {
+                    endpoint: serde_json::to_string(&endpoint).unwrap_or_default(),
+                    node_actor,
+                    telemetry_publisher,
+                    swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
+                    stage_index,
+                    readiness_id,
+                });
+                node.last_seen_unix_ms = daemon::unix_ms_now();
+            }
+        }
+    }
+
+    fn drain_observations(&mut self) -> Result<(), String> {
+        let mut dirty = false;
+        while let Ok(observation) = self.obs_rx.try_recv() {
+            emit_plugin_observation(
+                self.orch_telemetry,
+                self.dashboard,
+                self.provider,
+                &observation,
+            );
+            match observation {
+                PluginObservation::Exited { node_id, .. }
+                | PluginObservation::Failed { node_id, .. } => {
+                    if let Some(node) = self.snapshot.node_mut(node_id) {
+                        node.status = daemon::NodeStatus::Dead;
+                        node.last_seen_unix_ms = daemon::unix_ms_now();
+                        dirty = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if dirty {
+            self.save_snapshot()?;
+        }
+        Ok(())
+    }
+
+    fn teardown_if_requested(&mut self) -> Result<(), String> {
+        // Local process children cannot be adopted, so detaching them on an
+        // interactive shutdown only creates invisible orphan processes.
+        if self.destroy_on_exit || self.provider.as_str() == "process" {
+            for (_, mut cluster) in std::mem::take(&mut self.live_clusters) {
+                cluster.stop()?;
+            }
+            let specs = self
+                .snapshot
+                .nodes
+                .iter()
+                .filter_map(|node| node.spec.clone())
+                .collect::<Vec<_>>();
+            for spec in specs {
+                let _ = self.provisioner.stop_by_spec(&spec, self.sink.clone())?;
+            }
+            self.snapshot.nodes.clear();
+            self.save_snapshot()?;
+        } else {
+            for (_, mut cluster) in std::mem::take(&mut self.live_clusters) {
+                cluster.detach();
+            }
+            self.provisioner.detach_all();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ServeCluster<'_> {
+    fn drop(&mut self) {
+        if self.provider.as_str() == "process" {
+            for cluster in self.live_clusters.values_mut() {
+                let _ = cluster.stop();
+            }
+        } else {
+            for cluster in self.live_clusters.values_mut() {
+                cluster.detach();
+            }
+        }
+        self.provisioner.detach_all();
+    }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn serve_cluster(mut ctx: ServeCluster<'_>) -> Result<(), String> {
+    ctx.adopt_snapshot()?;
+    loop {
+        ctx.collector.pump(ctx.driver);
+        ctx.collector.drain(|stream, descriptor, channel, frame| {
+            if let Some(dashboard) = ctx.dashboard {
+                dashboard.publish_collected_frame(stream, descriptor, channel, frame);
+            }
+            ctx.orch_telemetry
+                .archive_frame("node", stream, channel, frame);
+        });
+        ctx.drain_observations()?;
+        while let Some(report) = ctx.orchestrator_reports.try_recv() {
+            ctx.observe_report(report);
+        }
+        emit_swim_transitions(
+            ctx.orch_telemetry,
+            ctx.dashboard,
+            ctx.run_id,
+            ctx.orchestrator_node_id,
+            ctx.stack,
+        );
+        emit_swim_probe_events(
+            ctx.orch_telemetry,
+            ctx.dashboard,
+            ctx.stack,
+            "daemon_monitor",
+        );
+        drain_orch_stdio_capture(
+            ctx.orch_stdio_rx,
+            ctx.orch_telemetry,
+            ctx.dashboard,
+            ctx.run_id,
+            ctx.orchestrator_node_id,
+        );
+        while let Ok(command) = ctx.control_rx.try_recv() {
+            ctx.handle_dashboard_command(command);
+        }
+        if stop_requested(ctx.stop_rx) {
+            break;
+        }
+        thread::sleep(PUMP_INTERVAL);
+    }
+    ctx.save_snapshot()?;
+    ctx.teardown_if_requested()
 }
 
 fn drain_observations_with_exit(

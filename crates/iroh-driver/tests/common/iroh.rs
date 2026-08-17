@@ -49,7 +49,6 @@ use distribution::types::{MemberState, NodeId};
 
 use super::test_config;
 
-
 // ── Membership fanout (copied verbatim from main.rs) ────────────────────────
 // Adapts the SwimActor's `MembershipChanged` stream (its sole observable) into
 // the registry/metadata/directory actors' `Membership` control messages, and
@@ -123,8 +122,8 @@ impl IrohNode {
         )
         .expect("build test engine");
 
-        let mut driver = IrohDriver::with_engine(engine.handle(), config)
-            .expect("failed to create iroh driver");
+        let mut driver =
+            IrohDriver::with_engine(engine.handle(), config).expect("failed to create iroh driver");
         let node_id = driver.node_id();
 
         // The node's distribution config (SWIM/registry/metadata params).
@@ -262,7 +261,6 @@ impl IrohNode {
         }
     }
 
-
     // ── Passthroughs to the driver (keep consumer churn small) ──────────────
 
     pub fn join(&mut self, seeds: &[EndpointAddr]) {
@@ -337,7 +335,6 @@ pub fn make_driver_with_relay(relay_url: iroh::RelayUrl) -> IrohNode {
         additional_alpns: vec![],
     })
 }
-
 
 /// Poll until `check_fn` holds over `a` and `b` or `timeout` elapses, sleeping
 /// ~10ms between checks. Progression is engine-hosted; this only waits for

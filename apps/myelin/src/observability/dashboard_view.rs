@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, VecDeque};
 
 use dashboard::FrameEvent;
 use dashboard::view::DashboardView;
-use telemetry::Record;
-use telemetry::frame::{Frame, StreamId};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::sync::RwLock;
+use telemetry::Record;
+use telemetry::frame::{Frame, StreamId};
 
 use crate::observability::lifecycle as obs;
 use crate::observability::telemetry::{

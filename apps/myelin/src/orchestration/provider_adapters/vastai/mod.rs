@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use telemetry::TelemetryProducer;
 use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::{
     Ctx, ExternalSender, Runtime, RuntimeConfig, RuntimeParts, SingleThreadRuntime,
@@ -21,10 +20,12 @@ use swactor_vastai::{
     CreateInstanceRequest, LifecyclePolicy, Offer, ProvisionRequest, ProvisionedInstance,
     SelectionPolicy, classify_vastai_error,
 };
+use telemetry::TelemetryProducer;
 
 use crate::observability::provisioning_logs::{BootstrapTelemetryBridge, node_stream_id};
 use crate::provisioning::{
-    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink, ProvisionPlugin,
+    AdoptedNode, NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginSink,
+    ProvisionPlugin,
 };
 
 #[derive(Clone, Debug)]
@@ -112,6 +113,9 @@ impl Drop for VastAiProviderMonitor {
 pub(crate) trait VastAiLeaseClient: Send {
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String>;
 
+    /// Resolves the live contract id carrying `label`, if any.
+    fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String>;
+
     fn ssh_endpoint(
         &mut self,
         contract_id: u64,
@@ -196,22 +200,6 @@ impl ToolsVastAiLeaseClient {
             gpu_ram: offer.gpu_ram,
             dph_total: offer.dph_total,
         })
-    }
-
-    fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String> {
-        let instances = self.runtime.block_on(self.client.list_by_label(label))?;
-        match instances.as_slice() {
-            [] => Ok(None),
-            [instance] => Ok(Some(instance.contract_id)),
-            _ => Err(format!(
-                "multiple VastAI contracts share stable label {label}: {}",
-                instances
-                    .iter()
-                    .map(|instance| instance.contract_id.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )),
-        }
     }
 }
 
@@ -442,6 +430,22 @@ fn adopted_instance(contract_id: u64) -> ProvisionedInstance {
 }
 
 impl VastAiLeaseClient for ToolsVastAiLeaseClient {
+    fn contract_by_label(&mut self, label: &str) -> Result<Option<u64>, String> {
+        let instances = self.runtime.block_on(self.client.list_by_label(label))?;
+        match instances.as_slice() {
+            [] => Ok(None),
+            [instance] => Ok(Some(instance.contract_id)),
+            _ => Err(format!(
+                "multiple VastAI contracts share stable label {label}: {}",
+                instances
+                    .iter()
+                    .map(|instance| instance.contract_id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )),
+        }
+    }
+
     fn provision_one(&mut self, request: ProvisionRequest) -> Result<ProvisionedInstance, String> {
         if request.count != 1 {
             return Err(format!(
@@ -1465,6 +1469,63 @@ where
             }
         }
     }
+
+    fn adopt_by_spec(
+        &mut self,
+        spec: &NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        let label = self.label_for(spec);
+        if self.client.contract_by_label(&label)?.is_none() {
+            return Ok(None);
+        }
+        // create_node's provision path adopts an existing labeled contract;
+        // the provider status monitor resumes and no agent restart occurs
+        // (start_bootstrap is deliberately not called).
+        let handle = self.create_node(spec.clone(), sink)?;
+        Ok(Some(AdoptedNode {
+            handle,
+            provider_ref: label,
+        }))
+    }
+
+    fn provider_ref_for(&self, spec: &NodeProvisionSpec) -> String {
+        self.label_for(spec)
+    }
+
+    fn stop_by_spec(&mut self, spec: &NodeProvisionSpec, sink: PluginSink) -> Result<bool, String> {
+        let label = self.label_for(spec);
+        let Some(contract_id) = self.client.contract_by_label(&label)? else {
+            return Ok(false);
+        };
+        let result = self.client.destroy_contract(contract_id);
+        emit_node_line(
+            &sink,
+            spec.run_id,
+            spec.node_id,
+            serde_json::json!({
+                "type": "VastAiContractCleanupBySpec",
+                "run_id": spec.run_id,
+                "node_id": spec.node_id,
+                "label": &label,
+                "contract_id": contract_id,
+                "result": if result.is_ok() { "ok" } else { "failed" },
+                "error": result.as_ref().err(),
+            })
+            .to_string(),
+        );
+        result.map(|_| true)
+    }
+
+    fn detach_all(&mut self) {
+        // Stop provider monitors (engine-hosted actors) without destroying
+        // leases: daemon exit must leave instances running.
+        for (_, mut node) in std::mem::take(&mut self.nodes) {
+            if let Some(mut monitor) = node.provider_monitor.take() {
+                monitor.stop();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1540,6 +1601,10 @@ mod tests {
     }
 
     impl VastAiLeaseClient for RetryDestroyClient {
+        fn contract_by_label(&mut self, _label: &str) -> Result<Option<u64>, String> {
+            Ok(None)
+        }
+
         fn provision_one(
             &mut self,
             _request: ProvisionRequest,

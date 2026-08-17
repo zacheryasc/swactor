@@ -7,8 +7,8 @@ mod common;
 use std::time::{Duration, UNIX_EPOCH};
 
 use common::{
-    check_invariants, gen_trace, group, group_with_role, run_trace, sanitized, shape, BootEvent,
-    Harness, Input, RecordingExecutor, Reply, RunOrder,
+    BootEvent, Harness, Input, RecordingExecutor, Reply, RunOrder, check_invariants, gen_trace,
+    group, group_with_role, run_trace, sanitized, shape,
 };
 use provisioning::*;
 
@@ -27,7 +27,11 @@ fn replayed_traces_are_identical() {
 
 #[test]
 fn happy_path_converges() {
-    let mut harness = Harness::new_with_backend(0, shape(1, vec![group("g0", 1)]), common::FakeBackend::default());
+    let mut harness = Harness::new_with_backend(
+        0,
+        shape(1, vec![group("g0", 1)]),
+        common::FakeBackend::default(),
+    );
     harness.step(Input::Run); // dispatch create lease
     harness.step(Input::Run); // execute create, dispatch bootstrap start
     harness.step(Input::Run); // execute bootstrap start, session active
@@ -35,14 +39,22 @@ fn happy_path_converges() {
     harness.step(Input::Boot(BootEvent::Closed));
     harness.step(Input::Run); // bootstrap convergence accepted
     assert!(harness.driver.is_converged());
-    assert!(harness.backend.calls().iter().any(|effect| {
-        matches!(effect.command, NodeManagerCommand::CreateLease(_))
-    }));
+    assert!(
+        harness
+            .backend
+            .calls()
+            .iter()
+            .any(|effect| { matches!(effect.command, NodeManagerCommand::CreateLease(_)) })
+    );
 }
 
 #[test]
 fn ambiguous_create_is_adopted_and_converges() {
-    let mut harness = Harness::new_with_backend(0, shape(1, vec![group("g0", 1)]), common::FakeBackend::default());
+    let mut harness = Harness::new_with_backend(
+        0,
+        shape(1, vec![group("g0", 1)]),
+        common::FakeBackend::default(),
+    );
     harness.step(Input::Reply(Reply::Ambiguous("create timed out")));
     harness.step(Input::Run); // create fails ambiguously, backoff starts
     harness.step(Input::Tick(Duration::from_secs(10))); // retry/adopt
@@ -52,7 +64,11 @@ fn ambiguous_create_is_adopted_and_converges() {
 
 #[test]
 fn shape_shrink_mid_lifecycle_converges() {
-    let mut harness = Harness::new_with_backend(0, shape(1, vec![group("g0", 2)]), common::FakeBackend::default());
+    let mut harness = Harness::new_with_backend(
+        0,
+        shape(1, vec![group("g0", 2)]),
+        common::FakeBackend::default(),
+    );
     harness.step(Input::Run);
     harness.step(Input::Run);
     harness.step(Input::Boot(BootEvent::Joined));
@@ -61,10 +77,12 @@ fn shape_shrink_mid_lifecycle_converges() {
     harness.fair_tail();
     assert!(harness.driver.is_converged());
     assert_eq!(harness.state().nodes.len(), 1);
-    assert!(harness
-        .state()
-        .nodes
-        .contains_key(&LogicalNodeId("g0-0".to_owned())));
+    assert!(
+        harness
+            .state()
+            .nodes
+            .contains_key(&LogicalNodeId("g0-0".to_owned()))
+    );
 }
 
 #[test]
@@ -80,7 +98,11 @@ fn same_generation_same_content_is_accepted() {
 
 #[test]
 fn deadline_expires_exactly_at_deadline() {
-    let mut harness = Harness::new_with_backend(0, shape(1, vec![group("g0", 1)]), common::FakeBackend::default());
+    let mut harness = Harness::new_with_backend(
+        0,
+        shape(1, vec![group("g0", 1)]),
+        common::FakeBackend::default(),
+    );
     harness.settle(); // create dispatched at the epoch
     let timeout = RetryPolicy::default().operation_timeout;
     let node = harness.state().nodes.values().next().expect("node exists");
@@ -90,14 +112,23 @@ fn deadline_expires_exactly_at_deadline() {
     // One tick before the deadline: still pending, nothing expired.
     harness.step(Input::Tick(timeout - Duration::from_secs(1)));
     let node = harness.state().nodes.values().next().expect("node exists");
-    assert!(node.pending.is_some(), "operation expired before its deadline");
+    assert!(
+        node.pending.is_some(),
+        "operation expired before its deadline"
+    );
     assert_eq!(node.retry.ambiguous_operation, None);
 
     // Exactly at the deadline: expired, classified ambiguous, never ran.
     harness.step(Input::Tick(Duration::from_secs(1)));
     let node = harness.state().nodes.values().next().expect("node exists");
-    assert!(node.pending.is_none(), "operation did not expire at its deadline");
-    assert_eq!(node.retry.ambiguous_operation, Some(OperationKind::CreateLease));
+    assert!(
+        node.pending.is_none(),
+        "operation did not expire at its deadline"
+    );
+    assert_eq!(
+        node.retry.ambiguous_operation,
+        Some(OperationKind::CreateLease)
+    );
     assert!(
         harness.backend.calls().is_empty(),
         "expired operation must not reach the backend"
@@ -118,7 +149,10 @@ fn clock_extremes_do_not_panic_or_corrupt_state() {
     let mut guard = 0;
     while executor.submitted < 8 {
         guard += 1;
-        assert!(guard <= 64, "driver stopped making progress at clock extremes");
+        assert!(
+            guard <= 64,
+            "driver stopped making progress at clock extremes"
+        );
         driver.trigger_if_due(now);
         driver
             .drive_until_blocked(now, &mut executor)
@@ -128,7 +162,9 @@ fn clock_extremes_do_not_panic_or_corrupt_state() {
         }
         check_invariants(driver.state(), &driver.desired().expand().expect("expands"))
             .unwrap_or_else(|violation| panic!("invariant broken at clock extreme: {violation}"));
-        now = now.checked_add(step).expect("probe clock still representable");
+        now = now
+            .checked_add(step)
+            .expect("probe clock still representable");
         if let Some(requeue) = driver.requeue_at()
             && requeue > now
         {
@@ -160,7 +196,11 @@ fn attempt_allocator_exhaustion_is_reported() {
 fn latest_desired_wins() {
     for seed in 0..16 {
         let trace = sanitized(&gen_trace(seed, 32));
-        let mut harness = Harness::new_with_backend(seed, shape(1, vec![group("g0", 1)]), common::FakeBackend::default());
+        let mut harness = Harness::new_with_backend(
+            seed,
+            shape(1, vec![group("g0", 1)]),
+            common::FakeBackend::default(),
+        );
         for input in &trace {
             harness.step(input.clone());
         }

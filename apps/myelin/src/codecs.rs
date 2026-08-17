@@ -9,5 +9,5 @@ pub(crate) fn register_myelin_actor_codecs(registry: &mut swactor_transport::Cod
     crate::node_actor::register_codecs(registry);
     crate::orchestration::actor::register_codecs(registry);
     telemetry::register_telemetry_publisher_codec(registry);
-    crate::prompt::rpc::register_codecs(registry);
+    swactor_job_runner::register_job_codecs(registry);
 }

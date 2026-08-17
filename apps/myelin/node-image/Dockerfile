@@ -1,4 +1,5 @@
-# Myelin node CODE image — thin layer over the CUDA/tinygrad base.
+# Myelin node agent: a thin Rust control-plane layer over the CUDA base.
+# Workload frameworks are supplied by job payload images.
 # Build from workspace root after compiling the Rust binary:
 #   cargo build --release -p myelin --bin myelin-worker
 #   docker build -f apps/myelin/node-image/Dockerfile.base -t myelin-node-base:cuda12.6 .
@@ -10,6 +11,4 @@ FROM ${BASE_IMAGE}
 ARG MYELIN_NODE_BIN=target/release/myelin-worker
 
 COPY ${MYELIN_NODE_BIN} /usr/local/bin/myelin-node
-COPY apps/myelin/node-image/tinygrad_worker.py /usr/local/share/myelin/tinygrad_worker.py
-
-RUN chmod +x /usr/local/bin/myelin-node /usr/local/share/myelin/tinygrad_worker.py
+RUN chmod +x /usr/local/bin/myelin-node

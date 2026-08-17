@@ -356,6 +356,11 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
       return Math.max(1, Math.min(8, Number(document.getElementById('provision-count').value) || 1));
     }
 
+    function commandId() {
+      return globalThis.crypto?.randomUUID?.()
+        || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
     function post(path, body, action) {
       fetch(path, {
         method: 'POST',
@@ -367,11 +372,11 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     }
 
     document.getElementById('provision').addEventListener('click', () => {
-      post('/control/provision', { Provision: { count: nodeCount() } }, 'provision');
+      post('/control/provision', { Provision: { command_id: commandId(), count: nodeCount() } }, 'provision');
     });
 
     document.getElementById('remove').addEventListener('click', () => {
-      post('/control/remove', { Remove: { count: nodeCount() } }, 'remove');
+      post('/control/remove', { Remove: { command_id: commandId(), count: nodeCount() } }, 'remove');
     });
 
     // A2: one delegated listener on the persistent tbody. Per-render binding
@@ -381,9 +386,10 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
       if (!button || !rows.contains(button)) return;
       const action = button.dataset.action || 'kill';
       const route = action === 'edge' ? '/control/edge' : '/control/kill';
+      const command_id = commandId();
       const body = action === 'edge'
-        ? { EstablishEdge: { node: button.dataset.node } }
-        : { Kill: { node: button.dataset.node } };
+        ? { EstablishEdge: { command_id, node: button.dataset.node } }
+        : { Kill: { command_id, node: button.dataset.node } };
       const label = action === 'edge' ? 'edge' : 'kill';
       if (action === 'edge') button.disabled = false; // edges can be re-issued
       else button.disabled = true;

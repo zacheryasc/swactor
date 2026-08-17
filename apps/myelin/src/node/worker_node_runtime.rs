@@ -18,13 +18,14 @@ use std::time::{Duration, Instant};
 
 use telemetry::frame::TelemetryEvent;
 use telemetry::{
-    ChannelContent, ChannelId, TELEMETRY_PUBLISHER_NAME, TelemetryEndpoint, TelemetryProducer,
-    TelemetryPublisherActor, TelemetrySubscribe, TelemetrySubscription, Lifetime, NodeId,
-    Record, StreamDescriptor, StreamId, StreamOrigin,
+    ChannelContent, ChannelId, Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
+    TELEMETRY_PUBLISHER_NAME, TelemetryEndpoint, TelemetryProducer, TelemetryPublisherActor,
+    TelemetrySubscribe, TelemetrySubscription,
 };
 
 use crate::codecs::register_myelin_actor_codecs;
 use crate::gguf_shard::{StageShardPlan, materialize_stage_shard_http, validate_stage_shard_cache};
+use crate::node::prompt_wire::{PromptEvent, TokenizerEvent};
 use crate::node_actor::{
     NodeAgentActor, NodeAgentMsg, NodeAgentReport, StageCommandWire, StageInboundEdgeWire,
     StageObjectSpecWire, StageOutboundEdgeWire,
@@ -32,20 +33,19 @@ use crate::node_actor::{
 use crate::observability::benchmark;
 use crate::orchestration::distribution_stack::{DistributionRuntimeStack, duration_ms_u64};
 use crate::orchestration::provider_adapters::relay::relay_runtime_config_from_env;
-use crate::prompt::rpc::{PromptEvent, TokenizerEvent};
 use crate::run_plan::{GgufSource, TokenizerSource};
 use crate::staging::control as stage;
 use data_plane::arena;
 use data_plane::edge_lifecycle as edge;
+use data_plane::edge_runtime;
 use data_plane::object_record as ingress;
 use distribution::node::DistributedNodeConfig;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
-use data_plane::edge_runtime;
 use iroh_driver::{
-    EDGE_ALPN, TELEMETRY_ALPN, TelemetryPublishHandle, TelemetryQuicHeader, IrohDriver,
-    IrohDriverConfig,
+    EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, TelemetryPublishHandle,
+    TelemetryQuicHeader, spawn_pull_server,
 };
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
@@ -863,9 +863,13 @@ impl edge_runtime::WorkerPort for TinygradRingPort<'_> {
             max_extent: spec.max_extent,
             alignment: spec.alignment.min(u64::from(u32::MAX)) as u32,
         };
-        let loaded = self
-            .worker
-            .ring_readable(ring_id.0, edge_id.0, wire_spec, self.config, self.telemetry)?;
+        let loaded = self.worker.ring_readable(
+            ring_id.0,
+            edge_id.0,
+            wire_spec,
+            self.config,
+            self.telemetry,
+        )?;
         Ok(edge_runtime::LoadedObject {
             object_id: loaded.object_id,
             sequence: loaded.sequence,
@@ -1087,7 +1091,15 @@ impl WorkerEdgeRuntime {
         config: &DeploymentConfig,
         telemetry: &mut NodeTelemetry,
     ) -> Result<(), String> {
-        self.poll_and_report(driver, stack, node_actor, worker, arena_manager, config, telemetry)
+        self.poll_and_report(
+            driver,
+            stack,
+            node_actor,
+            worker,
+            arena_manager,
+            config,
+            telemetry,
+        )
     }
 
     fn establish_inbound(
@@ -1125,7 +1137,15 @@ impl WorkerEdgeRuntime {
             parse_spec,
         );
         self.inbound_edge = Some(edge_wire);
-        self.poll_and_report(driver, stack, node_actor, worker, arena_manager, config, telemetry)
+        self.poll_and_report(
+            driver,
+            stack,
+            node_actor,
+            worker,
+            arena_manager,
+            config,
+            telemetry,
+        )
     }
 
     fn establish_outbound(
@@ -1176,7 +1196,15 @@ impl WorkerEdgeRuntime {
             peer,
         );
         self.outbound_edge = Some(edge_wire);
-        self.poll_and_report(driver, stack, node_actor, worker, arena_manager, config, telemetry)
+        self.poll_and_report(
+            driver,
+            stack,
+            node_actor,
+            worker,
+            arena_manager,
+            config,
+            telemetry,
+        )
     }
 
     fn execute_step(
@@ -1466,6 +1494,10 @@ fn run() -> Result<(), String> {
             return Err(format!("create iroh driver: {error}"));
         }
     };
+    // Bootstrap supervisors pull telemetry from the node endpoint. Keep these
+    // ALPN connections available to the node loop instead of the legacy push
+    // reader path.
+    driver.retain_telemetry_connections();
     let advertised_self_endpoint =
         advertised_endpoint(driver.endpoint_addr(), config.endpoint_addr_mask)?;
     boot(
@@ -1718,6 +1750,119 @@ fn run() -> Result<(), String> {
         json!({"node_actor":node_actor,"network_reachable":true}),
     )?;
 
+    if config.agent_only {
+        boot(
+            "agent_mode",
+            "ready",
+            json!({"framework":"none","workloads":"external_jobs"}),
+        )?;
+        let mut pending_runtime_ready = PendingRuntimeReady::new(
+            &config,
+            advertised_self_endpoint.clone(),
+            node_actor,
+            telemetry_publisher,
+        );
+        let ready = json!({
+            "type":"ready",
+            "role":"node",
+            "endpoint":advertised_self_endpoint.clone(),
+            "node_actor":node_actor,
+            "telemetry_publisher":telemetry_publisher,
+            "logical_node_id":config.logical_node_id,
+            "stage_index":config.stage_index,
+        });
+        boot(
+            "runtime_ready_local",
+            "ready",
+            json!({
+                "endpoint":advertised_self_endpoint,
+                "node_actor":node_actor,
+                "logical_node_id":config.logical_node_id,
+                "stage_index":config.stage_index,
+                "readiness_id":pending_runtime_ready.readiness_id,
+            }),
+        )?;
+        let shutdown_rx = spawn_stdin_shutdown_listener(config.exit_on_stdin_eof);
+        node_runtime(
+            &mut telemetry,
+            "main_loop",
+            "started",
+            json!({
+                "mode":"agent_only",
+                "poll_interval_ms":PUMP_INTERVAL.as_millis(),
+                "checks":["network","telemetry","node_reports","stdin_shutdown"],
+            }),
+        );
+        loop {
+            emit_swim_telemetry(&mut telemetry, &stack, "agent_loop");
+            drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut telemetry);
+            telemetry.tick();
+            serve_telemetry_pulls(&driver, &engine.handle(), &telemetry.endpoint);
+            while let Some(report) = reports.try_recv() {
+                if let NodeAgentReport::RuntimeReadyAck {
+                    run_id,
+                    node_id,
+                    stage_index,
+                    readiness_id,
+                } = report
+                    && pending_runtime_ready.observe_ack(run_id, node_id, stage_index, readiness_id)
+                {
+                    node_boot(
+                        &mut telemetry,
+                        "runtime_ready_ack",
+                        "ready",
+                        json!({
+                            "readiness_id":readiness_id,
+                            "attempts":pending_runtime_ready.attempts,
+                            "endpoint":&pending_runtime_ready.endpoint,
+                            "node_actor":pending_runtime_ready.node_actor,
+                        }),
+                    );
+                    telemetry.submit_text(telemetry.channels.node_ready, ready.to_string());
+                }
+            }
+            if !pending_runtime_ready.swim_logged && pending_runtime_ready.swim_ready(&stack) {
+                node_runtime(
+                    &mut telemetry,
+                    "coordinator_swim",
+                    "ready",
+                    json!({
+                        "coordinator":pending_runtime_ready
+                            .coordinator
+                            .map(|node| format!("{node:?}"))
+                            .unwrap_or_else(|| "standalone".to_owned()),
+                        "readiness_id":pending_runtime_ready.readiness_id,
+                    }),
+                );
+                pending_runtime_ready.swim_logged = true;
+            }
+            if !pending_runtime_ready.acked
+                && pending_runtime_ready.maybe_send(&stack, node_actor)?
+            {
+                node_runtime(
+                    &mut telemetry,
+                    "runtime_ready_signal",
+                    "sent",
+                    json!({
+                        "readiness_id":pending_runtime_ready.readiness_id,
+                        "attempts":pending_runtime_ready.attempts,
+                        "next_backoff_ms":pending_runtime_ready.backoff.as_millis(),
+                    }),
+                );
+            }
+            if shutdown_rx.try_recv().is_ok() {
+                node_shutdown(
+                    &mut telemetry,
+                    "node_exit",
+                    "ready",
+                    json!({"result":"ok","mode":"agent_only"}),
+                );
+                return Ok(());
+            }
+            thread::sleep(PUMP_INTERVAL);
+        }
+    }
+
     worker_evt(
         "worker_process",
         "started",
@@ -1801,7 +1946,7 @@ fn run() -> Result<(), String> {
         )?;
     }
 
-    let shutdown_rx = spawn_stdin_shutdown_listener();
+    let shutdown_rx = spawn_stdin_shutdown_listener(config.exit_on_stdin_eof);
     node_runtime(
         &mut telemetry,
         "stdin_shutdown_listener",
@@ -1821,6 +1966,7 @@ fn run() -> Result<(), String> {
         emit_swim_telemetry(&mut telemetry, &stack, "main_loop");
         drain_debug_join_commands(&mut debug_join_rx, &mut driver, &config, &mut telemetry);
         telemetry.tick();
+        serve_telemetry_pulls(&driver, &engine.handle(), &telemetry.endpoint);
         drain_worker_stderr(&worker.stderr_rx, &config, &mut telemetry);
         edge_runtime.poll_iroh(
             &mut driver,
@@ -1916,12 +2062,7 @@ fn run() -> Result<(), String> {
                         "ready",
                         json!({"worker_event_type":"WorkerStopped"}),
                     );
-                    node_shutdown(
-                        &mut telemetry,
-                        "node_exit",
-                        "ready",
-                        json!({"result":"ok"}),
-                    );
+                    node_shutdown(&mut telemetry, "node_exit", "ready", json!({"result":"ok"}));
                 }
                 Err(error) => node_shutdown(
                     &mut telemetry,
@@ -2141,6 +2282,20 @@ impl NodeTelemetry {
                 );
             },
         )
+    }
+}
+fn serve_telemetry_pulls(
+    driver: &IrohDriver,
+    engine: &EngineHandle,
+    endpoint: &Arc<TelemetryEndpoint>,
+) {
+    for (_node, connection) in driver.drain_accepted_for_alpn(TELEMETRY_ALPN) {
+        spawn_pull_server(
+            engine,
+            connection,
+            Arc::clone(endpoint),
+            Duration::from_millis(10),
+        );
     }
 }
 
@@ -3098,8 +3253,7 @@ fn materialize_stage_shard_with_process(
         while let Some(report) = reports.try_recv() {
             match report {
                 StageShardFetchReport::Progress(event) => {
-                    if let Err(error) = publish_stage_shard_fetch_event(telemetry, config, &event)
-                    {
+                    if let Err(error) = publish_stage_shard_fetch_event(telemetry, config, &event) {
                         let _ = stack.runtime.stop_actor(actor);
                         return Err(error);
                     }
@@ -3457,6 +3611,8 @@ struct DeploymentConfig {
     debug_join_socket: Option<String>,
     relay_mode: iroh::RelayMode,
     endpoint_addr_mask: EndpointAddrMask,
+    agent_only: bool,
+    exit_on_stdin_eof: bool,
     worker_script: String,
     device: String,
     model_id: String,
@@ -3528,6 +3684,9 @@ impl DeploymentConfig {
                 .map(EndpointAddrMask::parse)
                 .transpose()?
                 .unwrap_or_default(),
+            agent_only: env_optional("MYELIN_AGENT_ONLY")
+                .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on")),
+            exit_on_stdin_eof: provider == "process",
             worker_script: env_optional("MYELIN_TINYGRAD_WORKER")
                 .unwrap_or_else(|| DEFAULT_WORKER_SCRIPT.to_owned()),
             device: env_optional("DEV").unwrap_or_else(|| default_device.to_owned()),
@@ -4252,15 +4411,18 @@ impl Drop for TinygradWorker {
 
 // blocking user-stdin thread is process control, out of scope (ENGINE_SPEC.md §2)
 #[allow(clippy::disallowed_methods)]
-fn spawn_stdin_shutdown_listener() -> Receiver<()> {
+fn spawn_stdin_shutdown_listener(exit_on_eof: bool) -> Receiver<()> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines().map_while(Result::ok) {
             if line.trim().eq_ignore_ascii_case("shutdown") {
                 let _ = tx.send(());
-                break;
+                return;
             }
+        }
+        if exit_on_eof {
+            let _ = tx.send(());
         }
     });
     rx

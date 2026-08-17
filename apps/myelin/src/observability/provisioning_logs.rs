@@ -1,9 +1,9 @@
 use std::io::{BufRead, BufReader, Read};
 use std::thread::{self, JoinHandle};
 
-use telemetry::{ChannelContent, TelemetryProducer, Lifetime, NodeId, StreamId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use telemetry::{ChannelContent, Lifetime, NodeId, StreamId, TelemetryProducer};
 
 use crate::observability::telemetry::{
     MYELIN_PROVISIONING_LOGS, MyelinProvisionLogRecord, myelin_provision_log_channel,

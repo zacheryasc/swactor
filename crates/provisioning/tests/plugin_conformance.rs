@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{assert_plugin_contracts, run_trace_battery, FakePlugin, PluginBackendAdapter};
+use common::{FakePlugin, PluginBackendAdapter, assert_plugin_contracts, run_trace_battery};
 
 #[test]
 fn in_memory_plugin_passes_seam_contracts() {
@@ -15,11 +15,5 @@ fn in_memory_plugin_passes_seam_contracts() {
 
 #[test]
 fn in_memory_plugin_battery_holds_invariants_and_converges() {
-    run_trace_battery(
-        || PluginBackendAdapter::new(FakePlugin::default()),
-        256,
-        64,
-    );
+    run_trace_battery(|| PluginBackendAdapter::new(FakePlugin::default()), 256, 64);
 }
-
-

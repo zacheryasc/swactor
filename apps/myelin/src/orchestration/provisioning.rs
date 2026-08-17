@@ -17,9 +17,9 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use std::os::unix::process::CommandExt;
 
 pub use ::provisioning::plugin::{
-    NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink, PluginSink,
-    ProviderMount, ProvisionEvent, ProvisionEventKind, ProvisionLogLine, ProvisionLogStream,
-    ProvisionPlugin,
+    AdoptedNode, NodeProvisionSpec, PluginNodeHandle, PluginObservation, PluginObservationSink,
+    PluginSink, ProviderMount, ProvisionEvent, ProvisionEventKind, ProvisionLogLine,
+    ProvisionLogStream, ProvisionPlugin,
 };
 
 use crate::observability::provisioning_logs::BootstrapTelemetryBridge;
@@ -81,6 +81,22 @@ fn docker_container_name(prefix: &str, spec: &NodeProvisionSpec) -> String {
     )
 }
 
+/// Docker labels identifying every container this daemon owns. Orphan sweeps
+/// (`docker ps -a --filter label=myelin.daemon=<prefix>`) rely on these; the
+/// daemon label is the stable identity across restarts.
+fn docker_container_labels(prefix: &str, spec: &NodeProvisionSpec) -> Vec<String> {
+    vec![
+        format!("myelin.daemon={prefix}"),
+        format!("myelin.run={}", spec.run_id),
+        format!("myelin.node={}", spec.node_id),
+    ]
+}
+
+fn docker_inspect_error_is_absent(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("no such object") || stderr.contains("no such container")
+}
+
 #[allow(clippy::disallowed_methods)]
 fn docker_container_is_absent(name: &str) -> Result<bool, String> {
     let output = Command::new("docker")
@@ -92,7 +108,7 @@ fn docker_container_is_absent(name: &str) -> Result<bool, String> {
         return Ok(false);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.contains("No such object") || stderr.contains("No such container") {
+    if docker_inspect_error_is_absent(&stderr) {
         Ok(true)
     } else {
         Err(format!(
@@ -101,6 +117,52 @@ fn docker_container_is_absent(name: &str) -> Result<bool, String> {
             stderr.trim()
         ))
     }
+}
+
+#[allow(clippy::disallowed_methods)]
+fn docker_container_is_running(name: &str) -> Result<bool, String> {
+    let output = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}"])
+        .arg(name)
+        .output()
+        .map_err(|error| format!("inspect Docker container {name} state: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "inspect Docker container {name} state exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+/// Lists container names carrying this daemon's label, running or not.
+#[allow(clippy::disallowed_methods)]
+fn docker_labeled_containers(prefix: &str) -> Result<Vec<String>, String> {
+    let output = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label=myelin.daemon={prefix}"),
+            "--format",
+            "{{.Names}}",
+        ])
+        .output()
+        .map_err(|error| format!("list labeled Docker containers: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "list labeled Docker containers exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
 }
 
 fn docker_mount_arg(mount: &ProviderMount) -> String {
@@ -481,6 +543,14 @@ impl ProvisionPlugin for LocalProcessPlugin {
             }
         }
     }
+
+    fn detach_all(&mut self) {
+        // Leak the children deliberately: daemon exit must not kill nodes.
+        // Children become unmanageable (process provider has no cross-process
+        // adoption surface); explicit destroy happened before this call or
+        // not at all.
+        self.nodes.clear();
+    }
 }
 
 impl Drop for LocalProcessPlugin {
@@ -543,8 +613,11 @@ impl ProvisionPlugin for LocalDockerPlugin {
             .arg("--add-host")
             .arg("host.docker.internal:host-gateway")
             .arg("--name")
-            .arg(&container_name)
-            .arg("-i");
+            .arg(&container_name);
+        for label in docker_container_labels(&self.container_name_prefix, &spec) {
+            command.arg("--label").arg(label);
+        }
+        command.arg("-i");
         let docker_gpus = spec
             .env
             .iter()
@@ -669,6 +742,135 @@ impl ProvisionPlugin for LocalDockerPlugin {
         }
         result
     }
+
+    fn adopt_by_spec(
+        &mut self,
+        spec: &NodeProvisionSpec,
+        sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        let container_name = docker_container_name(&self.container_name_prefix, spec);
+        if docker_container_is_absent(&container_name)? {
+            return Ok(None);
+        }
+        let running = docker_container_is_running(&container_name)?;
+        let handle = PluginNodeHandle {
+            id: self.next_handle_id,
+            provider_process_id: None,
+        };
+        self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
+        if running {
+            // Follow the adopted container's logs and wait for its exit; no
+            // lifecycle action is taken — adoption is observation-only.
+            for (_stream, stdout_flag) in [("stdout", true), ("stderr", false)] {
+                let mut logs = Command::new("docker");
+                logs.arg("logs")
+                    .arg("-f")
+                    .arg("--tail")
+                    .arg("0")
+                    .arg(if stdout_flag { "--stdout" } else { "--stderr" })
+                    .arg(&container_name);
+                if let Ok(child) = logs.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+                    if let Some(out) = child.stdout {
+                        if stdout_flag {
+                            spawn_stdout_reader(spec.clone(), sink.clone(), out);
+                        } else {
+                            spawn_stderr_reader(spec.clone(), sink.clone(), out);
+                        }
+                    }
+                }
+            }
+            let wait_spec = spec.clone();
+            let wait_sink = sink.clone();
+            let wait_name = container_name.clone();
+            thread::spawn(move || {
+                let status = Command::new("docker").arg("wait").arg(&wait_name).output();
+                let code = status.ok().and_then(|output| {
+                    String::from_utf8_lossy(&output.stdout)
+                        .trim()
+                        .parse::<i32>()
+                        .ok()
+                });
+                wait_sink.observe(PluginObservation::Exited {
+                    run_id: wait_spec.run_id,
+                    node_id: wait_spec.node_id,
+                    status: code,
+                });
+            });
+        }
+        let adopted_name = docker_container_name(&self.container_name_prefix, spec);
+        self.nodes.insert(
+            handle.id,
+            LocalDockerNode {
+                spec: spec.clone(),
+                sink: sink.clone(),
+                container_name,
+                stdin: None,
+            },
+        );
+        sink.observe(PluginObservation::TelemetryFrame {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            channel: "myelin.provisioning.events".to_owned(),
+            payload: serde_json::json!({
+                "type":"DockerContainerAdopted",
+                "provider":"Docker",
+                "container":adopted_name.clone(),
+                "running":running,
+            })
+            .to_string(),
+        });
+        Ok(Some(AdoptedNode {
+            handle,
+            provider_ref: adopted_name,
+        }))
+    }
+
+    fn provider_ref_for(&self, spec: &NodeProvisionSpec) -> String {
+        docker_container_name(&self.container_name_prefix, spec)
+    }
+
+    fn list_managed_refs(&self) -> Result<Vec<String>, String> {
+        docker_labeled_containers(&self.container_name_prefix)
+    }
+
+    fn stop_by_spec(&mut self, spec: &NodeProvisionSpec, sink: PluginSink) -> Result<bool, String> {
+        let container_name = docker_container_name(&self.container_name_prefix, spec);
+        if docker_container_is_absent(&container_name)? {
+            return Ok(false);
+        }
+        let status = Command::new("docker")
+            .arg("rm")
+            .arg("-f")
+            .arg(&container_name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("docker rm {container_name}: {error}"))?;
+        let removed =
+            status.success() || matches!(docker_container_is_absent(&container_name), Ok(true));
+        sink.observe(PluginObservation::TelemetryFrame {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            channel: "myelin.provisioning.events".to_owned(),
+            payload: serde_json::json!({
+                "type":"DockerContainerRemoved",
+                "provider":"Docker",
+                "container":container_name,
+                "removed":removed,
+                "exit_ok":status.success(),
+            })
+            .to_string(),
+        });
+        if removed {
+            Ok(true)
+        } else {
+            Err(format!("docker rm {container_name} exited with {status}"))
+        }
+    }
+
+    fn detach_all(&mut self) {
+        self.nodes.clear();
+    }
 }
 
 fn spawn_stdout_reader(
@@ -691,6 +893,17 @@ fn spawn_stderr_reader(
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    #[test]
+    fn docker_absence_detection_is_case_insensitive() {
+        assert!(docker_inspect_error_is_absent(
+            "Error: No such object: missing"
+        ));
+        assert!(docker_inspect_error_is_absent(
+            "error: no such container: missing"
+        ));
+        assert!(!docker_inspect_error_is_absent("permission denied"));
+    }
 
     struct ChannelSink(mpsc::Sender<PluginObservation>);
 

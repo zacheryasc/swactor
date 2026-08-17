@@ -98,6 +98,16 @@ pub struct PluginNodeHandle {
     pub provider_process_id: Option<u32>,
 }
 
+/// Result of a successful spec-addressed adoption.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdoptedNode {
+    pub handle: PluginNodeHandle,
+    /// Stable provider-side address of the resource (docker container name,
+    /// vastai lease label, ...) for snapshot bookkeeping.
+    pub provider_ref: String,
+}
+
+
 pub trait PluginObservationSink: Send + Sync {
     fn observe(&self, observation: PluginObservation);
 }
@@ -135,6 +145,41 @@ pub trait ProvisionPlugin: Send {
     fn complete_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
 
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
+    fn adopt_by_spec(
+        &mut self,
+        _spec: &NodeProvisionSpec,
+        _sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        Ok(None)
+    }
+
+    /// Stable provider-side address for a spec (docker container name, vastai
+    /// lease label, ...). Derivable without provider state.
+    fn provider_ref_for(&self, _spec: &NodeProvisionSpec) -> String {
+        format!("node-{}-{}", _spec.run_id, _spec.node_id)
+    }
+
+    /// Lists provider resources carrying this daemon's label. Used for orphan
+    /// detection; providers without a label sweep return an empty list.
+    fn list_managed_refs(&self) -> Result<Vec<String>, String> {
+        Ok(Vec::new())
+    }
+
+    /// Stops a provider resource addressed by its provision spec. Returns
+    /// `Ok(false)` when nothing matching exists (already stopped is success).
+    fn stop_by_spec(
+        &mut self,
+        _spec: &NodeProvisionSpec,
+        _sink: PluginSink,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Releases every owned resource handle without stopping anything, so a
+    /// process exit leaves provider resources running. Callers that want
+    /// teardown must call [`ProvisionPlugin::stop_node`] or
+    /// [`ProvisionPlugin::stop_by_spec`] first.
+    fn detach_all(&mut self) {}
 }
 
 #[cfg(test)]

@@ -361,7 +361,9 @@ impl<P: TestablePlugin + 'static> PluginBackendAdapter<P> {
 
 impl<P: TestablePlugin + 'static> Clone for PluginBackendAdapter<P> {
     fn clone(&self) -> Self {
-        Self { shared: Arc::clone(&self.shared) }
+        Self {
+            shared: Arc::clone(&self.shared),
+        }
     }
 }
 
@@ -687,20 +689,26 @@ pub fn check_invariants(
             }
         }
         if node.active_bootstrap.is_some() && node.record.bootstrap.is_none() {
-            return Err(format!("node {id:?}: active session without bootstrap facts"));
+            return Err(format!(
+                "node {id:?}: active session without bootstrap facts"
+            ));
         }
         // Attempt-fact ownership: fixture identities are attempt-encoded,
         // so a fact from another attempt is detectable here.
         if let Some(lease) = &node.record.lease
-            && lease.lease_id.0 != format!("lease-{}", node.attempt.0) {
-                return Err(format!(
-                    "node {id:?}: lease {} leaked from another attempt",
-                    lease.lease_id.0
-                ));
-            }
-        for session in [node.active_bootstrap, node.record.bootstrap.as_ref().map(|f| f.session_id)]
-            .into_iter()
-            .flatten()
+            && lease.lease_id.0 != format!("lease-{}", node.attempt.0)
+        {
+            return Err(format!(
+                "node {id:?}: lease {} leaked from another attempt",
+                lease.lease_id.0
+            ));
+        }
+        for session in [
+            node.active_bootstrap,
+            node.record.bootstrap.as_ref().map(|f| f.session_id),
+        ]
+        .into_iter()
+        .flatten()
         {
             let owning_attempt = session.0 / SESSION_SEQ_SPACE;
             let sequence = session.0 % SESSION_SEQ_SPACE;
@@ -722,9 +730,12 @@ pub fn check_invariants(
             if node
                 .record
                 .swactor
-                .as_ref().is_none_or(|swactor| swactor.handed_off_at.is_none())
+                .as_ref()
+                .is_none_or(|swactor| swactor.handed_off_at.is_none())
             {
-                return Err(format!("node {id:?}: ready without completed swactor handoff"));
+                return Err(format!(
+                    "node {id:?}: ready without completed swactor handoff"
+                ));
             }
             match desired.get(id) {
                 Some(spec) if node.record.desired == *spec => {}
@@ -941,9 +952,7 @@ impl<B: HarnessedBackend> Harness<B> {
             // Resource conservation: convergence owns every live resource.
             let leaked = self.backend.leaked();
             if !leaked.is_empty() {
-                self.fail(&format!(
-                    "converged machine leaked resources: {leaked:?}"
-                ));
+                self.fail(&format!("converged machine leaked resources: {leaked:?}"));
             }
         }
     }
@@ -965,13 +974,16 @@ impl<B: HarnessedBackend> Harness<B> {
                     session_id: session,
                     swactor_id: SwactorId(format!("sw-{}-{}", id.0, attempt.0)),
                 },
-                BootEvent::Closed => NodeObservation::BootstrapClosed { session_id: session },
+                BootEvent::Closed => NodeObservation::BootstrapClosed {
+                    session_id: session,
+                },
                 BootEvent::Failed => NodeObservation::BootstrapFailed {
                     session_id: session,
                     reason: "scripted bootstrap failure".to_owned(),
                 },
             };
-            self.driver.apply_observation(&id, attempt, observation, self.now);
+            self.driver
+                .apply_observation(&id, attempt, observation, self.now);
         }
     }
 
@@ -1031,8 +1043,6 @@ impl<B: HarnessedBackend> Harness<B> {
     pub fn state(&self) -> &ClusterState {
         self.driver.state()
     }
-
-
 }
 
 impl<B: HarnessedBackend> Drop for Harness<B> {
@@ -1126,12 +1136,7 @@ pub fn run_trace_with<B: HarnessedBackend>(
     fair: bool,
     order: RunOrder,
 ) -> Harness<B> {
-    let mut harness = Harness::new_ordered(
-        seed,
-        shape(1, vec![group("g0", 1)]),
-        make(),
-        order,
-    );
+    let mut harness = Harness::new_ordered(seed, shape(1, vec![group("g0", 1)]), make(), order);
     for input in trace {
         harness.step(input.clone());
     }
@@ -1144,12 +1149,7 @@ pub fn run_trace_with<B: HarnessedBackend>(
     harness
 }
 
-pub fn run_trace(
-    seed: u64,
-    trace: &[Input],
-    fair: bool,
-    order: RunOrder,
-) -> Harness<FakeBackend> {
+pub fn run_trace(seed: u64, trace: &[Input], fair: bool, order: RunOrder) -> Harness<FakeBackend> {
     run_trace_with(FakeBackend::default, seed, trace, fair, order)
 }
 
@@ -1228,7 +1228,11 @@ pub fn assert_trace<B: HarnessedBackend>(
 
 /// The full battery: adversarial invariants plus fair convergence, over
 /// a fresh backend per run.
-pub fn run_trace_battery<B: HarnessedBackend>(make: impl Fn() -> B + Clone, seeds: u64, len: usize) {
+pub fn run_trace_battery<B: HarnessedBackend>(
+    make: impl Fn() -> B + Clone,
+    seeds: u64,
+    len: usize,
+) {
     for seed in 0..seeds {
         let trace = gen_trace(seed, len);
         assert_trace(make.clone(), seed, &trace, false);
@@ -1293,9 +1297,7 @@ pub fn assert_plugin_contracts<P: TestablePlugin>(plugin: &mut P) {
         "adoption must not create a second resource"
     );
     assert!(
-        plugin
-            .leaked_resources(&[first.id, adopted.id])
-            .is_empty(),
+        plugin.leaked_resources(&[first.id, adopted.id]).is_empty(),
         "owned resources are not leaks"
     );
 

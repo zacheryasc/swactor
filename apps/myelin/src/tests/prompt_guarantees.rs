@@ -1,18 +1,6 @@
-//! Behavior guarantees for the `prompt` module.
+//! Behavior guarantees for the prompt wire types.
 
-use myelin::prompt::rpc::{PromptEvent, SubmitPrompt};
-
-#[test]
-fn zero_request_limits_take_loop_defaults() {
-    let request = SubmitPrompt {
-        request_id: 7,
-        prompt_text: "hello".to_owned(),
-        max_tokens: 0,
-    }
-    .with_defaults(32);
-
-    assert_eq!(request.max_tokens, 32);
-}
+use myelin::node::prompt_wire::PromptEvent;
 
 #[test]
 fn event_terminal_state_is_explicit() {
@@ -39,4 +27,26 @@ fn event_terminal_state_is_explicit() {
         }
         .is_terminal()
     );
+}
+
+#[test]
+fn event_request_ids_are_always_available() {
+    let events = [
+        PromptEvent::TextDelta {
+            request_id: 4,
+            text: String::new(),
+        },
+        PromptEvent::Done {
+            request_id: 5,
+            final_text: String::new(),
+            tokens_generated: 0,
+            elapsed_ms: 0,
+        },
+        PromptEvent::Fault {
+            request_id: 6,
+            error: String::new(),
+        },
+    ];
+    let ids: Vec<u64> = events.iter().map(PromptEvent::request_id).collect();
+    assert_eq!(ids, vec![4, 5, 6]);
 }

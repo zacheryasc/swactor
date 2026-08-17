@@ -219,6 +219,23 @@ impl MyelinEffectBackend {
         (external_id, logical_id)
     }
 
+    fn detach_all(&self) {
+        let nodes = lock_nodes_read(&self.nodes)
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for effects in nodes {
+            let mut effects = lock_node(&effects);
+            if let Some(live) = effects.live.take() {
+                live.failure_sink.discard();
+            }
+            effects.plugin.detach_all();
+            if let Some(staged) = effects.staged.as_mut() {
+                staged.plugin.detach_all();
+            }
+        }
+    }
+
     fn stop_all(&self) -> Result<(), String> {
         let mut first_error = None;
         let nodes = lock_nodes_read(&self.nodes)
@@ -684,6 +701,14 @@ impl ProvisionedClusterGuard {
         Ok(())
     }
 
+    /// Releases the guard without touching any provider resource: no
+    /// shutdown shape, no stop_all. The daemon exits; nodes keep running and
+    /// are adopted by spec on the next boot.
+    pub(crate) fn detach(&mut self) {
+        self.executor.backend().detach_all();
+        self.stopped = true;
+    }
+
     fn drain_wakes(&mut self, now: SystemTime) {
         loop {
             match self.wake_rx.try_recv() {
@@ -859,9 +884,9 @@ mod tests {
 
     use crate::provisioning::ProviderMount;
     use ::provisioning::{
-        BootSpec, BootstrapSessionSpec, ClusterShape, CreateLeaseRequest, TelemetryStreamId,
-        DesiredNodeShape, LogicalNodeSpec, NodeGroupId, OperationId, ProviderKind, RetryPolicy,
-        RoleId, RunId, RunNodeGroupSpec, SwarmJoinSpec, SwarmJoinTemplate,
+        BootSpec, BootstrapSessionSpec, ClusterShape, CreateLeaseRequest, DesiredNodeShape,
+        LogicalNodeSpec, NodeGroupId, OperationId, ProviderKind, RetryPolicy, RoleId, RunId,
+        RunNodeGroupSpec, SwarmJoinSpec, SwarmJoinTemplate, TelemetryStreamId,
     };
 
     use super::*;

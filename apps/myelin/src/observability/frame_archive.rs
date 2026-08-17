@@ -2,8 +2,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use telemetry::frame::{Frame, StreamId};
 use serde_json::json;
+use telemetry::frame::{Frame, StreamId};
 
 use crate::observability::benchmark;
 

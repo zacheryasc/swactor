@@ -1,7 +1,7 @@
 //! Myelin-system-owned telemetry channel records.
 
-use telemetry::Record;
 use serde::{Deserialize, Serialize};
+use telemetry::Record;
 
 use crate::observability::lifecycle as obs;
 use crate::provisioning::{self, ProvisionLogStream};

@@ -5,15 +5,15 @@
 //! optional live dashboard. Both are consumed by the control loop in
 //! `orchestration::app`; frame-bearing read paths live in `frame_collector`.
 
-use telemetry::frame::{Frame, StreamId};
-use telemetry::{
-    ChannelContent, ChannelId, TelemetryEndpoint, TelemetryProducer, Lifetime, NodeId, Record,
-    StreamDescriptor, StreamOrigin,
-};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+use telemetry::frame::{Frame, StreamId};
+use telemetry::{
+    ChannelContent, ChannelId, Lifetime, NodeId, Record, StreamDescriptor, StreamOrigin,
+    TelemetryEndpoint, TelemetryProducer,
+};
 
 use crate::observability::benchmark;
 #[cfg(feature = "dashboard")]
@@ -290,17 +290,27 @@ pub(crate) struct DashboardSupport {
 
 #[cfg(feature = "dashboard")]
 impl DashboardSupport {
-    pub(crate) fn start(enabled: bool, engine: &EngineHandle) -> Result<Option<Self>, String> {
-        if !enabled {
-            return Ok(None);
-        }
+    fn config() -> Result<dashboard::DashboardConfig, String> {
         let mut config = dashboard::DashboardConfig::default();
         if let Some(port) = env_optional("MYELIN_DASHBOARD_PORT") {
             config.port = port
                 .parse::<u16>()
                 .map_err(|e| format!("invalid MYELIN_DASHBOARD_PORT={port:?}: {e}"))?;
         }
-        let handle = dashboard::DashboardHandle::new(config);
+        Ok(config)
+    }
+
+    pub(crate) fn configured_url(enabled: bool) -> Result<Option<String>, String> {
+        enabled
+            .then(|| Self::config().map(|config| format!("http://127.0.0.1:{}/", config.port)))
+            .transpose()
+    }
+
+    pub(crate) fn start(enabled: bool, engine: &EngineHandle) -> Result<Option<Self>, String> {
+        if !enabled {
+            return Ok(None);
+        }
+        let handle = dashboard::DashboardHandle::new(Self::config()?);
         handle.register_view(Arc::new(MyelinClusterDashboardView::new()));
         engine.spawn(handle.http_server());
         Ok(Some(Self { handle }))
@@ -311,6 +321,35 @@ impl DashboardSupport {
             stream: dashboard::StreamEvent {
                 node: stream.node.as_str().to_string(),
                 life: stream.life.0,
+                origin: None,
+                label: None,
+            },
+            channel: channel.to_owned(),
+            position: frame.position.0,
+            payload: frame.payload.clone(),
+        });
+    }
+    pub(crate) fn publish_collected_frame(
+        &self,
+        stream: &StreamId,
+        descriptor: Option<&StreamDescriptor>,
+        channel: &str,
+        frame: &Frame,
+    ) {
+        let origin = descriptor.map(|descriptor| {
+            match descriptor.origin {
+                StreamOrigin::Orchestrator => "orchestrator",
+                StreamOrigin::Bootstrap => "bootstrap",
+                StreamOrigin::RemoteNode => "remote-node",
+            }
+            .to_owned()
+        });
+        self.handle.publish(dashboard::FrameEvent {
+            stream: dashboard::StreamEvent {
+                node: stream.node.as_str().to_string(),
+                life: stream.life.0,
+                origin,
+                label: descriptor.and_then(|descriptor| descriptor.label.clone()),
             },
             channel: channel.to_owned(),
             position: frame.position.0,
@@ -324,6 +363,16 @@ pub(crate) struct DashboardSupport;
 
 #[cfg(not(feature = "dashboard"))]
 impl DashboardSupport {
+    pub(crate) fn configured_url(enabled: bool) -> Result<Option<String>, String> {
+        if enabled {
+            return Err(
+                "MYELIN_DASHBOARD requires building myelin-system with feature dashboard"
+                    .to_owned(),
+            );
+        }
+        Ok(None)
+    }
+
     pub(crate) fn start(enabled: bool, _engine: &EngineHandle) -> Result<Option<Self>, String> {
         if enabled {
             return Err(
@@ -335,4 +384,12 @@ impl DashboardSupport {
     }
 
     pub(crate) fn publish_frame(&self, _stream: &StreamId, _channel: &str, _frame: &Frame) {}
+    pub(crate) fn publish_collected_frame(
+        &self,
+        _stream: &StreamId,
+        _descriptor: Option<&StreamDescriptor>,
+        _channel: &str,
+        _frame: &Frame,
+    ) {
+    }
 }

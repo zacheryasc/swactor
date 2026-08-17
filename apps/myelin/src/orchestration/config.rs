@@ -87,9 +87,8 @@ pub(crate) fn looks_remote_image(image: &str) -> bool {
     host == "localhost" || host.contains('.') || host.contains(':')
 }
 
-/// Shared overlay for legacy and multi-binary configuration parsing. This accepts
-/// fields outside the fixed `myelin-chat` public config surface; `myelin-chat` uses a
-/// bin-local strict config loader instead.
+/// Shared overlay for daemon and worker configuration parsing. Unknown
+/// workload-specific fields remain available to dormant pipeline tooling.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(default)]
 pub(crate) struct TomlConfigOverlay {

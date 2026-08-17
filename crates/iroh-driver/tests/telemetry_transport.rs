@@ -1,9 +1,5 @@
 use std::net::{IpAddr, SocketAddr};
 
-use telemetry::frame::TelemetryEvent;
-use telemetry::{
-    ChannelContent, TelemetryEndpoint, Lifetime, NodeId, Position, StreamId,
-};
 use iroh::{Endpoint, EndpointAddr, RelayMode};
 use iroh_driver::{
     TELEMETRY_ALPN, TelemetryQuicHeader, read_next_uni_from_connection,
@@ -12,6 +8,8 @@ use iroh_driver::{
 use swactor::config::RuntimeConfig;
 use swactor::runtime::RuntimeParts;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
+use telemetry::frame::TelemetryEvent;
+use telemetry::{ChannelContent, Lifetime, NodeId, Position, StreamId, TelemetryEndpoint};
 
 /// Telemetry transport test scheduled through `EngineHandle`, not an ambient
 /// `#[tokio::test]` runtime (ENGINE_SPEC.md).

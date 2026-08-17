@@ -7,10 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-const NODE_IMAGE_CONTENT_INPUTS: &[&str] = &[
-    "apps/myelin/node-image/Dockerfile",
-    "apps/myelin/node-image/tinygrad_worker.py",
-];
+const NODE_IMAGE_CONTENT_INPUTS: &[&str] = &["apps/myelin/node-image/Dockerfile"];
 
 const BASE_IMAGE_SOURCE_INPUTS: &[&str] = &[
     "apps/myelin/node-image/Dockerfile.base",
@@ -18,7 +15,7 @@ const BASE_IMAGE_SOURCE_INPUTS: &[&str] = &[
 ];
 const NODE_IMAGE_TAG_LABEL: &str = "org.swactor.myelin.node-image-tag";
 const NODE_IMAGE_SOURCE_HASH_LABEL: &str = "org.swactor.myelin.node.source-hash";
-const NODE_IMAGE_WORKER_HASH_LABEL: &str = "org.swactor.myelin.node.worker-hash";
+const NODE_IMAGE_AGENT_HASH_LABEL: &str = "org.swactor.myelin.node.agent-hash";
 const NODE_IMAGE_BASE_HASH_LABEL: &str = "org.swactor.myelin.node.base-hash";
 const BASE_IMAGE_SOURCE_HASH_LABEL: &str = "org.swactor.myelin.base.source-hash";
 
@@ -117,18 +114,10 @@ fn prepare_node_image_inner(
     let tag = image_version_tag(&root, &image_content_hash)?;
     let image_ref = image.ref_for_tag(&tag);
     emit_image_reference(progress, "resolved", &image_ref);
-    let worker_hash = hash_relative_files_with_salts(
-        &root,
-        vec![relative_path(
-            &root,
-            &root.join("apps/myelin/node-image/tinygrad_worker.py"),
-        )?],
-        &[],
-    )?;
     let expected_node_labels = vec![
         (NODE_IMAGE_TAG_LABEL, tag.as_str()),
         (NODE_IMAGE_SOURCE_HASH_LABEL, image_content_hash.as_str()),
-        (NODE_IMAGE_WORKER_HASH_LABEL, worker_hash.as_str()),
+        (NODE_IMAGE_AGENT_HASH_LABEL, image_content_hash.as_str()),
         (NODE_IMAGE_BASE_HASH_LABEL, base_hash.as_str()),
     ];
     let expected_base_labels = vec![(BASE_IMAGE_SOURCE_HASH_LABEL, base_hash.as_str())];
@@ -545,7 +534,7 @@ fn prune_old_dirty_images(root: &Path, image: &ImageName, keep_tag: &str) {
         };
         if labels.get(NODE_IMAGE_TAG_LABEL).map(String::as_str) != Some(tag.as_str())
             || !labels.contains_key(NODE_IMAGE_SOURCE_HASH_LABEL)
-            || !labels.contains_key(NODE_IMAGE_WORKER_HASH_LABEL)
+            || !labels.contains_key(NODE_IMAGE_AGENT_HASH_LABEL)
             || !labels.contains_key(NODE_IMAGE_BASE_HASH_LABEL)
         {
             continue;

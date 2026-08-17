@@ -5,7 +5,7 @@ members = [
     "crates/bindings/python",
     "crates/bindings/wasm-runtime",
     "crates/process",
-    "crates/provisioning",
+    "crates/job-runner",
     "crates/transport",
     "crates/distribution",
     "crates/iroh-driver",

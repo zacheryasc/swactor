@@ -7,6 +7,13 @@ target/*
 !target/release/
 target/release/*
 !target/release/myelin-worker
+!target/x86_64-unknown-linux-musl/
+target/x86_64-unknown-linux-musl/*
+!target/x86_64-unknown-linux-musl/release/
+target/x86_64-unknown-linux-musl/release/*
+!target/x86_64-unknown-linux-musl/release/myelin-job-worker
+!.deploy-notes/
+!.deploy-notes/job_worker_entrypoint.sh
 !target/debug/
 target/debug/*
 !target/debug/myelin-worker

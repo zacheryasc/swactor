@@ -136,6 +136,25 @@ let selectedActor = params.get('actor') || null;
 let rosterFilter = '';
 let lastSnapshot = null;
 let detailTimer = null;
+// A1: last-rendered HTML per region. A poll that yields identical markup
+// must not swap innerHTML — the swap destroyed hover/selection/presses and
+// restarted animations every second even in a fully converged steady state.
+let lastPageHtml = null;
+let lastRosterHtml = null;
+let lastDossierHtml = null;
+
+// Receipt ages (dossier) render as empty spans carrying an absolute epoch —
+// stable across polls — and a 1 Hz pass rewrites their textContent. All other
+// ticking text (card seen/stats) is written per-poll by updateCardTexts.
+function agoSpan(epochMs) {
+  return `<span data-ago-at="${Math.round(epochMs)}"></span>`;
+}
+function updateAgo() {
+  const now = Date.now();
+  for (const span of document.querySelectorAll('[data-ago-at]')) {
+    span.textContent = ago(now - Number(span.dataset.agoAt));
+  }
+}
 
 function esc(value) {
   return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
@@ -205,6 +224,7 @@ function render() {
   } else {
     renderFleet(page, live, stale, totals);
   }
+  updateAgo();
 }
 
 function renderFleet(page, live, stale, totals) {
@@ -223,8 +243,12 @@ function renderFleet(page, live, stale, totals) {
       </details>`);
     }
   }
-  page.innerHTML = parts.join('');
-  bindCards();
+  const html = parts.join('');
+  if (html !== lastPageHtml) {
+    page.innerHTML = html;
+    lastPageHtml = html;
+  }
+  updateCardTexts(orchestrators.concat(workers, stale));
 }
 
 function nodeCard(node) {
@@ -233,29 +257,53 @@ function nodeCard(node) {
   const origin = node.stream.origin || '';
   const isOrchestrator = origin === 'orchestrator';
   const role = isOrchestrator ? '<span class="role">orchestrator</span>' : '';
-  const stats = [
+  const label = node.stream.label ? ` · ${esc(node.stream.label)}` : '';
+  // The stats line (actors · msg/s · uptime) jitters every frame on busy
+  // supervisors; it renders as a pass-filled span so the card markup — and
+  // with it the whole grid — stays byte-identical between polls.
+  return `<a class="node-card${isOrchestrator ? ' orchestrator' : ''}" data-stream="${esc(node.stream.key)}" data-live="${node.live ? 'true' : 'false'}" href="?stream=${encodeURIComponent(node.stream.key)}">
+    <h3>${esc(node.stream.node)}${role} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
+    <div class="meta">${proc}seen <span data-seen></span> ago · <span data-stats></span>${label}</div>
+    ${summary.poisoned ? `<div class="notice err">${fmt(summary.poisoned)} poisoned actor(s)</div>` : ''}
+  </a>`;
+}
+
+function cardStats(node) {
+  const summary = node.actor_summary || {};
+  return [
     summary.actors ? fmt(summary.actors) + ' actors' : null,
     summary.msg_per_sec ? fmtRate(summary.msg_per_sec) + ' msg/s' : null,
     summary.num_workers != null ? fmt(summary.num_workers) + ' workers' : null,
     summary.uptime_ms != null ? 'up ' + ago(summary.uptime_ms) : null,
-  ].filter(Boolean).join(' · ');
-  const label = node.stream.label ? ` · ${esc(node.stream.label)}` : '';
-  return `<a class="node-card${isOrchestrator ? ' orchestrator' : ''}" data-stream="${esc(node.stream.key)}" data-live="${node.live ? 'true' : 'false'}" href="?stream=${encodeURIComponent(node.stream.key)}">
-    <h3>${esc(node.stream.node)}${role} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
-    <div class="meta">${proc}seen ${ago(node.last_seen_ms_ago)} ago · ${stats || 'no runtime stats'}${label}</div>
-    ${summary.poisoned ? `<div class="notice err">${fmt(summary.poisoned)} poisoned actor(s)</div>` : ''}
-  </a>`;
+  ].filter(Boolean).join(' · ') || 'no runtime stats';
+}
+
+function updateCardTexts(nodes) {
+  const byStream = new Map(nodes.map(node => [node.stream.key, node]));
+  for (const card of document.querySelectorAll('a.node-card')) {
+    const node = byStream.get(card.getAttribute('data-stream'));
+    const seen = card.querySelector('[data-seen]');
+    if (seen) seen.textContent = node ? ago(node.last_seen_ms_ago) : '—';
+    const stats = card.querySelector('[data-stats]');
+    if (stats) stats.textContent = node ? cardStats(node) : 'no runtime stats';
+  }
 }
 
 function renderNode(page, node, live, stale) {
   const summary = node.actor_summary || {};
   const machine = machineDetail(node);
-  page.innerHTML = `
+  // The machine panel churns with live metrics, so swaps here are real; keep
+  // the roster filter usable by restoring focus and caret across them.
+  const active = document.activeElement;
+  const refocus = active && active.id === 'roster-filter' && page.contains(active)
+    ? { start: active.selectionStart, end: active.selectionEnd, dir: active.selectionDirection }
+    : null;
+  const html = `
     <a class="focus-back" href="/">← Fleet (${fmt(live.length)} live, ${fmt(stale.length)} stale)</a>
     <div class="layout ${selectedActor ? 'with-dossier' : ''}">
       <div class="node-view">
         <section class="panel">
-          <h2 style="margin:0 0 8px">${esc(node.stream.node)}${node.stream.label ? ` <span class="muted" style="font-size:13px">${esc(node.stream.label)}</span>` : ''} <span class="muted" style="font-size:13px">life ${fmt(node.stream.life)} · ${node.live ? 'live' : 'stale ' + ago(node.last_seen_ms_ago) + ' ago'}</span></h2>
+          <h2 style="margin:0 0 8px">${esc(node.stream.node)}${node.stream.label ? ` <span class="muted" style="font-size:13px">${esc(node.stream.label)}</span>` : ''} <span class="muted" style="font-size:13px">life ${fmt(node.stream.life)} · <span data-seen></span></span></h2>
           ${machine}
         </section>
         <section class="panel">
@@ -266,9 +314,19 @@ function renderNode(page, node, live, stale) {
       </div>
       <div id="dossier-slot"></div>
     </div>`;
+  if (html !== lastPageHtml) {
+    page.innerHTML = html;
+    lastPageHtml = html;
+    const filter = document.getElementById('roster-filter');
+    filter.addEventListener('input', e => { rosterFilter = e.target.value; renderRoster(node); });
+    if (refocus) {
+      filter.focus();
+      try { filter.setSelectionRange(refocus.start, refocus.end, refocus.dir); } catch { /* caret shape changed */ }
+    }
+  }
+  const seen = document.querySelector('#page h2 [data-seen]');
+  if (seen) seen.textContent = node.live ? 'live' : 'stale ' + ago(node.last_seen_ms_ago) + ' ago';
   renderRoster(node);
-  const filter = document.getElementById('roster-filter');
-  filter.addEventListener('input', e => { rosterFilter = e.target.value; renderRoster(node); });
   if (selectedActor) startDetailPolling();
 }
 
@@ -337,11 +395,11 @@ function renderRoster(node) {
   const notice = rows.length > capped.length
     ? `<div class="notice">showing ${fmt(capped.length)} of ${fmt(rows.length)} — refine the filter to see more</div>`
     : '';
+  let html;
   if (!rows.length) {
-    wrap.innerHTML = '<div class="empty">No actors on this stream (or none match the filter).</div>';
-    return;
-  }
-  wrap.innerHTML = notice + `<table>
+    html = '<div class="empty">No actors on this stream (or none match the filter).</div>';
+  } else {
+    html = notice + `<table>
     <thead><tr><th>Actor</th><th>Type</th><th>State</th><th>Mailbox</th><th>Msg/s</th><th>Processed</th><th>Worker</th><th>Last message</th></tr></thead>
     <tbody>${capped.map(a => `<tr data-addr="${esc(a.address)}" tabindex="0" ${a.address === selectedActor ? 'data-selected="true"' : ''}>
       <td class="mono">${esc(shortAddr(a.address))}${a.name ? `<br><span class="muted">${esc(a.name)}</span>` : ''}</td>
@@ -354,15 +412,10 @@ function renderRoster(node) {
       <td><span class="muted" title="${esc(a.last_msg_type || '')}">${typeShort(a.last_msg_type)}</span></td>
     </tr>`).join('')}</tbody>
   </table>`;
-  wrap.querySelectorAll('tr[data-addr]').forEach(tr => {
-    const select = () => {
-      selectedActor = tr.getAttribute('data-addr');
-      pushUrl();
-      render();
-    };
-    tr.addEventListener('click', select);
-    tr.addEventListener('keydown', e => { if (e.key === 'Enter') select(); });
-  });
+  }
+  if (html === lastRosterHtml) return;
+  wrap.innerHTML = html;
+  lastRosterHtml = html;
 }
 
 function shortAddr(address) {
@@ -393,6 +446,7 @@ function startDetailPolling() {
 function renderDossier(d) {
   const slot = document.getElementById('dossier-slot');
   if (!slot) return;
+
   const diet = (d.message_type_counts || []).slice().sort((a, b) => b.count - a.count);
   const dietMax = Math.max(1, ...diet.map(x => x.count));
   const lastName = d.last_msg_type;
@@ -405,14 +459,14 @@ function renderDossier(d) {
   const receiptsHtml = receipts.length ? `<table class="receipts">
       <thead><tr><th>When</th><th>Message type</th><th>Folded</th></tr></thead>
       <tbody>${receipts.map(r => `<tr>
-        <td class="muted">${ago(r.ms_ago)} ago</td>
+        <td class="muted">${agoSpan(Date.now() - r.ms_ago)} ago</td>
         <td><span class="mono" title="${esc(r.ty)}">${typeShort(r.ty)}</span></td>
         <td class="muted">${r.folded ? '+' + fmt(r.folded) + ' sampled' : '—'}</td>
       </tr>`).join('')}</tbody>
     </table>
     <div class="notice">showing last ${fmt(receipts.length)} receipts · ${fmt(d.sampled_out)} messages sampled out · ${fmt(d.messages_processed)} processed total</div>`
     : '<div class="empty">no message receipts folded yet</div>';
-  slot.innerHTML = `<section class="panel dossier">
+  const html = `<section class="panel dossier">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">
       <h2 style="margin:0">${typeShort(d.actor_type)} <span class="muted mono" style="font-size:12px">${esc(shortAddr(d.address))}</span></h2>
       <button id="dossier-close" aria-label="Close dossier" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px">×</button>
@@ -437,31 +491,56 @@ function renderDossier(d) {
     <h2>Message history</h2>
     ${receiptsHtml}
   </section>`;
-  document.getElementById('dossier-close').addEventListener('click', () => {
-    selectedActor = null;
-    pushUrl();
-    render();
-  });
+  if (html !== lastDossierHtml) {
+    slot.innerHTML = html;
+    lastDossierHtml = html;
+  }
   const history = d.history || [];
   const canvas = document.getElementById('dossier-spark');
   if (canvas && history.length > 1) {
     const ctx = canvas.getContext('2d');
     drawLine(ctx, history.map(h => h.msg_per_sec), '#60a5fa');
   }
+  updateAgo();
 }
 
-function bindCards() {
-  document.querySelectorAll('.node-card').forEach(card => {
-    card.addEventListener('click', e => {
-      e.preventDefault();
-      selectedStream = card.getAttribute('data-stream');
-      selectedActor = null;
-      pushUrl();
-      render();
-    });
-  });
-}
 
+// A2: delegation on the persistent #page container. Cards, roster rows and
+// the dossier close button are rebuilt by render passes; listeners bound at
+// startup mean a press straddling a rebuild still lands on the right target.
+const pageEl = document.getElementById('page');
+pageEl.addEventListener('click', e => {
+  if (e.target.closest('#dossier-close')) {
+    selectedActor = null;
+    pushUrl();
+    render();
+    return;
+  }
+  const rosterRow = e.target.closest('tr[data-addr]');
+  if (rosterRow) {
+    selectedActor = rosterRow.getAttribute('data-addr');
+    pushUrl();
+    render();
+    return;
+  }
+  const card = e.target.closest('a.node-card');
+  if (card) {
+    e.preventDefault();
+    selectedStream = card.getAttribute('data-stream');
+    selectedActor = null;
+    pushUrl();
+    render();
+  }
+});
+pageEl.addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  const rosterRow = e.target.closest('tr[data-addr]');
+  if (rosterRow) {
+    selectedActor = rosterRow.getAttribute('data-addr');
+    pushUrl();
+    render();
+  }
+});
 refresh();
 setInterval(refresh, POLL_MS);
 </script>
