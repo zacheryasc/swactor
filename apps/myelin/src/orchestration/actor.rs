@@ -33,7 +33,6 @@ pub(crate) enum OrchestratorMsg {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
-        telemetry_publisher: ActorAddress,
         readiness_id: u64,
     },
     ObserveNodeRuntimeReadyAck {
@@ -154,7 +153,6 @@ pub(crate) enum OrchestratorReport {
         stage_index: u32,
         endpoint: EndpointAddr,
         node_actor: ActorAddress,
-        telemetry_publisher: ActorAddress,
         readiness_id: u64,
     },
     NodeRuntimeReadyAck {
@@ -326,7 +324,6 @@ impl ActorInterface for OrchestratorActor {
                 stage_index,
                 endpoint,
                 node_actor,
-                telemetry_publisher,
                 readiness_id,
             } => {
                 if let Some(report_to) = self.report_to {
@@ -338,7 +335,6 @@ impl ActorInterface for OrchestratorActor {
                             stage_index,
                             endpoint,
                             node_actor,
-                            telemetry_publisher,
                             readiness_id,
                         },
                     );

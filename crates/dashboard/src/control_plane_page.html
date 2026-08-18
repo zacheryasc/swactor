@@ -59,7 +59,7 @@
     #status { font-family: var(--mono); font-size: 13px; color: var(--amber); }
     a.node-card { color: inherit; text-decoration: none; display: block; }
     .node-card.orchestrator { grid-column: 1 / -1; border-color: var(--amber); background: var(--card-hover); }
-    .node-card .role { display: inline-flex; margin-left: 8px; padding: 2px 6px; border: 1px solid var(--amber); border-radius: var(--r); color: var(--amber); font: 600 10px/1.4 var(--mono); text-transform: uppercase; letter-spacing: .07em; vertical-align: 2px; }
+    .node-card.orchestrator .role { margin-bottom: 6px; color: var(--muted); font: 600 9px/1.2 var(--mono); text-transform: uppercase; letter-spacing: .12em; }
     :is(a, button, input, summary):focus-visible, tr[data-addr]:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
     .node-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); padding: 14px; cursor: pointer; transition: border-color var(--t), background var(--t); }
@@ -262,7 +262,8 @@ function nodeCard(node) {
   // supervisors; it renders as a pass-filled span so the card markup — and
   // with it the whole grid — stays byte-identical between polls.
   return `<a class="node-card${isOrchestrator ? ' orchestrator' : ''}" data-stream="${esc(node.stream.key)}" data-live="${node.live ? 'true' : 'false'}" href="?stream=${encodeURIComponent(node.stream.key)}">
-    <h3>${esc(node.stream.node)}${role} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
+    ${role}
+    <h3>${esc(node.stream.node)} <span class="muted" style="font-size:12px">life ${fmt(node.stream.life)}</span></h3>
     <div class="meta">${proc}seen <span data-seen></span> ago · <span data-stats></span>${label}</div>
     ${summary.poisoned ? `<div class="notice err">${fmt(summary.poisoned)} poisoned actor(s)</div>` : ''}
   </a>`;

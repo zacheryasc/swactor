@@ -7,7 +7,9 @@
 //! intent and facts so a restarted daemon can adopt what still exists and
 //! never silently re-provisions.
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -39,7 +41,6 @@ pub(crate) enum NodeStatus {
 pub(crate) struct RuntimeFacts {
     pub endpoint: String,
     pub node_actor: ActorAddress,
-    pub telemetry_publisher: ActorAddress,
     pub swim_node_id: DistNodeId,
     pub stage_index: u32,
     pub readiness_id: u64,

@@ -104,11 +104,11 @@ pub fn spawn_pull_server(
     });
 }
 
-/// Supervisor side: dial a node on `TELEMETRY_ALPN`, send the pull request,
-/// and stream answering events into `fanout` as they arrive (incrementally,
-/// not buffered until stream end). The header is reported through
-/// `on_header` first so the caller can register stream/channel metadata
-/// before any frame lands.
+/// Supervisor side: retain a pull subscription to a node on `TELEMETRY_ALPN`.
+///
+/// A transport interruption reconnects with bounded backoff. Returning after
+/// the first EOF leaves a healthy node permanently stale, which is especially
+/// easy to trigger while several freshly-bootstrapped nodes answer at once.
 pub fn spawn_pull_collector(
     engine: &EngineHandle,
     endpoint: Endpoint,
@@ -119,34 +119,73 @@ pub fn spawn_pull_collector(
     fanout: std::sync::Arc<telemetry::DeliveryFanout>,
     on_header: std::sync::mpsc::Sender<TelemetryQuicHeader>,
 ) {
+    let engine_handle = engine.clone();
     engine.spawn(async move {
         let peer_id = peer.id.to_string();
-        let Ok(conn) = endpoint.connect(peer, TELEMETRY_ALPN).await else {
-            eprintln!("telemetry-pull: connect to {peer_id} failed");
-            return;
-        };
-        let Ok(mut req) = conn.open_uni().await else {
-            eprintln!("telemetry-pull: open request stream to {peer_id} failed");
-            return;
-        };
-        if let Err(error) = write_pull_request(&mut req, flow_id, &token, &request).await {
-            eprintln!("telemetry-pull: write request to {peer_id} failed: {error}");
-            return;
-        }
-        let Ok(mut recv) = conn.accept_uni().await else {
-            eprintln!("telemetry-pull: no answer stream from {peer_id}");
-            return;
-        };
-        let Ok(header) = read_header(&mut recv).await else {
-            eprintln!("telemetry-pull: answer header from {peer_id} unreadable");
-            return;
-        };
-        let _ = on_header.send(header.clone());
-        let stream = header.stream.clone();
-        while let Ok(Some(event)) = read_next_event(&mut recv, &stream).await {
-            fanout.publish(event);
+        let mut retry_delay = Duration::from_millis(250);
+        loop {
+            match collect_pull_once(
+                &endpoint, &peer, flow_id, &token, &request, &fanout, &on_header,
+            )
+            .await
+            {
+                Ok(()) => return,
+                Err(error) => {
+                    eprintln!(
+                        "telemetry-pull: {peer_id}: {error}; retrying in {} ms",
+                        retry_delay.as_millis()
+                    );
+                }
+            }
+            engine_handle.timer(retry_delay).await;
+            retry_delay = retry_delay
+                .checked_mul(2)
+                .unwrap_or(Duration::from_secs(5))
+                .min(Duration::from_secs(5));
         }
     });
+}
+
+async fn collect_pull_once(
+    endpoint: &Endpoint,
+    peer: &EndpointAddr,
+    flow_id: [u8; 16],
+    token: &[u8],
+    request: &telemetry::SubscriptionRequest,
+    fanout: &telemetry::DeliveryFanout,
+    on_header: &std::sync::mpsc::Sender<TelemetryQuicHeader>,
+) -> Result<(), String> {
+    let conn = endpoint
+        .connect(peer.clone(), TELEMETRY_ALPN)
+        .await
+        .map_err(|error| format!("connect failed: {error}"))?;
+    let mut req = conn
+        .open_uni()
+        .await
+        .map_err(|error| format!("open request stream failed: {error}"))?;
+    write_pull_request(&mut req, flow_id, token, request)
+        .await
+        .map_err(|error| format!("write request failed: {error}"))?;
+    let mut recv = conn
+        .accept_uni()
+        .await
+        .map_err(|error| format!("no answer stream: {error}"))?;
+    let header = read_header(&mut recv)
+        .await
+        .map_err(|error| format!("answer header unreadable: {error}"))?;
+    if on_header.send(header.clone()).is_err() {
+        return Ok(());
+    }
+    let stream = header.stream;
+    loop {
+        match read_next_event(&mut recv, &stream).await {
+            Ok(Some(event)) => {
+                fanout.publish(event);
+            }
+            Ok(None) => return Err("answer stream closed".to_owned()),
+            Err(error) => return Err(format!("read answer stream failed: {error}")),
+        }
+    }
 }
 const MAX_RECORD_BYTES: usize = 16 * 1024 * 1024;
 

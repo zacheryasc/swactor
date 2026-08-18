@@ -9,8 +9,6 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use swactor::actor::Message;
-use swactor::runtime::Inbox;
 use swactor_engine::{Engine, TokioBackend, TokioConfig};
 use swactor_job_runner::{
     Job, JobDone, JobState, NodeJobActor, OrchestratorJobActor, OrchestratorJobMsg, Workspace,
@@ -79,10 +77,6 @@ fn job_runs_across_two_nodes_over_real_iroh() {
     // route to it through the converged directory.
     let (engine_b, driver_b, stack_b) = build_composition();
     let sender_b = stack_b.runtime.create_sender();
-    let done_b_echo = stack_b
-        .runtime
-        .new_inbox::<JobDone>()
-        .expect("worker echo inbox");
     // Placeholder orchestrator address: the real one is on A; the node only
     // needs it once the orchestrator submits. We point the node at A's
     // orchestrator after it exists (address is fixed below), but the node actor
@@ -112,17 +106,18 @@ fn job_runs_across_two_nodes_over_real_iroh() {
         .expect("spawn node job actor on B");
     stack_b.register_local_actor(driver_b.register_actor(job_actor, 1));
 
-    // Orchestrator (A) joins the worker (B) over iroh and waits for the directory
-    // to converge: A's route view must learn job_actor → B.
+    // Both control directions must be routable before Submit. A learning the
+    // worker route does not imply B has already learned the orchestrator route;
+    // submitting at that one-way boundary loses the first node event.
     driver_a_join(&stack_a, &_driver_a, &driver_b);
     stack_a.register_local_actor(_driver_a.register_actor(orch, 1));
 
     let converged = wait_until(CONVERGE_DEADLINE, || {
-        stack_a.route_view.read().unwrap().contains_key(&job_actor)
+        stack_a.route_owner(job_actor).is_some() && stack_b.route_owner(orch).is_some()
     });
     assert!(
         converged,
-        "directory did not converge: A never learned the worker's NodeJobActor"
+        "directory did not converge bidirectionally for orchestrator and worker actors"
     );
 
     let job = Job {

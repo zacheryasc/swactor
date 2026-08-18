@@ -19,8 +19,7 @@ use std::time::{Duration, Instant};
 use telemetry::frame::TelemetryEvent;
 use telemetry::{
     ChannelContent, ChannelId, Lifetime, NodeId, Record, StreamDescriptor, StreamId, StreamOrigin,
-    TELEMETRY_PUBLISHER_NAME, TelemetryEndpoint, TelemetryProducer, TelemetryPublisherActor,
-    TelemetrySubscribe, TelemetrySubscription,
+    TelemetryEndpoint, TelemetryProducer, TelemetrySubscription,
 };
 
 use crate::codecs::register_myelin_actor_codecs;
@@ -43,10 +42,7 @@ use distribution::node::DistributedNodeConfig;
 use distribution::telemetry::{MembershipTransition, SwimProbeEvent};
 use distribution::types::{MemberState, NodeId as DistNodeId};
 use iroh::EndpointAddr;
-use iroh_driver::{
-    EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, TelemetryPublishHandle,
-    TelemetryQuicHeader, spawn_pull_server,
-};
+use iroh_driver::{EDGE_ALPN, IrohDriver, IrohDriverConfig, TELEMETRY_ALPN, spawn_pull_server};
 use iroh_driver::{EndpointAddrMask, MVP_IROH_ENDPOINT_ADDR_MASK_ENV, advertised_endpoint};
 use parking_lot::Mutex;
 use serde_json::{Value, json};
@@ -1593,23 +1589,8 @@ fn run() -> Result<(), String> {
     let node_shutdown = |ds: &mut NodeTelemetry, phase: &str, status: &str, detail: Value| {
         emit_node_event(ds, &config, NODE_SHUTDOWN_CHANNEL, phase, status, detail)
     };
-    let telemetry_transport = driver.telemetry_publish_handle();
-    let telemetry_publisher = match stack
-        .runtime
-        .spawn(telemetry.publisher_actor(telemetry_transport))
-    {
-        Ok(actor) => actor,
-        Err(error) => {
-            node_boot(
-                &mut telemetry,
-                "telemetry_publisher",
-                "failed",
-                json!({"error":error.to_string()}),
-            );
-            return Err(format!("spawn telemetry publisher: {error}"));
-        }
-    };
-    stack.register_local_actor(driver.register_actor(telemetry_publisher, 1));
+    // Telemetry leaves this node exclusively through pull subscriptions served
+    // by `serve_telemetry_pulls` on `TELEMETRY_ALPN`; no publisher actor.
     let sampler_health_channel = telemetry.channel_by_name(NODE_SAMPLER_CHANNEL);
     let sampler_health_context = SamplerHealthContext::from_config(&config);
     spawn_host_gpu_sampler(
@@ -1632,12 +1613,6 @@ fn run() -> Result<(), String> {
         telemetry.channels.arena,
         Arc::clone(&arena_manager),
     );
-    node_boot(
-        &mut telemetry,
-        "telemetry_publisher",
-        "ready",
-        json!({"actor":telemetry_publisher,"name":TELEMETRY_PUBLISHER_NAME,"subscription_transport":"iroh"}),
-    );
     let worker_synthetic_id = format!(
         "myelin-worker-{}-{}-telemetry-preflight",
         config.logical_node_id, config.stage_index
@@ -1657,7 +1632,7 @@ fn run() -> Result<(), String> {
                 "producer_class":"rust-worker-node",
                 "synthetic_id":worker_synthetic_id,
                 "telemetry_endpoint":{
-                    "role":"worker-node-iroh-publisher",
+                    "role":"worker-node-iroh-pull-server",
                     "transport":"iroh-telemetry",
                     "endpoint_addr_mask":config.endpoint_addr_mask.as_str(),
                     "relay_mode":format!("{:?}", config.relay_mode),
@@ -1756,18 +1731,13 @@ fn run() -> Result<(), String> {
             "ready",
             json!({"framework":"none","workloads":"external_jobs"}),
         )?;
-        let mut pending_runtime_ready = PendingRuntimeReady::new(
-            &config,
-            advertised_self_endpoint.clone(),
-            node_actor,
-            telemetry_publisher,
-        );
+        let mut pending_runtime_ready =
+            PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
         let ready = json!({
             "type":"ready",
             "role":"node",
             "endpoint":advertised_self_endpoint.clone(),
             "node_actor":node_actor,
-            "telemetry_publisher":telemetry_publisher,
             "logical_node_id":config.logical_node_id,
             "stage_index":config.stage_index,
         });
@@ -1907,19 +1877,14 @@ fn run() -> Result<(), String> {
         }
     }
     let mut edge_runtime = WorkerEdgeRuntime::new(config.logical_node_id);
-    let mut pending_runtime_ready = PendingRuntimeReady::new(
-        &config,
-        advertised_self_endpoint.clone(),
-        node_actor,
-        telemetry_publisher,
-    );
+    let mut pending_runtime_ready =
+        PendingRuntimeReady::new(&config, advertised_self_endpoint.clone(), node_actor);
 
     let ready = json!({
         "type":"ready",
         "role":"node",
         "endpoint": advertised_self_endpoint.clone(),
         "node_actor": node_actor,
-        "telemetry_publisher": telemetry_publisher,
         "logical_node_id": config.logical_node_id,
         "stage_index": config.stage_index,
     });
@@ -2262,28 +2227,8 @@ impl NodeTelemetry {
             archive.drain(&self.by_id);
         }
     }
-
-    fn publisher_actor(&self, transport: TelemetryPublishHandle) -> TelemetryPublisherActor {
-        TelemetryPublisherActor::new(
-            Arc::clone(&self.endpoint),
-            move |subscribe: TelemetrySubscribe, subscription: TelemetrySubscription| {
-                let Ok(header) = TelemetryQuicHeader::from_snapshot(
-                    subscribe.flow_id,
-                    subscribe.token,
-                    subscription.snapshot(),
-                ) else {
-                    return;
-                };
-                transport.publish_subscription(
-                    subscribe.collector,
-                    header,
-                    subscription,
-                    Duration::from_millis(10),
-                );
-            },
-        )
-    }
 }
+
 fn serve_telemetry_pulls(
     driver: &IrohDriver,
     engine: &EngineHandle,
@@ -2378,7 +2323,6 @@ struct PendingRuntimeReady {
     stage_index: u32,
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
-    telemetry_publisher: ActorAddress,
     coordinator: Option<DistNodeId>,
     readiness_id: u64,
     attempts: u32,
@@ -2389,19 +2333,13 @@ struct PendingRuntimeReady {
 }
 
 impl PendingRuntimeReady {
-    fn new(
-        config: &DeploymentConfig,
-        endpoint: EndpointAddr,
-        node_actor: ActorAddress,
-        telemetry_publisher: ActorAddress,
-    ) -> Self {
+    fn new(config: &DeploymentConfig, endpoint: EndpointAddr, node_actor: ActorAddress) -> Self {
         Self {
             run_id: config.run_id,
             node_id: config.logical_node_id,
             stage_index: config.stage_index,
             endpoint,
             node_actor,
-            telemetry_publisher,
             coordinator: config
                 .coordinator_endpoint
                 .as_ref()
@@ -2463,7 +2401,6 @@ impl PendingRuntimeReady {
                     stage_index: self.stage_index,
                     endpoint: self.endpoint.clone(),
                     node_actor: self.node_actor,
-                    telemetry_publisher: self.telemetry_publisher,
                     readiness_id: self.readiness_id,
                 },
             )

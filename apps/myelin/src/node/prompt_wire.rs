@@ -26,20 +26,6 @@ pub(crate) enum PromptEvent {
     },
 }
 
-impl PromptEvent {
-    pub(crate) fn request_id(&self) -> u64 {
-        match self {
-            Self::TextDelta { request_id, .. }
-            | Self::Done { request_id, .. }
-            | Self::Fault { request_id, .. } => *request_id,
-        }
-    }
-
-    pub(crate) fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done { .. } | Self::Fault { .. })
-    }
-}
-
 impl NetworkMessage for PromptEvent {
     fn type_tag() -> &'static str {
         "myelin::PromptEvent"

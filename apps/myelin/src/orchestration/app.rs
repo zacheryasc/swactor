@@ -5,6 +5,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -391,7 +392,7 @@ where
         json!({"actor":orchestrator_actor}),
     );
 
-    let stop_rx = stop_rx.unwrap_or_else(spawn_stop_listener);
+    let stop_signal = spawn_stop_listener(stop_rx);
 
     let provisioner = config.build_provisioner(stack.runtime.clone())?;
     bootstrap(
@@ -437,7 +438,7 @@ where
         obs_rx: &obs_rx,
         collector: &collector,
         orchestrator_reports: &orchestrator_reports,
-        stop_rx: &stop_rx,
+        stop_signal: stop_signal.as_ref(),
         dashboard: dashboard.as_ref(),
         orch_telemetry: &mut orch_telemetry,
         orch_stdio_rx: orch_stdio_rx.as_ref(),
@@ -1757,7 +1758,6 @@ impl Config {
 struct RuntimeReady {
     endpoint: EndpointAddr,
     node_actor: ActorAddress,
-    telemetry_publisher: ActorAddress,
     stage_index: u32,
     readiness_id: u64,
     swim_node_id: DistNodeId,
@@ -1800,14 +1800,14 @@ struct RuntimeReadyAckLoop<'a> {
     obs_rx: &'a mpsc::Receiver<PluginObservation>,
     collector: &'a FrameCollector,
     orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &'a mpsc::Receiver<()>,
+    stop_signal: &'a AtomicBool,
     dashboard: Option<&'a DashboardSupport>,
     orch_telemetry: &'a mut OrchTelemetry,
     orch_stdio_rx: Option<&'a mpsc::Receiver<OrchStdioLine>>,
     run_id: u64,
     orchestrator_node_id: u64,
     provider: &'a ProviderKind,
-    orchestrator_actor: ActorAddress,
+    engine: EngineHandle,
 }
 
 // synchronous process-control/orchestration sequencing; the engine drives all background work (ENGINE_SPEC.md §2)
@@ -1823,7 +1823,7 @@ fn wait_for_runtime_ready_acks(
         obs_rx,
         collector,
         orchestrator_reports,
-        stop_rx,
+        stop_signal,
         dashboard,
         orch_telemetry,
         orch_stdio_rx,
@@ -1877,7 +1877,7 @@ fn wait_for_runtime_ready_acks(
             run_id,
             orchestrator_node_id,
         );
-        if stop_requested(stop_rx) {
+        if stop_requested(stop_signal) {
             return Err(
                 "shutdown requested while waiting for runtime-ready acknowledgements".to_owned(),
             );
@@ -2060,11 +2060,12 @@ fn wait_for_runtime_readies(
         obs_rx,
         collector,
         orchestrator_reports,
-        stop_rx,
+        stop_signal,
         dashboard,
         orch_telemetry,
         orch_stdio_rx,
         run_id,
+        engine,
         provider,
         ..
     } = ctx;
@@ -2100,7 +2101,7 @@ fn wait_for_runtime_readies(
             run_id,
             expected_node_ids.first().copied().unwrap_or(0),
         );
-        if stop_requested(stop_rx) {
+        if stop_requested(stop_signal) {
             return Err("shutdown requested while waiting for pipeline nodes ready".to_owned());
         }
         while let Ok(observation) = obs_rx.try_recv() {
@@ -2121,7 +2122,6 @@ fn wait_for_runtime_readies(
                 stage_index,
                 endpoint,
                 node_actor,
-                telemetry_publisher,
                 readiness_id,
             } = report
                 && report_run_id == run_id
@@ -2129,12 +2129,24 @@ fn wait_for_runtime_readies(
                 && cluster.current_attempt(node_id)
                     == Some(::provisioning::NodeAttemptId(readiness_id))
             {
+                // Bootstrap-owned telemetry: the first runtime-ready report
+                // for a node dials its pull server and retains the live
+                // subscription for the node's lifetime — the same contract
+                // as the xtask demo's NodeTelemetryCollector.
+                if !pending.contains_key(&node_id) {
+                    collector.subscribe_node(
+                        &engine,
+                        driver.endpoint(),
+                        endpoint.clone(),
+                        run_id,
+                        node_id,
+                    );
+                }
                 pending.insert(
                     node_id,
                     RuntimeReady {
                         endpoint: endpoint.clone(),
                         node_actor,
-                        telemetry_publisher,
                         stage_index,
                         readiness_id,
                         swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
@@ -2254,33 +2266,37 @@ impl PluginObservationSink for ChannelObservationSink {
     }
 }
 
-fn stop_requested(stop_rx: &mpsc::Receiver<()>) -> bool {
-    stop_rx.try_recv().is_ok()
+fn stop_requested(stop_signal: &AtomicBool) -> bool {
+    stop_signal.load(Ordering::Acquire)
 }
 
 // top-level OS signal handling is process control, out of scope (ENGINE_SPEC.md §2)
 #[allow(clippy::disallowed_methods)]
-fn spawn_stop_listener() -> mpsc::Receiver<()> {
-    let (tx, rx) = mpsc::channel();
-    #[cfg(target_os = "linux")]
-    {
+fn spawn_stop_listener(external: Option<mpsc::Receiver<()>>) -> Arc<AtomicBool> {
+    let requested = Arc::new(AtomicBool::new(false));
+    let listener_requested = Arc::clone(&requested);
+    if let Some(external) = external {
         thread::spawn(move || {
-            let Ok(mut signals) = signal_hook::iterator::Signals::new([
-                signal_hook::consts::signal::SIGINT,
-                signal_hook::consts::signal::SIGTERM,
-            ]) else {
-                return;
-            };
-            if signals.forever().next().is_some() {
-                let _ = tx.send(());
+            if external.recv().is_ok() {
+                listener_requested.store(true, Ordering::Release);
             }
         });
+        return requested;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        drop(tx);
-    }
-    rx
+
+    #[cfg(target_os = "linux")]
+    thread::spawn(move || {
+        let Ok(mut signals) = signal_hook::iterator::Signals::new([
+            signal_hook::consts::signal::SIGINT,
+            signal_hook::consts::signal::SIGTERM,
+        ]) else {
+            return;
+        };
+        if signals.forever().next().is_some() {
+            listener_requested.store(true, Ordering::Release);
+        }
+    });
+    requested
 }
 
 struct ServeCluster<'a> {
@@ -2289,7 +2305,7 @@ struct ServeCluster<'a> {
     obs_rx: &'a mpsc::Receiver<PluginObservation>,
     collector: &'a FrameCollector,
     orchestrator_reports: &'a swactor::runtime::Inbox<OrchestratorReport>,
-    stop_rx: &'a mpsc::Receiver<()>,
+    stop_signal: &'a AtomicBool,
     dashboard: Option<&'a DashboardSupport>,
     orch_telemetry: &'a mut OrchTelemetry,
     orch_stdio_rx: Option<&'a mpsc::Receiver<OrchStdioLine>>,
@@ -2345,14 +2361,14 @@ impl ServeCluster<'_> {
             obs_rx: self.obs_rx,
             collector: self.collector,
             orchestrator_reports: self.orchestrator_reports,
-            stop_rx: self.stop_rx,
+            stop_signal: self.stop_signal,
             dashboard: self.dashboard,
             orch_telemetry: self.orch_telemetry,
             orch_stdio_rx: self.orch_stdio_rx,
             run_id: self.run_id,
             orchestrator_node_id: self.orchestrator_node_id,
             provider: self.provider,
-            orchestrator_actor: self.orchestrator_actor,
+            engine: self.engine.clone(),
         }
     }
 
@@ -2494,13 +2510,6 @@ impl ServeCluster<'_> {
             .get(&logical_node_id)
             .cloned()
             .ok_or_else(|| format!("node {logical_node_id} did not announce runtime ready"))?;
-        self.collector.subscribe_node(
-            &self.engine,
-            self.driver.endpoint(),
-            ready.endpoint.clone(),
-            self.run_id,
-            logical_node_id,
-        );
         let acknowledged = wait_for_runtime_ready_acks(
             self.ack_context(),
             &[RuntimeReadyAckTarget {
@@ -2541,7 +2550,6 @@ impl ServeCluster<'_> {
                 endpoint: serde_json::to_string(&ready.endpoint)
                     .map_err(|error| format!("serialize node endpoint: {error}"))?,
                 node_actor: ready.node_actor,
-                telemetry_publisher: ready.telemetry_publisher,
                 swim_node_id: ready.swim_node_id,
                 stage_index: ready.stage_index,
                 readiness_id: ready.readiness_id,
@@ -2630,11 +2638,25 @@ impl ServeCluster<'_> {
             return;
         }
         let result = match command {
+            ControlCommand::Provision { count: 0, .. } => {
+                Err("provision count must be at least 1".to_owned())
+            }
+            ControlCommand::Provision { count, .. } if count > 8 => {
+                Err(format!("provision count {count} exceeds maximum 8"))
+            }
             ControlCommand::Provision { count, .. } => {
                 (0..count).try_for_each(|_| self.add_node().map(|_| ()))
             }
-            ControlCommand::Kill { node, .. } => {
-                parse_control_node_id(&node).and_then(|node_id| self.kill_node(node_id).map(|_| ()))
+            ControlCommand::Kill { node, .. } => parse_control_node_id(&node).and_then(|node_id| {
+                self.kill_node(node_id)?.then_some(()).ok_or_else(|| {
+                    format!("node {node_id} is not tracked or has no provision intent")
+                })
+            }),
+            ControlCommand::Remove { count: 0, .. } => {
+                Err("remove count must be at least 1".to_owned())
+            }
+            ControlCommand::Remove { count, .. } if count > 8 => {
+                Err(format!("remove count {count} exceeds maximum 8"))
             }
             ControlCommand::Remove { count, .. } => {
                 let mut ids = self
@@ -2669,17 +2691,31 @@ impl ServeCluster<'_> {
             stage_index,
             endpoint,
             node_actor,
-            telemetry_publisher,
             readiness_id,
         } = report
             && run_id == self.run_id
         {
+            // Bootstrap-owned telemetry: a new runtime generation announces a
+            // fresh pull server, so re-dial and retain the live subscription.
+            let known_readiness = self
+                .snapshot
+                .node(node_id)
+                .and_then(|node| node.runtime.as_ref())
+                .map(|runtime| runtime.readiness_id);
+            if known_readiness != Some(readiness_id) {
+                self.collector.subscribe_node(
+                    &self.engine,
+                    self.driver.endpoint(),
+                    endpoint.clone(),
+                    run_id,
+                    node_id,
+                );
+            }
             if let Some(node) = self.snapshot.node_mut(node_id) {
                 node.status = daemon::NodeStatus::Running;
                 node.runtime = Some(daemon::RuntimeFacts {
                     endpoint: serde_json::to_string(&endpoint).unwrap_or_default(),
                     node_actor,
-                    telemetry_publisher,
                     swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
                     stage_index,
                     readiness_id,
@@ -2717,9 +2753,10 @@ impl ServeCluster<'_> {
     }
 
     fn teardown_if_requested(&mut self) -> Result<(), String> {
-        // Local process children cannot be adopted, so detaching them on an
-        // interactive shutdown only creates invisible orphan processes.
-        if self.destroy_on_exit || self.provider.as_str() == "process" {
+        // Local process and Docker nodes are run-scoped development resources:
+        // Ctrl+C must not leave invisible processes or containers behind.
+        // Remote providers remain adoptable unless explicitly destroyed.
+        if self.destroy_on_exit || matches!(self.provider.as_str(), "process" | "docker") {
             for (_, mut cluster) in std::mem::take(&mut self.live_clusters) {
                 cluster.stop()?;
             }
@@ -2798,7 +2835,7 @@ fn serve_cluster(mut ctx: ServeCluster<'_>) -> Result<(), String> {
         while let Ok(command) = ctx.control_rx.try_recv() {
             ctx.handle_dashboard_command(command);
         }
-        if stop_requested(ctx.stop_rx) {
+        if stop_requested(ctx.stop_signal) {
             break;
         }
         thread::sleep(PUMP_INTERVAL);
