@@ -34,7 +34,6 @@ struct LocalDockerNode {
     spec: NodeProvisionSpec,
     sink: PluginSink,
     container_name: String,
-    stdin: Option<ChildStdin>,
 }
 
 pub(crate) struct LocalProcessPlugin {
@@ -89,6 +88,7 @@ fn docker_container_labels(prefix: &str, spec: &NodeProvisionSpec) -> Vec<String
         format!("myelin.daemon={prefix}"),
         format!("myelin.run={}", spec.run_id),
         format!("myelin.node={}", spec.node_id),
+        format!("myelin.attempt={}", spec.attempt_id),
     ]
 }
 
@@ -163,6 +163,58 @@ fn docker_labeled_containers(prefix: &str) -> Result<Vec<String>, String> {
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect())
+}
+
+fn docker_containers_for_spec(
+    prefix: &str,
+    spec: &NodeProvisionSpec,
+) -> Result<Vec<String>, String> {
+    let output = Command::new("docker")
+        .args(["ps", "-a"])
+        .arg("--filter")
+        .arg(format!("label=myelin.daemon={prefix}"))
+        .arg("--filter")
+        .arg(format!("label=myelin.run={}", spec.run_id))
+        .arg("--filter")
+        .arg(format!("label=myelin.node={}", spec.node_id))
+        .args(["--format", "{{.Names}}"])
+        .output()
+        .map_err(|error| format!("list Docker containers for node {}: {error}", spec.node_id))?;
+    if !output.status.success() {
+        return Err(format!(
+            "list Docker containers for node {} exited with {}: {}",
+            spec.node_id,
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn docker_container_for_spec(
+    prefix: &str,
+    spec: &NodeProvisionSpec,
+) -> Result<Option<String>, String> {
+    let expected = docker_container_name(prefix, spec);
+    if !docker_container_is_absent(&expected)? {
+        return Ok(Some(expected));
+    }
+    let matches = docker_containers_for_spec(prefix, spec)?;
+    match matches.as_slice() {
+        [] => Ok(None),
+        [container] => Ok(Some(container.clone())),
+        _ => Err(format!(
+            "multiple Docker containers match run {} node {}: {}",
+            spec.run_id,
+            spec.node_id,
+            matches.join(", ")
+        )),
+    }
 }
 
 fn docker_mount_arg(mount: &ProviderMount) -> String {
@@ -587,7 +639,6 @@ impl ProvisionPlugin for LocalDockerPlugin {
                 container_name: docker_container_name(&self.container_name_prefix, &spec),
                 spec,
                 sink,
-                stdin: None,
             },
         );
         Ok(handle)
@@ -598,10 +649,13 @@ impl ProvisionPlugin for LocalDockerPlugin {
     fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
         let node = self
             .nodes
-            .get_mut(&handle.id)
+            .get(&handle.id)
             .ok_or_else(|| format!("Docker node handle {} is absent", handle.id))?;
-        if node.stdin.is_some() {
-            return Ok(());
+        if !docker_container_is_absent(&node.container_name)? {
+            return Err(format!(
+                "Docker container {} already exists before bootstrap",
+                node.container_name
+            ));
         }
         let spec = node.spec.clone();
         let sink = node.sink.clone();
@@ -609,7 +663,7 @@ impl ProvisionPlugin for LocalDockerPlugin {
         let mut command = Command::new("docker");
         command
             .arg("run")
-            .arg("--rm")
+            .arg("-d")
             .arg("--add-host")
             .arg("host.docker.internal:host-gateway")
             .arg("--name")
@@ -617,7 +671,6 @@ impl ProvisionPlugin for LocalDockerPlugin {
         for label in docker_container_labels(&self.container_name_prefix, &spec) {
             command.arg("--label").arg(label);
         }
-        command.arg("-i");
         let docker_gpus = spec
             .env
             .iter()
@@ -652,46 +705,18 @@ impl ProvisionPlugin for LocalDockerPlugin {
         for arg in &spec.args {
             command.arg(arg);
         }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("spawn Docker node {}: {e}", spec.node_id))?;
-
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = Command::new("docker")
-                .arg("rm")
-                .arg("-f")
-                .arg(&container_name)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+        let output = command
+            .output()
+            .map_err(|error| format!("run Docker node {}: {error}", spec.node_id))?;
+        if !output.status.success() {
             return Err(format!(
-                "Docker node {} did not expose piped stdio",
-                spec.node_id
+                "run Docker node {} exited with {}: {}",
+                spec.node_id,
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
             ));
-        };
-        node.stdin = Some(stdin);
-        spawn_stdout_reader(spec.clone(), sink.clone(), stdout);
-        spawn_stderr_reader(spec.clone(), sink.clone(), stderr);
-        thread::spawn(move || match child.wait() {
-            Ok(status) => sink.observe(PluginObservation::Exited {
-                run_id: spec.run_id,
-                node_id: spec.node_id,
-                status: status.code(),
-            }),
-            Err(error) => sink.observe(PluginObservation::Failed {
-                run_id: spec.run_id,
-                node_id: spec.node_id,
-                reason: format!("wait Docker node: {error}"),
-            }),
-        });
-        Ok(())
+        }
+        observe_docker_container(spec, sink, container_name, "all")
     }
 
     fn complete_bootstrap(&mut self, _handle: &PluginNodeHandle) -> Result<(), String> {
@@ -699,44 +724,10 @@ impl ProvisionPlugin for LocalDockerPlugin {
     }
 
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String> {
-        let Some(mut node) = self.nodes.remove(&handle.id) else {
+        let Some(node) = self.nodes.remove(&handle.id) else {
             return Ok(());
         };
-        let Some(stdin) = node.stdin.as_mut() else {
-            return Ok(());
-        };
-        let _ = writeln!(stdin, "shutdown");
-        let _ = stdin.flush();
-        let result = match Command::new("docker")
-            .arg("stop")
-            .arg("-t")
-            .arg("2")
-            .arg(&node.container_name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => Ok(()),
-            Ok(status) => match docker_container_is_absent(&node.container_name) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(format!(
-                    "docker stop {} exited with {status}",
-                    node.container_name
-                )),
-                Err(inspect_error) => Err(format!(
-                    "docker stop {} exited with {status}; {inspect_error}",
-                    node.container_name
-                )),
-            },
-            Err(error) => match docker_container_is_absent(&node.container_name) {
-                Ok(true) => Ok(()),
-                Ok(false) => Err(format!("docker stop {}: {error}", node.container_name)),
-                Err(inspect_error) => Err(format!(
-                    "docker stop {}: {error}; {inspect_error}",
-                    node.container_name
-                )),
-            },
-        };
+        let result = remove_docker_container(&node.container_name);
         if result.is_err() {
             self.nodes.insert(handle.id, node);
         }
@@ -748,10 +739,10 @@ impl ProvisionPlugin for LocalDockerPlugin {
         spec: &NodeProvisionSpec,
         sink: PluginSink,
     ) -> Result<Option<AdoptedNode>, String> {
-        let container_name = docker_container_name(&self.container_name_prefix, spec);
-        if docker_container_is_absent(&container_name)? {
+        let Some(container_name) = docker_container_for_spec(&self.container_name_prefix, spec)?
+        else {
             return Ok(None);
-        }
+        };
         let running = docker_container_is_running(&container_name)?;
         let handle = PluginNodeHandle {
             id: self.next_handle_id,
@@ -759,52 +750,18 @@ impl ProvisionPlugin for LocalDockerPlugin {
         };
         self.next_handle_id = self.next_handle_id.wrapping_add(1).max(1);
         if running {
-            // Follow the adopted container's logs and wait for its exit; no
-            // lifecycle action is taken — adoption is observation-only.
-            for (_stream, stdout_flag) in [("stdout", true), ("stderr", false)] {
-                let mut logs = Command::new("docker");
-                logs.arg("logs")
-                    .arg("-f")
-                    .arg("--tail")
-                    .arg("0")
-                    .arg(if stdout_flag { "--stdout" } else { "--stderr" })
-                    .arg(&container_name);
-                if let Ok(child) = logs.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
-                    if let Some(out) = child.stdout {
-                        if stdout_flag {
-                            spawn_stdout_reader(spec.clone(), sink.clone(), out);
-                        } else {
-                            spawn_stderr_reader(spec.clone(), sink.clone(), out);
-                        }
-                    }
-                }
-            }
-            let wait_spec = spec.clone();
-            let wait_sink = sink.clone();
-            let wait_name = container_name.clone();
-            thread::spawn(move || {
-                let status = Command::new("docker").arg("wait").arg(&wait_name).output();
-                let code = status.ok().and_then(|output| {
-                    String::from_utf8_lossy(&output.stdout)
-                        .trim()
-                        .parse::<i32>()
-                        .ok()
-                });
-                wait_sink.observe(PluginObservation::Exited {
-                    run_id: wait_spec.run_id,
-                    node_id: wait_spec.node_id,
-                    status: code,
-                });
-            });
+            // Replay this container's bootstrap log into the fresh daemon,
+            // then follow new output. The replay supplies runtime facts when
+            // the prior daemon died before persisting readiness.
+            observe_docker_container(spec.clone(), sink.clone(), container_name.clone(), "all")?;
         }
-        let adopted_name = docker_container_name(&self.container_name_prefix, spec);
+        let adopted_name = container_name.clone();
         self.nodes.insert(
             handle.id,
             LocalDockerNode {
                 spec: spec.clone(),
                 sink: sink.clone(),
                 container_name,
-                stdin: None,
             },
         );
         sink.observe(PluginObservation::TelemetryFrame {
@@ -834,20 +791,11 @@ impl ProvisionPlugin for LocalDockerPlugin {
     }
 
     fn stop_by_spec(&mut self, spec: &NodeProvisionSpec, sink: PluginSink) -> Result<bool, String> {
-        let container_name = docker_container_name(&self.container_name_prefix, spec);
-        if docker_container_is_absent(&container_name)? {
+        let Some(container_name) = docker_container_for_spec(&self.container_name_prefix, spec)?
+        else {
             return Ok(false);
-        }
-        let status = Command::new("docker")
-            .arg("rm")
-            .arg("-f")
-            .arg(&container_name)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map_err(|error| format!("docker rm {container_name}: {error}"))?;
-        let removed =
-            status.success() || matches!(docker_container_is_absent(&container_name), Ok(true));
+        };
+        remove_docker_container(&container_name)?;
         sink.observe(PluginObservation::TelemetryFrame {
             run_id: spec.run_id,
             node_id: spec.node_id,
@@ -856,21 +804,82 @@ impl ProvisionPlugin for LocalDockerPlugin {
                 "type":"DockerContainerRemoved",
                 "provider":"Docker",
                 "container":container_name,
-                "removed":removed,
-                "exit_ok":status.success(),
+                "removed":true,
+                "exit_ok":true,
             })
             .to_string(),
         });
-        if removed {
-            Ok(true)
-        } else {
-            Err(format!("docker rm {container_name} exited with {status}"))
-        }
+        Ok(true)
     }
 
     fn detach_all(&mut self) {
         self.nodes.clear();
     }
+}
+
+fn remove_docker_container(container_name: &str) -> Result<(), String> {
+    let status = Command::new("docker")
+        .arg("rm")
+        .arg("-f")
+        .arg(container_name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("docker rm {container_name}: {error}"))?;
+    if status.success() || matches!(docker_container_is_absent(container_name), Ok(true)) {
+        Ok(())
+    } else {
+        Err(format!("docker rm {container_name} exited with {status}"))
+    }
+}
+
+fn observe_docker_container(
+    spec: NodeProvisionSpec,
+    sink: PluginSink,
+    container_name: String,
+    tail: &str,
+) -> Result<(), String> {
+    let mut logs = Command::new("docker");
+    let mut logs = logs
+        .arg("logs")
+        .arg("--follow")
+        .arg("--tail")
+        .arg(tail)
+        .arg(&container_name)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("follow Docker logs for {container_name}: {error}"))?;
+    let stdout = logs
+        .stdout
+        .take()
+        .ok_or_else(|| format!("Docker logs for {container_name} has no stdout"))?;
+    let stderr = logs
+        .stderr
+        .take()
+        .ok_or_else(|| format!("Docker logs for {container_name} has no stderr"))?;
+    spawn_stdout_reader(spec.clone(), sink.clone(), stdout);
+    spawn_stderr_reader(spec.clone(), sink.clone(), stderr);
+    thread::spawn(move || {
+        let _ = logs.wait();
+    });
+
+    let wait_name = container_name;
+    thread::spawn(move || {
+        let status = Command::new("docker").arg("wait").arg(&wait_name).output();
+        let code = status.ok().and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<i32>()
+                .ok()
+        });
+        sink.observe(PluginObservation::Exited {
+            run_id: spec.run_id,
+            node_id: spec.node_id,
+            status: code,
+        });
+    });
+    Ok(())
 }
 
 fn spawn_stdout_reader(

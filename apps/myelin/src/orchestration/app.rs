@@ -2353,6 +2353,9 @@ fn parse_control_node_id(value: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("control node id {value:?} contains no numeric logical id"))
 }
 
+fn destroys_provider_resources_on_exit(provider: &str, explicitly_requested: bool) -> bool {
+    explicitly_requested || provider == "process"
+}
 impl ServeCluster<'_> {
     fn ack_context(&mut self) -> RuntimeReadyAckLoop<'_> {
         RuntimeReadyAckLoop {
@@ -2427,6 +2430,11 @@ impl ServeCluster<'_> {
                                     "snapshot node {node_id} telemetry endpoint is invalid: {error}"
                                 )
                             })?;
+                        // The daemon identity survives restart but its direct
+                        // socket addresses do not. Dial the worker from the
+                        // fresh endpoint so SWIM and actor routing can
+                        // converge over the new connection.
+                        self.driver.join(std::slice::from_ref(&endpoint));
                         self.collector.subscribe_node(
                             &self.engine,
                             self.driver.endpoint(),
@@ -2491,6 +2499,18 @@ impl ServeCluster<'_> {
             logical_node_id,
             0,
         )?;
+        // Persist the complete provider intent before creating anything. If
+        // the daemon dies during bootstrap, restart can recover the labeled
+        // resource by run/node identity even before its attempt is known.
+        self.snapshot.upsert_node(daemon::SnapshotNode {
+            logical_node_id,
+            spec: Some(spec.clone()),
+            provider_ref: Some(self.provisioner.provider_ref_for(&spec)),
+            status: daemon::NodeStatus::Running,
+            runtime: None,
+            last_seen_unix_ms: daemon::unix_ms_now(),
+        });
+        self.save_snapshot()?;
         self.emit_command_event(
             logical_node_id,
             ProvisionEventKind::ProvisionStart,
@@ -2505,19 +2525,45 @@ impl ServeCluster<'_> {
             self.sink.clone(),
         )?;
         let readies =
-            wait_for_runtime_readies(self.ack_context(), &[logical_node_id], &mut cluster)?;
+            match wait_for_runtime_readies(self.ack_context(), &[logical_node_id], &mut cluster) {
+                Ok(readies) => readies,
+                Err(error) => {
+                    if stop_requested(self.stop_signal)
+                        && !destroys_provider_resources_on_exit(
+                            self.provider.as_str(),
+                            self.destroy_on_exit,
+                        )
+                    {
+                        cluster.detach();
+                    }
+                    return Err(error);
+                }
+            };
         let ready = readies
             .get(&logical_node_id)
             .cloned()
             .ok_or_else(|| format!("node {logical_node_id} did not announce runtime ready"))?;
-        let acknowledged = wait_for_runtime_ready_acks(
+        let acknowledged = match wait_for_runtime_ready_acks(
             self.ack_context(),
             &[RuntimeReadyAckTarget {
                 node_id: logical_node_id,
                 ready: ready.clone(),
             }],
             &mut cluster,
-        )?;
+        ) {
+            Ok(acknowledged) => acknowledged,
+            Err(error) => {
+                if stop_requested(self.stop_signal)
+                    && !destroys_provider_resources_on_exit(
+                        self.provider.as_str(),
+                        self.destroy_on_exit,
+                    )
+                {
+                    cluster.detach();
+                }
+                return Err(error);
+            }
+        };
         if !acknowledged {
             return Err(format!(
                 "node {logical_node_id} changed attempt before runtime-ready acknowledgement"
@@ -2725,9 +2771,89 @@ impl ServeCluster<'_> {
         }
     }
 
+    fn recover_runtime_from_bootstrap(
+        &mut self,
+        observation: &PluginObservation,
+    ) -> Result<bool, String> {
+        let PluginObservation::TelemetryFrame {
+            run_id,
+            node_id,
+            channel,
+            payload,
+        } = observation
+        else {
+            return Ok(false);
+        };
+        if *run_id != self.run_id
+            || channel != "myelin.node.bootstrap"
+            || self
+                .snapshot
+                .node(*node_id)
+                .is_none_or(|node| node.runtime.is_some())
+        {
+            return Ok(false);
+        }
+        let event: Value = serde_json::from_str(payload)
+            .map_err(|error| format!("parse node {node_id} bootstrap telemetry: {error}"))?;
+        if event.get("phase").and_then(Value::as_str) != Some("runtime_ready_local")
+            || event.get("status").and_then(Value::as_str) != Some("ready")
+        {
+            return Ok(false);
+        }
+        let detail = event
+            .get("detail")
+            .ok_or_else(|| format!("node {node_id} runtime-ready event has no detail"))?;
+        let endpoint: EndpointAddr = serde_json::from_value(
+            detail
+                .get("endpoint")
+                .cloned()
+                .ok_or_else(|| format!("node {node_id} runtime-ready event has no endpoint"))?,
+        )
+        .map_err(|error| format!("parse node {node_id} runtime-ready endpoint: {error}"))?;
+        let node_actor = serde_json::from_value(
+            detail
+                .get("node_actor")
+                .cloned()
+                .ok_or_else(|| format!("node {node_id} runtime-ready event has no actor"))?,
+        )
+        .map_err(|error| format!("parse node {node_id} runtime-ready actor: {error}"))?;
+        let stage_index = detail
+            .get("stage_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| format!("node {node_id} runtime-ready event has no stage index"))?;
+        let readiness_id = detail
+            .get("readiness_id")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("node {node_id} runtime-ready event has no readiness id"))?;
+
+        self.driver.join(std::slice::from_ref(&endpoint));
+        self.collector.subscribe_node(
+            &self.engine,
+            self.driver.endpoint(),
+            endpoint.clone(),
+            *run_id,
+            *node_id,
+        );
+        if let Some(node) = self.snapshot.node_mut(*node_id) {
+            node.status = daemon::NodeStatus::Running;
+            node.runtime = Some(daemon::RuntimeFacts {
+                endpoint: serde_json::to_string(&endpoint)
+                    .map_err(|error| format!("serialize node {node_id} endpoint: {error}"))?,
+                node_actor,
+                swim_node_id: DistNodeId(*endpoint.id.as_bytes()),
+                stage_index,
+                readiness_id,
+            });
+            node.last_seen_unix_ms = daemon::unix_ms_now();
+        }
+        Ok(true)
+    }
+
     fn drain_observations(&mut self) -> Result<(), String> {
         let mut dirty = false;
         while let Ok(observation) = self.obs_rx.try_recv() {
+            dirty |= self.recover_runtime_from_bootstrap(&observation)?;
             emit_plugin_observation(
                 self.orch_telemetry,
                 self.dashboard,
@@ -2753,10 +2879,9 @@ impl ServeCluster<'_> {
     }
 
     fn teardown_if_requested(&mut self) -> Result<(), String> {
-        // Local process and Docker nodes are run-scoped development resources:
-        // Ctrl+C must not leave invisible processes or containers behind.
-        // Remote providers remain adoptable unless explicitly destroyed.
-        if self.destroy_on_exit || matches!(self.provider.as_str(), "process" | "docker") {
+        // Process-provider children cannot be adopted. Durable provider
+        // resources survive unless teardown was explicitly requested.
+        if destroys_provider_resources_on_exit(self.provider.as_str(), self.destroy_on_exit) {
             for (_, mut cluster) in std::mem::take(&mut self.live_clusters) {
                 cluster.stop()?;
             }
@@ -3219,4 +3344,17 @@ where
     value
         .parse::<T>()
         .map_err(|e| format!("invalid {name}={value:?}: {e}"))
+}
+
+#[cfg(test)]
+mod lifecycle_policy_tests {
+    use super::destroys_provider_resources_on_exit;
+
+    #[test]
+    fn durable_providers_survive_unrequested_daemon_shutdown() {
+        assert!(!destroys_provider_resources_on_exit("docker", false));
+        assert!(!destroys_provider_resources_on_exit("vastai", false));
+        assert!(destroys_provider_resources_on_exit("process", false));
+        assert!(destroys_provider_resources_on_exit("docker", true));
+    }
 }
