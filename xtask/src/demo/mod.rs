@@ -359,7 +359,6 @@ fn run_supervisor(args: &[String]) -> Result<(), String> {
         spawner,
     );
 
-
     // Bootstrap machinery: kind registry with the process logic, the
     // remote-stream fanout, and the pull collector.
     let fanout = Arc::new(telemetry::DeliveryFanout::new(1024));

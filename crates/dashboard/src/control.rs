@@ -10,8 +10,8 @@
 //! - `POST /control/kill` body `{"Kill":{"command_id":"...","node":"..."}}`
 //! - `POST /control/provision` body `{"Provision":{"command_id":"...","count":1}}`
 
-use std::sync::mpsc::Sender;
 use std::sync::OnceLock;
+use std::sync::mpsc::Sender;
 
 use serde::Deserialize;
 

@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use crate::search::OfferBrowseCriteria;
+
 use crate::types::{
     CreateInstanceRequest, InstanceInfo, LabeledInstance, LifecyclePolicy, Offer,
     ProviderInstanceStatus, ProvisionRequest, ProvisionedFleet, RunningInstance,
@@ -14,13 +16,15 @@ pub struct VastClient {
 }
 
 impl VastClient {
+    pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
+
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_base_url("https://cloud.vast.ai", api_key)
     }
 
     pub fn with_base_url(base_url: impl Into<String>, api_key: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(45))
+            .timeout(Self::REQUEST_TIMEOUT)
             .build()
             .expect("valid Vast.ai HTTP client");
         Self {
@@ -65,6 +69,13 @@ impl VastClient {
             target_count,
         )
         .await
+    }
+
+    pub async fn browse_offers(
+        &self,
+        criteria: &OfferBrowseCriteria,
+    ) -> Result<Vec<Offer>, String> {
+        crate::search::browse_offers(&self.http, &self.base_url, &self.api_key, criteria).await
     }
 
     pub async fn provision(&self, req: ProvisionRequest) -> Result<ProvisionedFleet, String> {

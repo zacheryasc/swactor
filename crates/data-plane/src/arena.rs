@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use telemetry::Record;
 use serde::{Deserialize, Serialize};
+use telemetry::Record;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArenaSnapshot {

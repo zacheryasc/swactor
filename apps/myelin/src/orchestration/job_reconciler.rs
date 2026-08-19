@@ -15,7 +15,7 @@ use provisioning::{
     ProviderKind, RetryPolicy, RoleId, RunId, RunNodeGroupSpec, SwactorId, SwarmJoinTemplate,
 };
 use swactor_job_runner::{Job, JobDone};
-use swactor_vastai::{LifecyclePolicy, SelectionPolicy};
+use swactor_vastai::SelectionPolicy;
 
 use crate::job_deploy::{self, NodeIdentity};
 use crate::orchestration::app::{
@@ -543,6 +543,3 @@ fn default_run_id() -> u64 {
 fn sessionless_orchestrator_ref() -> String {
     "job-orchestrator-identity-exchanged-out-of-band".to_owned()
 }
-
-#[allow(dead_code)]
-fn _assert_lifecycle_policy_is_linked(_: LifecyclePolicy) {}

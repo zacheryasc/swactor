@@ -30,10 +30,7 @@ fn runtime_basics() {
 
     assert!(inbox.try_recv().is_none(), "no processing before tick");
     tick_n(&mut host, 2);
-    assert!(
-        inbox.try_recv().is_some(),
-        "tick() drives processing"
-    );
+    assert!(inbox.try_recv().is_some(), "tick() drives processing");
 
     // Delegation (spawn child from handler) works on a single worker.
     let addr2 = rt.spawn(DelegatorActor).unwrap();
@@ -141,11 +138,7 @@ fn high_volume_delivery() {
         .unwrap();
 
         tick_n(&mut host, 100);
-        assert_eq!(
-            inbox.try_recv(),
-            Some(Done(50)),
-            "50-level chain completes"
-        );
+        assert_eq!(inbox.try_recv(), Some(Done(50)), "50-level chain completes");
     }
 }
 

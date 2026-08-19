@@ -8,15 +8,15 @@ Myelin is a persistent, dashboard-first control plane for manually managed compu
 myelin-orchestrator
   -> load stable iroh identity and cluster snapshot
   -> start engine, iroh endpoint, telemetry collector, and dashboard
-  -> adopt provider resources carrying this daemon's stable label
+  -> recover persisted provider resources without creating replacements
   -> idle event loop
-       - pump telemetry and membership
-       - dispatch add / kill / destroy commands
-       - atomically persist every state transition
-  -> on exit, detach provider handles without destroying resources
+       - ingest telemetry, membership, actor reports, and control messages
+       - dispatch explicit Provision / Kill effects
+       - atomically persist every state transition before dependent effects
+  -> on exit, detach durable-provider handles without destroying resources
 ```
 
-There is no prompt RPC, chat loop, desired-shape reconciler, or automatic node replacement. GGUF pipeline code remains dormant for historical compatibility. Job submission and a node re-join handshake are deferred.
+There is no desired-shape reconciler or automatic node replacement in the manual control path. Provisioning, Kill, recovery, runtime readiness, and worker rejoin are typed actor protocols; provider I/O and snapshot writes run outside actor handlers on the engine.
 
 ## Starting the daemon
 
@@ -32,37 +32,46 @@ The local default uses the process provider. Use Docker explicitly when required
 cargo run -p myelin -- --provider docker
 ```
 
-`MYELIN_DASHBOARD_PORT` selects the dashboard port. The dashboard root is the fleet-control view. Its control routes dispatch the same provider-neutral commands intended for a future CLI:
+Use Vast.ai without making valid credentials a startup prerequisite:
 
-- `Provision { command_id, count }`: add exactly `count` nodes, one transaction at a time.
-- `Kill { command_id, node }`: stop a node but retain its dead snapshot record.
-- `Remove { command_id, count }`: destroy the highest numbered managed nodes and remove their snapshot records.
-- `EstablishEdge { command_id, node }`: rejected; workload topology is not part of fleet control.
+```sh
+cargo run -p myelin -- --provider vastai
+```
 
-Every request carries a caller-generated command id. The daemon persists that id before any provider mutation; retries are ignored across restarts. This is deliberately at-most-once: a crash after acceptance may require a new operator command, but can never double-rent or double-destroy a resource. Node ids are monotonic and never reused.
+The dashboard starts in `unconfigured` or `configuration_error` state and accepts corrected credentials at runtime.
+
+`MYELIN_DASHBOARD_PORT` selects the dashboard port. The dashboard root remains the read-only Fleet view; `/provision` is the Myelin-owned mutation surface. Its provider-neutral control protocol includes:
+
+- `Provision { command_id, count, selected_offer_ids }`: create the requested nodes; Vast.ai requires and leases only the exact selected offer IDs.
+- `Kill { command_id, logical_node_id }`: stop one managed process/container or destroy one Vast.ai contract while retaining its terminal snapshot record.
+- `ConfigureProvider`: validate corrected in-memory Vast.ai credentials and bootstrap settings.
+- `SearchOffers`: inspect filtered Vast.ai offers without leasing.
+- `Query`: return provider readiness, recent commands, and managed node state.
+
+Every mutation carries a caller-generated command ID. The daemon persists the full command record and node intent before provider work. Reusing an ID returns the original record and never repeats create or destroy. Node IDs are monotonic and never reused.
 
 ## Durable state
 
 The state directory contains:
 
 - `identity.key`: 32-byte iroh secret key. Preserving it keeps the daemon endpoint stable across restarts.
-- `cluster.json`: schema-versioned snapshot containing the stable provider label, run id, next node id, accepted command ids, node specs, provider references, runtime facts, and observed status.
+- `cluster.json`: schema-versioned snapshot containing the stable provider label, run id, next node id, full command records, node specs, selected offer IDs, provider references, runtime facts, phases, and errors.
 
 Writes use a temporary file plus rename. A corrupt identity or snapshot is a hard startup error. `--reset-state` explicitly clears both files; startup never treats corruption as an empty fleet.
 
-Provider state is ground truth during adoption:
+Provider state is ground truth during recovery:
 
 - snapshot + provider resource: adopt and observe it;
-- snapshot only: mark dead;
-- provider resource only: report as an orphan and take no action.
+- snapshot only: mark the node stopped; never recreate it;
+- provider resource without managed intent: report it as an orphan and take no action.
 
-The current restart limitation is deliberate: an adopted node still has the prior orchestrator actor address in its environment. Provider monitoring and telemetry collection can resume, but actor-address re-join requires the deferred node handshake.
+The current orchestrator actor address is published under `myelin.manual-control` in the distributed name registry. A surviving worker observes a changed binding, sends `RejoinHello` with its persisted logical identity and current runtime facts, waits for the daemon to persist those facts, and only then rebinds to the returned actor address and control generation. No stable actor address is assumed.
 
 ## Lifecycle policy
 
 Graceful shutdown leaves Docker containers and Vast.ai leases running so a later daemon can adopt them. Local process children are different: they cannot be adopted, so Ctrl-C stops them and clears their snapshot records. They also exit when their daemon-owned stdin supervision pipe closes, preventing an abrupt daemon crash from leaving invisible local workers.
 
-Destruction of durable provider resources occurs only through an explicit dashboard command or the development-only `--destroy-on-exit` flag. The default process path re-enters the running orchestrator executable in an internal worker mode, so `cargo run -p myelin` never depends on a separately built or stale `myelin-worker` binary.
+Destruction of durable provider resources occurs only through an explicit dashboard command. The default process path re-enters the running orchestrator executable in an internal worker mode, so `cargo run -p myelin` never depends on a separately built or stale `myelin-worker` binary.
 
 ## Node image contract
 

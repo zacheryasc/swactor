@@ -7,38 +7,58 @@
 //! intent and facts so a restarted daemon can adopt what still exists and
 //! never silently re-provisions.
 
-#[cfg(test)]
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::orchestration::manual_control::{CommandKind, CommandRecord, CommandState, NodePhase};
 use crate::provisioning::NodeProvisionSpec;
 use distribution::types::NodeId as DistNodeId;
 use serde::{Deserialize, Serialize};
 use swactor::actor::ActorAddress;
 
-pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 pub(crate) const IDENTITY_FILE: &str = "identity.key";
 pub(crate) const SNAPSHOT_FILE: &str = "cluster.json";
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum NodeStatus {
-    /// Provider resource exists and the runtime joined (or is expected to).
+enum LegacyNodeStatus {
     Running,
-    /// Tracked by the snapshot but gone from the provider.
     Dead,
-    /// Exists at the provider under this daemon's label but was never added
-    /// through this daemon's command surface.
     Orphan,
+}
+
+#[derive(Deserialize)]
+struct LegacySnapshotNode {
+    logical_node_id: u64,
+    spec: Option<NodeProvisionSpec>,
+    provider_ref: Option<String>,
+    status: LegacyNodeStatus,
+    runtime: Option<RuntimeFacts>,
+    last_seen_unix_ms: u64,
+}
+
+#[derive(Deserialize)]
+struct LegacyClusterSnapshot {
+    schema_version: u32,
+    run_id: u64,
+    label: String,
+    next_node_id: u64,
+    #[serde(default)]
+    accepted_command_ids: BTreeSet<String>,
+    nodes: Vec<LegacySnapshotNode>,
 }
 
 /// Join/readiness facts captured when a node announced itself. Persisted so a
 /// restarted daemon can re-subscribe telemetry once routes recover.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RuntimeFacts {
+    #[serde(default)]
+    pub run_id: u64,
+    #[serde(default)]
+    pub attempt_id: u64,
     pub endpoint: String,
     pub node_actor: ActorAddress,
     pub swim_node_id: DistNodeId,
@@ -46,17 +66,21 @@ pub(crate) struct RuntimeFacts {
     pub readiness_id: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SnapshotNode {
     pub logical_node_id: u64,
     /// Provision intent for nodes added through this daemon. Absent for
     /// orphans (discovered, not managed).
     pub spec: Option<NodeProvisionSpec>,
-    /// Provider-side address (e.g. docker container name) for records that
-    /// exist without a full spec.
+    /// Exact operator selection. Only Vast.ai nodes set this.
+    #[serde(default)]
+    pub selected_offer_id: Option<u64>,
+    /// Provider-side address (container name, contract label, or process id).
     pub provider_ref: Option<String>,
-    pub status: NodeStatus,
+    pub phase: NodePhase,
     pub runtime: Option<RuntimeFacts>,
+    #[serde(default)]
+    pub last_error: Option<String>,
     pub last_seen_unix_ms: u64,
 }
 
@@ -66,11 +90,9 @@ pub(crate) struct ClusterSnapshot {
     pub run_id: u64,
     pub label: String,
     pub next_node_id: u64,
-    /// Durable at-most-once ledger for dashboard requests. A command id is
-    /// recorded before provider mutation, so retrying after a timeout or crash
-    /// cannot create or destroy a second resource.
+    /// Durable at-most-once command ledger, including terminal outcomes.
     #[serde(default)]
-    pub accepted_command_ids: BTreeSet<String>,
+    pub commands: BTreeMap<String, CommandRecord>,
     pub nodes: Vec<SnapshotNode>,
 }
 
@@ -81,7 +103,7 @@ impl ClusterSnapshot {
             run_id,
             label: label.into(),
             next_node_id: 1,
-            accepted_command_ids: BTreeSet::new(),
+            commands: BTreeMap::new(),
             nodes: Vec::new(),
         }
     }
@@ -96,12 +118,6 @@ impl ClusterSnapshot {
         self.nodes
             .iter_mut()
             .find(|node| node.logical_node_id == logical_node_id)
-    }
-
-    pub(crate) fn running_nodes(&self) -> impl Iterator<Item = &SnapshotNode> {
-        self.nodes
-            .iter()
-            .filter(|node| node.status == NodeStatus::Running)
     }
 
     /// Allocates the next logical node id. Ids are monotonic and never reused.
@@ -129,85 +145,6 @@ impl ClusterSnapshot {
             None => self.nodes.push(node),
         }
     }
-
-    pub(crate) fn remove_node(&mut self, logical_node_id: u64) -> Option<SnapshotNode> {
-        let index = self
-            .nodes
-            .iter()
-            .position(|node| node.logical_node_id == logical_node_id)?;
-        Some(self.nodes.remove(index))
-    }
-
-    /// Makes orphan records exactly match provider-only resources. Orphans are
-    /// keyed by provider reference because they intentionally have no logical
-    /// node id or provision spec.
-    pub(crate) fn sync_orphans(
-        &mut self,
-        provider_refs: impl IntoIterator<Item = String>,
-    ) -> Vec<String> {
-        let provider_refs = provider_refs
-            .into_iter()
-            .collect::<std::collections::BTreeSet<_>>();
-        self.nodes.retain(|node| {
-            node.status != NodeStatus::Orphan
-                || node
-                    .provider_ref
-                    .as_ref()
-                    .is_some_and(|provider_ref| provider_refs.contains(provider_ref))
-        });
-        let known = self
-            .nodes
-            .iter()
-            .filter(|node| node.status == NodeStatus::Orphan)
-            .filter_map(|node| node.provider_ref.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let added = provider_refs
-            .difference(&known)
-            .cloned()
-            .collect::<Vec<_>>();
-        let now = unix_ms_now();
-        for provider_ref in &added {
-            self.nodes.push(SnapshotNode {
-                logical_node_id: 0,
-                spec: None,
-                provider_ref: Some(provider_ref.clone()),
-                status: NodeStatus::Orphan,
-                runtime: None,
-                last_seen_unix_ms: now,
-            });
-        }
-        added
-    }
-
-    pub(crate) fn accept_command(&mut self, command_id: &str) -> Result<bool, String> {
-        let command_id = command_id.trim();
-        if command_id.is_empty() {
-            return Err("dashboard command_id must not be empty".to_owned());
-        }
-        Ok(self.accepted_command_ids.insert(command_id.to_owned()))
-    }
-}
-
-/// Operator commands accepted by the dispatcher. The dashboard (and later the
-/// CLI) is a transport into this surface.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum DaemonCommand {
-    /// Provision exactly one node using the configured provider + selection
-    /// policy. Fails (does not retry) if bring-up fails.
-    AddNode,
-    /// Terminate a node's provider resource; the record stays (status Dead).
-    Kill { logical_node_id: u64 },
-    /// Terminate and forget a node.
-    Destroy { logical_node_id: u64 },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum DaemonOutcome {
-    Added { logical_node_id: u64 },
-    Killed { logical_node_id: u64 },
-    Destroyed { logical_node_id: u64 },
-    NoSuchNode { logical_node_id: u64 },
-    Failed { command: String, reason: String },
 }
 
 /// Where the daemon keeps `identity.key` and `cluster.json`.
@@ -221,16 +158,15 @@ impl StateDir {
         Self { root: root.into() }
     }
 
-    pub(crate) fn root(&self) -> &Path {
-        &self.root
-    }
-
     fn identity_path(&self) -> PathBuf {
         self.root.join(IDENTITY_FILE)
     }
 
     fn snapshot_path(&self) -> PathBuf {
         self.root.join(SNAPSHOT_FILE)
+    }
+    pub(crate) fn process_registry_path(&self) -> PathBuf {
+        self.root.join("process-nodes.json")
     }
 
     /// Loads the persisted iroh secret key, creating it on first boot. The
@@ -263,23 +199,44 @@ impl StateDir {
         let path = self.snapshot_path();
         match fs::read_to_string(&path) {
             Ok(content) => {
-                let snapshot: ClusterSnapshot = serde_json::from_str(&content).map_err(|e| {
-                    format!(
-                        "cluster snapshot {} is corrupt ({e}); inspect it or remove it with \
-                         --reset-state — refusing to silently re-provision",
-                        path.display()
-                    )
-                })?;
-                if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
-                    return Err(format!(
-                        "cluster snapshot {} has unsupported schema_version {} (expected {}); \
+                let schema_version = serde_json::from_str::<serde_json::Value>(&content)
+                    .ok()
+                    .and_then(|value| value.get("schema_version").and_then(|value| value.as_u64()))
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| {
+                        format!(
+                            "cluster snapshot {} is corrupt (missing schema_version); inspect it or remove it with \
+                             --reset-state — refusing to silently re-provision",
+                            path.display()
+                        )
+                    })?;
+                match schema_version {
+                    SNAPSHOT_SCHEMA_VERSION => serde_json::from_str(&content).map_err(|error| {
+                        format!(
+                            "cluster snapshot {} is corrupt ({error}); inspect it or remove it with \
+                             --reset-state — refusing to silently re-provision",
+                            path.display()
+                        )
+                    }),
+                    1 => {
+                        let legacy: LegacyClusterSnapshot =
+                            serde_json::from_str(&content).map_err(|error| {
+                                format!(
+                                    "cluster snapshot {} schema v1 is corrupt ({error}); inspect it or remove it with \
+                                     --reset-state — refusing to silently re-provision",
+                                    path.display()
+                                )
+                            })?;
+                        Ok(migrate_v1(legacy))
+                    }
+                    unsupported => Err(format!(
+                        "cluster snapshot {} has unsupported schema_version {} (expected {} or migratable v1); \
                          migrate or remove it with --reset-state",
                         path.display(),
-                        snapshot.schema_version,
+                        unsupported,
                         SNAPSHOT_SCHEMA_VERSION
-                    ));
+                    )),
                 }
-                Ok(snapshot)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // Caller decides the run id/label for a fresh snapshot.
@@ -288,8 +245,8 @@ impl StateDir {
                     run_id: 0,
                     label: String::new(),
                     next_node_id: 1,
+                    commands: BTreeMap::new(),
                     nodes: Vec::new(),
-                    accepted_command_ids: BTreeSet::new(),
                 })
             }
             Err(error) => Err(format!("read cluster snapshot {}: {error}", path.display())),
@@ -317,6 +274,62 @@ impl StateDir {
     }
 }
 
+fn migrate_v1(legacy: LegacyClusterSnapshot) -> ClusterSnapshot {
+    debug_assert_eq!(legacy.schema_version, 1);
+    let commands = legacy
+        .accepted_command_ids
+        .into_iter()
+        .map(|command_id| {
+            (
+                command_id.clone(),
+                CommandRecord {
+                    command_id,
+                    kind: CommandKind::Migrated,
+                    state: CommandState::Failed,
+                    node_ids: Vec::new(),
+                    error: Some(
+                        "migrated schema-v1 command; outcome was not recorded and will not be replayed"
+                            .to_owned(),
+                    ),
+                },
+            )
+        })
+        .collect();
+    let nodes = legacy
+        .nodes
+        .into_iter()
+        .map(|legacy_node| {
+            let mut runtime = legacy_node.runtime;
+            if let (Some(spec), Some(facts)) = (legacy_node.spec.as_ref(), runtime.as_mut()) {
+                facts.run_id = spec.run_id;
+                facts.attempt_id = spec.attempt_id;
+            }
+            SnapshotNode {
+                logical_node_id: legacy_node.logical_node_id,
+                spec: legacy_node.spec,
+                selected_offer_id: None,
+                provider_ref: legacy_node.provider_ref,
+                phase: match legacy_node.status {
+                    LegacyNodeStatus::Running => NodePhase::Running,
+                    LegacyNodeStatus::Dead => NodePhase::Stopped,
+                    LegacyNodeStatus::Orphan => NodePhase::Orphan,
+                },
+                runtime,
+                last_error: None,
+                last_seen_unix_ms: legacy_node.last_seen_unix_ms,
+            }
+        })
+        .collect();
+    ClusterSnapshot {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        run_id: legacy.run_id,
+        label: legacy.label,
+        next_node_id: legacy.next_node_id,
+        commands,
+        nodes,
+    }
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), String> {
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, bytes).map_err(|error| format!("write {}: {error}", tmp.display()))?;
@@ -333,321 +346,79 @@ pub(crate) fn unix_ms_now() -> u64 {
         .unwrap_or_default()
 }
 
-/// Joins snapshot intent with provider ground truth at boot. Never takes a
-/// lifecycle action: live nodes are adopted for observation, missing ones are
-/// marked dead, provider-only resources are recorded as orphans.
-pub(crate) struct BootJoin {
-    pub snapshot: ClusterSnapshot,
-}
-
-pub(crate) struct JoinOutcome {
-    pub adopted: Vec<u64>,
-    pub dead: Vec<u64>,
-    pub orphans: Vec<String>,
-}
-
-impl BootJoin {
-    /// `labeled` lists provider resources carrying this daemon's label that
-    /// the snapshot does not account for.
-    pub(crate) fn apply_provider_truthtable(
-        &mut self,
-        live_specs: &BTreeMap<u64, bool>,
-        labeled_orphans: Vec<String>,
-    ) -> JoinOutcome {
-        let mut adopted = Vec::new();
-        let mut dead = Vec::new();
-        let now = unix_ms_now();
-        for node in &mut self.snapshot.nodes {
-            if node.status == NodeStatus::Orphan {
-                continue;
-            }
-            match live_specs.get(&node.logical_node_id) {
-                Some(true) => {
-                    node.status = NodeStatus::Running;
-                    node.last_seen_unix_ms = now;
-                    adopted.push(node.logical_node_id);
-                }
-                _ => {
-                    node.status = NodeStatus::Dead;
-                    dead.push(node.logical_node_id);
-                }
-            }
-        }
-        self.snapshot.sync_orphans(labeled_orphans.clone());
-        JoinOutcome {
-            adopted,
-            dead,
-            orphans: labeled_orphans,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
-    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(1);
+    #[test]
+    fn schema_v1_migrates_without_replaying_accepted_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::new(temp.path());
+        fs::write(
+            temp.path().join(SNAPSHOT_FILE),
+            serde_json::json!({
+                "schema_version": 1,
+                "run_id": 7,
+                "label": "legacy",
+                "next_node_id": 2,
+                "accepted_command_ids": ["already-accepted"],
+                "nodes": [{
+                    "logical_node_id": 1,
+                    "spec": null,
+                    "provider_ref": "legacy-resource",
+                    "status": "orphan",
+                    "runtime": null,
+                    "last_seen_unix_ms": 4
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
 
-    fn test_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "myelin-{name}-{}-{}",
-            std::process::id(),
-            NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    fn node(id: u64, status: NodeStatus) -> SnapshotNode {
-        SnapshotNode {
-            logical_node_id: id,
-            spec: None,
-            provider_ref: Some(format!("container-{id}")),
-            status,
-            runtime: None,
-            last_seen_unix_ms: 0,
-        }
+        let migrated = state.load_snapshot().unwrap();
+        assert_eq!(migrated.schema_version, SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(migrated.nodes[0].phase, NodePhase::Orphan);
+        assert_eq!(
+            migrated.commands["already-accepted"].state,
+            CommandState::Failed
+        );
+        assert_eq!(
+            migrated.commands["already-accepted"].kind,
+            CommandKind::Migrated
+        );
     }
 
     #[test]
-    fn node_ids_allocate_monotonically_and_never_reuse() {
-        let mut snapshot = ClusterSnapshot::fresh(1, "test");
+    fn unsupported_and_corrupt_snapshots_are_hard_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::new(temp.path());
+        fs::write(temp.path().join(SNAPSHOT_FILE), r#"{"schema_version":99}"#).unwrap();
+        assert!(state.load_snapshot().unwrap_err().contains("unsupported"));
+        fs::write(temp.path().join(SNAPSHOT_FILE), "{broken").unwrap();
+        assert!(state.load_snapshot().unwrap_err().contains("corrupt"));
+    }
+
+    #[test]
+    fn atomic_round_trip_preserves_monotonic_ids_and_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = StateDir::new(temp.path());
+        let mut snapshot = ClusterSnapshot::fresh(9, "roundtrip");
         assert_eq!(snapshot.allocate_node_id(), 1);
         assert_eq!(snapshot.allocate_node_id(), 2);
-        snapshot.next_node_id = u64::MAX;
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                snapshot.allocate_node_id()
-            }))
-            .is_err()
+        snapshot.commands.insert(
+            "done".to_owned(),
+            CommandRecord {
+                command_id: "done".to_owned(),
+                kind: CommandKind::Kill,
+                state: CommandState::Succeeded,
+                node_ids: vec![1],
+                error: None,
+            },
         );
-    }
-
-    #[test]
-    fn remove_then_allocate_does_not_reuse_ids() {
-        let mut snapshot = ClusterSnapshot::fresh(1, "test");
-        snapshot.upsert_node(node(1, NodeStatus::Running));
-        assert!(snapshot.remove_node(1).is_some());
-        assert_eq!(snapshot.allocate_node_id(), 2);
-    }
-
-    #[test]
-    fn join_marks_live_missing_and_orphans_without_actions() {
-        let mut join = BootJoin {
-            snapshot: ClusterSnapshot::fresh(1, "test"),
-        };
-        join.snapshot.upsert_node(node(1, NodeStatus::Running));
-        join.snapshot.upsert_node(node(2, NodeStatus::Running));
-        let live = BTreeMap::from([(1_u64, true), (2_u64, false)]);
-        let outcome = join.apply_provider_truthtable(&live, vec!["orphan-a".to_owned()]);
-        assert_eq!(outcome.adopted, vec![1]);
-        assert_eq!(outcome.dead, vec![2]);
-        assert_eq!(outcome.orphans, vec!["orphan-a".to_owned()]);
-        assert_eq!(join.snapshot.node(1).unwrap().status, NodeStatus::Running);
-        assert_eq!(join.snapshot.node(2).unwrap().status, NodeStatus::Dead);
-        assert_eq!(
-            join.snapshot
-                .nodes
-                .iter()
-                .find(|node| node.provider_ref.as_deref() == Some("orphan-a"))
-                .unwrap()
-                .status,
-            NodeStatus::Orphan
-        );
-    }
-
-    #[test]
-    fn snapshot_round_trips_through_disk() {
-        let dir = test_dir("snapshot");
-        let state = StateDir::new(&dir);
-        let mut snapshot = ClusterSnapshot::fresh(7, "label");
-        snapshot.upsert_node(SnapshotNode {
-            logical_node_id: 1,
-            spec: Some(NodeProvisionSpec {
-                run_id: 7,
-                node_id: 1,
-                attempt_id: 0,
-                stage_index: Some(0),
-                image: "myelin-node:latest".to_owned(),
-                env: vec![("A".to_owned(), "B".to_owned())],
-                args: vec![],
-                mounts: vec![],
-            }),
-            provider_ref: Some("container-1".to_owned()),
-            status: NodeStatus::Running,
-            runtime: None,
-            last_seen_unix_ms: 42,
-        });
         state.save_snapshot(&snapshot).unwrap();
         let loaded = state.load_snapshot().unwrap();
-        assert_eq!(loaded.run_id, 7);
-        assert_eq!(loaded.nodes.len(), 1);
-        assert_eq!(
-            loaded.nodes[0].spec.as_ref().unwrap().image,
-            "myelin-node:latest"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn corrupt_snapshot_is_a_hard_error() {
-        let dir = test_dir("corrupt");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(SNAPSHOT_FILE), b"{ not json").unwrap();
-        let state = StateDir::new(&dir);
-        let error = state.load_snapshot().unwrap_err();
-        assert!(error.contains("corrupt"), "unexpected error: {error}");
-        assert!(error.contains("refusing"), "unexpected error: {error}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn identity_key_is_stable_across_loads() {
-        let dir = test_dir("identity");
-        let state = StateDir::new(&dir);
-        let first = state.load_or_create_identity().unwrap();
-        let second = state.load_or_create_identity().unwrap();
-        assert_eq!(first.to_bytes(), second.to_bytes());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn command_ids_are_durable_at_most_once_tokens() {
-        let dir = test_dir("commands");
-        let state = StateDir::new(&dir);
-        let mut snapshot = ClusterSnapshot::fresh(1, "test");
-        assert!(snapshot.accept_command("request-a").unwrap());
-        assert!(!snapshot.accept_command("request-a").unwrap());
-        assert!(snapshot.accept_command("request-b").unwrap());
-        assert!(snapshot.accept_command(" ").is_err());
-        state.save_snapshot(&snapshot).unwrap();
-        let mut loaded = state.load_snapshot().unwrap();
-        assert!(!loaded.accept_command("request-a").unwrap());
-        assert!(!loaded.accept_command("request-b").unwrap());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn orphan_records_exactly_follow_provider_ground_truth() {
-        let mut snapshot = ClusterSnapshot::fresh(1, "test");
-        snapshot.sync_orphans(["b".to_owned(), "a".to_owned()]);
-        snapshot.sync_orphans(["b".to_owned(), "c".to_owned()]);
-        let refs = snapshot
-            .nodes
-            .iter()
-            .filter(|node| node.status == NodeStatus::Orphan)
-            .filter_map(|node| node.provider_ref.clone())
-            .collect::<BTreeSet<_>>();
-        assert_eq!(refs, BTreeSet::from(["b".to_owned(), "c".to_owned()]));
-    }
-
-    #[test]
-    fn partial_temp_write_never_replaces_last_snapshot() {
-        let dir = test_dir("atomic");
-        let state = StateDir::new(&dir);
-        let mut snapshot = ClusterSnapshot::fresh(7, "stable");
-        snapshot.allocate_node_id();
-        state.save_snapshot(&snapshot).unwrap();
-        std::fs::write(dir.join("cluster.tmp"), b"{partial").unwrap();
-        let loaded = state.load_snapshot().unwrap();
-        assert_eq!(loaded.run_id, 7);
-        assert_eq!(loaded.next_node_id, 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn identity_changes_only_after_explicit_reset() {
-        let dir = test_dir("identity-reset");
-        let state = StateDir::new(&dir);
-        let first = state.load_or_create_identity().unwrap();
-        assert_eq!(
-            first.to_bytes(),
-            state.load_or_create_identity().unwrap().to_bytes()
-        );
-        state.reset().unwrap();
-        let replacement = state.load_or_create_identity().unwrap();
-        assert_ne!(first.to_bytes(), replacement.to_bytes());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn fuzzed_manual_interleavings_preserve_snapshot_invariants() {
-        let dir = test_dir("state-fuzz");
-        let state = StateDir::new(&dir);
-        let mut snapshot = ClusterSnapshot::fresh(9, "fuzz");
-        let mut model_nodes = BTreeMap::<u64, NodeStatus>::new();
-        let mut provider_orphans = BTreeSet::<String>::new();
-        let mut command_ids = BTreeSet::<String>::new();
-        let mut rng = 0x6a09_e667_f3bc_c909_u64;
-
-        for step in 0..2_000_u64 {
-            rng = rng
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            match rng % 7 {
-                0 => {
-                    let id = snapshot.allocate_node_id();
-                    snapshot.upsert_node(node(id, NodeStatus::Running));
-                    model_nodes.insert(id, NodeStatus::Running);
-                }
-                1 => {
-                    let id = 1 + rng.rotate_left(17) % snapshot.next_node_id.max(2);
-                    if let Some(status) = model_nodes.get_mut(&id) {
-                        *status = NodeStatus::Dead;
-                        snapshot.node_mut(id).unwrap().status = NodeStatus::Dead;
-                    }
-                }
-                2 => {
-                    let id = 1 + rng.rotate_right(11) % snapshot.next_node_id.max(2);
-                    model_nodes.remove(&id);
-                    snapshot.remove_node(id);
-                }
-                3 => {
-                    provider_orphans.insert(format!("orphan-{}", rng % 19));
-                }
-                4 => {
-                    provider_orphans.remove(&format!("orphan-{}", rng % 19));
-                }
-                5 => {
-                    let command_id = format!("command-{}", rng % 31);
-                    let expected = command_ids.insert(command_id.clone());
-                    assert_eq!(snapshot.accept_command(&command_id).unwrap(), expected);
-                }
-                _ => {
-                    state.save_snapshot(&snapshot).unwrap();
-                    snapshot = state.load_snapshot().unwrap();
-                }
-            }
-            snapshot.sync_orphans(provider_orphans.iter().cloned());
-
-            let managed_ids = snapshot
-                .nodes
-                .iter()
-                .filter(|node| node.status != NodeStatus::Orphan)
-                .map(|node| node.logical_node_id)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                managed_ids.iter().copied().collect::<BTreeSet<_>>().len(),
-                managed_ids.len(),
-                "duplicate managed id after step {step}"
-            );
-            for (id, expected) in &model_nodes {
-                assert_eq!(
-                    snapshot.node(*id).map(|node| &node.status),
-                    Some(expected),
-                    "node model diverged after step {step}"
-                );
-            }
-            assert!(managed_ids.iter().all(|id| *id < snapshot.next_node_id));
-            let observed_orphans = snapshot
-                .nodes
-                .iter()
-                .filter(|node| node.status == NodeStatus::Orphan)
-                .filter_map(|node| node.provider_ref.clone())
-                .collect::<BTreeSet<_>>();
-            assert_eq!(observed_orphans, provider_orphans);
-            assert_eq!(snapshot.accepted_command_ids, command_ids);
-        }
-
-        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(loaded.next_node_id, 3);
+        assert_eq!(loaded.commands["done"].state, CommandState::Succeeded);
+        assert!(!temp.path().join("cluster.tmp").exists());
     }
 }

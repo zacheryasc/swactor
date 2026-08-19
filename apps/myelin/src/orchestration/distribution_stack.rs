@@ -25,7 +25,7 @@ use distribution::messages::{
 };
 use distribution::node::DistributedNodeConfig;
 use distribution::node_metadata_actor::{MetadataActor, MetadataIn};
-use distribution::registry_actor::{RegistryActor, RegistryIn};
+use distribution::registry_actor::{RegistryActor, RegistryIn, RegistryView};
 use distribution::swim::actor::{MembershipChanged, SwimActor, SwimIn};
 use distribution::swim::member_list::MemberList;
 use distribution::swim::probe::SwimConfig;
@@ -56,6 +56,7 @@ pub(crate) struct DistributionRuntimeStack {
     pub outbox: Outbox,
     pub relay_mirror: RelayMirror,
     pub route_view: RouteView,
+    pub registry_view: RegistryView,
     pub membership_mirror: Arc<Mutex<MemberList>>,
     pub swim_telemetry: Arc<SwimTelemetry>,
     pub swim_config: SwimConfig,
@@ -118,6 +119,7 @@ impl DistributionRuntimeStack {
         ));
         let swim_config = config.swim.clone();
         let swim_telemetry = SwimTelemetry::new();
+        let registry_view = Arc::new(RwLock::new(Default::default()));
 
         let swim_addr = runtime
             .spawn(
@@ -131,11 +133,10 @@ impl DistributionRuntimeStack {
             )
             .expect("spawn SwimActor");
         let registry_addr = runtime
-            .spawn(RegistryActor::new(
-                node_id,
-                config.registry.clone(),
-                peer_directory.clone(),
-            ))
+            .spawn(
+                RegistryActor::new(node_id, config.registry.clone(), peer_directory.clone())
+                    .with_view(Arc::clone(&registry_view)),
+            )
             .expect("spawn RegistryActor");
         let metadata_addr = runtime
             .spawn(MetadataActor::new(
@@ -188,6 +189,7 @@ impl DistributionRuntimeStack {
             relay_mirror,
             route_view,
             membership_mirror,
+            registry_view,
             swim_telemetry,
             swim_config,
             actors: DistributionActorAddrs {

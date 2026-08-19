@@ -76,9 +76,6 @@ pub(crate) enum WeightCommand {
         source: WeightSource,
         range: LayerRange,
     },
-    AdvertiseLoadedLayerRange {
-        range: LayerRange,
-    },
 }
 
 #[cfg(test)]

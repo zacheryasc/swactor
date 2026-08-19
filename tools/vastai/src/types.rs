@@ -36,6 +36,14 @@ pub struct Offer {
     /// `deverified`.
     #[serde(default)]
     pub verification: Option<String>,
+    /// Historical host reliability score in `[0, 1]`.
+    #[serde(default)]
+    pub reliability2: Option<f64>,
+    /// Measured inbound and outbound bandwidth in Mbps.
+    #[serde(default)]
+    pub inet_down: Option<f64>,
+    #[serde(default)]
+    pub inet_up: Option<f64>,
 }
 
 /// Connection details for a running instance.

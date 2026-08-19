@@ -41,13 +41,31 @@ pub trait JobEdgeSink: Send + Sync + 'static {
 /// Orchestrator → node commands. Spec §6 command table + workspace chunks.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeJobCommand {
-    MaterializeWorkspace { job_id: u64 },
+    MaterializeWorkspace {
+        job_id: u64,
+    },
     /// One chunk of the workspace tar stream. `eof` marks the final chunk; the
     /// node extracts the accumulated tar on the eof chunk.
-    WorkspaceChunk { job_id: u64, seq: u64, data: Vec<u8>, eof: bool },
-    RunSetup { job_id: u64, command: String, env: BTreeMap<String, String> },
-    RunJob { job_id: u64, command: String, env: BTreeMap<String, String> },
-    CollectOutputs { job_id: u64, outputs: Vec<String> },
+    WorkspaceChunk {
+        job_id: u64,
+        seq: u64,
+        data: Vec<u8>,
+        eof: bool,
+    },
+    RunSetup {
+        job_id: u64,
+        command: String,
+        env: BTreeMap<String, String>,
+    },
+    RunJob {
+        job_id: u64,
+        command: String,
+        env: BTreeMap<String, String>,
+    },
+    CollectOutputs {
+        job_id: u64,
+        outputs: Vec<String>,
+    },
 }
 
 impl NetworkMessage for NodeJobCommand {

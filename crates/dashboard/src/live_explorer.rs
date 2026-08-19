@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use telemetry::frame::{Frame, StreamId};
 use parking_lot::RwLock;
 use serde_json::{Value, json};
+use telemetry::frame::{Frame, StreamId};
 
 use crate::FrameEvent;
 use crate::view::DashboardView;

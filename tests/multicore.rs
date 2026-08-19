@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex;
 
 use common::*;
-use swactor::admin::OperationResult;
 use swactor::actor::{ActorAddress, ActorInterface, Ctx};
+use swactor::admin::OperationResult;
 use swactor::runtime::RuntimeConfig;
 
 /// A minimal message delivered to probe actors.
@@ -185,9 +185,21 @@ fn single_thread_host_advances_every_worker_once() {
     // processed its probe.
     let did_work = host.try_tick();
     assert!(did_work, "try_tick must report work when workers produced");
-    assert_eq!(c0.load(Ordering::SeqCst), 1, "worker 0 actor processed its probe");
-    assert_eq!(c1.load(Ordering::SeqCst), 1, "worker 1 actor processed its probe");
-    assert_eq!(c2.load(Ordering::SeqCst), 1, "worker 2 actor processed its probe");
+    assert_eq!(
+        c0.load(Ordering::SeqCst),
+        1,
+        "worker 0 actor processed its probe"
+    );
+    assert_eq!(
+        c1.load(Ordering::SeqCst),
+        1,
+        "worker 1 actor processed its probe"
+    );
+    assert_eq!(
+        c2.load(Ordering::SeqCst),
+        1,
+        "worker 2 actor processed its probe"
+    );
 }
 
 #[test]
@@ -196,7 +208,13 @@ fn single_worker_runtime_remains_equivalent() {
     let inbox = rt.new_inbox::<Pong>().expect("inbox");
     let addr = rt.spawn(PingPongActor).expect("spawn ping-pong");
 
-    rt.send_to(addr, Ping { reply_to: *inbox.addr() }).expect("send ping");
+    rt.send_to(
+        addr,
+        Ping {
+            reply_to: *inbox.addr(),
+        },
+    )
+    .expect("send ping");
     let pong = tick_until_recv(&mut host, &inbox, 16);
     assert_eq!(pong, Some(Pong), "single-worker delivery still works");
 }
@@ -231,7 +249,11 @@ fn ctx_spawn_places_child_on_parents_worker() {
     let report = rt.new_inbox::<ParentReport>().expect("inbox");
 
     // First runtime spawn → worker 0; the parent reports its own worker id.
-    let parent = rt.spawn(SpawningParent { reply_to: *report.addr() }).expect("spawn parent");
+    let parent = rt
+        .spawn(SpawningParent {
+            reply_to: *report.addr(),
+        })
+        .expect("spawn parent");
     let stats = rt.stats();
     assert_eq!(worker_of(&stats, parent), 0, "parent placed on worker 0");
 
@@ -253,9 +275,16 @@ fn cross_worker_delivery_and_fifo_hold() {
     let (rt, mut host) = std_host(config_with(2));
     let recorded = Arc::new(Mutex::new(Vec::new()));
 
-    let recorder = rt.spawn(Recorder { out: recorded.clone() }).expect("spawn recorder");
+    let recorder = rt
+        .spawn(Recorder {
+            out: recorded.clone(),
+        })
+        .expect("spawn recorder");
     let sender = rt
-        .spawn(BurstSender { target: recorder, values: vec![1, 2, 3] })
+        .spawn(BurstSender {
+            target: recorder,
+            values: vec![1, 2, 3],
+        })
         .expect("spawn sender");
 
     let stats = rt.stats();
@@ -267,7 +296,11 @@ fn cross_worker_delivery_and_fifo_hold() {
     tick_n(&mut host, 8);
 
     let got = recorded.lock().clone();
-    assert_eq!(got, vec![1, 2, 3], "cross-worker delivery preserves per-(sender,target) FIFO");
+    assert_eq!(
+        got,
+        vec![1, 2, 3],
+        "cross-worker delivery preserves per-(sender,target) FIFO"
+    );
 }
 
 #[test]
@@ -275,7 +308,12 @@ fn same_worker_sends_are_not_recursive_in_the_current_pass() {
     let (rt, mut host) = std_host(config_with(1));
     let out = Arc::new(Mutex::new(Vec::new()));
 
-    let addr = rt.spawn(ChainSelf { out: out.clone(), limit: 5 }).expect("spawn chain");
+    let addr = rt
+        .spawn(ChainSelf {
+            out: out.clone(),
+            limit: 5,
+        })
+        .expect("spawn chain");
     rt.send_to(addr, Seq(1)).expect("seed");
 
     // One pass: the seed is handled and the self-send is staged for next pass.
@@ -288,7 +326,11 @@ fn same_worker_sends_are_not_recursive_in_the_current_pass() {
 
     // Subsequent passes drain the self-chain one value per pass.
     tick_n(&mut host, 8);
-    assert_eq!(*out.lock(), vec![1, 2, 3, 4, 5], "chain completes across passes");
+    assert_eq!(
+        *out.lock(),
+        vec![1, 2, 3, 4, 5],
+        "chain completes across passes"
+    );
 }
 
 #[test]
@@ -299,7 +341,11 @@ fn transfer_backlog_is_consumed_across_multiple_passes() {
     let (rt, mut host) = std_host(config);
     let recorded = Arc::new(Mutex::new(Vec::new()));
 
-    let recorder = rt.spawn(Recorder { out: recorded.clone() }).expect("spawn recorder");
+    let recorder = rt
+        .spawn(Recorder {
+            out: recorded.clone(),
+        })
+        .expect("spawn recorder");
     host.try_tick(); // install recorder
 
     for v in 1..=10u32 {
@@ -434,7 +480,11 @@ fn spawn_and_admin_drains_are_not_blocked_by_transfer_backlog() {
     let (rt, mut host) = std_host(config);
     let recorded = Arc::new(Mutex::new(Vec::new()));
 
-    let recorder = rt.spawn(Recorder { out: recorded.clone() }).expect("spawn recorder");
+    let recorder = rt
+        .spawn(Recorder {
+            out: recorded.clone(),
+        })
+        .expect("spawn recorder");
 
     host.try_tick(); // install recorder
 
@@ -480,11 +530,15 @@ fn process_local_inbox_routing_precedes_remote_transport() {
     let (rt, mut host) = std_host(RuntimeConfig::default());
     let inbox = rt.new_inbox::<Probe>().expect("inbox");
 
-    rt.send_to(*inbox.addr(), Probe).expect("send to inbox address");
+    rt.send_to(*inbox.addr(), Probe)
+        .expect("send to inbox address");
     // Inbox delivery is synchronous through the registry; one tick suffices to
     // also prove no actor path captured it.
     host.try_tick();
-    assert!(inbox.try_recv().is_some(), "non-actor address delivered to the local inbox");
+    assert!(
+        inbox.try_recv().is_some(),
+        "non-actor address delivered to the local inbox"
+    );
 }
 
 // ─── Phase 3: multicore admin, stats, lifecycle, extensions ─────────────────
@@ -585,7 +639,11 @@ struct DistinctExt {
 impl RuntimeExtension for DistinctExt {
     fn on_actor_death(
         &self,
-        _dead: &[(ActorAddress, swactor::actor::StopReason, Option<swactor::actor::ExitValue>)],
+        _dead: &[(
+            ActorAddress,
+            swactor::actor::StopReason,
+            Option<swactor::actor::ExitValue>,
+        )],
     ) -> Vec<(ActorAddress, Box<dyn Any + Send>)> {
         Vec::new()
     }
@@ -611,12 +669,15 @@ impl RuntimeExtension for DistinctExt {
     }
 }
 
-
 #[test]
 fn targeted_admin_mutates_only_owning_worker() {
     let (rt, mut host) = std_host(config_with(2));
-    let a = rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0)))).expect("spawn a");
-    let b = rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0)))).expect("spawn b");
+    let a = rt
+        .spawn(CountingProbe(Arc::new(AtomicUsize::new(0))))
+        .expect("spawn a");
+    let b = rt
+        .spawn(CountingProbe(Arc::new(AtomicUsize::new(0))))
+        .expect("spawn b");
     // a → worker 0, b → worker 1 (round-robin).
 
     // Suspend only a; b on the other worker must be untouched.
@@ -650,7 +711,10 @@ fn list_actors_spans_every_worker() {
     let (rt, mut host) = std_host(config_with(3));
     let mut addrs = Vec::new();
     for _ in 0..3 {
-        addrs.push(rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0)))).expect("spawn"));
+        addrs.push(
+            rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0))))
+                .expect("spawn"),
+        );
     }
     host.try_tick(); // ensure actors are installed before listing
 
@@ -662,10 +726,18 @@ fn list_actors_spans_every_worker() {
         .expect("list ok");
 
     // Exactly one summary per actor, spanning all three workers exactly once.
-    assert_eq!(resp.actors.len(), 3, "list_actors completes once with every actor");
+    assert_eq!(
+        resp.actors.len(),
+        3,
+        "list_actors completes once with every actor"
+    );
     let mut workers: Vec<usize> = resp.actors.iter().map(|s| s.worker_id).collect();
     workers.sort();
-    assert_eq!(workers, vec![0, 1, 2], "actors from every worker are represented");
+    assert_eq!(
+        workers,
+        vec![0, 1, 2],
+        "actors from every worker are represented"
+    );
 }
 
 #[test]
@@ -673,14 +745,21 @@ fn stats_report_real_worker_ids_and_runtime_width() {
     let (rt, _host) = std_host(config_with(3));
     let mut addrs = Vec::new();
     for _ in 0..5 {
-        addrs.push(rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0)))).expect("spawn"));
+        addrs.push(
+            rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0))))
+                .expect("spawn"),
+        );
     }
 
     let stats = rt.stats();
     assert_eq!(stats.num_workers, 3, "num_workers reflects worker_count");
     assert_eq!(stats.workers.len(), 3, "one WorkerInfo per worker");
     let workers: Vec<usize> = addrs.iter().map(|a| worker_of(&stats, *a)).collect();
-    assert_eq!(workers, vec![0, 1, 2, 0, 1], "placements use real worker ids");
+    assert_eq!(
+        workers,
+        vec![0, 1, 2, 0, 1],
+        "placements use real worker ids"
+    );
 }
 
 #[test]
@@ -688,18 +767,32 @@ fn system_info_reflects_runtime_width() {
     let (rt, mut host) = std_host(config_with(3));
     let report = rt.new_inbox::<SystemReport>().expect("inbox");
     // First spawn → worker 0.
-    let reporter = rt.spawn(SystemReporter { reply_to: *report.addr() }).expect("spawn reporter");
+    let reporter = rt
+        .spawn(SystemReporter {
+            reply_to: *report.addr(),
+        })
+        .expect("spawn reporter");
 
     // Spawn two more so the runtime-wide actor count is observably > 1.
-    let _ = rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0)))).expect("spawn extra");
-    let _ = rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0)))).expect("spawn extra");
+    let _ = rt
+        .spawn(CountingProbe(Arc::new(AtomicUsize::new(0))))
+        .expect("spawn extra");
+    let _ = rt
+        .spawn(CountingProbe(Arc::new(AtomicUsize::new(0))))
+        .expect("spawn extra");
 
     rt.send_to(reporter, Probe).expect("trigger");
     let msg = tick_until_recv(&mut host, &report, 16).expect("system report");
 
     assert_eq!(msg.worker_id, 0, "reporter observes its own worker");
-    assert_eq!(msg.num_workers, 3, "system_info reports runtime-wide worker count");
-    assert!(msg.total_actors >= 3, "total_actors is runtime-wide, not per-worker");
+    assert_eq!(
+        msg.num_workers, 3,
+        "system_info reports runtime-wide worker count"
+    );
+    assert!(
+        msg.total_actors >= 3,
+        "total_actors is runtime-wide, not per-worker"
+    );
 }
 
 #[test]
@@ -722,7 +815,11 @@ fn per_worker_extensions_are_distinct() {
     }
     ids.sort();
     ids.dedup();
-    assert_eq!(ids, vec![0, 1, 2], "three distinct per-worker extension instances fired");
+    assert_eq!(
+        ids,
+        vec![0, 1, 2],
+        "three distinct per-worker extension instances fired"
+    );
 }
 
 #[test]
@@ -731,7 +828,9 @@ fn panic_on_one_worker_does_not_stop_another() {
     let healthy_counter = Arc::new(AtomicUsize::new(0));
     // Round-robin: panicker → worker 0, healthy → worker 1.
     let _panicker = rt.spawn(PanicOnProbe).expect("spawn panicker");
-    let healthy = rt.spawn(CountingProbe(healthy_counter.clone())).expect("spawn healthy");
+    let healthy = rt
+        .spawn(CountingProbe(healthy_counter.clone()))
+        .expect("spawn healthy");
 
     rt.send_to(_panicker, Probe).expect("trigger panic");
     rt.send_to(healthy, Probe).expect("trigger healthy");
@@ -756,9 +855,14 @@ fn death_notification_crosses_workers() {
     let got = Arc::new(AtomicUsize::new(0));
 
     // watched → worker 0; watcher → worker 1.
-    let watched = rt.spawn(CountingProbe(Arc::new(AtomicUsize::new(0)))).expect("spawn watched");
+    let watched = rt
+        .spawn(CountingProbe(Arc::new(AtomicUsize::new(0))))
+        .expect("spawn watched");
     let watcher = rt
-        .spawn(CrossWorkerWatcher { target: watched, got: got.clone() })
+        .spawn(CrossWorkerWatcher {
+            target: watched,
+            got: got.clone(),
+        })
         .expect("spawn watcher");
     let _ = watcher;
 

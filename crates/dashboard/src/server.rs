@@ -11,37 +11,52 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::FrameEvent;
 use crate::store::DashboardStore;
 use crate::view::ViewRegistry;
+use crate::{FrameEvent, PluginPage};
 
 #[derive(Clone)]
 pub(crate) struct AppState {
     pub frames: broadcast::Sender<FrameEvent>,
     pub store: Arc<DashboardStore>,
     pub views: Arc<ViewRegistry>,
+    pub plugin_pages: Arc<Vec<PluginPage>>,
+    pub page_script_urls: Arc<Vec<String>>,
     pub shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) async fn run_server(state: AppState, port: u16) {
+    run_server_with_routes(state, port, Router::new()).await;
+}
+
+pub(crate) async fn run_server_with_routes(state: AppState, port: u16, extra: Router) {
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .expect("failed to bind HTTP server");
     let shutdown = Arc::clone(&state.shutdown_notify);
-    axum::serve(listener, router(state))
+    axum::serve(listener, router(state).merge(extra))
         .with_graceful_shutdown(async move { shutdown.notified().await })
         .await
         .expect("HTTP server error");
 }
 
 fn router(state: AppState) -> Router {
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/", get(root_page))
         .route("/events", get(frame_stream))
         .route("/api/frames", get(recent_frames))
         .route("/api/views", get(views_json))
         .route("/api/view/{*path}", get(view_snapshot))
         .route("/view/{*path}", get(view_page));
+    for page in state.plugin_pages.iter().cloned() {
+        router = router.route(
+            page.path,
+            get(move |State(state): State<AppState>| {
+                let page = page.clone();
+                async move { Html(inject_nav(page.html, page.id, &state)) }
+            }),
+        );
+    }
     #[cfg(feature = "demo-control")]
     let router = router
         .route("/control/kill", axum::routing::post(control_kill))
@@ -52,9 +67,7 @@ fn router(state: AppState) -> Router {
 }
 
 #[cfg(feature = "demo-control")]
-async fn control_kill(
-    Json(command): Json<crate::control::ControlCommand>,
-) -> impl IntoResponse {
+async fn control_kill(Json(command): Json<crate::control::ControlCommand>) -> impl IntoResponse {
     match command {
         crate::control::ControlCommand::Kill { .. } => {
             if crate::control::dispatch(command) {
@@ -84,9 +97,7 @@ async fn control_provision(
 }
 
 #[cfg(feature = "demo-control")]
-async fn control_remove(
-    Json(command): Json<crate::control::ControlCommand>,
-) -> impl IntoResponse {
+async fn control_remove(Json(command): Json<crate::control::ControlCommand>) -> impl IntoResponse {
     match command {
         crate::control::ControlCommand::Remove { .. } => {
             if crate::control::dispatch(command) {
@@ -100,9 +111,7 @@ async fn control_remove(
 }
 
 #[cfg(feature = "demo-control")]
-async fn control_edge(
-    Json(command): Json<crate::control::ControlCommand>,
-) -> impl IntoResponse {
+async fn control_edge(Json(command): Json<crate::control::ControlCommand>) -> impl IntoResponse {
     match command {
         crate::control::ControlCommand::EstablishEdge { .. } => {
             if crate::control::dispatch(command) {
@@ -133,9 +142,6 @@ const NAV_PLACEHOLDER: &str = "<!--swactor:nav-->";
 /// Build the unified top navbar from the view registry (registration order,
 /// active by served path). Fleet links to `/` — it is the home page.
 fn inject_nav(html: &str, active_path: &str, state: &AppState) -> String {
-    if !html.contains(NAV_PLACEHOLDER) {
-        return html.to_owned();
-    }
     let mut links = Vec::new();
     for view in state.views.descriptors() {
         if !view.show_in_nav {
@@ -150,8 +156,24 @@ fn inject_nav(html: &str, active_path: &str, state: &AppState) -> String {
         links.push(format!(
             r#"<a href="{}"{}>{}</a>"#,
             escape_html(&href),
-            if active { r#" aria-current="page" data-active="true""# } else { "" },
+            if active {
+                r#" aria-current="page" data-active="true""#
+            } else {
+                ""
+            },
             escape_html(view.title),
+        ));
+    }
+    for page in state.plugin_pages.iter() {
+        links.push(format!(
+            r#"<a href="{}"{}>{}</a>"#,
+            escape_html(page.path),
+            if page.id == active_path {
+                r#" aria-current="page" data-active="true""#
+            } else {
+                ""
+            },
+            escape_html(page.title),
         ));
     }
     let nav = format!(
@@ -182,7 +204,16 @@ fn inject_nav(html: &str, active_path: &str, state: &AppState) -> String {
         ),
         links.join("")
     );
-    html.replace(NAV_PLACEHOLDER, &nav)
+    let rendered = html.replace(NAV_PLACEHOLDER, &nav);
+    if state.page_script_urls.is_empty() {
+        return rendered;
+    }
+    let scripts = state
+        .page_script_urls
+        .iter()
+        .map(|url| format!(r#"<script src="{}"></script>"#, escape_html(url)))
+        .collect::<String>();
+    rendered.replacen("</body>", &format!("{scripts}</body>"), 1)
 }
 
 fn escape_html(value: &str) -> String {
@@ -198,7 +229,21 @@ async fn recent_frames(State(state): State<AppState>) -> Json<Vec<FrameEvent>> {
 }
 
 async fn views_json(State(state): State<AppState>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "views": state.views.descriptors() }))
+    let pages = state
+        .plugin_pages
+        .iter()
+        .map(|page| {
+            serde_json::json!({
+                "id": page.id,
+                "title": page.title,
+                "path": page.path,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "views": state.views.descriptors(),
+        "plugin_pages": pages,
+    }))
 }
 
 async fn view_snapshot(
@@ -264,4 +309,36 @@ async fn frame_stream(
     });
 
     Sse::new(ReceiverStream::new(out).map(Ok)).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_plugin(page: PluginPage) -> AppState {
+        let views = Arc::new(ViewRegistry::new());
+        let store = Arc::new(DashboardStore::new(1, Arc::clone(&views)));
+        let (frames, _) = broadcast::channel(1);
+        AppState {
+            frames,
+            store,
+            views,
+            plugin_pages: Arc::new(vec![page]),
+            page_script_urls: Arc::new(Vec::new()),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    #[test]
+    fn registered_plugin_page_appears_in_shared_navigation() {
+        let state = state_with_plugin(PluginPage::new(
+            "provision",
+            "Provision",
+            "/provision",
+            "<!--swactor:nav-->",
+        ));
+        let rendered = inject_nav("<!--swactor:nav-->", "provision", &state);
+        assert!(rendered.contains(r#"<a href="/provision""#));
+        assert!(rendered.contains(r#"aria-current="page" data-active="true">Provision</a>"#));
+    }
 }

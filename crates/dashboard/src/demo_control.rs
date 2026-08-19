@@ -15,8 +15,8 @@ use serde::Serialize;
 use serde_json::Value;
 use telemetry::frame::{Frame, StreamId};
 
-use crate::view::DashboardView;
 use crate::FrameEvent;
+use crate::view::DashboardView;
 
 #[derive(Clone, Serialize)]
 struct ProcessEntry {

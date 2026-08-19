@@ -145,6 +145,10 @@ pub(crate) enum NodeAgentMsg {
         stage_index: u32,
         readiness_id: u64,
     },
+    RebindOrchestrator {
+        orchestrator_actor: ActorAddress,
+        control_generation: u64,
+    },
     MarkWeightsReady {
         run_id: u64,
         node_id: u64,
@@ -331,6 +335,7 @@ pub(crate) struct NodeAgentActor {
     core: stage::StageController,
     orchestrator: ActorAddress,
     report_to: Option<ActorAddress>,
+    control_generation: u64,
     inbound_edge: Option<StageInboundEdgeWire>,
     outbound_edge: Option<StageOutboundEdgeWire>,
     command_cursor: usize,
@@ -348,6 +353,7 @@ impl NodeAgentActor {
             core: stage::StageController::new(local_node_id),
             orchestrator,
             report_to,
+            control_generation: 0,
             inbound_edge: None,
             outbound_edge: None,
             command_cursor: 0,
@@ -430,6 +436,17 @@ impl NodeAgentActor {
     }
 
     fn observe(&mut self, ctx: &Ctx, msg: NodeAgentMsg) {
+        if let NodeAgentMsg::RebindOrchestrator {
+            orchestrator_actor,
+            control_generation,
+        } = msg
+        {
+            if control_generation >= self.control_generation {
+                self.orchestrator = orchestrator_actor;
+                self.control_generation = control_generation;
+            }
+            return;
+        }
         let Some(msg) = self.forward_prompt_or_snapshot(ctx, msg) else {
             return;
         };
@@ -586,6 +603,9 @@ impl NodeAgentActor {
             | NodeAgentMsg::EncodePrompt { .. }
             | NodeAgentMsg::DecodeTokens { .. }
             | NodeAgentMsg::Snapshot { .. } => unreachable!("prompt messages returned early"),
+            NodeAgentMsg::RebindOrchestrator { .. } => {
+                unreachable!("rebind messages returned early")
+            }
         }
         self.drain_outputs(ctx);
     }

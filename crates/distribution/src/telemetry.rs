@@ -1,7 +1,7 @@
 //! Distribution-owned telemetry records.
 
-use telemetry::Record;
 use serde::{Deserialize, Serialize};
+use telemetry::Record;
 
 /// Transport internals — connectivity to peers and relay.
 pub const TRANSPORT_INTERNALS: &str = "transport.internals";

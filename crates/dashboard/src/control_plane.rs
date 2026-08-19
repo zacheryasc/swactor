@@ -16,10 +16,10 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use telemetry::frame::{Frame, StreamId};
 use parking_lot::RwLock;
 use serde::Serialize;
 use serde_json::{Value, json};
+use telemetry::frame::{Frame, StreamId};
 
 use crate::hardware_view::{
     CpuSnapshot, GpuSnapshot, HardwareHistorySnapshot, NodeHardwareState, duration_ms,
@@ -34,6 +34,9 @@ const CONTROL_PLANE_HTML: &str = include_str!("control_plane_page.html");
 const LIVE_TTL: Duration = Duration::from_secs(8);
 /// Hard cap on retained stale streams; oldest are evicted.
 const STALE_POOL_CAP: usize = 50;
+/// Stream origin of the process hosting this dashboard. Its card can never
+/// go meaningfully stale: if that publisher were silent, no page would render.
+const ORIGIN_ORCHESTRATOR: &str = "orchestrator";
 
 /// Fused control-plane view serving `/` and `/view/fleet`.
 #[derive(Default)]
@@ -53,6 +56,12 @@ struct FusedNode {
     actors: RuntimeState,
     origin: Option<String>,
     label: Option<String>,
+}
+
+impl FusedNode {
+    fn is_orchestrator(&self) -> bool {
+        self.origin.as_deref() == Some(ORIGIN_ORCHESTRATOR)
+    }
 }
 
 impl DashboardView for ControlPlaneView {
@@ -113,16 +122,38 @@ impl DashboardView for ControlPlaneView {
             }
         }
         live.sort_by(|left, right| {
-            left.stream
-                .node
-                .cmp(&right.stream.node)
-                .then_with(|| left.stream.life.cmp(&right.stream.life))
+            // The orchestrator card leads the live pool: it is the control
+            // plane every other node hangs off of.
+            right
+                .stream
+                .origin
+                .as_deref()
+                .map(|origin| origin == ORIGIN_ORCHESTRATOR)
+                .unwrap_or(false)
+                .cmp(
+                    &left
+                        .stream
+                        .origin
+                        .as_deref()
+                        .map(|origin| origin == ORIGIN_ORCHESTRATOR)
+                        .unwrap_or(false),
+                )
+                .then_with(|| {
+                    left.stream
+                        .node
+                        .cmp(&right.stream.node)
+                        .then_with(|| left.stream.life.cmp(&right.stream.life))
+                })
         });
         // Stale pool: most recently seen first, bounded by the physical cap.
         stale.sort_by_key(|right| std::cmp::Reverse(right.last_seen_ms_ago));
         stale.truncate(STALE_POOL_CAP);
         let totals = fused_totals(live.len(), stale.len());
-        let snapshot = FusedSnapshot { totals, live, stale };
+        let snapshot = FusedSnapshot {
+            totals,
+            live,
+            stale,
+        };
         serde_json::to_value(snapshot).unwrap_or_else(|_| {
             json!({
                 "totals": FusedTotals::default(),
@@ -160,9 +191,7 @@ fn prune(streams: &mut BTreeMap<String, FusedNode>, fresh: &StreamEvent, now: In
     // process is gone by construction once its successor publishes.
     let superseded: Vec<String> = streams
         .iter()
-        .filter(|(_, node)| {
-            node.stream.node == fresh.node && node.stream.life < fresh.life
-        })
+        .filter(|(_, node)| node.stream.node == fresh.node && node.stream.life < fresh.life)
         .map(|(key, _)| key.clone())
         .collect();
     for key in superseded {
@@ -171,7 +200,9 @@ fn prune(streams: &mut BTreeMap<String, FusedNode>, fresh: &StreamEvent, now: In
 
     let mut stale: Vec<(String, Instant)> = streams
         .iter()
-        .filter(|(_, node)| now.duration_since(node.last_seen) > LIVE_TTL)
+        .filter(|(_, node)| {
+            !node.is_orchestrator() && now.duration_since(node.last_seen) > LIVE_TTL
+        })
         .map(|(key, node)| (key.clone(), node.last_seen))
         .collect();
     if stale.len() > STALE_POOL_CAP {
@@ -298,12 +329,7 @@ fn stream_key(stream: &StreamEvent) -> String {
 fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
     let summary = node.hardware.summary();
     let totals = node.actors.totals();
-    let mut roster: Vec<RosterRow> = node
-        .actors
-        .actors
-        .values()
-        .map(roster_row)
-        .collect();
+    let mut roster: Vec<RosterRow> = node.actors.actors.values().map(roster_row).collect();
     // Busiest actors first; ties fall back to address for stable rendering.
     roster.sort_by(|left, right| {
         right
@@ -320,7 +346,7 @@ fn node_card(node: &FusedNode, now: Instant) -> NodeCard {
             origin: node.origin.clone(),
             label: node.label.clone(),
         },
-        live: now.duration_since(node.last_seen) <= LIVE_TTL,
+        live: node.is_orchestrator() || now.duration_since(node.last_seen) <= LIVE_TTL,
         last_seen_ms_ago: duration_ms(now.duration_since(node.last_seen)),
         last_sample_unix_ms: summary.sample_unix_ms,
         errors: node.hardware.errors(),
@@ -361,7 +387,11 @@ fn roster_row(actor: &ActorState) -> RosterRow {
         name: actor.name.clone(),
         actor_type: actor.actor_type.clone(),
         message_type: actor.message_type.clone(),
-        state: if actor.poisoned { "poisoned" } else { "running" },
+        state: if actor.poisoned {
+            "poisoned"
+        } else {
+            "running"
+        },
         mailbox_depth: actor.mailbox_depth,
         messages_processed: actor.messages_processed,
         msg_per_sec: actor.msg_per_sec,
@@ -392,7 +422,11 @@ fn actor_detail(
         actor_type: actor.actor_type.clone(),
         message_type: actor.message_type.clone(),
         worker_id: actor.worker_id,
-        state: if actor.poisoned { "poisoned" } else { "running" },
+        state: if actor.poisoned {
+            "poisoned"
+        } else {
+            "running"
+        },
         poisoned: actor.poisoned,
         mailbox_depth: actor.mailbox_depth,
         mailbox_growth: actor.mailbox_growth,
@@ -575,12 +609,83 @@ mod tests {
     }
 
     #[test]
+    fn orchestrator_stream_stays_live_beyond_ttl_and_survives_pool_eviction() {
+        let view = ControlPlaneView::default();
+        let orch = StreamId::new(NodeId::new("orch"), Lifetime(1));
+        let worker = StreamId::new(NodeId::new("worker"), Lifetime(1));
+        let frame = Frame::new(ChannelId(1), Position(0), actors_payload(0, json!([])));
+        for (stream, origin) in [(&orch, Some("orchestrator")), (&worker, None)] {
+            let event = FrameEvent {
+                stream: crate::StreamEvent {
+                    node: stream.node.as_str().to_string(),
+                    life: stream.life.0,
+                    origin: origin.map(str::to_owned),
+                    label: None,
+                },
+                channel: "runtime.actors".to_owned(),
+                position: 0,
+                payload: frame.payload.clone(),
+            };
+            view.ingest(stream, &frame, &event);
+        }
+        {
+            let mut state = view.state.write();
+            for node in state.streams.values_mut() {
+                node.last_seen -= LIVE_TTL + Duration::from_secs(1);
+            }
+        }
+
+        let snapshot = view.snapshot_json();
+        let live = snapshot["live"].as_array().expect("live array");
+        assert_eq!(live.len(), 1, "only the orchestrator stays live");
+        assert_eq!(live[0]["stream"]["node"], json!("orch"));
+        assert_eq!(live[0]["live"], json!(true));
+        assert_eq!(snapshot["stale"].as_array().map(Vec::len), Some(1));
+
+        // The stale-pool eviction sweep must not remove the orchestrator
+        // stream even when it is the oldest entry.
+        let fresh = StreamId::new(NodeId::new("fresh"), Lifetime(1));
+        ingest_json(
+            &view,
+            &fresh,
+            0,
+            "runtime.actors",
+            actors_payload(0, json!([])),
+        );
+        let snapshot = view.snapshot_json();
+        let still_live: Vec<&str> = snapshot["live"]
+            .as_array()
+            .expect("live array")
+            .iter()
+            .map(|card| card["stream"]["node"].as_str().expect("node"))
+            .collect();
+        assert!(
+            still_live.contains(&"orch"),
+            "orchestrator evicted: {still_live:?}"
+        );
+        // Orchestrator leads the live pool regardless of node name order.
+        assert_eq!(still_live.first(), Some(&"orch"));
+    }
+
+    #[test]
     fn newer_life_generation_evicts_superseded_stream() {
         let view = ControlPlaneView::default();
         let old = StreamId::new(NodeId::new("node"), Lifetime(1));
         let new = StreamId::new(NodeId::new("node"), Lifetime(2));
-        ingest_json(&view, &old, 0, "runtime.actors", actors_payload(0, json!([])));
-        ingest_json(&view, &new, 0, "runtime.actors", actors_payload(0, json!([])));
+        ingest_json(
+            &view,
+            &old,
+            0,
+            "runtime.actors",
+            actors_payload(0, json!([])),
+        );
+        ingest_json(
+            &view,
+            &new,
+            0,
+            "runtime.actors",
+            actors_payload(0, json!([])),
+        );
 
         let snapshot = view.snapshot_json();
         let nodes: Vec<&str> = snapshot["live"]
@@ -597,7 +702,13 @@ mod tests {
         let view = ControlPlaneView::default();
         for index in 0..(STALE_POOL_CAP as u64 + 5) {
             let stream = StreamId::new(NodeId::new(&format!("old-{index}")), Lifetime(1));
-            ingest_json(&view, &stream, 0, "runtime.actors", actors_payload(0, json!([])));
+            ingest_json(
+                &view,
+                &stream,
+                0,
+                "runtime.actors",
+                actors_payload(0, json!([])),
+            );
         }
         {
             let mut state = view.state.write();
@@ -607,7 +718,13 @@ mod tests {
         }
         // Physical cap applies on the next ingest…
         let fresh = StreamId::new(NodeId::new("fresh"), Lifetime(1));
-        ingest_json(&view, &fresh, 0, "runtime.actors", actors_payload(0, json!([])));
+        ingest_json(
+            &view,
+            &fresh,
+            0,
+            "runtime.actors",
+            actors_payload(0, json!([])),
+        );
 
         let state = view.state.read();
         assert!(state.streams.len() <= STALE_POOL_CAP + 1);
@@ -643,7 +760,10 @@ mod tests {
         assert_eq!(detail["address"], json!("ff00"));
         assert_eq!(detail["actor_type"], json!("OrchestratorActor"));
         assert_eq!(detail["worker_id"], json!(7));
-        assert_eq!(detail["message_type_counts"][0]["message_type"], json!("Ping"));
+        assert_eq!(
+            detail["message_type_counts"][0]["message_type"],
+            json!("Ping")
+        );
         assert_eq!(detail["receipts"].as_array().map(Vec::len), Some(1));
         assert_eq!(detail["receipts"][0]["ty"], json!("Ping"));
     }
@@ -676,7 +796,9 @@ mod tests {
             ),
         );
 
-        let detail = view.detail_json("stream=node%231&actor=aa").expect("detail");
+        let detail = view
+            .detail_json("stream=node%231&actor=aa")
+            .expect("detail");
         let receipts = detail["receipts"].as_array().expect("receipts");
         assert_eq!(receipts.len(), 1);
         assert_eq!(detail["sampled_out"].as_u64(), Some(4));
@@ -691,7 +813,10 @@ mod tests {
 
     #[test]
     fn percent_decoding_handles_hash_and_plus() {
-        assert_eq!(query_param("stream=node%234&actor=ab", "stream").as_deref(), Some("node#4"));
+        assert_eq!(
+            query_param("stream=node%234&actor=ab", "stream").as_deref(),
+            Some("node#4")
+        );
         assert_eq!(query_param("a=1&actor=cd", "actor").as_deref(), Some("cd"));
         assert_eq!(query_param("stream=x", "actor"), None);
     }

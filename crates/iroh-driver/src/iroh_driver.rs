@@ -31,13 +31,13 @@ use distribution::swim::actor::SwimIn;
 use distribution::transport_bridge::{OutFrame, Outbox, RelayMirror, RouteView, peer_addr};
 use distribution::types::NodeId;
 
-use crate::edge_transport::{EDGE_ALPN, EdgeSendHandle, spawn_edge_recv_pump};
 use crate::edge_transport::spawn_edge_send_pump as spawn_edge_sender_task;
-use data_plane::edge_wire::WireEvent;
+use crate::edge_transport::{EDGE_ALPN, EdgeSendHandle, spawn_edge_recv_pump};
 use crate::telemetry_transport::{
     TELEMETRY_ALPN, TelemetryQuicHeader, TelemetryQuicRead, read_events_from_stream,
     spawn_subscription_writer,
 };
+use data_plane::edge_wire::WireEvent;
 use swactor::actor::ActorAddress;
 use swactor::runtime::Runtime;
 use swactor_transport::CodecRegistry;

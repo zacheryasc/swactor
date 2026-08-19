@@ -4,6 +4,7 @@ use swactor::actor::{ActorAddress, ActorInterface};
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, NetworkMessage};
 
+use crate::orchestration::manual_control::{ManualActorControl, ManualControlMsg};
 use crate::run_fsm as core;
 
 use swactor_transport::JsonCodec;
@@ -13,8 +14,7 @@ pub(crate) struct StageRefWire {
     pub stage_index: u32,
     pub node_id: u64,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) enum OrchestratorMsg {
     ObservePoolReady {
         nodes: Vec<u64>,
@@ -78,6 +78,7 @@ pub(crate) enum OrchestratorMsg {
     Snapshot {
         reply_to: ActorAddress,
     },
+    Manual(ManualControlMsg),
 }
 
 impl NetworkMessage for OrchestratorMsg {
@@ -193,6 +194,7 @@ pub(crate) struct OrchestratorActor {
     report_to: Option<ActorAddress>,
     command_cursor: usize,
     event_cursor: usize,
+    manual: Option<ManualActorControl>,
 }
 
 impl OrchestratorActor {
@@ -202,7 +204,13 @@ impl OrchestratorActor {
             report_to,
             command_cursor: 0,
             event_cursor: 0,
+            manual: None,
         }
+    }
+
+    pub(crate) fn with_manual_control(mut self, manual: ManualActorControl) -> Self {
+        self.manual = Some(manual);
+        self
     }
 
     fn observe(&mut self, msg: OrchestratorMsg) {
@@ -235,7 +243,8 @@ impl OrchestratorActor {
             OrchestratorMsg::ObserveNodeRuntimeReady { .. }
             | OrchestratorMsg::ObserveNodeRuntimeReadyAck { .. }
             | OrchestratorMsg::ObserveWeightsReady { .. }
-            | OrchestratorMsg::Snapshot { .. } => {}
+            | OrchestratorMsg::Snapshot { .. }
+            | OrchestratorMsg::Manual(_) => {}
             OrchestratorMsg::ObserveTokenInEndpointReady => {
                 self.core.observe(core::RunEvent::TokenInEndpointReady)
             }
@@ -316,7 +325,18 @@ impl ActorInterface for OrchestratorActor {
     type Incoming = OrchestratorMsg;
     type Response = ();
 
+    fn on_start(&mut self, ctx: &Ctx) {
+        if let Some(manual) = self.manual.as_mut() {
+            manual.start(ctx.self_addr());
+        }
+    }
     fn handle(&mut self, ctx: &Ctx, msg: Self::Incoming) {
+        if let OrchestratorMsg::Manual(manual_msg) = msg.clone() {
+            if let Some(manual) = self.manual.as_mut() {
+                manual.handle(ctx, manual_msg);
+            }
+            return;
+        }
         match msg.clone() {
             OrchestratorMsg::ObserveNodeRuntimeReady {
                 run_id,
@@ -326,6 +346,27 @@ impl ActorInterface for OrchestratorActor {
                 node_actor,
                 readiness_id,
             } => {
+                if let Some(manual) = self.manual.as_mut() {
+                    manual.observe_runtime_ready(
+                        ctx.self_addr(),
+                        node_id,
+                        crate::orchestration::daemon::RuntimeFacts {
+                            run_id,
+                            attempt_id: manual
+                                .read_model()
+                                .nodes
+                                .iter()
+                                .find(|node| node.logical_node_id == node_id)
+                                .and_then(|node| node.spec.as_ref())
+                                .map_or(0, |spec| spec.attempt_id),
+                            endpoint: serde_json::to_string(&endpoint).unwrap_or_default(),
+                            node_actor,
+                            swim_node_id: distribution::types::NodeId(*endpoint.id.as_bytes()),
+                            stage_index,
+                            readiness_id,
+                        },
+                    );
+                }
                 if let Some(report_to) = self.report_to {
                     let _ = ctx.send(
                         report_to,
@@ -347,6 +388,9 @@ impl ActorInterface for OrchestratorActor {
                 stage_index,
                 readiness_id,
             } => {
+                if let Some(manual) = self.manual.as_mut() {
+                    manual.observe_node_ack(ctx.self_addr(), node_id, readiness_id);
+                }
                 if let Some(report_to) = self.report_to {
                     let _ = ctx.send(
                         report_to,

@@ -66,9 +66,8 @@ pub mod wire;
 // ── Producer surface (re-exported at root; safe for control-plane code) ──
 
 pub use endpoint::{
-    CatalogSnapshot, ChannelRegistrationError, TelemetryEndpoint, TelemetryProducer,
-    TelemetrySnapshot, TelemetrySubscription, DeliveryFanout, EndpointTick, SubscriberSnapshot,
-    SubscriptionId,
+    CatalogSnapshot, ChannelRegistrationError, DeliveryFanout, EndpointTick, SubscriberSnapshot,
+    SubscriptionId, TelemetryEndpoint, TelemetryProducer, TelemetrySnapshot, TelemetrySubscription,
 };
 pub use frame::{
     ChannelContent, ChannelContentKind, ChannelDescriptor, ChannelFilter, ChannelId, ChannelRef,
@@ -77,8 +76,8 @@ pub use frame::{
 };
 pub use mux::Mux;
 pub use publisher_actor::{
-    TELEMETRY_PUBLISHER_NAME, TelemetryPublisherActor, TelemetryPublisherMsg,
-    TelemetrySubscribe, register_telemetry_publisher_codec,
+    TELEMETRY_PUBLISHER_NAME, TelemetryPublisherActor, TelemetryPublisherMsg, TelemetrySubscribe,
+    register_telemetry_publisher_codec,
 };
 pub use record::{ChannelKind, ChannelRegistry, Record};
 pub use sink_actor::{TELEMETRY_SINK_NAME, TelemetrySink};

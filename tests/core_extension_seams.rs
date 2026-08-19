@@ -168,10 +168,9 @@ impl ActorInterface for MarkerReporter {
 #[test]
 fn on_spawn_environment_mutation_is_visible_to_actor() {
     let state = Arc::new(SeamState::default());
-    let parts = RuntimeParts::new(RuntimeConfig::default())
-        .with_extension(Arc::new(
-            SeamExtension::new(Arc::clone(&state)).with_spawn_marker(),
-        ));
+    let parts = RuntimeParts::new(RuntimeConfig::default()).with_extension(Arc::new(
+        SeamExtension::new(Arc::clone(&state)).with_spawn_marker(),
+    ));
     let rt = parts.runtime().clone();
     let mut host = SingleThreadRuntime::new(parts);
     let inbox = rt.new_inbox::<SpawnMarkerSeen>().unwrap();

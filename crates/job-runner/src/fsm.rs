@@ -63,7 +63,11 @@ pub struct TransitionCtx {
 
 impl TransitionCtx {
     pub fn new(job_has_workspace: bool, job_has_setup: bool) -> Self {
-        Self { has_workspace: job_has_workspace, has_setup: job_has_setup, prior_exit: None }
+        Self {
+            has_workspace: job_has_workspace,
+            has_setup: job_has_setup,
+            prior_exit: None,
+        }
     }
 }
 
@@ -148,7 +152,11 @@ mod tests {
     use super::*;
 
     fn ctx(ws: bool, setup: bool, exit: Option<i32>) -> TransitionCtx {
-        TransitionCtx { has_workspace: ws, has_setup: setup, prior_exit: exit }
+        TransitionCtx {
+            has_workspace: ws,
+            has_setup: setup,
+            prior_exit: exit,
+        }
     }
 
     #[test]

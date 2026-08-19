@@ -107,7 +107,6 @@ pub struct AdoptedNode {
     pub provider_ref: String,
 }
 
-
 pub trait PluginObservationSink: Send + Sync {
     fn observe(&self, observation: PluginObservation);
 }
@@ -135,6 +134,22 @@ pub trait ProvisionPlugin: Send {
         sink: PluginSink,
     ) -> Result<PluginNodeHandle, String>;
 
+    /// Creates one concrete node. A selected offer is authoritative: providers
+    /// must either create exactly it or fail without substitution.
+    fn create_node_selected(
+        &mut self,
+        spec: NodeProvisionSpec,
+        sink: PluginSink,
+        selected_offer_id: Option<u64>,
+    ) -> Result<PluginNodeHandle, String> {
+        if let Some(offer_id) = selected_offer_id {
+            return Err(format!(
+                "provider does not support exact offer selection {offer_id}"
+            ));
+        }
+        self.create_node(spec, sink)
+    }
+
     /// Starts or adopts bootstrap work on an already-created provider resource.
     fn start_bootstrap(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
 
@@ -146,6 +161,16 @@ pub trait ProvisionPlugin: Send {
 
     fn stop_node(&mut self, handle: &PluginNodeHandle) -> Result<(), String>;
     fn adopt_by_spec(
+        &mut self,
+        _spec: &NodeProvisionSpec,
+        _sink: PluginSink,
+    ) -> Result<Option<AdoptedNode>, String> {
+        Ok(None)
+    }
+    /// Recreates only the provider-local bootstrap handle when durable intent
+    /// was persisted before the provider resource was started. This must not
+    /// allocate, rent, or otherwise create a remote resource.
+    fn prepare_missing_bootstrap(
         &mut self,
         _spec: &NodeProvisionSpec,
         _sink: PluginSink,
@@ -174,12 +199,6 @@ pub trait ProvisionPlugin: Send {
     ) -> Result<bool, String> {
         Ok(false)
     }
-
-    /// Releases every owned resource handle without stopping anything, so a
-    /// process exit leaves provider resources running. Callers that want
-    /// teardown must call [`ProvisionPlugin::stop_node`] or
-    /// [`ProvisionPlugin::stop_by_spec`] first.
-    fn detach_all(&mut self) {}
 }
 
 #[cfg(test)]

@@ -38,6 +38,9 @@ mod tests {
             inet_up_cost_per_tb: 0.0,
             host_id: Some(id),
             verification: Some("unverified".to_owned()),
+            reliability2: Some(0.99),
+            inet_down: Some(500.0),
+            inet_up: Some(250.0),
         }
     }
 

@@ -16,7 +16,10 @@ use crate::ids::{EdgeId, StreamId};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WireEvent {
     /// A new inbound stream arrived, tagged for `edge_id`.
-    StreamArrived { edge_id: EdgeId, stream_id: StreamId },
+    StreamArrived {
+        edge_id: EdgeId,
+        stream_id: StreamId,
+    },
     /// Bytes were read from an inbound stream.
     BytesRead {
         edge_id: EdgeId,
@@ -24,7 +27,10 @@ pub enum WireEvent {
         bytes: Vec<u8>,
     },
     /// An inbound stream ended cleanly.
-    StreamEnded { edge_id: EdgeId, stream_id: StreamId },
+    StreamEnded {
+        edge_id: EdgeId,
+        stream_id: StreamId,
+    },
     /// A stream or connection-level fault. `None` ids mean the fault could
     /// not be attributed to a specific edge or stream.
     StreamFault {
@@ -56,7 +62,11 @@ pub trait EdgeTransport {
     type PeerAddr: Clone;
 
     /// Open (or continue) the writer pumping bytes to `edge_id`'s peer.
-    fn open_writer(&mut self, edge_id: EdgeId, peer: &Self::PeerAddr) -> Result<Self::Writer, String>;
+    fn open_writer(
+        &mut self,
+        edge_id: EdgeId,
+        peer: &Self::PeerAddr,
+    ) -> Result<Self::Writer, String>;
 
     /// Drain all transport events observed since the last call.
     fn drain_events(&mut self) -> Vec<WireEvent>;

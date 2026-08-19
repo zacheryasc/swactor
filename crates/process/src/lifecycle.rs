@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 
-use telemetry::{ChannelContent, TelemetryProducer, StreamId};
 use serde_json::json;
 use swactor::actor::ActorAddress;
+use telemetry::{ChannelContent, StreamId, TelemetryProducer};
 
 use crate::message::ProcessOutput;
 use crate::types::{ExitStatus, ProcessSpec};
@@ -222,8 +222,8 @@ impl Drop for LifecycleLabelReservation {
 mod tests {
     use std::collections::HashMap;
 
-    use telemetry::{TelemetryEndpoint, Lifetime, NodeId, StreamId};
     use swactor::actor::ActorAddress;
+    use telemetry::{Lifetime, NodeId, StreamId, TelemetryEndpoint};
 
     use super::*;
 

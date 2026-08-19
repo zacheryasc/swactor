@@ -601,29 +601,16 @@ mod weight_lifecycle {
         harness.observe(weights::WeightEvent::Provisioned(valid_assignment()));
 
         // The load command may use the physical source, but its graph-visible layer
-        // range must be the assigned range.
-        for command in harness.commands() {
-            if let weights::WeightCommand::LoadOrBindRange { range, .. } = command {
-                assert_eq!(
-                    *range,
-                    weights::LayerRange {
-                        start: 12,
-                        end_exclusive: 24,
-                    }
-                );
+        // range must be exactly the assigned range.
+        assert_eq!(harness.commands().len(), 1);
+        let weights::WeightCommand::LoadOrBindRange { range, .. } = &harness.commands()[0];
+        assert_eq!(
+            *range,
+            weights::LayerRange {
+                start: 12,
+                end_exclusive: 24,
             }
-        }
-
-        // There must be no command claiming ownership of neighboring layers.
-        assert!(!harness.commands().iter().any(|command| {
-            matches!(
-                command,
-                weights::WeightCommand::AdvertiseLoadedLayerRange {
-                    range,
-                    ..
-                } if range.start < 12 || range.end_exclusive > 24
-            )
-        }));
+        );
     }
 
     // This proves whole GGUF download, shard download, and cache use are physical

@@ -13,7 +13,7 @@ use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;
 use swactor_transport::{CodecRegistry, JsonCodec, NetworkMessage};
 
-use crate::{TelemetryEndpoint, TelemetrySubscription, SubscriptionRequest};
+use crate::{SubscriptionRequest, TelemetryEndpoint, TelemetrySubscription};
 
 /// Well-known actor registry name for node-side telemetry subscription requests.
 pub const TELEMETRY_PUBLISHER_NAME: &str = "telemetry-publisher";

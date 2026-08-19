@@ -14,8 +14,8 @@
 use swactor::actor::ActorInterface;
 use swactor::runtime::Ctx;
 
-use crate::frame::{Frame, StreamId};
 use super::wire::{TelemetryFrame, decode_delivery};
+use crate::frame::{Frame, StreamId};
 
 /// Receives legacy [`TelemetryFrame`] cluster messages and folds each decoded
 /// delivery through `on_frame`. Spawn it, then publish its address under

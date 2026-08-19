@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Myelin Provision</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      --bg: #000000; --panel: #001220; --panel-hover: #001c38; --inset: #00060c;
+      --border: #14406a; --divider: #0d2c4a;
+      --text: #ffffff; --muted: #9db2c4;
+      --amber: #ff9900; --ghost: rgba(255, 153, 0, .16);
+      --ok: #00d400; --bad: #ff4141; --cyan: #5cd5ff;
+      --primary-fill: #ff9900; --primary-ink: #000000;
+      --selected: rgba(255, 153, 0, .10); --selected-edge: #ff9900;
+      --row-hover: #002a47; --r: 2px; --t: 120ms;
+      background: var(--bg); color: var(--text);
+    }
+    :root[data-theme="light"] {
+      color-scheme: light;
+      --bg: #fafafa; --panel: #ffffff; --panel-hover: #f0f0f0; --inset: #f5f5f5;
+      --border: #dcdce0; --divider: #eaeaea;
+      --text: #383a42; --muted: #696c77;
+      --amber: #986801; --ghost: rgba(152, 104, 1, .18);
+      --ok: #50a14f; --bad: #e45649; --cyan: #0184bc;
+      --primary-fill: #0184bc; --primary-ink: #ffffff;
+      --selected: rgba(64, 120, 242, .08); --selected-edge: #4078f2;
+      --row-hover: #eef1f8;
+    }
+    @media (prefers-color-scheme: light) {
+      :root:not([data-theme]) {
+        color-scheme: light;
+        --bg: #fafafa; --panel: #ffffff; --panel-hover: #f0f0f0; --inset: #f5f5f5;
+        --border: #dcdce0; --divider: #eaeaea;
+        --text: #383a42; --muted: #696c77;
+        --amber: #986801; --ghost: rgba(152, 104, 1, .18);
+        --ok: #50a14f; --bad: #e45649; --cyan: #0184bc;
+        --primary-fill: #0184bc; --primary-ink: #ffffff;
+        --selected: rgba(64, 120, 242, .08); --selected-edge: #4078f2;
+        --row-hover: #eef1f8;
+      }
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 20px; background: var(--bg); color: var(--text); }
+    .page { max-width: 1180px; margin: 0 auto; }
+    h1 { margin: 0; font-size: 20px; }
+    h2 { margin: 0 0 12px; color: var(--amber); font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; }
+    h3 { color: var(--amber); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; margin-top: 16px; }
+    .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r); padding: 16px; }
+    form { display: grid; gap: 10px; }
+    #search-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    label { display: grid; gap: 5px; margin: 0; color: var(--muted); font-size: 12px; }
+    label.row { display: flex; gap: 8px; align-items: center; }
+    input {
+      width: 100%; padding: 7px 9px; background: var(--inset); color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--r); font: 12px var(--mono);
+      transition: border-color var(--t);
+    }
+    input:hover { border-color: var(--cyan); }
+    input[type="checkbox"] { width: auto; accent-color: var(--primary-fill); }
+    button {
+      padding: 6px 12px; background: transparent; color: var(--text);
+      border: 1px solid var(--border); border-radius: var(--r); cursor: pointer;
+      font: 600 13px var(--mono); transition: background var(--t), border-color var(--t);
+    }
+    button:hover:not(:disabled) { background: var(--panel-hover); border-color: var(--cyan); }
+    button:active:not(:disabled) { transform: translateY(1px); }
+    button.primary { background: var(--primary-fill); border-color: var(--primary-fill); color: var(--primary-ink); }
+    button.primary:hover:not(:disabled) { background: var(--primary-fill); border-color: var(--cyan); filter: brightness(1.1); }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    :is(a, button, input):focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+    .status { font: 600 12px var(--mono); }
+    .error { color: var(--bad); white-space: pre-wrap; font: 12px var(--mono); }
+    .ok { color: var(--ok); }
+    .muted { color: var(--muted); font-size: 12px; }
+    #simulation-banner { padding: 8px 10px; border: 1px solid var(--ok); background: var(--panel); }
+    table { width: 100%; min-width: 1060px; border-collapse: collapse; font: 12px var(--mono); }
+    th, td { padding: 7px 8px; text-align: left; border-bottom: 1px solid var(--divider); font-variant-numeric: tabular-nums; }
+    th { color: var(--amber); font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+    tbody tr:hover { background: var(--row-hover); }
+    tbody tr:has(input:checked) { background: var(--selected); box-shadow: inset 2px 0 0 var(--selected-edge); }
+    code { color: var(--cyan); font-family: var(--mono); }
+    .offers-scroll { max-height: min(36rem, 65vh); overflow: auto; border: 1px solid var(--border); border-radius: var(--r); background: var(--inset); }
+    .offers-scroll th { position: sticky; top: 0; z-index: 1; background: var(--panel); white-space: nowrap; }
+    .sort-controls { display: inline-flex; gap: 2px; margin-left: 4px; vertical-align: middle; }
+    .sort-button { position: relative; width: 14px; height: 14px; padding: 0; border-color: transparent; font-size: 0; line-height: 0; }
+    .sort-button::before { content: ""; position: absolute; left: 4px; width: 0; height: 0; border-left: 3px solid transparent; border-right: 3px solid transparent; }
+    .sort-button[data-direction="asc"]::before { top: 3px; border-bottom: 5px solid currentColor; }
+    .sort-button[data-direction="desc"]::before { bottom: 3px; border-top: 5px solid currentColor; }
+    .sort-button:hover:not(:disabled), .sort-button[aria-pressed="true"] { color: var(--cyan); border-color: var(--cyan); background: var(--panel-hover); }
+    @media (max-width: 680px) { #search-form { grid-template-columns: 1fr; } }
+    @media (prefers-reduced-motion: reduce) { * { transition-duration: .01ms !important; } }
+  </style>
+</head>
+<body>
+  <!--swactor:nav-->
+  <main class="page">
+    <h1>Manual node control</h1>
+    <p class="muted">Every provision targets the submitted intent. Vast.ai selections never fall back to another offer.</p>
+    <p id="simulation-banner" class="status ok" hidden>SIMULATED provisioning: offers are live; no Vast.ai contract will be created or destroyed.</p>
+    <div class="grid">
+      <section id="provider-config-card" class="card">
+        <h2>Provider readiness</h2>
+        <p id="readiness" class="status">Loading…</p><p id="readiness-error" class="error"></p>
+        <form id="config-form" autocomplete="off">
+          <label>Vast.ai API key<input name="api_key" type="password" autocomplete="off"></label>
+          <label data-real-vastai>SSH identity path<input name="ssh_identity" placeholder="~/.ssh/id_ed25519"></label>
+          <label data-real-vastai>Bootstrap command<input name="bootstrap_command"></label>
+          <button class="primary">Validate configuration</button>
+        </form>
+        <p class="muted">The API key is sent once and held only in daemon memory; it is never stored in the browser. Non-secret search state stays in this tab.</p>
+      </section>
+      <section id="vast-search-card" class="card">
+        <h2>Search offers</h2>
+        <form id="search-form">
+          <label>GPU model contains<input name="gpu_model" placeholder="4090 or A100"></label>
+          <label>Minimum GPU RAM (MB)<input name="min_gpu_ram_mb" type="number" min="0"></label>
+          <label>Minimum compute capability<input name="min_compute_cap" type="number" min="0"></label>
+          <label>Minimum reliability<input name="min_reliability" type="number" min="0" max="1" step="0.001"></label>
+          <label>Minimum download Mbps<input name="min_download_mbps" type="number" min="0" step="0.1"></label>
+          <label>Minimum upload Mbps<input name="min_upload_mbps" type="number" min="0" step="0.1"></label>
+          <label>Maximum hourly price<input name="max_hourly_price" type="number" min="0" step="0.001"></label>
+          <label>Blacklist host IDs<input name="blacklist_hosts" placeholder="123,456"></label>
+          <label class="row"><input name="require_verified" type="checkbox" style="width:auto"> Verified hosts only</label>
+          <button id="search-button" class="primary">Search without leasing</button>
+        </form>
+      </section>
+      <section id="local-provision-card" class="card" hidden>
+        <h2><span id="local-provider-name"></span> nodes</h2>
+        <p class="muted">Starts the configured Myelin worker directly. No marketplace offer is involved.</p>
+        <form id="local-provision-form">
+          <label>Node count<input name="count" type="number" min="1" max="8" value="1"></label>
+          <button id="local-provision-button" class="primary">Provision nodes</button>
+        </form>
+        <p id="local-provision-error" class="error"></p>
+      </section>
+    </div>
+    <section id="vast-offers-card" class="card" style="margin-top:1rem">
+      <h2>Offers</h2><p id="offer-status" class="muted"></p><p id="offer-error" class="error"></p>
+      <div class="offers-scroll"><table id="offers-table"><thead><tr><th>Select</th><th>Offer<span class="sort-controls"><button type="button" class="sort-button" data-sort="offer_id" data-direction="asc" title="Sort offer ascending" aria-label="Sort offer ascending">↑</button><button type="button" class="sort-button" data-sort="offer_id" data-direction="desc" title="Sort offer descending" aria-label="Sort offer descending">↓</button></span></th><th>Host<span class="sort-controls"><button type="button" class="sort-button" data-sort="host_id" data-direction="asc" title="Sort host ascending" aria-label="Sort host ascending">↑</button><button type="button" class="sort-button" data-sort="host_id" data-direction="desc" title="Sort host descending" aria-label="Sort host descending">↓</button></span></th><th>GPU<span class="sort-controls"><button type="button" class="sort-button" data-sort="gpu_model" data-direction="asc" title="Sort GPU ascending" aria-label="Sort GPU ascending">↑</button><button type="button" class="sort-button" data-sort="gpu_model" data-direction="desc" title="Sort GPU descending" aria-label="Sort GPU descending">↓</button></span></th><th>RAM<span class="sort-controls"><button type="button" class="sort-button" data-sort="gpu_ram_mb" data-direction="asc" title="Sort RAM ascending" aria-label="Sort RAM ascending">↑</button><button type="button" class="sort-button" data-sort="gpu_ram_mb" data-direction="desc" title="Sort RAM descending" aria-label="Sort RAM descending">↓</button></span></th><th>CC<span class="sort-controls"><button type="button" class="sort-button" data-sort="compute_cap" data-direction="asc" title="Sort compute capability ascending" aria-label="Sort compute capability ascending">↑</button><button type="button" class="sort-button" data-sort="compute_cap" data-direction="desc" title="Sort compute capability descending" aria-label="Sort compute capability descending">↓</button></span></th><th>Verified<span class="sort-controls"><button type="button" class="sort-button" data-sort="verification" data-direction="asc" title="Sort verification ascending" aria-label="Sort verification ascending">↑</button><button type="button" class="sort-button" data-sort="verification" data-direction="desc" title="Sort verification descending" aria-label="Sort verification descending">↓</button></span></th><th>Reliability<span class="sort-controls"><button type="button" class="sort-button" data-sort="reliability" data-direction="asc" title="Sort reliability ascending" aria-label="Sort reliability ascending">↑</button><button type="button" class="sort-button" data-sort="reliability" data-direction="desc" title="Sort reliability descending" aria-label="Sort reliability descending">↓</button></span></th><th>Down<span class="sort-controls"><button type="button" class="sort-button" data-sort="download_mbps" data-direction="asc" title="Sort download speed ascending" aria-label="Sort download speed ascending">↑</button><button type="button" class="sort-button" data-sort="download_mbps" data-direction="desc" title="Sort download speed descending" aria-label="Sort download speed descending">↓</button></span></th><th>Up<span class="sort-controls"><button type="button" class="sort-button" data-sort="upload_mbps" data-direction="asc" title="Sort upload speed ascending" aria-label="Sort upload speed ascending">↑</button><button type="button" class="sort-button" data-sort="upload_mbps" data-direction="desc" title="Sort upload speed descending" aria-label="Sort upload speed descending">↓</button></span></th><th>Location<span class="sort-controls"><button type="button" class="sort-button" data-sort="location" data-direction="asc" title="Sort location ascending" aria-label="Sort location ascending">↑</button><button type="button" class="sort-button" data-sort="location" data-direction="desc" title="Sort location descending" aria-label="Sort location descending">↓</button></span></th><th>$/hr<span class="sort-controls"><button type="button" class="sort-button" data-sort="hourly_price" data-direction="asc" title="Sort price ascending" aria-label="Sort price ascending">↑</button><button type="button" class="sort-button" data-sort="hourly_price" data-direction="desc" title="Sort price descending" aria-label="Sort price descending">↓</button></span></th></tr></thead><tbody id="offers"></tbody></table></div>
+      <p>Selected exact offer IDs: <code id="selection">none (0/8)</code></p>
+      <button id="provision-button" class="primary" disabled>Provision selected offers</button>
+    </section>
+  </main>
+<script>
+'use strict';
+const $=id=>document.getElementById(id); const MAX_SELECTED_OFFERS=8; const PAGE_STATE_KEY='myelin.provision.page.v1'; const SEARCH_FIELDS=['gpu_model','min_gpu_ram_mb','min_compute_cap','min_reliability','min_download_mbps','min_upload_mbps','max_hourly_price','blacklist_hosts','require_verified']; let selected=new Set(); let provisioningMode='real'; let currentOffers=[]; let offerSorts=[]; let sortDoubleClickStartedActive=null;
+const value=(form,name)=>{const raw=new FormData(form).get(name);return typeof raw==='string'&&raw.trim()!==''?raw.trim():null};
+const number=(form,name)=>{const raw=value(form,name);return raw===null?null:Number(raw)};
+const escapeHtml=raw=>String(raw??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+async function jsonFetch(url,options={}){const response=await fetch(url,{...options,headers:{'content-type':'application/json',...(options.headers||{})}});const text=await response.text();let body=null;try{body=text?JSON.parse(text):null}catch{body={error:text}}if(!response.ok)throw new Error(body?.error||`${response.status} ${response.statusText}`);return body}
+function commandId(prefix){return `${prefix}-${crypto.randomUUID()}`}
+function formSnapshot(form,names){return Object.fromEntries(names.map(name=>{const field=form.elements[name];return [name,field.type==='checkbox'?field.checked:field.value]}))}
+function restoreForm(form,state){if(!state)return;Object.entries(state).forEach(([name,saved])=>{const field=form.elements[name];if(!field)return;if(field.type==='checkbox')field.checked=Boolean(saved);else field.value=String(saved??'')})}
+function persistPageState(){try{sessionStorage.setItem(PAGE_STATE_KEY,JSON.stringify({config:formSnapshot($('config-form'),['ssh_identity','bootstrap_command']),search:formSnapshot($('search-form'),SEARCH_FIELDS),local:formSnapshot($('local-provision-form'),['count']),offers:currentOffers,selected:[...selected],sorts:offerSorts}))}catch{}}
+function restorePageState(){try{const saved=JSON.parse(sessionStorage.getItem(PAGE_STATE_KEY)||'null');if(!saved)return;restoreForm($('config-form'),saved.config);restoreForm($('search-form'),saved.search);restoreForm($('local-provision-form'),saved.local);currentOffers=Array.isArray(saved.offers)?saved.offers:[];const available=new Set(currentOffers.map(offer=>Number(offer.offer_id)));selected=new Set((Array.isArray(saved.selected)?saved.selected:[]).map(Number).filter(id=>available.has(id)).slice(0,MAX_SELECTED_OFFERS));const savedSorts=Array.isArray(saved.sorts)?saved.sorts:(typeof saved.sortKey==='string'?[{key:saved.sortKey,direction:saved.sortDirection}]:[]);const seenSortKeys=new Set();offerSorts=savedSorts.filter(sort=>sort&&typeof sort.key==='string'&&!seenSortKeys.has(sort.key)&&seenSortKeys.add(sort.key)).map(sort=>({key:sort.key,direction:sort.direction==='desc'?'desc':'asc'}));renderOffers();updateSelectionUi();if(currentOffers.length)$('offer-status').textContent=`${currentOffers.length} matching offer${currentOffers.length===1?'':'s'}`}catch{}}
+function updateSelectionUi(){const count=selected.size;$('selection').textContent=count?`${[...selected].join(', ')} (${count}/${MAX_SELECTED_OFFERS})`:`none (0/${MAX_SELECTED_OFFERS})`;$('provision-button').disabled=count===0;$('provision-button').textContent=count===0?(provisioningMode==='mock'?'Simulate selected offers':'Provision selected offers'):`${provisioningMode==='mock'?'Simulate':'Provision'} ${count} selected offer${count===1?'':'s'}`}
+async function refresh(){try{const reply=await jsonFetch('/api/control/status');const model=reply.Status;const provider=model.provider.name;provisioningMode=model.provider.provisioning_mode||'real';const vast=provider==='vastai';const simulated=vast&&provisioningMode==='mock';const local=provider==='process'||provider==='docker';$('provider-config-card').hidden=!vast;$('vast-search-card').hidden=!vast;$('vast-offers-card').hidden=!vast;$('local-provision-card').hidden=!local;$('simulation-banner').hidden=!simulated;document.querySelectorAll('[data-real-vastai]').forEach(element=>element.hidden=simulated);$('local-provider-name').textContent=provider;$('readiness').textContent=`${provider} · ${provisioningMode} · ${model.provider.kind}`;$('readiness').className=model.provider.kind==='ready'?'status ok':'status';$('readiness-error').textContent=model.provider.error||'';$('search-button').disabled=!vast||model.provider.kind!=='ready';$('local-provision-button').disabled=!local||model.provider.kind!=='ready';updateSelectionUi()}catch(error){$('readiness-error').textContent=error.message}}
+$('config-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget;try{await jsonFetch('/api/control/provider',{method:'POST',body:JSON.stringify({api_key:value(form,'api_key'),ssh_identity:value(form,'ssh_identity'),bootstrap_command:value(form,'bootstrap_command')})});form.elements.api_key.value='';persistPageState();await refresh()}catch(error){$('readiness-error').textContent=error.message}});
+$('local-provision-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget;const count=number(form,'count')||1;const provider=$('local-provider-name').textContent;if(!confirm(`Provision ${count} ${provider} node${count===1?'':'s'}?`))return;try{await jsonFetch('/api/control/provision',{method:'POST',body:JSON.stringify({command_id:commandId('provision'),count,selected_offer_ids:[]})});$('local-provision-error').textContent='';await refresh()}catch(error){$('local-provision-error').textContent=error.message}});
+$('search-form').addEventListener('submit',async event=>{event.preventDefault();const form=event.currentTarget;const blacklist=(value(form,'blacklist_hosts')||'').split(',').map(v=>Number(v.trim())).filter(Number.isFinite);$('offer-status').textContent='Searching…';$('offer-error').textContent='';try{const reply=await jsonFetch('/api/control/offers',{method:'POST',body:JSON.stringify({gpu_model:value(form,'gpu_model'),min_gpu_ram_mb:number(form,'min_gpu_ram_mb'),min_compute_cap:number(form,'min_compute_cap'),min_reliability:number(form,'min_reliability'),require_verified:form.elements.require_verified.checked,min_download_mbps:number(form,'min_download_mbps'),min_upload_mbps:number(form,'min_upload_mbps'),max_hourly_price:number(form,'max_hourly_price'),blacklist_hosts:blacklist,count:null})});currentOffers=reply.Offers;selected.clear();renderOffers();updateSelectionUi();$('offer-status').textContent=currentOffers.length===0?'No offers match this search.':`${currentOffers.length} matching offer${currentOffers.length===1?'':'s'}`;persistPageState()}catch(error){$('offer-status').textContent='';$('offer-error').textContent=error.message}});
+function compareOfferValues(left,right){const leftMissing=left===null||left===undefined||left==='';const rightMissing=right===null||right===undefined||right==='';if(leftMissing||rightMissing)return leftMissing===rightMissing?0:leftMissing?1:-1;if(typeof left==='number'&&typeof right==='number')return left-right;return String(left).localeCompare(String(right),undefined,{numeric:true,sensitivity:'base'})}
+function renderOffers(){const offers=[...currentOffers];if(offerSorts.length)offers.sort((left,right)=>{for(const sort of offerSorts){const compared=compareOfferValues(left[sort.key],right[sort.key]);if(compared!==0)return compared*(sort.direction==='asc'?1:-1)}return Number(left.offer_id)-Number(right.offer_id)});$('offers').replaceChildren(...offers.map(offer=>{const tr=document.createElement('tr');tr.innerHTML=`<td><input type="checkbox" data-offer="${Number(offer.offer_id)}" style="width:auto"></td><td>${escapeHtml(offer.offer_id)}</td><td>${escapeHtml(offer.host_id)}</td><td>${escapeHtml(offer.gpu_model)}</td><td>${escapeHtml(offer.gpu_ram_mb)}</td><td>${escapeHtml(offer.compute_cap)}</td><td>${escapeHtml(offer.verification)}</td><td>${escapeHtml(offer.reliability)}</td><td>${escapeHtml(offer.download_mbps)}</td><td>${escapeHtml(offer.upload_mbps)}</td><td>${escapeHtml(offer.location)}</td><td>${escapeHtml(Number(offer.hourly_price).toFixed(3))}</td>`;tr.querySelector('[data-offer]').checked=selected.has(Number(offer.offer_id));return tr}));document.querySelectorAll('.sort-button').forEach(button=>button.setAttribute('aria-pressed',String(offerSorts.some(sort=>sort.key===button.dataset.sort&&sort.direction===button.dataset.direction))))}
+$('offers-table').addEventListener('click',event=>{const button=event.target.closest('.sort-button');if(!button)return;const id=`${button.dataset.sort}:${button.dataset.direction}`;const activeIndex=offerSorts.findIndex(sort=>sort.key===button.dataset.sort&&sort.direction===button.dataset.direction);if(event.detail===1)sortDoubleClickStartedActive=activeIndex>=0?id:null;if(event.detail===2&&sortDoubleClickStartedActive===id){offerSorts.splice(activeIndex,1);sortDoubleClickStartedActive=null}else if(activeIndex<0){const columnIndex=offerSorts.findIndex(sort=>sort.key===button.dataset.sort);const next={key:button.dataset.sort,direction:button.dataset.direction};if(columnIndex>=0)offerSorts.splice(columnIndex,1,next);else offerSorts.push(next)}renderOffers();persistPageState()});
+$('offers').addEventListener('change',event=>{const id=Number(event.target.dataset.offer);if(!Number.isFinite(id))return;if(event.target.checked){if(selected.size>=MAX_SELECTED_OFFERS){event.target.checked=false;$('offer-error').textContent=`Select at most ${MAX_SELECTED_OFFERS} offers.`;return}selected.add(id)}else selected.delete(id);$('offer-error').textContent='';updateSelectionUi();persistPageState()});
+$('provision-button').addEventListener('click',async()=>{try{const ids=[...selected];if(ids.length===0)return;const question=provisioningMode==='mock'?`Simulate provisioning exact Vast.ai offer IDs ${ids.join(', ')}? No rental will be created.`:`Provision exact Vast.ai offer IDs ${ids.join(', ')}? This can incur charges.`;if(!confirm(question))return;await jsonFetch('/api/control/provision',{method:'POST',body:JSON.stringify({command_id:commandId('provision'),count:ids.length,selected_offer_ids:ids})});const provisioned=new Set(ids);currentOffers=currentOffers.filter(offer=>!provisioned.has(Number(offer.offer_id)));selected.clear();renderOffers();updateSelectionUi();persistPageState();await refresh()}catch(error){$('offer-error').textContent=error.message}});
+$('config-form').addEventListener('input',persistPageState);$('search-form').addEventListener('input',persistPageState);$('local-provision-form').addEventListener('input',persistPageState);restorePageState();refresh();setInterval(refresh,1000);
+</script>
+</body></html>

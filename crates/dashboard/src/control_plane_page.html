@@ -58,7 +58,7 @@
     .mono { font-family: var(--mono); font-size: 12px; }
     #status { font-family: var(--mono); font-size: 13px; color: var(--amber); }
     a.node-card { color: inherit; text-decoration: none; display: block; }
-    .node-card.orchestrator { grid-column: 1 / -1; border-color: var(--amber); background: var(--card-hover); }
+    .node-card.orchestrator { grid-column: 1 / -1; border-color: var(--amber); background: var(--ghost); box-shadow: inset 3px 0 0 var(--amber); padding-left: 17px; }
     .node-card.orchestrator .role { margin-bottom: 6px; color: var(--muted); font: 600 9px/1.2 var(--mono); text-transform: uppercase; letter-spacing: .12em; }
     :is(a, button, input, summary):focus-visible, tr[data-addr]:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
@@ -141,6 +141,7 @@ let detailTimer = null;
 // restarted animations every second even in a fully converged steady state.
 let lastPageHtml = null;
 let lastRosterHtml = null;
+let lastMachineHtml = null;
 let lastDossierHtml = null;
 
 // Receipt ages (dossier) render as empty spans carrying an absolute epoch —
@@ -292,23 +293,20 @@ function updateCardTexts(nodes) {
 
 function renderNode(page, node, live, stale) {
   const summary = node.actor_summary || {};
-  const machine = machineDetail(node);
-  // The machine panel churns with live metrics, so swaps here are real; keep
-  // the roster filter usable by restoring focus and caret across them.
   const active = document.activeElement;
   const refocus = active && active.id === 'roster-filter' && page.contains(active)
     ? { start: active.selectionStart, end: active.selectionEnd, dir: active.selectionDirection }
     : null;
   const html = `
-    <a class="focus-back" href="/">← Fleet (${fmt(live.length)} live, ${fmt(stale.length)} stale)</a>
+    <a class="focus-back" href="/">← Fleet (<span data-live-count></span> live, <span data-stale-count></span> stale)</a>
     <div class="layout ${selectedActor ? 'with-dossier' : ''}">
-      <div class="node-view">
+      <div class="node-view" data-node="${esc(node.stream.node)}">
         <section class="panel">
           <h2 style="margin:0 0 8px">${esc(node.stream.node)}${node.stream.label ? ` <span class="muted" style="font-size:13px">${esc(node.stream.label)}</span>` : ''} <span class="muted" style="font-size:13px">life ${fmt(node.stream.life)} · <span data-seen></span></span></h2>
-          ${machine}
+          <div id="machine-detail"></div>
         </section>
         <section class="panel">
-          <h2 style="margin:0 0 8px">Actors (${fmt(summary.actors)})</h2>
+          <h2 style="margin:0 0 8px">Actors (<span data-actor-count></span>)</h2>
           <input type="search" id="roster-filter" aria-label="Filter actors" placeholder="filter by type, address, worker…" value="${esc(rosterFilter)}">
           <div id="roster-wrap" style="margin-top:10px"></div>
         </section>
@@ -318,6 +316,8 @@ function renderNode(page, node, live, stale) {
   if (html !== lastPageHtml) {
     page.innerHTML = html;
     lastPageHtml = html;
+    lastMachineHtml = null;
+    lastRosterHtml = null;
     const filter = document.getElementById('roster-filter');
     filter.addEventListener('input', e => { rosterFilter = e.target.value; renderRoster(node); });
     if (refocus) {
@@ -325,10 +325,26 @@ function renderNode(page, node, live, stale) {
       try { filter.setSelectionRange(refocus.start, refocus.end, refocus.dir); } catch { /* caret shape changed */ }
     }
   }
-  const seen = document.querySelector('#page h2 [data-seen]');
+  const liveCount = page.querySelector('[data-live-count]');
+  if (liveCount) liveCount.textContent = fmt(live.length);
+  const staleCount = page.querySelector('[data-stale-count]');
+  if (staleCount) staleCount.textContent = fmt(stale.length);
+  const actorCount = page.querySelector('[data-actor-count]');
+  if (actorCount) actorCount.textContent = fmt(summary.actors);
+  const seen = page.querySelector('h2 [data-seen]');
   if (seen) seen.textContent = node.live ? 'live' : 'stale ' + ago(node.last_seen_ms_ago) + ' ago';
+  const machine = machineDetail(node);
+  const machineSlot = document.getElementById('machine-detail');
+  if (machineSlot && machine !== lastMachineHtml) {
+    machineSlot.innerHTML = machine;
+    lastMachineHtml = machine;
+  }
   renderRoster(node);
-  if (selectedActor) startDetailPolling();
+  if (selectedActor) {
+    if (!detailTimer) startDetailPolling();
+  } else {
+    stopDetailPolling();
+  }
 }
 
 function machineDetail(node) {
@@ -406,17 +422,36 @@ function renderRoster(node) {
       <td class="mono">${esc(shortAddr(a.address))}${a.name ? `<br><span class="muted">${esc(a.name)}</span>` : ''}</td>
       <td><span class="muted" title="${esc(a.actor_type || '')}">${typeShort(a.actor_type)}</span></td>
       <td>${a.poisoned ? '<span class="pill poisoned">poisoned</span>' : '<span class="muted">running</span>'}</td>
-      <td>${fmt(a.mailbox_depth)}</td>
-      <td>${fmtRate(a.msg_per_sec)}</td>
-      <td>${fmt(a.messages_processed)}</td>
+      <td data-mailbox></td>
+      <td data-rate></td>
+      <td data-processed></td>
       <td>${a.worker_id == null ? '—' : fmt(a.worker_id)}</td>
-      <td><span class="muted" title="${esc(a.last_msg_type || '')}">${typeShort(a.last_msg_type)}</span></td>
+      <td><span class="muted" data-last-message></span></td>
     </tr>`).join('')}</tbody>
   </table>`;
   }
-  if (html === lastRosterHtml) return;
-  wrap.innerHTML = html;
-  lastRosterHtml = html;
+  if (html !== lastRosterHtml) {
+    wrap.innerHTML = html;
+    lastRosterHtml = html;
+  }
+  updateRosterTexts(wrap, capped);
+}
+
+function updateRosterTexts(wrap, actors) {
+  const byAddress = new Map(actors.map(actor => [actor.address, actor]));
+  for (const row of wrap.querySelectorAll('tr[data-addr]')) {
+    const actor = byAddress.get(row.getAttribute('data-addr'));
+    if (!actor) continue;
+    row.querySelector('[data-mailbox]').textContent = fmt(actor.mailbox_depth);
+    row.querySelector('[data-rate]').textContent = fmtRate(actor.msg_per_sec);
+    row.querySelector('[data-processed]').textContent = fmt(actor.messages_processed);
+    const last = row.querySelector('[data-last-message]');
+    const messageType = actor.last_msg_type || '';
+    last.title = messageType;
+    const parts = String(messageType).split('::');
+    last.textContent = messageType ? parts[parts.length - 1] || messageType : '—';
+  }
+
 }
 
 function shortAddr(address) {

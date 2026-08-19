@@ -2478,6 +2478,7 @@ dependencies = [
 name = "myelin"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "blake3",
  "dashboard",
  "data-plane",
@@ -2486,6 +2487,7 @@ dependencies = [
  "iroh-driver",
  "libc",
  "parking_lot",
+ "proptest",
  "provisioning",
  "serde",
  "serde_json",

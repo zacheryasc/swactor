@@ -147,7 +147,7 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
   <section class="panel">
     <table>
       <thead>
-        <tr><th>node</th><th>stage</th><th>state</th><th>pid</th><th>seen</th><th>edge</th><th></th></tr>
+        <tr><th>node</th><th>stage</th><th>state</th><th>pid</th><th>seen</th><th data-edge hidden>edge</th><th></th></tr>
       </thead>
       <tbody id="rows"></tbody>
     </table>
@@ -229,7 +229,7 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
     // One row per logical node: reconciler state (stage, attempt, ready) fused
     // with the observed process (state, pid, seen). Reconciler order leads;
     // processes the reconciler no longer tracks still render.
-    function renderRow(entry) {
+    function renderRow(entry, edgeCapable) {
       const reconciler = entry.reconciler;
       const process = entry.process;
       const node = reconciler ? reconciler.id : process.node;
@@ -245,9 +245,15 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
         ? `<div class="row-error">${escapeHtml(reconciler.failure)}</div>`
         : '';
       const killable = process && process.state === 'running';
-      const edge = entry.edge
-        ? `<span class="badge ${EDGE_CLASS[entry.edge.state] || 'b-progress'}">e${escapeHtml(entry.edge.edge)} ${escapeHtml(entry.edge.state)}</span>`
-        : '<span class="muted">—</span>';
+      const edgeCell = edgeCapable
+        ? `<td>${entry.edge
+            ? `<span class="badge ${EDGE_CLASS[entry.edge.state] || 'b-progress'}">e${escapeHtml(entry.edge.edge)} ${escapeHtml(entry.edge.state)}</span>`
+            : '<span class="muted">—</span>'}</td>`
+        : '';
+      const edgeButton = edgeCapable
+        ? ` <button class="edge" data-action="edge" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>edge</button>`
+        : '';
+      const colspan = edgeCapable ? 7 : 6;
       // "seen" is deliberately absent from this HTML: it is written per-poll
       // as textContent by updateSeen() so a ticking relative age never
       // invalidates the cached row markup.
@@ -257,12 +263,9 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
         <td>${state}</td>
         <td>${pid == null ? '—' : escapeHtml(pid)}</td>
         <td class="muted" data-seen>—</td>
-        <td>${edge}</td>
-        <td>
-          <button class="edge" data-action="edge" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>edge</button>
-          <button class="danger" data-action="kill" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>kill</button>
-        </td>
-      </tr>${failure ? `<tr><td colspan="7" style="padding-top:0">${failure}</td></tr>` : ''}`;
+        ${edgeCell}
+        <td>${edgeButton}<button class="danger" data-action="kill" data-node="${escapeHtml(node)}" ${killable ? '' : 'disabled'}>kill</button></td>
+      </tr>${failure ? `<tr><td colspan="${colspan}" style="padding-top:0">${failure}</td></tr>` : ''}`;
     }
 
     function fuse(processes, reconcilerNodes, edges) {
@@ -292,9 +295,13 @@ RISK: terminal cosplay if decoration creeps past data; held by the palette law.
       const processes = (processSnapshot && processSnapshot.nodes) || [];
       const reconcilerNodes = (reconcilerSnapshot && reconcilerSnapshot.nodes) || [];
       const edges = (reconcilerSnapshot && reconcilerSnapshot.edges) || [];
+      // The edge column exists only when a reconciler view supplies edge
+      // records; without it the edge button can never succeed.
+      const edgeCapable = !!reconcilerSnapshot && Array.isArray(reconcilerSnapshot.edges);
+      document.querySelector('th[data-edge]').hidden = !edgeCapable;
       const fused = fuse(processes, reconcilerNodes, edges);
       empty.hidden = fused.length > 0;
-      const rowsHtml = fused.map(renderRow).join('');
+      const rowsHtml = fused.map((entry) => renderRow(entry, edgeCapable)).join('');
       if (rowsHtml !== lastRowsHtml) {
         rows.innerHTML = rowsHtml;
         lastRowsHtml = rowsHtml;
